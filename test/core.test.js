@@ -39,6 +39,14 @@ import {
 
 import { detectPage, itemMarketUrl } from '../src/sources/route.js';
 import { parseBuyLabel } from '../src/sources/dom/scan.js';
+import {
+    recordSightings,
+    pruneLedger,
+    ledgerRows,
+    makeLedgerCacheEntry,
+    readLedgerCacheEntry,
+    LEDGER_TTL_MS,
+} from '../src/core/ledger.js';
 import { itemIdFromImage } from '../src/sources/dom/detect.js';
 
 /* ---------------------------------------------------------------- parse */
@@ -495,4 +503,77 @@ test('the item id comes from the image path', () => {
 
     assert.equal(itemIdFromImage(avatar), null);
     assert.equal(itemIdFromImage(null), null);
+});
+
+/* ----------------------------------------------- cross-page ledger */
+
+function sighting(id, name, price, profit) {
+    return {
+        itemId: id,
+        name,
+        qtyAtPrice: true,
+        profit: {
+            venue: 'NPC',
+            listingPrice: price,
+            exitPrice: price + profit,
+            profitPerUnit: profit,
+            roi: profit / price,
+            qty: 1,
+            affordableQty: 1,
+            totalProfit: profit,
+            realizableProfit: profit,
+            cashRequired: price,
+        },
+    };
+}
+
+test('the ledger keeps the cheapest sighting of each item', () => {
+    const ledger = new Map();
+    const t = 1_000_000;
+
+    recordSightings(ledger, [sighting('1', 'Hammer', 500, 50)], t);
+    recordSightings(ledger, [sighting('1', 'Hammer', 400, 150)], t + 1000);
+    recordSightings(ledger, [sighting('1', 'Hammer', 900, 10)], t + 2000);
+
+    assert.equal(ledger.size, 1);
+    assert.equal(ledger.get('1').listingPrice, 400);
+
+    // A worse price still confirms the item is around, so it refreshes age.
+    assert.equal(ledger.get('1').seenAt, t + 2000);
+});
+
+test('ledger entries expire so a stale price is never presented as live', () => {
+    const ledger = new Map();
+    const t = 1_000_000;
+
+    recordSightings(ledger, [sighting('1', 'Hammer', 400, 150)], t);
+
+    pruneLedger(ledger, t + LEDGER_TTL_MS - 1);
+    assert.equal(ledger.size, 1);
+
+    pruneLedger(ledger, t + LEDGER_TTL_MS + 1);
+    assert.equal(ledger.size, 0);
+});
+
+test('ledger rows carry no element, so the panel navigates instead', () => {
+    const ledger = new Map();
+    recordSightings(ledger, [sighting('206', 'Xanax', 1000, 500)]);
+
+    const [row] = ledgerRows(ledger);
+
+    assert.equal(row.el, null);
+    assert.equal(row.fromLedger, true);
+    assert.equal(row.profit.realizableProfit, 500);
+});
+
+test('the ledger survives a storage round trip, dropping stale entries', () => {
+    const ledger = new Map();
+    const t = 1_000_000;
+
+    recordSightings(ledger, [sighting('1', 'Hammer', 400, 150)], t);
+    const saved = makeLedgerCacheEntry(ledger, t);
+
+    assert.equal(readLedgerCacheEntry(saved, t + 1000).size, 1);
+    assert.equal(readLedgerCacheEntry(saved, t + LEDGER_TTL_MS + 1).size, 0);
+    assert.equal(readLedgerCacheEntry(null, t).size, 0);
 });

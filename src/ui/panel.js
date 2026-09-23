@@ -477,6 +477,29 @@ export class Panel {
             return label;
         };
 
+        this.showAllSeenInput = el('input', { type: 'checkbox' });
+        this.showAllSeenInput.addEventListener('change', () =>
+            this.emitSettings({ showAllSeen: this.showAllSeenInput.checked }),
+        );
+
+        this.filtersEl.appendChild(
+            mkCheck(
+                this.showAllSeenInput,
+                'Show everything seen while browsing',
+                'Keeps results from every category you visit, not just the ' +
+                    'page you are on. Entries expire after 30 minutes.',
+            ),
+        );
+
+        this.filtersEl.appendChild(
+            el('button', {
+                type: 'button',
+                text: 'Clear list',
+                onclick: () =>
+                    this.handlers.onClearList && this.handlers.onClearList(),
+            }),
+        );
+
         this.filtersEl.appendChild(
             mkCheck(
                 this.compareNpcInput,
@@ -604,6 +627,9 @@ export class Panel {
         if (this.unverifiedInput && settings.includeUnverifiedNpc !== undefined) {
             this.unverifiedInput.checked = Boolean(settings.includeUnverifiedNpc);
         }
+        if (this.showAllSeenInput && settings.showAllSeen !== undefined) {
+            this.showAllSeenInput.checked = Boolean(settings.showAllSeen);
+        }
         if (this.compareNpcInput && settings.compareNpc !== undefined) {
             this.compareNpcInput.checked = Boolean(settings.compareNpc);
         }
@@ -698,6 +724,20 @@ export class Panel {
 
         const name = el('div', { class: 'ttv2-row-name' });
         name.appendChild(document.createTextNode(row.name));
+
+        if (row.fromLedger) {
+            const age = Math.round((Date.now() - row.seenAt) / 60000);
+            name.appendChild(
+                el('span', {
+                    class: 'ttv2-guess',
+                    title:
+                        'Seen on another page, not on this one. The listing ' +
+                        'may already be gone - the button opens the item so ' +
+                        'you can check.',
+                    text: age < 1 ? ' (elsewhere)' : ' (' + age + 'm ago)',
+                }),
+            );
+        }
 
         // Buy: $2,896 -> NPC: $3,000
         const buyLine = el('div', {

@@ -21,6 +21,13 @@ import {
 import { bestVenue } from './core/profit.js';
 import { formatMoneyShort } from './core/parse.js';
 import { rankOpportunities, summarize } from './core/ranker.js';
+import {
+    recordSightings,
+    pruneLedger,
+    ledgerRows,
+    makeLedgerCacheEntry,
+    readLedgerCacheEntry,
+} from './core/ledger.js';
 import { TornApiClient, redactKey } from './api/client.js';
 import {
     fetchItems,
@@ -40,6 +47,7 @@ const STORE_NPC = 'npcCache';
 const STORE_MANUAL_NPC = 'npcManual';
 const STORE_SETTINGS = 'settings';
 const STORE_KEY_ACCESS = 'keyAccess';
+const STORE_LEDGER = 'ledger';
 
 const DEFAULT_SETTINGS = {
     /*
@@ -75,6 +83,9 @@ const DEFAULT_SETTINGS = {
      * turning it on hides real opportunities - see includeUnverifiedNpc.
      */
     npcShopsOnly: false,
+
+    /* Show everything seen while browsing, not just the current page. */
+    showAllSeen: true,
     collapsed: false,
     autoScan: true,
 };
@@ -93,6 +104,7 @@ const POLL_INTERVAL_MS = 2500;
 const app = {
     index: null,
     npcShops: new Map(),
+    ledger: new Map(),
     shopDataMissing: false,
     manualNpc: {},
     settings: { ...DEFAULT_SETTINGS },
@@ -167,6 +179,13 @@ function onForgetKey() {
 
     refreshKeyState();
     app.panel.setStatus('API key removed from this script.');
+}
+
+function onClearList() {
+    app.ledger = new Map();
+    gmDel(STORE_LEDGER);
+    app.panel.setStatus('Cleared everything seen so far.');
+    rescan();
 }
 
 function onClearCache() {
@@ -255,6 +274,7 @@ async function loadReferenceData() {
     app.shopDataMissing = app.npcShops.size === 0;
 
     app.manualNpc = gmGet(STORE_MANUAL_NPC, {}) || {};
+    app.ledger = readLedgerCacheEntry(gmGet(STORE_LEDGER, null));
 }
 
 /* ------------------------------------------------------------------ *
@@ -358,14 +378,48 @@ function rescan() {
             app.settings.includeUnverifiedNpc || app.shopDataMissing,
     });
 
+    /*
+     * Remember what this page showed.
+     *
+     * The scanner may only read the page you are on - but nothing stops it
+     * remembering. Browsing the categories once builds a view of the whole
+     * market without a single extra request.
+     */
+    const now = Date.now();
+    recordSightings(app.ledger, ranked, now);
+    pruneLedger(app.ledger, now);
+    gmSet(STORE_LEDGER, makeLedgerCacheEntry(app.ledger, now));
+
     markRows(ranked);
-    app.lastScanAt = Date.now();
+    app.lastScanAt = now;
+
+    /*
+     * The panel can show the whole ledger, but rows visible on THIS page win:
+     * they carry an element, so their action scrolls instead of navigating,
+     * and their numbers are from this second rather than from memory.
+     */
+    const onPage = new Set(ranked.map((r) => String(r.itemId)));
+
+    const combined = app.settings.showAllSeen
+        ? ranked.concat(
+              ledgerRows(app.ledger).filter(
+                  (r) => !onPage.has(String(r.itemId)),
+              ),
+          )
+        : ranked;
+
+    const shown = rankOpportunities(combined, {
+        ...app.settings,
+        includeUnverifiedNpc:
+            app.settings.includeUnverifiedNpc || app.shopDataMissing,
+    });
 
     app.panel.render({
-        rows: ranked,
-        summary: summarize(ranked),
+        rows: shown,
+        summary: summarize(shown),
         diagnostics: {
             ...diagnostics,
+            ledgerSize: app.ledger.size,
             priced: app.pricedCount,
             shopDataMissing: app.shopDataMissing,
             shopLoadError: app.shopLoadError || null,
@@ -589,6 +643,7 @@ export function boot() {
         onSaveKey,
         onForgetKey,
         onClearCache,
+        onClearList,
     });
 
     app.panel.mount();

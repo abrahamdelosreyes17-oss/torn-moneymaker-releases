@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      2.7.1
+// @version      2.8.0
 // @description  Ranks Bazaar / Item Market listings on the page you are viewing by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -32,7 +32,7 @@
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '2.7.1';
+    const TTV2_BUILD_VERSION = '2.8.0';
 
     /* ===== src/platform/gm.js ===== */
     /*
@@ -787,6 +787,149 @@
         }
 
         return { count: rows.length, totalProfit, cashRequired };
+    }
+
+    /* ===== src/core/ledger.js ===== */
+    /*
+     * What we have seen across the whole Item Market, not just this page.
+     *
+     * Pure - no DOM, no network, no storage. main.js persists it.
+     *
+     * The scanner can only read the page you are looking at; that is the rule and
+     * it is not negotiable. But nothing stops us REMEMBERING what we read. Click
+     * through the categories once and the ledger holds the whole market, built
+     * entirely from pages you loaded yourself.
+     *
+     * One entry per item, keeping the best opportunity seen for it. Entries
+     * expire, because a price from an hour ago is a rumour rather than a listing.
+     */
+
+    const LEDGER_VERSION = 'ledger-v1';
+
+    /** After this an entry is dropped: the listing has probably gone. */
+    const LEDGER_TTL_MS = 30 * 60 * 1000;
+
+    /** Keep the ledger bounded regardless of how long someone browses. */
+    const LEDGER_MAX_ENTRIES = 400;
+
+    function entryFrom(row, now) {
+        return {
+            itemId: String(row.itemId),
+            name: row.name,
+            listingPrice: row.profit.listingPrice,
+            exitPrice: row.profit.exitPrice,
+            venue: row.profit.venue,
+            profitPerUnit: row.profit.profitPerUnit,
+            roi: row.profit.roi,
+            qty: row.profit.qty,
+            qtyAtPrice: Boolean(row.qtyAtPrice),
+            marketTotal: row.marketTotal || null,
+            totalProfit: row.profit.totalProfit,
+            realizableProfit: row.profit.realizableProfit,
+            cashRequired: row.profit.cashRequired,
+            npcShop: row.npcShop || null,
+            seenAt: now,
+        };
+    }
+
+    /**
+     * Fold this page's opportunities into the ledger.
+     *
+     * A cheaper sighting of the same item always replaces the old one - that is
+     * the thing worth knowing. An equal-or-worse price still refreshes `seenAt`,
+     * because it confirms the item is still listed around that level.
+     *
+     * @param {Map<string, object>} ledger
+     * @param {Array<object>} rows - ranked rows carrying `profit`
+     * @returns {Map<string, object>} the same map, mutated
+     */
+    function recordSightings(ledger, rows, now = Date.now()) {
+        for (const row of rows || []) {
+            if (!row || !row.profit || !row.itemId) continue;
+
+            const id = String(row.itemId);
+            const existing = ledger.get(id);
+
+            if (!existing || row.profit.listingPrice < existing.listingPrice) {
+                ledger.set(id, entryFrom(row, now));
+            } else {
+                existing.seenAt = now;
+            }
+        }
+
+        return ledger;
+    }
+
+    /** Drop expired entries, and trim to the most profitable if oversized. */
+    function pruneLedger(ledger, now = Date.now(), ttl = LEDGER_TTL_MS) {
+        for (const [id, entry] of ledger) {
+            if (now - entry.seenAt > ttl) ledger.delete(id);
+        }
+
+        if (ledger.size > LEDGER_MAX_ENTRIES) {
+            const kept = [...ledger.values()]
+                .sort((a, b) => b.realizableProfit - a.realizableProfit)
+                .slice(0, LEDGER_MAX_ENTRIES);
+
+            ledger.clear();
+            for (const entry of kept) ledger.set(entry.itemId, entry);
+        }
+
+        return ledger;
+    }
+
+    /**
+     * The ledger as rows the panel and ranker understand.
+     *
+     * These carry no `el`, because the listing is not on the page you are looking
+     * at - the panel's action navigates to the item instead of scrolling to it.
+     */
+    function ledgerRows(ledger) {
+        return [...ledger.values()].map((entry) => ({
+            itemId: entry.itemId,
+            name: entry.name,
+            el: null,
+            fromLedger: true,
+            seenAt: entry.seenAt,
+            qtyAtPrice: entry.qtyAtPrice,
+            marketTotal: entry.marketTotal,
+            npcShop: entry.npcShop,
+            profit: {
+                venue: entry.venue,
+                listingPrice: entry.listingPrice,
+                exitPrice: entry.exitPrice,
+                profitPerUnit: entry.profitPerUnit,
+                roi: entry.roi,
+                qty: entry.qty,
+                affordableQty: entry.qty,
+                totalProfit: entry.totalProfit,
+                realizableProfit: entry.realizableProfit,
+                cashRequired: entry.cashRequired,
+            },
+        }));
+    }
+
+    function makeLedgerCacheEntry(ledger, now = Date.now()) {
+        return {
+            version: LEDGER_VERSION,
+            savedAt: now,
+            entries: [...ledger.values()],
+        };
+    }
+
+    function readLedgerCacheEntry(cached, now = Date.now()) {
+        const ledger = new Map();
+
+        if (!cached || cached.version !== LEDGER_VERSION) return ledger;
+
+        for (const entry of cached.entries || []) {
+            if (!entry || !entry.itemId) continue;
+            if (now - entry.seenAt > LEDGER_TTL_MS) continue;
+
+            ledger.set(String(entry.itemId), entry);
+        }
+
+        return ledger;
     }
 
     /* ===== src/api/client.js ===== */
@@ -2530,6 +2673,29 @@
                 return label;
             };
 
+            this.showAllSeenInput = el('input', { type: 'checkbox' });
+            this.showAllSeenInput.addEventListener('change', () =>
+                this.emitSettings({ showAllSeen: this.showAllSeenInput.checked }),
+            );
+
+            this.filtersEl.appendChild(
+                mkCheck(
+                    this.showAllSeenInput,
+                    'Show everything seen while browsing',
+                    'Keeps results from every category you visit, not just the ' +
+                        'page you are on. Entries expire after 30 minutes.',
+                ),
+            );
+
+            this.filtersEl.appendChild(
+                el('button', {
+                    type: 'button',
+                    text: 'Clear list',
+                    onclick: () =>
+                        this.handlers.onClearList && this.handlers.onClearList(),
+                }),
+            );
+
             this.filtersEl.appendChild(
                 mkCheck(
                     this.compareNpcInput,
@@ -2657,6 +2823,9 @@
             if (this.unverifiedInput && settings.includeUnverifiedNpc !== undefined) {
                 this.unverifiedInput.checked = Boolean(settings.includeUnverifiedNpc);
             }
+            if (this.showAllSeenInput && settings.showAllSeen !== undefined) {
+                this.showAllSeenInput.checked = Boolean(settings.showAllSeen);
+            }
             if (this.compareNpcInput && settings.compareNpc !== undefined) {
                 this.compareNpcInput.checked = Boolean(settings.compareNpc);
             }
@@ -2751,6 +2920,20 @@
 
             const name = el('div', { class: 'ttv2-row-name' });
             name.appendChild(document.createTextNode(row.name));
+
+            if (row.fromLedger) {
+                const age = Math.round((Date.now() - row.seenAt) / 60000);
+                name.appendChild(
+                    el('span', {
+                        class: 'ttv2-guess',
+                        title:
+                            'Seen on another page, not on this one. The listing ' +
+                            'may already be gone - the button opens the item so ' +
+                            'you can check.',
+                        text: age < 1 ? ' (elsewhere)' : ' (' + age + 'm ago)',
+                    }),
+                );
+            }
 
             // Buy: $2,896 -> NPC: $3,000
             const buyLine = el('div', {
@@ -3036,12 +3219,14 @@
 
 
 
+
     const STORE_KEY = 'apiKey';
     const STORE_ITEMS = 'itemsCache';
     const STORE_NPC = 'npcCache';
     const STORE_MANUAL_NPC = 'npcManual';
     const STORE_SETTINGS = 'settings';
     const STORE_KEY_ACCESS = 'keyAccess';
+    const STORE_LEDGER = 'ledger';
 
     const DEFAULT_SETTINGS = {
         /*
@@ -3077,6 +3262,9 @@
          * turning it on hides real opportunities - see includeUnverifiedNpc.
          */
         npcShopsOnly: false,
+
+        /* Show everything seen while browsing, not just the current page. */
+        showAllSeen: true,
         collapsed: false,
         autoScan: true,
     };
@@ -3095,6 +3283,7 @@
     const app = {
         index: null,
         npcShops: new Map(),
+        ledger: new Map(),
         shopDataMissing: false,
         manualNpc: {},
         settings: { ...DEFAULT_SETTINGS },
@@ -3169,6 +3358,13 @@
 
         refreshKeyState();
         app.panel.setStatus('API key removed from this script.');
+    }
+
+    function onClearList() {
+        app.ledger = new Map();
+        gmDel(STORE_LEDGER);
+        app.panel.setStatus('Cleared everything seen so far.');
+        rescan();
     }
 
     function onClearCache() {
@@ -3257,6 +3453,7 @@
         app.shopDataMissing = app.npcShops.size === 0;
 
         app.manualNpc = gmGet(STORE_MANUAL_NPC, {}) || {};
+        app.ledger = readLedgerCacheEntry(gmGet(STORE_LEDGER, null));
     }
 
     /* ------------------------------------------------------------------ *
@@ -3360,14 +3557,48 @@
                 app.settings.includeUnverifiedNpc || app.shopDataMissing,
         });
 
+        /*
+         * Remember what this page showed.
+         *
+         * The scanner may only read the page you are on - but nothing stops it
+         * remembering. Browsing the categories once builds a view of the whole
+         * market without a single extra request.
+         */
+        const now = Date.now();
+        recordSightings(app.ledger, ranked, now);
+        pruneLedger(app.ledger, now);
+        gmSet(STORE_LEDGER, makeLedgerCacheEntry(app.ledger, now));
+
         markRows(ranked);
-        app.lastScanAt = Date.now();
+        app.lastScanAt = now;
+
+        /*
+         * The panel can show the whole ledger, but rows visible on THIS page win:
+         * they carry an element, so their action scrolls instead of navigating,
+         * and their numbers are from this second rather than from memory.
+         */
+        const onPage = new Set(ranked.map((r) => String(r.itemId)));
+
+        const combined = app.settings.showAllSeen
+            ? ranked.concat(
+                  ledgerRows(app.ledger).filter(
+                      (r) => !onPage.has(String(r.itemId)),
+                  ),
+              )
+            : ranked;
+
+        const shown = rankOpportunities(combined, {
+            ...app.settings,
+            includeUnverifiedNpc:
+                app.settings.includeUnverifiedNpc || app.shopDataMissing,
+        });
 
         app.panel.render({
-            rows: ranked,
-            summary: summarize(ranked),
+            rows: shown,
+            summary: summarize(shown),
             diagnostics: {
                 ...diagnostics,
+                ledgerSize: app.ledger.size,
                 priced: app.pricedCount,
                 shopDataMissing: app.shopDataMissing,
                 shopLoadError: app.shopLoadError || null,
@@ -3591,6 +3822,7 @@
             onSaveKey,
             onForgetKey,
             onClearCache,
+            onClearList,
         });
 
         app.panel.mount();
