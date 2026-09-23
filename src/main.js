@@ -399,7 +399,12 @@ function rescan() {
      * market without a single extra request.
      */
     const now = Date.now();
-    recordSightings(app.ledger, ranked, now);
+    recordSightings(
+        app.ledger,
+        ranked,
+        now,
+        new Set(listings.map((l) => String(l.itemId))),
+    );
     pruneLedger(app.ledger, now);
     gmSet(STORE_LEDGER, makeLedgerCacheEntry(app.ledger, now));
 

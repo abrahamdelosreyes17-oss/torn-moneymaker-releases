@@ -527,19 +527,16 @@ function sighting(id, name, price, profit) {
     };
 }
 
-test('the ledger keeps the cheapest sighting of each item', () => {
+test('the ledger holds one current entry per item', () => {
     const ledger = new Map();
     const t = 1_000_000;
 
     recordSightings(ledger, [sighting('1', 'Hammer', 500, 50)], t);
     recordSightings(ledger, [sighting('1', 'Hammer', 400, 150)], t + 1000);
-    recordSightings(ledger, [sighting('1', 'Hammer', 900, 10)], t + 2000);
 
     assert.equal(ledger.size, 1);
     assert.equal(ledger.get('1').listingPrice, 400);
-
-    // A worse price still confirms the item is around, so it refreshes age.
-    assert.equal(ledger.get('1').seenAt, t + 2000);
+    assert.equal(ledger.get('1').seenAt, t + 1000);
 });
 
 test('ledger entries expire so a stale price is never presented as live', () => {
@@ -576,4 +573,42 @@ test('the ledger survives a storage round trip, dropping stale entries', () => {
     assert.equal(readLedgerCacheEntry(saved, t + 1000).size, 1);
     assert.equal(readLedgerCacheEntry(saved, t + LEDGER_TTL_MS + 1).size, 0);
     assert.equal(readLedgerCacheEntry(null, t).size, 0);
+});
+
+test('the newest sighting wins, even when the price got worse', () => {
+    /*
+     * Regression: keeping the cheapest price meant a sold-out $2,900 listing
+     * survived a re-sighting at $3,100 AND had its timestamp refreshed, so a
+     * dead listing looked permanently fresh.
+     */
+    const ledger = new Map();
+    const t = 1_000_000;
+
+    recordSightings(ledger, [sighting('1', 'Champagne', 2900, 200)], t);
+    recordSightings(ledger, [sighting('1', 'Champagne', 3050, 50)], t + 60000);
+
+    assert.equal(ledger.get('1').listingPrice, 3050);
+    assert.equal(ledger.get('1').profitPerUnit, 50);
+});
+
+test('an item seen on the page but no longer profitable is forgotten', () => {
+    const ledger = new Map();
+    const t = 1_000_000;
+
+    recordSightings(ledger, [sighting('1', 'Champagne', 2900, 200)], t);
+    assert.equal(ledger.size, 1);
+
+    // Revisited: item 1 is on the page, but has no opportunity any more.
+    recordSightings(ledger, [], t + 1000, new Set(['1']));
+    assert.equal(ledger.size, 0);
+});
+
+test('items not on this page are left alone', () => {
+    const ledger = new Map();
+    const t = 1_000_000;
+
+    recordSightings(ledger, [sighting('206', 'Xanax', 1000, 500)], t);
+    recordSightings(ledger, [], t + 1000, new Set(['1']));
+
+    assert.equal(ledger.size, 1);
 });

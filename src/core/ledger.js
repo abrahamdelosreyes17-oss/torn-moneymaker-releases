@@ -49,25 +49,39 @@ function entryFrom(row, now) {
 /**
  * Fold this page's opportunities into the ledger.
  *
- * A cheaper sighting of the same item always replaces the old one - that is
- * the thing worth knowing. An equal-or-worse price still refreshes `seenAt`,
- * because it confirms the item is still listed around that level.
+ * The NEWEST sighting always wins, even when it is worse.
+ *
+ * Keeping the cheapest price seen was wrong, and badly so: when an item rose
+ * from $2,900 to $3,100 the ledger kept the $2,900 entry AND refreshed its
+ * timestamp, so a listing that had already sold looked permanently fresh and
+ * kept offering a link to a trade that no longer existed. In a live market
+ * the current price is the only true one.
+ *
+ * `seenOnPage` is every item id the page showed, profitable or not. Anything
+ * in that set without a current opportunity is removed, so revisiting a page
+ * actively corrects the ledger instead of only adding to it.
  *
  * @param {Map<string, object>} ledger
  * @param {Array<object>} rows - ranked rows carrying `profit`
+ * @param {Set<string>} [seenOnPage] - all item ids present on the page
  * @returns {Map<string, object>} the same map, mutated
  */
-export function recordSightings(ledger, rows, now = Date.now()) {
+export function recordSightings(ledger, rows, now = Date.now(), seenOnPage) {
+    const stillGood = new Set();
+
     for (const row of rows || []) {
         if (!row || !row.profit || !row.itemId) continue;
 
         const id = String(row.itemId);
-        const existing = ledger.get(id);
+        stillGood.add(id);
+        ledger.set(id, entryFrom(row, now));
+    }
 
-        if (!existing || row.profit.listingPrice < existing.listingPrice) {
-            ledger.set(id, entryFrom(row, now));
-        } else {
-            existing.seenAt = now;
+    // Seen on this page, but no longer an opportunity: forget it.
+    if (seenOnPage) {
+        for (const id of seenOnPage) {
+            const key = String(id);
+            if (!stillGood.has(key)) ledger.delete(key);
         }
     }
 
