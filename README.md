@@ -180,6 +180,22 @@ code and the key handling, which is what the list above does.
 
 ---
 
+## Verifying a change before release
+
+`test/fixture.html` holds markup captured from live Torn pages. Serve the project and
+open it to run the real scanner against it in a real browser:
+
+```bash
+python -m http.server 8777
+```
+
+Then open `http://localhost:8777/test/fixture.html`. The page prints the diagnostics,
+what was parsed, and the ranking, and marks the profitable cards exactly as the
+script does on Torn.
+
+This exists because unit tests passed for days while the scanner could not read a
+single real page. **Run this before every release.**
+
 ## Status
 
 **Phase 1 complete, with one caveat.**

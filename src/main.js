@@ -19,6 +19,7 @@ import {
     npcExitPrice,
 } from './core/npc.js';
 import { computeOpportunity } from './core/profit.js';
+import { formatMoney } from './core/parse.js';
 import { rankOpportunities, summarize } from './core/ranker.js';
 import { TornApiClient, redactKey } from './api/client.js';
 import {
@@ -45,15 +46,24 @@ const DEFAULT_SETTINGS = {
     cashOnHand: null,
     includeUnverifiedNpc: false,
     collapsed: false,
-    autoScan: false,
-    selectorOverrides: null,
+    autoScan: true,
 };
 
-const RESCAN_DEBOUNCE_MS = 250;
+const RESCAN_DEBOUNCE_MS = 400;
+
+/*
+ * Item Market 2.0 and the bazaars re-render continuously, and a
+ * MutationObserver on one container misses a re-render that replaces the
+ * container itself. A slow poll alongside the observer is what makes the
+ * highlights stay put in practice. It touches only the DOM already on screen
+ * and makes no requests.
+ */
+const POLL_INTERVAL_MS = 2500;
 
 const app = {
     index: null,
     npcShops: new Map(),
+    shopDataMissing: false,
     manualNpc: {},
     settings: { ...DEFAULT_SETTINGS },
     pageType: PAGE_NONE,
@@ -206,6 +216,14 @@ async function loadReferenceData() {
         }
     }
 
+    /*
+     * If shop data is unavailable, every item is "unverified" - and hiding
+     * unverified items would then hide EVERYTHING, which reads as "no
+     * opportunities" when it really means "could not verify any". Degrade to
+     * showing them, flagged, and say why.
+     */
+    app.shopDataMissing = app.npcShops.size === 0;
+
     app.manualNpc = gmGet(STORE_MANUAL_NPC, {}) || {};
 }
 
@@ -216,6 +234,14 @@ async function loadReferenceData() {
 /** Turn raw page listings into priced opportunities. */
 function buildOpportunities(listings) {
     const rows = [];
+
+    /*
+     * The best NON-profitable listing, kept so the panel can prove the
+     * pipeline works. "0 opportunities" and "0 listings parsed" look
+     * identical to a user, and they mean completely different things.
+     */
+    app.nearMiss = null;
+    app.pricedCount = 0;
 
     for (const listing of listings) {
         const exitPrice = npcExitPrice(listing.item);
@@ -229,7 +255,19 @@ function buildOpportunities(listings) {
             cashOnHand: app.settings.cashOnHand,
         });
 
-        if (!profit || profit.profitPerUnit <= 0) continue;
+        if (!profit) continue;
+
+        app.pricedCount += 1;
+
+        if (profit.profitPerUnit <= 0) {
+            if (
+                !app.nearMiss ||
+                profit.profitPerUnit > app.nearMiss.profit.profitPerUnit
+            ) {
+                app.nearMiss = { ...listing, profit };
+            }
+            continue;
+        }
 
         const npcShop = npcShopFor(
             listing.itemId,
@@ -242,6 +280,13 @@ function buildOpportunities(listings) {
             profit,
             npcShop,
             npcVerified: npcShop !== null,
+            // What the green card itself shows.
+            cardLabel:
+                '+' +
+                formatMoney(profit.profitPerUnit) +
+                (profit.qty > 1
+                    ? ' x' + profit.qty + ' = +' + formatMoney(profit.totalProfit)
+                    : ''),
         });
     }
 
@@ -254,14 +299,17 @@ function rescan() {
 
     const { listings, diagnostics } = scanDom(app.pageType, document, {
         index: app.index,
-        selectorOverrides: app.settings.selectorOverrides,
         href: location.href,
     });
 
-    const ranked = rankOpportunities(
-        buildOpportunities(listings),
-        app.settings,
-    );
+    const priced = buildOpportunities(listings);
+
+    const ranked = rankOpportunities(priced, {
+        ...app.settings,
+        // Never hide everything just because verification data is missing.
+        includeUnverifiedNpc:
+            app.settings.includeUnverifiedNpc || app.shopDataMissing,
+    });
 
     markRows(ranked);
     app.lastScanAt = Date.now();
@@ -269,7 +317,20 @@ function rescan() {
     app.panel.render({
         rows: ranked,
         summary: summarize(ranked),
-        diagnostics,
+        diagnostics: {
+            ...diagnostics,
+            priced: app.pricedCount,
+            shopDataMissing: app.shopDataMissing,
+            shopLoadError: app.shopLoadError || null,
+            nearMiss: app.nearMiss
+                ? {
+                      name: app.nearMiss.name,
+                      listingPrice: app.nearMiss.profit.listingPrice,
+                      exitPrice: app.nearMiss.profit.exitPrice,
+                      shortfall: -app.nearMiss.profit.profitPerUnit,
+                  }
+                : null,
+        },
         lastScanAt: app.lastScanAt,
     });
 
@@ -486,6 +547,15 @@ export function boot() {
     app.panel.mount();
     app.panel.applySettings(app.settings);
 
+    /*
+     * Show the stored key in the field.
+     *
+     * Leaving it blank on every page load made a saved key look lost - the
+     * single most alarming thing a tool that asks for a credential can do.
+     * The field is masked by CSS, so this does not expose it on screen.
+     */
+    if (app.panel.keyInput) app.panel.keyInput.value = getStoredKey();
+
     refreshKeyState();
     registerMenu();
 
@@ -501,4 +571,10 @@ export function boot() {
 
     window.addEventListener('hashchange', handleRouteChange);
     window.addEventListener('popstate', handleRouteChange);
+
+    setInterval(() => {
+        if (document.visibilityState !== 'visible') return;
+        if (app.pageType === PAGE_NONE || !app.index) return;
+        rescan();
+    }, POLL_INTERVAL_MS);
 }

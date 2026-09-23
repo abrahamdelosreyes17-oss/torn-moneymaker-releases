@@ -38,7 +38,8 @@ import {
 } from '../src/core/npc.js';
 
 import { detectPage, itemMarketUrl } from '../src/sources/route.js';
-import { parseBuyLabel, itemIdFromImage } from '../src/sources/dom/scan.js';
+import { parseBuyLabel } from '../src/sources/dom/scan.js';
+import { itemIdFromImage } from '../src/sources/dom/detect.js';
 
 /* ---------------------------------------------------------------- parse */
 

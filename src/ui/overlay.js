@@ -18,15 +18,21 @@ export const HIT_TOP_CLASS = 'ttv2-hit-top';
 export const HIT_DATA_KEY = 'ttv2Hit';
 export const HIT_DATA_ATTR = 'data-ttv2-hit';
 
+/** Holds the text the ::after label displays on the card. */
+export const PROFIT_DATA_KEY = 'ttv2Profit';
+
 /** Rows ranked this high get the brighter stripe. */
 export const TOP_HIT_COUNT = 3;
 
-export function markRow(el, { top = false } = {}) {
+export function markRow(el, { top = false, label = '' } = {}) {
     if (!el || !el.classList) return;
 
     el.classList.add(HIT_CLASS);
     el.classList.toggle(HIT_TOP_CLASS, Boolean(top));
     el.dataset[HIT_DATA_KEY] = '1';
+
+    // Read back by the ::after rule in styles.js.
+    if (label) el.dataset[PROFIT_DATA_KEY] = label;
 }
 
 export function unmarkRow(el) {
@@ -35,6 +41,7 @@ export function unmarkRow(el) {
     el.classList.remove(HIT_CLASS);
     el.classList.remove(HIT_TOP_CLASS);
     delete el.dataset[HIT_DATA_KEY];
+    delete el.dataset[PROFIT_DATA_KEY];
 }
 
 /**
@@ -46,7 +53,11 @@ export function markRows(rankedRows, root = document) {
 
     rankedRows.forEach((row, i) => {
         if (!row || !row.el) return;
-        markRow(row.el, { top: i < TOP_HIT_COUNT });
+
+        markRow(row.el, {
+            top: i < TOP_HIT_COUNT,
+            label: row.cardLabel || '',
+        });
     });
 }
 

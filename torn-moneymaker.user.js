@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      2.2.0
+// @version      2.3.0
 // @description  Ranks Bazaar / Item Market listings on the page you are viewing by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -30,7 +30,7 @@
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '2.2.0';
+    const TTV2_BUILD_VERSION = '2.3.0';
 
     /* ===== src/platform/gm.js ===== */
     /*
@@ -522,6 +522,140 @@
         return best;
     }
 
+    /* ===== src/core/parse.js ===== */
+    /*
+     * Pure parsing + formatting helpers. No DOM, no network.
+     */
+
+    function applyMagnitude(value, suffix) {
+        if (!Number.isFinite(value)) return null;
+
+        switch ((suffix || '').toLowerCase()) {
+            case 'k':
+                return value * 1e3;
+            case 'm':
+                return value * 1e6;
+            case 'b':
+                return value * 1e9;
+            default:
+                return value;
+        }
+    }
+
+    /**
+     * Parse a money string into a number.
+     *
+     * Handles "$1,234", "1,234", "$1.2m", "806000". Returns null when the input
+     * contains no number, rather than guessing.
+     *
+     * Note: unlike V1 this is never handed whole-row text. Callers pass the
+     * contents of one specific cell, so there is no "first $ in the row" problem
+     * to solve here.
+     */
+    function parseMoney(text) {
+        if (typeof text !== 'string' && typeof text !== 'number') return null;
+
+        const cleaned = String(text).replace(/[$,\s]/g, '');
+
+        const exact = cleaned.match(/^(-?\d+(?:\.\d+)?)([kmb])?$/i);
+        if (exact) return applyMagnitude(Number(exact[1]), exact[2]);
+
+        /*
+         * Embedded in a longer string. The number must END there: a following
+         * letter or digit means we are looking at something else.
+         *
+         * This guard is load-bearing. Without it "$2,896 Buy" collapsed to
+         * "2896Buy", the "B" was read as the billions suffix, and the price came
+         * out as 2,896,000,000,000. Same for "$3,000 min" and "$500 market".
+         */
+        const loose = cleaned.match(/(-?\d+(?:\.\d+)?)([kmb])?(?![A-Za-z0-9])/);
+        if (!loose) return null;
+
+        return applyMagnitude(Number(loose[1]), loose[2]);
+    }
+
+    /**
+     * Parse a quantity from strings like "x12", "12", "12 available", "Qty: 12".
+     * Returns null when no quantity is present, so the caller decides whether to
+     * assume 1 or to skip the row.
+     */
+    function parseQuantity(text) {
+        if (text === null || text === undefined) return null;
+
+        /*
+         * Strip money figures before looking for a count.
+         *
+         * Without this, parseQuantity('$2,896') returned 2896 — so a price cell
+         * whose class happened to contain "amount" became the quantity, and total
+         * profit was inflated by three orders of magnitude.
+         */
+        const s = String(text)
+            .toLowerCase()
+            .replace(/,/g, '')
+            .replace(/\$\s*\d+(?:\.\d+)?/g, ' ');
+
+        // "x12" or "12x"
+        const xForm = s.match(/(?:^|[^a-z0-9])x\s*(\d+)|(\d+)\s*x(?:[^a-z0-9]|$)/);
+        if (xForm) {
+            const n = Number(xForm[1] !== undefined ? xForm[1] : xForm[2]);
+            if (Number.isFinite(n) && n > 0) return Math.floor(n);
+        }
+
+        const plain = s.match(/(\d+)/);
+        if (plain) {
+            const n = Number(plain[1]);
+            if (Number.isFinite(n) && n > 0) return Math.floor(n);
+        }
+
+        return null;
+    }
+
+    /** "$1,234" */
+    function formatMoney(value) {
+        if (!Number.isFinite(value)) return '-';
+
+        const rounded = Math.round(value);
+        const sign = rounded < 0 ? '-' : '';
+
+        return sign + '$' + Math.abs(rounded).toLocaleString('en-US');
+    }
+
+    /** "$1.2m" - compact form for tight panel rows. */
+    function formatMoneyShort(value) {
+        if (!Number.isFinite(value)) return '-';
+
+        const abs = Math.abs(value);
+        const sign = value < 0 ? '-' : '';
+
+        if (abs >= 1e9) return sign + '$' + (abs / 1e9).toFixed(2) + 'b';
+        if (abs >= 1e6) return sign + '$' + (abs / 1e6).toFixed(2) + 'm';
+        if (abs >= 1e4) return sign + '$' + (abs / 1e3).toFixed(1) + 'k';
+
+        return formatMoney(value);
+    }
+
+    /** "4.2%" */
+    function formatPct(ratio) {
+        if (!Number.isFinite(ratio)) return '-';
+        return (ratio * 100).toFixed(1) + '%';
+    }
+
+    /** "12s ago" / "4m ago" - for the staleness readout. */
+    function formatAge(ms) {
+        if (!Number.isFinite(ms) || ms < 0) return 'never';
+
+        const seconds = Math.floor(ms / 1000);
+        if (seconds < 60) return seconds + 's ago';
+
+        const minutes = Math.floor(seconds / 60);
+        if (minutes < 60) return minutes + 'm ago';
+
+        const hours = Math.floor(minutes / 60);
+        if (hours < 24) return hours + 'h ago';
+
+        return Math.floor(hours / 24) + 'd ago';
+    }
+
     /* ===== src/core/ranker.js ===== */
     /*
      * Ranking and filtering. Pure, no DOM.
@@ -1007,289 +1141,261 @@
         );
     }
 
-    /* ===== src/core/parse.js ===== */
+    /* ===== src/sources/dom/detect.js ===== */
     /*
-     * Pure parsing + formatting helpers. No DOM, no network.
+     * Finding the listing cards on the page.
+     *
+     * This is the part that has to work, so it uses two strategies and prefers
+     * whichever actually finds cards:
+     *
+     *   1. Image-anchored. Every listing carries an item image whose path holds
+     *      the item id (/images/items/206/large.png). Starting there and climbing
+     *      to the card is cheap and precise.
+     *
+     *   2. Content-shaped. Walk the document for elements whose text contains a
+     *      price AND "in stock", that are visible and card-sized, then climb to
+     *      the smallest ancestor that looks like a whole card (price + stock +
+     *      image + plausible dimensions).
+     *
+     * Strategy 2 is deliberately the same approach as the script that is known to
+     * work on live Torn pages. It is slower, so it runs only when strategy 1
+     * finds nothing - which keeps the fast path fast without betting the whole
+     * feature on it.
      */
 
-    function applyMagnitude(value, suffix) {
-        if (!Number.isFinite(value)) return null;
-
-        switch ((suffix || '').toLowerCase()) {
-            case 'k':
-                return value * 1e3;
-            case 'm':
-                return value * 1e6;
-            case 'b':
-                return value * 1e9;
-            default:
-                return value;
-        }
-    }
-
-    /**
-     * Parse a money string into a number.
-     *
-     * Handles "$1,234", "1,234", "$1.2m", "806000". Returns null when the input
-     * contains no number, rather than guessing.
-     *
-     * Note: unlike V1 this is never handed whole-row text. Callers pass the
-     * contents of one specific cell, so there is no "first $ in the row" problem
-     * to solve here.
-     */
-    function parseMoney(text) {
-        if (typeof text !== 'string' && typeof text !== 'number') return null;
-
-        const cleaned = String(text).replace(/[$,\s]/g, '');
-
-        const exact = cleaned.match(/^(-?\d+(?:\.\d+)?)([kmb])?$/i);
-        if (exact) return applyMagnitude(Number(exact[1]), exact[2]);
-
-        /*
-         * Embedded in a longer string. The number must END there: a following
-         * letter or digit means we are looking at something else.
-         *
-         * This guard is load-bearing. Without it "$2,896 Buy" collapsed to
-         * "2896Buy", the "B" was read as the billions suffix, and the price came
-         * out as 2,896,000,000,000. Same for "$3,000 min" and "$500 market".
-         */
-        const loose = cleaned.match(/(-?\d+(?:\.\d+)?)([kmb])?(?![A-Za-z0-9])/);
-        if (!loose) return null;
-
-        return applyMagnitude(Number(loose[1]), loose[2]);
-    }
-
-    /**
-     * Parse a quantity from strings like "x12", "12", "12 available", "Qty: 12".
-     * Returns null when no quantity is present, so the caller decides whether to
-     * assume 1 or to skip the row.
-     */
-    function parseQuantity(text) {
-        if (text === null || text === undefined) return null;
-
-        /*
-         * Strip money figures before looking for a count.
-         *
-         * Without this, parseQuantity('$2,896') returned 2896 — so a price cell
-         * whose class happened to contain "amount" became the quantity, and total
-         * profit was inflated by three orders of magnitude.
-         */
-        const s = String(text)
-            .toLowerCase()
-            .replace(/,/g, '')
-            .replace(/\$\s*\d+(?:\.\d+)?/g, ' ');
-
-        // "x12" or "12x"
-        const xForm = s.match(/(?:^|[^a-z0-9])x\s*(\d+)|(\d+)\s*x(?:[^a-z0-9]|$)/);
-        if (xForm) {
-            const n = Number(xForm[1] !== undefined ? xForm[1] : xForm[2]);
-            if (Number.isFinite(n) && n > 0) return Math.floor(n);
-        }
-
-        const plain = s.match(/(\d+)/);
-        if (plain) {
-            const n = Number(plain[1]);
-            if (Number.isFinite(n) && n > 0) return Math.floor(n);
-        }
-
-        return null;
-    }
-
-    /** "$1,234" */
-    function formatMoney(value) {
-        if (!Number.isFinite(value)) return '-';
-
-        const rounded = Math.round(value);
-        const sign = rounded < 0 ? '-' : '';
-
-        return sign + '$' + Math.abs(rounded).toLocaleString('en-US');
-    }
-
-    /** "$1.2m" - compact form for tight panel rows. */
-    function formatMoneyShort(value) {
-        if (!Number.isFinite(value)) return '-';
-
-        const abs = Math.abs(value);
-        const sign = value < 0 ? '-' : '';
-
-        if (abs >= 1e9) return sign + '$' + (abs / 1e9).toFixed(2) + 'b';
-        if (abs >= 1e6) return sign + '$' + (abs / 1e6).toFixed(2) + 'm';
-        if (abs >= 1e4) return sign + '$' + (abs / 1e3).toFixed(1) + 'k';
-
-        return formatMoney(value);
-    }
-
-    /** "4.2%" */
-    function formatPct(ratio) {
-        if (!Number.isFinite(ratio)) return '-';
-        return (ratio * 100).toFixed(1) + '%';
-    }
-
-    /** "12s ago" / "4m ago" - for the staleness readout. */
-    function formatAge(ms) {
-        if (!Number.isFinite(ms) || ms < 0) return 'never';
-
-        const seconds = Math.floor(ms / 1000);
-        if (seconds < 60) return seconds + 's ago';
-
-        const minutes = Math.floor(seconds / 60);
-        if (minutes < 60) return minutes + 'm ago';
-
-        const hours = Math.floor(minutes / 60);
-        if (hours < 24) return hours + 'h ago';
-
-        return Math.floor(hours / 24) + 'd ago';
-    }
-
-    /* ===== src/sources/dom/selectors.js ===== */
-    /*
-     * Selectors, derived from Torn's ACTUAL markup (captured 2026-09-23) rather
-     * than guessed at.
-     *
-     * The earlier version of this file invented names like `sellerRow___` and
-     * `itemsList` from a description of the page. None of them existed, so the
-     * scanner matched nothing and reported "no opportunities" on pages full of
-     * them. Everything here is now taken from a real page dump.
-     *
-     * Two Item Market layouts were observed:
-     *
-     *   1. Aggregate list  - <div class="itemDescription___TknAN"
-     *                             data-testid="item-description">
-     *                        text: "Xanax $839,700 1% ( 5,931 in stock)"
-     *                        buy control: aria-label="Buy: Xanax"
-     *
-     *   2. Seller listings - <div class="itemTile___gJeSo">
-     *                        buy control:
-     *                          aria-label="Buy item Hammer, $100, 1 in total."
-     *
-     * The hashed suffixes (`___gJeSo`) change whenever Torn rebuilds its
-     * frontend, so nothing here matches on them exactly - only on the stable
-     * prefix, on `data-testid`, or on ARIA, in that order of preference. ARIA and
-     * test ids are semantic: Torn changes them far less often than class hashes,
-     * and they are the reason this parser should survive a redesign.
-     */
-
-    /** Every item image carries its item id in the path: /images/items/206/... */
     const ITEM_IMAGE_SELECTOR =
         'img[src*="/images/items/"], img[srcset*="/images/items/"]';
 
     const ITEM_IMAGE_ID_RE = /\/images\/items\/(\d+)\//;
 
-    /**
-     * Torn's own buy control. Both observed phrasings:
-     *   "Buy item Hammer, $100, 1 in total."
-     *   "Buy: Xanax"
-     */
-    const BUY_CONTROL_SELECTOR =
-        '[aria-label^="Buy item"], [aria-label^="Buy:"]';
-
-    /** The rich form, which carries name, price and quantity together. */
-    const BUY_LABEL_FULL_RE =
-        /^buy item\s+(.+?),\s*\$([\d,]+(?:\.\d+)?),\s*([\d,]+)\s*in total/i;
-
-    /** The bare form, which carries only the name. */
-    const BUY_LABEL_NAME_RE = /^buy(?:\s+item)?:?\s+(.+?)\.?$/i;
-
-    /**
-     * Candidate card containers, tightest first. Used to snap from an item image
-     * up to the element that represents one listing.
-     */
+    /** Known card containers, tightest first. */
     const CARD_SELECTOR = [
         '[class*="itemTile"]',
         '[data-testid="item-description"]',
         '[class*="itemDescription"]',
         '[class*="sellerRow"]',
         '[class*="listItem"]',
-        'li',
     ].join(', ');
 
-    const DEFAULT_SELECTORS = {
-        card: CARD_SELECTOR,
-        itemImage: ITEM_IMAGE_SELECTOR,
-        buyControl: BUY_CONTROL_SELECTOR,
+    const PRICE_RE = /\$\s*[\d,]+/;
+    const STOCK_RE = /in\s+stock|in\s+total/i;
 
-        /* Fallbacks, only consulted when the ARIA label is absent. */
-        price: ['[class*="price"]', '[class*="cost"]'],
-        qty: ['[class*="quantity"]', '[class*="stock"]', '[class*="qty"]'],
-    };
+    const MAX_CLIMB = 8;
+
+    /** The item id from an image path, or null if it is not an item image. */
+    function itemIdFromImage(img) {
+        if (!img || typeof img.getAttribute !== 'function') return null;
+
+        const src = img.getAttribute('src') || img.getAttribute('srcset') || '';
+        const match = src.match(ITEM_IMAGE_ID_RE);
+
+        return match ? match[1] : null;
+    }
+
+    function isVisible(el) {
+        if (!el || typeof window === 'undefined') return true;
+
+        const style = window.getComputedStyle(el);
+        if (style.display === 'none' || style.visibility === 'hidden') return false;
+
+        const rect = el.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+    }
+
+    function boxOf(el) {
+        if (!el || typeof el.getBoundingClientRect !== 'function') {
+            return { width: 0, height: 0 };
+        }
+        return el.getBoundingClientRect();
+    }
+
+    function countItemImages(el) {
+        try {
+            return el.querySelectorAll(ITEM_IMAGE_SELECTOR).length;
+        } catch {
+            return 0;
+        }
+    }
 
     /**
-     * Merge user overrides over the defaults.
+     * Climb from an item image to the element representing ONE listing.
      *
-     * Overrides are still supported so a Torn change can be worked around from
-     * the settings panel without waiting for a new release.
+     * The guard that matters: the moment an ancestor contains more than one item
+     * image we have climbed into a container holding several listings and must
+     * stop. Without it, one card's name gets paired with another card's price -
+     * which is the oldest bug in this project.
      */
-    function resolveSelectors(pageType, overrides) {
-        const override = (overrides && (overrides[pageType] || overrides.all)) || {};
+    function cardFromImage(img) {
+        const preferred = img.closest ? img.closest(CARD_SELECTOR) : null;
+        if (preferred && countItemImages(preferred) === 1) return preferred;
 
-        return { ...DEFAULT_SELECTORS, ...override };
+        let node = img.parentElement;
+        let best = null;
+
+        for (let depth = 0; depth < MAX_CLIMB && node; depth += 1) {
+            if (countItemImages(node) > 1) break;
+
+            best = node;
+
+            const text = node.textContent || '';
+            if (node.querySelector('[aria-label^="Buy"]') || PRICE_RE.test(text)) {
+                return node;
+            }
+
+            node = node.parentElement;
+        }
+
+        return best;
+    }
+
+    /** Climb from a price-bearing element to something card-shaped. */
+    function cardFromContent(el) {
+        let node = el;
+
+        for (let depth = 0; depth < MAX_CLIMB && node; depth += 1) {
+            const text = node.textContent || '';
+            const box = boxOf(node);
+
+            if (
+                PRICE_RE.test(text) &&
+                STOCK_RE.test(text) &&
+                node.querySelector('img') &&
+                box.width >= 150 &&
+                box.width <= 600 &&
+                box.height >= 60 &&
+                box.height <= 400
+            ) {
+                return node;
+            }
+
+            node = node.parentElement;
+        }
+
+        return null;
+    }
+
+    function dedupe(cards) {
+        const seen = new Set();
+        const out = [];
+
+        for (const card of cards) {
+            if (!card || seen.has(card)) continue;
+            seen.add(card);
+            out.push(card);
+        }
+
+        return out;
+    }
+
+    /** Strategy 1: anchored on item images. */
+    function findByImage(root) {
+        let images;
+        try {
+            images = Array.from(root.querySelectorAll(ITEM_IMAGE_SELECTOR));
+        } catch {
+            return { cards: [], images: 0 };
+        }
+
+        const cards = dedupe(images.map(cardFromImage).filter(Boolean));
+
+        return { cards, images: images.length };
+    }
+
+    /** Strategy 2: shaped like a listing card. */
+    function findByContent(root) {
+        const candidates = [];
+
+        let all;
+        try {
+            all = root.querySelectorAll('body *');
+        } catch {
+            return [];
+        }
+
+        for (const el of all) {
+            const text = el.textContent || '';
+
+            if (!text || text.length > 500) continue;
+            if (!PRICE_RE.test(text)) continue;
+            if (!STOCK_RE.test(text)) continue;
+            if (!isVisible(el)) continue;
+
+            const box = boxOf(el);
+            if (box.width < 120 || box.height < 60) continue;
+
+            candidates.push(el);
+        }
+
+        return dedupe(candidates.map(cardFromContent).filter(Boolean));
+    }
+
+    /**
+     * Find every listing card on the page.
+     *
+     * @returns {{cards: Element[], strategy: string, images: number}}
+     */
+    function findCards(root) {
+        if (!root) return { cards: [], strategy: 'none', images: 0 };
+
+        const byImage = findByImage(root);
+        if (byImage.cards.length > 0) {
+            return {
+                cards: byImage.cards,
+                strategy: 'image',
+                images: byImage.images,
+            };
+        }
+
+        const byContent = findByContent(root);
+
+        return {
+            cards: byContent,
+            strategy: byContent.length > 0 ? 'content' : 'none',
+            images: byImage.images,
+        };
     }
 
     /* ===== src/sources/dom/scan.js ===== */
     /*
-     * Reading listings out of the page the user is currently viewing.
+     * Reading one listing card into numbers.
      *
-     * The strategy changed once real markup was in hand. Instead of guessing a
-     * row selector and then digging for the name, price and quantity inside it,
-     * the scanner now works from two things Torn states explicitly:
+     * Extraction order, most reliable first:
      *
-     *   - the item image, whose path carries the item id (/images/items/206/)
-     *   - the buy control's ARIA label, which carries the name, the price and the
-     *     quantity in one structured string
+     *   1. Torn's own buy-control ARIA label, which states everything outright:
+     *        "Buy item Hammer, $100, 1 in total."
+     *   2. The item image path, which carries the item id: /images/items/1/
+     *   3. Text parsing, as a fallback: the first price, and "( N in stock)".
      *
-     * That removes every guess that made the previous version fail: no name
-     * matching, no "first $ in the row", no distinguishing a unit price from a
-     * line total, no deciding whether "in stock" or "available" is the magic
-     * word. Where Torn tells us, we read; where it does not, we say so.
-     *
-     * Rules this module obeys:
-     *   - Only the current page. Nothing here fetches a Torn page, ever.
-     *   - No guessing. An unreadable row is counted in the diagnostics, not
-     *     reported as a confident wrong number.
+     * Steps 1 and 2 were read off live Torn markup, so where they apply there is
+     * no guessing at all. Step 3 exists because a layout that lacks both still
+     * needs to work, and it is the approach already proven on live pages.
      */
 
 
 
 
 
-    /** A leaf whose entire text is a price, e.g. "$2,896". */
-    const SCAN_PRICE_ONLY = /^\$\s*[\d,]+(?:\.\d+)?$/;
+    /** "Buy item Hammer, $100, 1 in total." */
+    const BUY_LABEL_FULL_RE =
+        /^buy item\s+(.+?),\s*\$([\d,]+(?:\.\d+)?),\s*([\d,]+)\s*in total/i;
 
-    /** "( 5,931 in stock)" - the aggregate Item Market list view. */
-    const SCAN_IN_STOCK_RE = /\(?\s*([\d,]+)\s*in\s+stock/i;
+    /** "Buy: Xanax" */
+    const BUY_LABEL_NAME_RE = /^buy(?:\s+item)?:?\s+(.+?)\.?$/i;
 
-    /** How far up from an item image a listing container may sit. */
-    const SCAN_MAX_CLIMB = 8;
+    const BUY_CONTROL_SELECTOR =
+        '[aria-label^="Buy item"], [aria-label^="Buy:"]';
 
-    function scanText(node) {
-        if (!node) return '';
-        return (node.textContent || '').trim();
-    }
+    /** "( 5,931 in stock)" */
+    const IN_STOCK_RE = /\(?\s*([\d,]+)\s*in\s+stock/i;
 
-    /**
-     * The item id from an image path.
-     *
-     * `/images/items/206/large.png` -> "206". This is the single most reliable
-     * identifier on the page: it does not depend on spelling, casing, pluralisation
-     * or Torn's display formatting, and it cannot be confused with another item.
-     */
-    function itemIdFromImage(img) {
-        if (!img) return null;
+    /** Every money figure in a block of text, in order. */
+    const ALL_PRICES_RE = /\$\s*[\d,]+(?:\.\d+)?/g;
 
-        const src =
-            img.getAttribute('src') || img.getAttribute('srcset') || '';
-
-        const match = src.match(ITEM_IMAGE_ID_RE);
-        return match ? match[1] : null;
-    }
+    /** Name cells, when the image alt is missing. */
+    const NAME_SELECTOR = '[class*="name___"], [class*="itemName"], .name';
 
     /**
      * Parse Torn's buy-control ARIA label.
-     *
-     * Two observed forms:
-     *   "Buy item Hammer, $100, 1 in total."  -> name, price and quantity
-     *   "Buy: Xanax"                          -> name only
-     *
      * @returns {{name: string, price: number|null, qty: number|null}|null}
      */
     function parseBuyLabel(label) {
@@ -1310,108 +1416,101 @@
         }
 
         const bare = text.match(BUY_LABEL_NAME_RE);
-        if (bare) {
-            return { name: bare[1].trim(), price: null, qty: null };
-        }
+        if (bare) return { name: bare[1].trim(), price: null, qty: null };
 
         return null;
     }
 
-    /**
-     * Snap from an item image up to the element representing ONE listing.
-     *
-     * The guard that matters: as soon as a candidate ancestor contains more than
-     * one item image we have climbed into a container holding several listings,
-     * and must stop. Without that guard this is exactly the V1 bug where a parent
-     * holding eight cards got paired with one price.
-     */
-    function findCard(img, cfg) {
-        const preferred = img.closest(cfg.card);
-        if (
-            preferred &&
-            preferred.querySelectorAll(cfg.itemImage).length === 1
-        ) {
-            return preferred;
-        }
-
-        let node = img.parentElement;
-        let best = null;
-
-        for (let depth = 0; depth < SCAN_MAX_CLIMB && node; depth += 1) {
-            if (node.querySelectorAll(cfg.itemImage).length > 1) break;
-
-            best = node;
-
-            const hasBuy = node.querySelector(cfg.buyControl);
-            const hasPrice = /\$\s*[\d,]/.test(node.textContent || '');
-
-            if (hasBuy || hasPrice) return node;
-
-            node = node.parentElement;
-        }
-
-        return best;
+    function textOf(node) {
+        if (!node) return '';
+        return (node.textContent || '').trim();
     }
 
-    /** Fallback price: a leaf cell that is nothing but a price. */
-    function fallbackPrice(card, cfg) {
-        for (const selector of cfg.price || []) {
-            let node;
-            try {
-                node = card.querySelector(selector);
-            } catch {
-                continue;
-            }
-            if (!node) continue;
+    /** The item name Torn shows on this card. */
+    function nameFromCard(card) {
+        const img = card.querySelector('img[alt]');
+        const alt = img ? (img.getAttribute('alt') || '').trim() : '';
+        if (alt) return alt;
 
-            const value = parseMoney(scanText(node));
-            if (Number.isFinite(value) && value > 0) {
-                return { price: value, assumed: false };
-            }
-        }
+        const named = card.querySelector(NAME_SELECTOR);
+        const text = textOf(named);
 
-        const cells = [];
-        for (const node of card.querySelectorAll('*')) {
-            if (node.children.length > 0) continue;
-
-            const text = scanText(node);
-            if (!SCAN_PRICE_ONLY.test(text)) continue;
-
-            const value = parseMoney(text);
-            if (Number.isFinite(value) && value > 0) cells.push(value);
-        }
-
-        if (cells.length === 0) return { price: null, assumed: false };
-        if (cells.length === 1) return { price: cells[0], assumed: false };
-
-        // Several prices and nothing to disambiguate them: the lowest is the only
-        // one that cannot be a line total, but flag it as inferred.
-        return { price: Math.min(...cells), assumed: true };
+        return text && text.length < 80 ? text : '';
     }
 
-    /** Fallback quantity: "( 5,931 in stock)". */
-    function fallbackQty(card) {
-        const match = (card.textContent || '').match(SCAN_IN_STOCK_RE);
-        if (match) {
-            const qty = parseQuantity(match[1]);
-            if (Number.isFinite(qty) && qty > 0) return { qty, assumed: false };
-        }
-
-        return { qty: 1, assumed: true };
-    }
-
-    /** Resolve the catalogue entry for a card, by id first and name only after. */
-    function resolveItem(card, img, index, buy) {
+    /** Catalogue lookup: by id where possible, by name only as a fallback. */
+    function resolveItem(card, index, buy) {
+        const img = card.querySelector(ITEM_IMAGE_SELECTOR);
         const id = itemIdFromImage(img);
+
         if (id) {
             const byId = findItemById(index, id);
             if (byId) return byId;
         }
 
-        const name =
-            (buy && buy.name) || (img && img.getAttribute('alt')) || '';
-
+        const name = (buy && buy.name) || nameFromCard(card);
         return findItemByName(index, name);
+    }
+
+    /**
+     * Read one card.
+     * @returns {object|null}
+     */
+    function readCard(card, index, pageType) {
+        const buyNode = card.querySelector(BUY_CONTROL_SELECTOR);
+        const buy = buyNode
+            ? parseBuyLabel(buyNode.getAttribute('aria-label'))
+            : null;
+
+        const item = resolveItem(card, index, buy);
+        if (!item) return { skipped: 'noItem' };
+
+        const text = card.textContent || '';
+
+        let price = buy && buy.price;
+        let priceAssumed = false;
+
+        if (!Number.isFinite(price) || price <= 0) {
+            /*
+             * Reading the price from text is only a guess when there is more than
+             * one money figure to choose between. With exactly one, it is the
+             * price - and treating that as "assumed" meant the aggregate Item
+             * Market view (which never carries a price in its ARIA label) had
+             * every row filtered out of the ranking.
+             */
+            const found = text.match(ALL_PRICES_RE) || [];
+
+            price = found.length > 0 ? parseMoney(found[0]) : null;
+            priceAssumed = found.length > 1;
+        }
+
+        if (!Number.isFinite(price) || price <= 0) return { skipped: 'noPrice' };
+
+        let qty = buy && buy.qty;
+        let qtyAssumed = false;
+
+        if (!Number.isFinite(qty) || qty <= 0) {
+            const match = text.match(IN_STOCK_RE);
+            qty = match ? parseQuantity(match[1]) : null;
+
+            if (!Number.isFinite(qty) || qty <= 0) {
+                qty = 1;
+                qtyAssumed = true;
+            }
+        }
+
+        return {
+            el: card,
+            buyEl: buyNode || null,
+            itemId: item.id,
+            name: item.name,
+            item,
+            listingPrice: price,
+            priceAssumed,
+            qty,
+            qtyAssumed,
+            source: pageType,
+        };
     }
 
     /**
@@ -1421,14 +1520,12 @@
      * @param {Document|Element} root
      * @param {object} ctx
      * @param {object} ctx.index - item index from buildItemIndex()
-     * @param {object} [ctx.selectorOverrides]
      * @returns {{listings: Array, diagnostics: object}}
      */
-    function scanDom(pageType, root, { index, selectorOverrides } = {}) {
-        const cfg = resolveSelectors(pageType, selectorOverrides);
-
+    function scanDom(pageType, root, { index } = {}) {
         const diagnostics = {
             pageType,
+            strategy: 'none',
             images: 0,
             cards: 0,
             fromAria: 0,
@@ -1441,75 +1538,30 @@
 
         if (!root || !index) return { listings: [], diagnostics };
 
-        let images;
-        try {
-            images = Array.from(root.querySelectorAll(cfg.itemImage));
-        } catch {
-            return { listings: [], diagnostics };
-        }
+        const found = findCards(root);
 
-        diagnostics.images = images.length;
+        diagnostics.strategy = found.strategy;
+        diagnostics.images = found.images;
+        diagnostics.cards = found.cards.length;
 
         const listings = [];
-        const seen = new Set();
 
-        for (const img of images) {
-            const card = findCard(img, cfg);
-            if (!card || seen.has(card)) continue;
+        for (const card of found.cards) {
+            const result = readCard(card, index, pageType);
 
-            seen.add(card);
-            diagnostics.cards += 1;
-
-            const buyNode = card.querySelector(cfg.buyControl);
-            const buy = buyNode
-                ? parseBuyLabel(buyNode.getAttribute('aria-label'))
-                : null;
-
-            const item = resolveItem(card, img, index, buy);
-            if (!item) {
-                diagnostics.noItem += 1;
+            if (!result || result.skipped) {
+                if (result && result.skipped === 'noItem') diagnostics.noItem += 1;
+                if (result && result.skipped === 'noPrice') diagnostics.noPrice += 1;
                 continue;
             }
 
-            let price = buy && buy.price;
-            let priceAssumed = false;
-
-            if (!Number.isFinite(price) || price <= 0) {
-                const fallback = fallbackPrice(card, cfg);
-                price = fallback.price;
-                priceAssumed = fallback.assumed;
+            if (!result.priceAssumed && !result.qtyAssumed) {
+                diagnostics.fromAria += 1;
             }
+            if (result.priceAssumed) diagnostics.priceAssumed += 1;
+            if (result.qtyAssumed) diagnostics.qtyAssumed += 1;
 
-            if (!Number.isFinite(price) || price <= 0) {
-                diagnostics.noPrice += 1;
-                continue;
-            }
-
-            let qty = buy && buy.qty;
-            let qtyAssumed = false;
-
-            if (!Number.isFinite(qty) || qty <= 0) {
-                const fallback = fallbackQty(card);
-                qty = fallback.qty;
-                qtyAssumed = fallback.assumed;
-            }
-
-            if (buy && buy.price && buy.qty) diagnostics.fromAria += 1;
-            if (priceAssumed) diagnostics.priceAssumed += 1;
-            if (qtyAssumed) diagnostics.qtyAssumed += 1;
-
-            listings.push({
-                el: card,
-                buyEl: buyNode || null,
-                itemId: item.id,
-                name: item.name,
-                item,
-                listingPrice: price,
-                priceAssumed,
-                qty,
-                qtyAssumed,
-                source: pageType,
-            });
+            listings.push(result);
         }
 
         diagnostics.listings = listings.length;
@@ -1535,15 +1587,48 @@
 
     const STYLE_CSS = `
     .ttv2-hit {
+        position: relative !important;
+
         box-shadow:
-            inset 0 0 0 1px rgba(53, 211, 90, 0.55),
-            inset 3px 0 0 0 #35d35a !important;
+            inset 0 0 0 3px #35d35a,
+            inset 0 0 0 9999px rgba(53, 211, 90, 0.16) !important;
+
+        transition: box-shadow 0.15s ease;
     }
 
+    /*
+     * The profit label, drawn as a pseudo-element from a data attribute.
+     *
+     * pointer-events: none is the important line: it means this can never
+     * intercept a click, so it cannot block Torn's Buy button no matter where it
+     * lands. That was the original complaint about V1, and it is fixed by making
+     * the label unclickable rather than by removing it.
+     */
+    .ttv2-hit::after {
+        content: attr(data-ttv2-profit);
+
+        position: absolute;
+        top: 4px;
+        right: 7px;
+        z-index: 20;
+
+        color: #ffffff;
+        font-size: 14px;
+        font-weight: 800;
+        line-height: 20px;
+
+        text-shadow:
+            0 1px 2px #000,
+            0 0 3px #000;
+
+        pointer-events: none;
+    }
+
+    /* The best few opportunities on the page get a warmer fill. */
     .ttv2-hit-top {
         box-shadow:
-            inset 0 0 0 1px rgba(126, 224, 143, 0.85),
-            inset 4px 0 0 0 #7ee08f !important;
+            inset 0 0 0 3px #7ee08f,
+            inset 0 0 0 9999px rgba(126, 224, 143, 0.24) !important;
     }
 
     .ttv2-panel {
@@ -2206,44 +2291,6 @@
             this.settingsEl.appendChild(el('h4', { text: 'Behaviour' }));
             this.settingsEl.appendChild(autoScanLabel);
 
-            /* ---- selectors ---- */
-
-            this.selectorInput = el('textarea', {
-                placeholder: '{ "bazaar": { "rowSets": ["ul.my-rows > li"] } }',
-                spellcheck: 'false',
-            });
-
-            const selectorSave = el('button', {
-                type: 'button',
-                text: 'Save selectors',
-                onclick: () => this.saveSelectors(),
-            });
-
-            const selectorReset = el('button', {
-                type: 'button',
-                text: 'Reset',
-                onclick: () => {
-                    this.selectorInput.value = '';
-                    this.emitSettings({ selectorOverrides: null });
-                },
-            });
-
-            this.settingsEl.appendChild(el('h4', { text: 'Row selectors' }));
-            this.settingsEl.appendChild(
-                el('div', {
-                    class: 'ttv2-note',
-                    text:
-                        'Only needed if a Torn update breaks detection. Check the ' +
-                        'diagnostics under Filter: "NO MATCH" means the row ' +
-                        'selector needs replacing. JSON, same shape as the ' +
-                        'defaults.',
-                }),
-            );
-            this.settingsEl.appendChild(this.selectorInput);
-            this.settingsEl.appendChild(
-                el('div', { class: 'ttv2-inline' }, [selectorSave, selectorReset]),
-            );
-
             /* ---- data ---- */
 
             this.settingsEl.appendChild(el('h4', { text: 'Cached data' }));
@@ -2267,23 +2314,6 @@
                         'Clearing makes the next scan re-download them.',
                 }),
             );
-        }
-
-        saveSelectors() {
-            const raw = this.selectorInput.value.trim();
-
-            if (!raw) {
-                this.emitSettings({ selectorOverrides: null });
-                return;
-            }
-
-            try {
-                const parsed = JSON.parse(raw);
-                this.emitSettings({ selectorOverrides: parsed });
-                this.setStatus('Selector overrides saved.');
-            } catch {
-                this.setStatus('Selector overrides are not valid JSON.', 'error');
-            }
         }
 
         /**
@@ -2464,11 +2494,6 @@
             }
             if (this.autoScanInput && settings.autoScan !== undefined) {
                 this.autoScanInput.checked = Boolean(settings.autoScan);
-            }
-            if (this.selectorInput && settings.selectorOverrides !== undefined) {
-                this.selectorInput.value = settings.selectorOverrides
-                    ? JSON.stringify(settings.selectorOverrides, null, 2)
-                    : '';
             }
             if (settings.collapsed !== undefined) {
                 this.setCollapsed(settings.collapsed);
@@ -2739,15 +2764,21 @@
     const HIT_DATA_KEY = 'ttv2Hit';
     const HIT_DATA_ATTR = 'data-ttv2-hit';
 
+    /** Holds the text the ::after label displays on the card. */
+    const PROFIT_DATA_KEY = 'ttv2Profit';
+
     /** Rows ranked this high get the brighter stripe. */
     const TOP_HIT_COUNT = 3;
 
-    function markRow(el, { top = false } = {}) {
+    function markRow(el, { top = false, label = '' } = {}) {
         if (!el || !el.classList) return;
 
         el.classList.add(HIT_CLASS);
         el.classList.toggle(HIT_TOP_CLASS, Boolean(top));
         el.dataset[HIT_DATA_KEY] = '1';
+
+        // Read back by the ::after rule in styles.js.
+        if (label) el.dataset[PROFIT_DATA_KEY] = label;
     }
 
     function unmarkRow(el) {
@@ -2756,6 +2787,7 @@
         el.classList.remove(HIT_CLASS);
         el.classList.remove(HIT_TOP_CLASS);
         delete el.dataset[HIT_DATA_KEY];
+        delete el.dataset[PROFIT_DATA_KEY];
     }
 
     /**
@@ -2767,7 +2799,11 @@
 
         rankedRows.forEach((row, i) => {
             if (!row || !row.el) return;
-            markRow(row.el, { top: i < TOP_HIT_COUNT });
+
+            markRow(row.el, {
+                top: i < TOP_HIT_COUNT,
+                label: row.cardLabel || '',
+            });
         });
     }
 
@@ -2810,6 +2846,7 @@
 
 
 
+
     const STORE_KEY = 'apiKey';
     const STORE_ITEMS = 'itemsCache';
     const STORE_NPC = 'npcCache';
@@ -2822,15 +2859,24 @@
         cashOnHand: null,
         includeUnverifiedNpc: false,
         collapsed: false,
-        autoScan: false,
-        selectorOverrides: null,
+        autoScan: true,
     };
 
-    const RESCAN_DEBOUNCE_MS = 250;
+    const RESCAN_DEBOUNCE_MS = 400;
+
+    /*
+     * Item Market 2.0 and the bazaars re-render continuously, and a
+     * MutationObserver on one container misses a re-render that replaces the
+     * container itself. A slow poll alongside the observer is what makes the
+     * highlights stay put in practice. It touches only the DOM already on screen
+     * and makes no requests.
+     */
+    const POLL_INTERVAL_MS = 2500;
 
     const app = {
         index: null,
         npcShops: new Map(),
+        shopDataMissing: false,
         manualNpc: {},
         settings: { ...DEFAULT_SETTINGS },
         pageType: PAGE_NONE,
@@ -2983,6 +3029,14 @@
             }
         }
 
+        /*
+         * If shop data is unavailable, every item is "unverified" - and hiding
+         * unverified items would then hide EVERYTHING, which reads as "no
+         * opportunities" when it really means "could not verify any". Degrade to
+         * showing them, flagged, and say why.
+         */
+        app.shopDataMissing = app.npcShops.size === 0;
+
         app.manualNpc = gmGet(STORE_MANUAL_NPC, {}) || {};
     }
 
@@ -2993,6 +3047,14 @@
     /** Turn raw page listings into priced opportunities. */
     function buildOpportunities(listings) {
         const rows = [];
+
+        /*
+         * The best NON-profitable listing, kept so the panel can prove the
+         * pipeline works. "0 opportunities" and "0 listings parsed" look
+         * identical to a user, and they mean completely different things.
+         */
+        app.nearMiss = null;
+        app.pricedCount = 0;
 
         for (const listing of listings) {
             const exitPrice = npcExitPrice(listing.item);
@@ -3006,7 +3068,19 @@
                 cashOnHand: app.settings.cashOnHand,
             });
 
-            if (!profit || profit.profitPerUnit <= 0) continue;
+            if (!profit) continue;
+
+            app.pricedCount += 1;
+
+            if (profit.profitPerUnit <= 0) {
+                if (
+                    !app.nearMiss ||
+                    profit.profitPerUnit > app.nearMiss.profit.profitPerUnit
+                ) {
+                    app.nearMiss = { ...listing, profit };
+                }
+                continue;
+            }
 
             const npcShop = npcShopFor(
                 listing.itemId,
@@ -3019,6 +3093,13 @@
                 profit,
                 npcShop,
                 npcVerified: npcShop !== null,
+                // What the green card itself shows.
+                cardLabel:
+                    '+' +
+                    formatMoney(profit.profitPerUnit) +
+                    (profit.qty > 1
+                        ? ' x' + profit.qty + ' = +' + formatMoney(profit.totalProfit)
+                        : ''),
             });
         }
 
@@ -3031,14 +3112,17 @@
 
         const { listings, diagnostics } = scanDom(app.pageType, document, {
             index: app.index,
-            selectorOverrides: app.settings.selectorOverrides,
             href: location.href,
         });
 
-        const ranked = rankOpportunities(
-            buildOpportunities(listings),
-            app.settings,
-        );
+        const priced = buildOpportunities(listings);
+
+        const ranked = rankOpportunities(priced, {
+            ...app.settings,
+            // Never hide everything just because verification data is missing.
+            includeUnverifiedNpc:
+                app.settings.includeUnverifiedNpc || app.shopDataMissing,
+        });
 
         markRows(ranked);
         app.lastScanAt = Date.now();
@@ -3046,7 +3130,20 @@
         app.panel.render({
             rows: ranked,
             summary: summarize(ranked),
-            diagnostics,
+            diagnostics: {
+                ...diagnostics,
+                priced: app.pricedCount,
+                shopDataMissing: app.shopDataMissing,
+                shopLoadError: app.shopLoadError || null,
+                nearMiss: app.nearMiss
+                    ? {
+                          name: app.nearMiss.name,
+                          listingPrice: app.nearMiss.profit.listingPrice,
+                          exitPrice: app.nearMiss.profit.exitPrice,
+                          shortfall: -app.nearMiss.profit.profitPerUnit,
+                      }
+                    : null,
+            },
             lastScanAt: app.lastScanAt,
         });
 
@@ -3263,6 +3360,15 @@
         app.panel.mount();
         app.panel.applySettings(app.settings);
 
+        /*
+         * Show the stored key in the field.
+         *
+         * Leaving it blank on every page load made a saved key look lost - the
+         * single most alarming thing a tool that asks for a credential can do.
+         * The field is masked by CSS, so this does not expose it on screen.
+         */
+        if (app.panel.keyInput) app.panel.keyInput.value = getStoredKey();
+
         refreshKeyState();
         registerMenu();
 
@@ -3278,6 +3384,12 @@
 
         window.addEventListener('hashchange', handleRouteChange);
         window.addEventListener('popstate', handleRouteChange);
+
+        setInterval(() => {
+            if (document.visibilityState !== 'visible') return;
+            if (app.pageType === PAGE_NONE || !app.index) return;
+            rescan();
+        }, POLL_INTERVAL_MS);
     }
 
     boot();

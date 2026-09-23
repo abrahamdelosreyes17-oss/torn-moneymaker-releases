@@ -15,15 +15,48 @@ export const UI_PREFIX = 'ttv2';
 
 export const STYLE_CSS = `
 .ttv2-hit {
+    position: relative !important;
+
     box-shadow:
-        inset 0 0 0 1px rgba(53, 211, 90, 0.55),
-        inset 3px 0 0 0 #35d35a !important;
+        inset 0 0 0 3px #35d35a,
+        inset 0 0 0 9999px rgba(53, 211, 90, 0.16) !important;
+
+    transition: box-shadow 0.15s ease;
 }
 
+/*
+ * The profit label, drawn as a pseudo-element from a data attribute.
+ *
+ * pointer-events: none is the important line: it means this can never
+ * intercept a click, so it cannot block Torn's Buy button no matter where it
+ * lands. That was the original complaint about V1, and it is fixed by making
+ * the label unclickable rather than by removing it.
+ */
+.ttv2-hit::after {
+    content: attr(data-ttv2-profit);
+
+    position: absolute;
+    top: 4px;
+    right: 7px;
+    z-index: 20;
+
+    color: #ffffff;
+    font-size: 14px;
+    font-weight: 800;
+    line-height: 20px;
+
+    text-shadow:
+        0 1px 2px #000,
+        0 0 3px #000;
+
+    pointer-events: none;
+}
+
+/* The best few opportunities on the page get a warmer fill. */
 .ttv2-hit-top {
     box-shadow:
-        inset 0 0 0 1px rgba(126, 224, 143, 0.85),
-        inset 4px 0 0 0 #7ee08f !important;
+        inset 0 0 0 3px #7ee08f,
+        inset 0 0 0 9999px rgba(126, 224, 143, 0.24) !important;
 }
 
 .ttv2-panel {

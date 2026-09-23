@@ -351,44 +351,6 @@ export class Panel {
         this.settingsEl.appendChild(el('h4', { text: 'Behaviour' }));
         this.settingsEl.appendChild(autoScanLabel);
 
-        /* ---- selectors ---- */
-
-        this.selectorInput = el('textarea', {
-            placeholder: '{ "bazaar": { "rowSets": ["ul.my-rows > li"] } }',
-            spellcheck: 'false',
-        });
-
-        const selectorSave = el('button', {
-            type: 'button',
-            text: 'Save selectors',
-            onclick: () => this.saveSelectors(),
-        });
-
-        const selectorReset = el('button', {
-            type: 'button',
-            text: 'Reset',
-            onclick: () => {
-                this.selectorInput.value = '';
-                this.emitSettings({ selectorOverrides: null });
-            },
-        });
-
-        this.settingsEl.appendChild(el('h4', { text: 'Row selectors' }));
-        this.settingsEl.appendChild(
-            el('div', {
-                class: 'ttv2-note',
-                text:
-                    'Only needed if a Torn update breaks detection. Check the ' +
-                    'diagnostics under Filter: "NO MATCH" means the row ' +
-                    'selector needs replacing. JSON, same shape as the ' +
-                    'defaults.',
-            }),
-        );
-        this.settingsEl.appendChild(this.selectorInput);
-        this.settingsEl.appendChild(
-            el('div', { class: 'ttv2-inline' }, [selectorSave, selectorReset]),
-        );
-
         /* ---- data ---- */
 
         this.settingsEl.appendChild(el('h4', { text: 'Cached data' }));
@@ -412,23 +374,6 @@ export class Panel {
                     'Clearing makes the next scan re-download them.',
             }),
         );
-    }
-
-    saveSelectors() {
-        const raw = this.selectorInput.value.trim();
-
-        if (!raw) {
-            this.emitSettings({ selectorOverrides: null });
-            return;
-        }
-
-        try {
-            const parsed = JSON.parse(raw);
-            this.emitSettings({ selectorOverrides: parsed });
-            this.setStatus('Selector overrides saved.');
-        } catch {
-            this.setStatus('Selector overrides are not valid JSON.', 'error');
-        }
     }
 
     /**
@@ -609,11 +554,6 @@ export class Panel {
         }
         if (this.autoScanInput && settings.autoScan !== undefined) {
             this.autoScanInput.checked = Boolean(settings.autoScan);
-        }
-        if (this.selectorInput && settings.selectorOverrides !== undefined) {
-            this.selectorInput.value = settings.selectorOverrides
-                ? JSON.stringify(settings.selectorOverrides, null, 2)
-                : '';
         }
         if (settings.collapsed !== undefined) {
             this.setCollapsed(settings.collapsed);

@@ -1,0 +1,153 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Scanner fixture</title>
+<style>
+    /* Cards need real dimensions, since the content strategy checks them. */
+    .itemTile___gJeSo,
+    .itemDescription___TknAN {
+        width: 320px;
+        height: 90px;
+        border: 1px solid #ccc;
+        margin: 6px;
+        font: 12px sans-serif;
+    }
+    #out { white-space: pre-wrap; font: 12px monospace; background: #eee; padding: 8px; }
+</style>
+</head>
+<body>
+
+<!--
+  Markup captured from live Torn pages on 2026-09-23.
+  Item Market seller listings: itemTile___ with the full buy ARIA label.
+-->
+<div class="itemTile___gJeSo">
+  <div class="baseItemTileWrapper___tV9VZ large___dkKZ0 imageBorder___mXhiD">
+    <div class="tileImage___mbztJ large___dkKZ0">
+      <img class="torn-item image___S3vQy" alt="Hammer"
+           srcset="/images/items/1/large.png 1x, /images/items/1/large@2x.png 2x"
+           src="/images/items/1/large.png">
+    </div>
+    <div class="actionsWrapper___t9l4N">
+      <button type="button" class="actionButton___okbi2"
+              aria-label="View info for item Hammer." aria-controls="wai-itemInfo-1">
+        <span class="title___Qu9TR">View Info</span>
+      </button>
+      <span class="srOnly___vrc2S"><div role="status">Content collapsed</div></span>
+      <button type="button" class="actionButton___okbi2"
+              aria-label="Buy item Hammer, $100, 1 in total."
+              aria-controls="wai-ariaControls-buy-1">Buy</button>
+    </div>
+  </div>
+  <div class="stats">18.35 55.29</div>
+  <div class="name">Hammer</div>
+  <div class="price">$100</div>
+</div>
+
+<div class="itemTile___gJeSo">
+  <div class="baseItemTileWrapper___tV9VZ">
+    <div class="tileImage___mbztJ">
+      <img class="torn-item image___S3vQy" alt="Hammer"
+           src="/images/items/1/large.png">
+    </div>
+    <div class="actionsWrapper___t9l4N">
+      <button type="button"
+              aria-label="Buy item Hammer, $2,500, 40 in total."
+              aria-controls="wai-ariaControls-buy-1">Buy</button>
+    </div>
+  </div>
+  <div class="price">$2,500</div>
+</div>
+
+<!--
+  Item Market aggregate list view: data-testid, bare buy label, "in stock".
+-->
+<div class="itemDescription___TknAN" data-testid="item-description">
+  <div class="imgBar___H65Bf" aria-label="Xanax" role="button">
+    <div class="imgContainer___dGTvI" data-testid="img-container">
+      <img class="img___nhcAx item-plate" alt="Xanax"
+           srcset="/images/items/206/large.png 1x"
+           src="/images/items/206/large.png">
+    </div>
+    <div class="controlPanel___sWR8Q" data-testid="control-panel">
+      <button aria-label="Show info: Xanax" type="button">i</button>
+      <button aria-label="Buy: Xanax" type="button">B</button>
+    </div>
+  </div>
+  <span>Xanax</span>
+  <span>$400</span>
+  <span>1%</span>
+  <span>(
+    5,931
+     in stock)</span>
+</div>
+
+<!-- A non-item image: must be ignored (this is the bazaar directory case). -->
+<a class="link___g3XKC" href="/bazaar.php?userId=3886744#/">
+  <img alt="" class="avatar____S1NE" src="https://avatars.torn.com/48X48_abc.png">
+  <span class="name___owgK4">friendliest $1/2 bazaar</span>
+</a>
+
+<div id="out">running...</div>
+
+<script type="module">
+import { buildItemIndex } from '../src/core/items.js';
+import { scanDom } from '../src/sources/dom/scan.js';
+import { computeOpportunity } from '../src/core/profit.js';
+import { rankOpportunities } from '../src/core/ranker.js';
+import { injectStyles } from '../src/ui/styles.js';
+import { markRows } from '../src/ui/overlay.js';
+import { formatMoney } from '../src/core/parse.js';
+
+// Hammer sell_price above the $100 listing, so the profit path is exercised.
+const index = buildItemIndex({
+    1: { name: 'Hammer', sell_price: 150 },
+    206: { name: 'Xanax', sell_price: 540 },
+});
+
+const { listings, diagnostics } = scanDom('itemmarket', document, { index });
+
+const priced = listings.map((l) => ({
+    ...l,
+    npcVerified: true,
+    profit: computeOpportunity({
+        listingPrice: l.listingPrice,
+        exitPrice: l.item.sellPrice,
+        qty: l.qty,
+        venue: 'NPC',
+    }),
+})).filter((r) => r.profit && r.profit.profitPerUnit > 0);
+
+const ranked = rankOpportunities(priced, { minTotalProfit: 0 }).map((r) => ({
+    ...r,
+    cardLabel:
+        '+' + formatMoney(r.profit.profitPerUnit) +
+        (r.profit.qty > 1
+            ? ' x' + r.profit.qty + ' = +' + formatMoney(r.profit.totalProfit)
+            : ''),
+}));
+
+injectStyles(document);
+markRows(ranked, document);
+
+document.getElementById('out').textContent = JSON.stringify({
+    diagnostics,
+    parsed: listings.map((l) => ({
+        name: l.name,
+        id: l.itemId,
+        price: l.listingPrice,
+        qty: l.qty,
+        priceAssumed: l.priceAssumed,
+        qtyAssumed: l.qtyAssumed,
+    })),
+    ranked: ranked.map((r) => ({
+        name: r.name,
+        perUnit: r.profit.profitPerUnit,
+        qty: r.profit.qty,
+        total: r.profit.totalProfit,
+    })),
+}, null, 2);
+</script>
+</body>
+</html>
