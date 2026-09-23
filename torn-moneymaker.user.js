@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      2.8.0
+// @version      2.9.0
 // @description  Ranks Bazaar / Item Market listings on the page you are viewing by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -32,7 +32,7 @@
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '2.8.0';
+    const TTV2_BUILD_VERSION = '2.9.0';
 
     /* ===== src/platform/gm.js ===== */
     /*
@@ -806,8 +806,14 @@
 
     const LEDGER_VERSION = 'ledger-v1';
 
-    /** After this an entry is dropped: the listing has probably gone. */
-    const LEDGER_TTL_MS = 30 * 60 * 1000;
+    /**
+     * After this an entry is dropped: the listing has probably gone.
+     *
+     * Ten minutes, not thirty. Torn's market turns over fast - a cheap listing is
+     * usually taken within minutes - and a remembered row that no longer exists
+     * is worse than no row at all.
+     */
+    const LEDGER_TTL_MS = 10 * 60 * 1000;
 
     /** Keep the ledger bounded regardless of how long someone browses. */
     const LEDGER_MAX_ENTRIES = 400;
@@ -2532,23 +2538,6 @@
 
             /* ---- behaviour ---- */
 
-            this.autoScanInput = el('input', { type: 'checkbox' });
-            this.autoScanInput.addEventListener('change', () =>
-                this.emitSettings({ autoScan: this.autoScanInput.checked }),
-            );
-
-            const autoScanLabel = el('label', { class: 'ttv2-check' }, [
-                this.autoScanInput,
-            ]);
-            autoScanLabel.appendChild(
-                document.createTextNode(' Scan automatically when a page loads'),
-            );
-
-            this.settingsEl.appendChild(el('h4', { text: 'Behaviour' }));
-            this.settingsEl.appendChild(autoScanLabel);
-
-            /* ---- data ---- */
-
             this.settingsEl.appendChild(el('h4', { text: 'Cached data' }));
             this.settingsEl.appendChild(
                 el('div', { class: 'ttv2-inline' }, [
@@ -2835,9 +2824,6 @@
             if (this.npcShopsOnlyInput && settings.npcShopsOnly !== undefined) {
                 this.npcShopsOnlyInput.checked = Boolean(settings.npcShopsOnly);
             }
-            if (this.autoScanInput && settings.autoScan !== undefined) {
-                this.autoScanInput.checked = Boolean(settings.autoScan);
-            }
             if (settings.collapsed !== undefined) {
                 this.setCollapsed(settings.collapsed);
             }
@@ -3096,7 +3082,11 @@
 
             const summary = this.state.summary || { count: 0, totalProfit: 0 };
 
+            const where = this.state.diagnostics && this.state.diagnostics.pageType;
+
             this.summaryEl.textContent =
+                (where === 'bazaar' ? 'Bazaar' : where === 'itemmarket' ? 'Item Market' : '-') +
+                '  |  ' +
                 summary.count +
                 ' opportunities  |  +' +
                 formatMoneyShort(summary.totalProfit) +
@@ -3541,6 +3531,20 @@
 
     /** Re-mark and re-render from the current DOM. Never makes a request. */
     function rescan() {
+        /*
+         * Re-detect the page every scan.
+         *
+         * Torn navigates with pushState, which fires neither hashchange nor
+         * popstate - so a bazaar kept being scanned as, and reported as, the Item
+         * Market. Detection is a string test, so doing it every pass costs
+         * nothing and removes a whole class of stale-state bugs.
+         */
+        const current = detectPage(location.href);
+        if (current !== app.pageType) {
+            app.pageType = current;
+            clearMarks();
+        }
+
         if (!app.index || app.pageType === PAGE_NONE) return;
 
         const { listings, diagnostics } = scanDom(app.pageType, document, {
@@ -3579,13 +3583,26 @@
          */
         const onPage = new Set(ranked.map((r) => String(r.itemId)));
 
-        const combined = app.settings.showAllSeen
-            ? ranked.concat(
-                  ledgerRows(app.ledger).filter(
-                      (r) => !onPage.has(String(r.itemId)),
-                  ),
+        /*
+         * Remembered rows were priced under whatever settings applied when they
+         * were seen. Re-filter them against the CURRENT settings, or switching
+         * "compare vs market value" off leaves market-priced rows on screen.
+         */
+        const venueAllowed = (venue) => {
+            if (venue === 'ITEM_MARKET') return app.settings.compareMarket !== false;
+            if (venue === 'NPC') return app.settings.compareNpc !== false;
+            return true;
+        };
+
+        const remembered = app.settings.showAllSeen
+            ? ledgerRows(app.ledger).filter(
+                  (r) =>
+                      !onPage.has(String(r.itemId)) &&
+                      venueAllowed(r.profit.venue),
               )
-            : ranked;
+            : [];
+
+        const combined = ranked.concat(remembered);
 
         const shown = rankOpportunities(combined, {
             ...app.settings,
@@ -3761,12 +3778,12 @@
             return;
         }
 
-        if (app.settings.autoScan && getStoredKey()) {
+        if (getStoredKey()) {
             onScan();
             return;
         }
 
-        app.panel.setStatus('Ready - press Scan.');
+        app.panel.setStatus('Paste a Public API key under Settings to begin.');
     }
 
     function handleRouteChange() {
@@ -3855,7 +3872,14 @@
 
         setInterval(() => {
             if (document.visibilityState !== 'visible') return;
-            if (app.pageType === PAGE_NONE || !app.index) return;
+            if (detectPage(location.href) === PAGE_NONE) return;
+
+            // Never scanned yet (no key at boot, or a failed first load).
+            if (!app.index) {
+                if (getStoredKey() && !app.loading) onScan();
+                return;
+            }
+
             rescan();
         }, POLL_INTERVAL_MS);
     }

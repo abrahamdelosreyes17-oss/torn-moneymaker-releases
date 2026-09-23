@@ -362,6 +362,20 @@ function buildOpportunities(listings) {
 
 /** Re-mark and re-render from the current DOM. Never makes a request. */
 function rescan() {
+    /*
+     * Re-detect the page every scan.
+     *
+     * Torn navigates with pushState, which fires neither hashchange nor
+     * popstate - so a bazaar kept being scanned as, and reported as, the Item
+     * Market. Detection is a string test, so doing it every pass costs
+     * nothing and removes a whole class of stale-state bugs.
+     */
+    const current = detectPage(location.href);
+    if (current !== app.pageType) {
+        app.pageType = current;
+        clearMarks();
+    }
+
     if (!app.index || app.pageType === PAGE_NONE) return;
 
     const { listings, diagnostics } = scanDom(app.pageType, document, {
@@ -400,13 +414,26 @@ function rescan() {
      */
     const onPage = new Set(ranked.map((r) => String(r.itemId)));
 
-    const combined = app.settings.showAllSeen
-        ? ranked.concat(
-              ledgerRows(app.ledger).filter(
-                  (r) => !onPage.has(String(r.itemId)),
-              ),
+    /*
+     * Remembered rows were priced under whatever settings applied when they
+     * were seen. Re-filter them against the CURRENT settings, or switching
+     * "compare vs market value" off leaves market-priced rows on screen.
+     */
+    const venueAllowed = (venue) => {
+        if (venue === 'ITEM_MARKET') return app.settings.compareMarket !== false;
+        if (venue === 'NPC') return app.settings.compareNpc !== false;
+        return true;
+    };
+
+    const remembered = app.settings.showAllSeen
+        ? ledgerRows(app.ledger).filter(
+              (r) =>
+                  !onPage.has(String(r.itemId)) &&
+                  venueAllowed(r.profit.venue),
           )
-        : ranked;
+        : [];
+
+    const combined = ranked.concat(remembered);
 
     const shown = rankOpportunities(combined, {
         ...app.settings,
@@ -582,12 +609,12 @@ function applyPageType(next, { initial = false } = {}) {
         return;
     }
 
-    if (app.settings.autoScan && getStoredKey()) {
+    if (getStoredKey()) {
         onScan();
         return;
     }
 
-    app.panel.setStatus('Ready - press Scan.');
+    app.panel.setStatus('Paste a Public API key under Settings to begin.');
 }
 
 function handleRouteChange() {
@@ -676,7 +703,14 @@ export function boot() {
 
     setInterval(() => {
         if (document.visibilityState !== 'visible') return;
-        if (app.pageType === PAGE_NONE || !app.index) return;
+        if (detectPage(location.href) === PAGE_NONE) return;
+
+        // Never scanned yet (no key at boot, or a failed first load).
+        if (!app.index) {
+            if (getStoredKey() && !app.loading) onScan();
+            return;
+        }
+
         rescan();
     }, POLL_INTERVAL_MS);
 }

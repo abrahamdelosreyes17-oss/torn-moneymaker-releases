@@ -336,23 +336,6 @@ export class Panel {
 
         /* ---- behaviour ---- */
 
-        this.autoScanInput = el('input', { type: 'checkbox' });
-        this.autoScanInput.addEventListener('change', () =>
-            this.emitSettings({ autoScan: this.autoScanInput.checked }),
-        );
-
-        const autoScanLabel = el('label', { class: 'ttv2-check' }, [
-            this.autoScanInput,
-        ]);
-        autoScanLabel.appendChild(
-            document.createTextNode(' Scan automatically when a page loads'),
-        );
-
-        this.settingsEl.appendChild(el('h4', { text: 'Behaviour' }));
-        this.settingsEl.appendChild(autoScanLabel);
-
-        /* ---- data ---- */
-
         this.settingsEl.appendChild(el('h4', { text: 'Cached data' }));
         this.settingsEl.appendChild(
             el('div', { class: 'ttv2-inline' }, [
@@ -639,9 +622,6 @@ export class Panel {
         if (this.npcShopsOnlyInput && settings.npcShopsOnly !== undefined) {
             this.npcShopsOnlyInput.checked = Boolean(settings.npcShopsOnly);
         }
-        if (this.autoScanInput && settings.autoScan !== undefined) {
-            this.autoScanInput.checked = Boolean(settings.autoScan);
-        }
         if (settings.collapsed !== undefined) {
             this.setCollapsed(settings.collapsed);
         }
@@ -900,7 +880,11 @@ export class Panel {
 
         const summary = this.state.summary || { count: 0, totalProfit: 0 };
 
+        const where = this.state.diagnostics && this.state.diagnostics.pageType;
+
         this.summaryEl.textContent =
+            (where === 'bazaar' ? 'Bazaar' : where === 'itemmarket' ? 'Item Market' : '-') +
+            '  |  ' +
             summary.count +
             ' opportunities  |  +' +
             formatMoneyShort(summary.totalProfit) +

@@ -14,8 +14,14 @@
 
 export const LEDGER_VERSION = 'ledger-v1';
 
-/** After this an entry is dropped: the listing has probably gone. */
-export const LEDGER_TTL_MS = 30 * 60 * 1000;
+/**
+ * After this an entry is dropped: the listing has probably gone.
+ *
+ * Ten minutes, not thirty. Torn's market turns over fast - a cheap listing is
+ * usually taken within minutes - and a remembered row that no longer exists
+ * is worse than no row at all.
+ */
+export const LEDGER_TTL_MS = 10 * 60 * 1000;
 
 /** Keep the ledger bounded regardless of how long someone browses. */
 export const LEDGER_MAX_ENTRIES = 400;
