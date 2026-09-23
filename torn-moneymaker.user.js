@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      2.6.0
+// @version      2.7.0
 // @description  Ranks Bazaar / Item Market listings on the page you are viewing by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -32,7 +32,7 @@
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '2.6.0';
+    const TTV2_BUILD_VERSION = '2.7.0';
 
     /* ===== src/platform/gm.js ===== */
     /*
@@ -1436,8 +1436,11 @@
     const BUY_CONTROL_SELECTOR =
         '[aria-label^="Buy item"], [aria-label^="Buy:"]';
 
-    /** "( 5,931 in stock)" */
+    /** "( 5,931 in stock)" - a market-wide total, NOT stock at this price. */
     const IN_STOCK_RE = /\(?\s*([\d,]+)\s*in\s+stock/i;
+
+    /** "1,805 available" - one seller's stock, which IS at this price. */
+    const AVAILABLE_RE = /([\d,]+)\s*available/i;
 
     /** Every money figure in a block of text, in order. */
     const ALL_PRICES_RE = /\$\s*[\d,]+(?:\.\d+)?/g;
@@ -1516,6 +1519,8 @@
         const item = resolveItem(card, index, buy);
         if (!item) return { skipped: 'noItem' };
 
+        let marketTotal = null;
+
         const text = card.textContent || '';
 
         let price = buy && buy.price;
@@ -1537,17 +1542,38 @@
 
         if (!Number.isFinite(price) || price <= 0) return { skipped: 'noPrice' };
 
-        let qty = buy && buy.qty;
+        /*
+         * Quantity, and crucially WHETHER IT IS AVAILABLE AT THIS PRICE.
+         *
+         * A category tile reports the market-wide total across every seller
+         * ("694,057 in total", "5,931 in stock") while showing only the CHEAPEST
+         * price. Multiplying the two is nonsense: of 694,057 Gasoline, only 1,805
+         * are at $424 - the next seller wants $520. Doing that produced a
+         * confident "+$3.58m" for a trade that does not exist.
+         *
+         * A seller row ("1,805 available") is the one case where the quantity
+         * really is available at the stated price.
+         */
+        let qty = null;
+        let qtyAtPrice = false;
         let qtyAssumed = false;
 
-        if (!Number.isFinite(qty) || qty <= 0) {
-            const match = text.match(IN_STOCK_RE);
-            qty = match ? parseQuantity(match[1]) : null;
+        const available = text.match(AVAILABLE_RE);
+        if (available) {
+            qty = parseQuantity(available[1]);
+            qtyAtPrice = Number.isFinite(qty) && qty > 0;
+        }
 
-            if (!Number.isFinite(qty) || qty <= 0) {
-                qty = 1;
-                qtyAssumed = true;
-            }
+        if (!qtyAtPrice) {
+            // Market-wide totals are context, never a multiplier.
+            const total = buy && buy.qty ? buy.qty : null;
+            const inStock = text.match(IN_STOCK_RE);
+
+            marketTotal =
+                total || (inStock ? parseQuantity(inStock[1]) : null) || null;
+
+            qty = 1;
+            qtyAssumed = true;
         }
 
         return {
@@ -1559,7 +1585,9 @@
             listingPrice: price,
             priceAssumed,
             qty,
+            qtyAtPrice,
             qtyAssumed,
+            marketTotal,
             source: pageType,
         };
     }
@@ -2471,6 +2499,55 @@
                 ]),
             );
 
+            this.compareNpcInput = el('input', { type: 'checkbox' });
+            this.compareNpcInput.addEventListener('change', () =>
+                this.emitSettings({ compareNpc: this.compareNpcInput.checked }),
+            );
+
+            this.compareMarketInput = el('input', { type: 'checkbox' });
+            this.compareMarketInput.addEventListener('change', () =>
+                this.emitSettings({
+                    compareMarket: this.compareMarketInput.checked,
+                }),
+            );
+
+            this.npcShopsOnlyInput = el('input', { type: 'checkbox' });
+            this.npcShopsOnlyInput.addEventListener('change', () =>
+                this.emitSettings({
+                    npcShopsOnly: this.npcShopsOnlyInput.checked,
+                }),
+            );
+
+            const mkCheck = (input, text, title) => {
+                const label = el('label', { class: 'ttv2-check', title }, [input]);
+                label.appendChild(document.createTextNode(' ' + text));
+                return label;
+            };
+
+            this.filtersEl.appendChild(
+                mkCheck(
+                    this.compareNpcInput,
+                    'Compare vs NPC price',
+                    'What a shop will pay you. A hard floor, no fee.',
+                ),
+            );
+            this.filtersEl.appendChild(
+                mkCheck(
+                    this.npcShopsOnlyInput,
+                    '  ↳ only items a shop stocks',
+                    'Restricts NPC comparison to items a city shop is known to ' +
+                        'deal in. Safer, but the shop list is incomplete.',
+                ),
+            );
+            this.filtersEl.appendChild(
+                mkCheck(
+                    this.compareMarketInput,
+                    'Compare vs market value',
+                    "Torn's rolling average, minus the 5% sales tax. More hits, " +
+                        'softer signal than the NPC price.',
+                ),
+            );
+
             const check = el('label', { class: 'ttv2-check' }, [
                 this.unverifiedInput,
             ]);
@@ -2572,6 +2649,15 @@
             }
             if (this.unverifiedInput && settings.includeUnverifiedNpc !== undefined) {
                 this.unverifiedInput.checked = Boolean(settings.includeUnverifiedNpc);
+            }
+            if (this.compareNpcInput && settings.compareNpc !== undefined) {
+                this.compareNpcInput.checked = Boolean(settings.compareNpc);
+            }
+            if (this.compareMarketInput && settings.compareMarket !== undefined) {
+                this.compareMarketInput.checked = Boolean(settings.compareMarket);
+            }
+            if (this.npcShopsOnlyInput && settings.npcShopsOnly !== undefined) {
+                this.npcShopsOnlyInput.checked = Boolean(settings.npcShopsOnly);
             }
             if (this.autoScanInput && settings.autoScan !== undefined) {
                 this.autoScanInput.checked = Boolean(settings.autoScan);
@@ -2700,12 +2786,27 @@
             // +$104 each  x12
             const eachLine = el('div', {
                 class: 'ttv2-row-line',
-                text:
-                    '+' +
-                    formatMoney(p.profitPerUnit) +
-                    ' each  x' +
-                    p.affordableQty,
+                text: row.qtyAtPrice
+                    ? '+' + formatMoney(p.profitPerUnit) + ' each  x' + p.affordableQty
+                    : '+' + formatMoney(p.profitPerUnit) + ' each',
             });
+
+            if (!row.qtyAtPrice) {
+                eachLine.appendChild(
+                    el('span', {
+                        class: 'ttv2-guess',
+                        title:
+                            'This is the cheapest listing, but Torn does not say ' +
+                            'how many are available AT this price - only the ' +
+                            'market-wide total' +
+                            (row.marketTotal
+                                ? ' (' + row.marketTotal.toLocaleString('en-US') + ')'
+                                : '') +
+                            '. Open the item to see each seller.',
+                        text: ' (qty unknown)',
+                    }),
+                );
+            }
 
             if (row.qtyAssumed) {
                 eachLine.appendChild(
@@ -2736,11 +2837,12 @@
             // TOTAL +$1,248 - ROI 3.6%
             const totalLine = el('div', {
                 class: 'ttv2-row-line ttv2-row-total',
-                text:
-                    'TOTAL +' +
-                    formatMoney(p.realizableProfit) +
-                    '  -  ROI ' +
-                    formatPct(p.roi),
+                text: row.qtyAtPrice
+                    ? 'TOTAL +' +
+                      formatMoney(p.realizableProfit) +
+                      '  -  ROI ' +
+                      formatPct(p.roi)
+                    : 'ROI ' + formatPct(p.roi),
             });
 
             // NPC Shop: Bits 'n' Bobs
@@ -2960,6 +3062,18 @@
          * just no longer decides what you are allowed to see.
          */
         includeUnverifiedNpc: true,
+
+        /* Which exits to price against. Either can be turned off. */
+        compareNpc: true,
+        compareMarket: true,
+
+        /*
+         * NPC mode means NPC mode: only items a city shop is known to stock, so
+         * you are never told to buy something on the promise of a sale that will
+         * not happen. Off by default because the shop lookup is incomplete and
+         * turning it on hides real opportunities - see includeUnverifiedNpc.
+         */
+        npcShopsOnly: false,
         collapsed: false,
         autoScan: true,
     };
@@ -3167,14 +3281,29 @@
              * Only checking the NPC price meant the common case - something
              * listed under market value - never lit up at all.
              */
+            const npcShop = npcShopFor(
+                listing.itemId,
+                app.npcShops,
+                app.manualNpc,
+            );
+
             const exits = {};
 
-            const npcPrice = npcExitPrice(listing.item);
-            if (npcPrice !== null) exits.NPC = npcPrice;
+            if (app.settings.compareNpc) {
+                const npcPrice = npcExitPrice(listing.item);
 
-            const marketValue = Number(listing.item.marketValue);
-            if (Number.isFinite(marketValue) && marketValue > 0) {
-                exits.ITEM_MARKET = marketValue;
+                // "Only on items NPCs sell" - an NPC price is only offered when a
+                // shop is known to deal in the item.
+                const shopKnown = !app.settings.npcShopsOnly || npcShop !== null;
+
+                if (npcPrice !== null && shopKnown) exits.NPC = npcPrice;
+            }
+
+            if (app.settings.compareMarket) {
+                const marketValue = Number(listing.item.marketValue);
+                if (Number.isFinite(marketValue) && marketValue > 0) {
+                    exits.ITEM_MARKET = marketValue;
+                }
             }
 
             if (Object.keys(exits).length === 0) continue;
@@ -3186,12 +3315,6 @@
                 cashOnHand: app.settings.cashOnHand,
             });
 
-            const npcShop = npcShopFor(
-                listing.itemId,
-                app.npcShops,
-                app.manualNpc,
-            );
-
             rows.push({
                 ...listing,
                 profit,
@@ -3202,7 +3325,14 @@
                  * item tile is about 123px wide, and the long form overflowed
                  * onto the neighbouring card. The full breakdown is in the panel.
                  */
-                cardLabel: '+' + formatMoneyShort(profit.totalProfit),
+                cardLabel:
+                    '+' +
+                    formatMoneyShort(
+                        listing.qtyAtPrice
+                            ? profit.totalProfit
+                            : profit.profitPerUnit,
+                    ) +
+                    (listing.qtyAtPrice ? '' : '/ea'),
             });
         }
 

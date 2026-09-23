@@ -63,6 +63,18 @@ const DEFAULT_SETTINGS = {
      * just no longer decides what you are allowed to see.
      */
     includeUnverifiedNpc: true,
+
+    /* Which exits to price against. Either can be turned off. */
+    compareNpc: true,
+    compareMarket: true,
+
+    /*
+     * NPC mode means NPC mode: only items a city shop is known to stock, so
+     * you are never told to buy something on the promise of a sale that will
+     * not happen. Off by default because the shop lookup is incomplete and
+     * turning it on hides real opportunities - see includeUnverifiedNpc.
+     */
+    npcShopsOnly: false,
     collapsed: false,
     autoScan: true,
 };
@@ -270,14 +282,29 @@ function buildOpportunities(listings) {
          * Only checking the NPC price meant the common case - something
          * listed under market value - never lit up at all.
          */
+        const npcShop = npcShopFor(
+            listing.itemId,
+            app.npcShops,
+            app.manualNpc,
+        );
+
         const exits = {};
 
-        const npcPrice = npcExitPrice(listing.item);
-        if (npcPrice !== null) exits.NPC = npcPrice;
+        if (app.settings.compareNpc) {
+            const npcPrice = npcExitPrice(listing.item);
 
-        const marketValue = Number(listing.item.marketValue);
-        if (Number.isFinite(marketValue) && marketValue > 0) {
-            exits.ITEM_MARKET = marketValue;
+            // "Only on items NPCs sell" - an NPC price is only offered when a
+            // shop is known to deal in the item.
+            const shopKnown = !app.settings.npcShopsOnly || npcShop !== null;
+
+            if (npcPrice !== null && shopKnown) exits.NPC = npcPrice;
+        }
+
+        if (app.settings.compareMarket) {
+            const marketValue = Number(listing.item.marketValue);
+            if (Number.isFinite(marketValue) && marketValue > 0) {
+                exits.ITEM_MARKET = marketValue;
+            }
         }
 
         if (Object.keys(exits).length === 0) continue;
@@ -289,12 +316,6 @@ function buildOpportunities(listings) {
             cashOnHand: app.settings.cashOnHand,
         });
 
-        const npcShop = npcShopFor(
-            listing.itemId,
-            app.npcShops,
-            app.manualNpc,
-        );
-
         rows.push({
             ...listing,
             profit,
@@ -305,7 +326,14 @@ function buildOpportunities(listings) {
              * item tile is about 123px wide, and the long form overflowed
              * onto the neighbouring card. The full breakdown is in the panel.
              */
-            cardLabel: '+' + formatMoneyShort(profit.totalProfit),
+            cardLabel:
+                '+' +
+                formatMoneyShort(
+                    listing.qtyAtPrice
+                        ? profit.totalProfit
+                        : profit.profitPerUnit,
+                ) +
+                (listing.qtyAtPrice ? '' : '/ea'),
         });
     }
 

@@ -27,8 +27,11 @@ export const BUY_LABEL_NAME_RE = /^buy(?:\s+item)?:?\s+(.+?)\.?$/i;
 export const BUY_CONTROL_SELECTOR =
     '[aria-label^="Buy item"], [aria-label^="Buy:"]';
 
-/** "( 5,931 in stock)" */
+/** "( 5,931 in stock)" - a market-wide total, NOT stock at this price. */
 const IN_STOCK_RE = /\(?\s*([\d,]+)\s*in\s+stock/i;
+
+/** "1,805 available" - one seller's stock, which IS at this price. */
+const AVAILABLE_RE = /([\d,]+)\s*available/i;
 
 /** Every money figure in a block of text, in order. */
 const ALL_PRICES_RE = /\$\s*[\d,]+(?:\.\d+)?/g;
@@ -107,6 +110,8 @@ export function readCard(card, index, pageType) {
     const item = resolveItem(card, index, buy);
     if (!item) return { skipped: 'noItem' };
 
+    let marketTotal = null;
+
     const text = card.textContent || '';
 
     let price = buy && buy.price;
@@ -128,17 +133,38 @@ export function readCard(card, index, pageType) {
 
     if (!Number.isFinite(price) || price <= 0) return { skipped: 'noPrice' };
 
-    let qty = buy && buy.qty;
+    /*
+     * Quantity, and crucially WHETHER IT IS AVAILABLE AT THIS PRICE.
+     *
+     * A category tile reports the market-wide total across every seller
+     * ("694,057 in total", "5,931 in stock") while showing only the CHEAPEST
+     * price. Multiplying the two is nonsense: of 694,057 Gasoline, only 1,805
+     * are at $424 - the next seller wants $520. Doing that produced a
+     * confident "+$3.58m" for a trade that does not exist.
+     *
+     * A seller row ("1,805 available") is the one case where the quantity
+     * really is available at the stated price.
+     */
+    let qty = null;
+    let qtyAtPrice = false;
     let qtyAssumed = false;
 
-    if (!Number.isFinite(qty) || qty <= 0) {
-        const match = text.match(IN_STOCK_RE);
-        qty = match ? parseQuantity(match[1]) : null;
+    const available = text.match(AVAILABLE_RE);
+    if (available) {
+        qty = parseQuantity(available[1]);
+        qtyAtPrice = Number.isFinite(qty) && qty > 0;
+    }
 
-        if (!Number.isFinite(qty) || qty <= 0) {
-            qty = 1;
-            qtyAssumed = true;
-        }
+    if (!qtyAtPrice) {
+        // Market-wide totals are context, never a multiplier.
+        const total = buy && buy.qty ? buy.qty : null;
+        const inStock = text.match(IN_STOCK_RE);
+
+        marketTotal =
+            total || (inStock ? parseQuantity(inStock[1]) : null) || null;
+
+        qty = 1;
+        qtyAssumed = true;
     }
 
     return {
@@ -150,7 +176,9 @@ export function readCard(card, index, pageType) {
         listingPrice: price,
         priceAssumed,
         qty,
+        qtyAtPrice,
         qtyAssumed,
+        marketTotal,
         source: pageType,
     };
 }

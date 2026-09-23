@@ -452,6 +452,55 @@ export class Panel {
             ]),
         );
 
+        this.compareNpcInput = el('input', { type: 'checkbox' });
+        this.compareNpcInput.addEventListener('change', () =>
+            this.emitSettings({ compareNpc: this.compareNpcInput.checked }),
+        );
+
+        this.compareMarketInput = el('input', { type: 'checkbox' });
+        this.compareMarketInput.addEventListener('change', () =>
+            this.emitSettings({
+                compareMarket: this.compareMarketInput.checked,
+            }),
+        );
+
+        this.npcShopsOnlyInput = el('input', { type: 'checkbox' });
+        this.npcShopsOnlyInput.addEventListener('change', () =>
+            this.emitSettings({
+                npcShopsOnly: this.npcShopsOnlyInput.checked,
+            }),
+        );
+
+        const mkCheck = (input, text, title) => {
+            const label = el('label', { class: 'ttv2-check', title }, [input]);
+            label.appendChild(document.createTextNode(' ' + text));
+            return label;
+        };
+
+        this.filtersEl.appendChild(
+            mkCheck(
+                this.compareNpcInput,
+                'Compare vs NPC price',
+                'What a shop will pay you. A hard floor, no fee.',
+            ),
+        );
+        this.filtersEl.appendChild(
+            mkCheck(
+                this.npcShopsOnlyInput,
+                '  ↳ only items a shop stocks',
+                'Restricts NPC comparison to items a city shop is known to ' +
+                    'deal in. Safer, but the shop list is incomplete.',
+            ),
+        );
+        this.filtersEl.appendChild(
+            mkCheck(
+                this.compareMarketInput,
+                'Compare vs market value',
+                "Torn's rolling average, minus the 5% sales tax. More hits, " +
+                    'softer signal than the NPC price.',
+            ),
+        );
+
         const check = el('label', { class: 'ttv2-check' }, [
             this.unverifiedInput,
         ]);
@@ -553,6 +602,15 @@ export class Panel {
         }
         if (this.unverifiedInput && settings.includeUnverifiedNpc !== undefined) {
             this.unverifiedInput.checked = Boolean(settings.includeUnverifiedNpc);
+        }
+        if (this.compareNpcInput && settings.compareNpc !== undefined) {
+            this.compareNpcInput.checked = Boolean(settings.compareNpc);
+        }
+        if (this.compareMarketInput && settings.compareMarket !== undefined) {
+            this.compareMarketInput.checked = Boolean(settings.compareMarket);
+        }
+        if (this.npcShopsOnlyInput && settings.npcShopsOnly !== undefined) {
+            this.npcShopsOnlyInput.checked = Boolean(settings.npcShopsOnly);
         }
         if (this.autoScanInput && settings.autoScan !== undefined) {
             this.autoScanInput.checked = Boolean(settings.autoScan);
@@ -681,12 +739,27 @@ export class Panel {
         // +$104 each  x12
         const eachLine = el('div', {
             class: 'ttv2-row-line',
-            text:
-                '+' +
-                formatMoney(p.profitPerUnit) +
-                ' each  x' +
-                p.affordableQty,
+            text: row.qtyAtPrice
+                ? '+' + formatMoney(p.profitPerUnit) + ' each  x' + p.affordableQty
+                : '+' + formatMoney(p.profitPerUnit) + ' each',
         });
+
+        if (!row.qtyAtPrice) {
+            eachLine.appendChild(
+                el('span', {
+                    class: 'ttv2-guess',
+                    title:
+                        'This is the cheapest listing, but Torn does not say ' +
+                        'how many are available AT this price - only the ' +
+                        'market-wide total' +
+                        (row.marketTotal
+                            ? ' (' + row.marketTotal.toLocaleString('en-US') + ')'
+                            : '') +
+                        '. Open the item to see each seller.',
+                    text: ' (qty unknown)',
+                }),
+            );
+        }
 
         if (row.qtyAssumed) {
             eachLine.appendChild(
@@ -717,11 +790,12 @@ export class Panel {
         // TOTAL +$1,248 - ROI 3.6%
         const totalLine = el('div', {
             class: 'ttv2-row-line ttv2-row-total',
-            text:
-                'TOTAL +' +
-                formatMoney(p.realizableProfit) +
-                '  -  ROI ' +
-                formatPct(p.roi),
+            text: row.qtyAtPrice
+                ? 'TOTAL +' +
+                  formatMoney(p.realizableProfit) +
+                  '  -  ROI ' +
+                  formatPct(p.roi)
+                : 'ROI ' + formatPct(p.roi),
         });
 
         // NPC Shop: Bits 'n' Bobs
