@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      2.1.1
+// @version      2.2.0
 // @description  Ranks Bazaar / Item Market listings on the page you are viewing by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -30,7 +30,7 @@
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '2.1.1';
+    const TTV2_BUILD_VERSION = '2.2.0';
 
     /* ===== src/platform/gm.js ===== */
     /*
@@ -1143,401 +1143,275 @@
 
     /* ===== src/sources/dom/selectors.js ===== */
     /*
-     * Row selectors for each page type.
+     * Selectors, derived from Torn's ACTUAL markup (captured 2026-09-23) rather
+     * than guessed at.
      *
-     * IMPORTANT: Torn's current UI ships hashed CSS module class names
-     * (`sellerRow___a1B2c`), and those hashes change whenever Torn rebuilds its
-     * frontend. Nothing here can be assumed stable, so:
+     * The earlier version of this file invented names like `sellerRow___` and
+     * `itemsList` from a description of the page. None of them existed, so the
+     * scanner matched nothing and reported "no opportunities" on pages full of
+     * them. Everything here is now taken from a real page dump.
      *
-     *   - Selectors are substring matches on class names, not exact matches.
-     *   - Each page type carries a LIST of candidate row selectors, tried in
-     *     order; the first that yields usable rows wins.
-     *   - The user can override the whole set from the panel's gear menu without
-     *     editing the script, and `diagnose()` reports what matched so a broken
-     *     selector is visible instead of silently returning zero opportunities.
+     * Two Item Market layouts were observed:
      *
-     * These lists are the part of the codebase most likely to need a one-line fix
-     * after a Torn frontend update. That is by design - the fix should never need
-     * to touch anything else.
+     *   1. Aggregate list  - <div class="itemDescription___TknAN"
+     *                             data-testid="item-description">
+     *                        text: "Xanax $839,700 1% ( 5,931 in stock)"
+     *                        buy control: aria-label="Buy: Xanax"
+     *
+     *   2. Seller listings - <div class="itemTile___gJeSo">
+     *                        buy control:
+     *                          aria-label="Buy item Hammer, $100, 1 in total."
+     *
+     * The hashed suffixes (`___gJeSo`) change whenever Torn rebuilds its
+     * frontend, so nothing here matches on them exactly - only on the stable
+     * prefix, on `data-testid`, or on ARIA, in that order of preference. ARIA and
+     * test ids are semantic: Torn changes them far less often than class hashes,
+     * and they are the reason this parser should survive a redesign.
      */
 
-    const DEFAULT_SELECTORS = {
-        bazaar: {
-            rowSets: [
-                'ul[class*="itemsList"] > li',
-                'ul[class*="ItemList"] > li',
-                'div[class*="bazaarItem"]',
-                'li[class*="item___"]',
-                '.bazaar-list > li',
-                'ul.items-list > li',
-            ],
-            name: [
-                '[class*="itemName"]',
-                '[class*="name___"]',
-                '.name',
-                'img[alt]',
-            ],
-            price: [
-                '[class*="price___"]',
-                '[class*="itemPrice"]',
-                '.price',
-            ],
-            qty: [
-                '[class*="qty___"]',
-                '[class*="quantity"]',
-                '[class*="amount"]',
-                '.qty',
-            ],
-        },
+    /** Every item image carries its item id in the path: /images/items/206/... */
+    const ITEM_IMAGE_SELECTOR =
+        'img[src*="/images/items/"], img[srcset*="/images/items/"]';
 
-        itemmarket: {
-            rowSets: [
-                'div[class*="sellerRow"]',
-                'ul[class*="sellerList"] > li',
-                'div[class*="itemRow"]',
-                'li[class*="item___"]',
-            ],
-            name: [
-                '[class*="itemName"]',
-                '[class*="name___"]',
-                'img[alt]',
-            ],
-            price: [
-                '[class*="price___"]',
-                '[class*="cost"]',
-                '.price',
-            ],
-            qty: [
-                '[class*="available"]',
-                '[class*="qty___"]',
-                '[class*="quantity"]',
-                '[class*="amount"]',
-            ],
-        },
+    const ITEM_IMAGE_ID_RE = /\/images\/items\/(\d+)\//;
+
+    /**
+     * Torn's own buy control. Both observed phrasings:
+     *   "Buy item Hammer, $100, 1 in total."
+     *   "Buy: Xanax"
+     */
+    const BUY_CONTROL_SELECTOR =
+        '[aria-label^="Buy item"], [aria-label^="Buy:"]';
+
+    /** The rich form, which carries name, price and quantity together. */
+    const BUY_LABEL_FULL_RE =
+        /^buy item\s+(.+?),\s*\$([\d,]+(?:\.\d+)?),\s*([\d,]+)\s*in total/i;
+
+    /** The bare form, which carries only the name. */
+    const BUY_LABEL_NAME_RE = /^buy(?:\s+item)?:?\s+(.+?)\.?$/i;
+
+    /**
+     * Candidate card containers, tightest first. Used to snap from an item image
+     * up to the element that represents one listing.
+     */
+    const CARD_SELECTOR = [
+        '[class*="itemTile"]',
+        '[data-testid="item-description"]',
+        '[class*="itemDescription"]',
+        '[class*="sellerRow"]',
+        '[class*="listItem"]',
+        'li',
+    ].join(', ');
+
+    const DEFAULT_SELECTORS = {
+        card: CARD_SELECTOR,
+        itemImage: ITEM_IMAGE_SELECTOR,
+        buyControl: BUY_CONTROL_SELECTOR,
+
+        /* Fallbacks, only consulted when the ARIA label is absent. */
+        price: ['[class*="price"]', '[class*="cost"]'],
+        qty: ['[class*="quantity"]', '[class*="stock"]', '[class*="qty"]'],
     };
 
     /**
-     * Merge user overrides over the defaults. An override supplies whole lists,
-     * not entries, so a user can replace a broken selector set outright.
+     * Merge user overrides over the defaults.
+     *
+     * Overrides are still supported so a Torn change can be worked around from
+     * the settings panel without waiting for a new release.
      */
     function resolveSelectors(pageType, overrides) {
-        const base = DEFAULT_SELECTORS[pageType];
-        if (!base) return null;
+        const override = (overrides && (overrides[pageType] || overrides.all)) || {};
 
-        const override = (overrides && overrides[pageType]) || {};
-
-        return {
-            rowSets: override.rowSets || base.rowSets,
-            name: override.name || base.name,
-            price: override.price || base.price,
-            qty: override.qty || base.qty,
-        };
+        return { ...DEFAULT_SELECTORS, ...override };
     }
 
     /* ===== src/sources/dom/scan.js ===== */
     /*
      * Reading listings out of the page the user is currently viewing.
      *
-     * Rules this module exists to obey:
+     * The strategy changed once real markup was in hand. Instead of guessing a
+     * row selector and then digging for the name, price and quantity inside it,
+     * the scanner now works from two things Torn states explicitly:
      *
-     *  - Only the current page. Nothing here fetches a Torn page, ever.
-     *  - Row-scoped. Name, price and quantity are read from specific cells inside
-     *    one row element. V1 regexed a whole element's text and took the first
-     *    `$` it found, which cheerfully paired one listing's name with another
-     *    listing's price.
-     *  - No guessing. When a row is genuinely ambiguous it is skipped and counted
-     *    in the diagnostics, rather than reported as a confident wrong number.
+     *   - the item image, whose path carries the item id (/images/items/206/)
+     *   - the buy control's ARIA label, which carries the name, the price and the
+     *     quantity in one structured string
+     *
+     * That removes every guess that made the previous version fail: no name
+     * matching, no "first $ in the row", no distinguishing a unit price from a
+     * line total, no deciding whether "in stock" or "available" is the magic
+     * word. Where Torn tells us, we read; where it does not, we say so.
+     *
+     * Rules this module obeys:
+     *   - Only the current page. Nothing here fetches a Torn page, ever.
+     *   - No guessing. An unreadable row is counted in the diagnostics, not
+     *     reported as a confident wrong number.
      */
 
 
 
 
 
-    /** A price cell on its own, e.g. "$2,896". */
+    /** A leaf whose entire text is a price, e.g. "$2,896". */
     const SCAN_PRICE_ONLY = /^\$\s*[\d,]+(?:\.\d+)?$/;
 
-    /** How many text candidates to try when resolving a row's item name. */
-    const SCAN_MAX_NAME_CANDIDATES = 12;
+    /** "( 5,931 in stock)" - the aggregate Item Market list view. */
+    const SCAN_IN_STOCK_RE = /\(?\s*([\d,]+)\s*in\s+stock/i;
+
+    /** How far up from an item image a listing container may sit. */
+    const SCAN_MAX_CLIMB = 8;
 
     function scanText(node) {
         if (!node) return '';
-        const text = node.textContent || '';
-        return text.trim();
-    }
-
-    /** First non-empty text among a list of selectors, searched within `row`. */
-    function firstText(row, selectors) {
-        for (const selector of selectors || []) {
-            let node;
-            try {
-                node = row.querySelector(selector);
-            } catch {
-                continue; // A malformed user override should not kill the scan.
-            }
-            if (!node) continue;
-
-            if (node.tagName === 'IMG') {
-                const alt = (node.getAttribute('alt') || '').trim();
-                if (alt) return alt;
-                continue;
-            }
-
-            const text = scanText(node);
-            if (text) return text;
-        }
-
-        return '';
+        return (node.textContent || '').trim();
     }
 
     /**
-     * Resolve the row's item via the name index.
+     * The item id from an image path.
      *
-     * Every lookup is a Map hit - the ~1,500-name array that V1 rebuilt and
-     * re-sorted inside its per-element loop is gone entirely.
+     * `/images/items/206/large.png` -> "206". This is the single most reliable
+     * identifier on the page: it does not depend on spelling, casing, pluralisation
+     * or Torn's display formatting, and it cannot be confused with another item.
      */
-    function resolveRowItem(row, cfg, index) {
-        const direct = firstText(row, cfg.name);
-        if (direct) {
-            const hit = findItemByName(index, direct);
-            if (hit) return hit;
+    function itemIdFromImage(img) {
+        if (!img) return null;
+
+        const src =
+            img.getAttribute('src') || img.getAttribute('srcset') || '';
+
+        const match = src.match(ITEM_IMAGE_ID_RE);
+        return match ? match[1] : null;
+    }
+
+    /**
+     * Parse Torn's buy-control ARIA label.
+     *
+     * Two observed forms:
+     *   "Buy item Hammer, $100, 1 in total."  -> name, price and quantity
+     *   "Buy: Xanax"                          -> name only
+     *
+     * @returns {{name: string, price: number|null, qty: number|null}|null}
+     */
+    function parseBuyLabel(label) {
+        if (typeof label !== 'string' || !label.trim()) return null;
+
+        const text = label.trim();
+
+        const full = text.match(BUY_LABEL_FULL_RE);
+        if (full) {
+            const price = parseMoney(full[2]);
+            const qty = parseQuantity(full[3]);
+
+            return {
+                name: full[1].trim(),
+                price: Number.isFinite(price) && price > 0 ? price : null,
+                qty: Number.isFinite(qty) && qty > 0 ? qty : null,
+            };
         }
 
-        // Fall back to short text fragments inside the row. Bounded, and every
-        // candidate is an exact Map lookup, so this stays cheap.
-        const candidates = [];
-
-        const alt = row.querySelector('img[alt]');
-        if (alt) candidates.push((alt.getAttribute('alt') || '').trim());
-
-        const title = row.querySelector('[title]');
-        if (title) candidates.push((title.getAttribute('title') || '').trim());
-
-        const lines = (row.textContent || '')
-            .split('\n')
-            .map((line) => line.trim())
-            .filter((line) => line.length > 1 && line.length < 60);
-
-        for (const line of lines) {
-            candidates.push(line);
-            if (candidates.length >= SCAN_MAX_NAME_CANDIDATES) break;
-        }
-
-        for (const candidate of candidates) {
-            if (!candidate) continue;
-            const hit = findItemByName(index, candidate);
-            if (hit) return hit;
+        const bare = text.match(BUY_LABEL_NAME_RE);
+        if (bare) {
+            return { name: bare[1].trim(), price: null, qty: null };
         }
 
         return null;
     }
 
     /**
-     * Find the UNIT price.
+     * Snap from an item image up to the element representing ONE listing.
      *
-     * A real Item Market row shows the unit price and the line total; a bazaar
-     * card can show a price next to other money. So "more than one price in the
-     * row" is the normal case, not an error, and refusing to pick would mean the
-     * scanner finds nothing on exactly the pages it exists for.
-     *
-     * Order of preference:
-     *   1. A cell the selectors identify as the price. Unambiguous, done.
-     *   2. If the quantity is known, a pair where one value is the other times
-     *      the quantity - that is unit price and line total, and the smaller of
-     *      the pair is the unit price. Also unambiguous.
-     *   3. Otherwise the smallest price in the row, flagged `assumed`, because a
-     *      line total can never be smaller than its own unit price.
-     *
-     * Returns { price, assumed }. `assumed` is surfaced in the panel so a guess
-     * is never presented as a fact - V1's actual sin was not guessing, it was
-     * guessing silently.
+     * The guard that matters: as soon as a candidate ancestor contains more than
+     * one item image we have climbed into a container holding several listings,
+     * and must stop. Without that guard this is exactly the V1 bug where a parent
+     * holding eight cards got paired with one price.
      */
-    function resolveRowPrice(row, cfg, qtyHint) {
-        const labelled = firstText(row, cfg.price);
-        if (labelled) {
-            const price = parseMoney(labelled);
-            if (Number.isFinite(price) && price > 0) {
-                return { price, assumed: false };
+    function findCard(img, cfg) {
+        const preferred = img.closest(cfg.card);
+        if (
+            preferred &&
+            preferred.querySelectorAll(cfg.itemImage).length === 1
+        ) {
+            return preferred;
+        }
+
+        let node = img.parentElement;
+        let best = null;
+
+        for (let depth = 0; depth < SCAN_MAX_CLIMB && node; depth += 1) {
+            if (node.querySelectorAll(cfg.itemImage).length > 1) break;
+
+            best = node;
+
+            const hasBuy = node.querySelector(cfg.buyControl);
+            const hasPrice = /\$\s*[\d,]/.test(node.textContent || '');
+
+            if (hasBuy || hasPrice) return node;
+
+            node = node.parentElement;
+        }
+
+        return best;
+    }
+
+    /** Fallback price: a leaf cell that is nothing but a price. */
+    function fallbackPrice(card, cfg) {
+        for (const selector of cfg.price || []) {
+            let node;
+            try {
+                node = card.querySelector(selector);
+            } catch {
+                continue;
+            }
+            if (!node) continue;
+
+            const value = parseMoney(scanText(node));
+            if (Number.isFinite(value) && value > 0) {
+                return { price: value, assumed: false };
             }
         }
 
-        const priceCells = [];
-        for (const node of row.querySelectorAll('*')) {
-            if (node.children.length > 0) continue; // leaves only
+        const cells = [];
+        for (const node of card.querySelectorAll('*')) {
+            if (node.children.length > 0) continue;
+
             const text = scanText(node);
             if (!SCAN_PRICE_ONLY.test(text)) continue;
 
             const value = parseMoney(text);
-            if (Number.isFinite(value) && value > 0) priceCells.push(value);
+            if (Number.isFinite(value) && value > 0) cells.push(value);
         }
 
-        if (priceCells.length === 0) return { price: null, assumed: false };
-        if (priceCells.length === 1) {
-            return { price: priceCells[0], assumed: false };
-        }
+        if (cells.length === 0) return { price: null, assumed: false };
+        if (cells.length === 1) return { price: cells[0], assumed: false };
 
-        if (Number.isFinite(qtyHint) && qtyHint > 1) {
-            for (const unit of priceCells) {
-                const expectedTotal = unit * qtyHint;
-                const hasTotal = priceCells.some(
-                    (other) => Math.abs(other - expectedTotal) < 1,
-                );
-                if (hasTotal) return { price: unit, assumed: false };
-            }
-        }
-
-        return { price: Math.min(...priceCells), assumed: true };
+        // Several prices and nothing to disambiguate them: the lowest is the only
+        // one that cannot be a line total, but flag it as inferred.
+        return { price: Math.min(...cells), assumed: true };
     }
 
-    /** Quantity, plus whether we had to assume it. */
-    function resolveRowQty(row, cfg) {
-        const labelled = firstText(row, cfg.qty);
-        if (labelled) {
-            const qty = parseQuantity(labelled);
+    /** Fallback quantity: "( 5,931 in stock)". */
+    function fallbackQty(card) {
+        const match = (card.textContent || '').match(SCAN_IN_STOCK_RE);
+        if (match) {
+            const qty = parseQuantity(match[1]);
             if (Number.isFinite(qty) && qty > 0) return { qty, assumed: false };
-        }
-
-        /*
-         * Read LEAF elements, never the row's concatenated textContent.
-         *
-         * React emits no whitespace between sibling nodes, so a row's textContent
-         * is "$2,89612 available" rather than "$2,896 12 available". Any regex
-         * over that string is guessing: "2,89612" could be a price of 2,896 next
-         * to a quantity of 12, or a quantity of 289,612, and nothing in the text
-         * distinguishes them. Reading each leaf separately removes the ambiguity
-         * instead of resolving it badly - which is the same mistake as V1's
-         * whole-row price regex, just in a different column.
-         */
-        const patterns = [
-            /(\d[\d,]*)\s*(?:available|in stock|left|remaining)/i,
-            /(?:available|quantity|qty|amount|stock)\s*[:x]?\s*(\d[\d,]*)/i,
-            /^\s*x\s*(\d[\d,]*)\s*$/i,
-        ];
-
-        for (const node of row.querySelectorAll('*')) {
-            if (node.children.length > 0) continue; // leaves only
-
-            const text = scanText(node);
-            if (!text || text.length > 40) continue;
-
-            // A leaf that is just a price is not a quantity.
-            if (SCAN_PRICE_ONLY.test(text)) continue;
-
-            for (const pattern of patterns) {
-                const match = text.match(pattern);
-                if (!match) continue;
-
-                const qty = parseQuantity(match[1]);
-                if (Number.isFinite(qty) && qty > 0) return { qty, assumed: false };
-            }
         }
 
         return { qty: 1, assumed: true };
     }
 
-    /** Drop candidates that contain another candidate: keep the innermost rows. */
-    function dropNestedRows(rows) {
-        return rows.filter(
-            (row) => !rows.some((other) => other !== row && row.contains(other)),
-        );
-    }
-
-    /** Rows matching one selector, innermost only. */
-    function collectRows(root, selector) {
-        let found;
-        try {
-            found = Array.from(root.querySelectorAll(selector));
-        } catch {
-            return [];
+    /** Resolve the catalogue entry for a card, by id first and name only after. */
+    function resolveItem(card, img, index, buy) {
+        const id = itemIdFromImage(img);
+        if (id) {
+            const byId = findItemById(index, id);
+            if (byId) return byId;
         }
 
-        return dropNestedRows(found);
-    }
+        const name =
+            (buy && buy.name) || (img && img.getAttribute('alt')) || '';
 
-    /**
-     * The item the WHOLE PAGE is about.
-     *
-     * The Item Market shows one item at a time: a header naming it, then seller
-     * rows carrying only price, quantity and a Buy button. The item name is not
-     * in the row, so a row-scoped name lookup finds nothing and every listing is
-     * discarded. V1 got this right by reading the page heading; this restores it,
-     * preferring the item id that is already sitting in the URL.
-     *
-     * @returns {object|null}
-     */
-    function resolvePageItem(root, index, href = '') {
-        const byId = String(href).match(/itemID=(\d+)/i);
-        if (byId) {
-            const hit = findItemById(index, byId[1]);
-            if (hit) return hit;
-        }
-
-        const headings = root.querySelectorAll(
-            'h1, h2, h3, h4, [class*="title"], [class*="header"]',
-        );
-
-        for (const heading of headings) {
-            const text = scanText(heading);
-            if (!text || text.length > 80) continue;
-
-            // Torn's heading reads "<item> Value"; try the bare text too.
-            const candidates = [text.replace(/\s*value\s*$/i, ''), text];
-
-            for (const candidate of candidates) {
-                const hit = findItemByName(index, candidate);
-                if (hit) return hit;
-            }
-        }
-
-        return null;
-    }
-
-    /** Read every listing under one candidate selector. */
-    function extractListings(rows, cfg, index, pageType, pageItem) {
-        const diagnostics = {
-            rowsSeen: rows.length,
-            noItem: 0,
-            noPrice: 0,
-            priceAssumed: 0,
-            qtyAssumed: 0,
-        };
-
-        const listings = [];
-
-        for (const row of rows) {
-            // Row name first; fall back to the page's item where the layout puts
-            // the name outside the row.
-            const item = resolveRowItem(row, cfg, index) || pageItem;
-            if (!item) {
-                diagnostics.noItem += 1;
-                continue;
-            }
-
-            // Quantity first: it is what lets the price resolver tell a unit
-            // price from a line total.
-            const { qty, assumed: qtyAssumed } = resolveRowQty(row, cfg);
-            if (qtyAssumed) diagnostics.qtyAssumed += 1;
-
-            const { price, assumed: priceAssumed } = resolveRowPrice(row, cfg, qty);
-            if (!Number.isFinite(price) || price <= 0) {
-                diagnostics.noPrice += 1;
-                continue;
-            }
-            if (priceAssumed) diagnostics.priceAssumed += 1;
-
-            listings.push({
-                el: row,
-                itemId: item.id,
-                name: item.name,
-                item,
-                listingPrice: price,
-                priceAssumed,
-                qty,
-                qtyAssumed,
-                source: pageType,
-            });
-        }
-
-        return { listings, diagnostics };
+        return findItemByName(index, name);
     }
 
     /**
@@ -1550,83 +1424,97 @@
      * @param {object} [ctx.selectorOverrides]
      * @returns {{listings: Array, diagnostics: object}}
      */
-    function scanDom(pageType, root, { index, selectorOverrides, href } = {}) {
+    function scanDom(pageType, root, { index, selectorOverrides } = {}) {
         const cfg = resolveSelectors(pageType, selectorOverrides);
 
-        const empty = {
+        const diagnostics = {
             pageType,
-            usedSelector: null,
-            pageItem: null,
-            rowsSeen: 0,
+            images: 0,
+            cards: 0,
+            fromAria: 0,
             noItem: 0,
             noPrice: 0,
             priceAssumed: 0,
             qtyAssumed: 0,
             listings: 0,
-            candidates: [],
         };
 
-        if (!cfg || !root || !index) return { listings: [], diagnostics: empty };
+        if (!root || !index) return { listings: [], diagnostics };
 
-        const pageItem =
-            pageType === 'itemmarket'
-                ? resolvePageItem(root, index, href || '')
+        let images;
+        try {
+            images = Array.from(root.querySelectorAll(cfg.itemImage));
+        } catch {
+            return { listings: [], diagnostics };
+        }
+
+        diagnostics.images = images.length;
+
+        const listings = [];
+        const seen = new Set();
+
+        for (const img of images) {
+            const card = findCard(img, cfg);
+            if (!card || seen.has(card)) continue;
+
+            seen.add(card);
+            diagnostics.cards += 1;
+
+            const buyNode = card.querySelector(cfg.buyControl);
+            const buy = buyNode
+                ? parseBuyLabel(buyNode.getAttribute('aria-label'))
                 : null;
 
-        /*
-         * Try every candidate selector and keep the one that PARSES the most
-         * rows, not the first one that matches something.
-         *
-         * First-match-wins was a trap: a loose selector like `li[class*="item"]`
-         * matches Torn's sidebar on most pages, so the search would stop there
-         * and every "row" would fail to yield an item. Scoring by parsed rows
-         * makes a wrong guess cost nothing.
-         */
-        let best = null;
-        const candidates = [];
-
-        for (const selector of cfg.rowSets || []) {
-            const rows = collectRows(root, selector);
-            if (rows.length === 0) continue;
-
-            const { listings, diagnostics } = extractListings(
-                rows,
-                cfg,
-                index,
-                pageType,
-                pageItem,
-            );
-
-            candidates.push({
-                selector,
-                rows: rows.length,
-                parsed: listings.length,
-            });
-
-            if (!best || listings.length > best.listings.length) {
-                best = { selector, listings, diagnostics };
+            const item = resolveItem(card, img, index, buy);
+            if (!item) {
+                diagnostics.noItem += 1;
+                continue;
             }
+
+            let price = buy && buy.price;
+            let priceAssumed = false;
+
+            if (!Number.isFinite(price) || price <= 0) {
+                const fallback = fallbackPrice(card, cfg);
+                price = fallback.price;
+                priceAssumed = fallback.assumed;
+            }
+
+            if (!Number.isFinite(price) || price <= 0) {
+                diagnostics.noPrice += 1;
+                continue;
+            }
+
+            let qty = buy && buy.qty;
+            let qtyAssumed = false;
+
+            if (!Number.isFinite(qty) || qty <= 0) {
+                const fallback = fallbackQty(card);
+                qty = fallback.qty;
+                qtyAssumed = fallback.assumed;
+            }
+
+            if (buy && buy.price && buy.qty) diagnostics.fromAria += 1;
+            if (priceAssumed) diagnostics.priceAssumed += 1;
+            if (qtyAssumed) diagnostics.qtyAssumed += 1;
+
+            listings.push({
+                el: card,
+                buyEl: buyNode || null,
+                itemId: item.id,
+                name: item.name,
+                item,
+                listingPrice: price,
+                priceAssumed,
+                qty,
+                qtyAssumed,
+                source: pageType,
+            });
         }
 
-        if (!best) {
-            return {
-                listings: [],
-                diagnostics: { ...empty, pageItem: pageItem && pageItem.name },
-            };
-        }
+        diagnostics.listings = listings.length;
 
-        return {
-            listings: best.listings,
-            diagnostics: {
-                ...empty,
-                ...best.diagnostics,
-                pageType,
-                usedSelector: best.selector,
-                pageItem: pageItem && pageItem.name,
-                listings: best.listings.length,
-                candidates,
-            },
-        };
+        return { listings, diagnostics };
     }
 
     /* ===== src/ui/styles.js ===== */
@@ -2624,25 +2512,26 @@
 
             if (!d) return 'Press Scan.';
 
-            if (!d.usedSelector) {
+            if (d.images === 0) {
                 return (
-                    'No listing rows found on this page. The row selectors may ' +
-                    'need updating after a Torn UI change - see Settings.'
+                    'No item images found on this page. Are there listings ' +
+                    'showing? If so, Torn may have changed its markup.'
                 );
             }
 
-            if (d.listings === 0 && d.rowsSeen > 0) {
-                if (d.noItem === d.rowsSeen) {
+            if (d.listings === 0 && d.cards > 0) {
+                if (d.noItem === d.cards) {
                     return (
                         'Found ' +
-                        d.rowsSeen +
-                        ' rows but could not identify the item in any of them.'
+                        d.cards +
+                        ' listings but none matched the item database. Try ' +
+                        'Settings > Clear cache, then Scan.'
                     );
                 }
                 return (
                     'Found ' +
-                    d.rowsSeen +
-                    ' rows but could not read a price from them.'
+                    d.cards +
+                    ' listings but could not read a price from them.'
                 );
             }
 
@@ -2785,24 +2674,17 @@
                 return;
             }
 
-            const candidates = (d.candidates || [])
-                .map((c) => '    ' + c.parsed + '/' + c.rows + '  ' + c.selector)
-                .join('\n');
-
             this.diagEl.textContent = [
                 'page: ' + (d.pageType || 'none'),
-                'page item: ' + (d.pageItem || '-'),
-                'row selector: ' + (d.usedSelector || 'NO MATCH'),
-                'rows seen: ' + d.rowsSeen,
+                'item images found: ' + d.images,
+                'listing cards: ' + d.cards,
+                'read from Torn aria labels: ' + d.fromAria,
                 'parsed: ' + d.listings,
-                'skipped - unknown item: ' + d.noItem,
+                'skipped - item not in database: ' + d.noItem,
                 'skipped - no price: ' + d.noPrice,
                 'price inferred: ' + d.priceAssumed,
                 'quantity assumed: ' + d.qtyAssumed,
-                candidates ? 'candidates (parsed/matched):\n' + candidates : '',
-            ]
-                .filter(Boolean)
-                .join('\n');
+            ].join('\n');
         }
 
         refreshAges() {

@@ -657,25 +657,26 @@ export class Panel {
 
         if (!d) return 'Press Scan.';
 
-        if (!d.usedSelector) {
+        if (d.images === 0) {
             return (
-                'No listing rows found on this page. The row selectors may ' +
-                'need updating after a Torn UI change - see Settings.'
+                'No item images found on this page. Are there listings ' +
+                'showing? If so, Torn may have changed its markup.'
             );
         }
 
-        if (d.listings === 0 && d.rowsSeen > 0) {
-            if (d.noItem === d.rowsSeen) {
+        if (d.listings === 0 && d.cards > 0) {
+            if (d.noItem === d.cards) {
                 return (
                     'Found ' +
-                    d.rowsSeen +
-                    ' rows but could not identify the item in any of them.'
+                    d.cards +
+                    ' listings but none matched the item database. Try ' +
+                    'Settings > Clear cache, then Scan.'
                 );
             }
             return (
                 'Found ' +
-                d.rowsSeen +
-                ' rows but could not read a price from them.'
+                d.cards +
+                ' listings but could not read a price from them.'
             );
         }
 
@@ -818,24 +819,17 @@ export class Panel {
             return;
         }
 
-        const candidates = (d.candidates || [])
-            .map((c) => '    ' + c.parsed + '/' + c.rows + '  ' + c.selector)
-            .join('\n');
-
         this.diagEl.textContent = [
             'page: ' + (d.pageType || 'none'),
-            'page item: ' + (d.pageItem || '-'),
-            'row selector: ' + (d.usedSelector || 'NO MATCH'),
-            'rows seen: ' + d.rowsSeen,
+            'item images found: ' + d.images,
+            'listing cards: ' + d.cards,
+            'read from Torn aria labels: ' + d.fromAria,
             'parsed: ' + d.listings,
-            'skipped - unknown item: ' + d.noItem,
+            'skipped - item not in database: ' + d.noItem,
             'skipped - no price: ' + d.noPrice,
             'price inferred: ' + d.priceAssumed,
             'quantity assumed: ' + d.qtyAssumed,
-            candidates ? 'candidates (parsed/matched):\n' + candidates : '',
-        ]
-            .filter(Boolean)
-            .join('\n');
+        ].join('\n');
     }
 
     refreshAges() {

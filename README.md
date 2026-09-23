@@ -184,11 +184,19 @@ code and the key handling, which is what the list above does.
 
 **Phase 1 complete, with one caveat.**
 
-The row selectors in `src/sources/dom/selectors.js` are **unverified against the live
-site**. Torn ships hashed CSS-module class names that change when it rebuilds its
-frontend, and these were written from the structure described in the V1 review rather
-than read off a live page. Everything else — profit model, ranking, caching, API
-client, key handling — is unit tested.
+The scanner reads Torn's own ARIA labels and image paths rather than its CSS classes:
+
+- `aria-label="Buy item Hammer, $100, 1 in total."` gives the name, unit price and
+  quantity in one structured string — no text scraping, no first-`$` guessing.
+- `/images/items/206/large.png` gives the item id directly, so nothing depends on
+  matching item names.
+
+Both were captured from live Item Market markup on 2026-09-23. Hashed class names
+(`itemTile___gJeSo`) are used only to snap from an image up to its card, and a
+generic climb handles the case where they change.
+
+**Item Market is verified. Bazaar pages are not** — that markup has not been captured
+yet, and may differ.
 
 To verify: open a bazaar, press Scan, and read the empty-state message and the
 diagnostics under **Filter**. `row selector: NO MATCH` means the selector list needs

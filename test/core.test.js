@@ -38,6 +38,7 @@ import {
 } from '../src/core/npc.js';
 
 import { detectPage, itemMarketUrl } from '../src/sources/route.js';
+import { parseBuyLabel, itemIdFromImage } from '../src/sources/dom/scan.js';
 
 /* ---------------------------------------------------------------- parse */
 
@@ -418,4 +419,68 @@ test('rows with a guessed price are excluded from the ranking', () => {
         }).length,
         2,
     );
+});
+
+/* ------------------------------ DOM parsing (from real Torn markup) */
+
+test('the buy control aria label yields name, price and quantity', () => {
+    // Observed on the Item Market seller listings, 2026-09-23.
+    const parsed = parseBuyLabel('Buy item Hammer, $100, 1 in total.');
+
+    assert.equal(parsed.name, 'Hammer');
+    assert.equal(parsed.price, 100);
+    assert.equal(parsed.qty, 1);
+});
+
+test('large prices and quantities in the aria label parse correctly', () => {
+    const parsed = parseBuyLabel(
+        'Buy item Business Class Ticket, $8,269,074, 18 in total.',
+    );
+
+    assert.equal(parsed.name, 'Business Class Ticket');
+    assert.equal(parsed.price, 8269074);
+    assert.equal(parsed.qty, 18);
+});
+
+test('the bare aria label yields a name only', () => {
+    // Observed on the aggregate Item Market list view.
+    const parsed = parseBuyLabel('Buy: Xanax');
+
+    assert.equal(parsed.name, 'Xanax');
+    assert.equal(parsed.price, null);
+    assert.equal(parsed.qty, null);
+});
+
+test('a non-buy aria label is rejected rather than half-read', () => {
+    assert.equal(parseBuyLabel('View info for item Hammer.'), null);
+    assert.equal(parseBuyLabel('Add friendliest $1/2 bazaar to favorites'), null);
+    assert.equal(parseBuyLabel(''), null);
+    assert.equal(parseBuyLabel(null), null);
+});
+
+test('the item id comes from the image path', () => {
+    const img = {
+        getAttribute: (name) =>
+            name === 'src' ? '/images/items/206/large.png' : null,
+    };
+
+    assert.equal(itemIdFromImage(img), '206');
+
+    const srcsetOnly = {
+        getAttribute: (name) =>
+            name === 'srcset'
+                ? '/images/items/1/large.png 1x, /images/items/1/large@2x.png 2x'
+                : null,
+    };
+
+    assert.equal(itemIdFromImage(srcsetOnly), '1');
+
+    // An avatar is not an item image - this is what the bazaar directory
+    // page is full of.
+    const avatar = {
+        getAttribute: () => 'https://avatars.torn.com/48X48_abc-123.png',
+    };
+
+    assert.equal(itemIdFromImage(avatar), null);
+    assert.equal(itemIdFromImage(null), null);
 });

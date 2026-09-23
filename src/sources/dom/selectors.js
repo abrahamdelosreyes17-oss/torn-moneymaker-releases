@@ -1,91 +1,82 @@
 /*
- * Row selectors for each page type.
+ * Selectors, derived from Torn's ACTUAL markup (captured 2026-09-23) rather
+ * than guessed at.
  *
- * IMPORTANT: Torn's current UI ships hashed CSS module class names
- * (`sellerRow___a1B2c`), and those hashes change whenever Torn rebuilds its
- * frontend. Nothing here can be assumed stable, so:
+ * The earlier version of this file invented names like `sellerRow___` and
+ * `itemsList` from a description of the page. None of them existed, so the
+ * scanner matched nothing and reported "no opportunities" on pages full of
+ * them. Everything here is now taken from a real page dump.
  *
- *   - Selectors are substring matches on class names, not exact matches.
- *   - Each page type carries a LIST of candidate row selectors, tried in
- *     order; the first that yields usable rows wins.
- *   - The user can override the whole set from the panel's gear menu without
- *     editing the script, and `diagnose()` reports what matched so a broken
- *     selector is visible instead of silently returning zero opportunities.
+ * Two Item Market layouts were observed:
  *
- * These lists are the part of the codebase most likely to need a one-line fix
- * after a Torn frontend update. That is by design - the fix should never need
- * to touch anything else.
+ *   1. Aggregate list  - <div class="itemDescription___TknAN"
+ *                             data-testid="item-description">
+ *                        text: "Xanax $839,700 1% ( 5,931 in stock)"
+ *                        buy control: aria-label="Buy: Xanax"
+ *
+ *   2. Seller listings - <div class="itemTile___gJeSo">
+ *                        buy control:
+ *                          aria-label="Buy item Hammer, $100, 1 in total."
+ *
+ * The hashed suffixes (`___gJeSo`) change whenever Torn rebuilds its
+ * frontend, so nothing here matches on them exactly - only on the stable
+ * prefix, on `data-testid`, or on ARIA, in that order of preference. ARIA and
+ * test ids are semantic: Torn changes them far less often than class hashes,
+ * and they are the reason this parser should survive a redesign.
  */
 
-export const DEFAULT_SELECTORS = {
-    bazaar: {
-        rowSets: [
-            'ul[class*="itemsList"] > li',
-            'ul[class*="ItemList"] > li',
-            'div[class*="bazaarItem"]',
-            'li[class*="item___"]',
-            '.bazaar-list > li',
-            'ul.items-list > li',
-        ],
-        name: [
-            '[class*="itemName"]',
-            '[class*="name___"]',
-            '.name',
-            'img[alt]',
-        ],
-        price: [
-            '[class*="price___"]',
-            '[class*="itemPrice"]',
-            '.price',
-        ],
-        qty: [
-            '[class*="qty___"]',
-            '[class*="quantity"]',
-            '[class*="amount"]',
-            '.qty',
-        ],
-    },
+/** Every item image carries its item id in the path: /images/items/206/... */
+export const ITEM_IMAGE_SELECTOR =
+    'img[src*="/images/items/"], img[srcset*="/images/items/"]';
 
-    itemmarket: {
-        rowSets: [
-            'div[class*="sellerRow"]',
-            'ul[class*="sellerList"] > li',
-            'div[class*="itemRow"]',
-            'li[class*="item___"]',
-        ],
-        name: [
-            '[class*="itemName"]',
-            '[class*="name___"]',
-            'img[alt]',
-        ],
-        price: [
-            '[class*="price___"]',
-            '[class*="cost"]',
-            '.price',
-        ],
-        qty: [
-            '[class*="available"]',
-            '[class*="qty___"]',
-            '[class*="quantity"]',
-            '[class*="amount"]',
-        ],
-    },
+export const ITEM_IMAGE_ID_RE = /\/images\/items\/(\d+)\//;
+
+/**
+ * Torn's own buy control. Both observed phrasings:
+ *   "Buy item Hammer, $100, 1 in total."
+ *   "Buy: Xanax"
+ */
+export const BUY_CONTROL_SELECTOR =
+    '[aria-label^="Buy item"], [aria-label^="Buy:"]';
+
+/** The rich form, which carries name, price and quantity together. */
+export const BUY_LABEL_FULL_RE =
+    /^buy item\s+(.+?),\s*\$([\d,]+(?:\.\d+)?),\s*([\d,]+)\s*in total/i;
+
+/** The bare form, which carries only the name. */
+export const BUY_LABEL_NAME_RE = /^buy(?:\s+item)?:?\s+(.+?)\.?$/i;
+
+/**
+ * Candidate card containers, tightest first. Used to snap from an item image
+ * up to the element that represents one listing.
+ */
+export const CARD_SELECTOR = [
+    '[class*="itemTile"]',
+    '[data-testid="item-description"]',
+    '[class*="itemDescription"]',
+    '[class*="sellerRow"]',
+    '[class*="listItem"]',
+    'li',
+].join(', ');
+
+export const DEFAULT_SELECTORS = {
+    card: CARD_SELECTOR,
+    itemImage: ITEM_IMAGE_SELECTOR,
+    buyControl: BUY_CONTROL_SELECTOR,
+
+    /* Fallbacks, only consulted when the ARIA label is absent. */
+    price: ['[class*="price"]', '[class*="cost"]'],
+    qty: ['[class*="quantity"]', '[class*="stock"]', '[class*="qty"]'],
 };
 
 /**
- * Merge user overrides over the defaults. An override supplies whole lists,
- * not entries, so a user can replace a broken selector set outright.
+ * Merge user overrides over the defaults.
+ *
+ * Overrides are still supported so a Torn change can be worked around from
+ * the settings panel without waiting for a new release.
  */
 export function resolveSelectors(pageType, overrides) {
-    const base = DEFAULT_SELECTORS[pageType];
-    if (!base) return null;
+    const override = (overrides && (overrides[pageType] || overrides.all)) || {};
 
-    const override = (overrides && overrides[pageType]) || {};
-
-    return {
-        rowSets: override.rowSets || base.rowSets,
-        name: override.name || base.name,
-        price: override.price || base.price,
-        qty: override.qty || base.qty,
-    };
+    return { ...DEFAULT_SELECTORS, ...override };
 }
