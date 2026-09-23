@@ -657,7 +657,23 @@ function registerMenu() {
 export function boot() {
     injectStyles();
 
-    app.settings = { ...DEFAULT_SETTINGS, ...(gmGet(STORE_SETTINGS, {}) || {}) };
+    const stored = gmGet(STORE_SETTINGS, {}) || {};
+
+    /*
+     * One-time migration.
+     *
+     * $1,000 was the old default minimum, and it was survivable only because
+     * totals were inflated by the market-wide quantity. With honest per-unit
+     * figures that threshold hides nearly everything, and it sits in storage
+     * where changing the default cannot reach it.
+     */
+    if (stored.minTotalProfit === 1000 && !stored.thresholdMigrated) {
+        stored.minTotalProfit = 0;
+        stored.thresholdMigrated = true;
+    }
+
+    app.settings = { ...DEFAULT_SETTINGS, ...stored };
+    gmSet(STORE_SETTINGS, app.settings);
 
     app.client = new TornApiClient({ getKey: getStoredKey });
 

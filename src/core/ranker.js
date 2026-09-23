@@ -44,7 +44,25 @@ export function rankOpportunities(opportunities, options = {}) {
             return false;
         }
 
-        if (row.profit.realizableProfit < opts.minTotalProfit) return false;
+        /*
+         * The minimum applies only to rows that HAVE a real total.
+         *
+         * A category tile cannot say how many units are available at its
+         * price, so its "total" is a single unit's profit. Testing that
+         * against a total-profit threshold compares two different quantities
+         * and silently deletes most of the list - which is exactly what
+         * happened when the inflated market-wide totals were corrected.
+         */
+        if (
+            row.qtyAtPrice !== false &&
+            row.profit.realizableProfit < opts.minTotalProfit
+        ) {
+            return false;
+        }
+
+        if (row.qtyAtPrice === false && row.profit.profitPerUnit <= 0) {
+            return false;
+        }
         if (row.profit.roi < opts.minRoi) return false;
 
         return true;

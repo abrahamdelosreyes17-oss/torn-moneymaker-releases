@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      2.9.1
+// @version      2.9.2
 // @description  Ranks Bazaar / Item Market listings on the page you are viewing by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -32,7 +32,7 @@
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '2.9.1';
+    const TTV2_BUILD_VERSION = '2.9.2';
 
     /* ===== src/platform/gm.js ===== */
     /*
@@ -757,7 +757,25 @@
                 return false;
             }
 
-            if (row.profit.realizableProfit < opts.minTotalProfit) return false;
+            /*
+             * The minimum applies only to rows that HAVE a real total.
+             *
+             * A category tile cannot say how many units are available at its
+             * price, so its "total" is a single unit's profit. Testing that
+             * against a total-profit threshold compares two different quantities
+             * and silently deletes most of the list - which is exactly what
+             * happened when the inflated market-wide totals were corrected.
+             */
+            if (
+                row.qtyAtPrice !== false &&
+                row.profit.realizableProfit < opts.minTotalProfit
+            ) {
+                return false;
+            }
+
+            if (row.qtyAtPrice === false && row.profit.profitPerUnit <= 0) {
+                return false;
+            }
             if (row.profit.roi < opts.minRoi) return false;
 
             return true;
@@ -3826,7 +3844,23 @@
     function boot() {
         injectStyles();
 
-        app.settings = { ...DEFAULT_SETTINGS, ...(gmGet(STORE_SETTINGS, {}) || {}) };
+        const stored = gmGet(STORE_SETTINGS, {}) || {};
+
+        /*
+         * One-time migration.
+         *
+         * $1,000 was the old default minimum, and it was survivable only because
+         * totals were inflated by the market-wide quantity. With honest per-unit
+         * figures that threshold hides nearly everything, and it sits in storage
+         * where changing the default cannot reach it.
+         */
+        if (stored.minTotalProfit === 1000 && !stored.thresholdMigrated) {
+            stored.minTotalProfit = 0;
+            stored.thresholdMigrated = true;
+        }
+
+        app.settings = { ...DEFAULT_SETTINGS, ...stored };
+        gmSet(STORE_SETTINGS, app.settings);
 
         app.client = new TornApiClient({ getKey: getStoredKey });
 
