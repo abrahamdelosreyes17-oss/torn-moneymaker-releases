@@ -32,24 +32,52 @@ export const STYLE_CSS = `
  * lands. That was the original complaint about V1, and it is fixed by making
  * the label unclickable rather than by removing it.
  */
-.ttv2-hit::after {
-    content: attr(data-ttv2-profit);
+.ttv2-hit.ttv2-hit::after {
+    /*
+     * Every declaration here is load-bearing, and all of it was worked out
+     * against a live Torn page rather than guessed.
+     *
+     * - The doubled class and !important on `content`: Torn defines ::after
+     *   on its own item tiles at equal specificity and wins on document
+     *   order, so the plain rule computed to content: "" and the label
+     *   silently never appeared.
+     * - The width/height/inset resets: overriding `content` alone leaves
+     *   Torn's geometry in place, which clipped the label to an 8px sliver.
+     * - The chip background: white text alone was invisible against the
+     *   tile's artwork.
+     */
+    content: attr(data-ttv2-profit) !important;
 
-    position: absolute;
-    top: 4px;
-    right: 7px;
-    z-index: 20;
+    display: block !important;
+    position: absolute !important;
+    top: 0 !important;
+    right: 0 !important;
+    left: auto !important;
+    bottom: auto !important;
 
-    color: #ffffff;
-    font-size: 14px;
-    font-weight: 800;
-    line-height: 20px;
+    width: auto !important;
+    height: auto !important;
+    min-width: 0 !important;
+    max-width: 100% !important;
+    margin: 0 !important;
+    padding: 1px 4px !important;
+    transform: none !important;
 
-    text-shadow:
-        0 1px 2px #000,
-        0 0 3px #000;
+    overflow: visible !important;
+    white-space: nowrap !important;
+    opacity: 1 !important;
+    visibility: visible !important;
+    z-index: 2147483000 !important;
 
-    pointer-events: none;
+    background: rgba(10, 40, 16, 0.92) !important;
+    border: 1px solid #35d35a !important;
+    border-radius: 0 0 0 5px !important;
+
+    color: #7ee08f !important;
+    font: 800 11px/14px Arial, Helvetica, sans-serif !important;
+
+    /* Cannot intercept a click, so it can never block Torn's Buy button. */
+    pointer-events: none !important;
 }
 
 /* The best few opportunities on the page get a warmer fill. */

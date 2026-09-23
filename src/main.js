@@ -19,7 +19,7 @@ import {
     npcExitPrice,
 } from './core/npc.js';
 import { computeOpportunity } from './core/profit.js';
-import { formatMoney } from './core/parse.js';
+import { formatMoneyShort } from './core/parse.js';
 import { rankOpportunities, summarize } from './core/ranker.js';
 import { TornApiClient, redactKey } from './api/client.js';
 import {
@@ -293,13 +293,12 @@ function buildOpportunities(listings) {
             profit,
             npcShop,
             npcVerified: npcShop !== null,
-            // What the green card itself shows.
-            cardLabel:
-                '+' +
-                formatMoney(profit.profitPerUnit) +
-                (profit.qty > 1
-                    ? ' x' + profit.qty + ' = +' + formatMoney(profit.totalProfit)
-                    : ''),
+            /*
+             * What the green card itself shows. Deliberately short: a Torn
+             * item tile is about 123px wide, and the long form overflowed
+             * onto the neighbouring card. The full breakdown is in the panel.
+             */
+            cardLabel: '+' + formatMoneyShort(profit.totalProfit),
         });
     }
 
