@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      2.9.2
+// @version      2.9.3
 // @description  Ranks Bazaar / Item Market listings on the page you are viewing by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -32,7 +32,7 @@
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '2.9.2';
+    const TTV2_BUILD_VERSION = '2.9.3';
 
     /* ===== src/platform/gm.js ===== */
     /*
@@ -1710,21 +1710,45 @@
 
         const text = card.textContent || '';
 
+        /*
+         * Read LEAF elements, never the row's concatenated text.
+         *
+         * React emits no whitespace between sibling nodes, so a seller row's
+         * textContent is "BCS605$6,9727 availableBUY". The price then parses as
+         * $69,727 instead of $6,972 - wildly above any exit price, so the row is
+         * judged unprofitable and never highlights, from a number that was never
+         * on screen. Each leaf holds exactly one value, so reading leaves removes
+         * the ambiguity instead of guessing at it.
+         */
+        const leaves = [];
+        for (const node of card.querySelectorAll('*')) {
+            if (node.children.length > 0) continue;
+            const t = (node.textContent || '').trim();
+            if (t) leaves.push(t);
+        }
+
+        const priceLeaf = leaves.find((t) => /^\$\s*[\d,]+(?:\.\d+)?$/.test(t));
+        const qtyLeaf = leaves.find((t) => /^[\d,]+\s*available$/i.test(t));
+
         let price = buy && buy.price;
         let priceAssumed = false;
 
         if (!Number.isFinite(price) || price <= 0) {
-            /*
-             * Reading the price from text is only a guess when there is more than
-             * one money figure to choose between. With exactly one, it is the
-             * price - and treating that as "assumed" meant the aggregate Item
-             * Market view (which never carries a price in its ARIA label) had
-             * every row filtered out of the ranking.
-             */
-            const found = text.match(ALL_PRICES_RE) || [];
+            if (priceLeaf) {
+                // A leaf that is nothing but a price is unambiguous.
+                price = parseMoney(priceLeaf);
+                priceAssumed = false;
+            } else {
+                /*
+                 * No dedicated price cell. Reading from text is only a guess when
+                 * there is more than one money figure to choose between; with
+                 * exactly one, it is the price.
+                 */
+                const found = text.match(ALL_PRICES_RE) || [];
 
-            price = found.length > 0 ? parseMoney(found[0]) : null;
-            priceAssumed = found.length > 1;
+                price = found.length > 0 ? parseMoney(found[0]) : null;
+                priceAssumed = found.length > 1;
+            }
         }
 
         if (!Number.isFinite(price) || price <= 0) return { skipped: 'noPrice' };
@@ -1745,10 +1769,15 @@
         let qtyAtPrice = false;
         let qtyAssumed = false;
 
-        const available = text.match(AVAILABLE_RE);
-        if (available) {
-            qty = parseQuantity(available[1]);
+        if (qtyLeaf) {
+            qty = parseQuantity(qtyLeaf);
             qtyAtPrice = Number.isFinite(qty) && qty > 0;
+        } else {
+            const available = text.match(AVAILABLE_RE);
+            if (available) {
+                qty = parseQuantity(available[1]);
+                qtyAtPrice = Number.isFinite(qty) && qty > 0;
+            }
         }
 
         if (!qtyAtPrice) {
