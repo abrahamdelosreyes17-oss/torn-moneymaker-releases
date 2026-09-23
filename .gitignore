@@ -1,0 +1,9 @@
+node_modules/
+
+# Internal working notes and the original script this replaces - deliberately
+# not published. See README for what the rewrite changed.
+docs/
+reference/
+
+# Build output; the released copy lives at torn-moneymaker.user.js
+dist/
