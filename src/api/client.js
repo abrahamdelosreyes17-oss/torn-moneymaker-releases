@@ -13,6 +13,8 @@
  *      A key that trips abuse detection is a worse outcome than a slow panel.
  */
 
+import { gmFetch } from '../platform/gm.js';
+
 export const TORN_API_BASE = 'https://api.torn.com/';
 
 /** Torn error codes worth reacting to specifically. */
@@ -58,7 +60,7 @@ export class TornApiClient {
      */
     constructor({
         getKey,
-        fetchImpl = typeof fetch === 'function' ? fetch.bind(globalThis) : null,
+        fetchImpl = gmFetch,
         maxPerMinute = 70,
         dedupTtlMs = 5000,
         maxRetries = 3,

@@ -50,6 +50,8 @@ const HEADER = `// ==UserScript==
 // @grant        GM_deleteValue
 // @grant        GM_registerMenuCommand
 // @grant        GM_openInTab
+// @grant        GM_xmlhttpRequest
+// @connect      api.torn.com
 // @downloadURL  ${REPO_RAW}
 // @updateURL    ${REPO_RAW}
 // @noframes

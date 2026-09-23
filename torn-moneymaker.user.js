@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      2.3.0
+// @version      2.4.0
 // @description  Ranks Bazaar / Item Market listings on the page you are viewing by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -11,6 +11,8 @@
 // @grant        GM_deleteValue
 // @grant        GM_registerMenuCommand
 // @grant        GM_openInTab
+// @grant        GM_xmlhttpRequest
+// @connect      api.torn.com
 // @downloadURL  https://raw.githubusercontent.com/abrahamdelosreyes17-oss/torn-moneymaker-releases/main/torn-moneymaker.user.js
 // @updateURL    https://raw.githubusercontent.com/abrahamdelosreyes17-oss/torn-moneymaker-releases/main/torn-moneymaker.user.js
 // @noframes
@@ -30,7 +32,7 @@
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '2.3.0';
+    const TTV2_BUILD_VERSION = '2.4.0';
 
     /* ===== src/platform/gm.js ===== */
     /*
@@ -107,6 +109,52 @@
         if (typeof GM_registerMenuCommand === 'function') {
             GM_registerMenuCommand(label, handler);
         }
+    }
+
+    /**
+     * HTTP GET through the userscript host's own transport.
+     *
+     * This matters more than it looks. A plain fetch() from a userscript runs in
+     * the PAGE's context and is therefore subject to Torn's Content-Security-
+     * Policy: if their CSP does not allow connect-src to api.torn.com, every API
+     * call is blocked by the browser before it is sent. The panel still loads and
+     * the buttons still respond - there is simply never any data, which presents
+     * as "it does not scan".
+     *
+     * GM_xmlhttpRequest runs outside the page, so the page's CSP does not apply.
+     * It requires `@connect api.torn.com` in the header.
+     *
+     * Falls back to fetch when the host does not provide it (and under node, for
+     * the tests).
+     *
+     * @returns {Promise<{ok: boolean, status: number, json: function}>}
+     */
+    function gmFetch(url) {
+        if (typeof GM_xmlhttpRequest !== 'function') {
+            if (typeof fetch === 'function') return fetch(url);
+            return Promise.reject(new Error('No HTTP transport available.'));
+        }
+
+        return new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url,
+                timeout: 30000,
+                onload(response) {
+                    resolve({
+                        ok: response.status >= 200 && response.status < 300,
+                        status: response.status,
+                        json: async () => JSON.parse(response.responseText),
+                    });
+                },
+                onerror() {
+                    reject(new Error('Network request failed.'));
+                },
+                ontimeout() {
+                    reject(new Error('Torn API request timed out.'));
+                },
+            });
+        });
     }
 
     /** Open a URL in a new tab, if the host supports it; otherwise fall back. */
@@ -750,6 +798,8 @@
      *      A key that trips abuse detection is a worse outcome than a slow panel.
      */
 
+
+
     const TORN_API_BASE = 'https://api.torn.com/';
 
     /** Torn error codes worth reacting to specifically. */
@@ -795,7 +845,7 @@
          */
         constructor({
             getKey,
-            fetchImpl = typeof fetch === 'function' ? fetch.bind(globalThis) : null,
+            fetchImpl = gmFetch,
             maxPerMinute = 70,
             dedupTtlMs = 5000,
             maxRetries = 3,
