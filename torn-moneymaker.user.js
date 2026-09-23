@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      2.5.2
+// @version      2.6.0
 // @description  Ranks Bazaar / Item Market listings on the page you are viewing by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -32,7 +32,7 @@
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '2.5.2';
+    const TTV2_BUILD_VERSION = '2.6.0';
 
     /* ===== src/platform/gm.js ===== */
     /*
@@ -2939,7 +2939,12 @@
     const STORE_KEY_ACCESS = 'keyAccess';
 
     const DEFAULT_SETTINGS = {
-        minTotalProfit: 1000,
+        /*
+         * No floor by default. The list is already ranked by total profit, so
+         * small hits sink to the bottom on their own - a threshold only makes
+         * them vanish without saying so.
+         */
+        minTotalProfit: 0,
         cashOnHand: null,
         /*
          * Show items with no confirmed city-shop buyer. ON by default.
@@ -3154,30 +3159,32 @@
         app.pricedCount = 0;
 
         for (const listing of listings) {
-            const exitPrice = npcExitPrice(listing.item);
-            if (exitPrice === null) continue;
+            /*
+             * Compare against BOTH exits and keep whichever pays more:
+             *   - NPC sell price: guaranteed, no fee, but usually well under market
+             *   - Market value:   resell on the Item Market, minus the 5% tax
+             *
+             * Only checking the NPC price meant the common case - something
+             * listed under market value - never lit up at all.
+             */
+            const exits = {};
 
-            const profit = computeOpportunity({
+            const npcPrice = npcExitPrice(listing.item);
+            if (npcPrice !== null) exits.NPC = npcPrice;
+
+            const marketValue = Number(listing.item.marketValue);
+            if (Number.isFinite(marketValue) && marketValue > 0) {
+                exits.ITEM_MARKET = marketValue;
+            }
+
+            if (Object.keys(exits).length === 0) continue;
+
+            const profit = bestVenue({
                 listingPrice: listing.listingPrice,
-                exitPrice,
+                exits,
                 qty: listing.qty,
-                venue: 'NPC',
                 cashOnHand: app.settings.cashOnHand,
             });
-
-            if (!profit) continue;
-
-            app.pricedCount += 1;
-
-            if (profit.profitPerUnit <= 0) {
-                if (
-                    !app.nearMiss ||
-                    profit.profitPerUnit > app.nearMiss.profit.profitPerUnit
-                ) {
-                    app.nearMiss = { ...listing, profit };
-                }
-                continue;
-            }
 
             const npcShop = npcShopFor(
                 listing.itemId,
