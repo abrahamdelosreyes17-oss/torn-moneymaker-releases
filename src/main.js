@@ -87,7 +87,6 @@ const DEFAULT_SETTINGS = {
     /* Show everything seen while browsing, not just the current page. */
     showAllSeen: true,
     collapsed: false,
-    autoScan: true,
 };
 
 const RESCAN_DEBOUNCE_MS = 400;

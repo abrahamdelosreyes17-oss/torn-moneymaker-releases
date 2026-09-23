@@ -193,8 +193,13 @@ Then open `http://localhost:8777/test/fixture.html`. The page prints the diagnos
 what was parsed, and the ranking, and marks the profitable cards exactly as the
 script does on Torn.
 
-This exists because unit tests passed for days while the scanner could not read a
-single real page. **Run this before every release.**
+`test/harness.html` boots the REAL built userscript with GM_* stubs and checks the
+panel actually mounts. Unit tests and a syntax check both pass on a bundle whose UI
+throws on load, so this is the one that catches "installed, and nothing appears".
+
+Both exist because unit tests passed for days while the scanner could not read a
+single real page, and because a release once shipped that no browser could parse.
+**Run both before every release.**
 
 ## Status
 

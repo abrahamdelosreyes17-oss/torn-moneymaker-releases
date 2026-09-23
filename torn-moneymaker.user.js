@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      2.9.0
+// @version      2.9.1
 // @description  Ranks Bazaar / Item Market listings on the page you are viewing by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -32,7 +32,7 @@
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '2.9.0';
+    const TTV2_BUILD_VERSION = '2.9.1';
 
     /* ===== src/platform/gm.js ===== */
     /*
@@ -3256,7 +3256,6 @@
         /* Show everything seen while browsing, not just the current page. */
         showAllSeen: true,
         collapsed: false,
-        autoScan: true,
     };
 
     const RESCAN_DEBOUNCE_MS = 400;

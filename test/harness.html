@@ -1,0 +1,31 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Runtime harness</title></head>
+<body>
+<div id="out">running...</div>
+<script>
+// Minimal Tampermonkey stubs so the real bundle can boot unmodified.
+const _store = {};
+function GM_getValue(k, d) { return k in _store ? _store[k] : d; }
+function GM_setValue(k, v) { _store[k] = v; }
+function GM_deleteValue(k) { delete _store[k]; }
+function GM_registerMenuCommand() {}
+function GM_openInTab() {}
+function GM_xmlhttpRequest() {}
+window.onerror = (m) => { document.getElementById('out').textContent = 'BOOT ERROR: ' + m; };
+</script>
+<script src="../torn-moneymaker.user.js"></script>
+<script>
+setTimeout(() => {
+  const p = document.querySelector('.ttv2-panel');
+  const out = document.getElementById('out');
+  if (out.textContent.startsWith('BOOT ERROR')) return;
+  out.textContent = JSON.stringify({
+    panelMounted: !!p,
+    title: (document.querySelector('.ttv2-title') || {}).textContent,
+    buttons: [...document.querySelectorAll('.ttv2-head button')].map(b => b.textContent),
+    filterControls: document.querySelectorAll('.ttv2-filters input, .ttv2-filters button').length,
+    settingsControls: document.querySelectorAll('.ttv2-settings input, .ttv2-settings button').length,
+    status: (document.querySelector('.ttv2-status') || {}).textContent,
+  }, null, 1);
+}, 1200);
+</script>
+</body></html>
