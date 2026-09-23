@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      2.5.1
+// @version      2.5.2
 // @description  Ranks Bazaar / Item Market listings on the page you are viewing by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -32,7 +32,7 @@
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '2.5.1';
+    const TTV2_BUILD_VERSION = '2.5.2';
 
     /* ===== src/platform/gm.js ===== */
     /*
@@ -1660,11 +1660,11 @@
          * Every declaration here is load-bearing, and all of it was worked out
          * against a live Torn page rather than guessed.
          *
-         * - The doubled class and !important on `content`: Torn defines ::after
+         * - The doubled class and !important on 'content': Torn defines ::after
          *   on its own item tiles at equal specificity and wins on document
          *   order, so the plain rule computed to content: "" and the label
          *   silently never appeared.
-         * - The width/height/inset resets: overriding `content` alone leaves
+         * - The width/height/inset resets: overriding 'content' alone leaves
          *   Torn's geometry in place, which clipped the label to an 8px sliver.
          * - The chip background: white text alone was invisible against the
          *   tile's artwork.

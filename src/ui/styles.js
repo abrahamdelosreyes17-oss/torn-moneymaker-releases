@@ -37,11 +37,11 @@ export const STYLE_CSS = `
      * Every declaration here is load-bearing, and all of it was worked out
      * against a live Torn page rather than guessed.
      *
-     * - The doubled class and !important on `content`: Torn defines ::after
+     * - The doubled class and !important on 'content': Torn defines ::after
      *   on its own item tiles at equal specificity and wins on document
      *   order, so the plain rule computed to content: "" and the label
      *   silently never appeared.
-     * - The width/height/inset resets: overriding `content` alone leaves
+     * - The width/height/inset resets: overriding 'content' alone leaves
      *   Torn's geometry in place, which clipped the label to an 8px sliver.
      * - The chip background: white text alone was invisible against the
      *   tile's artwork.

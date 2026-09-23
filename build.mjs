@@ -16,6 +16,7 @@
  */
 
 import { readFile, writeFile, mkdir } from 'node:fs/promises';
+import vm from 'node:vm';
 import { dirname, resolve, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -246,6 +247,24 @@ async function main() {
         indent(body) +
         '\n\n    boot();\n' +
         '})();\n';
+
+    /*
+     * Parse the bundle before writing it.
+     *
+     * v2.5.1 shipped a file that no browser could parse: a CSS comment inside
+     * the styles template literal contained a backtick, which terminated the
+     * string and broke the whole script. Tampermonkey silently ran nothing.
+     * `node --check` caught it as a separate step and the failure was missed,
+     * so the check belongs INSIDE the build where it cannot be skipped.
+     */
+    try {
+        new vm.Script(bundle, { filename: 'torn-moneymaker.user.js' });
+    } catch (error) {
+        throw new Error(
+            'Bundle is not valid JavaScript and was NOT written: ' +
+                error.message,
+        );
+    }
 
     await mkdir(dirname(OUT), { recursive: true });
     await writeFile(OUT, bundle, 'utf8');
