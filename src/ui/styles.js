@@ -156,6 +156,11 @@ export const STYLE_CSS = `
     box-sizing: border-box;
 }
 
+.ttv2-masked {
+    -webkit-text-security: disc;
+    text-security: disc;
+}
+
 .ttv2-check {
     display: flex;
     align-items: center;

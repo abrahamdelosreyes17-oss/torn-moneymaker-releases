@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      2.1.0
+// @version      2.1.1
 // @description  Ranks Bazaar / Item Market listings on the page you are viewing by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -1786,6 +1786,11 @@
         box-sizing: border-box;
     }
 
+    .ttv2-masked {
+        -webkit-text-security: disc;
+        text-security: disc;
+    }
+
     .ttv2-check {
         display: flex;
         align-items: center;
@@ -2008,6 +2013,39 @@
         return node;
     }
 
+    /**
+     * Wrap a click handler so a thrown error lands in the panel.
+     *
+     * Without this an exception inside a handler is swallowed by the event loop
+     * and the button simply appears dead - which is exactly how the first report
+     * of "clicking Scan does nothing" arrived. A visible error is worth far more
+     * than a tidy console.
+     */
+    function guarded(panel, label, fn) {
+        return (...args) => {
+            try {
+                const result = fn(...args);
+                if (result && typeof result.catch === 'function') {
+                    result.catch((error) => {
+                        panel.setStatus(
+                            label + ' failed: ' + describeError(error),
+                            'error',
+                        );
+                    });
+                }
+                return result;
+            } catch (error) {
+                panel.setStatus(label + ' failed: ' + describeError(error), 'error');
+                return undefined;
+            }
+        };
+    }
+
+    function describeError(error) {
+        if (!error) return 'unknown error';
+        return String(error.message || error);
+    }
+
     function numberFromInput(value, fallback) {
         const n = Number(String(value).replace(/[^0-9.\-]/g, ''));
         return Number.isFinite(n) ? n : fallback;
@@ -2064,7 +2102,9 @@
                 type: 'button',
                 title: 'Scan the page you are viewing',
                 text: 'Scan',
-                onclick: () => this.handlers.onScan && this.handlers.onScan(),
+                onclick: guarded(this, 'Scan', () =>
+                    this.handlers.onScan ? this.handlers.onScan() : undefined,
+                ),
             });
 
             this.clearBtn = el('button', {
@@ -2095,9 +2135,18 @@
                 onclick: () => this.toggleCollapsed(),
             });
 
+            /*
+             * The version is in the title on purpose: "did the update actually
+             * install" is the first question whenever someone reports that
+             * nothing happens, and this answers it without opening a devtool.
+             */
             this.titleEl = el('div', {
                 class: 'ttv2-title',
-                text: 'NPC Arbitrage',
+                text:
+                    'NPC Arbitrage v' +
+                    (typeof TTV2_BUILD_VERSION === 'string'
+                        ? TTV2_BUILD_VERSION
+                        : 'dev'),
             });
 
             const head = el('div', { class: 'ttv2-head' }, [
@@ -2153,11 +2202,25 @@
          * there is no server of ours.
          */
         buildSettings() {
+            /*
+             * NOT type="password".
+             *
+             * A password input makes Chrome treat this as a login form: it offers
+             * to save the "password" to the browser's password manager, and its
+             * autofill can overwrite whatever is typed here - which looks exactly
+             * like "the key won't save". Masking is done with CSS instead, which
+             * hides the characters without telling the browser this is a credential.
+             */
             this.keyInput = el('input', {
-                type: 'password',
+                type: 'text',
+                class: 'ttv2-masked',
                 placeholder: 'Paste your Public API key',
                 autocomplete: 'off',
+                autocapitalize: 'off',
+                autocorrect: 'off',
                 spellcheck: 'false',
+                'data-lpignore': 'true',
+                'data-1p-ignore': 'true',
             });
 
             this.keyStateEl = el('div', {
@@ -2169,19 +2232,28 @@
                 type: 'button',
                 text: 'Show',
                 onclick: () => {
-                    const hidden = this.keyInput.type === 'password';
-                    this.keyInput.type = hidden ? 'text' : 'password';
-                    showBtn.textContent = hidden ? 'Hide' : 'Show';
+                    const hidden = this.keyInput.classList.toggle('ttv2-masked');
+                    showBtn.textContent = hidden ? 'Show' : 'Hide';
                 },
+            });
+
+            this.keyInput.addEventListener('keydown', (event) => {
+                if (event.key !== 'Enter') return;
+                event.preventDefault();
+                if (this.handlers.onSaveKey) {
+                    this.handlers.onSaveKey(this.keyInput.value.trim());
+                }
             });
 
             const saveBtn = el('button', {
                 type: 'button',
                 text: 'Save',
-                onclick: () => {
+                onclick: guarded(this, 'Save', () => {
                     const key = this.keyInput.value.trim();
-                    if (this.handlers.onSaveKey) this.handlers.onSaveKey(key);
-                },
+                    return this.handlers.onSaveKey
+                        ? this.handlers.onSaveKey(key)
+                        : undefined;
+                }),
             });
 
             const forgetBtn = el('button', {

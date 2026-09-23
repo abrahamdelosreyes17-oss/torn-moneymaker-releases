@@ -33,7 +33,9 @@ const REPO_RAW =
     'https://raw.githubusercontent.com/abrahamdelosreyes17-oss/' +
     'torn-moneymaker-releases/main/torn-moneymaker.user.js';
 
-const VERSION = '2.1.0';
+const VERSION = JSON.parse(
+    await readFile(resolve(ROOT, 'package.json'), 'utf8'),
+).version;
 
 const HEADER = `// ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
