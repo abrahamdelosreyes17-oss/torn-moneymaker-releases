@@ -456,7 +456,9 @@ export class Panel {
             this.unverifiedInput,
         ]);
         check.appendChild(
-            document.createTextNode(' Show items with no verified NPC buyer'),
+            document.createTextNode(
+                ' Show items with no confirmed city-shop buyer',
+            ),
         );
         this.filtersEl.appendChild(check);
     }
@@ -642,8 +644,11 @@ export class Panel {
             name.appendChild(
                 el('span', {
                     class: 'ttv2-unverified',
-                    title: 'No city shop is known to buy this item back.',
-                    text: ' (unverified)',
+                    title:
+                        'No city shop is known to stock this item. The NPC ' +
+                        'price is still what Torn lists - check before you ' +
+                        'commit a large amount.',
+                    text: ' (?)',
                 }),
             );
         }

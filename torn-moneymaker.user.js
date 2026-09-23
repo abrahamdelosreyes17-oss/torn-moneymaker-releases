@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      2.4.0
+// @version      2.5.0
 // @description  Ranks Bazaar / Item Market listings on the page you are viewing by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -32,7 +32,7 @@
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '2.4.0';
+    const TTV2_BUILD_VERSION = '2.5.0';
 
     /* ===== src/platform/gm.js ===== */
     /*
@@ -719,7 +719,8 @@
         minTotalProfit: 1000,
         minRoi: 0,
         cashOnHand: null,
-        includeUnverifiedNpc: false,
+        /* See main.js: this defaults on, because the verification is an inference. */
+        includeUnverifiedNpc: true,
         /*
          * Rows whose unit price had to be inferred are excluded by default.
          *
@@ -2446,7 +2447,9 @@
                 this.unverifiedInput,
             ]);
             check.appendChild(
-                document.createTextNode(' Show items with no verified NPC buyer'),
+                document.createTextNode(
+                    ' Show items with no confirmed city-shop buyer',
+                ),
             );
             this.filtersEl.appendChild(check);
         }
@@ -2632,8 +2635,11 @@
                 name.appendChild(
                     el('span', {
                         class: 'ttv2-unverified',
-                        title: 'No city shop is known to buy this item back.',
-                        text: ' (unverified)',
+                        title:
+                            'No city shop is known to stock this item. The NPC ' +
+                            'price is still what Torn lists - check before you ' +
+                            'commit a large amount.',
+                        text: ' (?)',
                     }),
                 );
             }
@@ -2907,7 +2913,20 @@
     const DEFAULT_SETTINGS = {
         minTotalProfit: 1000,
         cashOnHand: null,
-        includeUnverifiedNpc: false,
+        /*
+         * Show items with no confirmed city-shop buyer. ON by default.
+         *
+         * This was false, and it was wrong. The reasoning behind it - "only an
+         * item a city shop stocks can be sold to an NPC" - is an inference that
+         * does not hold: Bottle of Champagne has a sell price of $3,100 and no
+         * shop stocks it. Filtering on that inference silently deleted a real
+         * $4.7m opportunity on a live page and reported "0 opportunities".
+         *
+         * An unreliable check that hides real money is worse than no check. The
+         * shop lookup still runs and still names the shop when it knows one; it
+         * just no longer decides what you are allowed to see.
+         */
+        includeUnverifiedNpc: true,
         collapsed: false,
         autoScan: true,
     };

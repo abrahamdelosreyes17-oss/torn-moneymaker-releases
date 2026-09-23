@@ -186,26 +186,37 @@ test('ranking is by realizable profit, not per-unit or percent', () => {
     );
 });
 
-test('threshold filters, and unverified NPC rows are hidden by default', () => {
+test('a missing city-shop match flags a row, it does not hide it', () => {
+    /*
+     * Regression: this filter defaulted to ON and silently removed a real
+     * $4.7m opportunity (Bottle of Champagne, sell price $3,100, stocked by
+     * no city shop) from a live page, reporting "0 opportunities".
+     *
+     * The shop lookup is an inference, so it annotates. It does not decide
+     * what the user is allowed to see.
+     */
     const rows = [
         row('kept', 5000, 0.1),
         row('too small', 10, 0.5),
-        row('unverified', 999999, 0.5, { npcVerified: false }),
+        row('no shop match', 4756500, 0.033, { npcVerified: false }),
     ];
 
     const ranked = rankOpportunities(rows, { minTotalProfit: 1000 });
+
     assert.deepEqual(
         ranked.map((r) => r.name),
-        ['kept'],
+        ['no shop match', 'kept'],
     );
 
-    const withUnverified = rankOpportunities(rows, {
+    // It is still available as an opt-in filter for anyone who wants it.
+    const strict = rankOpportunities(rows, {
         minTotalProfit: 1000,
-        includeUnverifiedNpc: true,
+        includeUnverifiedNpc: false,
     });
+
     assert.deepEqual(
-        withUnverified.map((r) => r.name),
-        ['unverified', 'kept'],
+        strict.map((r) => r.name),
+        ['kept'],
     );
 });
 

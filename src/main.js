@@ -44,7 +44,20 @@ const STORE_KEY_ACCESS = 'keyAccess';
 const DEFAULT_SETTINGS = {
     minTotalProfit: 1000,
     cashOnHand: null,
-    includeUnverifiedNpc: false,
+    /*
+     * Show items with no confirmed city-shop buyer. ON by default.
+     *
+     * This was false, and it was wrong. The reasoning behind it - "only an
+     * item a city shop stocks can be sold to an NPC" - is an inference that
+     * does not hold: Bottle of Champagne has a sell price of $3,100 and no
+     * shop stocks it. Filtering on that inference silently deleted a real
+     * $4.7m opportunity on a live page and reported "0 opportunities".
+     *
+     * An unreliable check that hides real money is worse than no check. The
+     * shop lookup still runs and still names the shop when it knows one; it
+     * just no longer decides what you are allowed to see.
+     */
+    includeUnverifiedNpc: true,
     collapsed: false,
     autoScan: true,
 };

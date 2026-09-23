@@ -12,7 +12,8 @@ export const DEFAULT_RANK_OPTIONS = {
     minTotalProfit: 1000,
     minRoi: 0,
     cashOnHand: null,
-    includeUnverifiedNpc: false,
+    /* See main.js: this defaults on, because the verification is an inference. */
+    includeUnverifiedNpc: true,
     /*
      * Rows whose unit price had to be inferred are excluded by default.
      *
