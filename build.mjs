@@ -240,6 +240,7 @@ async function main() {
         HEADER +
         '\n(function () {\n' +
         "    'use strict';\n\n" +
+        `    const TTV2_BUILD_VERSION = '${VERSION}';\n\n` +
         indent(body) +
         '\n\n    boot();\n' +
         '})();\n';

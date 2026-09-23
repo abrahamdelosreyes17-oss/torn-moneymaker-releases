@@ -30,6 +30,8 @@
 (function () {
     'use strict';
 
+    const TTV2_BUILD_VERSION = '2.1.1';
+
     /* ===== src/platform/gm.js ===== */
     /*
      * Userscript-host adapter.
