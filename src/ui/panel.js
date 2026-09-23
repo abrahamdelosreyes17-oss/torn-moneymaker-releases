@@ -488,8 +488,9 @@ export class Panel {
             mkCheck(
                 this.npcShopsOnlyInput,
                 '  ↳ only items a shop stocks',
-                'Restricts NPC comparison to items a city shop is known to ' +
-                    'deal in. Safer, but the shop list is incomplete.',
+                'Rarely useful. Confirmed live that an NPC buys items no ' +
+                    'shop stocks (Bottle of Champagne, $3,100), so this ' +
+                    'mostly just hides real opportunities.',
             ),
         );
         this.filtersEl.appendChild(
@@ -698,19 +699,6 @@ export class Panel {
         const name = el('div', { class: 'ttv2-row-name' });
         name.appendChild(document.createTextNode(row.name));
 
-        if (row.npcVerified === false) {
-            name.appendChild(
-                el('span', {
-                    class: 'ttv2-unverified',
-                    title:
-                        'No city shop is known to stock this item. The NPC ' +
-                        'price is still what Torn lists - check before you ' +
-                        'commit a large amount.',
-                    text: ' (?)',
-                }),
-            );
-        }
-
         // Buy: $2,896 -> NPC: $3,000
         const buyLine = el('div', {
             class: 'ttv2-row-line',
@@ -799,13 +787,22 @@ export class Panel {
         });
 
         // NPC Shop: Bits 'n' Bobs
+        /*
+         * Which shop, when we know it. NOT a confidence signal.
+         *
+         * Confirmed live: Bottle of Champagne sells to an NPC for $3,100 and
+         * no city shop stocks it. So sell_price alone is the NPC price, and
+         * an absent shop name means only that the shop list does not cover
+         * this item - never that the price is doubtful. Labelling it
+         * "unverified" implied a doubt that does not exist, and the filter
+         * built on that idea hid real money.
+         */
         const shopLine = el('div', {
             class: 'ttv2-row-shop',
             text:
-                'NPC Shop: ' +
-                (row.npcShop && row.npcShop.shopName
-                    ? row.npcShop.shopName
-                    : 'unverified'),
+                p.venue === 'NPC' && row.npcShop && row.npcShop.shopName
+                    ? 'NPC Shop: ' + row.npcShop.shopName
+                    : '',
         });
 
         const main = el('div', { class: 'ttv2-row-main' }, [

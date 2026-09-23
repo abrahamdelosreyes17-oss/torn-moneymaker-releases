@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      2.7.0
+// @version      2.7.1
 // @description  Ranks Bazaar / Item Market listings on the page you are viewing by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -32,7 +32,7 @@
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '2.7.0';
+    const TTV2_BUILD_VERSION = '2.7.1';
 
     /* ===== src/platform/gm.js ===== */
     /*
@@ -272,11 +272,17 @@
      * as "an NPC will pay me this". Essentially every item in Torn carries a
      * sell_price, so V1 confidently reported profit on items no shop will buy.
      *
-     * What is inferred here, stated plainly so nobody has to guess later:
+     * SETTLED, by testing in game: an item does NOT need to be stocked by a city
+     * shop for an NPC to buy it. Bottle of Champagne sells to an NPC for $3,100
+     * and no shop stocks it. So `sell_price` alone IS the NPC price.
      *
-     *   An item stocked by a city shop is taken to be an item that shop buys
-     *   back, and the price an NPC pays is the item's own `sell_price` - NOT the
-     *   shop's `price`, which is what the shop CHARGES you.
+     * The shop index is therefore informational only - it names the shop when it
+     * knows one. It must never gate whether an opportunity is shown. An earlier
+     * version treated a missing shop as "unverified" and hid those rows, which
+     * silently deleted a real $4.7m opportunity from a live page.
+     *
+     * Note the two prices are different things: `sell_price` is what a shop pays
+     * YOU; a shop inventory's `price` is what it CHARGES you.
      *
      * The shop identity is carried through so the panel can name it, which is
      * what makes a claim like "+$104/ea" checkable by the user instead of
@@ -2535,8 +2541,9 @@
                 mkCheck(
                     this.npcShopsOnlyInput,
                     '  ↳ only items a shop stocks',
-                    'Restricts NPC comparison to items a city shop is known to ' +
-                        'deal in. Safer, but the shop list is incomplete.',
+                    'Rarely useful. Confirmed live that an NPC buys items no ' +
+                        'shop stocks (Bottle of Champagne, $3,100), so this ' +
+                        'mostly just hides real opportunities.',
                 ),
             );
             this.filtersEl.appendChild(
@@ -2745,19 +2752,6 @@
             const name = el('div', { class: 'ttv2-row-name' });
             name.appendChild(document.createTextNode(row.name));
 
-            if (row.npcVerified === false) {
-                name.appendChild(
-                    el('span', {
-                        class: 'ttv2-unverified',
-                        title:
-                            'No city shop is known to stock this item. The NPC ' +
-                            'price is still what Torn lists - check before you ' +
-                            'commit a large amount.',
-                        text: ' (?)',
-                    }),
-                );
-            }
-
             // Buy: $2,896 -> NPC: $3,000
             const buyLine = el('div', {
                 class: 'ttv2-row-line',
@@ -2846,13 +2840,22 @@
             });
 
             // NPC Shop: Bits 'n' Bobs
+            /*
+             * Which shop, when we know it. NOT a confidence signal.
+             *
+             * Confirmed live: Bottle of Champagne sells to an NPC for $3,100 and
+             * no city shop stocks it. So sell_price alone is the NPC price, and
+             * an absent shop name means only that the shop list does not cover
+             * this item - never that the price is doubtful. Labelling it
+             * "unverified" implied a doubt that does not exist, and the filter
+             * built on that idea hid real money.
+             */
             const shopLine = el('div', {
                 class: 'ttv2-row-shop',
                 text:
-                    'NPC Shop: ' +
-                    (row.npcShop && row.npcShop.shopName
-                        ? row.npcShop.shopName
-                        : 'unverified'),
+                    p.venue === 'NPC' && row.npcShop && row.npcShop.shopName
+                        ? 'NPC Shop: ' + row.npcShop.shopName
+                        : '',
             });
 
             const main = el('div', { class: 'ttv2-row-main' }, [
