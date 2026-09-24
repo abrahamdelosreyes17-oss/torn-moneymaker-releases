@@ -107,7 +107,10 @@ test('a rate-limit error is retried with backoff', async () => {
         return jsonResponse({ items: {} });
     });
 
-    const client = makeClient(fetchImpl, { maxRetries: 1 });
+    const client = makeClient(fetchImpl, {
+        maxRetries: 1,
+        rateLimitBackoffMs: 5,
+    });
 
     const data = await client.get('torn', { selections: 'items' });
 

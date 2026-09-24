@@ -4,7 +4,14 @@
  * untouched.
  */
 
-import { gmGet, gmSet, gmDel, gmMenu, gmOpenTab } from './platform/gm.js';
+import {
+    gmGet,
+    gmSet,
+    gmDel,
+    gmMenu,
+    gmOpenTab,
+    gmOnChange,
+} from './platform/gm.js';
 import {
     buildItemIndex,
     makeItemsCacheEntry,
@@ -16,9 +23,19 @@ import {
     readNpcCacheEntry,
     isNpcCacheFresh,
     npcShopFor,
-    npcExitPrice,
 } from './core/npc.js';
 import { bestVenue } from './core/profit.js';
+import {
+    exitsFor,
+    feedOpportunities,
+    readFeedCacheEntry,
+    makeFeedCacheEntry,
+    reconcileWithPage,
+    bazaarUrl,
+    SOURCE_BAZAAR,
+    SOURCE_ITEM_MARKET,
+} from './core/feed.js';
+import { makeTabId } from './core/leader.js';
 import { formatMoneyShort } from './core/parse.js';
 import { rankOpportunities, summarize } from './core/ranker.js';
 import {
@@ -28,18 +45,35 @@ import {
     makeLedgerCacheEntry,
     readLedgerCacheEntry,
 } from './core/ledger.js';
-import { TornApiClient, redactKey } from './api/client.js';
+import { TornApiClient, redactKey, KEY_DEAD_CODES } from './api/client.js';
+import { W3bClient } from './api/w3b.js';
 import {
     fetchItems,
     fetchShops,
     fetchKeyAccess,
     ACCESS_PUBLIC,
 } from './api/torn.js';
-import { detectPage, itemMarketUrl, PAGE_NONE } from './sources/route.js';
+import {
+    detectPage,
+    itemMarketUrl,
+    bazaarOwnerId,
+    bazaarTarget,
+    PAGE_NONE,
+    PAGE_BAZAAR,
+} from './sources/route.js';
 import { scanDom } from './sources/dom/scan.js';
 import { injectStyles } from './ui/styles.js';
 import { Panel, TORN_API_KEY_URL } from './ui/panel.js';
-import { markRows, clearMarks, revealRow } from './ui/overlay.js';
+import {
+    markRows,
+    clearMarks,
+    revealRow,
+    markTarget,
+} from './ui/overlay.js';
+import {
+    LiveFeed,
+    FEED_STORE_KEY,
+} from './feed/controller.js';
 
 const STORE_KEY = 'apiKey';
 const STORE_ITEMS = 'itemsCache';
@@ -48,6 +82,9 @@ const STORE_MANUAL_NPC = 'npcManual';
 const STORE_SETTINGS = 'settings';
 const STORE_KEY_ACCESS = 'keyAccess';
 const STORE_LEDGER = 'ledger';
+const STORE_API_WINDOW = 'apiWindow';
+const STORE_KEY_DEAD = 'keyDead';
+const STORE_OPENED = 'opened';
 
 const DEFAULT_SETTINGS = {
     /*
@@ -86,10 +123,27 @@ const DEFAULT_SETTINGS = {
 
     /* Show everything seen while browsing, not just the current page. */
     showAllSeen: true,
+
+    /*
+     * The live feed: watch the market from ANY Torn page, not just the one
+     * you are on. Runs in one visible tab only, polls the Torn API well
+     * inside the rate limit, and never raises alerts - see README.
+     */
+    liveFeed: true,
+
+    /*
+     * TornW3B bazaar prices. OFF until the user opts in: Torn's API terms
+     * require an opt-in integration to link the other service's ToS, and
+     * this is a third party, so the user should choose it knowingly.
+     */
+    useW3b: false,
     collapsed: false,
 };
 
 const RESCAN_DEBOUNCE_MS = 400;
+
+/** How often every tab checks whether it should lead the live feed. */
+const FEED_TICK_MS = 5000;
 
 /*
  * Item Market 2.0 and the bazaars re-render continuously, and a
@@ -101,7 +155,26 @@ const RESCAN_DEBOUNCE_MS = 400;
 const POLL_INTERVAL_MS = 2500;
 
 const app = {
+    tabId: makeTabId(),
     index: null,
+    feed: null,
+    w3b: null,
+    /*
+     * Set when Torn says the key is invalid, disabled or paused. Nothing is
+     * sent until the user saves a key again: Torn's docs warn that repeated
+     * requests with an invalid key can earn a temporary IP ban, and the old
+     * 2.5s poll retried a bad key forever.
+     */
+    keyDead: false,
+    /* When each (item, price, qty) on THIS page load was first read. */
+    pageFirstSeen: new Map(),
+    pageHref: null,
+    pageRows: [],
+    pageDiagnostics: null,
+    lastLedgerJson: null,
+    targetShown: null,
+    /* After a failed load, the automatic retry waits until this time. */
+    retryLoadAt: 0,
     npcShops: new Map(),
     ledger: new Map(),
     shopDataMissing: false,
@@ -122,6 +195,29 @@ const app = {
 
 function getStoredKey() {
     return gmGet(STORE_KEY, '') || '';
+}
+
+/** A key we may actually send: present, and not rejected by Torn. */
+function hasUsableKey() {
+    return Boolean(getStoredKey()) && !app.keyDead;
+}
+
+function isKeyDeadError(error) {
+    return Boolean(error && KEY_DEAD_CODES.has(Number(error.code)));
+}
+
+/** Torn rejected the key: stop using it until the user saves another. */
+function markKeyDead(error) {
+    app.keyDead = true;
+    gmSet(STORE_KEY_DEAD, true);
+
+    app.panel.setStatus(
+        'Torn rejected this API key (' +
+            redactKey((error && error.message) || 'invalid key', getStoredKey()) +
+            '). Nothing more will be sent with it - paste a new Public key ' +
+            'under Settings.',
+        'error',
+    );
 }
 
 function looksLikeTornKey(key) {
@@ -164,6 +260,8 @@ async function onSaveKey(key) {
 
     gmSet(STORE_KEY, key);
     gmDel(STORE_KEY_ACCESS);
+    gmDel(STORE_KEY_DEAD);
+    app.keyDead = false;
 
     refreshKeyState();
     await onScan();
@@ -173,6 +271,8 @@ async function onSaveKey(key) {
 function onForgetKey() {
     gmDel(STORE_KEY);
     gmDel(STORE_KEY_ACCESS);
+    gmDel(STORE_KEY_DEAD);
+    app.keyDead = false;
 
     if (app.panel.keyInput) app.panel.keyInput.value = '';
 
@@ -182,7 +282,9 @@ function onForgetKey() {
 
 function onClearList() {
     app.ledger = new Map();
+    app.lastLedgerJson = null;
     gmDel(STORE_LEDGER);
+    gmDel(FEED_STORE_KEY);
     app.panel.setStatus('Cleared everything seen so far.');
     rescan();
 }
@@ -298,8 +400,8 @@ function buildOpportunities(listings) {
          *   - NPC sell price: guaranteed, no fee, but usually well under market
          *   - Market value:   resell on the Item Market, minus the 5% tax
          *
-         * Only checking the NPC price meant the common case - something
-         * listed under market value - never lit up at all.
+         * exitsFor() is shared with the live feed, so a listing is priced
+         * the same whether it was read off this page or found elsewhere.
          */
         const npcShop = npcShopFor(
             listing.itemId,
@@ -307,25 +409,7 @@ function buildOpportunities(listings) {
             app.manualNpc,
         );
 
-        const exits = {};
-
-        if (app.settings.compareNpc) {
-            const npcPrice = npcExitPrice(listing.item);
-
-            // "Only on items NPCs sell" - an NPC price is only offered when a
-            // shop is known to deal in the item.
-            const shopKnown = !app.settings.npcShopsOnly || npcShop !== null;
-
-            if (npcPrice !== null && shopKnown) exits.NPC = npcPrice;
-        }
-
-        if (app.settings.compareMarket) {
-            const marketValue = Number(listing.item.marketValue);
-            if (Number.isFinite(marketValue) && marketValue > 0) {
-                exits.ITEM_MARKET = marketValue;
-            }
-        }
-
+        const exits = exitsFor(listing.item, app.settings, npcShop);
         if (Object.keys(exits).length === 0) continue;
 
         const profit = bestVenue({
@@ -359,7 +443,34 @@ function buildOpportunities(listings) {
     return rows;
 }
 
-/** Re-mark and re-render from the current DOM. Never makes a request. */
+/**
+ * When did THIS page first show this exact listing?
+ *
+ * The page does not live-update: a price on screen is as old as the moment
+ * it rendered. Re-reading the same DOM every 2.5s must not make it younger.
+ * The map resets whenever the URL changes (a new category, a new bazaar, a
+ * reload), because that is when Torn fetched fresh data.
+ */
+function stampSeen(listing, now) {
+    const key =
+        listing.itemId + '|' + listing.listingPrice + '|' + (listing.qty || 1);
+
+    if (!app.pageFirstSeen.has(key)) app.pageFirstSeen.set(key, now);
+    return app.pageFirstSeen.get(key);
+}
+
+/** Current settings, with the one override that must always apply. */
+function rankSettings(extra = {}) {
+    return {
+        ...app.settings,
+        // Never hide everything just because verification data is missing.
+        includeUnverifiedNpc:
+            app.settings.includeUnverifiedNpc || app.shopDataMissing,
+        ...extra,
+    };
+}
+
+/** Read the page, fold it into memory, correct the feed, then render. */
 function rescan() {
     /*
      * Re-detect the page every scan.
@@ -375,21 +486,44 @@ function rescan() {
         clearMarks();
     }
 
-    if (!app.index || app.pageType === PAGE_NONE) return;
+    if (location.href !== app.pageHref) {
+        app.pageHref = location.href;
+        app.pageFirstSeen = new Map();
+        app.targetShown = null;
+    }
+
+    if (!app.index) return;
+
+    if (app.pageType === PAGE_NONE) {
+        app.pageRows = [];
+        app.pageDiagnostics = null;
+        refreshView();
+        return;
+    }
 
     const { listings, diagnostics } = scanDom(app.pageType, document, {
         index: app.index,
         href: location.href,
     });
 
+    const now = Date.now();
+    const sellerId =
+        app.pageType === PAGE_BAZAAR ? bazaarOwnerId(location.href) : null;
+
+    for (const l of listings) {
+        l.seenAt = stampSeen(l, now);
+        l.source =
+            app.pageType === PAGE_BAZAAR ? SOURCE_BAZAAR : SOURCE_ITEM_MARKET;
+        l.sellerId = sellerId;
+    }
+
     const priced = buildOpportunities(listings);
 
-    const ranked = rankOpportunities(priced, {
-        ...app.settings,
-        // Never hide everything just because verification data is missing.
-        includeUnverifiedNpc:
-            app.settings.includeUnverifiedNpc || app.shopDataMissing,
-    });
+    /*
+     * No limit here. The ranker's display cap of 100 made anything ranked
+     * 101st look "no longer an opportunity", and the ledger deleted it.
+     */
+    const ranked = rankOpportunities(priced, rankSettings({ limit: 0 }));
 
     /*
      * Remember what this page showed.
@@ -398,7 +532,6 @@ function rescan() {
      * remembering. Browsing the categories once builds a view of the whole
      * market without a single extra request.
      */
-    const now = Date.now();
     recordSightings(
         app.ledger,
         ranked,
@@ -406,17 +539,92 @@ function rescan() {
         new Set(listings.map((l) => String(l.itemId))),
     );
     pruneLedger(app.ledger, now);
-    gmSet(STORE_LEDGER, makeLedgerCacheEntry(app.ledger, now));
-
-    markRows(ranked);
-    app.lastScanAt = now;
+    persistLedger(now);
 
     /*
-     * The panel can show the whole ledger, but rows visible on THIS page win:
-     * they carry an element, so their action scrolls instead of navigating,
-     * and their numbers are from this second rather than from memory.
+     * The page you are looking at outranks every remote source. If it shows
+     * a higher price than the feed claims, the feed row has sold.
      */
-    const onPage = new Set(ranked.map((r) => String(r.itemId)));
+    if (listings.length) {
+        let removed = 0;
+        const feed = readFeedCacheEntry(gmGet(FEED_STORE_KEY, null), now);
+        removed = reconcileWithPage(feed, {
+            pageType: app.pageType,
+            sellerId,
+            listings,
+        });
+        if (removed > 0) gmSet(FEED_STORE_KEY, makeFeedCacheEntry(feed, now));
+    }
+
+    markRows(ranked.slice(0, 100));
+    showBazaarTarget(listings);
+
+    app.lastScanAt = now;
+    app.pageRows = ranked;
+    app.pageDiagnostics = diagnostics;
+
+    refreshView();
+    attachObserver(listings);
+}
+
+/** Write the ledger only when it changed - not every 2.5s poll. */
+function persistLedger(now) {
+    const entry = makeLedgerCacheEntry(app.ledger, now);
+    const json = JSON.stringify(entry.entries);
+
+    if (json === app.lastLedgerJson) return;
+
+    app.lastLedgerJson = json;
+    gmSet(STORE_LEDGER, entry);
+}
+
+/**
+ * Arrived from a feed link: point at the listing it named.
+ *
+ * Reading and marking the page the user opened is allowed; nothing is
+ * clicked, filled in, or bought. If the listing is visible at a different
+ * price, say so - that is the listing having changed since TornW3B saw it.
+ */
+function showBazaarTarget(listings) {
+    const target = bazaarTarget(location.href);
+    if (!target) return;
+
+    const matches = listings.filter((l) => String(l.itemId) === target.itemId);
+    if (!matches.length) return;
+
+    const exact = target.price
+        ? matches.find((l) => l.listingPrice <= target.price)
+        : matches[0];
+
+    const key = location.href;
+    const firstTime = app.targetShown !== key;
+    app.targetShown = key;
+
+    if (exact) {
+        markTarget(exact.el, firstTime);
+        return;
+    }
+
+    if (firstTime) {
+        app.panel.setStatus(
+            'That listing is no longer at ' +
+                formatMoneyShort(target.price) +
+                ' here - it sold or was repriced. Removed from the list.',
+            'warn',
+        );
+    }
+}
+
+/**
+ * Everything the panel shows: this page, what you saw elsewhere, and the
+ * live feed. Never makes a request and never reads the DOM, so the feed can
+ * re-render it whenever another tab updates storage.
+ */
+function refreshView() {
+    if (!app.panel) return;
+
+    const now = Date.now();
+    const onPage = new Set(app.pageRows.map((r) => String(r.itemId)));
 
     /*
      * Remembered rows were priced under whatever settings applied when they
@@ -429,44 +637,61 @@ function rescan() {
         return true;
     };
 
+    const feed = readFeedCacheEntry(gmGet(FEED_STORE_KEY, null), now);
+    const feedRows = app.index
+        ? feedOpportunities(feed, app.index, app.settings, {
+              now,
+              npcShopFor: (id) => npcShopFor(id, app.npcShops, app.manualNpc),
+              itemMarketUrl,
+          }).filter((r) => {
+              // The page you are on already shows these, with fresher numbers.
+              if (!onPage.has(String(r.itemId))) return true;
+              if (r.source === SOURCE_ITEM_MARKET) {
+                  return app.pageType !== 'itemmarket';
+              }
+              return !(
+                  app.pageType === PAGE_BAZAAR &&
+                  r.sellerId === bazaarOwnerId(location.href)
+              );
+          })
+        : [];
+
+    // A feed row for the same item and source supersedes a memory of it.
+    const inFeed = new Set(feedRows.map((r) => r.source + ':' + r.itemId));
+
     const remembered = app.settings.showAllSeen
         ? ledgerRows(app.ledger).filter(
               (r) =>
                   !onPage.has(String(r.itemId)) &&
+                  !inFeed.has((r.source || SOURCE_ITEM_MARKET) + ':' + r.itemId) &&
                   venueAllowed(r.profit.venue),
           )
         : [];
 
-    const combined = ranked.concat(remembered);
+    const opened = gmGet(STORE_OPENED, {}) || {};
+    for (const r of feedRows) {
+        const at = opened[openedKey(r)];
+        r.opened = Number.isFinite(at) && at >= r.dataAt;
+    }
 
-    const shown = rankOpportunities(combined, {
-        ...app.settings,
-        includeUnverifiedNpc:
-            app.settings.includeUnverifiedNpc || app.shopDataMissing,
-    });
+    const combined = app.pageRows.concat(remembered, feedRows);
+    const shown = rankOpportunities(combined, rankSettings());
 
     app.panel.render({
         rows: shown,
         summary: summarize(shown),
-        diagnostics: {
-            ...diagnostics,
-            ledgerSize: app.ledger.size,
-            priced: app.pricedCount,
-            shopDataMissing: app.shopDataMissing,
-            shopLoadError: app.shopLoadError || null,
-            nearMiss: app.nearMiss
-                ? {
-                      name: app.nearMiss.name,
-                      listingPrice: app.nearMiss.profit.listingPrice,
-                      exitPrice: app.nearMiss.profit.exitPrice,
-                      shortfall: -app.nearMiss.profit.profitPerUnit,
-                  }
-                : null,
-        },
+        diagnostics: app.pageDiagnostics
+            ? {
+                  ...app.pageDiagnostics,
+                  ledgerSize: app.ledger.size,
+                  shopDataMissing: app.shopDataMissing,
+                  shopLoadError: app.shopLoadError || null,
+              }
+            : null,
+        pageType: app.pageType,
         lastScanAt: app.lastScanAt,
+        live: app.feed ? app.feed.status() : null,
     });
-
-    attachObserver(listings);
 }
 
 /** The Scan button: loads reference data once, then scans the page. */
@@ -482,8 +707,11 @@ async function onScan() {
         return;
     }
 
-    if (app.pageType === PAGE_NONE) {
-        app.panel.setStatus('Not a Bazaar or Item Market page.');
+    if (app.keyDead) {
+        app.panel.setStatus(
+            'Torn rejected the saved key. Paste a new Public key under Settings.',
+            'error',
+        );
         return;
     }
 
@@ -494,11 +722,24 @@ async function onScan() {
         if (!app.index) await loadReferenceData();
         await checkKeyAccess();
         rescan();
+        if (app.pageType === PAGE_NONE) {
+            app.panel.setStatus(
+                app.settings.liveFeed
+                    ? 'Not a Bazaar or Item Market page - showing the live feed.'
+                    : 'Not a Bazaar or Item Market page.',
+            );
+        }
     } catch (error) {
-        app.panel.setStatus(
-            redactKey((error && error.message) || String(error), getStoredKey()),
-            'error',
-        );
+        if (isKeyDeadError(error)) {
+            markKeyDead(error);
+        } else {
+            // A network or Torn outage: retry, but not every 2.5s.
+            app.retryLoadAt = Date.now() + 60000;
+            app.panel.setStatus(
+                redactKey((error && error.message) || String(error), getStoredKey()),
+                'error',
+            );
+        }
     } finally {
         app.loading = false;
         app.panel.setBusy(false);
@@ -508,6 +749,7 @@ async function onScan() {
 function onClear() {
     clearMarks();
     app.lastScanAt = null;
+    app.pageRows = [];
 
     app.panel.render({
         rows: [],
@@ -518,10 +760,42 @@ function onClear() {
     app.panel.setStatus('Cleared.');
 }
 
+/** Identity of a feed listing for the "already opened" dimming. */
+function openedKey(row) {
+    return [row.source, row.itemId, row.sellerId || '', row.profit.listingPrice].join(':');
+}
+
 function onNavigate(row) {
     // One click, one navigation. Nothing is ever bought by the script.
     if (row.el && document.contains(row.el)) {
         revealRow(row.el);
+        return;
+    }
+
+    if (row.fromFeed) {
+        /*
+         * Remember it was opened, keyed to the data time: if TornW3B later
+         * re-confirms the listing, it lights up again (Weav3r's trick). Ask
+         * the feed to re-verify the item first on its next cycle.
+         */
+        const opened = gmGet(STORE_OPENED, {}) || {};
+        opened[openedKey(row)] = row.dataAt;
+        const keys = Object.keys(opened);
+        if (keys.length > 200) delete opened[keys[0]];
+        gmSet(STORE_OPENED, opened);
+
+        if (app.feed) app.feed.requestRecheck([row.itemId]);
+        refreshView();
+    }
+
+    if (row.url) {
+        gmOpenTab(row.url);
+        return;
+    }
+
+    // A bazaar sighting goes back to that bazaar, not to the Item Market.
+    if (row.source === SOURCE_BAZAAR && row.sellerId) {
+        gmOpenTab(bazaarUrl(row.sellerId, row.itemId, row.profit.listingPrice));
         return;
     }
 
@@ -533,6 +807,7 @@ function onSettingsChange(partial) {
     gmSet(STORE_SETTINGS, app.settings);
 
     if (app.index) rescan();
+    else refreshView();
 }
 
 /* ------------------------------------------------------------------ *
@@ -598,34 +873,90 @@ function applyPageType(next, { initial = false } = {}) {
 
     if (!initial) clearMarks();
 
-    if (next === PAGE_NONE) {
-        app.panel.setStatus('Not a Bazaar or Item Market page.');
-        app.panel.render({
-            rows: [],
-            summary: { count: 0, totalProfit: 0, cashRequired: 0 },
-            lastScanAt: null,
-        });
-        return;
-    }
-
+    /*
+     * Reference data is needed on EVERY page now, not just the markets: the
+     * live feed prices listings against it. It is a cached, one-time load.
+     */
     if (app.index) {
         rescan();
         return;
     }
 
-    if (getStoredKey()) {
+    if (hasUsableKey()) {
         onScan();
         return;
     }
 
-    app.panel.setStatus('Paste a Public API key under Settings to begin.');
+    if (next === PAGE_NONE && !getStoredKey()) {
+        app.panel.setStatus('Paste a Public API key under Settings to begin.');
+    }
 }
 
 function handleRouteChange() {
     const next = detectPage(location.href);
-    if (next === app.pageType) return;
+    if (next === app.pageType && location.href === app.pageHref) return;
 
     applyPageType(next);
+}
+
+/* ------------------------------------------------------------------ *
+ * Live feed
+ * ------------------------------------------------------------------ */
+
+function startLiveFeed() {
+    app.w3b = new W3bClient();
+
+    app.feed = new LiveFeed({
+        tabId: app.tabId,
+        w3b: app.w3b,
+        torn: app.client,
+        getIndex: () => app.index,
+        getSettings: () => app.settings,
+        hasUsableKey,
+        isVisible: () => document.visibilityState === 'visible',
+        load: (key) => gmGet(key, null),
+        save: (key, value) => gmSet(key, value),
+        onChange: () => refreshView(),
+        isKeyDead: isKeyDeadError,
+        onKeyDead: markKeyDead,
+    });
+
+    // Follower tabs re-render the moment the leader stores something new.
+    const listening = gmOnChange(FEED_STORE_KEY, () => refreshView());
+
+    const tick = () => {
+        app.feed
+            .tick()
+            .catch(() => {})
+            .finally(() => {
+                // Without a change listener, followers refresh on the tick.
+                if (!listening || app.feed.leading) refreshView();
+            });
+    };
+
+    setInterval(tick, FEED_TICK_MS);
+
+    /*
+     * Coming back to this tab after following a link: the opened listings
+     * are exactly the ones most likely to have changed. Re-verify them first.
+     */
+    document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState !== 'visible') {
+            // Step down at once rather than waiting for the next tick.
+            tick();
+            return;
+        }
+
+        const opened = gmGet(STORE_OPENED, {}) || {};
+        const ids = Object.keys(opened)
+            .map((k) => k.split(':')[1])
+            .filter(Boolean);
+        if (ids.length) app.feed.requestRecheck(ids.slice(-10));
+
+        tick();
+    });
+
+    tick();
 }
 
 /* ------------------------------------------------------------------ *
@@ -663,8 +994,18 @@ export function boot() {
     injectStyles();
 
     app.settings = { ...DEFAULT_SETTINGS, ...(gmGet(STORE_SETTINGS, {}) || {}) };
+    app.keyDead = Boolean(gmGet(STORE_KEY_DEAD, false));
 
-    app.client = new TornApiClient({ getKey: getStoredKey });
+    /*
+     * One request budget for every open Torn tab. Torn counts 100/min per
+     * user across all keys and tools; each tab keeping its own window let
+     * two tabs spend 140/min.
+     */
+    app.client = new TornApiClient({
+        getKey: getStoredKey,
+        loadWindow: () => gmGet(STORE_API_WINDOW, []),
+        saveWindow: (recent) => gmSet(STORE_API_WINDOW, recent),
+    });
 
     app.panel = new Panel({
         onScan,
@@ -675,19 +1016,16 @@ export function boot() {
         onForgetKey,
         onClearCache,
         onClearList,
+        /*
+         * The key is put into the field only when the user asks to see it.
+         * A value sitting in an <input> on torn.com is readable by every
+         * script on the page, including other userscripts.
+         */
+        onRevealKey: () => getStoredKey(),
     });
 
     app.panel.mount();
     app.panel.applySettings(app.settings);
-
-    /*
-     * Show the stored key in the field.
-     *
-     * Leaving it blank on every page load made a saved key look lost - the
-     * single most alarming thing a tool that asks for a credential can do.
-     * The field is masked by CSS, so this does not expose it on screen.
-     */
-    if (app.panel.keyInput) app.panel.keyInput.value = getStoredKey();
 
     refreshKeyState();
     registerMenu();
@@ -700,6 +1038,11 @@ export function boot() {
             'warn',
         );
         app.panel.toggleView('settings');
+    } else if (app.keyDead) {
+        app.panel.setStatus(
+            'Torn rejected the saved key. Paste a new Public key under Settings.',
+            'error',
+        );
     }
 
     window.addEventListener('hashchange', handleRouteChange);
@@ -707,14 +1050,23 @@ export function boot() {
 
     setInterval(() => {
         if (document.visibilityState !== 'visible') return;
-        if (detectPage(location.href) === PAGE_NONE) return;
 
-        // Never scanned yet (no key at boot, or a failed first load).
+        // Never loaded yet (no key at boot, or a failed first load). A key
+        // Torn has rejected is never retried - see markKeyDead.
         if (!app.index) {
-            if (getStoredKey() && !app.loading) onScan();
+            if (hasUsableKey() && !app.loading && Date.now() >= app.retryLoadAt) {
+                onScan();
+            }
+            return;
+        }
+
+        if (detectPage(location.href) === PAGE_NONE) {
+            if (app.pageType !== PAGE_NONE) rescan();
             return;
         }
 
         rescan();
     }, POLL_INTERVAL_MS);
+
+    startLiveFeed();
 }

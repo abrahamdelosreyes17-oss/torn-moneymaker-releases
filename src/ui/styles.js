@@ -81,6 +81,13 @@ export const STYLE_CSS = `
 }
 
 /* The best few opportunities on the page get a warmer fill. */
+/* The listing a feed link was opened for. Paint-only, like .ttv2-hit. */
+.ttv2-target {
+    box-shadow:
+        inset 0 0 0 3px #ffd24a,
+        inset 0 0 0 9999px rgba(255, 210, 74, 0.14) !important;
+}
+
 .ttv2-hit-top {
     box-shadow:
         inset 0 0 0 3px #7ee08f,
@@ -285,6 +292,50 @@ export const STYLE_CSS = `
 .ttv2-guess {
     color: #ffd24a;
     cursor: help;
+}
+
+/* Where a row came from and how old its data is. */
+.ttv2-row-src {
+    color: #8ea394;
+    font-size: 10px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.ttv2-row.ttv2-stale .ttv2-age {
+    color: #ffd24a;
+}
+
+/* Already followed: dimmed until the source re-confirms the listing. */
+.ttv2-row.ttv2-opened .ttv2-row-name {
+    color: #8ea394;
+}
+
+.ttv2-live {
+    font-size: 10px;
+}
+
+/* Torn's required API-key disclosure table. */
+.ttv2-tos {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 10px;
+    color: #a9bdad;
+}
+
+.ttv2-tos th,
+.ttv2-tos td {
+    text-align: left;
+    vertical-align: top;
+    padding: 2px 4px;
+    border-bottom: 1px solid #2c382e;
+}
+
+.ttv2-tos th {
+    width: 38%;
+    color: #8ea394;
+    font-weight: normal;
 }
 
 .ttv2-settings {

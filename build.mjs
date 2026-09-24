@@ -42,7 +42,7 @@ const HEADER = `// ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
 // @version      ${VERSION}
-// @description  Ranks Bazaar / Item Market listings on the page you are viewing by the profit you can actually realize.
+// @description  Finds Bazaar and Item Market listings below NPC / market value - on the page you are viewing, and live from the Torn API and TornW3B - ranked by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
 // @run-at       document-idle
@@ -52,7 +52,9 @@ const HEADER = `// ==UserScript==
 // @grant        GM_registerMenuCommand
 // @grant        GM_openInTab
 // @grant        GM_xmlhttpRequest
+// @grant        GM_addValueChangeListener
 // @connect      api.torn.com
+// @connect      weav3r.dev
 // @downloadURL  ${REPO_RAW}
 // @updateURL    ${REPO_RAW}
 // @noframes
@@ -67,6 +69,9 @@ const HEADER = `// ==UserScript==
  *   - It never buys anything. The only action button navigates.
  *   - Public API key only; the key goes to api.torn.com and nowhere else,
  *     and is never logged.
+ *   - The optional TornW3B bazaar feed (weav3r.dev) is opt-in, has its own
+ *     client, and never receives the key.
+ *   - The live feed runs in one visible tab only, and never raises alerts.
  */
 `;
 

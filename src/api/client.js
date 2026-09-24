@@ -22,6 +22,23 @@ export const TORN_ERROR_KEY_INVALID = 2;
 export const TORN_ERROR_RATE_LIMIT = 5;
 export const TORN_ERROR_IP_BLOCK = 8;
 export const TORN_ERROR_UNAVAILABLE = 9;
+export const TORN_ERROR_KEY_DISABLED = 13;
+export const TORN_ERROR_KEY_PAUSED = 18;
+
+/**
+ * Errors that mean "this key must not be used again until the user changes
+ * it". Torn's docs: "Multiple requests using invalid keys may result in a
+ * temporary IP ban - you must account for this by removing disabled or
+ * invalid keys upon error."
+ */
+export const KEY_DEAD_CODES = new Set([
+    TORN_ERROR_KEY_INVALID,
+    TORN_ERROR_KEY_DISABLED,
+    TORN_ERROR_KEY_PAUSED,
+]);
+
+/** Torn's rate block lasts "a small period"; 1-2-4s retries only burn it. */
+export const RATE_LIMIT_BACKOFF_MS = 30000;
 
 export class TornApiError extends Error {
     constructor(message, { code = null, http = null } = {}) {
@@ -57,6 +74,11 @@ export class TornApiClient {
      * @param {number} [options.maxPerMinute]     - request ceiling
      * @param {number} [options.dedupTtlMs]       - reuse identical responses
      * @param {number} [options.maxRetries]
+     * @param {function(): number[]} [options.loadWindow] - shared request
+     *   timestamps, so every open Torn tab draws on ONE budget. Torn's limit
+     *   is per user across all keys; a per-tab window let two tabs make
+     *   140/min against a 100/min ceiling.
+     * @param {function(number[])} [options.saveWindow]
      */
     constructor({
         getKey,
@@ -64,12 +86,18 @@ export class TornApiClient {
         maxPerMinute = 70,
         dedupTtlMs = 5000,
         maxRetries = 3,
+        loadWindow = null,
+        saveWindow = null,
+        rateLimitBackoffMs = RATE_LIMIT_BACKOFF_MS,
     } = {}) {
         this.getKey = getKey;
         this.fetchImpl = fetchImpl;
         this.maxPerMinute = maxPerMinute;
         this.dedupTtlMs = dedupTtlMs;
         this.maxRetries = maxRetries;
+        this.loadWindow = loadWindow;
+        this.saveWindow = saveWindow;
+        this.rateLimitBackoffMs = rateLimitBackoffMs;
 
         /** Timestamps of recent requests, for the sliding window. */
         this.recent = [];
@@ -82,6 +110,7 @@ export class TornApiClient {
 
     /** Requests made in the last 60s, and room remaining. */
     stats(now = Date.now()) {
+        this.syncWindow(now);
         const window = this.recent.filter((t) => now - t < 60000);
         return {
             usedLastMinute: window.length,
@@ -89,14 +118,45 @@ export class TornApiClient {
         };
     }
 
+    /**
+     * Adopt the shared window: it already holds this tab's own requests,
+     * because every slot taken is saved back to it. Replacing rather than
+     * merging matters - two requests in the same millisecond are two
+     * requests, and a Set of timestamps would count them as one.
+     */
+    syncWindow(now = Date.now()) {
+        if (!this.loadWindow) return;
+
+        let shared;
+        try {
+            shared = this.loadWindow();
+        } catch {
+            return;
+        }
+        if (!Array.isArray(shared)) return;
+
+        this.recent = shared
+            .filter((t) => Number.isFinite(t) && now - t < 60000)
+            .sort((a, b) => a - b);
+    }
+
     /** Block until the sliding window has room for one more request. */
     async waitForSlot() {
         for (;;) {
             const now = Date.now();
+            this.syncWindow(now);
             this.recent = this.recent.filter((t) => now - t < 60000);
 
             if (this.recent.length < this.maxPerMinute) {
                 this.recent.push(now);
+                if (this.saveWindow) {
+                    try {
+                        this.saveWindow(this.recent);
+                    } catch {
+                        // Sharing the window is best-effort; the local one
+                        // still limits this tab.
+                    }
+                }
                 return;
             }
 
@@ -132,10 +192,18 @@ export class TornApiClient {
 
         try {
             const data = await promise;
+            this.pruneCache();
             this.cache.set(cacheKey, { at: Date.now(), data });
             return data;
         } finally {
             this.inflight.delete(cacheKey);
+        }
+    }
+
+    /** The dedup cache is for bursts, not memory; a sweep adds hundreds. */
+    pruneCache(now = Date.now()) {
+        for (const [k, v] of this.cache) {
+            if (now - v.at >= this.dedupTtlMs) this.cache.delete(k);
         }
     }
 
@@ -166,8 +234,17 @@ export class TornApiClient {
                     throw error;
                 }
 
-                // Exponential backoff, not a retry loop. 1s, 2s, 4s.
-                await apiSleep(1000 * Math.pow(2, attempt));
+                // Torn's rate block outlasts a quick retry; wait it out.
+                // Otherwise exponential backoff: 1s, 2s, 4s.
+                const rateLimited =
+                    error instanceof TornApiError &&
+                    (error.code === TORN_ERROR_RATE_LIMIT || error.http === 429);
+
+                await apiSleep(
+                    rateLimited
+                        ? this.rateLimitBackoffMs
+                        : 1000 * Math.pow(2, attempt),
+                );
                 attempt += 1;
             }
         }
@@ -188,7 +265,16 @@ export class TornApiClient {
     }
 
     async requestOnce(path, params, key) {
-        const url = new URL(String(path).replace(/^\/+/, '') + '/', TORN_API_BASE);
+        /*
+         * v1 paths take a trailing slash ("torn/?selections=items" is the form
+         * verified in game). v2 paths are written without one everywhere they
+         * are documented, so they are left exactly as given.
+         */
+        const clean = String(path).replace(/^\/+/, '');
+        const url = new URL(
+            /^v2\//.test(clean) ? clean : clean + '/',
+            TORN_API_BASE,
+        );
 
         /*
          * A relative path resolves under the base, but an ABSOLUTE one
@@ -232,13 +318,24 @@ export class TornApiClient {
             throw new TornApiError('Torn API returned invalid JSON.');
         }
 
-        if (data && data.error) {
+        /*
+         * Errors arrive as HTTP 200 with { error: { code, error } } - and
+         * some v2 endpoints are reported to put { code, error } at the top
+         * level instead. Read both, or a v2 error looks like an empty result.
+         */
+        const err =
+            data && data.error && typeof data.error === 'object'
+                ? data.error
+                : data &&
+                    Number.isFinite(Number(data.code)) &&
+                    typeof data.error === 'string'
+                  ? { code: Number(data.code), error: data.error }
+                  : null;
+
+        if (err) {
             throw new TornApiError(
-                'Torn API ' +
-                    data.error.code +
-                    ': ' +
-                    redactKey(data.error.error, key),
-                { code: data.error.code },
+                'Torn API ' + err.code + ': ' + redactKey(err.error, key),
+                { code: Number(err.code) },
             );
         }
 

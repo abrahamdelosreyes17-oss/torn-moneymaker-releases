@@ -79,3 +79,20 @@ export function revealRow(el) {
     if (!el || typeof el.scrollIntoView !== 'function') return;
     el.scrollIntoView({ behavior: 'smooth', block: 'center' });
 }
+
+export const TARGET_CLASS = 'ttv2-target';
+
+/**
+ * Point at the listing a feed link was opened for. Adds one class; scrolls
+ * only the first time, so a re-render does not yank the page around.
+ */
+export function markTarget(el, scroll = false) {
+    if (!el || !el.classList) return;
+
+    for (const other of document.querySelectorAll('.' + TARGET_CLASS)) {
+        if (other !== el) other.classList.remove(TARGET_CLASS);
+    }
+
+    el.classList.add(TARGET_CLASS);
+    if (scroll) revealRow(el);
+}

@@ -28,9 +28,14 @@ export const VENUE_FEES = {
     AUCTION_HOUSE: 0.03,
 };
 
+/*
+ * "Market" is Torn's rolling average, not a price anyone has offered you -
+ * the live floor can sit well above or below it. The label says so; the NPC
+ * price is the only exit that is guaranteed.
+ */
 export const VENUE_LABELS = {
     NPC: 'NPC',
-    ITEM_MARKET: 'Market',
+    ITEM_MARKET: 'Market value (est.)',
     ITEM_MARKET_ANON: 'Market (anon)',
     AUCTION_HOUSE: 'Auction',
 };

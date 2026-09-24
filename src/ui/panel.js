@@ -22,6 +22,7 @@ import {
     formatAge,
 } from '../core/parse.js';
 import { VENUE_LABELS } from '../core/profit.js';
+import { W3B_TERMS_URL, W3B_SITE_URL } from '../api/w3b.js';
 
 /** Rows fade once the scan behind them is older than this. */
 export const PANEL_STALE_MS = 60000;
@@ -126,6 +127,7 @@ export class Panel {
          * ("this key has Full access") within the same tick.
          */
         this.summaryEl = el('div', { class: 'ttv2-status ttv2-summary' });
+        this.liveEl = el('div', { class: 'ttv2-status ttv2-live' });
         this.diagEl = el('div', { class: 'ttv2-diag' });
         this.filtersEl = el('div', { class: 'ttv2-filters' });
         this.settingsEl = el('div', { class: 'ttv2-settings' });
@@ -196,6 +198,7 @@ export class Panel {
         this.bodyEl = el('div', { class: 'ttv2-body' }, [
             this.statusEl,
             this.summaryEl,
+            this.liveEl,
             this.settingsEl,
             this.filtersEl,
             this.listEl,
@@ -263,12 +266,26 @@ export class Panel {
             text: 'No key saved.',
         });
 
+        /*
+         * The saved key is NOT kept in the field. A value in an <input> on
+         * torn.com can be read by any script on the page. Show fetches it
+         * into the field; Hide takes it out again.
+         */
+        this.keyRevealed = false;
         const showBtn = el('button', {
             type: 'button',
             text: 'Show',
             onclick: () => {
                 const hidden = this.keyInput.classList.toggle('ttv2-masked');
                 showBtn.textContent = hidden ? 'Show' : 'Hide';
+
+                if (!hidden && !this.keyInput.value && this.handlers.onRevealKey) {
+                    this.keyInput.value = this.handlers.onRevealKey() || '';
+                    this.keyRevealed = true;
+                } else if (hidden && this.keyRevealed) {
+                    this.keyInput.value = '';
+                    this.keyRevealed = false;
+                }
             },
         });
 
@@ -333,6 +350,80 @@ export class Panel {
         );
         this.settingsEl.appendChild(this.keyStateEl);
         this.settingsEl.appendChild(keyNote);
+        this.settingsEl.appendChild(this.buildTosTable());
+
+        /* ---- live feed ---- */
+
+        this.liveFeedInput = el('input', { type: 'checkbox' });
+        this.liveFeedInput.addEventListener('change', () =>
+            this.emitSettings({ liveFeed: this.liveFeedInput.checked }),
+        );
+
+        this.useW3bInput = el('input', { type: 'checkbox' });
+        this.useW3bInput.addEventListener('change', () =>
+            this.emitSettings({ useW3b: this.useW3bInput.checked }),
+        );
+
+        const liveLabel = el('label', { class: 'ttv2-check' }, [this.liveFeedInput]);
+        liveLabel.appendChild(
+            document.createTextNode(
+                ' Watch the Item Market from any Torn page',
+            ),
+        );
+
+        const w3bLabel = el('label', { class: 'ttv2-check' }, [this.useW3bInput]);
+        w3bLabel.appendChild(
+            document.createTextNode(' Also watch bazaars, using TornW3B'),
+        );
+
+        const w3bNote = el('div', { class: 'ttv2-note' });
+        w3bNote.appendChild(
+            document.createTextNode(
+                'Bazaar prices come from TornW3B (',
+            ),
+        );
+        w3bNote.appendChild(
+            el('a', {
+                href: W3B_SITE_URL,
+                target: '_blank',
+                rel: 'noopener noreferrer',
+                text: 'weav3r.dev',
+            }),
+        );
+        w3bNote.appendChild(
+            document.createTextNode(
+                '), a community service that TornTools also uses. Only item ' +
+                    'ids are sent to it - never your API key. Its prices are ' +
+                    'minutes old at best, so each row says how old. By ' +
+                    'enabling it you accept its ',
+            ),
+        );
+        w3bNote.appendChild(
+            el('a', {
+                href: W3B_TERMS_URL,
+                target: '_blank',
+                rel: 'noopener noreferrer',
+                text: 'terms of service',
+            }),
+        );
+        w3bNote.appendChild(document.createTextNode('.'));
+
+        this.settingsEl.appendChild(el('h4', { text: 'Live feed' }));
+        this.settingsEl.appendChild(liveLabel);
+        this.settingsEl.appendChild(w3bLabel);
+        this.settingsEl.appendChild(w3bNote);
+        this.settingsEl.appendChild(
+            el('div', {
+                class: 'ttv2-note',
+                text:
+                    'Runs in ONE Torn tab at a time, and only while you are ' +
+                    'looking at it: a hidden tab stops. It never plays sounds ' +
+                    'or sends notifications, and never buys or clicks ' +
+                    'anything - each row is a link you choose to follow. It ' +
+                    'uses at most 20 Torn API calls a minute, leaving room ' +
+                    'for your other tools.',
+            }),
+        );
 
         /* ---- behaviour ---- */
 
@@ -360,6 +451,39 @@ export class Panel {
     }
 
     /**
+     * Torn's API Terms of Service require any tool that takes a key to state,
+     * in this table form and where the key is entered, how it uses the key.
+     */
+    buildTosTable() {
+        const rows = [
+            ['Data storage', 'Only locally (in this browser)'],
+            ['Data sharing', 'Nobody'],
+            [
+                'Purpose of use',
+                'Competitive advantage: finding Bazaar and Item Market ' +
+                    'listings priced below NPC / market value',
+            ],
+            ['Key storage & sharing', 'Stored locally / Not shared'],
+            [
+                'Key access level',
+                'Public (torn: items, cityshops; market: itemmarket; key: info)',
+            ],
+        ];
+
+        const table = el('table', { class: 'ttv2-tos' });
+        for (const [k, v] of rows) {
+            table.appendChild(
+                el('tr', {}, [el('th', { text: k }), el('td', { text: v })]),
+            );
+        }
+
+        return el('div', {}, [
+            el('h4', { text: 'API key terms of use' }),
+            table,
+        ]);
+    }
+
+    /**
      * Reflect key status without ever showing the key itself.
      * @param {object} info - { hasKey, accessName, overScoped }
      */
@@ -382,9 +506,9 @@ export class Panel {
             return;
         }
 
-        this.keyStateEl.textContent = accessName
-            ? 'Saved - ' + accessName + ' access.'
-            : 'Saved.';
+        this.keyStateEl.textContent =
+            (accessName ? 'Saved - ' + accessName + ' access.' : 'Saved.') +
+            ' Hidden from the page; press Show to see it.';
         this.keyStateEl.classList.add('ttv2-ok');
     }
 
@@ -394,7 +518,7 @@ export class Panel {
         this.minProfitInput = el('input', {
             type: 'text',
             inputmode: 'numeric',
-            placeholder: '1000',
+            placeholder: '1',
         });
         this.minProfitInput.addEventListener('change', () => {
             this.emitSettings({
@@ -470,7 +594,8 @@ export class Panel {
                 this.showAllSeenInput,
                 'Show everything seen while browsing',
                 'Keeps results from every category you visit, not just the ' +
-                    'page you are on. Entries expire after 30 minutes.',
+                    'page you are on. Entries expire 10 minutes after the page ' +
+                    'showed them.',
             ),
         );
 
@@ -622,6 +747,12 @@ export class Panel {
         if (this.npcShopsOnlyInput && settings.npcShopsOnly !== undefined) {
             this.npcShopsOnlyInput.checked = Boolean(settings.npcShopsOnly);
         }
+        if (this.liveFeedInput && settings.liveFeed !== undefined) {
+            this.liveFeedInput.checked = Boolean(settings.liveFeed);
+        }
+        if (this.useW3bInput && settings.useW3b !== undefined) {
+            this.useW3bInput.checked = Boolean(settings.useW3b);
+        }
         if (settings.collapsed !== undefined) {
             this.setCollapsed(settings.collapsed);
         }
@@ -648,7 +779,33 @@ export class Panel {
         }
 
         this.renderDiagnostics();
+        this.renderLive();
         this.refreshAges();
+    }
+
+    renderLive() {
+        const live = this.state.live;
+        if (!this.liveEl) return;
+
+        if (!live || !live.enabled) {
+            this.liveEl.textContent = 'Live feed: off (Settings)';
+            this.liveEl.classList.remove('ttv2-warn');
+            return;
+        }
+
+        const bits = ['Live feed: ' + (live.leading ? 'on' : 'on in another tab')];
+
+        if (live.leading) {
+            bits.push(live.itemMarket ? 'Item Market' : 'no key');
+            bits.push(live.w3b ? 'bazaars (' + live.candidates + ' leads)' : 'bazaars off');
+            if (live.lastCycleAt) {
+                bits.push('updated ' + formatAge(Date.now() - live.lastCycleAt));
+            }
+        }
+
+        this.liveEl.textContent = bits.join('  |  ');
+        this.liveEl.title = live.lastError || '';
+        this.liveEl.classList.toggle('ttv2-warn', Boolean(live.lastError));
     }
 
     /**
@@ -661,8 +818,22 @@ export class Panel {
      */
     emptyReason() {
         const d = this.state.diagnostics;
+        const live = this.state.live;
 
-        if (!d) return 'Press Scan.';
+        if (!d) {
+            if (live && live.enabled && !live.itemMarket) {
+                return 'The live feed needs a Public API key - paste one under Settings.';
+            }
+            if (live && live.enabled && live.leading) {
+                return live.candidates || live.itemMarket
+                    ? 'Watching the market - nothing profitable right now.'
+                    : 'Watching the market...';
+            }
+            if (live && live.enabled) {
+                return 'Live feed runs in another Torn tab; results appear here.';
+            }
+            return 'Open a Bazaar or the Item Market, or turn on the live feed in Settings.';
+        }
 
         if (d.images === 0) {
             return (
@@ -706,15 +877,14 @@ export class Panel {
         name.appendChild(document.createTextNode(row.name));
 
         if (row.fromLedger) {
-            const age = Math.round((Date.now() - row.seenAt) / 60000);
             name.appendChild(
                 el('span', {
                     class: 'ttv2-guess',
                     title:
                         'Seen on another page, not on this one. The listing ' +
-                        'may already be gone - the button opens the item so ' +
-                        'you can check.',
-                    text: age < 1 ? ' (elsewhere)' : ' (' + age + 'm ago)',
+                        'may already be gone - the button opens it so you ' +
+                        'can check.',
+                    text: ' (seen elsewhere)',
                 }),
             );
         }
@@ -827,23 +997,83 @@ export class Panel {
 
         const main = el('div', { class: 'ttv2-row-main' }, [
             name,
+            this.sourceLine(row),
             buyLine,
             eachLine,
             totalLine,
             shopLine,
         ]);
 
+        const where =
+            row.source === 'bazaar'
+                ? row.sellerName
+                    ? "Open " + row.sellerName + "'s bazaar"
+                    : 'Open this bazaar'
+                : 'Open this item on the Item Market';
+
         const go = el('button', {
             type: 'button',
-            title: row.el
-                ? 'Scroll to this listing'
-                : 'Open this item on the Item Market',
+            title: row.el ? 'Scroll to this listing' : where,
             text: '>',
             onclick: () =>
                 this.handlers.onNavigate && this.handlers.onNavigate(row),
         });
 
-        return el('div', { class: 'ttv2-row' }, [main, go]);
+        const rowEl = el('div', { class: 'ttv2-row' }, [main, go]);
+        rowEl.dataset.ttv2At = String(this.rowTime(row) || '');
+        if (row.opened) rowEl.classList.add('ttv2-opened');
+
+        return rowEl;
+    }
+
+    /** When the data behind a row was true - not when we last looked. */
+    rowTime(row) {
+        if (row.fromFeed) return row.dataAt;
+        return row.seenAt || null;
+    }
+
+    /**
+     * Where a row came from, and how old it is. Every row says this, because
+     * "is this still there?" is the question that matters most.
+     */
+    sourceLine(row) {
+        const parts = [];
+
+        if (row.source === 'bazaar') {
+            parts.push('Bazaar' + (row.sellerName ? ' - ' + row.sellerName : ''));
+        } else if (row.source === 'itemmarket') {
+            parts.push('Item Market');
+        }
+
+        if (row.el) parts.push('on this page');
+        else if (row.fromFeed) parts.push(row.source === 'bazaar' ? 'via TornW3B' : 'via Torn API');
+        else if (row.fromLedger) parts.push('remembered');
+
+        const line = el('div', {
+            class: 'ttv2-row-src',
+            text: parts.join(' | '),
+        });
+
+        const age = el('span', { class: 'ttv2-age' });
+        line.appendChild(document.createTextNode(' | '));
+        line.appendChild(age);
+
+        if (row.fromFeed && row.dataAgeKnown === false) {
+            age.title = 'TornW3B did not say when it last checked this.';
+        }
+        if (row.opened) {
+            line.appendChild(
+                el('span', {
+                    class: 'ttv2-guess',
+                    title:
+                        'You opened this already. It lights up again if the ' +
+                        'listing is re-confirmed.',
+                    text: ' | opened',
+                }),
+            );
+        }
+
+        return line;
     }
 
     renderDiagnostics() {
@@ -869,27 +1099,39 @@ export class Panel {
     }
 
     refreshAges() {
-        if (!this.root || !this.state.lastScanAt) return;
+        if (!this.root) return;
 
-        const age = Date.now() - this.state.lastScanAt;
-        const stale = age > PANEL_STALE_MS;
+        const now = Date.now();
 
+        /*
+         * Staleness is per row, from the time its DATA was true. The panel
+         * used to fade on "time since last scan" - which the 2.5s poll reset
+         * forever, so nothing ever looked stale.
+         */
         for (const rowEl of this.listEl.querySelectorAll('.ttv2-row')) {
-            rowEl.classList.toggle('ttv2-stale', stale);
+            const at = Number(rowEl.dataset.ttv2At);
+            const ageEl = rowEl.querySelector('.ttv2-age');
+            const known = Number.isFinite(at) && at > 0;
+
+            if (ageEl) ageEl.textContent = known ? formatAge(now - at) : 'age unknown';
+            rowEl.classList.toggle('ttv2-stale', known && now - at > PANEL_STALE_MS);
         }
 
-        const summary = this.state.summary || { count: 0, totalProfit: 0 };
+        this.renderLive();
 
-        const where = this.state.diagnostics && this.state.diagnostics.pageType;
+        const summary = this.state.summary || { count: 0, totalProfit: 0 };
+        const where = this.state.pageType;
+        const age = this.state.lastScanAt ? now - this.state.lastScanAt : null;
+        const stale = age !== null && age > PANEL_STALE_MS;
 
         this.summaryEl.textContent =
-            (where === 'bazaar' ? 'Bazaar' : where === 'itemmarket' ? 'Item Market' : '-') +
+            (where === 'bazaar' ? 'Bazaar' : where === 'itemmarket' ? 'Item Market' : 'Live feed') +
             '  |  ' +
             summary.count +
             ' opportunities  |  +' +
             formatMoneyShort(summary.totalProfit) +
-            ' total  |  ' +
-            formatAge(age);
+            ' total' +
+            (age !== null ? '  |  scanned ' + formatAge(age) : '');
 
         this.summaryEl.classList.toggle('ttv2-warn', stale);
     }

@@ -81,24 +81,55 @@ export async function fetchKeyAccess(client) {
 }
 
 /**
- * Item Market listings for one item (Item Market 2.0, API v2).
+ * Item Market listings for one item: GET /v2/market/{id}/itemmarket.
  *
- * Phase 1 does not call this - the panel is fed from the page you are
- * viewing. It is here because it is the Phase 2 data source and it belongs
- * next to its siblings.
+ * Public key. "Globally cached selection" - Torn serves everyone the same
+ * snapshot and refreshes it no faster than `cache_delay` seconds (30 in every
+ * observed response), so asking again before cache_timestamp + cache_delay
+ * returns the same rows and only spends quota. The caller uses `nextAt` to
+ * avoid that.
+ *
+ * The response names no seller and no listing id: a row is a price and an
+ * amount. So an Item Market hit links to the item, never to a seller.
+ *
+ * @returns {Promise<{listings: Array<{price: number, amount: number}>,
+ *   averagePrice: number|null, cacheTimestamp: number|null, nextAt: number,
+ *   total: number}>} cacheTimestamp and nextAt in ms
  */
-export async function fetchItemMarket(client, itemId, { offset = 0 } = {}) {
-    const data = await client.get('v2/market/' + encodeURIComponent(itemId), {
-        selections: 'itemmarket',
-        offset,
-    });
+export async function fetchItemMarket(
+    client,
+    itemId,
+    { limit = 20, offset = 0, now = Date.now() } = {},
+) {
+    const data = await client.get(
+        'v2/market/' + encodeURIComponent(String(itemId)) + '/itemmarket',
+        { limit, offset },
+    );
 
-    const listings =
-        (data && data.itemmarket && data.itemmarket.listings) || [];
+    const market = (data && data.itemmarket) || {};
+    const raw = Array.isArray(market.listings) ? market.listings : [];
 
-    return listings.map((listing) => ({
-        id: listing.id ?? null,
-        price: Number(listing.price) || 0,
-        quantity: Number(listing.amount ?? listing.quantity) || 0,
-    }));
+    const cacheTs = Number(market.cache_timestamp);
+    const cacheDelay = Number(market.cache_delay);
+    const cacheTimestamp = Number.isFinite(cacheTs) && cacheTs > 0
+        ? cacheTs * 1000
+        : null;
+    const delayMs = (Number.isFinite(cacheDelay) && cacheDelay > 0
+        ? cacheDelay
+        : 30) * 1000;
+
+    const average = Number(market.item && market.item.average_price);
+
+    return {
+        listings: raw
+            .map((l) => ({
+                price: Number(l && l.price) || 0,
+                amount: Number(l && (l.amount ?? l.quantity)) || 0,
+            }))
+            .filter((l) => l.price > 0 && l.amount > 0),
+        averagePrice: Number.isFinite(average) && average > 0 ? average : null,
+        cacheTimestamp,
+        nextAt: (cacheTimestamp || now) + delayMs,
+        total: Number(data && data._metadata && data._metadata.total) || raw.length,
+    };
 }

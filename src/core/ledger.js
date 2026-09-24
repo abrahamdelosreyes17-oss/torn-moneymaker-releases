@@ -12,7 +12,7 @@
  * expire, because a price from an hour ago is a rumour rather than a listing.
  */
 
-export const LEDGER_VERSION = 'ledger-v1';
+export const LEDGER_VERSION = 'ledger-v2';
 
 /**
  * After this an entry is dropped: the listing has probably gone.
@@ -26,9 +26,23 @@ export const LEDGER_TTL_MS = 10 * 60 * 1000;
 /** Keep the ledger bounded regardless of how long someone browses. */
 export const LEDGER_MAX_ENTRIES = 400;
 
+/*
+ * `row.seenAt` is when the PAGE showed this listing - the first time this
+ * exact price was read since the page loaded - not when the DOM was last
+ * re-read. The 2.5s poll re-reads a page that is not changing; stamping each
+ * re-read "now" made a twenty-minute-old price look brand new, so nothing
+ * ever expired and sold listings stayed linked.
+ */
 function entryFrom(row, now) {
+    const seenAt = Number.isFinite(row.seenAt) ? row.seenAt : now;
+
     return {
         itemId: String(row.itemId),
+        source: row.source || null,
+        // Bazaar sightings remember whose bazaar, so the link goes back there
+        // rather than to an Item Market page where that price never existed.
+        sellerId: row.sellerId ? String(row.sellerId) : null,
+        npcVerified: row.npcVerified !== false,
         name: row.name,
         listingPrice: row.profit.listingPrice,
         exitPrice: row.profit.exitPrice,
@@ -42,7 +56,7 @@ function entryFrom(row, now) {
         realizableProfit: row.profit.realizableProfit,
         cashRequired: row.profit.cashRequired,
         npcShop: row.npcShop || null,
-        seenAt: now,
+        seenAt,
     };
 }
 
@@ -91,7 +105,10 @@ export function recordSightings(ledger, rows, now = Date.now(), seenOnPage) {
 /** Drop expired entries, and trim to the most profitable if oversized. */
 export function pruneLedger(ledger, now = Date.now(), ttl = LEDGER_TTL_MS) {
     for (const [id, entry] of ledger) {
-        if (now - entry.seenAt > ttl) ledger.delete(id);
+        // A missing time is not "forever fresh"; NaN > ttl is false.
+        if (!Number.isFinite(entry.seenAt) || now - entry.seenAt > ttl) {
+            ledger.delete(id);
+        }
     }
 
     if (ledger.size > LEDGER_MAX_ENTRIES) {
@@ -118,6 +135,9 @@ export function ledgerRows(ledger) {
         name: entry.name,
         el: null,
         fromLedger: true,
+        source: entry.source || null,
+        sellerId: entry.sellerId || null,
+        npcVerified: entry.npcVerified !== false,
         seenAt: entry.seenAt,
         qtyAtPrice: entry.qtyAtPrice,
         marketTotal: entry.marketTotal,
@@ -152,6 +172,7 @@ export function readLedgerCacheEntry(cached, now = Date.now()) {
 
     for (const entry of cached.entries || []) {
         if (!entry || !entry.itemId) continue;
+        if (!Number.isFinite(entry.seenAt)) continue;
         if (now - entry.seenAt > LEDGER_TTL_MS) continue;
 
         ledger.set(String(entry.itemId), entry);

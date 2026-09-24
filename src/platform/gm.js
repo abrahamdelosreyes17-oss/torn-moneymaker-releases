@@ -128,3 +128,19 @@ export function gmOpenTab(url) {
         window.open(url, '_blank', 'noopener');
     }
 }
+
+/**
+ * Be told when ANOTHER tab changes a stored value. This is how follower tabs
+ * see the live feed the leader tab writes, without polling anything.
+ * Returns false when the host has no listener API (the caller then re-reads
+ * on its own timer).
+ */
+export function gmOnChange(key, handler) {
+    if (typeof GM_addValueChangeListener !== 'function') return false;
+
+    GM_addValueChangeListener(gmKey(key), (_name, _old, _new, remote) => {
+        if (remote) handler();
+    });
+
+    return true;
+}

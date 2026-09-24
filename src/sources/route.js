@@ -50,3 +50,43 @@ export function itemMarketUrl(itemId, itemName) {
         params.toString()
     );
 }
+
+function queryOf(href) {
+    try {
+        return new URL(href).searchParams;
+    } catch {
+        return new URLSearchParams();
+    }
+}
+
+/**
+ * Whose bazaar is this? `bazaar.php?userId=123`. Null for your own bazaar
+ * (no userId) or anything unparseable - a sighting with no seller is simply
+ * remembered without one.
+ */
+export function bazaarOwnerId(href) {
+    if (detectPage(href) !== PAGE_BAZAAR) return null;
+
+    const id = queryOf(href).get('userId') || queryOf(href).get('userid');
+    return id && /^\d+$/.test(id) ? id : null;
+}
+
+/**
+ * The listing a feed link asked us to point at: `ttItem` / `ttPrice`, which
+ * bazaarUrl() in core/feed.js writes. Highlighting it is reading and marking
+ * the page the user opened, which is allowed; nothing is clicked or filled.
+ */
+export function bazaarTarget(href) {
+    if (detectPage(href) !== PAGE_BAZAAR) return null;
+
+    const q = queryOf(href);
+    const itemId = q.get('ttItem');
+    const price = Number(q.get('ttPrice'));
+
+    if (!itemId || !/^\d+$/.test(itemId)) return null;
+
+    return {
+        itemId,
+        price: Number.isFinite(price) && price > 0 ? price : null,
+    };
+}

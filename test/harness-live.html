@@ -1,0 +1,102 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Live feed harness</title></head>
+<body style="background:#222;color:#ddd;font:12px monospace">
+<div id="out">running... (the feed claims leadership on its first tick and polls on the second, ~6s)</div>
+<script>
+/*
+ * Boots the REAL built userscript on a page that is NOT a Bazaar or the Item
+ * Market, with GM_* stubs whose GM_xmlhttpRequest answers from canned Torn
+ * API and TornW3B payloads. Checks:
+ *   - the live feed finds listings with no market page open
+ *   - bazaar rows link to the seller's bazaar
+ *   - the Torn key never reaches weav3r.dev
+ * Every request URL is recorded in window.__requests.
+ */
+const _store = {};
+const NS = 'tornTrading.v2.';
+const KEY = 'abcdefgh12345678';
+_store[NS + 'apiKey'] = JSON.stringify(KEY);
+_store[NS + 'settings'] = JSON.stringify({ liveFeed: true, useW3b: true });
+
+function GM_getValue(k, d) { return k in _store ? _store[k] : d; }
+function GM_setValue(k, v) { _store[k] = v; }
+function GM_deleteValue(k) { delete _store[k]; }
+function GM_registerMenuCommand() {}
+function GM_addValueChangeListener() {}
+window.__opened = [];
+function GM_openInTab(url) { window.__opened.push(url); }
+
+const NOW_S = Math.floor(Date.now() / 1000);
+const ITEMS = {
+    1: { name: 'Hammer', sell_price: 100, market_value: 120 },
+    206: { name: 'Xanax', sell_price: 600, market_value: 830000 },
+    180: { name: 'Bottle of Beer', sell_price: 50, market_value: 55 },
+};
+
+window.__requests = [];
+function respond(url) {
+    const u = new URL(url);
+    if (u.hostname === 'api.torn.com') {
+        const sel = u.searchParams.get('selections');
+        if (u.pathname === '/torn/' && sel === 'items') return { items: ITEMS };
+        if (u.pathname === '/torn/' && sel === 'cityshops') {
+            return { cityshops: { 1: { name: "Bits 'n' Bobs", inventory: { 1: { price: 90 } } } } };
+        }
+        if (u.pathname === '/key/') return { access_level: 1, access_type: 'Public' };
+        const m = u.pathname.match(/^\/v2\/market\/(\d+)\/itemmarket$/);
+        if (m) {
+            const listings = m[1] === '180' ? [{ price: 30, amount: 10 }, { price: 58, amount: 4 }] : [{ price: 9999999, amount: 1 }];
+            return { itemmarket: { item: { id: +m[1], average_price: 55 }, listings, cache_timestamp: NOW_S - 10, cache_delay: 30 }, _metadata: { total: listings.length } };
+        }
+        return { error: { code: 0, error: 'unknown in harness: ' + u.pathname } };
+    }
+    if (u.hostname === 'weav3r.dev') {
+        if (u.pathname === '/api/marketplace') {
+            return { items: [
+                { item_id: 1, item_name: 'Hammer', lowest_price: 50, market_price: 120, total_bazaars: 3 },
+                { item_id: 206, item_name: 'Xanax', lowest_price: 840000, market_price: 830000 },
+            ] };
+        }
+        if (u.pathname === '/api/marketplace/1') {
+            return { total_listings: 3, listings: [
+                { player_id: 42, player_name: 'Sponsored', price: 95, quantity: 1, last_checked: NOW_S - 20, sponsored: 1 },
+                { player_id: 777, player_name: 'CheapSeller', price: 50, quantity: 4, last_checked: NOW_S - 30 },
+                { player_id: null, price: 10, quantity: 99, last_checked: NOW_S },
+                { player_id: 555, player_name: 'OldNews', price: 40, quantity: 9, last_checked: NOW_S - 3600 },
+            ] };
+        }
+        return { total_listings: 0, listings: [] };
+    }
+    throw new Error('Unexpected host ' + u.hostname);
+}
+function GM_xmlhttpRequest(opts) {
+    window.__requests.push(opts.url);
+    setTimeout(() => {
+        try {
+            opts.onload({ status: 200, responseText: JSON.stringify(respond(opts.url)) });
+        } catch (e) {
+            opts.onerror(e);
+        }
+    }, 5);
+}
+window.onerror = (m) => { document.getElementById('out').textContent = 'BOOT ERROR: ' + m; };
+</script>
+<script src="../torn-moneymaker.user.js"></script>
+<script>
+setTimeout(() => {
+  const out = document.getElementById('out');
+  if (out.textContent.startsWith('BOOT ERROR')) return;
+  const rows = [...document.querySelectorAll('.ttv2-row')].map(r => r.innerText.replace(/\n+/g, ' / '));
+  const w3b = window.__requests.filter(u => u.includes('weav3r.dev'));
+  out.textContent = JSON.stringify({
+    live: (document.querySelector('.ttv2-live') || {}).textContent,
+    status: (document.querySelector('.ttv2-status') || {}).textContent,
+    rows,
+    tosTable: document.querySelectorAll('.ttv2-tos tr').length,
+    keyInputValue: (document.querySelector('.ttv2-settings input') || {}).value,
+    requests: window.__requests.map(u => u.replace(KEY, '<KEY>')),
+    keyEverSentToW3b: w3b.some(u => u.includes(KEY)),
+  }, null, 1);
+  window.__done = true;
+}, 12000);
+</script>
+</body></html>

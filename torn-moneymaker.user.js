@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      2.9.3
-// @description  Ranks Bazaar / Item Market listings on the page you are viewing by the profit you can actually realize.
+// @version      3.0.0
+// @description  Finds Bazaar and Item Market listings below NPC / market value - on the page you are viewing, and live from the Torn API and TornW3B - ranked by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
 // @run-at       document-idle
@@ -12,7 +12,9 @@
 // @grant        GM_registerMenuCommand
 // @grant        GM_openInTab
 // @grant        GM_xmlhttpRequest
+// @grant        GM_addValueChangeListener
 // @connect      api.torn.com
+// @connect      weav3r.dev
 // @downloadURL  https://raw.githubusercontent.com/abrahamdelosreyes17-oss/torn-moneymaker-releases/main/torn-moneymaker.user.js
 // @updateURL    https://raw.githubusercontent.com/abrahamdelosreyes17-oss/torn-moneymaker-releases/main/torn-moneymaker.user.js
 // @noframes
@@ -27,12 +29,15 @@
  *   - It never buys anything. The only action button navigates.
  *   - Public API key only; the key goes to api.torn.com and nowhere else,
  *     and is never logged.
+ *   - The optional TornW3B bazaar feed (weav3r.dev) is opt-in, has its own
+ *     client, and never receives the key.
+ *   - The live feed runs in one visible tab only, and never raises alerts.
  */
 
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '2.9.3';
+    const TTV2_BUILD_VERSION = '3.0.0';
 
     /* ===== src/platform/gm.js ===== */
     /*
@@ -164,6 +169,22 @@
         } else if (typeof window !== 'undefined') {
             window.open(url, '_blank', 'noopener');
         }
+    }
+
+    /**
+     * Be told when ANOTHER tab changes a stored value. This is how follower tabs
+     * see the live feed the leader tab writes, without polling anything.
+     * Returns false when the host has no listener API (the caller then re-reads
+     * on its own timer).
+     */
+    function gmOnChange(key, handler) {
+        if (typeof GM_addValueChangeListener !== 'function') return false;
+
+        GM_addValueChangeListener(gmKey(key), (_name, _old, _new, remote) => {
+            if (remote) handler();
+        });
+
+        return true;
     }
 
     /* ===== src/core/items.js ===== */
@@ -476,9 +497,14 @@
         AUCTION_HOUSE: 0.03,
     };
 
+    /*
+     * "Market" is Torn's rolling average, not a price anyone has offered you -
+     * the live floor can sit well above or below it. The label says so; the NPC
+     * price is the only exit that is guaranteed.
+     */
     const VENUE_LABELS = {
         NPC: 'NPC',
-        ITEM_MARKET: 'Market',
+        ITEM_MARKET: 'Market value (est.)',
         ITEM_MARKET_ANON: 'Market (anon)',
         AUCTION_HOUSE: 'Auction',
     };
@@ -710,6 +736,522 @@
         return Math.floor(hours / 24) + 'd ago';
     }
 
+    /* ===== src/core/feed.js ===== */
+    /*
+     * The live feed: listings found anywhere in Torn, not just on this page.
+     *
+     * Pure - no DOM, no network, no storage. The controller fetches and stores;
+     * this decides what is a candidate, what a snapshot means, and when a row
+     * is too old to show.
+     *
+     * The rule that shapes everything here, learned the hard way: a listing is
+     * only as live as the data behind it. So every row carries TWO times:
+     *
+     *   dataAt    - when the SOURCE last saw it (TornW3B's last_checked, the
+     *               Item Market's cache_timestamp). Expiry and "age" use this.
+     *   fetchedAt - when WE asked. Only a hard cap uses this.
+     *
+     * The old ledger stamped rows with the time the DOM was re-read, every 2.5s,
+     * so a price from twenty minutes ago kept presenting as "just now" and the
+     * panel linked trades that no longer existed. Nothing here refreshes a time
+     * without new data behind it.
+     *
+     * And a new snapshot for an item REPLACES everything known about that item
+     * from that source. Merging is how a sold listing survives.
+     */
+
+
+
+
+    const FEED_CACHE_VERSION = 'feed-v1';
+
+    /** A bazaar row TornW3B has not re-checked in this long is not shown. */
+    const BAZAAR_MAX_DATA_AGE_MS = 5 * 60 * 1000;
+
+    /** Hard cap on a bazaar snapshot, whatever its rows claim. */
+    const BAZAAR_SNAPSHOT_TTL_MS = 10 * 60 * 1000;
+
+    /** Item Market snapshots are 30s-cached at source; 5 min unrefreshed is dead. */
+    const ITEM_MARKET_SNAPSHOT_TTL_MS = 5 * 60 * 1000;
+
+    /** Re-ask TornW3B about a candidate no sooner than its own 60s cache. */
+    const BAZAAR_REFRESH_MS = 60 * 1000;
+
+    /** Most candidates followed up per summary, cheapest-to-check first. */
+    const MAX_CANDIDATES = 30;
+
+    const SOURCE_BAZAAR = 'bazaar';
+    const SOURCE_ITEM_MARKET = 'itemmarket';
+
+    function emptyFeed() {
+        return { bazaar: new Map(), itemmarket: new Map() };
+    }
+
+    /**
+     * The exits an item can be sold into, under the current settings.
+     * Shared with the page scanner so both price listings identically.
+     *
+     * @param {object} item - record from buildItemIndex
+     * @param {object} settings - compareNpc, compareMarket, npcShopsOnly
+     * @param {object|null} npcShop - from npcShopFor
+     */
+    function exitsFor(item, settings = {}, npcShop = null) {
+        const exits = {};
+        if (!item) return exits;
+
+        if (settings.compareNpc !== false) {
+            const sell = Number(item.sellPrice);
+            const shopKnown = !settings.npcShopsOnly || npcShop !== null;
+            if (Number.isFinite(sell) && sell > 0 && shopKnown) exits.NPC = sell;
+        }
+
+        if (settings.compareMarket !== false) {
+            const mv = Number(item.marketValue);
+            if (Number.isFinite(mv) && mv > 0) exits.ITEM_MARKET = mv;
+        }
+
+        return exits;
+    }
+
+    /**
+     * Which items are worth a closer look, from TornW3B's one-call summary.
+     *
+     * One request covers every item; the friend's script made ~1,100 in a
+     * 22-minute loop to answer the same question, and the answer was stale
+     * before it finished.
+     *
+     * @param {Array} summary - from fetchW3bSummary
+     * @param {object} index - from buildItemIndex
+     * @param {object} settings
+     * @returns {Array<{itemId: string, lowestPrice: number, profitPerUnit: number}>}
+     */
+    function selectCandidates(summary, index, settings = {}, max = MAX_CANDIDATES) {
+        const out = [];
+
+        for (const s of summary || []) {
+            if (!s || !s.lowestPrice) continue;
+
+            const item = index && index.byId && index.byId.get(String(s.itemId));
+            if (!item) continue;
+
+            const best = bestVenue({
+                listingPrice: s.lowestPrice,
+                exits: exitsFor(item, settings),
+                qty: 1,
+            });
+
+            if (!best || best.profitPerUnit < 1) continue;
+
+            out.push({
+                itemId: String(s.itemId),
+                lowestPrice: s.lowestPrice,
+                profitPerUnit: best.profitPerUnit,
+            });
+        }
+
+        out.sort((a, b) => b.profitPerUnit - a.profitPerUnit);
+        return max > 0 ? out.slice(0, max) : out;
+    }
+
+    /** Seconds, milliseconds, or nothing -> ms or null. Unknown is not "old". */
+    function toMs(value) {
+        const n = Number(value);
+        if (!Number.isFinite(n) || n <= 0) return null;
+        return n < 1e12 ? n * 1000 : n;
+    }
+
+    /**
+     * TornW3B listings -> feed rows. Rows with no seller are dropped: there is
+     * nowhere to send the user, and "bazaar.php?userId=null" is not a link.
+     * Sorted by price ourselves - TornW3B puts sponsored rows first.
+     */
+    function normalizeW3bListings(raw) {
+        const rows = [];
+
+        for (const l of raw || []) {
+            if (!l) continue;
+
+            const sellerId = Number(l.player_id);
+            const price = Number(l.price);
+            const qty = Number(l.quantity);
+
+            if (!Number.isFinite(sellerId) || sellerId <= 0) continue;
+            if (!Number.isFinite(price) || price <= 0) continue;
+            if (!Number.isFinite(qty) || qty <= 0) continue;
+
+            rows.push({
+                sellerId: String(sellerId),
+                sellerName: l.player_name ? String(l.player_name) : null,
+                price,
+                qty: Math.floor(qty),
+                dataAt: toMs(l.last_checked) || toMs(l.content_updated),
+                changedAt: toMs(l.content_updated),
+            });
+        }
+
+        rows.sort((a, b) => a.price - b.price);
+        return rows;
+    }
+
+    /** Item Market rows are anonymous; identical prices are merged. */
+    function normalizeItemMarketRows(listings) {
+        const byPrice = new Map();
+
+        for (const l of listings || []) {
+            const price = Number(l && l.price);
+            const amount = Number(l && l.amount);
+            if (!(price > 0) || !(amount > 0)) continue;
+            byPrice.set(price, (byPrice.get(price) || 0) + amount);
+        }
+
+        return [...byPrice.entries()]
+            .sort((a, b) => a[0] - b[0])
+            .map(([price, qty]) => ({ price, qty }));
+    }
+
+    /** Replace everything known about an item's bazaar listings. */
+    function setBazaarSnapshot(feed, itemId, rows, fetchedAt) {
+        feed.bazaar.set(String(itemId), { fetchedAt, rows: rows || [] });
+        return feed;
+    }
+
+    /** Replace everything known about an item's Item Market listings. */
+    function setItemMarketSnapshot(
+        feed,
+        itemId,
+        { rows, fetchedAt, dataAt = null, nextAt = null, averagePrice = null },
+    ) {
+        feed.itemmarket.set(String(itemId), {
+            fetchedAt,
+            dataAt: dataAt || fetchedAt,
+            nextAt: nextAt || fetchedAt + 30000,
+            averagePrice,
+            rows: rows || [],
+        });
+        return feed;
+    }
+
+    /**
+     * Drop whatever is too old to trust.
+     * @returns {number} how many rows were removed
+     */
+    function expireFeed(feed, now = Date.now()) {
+        let removed = 0;
+
+        for (const [id, snap] of feed.bazaar) {
+            if (!Number.isFinite(snap.fetchedAt) || now - snap.fetchedAt > BAZAAR_SNAPSHOT_TTL_MS) {
+                removed += snap.rows.length;
+                feed.bazaar.delete(id);
+                continue;
+            }
+
+            const before = snap.rows.length;
+            snap.rows = snap.rows.filter(
+                (r) => r.dataAt === null || now - r.dataAt <= BAZAAR_MAX_DATA_AGE_MS,
+            );
+            removed += before - snap.rows.length;
+        }
+
+        for (const [id, snap] of feed.itemmarket) {
+            if (!Number.isFinite(snap.fetchedAt) || now - snap.fetchedAt > ITEM_MARKET_SNAPSHOT_TTL_MS) {
+                removed += snap.rows.length;
+                feed.itemmarket.delete(id);
+            }
+        }
+
+        return removed;
+    }
+
+    /**
+     * Should this candidate's bazaar listings be (re)fetched now?
+     * Yes when never fetched, when the summary's cheapest price moved, or when
+     * the snapshot is older than TornW3B's own cache.
+     */
+    function bazaarDue(feed, candidate, now = Date.now()) {
+        const snap = feed.bazaar.get(String(candidate.itemId));
+        if (!snap) return true;
+        if (now - snap.fetchedAt >= BAZAAR_REFRESH_MS) return true;
+
+        const cheapest = snap.rows.length ? snap.rows[0].price : null;
+        return cheapest !== candidate.lowestPrice;
+    }
+
+    /** Item Market: never before Torn's global cache can have changed. */
+    function itemMarketDue(feed, itemId, now = Date.now()) {
+        const snap = feed.itemmarket.get(String(itemId));
+        return !snap || now >= snap.nextAt;
+    }
+
+    /** Forget one seller's listing of one item (e.g. the page proved it gone). */
+    function removeBazaarRows(feed, itemId, predicate) {
+        const snap = feed.bazaar.get(String(itemId));
+        if (!snap) return 0;
+
+        const before = snap.rows.length;
+        snap.rows = snap.rows.filter((r) => !predicate(r));
+        return before - snap.rows.length;
+    }
+
+    /**
+     * The page you are viewing is the most authoritative source there is. When
+     * it contradicts the feed, the feed loses.
+     *
+     * - On a seller's bazaar: if the page shows an item from that seller only at
+     *   a HIGHER price than a feed row claims, that row is gone.
+     * - On the Item Market: the page shows the current cheapest price per item;
+     *   any feed row cheaper than that has sold.
+     *
+     * Absence from the page proves nothing - bazaars render lazily - so only a
+     * visible contradiction removes a row.
+     *
+     * @param {object} feed
+     * @param {object} page
+     * @param {'bazaar'|'itemmarket'} page.pageType
+     * @param {string|null} page.sellerId - bazaar owner, from the URL
+     * @param {Array<{itemId, listingPrice}>} page.listings
+     * @returns {number} rows removed
+     */
+    function reconcileWithPage(feed, { pageType, sellerId, listings }) {
+        const pageMin = new Map();
+        for (const l of listings || []) {
+            const id = String(l.itemId);
+            const p = Number(l.listingPrice);
+            if (!(p > 0)) continue;
+            if (!pageMin.has(id) || p < pageMin.get(id)) pageMin.set(id, p);
+        }
+
+        let removed = 0;
+
+        if (pageType === SOURCE_BAZAAR && sellerId) {
+            for (const [id, min] of pageMin) {
+                removed += removeBazaarRows(
+                    feed,
+                    id,
+                    (r) => r.sellerId === String(sellerId) && r.price < min,
+                );
+            }
+        }
+
+        if (pageType === SOURCE_ITEM_MARKET) {
+            for (const [id, min] of pageMin) {
+                const snap = feed.itemmarket.get(id);
+                if (!snap) continue;
+                const before = snap.rows.length;
+                snap.rows = snap.rows.filter((r) => r.price >= min);
+                removed += before - snap.rows.length;
+            }
+        }
+
+        return removed;
+    }
+
+    /** Deep link to one seller's bazaar, carrying what to highlight there. */
+    function bazaarUrl(sellerId, itemId, price) {
+        const params = new URLSearchParams({ userId: String(sellerId) });
+        if (itemId) params.set('ttItem', String(itemId));
+        if (price) params.set('ttPrice', String(price));
+        return 'https://www.torn.com/bazaar.php?' + params.toString() + '#/';
+    }
+
+    /**
+     * Feed rows -> priced opportunities the ranker and panel understand.
+     *
+     * @param {object} feed
+     * @param {object} index - item index
+     * @param {object} settings
+     * @param {object} [ctx]
+     * @param {function} [ctx.npcShopFor] - (itemId) => shop | null
+     * @param {function} [ctx.itemMarketUrl] - (itemId, name) => url
+     * @param {number} [ctx.now]
+     */
+    function feedOpportunities(feed, index, settings = {}, ctx = {}) {
+        const now = ctx.now || Date.now();
+        const shopOf = ctx.npcShopFor || (() => null);
+        const out = [];
+
+        const price = (item, row, extra) => {
+            const npcShop = shopOf(item.id);
+            const profit = bestVenue({
+                listingPrice: row.price,
+                exits: exitsFor(item, settings, npcShop),
+                qty: row.qty,
+                cashOnHand: settings.cashOnHand,
+            });
+
+            if (!profit || profit.profitPerUnit <= 0) return;
+
+            out.push({
+                itemId: item.id,
+                name: item.name,
+                item,
+                el: null,
+                fromFeed: true,
+                qtyAtPrice: true,
+                npcShop,
+                npcVerified: npcShop !== null,
+                profit,
+                cardLabel: '+' + formatMoneyShort(profit.totalProfit),
+                ...extra,
+            });
+        };
+
+        for (const [id, snap] of feed.bazaar) {
+            const item = index && index.byId && index.byId.get(id);
+            if (!item) continue;
+
+            for (const row of snap.rows) {
+                price(item, row, {
+                    source: SOURCE_BAZAAR,
+                    sellerId: row.sellerId,
+                    sellerName: row.sellerName,
+                    dataAt: row.dataAt || snap.fetchedAt,
+                    dataAgeKnown: row.dataAt !== null,
+                    fetchedAt: snap.fetchedAt,
+                    url: bazaarUrl(row.sellerId, id, row.price),
+                });
+            }
+        }
+
+        for (const [id, snap] of feed.itemmarket) {
+            const item = index && index.byId && index.byId.get(id);
+            if (!item) continue;
+
+            for (const row of snap.rows) {
+                price(item, row, {
+                    source: SOURCE_ITEM_MARKET,
+                    sellerId: null,
+                    sellerName: null,
+                    dataAt: snap.dataAt,
+                    dataAgeKnown: true,
+                    fetchedAt: snap.fetchedAt,
+                    url: ctx.itemMarketUrl ? ctx.itemMarketUrl(id, item.name) : null,
+                });
+            }
+        }
+
+        // Keep `now` meaningful for callers that sort by freshness.
+        for (const row of out) row.ageMs = Math.max(0, now - row.dataAt);
+
+        return out;
+    }
+
+    /* -------------------------------------------------------------- storage */
+
+    function makeFeedCacheEntry(feed, now = Date.now()) {
+        return {
+            version: FEED_CACHE_VERSION,
+            savedAt: now,
+            bazaar: [...feed.bazaar.entries()],
+            itemmarket: [...feed.itemmarket.entries()],
+        };
+    }
+
+    function readFeedCacheEntry(entry, now = Date.now()) {
+        const feed = emptyFeed();
+        if (!entry || entry.version !== FEED_CACHE_VERSION) return feed;
+
+        for (const [id, snap] of entry.bazaar || []) {
+            if (snap && Array.isArray(snap.rows)) feed.bazaar.set(String(id), snap);
+        }
+        for (const [id, snap] of entry.itemmarket || []) {
+            if (snap && Array.isArray(snap.rows)) feed.itemmarket.set(String(id), snap);
+        }
+
+        expireFeed(feed, now);
+        return feed;
+    }
+
+    /**
+     * Items worth sweeping on the Item Market when TornW3B has nothing to say
+     * about them: an NPC hit there is only possible when the NPC price is close
+     * to what the item normally trades for.
+     */
+    function itemMarketSweepList(index, settings = {}) {
+        const out = [];
+
+        for (const item of (index && index.byId && index.byId.values()) || []) {
+            const sell = Number(item.sellPrice);
+            const mv = Number(item.marketValue);
+            if (!(sell > 0) || !(mv > 0)) continue;
+
+            // Probe: a listing 15% under market value - would it beat an exit?
+            const probe = computeOpportunity({
+                listingPrice: mv * 0.85,
+                exitPrice: sell,
+                venue: 'NPC',
+            });
+
+            if (settings.compareNpc !== false && probe && probe.profitPerUnit > 0) {
+                out.push(item.id);
+            }
+        }
+
+        return out;
+    }
+
+    /* ===== src/core/leader.js ===== */
+    /*
+     * Which Torn tab runs the live feed. Pure: the caller reads and writes the
+     * shared record.
+     *
+     * Every Torn tab boots this script. Without one leader, five tabs make five
+     * times the requests - Torn's 100/min is per USER across every key and tool,
+     * and TornW3B's 100/min is per IP. So exactly one tab polls and the others
+     * render what it stores.
+     *
+     * Only a VISIBLE tab may lead. Torn's rules forbid software that works from
+     * unfocused pages to "generate alerts, or draw attention to itself"; a hidden
+     * tab polling in the background is the shape of that, so a tab that is
+     * hidden gives up the role instead of keeping it.
+     */
+
+    /** A leader that has not renewed in this long is presumed gone. */
+    const LEADER_STALE_MS = 15000;
+
+    /** How often the leader renews its claim. */
+    const LEADER_HEARTBEAT_MS = 5000;
+
+    /**
+     * @param {object|null} record - { id, ts } as last stored
+     * @param {string} me - this tab's id
+     * @param {object} opts
+     * @param {number} opts.now
+     * @param {boolean} opts.visible
+     * @returns {{lead: boolean, confirmed: boolean, write: object|null}}
+     *   `write` is the record to store (null = leave it alone). `confirmed` is
+     *   true only when the stored record ALREADY named this tab: two tabs can
+     *   both claim a stale record in the same instant, and only the one whose
+     *   write survived sees itself there on the next tick. Poll only when
+     *   confirmed, and the race costs one heartbeat instead of double requests.
+     */
+    function decideLeader(record, me, { now, visible, staleMs = LEADER_STALE_MS }) {
+        const held = record && record.id && Number.isFinite(record.ts);
+        const mine = held && record.id === me;
+        const fresh = held && now - record.ts < staleMs;
+
+        if (mine) {
+            if (visible) {
+                return { lead: true, confirmed: true, write: { id: me, ts: now } };
+            }
+            // Hidden: step down so a visible tab can take over at once.
+            return { lead: false, confirmed: false, write: { id: null, ts: 0 } };
+        }
+
+        if (!fresh && visible) {
+            return { lead: true, confirmed: false, write: { id: me, ts: now } };
+        }
+
+        return { lead: false, confirmed: false, write: null };
+    }
+
+    function makeTabId() {
+        return (
+            Date.now().toString(36) +
+            '-' +
+            Math.random().toString(36).slice(2, 10)
+        );
+    }
+
     /* ===== src/core/ranker.js ===== */
     /*
      * Ranking and filtering. Pure, no DOM.
@@ -822,7 +1364,7 @@
      * expire, because a price from an hour ago is a rumour rather than a listing.
      */
 
-    const LEDGER_VERSION = 'ledger-v1';
+    const LEDGER_VERSION = 'ledger-v2';
 
     /**
      * After this an entry is dropped: the listing has probably gone.
@@ -836,9 +1378,23 @@
     /** Keep the ledger bounded regardless of how long someone browses. */
     const LEDGER_MAX_ENTRIES = 400;
 
+    /*
+     * `row.seenAt` is when the PAGE showed this listing - the first time this
+     * exact price was read since the page loaded - not when the DOM was last
+     * re-read. The 2.5s poll re-reads a page that is not changing; stamping each
+     * re-read "now" made a twenty-minute-old price look brand new, so nothing
+     * ever expired and sold listings stayed linked.
+     */
     function entryFrom(row, now) {
+        const seenAt = Number.isFinite(row.seenAt) ? row.seenAt : now;
+
         return {
             itemId: String(row.itemId),
+            source: row.source || null,
+            // Bazaar sightings remember whose bazaar, so the link goes back there
+            // rather than to an Item Market page where that price never existed.
+            sellerId: row.sellerId ? String(row.sellerId) : null,
+            npcVerified: row.npcVerified !== false,
             name: row.name,
             listingPrice: row.profit.listingPrice,
             exitPrice: row.profit.exitPrice,
@@ -852,7 +1408,7 @@
             realizableProfit: row.profit.realizableProfit,
             cashRequired: row.profit.cashRequired,
             npcShop: row.npcShop || null,
-            seenAt: now,
+            seenAt,
         };
     }
 
@@ -901,7 +1457,10 @@
     /** Drop expired entries, and trim to the most profitable if oversized. */
     function pruneLedger(ledger, now = Date.now(), ttl = LEDGER_TTL_MS) {
         for (const [id, entry] of ledger) {
-            if (now - entry.seenAt > ttl) ledger.delete(id);
+            // A missing time is not "forever fresh"; NaN > ttl is false.
+            if (!Number.isFinite(entry.seenAt) || now - entry.seenAt > ttl) {
+                ledger.delete(id);
+            }
         }
 
         if (ledger.size > LEDGER_MAX_ENTRIES) {
@@ -928,6 +1487,9 @@
             name: entry.name,
             el: null,
             fromLedger: true,
+            source: entry.source || null,
+            sellerId: entry.sellerId || null,
+            npcVerified: entry.npcVerified !== false,
             seenAt: entry.seenAt,
             qtyAtPrice: entry.qtyAtPrice,
             marketTotal: entry.marketTotal,
@@ -962,6 +1524,7 @@
 
         for (const entry of cached.entries || []) {
             if (!entry || !entry.itemId) continue;
+            if (!Number.isFinite(entry.seenAt)) continue;
             if (now - entry.seenAt > LEDGER_TTL_MS) continue;
 
             ledger.set(String(entry.itemId), entry);
@@ -995,6 +1558,23 @@
     const TORN_ERROR_RATE_LIMIT = 5;
     const TORN_ERROR_IP_BLOCK = 8;
     const TORN_ERROR_UNAVAILABLE = 9;
+    const TORN_ERROR_KEY_DISABLED = 13;
+    const TORN_ERROR_KEY_PAUSED = 18;
+
+    /**
+     * Errors that mean "this key must not be used again until the user changes
+     * it". Torn's docs: "Multiple requests using invalid keys may result in a
+     * temporary IP ban - you must account for this by removing disabled or
+     * invalid keys upon error."
+     */
+    const KEY_DEAD_CODES = new Set([
+        TORN_ERROR_KEY_INVALID,
+        TORN_ERROR_KEY_DISABLED,
+        TORN_ERROR_KEY_PAUSED,
+    ]);
+
+    /** Torn's rate block lasts "a small period"; 1-2-4s retries only burn it. */
+    const RATE_LIMIT_BACKOFF_MS = 30000;
 
     class TornApiError extends Error {
         constructor(message, { code = null, http = null } = {}) {
@@ -1030,6 +1610,11 @@
          * @param {number} [options.maxPerMinute]     - request ceiling
          * @param {number} [options.dedupTtlMs]       - reuse identical responses
          * @param {number} [options.maxRetries]
+         * @param {function(): number[]} [options.loadWindow] - shared request
+         *   timestamps, so every open Torn tab draws on ONE budget. Torn's limit
+         *   is per user across all keys; a per-tab window let two tabs make
+         *   140/min against a 100/min ceiling.
+         * @param {function(number[])} [options.saveWindow]
          */
         constructor({
             getKey,
@@ -1037,12 +1622,18 @@
             maxPerMinute = 70,
             dedupTtlMs = 5000,
             maxRetries = 3,
+            loadWindow = null,
+            saveWindow = null,
+            rateLimitBackoffMs = RATE_LIMIT_BACKOFF_MS,
         } = {}) {
             this.getKey = getKey;
             this.fetchImpl = fetchImpl;
             this.maxPerMinute = maxPerMinute;
             this.dedupTtlMs = dedupTtlMs;
             this.maxRetries = maxRetries;
+            this.loadWindow = loadWindow;
+            this.saveWindow = saveWindow;
+            this.rateLimitBackoffMs = rateLimitBackoffMs;
 
             /** Timestamps of recent requests, for the sliding window. */
             this.recent = [];
@@ -1055,6 +1646,7 @@
 
         /** Requests made in the last 60s, and room remaining. */
         stats(now = Date.now()) {
+            this.syncWindow(now);
             const window = this.recent.filter((t) => now - t < 60000);
             return {
                 usedLastMinute: window.length,
@@ -1062,14 +1654,45 @@
             };
         }
 
+        /**
+         * Adopt the shared window: it already holds this tab's own requests,
+         * because every slot taken is saved back to it. Replacing rather than
+         * merging matters - two requests in the same millisecond are two
+         * requests, and a Set of timestamps would count them as one.
+         */
+        syncWindow(now = Date.now()) {
+            if (!this.loadWindow) return;
+
+            let shared;
+            try {
+                shared = this.loadWindow();
+            } catch {
+                return;
+            }
+            if (!Array.isArray(shared)) return;
+
+            this.recent = shared
+                .filter((t) => Number.isFinite(t) && now - t < 60000)
+                .sort((a, b) => a - b);
+        }
+
         /** Block until the sliding window has room for one more request. */
         async waitForSlot() {
             for (;;) {
                 const now = Date.now();
+                this.syncWindow(now);
                 this.recent = this.recent.filter((t) => now - t < 60000);
 
                 if (this.recent.length < this.maxPerMinute) {
                     this.recent.push(now);
+                    if (this.saveWindow) {
+                        try {
+                            this.saveWindow(this.recent);
+                        } catch {
+                            // Sharing the window is best-effort; the local one
+                            // still limits this tab.
+                        }
+                    }
                     return;
                 }
 
@@ -1105,10 +1728,18 @@
 
             try {
                 const data = await promise;
+                this.pruneCache();
                 this.cache.set(cacheKey, { at: Date.now(), data });
                 return data;
             } finally {
                 this.inflight.delete(cacheKey);
+            }
+        }
+
+        /** The dedup cache is for bursts, not memory; a sweep adds hundreds. */
+        pruneCache(now = Date.now()) {
+            for (const [k, v] of this.cache) {
+                if (now - v.at >= this.dedupTtlMs) this.cache.delete(k);
             }
         }
 
@@ -1139,8 +1770,17 @@
                         throw error;
                     }
 
-                    // Exponential backoff, not a retry loop. 1s, 2s, 4s.
-                    await apiSleep(1000 * Math.pow(2, attempt));
+                    // Torn's rate block outlasts a quick retry; wait it out.
+                    // Otherwise exponential backoff: 1s, 2s, 4s.
+                    const rateLimited =
+                        error instanceof TornApiError &&
+                        (error.code === TORN_ERROR_RATE_LIMIT || error.http === 429);
+
+                    await apiSleep(
+                        rateLimited
+                            ? this.rateLimitBackoffMs
+                            : 1000 * Math.pow(2, attempt),
+                    );
                     attempt += 1;
                 }
             }
@@ -1161,7 +1801,16 @@
         }
 
         async requestOnce(path, params, key) {
-            const url = new URL(String(path).replace(/^\/+/, '') + '/', TORN_API_BASE);
+            /*
+             * v1 paths take a trailing slash ("torn/?selections=items" is the form
+             * verified in game). v2 paths are written without one everywhere they
+             * are documented, so they are left exactly as given.
+             */
+            const clean = String(path).replace(/^\/+/, '');
+            const url = new URL(
+                /^v2\//.test(clean) ? clean : clean + '/',
+                TORN_API_BASE,
+            );
 
             /*
              * A relative path resolves under the base, but an ABSOLUTE one
@@ -1205,18 +1854,248 @@
                 throw new TornApiError('Torn API returned invalid JSON.');
             }
 
-            if (data && data.error) {
+            /*
+             * Errors arrive as HTTP 200 with { error: { code, error } } - and
+             * some v2 endpoints are reported to put { code, error } at the top
+             * level instead. Read both, or a v2 error looks like an empty result.
+             */
+            const err =
+                data && data.error && typeof data.error === 'object'
+                    ? data.error
+                    : data &&
+                        Number.isFinite(Number(data.code)) &&
+                        typeof data.error === 'string'
+                      ? { code: Number(data.code), error: data.error }
+                      : null;
+
+            if (err) {
                 throw new TornApiError(
-                    'Torn API ' +
-                        data.error.code +
-                        ': ' +
-                        redactKey(data.error.error, key),
-                    { code: data.error.code },
+                    'Torn API ' + err.code + ': ' + redactKey(err.error, key),
+                    { code: Number(err.code) },
                 );
             }
 
             return data;
         }
+    }
+
+    /* ===== src/api/w3b.js ===== */
+    /*
+     * TornW3B (weav3r.dev) - the crowd-sourced bazaar price feed.
+     *
+     * Torn's API has no per-listing bazaar prices a Public key can trust (the
+     * `user -> bazaar` selection can be served days old on a Public key, and the
+     * `market -> bazaar` selection is a directory with no prices). TornW3B polls
+     * bazaars with keys their SELLERS donated, for their own bazaar only, and
+     * publishes the result. TornTools, TornPDA and Weav3r's own script read it.
+     *
+     * Non-negotiables, enforced here rather than by convention:
+     *
+     *   1. This client NEVER sees a Torn API key. It has no key parameter, no
+     *      getKey, and the only query it ever sends is `comment`. The Torn client
+     *      and this one share nothing.
+     *   2. weav3r.dev is the only destination - asserted on the resolved URL, not
+     *      just implied by a constant, exactly as client.js does for api.torn.com.
+     *   3. Its own sliding window, well under TornW3B's 100/min Cloudflare limit,
+     *      and a hard cooldown on 429 or a non-JSON (Cloudflare challenge) body.
+     *
+     * Responses are cached server-side for 60s, so asking faster is pointless.
+     */
+
+
+
+    const W3B_API_BASE = 'https://weav3r.dev/api/';
+    const W3B_HOST = 'weav3r.dev';
+    const W3B_TERMS_URL = 'https://weav3r.dev/terms-of-service';
+    const W3B_SITE_URL = 'https://weav3r.dev';
+
+    /** TornW3B enforces 100/min; stay well clear so other tools keep working. */
+    const W3B_MAX_PER_MINUTE = 40;
+
+    /** After a 429 or a challenge page, stop asking for this long. */
+    const W3B_COOLDOWN_MS = 60000;
+
+    class W3bError extends Error {
+        constructor(message, { http = null, blocked = false } = {}) {
+            super(message);
+            this.name = 'W3bError';
+            this.http = http;
+            this.blocked = blocked;
+        }
+    }
+
+    function w3bSleep(ms) {
+        return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
+    class W3bClient {
+        /**
+         * @param {object} [options]
+         * @param {function} [options.fetchImpl] - injectable for tests
+         * @param {number} [options.maxPerMinute]
+         * @param {function} [options.now]
+         */
+        constructor({
+            fetchImpl = gmFetch,
+            maxPerMinute = W3B_MAX_PER_MINUTE,
+            now = () => Date.now(),
+        } = {}) {
+            this.fetchImpl = fetchImpl;
+            this.maxPerMinute = maxPerMinute;
+            this.now = now;
+            this.recent = [];
+            this.chain = Promise.resolve();
+            this.cooldownUntil = 0;
+        }
+
+        stats() {
+            const t = this.now();
+            const used = this.recent.filter((x) => t - x < 60000).length;
+            return {
+                usedLastMinute: used,
+                remaining: Math.max(0, this.maxPerMinute - used),
+                coolingDown: t < this.cooldownUntil,
+            };
+        }
+
+        async waitForSlot() {
+            for (;;) {
+                const t = this.now();
+                this.recent = this.recent.filter((x) => t - x < 60000);
+
+                if (this.recent.length < this.maxPerMinute) {
+                    this.recent.push(t);
+                    return;
+                }
+
+                await w3bSleep(Math.max(50, 60000 - (t - this.recent[0]) + 25));
+            }
+        }
+
+        /** Build and check a URL. Exposed for tests. */
+        buildUrl(path) {
+            const url = new URL(String(path).replace(/^\/+/, ''), W3B_API_BASE);
+
+            if (url.hostname !== W3B_HOST) {
+                throw new W3bError('Refusing to contact ' + url.hostname + '.');
+            }
+
+            // Nothing but an attribution comment ever goes in the query.
+            url.search = '';
+            url.searchParams.set('comment', 'TornTradingV2');
+
+            return url;
+        }
+
+        /** GET one TornW3B path. Serialised, rate-limited, never keyed. */
+        get(path) {
+            const run = () => this.execute(path);
+            const promise = this.chain.catch(() => {}).then(run);
+            this.chain = promise.catch(() => {});
+            return promise;
+        }
+
+        async execute(path) {
+            if (this.now() < this.cooldownUntil) {
+                throw new W3bError('TornW3B is rate limiting us; paused briefly.', {
+                    blocked: true,
+                });
+            }
+
+            const url = this.buildUrl(path);
+            await this.waitForSlot();
+
+            let response;
+            try {
+                response = await this.fetchImpl(url.toString());
+            } catch (error) {
+                throw new W3bError(
+                    'TornW3B network error: ' + ((error && error.message) || error),
+                );
+            }
+
+            if (response.status === 429) {
+                this.cooldownUntil = this.now() + W3B_COOLDOWN_MS;
+                throw new W3bError('TornW3B rate limit (429).', {
+                    http: 429,
+                    blocked: true,
+                });
+            }
+
+            if (!response.ok) {
+                throw new W3bError('TornW3B HTTP ' + response.status, {
+                    http: response.status,
+                });
+            }
+
+            try {
+                return await response.json();
+            } catch {
+                // Cloudflare answers a challenge page with HTML, not JSON.
+                this.cooldownUntil = this.now() + W3B_COOLDOWN_MS;
+                throw new W3bError('TornW3B returned a non-JSON page (blocked?).', {
+                    blocked: true,
+                });
+            }
+        }
+    }
+
+    /**
+     * Cheapest bazaar price for every item, in one request.
+     *
+     * @returns {Promise<Array<{itemId: string, name: string, lowestPrice: number|null,
+     *   marketPrice: number|null, bazaarAverage: number|null, totalBazaars: number}>>}
+     */
+    async function fetchW3bSummary(client) {
+        const data = await client.get('marketplace');
+        const items = data && Array.isArray(data.items) ? data.items : null;
+
+        if (!items) throw new W3bError('TornW3B returned no item summary.');
+
+        return items
+            .filter((i) => i && Number.isFinite(Number(i.item_id)))
+            .map((i) => ({
+                itemId: String(i.item_id),
+                name: i.item_name || '',
+                lowestPrice: positiveOrNull(i.lowest_price),
+                marketPrice: positiveOrNull(i.market_price),
+                bazaarAverage: positiveOrNull(i.bazaar_average),
+                totalBazaars: Number(i.total_bazaars) || 0,
+            }));
+    }
+
+    /**
+     * Every bazaar listing TornW3B knows for one item.
+     *
+     * Retries once when the payload says there are listings but sends none - a
+     * known mid-scan glitch. `maxPrice` and friends are deliberately NOT sent:
+     * they are not in TornW3B's spec, TornTools filters client-side anyway, and
+     * trusting an ignored filter is how a list fills with rows that are not deals.
+     *
+     * @returns {Promise<{listings: Array, total: number}>} raw listing objects
+     */
+    async function fetchW3bListings(client, itemId) {
+        const path = 'marketplace/' + encodeURIComponent(String(itemId));
+
+        let data = await client.get(path);
+
+        const empty = (d) =>
+            d &&
+            Number(d.total_listings) > 0 &&
+            Array.isArray(d.listings) &&
+            d.listings.length === 0;
+
+        if (empty(data)) data = await client.get(path);
+
+        return {
+            listings: data && Array.isArray(data.listings) ? data.listings : [],
+            total: Number(data && data.total_listings) || 0,
+        };
+    }
+
+    function positiveOrNull(value) {
+        const n = Number(value);
+        return Number.isFinite(n) && n > 0 ? n : null;
     }
 
     /* ===== src/api/torn.js ===== */
@@ -1303,26 +2182,57 @@
     }
 
     /**
-     * Item Market listings for one item (Item Market 2.0, API v2).
+     * Item Market listings for one item: GET /v2/market/{id}/itemmarket.
      *
-     * Phase 1 does not call this - the panel is fed from the page you are
-     * viewing. It is here because it is the Phase 2 data source and it belongs
-     * next to its siblings.
+     * Public key. "Globally cached selection" - Torn serves everyone the same
+     * snapshot and refreshes it no faster than `cache_delay` seconds (30 in every
+     * observed response), so asking again before cache_timestamp + cache_delay
+     * returns the same rows and only spends quota. The caller uses `nextAt` to
+     * avoid that.
+     *
+     * The response names no seller and no listing id: a row is a price and an
+     * amount. So an Item Market hit links to the item, never to a seller.
+     *
+     * @returns {Promise<{listings: Array<{price: number, amount: number}>,
+     *   averagePrice: number|null, cacheTimestamp: number|null, nextAt: number,
+     *   total: number}>} cacheTimestamp and nextAt in ms
      */
-    async function fetchItemMarket(client, itemId, { offset = 0 } = {}) {
-        const data = await client.get('v2/market/' + encodeURIComponent(itemId), {
-            selections: 'itemmarket',
-            offset,
-        });
+    async function fetchItemMarket(
+        client,
+        itemId,
+        { limit = 20, offset = 0, now = Date.now() } = {},
+    ) {
+        const data = await client.get(
+            'v2/market/' + encodeURIComponent(String(itemId)) + '/itemmarket',
+            { limit, offset },
+        );
 
-        const listings =
-            (data && data.itemmarket && data.itemmarket.listings) || [];
+        const market = (data && data.itemmarket) || {};
+        const raw = Array.isArray(market.listings) ? market.listings : [];
 
-        return listings.map((listing) => ({
-            id: listing.id ?? null,
-            price: Number(listing.price) || 0,
-            quantity: Number(listing.amount ?? listing.quantity) || 0,
-        }));
+        const cacheTs = Number(market.cache_timestamp);
+        const cacheDelay = Number(market.cache_delay);
+        const cacheTimestamp = Number.isFinite(cacheTs) && cacheTs > 0
+            ? cacheTs * 1000
+            : null;
+        const delayMs = (Number.isFinite(cacheDelay) && cacheDelay > 0
+            ? cacheDelay
+            : 30) * 1000;
+
+        const average = Number(market.item && market.item.average_price);
+
+        return {
+            listings: raw
+                .map((l) => ({
+                    price: Number(l && l.price) || 0,
+                    amount: Number(l && (l.amount ?? l.quantity)) || 0,
+                }))
+                .filter((l) => l.price > 0 && l.amount > 0),
+            averagePrice: Number.isFinite(average) && average > 0 ? average : null,
+            cacheTimestamp,
+            nextAt: (cacheTimestamp || now) + delayMs,
+            total: Number(data && data._metadata && data._metadata.total) || raw.length,
+        };
     }
 
     /* ===== src/sources/route.js ===== */
@@ -1377,6 +2287,46 @@
             'https://www.torn.com/page.php?sid=ItemMarket#/market/view=search&' +
             params.toString()
         );
+    }
+
+    function queryOf(href) {
+        try {
+            return new URL(href).searchParams;
+        } catch {
+            return new URLSearchParams();
+        }
+    }
+
+    /**
+     * Whose bazaar is this? `bazaar.php?userId=123`. Null for your own bazaar
+     * (no userId) or anything unparseable - a sighting with no seller is simply
+     * remembered without one.
+     */
+    function bazaarOwnerId(href) {
+        if (detectPage(href) !== PAGE_BAZAAR) return null;
+
+        const id = queryOf(href).get('userId') || queryOf(href).get('userid');
+        return id && /^\d+$/.test(id) ? id : null;
+    }
+
+    /**
+     * The listing a feed link asked us to point at: `ttItem` / `ttPrice`, which
+     * bazaarUrl() in core/feed.js writes. Highlighting it is reading and marking
+     * the page the user opened, which is allowed; nothing is clicked or filled.
+     */
+    function bazaarTarget(href) {
+        if (detectPage(href) !== PAGE_BAZAAR) return null;
+
+        const q = queryOf(href);
+        const itemId = q.get('ttItem');
+        const price = Number(q.get('ttPrice'));
+
+        if (!itemId || !/^\d+$/.test(itemId)) return null;
+
+        return {
+            itemId,
+            price: Number.isFinite(price) && price > 0 ? price : null,
+        };
     }
 
     /* ===== src/sources/dom/detect.js ===== */
@@ -1948,6 +2898,13 @@
     }
 
     /* The best few opportunities on the page get a warmer fill. */
+    /* The listing a feed link was opened for. Paint-only, like .ttv2-hit. */
+    .ttv2-target {
+        box-shadow:
+            inset 0 0 0 3px #ffd24a,
+            inset 0 0 0 9999px rgba(255, 210, 74, 0.14) !important;
+    }
+
     .ttv2-hit-top {
         box-shadow:
             inset 0 0 0 3px #7ee08f,
@@ -2154,6 +3111,50 @@
         cursor: help;
     }
 
+    /* Where a row came from and how old its data is. */
+    .ttv2-row-src {
+        color: #8ea394;
+        font-size: 10px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+
+    .ttv2-row.ttv2-stale .ttv2-age {
+        color: #ffd24a;
+    }
+
+    /* Already followed: dimmed until the source re-confirms the listing. */
+    .ttv2-row.ttv2-opened .ttv2-row-name {
+        color: #8ea394;
+    }
+
+    .ttv2-live {
+        font-size: 10px;
+    }
+
+    /* Torn's required API-key disclosure table. */
+    .ttv2-tos {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 10px;
+        color: #a9bdad;
+    }
+
+    .ttv2-tos th,
+    .ttv2-tos td {
+        text-align: left;
+        vertical-align: top;
+        padding: 2px 4px;
+        border-bottom: 1px solid #2c382e;
+    }
+
+    .ttv2-tos th {
+        width: 38%;
+        color: #8ea394;
+        font-weight: normal;
+    }
+
     .ttv2-settings {
         display: none;
         flex-direction: column;
@@ -2286,6 +3287,7 @@
 
 
 
+
     /** Rows fade once the scan behind them is older than this. */
     const PANEL_STALE_MS = 60000;
 
@@ -2389,6 +3391,7 @@
              * ("this key has Full access") within the same tick.
              */
             this.summaryEl = el('div', { class: 'ttv2-status ttv2-summary' });
+            this.liveEl = el('div', { class: 'ttv2-status ttv2-live' });
             this.diagEl = el('div', { class: 'ttv2-diag' });
             this.filtersEl = el('div', { class: 'ttv2-filters' });
             this.settingsEl = el('div', { class: 'ttv2-settings' });
@@ -2459,6 +3462,7 @@
             this.bodyEl = el('div', { class: 'ttv2-body' }, [
                 this.statusEl,
                 this.summaryEl,
+                this.liveEl,
                 this.settingsEl,
                 this.filtersEl,
                 this.listEl,
@@ -2526,12 +3530,26 @@
                 text: 'No key saved.',
             });
 
+            /*
+             * The saved key is NOT kept in the field. A value in an <input> on
+             * torn.com can be read by any script on the page. Show fetches it
+             * into the field; Hide takes it out again.
+             */
+            this.keyRevealed = false;
             const showBtn = el('button', {
                 type: 'button',
                 text: 'Show',
                 onclick: () => {
                     const hidden = this.keyInput.classList.toggle('ttv2-masked');
                     showBtn.textContent = hidden ? 'Show' : 'Hide';
+
+                    if (!hidden && !this.keyInput.value && this.handlers.onRevealKey) {
+                        this.keyInput.value = this.handlers.onRevealKey() || '';
+                        this.keyRevealed = true;
+                    } else if (hidden && this.keyRevealed) {
+                        this.keyInput.value = '';
+                        this.keyRevealed = false;
+                    }
                 },
             });
 
@@ -2596,6 +3614,80 @@
             );
             this.settingsEl.appendChild(this.keyStateEl);
             this.settingsEl.appendChild(keyNote);
+            this.settingsEl.appendChild(this.buildTosTable());
+
+            /* ---- live feed ---- */
+
+            this.liveFeedInput = el('input', { type: 'checkbox' });
+            this.liveFeedInput.addEventListener('change', () =>
+                this.emitSettings({ liveFeed: this.liveFeedInput.checked }),
+            );
+
+            this.useW3bInput = el('input', { type: 'checkbox' });
+            this.useW3bInput.addEventListener('change', () =>
+                this.emitSettings({ useW3b: this.useW3bInput.checked }),
+            );
+
+            const liveLabel = el('label', { class: 'ttv2-check' }, [this.liveFeedInput]);
+            liveLabel.appendChild(
+                document.createTextNode(
+                    ' Watch the Item Market from any Torn page',
+                ),
+            );
+
+            const w3bLabel = el('label', { class: 'ttv2-check' }, [this.useW3bInput]);
+            w3bLabel.appendChild(
+                document.createTextNode(' Also watch bazaars, using TornW3B'),
+            );
+
+            const w3bNote = el('div', { class: 'ttv2-note' });
+            w3bNote.appendChild(
+                document.createTextNode(
+                    'Bazaar prices come from TornW3B (',
+                ),
+            );
+            w3bNote.appendChild(
+                el('a', {
+                    href: W3B_SITE_URL,
+                    target: '_blank',
+                    rel: 'noopener noreferrer',
+                    text: 'weav3r.dev',
+                }),
+            );
+            w3bNote.appendChild(
+                document.createTextNode(
+                    '), a community service that TornTools also uses. Only item ' +
+                        'ids are sent to it - never your API key. Its prices are ' +
+                        'minutes old at best, so each row says how old. By ' +
+                        'enabling it you accept its ',
+                ),
+            );
+            w3bNote.appendChild(
+                el('a', {
+                    href: W3B_TERMS_URL,
+                    target: '_blank',
+                    rel: 'noopener noreferrer',
+                    text: 'terms of service',
+                }),
+            );
+            w3bNote.appendChild(document.createTextNode('.'));
+
+            this.settingsEl.appendChild(el('h4', { text: 'Live feed' }));
+            this.settingsEl.appendChild(liveLabel);
+            this.settingsEl.appendChild(w3bLabel);
+            this.settingsEl.appendChild(w3bNote);
+            this.settingsEl.appendChild(
+                el('div', {
+                    class: 'ttv2-note',
+                    text:
+                        'Runs in ONE Torn tab at a time, and only while you are ' +
+                        'looking at it: a hidden tab stops. It never plays sounds ' +
+                        'or sends notifications, and never buys or clicks ' +
+                        'anything - each row is a link you choose to follow. It ' +
+                        'uses at most 20 Torn API calls a minute, leaving room ' +
+                        'for your other tools.',
+                }),
+            );
 
             /* ---- behaviour ---- */
 
@@ -2623,6 +3715,39 @@
         }
 
         /**
+         * Torn's API Terms of Service require any tool that takes a key to state,
+         * in this table form and where the key is entered, how it uses the key.
+         */
+        buildTosTable() {
+            const rows = [
+                ['Data storage', 'Only locally (in this browser)'],
+                ['Data sharing', 'Nobody'],
+                [
+                    'Purpose of use',
+                    'Competitive advantage: finding Bazaar and Item Market ' +
+                        'listings priced below NPC / market value',
+                ],
+                ['Key storage & sharing', 'Stored locally / Not shared'],
+                [
+                    'Key access level',
+                    'Public (torn: items, cityshops; market: itemmarket; key: info)',
+                ],
+            ];
+
+            const table = el('table', { class: 'ttv2-tos' });
+            for (const [k, v] of rows) {
+                table.appendChild(
+                    el('tr', {}, [el('th', { text: k }), el('td', { text: v })]),
+                );
+            }
+
+            return el('div', {}, [
+                el('h4', { text: 'API key terms of use' }),
+                table,
+            ]);
+        }
+
+        /**
          * Reflect key status without ever showing the key itself.
          * @param {object} info - { hasKey, accessName, overScoped }
          */
@@ -2645,9 +3770,9 @@
                 return;
             }
 
-            this.keyStateEl.textContent = accessName
-                ? 'Saved - ' + accessName + ' access.'
-                : 'Saved.';
+            this.keyStateEl.textContent =
+                (accessName ? 'Saved - ' + accessName + ' access.' : 'Saved.') +
+                ' Hidden from the page; press Show to see it.';
             this.keyStateEl.classList.add('ttv2-ok');
         }
 
@@ -2657,7 +3782,7 @@
             this.minProfitInput = el('input', {
                 type: 'text',
                 inputmode: 'numeric',
-                placeholder: '1000',
+                placeholder: '1',
             });
             this.minProfitInput.addEventListener('change', () => {
                 this.emitSettings({
@@ -2733,7 +3858,8 @@
                     this.showAllSeenInput,
                     'Show everything seen while browsing',
                     'Keeps results from every category you visit, not just the ' +
-                        'page you are on. Entries expire after 30 minutes.',
+                        'page you are on. Entries expire 10 minutes after the page ' +
+                        'showed them.',
                 ),
             );
 
@@ -2885,6 +4011,12 @@
             if (this.npcShopsOnlyInput && settings.npcShopsOnly !== undefined) {
                 this.npcShopsOnlyInput.checked = Boolean(settings.npcShopsOnly);
             }
+            if (this.liveFeedInput && settings.liveFeed !== undefined) {
+                this.liveFeedInput.checked = Boolean(settings.liveFeed);
+            }
+            if (this.useW3bInput && settings.useW3b !== undefined) {
+                this.useW3bInput.checked = Boolean(settings.useW3b);
+            }
             if (settings.collapsed !== undefined) {
                 this.setCollapsed(settings.collapsed);
             }
@@ -2911,7 +4043,33 @@
             }
 
             this.renderDiagnostics();
+            this.renderLive();
             this.refreshAges();
+        }
+
+        renderLive() {
+            const live = this.state.live;
+            if (!this.liveEl) return;
+
+            if (!live || !live.enabled) {
+                this.liveEl.textContent = 'Live feed: off (Settings)';
+                this.liveEl.classList.remove('ttv2-warn');
+                return;
+            }
+
+            const bits = ['Live feed: ' + (live.leading ? 'on' : 'on in another tab')];
+
+            if (live.leading) {
+                bits.push(live.itemMarket ? 'Item Market' : 'no key');
+                bits.push(live.w3b ? 'bazaars (' + live.candidates + ' leads)' : 'bazaars off');
+                if (live.lastCycleAt) {
+                    bits.push('updated ' + formatAge(Date.now() - live.lastCycleAt));
+                }
+            }
+
+            this.liveEl.textContent = bits.join('  |  ');
+            this.liveEl.title = live.lastError || '';
+            this.liveEl.classList.toggle('ttv2-warn', Boolean(live.lastError));
         }
 
         /**
@@ -2924,8 +4082,22 @@
          */
         emptyReason() {
             const d = this.state.diagnostics;
+            const live = this.state.live;
 
-            if (!d) return 'Press Scan.';
+            if (!d) {
+                if (live && live.enabled && !live.itemMarket) {
+                    return 'The live feed needs a Public API key - paste one under Settings.';
+                }
+                if (live && live.enabled && live.leading) {
+                    return live.candidates || live.itemMarket
+                        ? 'Watching the market - nothing profitable right now.'
+                        : 'Watching the market...';
+                }
+                if (live && live.enabled) {
+                    return 'Live feed runs in another Torn tab; results appear here.';
+                }
+                return 'Open a Bazaar or the Item Market, or turn on the live feed in Settings.';
+            }
 
             if (d.images === 0) {
                 return (
@@ -2969,15 +4141,14 @@
             name.appendChild(document.createTextNode(row.name));
 
             if (row.fromLedger) {
-                const age = Math.round((Date.now() - row.seenAt) / 60000);
                 name.appendChild(
                     el('span', {
                         class: 'ttv2-guess',
                         title:
                             'Seen on another page, not on this one. The listing ' +
-                            'may already be gone - the button opens the item so ' +
-                            'you can check.',
-                        text: age < 1 ? ' (elsewhere)' : ' (' + age + 'm ago)',
+                            'may already be gone - the button opens it so you ' +
+                            'can check.',
+                        text: ' (seen elsewhere)',
                     }),
                 );
             }
@@ -3090,23 +4261,83 @@
 
             const main = el('div', { class: 'ttv2-row-main' }, [
                 name,
+                this.sourceLine(row),
                 buyLine,
                 eachLine,
                 totalLine,
                 shopLine,
             ]);
 
+            const where =
+                row.source === 'bazaar'
+                    ? row.sellerName
+                        ? "Open " + row.sellerName + "'s bazaar"
+                        : 'Open this bazaar'
+                    : 'Open this item on the Item Market';
+
             const go = el('button', {
                 type: 'button',
-                title: row.el
-                    ? 'Scroll to this listing'
-                    : 'Open this item on the Item Market',
+                title: row.el ? 'Scroll to this listing' : where,
                 text: '>',
                 onclick: () =>
                     this.handlers.onNavigate && this.handlers.onNavigate(row),
             });
 
-            return el('div', { class: 'ttv2-row' }, [main, go]);
+            const rowEl = el('div', { class: 'ttv2-row' }, [main, go]);
+            rowEl.dataset.ttv2At = String(this.rowTime(row) || '');
+            if (row.opened) rowEl.classList.add('ttv2-opened');
+
+            return rowEl;
+        }
+
+        /** When the data behind a row was true - not when we last looked. */
+        rowTime(row) {
+            if (row.fromFeed) return row.dataAt;
+            return row.seenAt || null;
+        }
+
+        /**
+         * Where a row came from, and how old it is. Every row says this, because
+         * "is this still there?" is the question that matters most.
+         */
+        sourceLine(row) {
+            const parts = [];
+
+            if (row.source === 'bazaar') {
+                parts.push('Bazaar' + (row.sellerName ? ' - ' + row.sellerName : ''));
+            } else if (row.source === 'itemmarket') {
+                parts.push('Item Market');
+            }
+
+            if (row.el) parts.push('on this page');
+            else if (row.fromFeed) parts.push(row.source === 'bazaar' ? 'via TornW3B' : 'via Torn API');
+            else if (row.fromLedger) parts.push('remembered');
+
+            const line = el('div', {
+                class: 'ttv2-row-src',
+                text: parts.join(' | '),
+            });
+
+            const age = el('span', { class: 'ttv2-age' });
+            line.appendChild(document.createTextNode(' | '));
+            line.appendChild(age);
+
+            if (row.fromFeed && row.dataAgeKnown === false) {
+                age.title = 'TornW3B did not say when it last checked this.';
+            }
+            if (row.opened) {
+                line.appendChild(
+                    el('span', {
+                        class: 'ttv2-guess',
+                        title:
+                            'You opened this already. It lights up again if the ' +
+                            'listing is re-confirmed.',
+                        text: ' | opened',
+                    }),
+                );
+            }
+
+            return line;
         }
 
         renderDiagnostics() {
@@ -3132,27 +4363,39 @@
         }
 
         refreshAges() {
-            if (!this.root || !this.state.lastScanAt) return;
+            if (!this.root) return;
 
-            const age = Date.now() - this.state.lastScanAt;
-            const stale = age > PANEL_STALE_MS;
+            const now = Date.now();
 
+            /*
+             * Staleness is per row, from the time its DATA was true. The panel
+             * used to fade on "time since last scan" - which the 2.5s poll reset
+             * forever, so nothing ever looked stale.
+             */
             for (const rowEl of this.listEl.querySelectorAll('.ttv2-row')) {
-                rowEl.classList.toggle('ttv2-stale', stale);
+                const at = Number(rowEl.dataset.ttv2At);
+                const ageEl = rowEl.querySelector('.ttv2-age');
+                const known = Number.isFinite(at) && at > 0;
+
+                if (ageEl) ageEl.textContent = known ? formatAge(now - at) : 'age unknown';
+                rowEl.classList.toggle('ttv2-stale', known && now - at > PANEL_STALE_MS);
             }
 
-            const summary = this.state.summary || { count: 0, totalProfit: 0 };
+            this.renderLive();
 
-            const where = this.state.diagnostics && this.state.diagnostics.pageType;
+            const summary = this.state.summary || { count: 0, totalProfit: 0 };
+            const where = this.state.pageType;
+            const age = this.state.lastScanAt ? now - this.state.lastScanAt : null;
+            const stale = age !== null && age > PANEL_STALE_MS;
 
             this.summaryEl.textContent =
-                (where === 'bazaar' ? 'Bazaar' : where === 'itemmarket' ? 'Item Market' : '-') +
+                (where === 'bazaar' ? 'Bazaar' : where === 'itemmarket' ? 'Item Market' : 'Live feed') +
                 '  |  ' +
                 summary.count +
                 ' opportunities  |  +' +
                 formatMoneyShort(summary.totalProfit) +
-                ' total  |  ' +
-                formatAge(age);
+                ' total' +
+                (age !== null ? '  |  scanned ' + formatAge(age) : '');
 
             this.summaryEl.classList.toggle('ttv2-warn', stale);
         }
@@ -3249,12 +4492,361 @@
         el.scrollIntoView({ behavior: 'smooth', block: 'center' });
     }
 
+    const TARGET_CLASS = 'ttv2-target';
+
+    /**
+     * Point at the listing a feed link was opened for. Adds one class; scrolls
+     * only the first time, so a re-render does not yank the page around.
+     */
+    function markTarget(el, scroll = false) {
+        if (!el || !el.classList) return;
+
+        for (const other of document.querySelectorAll('.' + TARGET_CLASS)) {
+            if (other !== el) other.classList.remove(TARGET_CLASS);
+        }
+
+        el.classList.add(TARGET_CLASS);
+        if (scroll) revealRow(el);
+    }
+
+    /* ===== src/feed/controller.js ===== */
+    /*
+     * Runs the live feed: decides whether this tab leads, and if it does, polls
+     * TornW3B and the Torn API within budget and stores what it finds.
+     *
+     * Everything userscript-specific is injected (storage, clients, visibility),
+     * so this is testable under node with fakes.
+     *
+     * Storage is the source of truth, not this object's memory. Every change is
+     * load -> mutate -> save in one synchronous step, because a follower tab also
+     * writes the feed (when the page it is viewing proves a row sold). Holding a
+     * private copy and saving it later would silently undo that correction.
+     *
+     * What this never does, by design (see README "Rules compliance"):
+     *   - request a torn.com page; only api.torn.com (Torn client) and
+     *     weav3r.dev (W3B client, which never holds the key)
+     *   - run while the tab is hidden, or raise any alert/notification
+     *   - buy, click, or pre-fill anything
+     */
+
+
+
+
+
+
+    /** TornW3B's summary is cached 60s at source. */
+    const SUMMARY_INTERVAL_MS = 60 * 1000;
+
+    /**
+     * Torn API requests the feed may spend per minute. Torn allows 100/min per
+     * user across EVERY tool; this leaves most of it for TornTools, TornStats,
+     * and the page scanner.
+     */
+    const FEED_TORN_PER_MINUTE = 20;
+
+    /** Per tick, so one cycle stays short and reacts to the tab being hidden. */
+    const MAX_W3B_FETCHES_PER_CYCLE = 8;
+    const MAX_TORN_FETCHES_PER_CYCLE = 2;
+
+    /** How many TornW3B candidates also get an Item Market check each cycle. */
+    const CANDIDATE_MARKET_CHECKS = 5;
+
+    const FEED_STORE_KEY = 'feed';
+    const FEED_LEADER_KEY = 'feedLeader';
+    const FEED_RECHECK_KEY = 'feedRecheck';
+
+    class LiveFeed {
+        /**
+         * @param {object} deps
+         * @param {string} deps.tabId
+         * @param {object} deps.w3b          - W3bClient
+         * @param {object} deps.torn         - TornApiClient
+         * @param {function} deps.getIndex   - () => item index | null
+         * @param {function} deps.getSettings
+         * @param {function} deps.hasUsableKey
+         * @param {function} deps.isVisible
+         * @param {function} deps.load       - (key) => value
+         * @param {function} deps.save       - (key, value) => void
+         * @param {function} [deps.onChange] - feed changed
+         * @param {function} [deps.isKeyDead] - (error) => boolean
+         * @param {function} [deps.onKeyDead] - (error) => void
+         * @param {function} [deps.now]
+         */
+        constructor(deps) {
+            this.d = deps;
+            this.now = deps.now || (() => Date.now());
+
+            this.leading = false;
+            this.busy = false;
+            this.lastSummaryAt = 0;
+            this.candidates = [];
+            this.sweep = [];
+            this.sweepPos = 0;
+            this.tornSpent = [];
+            this.lastError = null;
+            this.lastCycleAt = null;
+        }
+
+        /* ------------------------------------------------------ storage */
+
+        readFeed() {
+            return readFeedCacheEntry(this.d.load(FEED_STORE_KEY), this.now());
+        }
+
+        /** Load, mutate, save - in one synchronous step. */
+        mutate(fn) {
+            const feed = this.readFeed();
+            fn(feed);
+            this.d.save(FEED_STORE_KEY, makeFeedCacheEntry(feed, this.now()));
+            if (this.d.onChange) this.d.onChange();
+            return feed;
+        }
+
+        /** Ask the leader (whichever tab it is) to re-verify these items first. */
+        requestRecheck(itemIds) {
+            const queue = new Set(this.d.load(FEED_RECHECK_KEY) || []);
+            for (const id of itemIds || []) queue.add(String(id));
+            this.d.save(FEED_RECHECK_KEY, [...queue].slice(-50));
+        }
+
+        takeRechecks() {
+            const queue = this.d.load(FEED_RECHECK_KEY) || [];
+            if (queue.length) this.d.save(FEED_RECHECK_KEY, []);
+            return queue.map(String);
+        }
+
+        /* ------------------------------------------------------- status */
+
+        status() {
+            const s = this.d.getSettings();
+            return {
+                enabled: Boolean(s.liveFeed),
+                w3b: Boolean(s.liveFeed && s.useW3b),
+                itemMarket: Boolean(s.liveFeed && this.d.hasUsableKey()),
+                leading: this.leading,
+                candidates: this.candidates.length,
+                lastCycleAt: this.lastCycleAt,
+                lastError: this.lastError,
+            };
+        }
+
+        /* --------------------------------------------------------- tick */
+
+        /**
+         * Called on a timer by every tab. Cheap when not leading.
+         * @returns {Promise<void>}
+         */
+        async tick() {
+            const settings = this.d.getSettings();
+            const now = this.now();
+            const visible = this.d.isVisible();
+
+            const record = this.d.load(FEED_LEADER_KEY);
+
+            if (!settings.liveFeed) {
+                if (record && record.id === this.d.tabId) {
+                    this.d.save(FEED_LEADER_KEY, { id: null, ts: 0 });
+                }
+                this.leading = false;
+                return;
+            }
+
+            const decision = decideLeader(record, this.d.tabId, { now, visible });
+            if (decision.write) this.d.save(FEED_LEADER_KEY, decision.write);
+            this.leading = decision.lead;
+
+            if (!decision.confirmed || this.busy) return;
+            if (!this.d.getIndex()) return;
+
+            this.busy = true;
+            try {
+                await this.cycle();
+                this.lastCycleAt = this.now();
+            } finally {
+                this.busy = false;
+            }
+        }
+
+        /** Stop as soon as the tab is hidden or the user switches the feed off. */
+        stillAllowed() {
+            return this.d.isVisible() && Boolean(this.d.getSettings().liveFeed);
+        }
+
+        async cycle() {
+            const settings = this.d.getSettings();
+            const index = this.d.getIndex();
+
+            this.mutate((feed) => expireFeed(feed, this.now()));
+
+            const rechecks = this.takeRechecks();
+
+            if (settings.useW3b) {
+                await this.refreshSummary(index, settings);
+                await this.refreshBazaars(rechecks);
+            } else {
+                this.candidates = [];
+                // Opted out: forget what TornW3B told us.
+                this.mutate((feed) => feed.bazaar.clear());
+            }
+
+            if (this.d.hasUsableKey()) {
+                if (!this.sweep.length) this.sweep = itemMarketSweepList(index, settings);
+                await this.refreshItemMarket(rechecks);
+            }
+        }
+
+        async refreshSummary(index, settings) {
+            if (this.now() - this.lastSummaryAt < SUMMARY_INTERVAL_MS) return;
+
+            try {
+                const summary = await fetchW3bSummary(this.d.w3b);
+                this.lastSummaryAt = this.now();
+                this.candidates = selectCandidates(summary, index, settings);
+                this.lastError = null;
+
+                /*
+                 * The summary is authoritative about what is NOT a deal: if an
+                 * item's cheapest bazaar price no longer beats its exit, none of
+                 * its bazaar rows can. Drop them now rather than waiting out a TTL.
+                 */
+                const keep = new Set(this.candidates.map((c) => c.itemId));
+                this.mutate((feed) => {
+                    for (const id of [...feed.bazaar.keys()]) {
+                        if (!keep.has(id)) feed.bazaar.delete(id);
+                    }
+                });
+            } catch (error) {
+                this.lastError = 'TornW3B: ' + ((error && error.message) || error);
+            }
+        }
+
+        async refreshBazaars(rechecks) {
+            const feedNow = this.readFeed();
+            const byId = new Map(this.candidates.map((c) => [c.itemId, c]));
+
+            const queue = [];
+            for (const id of rechecks) if (byId.has(id)) queue.push(byId.get(id));
+            for (const c of this.candidates) {
+                if (!queue.includes(c) && bazaarDue(feedNow, c, this.now())) queue.push(c);
+            }
+
+            let fetched = 0;
+
+            for (const candidate of queue) {
+                if (fetched >= MAX_W3B_FETCHES_PER_CYCLE || !this.stillAllowed()) break;
+
+                try {
+                    const { listings } = await fetchW3bListings(
+                        this.d.w3b,
+                        candidate.itemId,
+                    );
+                    fetched += 1;
+
+                    const rows = normalizeW3bListings(listings);
+                    const at = this.now();
+                    this.mutate((feed) =>
+                        setBazaarSnapshot(feed, candidate.itemId, rows, at),
+                    );
+                } catch (error) {
+                    this.lastError = 'TornW3B: ' + ((error && error.message) || error);
+                    if (error && error.blocked) break;
+                }
+            }
+        }
+
+        tornBudgetLeft() {
+            const t = this.now();
+            this.tornSpent = this.tornSpent.filter((x) => t - x < 60000);
+            return FEED_TORN_PER_MINUTE - this.tornSpent.length;
+        }
+
+        async refreshItemMarket(rechecks) {
+            const feedNow = this.readFeed();
+            const now = this.now();
+
+            /*
+             * Rechecks first, then the top few TornW3B candidates (is it cheaper
+             * on the market too?), then the rotating sweep. Candidates are capped
+             * so they cannot starve the sweep of the whole budget.
+             */
+            const priority = [];
+            const add = (id) => {
+                if (!priority.includes(id) && itemMarketDue(feedNow, id, now)) priority.push(id);
+            };
+
+            for (const id of rechecks) add(id);
+            for (const c of this.candidates.slice(0, CANDIDATE_MARKET_CHECKS)) add(c.itemId);
+
+            // One slot per cycle always belongs to the sweep.
+            const order = priority.slice(0, MAX_TORN_FETCHES_PER_CYCLE - 1);
+            const sweepSlots = MAX_TORN_FETCHES_PER_CYCLE - order.length;
+
+            /*
+             * The sweep cursor advances past everything it LOOKED at, due or not,
+             * and stops at the last item it took. Advancing only on a fetch of the
+             * exact item under the cursor stalled it whenever that item was still
+             * inside its 30s cache window, and the sweep circled the same handful
+             * of items forever.
+             */
+            const len = this.sweep.length;
+            let examined = 0;
+            let taken = 0;
+            while (len && examined < len && taken < sweepSlots) {
+                const id = this.sweep[(this.sweepPos + examined) % len];
+                examined += 1;
+                if (!order.includes(id) && itemMarketDue(feedNow, id, now)) {
+                    order.push(id);
+                    taken += 1;
+                }
+            }
+            if (len) this.sweepPos = (this.sweepPos + examined) % len;
+
+            let fetched = 0;
+
+            for (const id of order) {
+                if (fetched >= MAX_TORN_FETCHES_PER_CYCLE) break;
+                if (this.tornBudgetLeft() <= 0 || !this.stillAllowed()) break;
+
+                this.tornSpent.push(this.now());
+                fetched += 1;
+
+                try {
+                    const market = await fetchItemMarket(this.d.torn, id, {
+                        now: this.now(),
+                    });
+                    const rows = normalizeItemMarketRows(market.listings);
+                    const at = this.now();
+
+                    this.mutate((feed) =>
+                        setItemMarketSnapshot(feed, id, {
+                            rows,
+                            fetchedAt: at,
+                            dataAt: market.cacheTimestamp,
+                            nextAt: market.nextAt,
+                            averagePrice: market.averagePrice,
+                        }),
+                    );
+                } catch (error) {
+                    this.lastError = 'Torn API: ' + ((error && error.message) || error);
+                    if (error && this.d.onKeyDead && this.d.isKeyDead && this.d.isKeyDead(error)) {
+                        this.d.onKeyDead(error);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
     /* ===== src/main.js ===== */
     /*
      * Wiring. This file is the only part of the codebase that knows it is a
      * userscript; core/ and api/ are plain modules that would move to a web app
      * untouched.
      */
+
+
+
+
 
 
 
@@ -3278,6 +4870,9 @@
     const STORE_SETTINGS = 'settings';
     const STORE_KEY_ACCESS = 'keyAccess';
     const STORE_LEDGER = 'ledger';
+    const STORE_API_WINDOW = 'apiWindow';
+    const STORE_KEY_DEAD = 'keyDead';
+    const STORE_OPENED = 'opened';
 
     const DEFAULT_SETTINGS = {
         /*
@@ -3316,10 +4911,27 @@
 
         /* Show everything seen while browsing, not just the current page. */
         showAllSeen: true,
+
+        /*
+         * The live feed: watch the market from ANY Torn page, not just the one
+         * you are on. Runs in one visible tab only, polls the Torn API well
+         * inside the rate limit, and never raises alerts - see README.
+         */
+        liveFeed: true,
+
+        /*
+         * TornW3B bazaar prices. OFF until the user opts in: Torn's API terms
+         * require an opt-in integration to link the other service's ToS, and
+         * this is a third party, so the user should choose it knowingly.
+         */
+        useW3b: false,
         collapsed: false,
     };
 
     const RESCAN_DEBOUNCE_MS = 400;
+
+    /** How often every tab checks whether it should lead the live feed. */
+    const FEED_TICK_MS = 5000;
 
     /*
      * Item Market 2.0 and the bazaars re-render continuously, and a
@@ -3331,7 +4943,26 @@
     const POLL_INTERVAL_MS = 2500;
 
     const app = {
+        tabId: makeTabId(),
         index: null,
+        feed: null,
+        w3b: null,
+        /*
+         * Set when Torn says the key is invalid, disabled or paused. Nothing is
+         * sent until the user saves a key again: Torn's docs warn that repeated
+         * requests with an invalid key can earn a temporary IP ban, and the old
+         * 2.5s poll retried a bad key forever.
+         */
+        keyDead: false,
+        /* When each (item, price, qty) on THIS page load was first read. */
+        pageFirstSeen: new Map(),
+        pageHref: null,
+        pageRows: [],
+        pageDiagnostics: null,
+        lastLedgerJson: null,
+        targetShown: null,
+        /* After a failed load, the automatic retry waits until this time. */
+        retryLoadAt: 0,
         npcShops: new Map(),
         ledger: new Map(),
         shopDataMissing: false,
@@ -3352,6 +4983,29 @@
 
     function getStoredKey() {
         return gmGet(STORE_KEY, '') || '';
+    }
+
+    /** A key we may actually send: present, and not rejected by Torn. */
+    function hasUsableKey() {
+        return Boolean(getStoredKey()) && !app.keyDead;
+    }
+
+    function isKeyDeadError(error) {
+        return Boolean(error && KEY_DEAD_CODES.has(Number(error.code)));
+    }
+
+    /** Torn rejected the key: stop using it until the user saves another. */
+    function markKeyDead(error) {
+        app.keyDead = true;
+        gmSet(STORE_KEY_DEAD, true);
+
+        app.panel.setStatus(
+            'Torn rejected this API key (' +
+                redactKey((error && error.message) || 'invalid key', getStoredKey()) +
+                '). Nothing more will be sent with it - paste a new Public key ' +
+                'under Settings.',
+            'error',
+        );
     }
 
     function looksLikeTornKey(key) {
@@ -3394,6 +5048,8 @@
 
         gmSet(STORE_KEY, key);
         gmDel(STORE_KEY_ACCESS);
+        gmDel(STORE_KEY_DEAD);
+        app.keyDead = false;
 
         refreshKeyState();
         await onScan();
@@ -3403,6 +5059,8 @@
     function onForgetKey() {
         gmDel(STORE_KEY);
         gmDel(STORE_KEY_ACCESS);
+        gmDel(STORE_KEY_DEAD);
+        app.keyDead = false;
 
         if (app.panel.keyInput) app.panel.keyInput.value = '';
 
@@ -3412,7 +5070,9 @@
 
     function onClearList() {
         app.ledger = new Map();
+        app.lastLedgerJson = null;
         gmDel(STORE_LEDGER);
+        gmDel(FEED_STORE_KEY);
         app.panel.setStatus('Cleared everything seen so far.');
         rescan();
     }
@@ -3528,8 +5188,8 @@
              *   - NPC sell price: guaranteed, no fee, but usually well under market
              *   - Market value:   resell on the Item Market, minus the 5% tax
              *
-             * Only checking the NPC price meant the common case - something
-             * listed under market value - never lit up at all.
+             * exitsFor() is shared with the live feed, so a listing is priced
+             * the same whether it was read off this page or found elsewhere.
              */
             const npcShop = npcShopFor(
                 listing.itemId,
@@ -3537,25 +5197,7 @@
                 app.manualNpc,
             );
 
-            const exits = {};
-
-            if (app.settings.compareNpc) {
-                const npcPrice = npcExitPrice(listing.item);
-
-                // "Only on items NPCs sell" - an NPC price is only offered when a
-                // shop is known to deal in the item.
-                const shopKnown = !app.settings.npcShopsOnly || npcShop !== null;
-
-                if (npcPrice !== null && shopKnown) exits.NPC = npcPrice;
-            }
-
-            if (app.settings.compareMarket) {
-                const marketValue = Number(listing.item.marketValue);
-                if (Number.isFinite(marketValue) && marketValue > 0) {
-                    exits.ITEM_MARKET = marketValue;
-                }
-            }
-
+            const exits = exitsFor(listing.item, app.settings, npcShop);
             if (Object.keys(exits).length === 0) continue;
 
             const profit = bestVenue({
@@ -3589,7 +5231,34 @@
         return rows;
     }
 
-    /** Re-mark and re-render from the current DOM. Never makes a request. */
+    /**
+     * When did THIS page first show this exact listing?
+     *
+     * The page does not live-update: a price on screen is as old as the moment
+     * it rendered. Re-reading the same DOM every 2.5s must not make it younger.
+     * The map resets whenever the URL changes (a new category, a new bazaar, a
+     * reload), because that is when Torn fetched fresh data.
+     */
+    function stampSeen(listing, now) {
+        const key =
+            listing.itemId + '|' + listing.listingPrice + '|' + (listing.qty || 1);
+
+        if (!app.pageFirstSeen.has(key)) app.pageFirstSeen.set(key, now);
+        return app.pageFirstSeen.get(key);
+    }
+
+    /** Current settings, with the one override that must always apply. */
+    function rankSettings(extra = {}) {
+        return {
+            ...app.settings,
+            // Never hide everything just because verification data is missing.
+            includeUnverifiedNpc:
+                app.settings.includeUnverifiedNpc || app.shopDataMissing,
+            ...extra,
+        };
+    }
+
+    /** Read the page, fold it into memory, correct the feed, then render. */
     function rescan() {
         /*
          * Re-detect the page every scan.
@@ -3605,21 +5274,44 @@
             clearMarks();
         }
 
-        if (!app.index || app.pageType === PAGE_NONE) return;
+        if (location.href !== app.pageHref) {
+            app.pageHref = location.href;
+            app.pageFirstSeen = new Map();
+            app.targetShown = null;
+        }
+
+        if (!app.index) return;
+
+        if (app.pageType === PAGE_NONE) {
+            app.pageRows = [];
+            app.pageDiagnostics = null;
+            refreshView();
+            return;
+        }
 
         const { listings, diagnostics } = scanDom(app.pageType, document, {
             index: app.index,
             href: location.href,
         });
 
+        const now = Date.now();
+        const sellerId =
+            app.pageType === PAGE_BAZAAR ? bazaarOwnerId(location.href) : null;
+
+        for (const l of listings) {
+            l.seenAt = stampSeen(l, now);
+            l.source =
+                app.pageType === PAGE_BAZAAR ? SOURCE_BAZAAR : SOURCE_ITEM_MARKET;
+            l.sellerId = sellerId;
+        }
+
         const priced = buildOpportunities(listings);
 
-        const ranked = rankOpportunities(priced, {
-            ...app.settings,
-            // Never hide everything just because verification data is missing.
-            includeUnverifiedNpc:
-                app.settings.includeUnverifiedNpc || app.shopDataMissing,
-        });
+        /*
+         * No limit here. The ranker's display cap of 100 made anything ranked
+         * 101st look "no longer an opportunity", and the ledger deleted it.
+         */
+        const ranked = rankOpportunities(priced, rankSettings({ limit: 0 }));
 
         /*
          * Remember what this page showed.
@@ -3628,7 +5320,6 @@
          * remembering. Browsing the categories once builds a view of the whole
          * market without a single extra request.
          */
-        const now = Date.now();
         recordSightings(
             app.ledger,
             ranked,
@@ -3636,17 +5327,92 @@
             new Set(listings.map((l) => String(l.itemId))),
         );
         pruneLedger(app.ledger, now);
-        gmSet(STORE_LEDGER, makeLedgerCacheEntry(app.ledger, now));
-
-        markRows(ranked);
-        app.lastScanAt = now;
+        persistLedger(now);
 
         /*
-         * The panel can show the whole ledger, but rows visible on THIS page win:
-         * they carry an element, so their action scrolls instead of navigating,
-         * and their numbers are from this second rather than from memory.
+         * The page you are looking at outranks every remote source. If it shows
+         * a higher price than the feed claims, the feed row has sold.
          */
-        const onPage = new Set(ranked.map((r) => String(r.itemId)));
+        if (listings.length) {
+            let removed = 0;
+            const feed = readFeedCacheEntry(gmGet(FEED_STORE_KEY, null), now);
+            removed = reconcileWithPage(feed, {
+                pageType: app.pageType,
+                sellerId,
+                listings,
+            });
+            if (removed > 0) gmSet(FEED_STORE_KEY, makeFeedCacheEntry(feed, now));
+        }
+
+        markRows(ranked.slice(0, 100));
+        showBazaarTarget(listings);
+
+        app.lastScanAt = now;
+        app.pageRows = ranked;
+        app.pageDiagnostics = diagnostics;
+
+        refreshView();
+        attachObserver(listings);
+    }
+
+    /** Write the ledger only when it changed - not every 2.5s poll. */
+    function persistLedger(now) {
+        const entry = makeLedgerCacheEntry(app.ledger, now);
+        const json = JSON.stringify(entry.entries);
+
+        if (json === app.lastLedgerJson) return;
+
+        app.lastLedgerJson = json;
+        gmSet(STORE_LEDGER, entry);
+    }
+
+    /**
+     * Arrived from a feed link: point at the listing it named.
+     *
+     * Reading and marking the page the user opened is allowed; nothing is
+     * clicked, filled in, or bought. If the listing is visible at a different
+     * price, say so - that is the listing having changed since TornW3B saw it.
+     */
+    function showBazaarTarget(listings) {
+        const target = bazaarTarget(location.href);
+        if (!target) return;
+
+        const matches = listings.filter((l) => String(l.itemId) === target.itemId);
+        if (!matches.length) return;
+
+        const exact = target.price
+            ? matches.find((l) => l.listingPrice <= target.price)
+            : matches[0];
+
+        const key = location.href;
+        const firstTime = app.targetShown !== key;
+        app.targetShown = key;
+
+        if (exact) {
+            markTarget(exact.el, firstTime);
+            return;
+        }
+
+        if (firstTime) {
+            app.panel.setStatus(
+                'That listing is no longer at ' +
+                    formatMoneyShort(target.price) +
+                    ' here - it sold or was repriced. Removed from the list.',
+                'warn',
+            );
+        }
+    }
+
+    /**
+     * Everything the panel shows: this page, what you saw elsewhere, and the
+     * live feed. Never makes a request and never reads the DOM, so the feed can
+     * re-render it whenever another tab updates storage.
+     */
+    function refreshView() {
+        if (!app.panel) return;
+
+        const now = Date.now();
+        const onPage = new Set(app.pageRows.map((r) => String(r.itemId)));
 
         /*
          * Remembered rows were priced under whatever settings applied when they
@@ -3659,44 +5425,61 @@
             return true;
         };
 
+        const feed = readFeedCacheEntry(gmGet(FEED_STORE_KEY, null), now);
+        const feedRows = app.index
+            ? feedOpportunities(feed, app.index, app.settings, {
+                  now,
+                  npcShopFor: (id) => npcShopFor(id, app.npcShops, app.manualNpc),
+                  itemMarketUrl,
+              }).filter((r) => {
+                  // The page you are on already shows these, with fresher numbers.
+                  if (!onPage.has(String(r.itemId))) return true;
+                  if (r.source === SOURCE_ITEM_MARKET) {
+                      return app.pageType !== 'itemmarket';
+                  }
+                  return !(
+                      app.pageType === PAGE_BAZAAR &&
+                      r.sellerId === bazaarOwnerId(location.href)
+                  );
+              })
+            : [];
+
+        // A feed row for the same item and source supersedes a memory of it.
+        const inFeed = new Set(feedRows.map((r) => r.source + ':' + r.itemId));
+
         const remembered = app.settings.showAllSeen
             ? ledgerRows(app.ledger).filter(
                   (r) =>
                       !onPage.has(String(r.itemId)) &&
+                      !inFeed.has((r.source || SOURCE_ITEM_MARKET) + ':' + r.itemId) &&
                       venueAllowed(r.profit.venue),
               )
             : [];
 
-        const combined = ranked.concat(remembered);
+        const opened = gmGet(STORE_OPENED, {}) || {};
+        for (const r of feedRows) {
+            const at = opened[openedKey(r)];
+            r.opened = Number.isFinite(at) && at >= r.dataAt;
+        }
 
-        const shown = rankOpportunities(combined, {
-            ...app.settings,
-            includeUnverifiedNpc:
-                app.settings.includeUnverifiedNpc || app.shopDataMissing,
-        });
+        const combined = app.pageRows.concat(remembered, feedRows);
+        const shown = rankOpportunities(combined, rankSettings());
 
         app.panel.render({
             rows: shown,
             summary: summarize(shown),
-            diagnostics: {
-                ...diagnostics,
-                ledgerSize: app.ledger.size,
-                priced: app.pricedCount,
-                shopDataMissing: app.shopDataMissing,
-                shopLoadError: app.shopLoadError || null,
-                nearMiss: app.nearMiss
-                    ? {
-                          name: app.nearMiss.name,
-                          listingPrice: app.nearMiss.profit.listingPrice,
-                          exitPrice: app.nearMiss.profit.exitPrice,
-                          shortfall: -app.nearMiss.profit.profitPerUnit,
-                      }
-                    : null,
-            },
+            diagnostics: app.pageDiagnostics
+                ? {
+                      ...app.pageDiagnostics,
+                      ledgerSize: app.ledger.size,
+                      shopDataMissing: app.shopDataMissing,
+                      shopLoadError: app.shopLoadError || null,
+                  }
+                : null,
+            pageType: app.pageType,
             lastScanAt: app.lastScanAt,
+            live: app.feed ? app.feed.status() : null,
         });
-
-        attachObserver(listings);
     }
 
     /** The Scan button: loads reference data once, then scans the page. */
@@ -3712,8 +5495,11 @@
             return;
         }
 
-        if (app.pageType === PAGE_NONE) {
-            app.panel.setStatus('Not a Bazaar or Item Market page.');
+        if (app.keyDead) {
+            app.panel.setStatus(
+                'Torn rejected the saved key. Paste a new Public key under Settings.',
+                'error',
+            );
             return;
         }
 
@@ -3724,11 +5510,24 @@
             if (!app.index) await loadReferenceData();
             await checkKeyAccess();
             rescan();
+            if (app.pageType === PAGE_NONE) {
+                app.panel.setStatus(
+                    app.settings.liveFeed
+                        ? 'Not a Bazaar or Item Market page - showing the live feed.'
+                        : 'Not a Bazaar or Item Market page.',
+                );
+            }
         } catch (error) {
-            app.panel.setStatus(
-                redactKey((error && error.message) || String(error), getStoredKey()),
-                'error',
-            );
+            if (isKeyDeadError(error)) {
+                markKeyDead(error);
+            } else {
+                // A network or Torn outage: retry, but not every 2.5s.
+                app.retryLoadAt = Date.now() + 60000;
+                app.panel.setStatus(
+                    redactKey((error && error.message) || String(error), getStoredKey()),
+                    'error',
+                );
+            }
         } finally {
             app.loading = false;
             app.panel.setBusy(false);
@@ -3738,6 +5537,7 @@
     function onClear() {
         clearMarks();
         app.lastScanAt = null;
+        app.pageRows = [];
 
         app.panel.render({
             rows: [],
@@ -3748,10 +5548,42 @@
         app.panel.setStatus('Cleared.');
     }
 
+    /** Identity of a feed listing for the "already opened" dimming. */
+    function openedKey(row) {
+        return [row.source, row.itemId, row.sellerId || '', row.profit.listingPrice].join(':');
+    }
+
     function onNavigate(row) {
         // One click, one navigation. Nothing is ever bought by the script.
         if (row.el && document.contains(row.el)) {
             revealRow(row.el);
+            return;
+        }
+
+        if (row.fromFeed) {
+            /*
+             * Remember it was opened, keyed to the data time: if TornW3B later
+             * re-confirms the listing, it lights up again (Weav3r's trick). Ask
+             * the feed to re-verify the item first on its next cycle.
+             */
+            const opened = gmGet(STORE_OPENED, {}) || {};
+            opened[openedKey(row)] = row.dataAt;
+            const keys = Object.keys(opened);
+            if (keys.length > 200) delete opened[keys[0]];
+            gmSet(STORE_OPENED, opened);
+
+            if (app.feed) app.feed.requestRecheck([row.itemId]);
+            refreshView();
+        }
+
+        if (row.url) {
+            gmOpenTab(row.url);
+            return;
+        }
+
+        // A bazaar sighting goes back to that bazaar, not to the Item Market.
+        if (row.source === SOURCE_BAZAAR && row.sellerId) {
+            gmOpenTab(bazaarUrl(row.sellerId, row.itemId, row.profit.listingPrice));
             return;
         }
 
@@ -3763,6 +5595,7 @@
         gmSet(STORE_SETTINGS, app.settings);
 
         if (app.index) rescan();
+        else refreshView();
     }
 
     /* ------------------------------------------------------------------ *
@@ -3828,34 +5661,90 @@
 
         if (!initial) clearMarks();
 
-        if (next === PAGE_NONE) {
-            app.panel.setStatus('Not a Bazaar or Item Market page.');
-            app.panel.render({
-                rows: [],
-                summary: { count: 0, totalProfit: 0, cashRequired: 0 },
-                lastScanAt: null,
-            });
-            return;
-        }
-
+        /*
+         * Reference data is needed on EVERY page now, not just the markets: the
+         * live feed prices listings against it. It is a cached, one-time load.
+         */
         if (app.index) {
             rescan();
             return;
         }
 
-        if (getStoredKey()) {
+        if (hasUsableKey()) {
             onScan();
             return;
         }
 
-        app.panel.setStatus('Paste a Public API key under Settings to begin.');
+        if (next === PAGE_NONE && !getStoredKey()) {
+            app.panel.setStatus('Paste a Public API key under Settings to begin.');
+        }
     }
 
     function handleRouteChange() {
         const next = detectPage(location.href);
-        if (next === app.pageType) return;
+        if (next === app.pageType && location.href === app.pageHref) return;
 
         applyPageType(next);
+    }
+
+    /* ------------------------------------------------------------------ *
+     * Live feed
+     * ------------------------------------------------------------------ */
+
+    function startLiveFeed() {
+        app.w3b = new W3bClient();
+
+        app.feed = new LiveFeed({
+            tabId: app.tabId,
+            w3b: app.w3b,
+            torn: app.client,
+            getIndex: () => app.index,
+            getSettings: () => app.settings,
+            hasUsableKey,
+            isVisible: () => document.visibilityState === 'visible',
+            load: (key) => gmGet(key, null),
+            save: (key, value) => gmSet(key, value),
+            onChange: () => refreshView(),
+            isKeyDead: isKeyDeadError,
+            onKeyDead: markKeyDead,
+        });
+
+        // Follower tabs re-render the moment the leader stores something new.
+        const listening = gmOnChange(FEED_STORE_KEY, () => refreshView());
+
+        const tick = () => {
+            app.feed
+                .tick()
+                .catch(() => {})
+                .finally(() => {
+                    // Without a change listener, followers refresh on the tick.
+                    if (!listening || app.feed.leading) refreshView();
+                });
+        };
+
+        setInterval(tick, FEED_TICK_MS);
+
+        /*
+         * Coming back to this tab after following a link: the opened listings
+         * are exactly the ones most likely to have changed. Re-verify them first.
+         */
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState !== 'visible') {
+                // Step down at once rather than waiting for the next tick.
+                tick();
+                return;
+            }
+
+            const opened = gmGet(STORE_OPENED, {}) || {};
+            const ids = Object.keys(opened)
+                .map((k) => k.split(':')[1])
+                .filter(Boolean);
+            if (ids.length) app.feed.requestRecheck(ids.slice(-10));
+
+            tick();
+        });
+
+        tick();
     }
 
     /* ------------------------------------------------------------------ *
@@ -3893,8 +5782,18 @@
         injectStyles();
 
         app.settings = { ...DEFAULT_SETTINGS, ...(gmGet(STORE_SETTINGS, {}) || {}) };
+        app.keyDead = Boolean(gmGet(STORE_KEY_DEAD, false));
 
-        app.client = new TornApiClient({ getKey: getStoredKey });
+        /*
+         * One request budget for every open Torn tab. Torn counts 100/min per
+         * user across all keys and tools; each tab keeping its own window let
+         * two tabs spend 140/min.
+         */
+        app.client = new TornApiClient({
+            getKey: getStoredKey,
+            loadWindow: () => gmGet(STORE_API_WINDOW, []),
+            saveWindow: (recent) => gmSet(STORE_API_WINDOW, recent),
+        });
 
         app.panel = new Panel({
             onScan,
@@ -3905,19 +5804,16 @@
             onForgetKey,
             onClearCache,
             onClearList,
+            /*
+             * The key is put into the field only when the user asks to see it.
+             * A value sitting in an <input> on torn.com is readable by every
+             * script on the page, including other userscripts.
+             */
+            onRevealKey: () => getStoredKey(),
         });
 
         app.panel.mount();
         app.panel.applySettings(app.settings);
-
-        /*
-         * Show the stored key in the field.
-         *
-         * Leaving it blank on every page load made a saved key look lost - the
-         * single most alarming thing a tool that asks for a credential can do.
-         * The field is masked by CSS, so this does not expose it on screen.
-         */
-        if (app.panel.keyInput) app.panel.keyInput.value = getStoredKey();
 
         refreshKeyState();
         registerMenu();
@@ -3930,6 +5826,11 @@
                 'warn',
             );
             app.panel.toggleView('settings');
+        } else if (app.keyDead) {
+            app.panel.setStatus(
+                'Torn rejected the saved key. Paste a new Public key under Settings.',
+                'error',
+            );
         }
 
         window.addEventListener('hashchange', handleRouteChange);
@@ -3937,16 +5838,25 @@
 
         setInterval(() => {
             if (document.visibilityState !== 'visible') return;
-            if (detectPage(location.href) === PAGE_NONE) return;
 
-            // Never scanned yet (no key at boot, or a failed first load).
+            // Never loaded yet (no key at boot, or a failed first load). A key
+            // Torn has rejected is never retried - see markKeyDead.
             if (!app.index) {
-                if (getStoredKey() && !app.loading) onScan();
+                if (hasUsableKey() && !app.loading && Date.now() >= app.retryLoadAt) {
+                    onScan();
+                }
+                return;
+            }
+
+            if (detectPage(location.href) === PAGE_NONE) {
+                if (app.pageType !== PAGE_NONE) rescan();
                 return;
             }
 
             rescan();
         }, POLL_INTERVAL_MS);
+
+        startLiveFeed();
     }
 
     boot();
