@@ -20,12 +20,13 @@
 export const UI_PREFIX = 'ttv2';
 
 /*
- * Colour tokens, shared by the panel and the selling page. Torn's own panel
- * colour is used for the background where Torn defines it (dark mode);
- * everything else is fixed so the text stays readable on it.
+ * Colour tokens, shared by the panel and the selling page. All fixed and
+ * dark. The background used to borrow Torn's --default-bg-panel-color, but
+ * Torn sets its dark value on <body>; the selling page is attached outside
+ * it and got Torn's LIGHT default - light-grey text on a light page.
  */
 export const TOKENS_CSS = `
-    --bg: var(--default-bg-panel-color, #2e2e2e);
+    --bg: #2e2e2e;
     --row: #2b2b2b;
     --line: #444;
     --text: #ddd;
@@ -198,9 +199,8 @@ ${TOKENS_CSS}
     z-index: 2147483000;
     width: 430px;
     max-width: calc(100vw - 16px);
-    /* Fits its content; the list scrolls beyond this. */
-    max-height: min(75vh, 720px);
-    min-height: 220px;
+    /* One fixed height on every tab and page; lists scroll inside it. */
+    height: min(75vh, 640px);
     display: flex;
     flex-direction: column;
     background: var(--bg);
@@ -433,7 +433,7 @@ ${TOKENS_CSS}
 /* -------------------------------------------------------------- collapsed */
 
 .ttv2-panel.ttv2-collapsed {
-    min-height: 0;
+    height: auto;
 }
 
 .ttv2-collapsed .ttv2-body {

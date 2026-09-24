@@ -184,10 +184,23 @@ ok((await cashChip.textContent()) === 'Cash: any', 'blank clears the cash cap');
 await q(p, '.ttv2-tab[data-label="Bazaars"]').click();
 await p.waitForTimeout(300);
 
+// Always dark, whatever Torn's own colour variables say (the harness sets
+// Torn's light --default-bg-panel-color on :root, as torn.com does).
+const bgLum = (loc) => loc.evaluate((n) => {
+  const m = getComputedStyle(n).backgroundColor.match(/\d+/g).map(Number);
+  return 0.2126 * m[0] + 0.7152 * m[1] + 0.0722 * m[2];
+});
+ok((await bgLum(q(p, '.ttv2-panel'))) < 80, 'overlay background is dark: ' + Math.round(await bgLum(q(p, '.ttv2-panel'))));
+
 // tabs
+const hBazaars = (await q(p, '.ttv2-panel').boundingBox()).height;
+const nBazaars = await q(p, '.ttv2-row').count();
 await q(p, '.ttv2-tab[data-label="Item Market"]').click();
 await p.waitForTimeout(200);
 ok((await q(p, '.ttv2-tab-on').textContent()).startsWith('Item Market'), 'tab switches');
+const hMarket = (await q(p, '.ttv2-panel').boundingBox()).height;
+const nMarket = await q(p, '.ttv2-row').count();
+ok(nBazaars !== nMarket && Math.abs(hBazaars - hMarket) <= 1, 'same panel height on both tabs (' + nBazaars + ' vs ' + nMarket + ' rows: ' + Math.round(hBazaars) + ' / ' + Math.round(hMarket) + 'px)');
 await q(p, '.ttv2-tab[data-label="Bazaars"]').click();
 
 // Seller status next to the seller's name on bazaar rows
@@ -344,9 +357,21 @@ ok(/1 hour.*\$30.*no data/.test(avgText.replace(/\s+/g, ' ')), 'the hour has one
 ok((avgText.match(/no data/g) || []).length >= 5 && /24 hours\$30no data<1%7 days\$30no data1%30 days\$30no data1%/.test(avgText.replace(/\s+/g, ' ')), 'a column with nothing recorded says no data; coverage is stated per window: ' + avgText.replace(/\s+/g, ' ').slice(-60));
 ok((await q(p, 'svg.ttv2-graph').count()) === 1, 'a graph is drawn');
 ok(/Asking prices this script recorded/.test(await txt(p, '.ttv2-bzdetail')), 'labelled as recorded asking prices');
-await p.evaluate(() => document.querySelectorAll('.ttv2-bztag')[1].click());
+// Like Torn's add page: pressing a row redraws it (the item opens for
+// pricing), which throws away anything added to it. A real mouse click on
+// the tag must still open that item - element.click() alone would skip the
+// press and hide the bug.
+await p.evaluate(() => {
+  for (const li of document.querySelectorAll('#fake-own li.clearfix')) {
+    li.addEventListener('mousedown', () => {
+      const t = li.querySelector('.title-wrap');
+      t.innerHTML = t.innerHTML; // re-created: our tag inside is detached
+    });
+  }
+});
+await p.locator('.ttv2-bztag').nth(1).click();
 await p.waitForTimeout(300);
-ok(/Xanax/.test(await txt(p, '.ttv2-bzdetail h3')), 'clicking a row tag selects that item in the panel');
+ok(/Xanax/.test(await txt(p, '.ttv2-bzdetail h3')), 'a real mouse click on a row tag opens that item, even when Torn redraws the row');
 ok(/Market value \$830,000/.test(await txt(p, '.ttv2-bzdetail')), 'market value shown as the sale-based line');
 await q(p, '.ttv2-window[aria-pressed="false"]').first().click();
 ok((await q(p, '.ttv2-window[aria-pressed="true"]').textContent()) === '7d', 'graph window switches');
@@ -434,6 +459,11 @@ await p.close();
   ok((await t.locator('#ttv2-sell-host').count()) === 1, 'a ?ttv2=traders tab IS the selling page');
   ok((await t.locator('#ttv2-host').count()) === 0, 'the overlay does not draw on the selling tab');
   ok(await s('.sp-settings').isVisible(), 'no keys: opens on its settings');
+  const spLum = await t.locator('#ttv2-sell-host').evaluate((h) => {
+    const m = getComputedStyle(h.shadowRoot.firstElementChild.nextElementSibling || h.shadowRoot.lastElementChild).backgroundColor.match(/\d+/g).map(Number);
+    return 0.2126 * m[0] + 0.7152 * m[1] + 0.0722 * m[2];
+  });
+  ok(spLum < 80, 'selling page background is dark: ' + Math.round(spLum));
   ok((await s('.sp-tos tr').count()) === 6, 'Torn ToS table beside the Limited key field');
   ok(/Limited/.test(await stxt('.sp-tos')), 'ToS names Limited access and the selections used');
   ok(/Add a Limited API key/.test(await stxt('.sp-banner')), 'banner asks for the Limited key');

@@ -386,20 +386,8 @@ export class Panel {
 
         const settings = this.page === 'settings';
 
-        /*
-         * Keep the panel's height steady across the switch: Settings may be
-         * shorter or taller than the list (it scrolls), and a panel that
-         * jumps in size on every click is the kind of jumpiness this
-         * redesign is meant to remove.
-         */
-        if (settings && !this.root.classList.contains('ttv2-on-settings')) {
-            const h = this.root.getBoundingClientRect().height + 'px';
-            this.root.style.minHeight = h;
-            this.root.style.height = h;
-        } else if (!settings) {
-            this.root.style.minHeight = '';
-            this.root.style.height = '';
-        }
+        // The panel has one fixed height (styles.js), so switching pages
+        // or tabs never resizes it.
 
         this.root.classList.toggle('ttv2-on-settings', settings);
         this.listPage.style.display = this.page === 'list' ? '' : 'none';

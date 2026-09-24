@@ -13,6 +13,8 @@
  */
 const _store = {};
 const NS = 'tornTrading.v2.';
+// Like torn.com: a LIGHT panel colour on :root; dark mode overrides it on <body> only.
+document.documentElement.style.setProperty('--default-bg-panel-color', '#f2f2f2');
 const KEY = 'abcdefgh12345678';
 // The selling page's own keys: a Limited Torn key and a TornExchange key.
 const LIMITED = 'LIMITED123456789';

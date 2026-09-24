@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      3.8.0
+// @version      3.8.1
 // @description  Finds Bazaar and Item Market listings below NPC / market value - on the page you are viewing, and live from the Torn API and TornW3B - ranked by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -38,7 +38,7 @@
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '3.8.0';
+    const TTV2_BUILD_VERSION = '3.8.1';
 
     /* ===== src/platform/gm.js ===== */
     /*
@@ -4606,12 +4606,13 @@
     const UI_PREFIX = 'ttv2';
 
     /*
-     * Colour tokens, shared by the panel and the selling page. Torn's own panel
-     * colour is used for the background where Torn defines it (dark mode);
-     * everything else is fixed so the text stays readable on it.
+     * Colour tokens, shared by the panel and the selling page. All fixed and
+     * dark. The background used to borrow Torn's --default-bg-panel-color, but
+     * Torn sets its dark value on <body>; the selling page is attached outside
+     * it and got Torn's LIGHT default - light-grey text on a light page.
      */
     const TOKENS_CSS = `
-        --bg: var(--default-bg-panel-color, #2e2e2e);
+        --bg: #2e2e2e;
         --row: #2b2b2b;
         --line: #444;
         --text: #ddd;
@@ -4784,9 +4785,8 @@
         z-index: 2147483000;
         width: 430px;
         max-width: calc(100vw - 16px);
-        /* Fits its content; the list scrolls beyond this. */
-        max-height: min(75vh, 720px);
-        min-height: 220px;
+        /* One fixed height on every tab and page; lists scroll inside it. */
+        height: min(75vh, 640px);
         display: flex;
         flex-direction: column;
         background: var(--bg);
@@ -5019,7 +5019,7 @@
     /* -------------------------------------------------------------- collapsed */
 
     .ttv2-panel.ttv2-collapsed {
-        min-height: 0;
+        height: auto;
     }
 
     .ttv2-collapsed .ttv2-body {
@@ -6113,20 +6113,8 @@
 
             const settings = this.page === 'settings';
 
-            /*
-             * Keep the panel's height steady across the switch: Settings may be
-             * shorter or taller than the list (it scrolls), and a panel that
-             * jumps in size on every click is the kind of jumpiness this
-             * redesign is meant to remove.
-             */
-            if (settings && !this.root.classList.contains('ttv2-on-settings')) {
-                const h = this.root.getBoundingClientRect().height + 'px';
-                this.root.style.minHeight = h;
-                this.root.style.height = h;
-            } else if (!settings) {
-                this.root.style.minHeight = '';
-                this.root.style.height = '';
-            }
+            // The panel has one fixed height (styles.js), so switching pages
+            // or tabs never resizes it.
 
             this.root.classList.toggle('ttv2-on-settings', settings);
             this.listPage.style.display = this.page === 'list' ? '' : 'none';
@@ -9545,26 +9533,61 @@
             const tag = ensureRowTag(row, document);
             app.bzDiagnostics.tags += 1;
             paintRowTag(tag, row.itemId);
-            if (!tag.dataset.bound) {
-                tag.dataset.bound = '1';
-                tag.title = 'Show averages and graph';
-                tag.addEventListener('click', (event) => {
-                    event.preventDefault();
-                    event.stopPropagation();
-                    // The row's item NOW: #/manage reuses row elements as you scroll.
-                    app.bzSelected = tag.dataset.itemId || row.itemId;
-                    if (app.panel.collapsed) app.panel.setCollapsed(false, { save: true });
-                    if (app.panel.page !== 'mybazaar') app.panel.showPage('mybazaar');
-                    repaintOwnBazaar();
-                });
-            }
+            if (tag.title !== 'Show averages and graph') tag.title = 'Show averages and graph';
         }
+        bindRowTagPress();
         if (changed) markHistoryDirty();
 
         if (!app.bzSelected && rows.length) app.bzSelected = rows[0].itemId;
 
         attachObserver(rows);
         fetchOwnBazaarPrices();
+    }
+
+    /**
+     * Pressing a price tag opens that item's averages and graph.
+     *
+     * Caught once, on window, in the capture phase: Torn's own row handlers
+     * react to the PRESS (the add page opens the item for pricing and redraws
+     * the row), which threw the tag away before a click could land on it. Here
+     * the press is handled before Torn sees it, and the rest of that click is
+     * swallowed so the row does not also react.
+     */
+    function bindRowTagPress() {
+        if (app.bzPressBound) return;
+        app.bzPressBound = true;
+
+        const tagOf = (event) => {
+            const t = event.target;
+            return t && t.closest ? t.closest('.ttv2-bztag') : null;
+        };
+
+        const open = (event) => {
+            const tag = tagOf(event);
+            if (!tag || !app.ownBazaar) return;
+            event.preventDefault();
+            event.stopPropagation();
+            if (event.type === 'click' && app.bzPressedAt && Date.now() - app.bzPressedAt < 800) return;
+            if (event.type !== 'click') app.bzPressedAt = Date.now();
+
+            // The row's item NOW: #/manage reuses row elements as you scroll.
+            app.bzSelected = tag.dataset.itemId || app.bzSelected;
+            if (app.panel.collapsed) app.panel.setCollapsed(false, { save: true });
+            if (app.panel.page !== 'mybazaar') app.panel.showPage('mybazaar');
+            repaintOwnBazaar();
+        };
+
+        const swallow = (event) => {
+            if (!tagOf(event)) return;
+            event.preventDefault();
+            event.stopPropagation();
+        };
+
+        window.addEventListener(typeof PointerEvent === 'function' ? 'pointerdown' : 'mousedown', open, true);
+        if (typeof PointerEvent === 'function') window.addEventListener('mousedown', swallow, true);
+        window.addEventListener('mouseup', swallow, true);
+        // Keyboard and scripted clicks still work; a click right after a press is ignored.
+        window.addEventListener('click', open, true);
     }
 
     /** The current prices for one item, from the caches: { im, bz }. */

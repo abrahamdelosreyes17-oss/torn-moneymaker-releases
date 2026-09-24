@@ -1142,26 +1142,61 @@ function scanOwnBazaarPage(which) {
         const tag = ensureRowTag(row, document);
         app.bzDiagnostics.tags += 1;
         paintRowTag(tag, row.itemId);
-        if (!tag.dataset.bound) {
-            tag.dataset.bound = '1';
-            tag.title = 'Show averages and graph';
-            tag.addEventListener('click', (event) => {
-                event.preventDefault();
-                event.stopPropagation();
-                // The row's item NOW: #/manage reuses row elements as you scroll.
-                app.bzSelected = tag.dataset.itemId || row.itemId;
-                if (app.panel.collapsed) app.panel.setCollapsed(false, { save: true });
-                if (app.panel.page !== 'mybazaar') app.panel.showPage('mybazaar');
-                repaintOwnBazaar();
-            });
-        }
+        if (tag.title !== 'Show averages and graph') tag.title = 'Show averages and graph';
     }
+    bindRowTagPress();
     if (changed) markHistoryDirty();
 
     if (!app.bzSelected && rows.length) app.bzSelected = rows[0].itemId;
 
     attachObserver(rows);
     fetchOwnBazaarPrices();
+}
+
+/**
+ * Pressing a price tag opens that item's averages and graph.
+ *
+ * Caught once, on window, in the capture phase: Torn's own row handlers
+ * react to the PRESS (the add page opens the item for pricing and redraws
+ * the row), which threw the tag away before a click could land on it. Here
+ * the press is handled before Torn sees it, and the rest of that click is
+ * swallowed so the row does not also react.
+ */
+function bindRowTagPress() {
+    if (app.bzPressBound) return;
+    app.bzPressBound = true;
+
+    const tagOf = (event) => {
+        const t = event.target;
+        return t && t.closest ? t.closest('.ttv2-bztag') : null;
+    };
+
+    const open = (event) => {
+        const tag = tagOf(event);
+        if (!tag || !app.ownBazaar) return;
+        event.preventDefault();
+        event.stopPropagation();
+        if (event.type === 'click' && app.bzPressedAt && Date.now() - app.bzPressedAt < 800) return;
+        if (event.type !== 'click') app.bzPressedAt = Date.now();
+
+        // The row's item NOW: #/manage reuses row elements as you scroll.
+        app.bzSelected = tag.dataset.itemId || app.bzSelected;
+        if (app.panel.collapsed) app.panel.setCollapsed(false, { save: true });
+        if (app.panel.page !== 'mybazaar') app.panel.showPage('mybazaar');
+        repaintOwnBazaar();
+    };
+
+    const swallow = (event) => {
+        if (!tagOf(event)) return;
+        event.preventDefault();
+        event.stopPropagation();
+    };
+
+    window.addEventListener(typeof PointerEvent === 'function' ? 'pointerdown' : 'mousedown', open, true);
+    if (typeof PointerEvent === 'function') window.addEventListener('mousedown', swallow, true);
+    window.addEventListener('mouseup', swallow, true);
+    // Keyboard and scripted clicks still work; a click right after a press is ignored.
+    window.addEventListener('click', open, true);
 }
 
 /** The current prices for one item, from the caches: { im, bz }. */
