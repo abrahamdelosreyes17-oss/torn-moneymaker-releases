@@ -94,20 +94,26 @@ export const STYLE_CSS = `
         inset 0 0 0 9999px rgba(126, 224, 143, 0.24) !important;
 }
 
+/*
+ * Panel chrome and rows follow the original ChatGPT script's look, which
+ * the people using this liked: neutral greys, cards with a rank, a green
+ * profit column and a full-width GO button.
+ */
 .ttv2-panel {
     position: fixed;
     right: 16px;
     bottom: 16px;
     z-index: 2147483000;
-    width: 340px;
-    max-height: 70vh;
+    width: 430px;
+    max-width: calc(100vw - 32px);
+    max-height: 75vh;
     display: flex;
     flex-direction: column;
-    background: #1b1f1c;
-    color: #e8efe9;
-    border: 1px solid #3a4a3d;
-    border-radius: 10px;
-    box-shadow: 0 6px 24px rgba(0, 0, 0, 0.55);
+    background: #1f1f1f;
+    color: #eee;
+    border: 1px solid #555;
+    border-radius: 7px;
+    box-shadow: 0 8px 30px rgba(0, 0, 0, 0.55);
     font-family: Arial, Helvetica, sans-serif;
     font-size: 12px;
     line-height: 1.35;
@@ -121,8 +127,10 @@ export const STYLE_CSS = `
     display: flex;
     align-items: center;
     gap: 6px;
-    padding: 8px 10px;
-    border-bottom: 1px solid #3a4a3d;
+    padding: 9px 12px;
+    background: #292929;
+    border-bottom: 1px solid #444;
+    border-radius: 7px 7px 0 0;
     cursor: move;
 }
 
@@ -136,18 +144,19 @@ export const STYLE_CSS = `
 }
 
 .ttv2-panel button {
-    background: #2b342d;
-    color: #e8efe9;
-    border: 1px solid #46584a;
-    border-radius: 5px;
-    padding: 4px 7px;
+    background: #353535;
+    color: #eee;
+    border: 1px solid #555;
+    border-radius: 4px;
+    padding: 5px 8px;
     font-size: 11px;
+    font-weight: bold;
     cursor: pointer;
     font-family: inherit;
 }
 
 .ttv2-panel button:hover {
-    background: #38463b;
+    background: #444;
 }
 
 .ttv2-panel button[disabled] {
@@ -162,15 +171,17 @@ export const STYLE_CSS = `
 }
 
 .ttv2-status {
-    padding: 6px 10px;
-    border-bottom: 1px solid #2c382e;
-    color: #a9bdad;
+    padding: 7px 12px;
+    border-bottom: 1px solid #383838;
+    color: #aaa;
     font-size: 11px;
 }
 
 .ttv2-summary {
-    border-bottom: 1px solid #2c382e;
-    color: #8ea394;
+    background: #242424;
+    border-bottom: 1px solid #383838;
+    color: #ddd;
+    font-size: 12px;
 }
 
 .ttv2-summary:empty {
@@ -190,7 +201,7 @@ export const STYLE_CSS = `
     flex-wrap: wrap;
     gap: 6px;
     padding: 8px 10px;
-    border-bottom: 1px solid #2c382e;
+    border-bottom: 1px solid #383838;
 }
 
 .ttv2-filters.ttv2-open {
@@ -205,7 +216,7 @@ export const STYLE_CSS = `
 }
 
 .ttv2-field label {
-    color: #a9bdad;
+    color: #aaa;
     font-size: 10px;
     text-transform: uppercase;
     letter-spacing: 0.4px;
@@ -213,9 +224,9 @@ export const STYLE_CSS = `
 
 .ttv2-panel input[type="text"],
 .ttv2-panel input[type="password"] {
-    background: #121614;
-    color: #e8efe9;
-    border: 1px solid #46584a;
+    background: #181818;
+    color: #eee;
+    border: 1px solid #555;
     border-radius: 4px;
     padding: 4px 6px;
     font-size: 11px;
@@ -234,59 +245,101 @@ export const STYLE_CSS = `
     align-items: center;
     gap: 5px;
     flex: 1 1 100%;
-    color: #a9bdad;
+    color: #aaa;
     font-size: 11px;
 }
 
 .ttv2-list {
     overflow-y: auto;
     min-height: 0;
+    padding: 7px;
 }
 
 .ttv2-row {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 7px 10px;
-    border-bottom: 1px solid #2c382e;
+    display: grid;
+    grid-template-columns: 25px minmax(0, 1fr) 105px;
+    gap: 4px 7px;
+    padding: 9px 8px;
+    margin-bottom: 6px;
+    background: #292929;
+    border: 1px solid #444;
+    border-radius: 5px;
+}
+
+/* A listing on the page you are viewing. */
+.ttv2-row.ttv2-onpage {
+    border-color: #3f6b48;
 }
 
 .ttv2-row.ttv2-stale {
-    opacity: 0.45;
+    opacity: 0.5;
+}
+
+.ttv2-rank {
+    color: #888;
+    font-weight: bold;
+    padding-top: 2px;
 }
 
 .ttv2-row-main {
-    flex: 1;
     min-width: 0;
 }
 
 .ttv2-row-name {
+    font-size: 13px;
     font-weight: bold;
+    color: #fff;
+    margin-bottom: 2px;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
 }
 
-.ttv2-row-line {
-    color: #c4d4c7;
+.ttv2-row-prices {
+    color: #bbb;
     font-size: 11px;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    margin-top: 3px;
 }
 
-.ttv2-row-total {
-    color: #7ee08f;
-    font-weight: bold;
-    font-size: 12px;
+.ttv2-row-prices b {
+    color: #fff;
 }
 
-.ttv2-row-shop {
-    color: #8ea394;
+.ttv2-row-qty {
+    margin-top: 3px;
+    color: #777;
     font-size: 10px;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
+}
+
+.ttv2-row-profit {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    text-align: right;
+    color: #65d27a;
+}
+
+.ttv2-row-profit strong {
+    font-size: 14px;
+}
+
+.ttv2-row-profit span {
+    color: #aaa;
+    font-size: 10px;
+    margin-top: 2px;
+}
+
+.ttv2-panel button.ttv2-go {
+    grid-column: 2 / 4;
+    display: block;
+    width: 100%;
+    text-align: center;
+    padding: 5px 7px;
+    color: #ddd;
+}
+
+.ttv2-panel button.ttv2-go:hover {
+    color: #fff;
 }
 
 .ttv2-guess {
@@ -296,7 +349,7 @@ export const STYLE_CSS = `
 
 /* Where a row came from and how old its data is. */
 .ttv2-row-src {
-    color: #8ea394;
+    color: #aaa;
     font-size: 10px;
     white-space: nowrap;
     overflow: hidden;
@@ -309,7 +362,7 @@ export const STYLE_CSS = `
 
 /* Already followed: dimmed until the source re-confirms the listing. */
 .ttv2-row.ttv2-opened .ttv2-row-name {
-    color: #8ea394;
+    color: #999;
 }
 
 .ttv2-live {
@@ -321,7 +374,7 @@ export const STYLE_CSS = `
     width: 100%;
     border-collapse: collapse;
     font-size: 10px;
-    color: #a9bdad;
+    color: #aaa;
 }
 
 .ttv2-tos th,
@@ -329,12 +382,12 @@ export const STYLE_CSS = `
     text-align: left;
     vertical-align: top;
     padding: 2px 4px;
-    border-bottom: 1px solid #2c382e;
+    border-bottom: 1px solid #383838;
 }
 
 .ttv2-tos th {
     width: 38%;
-    color: #8ea394;
+    color: #999;
     font-weight: normal;
 }
 
@@ -343,7 +396,7 @@ export const STYLE_CSS = `
     flex-direction: column;
     gap: 9px;
     padding: 10px;
-    border-bottom: 1px solid #2c382e;
+    border-bottom: 1px solid #383838;
     overflow-y: auto;
 }
 
@@ -356,11 +409,11 @@ export const STYLE_CSS = `
     font-size: 11px;
     text-transform: uppercase;
     letter-spacing: 0.5px;
-    color: #8ea394;
+    color: #999;
 }
 
 .ttv2-note {
-    color: #8ea394;
+    color: #999;
     font-size: 10px;
     line-height: 1.4;
 }
@@ -382,7 +435,7 @@ export const STYLE_CSS = `
 
 .ttv2-keystate {
     font-size: 10px;
-    color: #8ea394;
+    color: #999;
 }
 
 .ttv2-keystate.ttv2-ok {
@@ -394,9 +447,9 @@ export const STYLE_CSS = `
 }
 
 .ttv2-settings textarea {
-    background: #121614;
-    color: #e8efe9;
-    border: 1px solid #46584a;
+    background: #181818;
+    color: #eee;
+    border: 1px solid #555;
     border-radius: 4px;
     padding: 5px 6px;
     font-family: Consolas, monospace;
@@ -418,15 +471,15 @@ export const STYLE_CSS = `
 }
 
 .ttv2-empty {
-    padding: 14px 10px;
-    color: #a9bdad;
+    padding: 20px 10px;
+    color: #888;
     text-align: center;
 }
 
 .ttv2-diag {
     padding: 6px 10px;
-    border-top: 1px solid #2c382e;
-    color: #8ea394;
+    border-top: 1px solid #383838;
+    color: #999;
     font-size: 10px;
     white-space: pre-wrap;
     display: none;

@@ -16,6 +16,7 @@ import {
     buildItemIndex,
     makeItemsCacheEntry,
     isItemsCacheFresh,
+    ITEMS_TTL_MS,
 } from './core/items.js';
 import {
     buildNpcShopIndex,
@@ -112,6 +113,14 @@ const DEFAULT_SETTINGS = {
     /* Which exits to price against. Either can be turned off. */
     compareNpc: true,
     compareMarket: true,
+
+    /*
+     * Price the market-value exit as a resale in your own bazaar (no tax)
+     * rather than on the Item Market (5% tax). With the tax, a listing 1%
+     * under market value is a loss - which is why a visibly cheap Xanax did
+     * not light up.
+     */
+    resaleInBazaar: true,
 
     /*
      * NPC mode means NPC mode: only items a city shop is known to stock, so
@@ -334,11 +343,14 @@ async function loadReferenceData() {
 
     if (isItemsCacheFresh(cachedItems)) {
         app.index = buildItemIndex(cachedItems.items);
+        app.itemsFetchedAt = cachedItems.fetchedAt;
     } else {
         app.panel.setStatus('Downloading item database...');
         const raw = await fetchItems(app.client);
-        gmSet(STORE_ITEMS, makeItemsCacheEntry(raw));
+        const entry = makeItemsCacheEntry(raw);
+        gmSet(STORE_ITEMS, entry);
         app.index = buildItemIndex(raw);
+        app.itemsFetchedAt = entry.fetchedAt;
     }
 
     const cachedNpc = gmGet(STORE_NPC, null);
@@ -376,6 +388,39 @@ async function loadReferenceData() {
 
     app.manualNpc = gmGet(STORE_MANUAL_NPC, {}) || {};
     app.ledger = readLedgerCacheEntry(gmGet(STORE_LEDGER, null));
+}
+
+/**
+ * Keep market values current in a tab that stays open for hours. Another
+ * tab may already have refreshed the shared cache; only fetch if it has not.
+ */
+async function refreshItemsIfStale() {
+    if (!app.index || app.loading || app.refreshingItems || !hasUsableKey()) return;
+    if (app.itemsFetchedAt && Date.now() - app.itemsFetchedAt < ITEMS_TTL_MS) return;
+
+    const cached = gmGet(STORE_ITEMS, null);
+    if (isItemsCacheFresh(cached)) {
+        if (cached.fetchedAt !== app.itemsFetchedAt) {
+            app.index = buildItemIndex(cached.items);
+            app.itemsFetchedAt = cached.fetchedAt;
+        }
+        return;
+    }
+
+    app.refreshingItems = true;
+    try {
+        const raw = await fetchItems(app.client);
+        const entry = makeItemsCacheEntry(raw);
+        gmSet(STORE_ITEMS, entry);
+        app.index = buildItemIndex(raw);
+        app.itemsFetchedAt = entry.fetchedAt;
+    } catch (error) {
+        if (isKeyDeadError(error)) markKeyDead(error);
+        // Otherwise keep the old values and try again on a later tick.
+        app.itemsFetchedAt = Date.now() - ITEMS_TTL_MS + 5 * 60 * 1000;
+    } finally {
+        app.refreshingItems = false;
+    }
 }
 
 /* ------------------------------------------------------------------ *
@@ -632,7 +677,9 @@ function refreshView() {
      * "compare vs market value" off leaves market-priced rows on screen.
      */
     const venueAllowed = (venue) => {
-        if (venue === 'ITEM_MARKET') return app.settings.compareMarket !== false;
+        if (venue === 'ITEM_MARKET' || venue === 'BAZAAR_RESALE') {
+            return app.settings.compareMarket !== false;
+        }
         if (venue === 'NPC') return app.settings.compareNpc !== false;
         return true;
     };
@@ -719,9 +766,16 @@ async function onScan() {
     app.panel.setBusy(true);
 
     try {
-        if (!app.index) await loadReferenceData();
+        const firstLoad = !app.index;
+        if (firstLoad) await loadReferenceData();
         await checkKeyAccess();
         rescan();
+
+        // Replace "Downloading..." - it is done. A key warning set by
+        // checkKeyAccess is left in place.
+        if (firstLoad && !app.panel.state.status.level.match(/warn|error/)) {
+            app.panel.setStatus('Ready.');
+        }
         if (app.pageType === PAGE_NONE) {
             app.panel.setStatus(
                 app.settings.liveFeed
@@ -1059,6 +1113,8 @@ export function boot() {
             }
             return;
         }
+
+        refreshItemsIfStale();
 
         if (detectPage(location.href) === PAGE_NONE) {
             if (app.pageType !== PAGE_NONE) rescan();

@@ -10,8 +10,13 @@
 /** Bump to invalidate every cached item database in the wild. */
 export const ITEMS_CACHE_VERSION = 'items-v2.1';
 
-/** sell_price is near-static, but new items do appear. */
-export const ITEMS_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+/**
+ * One hour. sell_price barely moves, but market_value moves every day, and
+ * every "below market value" judgement is only as good as it. A week-old
+ * market value made listings look cheap, or not, against a price that no
+ * longer existed. One Public API call an hour is nothing.
+ */
+export const ITEMS_TTL_MS = 60 * 60 * 1000;
 
 /**
  * Canonical form for name matching: lowercase, collapsed whitespace.

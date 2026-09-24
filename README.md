@@ -61,6 +61,12 @@ it cannot vouch for rather than showing it:
 - a row you opened is dimmed and re-verified first, and lights up again only if
   the source re-confirms it.
 
+**Resale exit.** "Market value" is priced as a resale in **your own bazaar** by
+default, which is untaxed, so a listing 1% under market value shows as a 1% margin.
+Untick *Filters → resell in my bazaar* to price it as an Item Market sale instead,
+where the 5% tax makes that same listing a loss. Each row says which exit it assumed.
+Market value is refreshed hourly (it was cached for a week).
+
 **Filters** button: minimum total profit, cash on hand, and whether to show items
 with no verified NPC buyer. It also reveals scan diagnostics — which row selector
 matched, how many rows each candidate parsed, and why rows were skipped. When the
@@ -277,7 +283,10 @@ Both were captured from live Item Market markup on 2026-09-23. Hashed class name
 generic climb handles the case where they change.
 
 **Item Market is verified. Bazaar pages are not** — that markup has not been captured
-yet, and may differ.
+yet. v3.0.0 reads a bazaar card's own text nodes (so a price sharing its element with
+the "↓1%" badge still reads as $838,745, not $8,387,451) and treats "(N in stock)" as
+that seller's quantity, and both work on a card reconstructed from a screenshot —
+but that is not captured markup.
 
 To verify: open a bazaar, press Scan, and read the empty-state message and the
 diagnostics under **Filter**. `row selector: NO MATCH` means the selector list needs

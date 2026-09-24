@@ -200,8 +200,13 @@
     /** Bump to invalidate every cached item database in the wild. */
     const ITEMS_CACHE_VERSION = 'items-v2.1';
 
-    /** sell_price is near-static, but new items do appear. */
-    const ITEMS_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+    /**
+     * One hour. sell_price barely moves, but market_value moves every day, and
+     * every "below market value" judgement is only as good as it. A week-old
+     * market value made listings look cheap, or not, against a price that no
+     * longer existed. One Public API call an hour is nothing.
+     */
+    const ITEMS_TTL_MS = 60 * 60 * 1000;
 
     /**
      * Canonical form for name matching: lowercase, collapsed whitespace.
@@ -484,6 +489,7 @@
      *
      * - NPC: shops pay the listed sell_price with no tax.
      * - ITEM_MARKET: 5% sales tax (introduced 22 June 2025).
+     * - BAZAAR_RESALE: relisting in your own bazaar carries no tax.
      * - ITEM_MARKET_ANON: listing anonymously adds a further 10%, so 15% total.
      * - AUCTION_HOUSE: 3%.
      *
@@ -493,6 +499,9 @@
     const VENUE_FEES = {
         NPC: 0,
         ITEM_MARKET: 0.05,
+        // Relisting in your own bazaar: no sales tax. The price is still an
+        // estimate - someone has to buy it at market value.
+        BAZAAR_RESALE: 0,
         ITEM_MARKET_ANON: 0.15,
         AUCTION_HOUSE: 0.03,
     };
@@ -505,6 +514,7 @@
     const VENUE_LABELS = {
         NPC: 'NPC',
         ITEM_MARKET: 'Market value (est.)',
+        BAZAAR_RESALE: 'Market value (est.)',
         ITEM_MARKET_ANON: 'Market (anon)',
         AUCTION_HOUSE: 'Auction',
     };
@@ -807,7 +817,15 @@
 
         if (settings.compareMarket !== false) {
             const mv = Number(item.marketValue);
-            if (Number.isFinite(mv) && mv > 0) exits.ITEM_MARKET = mv;
+            /*
+             * Where you would resell decides the fee. Your own bazaar charges
+             * none, so anything under market value is a margin there; the Item
+             * Market takes 5%, which wipes out a listing 1% under. Default is the
+             * bazaar - that is how "below market value" is normally read, and the
+             * row says which exit it assumed.
+             */
+            const venue = settings.resaleInBazaar === false ? 'ITEM_MARKET' : 'BAZAAR_RESALE';
+            if (Number.isFinite(mv) && mv > 0) exits[venue] = mv;
         }
 
         return exits;
@@ -2612,6 +2630,23 @@
         return null;
     }
 
+    /**
+     * An element's OWN text: its direct text nodes, joined - never its
+     * children's. This is a stricter form of "read leaves".
+     *
+     * A leaf-element rule misses a price that shares its element with a badge:
+     * <p>$838,745<span>1%</span></p> has a child, so it is not a leaf, and its
+     * full text "$838,7451%" reads as $8,387,451. Own text is "$838,745". It
+     * also rejoins what React splits: {'$'}{price} renders two text nodes.
+     */
+    function ownText(node) {
+        let out = '';
+        for (const child of node.childNodes || []) {
+            if (child.nodeType === 3) out += child.nodeValue;
+        }
+        return out.replace(/\s+/g, ' ').trim();
+    }
+
     function textOf(node) {
         if (!node) return '';
         return (node.textContent || '').trim();
@@ -2672,8 +2707,7 @@
          */
         const leaves = [];
         for (const node of card.querySelectorAll('*')) {
-            if (node.children.length > 0) continue;
-            const t = (node.textContent || '').trim();
+            const t = ownText(node);
             if (t) leaves.push(t);
         }
 
@@ -2726,6 +2760,23 @@
             const available = text.match(AVAILABLE_RE);
             if (available) {
                 qty = parseQuantity(available[1]);
+                qtyAtPrice = Number.isFinite(qty) && qty > 0;
+            }
+        }
+
+        /*
+         * On a BAZAAR, "(390 in stock)" is this one seller's stock, all at the
+         * one price shown - a bazaar has a single price per item. Only on the
+         * Item Market's category tiles is "in stock" a market-wide total. Reading
+         * it as a total everywhere left every bazaar row "qty unknown".
+         */
+        if (!qtyAtPrice && pageType === 'bazaar' && !(buy && buy.qty)) {
+            const inStock = leaves
+                .map((t) => t.match(IN_STOCK_RE))
+                .find(Boolean) || text.match(IN_STOCK_RE);
+
+            if (inStock) {
+                qty = parseQuantity(inStock[1]);
                 qtyAtPrice = Number.isFinite(qty) && qty > 0;
             }
         }
@@ -2911,20 +2962,26 @@
             inset 0 0 0 9999px rgba(126, 224, 143, 0.24) !important;
     }
 
+    /*
+     * Panel chrome and rows follow the original ChatGPT script's look, which
+     * the people using this liked: neutral greys, cards with a rank, a green
+     * profit column and a full-width GO button.
+     */
     .ttv2-panel {
         position: fixed;
         right: 16px;
         bottom: 16px;
         z-index: 2147483000;
-        width: 340px;
-        max-height: 70vh;
+        width: 430px;
+        max-width: calc(100vw - 32px);
+        max-height: 75vh;
         display: flex;
         flex-direction: column;
-        background: #1b1f1c;
-        color: #e8efe9;
-        border: 1px solid #3a4a3d;
-        border-radius: 10px;
-        box-shadow: 0 6px 24px rgba(0, 0, 0, 0.55);
+        background: #1f1f1f;
+        color: #eee;
+        border: 1px solid #555;
+        border-radius: 7px;
+        box-shadow: 0 8px 30px rgba(0, 0, 0, 0.55);
         font-family: Arial, Helvetica, sans-serif;
         font-size: 12px;
         line-height: 1.35;
@@ -2938,8 +2995,10 @@
         display: flex;
         align-items: center;
         gap: 6px;
-        padding: 8px 10px;
-        border-bottom: 1px solid #3a4a3d;
+        padding: 9px 12px;
+        background: #292929;
+        border-bottom: 1px solid #444;
+        border-radius: 7px 7px 0 0;
         cursor: move;
     }
 
@@ -2953,18 +3012,19 @@
     }
 
     .ttv2-panel button {
-        background: #2b342d;
-        color: #e8efe9;
-        border: 1px solid #46584a;
-        border-radius: 5px;
-        padding: 4px 7px;
+        background: #353535;
+        color: #eee;
+        border: 1px solid #555;
+        border-radius: 4px;
+        padding: 5px 8px;
         font-size: 11px;
+        font-weight: bold;
         cursor: pointer;
         font-family: inherit;
     }
 
     .ttv2-panel button:hover {
-        background: #38463b;
+        background: #444;
     }
 
     .ttv2-panel button[disabled] {
@@ -2979,15 +3039,17 @@
     }
 
     .ttv2-status {
-        padding: 6px 10px;
-        border-bottom: 1px solid #2c382e;
-        color: #a9bdad;
+        padding: 7px 12px;
+        border-bottom: 1px solid #383838;
+        color: #aaa;
         font-size: 11px;
     }
 
     .ttv2-summary {
-        border-bottom: 1px solid #2c382e;
-        color: #8ea394;
+        background: #242424;
+        border-bottom: 1px solid #383838;
+        color: #ddd;
+        font-size: 12px;
     }
 
     .ttv2-summary:empty {
@@ -3007,7 +3069,7 @@
         flex-wrap: wrap;
         gap: 6px;
         padding: 8px 10px;
-        border-bottom: 1px solid #2c382e;
+        border-bottom: 1px solid #383838;
     }
 
     .ttv2-filters.ttv2-open {
@@ -3022,7 +3084,7 @@
     }
 
     .ttv2-field label {
-        color: #a9bdad;
+        color: #aaa;
         font-size: 10px;
         text-transform: uppercase;
         letter-spacing: 0.4px;
@@ -3030,9 +3092,9 @@
 
     .ttv2-panel input[type="text"],
     .ttv2-panel input[type="password"] {
-        background: #121614;
-        color: #e8efe9;
-        border: 1px solid #46584a;
+        background: #181818;
+        color: #eee;
+        border: 1px solid #555;
         border-radius: 4px;
         padding: 4px 6px;
         font-size: 11px;
@@ -3051,59 +3113,101 @@
         align-items: center;
         gap: 5px;
         flex: 1 1 100%;
-        color: #a9bdad;
+        color: #aaa;
         font-size: 11px;
     }
 
     .ttv2-list {
         overflow-y: auto;
         min-height: 0;
+        padding: 7px;
     }
 
     .ttv2-row {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        padding: 7px 10px;
-        border-bottom: 1px solid #2c382e;
+        display: grid;
+        grid-template-columns: 25px minmax(0, 1fr) 105px;
+        gap: 4px 7px;
+        padding: 9px 8px;
+        margin-bottom: 6px;
+        background: #292929;
+        border: 1px solid #444;
+        border-radius: 5px;
+    }
+
+    /* A listing on the page you are viewing. */
+    .ttv2-row.ttv2-onpage {
+        border-color: #3f6b48;
     }
 
     .ttv2-row.ttv2-stale {
-        opacity: 0.45;
+        opacity: 0.5;
+    }
+
+    .ttv2-rank {
+        color: #888;
+        font-weight: bold;
+        padding-top: 2px;
     }
 
     .ttv2-row-main {
-        flex: 1;
         min-width: 0;
     }
 
     .ttv2-row-name {
+        font-size: 13px;
         font-weight: bold;
+        color: #fff;
+        margin-bottom: 2px;
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
     }
 
-    .ttv2-row-line {
-        color: #c4d4c7;
+    .ttv2-row-prices {
+        color: #bbb;
         font-size: 11px;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
+        margin-top: 3px;
     }
 
-    .ttv2-row-total {
-        color: #7ee08f;
-        font-weight: bold;
-        font-size: 12px;
+    .ttv2-row-prices b {
+        color: #fff;
     }
 
-    .ttv2-row-shop {
-        color: #8ea394;
+    .ttv2-row-qty {
+        margin-top: 3px;
+        color: #777;
         font-size: 10px;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
+    }
+
+    .ttv2-row-profit {
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        text-align: right;
+        color: #65d27a;
+    }
+
+    .ttv2-row-profit strong {
+        font-size: 14px;
+    }
+
+    .ttv2-row-profit span {
+        color: #aaa;
+        font-size: 10px;
+        margin-top: 2px;
+    }
+
+    .ttv2-panel button.ttv2-go {
+        grid-column: 2 / 4;
+        display: block;
+        width: 100%;
+        text-align: center;
+        padding: 5px 7px;
+        color: #ddd;
+    }
+
+    .ttv2-panel button.ttv2-go:hover {
+        color: #fff;
     }
 
     .ttv2-guess {
@@ -3113,7 +3217,7 @@
 
     /* Where a row came from and how old its data is. */
     .ttv2-row-src {
-        color: #8ea394;
+        color: #aaa;
         font-size: 10px;
         white-space: nowrap;
         overflow: hidden;
@@ -3126,7 +3230,7 @@
 
     /* Already followed: dimmed until the source re-confirms the listing. */
     .ttv2-row.ttv2-opened .ttv2-row-name {
-        color: #8ea394;
+        color: #999;
     }
 
     .ttv2-live {
@@ -3138,7 +3242,7 @@
         width: 100%;
         border-collapse: collapse;
         font-size: 10px;
-        color: #a9bdad;
+        color: #aaa;
     }
 
     .ttv2-tos th,
@@ -3146,12 +3250,12 @@
         text-align: left;
         vertical-align: top;
         padding: 2px 4px;
-        border-bottom: 1px solid #2c382e;
+        border-bottom: 1px solid #383838;
     }
 
     .ttv2-tos th {
         width: 38%;
-        color: #8ea394;
+        color: #999;
         font-weight: normal;
     }
 
@@ -3160,7 +3264,7 @@
         flex-direction: column;
         gap: 9px;
         padding: 10px;
-        border-bottom: 1px solid #2c382e;
+        border-bottom: 1px solid #383838;
         overflow-y: auto;
     }
 
@@ -3173,11 +3277,11 @@
         font-size: 11px;
         text-transform: uppercase;
         letter-spacing: 0.5px;
-        color: #8ea394;
+        color: #999;
     }
 
     .ttv2-note {
-        color: #8ea394;
+        color: #999;
         font-size: 10px;
         line-height: 1.4;
     }
@@ -3199,7 +3303,7 @@
 
     .ttv2-keystate {
         font-size: 10px;
-        color: #8ea394;
+        color: #999;
     }
 
     .ttv2-keystate.ttv2-ok {
@@ -3211,9 +3315,9 @@
     }
 
     .ttv2-settings textarea {
-        background: #121614;
-        color: #e8efe9;
-        border: 1px solid #46584a;
+        background: #181818;
+        color: #eee;
+        border: 1px solid #555;
         border-radius: 4px;
         padding: 5px 6px;
         font-family: Consolas, monospace;
@@ -3235,15 +3339,15 @@
     }
 
     .ttv2-empty {
-        padding: 14px 10px;
-        color: #a9bdad;
+        padding: 20px 10px;
+        color: #888;
         text-align: center;
     }
 
     .ttv2-diag {
         padding: 6px 10px;
-        border-top: 1px solid #2c382e;
-        color: #8ea394;
+        border-top: 1px solid #383838;
+        color: #999;
         font-size: 10px;
         white-space: pre-wrap;
         display: none;
@@ -3444,7 +3548,7 @@
             this.titleEl = el('div', {
                 class: 'ttv2-title',
                 text:
-                    'NPC Arbitrage v' +
+                    'NPC ARBITRAGE v' +
                     (typeof TTV2_BUILD_VERSION === 'string'
                         ? TTV2_BUILD_VERSION
                         : 'dev'),
@@ -3835,6 +3939,11 @@
                 }),
             );
 
+            this.resaleInput = el('input', { type: 'checkbox' });
+            this.resaleInput.addEventListener('change', () =>
+                this.emitSettings({ resaleInBazaar: this.resaleInput.checked }),
+            );
+
             this.npcShopsOnlyInput = el('input', { type: 'checkbox' });
             this.npcShopsOnlyInput.addEventListener('change', () =>
                 this.emitSettings({
@@ -3892,8 +4001,18 @@
                 mkCheck(
                     this.compareMarketInput,
                     'Compare vs market value',
-                    "Torn's rolling average, minus the 5% sales tax. More hits, " +
-                        'softer signal than the NPC price.',
+                    "Torn's rolling average. More hits, softer signal than the " +
+                        'NPC price.',
+                ),
+            );
+            this.filtersEl.appendChild(
+                mkCheck(
+                    this.resaleInput,
+                    '  ↳ resell in my bazaar (no 5% tax)',
+                    'On: anything under market value counts, as you would relist ' +
+                        'it in your own bazaar, which is untaxed. Off: priced as ' +
+                        'an Item Market sale, so the 5% tax is taken first - a ' +
+                        'listing 1% under market value is then a loss.',
                 ),
             );
 
@@ -4008,6 +4127,9 @@
             if (this.compareMarketInput && settings.compareMarket !== undefined) {
                 this.compareMarketInput.checked = Boolean(settings.compareMarket);
             }
+            if (this.resaleInput && settings.resaleInBazaar !== undefined) {
+                this.resaleInput.checked = Boolean(settings.resaleInBazaar);
+            }
             if (this.npcShopsOnlyInput && settings.npcShopsOnly !== undefined) {
                 this.npcShopsOnlyInput.checked = Boolean(settings.npcShopsOnly);
             }
@@ -4037,9 +4159,9 @@
                     el('div', { class: 'ttv2-empty', text: this.emptyReason() }),
                 );
             } else {
-                for (const row of rows) {
-                    this.listEl.appendChild(this.renderRow(row));
-                }
+                rows.forEach((row, i) => {
+                    this.listEl.appendChild(this.renderRow(row, i));
+                });
             }
 
             this.renderDiagnostics();
@@ -4133,40 +4255,36 @@
             return 'No opportunities above your threshold.';
         }
 
-        renderRow(row) {
+        /**
+         * One opportunity, as a card - the layout the original ChatGPT script
+         * used and people liked:
+         *
+         *     #1  Xanax                                  +$11,255
+         *         Bazaar - SellerName | via TornW3B | 40s   $11,255 / item
+         *         Buy $838,745 -> Market value $850,000
+         *         Qty: 390 | resell in your bazaar
+         *         [            GO TO BAZAAR             ]
+         *
+         * Everything goes in through textContent; names from Torn or TornW3B
+         * never touch innerHTML.
+         */
+        renderRow(row, rank = 0) {
             const p = row.profit;
             const venue = VENUE_LABELS[p.venue] || p.venue;
+            const known = row.qtyAtPrice !== false;
 
-            const name = el('div', { class: 'ttv2-row-name' });
-            name.appendChild(document.createTextNode(row.name));
+            /* ---- rank ---- */
+            const rankEl = el('div', { class: 'ttv2-rank', text: '#' + (rank + 1) });
 
-            if (row.fromLedger) {
-                name.appendChild(
-                    el('span', {
-                        class: 'ttv2-guess',
-                        title:
-                            'Seen on another page, not on this one. The listing ' +
-                            'may already be gone - the button opens it so you ' +
-                            'can check.',
-                        text: ' (seen elsewhere)',
-                    }),
-                );
-            }
+            /* ---- name ---- */
+            const name = el('div', { class: 'ttv2-row-name', text: row.name });
 
-            // Buy: $2,896 -> NPC: $3,000
-            const buyLine = el('div', {
-                class: 'ttv2-row-line',
-                text:
-                    'Buy: ' +
-                    formatMoney(p.listingPrice) +
-                    '  ->  ' +
-                    venue +
-                    ': ' +
-                    formatMoney(p.exitPrice),
-            });
-
+            /* ---- Buy $x -> Exit $y ---- */
+            const prices = el('div', { class: 'ttv2-row-prices' });
+            prices.appendChild(document.createTextNode('Buy '));
+            prices.appendChild(el('b', { text: formatMoney(p.listingPrice) }));
             if (row.priceAssumed) {
-                buyLine.appendChild(
+                prices.appendChild(
                     el('span', {
                         class: 'ttv2-guess',
                         title:
@@ -4177,17 +4295,34 @@
                     }),
                 );
             }
+            prices.appendChild(document.createTextNode('  ->  ' + venue + ' '));
+            prices.appendChild(el('b', { text: formatMoney(p.exitPrice) }));
 
-            // +$104 each  x12
-            const eachLine = el('div', {
-                class: 'ttv2-row-line',
-                text: row.qtyAtPrice
-                    ? '+' + formatMoney(p.profitPerUnit) + ' each  x' + p.affordableQty
-                    : '+' + formatMoney(p.profitPerUnit) + ' each',
-            });
+            /* ---- Qty | exit note | shop ---- */
+            const qty = el('div', { class: 'ttv2-row-qty' });
+            const bits = [];
 
-            if (!row.qtyAtPrice) {
-                eachLine.appendChild(
+            if (known) {
+                bits.push(
+                    'Qty: ' +
+                        p.affordableQty.toLocaleString('en-US') +
+                        (p.affordableQty < p.qty
+                            ? ' of ' + p.qty.toLocaleString('en-US') + ' (cash)'
+                            : ''),
+                );
+            }
+            if (p.venue === 'BAZAAR_RESALE') bits.push('resell in your bazaar');
+            if (p.venue === 'ITEM_MARKET') bits.push('after 5% market tax');
+            if (p.venue === 'NPC' && row.npcShop && row.npcShop.shopName) {
+                bits.push('NPC shop: ' + row.npcShop.shopName);
+            } else if (p.venue === 'NPC') {
+                bits.push('sell to NPC');
+            }
+
+            qty.appendChild(document.createTextNode(bits.join('  |  ')));
+
+            if (!known) {
+                qty.appendChild(
                     el('span', {
                         class: 'ttv2-guess',
                         title:
@@ -4198,94 +4333,59 @@
                                 ? ' (' + row.marketTotal.toLocaleString('en-US') + ')'
                                 : '') +
                             '. Open the item to see each seller.',
-                        text: ' (qty unknown)',
+                        text: (bits.length ? '  |  ' : '') + 'qty unknown',
                     }),
                 );
             }
-
-            if (row.qtyAssumed) {
-                eachLine.appendChild(
-                    el('span', {
-                        class: 'ttv2-guess',
-                        title:
-                            'No quantity found on this row; assumed 1.',
-                        text: ' ?',
-                    }),
-                );
-            }
-
-            if (p.affordableQty < p.qty) {
-                eachLine.appendChild(
-                    el('span', {
-                        class: 'ttv2-guess',
-                        title:
-                            'Capped by your cash: ' +
-                            p.affordableQty +
-                            ' of ' +
-                            p.qty +
-                            ' available.',
-                        text: ' (of ' + p.qty + ')',
-                    }),
-                );
-            }
-
-            // TOTAL +$1,248 - ROI 3.6%
-            const totalLine = el('div', {
-                class: 'ttv2-row-line ttv2-row-total',
-                text: row.qtyAtPrice
-                    ? 'TOTAL +' +
-                      formatMoney(p.realizableProfit) +
-                      '  -  ROI ' +
-                      formatPct(p.roi)
-                    : 'ROI ' + formatPct(p.roi),
-            });
-
-            // NPC Shop: Bits 'n' Bobs
-            /*
-             * Which shop, when we know it. NOT a confidence signal.
-             *
-             * Confirmed live: Bottle of Champagne sells to an NPC for $3,100 and
-             * no city shop stocks it. So sell_price alone is the NPC price, and
-             * an absent shop name means only that the shop list does not cover
-             * this item - never that the price is doubtful. Labelling it
-             * "unverified" implied a doubt that does not exist, and the filter
-             * built on that idea hid real money.
-             */
-            const shopLine = el('div', {
-                class: 'ttv2-row-shop',
-                text:
-                    p.venue === 'NPC' && row.npcShop && row.npcShop.shopName
-                        ? 'NPC Shop: ' + row.npcShop.shopName
-                        : '',
-            });
 
             const main = el('div', { class: 'ttv2-row-main' }, [
                 name,
                 this.sourceLine(row),
-                buyLine,
-                eachLine,
-                totalLine,
-                shopLine,
+                prices,
+                qty,
             ]);
 
-            const where =
-                row.source === 'bazaar'
-                    ? row.sellerName
-                        ? "Open " + row.sellerName + "'s bazaar"
-                        : 'Open this bazaar'
-                    : 'Open this item on the Item Market';
+            /* ---- profit column ---- */
+            const profit = el('div', { class: 'ttv2-row-profit' }, [
+                el('strong', {
+                    text: known
+                        ? '+' + formatMoney(p.realizableProfit)
+                        : '+' + formatMoney(p.profitPerUnit),
+                }),
+                el('span', {
+                    text: known
+                        ? formatMoney(p.profitPerUnit) + ' / item'
+                        : 'per item',
+                }),
+                el('span', { text: 'ROI ' + formatPct(p.roi) }),
+            ]);
+
+            /* ---- the one action ---- */
+            const label = row.el
+                ? 'SCROLL TO LISTING'
+                : row.source === 'bazaar' && (row.url || row.sellerId)
+                  ? 'GO TO BAZAAR'
+                  : 'GO TO MARKET';
 
             const go = el('button', {
                 type: 'button',
-                title: row.el ? 'Scroll to this listing' : where,
-                text: '>',
+                class: 'ttv2-go',
+                title: row.el
+                    ? 'Scroll to this listing'
+                    : row.source === 'bazaar'
+                      ? row.sellerName
+                          ? "Open " + row.sellerName + "'s bazaar"
+                          : 'Open this bazaar'
+                      : 'Open this item on the Item Market',
+                text: label,
                 onclick: () =>
                     this.handlers.onNavigate && this.handlers.onNavigate(row),
             });
 
-            const rowEl = el('div', { class: 'ttv2-row' }, [main, go]);
+            const rowEl = el('div', { class: 'ttv2-row' }, [rankEl, main, profit, go]);
             rowEl.dataset.ttv2At = String(this.rowTime(row) || '');
             if (row.opened) rowEl.classList.add('ttv2-opened');
+            if (row.el) rowEl.classList.add('ttv2-onpage');
 
             return rowEl;
         }
@@ -4311,15 +4411,15 @@
 
             if (row.el) parts.push('on this page');
             else if (row.fromFeed) parts.push(row.source === 'bazaar' ? 'via TornW3B' : 'via Torn API');
-            else if (row.fromLedger) parts.push('remembered');
+            else if (row.fromLedger) parts.push('seen earlier');
 
             const line = el('div', {
                 class: 'ttv2-row-src',
-                text: parts.join(' | '),
+                text: parts.join('  |  '),
             });
 
             const age = el('span', { class: 'ttv2-age' });
-            line.appendChild(document.createTextNode(' | '));
+            line.appendChild(document.createTextNode(parts.length ? '  |  ' : ''));
             line.appendChild(age);
 
             if (row.fromFeed && row.dataAgeKnown === false) {
@@ -4332,7 +4432,7 @@
                         title:
                             'You opened this already. It lights up again if the ' +
                             'listing is re-confirmed.',
-                        text: ' | opened',
+                        text: '  |  opened',
                     }),
                 );
             }
@@ -4902,6 +5002,14 @@
         compareMarket: true,
 
         /*
+         * Price the market-value exit as a resale in your own bazaar (no tax)
+         * rather than on the Item Market (5% tax). With the tax, a listing 1%
+         * under market value is a loss - which is why a visibly cheap Xanax did
+         * not light up.
+         */
+        resaleInBazaar: true,
+
+        /*
          * NPC mode means NPC mode: only items a city shop is known to stock, so
          * you are never told to buy something on the promise of a sale that will
          * not happen. Off by default because the shop lookup is incomplete and
@@ -5122,11 +5230,14 @@
 
         if (isItemsCacheFresh(cachedItems)) {
             app.index = buildItemIndex(cachedItems.items);
+            app.itemsFetchedAt = cachedItems.fetchedAt;
         } else {
             app.panel.setStatus('Downloading item database...');
             const raw = await fetchItems(app.client);
-            gmSet(STORE_ITEMS, makeItemsCacheEntry(raw));
+            const entry = makeItemsCacheEntry(raw);
+            gmSet(STORE_ITEMS, entry);
             app.index = buildItemIndex(raw);
+            app.itemsFetchedAt = entry.fetchedAt;
         }
 
         const cachedNpc = gmGet(STORE_NPC, null);
@@ -5164,6 +5275,39 @@
 
         app.manualNpc = gmGet(STORE_MANUAL_NPC, {}) || {};
         app.ledger = readLedgerCacheEntry(gmGet(STORE_LEDGER, null));
+    }
+
+    /**
+     * Keep market values current in a tab that stays open for hours. Another
+     * tab may already have refreshed the shared cache; only fetch if it has not.
+     */
+    async function refreshItemsIfStale() {
+        if (!app.index || app.loading || app.refreshingItems || !hasUsableKey()) return;
+        if (app.itemsFetchedAt && Date.now() - app.itemsFetchedAt < ITEMS_TTL_MS) return;
+
+        const cached = gmGet(STORE_ITEMS, null);
+        if (isItemsCacheFresh(cached)) {
+            if (cached.fetchedAt !== app.itemsFetchedAt) {
+                app.index = buildItemIndex(cached.items);
+                app.itemsFetchedAt = cached.fetchedAt;
+            }
+            return;
+        }
+
+        app.refreshingItems = true;
+        try {
+            const raw = await fetchItems(app.client);
+            const entry = makeItemsCacheEntry(raw);
+            gmSet(STORE_ITEMS, entry);
+            app.index = buildItemIndex(raw);
+            app.itemsFetchedAt = entry.fetchedAt;
+        } catch (error) {
+            if (isKeyDeadError(error)) markKeyDead(error);
+            // Otherwise keep the old values and try again on a later tick.
+            app.itemsFetchedAt = Date.now() - ITEMS_TTL_MS + 5 * 60 * 1000;
+        } finally {
+            app.refreshingItems = false;
+        }
     }
 
     /* ------------------------------------------------------------------ *
@@ -5420,7 +5564,9 @@
          * "compare vs market value" off leaves market-priced rows on screen.
          */
         const venueAllowed = (venue) => {
-            if (venue === 'ITEM_MARKET') return app.settings.compareMarket !== false;
+            if (venue === 'ITEM_MARKET' || venue === 'BAZAAR_RESALE') {
+                return app.settings.compareMarket !== false;
+            }
             if (venue === 'NPC') return app.settings.compareNpc !== false;
             return true;
         };
@@ -5507,9 +5653,16 @@
         app.panel.setBusy(true);
 
         try {
-            if (!app.index) await loadReferenceData();
+            const firstLoad = !app.index;
+            if (firstLoad) await loadReferenceData();
             await checkKeyAccess();
             rescan();
+
+            // Replace "Downloading..." - it is done. A key warning set by
+            // checkKeyAccess is left in place.
+            if (firstLoad && !app.panel.state.status.level.match(/warn|error/)) {
+                app.panel.setStatus('Ready.');
+            }
             if (app.pageType === PAGE_NONE) {
                 app.panel.setStatus(
                     app.settings.liveFeed
@@ -5847,6 +6000,8 @@
                 }
                 return;
             }
+
+            refreshItemsIfStale();
 
             if (detectPage(location.href) === PAGE_NONE) {
                 if (app.pageType !== PAGE_NONE) rescan();

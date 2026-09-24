@@ -66,6 +66,23 @@ export function parseBuyLabel(label) {
     return null;
 }
 
+/**
+ * An element's OWN text: its direct text nodes, joined - never its
+ * children's. This is a stricter form of "read leaves".
+ *
+ * A leaf-element rule misses a price that shares its element with a badge:
+ * <p>$838,745<span>1%</span></p> has a child, so it is not a leaf, and its
+ * full text "$838,7451%" reads as $8,387,451. Own text is "$838,745". It
+ * also rejoins what React splits: {'$'}{price} renders two text nodes.
+ */
+export function ownText(node) {
+    let out = '';
+    for (const child of node.childNodes || []) {
+        if (child.nodeType === 3) out += child.nodeValue;
+    }
+    return out.replace(/\s+/g, ' ').trim();
+}
+
 function textOf(node) {
     if (!node) return '';
     return (node.textContent || '').trim();
@@ -126,8 +143,7 @@ export function readCard(card, index, pageType) {
      */
     const leaves = [];
     for (const node of card.querySelectorAll('*')) {
-        if (node.children.length > 0) continue;
-        const t = (node.textContent || '').trim();
+        const t = ownText(node);
         if (t) leaves.push(t);
     }
 
@@ -180,6 +196,23 @@ export function readCard(card, index, pageType) {
         const available = text.match(AVAILABLE_RE);
         if (available) {
             qty = parseQuantity(available[1]);
+            qtyAtPrice = Number.isFinite(qty) && qty > 0;
+        }
+    }
+
+    /*
+     * On a BAZAAR, "(390 in stock)" is this one seller's stock, all at the
+     * one price shown - a bazaar has a single price per item. Only on the
+     * Item Market's category tiles is "in stock" a market-wide total. Reading
+     * it as a total everywhere left every bazaar row "qty unknown".
+     */
+    if (!qtyAtPrice && pageType === 'bazaar' && !(buy && buy.qty)) {
+        const inStock = leaves
+            .map((t) => t.match(IN_STOCK_RE))
+            .find(Boolean) || text.match(IN_STOCK_RE);
+
+        if (inStock) {
+            qty = parseQuantity(inStock[1]);
             qtyAtPrice = Number.isFinite(qty) && qty > 0;
         }
     }

@@ -84,7 +84,8 @@ const RAW_ITEMS = {
 };
 
 const index = buildItemIndex(RAW_ITEMS);
-const SETTINGS = { compareNpc: true, compareMarket: true, cashOnHand: null };
+// Priced as Item Market resales (5% tax) unless a test says otherwise.
+const SETTINGS = { compareNpc: true, compareMarket: true, cashOnHand: null, resaleInBazaar: false };
 
 /* ================================================================ W3B client */
 
@@ -264,6 +265,20 @@ test('exitsFor honours the NPC / market switches', () => {
     assert.deepEqual(exitsFor(hammer, { ...SETTINGS, compareMarket: false }), { NPC: 100 });
     assert.deepEqual(exitsFor(hammer, { ...SETTINGS, npcShopsOnly: true }, null), { ITEM_MARKET: 120 });
     assert.deepEqual(exitsFor(index.byId.get('2'), SETTINGS), {});
+    assert.deepEqual(exitsFor(hammer, { ...SETTINGS, resaleInBazaar: true }), { NPC: 100, BAZAAR_RESALE: 120 });
+});
+
+test('a Xanax 1% under market value is a margin in your bazaar, a loss on the Item Market', () => {
+    // From a live bazaar: $838,745, shown as 1% under market value.
+    const idx = buildItemIndex({ 206: { name: 'Xanax', sell_price: 600, market_value: 850000 } });
+    const summary = [{ itemId: '206', lowestPrice: 838745 }];
+
+    const taxed = selectCandidates(summary, idx, { ...SETTINGS, resaleInBazaar: false });
+    assert.equal(taxed.length, 0, '850,000 x 0.95 = 807,500 < 838,745');
+
+    const untaxed = selectCandidates(summary, idx, { ...SETTINGS, resaleInBazaar: true });
+    assert.equal(untaxed.length, 1);
+    assert.equal(untaxed[0].profitPerUnit, 11255);
 });
 
 test('candidates come from one summary call, best edge first', () => {

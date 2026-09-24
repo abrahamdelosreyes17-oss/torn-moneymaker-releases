@@ -68,7 +68,15 @@ export function exitsFor(item, settings = {}, npcShop = null) {
 
     if (settings.compareMarket !== false) {
         const mv = Number(item.marketValue);
-        if (Number.isFinite(mv) && mv > 0) exits.ITEM_MARKET = mv;
+        /*
+         * Where you would resell decides the fee. Your own bazaar charges
+         * none, so anything under market value is a margin there; the Item
+         * Market takes 5%, which wipes out a listing 1% under. Default is the
+         * bazaar - that is how "below market value" is normally read, and the
+         * row says which exit it assumed.
+         */
+        const venue = settings.resaleInBazaar === false ? 'ITEM_MARKET' : 'BAZAAR_RESALE';
+        if (Number.isFinite(mv) && mv > 0) exits[venue] = mv;
     }
 
     return exits;

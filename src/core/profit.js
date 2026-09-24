@@ -15,6 +15,7 @@
  *
  * - NPC: shops pay the listed sell_price with no tax.
  * - ITEM_MARKET: 5% sales tax (introduced 22 June 2025).
+ * - BAZAAR_RESALE: relisting in your own bazaar carries no tax.
  * - ITEM_MARKET_ANON: listing anonymously adds a further 10%, so 15% total.
  * - AUCTION_HOUSE: 3%.
  *
@@ -24,6 +25,9 @@
 export const VENUE_FEES = {
     NPC: 0,
     ITEM_MARKET: 0.05,
+    // Relisting in your own bazaar: no sales tax. The price is still an
+    // estimate - someone has to buy it at market value.
+    BAZAAR_RESALE: 0,
     ITEM_MARKET_ANON: 0.15,
     AUCTION_HOUSE: 0.03,
 };
@@ -36,6 +40,7 @@ export const VENUE_FEES = {
 export const VENUE_LABELS = {
     NPC: 'NPC',
     ITEM_MARKET: 'Market value (est.)',
+    BAZAAR_RESALE: 'Market value (est.)',
     ITEM_MARKET_ANON: 'Market (anon)',
     AUCTION_HOUSE: 'Auction',
 };

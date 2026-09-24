@@ -180,7 +180,7 @@ export class Panel {
         this.titleEl = el('div', {
             class: 'ttv2-title',
             text:
-                'NPC Arbitrage v' +
+                'NPC ARBITRAGE v' +
                 (typeof TTV2_BUILD_VERSION === 'string'
                     ? TTV2_BUILD_VERSION
                     : 'dev'),
@@ -571,6 +571,11 @@ export class Panel {
             }),
         );
 
+        this.resaleInput = el('input', { type: 'checkbox' });
+        this.resaleInput.addEventListener('change', () =>
+            this.emitSettings({ resaleInBazaar: this.resaleInput.checked }),
+        );
+
         this.npcShopsOnlyInput = el('input', { type: 'checkbox' });
         this.npcShopsOnlyInput.addEventListener('change', () =>
             this.emitSettings({
@@ -628,8 +633,18 @@ export class Panel {
             mkCheck(
                 this.compareMarketInput,
                 'Compare vs market value',
-                "Torn's rolling average, minus the 5% sales tax. More hits, " +
-                    'softer signal than the NPC price.',
+                "Torn's rolling average. More hits, softer signal than the " +
+                    'NPC price.',
+            ),
+        );
+        this.filtersEl.appendChild(
+            mkCheck(
+                this.resaleInput,
+                '  ↳ resell in my bazaar (no 5% tax)',
+                'On: anything under market value counts, as you would relist ' +
+                    'it in your own bazaar, which is untaxed. Off: priced as ' +
+                    'an Item Market sale, so the 5% tax is taken first - a ' +
+                    'listing 1% under market value is then a loss.',
             ),
         );
 
@@ -744,6 +759,9 @@ export class Panel {
         if (this.compareMarketInput && settings.compareMarket !== undefined) {
             this.compareMarketInput.checked = Boolean(settings.compareMarket);
         }
+        if (this.resaleInput && settings.resaleInBazaar !== undefined) {
+            this.resaleInput.checked = Boolean(settings.resaleInBazaar);
+        }
         if (this.npcShopsOnlyInput && settings.npcShopsOnly !== undefined) {
             this.npcShopsOnlyInput.checked = Boolean(settings.npcShopsOnly);
         }
@@ -773,9 +791,9 @@ export class Panel {
                 el('div', { class: 'ttv2-empty', text: this.emptyReason() }),
             );
         } else {
-            for (const row of rows) {
-                this.listEl.appendChild(this.renderRow(row));
-            }
+            rows.forEach((row, i) => {
+                this.listEl.appendChild(this.renderRow(row, i));
+            });
         }
 
         this.renderDiagnostics();
@@ -869,40 +887,36 @@ export class Panel {
         return 'No opportunities above your threshold.';
     }
 
-    renderRow(row) {
+    /**
+     * One opportunity, as a card - the layout the original ChatGPT script
+     * used and people liked:
+     *
+     *     #1  Xanax                                  +$11,255
+     *         Bazaar - SellerName | via TornW3B | 40s   $11,255 / item
+     *         Buy $838,745 -> Market value $850,000
+     *         Qty: 390 | resell in your bazaar
+     *         [            GO TO BAZAAR             ]
+     *
+     * Everything goes in through textContent; names from Torn or TornW3B
+     * never touch innerHTML.
+     */
+    renderRow(row, rank = 0) {
         const p = row.profit;
         const venue = VENUE_LABELS[p.venue] || p.venue;
+        const known = row.qtyAtPrice !== false;
 
-        const name = el('div', { class: 'ttv2-row-name' });
-        name.appendChild(document.createTextNode(row.name));
+        /* ---- rank ---- */
+        const rankEl = el('div', { class: 'ttv2-rank', text: '#' + (rank + 1) });
 
-        if (row.fromLedger) {
-            name.appendChild(
-                el('span', {
-                    class: 'ttv2-guess',
-                    title:
-                        'Seen on another page, not on this one. The listing ' +
-                        'may already be gone - the button opens it so you ' +
-                        'can check.',
-                    text: ' (seen elsewhere)',
-                }),
-            );
-        }
+        /* ---- name ---- */
+        const name = el('div', { class: 'ttv2-row-name', text: row.name });
 
-        // Buy: $2,896 -> NPC: $3,000
-        const buyLine = el('div', {
-            class: 'ttv2-row-line',
-            text:
-                'Buy: ' +
-                formatMoney(p.listingPrice) +
-                '  ->  ' +
-                venue +
-                ': ' +
-                formatMoney(p.exitPrice),
-        });
-
+        /* ---- Buy $x -> Exit $y ---- */
+        const prices = el('div', { class: 'ttv2-row-prices' });
+        prices.appendChild(document.createTextNode('Buy '));
+        prices.appendChild(el('b', { text: formatMoney(p.listingPrice) }));
         if (row.priceAssumed) {
-            buyLine.appendChild(
+            prices.appendChild(
                 el('span', {
                     class: 'ttv2-guess',
                     title:
@@ -913,17 +927,34 @@ export class Panel {
                 }),
             );
         }
+        prices.appendChild(document.createTextNode('  ->  ' + venue + ' '));
+        prices.appendChild(el('b', { text: formatMoney(p.exitPrice) }));
 
-        // +$104 each  x12
-        const eachLine = el('div', {
-            class: 'ttv2-row-line',
-            text: row.qtyAtPrice
-                ? '+' + formatMoney(p.profitPerUnit) + ' each  x' + p.affordableQty
-                : '+' + formatMoney(p.profitPerUnit) + ' each',
-        });
+        /* ---- Qty | exit note | shop ---- */
+        const qty = el('div', { class: 'ttv2-row-qty' });
+        const bits = [];
 
-        if (!row.qtyAtPrice) {
-            eachLine.appendChild(
+        if (known) {
+            bits.push(
+                'Qty: ' +
+                    p.affordableQty.toLocaleString('en-US') +
+                    (p.affordableQty < p.qty
+                        ? ' of ' + p.qty.toLocaleString('en-US') + ' (cash)'
+                        : ''),
+            );
+        }
+        if (p.venue === 'BAZAAR_RESALE') bits.push('resell in your bazaar');
+        if (p.venue === 'ITEM_MARKET') bits.push('after 5% market tax');
+        if (p.venue === 'NPC' && row.npcShop && row.npcShop.shopName) {
+            bits.push('NPC shop: ' + row.npcShop.shopName);
+        } else if (p.venue === 'NPC') {
+            bits.push('sell to NPC');
+        }
+
+        qty.appendChild(document.createTextNode(bits.join('  |  ')));
+
+        if (!known) {
+            qty.appendChild(
                 el('span', {
                     class: 'ttv2-guess',
                     title:
@@ -934,94 +965,59 @@ export class Panel {
                             ? ' (' + row.marketTotal.toLocaleString('en-US') + ')'
                             : '') +
                         '. Open the item to see each seller.',
-                    text: ' (qty unknown)',
+                    text: (bits.length ? '  |  ' : '') + 'qty unknown',
                 }),
             );
         }
-
-        if (row.qtyAssumed) {
-            eachLine.appendChild(
-                el('span', {
-                    class: 'ttv2-guess',
-                    title:
-                        'No quantity found on this row; assumed 1.',
-                    text: ' ?',
-                }),
-            );
-        }
-
-        if (p.affordableQty < p.qty) {
-            eachLine.appendChild(
-                el('span', {
-                    class: 'ttv2-guess',
-                    title:
-                        'Capped by your cash: ' +
-                        p.affordableQty +
-                        ' of ' +
-                        p.qty +
-                        ' available.',
-                    text: ' (of ' + p.qty + ')',
-                }),
-            );
-        }
-
-        // TOTAL +$1,248 - ROI 3.6%
-        const totalLine = el('div', {
-            class: 'ttv2-row-line ttv2-row-total',
-            text: row.qtyAtPrice
-                ? 'TOTAL +' +
-                  formatMoney(p.realizableProfit) +
-                  '  -  ROI ' +
-                  formatPct(p.roi)
-                : 'ROI ' + formatPct(p.roi),
-        });
-
-        // NPC Shop: Bits 'n' Bobs
-        /*
-         * Which shop, when we know it. NOT a confidence signal.
-         *
-         * Confirmed live: Bottle of Champagne sells to an NPC for $3,100 and
-         * no city shop stocks it. So sell_price alone is the NPC price, and
-         * an absent shop name means only that the shop list does not cover
-         * this item - never that the price is doubtful. Labelling it
-         * "unverified" implied a doubt that does not exist, and the filter
-         * built on that idea hid real money.
-         */
-        const shopLine = el('div', {
-            class: 'ttv2-row-shop',
-            text:
-                p.venue === 'NPC' && row.npcShop && row.npcShop.shopName
-                    ? 'NPC Shop: ' + row.npcShop.shopName
-                    : '',
-        });
 
         const main = el('div', { class: 'ttv2-row-main' }, [
             name,
             this.sourceLine(row),
-            buyLine,
-            eachLine,
-            totalLine,
-            shopLine,
+            prices,
+            qty,
         ]);
 
-        const where =
-            row.source === 'bazaar'
-                ? row.sellerName
-                    ? "Open " + row.sellerName + "'s bazaar"
-                    : 'Open this bazaar'
-                : 'Open this item on the Item Market';
+        /* ---- profit column ---- */
+        const profit = el('div', { class: 'ttv2-row-profit' }, [
+            el('strong', {
+                text: known
+                    ? '+' + formatMoney(p.realizableProfit)
+                    : '+' + formatMoney(p.profitPerUnit),
+            }),
+            el('span', {
+                text: known
+                    ? formatMoney(p.profitPerUnit) + ' / item'
+                    : 'per item',
+            }),
+            el('span', { text: 'ROI ' + formatPct(p.roi) }),
+        ]);
+
+        /* ---- the one action ---- */
+        const label = row.el
+            ? 'SCROLL TO LISTING'
+            : row.source === 'bazaar' && (row.url || row.sellerId)
+              ? 'GO TO BAZAAR'
+              : 'GO TO MARKET';
 
         const go = el('button', {
             type: 'button',
-            title: row.el ? 'Scroll to this listing' : where,
-            text: '>',
+            class: 'ttv2-go',
+            title: row.el
+                ? 'Scroll to this listing'
+                : row.source === 'bazaar'
+                  ? row.sellerName
+                      ? "Open " + row.sellerName + "'s bazaar"
+                      : 'Open this bazaar'
+                  : 'Open this item on the Item Market',
+            text: label,
             onclick: () =>
                 this.handlers.onNavigate && this.handlers.onNavigate(row),
         });
 
-        const rowEl = el('div', { class: 'ttv2-row' }, [main, go]);
+        const rowEl = el('div', { class: 'ttv2-row' }, [rankEl, main, profit, go]);
         rowEl.dataset.ttv2At = String(this.rowTime(row) || '');
         if (row.opened) rowEl.classList.add('ttv2-opened');
+        if (row.el) rowEl.classList.add('ttv2-onpage');
 
         return rowEl;
     }
@@ -1047,15 +1043,15 @@ export class Panel {
 
         if (row.el) parts.push('on this page');
         else if (row.fromFeed) parts.push(row.source === 'bazaar' ? 'via TornW3B' : 'via Torn API');
-        else if (row.fromLedger) parts.push('remembered');
+        else if (row.fromLedger) parts.push('seen earlier');
 
         const line = el('div', {
             class: 'ttv2-row-src',
-            text: parts.join(' | '),
+            text: parts.join('  |  '),
         });
 
         const age = el('span', { class: 'ttv2-age' });
-        line.appendChild(document.createTextNode(' | '));
+        line.appendChild(document.createTextNode(parts.length ? '  |  ' : ''));
         line.appendChild(age);
 
         if (row.fromFeed && row.dataAgeKnown === false) {
@@ -1068,7 +1064,7 @@ export class Panel {
                     title:
                         'You opened this already. It lights up again if the ' +
                         'listing is re-confirmed.',
-                    text: ' | opened',
+                    text: '  |  opened',
                 }),
             );
         }
