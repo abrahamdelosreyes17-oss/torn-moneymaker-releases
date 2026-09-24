@@ -126,6 +126,15 @@ const DEFAULT_SETTINGS = {
 
 const RESCAN_DEBOUNCE_MS = 400;
 
+/*
+ * Torn changes pages with pushState, which fires no event, and draws the
+ * listings a moment after the address changes. Checking the address is a
+ * string compare, so it is done often; on a change the page is scanned at
+ * once and a few more times while the listings finish drawing.
+ */
+const HREF_WATCH_MS = 250;
+const SCAN_BURST_MS = [0, 300, 700, 1200, 2000, 3000];
+
 /** How often every tab checks whether it should lead the live feed. */
 const FEED_TICK_MS = LEADER_HEARTBEAT_MS;
 
@@ -790,6 +799,80 @@ async function onScan() {
 }
 
 
+/**
+ * The small Scan button: re-read this page now. No requests - just the DOM
+ * already on screen - so it can be pressed freely. Always animates, so a
+ * press visibly did something even when the list does not change.
+ */
+function onScanPage() {
+    // Nothing loaded yet: the first load IS the scan.
+    if (!app.index) return onScan();
+
+    rescan();
+    app.panel.showScan(scanSummary());
+    return undefined;
+}
+
+function scanSummary() {
+    if (app.pageType === PAGE_NONE) {
+        return 'Nothing to scan here - not a Bazaar or Item Market page.';
+    }
+
+    const found = (app.pageDiagnostics && app.pageDiagnostics.listings) || 0;
+    if (!found) {
+        return 'Scanned: no listings found on this page yet.';
+    }
+
+    const deals = (app.pageRows || []).length;
+    return (
+        'Scanned: ' +
+        found +
+        (found === 1 ? ' listing' : ' listings') +
+        ' · ' +
+        deals +
+        (deals === 1 ? ' deal' : ' deals') +
+        ' on this page.'
+    );
+}
+
+/**
+ * A new page: scan now, then again while its listings finish drawing. The
+ * first scan that finds listings plays the scan animation, so you can see
+ * the new page was picked up.
+ */
+function scanBurst() {
+    const href = location.href;
+    app.burstHref = href;
+
+    for (const delay of SCAN_BURST_MS) {
+        setTimeout(() => {
+            if (app.burstHref !== href || location.href !== href) return;
+            if (!app.index || document.visibilityState !== 'visible') return;
+            if (app.announcedHref === href) return;
+
+            rescan();
+
+            if (app.pageType === PAGE_NONE) return;
+            if (app.pageDiagnostics && app.pageDiagnostics.listings > 0) {
+                app.announcedHref = href;
+                app.panel.showScan();
+            }
+        }, delay);
+    }
+}
+
+function startPageWatch() {
+    app.watchedHref = location.href;
+    scanBurst();
+
+    setInterval(() => {
+        if (location.href === app.watchedHref) return;
+        app.watchedHref = location.href;
+        handleRouteChange();
+        scanBurst();
+    }, HREF_WATCH_MS);
+}
+
 /** Identity of a feed listing you followed, so it is re-checked first. */
 function openedKey(row) {
     return [row.source, row.itemId, row.sellerId || '', row.profit.listingPrice].join(':');
@@ -1071,6 +1154,7 @@ export function boot() {
 
     app.panel = new Panel({
         onScan,
+        onScanPage,
         onNavigate,
         onSettingsChange,
         onSaveKey,
@@ -1131,5 +1215,6 @@ export function boot() {
         rescan();
     }, POLL_INTERVAL_MS);
 
+    startPageWatch();
     startLiveFeed();
 }

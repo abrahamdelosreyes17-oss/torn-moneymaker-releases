@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      3.3.2
+// @version      3.3.3
 // @description  Finds Bazaar and Item Market listings below NPC / market value - on the page you are viewing, and live from the Torn API and TornW3B - ranked by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -37,7 +37,7 @@
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '3.3.2';
+    const TTV2_BUILD_VERSION = '3.3.3';
 
     /* ===== src/platform/gm.js ===== */
     /*
@@ -3101,6 +3101,7 @@
         cursor: move;
         user-select: none;
         flex: 0 0 auto;
+        position: relative;
     }
 
     .ttv2-title {
@@ -3158,6 +3159,50 @@
 
     .ttv2-on-settings button.ttv2-back {
         display: inline-block;
+    }
+
+    .ttv2-panel button.ttv2-scan {
+        height: 24px;
+        padding: 0 9px;
+        margin-right: 2px;
+        font-size: 12px;
+        font-weight: bold;
+        color: var(--green);
+        background: transparent;
+        border-color: #4a6a4a;
+    }
+
+    .ttv2-panel button.ttv2-scan:hover:not(:disabled) {
+        background: #2f3d2f;
+    }
+
+    .ttv2-scanning button.ttv2-scan {
+        animation: ttv2-pulse 0.8s ease-out;
+    }
+
+    @keyframes ttv2-pulse {
+        0% { box-shadow: 0 0 0 0 rgba(120, 200, 120, 0.7); background: #2f4a2f; }
+        100% { box-shadow: 0 0 0 8px rgba(120, 200, 120, 0); }
+    }
+
+    .ttv2-sweep {
+        position: absolute;
+        left: 0;
+        bottom: -1px;
+        height: 2px;
+        width: 30%;
+        background: linear-gradient(90deg, transparent, var(--green), transparent);
+        opacity: 0;
+        pointer-events: none;
+    }
+
+    .ttv2-scanning .ttv2-sweep {
+        animation: ttv2-sweep 0.8s ease-in-out;
+    }
+
+    @keyframes ttv2-sweep {
+        0% { left: -30%; opacity: 1; }
+        100% { left: 100%; opacity: 1; }
     }
 
     .ttv2-spin {
@@ -3678,10 +3723,14 @@
         return Number.isFinite(n) ? n : fallback;
     }
 
+    /** Long enough to see, short enough not to get in the way. */
+    const SCAN_ANIMATION_MS = 800;
+
     class Panel {
         /**
          * @param {object} handlers
          * @param {function} handlers.onScan           - refresh everything now
+         * @param {function} handlers.onScanPage       - re-read this page now
          * @param {function} handlers.onNavigate       - (row) => void
          * @param {function} handlers.onSettingsChange - (partialSettings) => void
          * @param {function} handlers.onViewChange     - ('bazaar'|'itemmarket')
@@ -3743,6 +3792,23 @@
             this.titleEl.appendChild(this.versionEl);
             this.titleEl.appendChild(this.miniEl);
 
+            // Re-reads the listings on this page right away - no requests, so
+            // it can be pressed as often as you like. The feed refresh is ↻.
+            this.scanBtn = el('button', {
+                type: 'button',
+                class: 'ttv2-scan',
+                title: 'Scan this page now',
+                'aria-label': 'Scan this page now',
+                text: 'Scan',
+                onclick: guarded(this, 'Scan', () => {
+                    if (!this.hasKey) {
+                        this.showPage('settings', { focusKey: true });
+                        return undefined;
+                    }
+                    return this.handlers.onScanPage ? this.handlers.onScanPage() : undefined;
+                }),
+            });
+
             this.refreshBtn = el('button', {
                 type: 'button',
                 class: 'ttv2-icon',
@@ -3778,12 +3844,18 @@
                 onclick: () => this.setCollapsed(!this.collapsed, { save: true }),
             });
 
+            // A thin line that sweeps under the header on every visible scan, so
+            // you can see a scan happened even when nothing on the list changed.
+            this.sweepEl = el('div', { class: 'ttv2-sweep', 'aria-hidden': 'true' });
+
             this.headEl = el('div', { class: 'ttv2-head' }, [
                 this.backBtn,
                 this.titleEl,
+                this.scanBtn,
                 this.refreshBtn,
                 this.settingsBtn,
                 this.collapseBtn,
+                this.sweepEl,
             ]);
 
             /* ---- status bar ---- */
@@ -4401,6 +4473,28 @@
             this.setCollapsed(!this.collapsed, { save: true });
         }
 
+        /**
+         * Play the scan animation: the Scan button pulses and a line sweeps
+         * under the header. Restarts if a scan lands mid-animation.
+         *
+         * @param {string} [message] - result line for the status bar
+         */
+        showScan(message) {
+            if (!this.root) return;
+
+            this.root.classList.remove('ttv2-scanning');
+            // Force a reflow so the CSS animation starts over.
+            void this.root.offsetWidth;
+            this.root.classList.add('ttv2-scanning');
+
+            clearTimeout(this.scanTimer);
+            this.scanTimer = setTimeout(() => {
+                if (this.root) this.root.classList.remove('ttv2-scanning');
+            }, SCAN_ANIMATION_MS);
+
+            if (message) this.setStatus(message);
+        }
+
         setBusy(busy) {
             this.state.busy = Boolean(busy);
             if (!this.refreshBtn) return;
@@ -4845,6 +4939,7 @@
 
         destroy() {
             if (this.ticker) clearInterval(this.ticker);
+            clearTimeout(this.scanTimer);
             if (this.host && this.host.parentNode) {
                 this.host.parentNode.removeChild(this.host);
             }
@@ -5390,6 +5485,15 @@
     };
 
     const RESCAN_DEBOUNCE_MS = 400;
+
+    /*
+     * Torn changes pages with pushState, which fires no event, and draws the
+     * listings a moment after the address changes. Checking the address is a
+     * string compare, so it is done often; on a change the page is scanned at
+     * once and a few more times while the listings finish drawing.
+     */
+    const HREF_WATCH_MS = 250;
+    const SCAN_BURST_MS = [0, 300, 700, 1200, 2000, 3000];
 
     /** How often every tab checks whether it should lead the live feed. */
     const FEED_TICK_MS = LEADER_HEARTBEAT_MS;
@@ -6055,6 +6159,80 @@
     }
 
 
+    /**
+     * The small Scan button: re-read this page now. No requests - just the DOM
+     * already on screen - so it can be pressed freely. Always animates, so a
+     * press visibly did something even when the list does not change.
+     */
+    function onScanPage() {
+        // Nothing loaded yet: the first load IS the scan.
+        if (!app.index) return onScan();
+
+        rescan();
+        app.panel.showScan(scanSummary());
+        return undefined;
+    }
+
+    function scanSummary() {
+        if (app.pageType === PAGE_NONE) {
+            return 'Nothing to scan here - not a Bazaar or Item Market page.';
+        }
+
+        const found = (app.pageDiagnostics && app.pageDiagnostics.listings) || 0;
+        if (!found) {
+            return 'Scanned: no listings found on this page yet.';
+        }
+
+        const deals = (app.pageRows || []).length;
+        return (
+            'Scanned: ' +
+            found +
+            (found === 1 ? ' listing' : ' listings') +
+            ' · ' +
+            deals +
+            (deals === 1 ? ' deal' : ' deals') +
+            ' on this page.'
+        );
+    }
+
+    /**
+     * A new page: scan now, then again while its listings finish drawing. The
+     * first scan that finds listings plays the scan animation, so you can see
+     * the new page was picked up.
+     */
+    function scanBurst() {
+        const href = location.href;
+        app.burstHref = href;
+
+        for (const delay of SCAN_BURST_MS) {
+            setTimeout(() => {
+                if (app.burstHref !== href || location.href !== href) return;
+                if (!app.index || document.visibilityState !== 'visible') return;
+                if (app.announcedHref === href) return;
+
+                rescan();
+
+                if (app.pageType === PAGE_NONE) return;
+                if (app.pageDiagnostics && app.pageDiagnostics.listings > 0) {
+                    app.announcedHref = href;
+                    app.panel.showScan();
+                }
+            }, delay);
+        }
+    }
+
+    function startPageWatch() {
+        app.watchedHref = location.href;
+        scanBurst();
+
+        setInterval(() => {
+            if (location.href === app.watchedHref) return;
+            app.watchedHref = location.href;
+            handleRouteChange();
+            scanBurst();
+        }, HREF_WATCH_MS);
+    }
+
     /** Identity of a feed listing you followed, so it is re-checked first. */
     function openedKey(row) {
         return [row.source, row.itemId, row.sellerId || '', row.profit.listingPrice].join(':');
@@ -6336,6 +6514,7 @@
 
         app.panel = new Panel({
             onScan,
+            onScanPage,
             onNavigate,
             onSettingsChange,
             onSaveKey,
@@ -6396,6 +6575,7 @@
             rescan();
         }, POLL_INTERVAL_MS);
 
+        startPageWatch();
         startLiveFeed();
     }
 

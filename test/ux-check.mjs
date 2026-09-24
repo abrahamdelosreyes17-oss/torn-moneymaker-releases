@@ -142,6 +142,33 @@ const saved = await p.evaluate(() => JSON.parse(GM_getValue('tornTrading.v2.sett
 ok(saved && Math.abs(saved.left - after.x) < 2, 'position remembered: ' + JSON.stringify(saved));
 ok(await vis(p, '.ttv2-body'), 'a drag is not a click (did not collapse)');
 
+// Scan button: always animates, and says what it found
+const scanning = () => q(p, '.ttv2-panel').evaluate((n) => n.classList.contains('ttv2-scanning'));
+await q(p, 'button.ttv2-scan').click();
+ok(await scanning(), 'Scan plays the scan animation');
+ok(/Nothing to scan here/.test(await txt(p, '.ttv2-bar-left')), 'Scan off a market page says so: ' + (await txt(p, '.ttv2-bar-left')));
+await p.waitForTimeout(1000);
+ok(!(await scanning()), 'scan animation ends by itself');
+
+// A Torn-style page change (pushState, no event) with listings that draw
+// late: picked up without pressing anything, well inside the old 2.5s poll.
+const tiles = await p.evaluate(async () => {
+  const html = await (await fetch('/test/fixture.html')).text();
+  const doc = new DOMParser().parseFromString(html, 'text/html');
+  return [...doc.querySelectorAll('.itemTile___gJeSo')].map((n) => n.outerHTML).join('');
+});
+ok(tiles.length > 0, 'fixture listings loaded');
+await p.evaluate(() => history.pushState({}, '', '/test/harness-live.html?sid=ItemMarket#/market/view=search&itemID=1'));
+await p.waitForTimeout(500);
+await p.evaluate((h) => { const d = document.createElement('div'); d.id = 'fake-market'; d.innerHTML = h; document.body.appendChild(d); }, tiles);
+let caught = false;
+for (let i = 0; i < 20 && !caught; i++) { await p.waitForTimeout(50); caught = await scanning(); }
+ok(caught, 'new page auto-scanned (with animation) within ~1s of its listings drawing');
+await p.waitForTimeout(900);
+await q(p, 'button.ttv2-scan').click();
+ok(/Scanned: \d+ listing/.test(await txt(p, '.ttv2-bar-left')), 'Scan on a market page counts listings: ' + (await txt(p, '.ttv2-bar-left')));
+await p.screenshot({ path: sp + '/ux-scan.png' });
+
 console.log('ERRORS', errs);
 console.log(failures ? failures + ' FAILED' : 'ALL PASSED');
 await b.close(); server.close();

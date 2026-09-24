@@ -93,10 +93,14 @@ function numberFromInput(value, fallback) {
     return Number.isFinite(n) ? n : fallback;
 }
 
+/** Long enough to see, short enough not to get in the way. */
+const SCAN_ANIMATION_MS = 800;
+
 export class Panel {
     /**
      * @param {object} handlers
      * @param {function} handlers.onScan           - refresh everything now
+     * @param {function} handlers.onScanPage       - re-read this page now
      * @param {function} handlers.onNavigate       - (row) => void
      * @param {function} handlers.onSettingsChange - (partialSettings) => void
      * @param {function} handlers.onViewChange     - ('bazaar'|'itemmarket')
@@ -158,6 +162,23 @@ export class Panel {
         this.titleEl.appendChild(this.versionEl);
         this.titleEl.appendChild(this.miniEl);
 
+        // Re-reads the listings on this page right away - no requests, so
+        // it can be pressed as often as you like. The feed refresh is ↻.
+        this.scanBtn = el('button', {
+            type: 'button',
+            class: 'ttv2-scan',
+            title: 'Scan this page now',
+            'aria-label': 'Scan this page now',
+            text: 'Scan',
+            onclick: guarded(this, 'Scan', () => {
+                if (!this.hasKey) {
+                    this.showPage('settings', { focusKey: true });
+                    return undefined;
+                }
+                return this.handlers.onScanPage ? this.handlers.onScanPage() : undefined;
+            }),
+        });
+
         this.refreshBtn = el('button', {
             type: 'button',
             class: 'ttv2-icon',
@@ -193,12 +214,18 @@ export class Panel {
             onclick: () => this.setCollapsed(!this.collapsed, { save: true }),
         });
 
+        // A thin line that sweeps under the header on every visible scan, so
+        // you can see a scan happened even when nothing on the list changed.
+        this.sweepEl = el('div', { class: 'ttv2-sweep', 'aria-hidden': 'true' });
+
         this.headEl = el('div', { class: 'ttv2-head' }, [
             this.backBtn,
             this.titleEl,
+            this.scanBtn,
             this.refreshBtn,
             this.settingsBtn,
             this.collapseBtn,
+            this.sweepEl,
         ]);
 
         /* ---- status bar ---- */
@@ -816,6 +843,28 @@ export class Panel {
         this.setCollapsed(!this.collapsed, { save: true });
     }
 
+    /**
+     * Play the scan animation: the Scan button pulses and a line sweeps
+     * under the header. Restarts if a scan lands mid-animation.
+     *
+     * @param {string} [message] - result line for the status bar
+     */
+    showScan(message) {
+        if (!this.root) return;
+
+        this.root.classList.remove('ttv2-scanning');
+        // Force a reflow so the CSS animation starts over.
+        void this.root.offsetWidth;
+        this.root.classList.add('ttv2-scanning');
+
+        clearTimeout(this.scanTimer);
+        this.scanTimer = setTimeout(() => {
+            if (this.root) this.root.classList.remove('ttv2-scanning');
+        }, SCAN_ANIMATION_MS);
+
+        if (message) this.setStatus(message);
+    }
+
     setBusy(busy) {
         this.state.busy = Boolean(busy);
         if (!this.refreshBtn) return;
@@ -1260,6 +1309,7 @@ export class Panel {
 
     destroy() {
         if (this.ticker) clearInterval(this.ticker);
+        clearTimeout(this.scanTimer);
         if (this.host && this.host.parentNode) {
             this.host.parentNode.removeChild(this.host);
         }

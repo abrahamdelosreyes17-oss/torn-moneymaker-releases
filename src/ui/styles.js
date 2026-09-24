@@ -231,6 +231,7 @@ export const PANEL_CSS = `
     cursor: move;
     user-select: none;
     flex: 0 0 auto;
+    position: relative;
 }
 
 .ttv2-title {
@@ -288,6 +289,50 @@ export const PANEL_CSS = `
 
 .ttv2-on-settings button.ttv2-back {
     display: inline-block;
+}
+
+.ttv2-panel button.ttv2-scan {
+    height: 24px;
+    padding: 0 9px;
+    margin-right: 2px;
+    font-size: 12px;
+    font-weight: bold;
+    color: var(--green);
+    background: transparent;
+    border-color: #4a6a4a;
+}
+
+.ttv2-panel button.ttv2-scan:hover:not(:disabled) {
+    background: #2f3d2f;
+}
+
+.ttv2-scanning button.ttv2-scan {
+    animation: ttv2-pulse 0.8s ease-out;
+}
+
+@keyframes ttv2-pulse {
+    0% { box-shadow: 0 0 0 0 rgba(120, 200, 120, 0.7); background: #2f4a2f; }
+    100% { box-shadow: 0 0 0 8px rgba(120, 200, 120, 0); }
+}
+
+.ttv2-sweep {
+    position: absolute;
+    left: 0;
+    bottom: -1px;
+    height: 2px;
+    width: 30%;
+    background: linear-gradient(90deg, transparent, var(--green), transparent);
+    opacity: 0;
+    pointer-events: none;
+}
+
+.ttv2-scanning .ttv2-sweep {
+    animation: ttv2-sweep 0.8s ease-in-out;
+}
+
+@keyframes ttv2-sweep {
+    0% { left: -30%; opacity: 1; }
+    100% { left: 100%; opacity: 1; }
 }
 
 .ttv2-spin {
