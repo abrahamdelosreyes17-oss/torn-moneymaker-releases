@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      3.3.0
+// @version      3.3.1
 // @description  Finds Bazaar and Item Market listings below NPC / market value - on the page you are viewing, and live from the Torn API and TornW3B - ranked by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -37,7 +37,7 @@
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '3.3.0';
+    const TTV2_BUILD_VERSION = '3.3.1';
 
     /* ===== src/platform/gm.js ===== */
     /*
@@ -3521,16 +3521,14 @@
     .ttv2-keystate.ttv2-ok { color: var(--green); }
     .ttv2-keystate.ttv2-bad { color: var(--red); }
 
-    .ttv2-tos-box,
-    .ttv2-advanced {
+    .ttv2-tos-box {
         border: 1px solid var(--line);
         border-radius: 5px;
         padding: 6px 8px;
         background: var(--bg2);
     }
 
-    .ttv2-tos-box summary,
-    .ttv2-advanced summary {
+    .ttv2-tos-box summary {
         cursor: pointer;
         color: var(--text);
         font-size: 11px;
@@ -3556,22 +3554,6 @@
         width: 36%;
         color: var(--muted);
         font-weight: normal;
-    }
-
-    .ttv2-advanced[open] {
-        display: flex;
-        flex-direction: column;
-        gap: 6px;
-    }
-
-    .ttv2-diag {
-        margin: 0;
-        padding: 6px;
-        background: #181818;
-        border-radius: 4px;
-        color: #aaa;
-        font: 10.5px/1.4 Consolas, monospace;
-        white-space: pre-wrap;
     }
     `;
 
@@ -3903,6 +3885,17 @@
 
             const settings = this.page === 'settings';
 
+            /*
+             * Keep the panel's height steady across the switch: Settings is
+             * shorter than a full list, and a panel that jumps in size on every
+             * click is the kind of jumpiness this redesign is meant to remove.
+             */
+            if (settings && !this.root.classList.contains('ttv2-on-settings')) {
+                this.root.style.minHeight = this.root.getBoundingClientRect().height + 'px';
+            } else if (!settings) {
+                this.root.style.minHeight = '';
+            }
+
             this.root.classList.toggle('ttv2-on-settings', settings);
             this.settingsBtn.setAttribute('aria-pressed', String(settings));
             this.titleTextEl.textContent = settings ? 'Settings' : 'NPC Arbitrage';
@@ -3910,9 +3903,8 @@
             // Opening a page from a collapsed panel should show it.
             if (this.collapsed) this.setCollapsed(false, { save: true });
 
-            if (settings) {
-                this.renderDiagnostics();
-                if (focusKey && this.keyInput) setTimeout(() => this.keyInput.focus(), 0);
+            if (settings && focusKey && this.keyInput) {
+                setTimeout(() => this.keyInput.focus(), 0);
             }
         }
 
@@ -4061,8 +4053,9 @@
 
         /**
          * Settings, top to bottom: the key (with Torn's required disclosure
-         * right under it), the live feed, data, and advanced. Short lines, not
-         * paragraphs.
+         * right under it), and the live feed. Nothing else - maintenance
+         * (re-download item data, reset panel position, scan diagnostics) is in
+         * the Tampermonkey menu, out of the way.
          */
         buildSettings() {
             const section = (title, children) =>
@@ -4208,43 +4201,6 @@
                         'Never buys, clicks, notifies or plays sounds. Every row is ' +
                             'a link you follow yourself.',
                     ),
-                ]),
-            );
-
-            /* ---- data ---- */
-
-            this.settingsPage.appendChild(
-                section('Data', [
-                    el('div', { class: 'ttv2-inline' }, [
-                        el('button', {
-                            type: 'button',
-                            text: 'Re-download item data',
-                            onclick: () => this.handlers.onClearCache && this.handlers.onClearCache(),
-                        }),
-                    ]),
-                    note("Item prices refresh hourly on their own. Use this if an item's Sell price looks wrong."),
-                ]),
-            );
-
-            /* ---- advanced ---- */
-
-            this.diagEl = el('pre', { class: 'ttv2-diag' });
-
-            this.settingsPage.appendChild(
-                el('details', { class: 'ttv2-advanced' }, [
-                    el('summary', { text: 'Advanced' }),
-                    el('div', { class: 'ttv2-sub', text: 'Scan of the page you are on:' }),
-                    this.diagEl,
-                    el('div', { class: 'ttv2-inline' }, [
-                        el('button', {
-                            type: 'button',
-                            text: 'Reset panel position',
-                            onclick: () => {
-                                this.emitSettings({ panelPos: null });
-                                this.applyPosition(null);
-                            },
-                        }),
-                    ]),
                 ]),
             );
         }
@@ -4502,7 +4458,6 @@
             }
 
             this.renderTabs();
-            if (this.page === 'settings') this.renderDiagnostics();
             this.refreshAges();
         }
 
@@ -4660,7 +4615,7 @@
                         'Found ' +
                         d.cards +
                         ' listings but none matched the item database. Try ' +
-                        'Settings › Re-download item data.'
+                        'Tampermonkey menu › Re-download item data.'
                     );
                 }
                 return (
@@ -4858,28 +4813,6 @@
                 age.title = 'TornW3B did not say when it last checked this.';
             }
             return line;
-        }
-
-        renderDiagnostics() {
-            const d = this.state.diagnostics;
-            if (!this.diagEl) return;
-
-            if (!d) {
-                this.diagEl.textContent = '';
-                return;
-            }
-
-            this.diagEl.textContent = [
-                'page: ' + (d.pageType || 'none'),
-                'item images found: ' + d.images,
-                'listing cards: ' + d.cards,
-                'read from Torn aria labels: ' + d.fromAria,
-                'parsed: ' + d.listings,
-                'skipped - item not in database: ' + d.noItem,
-                'skipped - no price: ' + d.noPrice,
-                'price inferred: ' + d.priceAssumed,
-                'quantity assumed: ' + d.qtyAssumed,
-            ].join('\n');
         }
 
         refreshAges() {
@@ -5614,7 +5547,8 @@
         app.index = null;
         app.npcShops = new Map();
 
-        app.panel.setStatus('Cached item and shop data cleared.');
+        app.panel.setStatus('Re-downloading item data...');
+        if (hasUsableKey()) onScan();
     }
 
     /**
@@ -6339,7 +6273,33 @@
             gmOpenTab(TORN_API_KEY_URL);
         });
 
-        gmMenu('Clear cached item + shop data', onClearCache);
+        // Maintenance lives here rather than in the panel's Settings.
+        gmMenu('Re-download item data', onClearCache);
+
+        gmMenu('Reset panel position', () => {
+            onSettingsChange({ panelPos: null });
+            app.panel.applyPosition(null);
+        });
+
+        gmMenu('Show scan diagnostics', () => {
+            const d = app.pageDiagnostics;
+            alert(
+                d
+                    ? 'Scan of the page you are on\n\n' +
+                          [
+                              'page: ' + (d.pageType || 'none'),
+                              'item images found: ' + d.images,
+                              'listing cards: ' + d.cards,
+                              'read from Torn aria labels: ' + d.fromAria,
+                              'parsed: ' + d.listings,
+                              'skipped - item not in database: ' + d.noItem,
+                              'skipped - no price: ' + d.noPrice,
+                              'price inferred: ' + d.priceAssumed,
+                              'quantity assumed: ' + d.qtyAssumed,
+                          ].join('\n')
+                    : 'Open a Bazaar or the Item Market first.',
+            );
+        });
     }
 
     /* ------------------------------------------------------------------ *

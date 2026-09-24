@@ -311,6 +311,17 @@ export class Panel {
 
         const settings = this.page === 'settings';
 
+        /*
+         * Keep the panel's height steady across the switch: Settings is
+         * shorter than a full list, and a panel that jumps in size on every
+         * click is the kind of jumpiness this redesign is meant to remove.
+         */
+        if (settings && !this.root.classList.contains('ttv2-on-settings')) {
+            this.root.style.minHeight = this.root.getBoundingClientRect().height + 'px';
+        } else if (!settings) {
+            this.root.style.minHeight = '';
+        }
+
         this.root.classList.toggle('ttv2-on-settings', settings);
         this.settingsBtn.setAttribute('aria-pressed', String(settings));
         this.titleTextEl.textContent = settings ? 'Settings' : 'NPC Arbitrage';
@@ -318,9 +329,8 @@ export class Panel {
         // Opening a page from a collapsed panel should show it.
         if (this.collapsed) this.setCollapsed(false, { save: true });
 
-        if (settings) {
-            this.renderDiagnostics();
-            if (focusKey && this.keyInput) setTimeout(() => this.keyInput.focus(), 0);
+        if (settings && focusKey && this.keyInput) {
+            setTimeout(() => this.keyInput.focus(), 0);
         }
     }
 
@@ -469,8 +479,9 @@ export class Panel {
 
     /**
      * Settings, top to bottom: the key (with Torn's required disclosure
-     * right under it), the live feed, data, and advanced. Short lines, not
-     * paragraphs.
+     * right under it), and the live feed. Nothing else - maintenance
+     * (re-download item data, reset panel position, scan diagnostics) is in
+     * the Tampermonkey menu, out of the way.
      */
     buildSettings() {
         const section = (title, children) =>
@@ -616,43 +627,6 @@ export class Panel {
                     'Never buys, clicks, notifies or plays sounds. Every row is ' +
                         'a link you follow yourself.',
                 ),
-            ]),
-        );
-
-        /* ---- data ---- */
-
-        this.settingsPage.appendChild(
-            section('Data', [
-                el('div', { class: 'ttv2-inline' }, [
-                    el('button', {
-                        type: 'button',
-                        text: 'Re-download item data',
-                        onclick: () => this.handlers.onClearCache && this.handlers.onClearCache(),
-                    }),
-                ]),
-                note("Item prices refresh hourly on their own. Use this if an item's Sell price looks wrong."),
-            ]),
-        );
-
-        /* ---- advanced ---- */
-
-        this.diagEl = el('pre', { class: 'ttv2-diag' });
-
-        this.settingsPage.appendChild(
-            el('details', { class: 'ttv2-advanced' }, [
-                el('summary', { text: 'Advanced' }),
-                el('div', { class: 'ttv2-sub', text: 'Scan of the page you are on:' }),
-                this.diagEl,
-                el('div', { class: 'ttv2-inline' }, [
-                    el('button', {
-                        type: 'button',
-                        text: 'Reset panel position',
-                        onclick: () => {
-                            this.emitSettings({ panelPos: null });
-                            this.applyPosition(null);
-                        },
-                    }),
-                ]),
             ]),
         );
     }
@@ -910,7 +884,6 @@ export class Panel {
         }
 
         this.renderTabs();
-        if (this.page === 'settings') this.renderDiagnostics();
         this.refreshAges();
     }
 
@@ -1068,7 +1041,7 @@ export class Panel {
                     'Found ' +
                     d.cards +
                     ' listings but none matched the item database. Try ' +
-                    'Settings › Re-download item data.'
+                    'Tampermonkey menu › Re-download item data.'
                 );
             }
             return (
@@ -1266,28 +1239,6 @@ export class Panel {
             age.title = 'TornW3B did not say when it last checked this.';
         }
         return line;
-    }
-
-    renderDiagnostics() {
-        const d = this.state.diagnostics;
-        if (!this.diagEl) return;
-
-        if (!d) {
-            this.diagEl.textContent = '';
-            return;
-        }
-
-        this.diagEl.textContent = [
-            'page: ' + (d.pageType || 'none'),
-            'item images found: ' + d.images,
-            'listing cards: ' + d.cards,
-            'read from Torn aria labels: ' + d.fromAria,
-            'parsed: ' + d.listings,
-            'skipped - item not in database: ' + d.noItem,
-            'skipped - no price: ' + d.noPrice,
-            'price inferred: ' + d.priceAssumed,
-            'quantity assumed: ' + d.qtyAssumed,
-        ].join('\n');
     }
 
     refreshAges() {

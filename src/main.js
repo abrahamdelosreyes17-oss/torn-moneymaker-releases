@@ -293,7 +293,8 @@ function onClearCache() {
     app.index = null;
     app.npcShops = new Map();
 
-    app.panel.setStatus('Cached item and shop data cleared.');
+    app.panel.setStatus('Re-downloading item data...');
+    if (hasUsableKey()) onScan();
 }
 
 /**
@@ -1018,7 +1019,33 @@ function registerMenu() {
         gmOpenTab(TORN_API_KEY_URL);
     });
 
-    gmMenu('Clear cached item + shop data', onClearCache);
+    // Maintenance lives here rather than in the panel's Settings.
+    gmMenu('Re-download item data', onClearCache);
+
+    gmMenu('Reset panel position', () => {
+        onSettingsChange({ panelPos: null });
+        app.panel.applyPosition(null);
+    });
+
+    gmMenu('Show scan diagnostics', () => {
+        const d = app.pageDiagnostics;
+        alert(
+            d
+                ? 'Scan of the page you are on\n\n' +
+                      [
+                          'page: ' + (d.pageType || 'none'),
+                          'item images found: ' + d.images,
+                          'listing cards: ' + d.cards,
+                          'read from Torn aria labels: ' + d.fromAria,
+                          'parsed: ' + d.listings,
+                          'skipped - item not in database: ' + d.noItem,
+                          'skipped - no price: ' + d.noPrice,
+                          'price inferred: ' + d.priceAssumed,
+                          'quantity assumed: ' + d.qtyAssumed,
+                      ].join('\n')
+                : 'Open a Bazaar or the Item Market first.',
+        );
+    });
 }
 
 /* ------------------------------------------------------------------ *

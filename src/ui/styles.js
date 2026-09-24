@@ -662,16 +662,14 @@ export const PANEL_CSS = `
 .ttv2-keystate.ttv2-ok { color: var(--green); }
 .ttv2-keystate.ttv2-bad { color: var(--red); }
 
-.ttv2-tos-box,
-.ttv2-advanced {
+.ttv2-tos-box {
     border: 1px solid var(--line);
     border-radius: 5px;
     padding: 6px 8px;
     background: var(--bg2);
 }
 
-.ttv2-tos-box summary,
-.ttv2-advanced summary {
+.ttv2-tos-box summary {
     cursor: pointer;
     color: var(--text);
     font-size: 11px;
@@ -697,22 +695,6 @@ export const PANEL_CSS = `
     width: 36%;
     color: var(--muted);
     font-weight: normal;
-}
-
-.ttv2-advanced[open] {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-}
-
-.ttv2-diag {
-    margin: 0;
-    padding: 6px;
-    background: #181818;
-    border-radius: 4px;
-    color: #aaa;
-    font: 10.5px/1.4 Consolas, monospace;
-    white-space: pre-wrap;
 }
 `;
 

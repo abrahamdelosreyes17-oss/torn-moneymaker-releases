@@ -85,9 +85,10 @@ scrolls to it when it is on the page you are viewing. Nothing is ever bought for
     Item Market (after the 5% tax).
   - **Min** and **Cash** chips: click to type a minimum total profit or the cash
     you have; Enter saves, Esc cancels.
-- **Settings** replaces the list (← Back or Esc returns): API key and Torn's key-use
-  disclosure, live feed switches, re-download item data, and *Advanced* (scan
-  diagnostics for the page you are on, reset panel position).
+- **Settings** replaces the list (← Back or Esc returns): the API key with Torn's
+  key-use disclosure, and the live feed switches. That is all.
+- **Tampermonkey menu** (maintenance, out of the way): Open settings, Re-download
+  item data, Reset panel position, Show scan diagnostics, Key safety.
 - An empty list always says why and offers the one button that would help.
 
 Item data (Sell price, Value) is refreshed hourly.
@@ -314,11 +315,10 @@ the "↓1%" badge still reads as $838,745, not $8,387,451) and treats "(N in sto
 that seller's quantity, and both work on a card reconstructed from a screenshot —
 but that is not captured markup.
 
-To verify: open a bazaar, press Scan, and read the empty-state message and the
-diagnostics under **Filter**. `row selector: NO MATCH` means the selector list needs
-an entry for your page; you can paste one into Settings → Row selectors without
-editing the script. `skipped - unknown item` counts rows whose name cell was not
-found.
+To verify: open a bazaar and read the empty-state message and the scan
+diagnostics (Tampermonkey menu › *Show scan diagnostics*). `listing cards: 0` means
+the card finder needs an entry for your page; `skipped - item not in database`
+counts cards whose item could not be identified.
 
 Also unverified: the rule that **an item stocked by a city shop is one that shop buys
 back**. That inference is what the whole verified/unverified split rests on, and

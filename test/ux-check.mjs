@@ -71,7 +71,7 @@ const box1 = await q(p, '.ttv2-panel').boundingBox();
 await q(p, 'button[title="Settings"]').click();
 ok(await vis(p, '.ttv2-page-settings') && !(await vis(p, '.ttv2-page-list')), 'Settings replaces the list');
 const box2 = await q(p, '.ttv2-panel').boundingBox();
-ok(box2.height >= box1.height - 2, 'Settings has at least the list space (' + Math.round(box1.height) + ' -> ' + Math.round(box2.height) + ')');
+ok(Math.abs(box2.height - box1.height) <= 4, 'panel height steady when opening Settings (' + Math.round(box1.height) + ' -> ' + Math.round(box2.height) + ')');
 ok((await q(p, 'button[title="Settings"]').getAttribute('aria-pressed')) === 'true', 'Settings button shows pressed');
 ok(!(await q(p, '.ttv2-tos-box').evaluate(e => e.open)), 'key saved: ToS folded but present');
 await p.screenshot({ path: sp + '/ux-settings.png' });
