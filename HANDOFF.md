@@ -3,6 +3,70 @@
 Read this first, then `README.md`. The README holds the product and the binding
 rules; this file holds where we are, how the owner works, and what is settled.
 
+## READ FIRST: corrections from the owner (after 3.8.1)
+
+The selling page as built does NOT match what he wants. He said the previous
+session misunderstood him and should have asked instead of guessing. **If
+anything below is unclear, ask him before coding. Asking is free; wrong builds
+cost him real money.**
+
+### 1. The TornExchange key: there is no separate key (likely root cause)
+- Checked in TornExchange's source (`users/views.py`): at login TE takes the
+  Torn API key you type in, checks it against Torn, and saves it as
+  `profile.api_key`. The API's `?key=` must equal that key. So the "TE API
+  key" **is the Torn API key he logged into tornexchange.com with**.
+- He logged in with his **Limited** key, so both fields should hold the
+  **same key**. The page refuses that (`src/main.js` ~2205, and the reverse
+  checks at ~2167 and ~399). So TE gets no key, no traders load, every item
+  says "No buyer on TE", and no online statuses are fetched. That matches
+  everything he saw. Confirm live, then fix: allow the same key, or use one
+  field for both. TE already holds this key, since he logged in with it.
+
+### 2. What the selling page must show (his words)
+> "I just want the information from their page and from the traders' links.
+> Of course they will have 0 buyers. I am the buyer. In Torn we buy by
+> messaging the trader and creating the trade. No one else can track it.
+> Thus I just want the trader's name, their link, profile link, what they're
+> selling and how much."
+
+- Per item: each TornExchange trader for it, with **name**, **TE price list
+  link**, **Torn profile link**, and the **price** from their list. Their
+  **online status**, fetched the same way as bazaar sellers' status.
+- TE doesn't track trades. They happen by message in Torn, so there are no
+  "buyer" counts. Drop wording like "No buyer on TE"; ask him what an item
+  with no trader should say.
+
+### 3. Replace "Traders avg"
+> "Why do I care about traders avg? I want the item's average on the Item
+> Market, from any information we have on the item."
+
+- Show the item's **Item Market average**, from what we have: Torn's market
+  value (daily average of real sales), the v2 `itemmarket` `average_price`,
+  and the script's own recorded asks. **Ask him which of these to show and
+  how to label them before building.**
+
+### 4. "Total": he asked what it is
+- It's his quantity × the best offer: what selling the whole stack to that
+  trader would pay. Explain that and **ask whether to keep it**.
+
+### 5. Graphs, when selling
+- He can't see graphs when selling. The facts:
+  - No API has past price history. Only the script's own recordings exist,
+    since he installed 3.8.0: every 5 min, with a Torn tab open and TornW3B
+    on, for items seen on the own-bazaar add/manage page or in the selling
+    page's inventory.
+  - The graph is only in the overlay's "My bazaar" view, opened by clicking
+    a price tag on `bazaar.php#/add` or `#/manage`. The selling page has no
+    graph at all. Tag clicks were broken in 3.8.0 and fixed in 3.8.1.
+  - Unresearched idea: read Torn's in-game market-value graph when *he* opens
+    an item's info (reading a page he's viewing is allowed).
+- **Ask him** whether he wants a graph or averages on the selling page.
+
+### 6. Process: budget is tight
+- Research only the specific question, cheaply.
+- Restate his words back and get a yes before building.
+- One focused change at a time.
+
 ## Where things stand
 
 - **Version 3.8.1**, branch `claude/optimistic-ride-1gqguu`, commit `0210c53`.
