@@ -83,9 +83,14 @@ export function emptyFeed() {
  * @param {object} item - record from buildItemIndex
  * @param {object} settings - sellToNpc, resaleBazaar, resaleMarket
  */
-export function exitsFor(item, settings = {}) {
+export function exitsFor(item, settings = {}, traderPrice = 0) {
     const exits = {};
     if (!item) return exits;
+
+    // What the chosen TornExchange trader pays - see core/traders.js.
+    if (settings.sellToTrader && Number(traderPrice) > 0) {
+        exits.TRADER = Number(traderPrice);
+    }
 
     if (settings.sellToNpc !== false) {
         const sell = Number(item.sellPrice);
@@ -113,7 +118,13 @@ export function exitsFor(item, settings = {}) {
  * @param {object} settings
  * @returns {Array<{itemId: string, lowestPrice: number, profitPerUnit: number}>}
  */
-export function selectCandidates(summary, index, settings = {}, max = MAX_CANDIDATES) {
+export function selectCandidates(
+    summary,
+    index,
+    settings = {},
+    max = MAX_CANDIDATES,
+    traderPriceOf = () => 0,
+) {
     const out = [];
 
     for (const s of summary || []) {
@@ -124,7 +135,7 @@ export function selectCandidates(summary, index, settings = {}, max = MAX_CANDID
 
         const best = bestVenue({
             listingPrice: s.lowestPrice,
-            exits: exitsFor(item, settings),
+            exits: exitsFor(item, settings, traderPriceOf(item.id)),
             qty: 1,
         });
 
@@ -411,11 +422,14 @@ export function feedOpportunities(feed, index, settings = {}, ctx = {}) {
     const shopOf = ctx.npcShopFor || (() => null);
     const out = [];
 
+    const traderFor = ctx.traderFor || (() => null);
+
     const price = (item, row, extra) => {
         const npcShop = shopOf(item.id);
+        const pick = traderFor(item);
         const profit = bestVenue({
             listingPrice: row.price,
-            exits: exitsFor(item, settings),
+            exits: exitsFor(item, settings, pick && pick.trader.price),
             qty: row.qty,
             cashOnHand: settings.cashOnHand,
         });
@@ -432,6 +446,7 @@ export function feedOpportunities(feed, index, settings = {}, ctx = {}) {
             npcShop,
             npcVerified: npcShop !== null,
             profit,
+            traderPick: profit.venue === 'TRADER' ? pick : null,
             cardLabel: '+' + formatMoneyShort(profit.totalProfit),
             ...extra,
         });
@@ -508,22 +523,23 @@ export function readFeedCacheEntry(entry, now = Date.now()) {
  * about them: an NPC hit there is only possible when the NPC price is close
  * to what the item normally trades for.
  */
-export function itemMarketSweepList(index, settings = {}) {
+export function itemMarketSweepList(index, settings = {}, traderPriceOf = () => 0) {
     const out = [];
 
     for (const item of (index && index.byId && index.byId.values()) || []) {
         const sell = Number(item.sellPrice);
         const mv = Number(item.marketValue);
-        if (!(sell > 0) || !(mv > 0)) continue;
+        if (!(mv > 0)) continue;
 
         // Probe: a listing 15% under market value - would it beat an exit?
-        const probe = computeOpportunity({
-            listingPrice: mv * 0.85,
-            exitPrice: sell,
-            venue: 'NPC',
-        });
+        const beats = (exitPrice, venue) => {
+            const probe = computeOpportunity({ listingPrice: mv * 0.85, exitPrice, venue });
+            return Boolean(probe && probe.profitPerUnit > 0);
+        };
 
-        if (settings.sellToNpc !== false && probe && probe.profitPerUnit > 0) {
+        if (settings.sellToNpc !== false && sell > 0 && beats(sell, 'NPC')) {
+            out.push(item.id);
+        } else if (settings.sellToTrader && beats(Number(traderPriceOf(item.id)) || 0, 'TRADER')) {
             out.push(item.id);
         }
     }

@@ -243,8 +243,54 @@ await p.keyboard.press('Backquote');
 ok(await vis(p, '.ttv2-body'), '` typed in a chat box does not toggle');
 ok((await p.evaluate(() => document.getElementById('fake-chat').value)) === '`', 'and the ` still reaches the chat box');
 
-// Settings -> "Open deals in a new tab" off: GO goes there in this tab.
+// ---------- Traders (TornExchange) ----------
 await p.evaluate(() => document.getElementById('fake-chat').blur());
+await q(p, 'button[title="Settings"]').click();
+await q(p, '.ttv2-te-key').fill('abcdefgh12345678');
+await q(p, '.ttv2-te-key').press('Enter');
+ok(/different Public key/.test(await txt(p, '.ttv2-bar-left')), 'main key refused as the TornExchange key: ' + (await txt(p, '.ttv2-bar-left')));
+await q(p, '.ttv2-te-key').fill('TEKEYabcdefgh123');
+await q(p, '.ttv2-te-key').press('Enter');
+await q(p, 'button[title="Settings"]').click();
+await q(p, '.ttv2-chip[data-key="sellToTrader"]').click();
+await p.waitForTimeout(1500);
+await q(p, 'button[title="Refresh now"]').click(); // re-pick feed items with trader prices known
+await p.waitForTimeout(6000);
+const traderRows = q(p, '.ttv2-row.ttv2-row-trader');
+ok((await traderRows.count()) >= 2, 'trader deals listed: ' + (await traderRows.count()));
+const hammer = q(p, '.ttv2-row').filter({ hasText: 'CheapSeller' }).first();
+const hammerText = (await hammer.textContent()) || '';
+ok(/Buy \$50\s+->\s+Trader \$110/.test(hammerText), 'priced against the ONLINE trader (Bob $110), not offline Alice $115: ' + hammerText);
+ok(/Bob\s*Online · net \+214/.test(await hammer.locator('.ttv2-trader').textContent()), 'trader line: name, status, net score');
+ok(/best offline: Alice \$115/.test(hammerText), 'the higher offline trader is still mentioned');
+ok(/XanSeller/.test((await q(p, '.ttv2-list').textContent()) || ''), 'a listing only a trader makes profitable is found (Xanax $840k -> $850k)');
+await hammer.locator('button', { hasText: 'Profile' }).click();
+ok(/profiles\.php\?XID=11$/.test(await p.evaluate(() => window.__opened.at(-1))), 'Profile opens the trader\'s Torn profile');
+await hammer.locator('button', { hasText: 'Price list' }).click();
+ok((await p.evaluate(() => window.__opened.at(-1))) === 'https://www.tornexchange.com/prices/11/', 'Price list opens their TornExchange list');
+
+await q(p, '.ttv2-tab[data-label="By trader"]').click();
+await p.waitForTimeout(300);
+const groupHeads = await q(p, '.ttv2-group-head').allTextContents();
+ok(groupHeads.length === 1 && /^Bob\s*Online · net \+214 · 3 deals/.test(groupHeads[0]), 'By trader: one trade with Bob, 3 deals: ' + JSON.stringify(groupHeads));
+ok((await q(p, '.ttv2-group-item').count()) === 3 && /XanSeller/.test(await q(p, '.ttv2-group').first().textContent()), 'group lists each deal with where to buy it');
+await p.screenshot({ path: sp + '/ux-traders.png' });
+
+const reqs = await p.evaluate(() => window.__requests);
+const teReqs = reqs.filter((u) => u.includes('tornexchange.com'));
+ok(teReqs.length === 1, 'one TornExchange call for all of this: ' + teReqs.length);
+ok(teReqs.every((u) => u.includes('key=TEKEYabcdefgh123') && !u.includes('abcdefgh12345678')), 'TornExchange gets only its own key');
+ok(!reqs.some((u) => u.includes('api.torn.com') && u.includes('TEKEY')), 'the TornExchange key never goes to the Torn API');
+
+await q(p, 'button[title="Settings"]').click();
+ok(/Trader prices for 2 items, updated/.test(await txt(p, '.ttv2-page-settings .ttv2-keystate >> nth=1')), 'Settings shows trader price freshness: ' + (await txt(p, '.ttv2-page-settings .ttv2-keystate >> nth=1')));
+await q(p, 'button[title="Settings"]').click();
+await q(p, '.ttv2-chip[data-key="sellToTrader"]').click();
+await p.waitForTimeout(300);
+ok(/Turn on Trader/.test(await txt(p, '.ttv2-empty')), 'By trader with the chip off explains and offers the fix');
+await q(p, '.ttv2-tab[data-label="Bazaars"]').click();
+
+// Settings -> "Open deals in a new tab" off: GO goes there in this tab.
 await q(p, 'button[title="Settings"]').click();
 const newTab = q(p, '.ttv2-check').filter({ hasText: 'Open deals in a new tab' }).locator('input');
 ok(await newTab.isChecked(), 'new-tab setting on by default');

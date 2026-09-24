@@ -62,6 +62,13 @@ function respond(url) {
         }
         if (u.pathname === '/key/') return { access_level: 1, access_type: 'Public' };
         const who = u.pathname.match(/^\/v2\/user\/(\d+)\/profile$/);
+        // Traders: Bob is online, Alice is not.
+        if (who && who[1] === '11') {
+            return { profile: { id: 11, name: 'Bob', last_action: { status: 'Online', timestamp: NOW_S }, status: { description: 'Okay', state: 'Okay' } } };
+        }
+        if (who && who[1] === '12') {
+            return { profile: { id: 12, name: 'Alice', last_action: { status: 'Offline', timestamp: NOW_S - 7200 }, status: { description: 'Okay', state: 'Okay' } } };
+        }
         if (who) {
             return { profile: { id: +who[1], name: 'DixieNormousss',
                 last_action: { status: 'Offline', timestamp: NOW_S - 3 * 3600, relative: '3 hours ago' },
@@ -73,6 +80,19 @@ function respond(url) {
             return { itemmarket: { item: { id: +m[1], average_price: 55 }, listings, cache_timestamp: NOW_S - 10, cache_delay: 30 }, _metadata: { total: listings.length } };
         }
         return { error: { code: 0, error: 'unknown in harness: ' + u.pathname } };
+    }
+    if (u.hostname === 'www.tornexchange.com') {
+        if (u.pathname === '/api/all_best_listings') {
+            if (u.searchParams.get('key') !== 'TEKEYabcdefgh123') return { status: 'error', message: 'Invalid API key', __http: 401 };
+            return { status: 'success', data: {
+                1: { item: 'Hammer', traders: [
+                    { trader: 'Alice', trader_id: 12, price: 115, vote_score: 40 },
+                    { trader: 'Bob', trader_id: 11, price: 110, vote_score: 214 },
+                ] },
+                206: { item: 'Xanax', traders: [{ trader: 'Bob', trader_id: 11, price: 850000, vote_score: 214 }] },
+            } };
+        }
+        return { status: 'error', message: 'Endpoint not found', __http: 404 };
     }
     if (u.hostname === 'weav3r.dev') {
         if (u.pathname === '/api/marketplace') {
@@ -91,6 +111,9 @@ function respond(url) {
                 { player_id: 555, player_name: 'OldNews', price: 40, quantity: 9, last_checked: NOW_S - 3600 },
             ] };
         }
+        if (u.pathname === '/api/marketplace/206') {
+            return { total_listings: 1, listings: [{ player_id: 888, player_name: 'XanSeller', price: 840000, quantity: 2, last_checked: NOW_S - 15 }] };
+        }
         if (u.pathname === '/api/marketplace/335') {
             return { total_listings: 1, listings: [{ player_id: 2, player_name: 'Y', price: 17500, quantity: 53, last_checked: NOW_S }] };
         }
@@ -105,7 +128,8 @@ function GM_xmlhttpRequest(opts) {
     window.__requests.push(opts.url);
     setTimeout(() => {
         try {
-            opts.onload({ status: 200, responseText: JSON.stringify(respond(opts.url)) });
+            const body = respond(opts.url);
+            opts.onload({ status: (body && body.__http) || 200, responseText: JSON.stringify(body) });
         } catch (e) {
             opts.onerror(e);
         }

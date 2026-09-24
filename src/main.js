@@ -43,6 +43,15 @@ import { formatMoneyShort } from './core/parse.js';
 import { rankOpportunities, summarize } from './core/ranker.js';
 import { TornApiClient, redactKey, KEY_DEAD_CODES } from './api/client.js';
 import { W3bClient } from './api/w3b.js';
+import { TeClient, fetchTeBestListings, tePriceListUrl } from './api/te.js';
+import {
+    pickTrader,
+    maxTraderPrice,
+    groupByTrader,
+    makeTeCacheEntry,
+    readTeCacheEntry,
+    TE_REFRESH_MS,
+} from './core/traders.js';
 import {
     fetchItems,
     fetchShops,
@@ -88,6 +97,10 @@ const STORE_KEY_ACCESS = 'keyAccess';
 const STORE_API_WINDOW = 'apiWindow';
 const STORE_KEY_DEAD = 'keyDead';
 const STORE_OPENED = 'opened';
+/* TornExchange: its own key (never the main one), its prices, and its backoff. */
+const STORE_TE_KEY = 'teKey';
+const STORE_TE = 'teCache';
+const STORE_TE_STATE = 'teState';
 
 const DEFAULT_SETTINGS = {
     /*
@@ -107,6 +120,12 @@ const DEFAULT_SETTINGS = {
     sellToNpc: true,
     resaleBazaar: false,
     resaleMarket: false,
+    /*
+     * Sell to a player trader, at the price on their TornExchange list. Off
+     * by default: it needs a TornExchange key, and a trader's price is an
+     * offer, not a guarantee.
+     */
+    sellToTrader: false,
 
     /*
      * The live feed: watch the market from ANY Torn page, not just the one
@@ -155,18 +174,23 @@ const OWNER_REFRESH_MS = 30000;
 const OWNER_RETRY_MS = 60000;
 
 /*
- * Status next to each seller in the Bazaars list: the first
- * SELLER_STATUS_MAX sellers shown, one public-profile call each, then at most
- * once per SELLER_REFRESH_MS while they stay on the list - so a full list
- * costs about 10 calls a minute, inside the shared 70/min budget. Only while
- * the Bazaars list is on screen in a visible tab.
+ * Online status for players on the lists: the first SELLER_STATUS_MAX bazaar
+ * sellers (while the Bazaars list is on screen) and the first
+ * TRADER_STATUS_MAX traders deals would be sold to (while the Trader chip is
+ * on). One public-profile call each, then at most once per
+ * PRESENCE_REFRESH_MS while they stay listed - at most 25 calls a minute,
+ * inside the shared 70/min budget next to the feed's 30. Visible tab only.
  */
 const SELLER_STATUS_MAX = 10;
-const SELLER_REFRESH_MS = 60000;
-const SELLER_RETRY_MS = 120000;
-const SELLER_MAX_PENDING = 3;
-/* Sellers not on the list this long are forgotten. */
-const SELLER_FORGET_MS = 10 * 60 * 1000;
+const TRADER_STATUS_MAX = 15;
+const PRESENCE_REFRESH_MS = 60000;
+const PRESENCE_RETRY_MS = 120000;
+const PRESENCE_MAX_PENDING = 3;
+/* Players not on a list this long are forgotten. */
+const PRESENCE_FORGET_MS = 10 * 60 * 1000;
+
+/* A failed TornExchange call is not retried sooner than this. */
+const TE_RETRY_MS = 5 * 60 * 1000;
 
 /* A bazaar seen closed keeps its feed deals hidden this long (or until seen open). */
 const CLOSED_MEMORY_MS = 10 * 60 * 1000;
@@ -204,8 +228,12 @@ const app = {
     pageRows: [],
     /* { id, presence, fetchedAt, pending, retryAt, open } for the viewed bazaar. */
     owner: null,
-    /* sellerId -> { presence, fetchedAt, pending, retryAt, listedAt } for the Bazaars list. */
-    sellers: new Map(),
+    /* playerId -> { presence, fetchedAt, pending, retryAt, listedAt }: list sellers and traders. */
+    presence: new Map(),
+    te: null,
+    /* { fetchedAt, map: itemId -> traders } from TornExchange, or null. */
+    traders: null,
+    teLoading: false,
     /* sellerId -> time until which their bazaar counts as closed. */
     closedSellers: new Map(),
     pageDiagnostics: null,
@@ -312,6 +340,15 @@ async function onSaveKey(key) {
                 'Saved anyway - if calls fail, check it.',
             'warn',
         );
+    }
+
+    if (key === getTeKey()) {
+        app.panel.setStatus(
+            'That is your TornExchange key. Use a different Public key here - ' +
+                'the main key never goes to TornExchange.',
+            'error',
+        );
+        return;
     }
 
     gmSet(STORE_KEY, key);
@@ -495,7 +532,8 @@ function buildOpportunities(listings) {
             app.manualNpc,
         );
 
-        const exits = exitsFor(listing.item, app.settings, npcShop);
+        const pick = traderFor(listing.item);
+        const exits = exitsFor(listing.item, app.settings, pick && pick.trader.price);
         if (Object.keys(exits).length === 0) continue;
 
         const profit = bestVenue({
@@ -508,6 +546,7 @@ function buildOpportunities(listings) {
         rows.push({
             ...listing,
             profit,
+            traderPick: profit && profit.venue === 'TRADER' ? pick : null,
             npcShop,
             npcVerified: npcShop !== null,
             /*
@@ -716,6 +755,7 @@ function refreshView() {
               now,
               npcShopFor: (id) => npcShopFor(id, app.npcShops, app.manualNpc),
               itemMarketUrl,
+              traderFor,
           }).filter((r) => {
               // The page you are on already shows these, with fresher numbers.
               if (r.source === SOURCE_ITEM_MARKET) {
@@ -743,16 +783,38 @@ function refreshView() {
     const bazaarRows = rankOpportunities(lists.bazaar, rankSettings());
     const marketRows = rankOpportunities(lists.itemmarket, rankSettings());
 
-    const tab = activeTab();
-    const shown = tab === 'bazaar' ? bazaarRows : marketRows;
+    // One trade window per trader, from both lists.
+    const groups = app.settings.sellToTrader
+        ? groupByTrader(bazaarRows.concat(marketRows))
+        : [];
 
-    if (tab === 'bazaar') updateSellerStatus(bazaarRows, now);
+    const tab = activeTab();
+    const shown =
+        tab === 'bazaar'
+            ? bazaarRows
+            : tab === 'traders'
+              ? groups.flatMap((g) => g.rows)
+              : marketRows;
+
+    updatePresence(
+        [
+            ...(tab === 'bazaar' ? listedSellers(bazaarRows) : []),
+            ...listedTraders(bazaarRows.concat(marketRows)),
+        ],
+        now,
+    );
 
     app.panel.render({
         rows: shown,
+        groups,
         tab,
-        sellerStatus: tab === 'bazaar' ? sellerStatusMap(bazaarRows, now) : null,
-        counts: { bazaar: bazaarRows.length, itemmarket: marketRows.length },
+        statuses: statusMap(now),
+        traderInfo: traderInfo(now),
+        counts: {
+            bazaar: bazaarRows.length,
+            itemmarket: marketRows.length,
+            traders: groups.length,
+        },
         summary: summarize(shown),
         diagnostics:
             app.pageDiagnostics && app.pageType === tab
@@ -775,7 +837,8 @@ function activeTab() {
     if (app.tabOverride) return app.tabOverride;
     if (app.pageType === PAGE_BAZAAR) return 'bazaar';
     if (app.pageType === 'itemmarket') return 'itemmarket';
-    return app.settings.viewTab === 'itemmarket' ? 'itemmarket' : 'bazaar';
+    const v = app.settings.viewTab;
+    return v === 'itemmarket' || v === 'traders' ? v : 'bazaar';
 }
 
 function onViewChange(tab) {
@@ -950,7 +1013,7 @@ function paintOwner(now) {
 }
 
 /* ------------------------------------------------------------------ *
- * Seller status on the Bazaars list
+ * Online status: bazaar sellers and traders on the lists
  * ------------------------------------------------------------------ */
 
 /** The first SELLER_STATUS_MAX distinct sellers on the list, in list order. */
@@ -966,35 +1029,60 @@ function listedSellers(rows) {
 }
 
 /**
- * Look up the public status of the sellers on the Bazaars list, when due.
- * The viewed bazaar's owner is skipped: updateOwner() already has it.
+ * The traders behind trader deals - every one of the top three for each
+ * item, since who is online decides which of them the deal goes to.
  */
-function updateSellerStatus(rows, now) {
-    for (const [id, s] of app.sellers) {
-        if (!s.pending && now - s.listedAt > SELLER_FORGET_MS) app.sellers.delete(id);
+function listedTraders(rows) {
+    const ids = [];
+    if (!app.settings.sellToTrader || !app.traders) return ids;
+
+    for (const r of rows) {
+        if (!r.traderPick) continue;
+        for (const t of app.traders.map.get(String(r.itemId)) || []) {
+            if (!ids.includes(t.id)) ids.push(t.id);
+            if (ids.length >= TRADER_STATUS_MAX) return ids;
+        }
+    }
+    return ids;
+}
+
+/** A player's last known public status: the viewed bazaar's owner, or the lookups. */
+function presenceOf(id) {
+    const key = String(id);
+    if (app.owner && app.owner.id === key && app.owner.presence) return app.owner.presence;
+    const entry = app.presence.get(key);
+    return (entry && entry.presence) || null;
+}
+
+/**
+ * Look up the public status of listed players, when due. The viewed
+ * bazaar's owner is skipped: updateOwner() already has it.
+ */
+function updatePresence(ids, now) {
+    for (const [id, s] of app.presence) {
+        if (!s.pending && now - s.listedAt > PRESENCE_FORGET_MS) app.presence.delete(id);
     }
 
-    const ids = listedSellers(rows);
     for (const id of ids) {
-        if (!app.sellers.has(id)) {
-            app.sellers.set(id, { presence: null, fetchedAt: 0, pending: false, retryAt: 0, listedAt: now });
+        if (!app.presence.has(id)) {
+            app.presence.set(id, { presence: null, fetchedAt: 0, pending: false, retryAt: 0, listedAt: now });
         }
-        app.sellers.get(id).listedAt = now;
+        app.presence.get(id).listedAt = now;
     }
 
     if (!app.client || !hasUsableKey()) return;
     if (document.visibilityState !== 'visible' || app.panel.collapsed) return;
 
     let pending = 0;
-    for (const s of app.sellers.values()) if (s.pending) pending++;
+    for (const s of app.presence.values()) if (s.pending) pending++;
 
     const ownerId = app.owner && app.owner.id;
     for (const id of ids) {
-        if (pending >= SELLER_MAX_PENDING) break;
+        if (pending >= PRESENCE_MAX_PENDING) break;
         if (id === ownerId) continue;
 
-        const s = app.sellers.get(id);
-        if (s.pending || now < s.retryAt || now - s.fetchedAt < SELLER_REFRESH_MS) continue;
+        const s = app.presence.get(id);
+        if (s.pending || now < s.retryAt || now - s.fetchedAt < PRESENCE_REFRESH_MS) continue;
 
         pending++;
         s.pending = true;
@@ -1002,36 +1090,169 @@ function updateSellerStatus(rows, now) {
             .then((presence) => {
                 s.fetchedAt = Date.now();
                 if (presence) s.presence = presence;
-                else s.retryAt = Date.now() + SELLER_RETRY_MS;
+                else s.retryAt = Date.now() + PRESENCE_RETRY_MS;
             })
             .catch((error) => {
                 if (isKeyDeadError(error)) markKeyDead(error);
-                s.retryAt = Date.now() + SELLER_RETRY_MS;
+                s.retryAt = Date.now() + PRESENCE_RETRY_MS;
             })
             .finally(() => {
                 s.pending = false;
-                refreshView();
+                // A trader coming online can change who a deal goes to.
+                if (app.index && app.settings.sellToTrader) rescan();
+                else refreshView();
             });
     }
 }
 
-/** sellerId -> { name, level, text, title } for every seller whose status is known. */
-function sellerStatusMap(rows, now) {
+/** playerId -> { name, level, text, title } for everyone whose status is known. */
+function statusMap(now) {
     const out = new Map();
-    for (const r of rows) {
-        if (r.source !== SOURCE_BAZAAR || !r.sellerId) continue;
-        const id = String(r.sellerId);
-        if (out.has(id)) continue;
-
-        const presence =
-            app.owner && app.owner.id === id && app.owner.presence
-                ? app.owner.presence
-                : app.sellers.has(id) && app.sellers.get(id).presence;
-        if (!presence) continue;
-
-        out.set(id, { name: presence.name, ...presenceShort(presence, now) });
+    for (const id of app.presence.keys()) {
+        const presence = presenceOf(id);
+        if (presence) out.set(id, { name: presence.name, ...presenceShort(presence, now) });
+    }
+    if (app.owner && app.owner.presence) {
+        out.set(app.owner.id, { name: app.owner.presence.name, ...presenceShort(app.owner.presence, now) });
     }
     return out;
+}
+
+/* ------------------------------------------------------------------ *
+ * Traders (TornExchange)
+ * ------------------------------------------------------------------ */
+
+function getTeKey() {
+    return gmGet(STORE_TE_KEY, '') || '';
+}
+
+function teState() {
+    return gmGet(STORE_TE_STATE, {}) || {};
+}
+
+function setTeState(patch) {
+    gmSet(STORE_TE_STATE, { ...teState(), ...patch });
+}
+
+/** Re-read the stored trader prices (another tab may have fetched them). */
+function loadTraders(now = Date.now()) {
+    const entry = gmGet(STORE_TE, null);
+    const fetchedAt = entry && entry.fetchedAt;
+    if (app.traders && app.traders.fetchedAt === fetchedAt) return;
+    app.traders = readTeCacheEntry(entry, now);
+}
+
+/** Who a deal on this item would be sold to, or null. */
+function traderFor(item) {
+    if (!item || !app.settings.sellToTrader || !app.traders) return null;
+    return pickTrader(app.traders.map.get(String(item.id)), {
+        presenceOf,
+        marketValue: Number(item.marketValue) || 0,
+    });
+}
+
+/** What the best sane trader pays for an item - for choosing what to fetch. */
+function traderPriceOf(itemId) {
+    if (!app.settings.sellToTrader || !app.traders || !app.index) return 0;
+    const item = app.index.byId.get(String(itemId));
+    return maxTraderPrice(app.traders.map.get(String(itemId)), item ? Number(item.marketValue) : 0);
+}
+
+/** For the panel: key, freshness and trouble, never the key itself. */
+function traderInfo(now = Date.now()) {
+    const st = teState();
+    return {
+        hasKey: Boolean(getTeKey()),
+        items: app.traders ? app.traders.map.size : 0,
+        fetchedAt: app.traders ? app.traders.fetchedAt : null,
+        error: st.error || null,
+        badKey: Boolean(st.badKey),
+        waitUntil: st.blockedUntil > now ? st.blockedUntil : null,
+        loading: app.teLoading,
+    };
+}
+
+/**
+ * One TornExchange call every TE_REFRESH_MS, from whichever visible tab gets
+ * there first. `lastAttemptAt` is stored BEFORE the call, so two tabs cannot
+ * both ask; failures wait TE_RETRY_MS, and a 429 waits what TornExchange says.
+ */
+async function refreshTraders({ force = false } = {}) {
+    if (!app.settings.sellToTrader || !getTeKey() || app.teLoading) return;
+    if (document.visibilityState !== 'visible') return;
+
+    const now = Date.now();
+    loadTraders(now);
+
+    const st = teState();
+    if (st.badKey) return;
+    if (st.blockedUntil && now < st.blockedUntil) return;
+    if (now - (st.lastAttemptAt || 0) < (force ? 30000 : TE_RETRY_MS)) return;
+    if (!force && app.traders && now - app.traders.fetchedAt < TE_REFRESH_MS) return;
+
+    setTeState({ lastAttemptAt: now });
+    app.teLoading = true;
+    refreshView();
+
+    try {
+        const map = await fetchTeBestListings(app.te);
+        gmSet(STORE_TE, makeTeCacheEntry(map, Date.now()));
+        setTeState({ error: null });
+        app.traders = null;
+        loadTraders();
+    } catch (error) {
+        const patch = { error: (error && error.message) || 'TornExchange failed.' };
+        if (error && error.badKey) patch.badKey = true;
+        if (error && error.http === 429) patch.blockedUntil = Date.now() + error.retryAfterMs;
+        setTeState(patch);
+    } finally {
+        app.teLoading = false;
+        if (app.index) rescan();
+        else refreshView();
+    }
+}
+
+function onSaveTeKey(key) {
+    key = String(key || '').trim();
+    if (!key) {
+        app.panel.setStatus('Paste your TornExchange key first.', 'error');
+        return;
+    }
+    // The main key is never sent to a third party - not even this one.
+    if (key === getStoredKey()) {
+        app.panel.setStatus(
+            'Use a different Public key for TornExchange than your main key - ' +
+                'the main key never leaves api.torn.com.',
+            'error',
+        );
+        return;
+    }
+
+    gmSet(STORE_TE_KEY, key);
+    gmDel(STORE_TE_STATE);
+    app.panel.setStatus('TornExchange key saved. Loading trader prices...');
+    refreshTraders({ force: true });
+    refreshView();
+}
+
+function onForgetTeKey() {
+    gmDel(STORE_TE_KEY);
+    gmDel(STORE_TE_STATE);
+    gmDel(STORE_TE);
+    app.traders = null;
+    if (app.panel.teKeyInput) app.panel.teKeyInput.value = '';
+    app.panel.setStatus('TornExchange key and trader prices removed.');
+    if (app.index) rescan();
+    else refreshView();
+}
+
+function onOpenProfile(playerId) {
+    openDeal('https://www.torn.com/profiles.php?XID=' + encodeURIComponent(String(playerId)));
+}
+
+/** Their TornExchange list - another site, so always a new tab. */
+function onOpenPriceList(traderId) {
+    gmOpenTab(tePriceListUrl(traderId));
 }
 
 /**
@@ -1175,6 +1396,8 @@ function onSettingsChange(partial) {
     // Position and collapse are chrome: nothing to re-price.
     if (Object.keys(partial).every((k) => k === 'panelPos' || k === 'collapsed')) return;
 
+    if (partial.sellToTrader) refreshTraders();
+
     if (app.index) rescan();
     else refreshView();
 }
@@ -1275,6 +1498,13 @@ function handleRouteChange() {
 
 function startLiveFeed() {
     app.w3b = new W3bClient();
+    app.te = new TeClient({ getKey: getTeKey });
+    loadTraders();
+    // Another tab fetched trader prices: use them here too.
+    gmOnChange(STORE_TE, () => {
+        loadTraders();
+        if (app.index) rescan();
+    });
 
     app.feed = new LiveFeed({
         tabId: app.tabId,
@@ -1289,6 +1519,9 @@ function startLiveFeed() {
         onChange: () => refreshView(),
         isKeyDead: isKeyDeadError,
         onKeyDead: markKeyDead,
+        traderPriceOf,
+        traderVersion: () =>
+            app.settings.sellToTrader && app.traders ? app.traders.fetchedAt : 0,
     });
 
     // Follower tabs re-render the moment the leader stores something new.
@@ -1418,6 +1651,12 @@ export function boot() {
          * script on the page, including other userscripts.
          */
         onRevealKey: () => getStoredKey(),
+        onSaveTeKey,
+        onForgetTeKey,
+        onRevealTeKey: () => getTeKey(),
+        onRefreshTraders: () => refreshTraders({ force: true }),
+        onOpenProfile,
+        onOpenPriceList,
     });
 
     app.panel.mount();
@@ -1458,6 +1697,7 @@ export function boot() {
         }
 
         refreshItemsIfStale();
+        refreshTraders();
 
         if (detectPage(location.href) === PAGE_NONE) {
             if (app.pageType !== PAGE_NONE) rescan();

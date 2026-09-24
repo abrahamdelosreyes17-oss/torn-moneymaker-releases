@@ -94,6 +94,25 @@ scrolls to it when it is on the page you are viewing. Nothing is ever bought for
   One public-profile call when you open it, then at most every 30 s while you
   stay. If the banner says the bazaar is **closed**, its listings are not shown
   as deals, here or in the feed, until it is seen open again.
+- **Traders** (*Trader* chip, off by default; needs a TornExchange key under
+  Settings): also shows listings cheaper than what a **TornExchange trader**
+  pays - instant cash in one trade, no tax. Trader prices come from one
+  TornExchange call every 30 minutes (the top three buyers for every item).
+  - **Online traders first.** A deal is priced against the trader you can most
+    likely sell to *now*: online, then idle, then not yet known, then offline;
+    within that, the best price. If an offline trader pays more, the row says so
+    (*best offline: Alice $24,500*).
+  - A trader's price is an **offer, not a guarantee**, so trader profit is blue,
+    not NPC green, and every trader deal shows the trader's status, TornExchange
+    net score and % of the item's value. A price more than 105% of value is
+    usually one they forgot to update: it is flagged *check their list first*
+    and ranked last.
+  - **[Profile]** opens the trader's Torn profile (start the trade there) and
+    follows the new-tab setting; **[Price list]** opens their TornExchange list
+    in a new tab.
+  - **By trader** tab: every trader deal grouped by the trader who buys it, so
+    several items go in one trade. Online traders first, then biggest total.
+    Each item keeps its own GO button.
 - **Seller status on every bazaar deal:** each row in the Bazaars list shows the
   owner's status right after their name (*Bazaar - Garrett89 ● Offline 3h ago ·
   Traveling*; hover for the full line), so you know whether they are around
@@ -111,7 +130,7 @@ scrolls to it when it is on the page you are viewing. Nothing is ever bought for
   - **Min** and **Cash** chips: click to type a minimum total profit or the cash
     you have; Enter saves, Esc cancels.
 - **Settings** replaces the list (← Back or Esc returns): the API key with Torn's
-  key-use disclosure, the live feed switches, and **Open deals in a new tab**
+  key-use disclosure, the live feed switches, the TornExchange key, and **Open deals in a new tab**
   (on by default; untick it and GO TO BAZAAR / GO TO MARKET open in the tab
   you are in).
 - **Tampermonkey menu** (maintenance, out of the way): Open settings, Re-download
@@ -181,8 +200,9 @@ them.
    or scrolls. A user click never triggers a chain of game actions, and nothing is
    clicked or pre-filled for you.
 2. **Never fetch a Torn page the user is not viewing.** There is no `fetch` of
-   `torn.com` anywhere — only `api.torn.com` (from `src/api/client.js`) and
-   `weav3r.dev` (from `src/api/w3b.js`). Do not add page scraping, and do not
+   `torn.com` anywhere — only `api.torn.com` (from `src/api/client.js`),
+   `weav3r.dev` (from `src/api/w3b.js`) and `www.tornexchange.com` (from
+   `src/api/te.js`). Do not add page scraping, and do not
    "verify" a listing by loading a bazaar in a hidden tab or iframe.
 3. **Public API key only.** Nothing this script does needs more.
 4. **Rate-limit everything.** All Torn API calls pass through one queue capped at
@@ -200,6 +220,17 @@ them.
    tool's own terms cover it: Settings names it, says it receives item ids only,
    and links its terms, and the Bazaars list credits it. Unticking it stops every
    request to it. Only item ids are sent; never the key.
+   **TornExchange** is opt-in (the Trader chip plus its own key). Its API only
+   answers to the Torn key the user logged into tornexchange.com with, so it gets
+   a **separate** Public key from its own Settings field. The script refuses to
+   save the same key in both fields, and the main key is never sent there. At
+   most one call every 30 minutes, never retried on its own, and a 429 waits out
+   TornExchange's `retry_after`: it allows 10 requests a minute per IP, and every
+   request over that doubles a penalty that reaches 48 hours.
+9. **One key's worth of API.** Torn's limit is 100 a minute **per user, across
+   all of their keys**, so extra keys add nothing. Using other players' keys to
+   pool the limit needs each owner's informed opt-in under a disclosed ToS, and
+   extra accounts are banned outright. Do not add key rotation.
 8. **Stop on a dead key.** Torn error 2, 13 or 18 marks the key dead and nothing is
    sent until the user saves another. Torn warns that repeated invalid-key requests
    can earn an IP ban.
@@ -214,7 +245,9 @@ Shown in Settings next to the key field, as Torn requires:
 
 Plus a line naming the automatic integration: *TornW3B (weav3r.dev), for bazaar
 prices; receives item ids only, never the key* - with a link to its terms beside
-the Settings toggle and on the Bazaars list.
+the Settings toggle and on the Bazaars list - and, only if you add a TornExchange
+key: *TornExchange (tornexchange.com), for traders' buy prices; receives that
+separate key, never the main one.*
 
 The research behind these rules - the rules.php and api.html text, how TornTools and
 others use TornW3B, and the data sources' real caching - is summarised in

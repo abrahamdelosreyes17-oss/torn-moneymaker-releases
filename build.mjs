@@ -54,6 +54,7 @@ const HEADER = `// ==UserScript==
 // @grant        GM_xmlhttpRequest
 // @grant        GM_addValueChangeListener
 // @connect      api.torn.com
+// @connect      www.tornexchange.com
 // @connect      weav3r.dev
 // @downloadURL  ${REPO_RAW}
 // @updateURL    ${REPO_RAW}

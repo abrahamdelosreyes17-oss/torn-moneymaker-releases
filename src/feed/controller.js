@@ -76,6 +76,8 @@ export class LiveFeed {
      * @param {function} [deps.isKeyDead] - (error) => boolean
      * @param {function} [deps.onKeyDead] - (error) => void
      * @param {function} [deps.now]
+     * @param {function} [deps.traderPriceOf] - (itemId) => best trader price, or 0
+     * @param {function} [deps.traderVersion] - changes when trader prices do
      */
     constructor(deps) {
         this.d = deps;
@@ -101,6 +103,11 @@ export class LiveFeed {
         this.d.save(FEED_STORE_KEY, null);
         this.d.save(FEED_REFRESH_KEY, this.now());
         if (this.d.onChange) this.d.onChange();
+    }
+
+    /** (itemId) => what the best sane trader pays, or 0. */
+    traderPriceOf() {
+        return this.d.traderPriceOf || (() => 0);
     }
 
     /* ------------------------------------------------------ storage */
@@ -213,7 +220,19 @@ export class LiveFeed {
         }
 
         if (this.d.hasUsableKey()) {
-            if (!this.sweep.length) this.sweep = itemMarketSweepList(index, settings);
+            // Rebuilt when what counts as an exit changes (a chip, new
+            // trader prices), not just once.
+            const sig = [
+                settings.sellToNpc !== false,
+                Boolean(settings.sellToTrader),
+                this.d.traderVersion ? this.d.traderVersion() : 0,
+            ].join('|');
+            if (this.sweepSig === undefined) this.sweepSig = sig;
+            if (!this.sweep.length || sig !== this.sweepSig) {
+                this.sweep = itemMarketSweepList(index, settings, this.traderPriceOf());
+                this.sweepSig = sig;
+                this.sweepPos = 0;
+            }
             await this.refreshItemMarket(rechecks);
         }
     }
@@ -224,7 +243,13 @@ export class LiveFeed {
         try {
             const summary = await fetchW3bSummary(this.d.w3b);
             this.lastSummaryAt = this.now();
-            this.candidates = selectCandidates(summary, index, settings);
+            this.candidates = selectCandidates(
+                summary,
+                index,
+                settings,
+                undefined,
+                this.traderPriceOf(),
+            );
             this.lastError = null;
 
             /*

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      3.5.0
+// @version      3.6.0
 // @description  Finds Bazaar and Item Market listings below NPC / market value - on the page you are viewing, and live from the Torn API and TornW3B - ranked by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -14,6 +14,7 @@
 // @grant        GM_xmlhttpRequest
 // @grant        GM_addValueChangeListener
 // @connect      api.torn.com
+// @connect      www.tornexchange.com
 // @connect      weav3r.dev
 // @downloadURL  https://raw.githubusercontent.com/abrahamdelosreyes17-oss/torn-moneymaker-releases/main/torn-moneymaker.user.js
 // @updateURL    https://raw.githubusercontent.com/abrahamdelosreyes17-oss/torn-moneymaker-releases/main/torn-moneymaker.user.js
@@ -37,7 +38,7 @@
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '3.5.0';
+    const TTV2_BUILD_VERSION = '3.6.0';
 
     /* ===== src/platform/gm.js ===== */
     /*
@@ -507,6 +508,9 @@
         BAZAAR_RESALE: 0,
         ITEM_MARKET_ANON: 0.15,
         AUCTION_HOUSE: 0.03,
+        // A player trader (TornExchange price list): paid in the trade, no tax.
+        // An offer, not a guarantee - see core/traders.js.
+        TRADER: 0,
     };
 
     /*
@@ -520,6 +524,7 @@
         BAZAAR_RESALE: 'Avg value',
         ITEM_MARKET_ANON: 'Market (anon)',
         AUCTION_HOUSE: 'Auction',
+        TRADER: 'Trader',
     };
 
     /**
@@ -835,9 +840,14 @@
      * @param {object} item - record from buildItemIndex
      * @param {object} settings - sellToNpc, resaleBazaar, resaleMarket
      */
-    function exitsFor(item, settings = {}) {
+    function exitsFor(item, settings = {}, traderPrice = 0) {
         const exits = {};
         if (!item) return exits;
+
+        // What the chosen TornExchange trader pays - see core/traders.js.
+        if (settings.sellToTrader && Number(traderPrice) > 0) {
+            exits.TRADER = Number(traderPrice);
+        }
 
         if (settings.sellToNpc !== false) {
             const sell = Number(item.sellPrice);
@@ -865,7 +875,13 @@
      * @param {object} settings
      * @returns {Array<{itemId: string, lowestPrice: number, profitPerUnit: number}>}
      */
-    function selectCandidates(summary, index, settings = {}, max = MAX_CANDIDATES) {
+    function selectCandidates(
+        summary,
+        index,
+        settings = {},
+        max = MAX_CANDIDATES,
+        traderPriceOf = () => 0,
+    ) {
         const out = [];
 
         for (const s of summary || []) {
@@ -876,7 +892,7 @@
 
             const best = bestVenue({
                 listingPrice: s.lowestPrice,
-                exits: exitsFor(item, settings),
+                exits: exitsFor(item, settings, traderPriceOf(item.id)),
                 qty: 1,
             });
 
@@ -1163,11 +1179,14 @@
         const shopOf = ctx.npcShopFor || (() => null);
         const out = [];
 
+        const traderFor = ctx.traderFor || (() => null);
+
         const price = (item, row, extra) => {
             const npcShop = shopOf(item.id);
+            const pick = traderFor(item);
             const profit = bestVenue({
                 listingPrice: row.price,
-                exits: exitsFor(item, settings),
+                exits: exitsFor(item, settings, pick && pick.trader.price),
                 qty: row.qty,
                 cashOnHand: settings.cashOnHand,
             });
@@ -1184,6 +1203,7 @@
                 npcShop,
                 npcVerified: npcShop !== null,
                 profit,
+                traderPick: profit.venue === 'TRADER' ? pick : null,
                 cardLabel: '+' + formatMoneyShort(profit.totalProfit),
                 ...extra,
             });
@@ -1260,22 +1280,23 @@
      * about them: an NPC hit there is only possible when the NPC price is close
      * to what the item normally trades for.
      */
-    function itemMarketSweepList(index, settings = {}) {
+    function itemMarketSweepList(index, settings = {}, traderPriceOf = () => 0) {
         const out = [];
 
         for (const item of (index && index.byId && index.byId.values()) || []) {
             const sell = Number(item.sellPrice);
             const mv = Number(item.marketValue);
-            if (!(sell > 0) || !(mv > 0)) continue;
+            if (!(mv > 0)) continue;
 
             // Probe: a listing 15% under market value - would it beat an exit?
-            const probe = computeOpportunity({
-                listingPrice: mv * 0.85,
-                exitPrice: sell,
-                venue: 'NPC',
-            });
+            const beats = (exitPrice, venue) => {
+                const probe = computeOpportunity({ listingPrice: mv * 0.85, exitPrice, venue });
+                return Boolean(probe && probe.profitPerUnit > 0);
+            };
 
-            if (settings.sellToNpc !== false && probe && probe.profitPerUnit > 0) {
+            if (settings.sellToNpc !== false && sell > 0 && beats(sell, 'NPC')) {
+                out.push(item.id);
+            } else if (settings.sellToTrader && beats(Number(traderPriceOf(item.id)) || 0, 'TRADER')) {
                 out.push(item.id);
             }
         }
@@ -2006,6 +2027,369 @@
     function positiveOrNull(value) {
         const n = Number(value);
         return Number.isFinite(n) && n > 0 ? n : null;
+    }
+
+    /* ===== src/api/te.js ===== */
+    /*
+     * TornExchange (tornexchange.com) - traders' published buy prices.
+     *
+     * TornExchange is where traders post "I buy X at $Y". Its API wants `?key=`
+     * equal to the Torn API key the user last logged into TornExchange with
+     * (main/api.py, require_api_key). So this client carries a key - but NEVER
+     * the main one:
+     *
+     *   1. It is given its own key (Settings -> TornExchange), which main.js
+     *      refuses to accept if it equals the main Torn key. The Torn client and
+     *      this one share nothing.
+     *   2. www.tornexchange.com is the only destination - asserted on the
+     *      resolved URL, as client.js does for api.torn.com.
+     *   3. Its rate limit is harsh: 10 requests a minute PER IP across the whole
+     *      API, and every request over it doubles a penalty that can reach 48
+     *      hours (rate_limit_exponential in main/api.py). So this client makes
+     *      at most TE_MIN_GAP_MS between requests, never retries on its own, and
+     *      after a 429 waits out the server's `retry_after` before asking again.
+     *
+     * One call, /api/all_best_listings, returns the top three buyers for EVERY
+     * item (active traders with a non-negative score only). The server caches it
+     * for 5 minutes; we ask every 30.
+     */
+
+
+
+    const TE_API_BASE = 'https://www.tornexchange.com/api/';
+    const TE_HOST = 'www.tornexchange.com';
+    const TE_SITE_URL = 'https://www.tornexchange.com';
+
+    /** A trader's public price list on TornExchange (accepts id or name). */
+    function tePriceListUrl(traderId) {
+        return TE_SITE_URL + '/prices/' + encodeURIComponent(String(traderId)) + '/';
+    }
+
+    /** Never two requests closer than this, from any code path. */
+    const TE_MIN_GAP_MS = 20000;
+
+    class TeError extends Error {
+        constructor(message, { http = null, retryAfterMs = 0, badKey = false } = {}) {
+            super(message);
+            this.name = 'TeError';
+            this.http = http;
+            this.retryAfterMs = retryAfterMs;
+            this.badKey = badKey;
+        }
+    }
+
+    class TeClient {
+        /**
+         * @param {object} options
+         * @param {function} options.getKey      - () => the TornExchange key ('' = none)
+         * @param {function} [options.fetchImpl] - injectable for tests
+         * @param {function} [options.now]
+         */
+        constructor({ getKey, fetchImpl = gmFetch, now = () => Date.now() } = {}) {
+            this.getKey = getKey || (() => '');
+            this.fetchImpl = fetchImpl;
+            this.now = now;
+            this.lastRequestAt = 0;
+            this.blockedUntil = 0;
+        }
+
+        /** Build and check a URL. The key is attached here and nowhere else. */
+        buildUrl(path, key) {
+            const url = new URL(String(path).replace(/^\/+/, ''), TE_API_BASE);
+
+            if (url.hostname !== TE_HOST) {
+                throw new TeError('Refusing to contact ' + url.hostname + '.');
+            }
+
+            url.search = '';
+            url.searchParams.set('key', key);
+            return url;
+        }
+
+        async get(path) {
+            const key = String(this.getKey() || '').trim();
+            if (!key) throw new TeError('No TornExchange key.', { badKey: true });
+
+            const t = this.now();
+            if (t < this.blockedUntil) {
+                throw new TeError('TornExchange asked us to wait.', {
+                    http: 429,
+                    retryAfterMs: this.blockedUntil - t,
+                });
+            }
+            if (t - this.lastRequestAt < TE_MIN_GAP_MS) {
+                throw new TeError('Too soon to ask TornExchange again.', {
+                    retryAfterMs: TE_MIN_GAP_MS - (t - this.lastRequestAt),
+                });
+            }
+
+            const url = this.buildUrl(path, key);
+            this.lastRequestAt = t;
+
+            let response;
+            try {
+                response = await this.fetchImpl(url.toString());
+            } catch (error) {
+                // The message never carries the URL, so never the key.
+                throw new TeError('TornExchange network error.');
+            }
+
+            let body = null;
+            try {
+                body = await response.json();
+            } catch {
+                body = null;
+            }
+
+            if (response.status === 429) {
+                const seconds = Number(body && body.retry_after);
+                const wait = (Number.isFinite(seconds) && seconds > 0 ? seconds : 60) * 1000;
+                this.blockedUntil = this.now() + wait;
+                throw new TeError('TornExchange rate limit - waiting ' + Math.ceil(wait / 1000) + 's.', {
+                    http: 429,
+                    retryAfterMs: wait,
+                });
+            }
+
+            if (response.status === 401) {
+                throw new TeError(
+                    'TornExchange did not accept the key. Log in at tornexchange.com ' +
+                        'with this same key, then save it again.',
+                    { http: 401, badKey: true },
+                );
+            }
+
+            if (!response.ok || !body) {
+                throw new TeError('TornExchange HTTP ' + response.status + '.', {
+                    http: response.status,
+                });
+            }
+
+            if (body.status && body.status !== 'success') {
+                throw new TeError('TornExchange: ' + String(body.message || 'error') + '.');
+            }
+
+            return body;
+        }
+    }
+
+    /**
+     * The top three buyers for every item, highest price first.
+     *
+     * @returns {Promise<Map<string, Array<{name: string, id: string, price: number, score: number}>>>}
+     */
+    async function fetchTeBestListings(client) {
+        return parseTeBestListings(await client.get('all_best_listings'));
+    }
+
+    /** Exposed for tests. Bad rows are dropped, never guessed. */
+    function parseTeBestListings(body) {
+        const data = body && body.data;
+        if (!data || typeof data !== 'object') {
+            throw new TeError('TornExchange returned no trader prices.');
+        }
+
+        const out = new Map();
+
+        for (const [itemId, entry] of Object.entries(data)) {
+            if (!/^\d+$/.test(itemId) || !entry || !Array.isArray(entry.traders)) continue;
+
+            const traders = [];
+            for (const t of entry.traders) {
+                const id = String((t && t.trader_id) || '').replace(/\D/g, '');
+                const price = Number(t && t.price);
+                if (!id || !Number.isFinite(price) || price <= 0) continue;
+
+                traders.push({
+                    name: typeof t.trader === 'string' && t.trader ? t.trader : 'Trader ' + id,
+                    id,
+                    price,
+                    score: Number(t.vote_score) || 0,
+                });
+            }
+
+            if (traders.length) {
+                traders.sort((a, b) => b.price - a.price);
+                out.set(itemId, traders);
+            }
+        }
+
+        return out;
+    }
+
+    /* ===== src/core/traders.js ===== */
+    /*
+     * Traders: which one to sell to, and the "By trader" grouping. Pure, no DOM.
+     *
+     * A trader's price is an OFFER, not a fact like an NPC's Sell price: the
+     * trader may be offline, may have changed the price, or may refuse. So the
+     * trader a deal is priced against is the one you can most likely sell to NOW:
+     *
+     *   1. a sane price first - more than TRADER_SUSPECT_RATIO x the item's value
+     *      is usually a price the trader forgot to update, not a real bid;
+     *   2. then online, idle, not-yet-known, offline - in that order;
+     *   3. then the highest price, then the best TornExchange score.
+     *
+     * If someone further down that order pays more, the row says so ("best
+     * offline: Alice $24,500") rather than hiding it.
+     */
+
+    /** Above this multiple of the item's value, a trader's price gets a "check" flag. */
+    const TRADER_SUSPECT_RATIO = 1.05;
+
+    /** Ask TornExchange this often. It caches for 5 min; prices move slowly. */
+    const TE_REFRESH_MS = 30 * 60 * 1000;
+
+    /** Trader prices older than this are not used at all. */
+    const TE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+    const TE_CACHE_VERSION = 1;
+
+    const LEVEL_RANK = { online: 0, idle: 1, unknown: 2, offline: 3 };
+
+    /** 'online' | 'idle' | 'offline' | 'unknown' from a parsed presence. */
+    function presenceLevel(presence) {
+        const s = presence && presence.online;
+        return s ? String(s).toLowerCase() : 'unknown';
+    }
+
+    function isSuspect(price, marketValue) {
+        return Number(marketValue) > 0 && price > marketValue * TRADER_SUSPECT_RATIO;
+    }
+
+    /**
+     * @param {Array<{name, id, price, score}>} traders - TornExchange's top buyers
+     * @param {object} ctx
+     * @param {function} ctx.presenceOf - (traderId) => presence | null
+     * @param {number} [ctx.marketValue]
+     * @returns {null | {trader, level, suspect, pctOfValue, better}}
+     *   better: a trader who pays more but is further down the order, or null
+     */
+    function pickTrader(traders, { presenceOf = () => null, marketValue = 0 } = {}) {
+        if (!Array.isArray(traders) || !traders.length) return null;
+
+        const ranked = traders.map((trader) => ({
+            trader,
+            level: presenceLevel(presenceOf(trader.id)),
+            suspect: isSuspect(trader.price, marketValue),
+        }));
+
+        ranked.sort(
+            (a, b) =>
+                Number(a.suspect) - Number(b.suspect) ||
+                (LEVEL_RANK[a.level] ?? 2) - (LEVEL_RANK[b.level] ?? 2) ||
+                b.trader.price - a.trader.price ||
+                b.trader.score - a.trader.score,
+        );
+
+        const chosen = ranked[0];
+
+        let better = null;
+        for (const r of ranked.slice(1)) {
+            if (r.suspect || r.trader.price <= chosen.trader.price) continue;
+            if (!better || r.trader.price > better.trader.price) better = r;
+        }
+
+        return {
+            trader: chosen.trader,
+            level: chosen.level,
+            suspect: chosen.suspect,
+            pctOfValue: Number(marketValue) > 0 ? chosen.trader.price / marketValue : null,
+            better: better ? { trader: better.trader, level: better.level } : null,
+        };
+    }
+
+    /**
+     * The most any sane trader pays - used to decide which items are worth
+     * fetching listings for, before anyone's online status is known.
+     */
+    function maxTraderPrice(traders, marketValue = 0) {
+        let best = 0;
+        for (const t of traders || []) {
+            if (isSuspect(t.price, marketValue)) continue;
+            if (t.price > best) best = t.price;
+        }
+        return best;
+    }
+
+    /**
+     * Deals sold to a trader, grouped by that trader: one trade window each.
+     * Online traders first, then the biggest total.
+     *
+     * @param {Array} rows - priced rows; only those whose best exit is TRADER count
+     * @returns {Array<{trader, level, score, rows, totalProfit, cashRequired}>}
+     */
+    function groupByTrader(rows) {
+        const groups = new Map();
+
+        for (const row of rows || []) {
+            if (!row || !row.profit || row.profit.venue !== 'TRADER' || !row.traderPick) continue;
+
+            const pick = row.traderPick;
+            const id = pick.trader.id;
+            if (!groups.has(id)) {
+                groups.set(id, {
+                    trader: pick.trader,
+                    level: pick.level,
+                    rows: [],
+                    totalProfit: 0,
+                    cashRequired: 0,
+                });
+            }
+
+            const g = groups.get(id);
+            g.rows.push(row);
+            g.totalProfit += row.profit.realizableProfit;
+            g.cashRequired += row.profit.cashRequired;
+        }
+
+        const out = [...groups.values()];
+        for (const g of out) {
+            g.rows.sort((a, b) => b.profit.realizableProfit - a.profit.realizableProfit);
+        }
+
+        out.sort(
+            (a, b) =>
+                (LEVEL_RANK[a.level] ?? 2) - (LEVEL_RANK[b.level] ?? 2) ||
+                b.totalProfit - a.totalProfit,
+        );
+        return out;
+    }
+
+    /* -------------------------------------------------------------- storage */
+
+    /** Compact form for GM storage: {id: [[name, traderId, price, score], ...]}. */
+    function makeTeCacheEntry(map, now = Date.now()) {
+        const items = {};
+        for (const [itemId, traders] of map) {
+            items[itemId] = traders.map((t) => [t.name, t.id, t.price, t.score]);
+        }
+        return { version: TE_CACHE_VERSION, fetchedAt: now, items };
+    }
+
+    /** @returns {{fetchedAt: number, map: Map}|null} null if absent, old-format or too old */
+    function readTeCacheEntry(entry, now = Date.now()) {
+        if (!entry || entry.version !== TE_CACHE_VERSION || !entry.items) return null;
+
+        const fetchedAt = Number(entry.fetchedAt);
+        if (!Number.isFinite(fetchedAt) || now - fetchedAt > TE_MAX_AGE_MS) return null;
+
+        const map = new Map();
+        for (const [itemId, rows] of Object.entries(entry.items)) {
+            if (!Array.isArray(rows)) continue;
+            const traders = rows
+                .filter((r) => Array.isArray(r) && r.length >= 3)
+                .map(([name, id, price, score]) => ({
+                    name: String(name),
+                    id: String(id),
+                    price: Number(price),
+                    score: Number(score) || 0,
+                }))
+                .filter((t) => t.id && t.price > 0);
+            if (traders.length) map.set(itemId, traders);
+        }
+
+        return { fetchedAt, map };
     }
 
     /* ===== src/api/torn.js ===== */
@@ -3231,6 +3615,8 @@
         --faint: #777;
         --green: #65d27a;
         --amber: #ffcc4d;
+        /* Trader offers: cooler than NPC green, which means "guaranteed". */
+        --trader: #7ec8ff;
         --red: #ff8f7a;
 
         position: fixed;
@@ -3760,6 +4146,102 @@
     .ttv2-src-status[data-level="idle"] { color: var(--amber); }
     .ttv2-src-status[data-level="idle"]::before { background: var(--amber); }
 
+    /* ---- traders ---- */
+
+    .ttv2-row-trader .ttv2-row-profit,
+    .ttv2-group-total,
+    .ttv2-group-profit {
+        color: var(--trader);
+    }
+
+    .ttv2-trader {
+        font-size: 11px;
+        color: #bbb;
+    }
+
+    .ttv2-trader b,
+    .ttv2-group-who b {
+        color: #fff;
+    }
+
+    .ttv2-trader-links {
+        display: inline-flex;
+        gap: 4px;
+        vertical-align: middle;
+    }
+
+    .ttv2-panel button.ttv2-mini-btn {
+        padding: 1px 7px;
+        font-size: 10px;
+        font-weight: bold;
+        line-height: 16px;
+        color: #ddd;
+    }
+
+    .ttv2-trader-warn {
+        color: var(--amber);
+        font-size: 10px;
+        cursor: help;
+    }
+
+    .ttv2-trader-alt {
+        color: var(--muted);
+        font-size: 10px;
+    }
+
+    .ttv2-group {
+        margin-bottom: 8px;
+        background: #292929;
+        border: 1px solid #444;
+        border-left: 3px solid var(--trader);
+        border-radius: 5px;
+    }
+
+    .ttv2-group-head {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        gap: 4px 8px;
+        align-items: center;
+        padding: 8px 9px 6px;
+        border-bottom: 1px solid var(--line);
+        font-size: 12px;
+    }
+
+    .ttv2-group-head .ttv2-trader-links {
+        grid-column: 1 / 3;
+    }
+
+    .ttv2-group-facts {
+        color: var(--muted);
+        font-size: 11px;
+    }
+
+    .ttv2-group-total {
+        font-size: 14px;
+        text-align: right;
+    }
+
+    .ttv2-group-item {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto auto;
+        gap: 2px 8px;
+        align-items: center;
+        padding: 6px 9px;
+        border-bottom: 1px solid #333;
+    }
+
+    .ttv2-group-item:last-child {
+        border-bottom: 0;
+    }
+
+    .ttv2-group-item .ttv2-row-name {
+        font-size: 12px;
+    }
+
+    .ttv2-group-profit {
+        font-size: 12px;
+    }
+
     .ttv2-row-prices {
         color: #bbb;
         font-size: 11px;
@@ -3959,6 +4441,7 @@
      * here. All text goes in through textContent - names from Torn or TornW3B
      * never touch innerHTML. The panel is in a shadow root (see mount()).
      */
+
 
 
 
@@ -4199,7 +4682,11 @@
 
             this.tabBtns = {};
             this.tabsEl = el('div', { class: 'ttv2-tabs' });
-            for (const [key, label] of [['bazaar', 'Bazaars'], ['itemmarket', 'Item Market']]) {
+            for (const [key, label] of [
+                ['bazaar', 'Bazaars'],
+                ['itemmarket', 'Item Market'],
+                ['traders', 'By trader'],
+            ]) {
                 const btn = el('button', {
                     type: 'button',
                     class: 'ttv2-tab',
@@ -4230,6 +4717,18 @@
                 }),
             ]);
             this.tabsEl.appendChild(this.creditEl);
+
+            // Where trader prices come from, on the tab they feed.
+            this.teCreditEl = el('span', { class: 'ttv2-credit' }, [
+                el('a', {
+                    href: TE_SITE_URL,
+                    target: '_blank',
+                    rel: 'noopener noreferrer',
+                    title: 'Trader prices come from TornExchange',
+                    text: 'via TornExchange',
+                }),
+            ]);
+            this.tabsEl.appendChild(this.teCreditEl);
 
             this.listEl = el('div', { class: 'ttv2-list' });
 
@@ -4382,6 +4881,14 @@
                     'Item Market after its 5% tax.',
             );
 
+            this.chipTrader = toggle(
+                'sellToTrader',
+                'Trader',
+                'Sell to a player trader: listings cheaper than what a TornExchange ' +
+                    'trader pays, online traders first. Instant cash, no tax - but an ' +
+                    'offer, not a guarantee. Needs a TornExchange key (Settings).',
+            );
+
             this.chipMin = this.valueChip('minTotalProfit', (v) =>
                 'Min ' + formatMoneyShort(v || 0),
                 'Hide listings whose total profit is below this',
@@ -4395,6 +4902,7 @@
             this.chipsEl.appendChild(this.chipNpc);
             this.chipsEl.appendChild(this.chipBazaar);
             this.chipsEl.appendChild(this.chipMarket);
+            this.chipsEl.appendChild(this.chipTrader);
             this.chipsEl.appendChild(el('span', { class: 'ttv2-chips-gap' }));
             this.chipsEl.appendChild(this.chipMin);
             this.chipsEl.appendChild(this.chipCash);
@@ -4636,6 +5144,120 @@
             this.newTabInput = nt.input;
 
             this.settingsPage.appendChild(section('Links', [nt.row]));
+
+            /* ---- TornExchange ---- */
+
+            this.teKeyInput = el('input', {
+                type: 'text',
+                class: 'ttv2-masked ttv2-te-key',
+                placeholder: 'Paste your TornExchange key',
+                autocomplete: 'off',
+                autocapitalize: 'off',
+                autocorrect: 'off',
+                spellcheck: 'false',
+                'data-lpignore': 'true',
+                'data-1p-ignore': 'true',
+            });
+
+            this.teKeyRevealed = false;
+            const teShowBtn = el('button', {
+                type: 'button',
+                text: 'Show',
+                onclick: () => {
+                    const hidden = this.teKeyInput.classList.toggle('ttv2-masked');
+                    teShowBtn.textContent = hidden ? 'Show' : 'Hide';
+                    if (!hidden && !this.teKeyInput.value && this.handlers.onRevealTeKey) {
+                        this.teKeyInput.value = this.handlers.onRevealTeKey() || '';
+                        this.teKeyRevealed = true;
+                    } else if (hidden && this.teKeyRevealed) {
+                        this.teKeyInput.value = '';
+                        this.teKeyRevealed = false;
+                    }
+                },
+            });
+
+            const teSave = guarded(this, 'Save', () => {
+                const key = this.teKeyInput.value.trim();
+                this.teKeyInput.value = '';
+                this.teKeyRevealed = false;
+                return this.handlers.onSaveTeKey ? this.handlers.onSaveTeKey(key) : undefined;
+            });
+            this.teKeyInput.addEventListener('keydown', (event) => {
+                if (event.key !== 'Enter') return;
+                event.preventDefault();
+                teSave();
+            });
+
+            this.teStateEl = el('div', { class: 'ttv2-keystate', text: 'No TornExchange key.' });
+
+            const teHelp = el('div', { class: 'ttv2-note' });
+            teHelp.appendChild(document.createTextNode(
+                "TornExchange only answers to the Torn key you log in there with. Make a " +
+                    'second Public key, log in at ',
+            ));
+            teHelp.appendChild(el('a', { href: TE_SITE_URL, target: '_blank', rel: 'noopener noreferrer', text: 'tornexchange.com' }));
+            teHelp.appendChild(document.createTextNode(
+                ' with it, and paste that same key here. Your main key is never sent there. ' +
+                    'Trader prices are fetched once every 30 minutes.',
+            ));
+
+            this.settingsPage.appendChild(
+                section('Traders (TornExchange)', [
+                    el('div', { class: 'ttv2-inline' }, [
+                        this.teKeyInput,
+                        teShowBtn,
+                        el('button', { type: 'button', class: 'ttv2-primary', text: 'Save', onclick: teSave }),
+                    ]),
+                    this.teStateEl,
+                    teHelp,
+                    el('div', { class: 'ttv2-inline' }, [
+                        el('button', {
+                            type: 'button',
+                            class: 'ttv2-link',
+                            text: 'Refresh trader prices',
+                            onclick: guarded(this, 'Refresh', () =>
+                                this.handlers.onRefreshTraders && this.handlers.onRefreshTraders(),
+                            ),
+                        }),
+                        el('button', {
+                            type: 'button',
+                            class: 'ttv2-link',
+                            text: 'Forget TornExchange key',
+                            onclick: () => this.handlers.onForgetTeKey && this.handlers.onForgetTeKey(),
+                        }),
+                    ]),
+                ]),
+            );
+        }
+
+        /** The TornExchange line in Settings: never the key, only its state. */
+        renderTraderInfo() {
+            const info = this.state.traderInfo;
+            if (!this.teStateEl || !info) return;
+
+            this.teStateEl.classList.remove('ttv2-ok', 'ttv2-bad');
+            let text;
+            if (!info.hasKey) {
+                text = 'No TornExchange key.';
+            } else if (info.badKey) {
+                text = info.error || 'TornExchange did not accept the key.';
+                this.teStateEl.classList.add('ttv2-bad');
+            } else if (info.loading) {
+                text = 'Loading trader prices...';
+            } else if (info.fetchedAt) {
+                text =
+                    'Trader prices for ' + info.items.toLocaleString('en-US') + ' items, updated ' +
+                    formatAge(Date.now() - info.fetchedAt) + '.';
+                this.teStateEl.classList.add('ttv2-ok');
+                if (info.error) text += ' Last refresh failed: ' + info.error;
+            } else {
+                text = info.error || 'Key saved. Turn on the Trader chip to load prices.';
+                if (info.error) this.teStateEl.classList.add('ttv2-bad');
+            }
+            if (info.waitUntil) {
+                text += ' Waiting ' + formatAge(info.waitUntil - Date.now()) + ' (TornExchange rate limit).';
+            }
+            this.teStateEl.textContent = text;
         }
 
         /**
@@ -4661,7 +5283,9 @@
                 [
                     'Other services',
                     'TornW3B (weav3r.dev), for bazaar prices. It receives item ids ' +
-                        'only - never your key or anything about you.',
+                        'only - never your key or anything about you. TornExchange ' +
+                        '(tornexchange.com), for traders\' buy prices, only if you add a ' +
+                        'TornExchange key: it receives that separate key - never your main key.',
                 ],
             ];
 
@@ -4936,6 +5560,7 @@
             this.chipNpc.setAttribute('aria-pressed', String(s.sellToNpc !== false));
             this.chipBazaar.setAttribute('aria-pressed', String(Boolean(s.resaleBazaar)));
             this.chipMarket.setAttribute('aria-pressed', String(Boolean(s.resaleMarket)));
+            this.chipTrader.setAttribute('aria-pressed', String(Boolean(s.sellToTrader)));
             this.chipMin.textContent = this.chipMin.labelFor(s.minTotalProfit);
             this.chipCash.textContent = this.chipCash.labelFor(s.cashOnHand);
             this.chipCash.classList.toggle('ttv2-chip-set', Boolean(s.cashOnHand));
@@ -4954,6 +5579,10 @@
 
             if (rows.length === 0) {
                 this.listEl.appendChild(this.renderEmpty());
+            } else if (this.state.tab === 'traders') {
+                (this.state.groups || []).forEach((g) => {
+                    this.listEl.appendChild(this.renderGroup(g));
+                });
             } else {
                 rows.forEach((row, i) => {
                     this.listEl.appendChild(this.renderRow(row, i));
@@ -4961,6 +5590,7 @@
             }
 
             this.renderTabs();
+            this.renderTraderInfo();
             this.refreshAges();
         }
 
@@ -4978,6 +5608,9 @@
             if (this.creditEl) {
                 const live = this.state.live;
                 this.creditEl.style.display = tab === 'bazaar' && live && live.w3b ? '' : 'none';
+            }
+            if (this.teCreditEl) {
+                this.teCreditEl.style.display = tab === 'traders' ? '' : 'none';
             }
         }
 
@@ -5077,7 +5710,33 @@
             }
 
             const s = this.state.settings;
-            if (s.sellToNpc === false && !s.resaleBazaar && !s.resaleMarket) {
+            const ti = this.state.traderInfo || {};
+
+            if (tab === 'traders' && !s.sellToTrader) {
+                return box(
+                    'Groups deals by the trader who buys them - one trade each, online traders first.',
+                    'Turn on Trader',
+                    () => this.emitSettings({ sellToTrader: true }),
+                );
+            }
+            if (s.sellToTrader && !ti.hasKey && (tab === 'traders' || s.sellToNpc === false)) {
+                return box('Trader prices need a TornExchange key.', 'Add it', () =>
+                    this.showPage('settings'),
+                );
+            }
+            if (tab === 'traders') {
+                return box(
+                    ti.loading
+                        ? 'Loading trader prices...'
+                        : ti.error && !ti.fetchedAt
+                          ? 'No trader prices: ' + ti.error
+                          : 'No listing is cheaper than what a trader pays right now.',
+                    ti.error && !ti.loading ? 'Open Settings' : null,
+                    () => this.showPage('settings'),
+                );
+            }
+
+            if (s.sellToNpc === false && !s.resaleBazaar && !s.resaleMarket && !s.sellToTrader) {
                 return box('Nothing to sell to is selected.', 'Sell to NPC shops', () =>
                     this.emitSettings({ sellToNpc: true }),
                 );
@@ -5209,6 +5868,7 @@
             } else if (p.venue === 'NPC') {
                 bits.push('sell to NPC');
             }
+            if (p.venue === 'TRADER') bits.push('one trade, no tax');
 
             qty.appendChild(document.createTextNode(bits.join('  |  ')));
 
@@ -5233,6 +5893,7 @@
                 name,
                 this.sourceLine(row),
                 prices,
+                p.venue === 'TRADER' && row.traderPick ? this.traderLine(row.traderPick) : null,
                 qty,
             ]);
 
@@ -5276,8 +5937,146 @@
             const rowEl = el('div', { class: 'ttv2-row' }, [rankEl, main, profit, go]);
             rowEl.dataset.ttv2At = String(this.rowTime(row) || '');
             if (row.el) rowEl.classList.add('ttv2-onpage');
+            // An offer, not a guarantee: trader deals never look like NPC ones.
+            if (p.venue === 'TRADER') rowEl.classList.add('ttv2-row-trader');
 
             return rowEl;
+        }
+
+        /**
+         * Who the deal would be sold to, and whether they are around:
+         *   Bob ● Online · net +214 · 98% of value   [Profile] [Price list]
+         *   best offline: Alice $24,500
+         */
+        traderLine(pick) {
+            const t = pick.trader;
+            const line = el('div', { class: 'ttv2-trader' });
+
+            const who = el('span', { class: 'ttv2-src-part' });
+            who.appendChild(el('b', { text: t.name }));
+            who.appendChild(this.statusBadge(t.id, t.name, pick.level));
+            line.appendChild(who);
+
+            const facts = ['net ' + (t.score >= 0 ? '+' : '') + t.score];
+            if (pick.pctOfValue) facts.push(Math.round(pick.pctOfValue * 100) + '% of value');
+            line.appendChild(el('span', { class: 'ttv2-src-part', text: ' · ' + facts.join(' · ') + ' ' }));
+
+            line.appendChild(this.traderLinks(t));
+
+            if (pick.suspect) {
+                line.appendChild(
+                    el('div', {
+                        class: 'ttv2-trader-warn',
+                        title: 'Traders usually pay 94-100% of value. A higher price is often one they forgot to update.',
+                        text: 'Above value - check their list first',
+                    }),
+                );
+            }
+            if (pick.better) {
+                const b = pick.better;
+                line.appendChild(
+                    el('div', {
+                        class: 'ttv2-trader-alt',
+                        text:
+                            'best ' + (b.level === 'unknown' ? 'other' : b.level) + ': ' +
+                            b.trader.name + ' ' + formatMoney(b.trader.price),
+                    }),
+                );
+            }
+            return line;
+        }
+
+        /** [Profile] opens their Torn profile (trade from there); [Price list] their TornExchange list. */
+        traderLinks(trader) {
+            return el('span', { class: 'ttv2-trader-links' }, [
+                el('button', {
+                    type: 'button',
+                    class: 'ttv2-mini-btn',
+                    title: "Open " + trader.name + "'s Torn profile - start the trade from there",
+                    text: 'Profile',
+                    onclick: () => this.handlers.onOpenProfile && this.handlers.onOpenProfile(trader.id),
+                }),
+                el('button', {
+                    type: 'button',
+                    class: 'ttv2-mini-btn',
+                    title: 'Open ' + trader.name + "'s price list on TornExchange (new tab)",
+                    text: 'Price list',
+                    onclick: () => this.handlers.onOpenPriceList && this.handlers.onOpenPriceList(trader.id),
+                }),
+            ]);
+        }
+
+        /** "● Online" for a player, from the known statuses; "● checking" until known. */
+        statusBadge(id, name, fallbackLevel) {
+            const statuses = this.state.statuses;
+            const status = statuses ? statuses.get(String(id)) : null;
+            const badge = el('span', {
+                class: 'ttv2-src-status',
+                title: status ? (name ? name + ': ' : '') + status.title + ' (Torn API)' : 'Checking status...',
+                text: status ? status.text : 'checking',
+            });
+            badge.dataset.level = status ? status.level : fallbackLevel || 'unknown';
+            return badge;
+        }
+
+        /**
+         * One trader, and every deal you could sell them in one trade:
+         *
+         *   Bob ● Online · net +214 · 4 deals · +$41,000   [Profile] [Price list]
+         *     Mountie Hat ×3   $20,000 -> $24,000   +$12,000   [GO]
+         *       Bazaar - Garrett89 ● Online | 1m ago
+         */
+        renderGroup(group) {
+            const t = group.trader;
+
+            const head = el('div', { class: 'ttv2-group-head' }, [
+                el('div', { class: 'ttv2-group-who' }, [
+                    el('b', { text: t.name }),
+                    this.statusBadge(t.id, t.name, group.level),
+                    el('span', {
+                        class: 'ttv2-group-facts',
+                        text:
+                            ' · net ' + (t.score >= 0 ? '+' : '') + t.score + ' · ' +
+                            group.rows.length + (group.rows.length === 1 ? ' deal' : ' deals'),
+                    }),
+                ]),
+                el('strong', { class: 'ttv2-group-total', text: '+' + formatMoney(group.totalProfit) }),
+                this.traderLinks(t),
+            ]);
+
+            const items = group.rows.map((row) => {
+                const p = row.profit;
+                const known = row.qtyAtPrice !== false;
+                const line = el('div', { class: 'ttv2-group-item' }, [
+                    el('div', { class: 'ttv2-group-item-main' }, [
+                        el('div', {
+                            class: 'ttv2-row-name',
+                            text: row.name + (known && p.affordableQty > 1 ? ' ×' + p.affordableQty : ''),
+                        }),
+                        el('div', {
+                            class: 'ttv2-row-prices',
+                            text: 'Buy ' + formatMoney(p.listingPrice) + '  ->  ' + formatMoney(p.exitPrice),
+                        }),
+                        this.sourceLine(row),
+                    ]),
+                    el('strong', {
+                        class: 'ttv2-group-profit',
+                        text: '+' + formatMoney(known ? p.realizableProfit : p.profitPerUnit),
+                    }),
+                    el('button', {
+                        type: 'button',
+                        class: 'ttv2-mini-btn ttv2-group-go',
+                        title: row.el ? 'Scroll to this listing' : 'Go to this listing',
+                        text: 'GO',
+                        onclick: () => this.handlers.onNavigate && this.handlers.onNavigate(row),
+                    }),
+                ]);
+                line.dataset.ttv2At = String(this.rowTime(row) || '');
+                line.classList.add('ttv2-row-lite');
+                return line;
+            });
+
+            return el('div', { class: 'ttv2-group' }, [head, ...items]);
         }
 
         /** When the data behind a row was true - not when we last looked. */
@@ -5302,7 +6101,7 @@
             if (row.source === 'bazaar') {
                 // The owner's status right after their name, so you know whether
                 // they are around before you click.
-                const statuses = this.state.sellerStatus;
+                const statuses = this.state.statuses;
                 const status =
                     statuses && row.sellerId ? statuses.get(String(row.sellerId)) : null;
                 const name = row.sellerName || (status && status.name) || null;
@@ -5354,7 +6153,7 @@
 
             // Just the age. Nothing is greyed out: a listing the latest refresh
             // did not confirm is removed, not faded.
-            for (const rowEl of this.listEl.querySelectorAll('.ttv2-row')) {
+            for (const rowEl of this.listEl.querySelectorAll('.ttv2-row, .ttv2-row-lite')) {
                 const at = Number(rowEl.dataset.ttv2At);
                 const ageEl = rowEl.querySelector('.ttv2-age');
                 const known = Number.isFinite(at) && at > 0;
@@ -5543,6 +6342,8 @@
          * @param {function} [deps.isKeyDead] - (error) => boolean
          * @param {function} [deps.onKeyDead] - (error) => void
          * @param {function} [deps.now]
+         * @param {function} [deps.traderPriceOf] - (itemId) => best trader price, or 0
+         * @param {function} [deps.traderVersion] - changes when trader prices do
          */
         constructor(deps) {
             this.d = deps;
@@ -5568,6 +6369,11 @@
             this.d.save(FEED_STORE_KEY, null);
             this.d.save(FEED_REFRESH_KEY, this.now());
             if (this.d.onChange) this.d.onChange();
+        }
+
+        /** (itemId) => what the best sane trader pays, or 0. */
+        traderPriceOf() {
+            return this.d.traderPriceOf || (() => 0);
         }
 
         /* ------------------------------------------------------ storage */
@@ -5680,7 +6486,19 @@
             }
 
             if (this.d.hasUsableKey()) {
-                if (!this.sweep.length) this.sweep = itemMarketSweepList(index, settings);
+                // Rebuilt when what counts as an exit changes (a chip, new
+                // trader prices), not just once.
+                const sig = [
+                    settings.sellToNpc !== false,
+                    Boolean(settings.sellToTrader),
+                    this.d.traderVersion ? this.d.traderVersion() : 0,
+                ].join('|');
+                if (this.sweepSig === undefined) this.sweepSig = sig;
+                if (!this.sweep.length || sig !== this.sweepSig) {
+                    this.sweep = itemMarketSweepList(index, settings, this.traderPriceOf());
+                    this.sweepSig = sig;
+                    this.sweepPos = 0;
+                }
                 await this.refreshItemMarket(rechecks);
             }
         }
@@ -5691,7 +6509,13 @@
             try {
                 const summary = await fetchW3bSummary(this.d.w3b);
                 this.lastSummaryAt = this.now();
-                this.candidates = selectCandidates(summary, index, settings);
+                this.candidates = selectCandidates(
+                    summary,
+                    index,
+                    settings,
+                    undefined,
+                    this.traderPriceOf(),
+                );
                 this.lastError = null;
 
                 /*
@@ -5863,6 +6687,8 @@
 
 
 
+
+
     const STORE_KEY = 'apiKey';
     const STORE_ITEMS = 'itemsCache';
     const STORE_NPC = 'npcCache';
@@ -5872,6 +6698,10 @@
     const STORE_API_WINDOW = 'apiWindow';
     const STORE_KEY_DEAD = 'keyDead';
     const STORE_OPENED = 'opened';
+    /* TornExchange: its own key (never the main one), its prices, and its backoff. */
+    const STORE_TE_KEY = 'teKey';
+    const STORE_TE = 'teCache';
+    const STORE_TE_STATE = 'teState';
 
     const DEFAULT_SETTINGS = {
         /*
@@ -5891,6 +6721,12 @@
         sellToNpc: true,
         resaleBazaar: false,
         resaleMarket: false,
+        /*
+         * Sell to a player trader, at the price on their TornExchange list. Off
+         * by default: it needs a TornExchange key, and a trader's price is an
+         * offer, not a guarantee.
+         */
+        sellToTrader: false,
 
         /*
          * The live feed: watch the market from ANY Torn page, not just the one
@@ -5939,18 +6775,23 @@
     const OWNER_RETRY_MS = 60000;
 
     /*
-     * Status next to each seller in the Bazaars list: the first
-     * SELLER_STATUS_MAX sellers shown, one public-profile call each, then at most
-     * once per SELLER_REFRESH_MS while they stay on the list - so a full list
-     * costs about 10 calls a minute, inside the shared 70/min budget. Only while
-     * the Bazaars list is on screen in a visible tab.
+     * Online status for players on the lists: the first SELLER_STATUS_MAX bazaar
+     * sellers (while the Bazaars list is on screen) and the first
+     * TRADER_STATUS_MAX traders deals would be sold to (while the Trader chip is
+     * on). One public-profile call each, then at most once per
+     * PRESENCE_REFRESH_MS while they stay listed - at most 25 calls a minute,
+     * inside the shared 70/min budget next to the feed's 30. Visible tab only.
      */
     const SELLER_STATUS_MAX = 10;
-    const SELLER_REFRESH_MS = 60000;
-    const SELLER_RETRY_MS = 120000;
-    const SELLER_MAX_PENDING = 3;
-    /* Sellers not on the list this long are forgotten. */
-    const SELLER_FORGET_MS = 10 * 60 * 1000;
+    const TRADER_STATUS_MAX = 15;
+    const PRESENCE_REFRESH_MS = 60000;
+    const PRESENCE_RETRY_MS = 120000;
+    const PRESENCE_MAX_PENDING = 3;
+    /* Players not on a list this long are forgotten. */
+    const PRESENCE_FORGET_MS = 10 * 60 * 1000;
+
+    /* A failed TornExchange call is not retried sooner than this. */
+    const TE_RETRY_MS = 5 * 60 * 1000;
 
     /* A bazaar seen closed keeps its feed deals hidden this long (or until seen open). */
     const CLOSED_MEMORY_MS = 10 * 60 * 1000;
@@ -5988,8 +6829,12 @@
         pageRows: [],
         /* { id, presence, fetchedAt, pending, retryAt, open } for the viewed bazaar. */
         owner: null,
-        /* sellerId -> { presence, fetchedAt, pending, retryAt, listedAt } for the Bazaars list. */
-        sellers: new Map(),
+        /* playerId -> { presence, fetchedAt, pending, retryAt, listedAt }: list sellers and traders. */
+        presence: new Map(),
+        te: null,
+        /* { fetchedAt, map: itemId -> traders } from TornExchange, or null. */
+        traders: null,
+        teLoading: false,
         /* sellerId -> time until which their bazaar counts as closed. */
         closedSellers: new Map(),
         pageDiagnostics: null,
@@ -6096,6 +6941,15 @@
                     'Saved anyway - if calls fail, check it.',
                 'warn',
             );
+        }
+
+        if (key === getTeKey()) {
+            app.panel.setStatus(
+                'That is your TornExchange key. Use a different Public key here - ' +
+                    'the main key never goes to TornExchange.',
+                'error',
+            );
+            return;
         }
 
         gmSet(STORE_KEY, key);
@@ -6279,7 +7133,8 @@
                 app.manualNpc,
             );
 
-            const exits = exitsFor(listing.item, app.settings, npcShop);
+            const pick = traderFor(listing.item);
+            const exits = exitsFor(listing.item, app.settings, pick && pick.trader.price);
             if (Object.keys(exits).length === 0) continue;
 
             const profit = bestVenue({
@@ -6292,6 +7147,7 @@
             rows.push({
                 ...listing,
                 profit,
+                traderPick: profit && profit.venue === 'TRADER' ? pick : null,
                 npcShop,
                 npcVerified: npcShop !== null,
                 /*
@@ -6500,6 +7356,7 @@
                   now,
                   npcShopFor: (id) => npcShopFor(id, app.npcShops, app.manualNpc),
                   itemMarketUrl,
+                  traderFor,
               }).filter((r) => {
                   // The page you are on already shows these, with fresher numbers.
                   if (r.source === SOURCE_ITEM_MARKET) {
@@ -6527,16 +7384,38 @@
         const bazaarRows = rankOpportunities(lists.bazaar, rankSettings());
         const marketRows = rankOpportunities(lists.itemmarket, rankSettings());
 
-        const tab = activeTab();
-        const shown = tab === 'bazaar' ? bazaarRows : marketRows;
+        // One trade window per trader, from both lists.
+        const groups = app.settings.sellToTrader
+            ? groupByTrader(bazaarRows.concat(marketRows))
+            : [];
 
-        if (tab === 'bazaar') updateSellerStatus(bazaarRows, now);
+        const tab = activeTab();
+        const shown =
+            tab === 'bazaar'
+                ? bazaarRows
+                : tab === 'traders'
+                  ? groups.flatMap((g) => g.rows)
+                  : marketRows;
+
+        updatePresence(
+            [
+                ...(tab === 'bazaar' ? listedSellers(bazaarRows) : []),
+                ...listedTraders(bazaarRows.concat(marketRows)),
+            ],
+            now,
+        );
 
         app.panel.render({
             rows: shown,
+            groups,
             tab,
-            sellerStatus: tab === 'bazaar' ? sellerStatusMap(bazaarRows, now) : null,
-            counts: { bazaar: bazaarRows.length, itemmarket: marketRows.length },
+            statuses: statusMap(now),
+            traderInfo: traderInfo(now),
+            counts: {
+                bazaar: bazaarRows.length,
+                itemmarket: marketRows.length,
+                traders: groups.length,
+            },
             summary: summarize(shown),
             diagnostics:
                 app.pageDiagnostics && app.pageType === tab
@@ -6559,7 +7438,8 @@
         if (app.tabOverride) return app.tabOverride;
         if (app.pageType === PAGE_BAZAAR) return 'bazaar';
         if (app.pageType === 'itemmarket') return 'itemmarket';
-        return app.settings.viewTab === 'itemmarket' ? 'itemmarket' : 'bazaar';
+        const v = app.settings.viewTab;
+        return v === 'itemmarket' || v === 'traders' ? v : 'bazaar';
     }
 
     function onViewChange(tab) {
@@ -6734,7 +7614,7 @@
     }
 
     /* ------------------------------------------------------------------ *
-     * Seller status on the Bazaars list
+     * Online status: bazaar sellers and traders on the lists
      * ------------------------------------------------------------------ */
 
     /** The first SELLER_STATUS_MAX distinct sellers on the list, in list order. */
@@ -6750,35 +7630,60 @@
     }
 
     /**
-     * Look up the public status of the sellers on the Bazaars list, when due.
-     * The viewed bazaar's owner is skipped: updateOwner() already has it.
+     * The traders behind trader deals - every one of the top three for each
+     * item, since who is online decides which of them the deal goes to.
      */
-    function updateSellerStatus(rows, now) {
-        for (const [id, s] of app.sellers) {
-            if (!s.pending && now - s.listedAt > SELLER_FORGET_MS) app.sellers.delete(id);
+    function listedTraders(rows) {
+        const ids = [];
+        if (!app.settings.sellToTrader || !app.traders) return ids;
+
+        for (const r of rows) {
+            if (!r.traderPick) continue;
+            for (const t of app.traders.map.get(String(r.itemId)) || []) {
+                if (!ids.includes(t.id)) ids.push(t.id);
+                if (ids.length >= TRADER_STATUS_MAX) return ids;
+            }
+        }
+        return ids;
+    }
+
+    /** A player's last known public status: the viewed bazaar's owner, or the lookups. */
+    function presenceOf(id) {
+        const key = String(id);
+        if (app.owner && app.owner.id === key && app.owner.presence) return app.owner.presence;
+        const entry = app.presence.get(key);
+        return (entry && entry.presence) || null;
+    }
+
+    /**
+     * Look up the public status of listed players, when due. The viewed
+     * bazaar's owner is skipped: updateOwner() already has it.
+     */
+    function updatePresence(ids, now) {
+        for (const [id, s] of app.presence) {
+            if (!s.pending && now - s.listedAt > PRESENCE_FORGET_MS) app.presence.delete(id);
         }
 
-        const ids = listedSellers(rows);
         for (const id of ids) {
-            if (!app.sellers.has(id)) {
-                app.sellers.set(id, { presence: null, fetchedAt: 0, pending: false, retryAt: 0, listedAt: now });
+            if (!app.presence.has(id)) {
+                app.presence.set(id, { presence: null, fetchedAt: 0, pending: false, retryAt: 0, listedAt: now });
             }
-            app.sellers.get(id).listedAt = now;
+            app.presence.get(id).listedAt = now;
         }
 
         if (!app.client || !hasUsableKey()) return;
         if (document.visibilityState !== 'visible' || app.panel.collapsed) return;
 
         let pending = 0;
-        for (const s of app.sellers.values()) if (s.pending) pending++;
+        for (const s of app.presence.values()) if (s.pending) pending++;
 
         const ownerId = app.owner && app.owner.id;
         for (const id of ids) {
-            if (pending >= SELLER_MAX_PENDING) break;
+            if (pending >= PRESENCE_MAX_PENDING) break;
             if (id === ownerId) continue;
 
-            const s = app.sellers.get(id);
-            if (s.pending || now < s.retryAt || now - s.fetchedAt < SELLER_REFRESH_MS) continue;
+            const s = app.presence.get(id);
+            if (s.pending || now < s.retryAt || now - s.fetchedAt < PRESENCE_REFRESH_MS) continue;
 
             pending++;
             s.pending = true;
@@ -6786,36 +7691,169 @@
                 .then((presence) => {
                     s.fetchedAt = Date.now();
                     if (presence) s.presence = presence;
-                    else s.retryAt = Date.now() + SELLER_RETRY_MS;
+                    else s.retryAt = Date.now() + PRESENCE_RETRY_MS;
                 })
                 .catch((error) => {
                     if (isKeyDeadError(error)) markKeyDead(error);
-                    s.retryAt = Date.now() + SELLER_RETRY_MS;
+                    s.retryAt = Date.now() + PRESENCE_RETRY_MS;
                 })
                 .finally(() => {
                     s.pending = false;
-                    refreshView();
+                    // A trader coming online can change who a deal goes to.
+                    if (app.index && app.settings.sellToTrader) rescan();
+                    else refreshView();
                 });
         }
     }
 
-    /** sellerId -> { name, level, text, title } for every seller whose status is known. */
-    function sellerStatusMap(rows, now) {
+    /** playerId -> { name, level, text, title } for everyone whose status is known. */
+    function statusMap(now) {
         const out = new Map();
-        for (const r of rows) {
-            if (r.source !== SOURCE_BAZAAR || !r.sellerId) continue;
-            const id = String(r.sellerId);
-            if (out.has(id)) continue;
-
-            const presence =
-                app.owner && app.owner.id === id && app.owner.presence
-                    ? app.owner.presence
-                    : app.sellers.has(id) && app.sellers.get(id).presence;
-            if (!presence) continue;
-
-            out.set(id, { name: presence.name, ...presenceShort(presence, now) });
+        for (const id of app.presence.keys()) {
+            const presence = presenceOf(id);
+            if (presence) out.set(id, { name: presence.name, ...presenceShort(presence, now) });
+        }
+        if (app.owner && app.owner.presence) {
+            out.set(app.owner.id, { name: app.owner.presence.name, ...presenceShort(app.owner.presence, now) });
         }
         return out;
+    }
+
+    /* ------------------------------------------------------------------ *
+     * Traders (TornExchange)
+     * ------------------------------------------------------------------ */
+
+    function getTeKey() {
+        return gmGet(STORE_TE_KEY, '') || '';
+    }
+
+    function teState() {
+        return gmGet(STORE_TE_STATE, {}) || {};
+    }
+
+    function setTeState(patch) {
+        gmSet(STORE_TE_STATE, { ...teState(), ...patch });
+    }
+
+    /** Re-read the stored trader prices (another tab may have fetched them). */
+    function loadTraders(now = Date.now()) {
+        const entry = gmGet(STORE_TE, null);
+        const fetchedAt = entry && entry.fetchedAt;
+        if (app.traders && app.traders.fetchedAt === fetchedAt) return;
+        app.traders = readTeCacheEntry(entry, now);
+    }
+
+    /** Who a deal on this item would be sold to, or null. */
+    function traderFor(item) {
+        if (!item || !app.settings.sellToTrader || !app.traders) return null;
+        return pickTrader(app.traders.map.get(String(item.id)), {
+            presenceOf,
+            marketValue: Number(item.marketValue) || 0,
+        });
+    }
+
+    /** What the best sane trader pays for an item - for choosing what to fetch. */
+    function traderPriceOf(itemId) {
+        if (!app.settings.sellToTrader || !app.traders || !app.index) return 0;
+        const item = app.index.byId.get(String(itemId));
+        return maxTraderPrice(app.traders.map.get(String(itemId)), item ? Number(item.marketValue) : 0);
+    }
+
+    /** For the panel: key, freshness and trouble, never the key itself. */
+    function traderInfo(now = Date.now()) {
+        const st = teState();
+        return {
+            hasKey: Boolean(getTeKey()),
+            items: app.traders ? app.traders.map.size : 0,
+            fetchedAt: app.traders ? app.traders.fetchedAt : null,
+            error: st.error || null,
+            badKey: Boolean(st.badKey),
+            waitUntil: st.blockedUntil > now ? st.blockedUntil : null,
+            loading: app.teLoading,
+        };
+    }
+
+    /**
+     * One TornExchange call every TE_REFRESH_MS, from whichever visible tab gets
+     * there first. `lastAttemptAt` is stored BEFORE the call, so two tabs cannot
+     * both ask; failures wait TE_RETRY_MS, and a 429 waits what TornExchange says.
+     */
+    async function refreshTraders({ force = false } = {}) {
+        if (!app.settings.sellToTrader || !getTeKey() || app.teLoading) return;
+        if (document.visibilityState !== 'visible') return;
+
+        const now = Date.now();
+        loadTraders(now);
+
+        const st = teState();
+        if (st.badKey) return;
+        if (st.blockedUntil && now < st.blockedUntil) return;
+        if (now - (st.lastAttemptAt || 0) < (force ? 30000 : TE_RETRY_MS)) return;
+        if (!force && app.traders && now - app.traders.fetchedAt < TE_REFRESH_MS) return;
+
+        setTeState({ lastAttemptAt: now });
+        app.teLoading = true;
+        refreshView();
+
+        try {
+            const map = await fetchTeBestListings(app.te);
+            gmSet(STORE_TE, makeTeCacheEntry(map, Date.now()));
+            setTeState({ error: null });
+            app.traders = null;
+            loadTraders();
+        } catch (error) {
+            const patch = { error: (error && error.message) || 'TornExchange failed.' };
+            if (error && error.badKey) patch.badKey = true;
+            if (error && error.http === 429) patch.blockedUntil = Date.now() + error.retryAfterMs;
+            setTeState(patch);
+        } finally {
+            app.teLoading = false;
+            if (app.index) rescan();
+            else refreshView();
+        }
+    }
+
+    function onSaveTeKey(key) {
+        key = String(key || '').trim();
+        if (!key) {
+            app.panel.setStatus('Paste your TornExchange key first.', 'error');
+            return;
+        }
+        // The main key is never sent to a third party - not even this one.
+        if (key === getStoredKey()) {
+            app.panel.setStatus(
+                'Use a different Public key for TornExchange than your main key - ' +
+                    'the main key never leaves api.torn.com.',
+                'error',
+            );
+            return;
+        }
+
+        gmSet(STORE_TE_KEY, key);
+        gmDel(STORE_TE_STATE);
+        app.panel.setStatus('TornExchange key saved. Loading trader prices...');
+        refreshTraders({ force: true });
+        refreshView();
+    }
+
+    function onForgetTeKey() {
+        gmDel(STORE_TE_KEY);
+        gmDel(STORE_TE_STATE);
+        gmDel(STORE_TE);
+        app.traders = null;
+        if (app.panel.teKeyInput) app.panel.teKeyInput.value = '';
+        app.panel.setStatus('TornExchange key and trader prices removed.');
+        if (app.index) rescan();
+        else refreshView();
+    }
+
+    function onOpenProfile(playerId) {
+        openDeal('https://www.torn.com/profiles.php?XID=' + encodeURIComponent(String(playerId)));
+    }
+
+    /** Their TornExchange list - another site, so always a new tab. */
+    function onOpenPriceList(traderId) {
+        gmOpenTab(tePriceListUrl(traderId));
     }
 
     /**
@@ -6959,6 +7997,8 @@
         // Position and collapse are chrome: nothing to re-price.
         if (Object.keys(partial).every((k) => k === 'panelPos' || k === 'collapsed')) return;
 
+        if (partial.sellToTrader) refreshTraders();
+
         if (app.index) rescan();
         else refreshView();
     }
@@ -7059,6 +8099,13 @@
 
     function startLiveFeed() {
         app.w3b = new W3bClient();
+        app.te = new TeClient({ getKey: getTeKey });
+        loadTraders();
+        // Another tab fetched trader prices: use them here too.
+        gmOnChange(STORE_TE, () => {
+            loadTraders();
+            if (app.index) rescan();
+        });
 
         app.feed = new LiveFeed({
             tabId: app.tabId,
@@ -7073,6 +8120,9 @@
             onChange: () => refreshView(),
             isKeyDead: isKeyDeadError,
             onKeyDead: markKeyDead,
+            traderPriceOf,
+            traderVersion: () =>
+                app.settings.sellToTrader && app.traders ? app.traders.fetchedAt : 0,
         });
 
         // Follower tabs re-render the moment the leader stores something new.
@@ -7202,6 +8252,12 @@
              * script on the page, including other userscripts.
              */
             onRevealKey: () => getStoredKey(),
+            onSaveTeKey,
+            onForgetTeKey,
+            onRevealTeKey: () => getTeKey(),
+            onRefreshTraders: () => refreshTraders({ force: true }),
+            onOpenProfile,
+            onOpenPriceList,
         });
 
         app.panel.mount();
@@ -7242,6 +8298,7 @@
             }
 
             refreshItemsIfStale();
+            refreshTraders();
 
             if (detectPage(location.href) === PAGE_NONE) {
                 if (app.pageType !== PAGE_NONE) rescan();

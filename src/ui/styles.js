@@ -152,6 +152,8 @@ export const PANEL_CSS = `
     --faint: #777;
     --green: #65d27a;
     --amber: #ffcc4d;
+    /* Trader offers: cooler than NPC green, which means "guaranteed". */
+    --trader: #7ec8ff;
     --red: #ff8f7a;
 
     position: fixed;
@@ -680,6 +682,102 @@ export const PANEL_CSS = `
 .ttv2-src-status[data-level="online"]::before { background: var(--green); }
 .ttv2-src-status[data-level="idle"] { color: var(--amber); }
 .ttv2-src-status[data-level="idle"]::before { background: var(--amber); }
+
+/* ---- traders ---- */
+
+.ttv2-row-trader .ttv2-row-profit,
+.ttv2-group-total,
+.ttv2-group-profit {
+    color: var(--trader);
+}
+
+.ttv2-trader {
+    font-size: 11px;
+    color: #bbb;
+}
+
+.ttv2-trader b,
+.ttv2-group-who b {
+    color: #fff;
+}
+
+.ttv2-trader-links {
+    display: inline-flex;
+    gap: 4px;
+    vertical-align: middle;
+}
+
+.ttv2-panel button.ttv2-mini-btn {
+    padding: 1px 7px;
+    font-size: 10px;
+    font-weight: bold;
+    line-height: 16px;
+    color: #ddd;
+}
+
+.ttv2-trader-warn {
+    color: var(--amber);
+    font-size: 10px;
+    cursor: help;
+}
+
+.ttv2-trader-alt {
+    color: var(--muted);
+    font-size: 10px;
+}
+
+.ttv2-group {
+    margin-bottom: 8px;
+    background: #292929;
+    border: 1px solid #444;
+    border-left: 3px solid var(--trader);
+    border-radius: 5px;
+}
+
+.ttv2-group-head {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 4px 8px;
+    align-items: center;
+    padding: 8px 9px 6px;
+    border-bottom: 1px solid var(--line);
+    font-size: 12px;
+}
+
+.ttv2-group-head .ttv2-trader-links {
+    grid-column: 1 / 3;
+}
+
+.ttv2-group-facts {
+    color: var(--muted);
+    font-size: 11px;
+}
+
+.ttv2-group-total {
+    font-size: 14px;
+    text-align: right;
+}
+
+.ttv2-group-item {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto auto;
+    gap: 2px 8px;
+    align-items: center;
+    padding: 6px 9px;
+    border-bottom: 1px solid #333;
+}
+
+.ttv2-group-item:last-child {
+    border-bottom: 0;
+}
+
+.ttv2-group-item .ttv2-row-name {
+    font-size: 12px;
+}
+
+.ttv2-group-profit {
+    font-size: 12px;
+}
 
 .ttv2-row-prices {
     color: #bbb;

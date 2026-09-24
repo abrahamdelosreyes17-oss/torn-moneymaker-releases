@@ -30,6 +30,9 @@ export const VENUE_FEES = {
     BAZAAR_RESALE: 0,
     ITEM_MARKET_ANON: 0.15,
     AUCTION_HOUSE: 0.03,
+    // A player trader (TornExchange price list): paid in the trade, no tax.
+    // An offer, not a guarantee - see core/traders.js.
+    TRADER: 0,
 };
 
 /*
@@ -43,6 +46,7 @@ export const VENUE_LABELS = {
     BAZAAR_RESALE: 'Avg value',
     ITEM_MARKET_ANON: 'Market (anon)',
     AUCTION_HOUSE: 'Auction',
+    TRADER: 'Trader',
 };
 
 /**
