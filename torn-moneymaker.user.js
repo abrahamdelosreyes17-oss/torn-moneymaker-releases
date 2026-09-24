@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      3.2.1
+// @version      3.3.0
 // @description  Finds Bazaar and Item Market listings below NPC / market value - on the page you are viewing, and live from the Torn API and TornW3B - ranked by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -37,7 +37,7 @@
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '3.2.1';
+    const TTV2_BUILD_VERSION = '3.3.0';
 
     /* ===== src/platform/gm.js ===== */
     /*
@@ -2969,197 +2969,387 @@
     }
 
     /*
-     * Panel chrome and rows follow the original ChatGPT script's look, which
-     * the people using this liked: neutral greys, cards with a rank, a green
-     * profit column and a full-width GO button.
+     * Neutral greys, cards with a rank, a green profit column and a full-width
+     * GO button - the original script's look, which people liked.
      */
     .ttv2-panel {
+        --bg: #1f1f1f;
+        --bg2: #262626;
+        --bg3: #2d2d2d;
+        --line: #3a3a3a;
+        --line2: #4a4a4a;
+        --text: #eee;
+        --muted: #9a9a9a;
+        --faint: #777;
+        --green: #65d27a;
+        --amber: #ffcc4d;
+        --red: #ff8f7a;
+
         position: fixed;
         right: 16px;
         bottom: 16px;
         z-index: 2147483000;
         width: 430px;
         max-width: calc(100vw - 32px);
-        max-height: 75vh;
+        /* Fits its content; the list scrolls beyond this. */
+        max-height: min(75vh, 720px);
+        min-height: 220px;
         display: flex;
         flex-direction: column;
-        background: #1f1f1f;
-        color: #eee;
+        background: var(--bg);
+        color: var(--text);
         border: 1px solid #555;
-        border-radius: 7px;
-        box-shadow: 0 8px 30px rgba(0, 0, 0, 0.55);
-        font-family: Arial, Helvetica, sans-serif;
-        font-size: 12px;
-        line-height: 1.35;
+        border-radius: 8px;
+        box-shadow: 0 10px 34px rgba(0, 0, 0, 0.6);
+        font: 12px/1.35 Arial, Helvetica, sans-serif;
+        text-align: left;
+        overflow: hidden;
     }
 
-    .ttv2-panel.ttv2-collapsed .ttv2-body {
-        display: none;
+    .ttv2-panel *,
+    .ttv2-panel *::before,
+    .ttv2-panel *::after {
+        box-sizing: border-box;
     }
+
+    .ttv2-panel a {
+        color: var(--green);
+    }
+
+    .ttv2-panel button {
+        font: inherit;
+        font-size: 11px;
+        font-weight: bold;
+        color: var(--text);
+        background: #353535;
+        border: 1px solid #555;
+        border-radius: 4px;
+        padding: 5px 9px;
+        cursor: pointer;
+    }
+
+    .ttv2-panel button:hover:not(:disabled) {
+        background: #444;
+    }
+
+    .ttv2-panel button:disabled {
+        opacity: 0.5;
+        cursor: default;
+    }
+
+    .ttv2-panel button:focus-visible,
+    .ttv2-panel input:focus-visible,
+    .ttv2-panel summary:focus-visible {
+        outline: 2px solid var(--green);
+        outline-offset: 1px;
+    }
+
+    .ttv2-panel button.ttv2-primary {
+        background: #2f5d38;
+        border-color: #3f7d4b;
+    }
+
+    .ttv2-panel button.ttv2-primary:hover:not(:disabled) {
+        background: #37703f;
+    }
+
+    .ttv2-panel button.ttv2-link {
+        background: none;
+        border: 0;
+        padding: 2px 0;
+        color: var(--muted);
+        font-weight: normal;
+        text-decoration: underline;
+        align-self: flex-start;
+    }
+
+    .ttv2-panel input[type="text"] {
+        font: inherit;
+        color: var(--text);
+        background: #181818;
+        border: 1px solid #555;
+        border-radius: 4px;
+        padding: 5px 7px;
+        width: 100%;
+    }
+
+    .ttv2-panel input[type="checkbox"] {
+        accent-color: var(--green);
+        margin: 2px 0 0;
+    }
+
+    /* ---------------------------------------------------------------- header */
 
     .ttv2-head {
         display: flex;
         align-items: center;
-        gap: 6px;
-        padding: 9px 12px;
+        gap: 4px;
+        padding: 6px 6px 6px 12px;
         background: #292929;
         border-bottom: 1px solid #444;
-        border-radius: 7px 7px 0 0;
         cursor: move;
+        user-select: none;
+        flex: 0 0 auto;
     }
 
     .ttv2-title {
-        font-weight: bold;
-        font-size: 13px;
         flex: 1;
+        min-width: 0;
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
     }
 
-    .ttv2-panel button {
-        background: #353535;
-        color: #eee;
-        border: 1px solid #555;
-        border-radius: 4px;
-        padding: 5px 8px;
-        font-size: 11px;
+    .ttv2-title-text {
+        font-size: 13px;
         font-weight: bold;
-        cursor: pointer;
-        font-family: inherit;
     }
 
-    .ttv2-panel button:hover {
-        background: #444;
+    .ttv2-ver {
+        margin-left: 6px;
+        color: var(--faint);
+        font-size: 10px;
     }
 
-    .ttv2-panel button[disabled] {
-        opacity: 0.5;
-        cursor: default;
+    .ttv2-mini {
+        margin-left: 6px;
+        color: var(--green);
+        font-weight: bold;
     }
 
-    .ttv2-body {
-        display: flex;
-        flex-direction: column;
+    .ttv2-panel button.ttv2-icon {
+        width: 28px;
+        height: 28px;
+        padding: 0;
+        font-size: 15px;
+        line-height: 26px;
+        text-align: center;
+        background: transparent;
+        border-color: transparent;
+        color: #ccc;
+    }
+
+    .ttv2-panel button.ttv2-icon:hover:not(:disabled) {
+        background: #3a3a3a;
+        color: #fff;
+    }
+
+    .ttv2-panel button.ttv2-icon[aria-pressed="true"] {
+        background: #3a3a3a;
+        border-color: #555;
+        color: var(--green);
+    }
+
+    .ttv2-panel button.ttv2-back {
+        display: none;
+        margin-left: -6px;
+    }
+
+    .ttv2-on-settings button.ttv2-back {
+        display: inline-block;
+    }
+
+    .ttv2-spin {
+        animation: ttv2-spin 0.9s linear infinite;
+    }
+
+    @keyframes ttv2-spin {
+        to { transform: rotate(360deg); }
+    }
+
+    /* -------------------------------------------------------------- collapsed */
+
+    .ttv2-panel.ttv2-collapsed {
         min-height: 0;
     }
 
-    .ttv2-status {
-        padding: 7px 12px;
-        border-bottom: 1px solid #383838;
-        color: #aaa;
-        font-size: 11px;
-    }
-
-    .ttv2-summary {
-        background: #242424;
-        border-bottom: 1px solid #383838;
-        color: #ddd;
-        font-size: 12px;
-    }
-
-    .ttv2-summary:empty {
+    .ttv2-collapsed .ttv2-body {
         display: none;
     }
 
-    .ttv2-status.ttv2-warn {
-        color: #ffd24a;
+    .ttv2-collapsed .ttv2-head {
+        border-bottom: 0;
+        cursor: pointer;
     }
 
-    .ttv2-status.ttv2-error {
-        color: #ff8f7a;
-    }
-
-    .ttv2-filters {
+    .ttv2-collapsed .ttv2-ver {
         display: none;
-        flex-wrap: wrap;
-        gap: 6px;
-        padding: 8px 10px;
-        border-bottom: 1px solid #383838;
     }
 
-    .ttv2-filters.ttv2-open {
-        display: flex;
-    }
+    /* ------------------------------------------------------------ status bar */
 
-    .ttv2-field {
+    .ttv2-body {
+        flex: 1;
+        min-height: 0;
         display: flex;
         flex-direction: column;
-        gap: 2px;
-        flex: 1 1 45%;
     }
 
-    .ttv2-field label {
-        color: #aaa;
-        font-size: 10px;
-        text-transform: uppercase;
-        letter-spacing: 0.4px;
-    }
-
-    .ttv2-panel input[type="text"],
-    .ttv2-panel input[type="password"] {
-        background: #181818;
-        color: #eee;
-        border: 1px solid #555;
-        border-radius: 4px;
-        padding: 4px 6px;
-        font-size: 11px;
-        font-family: inherit;
-        width: 100%;
-        box-sizing: border-box;
-    }
-
-    .ttv2-masked {
-        -webkit-text-security: disc;
-        text-security: disc;
-    }
-
-    .ttv2-check {
+    .ttv2-bar {
         display: flex;
         align-items: center;
+        gap: 10px;
+        padding: 6px 12px;
+        background: var(--bg2);
+        border-bottom: 1px solid var(--line);
+        font-size: 12px;
+        flex: 0 0 auto;
+    }
+
+    .ttv2-bar-left {
+        flex: 1;
+        min-width: 0;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        font-weight: bold;
+    }
+
+    .ttv2-bar.ttv2-warn .ttv2-bar-left {
+        color: var(--amber);
+        font-weight: normal;
+    }
+
+    .ttv2-bar.ttv2-error .ttv2-bar-left {
+        color: var(--red);
+        font-weight: normal;
+    }
+
+    .ttv2-bar-right {
+        color: var(--muted);
+        font-size: 11px;
+        white-space: nowrap;
+    }
+
+    .ttv2-dot {
+        display: inline-block;
+        width: 7px;
+        height: 7px;
+        margin-right: 5px;
+        border-radius: 50%;
+        background: #666;
+        vertical-align: 0;
+    }
+
+    .ttv2-dot-live { background: var(--green); box-shadow: 0 0 5px var(--green); }
+    .ttv2-dot-warn { background: var(--amber); }
+    .ttv2-dot-other { background: #7aa7d6; }
+
+    /* ------------------------------------------------------------------ pages */
+
+    .ttv2-page {
+        flex: 1;
+        min-height: 0;
+        display: flex;
+        flex-direction: column;
+    }
+
+    .ttv2-page-settings,
+    .ttv2-on-settings .ttv2-page-list {
+        display: none;
+    }
+
+    .ttv2-on-settings .ttv2-page-settings {
+        display: flex;
+        overflow-y: auto;
+        padding: 10px 12px 14px;
+        gap: 14px;
+    }
+
+    /* ------------------------------------------------------------------ chips */
+
+    .ttv2-chips {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
         gap: 5px;
-        flex: 1 1 100%;
-        color: #aaa;
+        padding: 7px 10px;
+        border-bottom: 1px solid var(--line);
+        flex: 0 0 auto;
+    }
+
+    .ttv2-chips-label {
+        color: var(--muted);
+        font-size: 11px;
+        margin-right: 2px;
+    }
+
+    .ttv2-chips-gap {
+        flex: 1;
+    }
+
+    .ttv2-panel button.ttv2-chip {
+        padding: 3px 9px;
+        border-radius: 12px;
+        font-size: 11px;
+        font-weight: normal;
+        background: transparent;
+        border-color: #555;
+        color: var(--muted);
+    }
+
+    .ttv2-panel button.ttv2-chip[aria-pressed="true"] {
+        color: #fff;
+        border-color: var(--green);
+        background: rgba(101, 210, 122, 0.14);
+    }
+
+    .ttv2-panel button.ttv2-chip[aria-pressed="true"]::before {
+        content: '✓ ';
+        color: var(--green);
+    }
+
+    .ttv2-panel button.ttv2-chip-set {
+        color: #fff;
+        border-color: #777;
+    }
+
+    .ttv2-panel input.ttv2-chip-input {
+        width: 90px;
+        padding: 3px 8px;
+        border-radius: 12px;
         font-size: 11px;
     }
+
+    /* ------------------------------------------------------------------- tabs */
 
     .ttv2-tabs {
         display: flex;
-        gap: 6px;
-        padding: 8px 10px 0;
+        align-items: flex-end;
+        gap: 4px;
+        padding: 6px 10px 0;
         background: #292929;
         border-bottom: 1px solid #444;
+        flex: 0 0 auto;
     }
 
     .ttv2-panel button.ttv2-tab {
-        flex: 1;
-        border-radius: 4px 4px 0 0;
+        border-radius: 5px 5px 0 0;
         border-bottom: 0;
         background: #242424;
-        color: #aaa;
-        padding: 6px 8px;
+        color: var(--muted);
+        padding: 6px 12px;
     }
 
     .ttv2-panel button.ttv2-tab.ttv2-tab-on {
-        background: #1f1f1f;
+        background: var(--bg);
         color: #fff;
-        box-shadow: inset 0 2px 0 #65d27a;
+        box-shadow: inset 0 2px 0 var(--green);
     }
 
     .ttv2-credit {
-        padding: 5px 12px;
-        color: #888;
+        margin-left: auto;
+        padding-bottom: 6px;
+        color: var(--faint);
         font-size: 10px;
-        border-bottom: 1px solid #383838;
     }
 
-    .ttv2-credit a {
-        color: #65d27a;
-    }
+    /* ------------------------------------------------------------------- list */
 
     .ttv2-list {
-        overflow-y: auto;
+        flex: 1;
         min-height: 0;
+        overflow-y: auto;
         padding: 7px;
     }
 
@@ -3174,7 +3364,6 @@
         border-radius: 5px;
     }
 
-    /* A listing on the page you are viewing. */
     .ttv2-row.ttv2-onpage {
         border-color: #3f6b48;
     }
@@ -3199,6 +3388,14 @@
         text-overflow: ellipsis;
     }
 
+    .ttv2-row-src {
+        color: var(--muted);
+        font-size: 10px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+
     .ttv2-row-prices {
         color: #bbb;
         font-size: 11px;
@@ -3211,7 +3408,7 @@
 
     .ttv2-row-qty {
         margin-top: 3px;
-        color: #777;
+        color: var(--faint);
         font-size: 10px;
     }
 
@@ -3220,7 +3417,7 @@
         flex-direction: column;
         justify-content: center;
         text-align: right;
-        color: #65d27a;
+        color: var(--green);
     }
 
     .ttv2-row-profit strong {
@@ -3235,96 +3432,70 @@
 
     .ttv2-panel button.ttv2-go {
         grid-column: 2 / 4;
-        display: block;
         width: 100%;
         text-align: center;
         padding: 5px 7px;
         color: #ddd;
     }
 
-    .ttv2-panel button.ttv2-go:hover {
-        color: #fff;
-    }
-
     .ttv2-guess {
-        color: #ffd24a;
+        color: var(--amber);
         cursor: help;
     }
 
-    /* Where a row came from and how old its data is. */
-    .ttv2-row-src {
-        color: #aaa;
-        font-size: 10px;
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-    }
-
-    /* A heading inside the Filters view. */
-    .ttv2-group {
-        flex: 1 1 100%;
-        margin-top: 4px;
-        color: #999;
-        font-size: 10px;
-        text-transform: uppercase;
-        letter-spacing: 0.4px;
-    }
-
-    .ttv2-live {
-        font-size: 10px;
-    }
-
-    /* Torn's required API-key disclosure table. */
-    .ttv2-tos {
-        width: 100%;
-        border-collapse: collapse;
-        font-size: 10px;
-        color: #aaa;
-    }
-
-    .ttv2-tos th,
-    .ttv2-tos td {
-        text-align: left;
-        vertical-align: top;
-        padding: 2px 4px;
-        border-bottom: 1px solid #383838;
-    }
-
-    .ttv2-tos th {
-        width: 38%;
-        color: #999;
-        font-weight: normal;
-    }
-
-    .ttv2-settings {
-        display: none;
-        flex-direction: column;
-        gap: 9px;
-        padding: 10px;
-        border-bottom: 1px solid #383838;
-        overflow-y: auto;
-    }
-
-    .ttv2-settings.ttv2-open {
+    .ttv2-empty {
         display: flex;
+        flex-direction: column;
+        align-items: center;
+        gap: 10px;
+        padding: 28px 16px;
+        text-align: center;
     }
 
-    .ttv2-settings h4 {
+    .ttv2-empty-text {
+        color: var(--muted);
+        max-width: 300px;
+    }
+
+    /* --------------------------------------------------------------- settings */
+
+    .ttv2-section {
+        display: flex;
+        flex-direction: column;
+        gap: 7px;
+    }
+
+    .ttv2-h {
         margin: 0;
+        padding: 0;
         font-size: 11px;
+        font-weight: bold;
         text-transform: uppercase;
         letter-spacing: 0.5px;
-        color: #999;
+        color: var(--muted);
     }
 
-    .ttv2-note {
-        color: #999;
-        font-size: 10px;
-        line-height: 1.4;
+    .ttv2-note,
+    .ttv2-sub {
+        color: var(--muted);
+        font-size: 11px;
     }
 
-    .ttv2-note a {
-        color: #7ee08f;
+    .ttv2-sub {
+        display: block;
+        margin-top: 2px;
+        font-size: 10.5px;
+    }
+
+    .ttv2-check {
+        display: flex;
+        align-items: flex-start;
+        gap: 8px;
+        cursor: pointer;
+    }
+
+    .ttv2-check-label {
+        color: var(--text);
     }
 
     .ttv2-inline {
@@ -3338,60 +3509,69 @@
         min-width: 0;
     }
 
+    .ttv2-masked {
+        -webkit-text-security: disc;
+    }
+
     .ttv2-keystate {
-        font-size: 10px;
-        color: #999;
+        font-size: 11px;
+        color: var(--muted);
     }
 
-    .ttv2-keystate.ttv2-ok {
-        color: #7ee08f;
+    .ttv2-keystate.ttv2-ok { color: var(--green); }
+    .ttv2-keystate.ttv2-bad { color: var(--red); }
+
+    .ttv2-tos-box,
+    .ttv2-advanced {
+        border: 1px solid var(--line);
+        border-radius: 5px;
+        padding: 6px 8px;
+        background: var(--bg2);
     }
 
-    .ttv2-keystate.ttv2-bad {
-        color: #ffd24a;
+    .ttv2-tos-box summary,
+    .ttv2-advanced summary {
+        cursor: pointer;
+        color: var(--text);
+        font-size: 11px;
     }
 
-    .ttv2-settings textarea {
-        background: #181818;
-        color: #eee;
-        border: 1px solid #555;
-        border-radius: 4px;
-        padding: 5px 6px;
-        font-family: Consolas, monospace;
-        font-size: 10px;
-        min-height: 60px;
-        resize: vertical;
+    .ttv2-tos {
         width: 100%;
-        box-sizing: border-box;
+        margin-top: 6px;
+        border-collapse: collapse;
+        font-size: 10.5px;
+        color: #bbb;
     }
 
-    .ttv2-profit {
-        color: #7ee08f;
-        font-weight: bold;
-        white-space: nowrap;
+    .ttv2-tos th,
+    .ttv2-tos td {
+        text-align: left;
+        vertical-align: top;
+        padding: 3px 4px;
+        border-top: 1px solid var(--line);
     }
 
-    .ttv2-unverified {
-        color: #ffd24a;
+    .ttv2-tos th {
+        width: 36%;
+        color: var(--muted);
+        font-weight: normal;
     }
 
-    .ttv2-empty {
-        padding: 20px 10px;
-        color: #888;
-        text-align: center;
+    .ttv2-advanced[open] {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
     }
 
     .ttv2-diag {
-        padding: 6px 10px;
-        border-top: 1px solid #383838;
-        color: #999;
-        font-size: 10px;
+        margin: 0;
+        padding: 6px;
+        background: #181818;
+        border-radius: 4px;
+        color: #aaa;
+        font: 10.5px/1.4 Consolas, monospace;
         white-space: pre-wrap;
-        display: none;
-    }
-
-    .ttv2-diag.ttv2-open {
-        display: block;
     }
     `;
 
@@ -3416,20 +3596,22 @@
 
     /* ===== src/ui/panel.js ===== */
     /*
-     * The side panel: the ranked opportunity list, and the settings view.
+     * The panel: a floating window with two pages - the list, and Settings.
      *
-     * The contract with the page is that nothing goes on Torn's item cards. The
-     * card gets one subtle stripe class and nothing else; every number lives
-     * here. Row layout follows the format the user asked for:
+     *   header      title, and three icon buttons: refresh, settings, collapse
+     *   status bar  ONE line: "5 deals · +$5.18m"  ...  "● live · refresh 12s"
+     *   list page   sell-to chips, Bazaars / Item Market tabs, ranked cards
+     *   settings    replaces the list (with Back) - never stacks on top of it
      *
-     *     Hoe
-     *     Buy: $2,896 -> NPC: $3,000
-     *     +$104 each  x12
-     *     TOTAL +$1,248 - ROI 3.6%
-     *     NPC Shop: Bits 'n' Bobs
+     * The redesign answers specific complaints: Settings opened inline and
+     * drowned the list; three status strips said the same thing; Clear and
+     * Filter were buttons that did nothing lasting; collapse felt random and
+     * the panel forgot where it was put. Every button now has one clear job,
+     * shows its state, and every click does something visible.
      *
-     * All text goes in through textContent. Item names and shop names come from
-     * Torn's data and are never interpolated into innerHTML.
+     * Nothing goes on Torn's item cards beyond one class; every number lives
+     * here. All text goes in through textContent - names from Torn or TornW3B
+     * never touch innerHTML. The panel is in a shadow root (see mount()).
      */
 
 
@@ -3437,10 +3619,13 @@
 
 
 
-    /** Rows fade once the scan behind them is older than this. */
+    /** "last update 2m ago" turns the status amber after this. */
     const PANEL_STALE_MS = 60000;
 
     const TORN_API_KEY_URL = 'https://www.torn.com/preferences.php#tab=api';
+
+    /** Info messages ("Ready.") clear themselves; warnings and errors stay. */
+    const INFO_STATUS_MS = 6000;
 
     function el(tag, props = {}, children = []) {
         const node = document.createElement(tag);
@@ -3503,26 +3688,32 @@
     class Panel {
         /**
          * @param {object} handlers
-         * @param {function} handlers.onScan
-         * @param {function} handlers.onClear
-         * @param {function} handlers.onSettingsChange - (partialSettings) => void
+         * @param {function} handlers.onScan           - refresh everything now
          * @param {function} handlers.onNavigate       - (row) => void
+         * @param {function} handlers.onSettingsChange - (partialSettings) => void
+         * @param {function} handlers.onViewChange     - ('bazaar'|'itemmarket')
          * @param {function} handlers.onSaveKey        - (key) => Promise<void>
          * @param {function} handlers.onForgetKey
          * @param {function} handlers.onClearCache
+         * @param {function} handlers.onRevealKey      - () => stored key
          */
         constructor(handlers = {}) {
             this.handlers = handlers;
             this.state = {
                 rows: [],
                 summary: { count: 0, totalProfit: 0, cashRequired: 0 },
-                status: { text: 'Ready', level: 'info' },
+                status: { text: '', level: 'info', at: 0 },
                 settings: {},
                 diagnostics: null,
                 lastScanAt: null,
                 busy: false,
+                tab: 'bazaar',
+                counts: {},
+                live: null,
             };
 
+            this.page = 'list';
+            this.hasKey = false;
             this.root = null;
             this.ticker = null;
         }
@@ -3532,24 +3723,90 @@
         mount(parent = document.body) {
             if (this.root) return this.root;
 
-            this.listEl = el('div', { class: 'ttv2-list' });
-            this.statusEl = el('div', { class: 'ttv2-status', text: 'Ready' });
-            /*
-             * Separate from statusEl on purpose. The age/summary line refreshes
-             * every 5s; when both shared one element that refresh wiped warnings
-             * ("this key has Full access") within the same tick.
-             */
-            this.summaryEl = el('div', { class: 'ttv2-status ttv2-summary' });
-            this.liveEl = el('div', { class: 'ttv2-status ttv2-live' });
+            /* ---- header ---- */
 
-            /*
-             * Two lists: bazaars and the Item Market. Never mixed - a bazaar page
-             * showing Item Market opportunities read as if they were in that
-             * bazaar.
-             */
+            this.backBtn = el('button', {
+                type: 'button',
+                class: 'ttv2-icon ttv2-back',
+                title: 'Back to the list (Esc)',
+                'aria-label': 'Back',
+                text: '←',
+                onclick: () => this.showPage('list'),
+            });
+
+            this.titleEl = el('div', { class: 'ttv2-title' });
+            this.titleTextEl = el('span', { class: 'ttv2-title-text', text: 'NPC Arbitrage' });
+            this.versionEl = el('span', {
+                class: 'ttv2-ver',
+                title: 'Installed version',
+                text:
+                    'v' +
+                    (typeof TTV2_BUILD_VERSION === 'string' ? TTV2_BUILD_VERSION : 'dev'),
+            });
+            // Shown only while collapsed: the headline, so a collapsed panel
+            // still answers "is there anything to buy?".
+            this.miniEl = el('span', { class: 'ttv2-mini' });
+            this.titleEl.appendChild(this.titleTextEl);
+            this.titleEl.appendChild(this.versionEl);
+            this.titleEl.appendChild(this.miniEl);
+
+            this.refreshBtn = el('button', {
+                type: 'button',
+                class: 'ttv2-icon',
+                title: 'Refresh now',
+                'aria-label': 'Refresh now',
+                text: '↻',
+                onclick: guarded(this, 'Refresh', () => {
+                    if (!this.hasKey) {
+                        this.showPage('settings', { focusKey: true });
+                        return undefined;
+                    }
+                    return this.handlers.onScan ? this.handlers.onScan() : undefined;
+                }),
+            });
+
+            this.settingsBtn = el('button', {
+                type: 'button',
+                class: 'ttv2-icon',
+                title: 'Settings',
+                'aria-label': 'Settings',
+                'aria-pressed': 'false',
+                text: '⚙',
+                onclick: () =>
+                    this.showPage(this.page === 'settings' ? 'list' : 'settings'),
+            });
+
+            this.collapseBtn = el('button', {
+                type: 'button',
+                class: 'ttv2-icon',
+                title: 'Collapse',
+                'aria-label': 'Collapse',
+                text: '–',
+                onclick: () => this.setCollapsed(!this.collapsed, { save: true }),
+            });
+
+            this.headEl = el('div', { class: 'ttv2-head' }, [
+                this.backBtn,
+                this.titleEl,
+                this.refreshBtn,
+                this.settingsBtn,
+                this.collapseBtn,
+            ]);
+
+            /* ---- status bar ---- */
+
+            this.barLeft = el('span', { class: 'ttv2-bar-left' });
+            this.barRight = el('span', { class: 'ttv2-bar-right' });
+            this.barEl = el('div', { class: 'ttv2-bar' }, [this.barLeft, this.barRight]);
+
+            /* ---- list page ---- */
+
+            this.chipsEl = el('div', { class: 'ttv2-chips' });
+            this.buildChips();
+
             this.tabBtns = {};
-            const tabBar = el('div', { class: 'ttv2-tabs' });
-            for (const [key, label] of [['bazaar', 'BAZAARS'], ['itemmarket', 'ITEM MARKET']]) {
+            this.tabsEl = el('div', { class: 'ttv2-tabs' });
+            for (const [key, label] of [['bazaar', 'Bazaars'], ['itemmarket', 'Item Market']]) {
                 const btn = el('button', {
                     type: 'button',
                     class: 'ttv2-tab',
@@ -3559,117 +3816,57 @@
                 });
                 btn.dataset.label = label;
                 this.tabBtns[key] = btn;
-                tabBar.appendChild(btn);
+                this.tabsEl.appendChild(btn);
             }
-            this.tabBar = tabBar;
 
-            // Credit where the bazaar data comes from, on the list it feeds.
-            this.creditEl = el('div', { class: 'ttv2-credit' });
-            this.creditEl.appendChild(
-                document.createTextNode('Bazaar listings from '),
-            );
-            this.creditEl.appendChild(
+            // Where bazaar data comes from, on the tab it feeds.
+            this.creditEl = el('span', { class: 'ttv2-credit' }, [
                 el('a', {
                     href: W3B_SITE_URL,
                     target: '_blank',
                     rel: 'noopener noreferrer',
-                    text: 'TornW3B',
+                    title: 'Bazaar prices come from TornW3B',
+                    text: 'via TornW3B',
                 }),
-            );
-            this.creditEl.appendChild(document.createTextNode(' ('));
-            this.creditEl.appendChild(
+                document.createTextNode(' · '),
                 el('a', {
                     href: W3B_TERMS_URL,
                     target: '_blank',
                     rel: 'noopener noreferrer',
                     text: 'terms',
                 }),
-            );
-            this.creditEl.appendChild(
-                document.createTextNode(') and the bazaars you open.'),
-            );
-            this.diagEl = el('div', { class: 'ttv2-diag' });
-            this.filtersEl = el('div', { class: 'ttv2-filters' });
-            this.settingsEl = el('div', { class: 'ttv2-settings' });
+            ]);
+            this.tabsEl.appendChild(this.creditEl);
 
-            this.buildFilters();
+            this.listEl = el('div', { class: 'ttv2-list' });
+
+            this.listPage = el('div', { class: 'ttv2-page ttv2-page-list' }, [
+                this.chipsEl,
+                this.tabsEl,
+                this.listEl,
+            ]);
+
+            /* ---- settings page ---- */
+
+            this.settingsPage = el('div', { class: 'ttv2-page ttv2-page-settings' });
             this.buildSettings();
 
-            this.scanBtn = el('button', {
-                type: 'button',
-                title: 'Scan the page you are viewing',
-                text: 'Scan',
-                onclick: guarded(this, 'Scan', () =>
-                    this.handlers.onScan ? this.handlers.onScan() : undefined,
-                ),
-            });
-
-            this.clearBtn = el('button', {
-                type: 'button',
-                title: 'Clear markers',
-                text: 'Clear',
-                onclick: () => this.handlers.onClear && this.handlers.onClear(),
-            });
-
-            this.filterBtn = el('button', {
-                type: 'button',
-                title: 'Filters',
-                text: 'Filter',
-                onclick: () => this.toggleView('filters'),
-            });
-
-            this.settingsBtn = el('button', {
-                type: 'button',
-                title: 'Settings',
-                text: 'Settings',
-                onclick: () => this.toggleView('settings'),
-            });
-
-            this.collapseBtn = el('button', {
-                type: 'button',
-                title: 'Collapse',
-                text: '-',
-                onclick: () => this.toggleCollapsed(),
-            });
-
-            /*
-             * The version is in the title on purpose: "did the update actually
-             * install" is the first question whenever someone reports that
-             * nothing happens, and this answers it without opening a devtool.
-             */
-            this.titleEl = el('div', {
-                class: 'ttv2-title',
-                text:
-                    'NPC ARBITRAGE v' +
-                    (typeof TTV2_BUILD_VERSION === 'string'
-                        ? TTV2_BUILD_VERSION
-                        : 'dev'),
-            });
-
-            const head = el('div', { class: 'ttv2-head' }, [
-                this.titleEl,
-                this.scanBtn,
-                this.clearBtn,
-                this.filterBtn,
-                this.settingsBtn,
-                this.collapseBtn,
-            ]);
-
             this.bodyEl = el('div', { class: 'ttv2-body' }, [
-                this.statusEl,
-                this.summaryEl,
-                this.liveEl,
-                this.settingsEl,
-                this.filtersEl,
-                this.tabBar,
-                this.creditEl,
-                this.listEl,
-                this.diagEl,
+                this.barEl,
+                this.listPage,
+                this.settingsPage,
             ]);
 
-            this.root = el('div', { class: 'ttv2-panel' }, [head, this.bodyEl]);
+            this.root = el('div', { class: 'ttv2-panel' }, [this.headEl, this.bodyEl]);
 
-            this.enableDrag(head);
+            // Esc closes an open chip editor, then Settings.
+            this.root.addEventListener('keydown', (event) => {
+                if (event.key !== 'Escape') return;
+                if (this.closeChipEditor()) return;
+                if (this.page === 'settings') this.showPage('list');
+            });
+
+            this.enableDrag(this.headEl);
 
             /*
              * The panel lives in a shadow root. Torn's stylesheet cannot reach
@@ -3683,49 +3880,210 @@
             this.shadow.appendChild(this.root);
             parent.appendChild(this.host);
 
-            // Every second: row ages are the "is this still there?" signal.
+            window.addEventListener('resize', () => this.clampIntoView());
+
+            this.showPage('list');
+
+            // Every second: row ages and the refresh countdown are the "is this
+            // still live?" signal.
             this.ticker = setInterval(() => this.refreshAges(), 1000);
 
             return this.root;
         }
 
-        /** Only one of filters / settings is open at a time. */
+        /* ------------------------------------------------------------ pages */
+
+        /**
+         * Switch between the list and Settings. Settings REPLACES the list, at
+         * the same panel size - it never stacks on top of it.
+         */
+        showPage(page, { focusKey = false } = {}) {
+            this.page = page === 'settings' ? 'settings' : 'list';
+            if (!this.root) return;
+
+            const settings = this.page === 'settings';
+
+            this.root.classList.toggle('ttv2-on-settings', settings);
+            this.settingsBtn.setAttribute('aria-pressed', String(settings));
+            this.titleTextEl.textContent = settings ? 'Settings' : 'NPC Arbitrage';
+
+            // Opening a page from a collapsed panel should show it.
+            if (this.collapsed) this.setCollapsed(false, { save: true });
+
+            if (settings) {
+                this.renderDiagnostics();
+                if (focusKey && this.keyInput) setTimeout(() => this.keyInput.focus(), 0);
+            }
+        }
+
+        /** Old name, kept for callers: open Settings. */
         toggleView(which) {
-            const target = which === 'settings' ? this.settingsEl : this.filtersEl;
-            const other = which === 'settings' ? this.filtersEl : this.settingsEl;
+            this.showPage(which === 'settings' ? 'settings' : 'list', {
+                focusKey: which === 'settings' && !this.hasKey,
+            });
+        }
 
-            const open = !target.classList.contains('ttv2-open');
+        openSettings({ focusKey = false } = {}) {
+            this.showPage('settings', { focusKey });
+        }
 
-            target.classList.toggle('ttv2-open', open);
-            other.classList.remove('ttv2-open');
-            this.diagEl.classList.toggle('ttv2-open', open && which === 'filters');
+        /* ------------------------------------------------------------ chips */
+
+        /**
+         * Always-visible filters. "Sell to" answers the one question that
+         * matters, with one click and no menu; the money filters open a tiny
+         * editor in place.
+         */
+        buildChips() {
+            const toggle = (key, label, title) => {
+                const chip = el('button', {
+                    type: 'button',
+                    class: 'ttv2-chip',
+                    title,
+                    'aria-pressed': 'false',
+                    text: label,
+                    onclick: () => {
+                        const on = chip.getAttribute('aria-pressed') !== 'true';
+                        chip.setAttribute('aria-pressed', String(on));
+                        this.emitSettings({ [key]: on });
+                    },
+                });
+                chip.dataset.key = key;
+                return chip;
+            };
+
+            this.chipNpc = toggle(
+                'sellToNpc',
+                'NPC',
+                "Sell to an NPC shop: listings cheaper than what an NPC shop pays (the item's Sell " +
+                    'price). Guaranteed, no tax. Items whose Sell is N/A never appear.',
+            );
+            this.chipBazaar = toggle(
+                'resaleBazaar',
+                'My bazaar',
+                "Trading: listings under the item's average value, relisted in " +
+                    'your own bazaar (no tax). Someone still has to buy.',
+            );
+            this.chipMarket = toggle(
+                'resaleMarket',
+                'Market',
+                "Trading: listings under the item's average value, sold on the " +
+                    'Item Market after its 5% tax.',
+            );
+
+            this.chipMin = this.valueChip('minTotalProfit', (v) =>
+                'Min ' + formatMoneyShort(v || 0),
+                'Hide listings whose total profit is below this',
+            );
+            this.chipCash = this.valueChip('cashOnHand', (v) =>
+                v ? 'Cash ' + formatMoneyShort(v) : 'Cash: any',
+                'Only count what you can afford (blank = no limit)',
+            );
+
+            this.chipsEl.appendChild(el('span', { class: 'ttv2-chips-label', text: 'Sell to' }));
+            this.chipsEl.appendChild(this.chipNpc);
+            this.chipsEl.appendChild(this.chipBazaar);
+            this.chipsEl.appendChild(this.chipMarket);
+            this.chipsEl.appendChild(el('span', { class: 'ttv2-chips-gap' }));
+            this.chipsEl.appendChild(this.chipMin);
+            this.chipsEl.appendChild(this.chipCash);
+        }
+
+        /** A chip showing a number; click it to edit in place (Enter / Esc). */
+        valueChip(key, label, title) {
+            const chip = el('button', {
+                type: 'button',
+                class: 'ttv2-chip ttv2-chip-value',
+                title: title + ' - click to change',
+            });
+            chip.dataset.key = key;
+            chip.labelFor = label;
+            chip.textContent = label(null);
+
+            chip.addEventListener('click', () => {
+                this.closeChipEditor();
+
+                const input = el('input', {
+                    type: 'text',
+                    inputmode: 'numeric',
+                    class: 'ttv2-chip-input',
+                    placeholder: key === 'cashOnHand' ? 'no cap' : '0',
+                    'aria-label': title,
+                });
+                const current = this.state.settings[key];
+                input.value = current === null || current === undefined ? '' : String(current);
+
+                const commit = () => {
+                    const raw = input.value.trim();
+                    const value =
+                        key === 'cashOnHand'
+                            ? raw
+                                ? numberFromInput(raw, null)
+                                : null
+                            : numberFromInput(raw || '0', 0);
+                    this.closeChipEditor();
+                    this.emitSettings({ [key]: value });
+                };
+
+                input.addEventListener('keydown', (event) => {
+                    if (event.key === 'Enter') commit();
+                    if (event.key === 'Escape') {
+                        event.stopPropagation();
+                        this.closeChipEditor();
+                    }
+                });
+                input.addEventListener('blur', () => {
+                    if (this.chipEditor && this.chipEditor.input === input) commit();
+                });
+
+                chip.style.display = 'none';
+                chip.parentNode.insertBefore(input, chip.nextSibling);
+                this.chipEditor = { chip, input };
+                input.focus();
+                input.select();
+            });
+
+            return chip;
+        }
+
+        /** @returns {boolean} true if an editor was open */
+        closeChipEditor() {
+            const editor = this.chipEditor;
+            if (!editor) return false;
+
+            this.chipEditor = null;
+            editor.chip.style.display = '';
+            if (editor.input.parentNode) editor.input.parentNode.removeChild(editor.input);
+            return true;
         }
 
         /* --------------------------------------------------------- settings */
 
         /**
-         * The settings view. The API key box is the reason this exists: pasting a
-         * key into a panel you can see beats a browser prompt() you cannot.
-         *
-         * The field is type=password so the key is not shoulder-surfable and does
-         * not land in a screenshot, with an explicit Show toggle. The key is held
-         * in the input and in local userscript storage only - it is sent to
-         * api.torn.com and nowhere else, and never to any server of ours, because
-         * there is no server of ours.
+         * Settings, top to bottom: the key (with Torn's required disclosure
+         * right under it), the live feed, data, and advanced. Short lines, not
+         * paragraphs.
          */
         buildSettings() {
+            const section = (title, children) =>
+                el('section', { class: 'ttv2-section' }, [
+                    el('h3', { class: 'ttv2-h', text: title }),
+                    ...children,
+                ]);
+
+            const note = (text) => el('div', { class: 'ttv2-note', text });
+
+            /* ---- API key ---- */
+
             /*
-             * NOT type="password".
-             *
-             * A password input makes Chrome treat this as a login form: it offers
-             * to save the "password" to the browser's password manager, and its
-             * autofill can overwrite whatever is typed here - which looks exactly
-             * like "the key won't save". Masking is done with CSS instead, which
-             * hides the characters without telling the browser this is a credential.
+             * NOT type="password": Chrome would treat it as a login form, offer
+             * to save it, and autofill over it. Masking is CSS. And the saved key
+             * is not kept in the field - a value in an <input> is readable by any
+             * script with the panel's shadow root - Show fetches it, Hide removes it.
              */
             this.keyInput = el('input', {
                 type: 'text',
-                class: 'ttv2-masked',
+                class: 'ttv2-masked ttv2-key',
                 placeholder: 'Paste your Public API key',
                 autocomplete: 'off',
                 autocapitalize: 'off',
@@ -3735,16 +4093,6 @@
                 'data-1p-ignore': 'true',
             });
 
-            this.keyStateEl = el('div', {
-                class: 'ttv2-keystate',
-                text: 'No key saved.',
-            });
-
-            /*
-             * The saved key is NOT kept in the field. A value in an <input> on
-             * torn.com can be read by any script on the page. Show fetches it
-             * into the field; Hide takes it out again.
-             */
             this.keyRevealed = false;
             const showBtn = el('button', {
                 type: 'button',
@@ -3763,165 +4111,141 @@
                 },
             });
 
+            const save = guarded(this, 'Save', () => {
+                const key = this.keyInput.value.trim();
+                return this.handlers.onSaveKey ? this.handlers.onSaveKey(key) : undefined;
+            });
+
             this.keyInput.addEventListener('keydown', (event) => {
                 if (event.key !== 'Enter') return;
                 event.preventDefault();
-                if (this.handlers.onSaveKey) {
-                    this.handlers.onSaveKey(this.keyInput.value.trim());
-                }
+                save();
             });
 
-            const saveBtn = el('button', {
-                type: 'button',
-                text: 'Save',
-                onclick: guarded(this, 'Save', () => {
-                    const key = this.keyInput.value.trim();
-                    return this.handlers.onSaveKey
-                        ? this.handlers.onSaveKey(key)
-                        : undefined;
+            const saveBtn = el('button', { type: 'button', class: 'ttv2-primary', text: 'Save', onclick: save });
+
+            this.keyStateEl = el('div', { class: 'ttv2-keystate', text: 'No key saved.' });
+
+            const keyHelp = el('div', { class: 'ttv2-note' });
+            keyHelp.appendChild(document.createTextNode('Needs a '));
+            keyHelp.appendChild(el('strong', { text: 'Public' }));
+            keyHelp.appendChild(document.createTextNode(' key - make one at '));
+            keyHelp.appendChild(
+                el('a', {
+                    href: TORN_API_KEY_URL,
+                    target: '_blank',
+                    rel: 'noopener noreferrer',
+                    text: 'Torn › Settings › API Key',
                 }),
-            });
+            );
+            keyHelp.appendChild(
+                document.createTextNode(
+                    ". A Public key can't read your money, mail or inventory.",
+                ),
+            );
+
+            // Torn requires this where the key is entered; it stays right here.
+            this.tosEl = el('details', { class: 'ttv2-tos-box', open: '' }, [
+                el('summary', { text: 'How this script uses your key (Torn API terms)' }),
+                this.buildTosTable(),
+            ]);
 
             const forgetBtn = el('button', {
                 type: 'button',
+                class: 'ttv2-link',
                 text: 'Forget key',
-                onclick: () =>
-                    this.handlers.onForgetKey && this.handlers.onForgetKey(),
+                onclick: () => this.handlers.onForgetKey && this.handlers.onForgetKey(),
             });
 
-            const keyLink = el('a', {
-                href: TORN_API_KEY_URL,
-                target: '_blank',
-                rel: 'noopener noreferrer',
-                text: 'Settings > API Key',
-            });
-
-            const keyNote = el('div', { class: 'ttv2-note' });
-            keyNote.appendChild(
-                document.createTextNode('Create a key with access level '),
-            );
-            keyNote.appendChild(el('strong', { text: 'Public' }));
-            keyNote.appendChild(document.createTextNode(' at '));
-            keyNote.appendChild(keyLink);
-            keyNote.appendChild(
-                document.createTextNode(
-                    '. Public is all this script needs, so a wider key only adds ' +
-                        'risk for no benefit: a Limited or Full key can read your ' +
-                        'mail, money and inventory. Your key stays in this ' +
-                        'browser, in storage private to this script, and is sent ' +
-                        'only to api.torn.com - never to any server of ours, because ' +
-                        'there is no server of ours.',
-                ),
-            );
-
-            this.settingsEl.appendChild(el('h4', { text: 'API key' }));
-            this.settingsEl.appendChild(
-                el('div', { class: 'ttv2-inline' }, [
-                    this.keyInput,
-                    showBtn,
-                    saveBtn,
-                ]),
-            );
-            this.settingsEl.appendChild(this.keyStateEl);
-            this.settingsEl.appendChild(keyNote);
-            this.settingsEl.appendChild(this.buildTosTable());
-
-            /* ---- live feed ---- */
-
-            this.liveFeedInput = el('input', { type: 'checkbox' });
-            this.liveFeedInput.addEventListener('change', () =>
-                this.emitSettings({ liveFeed: this.liveFeedInput.checked }),
-            );
-
-            this.useW3bInput = el('input', { type: 'checkbox' });
-            this.useW3bInput.addEventListener('change', () =>
-                this.emitSettings({ useW3b: this.useW3bInput.checked }),
-            );
-
-            const liveLabel = el('label', { class: 'ttv2-check' }, [this.liveFeedInput]);
-            liveLabel.appendChild(
-                document.createTextNode(
-                    ' Watch the Item Market from any Torn page',
-                ),
-            );
-
-            const w3bLabel = el('label', { class: 'ttv2-check' }, [this.useW3bInput]);
-            w3bLabel.appendChild(
-                document.createTextNode(' Watch bazaars too, using TornW3B'),
-            );
-
-            const w3bNote = el('div', { class: 'ttv2-note' });
-            w3bNote.appendChild(
-                document.createTextNode(
-                    'Bazaar prices come from TornW3B (',
-                ),
-            );
-            w3bNote.appendChild(
-                el('a', {
-                    href: W3B_SITE_URL,
-                    target: '_blank',
-                    rel: 'noopener noreferrer',
-                    text: 'weav3r.dev',
-                }),
-            );
-            w3bNote.appendChild(
-                document.createTextNode(
-                    '), a community service that TornTools also uses. Only item ' +
-                        'ids are sent to it - never your API key, and nothing about ' +
-                        'you. Its prices are seconds to minutes old, so each row ' +
-                        'says how old. On by default; untick to stop contacting it ' +
-                        'at all. Its '
-                ),
-            );
-            w3bNote.appendChild(
-                el('a', {
-                    href: W3B_TERMS_URL,
-                    target: '_blank',
-                    rel: 'noopener noreferrer',
-                    text: 'terms of service',
-                }),
-            );
-            w3bNote.appendChild(document.createTextNode(' apply to that data.'));
-
-            this.settingsEl.appendChild(el('h4', { text: 'Live feed' }));
-            this.settingsEl.appendChild(liveLabel);
-            this.settingsEl.appendChild(w3bLabel);
-            this.settingsEl.appendChild(w3bNote);
-            this.settingsEl.appendChild(
-                el('div', {
-                    class: 'ttv2-note',
-                    text:
-                        'Runs in ONE Torn tab at a time, and only while you are ' +
-                        'looking at it: a hidden tab stops. It never plays sounds ' +
-                        'or sends notifications, and never buys or clicks ' +
-                        'anything - each row is a link you choose to follow. It ' +
-                        'uses at most 30 Torn API calls a minute, leaving room ' +
-                        'for your other tools.',
-                }),
-            );
-
-            /* ---- behaviour ---- */
-
-            this.settingsEl.appendChild(el('h4', { text: 'Cached data' }));
-            this.settingsEl.appendChild(
-                el('div', { class: 'ttv2-inline' }, [
-                    el('button', {
-                        type: 'button',
-                        text: 'Clear item + shop cache',
-                        onclick: () =>
-                            this.handlers.onClearCache &&
-                            this.handlers.onClearCache(),
-                    }),
+            this.settingsPage.appendChild(
+                section('API key', [
+                    el('div', { class: 'ttv2-inline' }, [this.keyInput, showBtn, saveBtn]),
+                    this.keyStateEl,
+                    keyHelp,
+                    this.tosEl,
                     forgetBtn,
                 ]),
             );
-            this.settingsEl.appendChild(
-                el('div', {
-                    class: 'ttv2-note',
-                    text:
-                        'The item list and shop inventories are cached for 7 days. ' +
-                        'Clearing makes the next scan re-download them.',
-                }),
+
+            /* ---- live feed ---- */
+
+            const check = (key, label, sub) => {
+                const input = el('input', { type: 'checkbox' });
+                input.addEventListener('change', () => this.emitSettings({ [key]: input.checked }));
+
+                const row = el('label', { class: 'ttv2-check' }, [
+                    input,
+                    el('span', {}, [
+                        el('span', { class: 'ttv2-check-label', text: label }),
+                        sub,
+                    ]),
+                ]);
+                return { input, row };
+            };
+
+            const im = check(
+                'liveFeed',
+                'Watch the Item Market from any Torn page',
+                el('span', { class: 'ttv2-sub', text: 'Runs in one visible Torn tab, at most 30 API calls a minute.' }),
+            );
+            this.liveFeedInput = im.input;
+
+            const w3bSub = el('span', { class: 'ttv2-sub' });
+            w3bSub.appendChild(document.createTextNode('Bazaar prices from '));
+            w3bSub.appendChild(el('a', { href: W3B_SITE_URL, target: '_blank', rel: 'noopener noreferrer', text: 'weav3r.dev' }));
+            w3bSub.appendChild(document.createTextNode(' ('));
+            w3bSub.appendChild(el('a', { href: W3B_TERMS_URL, target: '_blank', rel: 'noopener noreferrer', text: 'terms' }));
+            w3bSub.appendChild(document.createTextNode('). It gets item ids only - never your key.'));
+
+            const bz = check('useW3b', 'Watch bazaars via TornW3B', w3bSub);
+            this.useW3bInput = bz.input;
+
+            this.settingsPage.appendChild(
+                section('Live feed', [
+                    im.row,
+                    bz.row,
+                    note(
+                        'Never buys, clicks, notifies or plays sounds. Every row is ' +
+                            'a link you follow yourself.',
+                    ),
+                ]),
+            );
+
+            /* ---- data ---- */
+
+            this.settingsPage.appendChild(
+                section('Data', [
+                    el('div', { class: 'ttv2-inline' }, [
+                        el('button', {
+                            type: 'button',
+                            text: 'Re-download item data',
+                            onclick: () => this.handlers.onClearCache && this.handlers.onClearCache(),
+                        }),
+                    ]),
+                    note("Item prices refresh hourly on their own. Use this if an item's Sell price looks wrong."),
+                ]),
+            );
+
+            /* ---- advanced ---- */
+
+            this.diagEl = el('pre', { class: 'ttv2-diag' });
+
+            this.settingsPage.appendChild(
+                el('details', { class: 'ttv2-advanced' }, [
+                    el('summary', { text: 'Advanced' }),
+                    el('div', { class: 'ttv2-sub', text: 'Scan of the page you are on:' }),
+                    this.diagEl,
+                    el('div', { class: 'ttv2-inline' }, [
+                        el('button', {
+                            type: 'button',
+                            text: 'Reset panel position',
+                            onclick: () => {
+                                this.emitSettings({ panelPos: null });
+                                this.applyPosition(null);
+                            },
+                        }),
+                    ]),
+                ]),
             );
         }
 
@@ -3968,7 +4292,13 @@
          * @param {object} info - { hasKey, accessName, overScoped }
          */
         setKeyState({ hasKey, accessName, overScoped }) {
+            const had = this.hasKey;
+            this.hasKey = Boolean(hasKey);
             if (!this.keyStateEl) return;
+
+            // Terms expanded while there is no key; folded (still one click
+            // away, right under the field) once one is saved.
+            if (this.tosEl && had !== this.hasKey) this.tosEl.open = !this.hasKey;
 
             this.keyStateEl.classList.remove('ttv2-ok', 'ttv2-bad');
 
@@ -3992,208 +4322,165 @@
             this.keyStateEl.classList.add('ttv2-ok');
         }
 
-        /* ---------------------------------------------------------- filters */
-
-        buildFilters() {
-            this.minProfitInput = el('input', {
-                type: 'text',
-                inputmode: 'numeric',
-                placeholder: '1',
-            });
-            this.minProfitInput.addEventListener('change', () => {
-                this.emitSettings({
-                    minTotalProfit: numberFromInput(this.minProfitInput.value, 0),
-                });
-            });
-
-            this.cashInput = el('input', {
-                type: 'text',
-                inputmode: 'numeric',
-                placeholder: 'no cap',
-            });
-            this.cashInput.addEventListener('change', () => {
-                const value = this.cashInput.value.trim();
-                this.emitSettings({
-                    cashOnHand: value ? numberFromInput(value, null) : null,
-                });
-            });
-
-            this.filtersEl.appendChild(
-                el('div', { class: 'ttv2-field' }, [
-                    el('label', { text: 'Min total profit' }),
-                    this.minProfitInput,
-                ]),
-            );
-
-            this.filtersEl.appendChild(
-                el('div', { class: 'ttv2-field' }, [
-                    el('label', { text: 'Cash on hand' }),
-                    this.cashInput,
-                ]),
-            );
-
-            const mkCheck = (input, text, title) => {
-                const label = el('label', { class: 'ttv2-check', title }, [input]);
-                label.appendChild(document.createTextNode(' ' + text));
-                return label;
-            };
-
-            const mkToggle = (key) => {
-                const input = el('input', { type: 'checkbox' });
-                input.addEventListener('change', () =>
-                    this.emitSettings({ [key]: input.checked }),
-                );
-                return input;
-            };
-
-            /*
-             * Where would you sell what you buy? One question, in plain words.
-             * Selling to an NPC is what this tool is for; the resale options are
-             * the start of real trading and are off unless chosen.
-             */
-            this.sellToNpcInput = mkToggle('sellToNpc');
-            this.resaleBazaarInput = mkToggle('resaleBazaar');
-            this.resaleMarketInput = mkToggle('resaleMarket');
-
-            this.filtersEl.appendChild(
-                el('div', { class: 'ttv2-group', text: 'Where would you sell it?' }),
-            );
-            this.filtersEl.appendChild(
-                mkCheck(
-                    this.sellToNpcInput,
-                    'Sell to an NPC shop',
-                    "Listings cheaper than what an NPC shop pays (the item's " +
-                        '"Sell" price). Guaranteed and untaxed. Items whose Sell ' +
-                        'is N/A never appear.',
-                ),
-            );
-
-            this.filtersEl.appendChild(
-                el('div', { class: 'ttv2-group', text: 'Trading (resell to players)' }),
-            );
-            this.filtersEl.appendChild(
-                mkCheck(
-                    this.resaleBazaarInput,
-                    'Resell in my bazaar at the average value',
-                    'Listings cheaper than the average value (the item\'s ' +
-                        '"Value"), if you relist them in your own bazaar - no ' +
-                        'tax. Not guaranteed: someone has to buy.',
-                ),
-            );
-            this.filtersEl.appendChild(
-                mkCheck(
-                    this.resaleMarketInput,
-                    'Resell on the Item Market at the average value',
-                    'Same, but sold on the Item Market, which takes 5% - so a ' +
-                        'listing has to be more than 5% under the average value.',
-                ),
-            );
-        }
-
         emitSettings(partial) {
-            if (this.handlers.onSettingsChange) {
-                this.handlers.onSettingsChange(partial);
-            }
+            this.state.settings = { ...this.state.settings, ...partial };
+            this.syncChips();
+            if (this.handlers.onSettingsChange) this.handlers.onSettingsChange(partial);
         }
 
         /* ------------------------------------------------------------- chrome */
 
+        /**
+         * Drag by the header; the position is remembered. A press that does not
+         * move is a click: on a collapsed panel it expands it.
+         */
         enableDrag(handle) {
-            let startX = 0;
-            let startY = 0;
-            let originLeft = 0;
-            let originTop = 0;
-            let dragging = false;
+            let start = null;
 
-            const onMove = (event) => {
-                if (!dragging) return;
+            handle.style.touchAction = 'none';
 
-                const left = originLeft + (event.clientX - startX);
-                const top = originTop + (event.clientY - startY);
-
-                this.root.style.left = Math.max(0, left) + 'px';
-                this.root.style.top = Math.max(0, top) + 'px';
-                this.root.style.right = 'auto';
-                this.root.style.bottom = 'auto';
-            };
-
-            const onUp = () => {
-                dragging = false;
-                document.removeEventListener('mousemove', onMove);
-                document.removeEventListener('mouseup', onUp);
-            };
-
-            handle.addEventListener('mousedown', (event) => {
-                if (event.target.tagName === 'BUTTON') return;
+            handle.addEventListener('pointerdown', (event) => {
+                if (event.button !== 0) return;
+                if (event.target.closest && event.target.closest('button, a, input')) return;
 
                 const rect = this.root.getBoundingClientRect();
-                startX = event.clientX;
-                startY = event.clientY;
-                originLeft = rect.left;
-                originTop = rect.top;
-                dragging = true;
-
-                document.addEventListener('mousemove', onMove);
-                document.addEventListener('mouseup', onUp);
-                event.preventDefault();
+                start = { x: event.clientX, y: event.clientY, left: rect.left, top: rect.top, moved: false };
+                handle.setPointerCapture(event.pointerId);
             });
+
+            handle.addEventListener('pointermove', (event) => {
+                if (!start) return;
+
+                const dx = event.clientX - start.x;
+                const dy = event.clientY - start.y;
+                if (!start.moved && Math.abs(dx) + Math.abs(dy) < 4) return;
+
+                start.moved = true;
+                this.placeAt(start.left + dx, start.top + dy);
+            });
+
+            const end = (event) => {
+                if (!start) return;
+                const { moved } = start;
+                start = null;
+
+                if (handle.hasPointerCapture && handle.hasPointerCapture(event.pointerId)) {
+                    handle.releasePointerCapture(event.pointerId);
+                }
+
+                if (moved) {
+                    const rect = this.root.getBoundingClientRect();
+                    this.emitSettings({ panelPos: { left: Math.round(rect.left), top: Math.round(rect.top) } });
+                } else if (this.collapsed) {
+                    this.setCollapsed(false, { save: true });
+                }
+            };
+
+            handle.addEventListener('pointerup', end);
+            handle.addEventListener('pointercancel', end);
+        }
+
+        /** Put the panel's top-left corner here, kept fully on screen. */
+        placeAt(left, top) {
+            const rect = this.root.getBoundingClientRect();
+            const maxLeft = Math.max(0, window.innerWidth - rect.width);
+            const maxTop = Math.max(0, window.innerHeight - Math.min(rect.height, 60));
+
+            this.root.style.left = Math.min(Math.max(0, left), maxLeft) + 'px';
+            this.root.style.top = Math.min(Math.max(0, top), maxTop) + 'px';
+            this.root.style.right = 'auto';
+            this.root.style.bottom = 'auto';
+        }
+
+        /** Restore a saved position, or the default bottom-right corner. */
+        applyPosition(pos) {
+            if (!this.root) return;
+
+            if (pos && Number.isFinite(pos.left) && Number.isFinite(pos.top)) {
+                this.placeAt(pos.left, pos.top);
+                return;
+            }
+
+            this.root.style.left = '';
+            this.root.style.top = '';
+            this.root.style.right = '';
+            this.root.style.bottom = '';
+        }
+
+        clampIntoView() {
+            if (!this.root || !this.root.style.left) return;
+            const rect = this.root.getBoundingClientRect();
+            this.placeAt(rect.left, rect.top);
+        }
+
+        setCollapsed(collapsed, { save = false } = {}) {
+            this.collapsed = Boolean(collapsed);
+            if (!this.root) return;
+
+            this.root.classList.toggle('ttv2-collapsed', this.collapsed);
+            this.collapseBtn.textContent = this.collapsed ? '+' : '–';
+            this.collapseBtn.title = this.collapsed ? 'Expand' : 'Collapse';
+            this.collapseBtn.setAttribute('aria-label', this.collapseBtn.title);
+
+            this.renderBar();
+            this.clampIntoView();
+
+            if (save && this.handlers.onSettingsChange) {
+                this.handlers.onSettingsChange({ collapsed: this.collapsed });
+            }
         }
 
         toggleCollapsed() {
-            const collapsed = this.root.classList.toggle('ttv2-collapsed');
-            this.collapseBtn.textContent = collapsed ? '+' : '-';
-            this.emitSettings({ collapsed });
-        }
-
-        setCollapsed(collapsed) {
-            if (!this.root) return;
-            this.root.classList.toggle('ttv2-collapsed', Boolean(collapsed));
-            this.collapseBtn.textContent = collapsed ? '+' : '-';
+            this.setCollapsed(!this.collapsed, { save: true });
         }
 
         setBusy(busy) {
-            this.state.busy = busy;
-            if (this.scanBtn) this.scanBtn.disabled = Boolean(busy);
+            this.state.busy = Boolean(busy);
+            if (!this.refreshBtn) return;
+
+            this.refreshBtn.disabled = this.state.busy;
+            this.refreshBtn.classList.toggle('ttv2-spin', this.state.busy);
+            this.refreshBtn.title = this.state.busy ? 'Refreshing...' : 'Refresh now';
+            this.renderBar();
         }
 
+        /**
+         * A message for the status line. Info clears itself after a few seconds
+         * and gives the line back to the summary; warnings and errors stay until
+         * replaced.
+         */
         setStatus(text, level = 'info') {
-            this.state.status = { text, level };
-            if (!this.statusEl) return;
-
-            this.statusEl.textContent = text;
-            this.statusEl.classList.toggle('ttv2-warn', level === 'warn');
-            this.statusEl.classList.toggle('ttv2-error', level === 'error');
+            this.state.status = { text: text || '', level, at: Date.now() };
+            this.renderBar();
         }
 
         applySettings(settings) {
             this.state.settings = { ...this.state.settings, ...settings };
             if (!this.root) return;
 
-            if (this.minProfitInput && settings.minTotalProfit !== undefined) {
-                this.minProfitInput.value = String(settings.minTotalProfit ?? '');
-            }
-            if (this.cashInput && settings.cashOnHand !== undefined) {
-                this.cashInput.value =
-                    settings.cashOnHand === null || settings.cashOnHand === undefined
-                        ? ''
-                        : String(settings.cashOnHand);
-            }
-            for (const [key, input] of [
-                ['sellToNpc', this.sellToNpcInput],
-                ['resaleBazaar', this.resaleBazaarInput],
-                ['resaleMarket', this.resaleMarketInput],
-            ]) {
-                if (input && settings[key] !== undefined) input.checked = Boolean(settings[key]);
-            }
+            this.syncChips();
+
             if (this.liveFeedInput && settings.liveFeed !== undefined) {
                 this.liveFeedInput.checked = Boolean(settings.liveFeed);
             }
             if (this.useW3bInput && settings.useW3b !== undefined) {
                 this.useW3bInput.checked = Boolean(settings.useW3b);
             }
-            if (settings.collapsed !== undefined) {
-                this.setCollapsed(settings.collapsed);
-            }
+            if (settings.collapsed !== undefined) this.setCollapsed(settings.collapsed);
+            if (settings.panelPos !== undefined) this.applyPosition(settings.panelPos);
+        }
+
+        syncChips() {
+            const s = this.state.settings;
+            if (!this.chipNpc) return;
+
+            this.chipNpc.setAttribute('aria-pressed', String(s.sellToNpc !== false));
+            this.chipBazaar.setAttribute('aria-pressed', String(Boolean(s.resaleBazaar)));
+            this.chipMarket.setAttribute('aria-pressed', String(Boolean(s.resaleMarket)));
+            this.chipMin.textContent = this.chipMin.labelFor(s.minTotalProfit);
+            this.chipCash.textContent = this.chipCash.labelFor(s.cashOnHand);
+            this.chipCash.classList.toggle('ttv2-chip-set', Boolean(s.cashOnHand));
+            this.chipMin.classList.toggle('ttv2-chip-set', Number(s.minTotalProfit) > 1);
         }
 
         /* ------------------------------------------------------------ render */
@@ -4207,9 +4494,7 @@
             const rows = this.state.rows || [];
 
             if (rows.length === 0) {
-                this.listEl.appendChild(
-                    el('div', { class: 'ttv2-empty', text: this.emptyReason() }),
-                );
+                this.listEl.appendChild(this.renderEmpty());
             } else {
                 rows.forEach((row, i) => {
                     this.listEl.appendChild(this.renderRow(row, i));
@@ -4217,8 +4502,7 @@
             }
 
             this.renderTabs();
-            this.renderDiagnostics();
-            this.renderLive();
+            if (this.page === 'settings') this.renderDiagnostics();
             this.refreshAges();
         }
 
@@ -4227,68 +4511,131 @@
             const counts = this.state.counts || {};
 
             for (const [key, btn] of Object.entries(this.tabBtns || {})) {
-                btn.classList.toggle('ttv2-tab-on', key === tab);
-                btn.textContent =
-                    btn.dataset.label + (counts[key] ? ' (' + counts[key] + ')' : '');
+                const on = key === tab;
+                btn.classList.toggle('ttv2-tab-on', on);
+                btn.setAttribute('aria-selected', String(on));
+                btn.textContent = btn.dataset.label + (counts[key] ? ' (' + counts[key] + ')' : '');
             }
 
             if (this.creditEl) {
                 const live = this.state.live;
-                this.creditEl.style.display =
-                    tab === 'bazaar' && live && live.w3b ? '' : 'none';
+                this.creditEl.style.display = tab === 'bazaar' && live && live.w3b ? '' : 'none';
             }
-        }
-
-        renderLive() {
-            const live = this.state.live;
-            if (!this.liveEl) return;
-
-            if (!live || !live.enabled) {
-                this.liveEl.textContent = 'Live feed: off (Settings)';
-                this.liveEl.classList.remove('ttv2-warn');
-                return;
-            }
-
-            const bits = ['Live feed: ' + (live.leading ? 'on' : 'on in another tab')];
-
-            if (live.leading) {
-                bits.push(live.itemMarket ? 'Item Market' : 'no key');
-                bits.push(live.w3b ? 'bazaars (' + live.candidates + ' leads)' : 'bazaars off');
-                if (live.nextRefreshAt) {
-                    const secs = Math.max(0, Math.ceil((live.nextRefreshAt - Date.now()) / 1000));
-                    bits.push('refresh in ' + secs + 's');
-                }
-            }
-
-            this.liveEl.textContent = bits.join('  |  ');
-            this.liveEl.title = live.lastError || '';
-            this.liveEl.classList.toggle('ttv2-warn', Boolean(live.lastError));
         }
 
         /**
-         * Why the list is empty.
-         *
-         * "No opportunities above your threshold" was shown even when the scanner
-         * had matched no rows at all, or had found rows it could not read - two
-         * completely different problems, both reported as "nothing to buy". The
-         * diagnostics that distinguished them were hidden behind a button.
+         * The one status line. Left: this list's deals and total - or a message.
+         * Right: whether the feed is live, and when it next refreshes.
          */
+        renderBar() {
+            if (!this.barEl) return;
+
+            const now = Date.now();
+            const st = this.state.status || {};
+            const summary = this.state.summary || { count: 0, totalProfit: 0 };
+            const headline =
+                summary.count === 1
+                    ? '1 deal · +' + formatMoneyShort(summary.totalProfit)
+                    : summary.count + ' deals · +' + formatMoneyShort(summary.totalProfit);
+
+            const showMessage =
+                st.text &&
+                (st.level !== 'info' || this.state.busy || now - st.at < INFO_STATUS_MS);
+
+            this.barLeft.textContent = showMessage ? st.text : headline;
+            this.barLeft.title = showMessage ? st.text : '';
+            this.barEl.classList.toggle('ttv2-warn', showMessage && st.level === 'warn');
+            this.barEl.classList.toggle('ttv2-error', showMessage && st.level === 'error');
+
+            // Collapsed: the headline rides in the header.
+            this.miniEl.textContent = this.collapsed ? '· ' + headline : '';
+
+            /* ---- liveness ---- */
+            const live = this.state.live;
+            let dot = 'off';
+            let text = 'feed off';
+            let title = 'Live feed is off (Settings)';
+
+            if (live && live.enabled) {
+                if (!live.itemMarket) {
+                    dot = 'warn';
+                    text = 'needs key';
+                    title = 'Add a Public API key in Settings';
+                } else if (live.leading) {
+                    dot = live.lastError ? 'warn' : 'live';
+                    const secs = live.nextRefreshAt
+                        ? Math.max(0, Math.ceil((live.nextRefreshAt - now) / 1000))
+                        : null;
+                    text = 'live' + (secs !== null ? ' · refresh ' + secs + 's' : '');
+                    title = live.lastError || 'Refreshes every 30 seconds';
+                } else {
+                    dot = 'other';
+                    text = 'live in another tab';
+                    title = 'Another visible Torn tab is running the feed; results show here too.';
+                }
+            }
+
+            this.barRight.textContent = '';
+            this.barRight.appendChild(el('span', { class: 'ttv2-dot ttv2-dot-' + dot }));
+            this.barRight.appendChild(document.createTextNode(text));
+            this.barRight.title = title;
+        }
+
+        /**
+         * An empty list says why, and offers the one thing that would help -
+         * never a dead end.
+         */
+        renderEmpty() {
+            const d = this.state.diagnostics;
+            const live = this.state.live;
+            const tab = this.state.tab;
+
+            const box = (text, label, fn) => {
+                const children = [el('div', { class: 'ttv2-empty-text', text })];
+                if (label) {
+                    children.push(
+                        el('button', { type: 'button', class: 'ttv2-primary', text: label, onclick: fn }),
+                    );
+                }
+                return el('div', { class: 'ttv2-empty' }, children);
+            };
+
+            if (!this.hasKey) {
+                return box('Needs a Public API key to start.', 'Add key', () =>
+                    this.showPage('settings', { focusKey: true }),
+                );
+            }
+
+            if (!d && tab === 'bazaar' && live && !live.w3b) {
+                return box('Bazaar watching is off.', 'Turn it on', () =>
+                    this.emitSettings({ useW3b: true, liveFeed: true }),
+                );
+            }
+
+            if (!d && live && !live.enabled) {
+                return box('The live feed is off, so only the page you are on is scanned.', 'Turn it on', () =>
+                    this.emitSettings({ liveFeed: true }),
+                );
+            }
+
+            const s = this.state.settings;
+            if (s.sellToNpc === false && !s.resaleBazaar && !s.resaleMarket) {
+                return box('Nothing to sell to is selected.', 'Sell to NPC shops', () =>
+                    this.emitSettings({ sellToNpc: true }),
+                );
+            }
+
+            return box(this.emptyReason(), 'Refresh now', () =>
+                this.handlers.onScan && this.handlers.onScan(),
+            );
+        }
+
         emptyReason() {
             const d = this.state.diagnostics;
             const live = this.state.live;
             const tab = this.state.tab;
 
-            if (!d && tab === 'bazaar' && live && live.enabled && !live.w3b) {
-                return (
-                    'Bazaar watching is off. Tick "Watch bazaars too" in ' +
-                    'Settings, or open a bazaar to scan it.'
-                );
-            }
-
             if (!d) {
-                if (live && live.enabled && !live.itemMarket) {
-                    return 'The live feed needs a Public API key - paste one under Settings.';
-                }
                 if (live && live.enabled && live.leading) {
                     return tab === 'bazaar'
                         ? 'Watching bazaars - nothing profitable right now.'
@@ -4297,7 +4644,7 @@
                 if (live && live.enabled) {
                     return 'Live feed runs in another Torn tab; results appear here.';
                 }
-                return 'Open a Bazaar or the Item Market, or turn on the live feed in Settings.';
+                return 'Nothing yet.';
             }
 
             if (d.images === 0) {
@@ -4313,7 +4660,7 @@
                         'Found ' +
                         d.cards +
                         ' listings but none matched the item database. Try ' +
-                        'Settings > Clear cache, then Scan.'
+                        'Settings › Re-download item data.'
                     );
                 }
                 return (
@@ -4331,7 +4678,9 @@
                 );
             }
 
-            return 'No opportunities above your threshold.';
+            return tab === 'bazaar'
+                ? 'No bazaar deals right now.'
+                : 'No Item Market deals right now.';
         }
 
         /**
@@ -4538,38 +4887,16 @@
 
             const now = Date.now();
 
-            /*
-             * Staleness is per row, from the time its DATA was true. The panel
-             * used to fade on "time since last scan" - which the 2.5s poll reset
-             * forever, so nothing ever looked stale.
-             */
+            // Just the age. Nothing is greyed out: a listing the latest refresh
+            // did not confirm is removed, not faded.
             for (const rowEl of this.listEl.querySelectorAll('.ttv2-row')) {
                 const at = Number(rowEl.dataset.ttv2At);
                 const ageEl = rowEl.querySelector('.ttv2-age');
                 const known = Number.isFinite(at) && at > 0;
-
-                // Just the age. Nothing is greyed out: a listing the latest
-                // refresh did not confirm is removed, not faded.
                 if (ageEl) ageEl.textContent = known ? formatAge(now - at) : 'age unknown';
             }
 
-            this.renderLive();
-
-            const summary = this.state.summary || { count: 0, totalProfit: 0 };
-            const where = this.state.tab;
-            const age = this.state.lastScanAt ? now - this.state.lastScanAt : null;
-            const stale = age !== null && age > PANEL_STALE_MS;
-
-            this.summaryEl.textContent =
-                (where === 'itemmarket' ? 'Item Market' : 'Bazaars') +
-                '  |  ' +
-                summary.count +
-                ' opportunities  |  +' +
-                formatMoneyShort(summary.totalProfit) +
-                ' total' +
-                (age !== null ? '  |  scanned ' + formatAge(age) : '');
-
-            this.summaryEl.classList.toggle('ttv2-warn', stale);
+            this.renderBar();
         }
 
         destroy() {
@@ -5114,6 +5441,8 @@
         /* Which list the panel shows when you are on neither market page. */
         viewTab: 'bazaar',
         collapsed: false,
+        /* Where the panel was dragged to; null = bottom-right. */
+        panelPos: null,
     };
 
     const RESCAN_DEBOUNCE_MS = 400;
@@ -5260,6 +5589,9 @@
         refreshKeyState();
         await onScan();
         refreshKeyState();
+
+        // Key accepted: back to the list, which is now loading.
+        if (!app.keyDead && app.index) app.panel.showPage('list');
     }
 
     function onForgetKey() {
@@ -5716,7 +6048,7 @@
                 'No API key yet - paste a Public key under Settings.',
                 'error',
             );
-            app.panel.toggleView('settings');
+            app.panel.openSettings({ focusKey: !getStoredKey() });
             return;
         }
 
@@ -5777,19 +6109,6 @@
         }
     }
 
-    function onClear() {
-        clearMarks();
-        app.lastScanAt = null;
-        app.pageRows = [];
-
-        app.panel.render({
-            rows: [],
-            summary: { count: 0, totalProfit: 0, cashRequired: 0 },
-            diagnostics: null,
-            lastScanAt: null,
-        });
-        app.panel.setStatus('Cleared.');
-    }
 
     /** Identity of a feed listing you followed, so it is re-checked first. */
     function openedKey(row) {
@@ -5835,6 +6154,13 @@
     function onSettingsChange(partial) {
         app.settings = { ...app.settings, ...partial };
         gmSet(STORE_SETTINGS, app.settings);
+
+        // A change made in one place (a chip, an empty-state button) shows in
+        // every control for it.
+        app.panel.applySettings(partial);
+
+        // Position and collapse are chrome: nothing to re-price.
+        if (Object.keys(partial).every((k) => k === 'panelPos' || k === 'collapsed')) return;
 
         if (app.index) rescan();
         else refreshView();
@@ -5996,8 +6322,7 @@
 
     function registerMenu() {
         gmMenu('Open settings', () => {
-            app.panel.setCollapsed(false);
-            app.panel.toggleView('settings');
+            app.panel.openSettings({ focusKey: !getStoredKey() });
         });
 
         gmMenu('Key safety / rotate key', () => {
@@ -6040,7 +6365,6 @@
 
         app.panel = new Panel({
             onScan,
-            onClear,
             onNavigate,
             onSettingsChange,
             onSaveKey,
@@ -6068,7 +6392,7 @@
                 'Paste a Public API key under Settings to begin.',
                 'warn',
             );
-            app.panel.toggleView('settings');
+            app.panel.openSettings({ focusKey: !getStoredKey() });
         } else if (app.keyDead) {
             app.panel.setStatus(
                 'Torn rejected the saved key. Paste a new Public key under Settings.',

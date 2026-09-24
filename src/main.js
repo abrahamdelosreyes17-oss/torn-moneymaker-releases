@@ -120,6 +120,8 @@ const DEFAULT_SETTINGS = {
     /* Which list the panel shows when you are on neither market page. */
     viewTab: 'bazaar',
     collapsed: false,
+    /* Where the panel was dragged to; null = bottom-right. */
+    panelPos: null,
 };
 
 const RESCAN_DEBOUNCE_MS = 400;
@@ -266,6 +268,9 @@ async function onSaveKey(key) {
     refreshKeyState();
     await onScan();
     refreshKeyState();
+
+    // Key accepted: back to the list, which is now loading.
+    if (!app.keyDead && app.index) app.panel.showPage('list');
 }
 
 function onForgetKey() {
@@ -722,7 +727,7 @@ async function onScan() {
             'No API key yet - paste a Public key under Settings.',
             'error',
         );
-        app.panel.toggleView('settings');
+        app.panel.openSettings({ focusKey: !getStoredKey() });
         return;
     }
 
@@ -783,19 +788,6 @@ async function onScan() {
     }
 }
 
-function onClear() {
-    clearMarks();
-    app.lastScanAt = null;
-    app.pageRows = [];
-
-    app.panel.render({
-        rows: [],
-        summary: { count: 0, totalProfit: 0, cashRequired: 0 },
-        diagnostics: null,
-        lastScanAt: null,
-    });
-    app.panel.setStatus('Cleared.');
-}
 
 /** Identity of a feed listing you followed, so it is re-checked first. */
 function openedKey(row) {
@@ -841,6 +833,13 @@ function onNavigate(row) {
 function onSettingsChange(partial) {
     app.settings = { ...app.settings, ...partial };
     gmSet(STORE_SETTINGS, app.settings);
+
+    // A change made in one place (a chip, an empty-state button) shows in
+    // every control for it.
+    app.panel.applySettings(partial);
+
+    // Position and collapse are chrome: nothing to re-price.
+    if (Object.keys(partial).every((k) => k === 'panelPos' || k === 'collapsed')) return;
 
     if (app.index) rescan();
     else refreshView();
@@ -1002,8 +1001,7 @@ function startLiveFeed() {
 
 function registerMenu() {
     gmMenu('Open settings', () => {
-        app.panel.setCollapsed(false);
-        app.panel.toggleView('settings');
+        app.panel.openSettings({ focusKey: !getStoredKey() });
     });
 
     gmMenu('Key safety / rotate key', () => {
@@ -1046,7 +1044,6 @@ export function boot() {
 
     app.panel = new Panel({
         onScan,
-        onClear,
         onNavigate,
         onSettingsChange,
         onSaveKey,
@@ -1074,7 +1071,7 @@ export function boot() {
             'Paste a Public API key under Settings to begin.',
             'warn',
         );
-        app.panel.toggleView('settings');
+        app.panel.openSettings({ focusKey: !getStoredKey() });
     } else if (app.keyDead) {
         app.panel.setStatus(
             'Torn rejected the saved key. Paste a new Public key under Settings.',

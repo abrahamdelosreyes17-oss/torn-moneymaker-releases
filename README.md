@@ -71,21 +71,26 @@ scrolls to it when it is on the page you are viewing. Nothing is ever bought for
   checks each bazaar every 30 s-5 min; Torn refreshes the Item Market every 30 s.
   Every row shows its real age rather than pretending to be newer.
 
-**Filters** button - *Where would you sell it?*
+### The panel
 
-- **Sell to an NPC shop** (on): listings under the item's Sell price.
-- *Trading (resell to players)*, off by default - groundwork for real trading:
-  - **Resell in my bazaar at the average value**: listings under the Value, relisted
-    in your own bazaar, untaxed.
-  - **Resell on the Item Market at the average value**: the same, after the 5% tax.
+- **Header:** ↻ refresh now · ⚙ Settings · – collapse. Drag it anywhere; the
+  position is remembered. Collapsed, it still shows *N deals · +$total*; click it
+  to expand.
+- **Status line:** this list's deals and total on the left; on the right whether
+  the feed is live and when it next refreshes (hover for the last error).
+- **Sell to** chips, always visible - one click each:
+  - **NPC** (on): listings under the item's Sell price.
+  - **My bazaar** / **Market** - *trading*, off by default: listings under the
+    item's average value, relisted in your own bazaar (untaxed) or sold on the
+    Item Market (after the 5% tax).
+  - **Min** and **Cash** chips: click to type a minimum total profit or the cash
+    you have; Enter saves, Esc cancels.
+- **Settings** replaces the list (← Back or Esc returns): API key and Torn's key-use
+  disclosure, live feed switches, re-download item data, and *Advanced* (scan
+  diagnostics for the page you are on, reset panel position).
+- An empty list always says why and offers the one button that would help.
 
-Plus minimum total profit and cash on hand. The Filters view also shows scan
-diagnostics for the page you are on; when nothing is found, the empty-state message
-says why.
-
-**Settings** button: API key, the Torn API key-use disclosure, the live feed and
-TornW3B switches, and cache controls. Item data (Sell price, Value) is refreshed
-hourly.
+Item data (Sell price, Value) is refreshed hourly.
 
 ---
 
@@ -281,9 +286,12 @@ throws on load, so this is the one that catches "installed, and nothing appears"
 Torn API and TornW3B responses, waits for the live feed, and prints the rows, every
 request URL, and whether the key ever reached weav3r.dev (it must not).
 
-All three exist because unit tests passed for days while the scanner could not read
+`test/ux-check.mjs` clicks every control in the panel in Chromium against the
+built script and fails if any click does nothing visible.
+
+All four exist because unit tests passed for days while the scanner could not read
 a single real page, and because a release once shipped that no browser could parse.
-**Run all three before every release.**
+**Run all four before every release.**
 
 ## Status
 
