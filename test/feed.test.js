@@ -9,7 +9,8 @@ import {
     fetchW3bListings,
 } from '../src/api/w3b.js';
 import { TornApiClient, KEY_DEAD_CODES } from '../src/api/client.js';
-import { fetchItemMarket, fetchItems, npcSaleFromValue } from '../src/api/torn.js';
+import { fetchItemMarket, fetchItems, npcSaleFromValue, parseUserPresence } from '../src/api/torn.js';
+import { agoText, presenceText } from '../src/sources/dom/owner.js';
 import { buildItemIndex } from '../src/core/items.js';
 import {
     emptyFeed,
@@ -804,4 +805,23 @@ test('items with a live Item Market row are re-checked on every refresh', async 
     // ~90s of ticks: item 1 (a live opportunity) re-checked every ~30s.
     const hits = asked.filter((id) => id === '1').length;
     assert.ok(hits >= 3, 'item 1 re-checked ' + hits + ' times');
+});
+
+test('bazaar owner presence: v2 and v1 shapes, and the words shown', () => {
+    const now = 1_800_000_000_000;
+    const la = { status: 'Idle', timestamp: now / 1000 - 12 * 60, relative: '12 minutes ago' };
+    const v2 = parseUserPresence({ profile: { name: 'Dixie', last_action: la, status: { state: 'Okay', description: 'Okay' } } });
+    const v1 = parseUserPresence({ name: 'Dixie', last_action: la, status: { state: 'Okay', description: 'Okay' } });
+    assert.deepEqual(v1, v2);
+    assert.equal(v2.online, 'Idle');
+    assert.deepEqual(presenceText(v2, now), { level: 'idle', text: 'Idle · 12m ago' });
+
+    const online = parseUserPresence({ profile: { name: 'X', last_action: { status: 'Online', timestamp: now / 1000 }, status: { state: 'Hospital', description: 'In hospital for 20 mins' } } });
+    assert.deepEqual(presenceText(online, now), { level: 'online', text: 'Online · In hospital for 20 mins' });
+
+    assert.equal(parseUserPresence({ error: { code: 6 } }), null);
+    assert.equal(presenceText(null).level, 'unknown');
+    assert.equal(agoText(now - 30_000, now), 'just now');
+    assert.equal(agoText(now - 3 * 3600_000, now), '3h ago');
+    assert.equal(agoText(now - 2 * 86400_000, now), '2d ago');
 });

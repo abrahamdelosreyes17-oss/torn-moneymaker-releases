@@ -61,6 +61,12 @@ function respond(url) {
             return { cityshops: { 1: { name: "Bits 'n' Bobs", inventory: { 1: { price: 90 } } } } };
         }
         if (u.pathname === '/key/') return { access_level: 1, access_type: 'Public' };
+        const who = u.pathname.match(/^\/v2\/user\/(\d+)\/profile$/);
+        if (who) {
+            return { profile: { id: +who[1], name: 'DixieNormousss',
+                last_action: { status: 'Offline', timestamp: NOW_S - 3 * 3600, relative: '3 hours ago' },
+                status: { description: 'Traveling to Mexico', state: 'Traveling' } } };
+        }
         const m = u.pathname.match(/^\/v2\/market\/(\d+)\/itemmarket$/);
         if (m) {
             const listings = m[1] === '180' ? [{ price: 30, amount: 10 }, { price: 58, amount: 4 }] : [{ price: 9999999, amount: 1 }];

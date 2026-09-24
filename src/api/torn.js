@@ -257,3 +257,53 @@ export async function fetchItemMarket(
         total: Number(data && data._metadata && data._metadata.total) || raw.length,
     };
 }
+
+/**
+ * A player's public presence: Online / Idle / Offline and where they are.
+ * Accepts the v2 `/user/{id}/profile` shape ({ profile: {...} }) and the v1
+ * `user/{id}?selections=profile` shape (fields at the top level).
+ *
+ * @returns {{name, online, lastActionAt, state, description}|null}
+ */
+export function parseUserPresence(data) {
+    const p = (data && (data.profile || data)) || {};
+    const la = p.last_action || {};
+    const st = p.status || {};
+
+    const online = ['Online', 'Idle', 'Offline'].includes(la.status) ? la.status : null;
+    const seconds = Number(la.timestamp);
+
+    if (!online && !st.state) return null;
+
+    return {
+        name: typeof p.name === 'string' ? p.name : null,
+        online,
+        lastActionAt: Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : null,
+        state: typeof st.state === 'string' ? st.state : null,
+        description: typeof st.description === 'string' ? st.description : null,
+    };
+}
+
+/**
+ * The public status of one player - the owner of the bazaar being viewed.
+ * Public data (what their profile shows anyone); a Public key can read it.
+ * Tries v2 first, then v1; a dead key or rate limit is not retried.
+ */
+export async function fetchUserPresence(client, userId) {
+    const id = String(userId).replace(/\D/g, '');
+    if (!id) return null;
+
+    try {
+        return parseUserPresence(await client.get('v2/user/' + id + '/profile'));
+    } catch (error) {
+        const code = error && error.code;
+        if (
+            code === TORN_ERROR_RATE_LIMIT ||
+            code === TORN_ERROR_IP_BLOCK ||
+            KEY_DEAD_CODES.has(code)
+        ) {
+            throw error;
+        }
+        return parseUserPresence(await client.get('user/' + id, { selections: 'profile' }));
+    }
+}

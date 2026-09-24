@@ -93,6 +93,26 @@ function numberFromInput(value, fallback) {
     return Number.isFinite(n) ? n : fallback;
 }
 
+/** Keys typed into these belong to the page (or our fields), not the hotkey. */
+const TEXT_INPUT_TYPES = new Set([
+    '', 'text', 'search', 'email', 'number', 'password', 'tel', 'url',
+]);
+
+export function isTypingTarget(event) {
+    // composedPath() sees into shadow roots, so our own inputs count too.
+    const path = typeof event.composedPath === 'function' ? event.composedPath() : [];
+    const node = path[0] || event.target;
+    if (!node || node.nodeType !== 1) return false;
+
+    if (node.isContentEditable) return true;
+    const tag = node.tagName;
+    if (tag === 'TEXTAREA' || tag === 'SELECT') return true;
+    if (tag === 'INPUT') {
+        return TEXT_INPUT_TYPES.has(String(node.getAttribute('type') || '').toLowerCase());
+    }
+    return false;
+}
+
 /** Long enough to see, short enough not to get in the way. */
 const SCAN_ANIMATION_MS = 800;
 
@@ -208,7 +228,7 @@ export class Panel {
         this.collapseBtn = el('button', {
             type: 'button',
             class: 'ttv2-icon',
-            title: 'Collapse',
+            title: 'Collapse (`)',
             'aria-label': 'Collapse',
             text: '–',
             onclick: () => this.setCollapsed(!this.collapsed, { save: true }),
@@ -275,7 +295,11 @@ export class Panel {
 
         this.listEl = el('div', { class: 'ttv2-list' });
 
+        // Whose bazaar this is, and whether they are around. Bazaar pages only.
+        this.sellerEl = el('div', { class: 'ttv2-seller' });
+
         this.listPage = el('div', { class: 'ttv2-page ttv2-page-list' }, [
+            this.sellerEl,
             this.chipsEl,
             this.tabsEl,
             this.listEl,
@@ -674,7 +698,9 @@ export class Panel {
             ['Key storage & sharing', 'Stored locally / Not shared'],
             [
                 'Key access level',
-                'Public (torn: items, cityshops; market: itemmarket; key: info)',
+                'Public (torn: items, cityshops; market: itemmarket; key: info; ' +
+                    "user: profile - only the viewed bazaar owner's public " +
+                    'online status)',
             ],
             [
                 'Other services',
@@ -828,8 +854,8 @@ export class Panel {
 
         this.root.classList.toggle('ttv2-collapsed', this.collapsed);
         this.collapseBtn.textContent = this.collapsed ? '+' : '–';
-        this.collapseBtn.title = this.collapsed ? 'Expand' : 'Collapse';
-        this.collapseBtn.setAttribute('aria-label', this.collapseBtn.title);
+        this.collapseBtn.setAttribute('aria-label', this.collapsed ? 'Expand' : 'Collapse');
+        this.collapseBtn.title = (this.collapsed ? 'Expand' : 'Collapse') + ' (`)';
 
         this.renderBar();
         this.clampIntoView();
@@ -841,6 +867,49 @@ export class Panel {
 
     toggleCollapsed() {
         this.setCollapsed(!this.collapsed, { save: true });
+    }
+
+    /**
+     * The bazaar owner line. null hides it.
+     * @param {{name: string|null, level: string, text: string, closed: boolean}|null} info
+     */
+    setSeller(info) {
+        if (!this.sellerEl) return;
+        this.sellerEl.textContent = '';
+        this.sellerEl.classList.toggle('ttv2-shown', Boolean(info));
+        if (!info) return;
+
+        const dot = el('span', { class: 'ttv2-dot' });
+        dot.dataset.level = info.level;
+        this.sellerEl.appendChild(document.createTextNode('Seller: '));
+        this.sellerEl.appendChild(el('b', { text: info.name || 'this bazaar' }));
+        this.sellerEl.appendChild(dot);
+        this.sellerEl.appendChild(document.createTextNode(info.text));
+        if (info.closed) {
+            this.sellerEl.appendChild(
+                el('span', { class: 'ttv2-closed', text: 'Bazaar closed - nothing here can be bought' }),
+            );
+        }
+        this.sellerEl.title = this.sellerEl.textContent;
+    }
+
+    /**
+     * ` shows and hides the overlay, from anywhere on the page - except while
+     * typing (chat, search, quantity boxes, our own fields), and never with
+     * Ctrl / Alt / Cmd held.
+     */
+    enableHotkey(target = document) {
+        if (this.hotkeyHandler) return;
+        this.hotkeyHandler = (event) => {
+            if (event.key !== '`' || event.repeat) return;
+            if (event.ctrlKey || event.altKey || event.metaKey) return;
+            if (isTypingTarget(event)) return;
+            if (!this.root) return;
+            event.preventDefault();
+            this.setCollapsed(!this.collapsed, { save: true });
+        };
+        this.hotkeyTarget = target;
+        target.addEventListener('keydown', this.hotkeyHandler);
     }
 
     /**
@@ -1310,6 +1379,10 @@ export class Panel {
     destroy() {
         if (this.ticker) clearInterval(this.ticker);
         clearTimeout(this.scanTimer);
+        if (this.hotkeyHandler && this.hotkeyTarget) {
+            this.hotkeyTarget.removeEventListener('keydown', this.hotkeyHandler);
+            this.hotkeyHandler = null;
+        }
         if (this.host && this.host.parentNode) {
             this.host.parentNode.removeChild(this.host);
         }

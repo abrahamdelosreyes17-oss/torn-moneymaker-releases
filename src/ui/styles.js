@@ -101,6 +101,34 @@ export const PAGE_CSS = `
         inset 0 0 0 3px #7ee08f,
         inset 0 0 0 9999px rgba(126, 224, 143, 0.24) !important;
 }
+
+/* Bazaar owner status, right after their name in the page banner. */
+.ttv2-owner {
+    display: inline-block;
+    margin: 0 4px 0 6px;
+    padding: 0 7px 0 6px;
+    border-radius: 9px;
+    font: bold 11px/17px Arial, Helvetica, sans-serif;
+    color: #ddd;
+    background: rgba(0, 0, 0, 0.35);
+    white-space: nowrap;
+    vertical-align: middle;
+}
+
+.ttv2-owner::before {
+    content: "";
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    margin-right: 5px;
+    border-radius: 50%;
+    background: #888;
+    vertical-align: 0;
+}
+
+.ttv2-owner[data-level="online"]::before { background: #5ed36f; }
+.ttv2-owner[data-level="idle"]::before { background: #f0c040; }
+.ttv2-owner[data-level="offline"]::before { background: #777; }
 `;
 
 export const PANEL_CSS = `
@@ -333,6 +361,44 @@ export const PANEL_CSS = `
 @keyframes ttv2-sweep {
     0% { left: -30%; opacity: 1; }
     100% { left: 100%; opacity: 1; }
+}
+
+.ttv2-seller {
+    display: none;
+    padding: 5px 12px;
+    font-size: 12px;
+    color: #ccc;
+    border-bottom: 1px solid var(--line);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.ttv2-seller.ttv2-shown {
+    display: block;
+}
+
+.ttv2-seller b {
+    color: #fff;
+}
+
+.ttv2-seller .ttv2-dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    margin: 0 4px 0 6px;
+    border-radius: 50%;
+    background: #888;
+}
+
+.ttv2-seller .ttv2-dot[data-level="online"] { background: #5ed36f; }
+.ttv2-seller .ttv2-dot[data-level="idle"] { background: #f0c040; }
+.ttv2-seller .ttv2-dot[data-level="offline"] { background: #777; }
+
+.ttv2-seller .ttv2-closed {
+    margin-left: 6px;
+    color: #ff8a80;
+    font-weight: bold;
 }
 
 .ttv2-spin {

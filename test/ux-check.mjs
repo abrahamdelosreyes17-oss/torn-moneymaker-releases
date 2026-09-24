@@ -123,7 +123,7 @@ await p.waitForTimeout(1500);
 ok(!(await q(p, 'button[title="Refresh now"]').isDisabled()), 'Refresh completes');
 
 // collapse / expand
-await q(p, 'button[title="Collapse"]').click();
+await q(p, 'button[aria-label="Collapse"]').click();
 ok(!(await vis(p, '.ttv2-body')), 'collapse hides the body');
 ok(/deal/.test(await txt(p, '.ttv2-mini')), 'collapsed bar keeps the headline: ' + (await txt(p, '.ttv2-mini')));
 await p.screenshot({ path: sp + '/ux-collapsed.png' });
@@ -168,6 +168,39 @@ await p.waitForTimeout(900);
 await q(p, 'button.ttv2-scan').click();
 ok(/Scanned: \d+ listing/.test(await txt(p, '.ttv2-bar-left')), 'Scan on a market page counts listings: ' + (await txt(p, '.ttv2-bar-left')));
 await p.screenshot({ path: sp + '/ux-scan.png' });
+
+// Bazaar owner: status badge after the name in the page banner, the same
+// line in the panel, and a closed bazaar hides its deals.
+const banner = (state) => `<div class="delimiter" id="fake-banner"><div class="msg right-round messageContent___cdSrs"><a href="profiles.php?XID=4254715">DixieNormousss's</a> bazaar, favorited by <b>3</b> citizens, is currently <span class="bold">${state}.</span></div></div>`
+  + '<div class="listItem___h3qQ0"><a href="profiles.php?XID=4254715">DixieNormousss\'s Profile</a></div>';
+await p.evaluate((h) => { document.getElementById('fake-market')?.remove(); const d = document.createElement('div'); d.id = 'fake-bz'; d.innerHTML = h; document.body.prepend(d); }, banner('open'));
+await p.evaluate(() => history.pushState({}, '', '/test/harness-live.html?page=bazaar&userId=4254715'));
+await p.waitForTimeout(1500);
+const badge = await p.evaluate(() => [...document.querySelectorAll('.ttv2-owner')].map((b) => [b.dataset.level, b.textContent, b.previousElementSibling && b.previousElementSibling.textContent]));
+ok(badge.length === 1, 'one owner badge on the page (not in the dropdown): ' + JSON.stringify(badge));
+ok(badge[0] && badge[0][0] === 'offline' && /Offline · 3h ago · Traveling to Mexico/.test(badge[0][1]) && /DixieNormousss/.test(badge[0][2]), 'badge sits after the name and reads the status');
+ok(/Seller: DixieNormousss.*Offline · 3h ago/.test(await txt(p, '.ttv2-seller')), 'panel seller line: ' + (await txt(p, '.ttv2-seller')));
+ok(!/closed/i.test(await txt(p, '.ttv2-seller')), 'open bazaar is not flagged closed');
+await p.screenshot({ path: sp + '/ux-owner.png' });
+await p.evaluate((h) => { document.getElementById('fake-bz').innerHTML = h; }, banner('closed'));
+await p.waitForTimeout(3000);
+ok(/Bazaar closed/.test(await txt(p, '.ttv2-seller')), 'closed bazaar flagged in the panel');
+ok((await p.evaluate(() => document.querySelectorAll('.ttv2-owner').length)) === 1, 'badge survives the banner re-rendering');
+await p.evaluate(() => history.pushState({}, '', '/test/harness-live.html'));
+await p.waitForTimeout(800);
+ok(!(await vis(p, '.ttv2-seller')), 'seller line gone off the bazaar');
+ok((await p.evaluate(() => document.querySelectorAll('.ttv2-owner').length)) === 0, 'badge removed off the bazaar');
+
+// ` shows and hides the overlay - but not while typing
+await p.evaluate(() => document.activeElement && document.activeElement.blur());
+await p.keyboard.press('Backquote');
+ok(!(await vis(p, '.ttv2-body')), '` collapses the overlay');
+await p.keyboard.press('Backquote');
+ok(await vis(p, '.ttv2-body'), '` expands it again');
+await p.evaluate(() => { const t = document.createElement('textarea'); t.id = 'fake-chat'; document.body.appendChild(t); t.focus(); });
+await p.keyboard.press('Backquote');
+ok(await vis(p, '.ttv2-body'), '` typed in a chat box does not toggle');
+ok((await p.evaluate(() => document.getElementById('fake-chat').value)) === '`', 'and the ` still reaches the chat box');
 
 console.log('ERRORS', errs);
 console.log(failures ? failures + ' FAILED' : 'ALL PASSED');

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      3.3.3
+// @version      3.4.0
 // @description  Finds Bazaar and Item Market listings below NPC / market value - on the page you are viewing, and live from the Torn API and TornW3B - ranked by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -37,7 +37,7 @@
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '3.3.3';
+    const TTV2_BUILD_VERSION = '3.4.0';
 
     /* ===== src/platform/gm.js ===== */
     /*
@@ -2255,6 +2255,56 @@
         };
     }
 
+    /**
+     * A player's public presence: Online / Idle / Offline and where they are.
+     * Accepts the v2 `/user/{id}/profile` shape ({ profile: {...} }) and the v1
+     * `user/{id}?selections=profile` shape (fields at the top level).
+     *
+     * @returns {{name, online, lastActionAt, state, description}|null}
+     */
+    function parseUserPresence(data) {
+        const p = (data && (data.profile || data)) || {};
+        const la = p.last_action || {};
+        const st = p.status || {};
+
+        const online = ['Online', 'Idle', 'Offline'].includes(la.status) ? la.status : null;
+        const seconds = Number(la.timestamp);
+
+        if (!online && !st.state) return null;
+
+        return {
+            name: typeof p.name === 'string' ? p.name : null,
+            online,
+            lastActionAt: Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : null,
+            state: typeof st.state === 'string' ? st.state : null,
+            description: typeof st.description === 'string' ? st.description : null,
+        };
+    }
+
+    /**
+     * The public status of one player - the owner of the bazaar being viewed.
+     * Public data (what their profile shows anyone); a Public key can read it.
+     * Tries v2 first, then v1; a dead key or rate limit is not retried.
+     */
+    async function fetchUserPresence(client, userId) {
+        const id = String(userId).replace(/\D/g, '');
+        if (!id) return null;
+
+        try {
+            return parseUserPresence(await client.get('v2/user/' + id + '/profile'));
+        } catch (error) {
+            const code = error && error.code;
+            if (
+                code === TORN_ERROR_RATE_LIMIT ||
+                code === TORN_ERROR_IP_BLOCK ||
+                KEY_DEAD_CODES.has(code)
+            ) {
+                throw error;
+            }
+            return parseUserPresence(await client.get('user/' + id, { selections: 'profile' }));
+        }
+    }
+
     /* ===== src/sources/route.js ===== */
     /*
      * Which Torn page are we on? Pure string work, so it is testable.
@@ -2867,6 +2917,108 @@
         return { listings, diagnostics };
     }
 
+    /* ===== src/sources/dom/owner.js ===== */
+    /*
+     * The bazaar owner banner, captured live 2026-09-24:
+     *
+     *   <div class="msg right-round messageContent___cdSrs">
+     *     <a href="profiles.php?XID=4254715">DixieNormousss's</a> bazaar,
+     *     favorited by <b>3</b> citizens, is currently <span class="bold">open.</span>
+     *   </div>
+     *
+     * The same profile link also sits in a (usually hidden) dropdown menu, in a
+     * listItem___ wrapper - that one is skipped.
+     *
+     * Paint-only: a badge is added after the name. Nothing is clicked or read
+     * beyond this banner.
+     */
+
+    const OWNER_BADGE_CLASS = 'ttv2-owner';
+
+    /** The owner's name link inside the banner, or null. */
+    function findOwnerLink(root, ownerId) {
+        const id = String(ownerId || '').replace(/\D/g, '');
+        if (!id || !root) return null;
+
+        const links = root.querySelectorAll('a[href*="XID=' + id + '"]');
+        for (const a of links) {
+            const href = a.getAttribute('href') || '';
+            // XID=42 must not match XID=4254715.
+            if (!new RegExp('XID=' + id + '(?!\\d)').test(href)) continue;
+            if (a.closest('[class*="listItem"]')) continue;
+            if (a.closest('[class*="messageContent"], .msg')) return a;
+        }
+        return null;
+    }
+
+    /** true = open, false = closed, null = the banner does not say. */
+    function readBazaarOpen(root, ownerId) {
+        const link = findOwnerLink(root, ownerId);
+        if (!link) return null;
+
+        const banner = link.closest('[class*="messageContent"], .msg');
+        const text = ((banner && banner.textContent) || '').replace(/\s+/g, ' ');
+
+        if (/currently\s+closed/i.test(text)) return false;
+        if (/currently\s+open/i.test(text)) return true;
+        return null;
+    }
+
+    /** "just now", "4m ago", "3h ago", "2d ago". */
+    function agoText(ms, now = Date.now()) {
+        if (!Number.isFinite(ms)) return '';
+        const s = Math.max(0, Math.round((now - ms) / 1000));
+        if (s < 60) return 'just now';
+        if (s < 3600) return Math.floor(s / 60) + 'm ago';
+        if (s < 86400) return Math.floor(s / 3600) + 'h ago';
+        return Math.floor(s / 86400) + 'd ago';
+    }
+
+    /**
+     * The badge's words, shared with the panel line.
+     * @returns {{level: 'online'|'idle'|'offline'|'unknown', text: string}}
+     */
+    function presenceText(presence, now = Date.now()) {
+        if (!presence || !presence.online) return { level: 'unknown', text: 'status unknown' };
+
+        const level = presence.online.toLowerCase();
+        const parts = [presence.online];
+
+        if (presence.online !== 'Online' && presence.lastActionAt) {
+            parts.push(agoText(presence.lastActionAt, now));
+        }
+
+        // Anything but "Okay" matters: travelling, abroad, hospital, jail.
+        if (presence.state && presence.state !== 'Okay') {
+            parts.push(presence.description || presence.state);
+        }
+
+        return { level, text: parts.join(' · ') };
+    }
+
+    /** Put (or refresh) the badge after the owner's name. Returns true if shown. */
+    function renderOwnerBadge(root, ownerId, presence, now = Date.now()) {
+        const link = findOwnerLink(root, ownerId);
+        if (!link) return false;
+
+        let badge = link.nextElementSibling;
+        if (!badge || !badge.classList.contains(OWNER_BADGE_CLASS)) {
+            badge = link.ownerDocument.createElement('span');
+            badge.className = OWNER_BADGE_CLASS;
+            link.insertAdjacentElement('afterend', badge);
+        }
+
+        const { level, text } = presenceText(presence, now);
+        if (badge.dataset.level !== level) badge.dataset.level = level;
+        if (badge.textContent !== text) badge.textContent = text;
+        badge.title = 'Bazaar owner status (Torn API)';
+        return true;
+    }
+
+    function removeOwnerBadges(root) {
+        for (const b of root.querySelectorAll('.' + OWNER_BADGE_CLASS)) b.remove();
+    }
+
     /* ===== src/ui/styles.js ===== */
     /*
      * All CSS for the script, in one place.
@@ -2971,6 +3123,34 @@
             inset 0 0 0 3px #7ee08f,
             inset 0 0 0 9999px rgba(126, 224, 143, 0.24) !important;
     }
+
+    /* Bazaar owner status, right after their name in the page banner. */
+    .ttv2-owner {
+        display: inline-block;
+        margin: 0 4px 0 6px;
+        padding: 0 7px 0 6px;
+        border-radius: 9px;
+        font: bold 11px/17px Arial, Helvetica, sans-serif;
+        color: #ddd;
+        background: rgba(0, 0, 0, 0.35);
+        white-space: nowrap;
+        vertical-align: middle;
+    }
+
+    .ttv2-owner::before {
+        content: "";
+        display: inline-block;
+        width: 8px;
+        height: 8px;
+        margin-right: 5px;
+        border-radius: 50%;
+        background: #888;
+        vertical-align: 0;
+    }
+
+    .ttv2-owner[data-level="online"]::before { background: #5ed36f; }
+    .ttv2-owner[data-level="idle"]::before { background: #f0c040; }
+    .ttv2-owner[data-level="offline"]::before { background: #777; }
     `;
 
     const PANEL_CSS = `
@@ -3203,6 +3383,44 @@
     @keyframes ttv2-sweep {
         0% { left: -30%; opacity: 1; }
         100% { left: 100%; opacity: 1; }
+    }
+
+    .ttv2-seller {
+        display: none;
+        padding: 5px 12px;
+        font-size: 12px;
+        color: #ccc;
+        border-bottom: 1px solid var(--line);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+
+    .ttv2-seller.ttv2-shown {
+        display: block;
+    }
+
+    .ttv2-seller b {
+        color: #fff;
+    }
+
+    .ttv2-seller .ttv2-dot {
+        display: inline-block;
+        width: 8px;
+        height: 8px;
+        margin: 0 4px 0 6px;
+        border-radius: 50%;
+        background: #888;
+    }
+
+    .ttv2-seller .ttv2-dot[data-level="online"] { background: #5ed36f; }
+    .ttv2-seller .ttv2-dot[data-level="idle"] { background: #f0c040; }
+    .ttv2-seller .ttv2-dot[data-level="offline"] { background: #777; }
+
+    .ttv2-seller .ttv2-closed {
+        margin-left: 6px;
+        color: #ff8a80;
+        font-weight: bold;
     }
 
     .ttv2-spin {
@@ -3723,6 +3941,26 @@
         return Number.isFinite(n) ? n : fallback;
     }
 
+    /** Keys typed into these belong to the page (or our fields), not the hotkey. */
+    const TEXT_INPUT_TYPES = new Set([
+        '', 'text', 'search', 'email', 'number', 'password', 'tel', 'url',
+    ]);
+
+    function isTypingTarget(event) {
+        // composedPath() sees into shadow roots, so our own inputs count too.
+        const path = typeof event.composedPath === 'function' ? event.composedPath() : [];
+        const node = path[0] || event.target;
+        if (!node || node.nodeType !== 1) return false;
+
+        if (node.isContentEditable) return true;
+        const tag = node.tagName;
+        if (tag === 'TEXTAREA' || tag === 'SELECT') return true;
+        if (tag === 'INPUT') {
+            return TEXT_INPUT_TYPES.has(String(node.getAttribute('type') || '').toLowerCase());
+        }
+        return false;
+    }
+
     /** Long enough to see, short enough not to get in the way. */
     const SCAN_ANIMATION_MS = 800;
 
@@ -3838,7 +4076,7 @@
             this.collapseBtn = el('button', {
                 type: 'button',
                 class: 'ttv2-icon',
-                title: 'Collapse',
+                title: 'Collapse (`)',
                 'aria-label': 'Collapse',
                 text: '–',
                 onclick: () => this.setCollapsed(!this.collapsed, { save: true }),
@@ -3905,7 +4143,11 @@
 
             this.listEl = el('div', { class: 'ttv2-list' });
 
+            // Whose bazaar this is, and whether they are around. Bazaar pages only.
+            this.sellerEl = el('div', { class: 'ttv2-seller' });
+
             this.listPage = el('div', { class: 'ttv2-page ttv2-page-list' }, [
+                this.sellerEl,
                 this.chipsEl,
                 this.tabsEl,
                 this.listEl,
@@ -4304,7 +4546,9 @@
                 ['Key storage & sharing', 'Stored locally / Not shared'],
                 [
                     'Key access level',
-                    'Public (torn: items, cityshops; market: itemmarket; key: info)',
+                    'Public (torn: items, cityshops; market: itemmarket; key: info; ' +
+                        "user: profile - only the viewed bazaar owner's public " +
+                        'online status)',
                 ],
                 [
                     'Other services',
@@ -4458,8 +4702,8 @@
 
             this.root.classList.toggle('ttv2-collapsed', this.collapsed);
             this.collapseBtn.textContent = this.collapsed ? '+' : '–';
-            this.collapseBtn.title = this.collapsed ? 'Expand' : 'Collapse';
-            this.collapseBtn.setAttribute('aria-label', this.collapseBtn.title);
+            this.collapseBtn.setAttribute('aria-label', this.collapsed ? 'Expand' : 'Collapse');
+            this.collapseBtn.title = (this.collapsed ? 'Expand' : 'Collapse') + ' (`)';
 
             this.renderBar();
             this.clampIntoView();
@@ -4471,6 +4715,49 @@
 
         toggleCollapsed() {
             this.setCollapsed(!this.collapsed, { save: true });
+        }
+
+        /**
+         * The bazaar owner line. null hides it.
+         * @param {{name: string|null, level: string, text: string, closed: boolean}|null} info
+         */
+        setSeller(info) {
+            if (!this.sellerEl) return;
+            this.sellerEl.textContent = '';
+            this.sellerEl.classList.toggle('ttv2-shown', Boolean(info));
+            if (!info) return;
+
+            const dot = el('span', { class: 'ttv2-dot' });
+            dot.dataset.level = info.level;
+            this.sellerEl.appendChild(document.createTextNode('Seller: '));
+            this.sellerEl.appendChild(el('b', { text: info.name || 'this bazaar' }));
+            this.sellerEl.appendChild(dot);
+            this.sellerEl.appendChild(document.createTextNode(info.text));
+            if (info.closed) {
+                this.sellerEl.appendChild(
+                    el('span', { class: 'ttv2-closed', text: 'Bazaar closed - nothing here can be bought' }),
+                );
+            }
+            this.sellerEl.title = this.sellerEl.textContent;
+        }
+
+        /**
+         * ` shows and hides the overlay, from anywhere on the page - except while
+         * typing (chat, search, quantity boxes, our own fields), and never with
+         * Ctrl / Alt / Cmd held.
+         */
+        enableHotkey(target = document) {
+            if (this.hotkeyHandler) return;
+            this.hotkeyHandler = (event) => {
+                if (event.key !== '`' || event.repeat) return;
+                if (event.ctrlKey || event.altKey || event.metaKey) return;
+                if (isTypingTarget(event)) return;
+                if (!this.root) return;
+                event.preventDefault();
+                this.setCollapsed(!this.collapsed, { save: true });
+            };
+            this.hotkeyTarget = target;
+            target.addEventListener('keydown', this.hotkeyHandler);
         }
 
         /**
@@ -4940,6 +5227,10 @@
         destroy() {
             if (this.ticker) clearInterval(this.ticker);
             clearTimeout(this.scanTimer);
+            if (this.hotkeyHandler && this.hotkeyTarget) {
+                this.hotkeyTarget.removeEventListener('keydown', this.hotkeyHandler);
+                this.hotkeyHandler = null;
+            }
             if (this.host && this.host.parentNode) {
                 this.host.parentNode.removeChild(this.host);
             }
@@ -5431,6 +5722,7 @@
 
 
 
+
     const STORE_KEY = 'apiKey';
     const STORE_ITEMS = 'itemsCache';
     const STORE_NPC = 'npcCache';
@@ -5492,6 +5784,16 @@
      * string compare, so it is done often; on a change the page is scanned at
      * once and a few more times while the listings finish drawing.
      */
+    /*
+     * The viewed bazaar's owner: one public-profile call when you open it, then
+     * at most once per OWNER_REFRESH_MS while you stay. A failure waits a minute.
+     */
+    const OWNER_REFRESH_MS = 30000;
+    const OWNER_RETRY_MS = 60000;
+
+    /* A bazaar seen closed keeps its feed deals hidden this long (or until seen open). */
+    const CLOSED_MEMORY_MS = 10 * 60 * 1000;
+
     const HREF_WATCH_MS = 250;
     const SCAN_BURST_MS = [0, 300, 700, 1200, 2000, 3000];
 
@@ -5523,6 +5825,10 @@
         pageFirstSeen: new Map(),
         pageHref: null,
         pageRows: [],
+        /* { id, presence, fetchedAt, pending, retryAt, open } for the viewed bazaar. */
+        owner: null,
+        /* sellerId -> time until which their bazaar counts as closed. */
+        closedSellers: new Map(),
         pageDiagnostics: null,
         targetShown: null,
         /* After a failed load, the automatic retry waits until this time. */
@@ -5893,6 +6199,8 @@
             app.targetShown = null;
         }
 
+        updateOwner(Date.now());
+
         if (!app.index) return;
 
         if (app.pageType === PAGE_NONE) {
@@ -5943,7 +6251,12 @@
             if (removed > 0) gmSet(FEED_STORE_KEY, makeFeedCacheEntry(feed, now));
         }
 
-        const live = ranked.filter((row) => !pageRowContradicted(feed, row));
+        // A closed bazaar sells nothing, however cheap its listings look.
+        const closedHere = Boolean(app.owner && app.owner.open === false);
+        const live = closedHere
+            ? []
+            : ranked.filter((row) => !pageRowContradicted(feed, row));
+        if (closedHere) clearMarks();
 
         // Ask the feed to keep re-checking what this page shows, every refresh.
         if (app.feed && live.length && now - (app.lastPageRecheckAt || 0) >= REFRESH_MS) {
@@ -6028,6 +6341,7 @@
                   if (r.source === SOURCE_ITEM_MARKET) {
                       return !onPage.has(SOURCE_ITEM_MARKET + ':' + r.itemId);
                   }
+                  if (isSellerClosed(r.sellerId, now)) return false;
                   return !(
                       r.sellerId === sellerHere &&
                       onPage.has(SOURCE_BAZAAR + ':' + r.itemId)
@@ -6158,6 +6472,99 @@
         }
     }
 
+
+    /* ------------------------------------------------------------------ *
+     * Bazaar owner: online status and open/closed
+     * ------------------------------------------------------------------ */
+
+    function isSellerClosed(sellerId, now = Date.now()) {
+        if (!sellerId) return false;
+        const until = app.closedSellers.get(String(sellerId));
+        if (!until) return false;
+        if (until > now) return true;
+        app.closedSellers.delete(String(sellerId));
+        return false;
+    }
+
+    /**
+     * Runs with every scan: reads open/closed from the page banner (free),
+     * refreshes the owner's public status when it is due, and paints both.
+     */
+    function updateOwner(now) {
+        const ownerId =
+            app.pageType === PAGE_BAZAAR ? bazaarOwnerId(location.href) : null;
+
+        if (!ownerId) {
+            if (app.owner) {
+                app.owner = null;
+                removeOwnerBadges(document);
+                if (app.panel) app.panel.setSeller(null);
+            }
+            return;
+        }
+
+        if (!app.owner || app.owner.id !== ownerId) {
+            removeOwnerBadges(document);
+            app.owner = {
+                id: ownerId,
+                presence: null,
+                fetchedAt: 0,
+                pending: false,
+                retryAt: 0,
+                open: null,
+            };
+        }
+
+        const owner = app.owner;
+        const open = readBazaarOpen(document, ownerId);
+        if (open !== null) owner.open = open;
+        if (owner.open === false) app.closedSellers.set(ownerId, now + CLOSED_MEMORY_MS);
+        if (owner.open === true) app.closedSellers.delete(ownerId);
+
+        paintOwner(now);
+
+        const due =
+            !owner.pending &&
+            now >= owner.retryAt &&
+            now - owner.fetchedAt >= OWNER_REFRESH_MS;
+        if (!due || !app.client || !hasUsableKey()) return;
+        if (document.visibilityState !== 'visible') return;
+
+        owner.pending = true;
+        fetchUserPresence(app.client, ownerId)
+            .then((presence) => {
+                owner.fetchedAt = Date.now();
+                if (presence) owner.presence = presence;
+                else owner.retryAt = Date.now() + OWNER_RETRY_MS;
+            })
+            .catch((error) => {
+                if (isKeyDeadError(error)) markKeyDead(error);
+                owner.retryAt = Date.now() + OWNER_RETRY_MS;
+            })
+            .finally(() => {
+                owner.pending = false;
+                if (app.owner === owner) paintOwner(Date.now());
+            });
+    }
+
+    function paintOwner(now) {
+        const owner = app.owner;
+        if (!owner) return;
+
+        if (owner.presence) renderOwnerBadge(document, owner.id, owner.presence, now);
+
+        if (!app.panel) return;
+        const words = owner.presence
+            ? presenceText(owner.presence, now)
+            : { level: 'unknown', text: owner.pending || !owner.fetchedAt ? 'checking...' : 'status unknown' };
+
+        app.panel.setSeller({
+            name: (owner.presence && owner.presence.name) || null,
+            level: words.level,
+            text: words.text,
+            closed: owner.open === false,
+        });
+    }
 
     /**
      * The small Scan button: re-read this page now. No requests - just the DOM
@@ -6530,6 +6937,7 @@
         });
 
         app.panel.mount();
+        app.panel.enableHotkey();
         app.panel.applySettings(app.settings);
 
         refreshKeyState();

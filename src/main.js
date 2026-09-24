@@ -47,6 +47,7 @@ import {
     fetchItems,
     fetchShops,
     fetchKeyAccess,
+    fetchUserPresence,
     ACCESS_PUBLIC,
 } from './api/torn.js';
 import {
@@ -58,6 +59,12 @@ import {
     PAGE_BAZAAR,
 } from './sources/route.js';
 import { scanDom } from './sources/dom/scan.js';
+import {
+    readBazaarOpen,
+    renderOwnerBadge,
+    removeOwnerBadges,
+    presenceText,
+} from './sources/dom/owner.js';
 import { injectStyles } from './ui/styles.js';
 import { Panel, TORN_API_KEY_URL } from './ui/panel.js';
 import {
@@ -132,6 +139,16 @@ const RESCAN_DEBOUNCE_MS = 400;
  * string compare, so it is done often; on a change the page is scanned at
  * once and a few more times while the listings finish drawing.
  */
+/*
+ * The viewed bazaar's owner: one public-profile call when you open it, then
+ * at most once per OWNER_REFRESH_MS while you stay. A failure waits a minute.
+ */
+const OWNER_REFRESH_MS = 30000;
+const OWNER_RETRY_MS = 60000;
+
+/* A bazaar seen closed keeps its feed deals hidden this long (or until seen open). */
+const CLOSED_MEMORY_MS = 10 * 60 * 1000;
+
 const HREF_WATCH_MS = 250;
 const SCAN_BURST_MS = [0, 300, 700, 1200, 2000, 3000];
 
@@ -163,6 +180,10 @@ const app = {
     pageFirstSeen: new Map(),
     pageHref: null,
     pageRows: [],
+    /* { id, presence, fetchedAt, pending, retryAt, open } for the viewed bazaar. */
+    owner: null,
+    /* sellerId -> time until which their bazaar counts as closed. */
+    closedSellers: new Map(),
     pageDiagnostics: null,
     targetShown: null,
     /* After a failed load, the automatic retry waits until this time. */
@@ -533,6 +554,8 @@ function rescan() {
         app.targetShown = null;
     }
 
+    updateOwner(Date.now());
+
     if (!app.index) return;
 
     if (app.pageType === PAGE_NONE) {
@@ -583,7 +606,12 @@ function rescan() {
         if (removed > 0) gmSet(FEED_STORE_KEY, makeFeedCacheEntry(feed, now));
     }
 
-    const live = ranked.filter((row) => !pageRowContradicted(feed, row));
+    // A closed bazaar sells nothing, however cheap its listings look.
+    const closedHere = Boolean(app.owner && app.owner.open === false);
+    const live = closedHere
+        ? []
+        : ranked.filter((row) => !pageRowContradicted(feed, row));
+    if (closedHere) clearMarks();
 
     // Ask the feed to keep re-checking what this page shows, every refresh.
     if (app.feed && live.length && now - (app.lastPageRecheckAt || 0) >= REFRESH_MS) {
@@ -668,6 +696,7 @@ function refreshView() {
               if (r.source === SOURCE_ITEM_MARKET) {
                   return !onPage.has(SOURCE_ITEM_MARKET + ':' + r.itemId);
               }
+              if (isSellerClosed(r.sellerId, now)) return false;
               return !(
                   r.sellerId === sellerHere &&
                   onPage.has(SOURCE_BAZAAR + ':' + r.itemId)
@@ -798,6 +827,99 @@ async function onScan() {
     }
 }
 
+
+/* ------------------------------------------------------------------ *
+ * Bazaar owner: online status and open/closed
+ * ------------------------------------------------------------------ */
+
+function isSellerClosed(sellerId, now = Date.now()) {
+    if (!sellerId) return false;
+    const until = app.closedSellers.get(String(sellerId));
+    if (!until) return false;
+    if (until > now) return true;
+    app.closedSellers.delete(String(sellerId));
+    return false;
+}
+
+/**
+ * Runs with every scan: reads open/closed from the page banner (free),
+ * refreshes the owner's public status when it is due, and paints both.
+ */
+function updateOwner(now) {
+    const ownerId =
+        app.pageType === PAGE_BAZAAR ? bazaarOwnerId(location.href) : null;
+
+    if (!ownerId) {
+        if (app.owner) {
+            app.owner = null;
+            removeOwnerBadges(document);
+            if (app.panel) app.panel.setSeller(null);
+        }
+        return;
+    }
+
+    if (!app.owner || app.owner.id !== ownerId) {
+        removeOwnerBadges(document);
+        app.owner = {
+            id: ownerId,
+            presence: null,
+            fetchedAt: 0,
+            pending: false,
+            retryAt: 0,
+            open: null,
+        };
+    }
+
+    const owner = app.owner;
+    const open = readBazaarOpen(document, ownerId);
+    if (open !== null) owner.open = open;
+    if (owner.open === false) app.closedSellers.set(ownerId, now + CLOSED_MEMORY_MS);
+    if (owner.open === true) app.closedSellers.delete(ownerId);
+
+    paintOwner(now);
+
+    const due =
+        !owner.pending &&
+        now >= owner.retryAt &&
+        now - owner.fetchedAt >= OWNER_REFRESH_MS;
+    if (!due || !app.client || !hasUsableKey()) return;
+    if (document.visibilityState !== 'visible') return;
+
+    owner.pending = true;
+    fetchUserPresence(app.client, ownerId)
+        .then((presence) => {
+            owner.fetchedAt = Date.now();
+            if (presence) owner.presence = presence;
+            else owner.retryAt = Date.now() + OWNER_RETRY_MS;
+        })
+        .catch((error) => {
+            if (isKeyDeadError(error)) markKeyDead(error);
+            owner.retryAt = Date.now() + OWNER_RETRY_MS;
+        })
+        .finally(() => {
+            owner.pending = false;
+            if (app.owner === owner) paintOwner(Date.now());
+        });
+}
+
+function paintOwner(now) {
+    const owner = app.owner;
+    if (!owner) return;
+
+    if (owner.presence) renderOwnerBadge(document, owner.id, owner.presence, now);
+
+    if (!app.panel) return;
+    const words = owner.presence
+        ? presenceText(owner.presence, now)
+        : { level: 'unknown', text: owner.pending || !owner.fetchedAt ? 'checking...' : 'status unknown' };
+
+    app.panel.setSeller({
+        name: (owner.presence && owner.presence.name) || null,
+        level: words.level,
+        text: words.text,
+        closed: owner.open === false,
+    });
+}
 
 /**
  * The small Scan button: re-read this page now. No requests - just the DOM
@@ -1170,6 +1292,7 @@ export function boot() {
     });
 
     app.panel.mount();
+    app.panel.enableHotkey();
     app.panel.applySettings(app.settings);
 
     refreshKeyState();

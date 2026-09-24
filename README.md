@@ -73,9 +73,20 @@ scrolls to it when it is on the page you are viewing. Nothing is ever bought for
 
 ### The panel
 
-- **Header:** ↻ refresh now · ⚙ Settings · – collapse. Drag it anywhere; the
-  position is remembered. Collapsed, it still shows *N deals · +$total*; click it
-  to expand.
+- **Header:** **Scan** (re-read this page now) · ↻ refresh everything · ⚙ Settings ·
+  – collapse. Drag it anywhere; the position is remembered. Collapsed, it still
+  shows *N deals · +$total*; click it to expand.
+- **` (backtick)** shows and hides the panel from anywhere on the page - except
+  while typing in chat or any other text box.
+- **Scan** plays a short animation every time (the button pulses, a line sweeps
+  under the header) and says what it found. A new page is scanned by itself as
+  soon as its listings draw - Torn changes pages without an event, so the
+  address is checked every 250 ms - with the same animation.
+- **On a player's bazaar:** a badge after the owner's name in Torn's banner
+  (*● Offline · 3h ago · Traveling to Mexico*) and the same line in the panel.
+  One public-profile call when you open it, then at most every 30 s while you
+  stay. If the banner says the bazaar is **closed**, its listings are not shown
+  as deals, here or in the feed, until it is seen open again.
 - **Status line:** this list's deals and total on the left; on the right whether
   the feed is live and when it next refreshes (hover for the last error).
 - **Sell to** chips, always visible - one click each:
@@ -183,7 +194,7 @@ Shown in Settings next to the key field, as Torn requires:
 
 | Data storage | Data sharing | Purpose of use | Key storage & sharing | Key access level |
 |---|---|---|---|---|
-| Only locally | Nobody | Competitive advantage: finding Bazaar and Item Market listings below NPC / market value | Stored locally / Not shared | Public |
+| Only locally | Nobody | Competitive advantage: finding Bazaar and Item Market listings below NPC / market value | Stored locally / Not shared | Public (torn: items, cityshops; market: itemmarket; key: info; user: profile - only the viewed bazaar owner's public online status) |
 
 Plus a line naming the automatic integration: *TornW3B (weav3r.dev), for bazaar
 prices; receives item ids only, never the key* - with a link to its terms beside
