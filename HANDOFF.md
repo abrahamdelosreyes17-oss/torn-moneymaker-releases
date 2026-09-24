@@ -51,10 +51,30 @@ cost him real money.**
 
 - A trader's price list only has **prices per item**, and no quantities. His
   example: https://weav3r.dev/pricelist/3727302, one trader's list on TornW3B.
-- The page's **Qty** was how many of the item *he* holds, from his inventory,
-  not the trader's. **Total** was his quantity × the best offer. Neither is
-  wanted. Remove the Qty column, the Total column, and the "Per item |
-  Bundle" switch. Order items by the best per-item price.
+- Remove the **Qty** column, the **Total** column and the **"Per item |
+  Bundle"** switch. The page is about the **best trader and best price per
+  item**, not quantities.
+
+### 4a. Page layout (his latest words, confirmed)
+> "It should have a page of the list of items that traders buy, but on the
+> first one, we prioritize our items. Now we can have a separate area where we
+> can check what other traders buy, filterable by a search button. It
+> shouldn't be items that I add myself; hence I have the Limited key. The
+> part where I can only see my items and finding the best trader for it, I can
+> also filter out what items I like, so if I wanna sell a Xanax I only see
+> the traders with Xanax."
+
+1. **"My items" section, first:** the items he holds (from his inventory,
+   via the Limited key) that traders buy. Each shows the best trader and
+   price per item. A **filter** narrows it: typing "xanax" shows only Xanax
+   and the traders buying it.
+2. **"All items" section:** every item any trader buys, with a **search
+   box**.
+3. **For every item:** its traders, **highest price first**, each with name,
+   **price per item**, online status (checked the same way as bazaar
+   sellers), **Profile** link and **price list** link.
+4. **Items are never added by hand.** They come from the traders' lists and
+   his inventory.
 
 ### 4b. Trader price lists live on TornW3B too, not only TornExchange
 - Traders publish price lists on **TornW3B** (`weav3r.dev/pricelist/{traderId}`)
