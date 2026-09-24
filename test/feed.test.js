@@ -9,7 +9,7 @@ import {
     fetchW3bListings,
 } from '../src/api/w3b.js';
 import { TornApiClient, KEY_DEAD_CODES } from '../src/api/client.js';
-import { fetchItemMarket } from '../src/api/torn.js';
+import { fetchItemMarket, fetchItems } from '../src/api/torn.js';
 import { buildItemIndex } from '../src/core/items.js';
 import {
     emptyFeed,
@@ -23,6 +23,7 @@ import {
     bazaarDue,
     itemMarketDue,
     reconcileWithPage,
+    pageRowContradicted,
     bazaarUrl,
     feedOpportunities,
     makeFeedCacheEntry,
@@ -33,19 +34,12 @@ import {
     BAZAAR_REFRESH_MS,
 } from '../src/core/feed.js';
 import { decideLeader, LEADER_STALE_MS } from '../src/core/leader.js';
-import {
-    ledgerKey,
-    recordSightings,
-    pruneLedger,
-    ledgerRows,
-    makeLedgerCacheEntry,
-    readLedgerCacheEntry,
-} from '../src/core/ledger.js';
 import { bazaarOwnerId, bazaarTarget } from '../src/sources/route.js';
 import {
     LiveFeed,
     FEED_STORE_KEY,
     FEED_LEADER_KEY,
+    FEED_REFRESH_KEY,
 } from '../src/feed/controller.js';
 
 const KEY = 'abcdef1234567890';
@@ -85,8 +79,8 @@ const RAW_ITEMS = {
 };
 
 const index = buildItemIndex(RAW_ITEMS);
-// Priced as Item Market resales (5% tax) unless a test says otherwise.
-const SETTINGS = { compareNpc: true, compareMarket: true, cashOnHand: null, resaleInBazaar: false };
+// NPC plus Item Market resale (5% tax) unless a test says otherwise.
+const SETTINGS = { sellToNpc: true, resaleMarket: true, resaleBazaar: false, cashOnHand: null };
 
 /* ================================================================ W3B client */
 
@@ -260,26 +254,33 @@ test('fetchItemMarket reads the v2 shape and when Torn will next refresh it', as
 
 /* ================================================================ feed core */
 
-test('exitsFor honours the NPC / market switches', () => {
+test('exitsFor: Sell to NPC is the default; resale exits only when chosen', () => {
     const hammer = index.byId.get('1');
+    assert.deepEqual(exitsFor(hammer, {}), { NPC: 100 }, 'defaults: NPC only');
     assert.deepEqual(exitsFor(hammer, SETTINGS), { NPC: 100, ITEM_MARKET: 120 });
-    assert.deepEqual(exitsFor(hammer, { ...SETTINGS, compareMarket: false }), { NPC: 100 });
-    assert.deepEqual(exitsFor(hammer, { ...SETTINGS, npcShopsOnly: true }, null), { ITEM_MARKET: 120 });
+    assert.deepEqual(exitsFor(hammer, { resaleBazaar: true }), { NPC: 100, BAZAAR_RESALE: 120 });
+    assert.deepEqual(exitsFor(hammer, { sellToNpc: false, resaleMarket: true }), { ITEM_MARKET: 120 });
     assert.deepEqual(exitsFor(index.byId.get('2'), SETTINGS), {});
-    assert.deepEqual(exitsFor(hammer, { ...SETTINGS, resaleInBazaar: true }), { NPC: 100, BAZAAR_RESALE: 120 });
 });
 
-test('a Xanax 1% under market value is a margin in your bazaar, a loss on the Item Market', () => {
-    // From a live bazaar: $838,745, shown as 1% under market value.
-    const idx = buildItemIndex({ 206: { name: 'Xanax', sell_price: 600, market_value: 850000 } });
-    const summary = [{ itemId: '206', lowestPrice: 838745 }];
+test('an item with no NPC sell price ("Sell: N/A") never gets an NPC price', () => {
+    const idx = buildItemIndex({
+        900: { name: 'Companion Script : Ubay', sell_price: null, market_value: 10088888 },
+        18: { name: 'Beretta M9', sell_price: 3800, market_value: 3542 },
+    });
 
-    const taxed = selectCandidates(summary, idx, { ...SETTINGS, resaleInBazaar: false });
-    assert.equal(taxed.length, 0, '850,000 x 0.95 = 807,500 < 838,745');
+    assert.deepEqual(exitsFor(idx.byId.get('900'), {}), {});
+    assert.deepEqual(exitsFor(idx.byId.get('18'), {}), { NPC: 3800 });
 
-    const untaxed = selectCandidates(summary, idx, { ...SETTINGS, resaleInBazaar: true });
-    assert.equal(untaxed.length, 1);
-    assert.equal(untaxed[0].profitPerUnit, 11255);
+    // A Beretta listed at $3,600 is an NPC flip even though it is ABOVE its
+    // average value ($3,542): the NPC pays $3,800.
+    const c = selectCandidates(
+        [{ itemId: '900', lowestPrice: 10319999 }, { itemId: '18', lowestPrice: 3600 }],
+        idx,
+        {},
+    );
+    assert.deepEqual(c.map((x) => x.itemId), ['18']);
+    assert.equal(c[0].profitPerUnit, 200);
 });
 
 test('candidates come from one summary call, best edge first', () => {
@@ -312,11 +313,13 @@ test('a listing with no timestamp is "age unknown", not "ancient"', () => {
     const [row] = normalizeW3bListings([{ player_id: 7, price: 50, quantity: 1 }]);
     assert.equal(row.dataAt, null);
 
+    // Kept for as long as the snapshot that returned it is current...
     const feed = emptyFeed();
     setBazaarSnapshot(feed, '1', [row], 1000);
-    expireFeed(feed, 1000 + BAZAAR_MAX_DATA_AGE_MS + 1);
-    assert.equal(feed.bazaar.get('1').rows.length, 1, 'kept until the snapshot cap');
+    expireFeed(feed, 1000 + BAZAAR_SNAPSHOT_TTL_MS - 1);
+    assert.equal(feed.bazaar.get('1').rows.length, 1);
 
+    // ...and removed with it.
     expireFeed(feed, 1000 + BAZAAR_SNAPSHOT_TTL_MS + 1);
     assert.equal(feed.bazaar.size, 0);
 });
@@ -485,60 +488,6 @@ test('only one visible tab leads, and a hidden leader steps down', () => {
     assert.equal(d.lead, false, 'a hidden tab never claims');
 });
 
-/* =================================================================== ledger */
-
-function pageRow(id, name, price, profit, extra = {}) {
-    return {
-        itemId: id,
-        name,
-        qtyAtPrice: true,
-        profit: {
-            venue: 'NPC',
-            listingPrice: price,
-            exitPrice: price + profit,
-            profitPerUnit: profit,
-            roi: profit / price,
-            qty: 1,
-            affordableQty: 1,
-            totalProfit: profit,
-            realizableProfit: profit,
-            cashRequired: price,
-        },
-        ...extra,
-    };
-}
-
-test('re-reading an unchanged page does not make its prices younger', () => {
-    const ledger = new Map();
-    const loaded = 1_000_000;
-
-    // The poll re-reads the same page 20 minutes later; the row still says
-    // when the page first showed it.
-    recordSightings(ledger, [pageRow('1', 'Hammer', 50, 50, { seenAt: loaded })], loaded + 20 * 60000);
-    assert.equal(ledger.get('1').seenAt, loaded);
-
-    pruneLedger(ledger, loaded + 20 * 60000);
-    assert.equal(ledger.size, 0, 'and so it expires');
-});
-
-test('a bazaar sighting remembers whose bazaar it was', () => {
-    const ledger = new Map();
-    recordSightings(ledger, [pageRow('1', 'Hammer', 50, 50, { source: 'bazaar', sellerId: '42' })], 5);
-
-    const [row] = ledgerRows(ledger);
-    assert.equal(row.source, 'bazaar');
-    assert.equal(row.sellerId, '42');
-});
-
-test('an entry with no valid time is dropped, not kept forever', () => {
-    const ledger = new Map([['1', { itemId: '1', seenAt: undefined, realizableProfit: 1 }]]);
-    pruneLedger(ledger, 1000);
-    assert.equal(ledger.size, 0);
-
-    const stored = makeLedgerCacheEntry(new Map([['1', { itemId: '1', seenAt: 'x' }]]), 0);
-    assert.equal(readLedgerCacheEntry(stored, 0).size, 0);
-});
-
 /* =============================================================== controller */
 
 function memoryStore() {
@@ -689,17 +638,131 @@ test('the Item Market sweep covers every item, even with candidates queued', asy
     }
 });
 
-test('a bazaar sighting never overwrites the Item Market entry for the same item', () => {
-    const ledger = new Map();
+test('the item list comes from v2, where "Sell: N/A" is null', async () => {
+    const asked = [];
+    const client = {
+        get: async (path, params) => {
+            asked.push(path);
+            return {
+                items: [
+                    { id: 18, name: 'Beretta M9', type: 'Primary', value: { vendor: { name: "Big Al's Gun Shop" }, buy_price: 5600, sell_price: 3800, market_price: 3542 } },
+                    { id: 900, name: 'Companion Script : Ubay', type: 'Special', value: { vendor: null, buy_price: null, sell_price: null, market_price: 10088888 } },
+                ],
+                _metadata: { links: { next: null } },
+            };
+        },
+    };
 
-    recordSightings(ledger, [pageRow('206', 'Xanax', 800000, 30000, { source: 'itemmarket', seenAt: 1 })], 1);
+    const raw = await fetchItems(client);
+    assert.deepEqual(asked, ['v2/torn/items']);
 
-    // Now on seller 42's bazaar: Xanax there is not a deal.
-    recordSightings(ledger, [], 2, new Set([ledgerKey({ itemId: '206', source: 'bazaar', sellerId: '42' })]));
-    assert.equal(ledger.get('206').listingPrice, 800000, 'Item Market entry untouched');
+    const idx = buildItemIndex(raw);
+    assert.equal(idx.byId.get('18').sellPrice, 3800);
+    assert.equal(idx.byId.get('18').marketValue, 3542);
+    assert.equal(idx.byId.get('900').sellPrice, 0, 'N/A -> no NPC price');
+});
 
-    // And a good Xanax in that bazaar is its own entry.
-    recordSightings(ledger, [pageRow('206', 'Xanax', 790000, 40000, { source: 'bazaar', sellerId: '42', seenAt: 3 })], 3);
-    assert.equal(ledger.size, 2);
-    assert.deepEqual(ledgerRows(ledger).map((r) => r.source).sort(), ['bazaar', 'itemmarket']);
+test('if v2 fails for a non-key reason, v1 is used instead', async () => {
+    const client = {
+        get: async (path) => {
+            if (path === 'v2/torn/items') throw Object.assign(new Error('shape'), { code: 23 });
+            return { items: { 18: { name: 'Beretta M9', sell_price: 3800, market_value: 3542 } } };
+        },
+    };
+    const raw = await fetchItems(client);
+    assert.equal(raw['18'].sell_price, 3800);
+});
+
+test('a dead key is not retried against v1', async () => {
+    let calls = 0;
+    const client = {
+        get: async () => {
+            calls += 1;
+            throw Object.assign(new Error('Incorrect key'), { code: 2 });
+        },
+    };
+    await assert.rejects(() => fetchItems(client));
+    assert.equal(calls, 1);
+});
+
+test('a page listing is removed once fresher data proves it sold', () => {
+    const feed = emptyFeed();
+    const loaded = 1_000_000;
+
+    // Item Market: the page showed Beretta at $3,600 when it loaded.
+    const imRow = { itemId: '18', source: 'itemmarket', seenAt: loaded, listingPrice: 3600 };
+
+    setItemMarketSnapshot(feed, '18', { rows: [{ price: 3600, qty: 1 }], fetchedAt: loaded - 5000, dataAt: loaded - 5000 });
+    assert.equal(pageRowContradicted(feed, imRow), false, 'older data proves nothing');
+
+    setItemMarketSnapshot(feed, '18', { rows: [{ price: 3600, qty: 1 }], fetchedAt: loaded + 30000, dataAt: loaded + 30000 });
+    assert.equal(pageRowContradicted(feed, imRow), false, 'still listed');
+
+    setItemMarketSnapshot(feed, '18', { rows: [{ price: 3900, qty: 2 }], fetchedAt: loaded + 60000, dataAt: loaded + 60000 });
+    assert.equal(pageRowContradicted(feed, imRow), true, 'cheapest is now $3,900: it sold');
+
+    // Bazaar: seller 42 re-checked by TornW3B after the page loaded, now dearer.
+    const bzRow = { itemId: '18', source: 'bazaar', sellerId: '42', seenAt: loaded, listingPrice: 3600 };
+    setBazaarSnapshot(feed, '18', [{ sellerId: '99', price: 3500, qty: 1, dataAt: loaded + 1000 }], loaded + 1000);
+    assert.equal(pageRowContradicted(feed, bzRow), false, 'seller not tracked: proves nothing');
+
+    setBazaarSnapshot(feed, '18', [{ sellerId: '42', price: 4000, qty: 1, dataAt: loaded + 1000 }], loaded + 1000);
+    assert.equal(pageRowContradicted(feed, bzRow), true);
+});
+
+test('Scan in any tab makes the leader rebuild everything at once', async () => {
+    const store = memoryStore();
+    let t = 1_000_000;
+    const fetchImpl = w3bServer();
+    const feed = makeFeed({ store, w3bFetch: fetchImpl, now: () => t });
+
+    await feed.tick();
+    t += 3000;
+    await feed.tick();
+    const firstPass = fetchImpl.calls.length;
+    assert.ok(firstPass >= 2);
+
+    // 10s later nothing is due yet...
+    t += 10000;
+    await feed.tick();
+    assert.equal(fetchImpl.calls.length, firstPass);
+
+    // ...until Scan (from another tab object sharing the store).
+    const other = makeFeed({ store, tabId: 'B', w3bFetch: w3bServer(), now: () => t });
+    other.requestRefresh();
+    assert.equal(store.load(FEED_STORE_KEY), null, 'feed cleared at once');
+    assert.ok(store.load(FEED_REFRESH_KEY) > 0);
+
+    t += 3000;
+    await feed.tick();
+    assert.ok(fetchImpl.calls.length >= firstPass + 2, 'summary and listings fetched again');
+});
+
+test('items with a live Item Market row are re-checked on every refresh', async () => {
+    const store = memoryStore();
+    let t = 1_000_000;
+    const asked = [];
+
+    const feed = makeFeed({
+        store,
+        now: () => t,
+        settings: { useW3b: false },
+        tornGet: async (path) => {
+            const id = path.split('/')[2];
+            asked.push(id);
+            return { itemmarket: { listings: id === '1' ? [{ price: 10, amount: 1 }] : [], cache_timestamp: Math.floor(t / 1000), cache_delay: 30 } };
+        },
+    });
+    feed.sweep = ['1', 'x', 'y', 'z', 'w', 'v'];
+
+    await feed.tick();
+    for (let i = 0; i < 30; i++) {
+        t += 3000;
+        feed.tornSpent = [];
+        await feed.tick();
+    }
+
+    // ~90s of ticks: item 1 (a live opportunity) re-checked every ~30s.
+    const hits = asked.filter((id) => id === '1').length;
+    assert.ok(hits >= 3, 'item 1 re-checked ' + hits + ' times');
 });

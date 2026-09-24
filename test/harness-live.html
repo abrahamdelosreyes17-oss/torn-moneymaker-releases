@@ -31,6 +31,8 @@ const ITEMS = {
     1: { name: 'Hammer', sell_price: 100, market_value: 120 },
     206: { name: 'Xanax', sell_price: 600, market_value: 830000 },
     180: { name: 'Bottle of Beer', sell_price: 50, market_value: 55 },
+    // "Sell: N/A" in game. Listed cheap on TornW3B - must NEVER appear.
+    900: { name: 'Companion Script : Test', sell_price: null, market_value: 10088888 },
 };
 
 window.__requests = [];
@@ -38,6 +40,13 @@ function respond(url) {
     const u = new URL(url);
     if (u.hostname === 'api.torn.com') {
         const sel = u.searchParams.get('selections');
+        if (u.pathname === '/v2/torn/items') {
+            // v2 shape: an array, sell_price null where the game says "Sell: N/A".
+            return { items: Object.entries(ITEMS).map(([id, i]) => ({
+                id: +id, name: i.name, type: 'Other',
+                value: { vendor: null, buy_price: null, sell_price: i.sell_price, market_price: i.market_value },
+            })), _metadata: { links: { next: null } } };
+        }
         if (u.pathname === '/torn/' && sel === 'items') return { items: ITEMS };
         if (u.pathname === '/torn/' && sel === 'cityshops') {
             return { cityshops: { 1: { name: "Bits 'n' Bobs", inventory: { 1: { price: 90 } } } } };
@@ -55,6 +64,7 @@ function respond(url) {
             return { items: [
                 { item_id: 1, item_name: 'Hammer', lowest_price: 50, market_price: 120, total_bazaars: 3 },
                 { item_id: 206, item_name: 'Xanax', lowest_price: 840000, market_price: 830000 },
+                { item_id: 900, item_name: 'Companion Script : Test', lowest_price: 5, market_price: 10088888 },
             ] };
         }
         if (u.pathname === '/api/marketplace/1') {
@@ -64,6 +74,9 @@ function respond(url) {
                 { player_id: null, price: 10, quantity: 99, last_checked: NOW_S },
                 { player_id: 555, player_name: 'OldNews', price: 40, quantity: 9, last_checked: NOW_S - 3600 },
             ] };
+        }
+        if (u.pathname === '/api/marketplace/900') {
+            return { total_listings: 1, listings: [{ player_id: 1, player_name: 'X', price: 5, quantity: 3, last_checked: NOW_S }] };
         }
         return { total_listings: 0, listings: [] };
     }
@@ -97,6 +110,7 @@ setTimeout(() => {
     keyInputValue: (document.querySelector('.ttv2-settings input') || {}).value,
     requests: window.__requests.map(u => u.replace(KEY, '<KEY>')),
     keyEverSentToW3b: w3b.some(u => u.includes(KEY)),
+    naItemShown: document.body.innerText.includes('Companion Script'),
   }, null, 1);
   window.__done = true;
 }, 12000);

@@ -37,47 +37,55 @@ wider key can read your mail, money and inventory.
 
 ## Use
 
+**What it is for:** finding items players are selling cheaply - in bazaars or on
+the Item Market - **below what an NPC shop pays** for them (the item's *Sell*
+price), so you can buy and sell to the NPC for a guaranteed, untaxed profit. An
+item whose Sell is *N/A* is never shown: no NPC buys it. The item's *Value* (the
+average Item Market price) is a different number and is never used as an NPC price.
+
 The panel has two lists, **Bazaars** and **Item Market**, never mixed. It shows the
 one matching the page you are on (switching as you move between them), and the one
-you last picked anywhere else.
+you last picked anywhere else. It works from any Torn page: the Item Market is
+watched through the Torn API, bazaars through TornW3B (*Settings → Watch bazaars
+too*, on by default). Each row says where the listing is (`Bazaar - SellerName` or
+`Item Market`), where the data came from, and how old it is; its button opens the
+seller's bazaar - with the listing highlighted - or the item's market page, or
+scrolls to it when it is on the page you are viewing. Nothing is ever bought for you.
 
-- **On a Bazaar or the Item Market**, profitable listings on the page get a green
-  highlight and a profit label, and the panel ranks them; `>` scrolls to one.
-- **Anywhere in Torn**, the live feed (on by default) watches the Item Market
-  through the Torn API, and bazaars through TornW3B's feed (*Settings → Watch
-  bazaars too*) - on by default, untick it to stop. Each row says where it is (`Bazaar - SellerName` or
-  `Item Market`), where the data came from, and **how old that data is**; `>`
-  opens the seller's bazaar - with the listing highlighted - or the item's market
-  page. Nothing is ever bought for you.
+### Only live listings
 
-Every row carries the age of the data behind it, and fades once that passes a
-minute. A feed row is only as fresh as its source: TornW3B re-checks a bazaar every
-30 s-5 min, and Torn caches the Item Market for 30 s. The feed therefore drops what
-it cannot vouch for rather than showing it:
+- **The list refreshes itself every 30 seconds**, and **Scan** refreshes it at once:
+  it throws everything away and rebuilds from fresh data.
+- **Nothing is greyed out.** A listing the latest refresh does not confirm is
+  removed:
+  - a new fetch for an item **replaces** everything known about it, so a sold
+    listing disappears on the next refresh;
+  - bazaar listings TornW3B has not checked in the last 2 minutes are not shown;
+  - Item Market items with a live opportunity are re-checked every 30 s; one that
+    misses two refreshes is removed;
+  - **the page you are viewing and the feed correct each other**: a feed row the
+    page contradicts is removed, and a listing on the page that a later re-check
+    shows has sold is removed (and loses its highlight) - Torn's page does not
+    update itself, and this script may not reload it.
+- **Two limits no script can get past:** TornW3B serves each answer for 60 s and
+  checks each bazaar every 30 s-5 min; Torn refreshes the Item Market every 30 s.
+  Every row shows its real age rather than pretending to be newer.
 
-- a new fetch for an item **replaces** everything known about it, so a sold listing
-  disappears on the next refresh instead of lingering;
-- bazaar rows TornW3B has not re-checked in 5 minutes are dropped, and any feed data
-  not refreshed within 5-10 minutes expires;
-- an item whose cheapest bazaar price stops being a deal loses its rows at once;
-- **the page you are viewing overrules the feed**: open a bazaar or the market and
-  any feed row the page contradicts (a higher price is showing) is removed;
-- a row you opened is dimmed and re-verified first, and lights up again only if
-  the source re-confirms it.
+**Filters** button - *Where would you sell it?*
 
-**Resale exit.** "Market value" is priced as a resale in **your own bazaar** by
-default, which is untaxed, so a listing 1% under market value shows as a 1% margin.
-Untick *Filters → resell in my bazaar* to price it as an Item Market sale instead,
-where the 5% tax makes that same listing a loss. Each row says which exit it assumed.
-Market value is refreshed hourly (it was cached for a week).
+- **Sell to an NPC shop** (on): listings under the item's Sell price.
+- *Trading (resell to players)*, off by default - groundwork for real trading:
+  - **Resell in my bazaar at the average value**: listings under the Value, relisted
+    in your own bazaar, untaxed.
+  - **Resell on the Item Market at the average value**: the same, after the 5% tax.
 
-**Filters** button: minimum total profit, cash on hand, and whether to show items
-with no verified NPC buyer. It also reveals scan diagnostics — which row selector
-matched, how many rows each candidate parsed, and why rows were skipped. When the
-script finds nothing, the panel says *why* in the empty-state message; the
-diagnostics are the detail behind it.
+Plus minimum total profit and cash on hand. The Filters view also shows scan
+diagnostics for the page you are on; when nothing is found, the empty-state message
+says why.
 
-**Settings** button: API key, auto-scan, row-selector overrides, and cache controls.
+**Settings** button: API key, the Torn API key-use disclosure, the live feed and
+TornW3B switches, and cache controls. Item data (Sell price, Value) is refreshed
+hourly.
 
 ---
 
@@ -91,8 +99,8 @@ src/
     npc.js       NPC-sellable allowlist, NPC exit price
     profit.js    net = exit * (1 - fee) - listing ; fees per venue
     ranker.js    filter + sort by realizable profit
-    ledger.js    what pages you visited showed, stamped with when they showed it
-    feed.js      live feed: candidates, snapshots, expiry, page reconciliation
+    feed.js      live feed: exits, candidates, snapshots, expiry, and the
+                 two-way correction between the page and the feed
     leader.js    which tab runs the feed (one, visible)
   feed/
     controller.js  polls within budget in the leader tab; storage is the truth

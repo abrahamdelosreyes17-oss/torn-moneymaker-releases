@@ -1,3 +1,9 @@
+import {
+    KEY_DEAD_CODES,
+    TORN_ERROR_RATE_LIMIT,
+    TORN_ERROR_IP_BLOCK,
+} from './client.js';
+
 /*
  * Thin wrappers over the Torn endpoints this tool uses. Every one of these
  * works with a Public access key - that is the point.
@@ -13,8 +19,30 @@ export const ACCESS_LEVEL_NAMES = {
     4: 'Full',
 };
 
-/** The full item database. Public key. */
+/**
+ * The full item database. Public key.
+ *
+ * Read from v2 (`/v2/torn/items`), where an item no NPC will buy has
+ * `value.sell_price: null` - the game's "Sell: N/A". That null is the whole
+ * point: an item without an NPC sell price must never be priced as if an NPC
+ * would pay for it. v1 (`torn?selections=items`) is the fallback if v2 fails.
+ *
+ * Returned in the v1 shape ({ "<id>": { name, sell_price, market_value } })
+ * so buildItemIndex has one input format.
+ */
 export async function fetchItems(client) {
+    try {
+        return await fetchItemsV2(client);
+    } catch (error) {
+        // A dead key, a rate limit or an IP block fails v1 the same way; do
+        // not ask twice. Anything else (a v2 shape change, an unknown
+        // selection) falls back.
+        const code = error && Number(error.code);
+        if (KEY_DEAD_CODES.has(code) || code === TORN_ERROR_RATE_LIMIT || code === TORN_ERROR_IP_BLOCK) {
+            throw error;
+        }
+    }
+
     const data = await client.get('torn', { selections: 'items' });
 
     if (!data || !data.items) {
@@ -22,6 +50,48 @@ export async function fetchItems(client) {
     }
 
     return data.items;
+}
+
+/** v2 item list -> v1-shaped map. Follows `_metadata.links.next` if paged. */
+export async function fetchItemsV2(client) {
+    const out = {};
+    let params = { sort: 'ASC' };
+
+    for (let page = 0; page < 20; page += 1) {
+        const data = await client.get('v2/torn/items', params);
+
+        if (!data || !Array.isArray(data.items)) {
+            throw new Error('Torn API v2 returned no item list.');
+        }
+
+        for (const item of data.items) {
+            if (!item || !Number.isFinite(Number(item.id))) continue;
+            const value = item.value || {};
+
+            out[String(item.id)] = {
+                name: item.name,
+                type: item.type || null,
+                // null = "N/A": no NPC buys it.
+                sell_price: value.sell_price ?? null,
+                buy_price: value.buy_price ?? null,
+                market_value: value.market_price ?? 0,
+                circulation: item.circulation ?? 0,
+            };
+        }
+
+        const next = data._metadata && data._metadata.links && data._metadata.links.next;
+        if (!next) break;
+
+        const nextUrl = new URL(next);
+        params = Object.fromEntries(nextUrl.searchParams);
+        delete params.key;
+    }
+
+    if (Object.keys(out).length === 0) {
+        throw new Error('Torn API v2 returned an empty item list.');
+    }
+
+    return out;
 }
 
 /**

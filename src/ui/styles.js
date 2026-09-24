@@ -305,10 +305,6 @@ export const STYLE_CSS = `
     border-color: #3f6b48;
 }
 
-.ttv2-row.ttv2-stale {
-    opacity: 0.5;
-}
-
 .ttv2-rank {
     color: #888;
     font-weight: bold;
@@ -390,13 +386,14 @@ export const STYLE_CSS = `
     text-overflow: ellipsis;
 }
 
-.ttv2-row.ttv2-stale .ttv2-age {
-    color: #ffd24a;
-}
-
-/* Already followed: dimmed until the source re-confirms the listing. */
-.ttv2-row.ttv2-opened .ttv2-row-name {
+/* A heading inside the Filters view. */
+.ttv2-group {
+    flex: 1 1 100%;
+    margin-top: 4px;
     color: #999;
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
 }
 
 .ttv2-live {

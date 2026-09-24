@@ -27,6 +27,8 @@ import {
     bazaarDue,
     itemMarketDue,
     itemMarketSweepList,
+    itemMarketLiveIds,
+    REFRESH_MS,
     makeFeedCacheEntry,
     readFeedCacheEntry,
 } from '../core/feed.js';
@@ -34,8 +36,8 @@ import { decideLeader } from '../core/leader.js';
 import { fetchW3bSummary, fetchW3bListings } from '../api/w3b.js';
 import { fetchItemMarket } from '../api/torn.js';
 
-/** TornW3B's summary is cached 60s at source. */
-export const SUMMARY_INTERVAL_MS = 60 * 1000;
+/** TornW3B's one-call summary: re-read on every 30s refresh. */
+export const SUMMARY_INTERVAL_MS = REFRESH_MS;
 
 /**
  * Torn API requests the feed may spend per minute. Torn allows 100/min per
@@ -54,6 +56,9 @@ export const CANDIDATE_MARKET_CHECKS = 5;
 export const FEED_STORE_KEY = 'feed';
 export const FEED_LEADER_KEY = 'feedLeader';
 export const FEED_RECHECK_KEY = 'feedRecheck';
+
+/** Set by Scan in any tab: the leader rebuilds everything at once. */
+export const FEED_REFRESH_KEY = 'feedRefreshAt';
 
 export class LiveFeed {
     /**
@@ -85,6 +90,17 @@ export class LiveFeed {
         this.tornSpent = [];
         this.lastError = null;
         this.lastCycleAt = null;
+        this.lastRefreshSeen = 0;
+    }
+
+    /**
+     * Scan: throw away everything and rebuild from fresh data now. Works from
+     * any tab - the flag is shared, and whichever tab leads acts on it.
+     */
+    requestRefresh() {
+        this.d.save(FEED_STORE_KEY, null);
+        this.d.save(FEED_REFRESH_KEY, this.now());
+        if (this.d.onChange) this.d.onChange();
     }
 
     /* ------------------------------------------------------ storage */
@@ -125,6 +141,7 @@ export class LiveFeed {
             itemMarket: Boolean(s.liveFeed && this.d.hasUsableKey()),
             leading: this.leading,
             candidates: this.candidates.length,
+            nextRefreshAt: this.lastSummaryAt ? this.lastSummaryAt + SUMMARY_INTERVAL_MS : null,
             lastCycleAt: this.lastCycleAt,
             lastError: this.lastError,
         };
@@ -177,6 +194,12 @@ export class LiveFeed {
         const index = this.d.getIndex();
 
         this.mutate((feed) => expireFeed(feed, this.now()));
+
+        const refreshAt = Number(this.d.load(FEED_REFRESH_KEY)) || 0;
+        if (refreshAt > this.lastRefreshSeen) {
+            this.lastRefreshSeen = refreshAt;
+            this.lastSummaryAt = 0;
+        }
 
         const rechecks = this.takeRechecks();
 
@@ -274,11 +297,21 @@ export class LiveFeed {
             if (!priority.includes(id) && itemMarketDue(feedNow, id, now)) priority.push(id);
         };
 
+        /*
+         * Items with a live Item Market opportunity are re-checked on every
+         * refresh: that is what keeps a sold listing from staying on screen.
+         */
         for (const id of rechecks) add(id);
+        for (const id of itemMarketLiveIds(feedNow)) add(id);
         for (const c of this.candidates.slice(0, CANDIDATE_MARKET_CHECKS)) add(c.itemId);
 
-        // One slot per cycle always belongs to the sweep.
-        const order = priority.slice(0, MAX_TORN_FETCHES_PER_CYCLE - 1);
+        /*
+         * Every other cycle, one slot belongs to the sweep, so discovery never
+         * stops; the rest go to keeping live rows live.
+         */
+        this.cycleCount = (this.cycleCount || 0) + 1;
+        const reserve = this.cycleCount % 2 === 0 ? 1 : 0;
+        const order = priority.slice(0, MAX_TORN_FETCHES_PER_CYCLE - reserve);
         const sweepSlots = MAX_TORN_FETCHES_PER_CYCLE - order.length;
 
         /*

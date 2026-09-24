@@ -594,13 +594,6 @@ export class Panel {
             });
         });
 
-        this.unverifiedInput = el('input', { type: 'checkbox' });
-        this.unverifiedInput.addEventListener('change', () => {
-            this.emitSettings({
-                includeUnverifiedNpc: this.unverifiedInput.checked,
-            });
-        });
-
         this.filtersEl.appendChild(
             el('div', { class: 'ttv2-field' }, [
                 el('label', { text: 'Min total profit' }),
@@ -615,104 +608,62 @@ export class Panel {
             ]),
         );
 
-        this.compareNpcInput = el('input', { type: 'checkbox' });
-        this.compareNpcInput.addEventListener('change', () =>
-            this.emitSettings({ compareNpc: this.compareNpcInput.checked }),
-        );
-
-        this.compareMarketInput = el('input', { type: 'checkbox' });
-        this.compareMarketInput.addEventListener('change', () =>
-            this.emitSettings({
-                compareMarket: this.compareMarketInput.checked,
-            }),
-        );
-
-        this.resaleInput = el('input', { type: 'checkbox' });
-        this.resaleInput.addEventListener('change', () =>
-            this.emitSettings({ resaleInBazaar: this.resaleInput.checked }),
-        );
-
-        this.npcShopsOnlyInput = el('input', { type: 'checkbox' });
-        this.npcShopsOnlyInput.addEventListener('change', () =>
-            this.emitSettings({
-                npcShopsOnly: this.npcShopsOnlyInput.checked,
-            }),
-        );
-
         const mkCheck = (input, text, title) => {
             const label = el('label', { class: 'ttv2-check', title }, [input]);
             label.appendChild(document.createTextNode(' ' + text));
             return label;
         };
 
-        this.showAllSeenInput = el('input', { type: 'checkbox' });
-        this.showAllSeenInput.addEventListener('change', () =>
-            this.emitSettings({ showAllSeen: this.showAllSeenInput.checked }),
+        const mkToggle = (key) => {
+            const input = el('input', { type: 'checkbox' });
+            input.addEventListener('change', () =>
+                this.emitSettings({ [key]: input.checked }),
+            );
+            return input;
+        };
+
+        /*
+         * Where would you sell what you buy? One question, in plain words.
+         * Selling to an NPC is what this tool is for; the resale options are
+         * the start of real trading and are off unless chosen.
+         */
+        this.sellToNpcInput = mkToggle('sellToNpc');
+        this.resaleBazaarInput = mkToggle('resaleBazaar');
+        this.resaleMarketInput = mkToggle('resaleMarket');
+
+        this.filtersEl.appendChild(
+            el('div', { class: 'ttv2-group', text: 'Where would you sell it?' }),
+        );
+        this.filtersEl.appendChild(
+            mkCheck(
+                this.sellToNpcInput,
+                'Sell to an NPC shop',
+                "Listings cheaper than what an NPC shop pays (the item's " +
+                    '"Sell" price). Guaranteed and untaxed. Items whose Sell ' +
+                    'is N/A never appear.',
+            ),
         );
 
         this.filtersEl.appendChild(
-            mkCheck(
-                this.showAllSeenInput,
-                'Show everything seen while browsing',
-                'Keeps results from every category you visit, not just the ' +
-                    'page you are on. Entries expire 10 minutes after the page ' +
-                    'showed them.',
-            ),
+            el('div', { class: 'ttv2-group', text: 'Trading (resell to players)' }),
         );
-
-        this.filtersEl.appendChild(
-            el('button', {
-                type: 'button',
-                text: 'Clear list',
-                onclick: () =>
-                    this.handlers.onClearList && this.handlers.onClearList(),
-            }),
-        );
-
         this.filtersEl.appendChild(
             mkCheck(
-                this.compareNpcInput,
-                'Compare vs NPC price',
-                'What a shop will pay you. A hard floor, no fee.',
+                this.resaleBazaarInput,
+                'Resell in my bazaar at the average value',
+                'Listings cheaper than the average value (the item\'s ' +
+                    '"Value"), if you relist them in your own bazaar - no ' +
+                    'tax. Not guaranteed: someone has to buy.',
             ),
         );
         this.filtersEl.appendChild(
             mkCheck(
-                this.npcShopsOnlyInput,
-                '  ↳ only items a shop stocks',
-                'Rarely useful. Confirmed live that an NPC buys items no ' +
-                    'shop stocks (Bottle of Champagne, $3,100), so this ' +
-                    'mostly just hides real opportunities.',
+                this.resaleMarketInput,
+                'Resell on the Item Market at the average value',
+                'Same, but sold on the Item Market, which takes 5% - so a ' +
+                    'listing has to be more than 5% under the average value.',
             ),
         );
-        this.filtersEl.appendChild(
-            mkCheck(
-                this.compareMarketInput,
-                'Compare vs market value',
-                "Torn's rolling average. More hits, softer signal than the " +
-                    'NPC price.',
-            ),
-        );
-        this.filtersEl.appendChild(
-            mkCheck(
-                this.resaleInput,
-                '  ↳ resell in my bazaar (no 5% tax)',
-                'On: anything under market value counts, as you would relist ' +
-                    'it in your own bazaar, which is untaxed. Off: priced as ' +
-                    'an Item Market sale, so the 5% tax is taken first - a ' +
-                    'listing 1% under market value is then a loss.',
-            ),
-        );
-
-        const check = el('label', { class: 'ttv2-check' }, [
-            this.unverifiedInput,
-        ]);
-        check.appendChild(
-            document.createTextNode(
-                ' Show items with no confirmed city-shop buyer',
-            ),
-        );
-        this.filtersEl.appendChild(check);
     }
 
     emitSettings(partial) {
@@ -803,23 +754,12 @@ export class Panel {
                     ? ''
                     : String(settings.cashOnHand);
         }
-        if (this.unverifiedInput && settings.includeUnverifiedNpc !== undefined) {
-            this.unverifiedInput.checked = Boolean(settings.includeUnverifiedNpc);
-        }
-        if (this.showAllSeenInput && settings.showAllSeen !== undefined) {
-            this.showAllSeenInput.checked = Boolean(settings.showAllSeen);
-        }
-        if (this.compareNpcInput && settings.compareNpc !== undefined) {
-            this.compareNpcInput.checked = Boolean(settings.compareNpc);
-        }
-        if (this.compareMarketInput && settings.compareMarket !== undefined) {
-            this.compareMarketInput.checked = Boolean(settings.compareMarket);
-        }
-        if (this.resaleInput && settings.resaleInBazaar !== undefined) {
-            this.resaleInput.checked = Boolean(settings.resaleInBazaar);
-        }
-        if (this.npcShopsOnlyInput && settings.npcShopsOnly !== undefined) {
-            this.npcShopsOnlyInput.checked = Boolean(settings.npcShopsOnly);
+        for (const [key, input] of [
+            ['sellToNpc', this.sellToNpcInput],
+            ['resaleBazaar', this.resaleBazaarInput],
+            ['resaleMarket', this.resaleMarketInput],
+        ]) {
+            if (input && settings[key] !== undefined) input.checked = Boolean(settings[key]);
         }
         if (this.liveFeedInput && settings.liveFeed !== undefined) {
             this.liveFeedInput.checked = Boolean(settings.liveFeed);
@@ -890,8 +830,9 @@ export class Panel {
         if (live.leading) {
             bits.push(live.itemMarket ? 'Item Market' : 'no key');
             bits.push(live.w3b ? 'bazaars (' + live.candidates + ' leads)' : 'bazaars off');
-            if (live.lastCycleAt) {
-                bits.push('updated ' + formatAge(Date.now() - live.lastCycleAt));
+            if (live.nextRefreshAt) {
+                const secs = Math.max(0, Math.ceil((live.nextRefreshAt - Date.now()) / 1000));
+                bits.push('refresh in ' + secs + 's');
             }
         }
 
@@ -1025,8 +966,8 @@ export class Panel {
                         : ''),
             );
         }
-        if (p.venue === 'BAZAAR_RESALE') bits.push('resell in your bazaar');
-        if (p.venue === 'ITEM_MARKET') bits.push('after 5% market tax');
+        if (p.venue === 'BAZAAR_RESALE') bits.push('resell in your bazaar, no tax');
+        if (p.venue === 'ITEM_MARKET') bits.push('resell on the Item Market, after 5% tax');
         if (p.venue === 'NPC' && row.npcShop && row.npcShop.shopName) {
             bits.push('NPC shop: ' + row.npcShop.shopName);
         } else if (p.venue === 'NPC') {
@@ -1098,7 +1039,6 @@ export class Panel {
 
         const rowEl = el('div', { class: 'ttv2-row' }, [rankEl, main, profit, go]);
         rowEl.dataset.ttv2At = String(this.rowTime(row) || '');
-        if (row.opened) rowEl.classList.add('ttv2-opened');
         if (row.el) rowEl.classList.add('ttv2-onpage');
 
         return rowEl;
@@ -1139,18 +1079,6 @@ export class Panel {
         if (row.fromFeed && row.dataAgeKnown === false) {
             age.title = 'TornW3B did not say when it last checked this.';
         }
-        if (row.opened) {
-            line.appendChild(
-                el('span', {
-                    class: 'ttv2-guess',
-                    title:
-                        'You opened this already. It lights up again if the ' +
-                        'listing is re-confirmed.',
-                    text: '  |  opened',
-                }),
-            );
-        }
-
         return line;
     }
 
@@ -1191,8 +1119,9 @@ export class Panel {
             const ageEl = rowEl.querySelector('.ttv2-age');
             const known = Number.isFinite(at) && at > 0;
 
+            // Just the age. Nothing is greyed out: a listing the latest
+            // refresh did not confirm is removed, not faded.
             if (ageEl) ageEl.textContent = known ? formatAge(now - at) : 'age unknown';
-            rowEl.classList.toggle('ttv2-stale', known && now - at > PANEL_STALE_MS);
         }
 
         this.renderLive();

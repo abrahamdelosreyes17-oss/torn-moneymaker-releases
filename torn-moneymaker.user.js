@@ -198,7 +198,7 @@
      */
 
     /** Bump to invalidate every cached item database in the wild. */
-    const ITEMS_CACHE_VERSION = 'items-v2.1';
+    const ITEMS_CACHE_VERSION = 'items-v3';
 
     /**
      * One hour. sell_price barely moves, but market_value moves every day, and
@@ -234,6 +234,7 @@
                 name: item.name,
                 type: item.type || null,
                 buyPrice: Number(item.buy_price) || 0,
+                // 0 when there is no NPC sell price ("Sell: N/A" in game).
                 sellPrice: Number(item.sell_price) || 0,
                 marketValue: Number(item.market_value) || 0,
                 circulation: Number(item.circulation) || 0,
@@ -513,8 +514,8 @@
      */
     const VENUE_LABELS = {
         NPC: 'NPC',
-        ITEM_MARKET: 'Market value (est.)',
-        BAZAAR_RESALE: 'Market value (est.)',
+        ITEM_MARKET: 'Avg value',
+        BAZAAR_RESALE: 'Avg value',
         ITEM_MARKET_ANON: 'Market (anon)',
         AUCTION_HOUSE: 'Auction',
     };
@@ -775,20 +776,38 @@
 
     const FEED_CACHE_VERSION = 'feed-v1';
 
-    /** A bazaar row TornW3B has not re-checked in this long is not shown. */
-    const BAZAAR_MAX_DATA_AGE_MS = 5 * 60 * 1000;
+    /*
+     * Only what the latest refresh confirmed is shown. Nothing is greyed out:
+     * a row that is not re-confirmed in time is removed.
+     */
 
-    /** Hard cap on a bazaar snapshot, whatever its rows claim. */
-    const BAZAAR_SNAPSHOT_TTL_MS = 10 * 60 * 1000;
+    /** The list is rebuilt from fresh data this often. */
+    const REFRESH_MS = 30 * 1000;
 
-    /** Item Market snapshots are 30s-cached at source; 5 min unrefreshed is dead. */
-    const ITEM_MARKET_SNAPSHOT_TTL_MS = 5 * 60 * 1000;
+    /** A bazaar row TornW3B has not checked within this long is not shown. */
+    const BAZAAR_MAX_DATA_AGE_MS = 2 * 60 * 1000;
 
-    /** Re-ask TornW3B about a candidate no sooner than its own 60s cache. */
+    /**
+     * Re-ask TornW3B about an item this often. Its server caches each answer for
+     * 60s, so asking every 30s would return the same body half the time.
+     */
     const BAZAAR_REFRESH_MS = 60 * 1000;
 
-    /** Most candidates followed up per summary, cheapest-to-check first. */
-    const MAX_CANDIDATES = 30;
+    /** A bazaar snapshot not refreshed in time is dropped, rows and all. */
+    const BAZAAR_SNAPSHOT_TTL_MS = BAZAAR_REFRESH_MS + REFRESH_MS;
+
+    /**
+     * Item Market: Torn refreshes it every 30s, and items with a live
+     * opportunity are re-checked each time. One missed refresh is tolerated;
+     * two is removal.
+     */
+    const ITEM_MARKET_SNAPSHOT_TTL_MS = 2 * REFRESH_MS + 15 * 1000;
+
+    /**
+     * Most candidates followed up per summary. 25 per minute plus two summaries
+     * stays inside the 60/min this tool allows itself on TornW3B.
+     */
+    const MAX_CANDIDATES = 25;
 
     const SOURCE_BAZAAR = 'bazaar';
     const SOURCE_ITEM_MARKET = 'itemmarket';
@@ -798,34 +817,35 @@
     }
 
     /**
-     * The exits an item can be sold into, under the current settings.
-     * Shared with the page scanner so both price listings identically.
+     * Where you could sell an item, under the current settings. Shared with the
+     * page scanner so both price listings identically.
+     *
+     *   NPC            - "Sell to NPC": the item's Sell price, no tax. The main
+     *                    job of this tool. Only when the item HAS a Sell price;
+     *                    "Sell: N/A" in game (no sell_price) means no NPC buys it.
+     *   BAZAAR_RESALE  - trading: relist in your own bazaar at the average value
+     *                    (Torn's "Value"), no tax.
+     *   ITEM_MARKET    - trading: sell on the Item Market at the average value,
+     *                    minus the 5% tax.
+     *
+     * The average value is what an item tends to trade for, never an NPC price.
      *
      * @param {object} item - record from buildItemIndex
-     * @param {object} settings - compareNpc, compareMarket, npcShopsOnly
-     * @param {object|null} npcShop - from npcShopFor
+     * @param {object} settings - sellToNpc, resaleBazaar, resaleMarket
      */
-    function exitsFor(item, settings = {}, npcShop = null) {
+    function exitsFor(item, settings = {}) {
         const exits = {};
         if (!item) return exits;
 
-        if (settings.compareNpc !== false) {
+        if (settings.sellToNpc !== false) {
             const sell = Number(item.sellPrice);
-            const shopKnown = !settings.npcShopsOnly || npcShop !== null;
-            if (Number.isFinite(sell) && sell > 0 && shopKnown) exits.NPC = sell;
+            if (Number.isFinite(sell) && sell > 0) exits.NPC = sell;
         }
 
-        if (settings.compareMarket !== false) {
-            const mv = Number(item.marketValue);
-            /*
-             * Where you would resell decides the fee. Your own bazaar charges
-             * none, so anything under market value is a margin there; the Item
-             * Market takes 5%, which wipes out a listing 1% under. Default is the
-             * bazaar - that is how "below market value" is normally read, and the
-             * row says which exit it assumed.
-             */
-            const venue = settings.resaleInBazaar === false ? 'ITEM_MARKET' : 'BAZAAR_RESALE';
-            if (Number.isFinite(mv) && mv > 0) exits[venue] = mv;
+        const value = Number(item.marketValue);
+        if (Number.isFinite(value) && value > 0) {
+            if (settings.resaleBazaar) exits.BAZAAR_RESALE = value;
+            if (settings.resaleMarket) exits.ITEM_MARKET = value;
         }
 
         return exits;
@@ -994,6 +1014,13 @@
         return cheapest !== candidate.lowestPrice;
     }
 
+    /** Items that currently have an Item Market opportunity: re-check first. */
+    function itemMarketLiveIds(feed) {
+        const ids = [];
+        for (const [id, snap] of feed.itemmarket) if (snap.rows.length) ids.push(id);
+        return ids;
+    }
+
     /** Item Market: never before Torn's global cache can have changed. */
     function itemMarketDue(feed, itemId, now = Date.now()) {
         const snap = feed.itemmarket.get(String(itemId));
@@ -1063,6 +1090,45 @@
         return removed;
     }
 
+    /**
+     * Has fresher data proved that a listing on the page you are viewing is gone?
+     *
+     * Torn's page does not update itself, and this script may not reload it -
+     * so a listing can sell while it is still on screen. The feed re-checks it:
+     *
+     * - Item Market: if a snapshot taken AFTER the page showed the row has
+     *   nothing at or below that price, it sold.
+     * - Bazaar: if TornW3B checked that seller AFTER the page showed the row and
+     *   has them at a higher price, it was bought or repriced. A seller missing
+     *   from TornW3B's data proves nothing - it may simply not track them.
+     *
+     * @param {object} feed
+     * @param {object} row - a page row: itemId, source, sellerId, seenAt, listingPrice
+     */
+    function pageRowContradicted(feed, row) {
+        const id = String(row.itemId);
+        const price = Number(row.listingPrice ?? (row.profit && row.profit.listingPrice));
+        const seenAt = Number(row.seenAt) || 0;
+
+        if (row.source === SOURCE_ITEM_MARKET) {
+            const snap = feed.itemmarket.get(id);
+            if (!snap || !(snap.dataAt > seenAt)) return false;
+            return !snap.rows.some((r) => r.price <= price);
+        }
+
+        if (row.source === SOURCE_BAZAAR && row.sellerId) {
+            const snap = feed.bazaar.get(id);
+            if (!snap) return false;
+
+            const mine = snap.rows.filter(
+                (r) => r.sellerId === String(row.sellerId) && r.dataAt > seenAt,
+            );
+            return mine.length > 0 && !mine.some((r) => r.price <= price);
+        }
+
+        return false;
+    }
+
     /** Deep link to one seller's bazaar, carrying what to highlight there. */
     function bazaarUrl(sellerId, itemId, price) {
         const params = new URLSearchParams({ userId: String(sellerId) });
@@ -1091,7 +1157,7 @@
             const npcShop = shopOf(item.id);
             const profit = bestVenue({
                 listingPrice: row.price,
-                exits: exitsFor(item, settings, npcShop),
+                exits: exitsFor(item, settings),
                 qty: row.qty,
                 cashOnHand: settings.cashOnHand,
             });
@@ -1199,7 +1265,7 @@
                 venue: 'NPC',
             });
 
-            if (settings.compareNpc !== false && probe && probe.profitPerUnit > 0) {
+            if (settings.sellToNpc !== false && probe && probe.profitPerUnit > 0) {
                 out.push(item.id);
             }
         }
@@ -1365,207 +1431,6 @@
         }
 
         return { count: rows.length, totalProfit, cashRequired };
-    }
-
-    /* ===== src/core/ledger.js ===== */
-    /*
-     * What we have seen across the whole Item Market, not just this page.
-     *
-     * Pure - no DOM, no network, no storage. main.js persists it.
-     *
-     * The scanner can only read the page you are looking at; that is the rule and
-     * it is not negotiable. But nothing stops us REMEMBERING what we read. Click
-     * through the categories once and the ledger holds the whole market, built
-     * entirely from pages you loaded yourself.
-     *
-     * One entry per item, keeping the best opportunity seen for it. Entries
-     * expire, because a price from an hour ago is a rumour rather than a listing.
-     */
-
-    const LEDGER_VERSION = 'ledger-v3';
-
-    /**
-     * One entry per LISTING PLACE, not per item: the Item Market's Xanax and
-     * seller 42's Xanax are different listings. Keying by item alone let a
-     * bazaar sighting overwrite - or, as "no longer an opportunity", delete -
-     * the Item Market's entry for the same item.
-     *
-     * Item Market entries keep the bare item id as their key.
-     */
-    function ledgerKey(row) {
-        const id = String(row.itemId);
-        if (row.source === 'bazaar') return 'bazaar:' + (row.sellerId || '') + ':' + id;
-        return id;
-    }
-
-    /**
-     * After this an entry is dropped: the listing has probably gone.
-     *
-     * Ten minutes, not thirty. Torn's market turns over fast - a cheap listing is
-     * usually taken within minutes - and a remembered row that no longer exists
-     * is worse than no row at all.
-     */
-    const LEDGER_TTL_MS = 10 * 60 * 1000;
-
-    /** Keep the ledger bounded regardless of how long someone browses. */
-    const LEDGER_MAX_ENTRIES = 400;
-
-    /*
-     * `row.seenAt` is when the PAGE showed this listing - the first time this
-     * exact price was read since the page loaded - not when the DOM was last
-     * re-read. The 2.5s poll re-reads a page that is not changing; stamping each
-     * re-read "now" made a twenty-minute-old price look brand new, so nothing
-     * ever expired and sold listings stayed linked.
-     */
-    function entryFrom(row, now) {
-        const seenAt = Number.isFinite(row.seenAt) ? row.seenAt : now;
-
-        return {
-            itemId: String(row.itemId),
-            key: ledgerKey(row),
-            source: row.source || null,
-            // Bazaar sightings remember whose bazaar, so the link goes back there
-            // rather than to an Item Market page where that price never existed.
-            sellerId: row.sellerId ? String(row.sellerId) : null,
-            npcVerified: row.npcVerified !== false,
-            name: row.name,
-            listingPrice: row.profit.listingPrice,
-            exitPrice: row.profit.exitPrice,
-            venue: row.profit.venue,
-            profitPerUnit: row.profit.profitPerUnit,
-            roi: row.profit.roi,
-            qty: row.profit.qty,
-            qtyAtPrice: Boolean(row.qtyAtPrice),
-            marketTotal: row.marketTotal || null,
-            totalProfit: row.profit.totalProfit,
-            realizableProfit: row.profit.realizableProfit,
-            cashRequired: row.profit.cashRequired,
-            npcShop: row.npcShop || null,
-            seenAt,
-        };
-    }
-
-    /**
-     * Fold this page's opportunities into the ledger.
-     *
-     * The NEWEST sighting always wins, even when it is worse.
-     *
-     * Keeping the cheapest price seen was wrong, and badly so: when an item rose
-     * from $2,900 to $3,100 the ledger kept the $2,900 entry AND refreshed its
-     * timestamp, so a listing that had already sold looked permanently fresh and
-     * kept offering a link to a trade that no longer existed. In a live market
-     * the current price is the only true one.
-     *
-     * `seenOnPage` is every item id the page showed, profitable or not. Anything
-     * in that set without a current opportunity is removed, so revisiting a page
-     * actively corrects the ledger instead of only adding to it.
-     *
-     * @param {Map<string, object>} ledger
-     * @param {Array<object>} rows - ranked rows carrying `profit`
-     * @param {Set<string>} [seenOnPage] - all item ids present on the page
-     * @returns {Map<string, object>} the same map, mutated
-     */
-    function recordSightings(ledger, rows, now = Date.now(), seenOnPage) {
-        const stillGood = new Set();
-
-        for (const row of rows || []) {
-            if (!row || !row.profit || !row.itemId) continue;
-
-            const key = ledgerKey(row);
-            stillGood.add(key);
-            ledger.set(key, entryFrom(row, now));
-        }
-
-        // Seen on this page, but no longer an opportunity: forget it. Entries are
-        // ledger keys (ledgerKey of each listing on the page); a bare item id is
-        // an Item Market key.
-        if (seenOnPage) {
-            for (const seen of seenOnPage) {
-                const key = String(seen);
-                if (!stillGood.has(key)) ledger.delete(key);
-            }
-        }
-
-        return ledger;
-    }
-
-    /** Drop expired entries, and trim to the most profitable if oversized. */
-    function pruneLedger(ledger, now = Date.now(), ttl = LEDGER_TTL_MS) {
-        for (const [id, entry] of ledger) {
-            // A missing time is not "forever fresh"; NaN > ttl is false.
-            if (!Number.isFinite(entry.seenAt) || now - entry.seenAt > ttl) {
-                ledger.delete(id);
-            }
-        }
-
-        if (ledger.size > LEDGER_MAX_ENTRIES) {
-            const kept = [...ledger.values()]
-                .sort((a, b) => b.realizableProfit - a.realizableProfit)
-                .slice(0, LEDGER_MAX_ENTRIES);
-
-            ledger.clear();
-            for (const entry of kept) ledger.set(entry.key || entry.itemId, entry);
-        }
-
-        return ledger;
-    }
-
-    /**
-     * The ledger as rows the panel and ranker understand.
-     *
-     * These carry no `el`, because the listing is not on the page you are looking
-     * at - the panel's action navigates to the item instead of scrolling to it.
-     */
-    function ledgerRows(ledger) {
-        return [...ledger.values()].map((entry) => ({
-            itemId: entry.itemId,
-            name: entry.name,
-            el: null,
-            fromLedger: true,
-            source: entry.source || null,
-            sellerId: entry.sellerId || null,
-            npcVerified: entry.npcVerified !== false,
-            seenAt: entry.seenAt,
-            qtyAtPrice: entry.qtyAtPrice,
-            marketTotal: entry.marketTotal,
-            npcShop: entry.npcShop,
-            profit: {
-                venue: entry.venue,
-                listingPrice: entry.listingPrice,
-                exitPrice: entry.exitPrice,
-                profitPerUnit: entry.profitPerUnit,
-                roi: entry.roi,
-                qty: entry.qty,
-                affordableQty: entry.qty,
-                totalProfit: entry.totalProfit,
-                realizableProfit: entry.realizableProfit,
-                cashRequired: entry.cashRequired,
-            },
-        }));
-    }
-
-    function makeLedgerCacheEntry(ledger, now = Date.now()) {
-        return {
-            version: LEDGER_VERSION,
-            savedAt: now,
-            entries: [...ledger.values()],
-        };
-    }
-
-    function readLedgerCacheEntry(cached, now = Date.now()) {
-        const ledger = new Map();
-
-        if (!cached || cached.version !== LEDGER_VERSION) return ledger;
-
-        for (const entry of cached.entries || []) {
-            if (!entry || !entry.itemId) continue;
-            if (!Number.isFinite(entry.seenAt)) continue;
-            if (now - entry.seenAt > LEDGER_TTL_MS) continue;
-
-            ledger.set(String(entry.key || entry.itemId), entry);
-        }
-
-        return ledger;
     }
 
     /* ===== src/api/client.js ===== */
@@ -2149,8 +2014,30 @@
         4: 'Full',
     };
 
-    /** The full item database. Public key. */
+    /**
+     * The full item database. Public key.
+     *
+     * Read from v2 (`/v2/torn/items`), where an item no NPC will buy has
+     * `value.sell_price: null` - the game's "Sell: N/A". That null is the whole
+     * point: an item without an NPC sell price must never be priced as if an NPC
+     * would pay for it. v1 (`torn?selections=items`) is the fallback if v2 fails.
+     *
+     * Returned in the v1 shape ({ "<id>": { name, sell_price, market_value } })
+     * so buildItemIndex has one input format.
+     */
     async function fetchItems(client) {
+        try {
+            return await fetchItemsV2(client);
+        } catch (error) {
+            // A dead key, a rate limit or an IP block fails v1 the same way; do
+            // not ask twice. Anything else (a v2 shape change, an unknown
+            // selection) falls back.
+            const code = error && Number(error.code);
+            if (KEY_DEAD_CODES.has(code) || code === TORN_ERROR_RATE_LIMIT || code === TORN_ERROR_IP_BLOCK) {
+                throw error;
+            }
+        }
+
         const data = await client.get('torn', { selections: 'items' });
 
         if (!data || !data.items) {
@@ -2158,6 +2045,48 @@
         }
 
         return data.items;
+    }
+
+    /** v2 item list -> v1-shaped map. Follows `_metadata.links.next` if paged. */
+    async function fetchItemsV2(client) {
+        const out = {};
+        let params = { sort: 'ASC' };
+
+        for (let page = 0; page < 20; page += 1) {
+            const data = await client.get('v2/torn/items', params);
+
+            if (!data || !Array.isArray(data.items)) {
+                throw new Error('Torn API v2 returned no item list.');
+            }
+
+            for (const item of data.items) {
+                if (!item || !Number.isFinite(Number(item.id))) continue;
+                const value = item.value || {};
+
+                out[String(item.id)] = {
+                    name: item.name,
+                    type: item.type || null,
+                    // null = "N/A": no NPC buys it.
+                    sell_price: value.sell_price ?? null,
+                    buy_price: value.buy_price ?? null,
+                    market_value: value.market_price ?? 0,
+                    circulation: item.circulation ?? 0,
+                };
+            }
+
+            const next = data._metadata && data._metadata.links && data._metadata.links.next;
+            if (!next) break;
+
+            const nextUrl = new URL(next);
+            params = Object.fromEntries(nextUrl.searchParams);
+            delete params.key;
+        }
+
+        if (Object.keys(out).length === 0) {
+            throw new Error('Torn API v2 returned an empty item list.');
+        }
+
+        return out;
     }
 
     /**
@@ -3190,10 +3119,6 @@
         border-color: #3f6b48;
     }
 
-    .ttv2-row.ttv2-stale {
-        opacity: 0.5;
-    }
-
     .ttv2-rank {
         color: #888;
         font-weight: bold;
@@ -3275,13 +3200,14 @@
         text-overflow: ellipsis;
     }
 
-    .ttv2-row.ttv2-stale .ttv2-age {
-        color: #ffd24a;
-    }
-
-    /* Already followed: dimmed until the source re-confirms the listing. */
-    .ttv2-row.ttv2-opened .ttv2-row-name {
+    /* A heading inside the Filters view. */
+    .ttv2-group {
+        flex: 1 1 100%;
+        margin-top: 4px;
         color: #999;
+        font-size: 10px;
+        text-transform: uppercase;
+        letter-spacing: 0.4px;
     }
 
     .ttv2-live {
@@ -4013,13 +3939,6 @@
                 });
             });
 
-            this.unverifiedInput = el('input', { type: 'checkbox' });
-            this.unverifiedInput.addEventListener('change', () => {
-                this.emitSettings({
-                    includeUnverifiedNpc: this.unverifiedInput.checked,
-                });
-            });
-
             this.filtersEl.appendChild(
                 el('div', { class: 'ttv2-field' }, [
                     el('label', { text: 'Min total profit' }),
@@ -4034,104 +3953,62 @@
                 ]),
             );
 
-            this.compareNpcInput = el('input', { type: 'checkbox' });
-            this.compareNpcInput.addEventListener('change', () =>
-                this.emitSettings({ compareNpc: this.compareNpcInput.checked }),
-            );
-
-            this.compareMarketInput = el('input', { type: 'checkbox' });
-            this.compareMarketInput.addEventListener('change', () =>
-                this.emitSettings({
-                    compareMarket: this.compareMarketInput.checked,
-                }),
-            );
-
-            this.resaleInput = el('input', { type: 'checkbox' });
-            this.resaleInput.addEventListener('change', () =>
-                this.emitSettings({ resaleInBazaar: this.resaleInput.checked }),
-            );
-
-            this.npcShopsOnlyInput = el('input', { type: 'checkbox' });
-            this.npcShopsOnlyInput.addEventListener('change', () =>
-                this.emitSettings({
-                    npcShopsOnly: this.npcShopsOnlyInput.checked,
-                }),
-            );
-
             const mkCheck = (input, text, title) => {
                 const label = el('label', { class: 'ttv2-check', title }, [input]);
                 label.appendChild(document.createTextNode(' ' + text));
                 return label;
             };
 
-            this.showAllSeenInput = el('input', { type: 'checkbox' });
-            this.showAllSeenInput.addEventListener('change', () =>
-                this.emitSettings({ showAllSeen: this.showAllSeenInput.checked }),
+            const mkToggle = (key) => {
+                const input = el('input', { type: 'checkbox' });
+                input.addEventListener('change', () =>
+                    this.emitSettings({ [key]: input.checked }),
+                );
+                return input;
+            };
+
+            /*
+             * Where would you sell what you buy? One question, in plain words.
+             * Selling to an NPC is what this tool is for; the resale options are
+             * the start of real trading and are off unless chosen.
+             */
+            this.sellToNpcInput = mkToggle('sellToNpc');
+            this.resaleBazaarInput = mkToggle('resaleBazaar');
+            this.resaleMarketInput = mkToggle('resaleMarket');
+
+            this.filtersEl.appendChild(
+                el('div', { class: 'ttv2-group', text: 'Where would you sell it?' }),
+            );
+            this.filtersEl.appendChild(
+                mkCheck(
+                    this.sellToNpcInput,
+                    'Sell to an NPC shop',
+                    "Listings cheaper than what an NPC shop pays (the item's " +
+                        '"Sell" price). Guaranteed and untaxed. Items whose Sell ' +
+                        'is N/A never appear.',
+                ),
             );
 
             this.filtersEl.appendChild(
-                mkCheck(
-                    this.showAllSeenInput,
-                    'Show everything seen while browsing',
-                    'Keeps results from every category you visit, not just the ' +
-                        'page you are on. Entries expire 10 minutes after the page ' +
-                        'showed them.',
-                ),
+                el('div', { class: 'ttv2-group', text: 'Trading (resell to players)' }),
             );
-
-            this.filtersEl.appendChild(
-                el('button', {
-                    type: 'button',
-                    text: 'Clear list',
-                    onclick: () =>
-                        this.handlers.onClearList && this.handlers.onClearList(),
-                }),
-            );
-
             this.filtersEl.appendChild(
                 mkCheck(
-                    this.compareNpcInput,
-                    'Compare vs NPC price',
-                    'What a shop will pay you. A hard floor, no fee.',
+                    this.resaleBazaarInput,
+                    'Resell in my bazaar at the average value',
+                    'Listings cheaper than the average value (the item\'s ' +
+                        '"Value"), if you relist them in your own bazaar - no ' +
+                        'tax. Not guaranteed: someone has to buy.',
                 ),
             );
             this.filtersEl.appendChild(
                 mkCheck(
-                    this.npcShopsOnlyInput,
-                    '  ↳ only items a shop stocks',
-                    'Rarely useful. Confirmed live that an NPC buys items no ' +
-                        'shop stocks (Bottle of Champagne, $3,100), so this ' +
-                        'mostly just hides real opportunities.',
+                    this.resaleMarketInput,
+                    'Resell on the Item Market at the average value',
+                    'Same, but sold on the Item Market, which takes 5% - so a ' +
+                        'listing has to be more than 5% under the average value.',
                 ),
             );
-            this.filtersEl.appendChild(
-                mkCheck(
-                    this.compareMarketInput,
-                    'Compare vs market value',
-                    "Torn's rolling average. More hits, softer signal than the " +
-                        'NPC price.',
-                ),
-            );
-            this.filtersEl.appendChild(
-                mkCheck(
-                    this.resaleInput,
-                    '  ↳ resell in my bazaar (no 5% tax)',
-                    'On: anything under market value counts, as you would relist ' +
-                        'it in your own bazaar, which is untaxed. Off: priced as ' +
-                        'an Item Market sale, so the 5% tax is taken first - a ' +
-                        'listing 1% under market value is then a loss.',
-                ),
-            );
-
-            const check = el('label', { class: 'ttv2-check' }, [
-                this.unverifiedInput,
-            ]);
-            check.appendChild(
-                document.createTextNode(
-                    ' Show items with no confirmed city-shop buyer',
-                ),
-            );
-            this.filtersEl.appendChild(check);
         }
 
         emitSettings(partial) {
@@ -4222,23 +4099,12 @@
                         ? ''
                         : String(settings.cashOnHand);
             }
-            if (this.unverifiedInput && settings.includeUnverifiedNpc !== undefined) {
-                this.unverifiedInput.checked = Boolean(settings.includeUnverifiedNpc);
-            }
-            if (this.showAllSeenInput && settings.showAllSeen !== undefined) {
-                this.showAllSeenInput.checked = Boolean(settings.showAllSeen);
-            }
-            if (this.compareNpcInput && settings.compareNpc !== undefined) {
-                this.compareNpcInput.checked = Boolean(settings.compareNpc);
-            }
-            if (this.compareMarketInput && settings.compareMarket !== undefined) {
-                this.compareMarketInput.checked = Boolean(settings.compareMarket);
-            }
-            if (this.resaleInput && settings.resaleInBazaar !== undefined) {
-                this.resaleInput.checked = Boolean(settings.resaleInBazaar);
-            }
-            if (this.npcShopsOnlyInput && settings.npcShopsOnly !== undefined) {
-                this.npcShopsOnlyInput.checked = Boolean(settings.npcShopsOnly);
+            for (const [key, input] of [
+                ['sellToNpc', this.sellToNpcInput],
+                ['resaleBazaar', this.resaleBazaarInput],
+                ['resaleMarket', this.resaleMarketInput],
+            ]) {
+                if (input && settings[key] !== undefined) input.checked = Boolean(settings[key]);
             }
             if (this.liveFeedInput && settings.liveFeed !== undefined) {
                 this.liveFeedInput.checked = Boolean(settings.liveFeed);
@@ -4309,8 +4175,9 @@
             if (live.leading) {
                 bits.push(live.itemMarket ? 'Item Market' : 'no key');
                 bits.push(live.w3b ? 'bazaars (' + live.candidates + ' leads)' : 'bazaars off');
-                if (live.lastCycleAt) {
-                    bits.push('updated ' + formatAge(Date.now() - live.lastCycleAt));
+                if (live.nextRefreshAt) {
+                    const secs = Math.max(0, Math.ceil((live.nextRefreshAt - Date.now()) / 1000));
+                    bits.push('refresh in ' + secs + 's');
                 }
             }
 
@@ -4444,8 +4311,8 @@
                             : ''),
                 );
             }
-            if (p.venue === 'BAZAAR_RESALE') bits.push('resell in your bazaar');
-            if (p.venue === 'ITEM_MARKET') bits.push('after 5% market tax');
+            if (p.venue === 'BAZAAR_RESALE') bits.push('resell in your bazaar, no tax');
+            if (p.venue === 'ITEM_MARKET') bits.push('resell on the Item Market, after 5% tax');
             if (p.venue === 'NPC' && row.npcShop && row.npcShop.shopName) {
                 bits.push('NPC shop: ' + row.npcShop.shopName);
             } else if (p.venue === 'NPC') {
@@ -4517,7 +4384,6 @@
 
             const rowEl = el('div', { class: 'ttv2-row' }, [rankEl, main, profit, go]);
             rowEl.dataset.ttv2At = String(this.rowTime(row) || '');
-            if (row.opened) rowEl.classList.add('ttv2-opened');
             if (row.el) rowEl.classList.add('ttv2-onpage');
 
             return rowEl;
@@ -4558,18 +4424,6 @@
             if (row.fromFeed && row.dataAgeKnown === false) {
                 age.title = 'TornW3B did not say when it last checked this.';
             }
-            if (row.opened) {
-                line.appendChild(
-                    el('span', {
-                        class: 'ttv2-guess',
-                        title:
-                            'You opened this already. It lights up again if the ' +
-                            'listing is re-confirmed.',
-                        text: '  |  opened',
-                    }),
-                );
-            }
-
             return line;
         }
 
@@ -4610,8 +4464,9 @@
                 const ageEl = rowEl.querySelector('.ttv2-age');
                 const known = Number.isFinite(at) && at > 0;
 
+                // Just the age. Nothing is greyed out: a listing the latest
+                // refresh did not confirm is removed, not faded.
                 if (ageEl) ageEl.textContent = known ? formatAge(now - at) : 'age unknown';
-                rowEl.classList.toggle('ttv2-stale', known && now - at > PANEL_STALE_MS);
             }
 
             this.renderLive();
@@ -4767,8 +4622,8 @@
 
 
 
-    /** TornW3B's summary is cached 60s at source. */
-    const SUMMARY_INTERVAL_MS = 60 * 1000;
+    /** TornW3B's one-call summary: re-read on every 30s refresh. */
+    const SUMMARY_INTERVAL_MS = REFRESH_MS;
 
     /**
      * Torn API requests the feed may spend per minute. Torn allows 100/min per
@@ -4787,6 +4642,9 @@
     const FEED_STORE_KEY = 'feed';
     const FEED_LEADER_KEY = 'feedLeader';
     const FEED_RECHECK_KEY = 'feedRecheck';
+
+    /** Set by Scan in any tab: the leader rebuilds everything at once. */
+    const FEED_REFRESH_KEY = 'feedRefreshAt';
 
     class LiveFeed {
         /**
@@ -4818,6 +4676,17 @@
             this.tornSpent = [];
             this.lastError = null;
             this.lastCycleAt = null;
+            this.lastRefreshSeen = 0;
+        }
+
+        /**
+         * Scan: throw away everything and rebuild from fresh data now. Works from
+         * any tab - the flag is shared, and whichever tab leads acts on it.
+         */
+        requestRefresh() {
+            this.d.save(FEED_STORE_KEY, null);
+            this.d.save(FEED_REFRESH_KEY, this.now());
+            if (this.d.onChange) this.d.onChange();
         }
 
         /* ------------------------------------------------------ storage */
@@ -4858,6 +4727,7 @@
                 itemMarket: Boolean(s.liveFeed && this.d.hasUsableKey()),
                 leading: this.leading,
                 candidates: this.candidates.length,
+                nextRefreshAt: this.lastSummaryAt ? this.lastSummaryAt + SUMMARY_INTERVAL_MS : null,
                 lastCycleAt: this.lastCycleAt,
                 lastError: this.lastError,
             };
@@ -4910,6 +4780,12 @@
             const index = this.d.getIndex();
 
             this.mutate((feed) => expireFeed(feed, this.now()));
+
+            const refreshAt = Number(this.d.load(FEED_REFRESH_KEY)) || 0;
+            if (refreshAt > this.lastRefreshSeen) {
+                this.lastRefreshSeen = refreshAt;
+                this.lastSummaryAt = 0;
+            }
 
             const rechecks = this.takeRechecks();
 
@@ -5007,11 +4883,21 @@
                 if (!priority.includes(id) && itemMarketDue(feedNow, id, now)) priority.push(id);
             };
 
+            /*
+             * Items with a live Item Market opportunity are re-checked on every
+             * refresh: that is what keeps a sold listing from staying on screen.
+             */
             for (const id of rechecks) add(id);
+            for (const id of itemMarketLiveIds(feedNow)) add(id);
             for (const c of this.candidates.slice(0, CANDIDATE_MARKET_CHECKS)) add(c.itemId);
 
-            // One slot per cycle always belongs to the sweep.
-            const order = priority.slice(0, MAX_TORN_FETCHES_PER_CYCLE - 1);
+            /*
+             * Every other cycle, one slot belongs to the sweep, so discovery never
+             * stops; the rest go to keeping live rows live.
+             */
+            this.cycleCount = (this.cycleCount || 0) + 1;
+            const reserve = this.cycleCount % 2 === 0 ? 1 : 0;
+            const order = priority.slice(0, MAX_TORN_FETCHES_PER_CYCLE - reserve);
             const sweepSlots = MAX_TORN_FETCHES_PER_CYCLE - order.length;
 
             /*
@@ -5095,14 +4981,12 @@
 
 
 
-
     const STORE_KEY = 'apiKey';
     const STORE_ITEMS = 'itemsCache';
     const STORE_NPC = 'npcCache';
     const STORE_MANUAL_NPC = 'npcManual';
     const STORE_SETTINGS = 'settings';
     const STORE_KEY_ACCESS = 'keyAccess';
-    const STORE_LEDGER = 'ledger';
     const STORE_API_WINDOW = 'apiWindow';
     const STORE_KEY_DEAD = 'keyDead';
     const STORE_OPENED = 'opened';
@@ -5116,42 +5000,15 @@
         minTotalProfit: 1,
         cashOnHand: null,
         /*
-         * Show items with no confirmed city-shop buyer. ON by default.
-         *
-         * This was false, and it was wrong. The reasoning behind it - "only an
-         * item a city shop stocks can be sold to an NPC" - is an inference that
-         * does not hold: Bottle of Champagne has a sell price of $3,100 and no
-         * shop stocks it. Filtering on that inference silently deleted a real
-         * $4.7m opportunity on a live page and reported "0 opportunities".
-         *
-         * An unreliable check that hides real money is worse than no check. The
-         * shop lookup still runs and still names the shop when it knows one; it
-         * just no longer decides what you are allowed to see.
+         * Where you could sell what you buy. "Sell to NPC" is the job this tool
+         * exists for: listings cheaper than an NPC shop's Sell price, which is
+         * guaranteed and untaxed. The two resale exits compare against the
+         * average value (Torn's "Value") and are groundwork for trading - off
+         * by default, and never mixed into the NPC numbers.
          */
-        includeUnverifiedNpc: true,
-
-        /* Which exits to price against. Either can be turned off. */
-        compareNpc: true,
-        compareMarket: true,
-
-        /*
-         * Price the market-value exit as a resale in your own bazaar (no tax)
-         * rather than on the Item Market (5% tax). With the tax, a listing 1%
-         * under market value is a loss - which is why a visibly cheap Xanax did
-         * not light up.
-         */
-        resaleInBazaar: true,
-
-        /*
-         * NPC mode means NPC mode: only items a city shop is known to stock, so
-         * you are never told to buy something on the promise of a sale that will
-         * not happen. Off by default because the shop lookup is incomplete and
-         * turning it on hides real opportunities - see includeUnverifiedNpc.
-         */
-        npcShopsOnly: false,
-
-        /* Show everything seen while browsing, not just the current page. */
-        showAllSeen: true,
+        sellToNpc: true,
+        resaleBazaar: false,
+        resaleMarket: false,
 
         /*
          * The live feed: watch the market from ANY Torn page, not just the one
@@ -5206,15 +5063,12 @@
         pageHref: null,
         pageRows: [],
         pageDiagnostics: null,
-        lastLedgerJson: null,
         targetShown: null,
         /* After a failed load, the automatic retry waits until this time. */
         retryLoadAt: 0,
         /* A tab the user clicked, until the page type next changes. */
         tabOverride: null,
         npcShops: new Map(),
-        ledger: new Map(),
-        shopDataMissing: false,
         manualNpc: {},
         settings: { ...DEFAULT_SETTINGS },
         pageType: PAGE_NONE,
@@ -5225,6 +5079,25 @@
         lastScanAt: null,
         loading: false,
     };
+
+    /**
+     * Stored settings over the defaults, keeping only settings that still exist.
+     * The shop-stock filters, "show unverified", "show everything seen" and the
+     * old compare switches were removed; an old stored value must not linger.
+     */
+    function loadSettings() {
+        const stored = gmGet(STORE_SETTINGS, {}) || {};
+        const out = { ...DEFAULT_SETTINGS };
+
+        for (const key of Object.keys(DEFAULT_SETTINGS)) {
+            if (Object.prototype.hasOwnProperty.call(stored, key)) out[key] = stored[key];
+        }
+
+        // The NPC switch was called compareNpc.
+        if (stored.compareNpc === false && !('sellToNpc' in stored)) out.sellToNpc = false;
+
+        return out;
+    }
 
     /* ------------------------------------------------------------------ *
      * API key
@@ -5317,14 +5190,6 @@
         app.panel.setStatus('API key removed from this script.');
     }
 
-    function onClearList() {
-        app.ledger = new Map();
-        app.lastLedgerJson = null;
-        gmDel(STORE_LEDGER);
-        gmDel(FEED_STORE_KEY);
-        app.panel.setStatus('Cleared everything seen so far.');
-        rescan();
-    }
 
     function onClearCache() {
         gmDel(STORE_ITEMS);
@@ -5412,10 +5277,8 @@
          * opportunities" when it really means "could not verify any". Degrade to
          * showing them, flagged, and say why.
          */
-        app.shopDataMissing = app.npcShops.size === 0;
 
         app.manualNpc = gmGet(STORE_MANUAL_NPC, {}) || {};
-        app.ledger = readLedgerCacheEntry(gmGet(STORE_LEDGER, null));
     }
 
     /**
@@ -5532,15 +5395,13 @@
         return app.pageFirstSeen.get(key);
     }
 
-    /** Current settings, with the one override that must always apply. */
+    /**
+     * Current settings for the ranker. Whether a city shop STOCKS an item never
+     * decides anything - an NPC buys whatever has a Sell price - so that filter
+     * is always off.
+     */
     function rankSettings(extra = {}) {
-        return {
-            ...app.settings,
-            // Never hide everything just because verification data is missing.
-            includeUnverifiedNpc:
-                app.settings.includeUnverifiedNpc || app.shopDataMissing,
-            ...extra,
-        };
+        return { ...app.settings, includeUnverifiedNpc: true, ...extra };
     }
 
     /** Read the page, fold it into memory, correct the feed, then render. */
@@ -5594,31 +5455,22 @@
 
         const priced = buildOpportunities(listings);
 
-        /*
-         * No limit here. The ranker's display cap of 100 made anything ranked
-         * 101st look "no longer an opportunity", and the ledger deleted it.
-         */
+        // No limit here; only the markers and the panel are capped.
         const ranked = rankOpportunities(priced, rankSettings({ limit: 0 }));
 
         /*
-         * Remember what this page showed.
+         * Two-way correction between the page and the feed.
          *
-         * The scanner may only read the page you are on - but nothing stops it
-         * remembering. Browsing the categories once builds a view of the whole
-         * market without a single extra request.
+         * The page overrules the feed: if it shows a higher price than a feed
+         * row claims, that feed row has sold. And fresher feed data overrules
+         * the page: Torn's page does not update itself and this script may not
+         * reload it, so a listing that sold while you were looking is removed
+         * once the 30s re-check proves it gone. Only live listings are shown.
          */
-        recordSightings(app.ledger, ranked, now, new Set(listings.map(ledgerKey)));
-        pruneLedger(app.ledger, now);
-        persistLedger(now);
+        const feed = readFeedCacheEntry(gmGet(FEED_STORE_KEY, null), now);
 
-        /*
-         * The page you are looking at outranks every remote source. If it shows
-         * a higher price than the feed claims, the feed row has sold.
-         */
         if (listings.length) {
-            let removed = 0;
-            const feed = readFeedCacheEntry(gmGet(FEED_STORE_KEY, null), now);
-            removed = reconcileWithPage(feed, {
+            const removed = reconcileWithPage(feed, {
                 pageType: app.pageType,
                 sellerId,
                 listings,
@@ -5626,26 +5478,23 @@
             if (removed > 0) gmSet(FEED_STORE_KEY, makeFeedCacheEntry(feed, now));
         }
 
-        markRows(ranked.slice(0, 100));
+        const live = ranked.filter((row) => !pageRowContradicted(feed, row));
+
+        // Ask the feed to keep re-checking what this page shows, every refresh.
+        if (app.feed && live.length && now - (app.lastPageRecheckAt || 0) >= REFRESH_MS) {
+            app.lastPageRecheckAt = now;
+            app.feed.requestRecheck(live.slice(0, 10).map((r) => r.itemId));
+        }
+
+        markRows(live.slice(0, 100));
         showBazaarTarget(listings);
 
         app.lastScanAt = now;
-        app.pageRows = ranked;
+        app.pageRows = live;
         app.pageDiagnostics = diagnostics;
 
         refreshView();
         attachObserver(listings);
-    }
-
-    /** Write the ledger only when it changed - not every 2.5s poll. */
-    function persistLedger(now) {
-        const entry = makeLedgerCacheEntry(app.ledger, now);
-        const json = JSON.stringify(entry.entries);
-
-        if (json === app.lastLedgerJson) return;
-
-        app.lastLedgerJson = json;
-        gmSet(STORE_LEDGER, entry);
     }
 
     /**
@@ -5703,19 +5552,6 @@
             app.pageRows.map((r) => (r.source || app.pageType) + ':' + r.itemId),
         );
 
-        /*
-         * Remembered rows were priced under whatever settings applied when they
-         * were seen. Re-filter them against the CURRENT settings, or switching
-         * "compare vs market value" off leaves market-priced rows on screen.
-         */
-        const venueAllowed = (venue) => {
-            if (venue === 'ITEM_MARKET' || venue === 'BAZAAR_RESALE') {
-                return app.settings.compareMarket !== false;
-            }
-            if (venue === 'NPC') return app.settings.compareNpc !== false;
-            return true;
-        };
-
         const feed = readFeedCacheEntry(gmGet(FEED_STORE_KEY, null), now);
         const feedRows = app.index
             ? feedOpportunities(feed, app.index, app.settings, {
@@ -5734,28 +5570,12 @@
               })
             : [];
 
-        // A feed row for the same item and source supersedes a memory of it.
-        const inFeed = new Set(feedRows.map((r) => r.source + ':' + r.itemId));
-
-        const remembered = app.settings.showAllSeen
-            ? ledgerRows(app.ledger).filter((r) => {
-                  const key = (r.source || SOURCE_ITEM_MARKET) + ':' + r.itemId;
-                  return !onPage.has(key) && !inFeed.has(key) && venueAllowed(r.profit.venue);
-              })
-            : [];
-
-        const opened = gmGet(STORE_OPENED, {}) || {};
-        for (const r of feedRows) {
-            const at = opened[openedKey(r)];
-            r.opened = Number.isFinite(at) && at >= r.dataAt;
-        }
-
         /*
          * Two lists, never mixed. Arriving on a bazaar from the Item Market used
          * to leave the Item Market's opportunities on screen, which read as if
          * they were in this bazaar.
          */
-        const all = app.pageRows.concat(remembered, feedRows);
+        const all = app.pageRows.concat(feedRows);
         const lists = { bazaar: [], itemmarket: [] };
         for (const r of all) {
             lists[r.source === SOURCE_BAZAAR ? 'bazaar' : 'itemmarket'].push(r);
@@ -5776,8 +5596,6 @@
                 app.pageDiagnostics && app.pageType === tab
                     ? {
                           ...app.pageDiagnostics,
-                          ledgerSize: app.ledger.size,
-                          shopDataMissing: app.shopDataMissing,
                           shopLoadError: app.shopLoadError || null,
                       }
                     : null,
@@ -5833,6 +5651,17 @@
             const firstLoad = !app.index;
             if (firstLoad) await loadReferenceData();
             await checkKeyAccess();
+
+            /*
+             * Scan is a full refresh: drop everything the feed holds and rebuild
+             * it from fresh data now, then re-read this page. Nothing old
+             * survives a Scan.
+             */
+            clearMarks();
+            if (app.feed) {
+                app.feed.requestRefresh();
+                app.feed.tick().catch(() => {});
+            }
             rescan();
 
             // Replace "Downloading..." - it is done. A key warning set by
@@ -5878,7 +5707,7 @@
         app.panel.setStatus('Cleared.');
     }
 
-    /** Identity of a feed listing for the "already opened" dimming. */
+    /** Identity of a feed listing you followed, so it is re-checked first. */
     function openedKey(row) {
         return [row.source, row.itemId, row.sellerId || '', row.profit.listingPrice].join(':');
     }
@@ -5892,9 +5721,9 @@
 
         if (row.fromFeed) {
             /*
-             * Remember it was opened, keyed to the data time: if TornW3B later
-             * re-confirms the listing, it lights up again (Weav3r's trick). Ask
-             * the feed to re-verify the item first on its next cycle.
+             * Remember it was followed, and ask the feed to re-verify the item
+             * first: a listing someone just went to buy is the one most likely
+             * to be gone. If it is, the next refresh removes it.
              */
             const opened = gmGet(STORE_OPENED, {}) || {};
             opened[openedKey(row)] = row.dataAt;
@@ -5903,7 +5732,6 @@
             gmSet(STORE_OPENED, opened);
 
             if (app.feed) app.feed.requestRecheck([row.itemId]);
-            refreshView();
         }
 
         if (row.url) {
@@ -6112,7 +5940,7 @@
     function boot() {
         injectStyles();
 
-        app.settings = { ...DEFAULT_SETTINGS, ...(gmGet(STORE_SETTINGS, {}) || {}) };
+        app.settings = loadSettings();
         app.keyDead = Boolean(gmGet(STORE_KEY_DEAD, false));
 
         /*
@@ -6134,7 +5962,6 @@
             onSaveKey,
             onForgetKey,
             onClearCache,
-            onClearList,
             onViewChange,
             /*
              * The key is put into the field only when the user asks to see it.

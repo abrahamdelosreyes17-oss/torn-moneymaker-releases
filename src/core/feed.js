@@ -26,20 +26,38 @@ import { formatMoneyShort } from './parse.js';
 
 export const FEED_CACHE_VERSION = 'feed-v1';
 
-/** A bazaar row TornW3B has not re-checked in this long is not shown. */
-export const BAZAAR_MAX_DATA_AGE_MS = 5 * 60 * 1000;
+/*
+ * Only what the latest refresh confirmed is shown. Nothing is greyed out:
+ * a row that is not re-confirmed in time is removed.
+ */
 
-/** Hard cap on a bazaar snapshot, whatever its rows claim. */
-export const BAZAAR_SNAPSHOT_TTL_MS = 10 * 60 * 1000;
+/** The list is rebuilt from fresh data this often. */
+export const REFRESH_MS = 30 * 1000;
 
-/** Item Market snapshots are 30s-cached at source; 5 min unrefreshed is dead. */
-export const ITEM_MARKET_SNAPSHOT_TTL_MS = 5 * 60 * 1000;
+/** A bazaar row TornW3B has not checked within this long is not shown. */
+export const BAZAAR_MAX_DATA_AGE_MS = 2 * 60 * 1000;
 
-/** Re-ask TornW3B about a candidate no sooner than its own 60s cache. */
+/**
+ * Re-ask TornW3B about an item this often. Its server caches each answer for
+ * 60s, so asking every 30s would return the same body half the time.
+ */
 export const BAZAAR_REFRESH_MS = 60 * 1000;
 
-/** Most candidates followed up per summary, cheapest-to-check first. */
-export const MAX_CANDIDATES = 30;
+/** A bazaar snapshot not refreshed in time is dropped, rows and all. */
+export const BAZAAR_SNAPSHOT_TTL_MS = BAZAAR_REFRESH_MS + REFRESH_MS;
+
+/**
+ * Item Market: Torn refreshes it every 30s, and items with a live
+ * opportunity are re-checked each time. One missed refresh is tolerated;
+ * two is removal.
+ */
+export const ITEM_MARKET_SNAPSHOT_TTL_MS = 2 * REFRESH_MS + 15 * 1000;
+
+/**
+ * Most candidates followed up per summary. 25 per minute plus two summaries
+ * stays inside the 60/min this tool allows itself on TornW3B.
+ */
+export const MAX_CANDIDATES = 25;
 
 export const SOURCE_BAZAAR = 'bazaar';
 export const SOURCE_ITEM_MARKET = 'itemmarket';
@@ -49,34 +67,35 @@ export function emptyFeed() {
 }
 
 /**
- * The exits an item can be sold into, under the current settings.
- * Shared with the page scanner so both price listings identically.
+ * Where you could sell an item, under the current settings. Shared with the
+ * page scanner so both price listings identically.
+ *
+ *   NPC            - "Sell to NPC": the item's Sell price, no tax. The main
+ *                    job of this tool. Only when the item HAS a Sell price;
+ *                    "Sell: N/A" in game (no sell_price) means no NPC buys it.
+ *   BAZAAR_RESALE  - trading: relist in your own bazaar at the average value
+ *                    (Torn's "Value"), no tax.
+ *   ITEM_MARKET    - trading: sell on the Item Market at the average value,
+ *                    minus the 5% tax.
+ *
+ * The average value is what an item tends to trade for, never an NPC price.
  *
  * @param {object} item - record from buildItemIndex
- * @param {object} settings - compareNpc, compareMarket, npcShopsOnly
- * @param {object|null} npcShop - from npcShopFor
+ * @param {object} settings - sellToNpc, resaleBazaar, resaleMarket
  */
-export function exitsFor(item, settings = {}, npcShop = null) {
+export function exitsFor(item, settings = {}) {
     const exits = {};
     if (!item) return exits;
 
-    if (settings.compareNpc !== false) {
+    if (settings.sellToNpc !== false) {
         const sell = Number(item.sellPrice);
-        const shopKnown = !settings.npcShopsOnly || npcShop !== null;
-        if (Number.isFinite(sell) && sell > 0 && shopKnown) exits.NPC = sell;
+        if (Number.isFinite(sell) && sell > 0) exits.NPC = sell;
     }
 
-    if (settings.compareMarket !== false) {
-        const mv = Number(item.marketValue);
-        /*
-         * Where you would resell decides the fee. Your own bazaar charges
-         * none, so anything under market value is a margin there; the Item
-         * Market takes 5%, which wipes out a listing 1% under. Default is the
-         * bazaar - that is how "below market value" is normally read, and the
-         * row says which exit it assumed.
-         */
-        const venue = settings.resaleInBazaar === false ? 'ITEM_MARKET' : 'BAZAAR_RESALE';
-        if (Number.isFinite(mv) && mv > 0) exits[venue] = mv;
+    const value = Number(item.marketValue);
+    if (Number.isFinite(value) && value > 0) {
+        if (settings.resaleBazaar) exits.BAZAAR_RESALE = value;
+        if (settings.resaleMarket) exits.ITEM_MARKET = value;
     }
 
     return exits;
@@ -245,6 +264,13 @@ export function bazaarDue(feed, candidate, now = Date.now()) {
     return cheapest !== candidate.lowestPrice;
 }
 
+/** Items that currently have an Item Market opportunity: re-check first. */
+export function itemMarketLiveIds(feed) {
+    const ids = [];
+    for (const [id, snap] of feed.itemmarket) if (snap.rows.length) ids.push(id);
+    return ids;
+}
+
 /** Item Market: never before Torn's global cache can have changed. */
 export function itemMarketDue(feed, itemId, now = Date.now()) {
     const snap = feed.itemmarket.get(String(itemId));
@@ -314,6 +340,45 @@ export function reconcileWithPage(feed, { pageType, sellerId, listings }) {
     return removed;
 }
 
+/**
+ * Has fresher data proved that a listing on the page you are viewing is gone?
+ *
+ * Torn's page does not update itself, and this script may not reload it -
+ * so a listing can sell while it is still on screen. The feed re-checks it:
+ *
+ * - Item Market: if a snapshot taken AFTER the page showed the row has
+ *   nothing at or below that price, it sold.
+ * - Bazaar: if TornW3B checked that seller AFTER the page showed the row and
+ *   has them at a higher price, it was bought or repriced. A seller missing
+ *   from TornW3B's data proves nothing - it may simply not track them.
+ *
+ * @param {object} feed
+ * @param {object} row - a page row: itemId, source, sellerId, seenAt, listingPrice
+ */
+export function pageRowContradicted(feed, row) {
+    const id = String(row.itemId);
+    const price = Number(row.listingPrice ?? (row.profit && row.profit.listingPrice));
+    const seenAt = Number(row.seenAt) || 0;
+
+    if (row.source === SOURCE_ITEM_MARKET) {
+        const snap = feed.itemmarket.get(id);
+        if (!snap || !(snap.dataAt > seenAt)) return false;
+        return !snap.rows.some((r) => r.price <= price);
+    }
+
+    if (row.source === SOURCE_BAZAAR && row.sellerId) {
+        const snap = feed.bazaar.get(id);
+        if (!snap) return false;
+
+        const mine = snap.rows.filter(
+            (r) => r.sellerId === String(row.sellerId) && r.dataAt > seenAt,
+        );
+        return mine.length > 0 && !mine.some((r) => r.price <= price);
+    }
+
+    return false;
+}
+
 /** Deep link to one seller's bazaar, carrying what to highlight there. */
 export function bazaarUrl(sellerId, itemId, price) {
     const params = new URLSearchParams({ userId: String(sellerId) });
@@ -342,7 +407,7 @@ export function feedOpportunities(feed, index, settings = {}, ctx = {}) {
         const npcShop = shopOf(item.id);
         const profit = bestVenue({
             listingPrice: row.price,
-            exits: exitsFor(item, settings, npcShop),
+            exits: exitsFor(item, settings),
             qty: row.qty,
             cashOnHand: settings.cashOnHand,
         });
@@ -450,7 +515,7 @@ export function itemMarketSweepList(index, settings = {}) {
             venue: 'NPC',
         });
 
-        if (settings.compareNpc !== false && probe && probe.profitPerUnit > 0) {
+        if (settings.sellToNpc !== false && probe && probe.profitPerUnit > 0) {
             out.push(item.id);
         }
     }

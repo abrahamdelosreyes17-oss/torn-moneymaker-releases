@@ -32,6 +32,8 @@ import {
     readFeedCacheEntry,
     makeFeedCacheEntry,
     reconcileWithPage,
+    pageRowContradicted,
+    REFRESH_MS,
     bazaarUrl,
     SOURCE_BAZAAR,
     SOURCE_ITEM_MARKET,
@@ -39,14 +41,6 @@ import {
 import { makeTabId, LEADER_HEARTBEAT_MS } from './core/leader.js';
 import { formatMoneyShort } from './core/parse.js';
 import { rankOpportunities, summarize } from './core/ranker.js';
-import {
-    ledgerKey,
-    recordSightings,
-    pruneLedger,
-    ledgerRows,
-    makeLedgerCacheEntry,
-    readLedgerCacheEntry,
-} from './core/ledger.js';
 import { TornApiClient, redactKey, KEY_DEAD_CODES } from './api/client.js';
 import { W3bClient } from './api/w3b.js';
 import {
@@ -83,7 +77,6 @@ const STORE_NPC = 'npcCache';
 const STORE_MANUAL_NPC = 'npcManual';
 const STORE_SETTINGS = 'settings';
 const STORE_KEY_ACCESS = 'keyAccess';
-const STORE_LEDGER = 'ledger';
 const STORE_API_WINDOW = 'apiWindow';
 const STORE_KEY_DEAD = 'keyDead';
 const STORE_OPENED = 'opened';
@@ -97,42 +90,15 @@ const DEFAULT_SETTINGS = {
     minTotalProfit: 1,
     cashOnHand: null,
     /*
-     * Show items with no confirmed city-shop buyer. ON by default.
-     *
-     * This was false, and it was wrong. The reasoning behind it - "only an
-     * item a city shop stocks can be sold to an NPC" - is an inference that
-     * does not hold: Bottle of Champagne has a sell price of $3,100 and no
-     * shop stocks it. Filtering on that inference silently deleted a real
-     * $4.7m opportunity on a live page and reported "0 opportunities".
-     *
-     * An unreliable check that hides real money is worse than no check. The
-     * shop lookup still runs and still names the shop when it knows one; it
-     * just no longer decides what you are allowed to see.
+     * Where you could sell what you buy. "Sell to NPC" is the job this tool
+     * exists for: listings cheaper than an NPC shop's Sell price, which is
+     * guaranteed and untaxed. The two resale exits compare against the
+     * average value (Torn's "Value") and are groundwork for trading - off
+     * by default, and never mixed into the NPC numbers.
      */
-    includeUnverifiedNpc: true,
-
-    /* Which exits to price against. Either can be turned off. */
-    compareNpc: true,
-    compareMarket: true,
-
-    /*
-     * Price the market-value exit as a resale in your own bazaar (no tax)
-     * rather than on the Item Market (5% tax). With the tax, a listing 1%
-     * under market value is a loss - which is why a visibly cheap Xanax did
-     * not light up.
-     */
-    resaleInBazaar: true,
-
-    /*
-     * NPC mode means NPC mode: only items a city shop is known to stock, so
-     * you are never told to buy something on the promise of a sale that will
-     * not happen. Off by default because the shop lookup is incomplete and
-     * turning it on hides real opportunities - see includeUnverifiedNpc.
-     */
-    npcShopsOnly: false,
-
-    /* Show everything seen while browsing, not just the current page. */
-    showAllSeen: true,
+    sellToNpc: true,
+    resaleBazaar: false,
+    resaleMarket: false,
 
     /*
      * The live feed: watch the market from ANY Torn page, not just the one
@@ -187,15 +153,12 @@ const app = {
     pageHref: null,
     pageRows: [],
     pageDiagnostics: null,
-    lastLedgerJson: null,
     targetShown: null,
     /* After a failed load, the automatic retry waits until this time. */
     retryLoadAt: 0,
     /* A tab the user clicked, until the page type next changes. */
     tabOverride: null,
     npcShops: new Map(),
-    ledger: new Map(),
-    shopDataMissing: false,
     manualNpc: {},
     settings: { ...DEFAULT_SETTINGS },
     pageType: PAGE_NONE,
@@ -206,6 +169,25 @@ const app = {
     lastScanAt: null,
     loading: false,
 };
+
+/**
+ * Stored settings over the defaults, keeping only settings that still exist.
+ * The shop-stock filters, "show unverified", "show everything seen" and the
+ * old compare switches were removed; an old stored value must not linger.
+ */
+function loadSettings() {
+    const stored = gmGet(STORE_SETTINGS, {}) || {};
+    const out = { ...DEFAULT_SETTINGS };
+
+    for (const key of Object.keys(DEFAULT_SETTINGS)) {
+        if (Object.prototype.hasOwnProperty.call(stored, key)) out[key] = stored[key];
+    }
+
+    // The NPC switch was called compareNpc.
+    if (stored.compareNpc === false && !('sellToNpc' in stored)) out.sellToNpc = false;
+
+    return out;
+}
 
 /* ------------------------------------------------------------------ *
  * API key
@@ -298,14 +280,6 @@ function onForgetKey() {
     app.panel.setStatus('API key removed from this script.');
 }
 
-function onClearList() {
-    app.ledger = new Map();
-    app.lastLedgerJson = null;
-    gmDel(STORE_LEDGER);
-    gmDel(FEED_STORE_KEY);
-    app.panel.setStatus('Cleared everything seen so far.');
-    rescan();
-}
 
 function onClearCache() {
     gmDel(STORE_ITEMS);
@@ -393,10 +367,8 @@ async function loadReferenceData() {
      * opportunities" when it really means "could not verify any". Degrade to
      * showing them, flagged, and say why.
      */
-    app.shopDataMissing = app.npcShops.size === 0;
 
     app.manualNpc = gmGet(STORE_MANUAL_NPC, {}) || {};
-    app.ledger = readLedgerCacheEntry(gmGet(STORE_LEDGER, null));
 }
 
 /**
@@ -513,15 +485,13 @@ function stampSeen(listing, now) {
     return app.pageFirstSeen.get(key);
 }
 
-/** Current settings, with the one override that must always apply. */
+/**
+ * Current settings for the ranker. Whether a city shop STOCKS an item never
+ * decides anything - an NPC buys whatever has a Sell price - so that filter
+ * is always off.
+ */
 function rankSettings(extra = {}) {
-    return {
-        ...app.settings,
-        // Never hide everything just because verification data is missing.
-        includeUnverifiedNpc:
-            app.settings.includeUnverifiedNpc || app.shopDataMissing,
-        ...extra,
-    };
+    return { ...app.settings, includeUnverifiedNpc: true, ...extra };
 }
 
 /** Read the page, fold it into memory, correct the feed, then render. */
@@ -575,31 +545,22 @@ function rescan() {
 
     const priced = buildOpportunities(listings);
 
-    /*
-     * No limit here. The ranker's display cap of 100 made anything ranked
-     * 101st look "no longer an opportunity", and the ledger deleted it.
-     */
+    // No limit here; only the markers and the panel are capped.
     const ranked = rankOpportunities(priced, rankSettings({ limit: 0 }));
 
     /*
-     * Remember what this page showed.
+     * Two-way correction between the page and the feed.
      *
-     * The scanner may only read the page you are on - but nothing stops it
-     * remembering. Browsing the categories once builds a view of the whole
-     * market without a single extra request.
+     * The page overrules the feed: if it shows a higher price than a feed
+     * row claims, that feed row has sold. And fresher feed data overrules
+     * the page: Torn's page does not update itself and this script may not
+     * reload it, so a listing that sold while you were looking is removed
+     * once the 30s re-check proves it gone. Only live listings are shown.
      */
-    recordSightings(app.ledger, ranked, now, new Set(listings.map(ledgerKey)));
-    pruneLedger(app.ledger, now);
-    persistLedger(now);
+    const feed = readFeedCacheEntry(gmGet(FEED_STORE_KEY, null), now);
 
-    /*
-     * The page you are looking at outranks every remote source. If it shows
-     * a higher price than the feed claims, the feed row has sold.
-     */
     if (listings.length) {
-        let removed = 0;
-        const feed = readFeedCacheEntry(gmGet(FEED_STORE_KEY, null), now);
-        removed = reconcileWithPage(feed, {
+        const removed = reconcileWithPage(feed, {
             pageType: app.pageType,
             sellerId,
             listings,
@@ -607,26 +568,23 @@ function rescan() {
         if (removed > 0) gmSet(FEED_STORE_KEY, makeFeedCacheEntry(feed, now));
     }
 
-    markRows(ranked.slice(0, 100));
+    const live = ranked.filter((row) => !pageRowContradicted(feed, row));
+
+    // Ask the feed to keep re-checking what this page shows, every refresh.
+    if (app.feed && live.length && now - (app.lastPageRecheckAt || 0) >= REFRESH_MS) {
+        app.lastPageRecheckAt = now;
+        app.feed.requestRecheck(live.slice(0, 10).map((r) => r.itemId));
+    }
+
+    markRows(live.slice(0, 100));
     showBazaarTarget(listings);
 
     app.lastScanAt = now;
-    app.pageRows = ranked;
+    app.pageRows = live;
     app.pageDiagnostics = diagnostics;
 
     refreshView();
     attachObserver(listings);
-}
-
-/** Write the ledger only when it changed - not every 2.5s poll. */
-function persistLedger(now) {
-    const entry = makeLedgerCacheEntry(app.ledger, now);
-    const json = JSON.stringify(entry.entries);
-
-    if (json === app.lastLedgerJson) return;
-
-    app.lastLedgerJson = json;
-    gmSet(STORE_LEDGER, entry);
 }
 
 /**
@@ -684,19 +642,6 @@ function refreshView() {
         app.pageRows.map((r) => (r.source || app.pageType) + ':' + r.itemId),
     );
 
-    /*
-     * Remembered rows were priced under whatever settings applied when they
-     * were seen. Re-filter them against the CURRENT settings, or switching
-     * "compare vs market value" off leaves market-priced rows on screen.
-     */
-    const venueAllowed = (venue) => {
-        if (venue === 'ITEM_MARKET' || venue === 'BAZAAR_RESALE') {
-            return app.settings.compareMarket !== false;
-        }
-        if (venue === 'NPC') return app.settings.compareNpc !== false;
-        return true;
-    };
-
     const feed = readFeedCacheEntry(gmGet(FEED_STORE_KEY, null), now);
     const feedRows = app.index
         ? feedOpportunities(feed, app.index, app.settings, {
@@ -715,28 +660,12 @@ function refreshView() {
           })
         : [];
 
-    // A feed row for the same item and source supersedes a memory of it.
-    const inFeed = new Set(feedRows.map((r) => r.source + ':' + r.itemId));
-
-    const remembered = app.settings.showAllSeen
-        ? ledgerRows(app.ledger).filter((r) => {
-              const key = (r.source || SOURCE_ITEM_MARKET) + ':' + r.itemId;
-              return !onPage.has(key) && !inFeed.has(key) && venueAllowed(r.profit.venue);
-          })
-        : [];
-
-    const opened = gmGet(STORE_OPENED, {}) || {};
-    for (const r of feedRows) {
-        const at = opened[openedKey(r)];
-        r.opened = Number.isFinite(at) && at >= r.dataAt;
-    }
-
     /*
      * Two lists, never mixed. Arriving on a bazaar from the Item Market used
      * to leave the Item Market's opportunities on screen, which read as if
      * they were in this bazaar.
      */
-    const all = app.pageRows.concat(remembered, feedRows);
+    const all = app.pageRows.concat(feedRows);
     const lists = { bazaar: [], itemmarket: [] };
     for (const r of all) {
         lists[r.source === SOURCE_BAZAAR ? 'bazaar' : 'itemmarket'].push(r);
@@ -757,8 +686,6 @@ function refreshView() {
             app.pageDiagnostics && app.pageType === tab
                 ? {
                       ...app.pageDiagnostics,
-                      ledgerSize: app.ledger.size,
-                      shopDataMissing: app.shopDataMissing,
                       shopLoadError: app.shopLoadError || null,
                   }
                 : null,
@@ -814,6 +741,17 @@ async function onScan() {
         const firstLoad = !app.index;
         if (firstLoad) await loadReferenceData();
         await checkKeyAccess();
+
+        /*
+         * Scan is a full refresh: drop everything the feed holds and rebuild
+         * it from fresh data now, then re-read this page. Nothing old
+         * survives a Scan.
+         */
+        clearMarks();
+        if (app.feed) {
+            app.feed.requestRefresh();
+            app.feed.tick().catch(() => {});
+        }
         rescan();
 
         // Replace "Downloading..." - it is done. A key warning set by
@@ -859,7 +797,7 @@ function onClear() {
     app.panel.setStatus('Cleared.');
 }
 
-/** Identity of a feed listing for the "already opened" dimming. */
+/** Identity of a feed listing you followed, so it is re-checked first. */
 function openedKey(row) {
     return [row.source, row.itemId, row.sellerId || '', row.profit.listingPrice].join(':');
 }
@@ -873,9 +811,9 @@ function onNavigate(row) {
 
     if (row.fromFeed) {
         /*
-         * Remember it was opened, keyed to the data time: if TornW3B later
-         * re-confirms the listing, it lights up again (Weav3r's trick). Ask
-         * the feed to re-verify the item first on its next cycle.
+         * Remember it was followed, and ask the feed to re-verify the item
+         * first: a listing someone just went to buy is the one most likely
+         * to be gone. If it is, the next refresh removes it.
          */
         const opened = gmGet(STORE_OPENED, {}) || {};
         opened[openedKey(row)] = row.dataAt;
@@ -884,7 +822,6 @@ function onNavigate(row) {
         gmSet(STORE_OPENED, opened);
 
         if (app.feed) app.feed.requestRecheck([row.itemId]);
-        refreshView();
     }
 
     if (row.url) {
@@ -1093,7 +1030,7 @@ function registerMenu() {
 export function boot() {
     injectStyles();
 
-    app.settings = { ...DEFAULT_SETTINGS, ...(gmGet(STORE_SETTINGS, {}) || {}) };
+    app.settings = loadSettings();
     app.keyDead = Boolean(gmGet(STORE_KEY_DEAD, false));
 
     /*
@@ -1115,7 +1052,6 @@ export function boot() {
         onSaveKey,
         onForgetKey,
         onClearCache,
-        onClearList,
         onViewChange,
         /*
          * The key is put into the field only when the user asks to see it.

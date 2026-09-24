@@ -39,8 +39,8 @@ export const VENUE_FEES = {
  */
 export const VENUE_LABELS = {
     NPC: 'NPC',
-    ITEM_MARKET: 'Market value (est.)',
-    BAZAAR_RESALE: 'Market value (est.)',
+    ITEM_MARKET: 'Avg value',
+    BAZAAR_RESALE: 'Avg value',
     ITEM_MARKET_ANON: 'Market (anon)',
     AUCTION_HOUSE: 'Auction',
 };
