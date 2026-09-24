@@ -45,9 +45,26 @@ cost him real money.**
   and the script's own recorded asks. **Ask him which of these to show and
   how to label them before building.**
 
-### 4. "Total": he asked what it is
-- It's his quantity × the best offer: what selling the whole stack to that
-  trader would pay. Explain that and **ask whether to keep it**.
+### 4. Remove Qty, Total and the "Per item | Bundle" switch
+> "I don't want that bundle, I only care about their price PER item. I don't
+> care how much they have. We're not checking their bazaar."
+
+- A trader's price list only has **prices per item**, and no quantities. His
+  example: https://weav3r.dev/pricelist/3727302, one trader's list on TornW3B.
+- The page's **Qty** was how many of the item *he* holds, from his inventory,
+  not the trader's. **Total** was his quantity × the best offer. Neither is
+  wanted. Remove the Qty column, the Total column, and the "Per item |
+  Bundle" switch. Order items by the best per-item price.
+
+### 4b. Trader price lists live on TornW3B too, not only TornExchange
+- Traders publish price lists on **TornW3B** (`weav3r.dev/pricelist/{traderId}`)
+  as well as TornExchange. Earlier research, from third-party code and not
+  verified: TornW3B has `GET /api/pricelist/{traderId}` returning
+  `[{itemId, name, buyPrice}]`, but **no endpoint listing all traders**.
+- He wants traders' prices "from their page and from the traders' links", so
+  both sources probably matter. **Research cheaply and ask him** before
+  building: which sources, and how to find the traders (TornExchange's
+  `active_traders` gives ids; TornW3B has no list).
 
 ### 5. Graphs, when selling
 - He can't see graphs when selling. The facts:
