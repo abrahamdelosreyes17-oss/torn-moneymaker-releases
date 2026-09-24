@@ -22,6 +22,7 @@ import {
     formatMoneyShort,
     formatPct,
     formatAge,
+    parseMoneyInput,
 } from '../core/parse.js';
 import { VENUE_LABELS } from '../core/profit.js';
 import { W3B_TERMS_URL, W3B_SITE_URL } from '../api/w3b.js';
@@ -90,8 +91,8 @@ function describeError(error) {
 }
 
 function numberFromInput(value, fallback) {
-    const n = Number(String(value).replace(/[^0-9.\-]/g, ''));
-    return Number.isFinite(n) ? n : fallback;
+    const n = parseMoneyInput(value);
+    return n === null ? fallback : n;
 }
 
 /** Keys typed into these belong to the page (or our fields), not the hotkey. */
@@ -239,9 +240,19 @@ export class Panel {
         // you can see a scan happened even when nothing on the list changed.
         this.sweepEl = el('div', { class: 'ttv2-sweep', 'aria-hidden': 'true' });
 
+        // The Traders page: its own full page, fed by this overlay.
+        this.tradersBtn = el('button', {
+            type: 'button',
+            class: 'ttv2-traders-btn',
+            title: 'Open the Traders page: every deal with the traders who buy it',
+            text: 'Traders',
+            onclick: guarded(this, 'Traders', () => this.handlers.onOpenTraders && this.handlers.onOpenTraders()),
+        });
+
         this.headEl = el('div', { class: 'ttv2-head' }, [
             this.backBtn,
             this.titleEl,
+            this.tradersBtn,
             this.scanBtn,
             this.refreshBtn,
             this.settingsBtn,
@@ -339,6 +350,7 @@ export class Panel {
         this.root.addEventListener('keydown', (event) => {
             if (event.key !== 'Escape') return;
             if (this.closeChipEditor()) return;
+            if (this.closeTradersPrompt()) return;
             if (this.page === 'settings') this.showPage('list');
         });
 
@@ -723,7 +735,21 @@ export class Panel {
         );
         this.newTabInput = nt.input;
 
-        this.settingsPage.appendChild(section('Links', [nt.row]));
+        // The Traders page keeps its own preferences; this only shows and
+        // resets how its button opens it.
+        this.tradersModeEl = el('span', { class: 'ttv2-sub' });
+        const tradersLine = el('div', { class: 'ttv2-note ttv2-traders-mode' }, [
+            this.tradersModeEl,
+            document.createTextNode(' '),
+            el('button', {
+                type: 'button',
+                class: 'ttv2-link',
+                text: 'Ask again',
+                onclick: () => this.handlers.onTradersOpenMode && this.handlers.onTradersOpenMode('ask'),
+            }),
+        ]);
+
+        this.settingsPage.appendChild(section('Links', [nt.row, tradersLine]));
 
         /* ---- TornExchange ---- */
 
@@ -808,6 +834,55 @@ export class Panel {
                 ]),
             ]),
         );
+    }
+
+    renderTradersMode() {
+        if (!this.tradersModeEl) return;
+        const mode = this.state.tradersOpenMode || 'ask';
+        this.tradersModeEl.textContent =
+            'Traders page opens: ' +
+            (mode === 'tab' ? 'in a new tab' : mode === 'overlay' ? 'over the page' : 'ask each time') + '.';
+        this.tradersModeEl.parentNode.lastChild.hidden = mode === 'ask';
+    }
+
+    /**
+     * "Open the Traders page in a new tab?" - Yes / No, here / Remember.
+     * @param {function} onChoice - (newTab: boolean, remember: boolean)
+     */
+    showTradersPrompt(onChoice) {
+        this.closeTradersPrompt();
+        if (this.collapsed) this.setCollapsed(false, { save: true });
+
+        const remember = el('input', { type: 'checkbox' });
+        const choose = (newTab) => {
+            const keep = remember.checked;
+            this.closeTradersPrompt();
+            onChoice(newTab, keep);
+        };
+
+        const yes = el('button', { type: 'button', class: 'ttv2-primary', text: 'Yes', onclick: () => choose(true) });
+        this.tradersPrompt = el('div', { class: 'ttv2-prompt', role: 'dialog', 'aria-label': 'Open the Traders page' }, [
+            el('div', { class: 'ttv2-prompt-q', text: 'Open the Traders page in a new tab?' }),
+            el('div', {
+                class: 'ttv2-note',
+                text: 'Yes: its own tab, stays open while you browse Torn. No: full screen over this page, ✕ to close.',
+            }),
+            el('label', { class: 'ttv2-check ttv2-prompt-remember' }, [remember, el('span', { text: 'Remember my choice' })]),
+            el('div', { class: 'ttv2-prompt-btns' }, [
+                el('button', { type: 'button', text: 'No, here', onclick: () => choose(false) }),
+                yes,
+            ]),
+        ]);
+        this.root.appendChild(this.tradersPrompt);
+        yes.focus();
+    }
+
+    /** @returns {boolean} true if a prompt was open */
+    closeTradersPrompt() {
+        if (!this.tradersPrompt) return false;
+        this.tradersPrompt.remove();
+        this.tradersPrompt = null;
+        return true;
     }
 
     /** The TornExchange line in Settings: never the key, only its state. */
@@ -1171,6 +1246,7 @@ export class Panel {
 
         this.renderTabs();
         this.renderTraderInfo();
+        this.renderTradersMode();
         this.refreshAges();
     }
 
@@ -1322,9 +1398,53 @@ export class Panel {
             );
         }
 
+        const why = this.filterReason();
+        if (why) return box(why.text, why.label, why.fn);
+
         return box(this.emptyReason(), 'Refresh now', () =>
             this.handlers.onScan && this.handlers.onScan(),
         );
+    }
+
+    /**
+     * An empty list because of Cash / Min, said plainly - with the return
+     * the two together demand. $1m cash and a $1m Min means doubling your
+     * money, which almost never happens, and the list must say so rather
+     * than look broken.
+     */
+    filterReason() {
+        const s = this.state.settings || {};
+        const h = this.state.hidden || {};
+        const cash = Number(s.cashOnHand) || 0;
+        const min = Number(s.minTotalProfit) || 0;
+        const lines = [];
+
+        if (h.cash) {
+            lines.push(
+                h.cash + (h.cash === 1 ? ' deal is' : ' deals are') + ' hidden by your ' +
+                    formatMoneyShort(cash) + ' cash: you cannot buy enough of ' +
+                    (h.cash === 1 ? 'it' : 'them') + ' to make ' + formatMoneyShort(min) + '.',
+            );
+        }
+        if (h.min) {
+            lines.push(
+                h.min + (h.min === 1 ? ' deal makes' : ' deals make') + ' less than your Min of ' +
+                    formatMoneyShort(min) + '.',
+            );
+        }
+        if (cash > 0 && min > 1 && min / cash >= 0.2) {
+            lines.push(
+                'With ' + formatMoneyShort(cash) + ' cash, a ' + formatMoneyShort(min) +
+                    ' profit needs a ' + Math.round((min / cash) * 100) +
+                    '% return - that is rare. Try a lower Min.',
+            );
+        }
+        if (!lines.length) return null;
+
+        if (min > 1) {
+            return { text: lines.join(' '), label: 'Set Min to $1', fn: () => this.emitSettings({ minTotalProfit: 1 }) };
+        }
+        return { text: lines.join(' '), label: 'Clear cash', fn: () => this.emitSettings({ cashOnHand: null }) };
     }
 
     emptyReason() {

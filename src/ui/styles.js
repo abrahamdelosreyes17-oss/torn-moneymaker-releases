@@ -683,6 +683,42 @@ export const PANEL_CSS = `
 .ttv2-src-status[data-level="idle"] { color: var(--amber); }
 .ttv2-src-status[data-level="idle"]::before { background: var(--amber); }
 
+/* ---- Traders page button and its prompt ---- */
+
+.ttv2-panel button.ttv2-traders-btn {
+    padding: 3px 9px;
+    border-color: var(--trader);
+    color: var(--trader);
+    font-weight: bold;
+}
+
+.ttv2-prompt {
+    position: absolute;
+    top: 46px;
+    left: 10px;
+    right: 10px;
+    z-index: 5;
+    display: grid;
+    gap: 8px;
+    padding: 12px;
+    background: #2a2a2a;
+    border: 1px solid #666;
+    border-radius: 6px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.55);
+}
+
+.ttv2-prompt-q {
+    font-weight: bold;
+    font-size: 13px;
+    color: #fff;
+}
+
+.ttv2-prompt-btns {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+}
+
 /* ---- traders ---- */
 
 .ttv2-row-trader .ttv2-row-profit,

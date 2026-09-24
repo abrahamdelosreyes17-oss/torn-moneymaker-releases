@@ -79,6 +79,27 @@ export function rankOpportunities(opportunities, options = {}) {
     return opts.limit > 0 ? kept.slice(0, opts.limit) : kept;
 }
 
+/**
+ * What the Cash and Min filters took out of a list, so an empty list can say
+ * why instead of looking like "no deals".
+ * @returns {{cash: number, min: number}}
+ *   cash: profitable, and would reach Min if you could afford more of them
+ *   min:  profitable, but under Min even buying every one
+ */
+export function hiddenCounts(opportunities, options = {}) {
+    const min = Number(options.minTotalProfit) || 0;
+    const out = { cash: 0, min: 0 };
+
+    for (const row of opportunities || []) {
+        if (!row || !row.profit || row.profit.profitPerUnit <= 0) continue;
+        if (row.qtyAtPrice === false) continue;
+        if (row.profit.realizableProfit >= min) continue;
+        if (row.profit.totalProfit >= min) out.cash++;
+        else out.min++;
+    }
+    return out;
+}
+
 /** Headline totals for the panel. */
 export function summarize(rankedRows) {
     const rows = rankedRows || [];

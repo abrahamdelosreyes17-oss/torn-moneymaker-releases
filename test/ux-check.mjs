@@ -290,6 +290,89 @@ await p.waitForTimeout(300);
 ok(/Turn on Trader/.test(await txt(p, '.ttv2-empty')), 'By trader with the chip off explains and offers the fix');
 await q(p, '.ttv2-tab[data-label="Bazaars"]').click();
 
+// ---------- The Traders page ----------
+const tp = (sel) => p.locator('#ttv2-traders-host').locator(sel);
+await q(p, 'button.ttv2-traders-btn').click();
+ok(await vis(p, '.ttv2-prompt'), 'Traders button asks: new tab?');
+ok(/Open the Traders page in a new tab\?/.test(await txt(p, '.ttv2-prompt')), 'prompt text');
+await p.keyboard.press('Escape');
+ok(!(await vis(p, '.ttv2-prompt')), 'Esc cancels the prompt');
+
+await q(p, 'button.ttv2-traders-btn').click();
+await q(p, '.ttv2-prompt button', ).filter({ hasText: 'No, here' }).click();
+await p.waitForTimeout(2500);
+ok((await p.locator('#ttv2-traders-host').count()) === 1, '"No, here" draws the page over this one');
+ok(await tp('button[aria-label="Close"]').isVisible(), 'over-the-page mode has a close button');
+ok((await p.evaluate(() => JSON.parse(GM_getValue('tornTrading.v2.tradersPage') || '{}').openMode || 'ask')) === 'ask', 'not remembered unless ticked');
+ok(/Trader chip is off/.test(await tp('.tp-banner').textContent()), 'chip off: the page says trader-only deals are hidden');
+ok(/No trader buys these \(1\)/.test(await tp('.tp-notrader summary').textContent()), 'deals no trader buys are folded away, not lost');
+await tp('.tp-banner button').click();
+await p.waitForTimeout(6000);
+const cards = await tp('.tp-card:not(.tp-notrader)').allTextContents();
+ok(cards.length === 2 && cards.some((c) => /Xanax/.test(c)), '"Turn on Trader": the trader-only Xanax deal appears: ' + cards.length);
+ok(!(await tp('.tp-banner').isVisible()), 'and the banner goes');
+const hammerCard = tp('.tp-card').filter({ hasText: 'CheapSeller' }).first();
+const rowsText = await hammerCard.locator('.tp-tr:not(.tp-th)').allTextContents();
+ok(rowsText.length === 2 && /Bob/.test(rowsText[0]) && /Alice/.test(rowsText[1]), 'ALL its traders, online Bob above offline Alice: ' + JSON.stringify(rowsText));
+ok(/sell here/.test(rowsText[0]) && /Online/.test(rowsText[0]) && /Offline/.test(rowsText[1]), 'chosen trader tagged, statuses shown');
+ok(/traders? online · \+\$[\d,]+ sellable now/.test(await tp('.tp-strip').textContent()), 'reach strip: ' + (await tp('.tp-strip').textContent()));
+await hammerCard.locator('.tp-trader-name', { hasText: 'Bob' }).click();
+ok(/profiles\.php\?XID=11$/.test(await p.evaluate(() => window.__opened.at(-1))), 'clicking the trader\'s name opens their profile');
+await hammerCard.locator('button', { hasText: 'Price list' }).first().click();
+ok((await p.evaluate(() => window.__opened.at(-1))) === 'https://www.tornexchange.com/prices/11/', 'Price list opens their TornExchange list');
+await p.screenshot({ path: sp + '/ux-traders-page.png' });
+
+await tp('.tp-search').fill('xanax');
+await p.waitForTimeout(200);
+ok((await tp('.tp-card:not(.tp-notrader)').count()) === 1, 'search filters to one item');
+await tp('.tp-search').fill('');
+await tp('.tp-seg[data-view="trader"]').click();
+await p.waitForTimeout(300);
+const groupText = await tp('.tp-group').allTextContents();
+ok(groupText.length === 1 && /Bob/.test(groupText[0]) && /needs \$[\d.]+[km]? cash/.test(groupText[0]), 'By trader: one trade with Bob, and the cash it needs: ' + groupText[0]);
+await p.screenshot({ path: sp + '/ux-traders-page-bytrader.png' });
+await tp('.tp-seg[data-view="item"]').click();
+
+// The page's link preference is its own: off here, the overlay's stays on.
+await tp('button[title="Page preferences"]').click();
+await tp('.tp-prefs input[type="checkbox"]').uncheck();
+const prefs = await p.evaluate(() => JSON.parse(GM_getValue('tornTrading.v2.tradersPage')));
+const overlay = await p.evaluate(() => JSON.parse(GM_getValue('tornTrading.v2.settings')));
+ok(prefs.linksNewTab === false && overlay.openInNewTab !== false, 'page preferences are separate from the overlay\'s');
+await tp('.tp-prefs input[type="checkbox"]').check();
+await p.keyboard.press('Escape');
+await p.keyboard.press('Escape');
+ok((await p.locator('#ttv2-traders-host').count()) === 0, 'Esc closes the page');
+
+await q(p, 'button.ttv2-traders-btn').click();
+await q(p, '.ttv2-prompt-remember input').check();
+await q(p, '.ttv2-prompt button').filter({ hasText: 'Yes' }).click();
+ok(/index\.php\?ttv2=traders$/.test(await p.evaluate(() => window.__opened.at(-1))), '"Yes" opens it in its own tab');
+ok((await p.evaluate(() => JSON.parse(GM_getValue('tornTrading.v2.tradersPage')).openMode)) === 'tab', '"Remember" saves the choice');
+await q(p, 'button.ttv2-traders-btn').click();
+ok(!(await vis(p, '.ttv2-prompt')) && /ttv2=traders$/.test(await p.evaluate(() => window.__opened.at(-1))), 'remembered: no question next time');
+await q(p, 'button[title="Settings"]').click();
+ok(/Traders page opens: in a new tab/.test(await txt(p, '.ttv2-traders-mode')), 'overlay Settings shows the remembered choice');
+await q(p, '.ttv2-traders-mode button').click();
+ok((await p.evaluate(() => JSON.parse(GM_getValue('tornTrading.v2.tradersPage')).openMode)) === 'ask', '"Ask again" resets it');
+await q(p, 'button[title="Settings"]').click();
+
+// Its own tab: the URL alone turns the page into the Traders page.
+{
+  const t = await b.newPage({ viewport: { width: 1280, height: 900 } });
+  t.on('pageerror', e => errs.push(String(e)));
+  await t.goto('http://localhost:8780/test/harness-live.html?ttv2=traders');
+  await t.waitForTimeout(3000);
+  ok((await t.locator('#ttv2-traders-host').count()) === 1, 'a ?ttv2=traders tab IS the Traders page');
+  ok(!(await t.locator('#ttv2-traders-host').locator('button[aria-label="Close"]').isVisible()), 'its own tab has no close button');
+  await t.setViewportSize({ width: 430, height: 800 });
+  await t.waitForTimeout(300);
+  const overflow = await t.locator('#ttv2-traders-host').evaluate((h) => { const pg = h.shadowRoot.querySelector('.tp-list'); return pg.scrollWidth - pg.clientWidth; });
+  ok(overflow <= 2, 'no sideways scroll at 430px: ' + overflow);
+  await t.screenshot({ path: sp + '/ux-traders-page-narrow.png' });
+  await t.close();
+}
+
 // Settings -> "Open deals in a new tab" off: GO goes there in this tab.
 await q(p, 'button[title="Settings"]').click();
 const newTab = q(p, '.ttv2-check').filter({ hasText: 'Open deals in a new tab' }).locator('input');

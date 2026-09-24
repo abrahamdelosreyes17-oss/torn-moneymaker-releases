@@ -225,6 +225,9 @@ export class LiveFeed {
             const sig = [
                 settings.sellToNpc !== false,
                 Boolean(settings.sellToTrader),
+                Boolean(settings.resaleMarket),
+                Boolean(settings.resaleBazaar),
+                Number(settings.cashOnHand) || 0,
                 this.d.traderVersion ? this.d.traderVersion() : 0,
             ].join('|');
             if (this.sweepSig === undefined) this.sweepSig = sig;

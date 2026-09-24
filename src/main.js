@@ -40,7 +40,7 @@ import {
 } from './core/feed.js';
 import { makeTabId, LEADER_HEARTBEAT_MS } from './core/leader.js';
 import { formatMoneyShort } from './core/parse.js';
-import { rankOpportunities, summarize } from './core/ranker.js';
+import { rankOpportunities, summarize, hiddenCounts } from './core/ranker.js';
 import { TornApiClient, redactKey, KEY_DEAD_CODES } from './api/client.js';
 import { W3bClient } from './api/w3b.js';
 import { TeClient, fetchTeBestListings, tePriceListUrl } from './api/te.js';
@@ -48,6 +48,7 @@ import {
     pickTrader,
     maxTraderPrice,
     groupByTrader,
+    buildTraderBoard,
     makeTeCacheEntry,
     readTeCacheEntry,
     TE_REFRESH_MS,
@@ -64,6 +65,8 @@ import {
     itemMarketUrl,
     bazaarOwnerId,
     bazaarTarget,
+    tradersPageUrl,
+    isTradersPageUrl,
     PAGE_NONE,
     PAGE_BAZAAR,
 } from './sources/route.js';
@@ -77,6 +80,7 @@ import {
 } from './sources/dom/owner.js';
 import { injectStyles } from './ui/styles.js';
 import { Panel, TORN_API_KEY_URL } from './ui/panel.js';
+import { TradersPage, TRADERS_PAGE_DEFAULTS } from './ui/traders-page.js';
 import {
     markRows,
     clearMarks,
@@ -101,6 +105,8 @@ const STORE_OPENED = 'opened';
 const STORE_TE_KEY = 'teKey';
 const STORE_TE = 'teCache';
 const STORE_TE_STATE = 'teState';
+/* The Traders page's own preferences - never mixed with the overlay's settings. */
+const STORE_TRADERS_PAGE = 'tradersPage';
 
 const DEFAULT_SETTINGS = {
     /*
@@ -183,6 +189,8 @@ const OWNER_RETRY_MS = 60000;
  */
 const SELLER_STATUS_MAX = 10;
 const TRADER_STATUS_MAX = 15;
+/* While the Traders page is open: its top traders, in page order. */
+const PAGE_TRADER_STATUS_MAX = 20;
 const PRESENCE_REFRESH_MS = 60000;
 const PRESENCE_RETRY_MS = 120000;
 const PRESENCE_MAX_PENDING = 3;
@@ -234,6 +242,9 @@ const app = {
     /* { fetchedAt, map: itemId -> traders } from TornExchange, or null. */
     traders: null,
     teLoading: false,
+    /* The Traders page, while it is open here: { page, mode }. */
+    tradersPage: null,
+    tradersPageOpen: false,
     /* sellerId -> time until which their bazaar counts as closed. */
     closedSellers: new Map(),
     pageDiagnostics: null,
@@ -796,10 +807,20 @@ function refreshView() {
               ? groups.flatMap((g) => g.rows)
               : marketRows;
 
+    // The Traders page: every deal in both lists, with all its traders.
+    const board = app.tradersPageOpen
+        ? buildTraderBoard(bazaarRows.concat(marketRows), app.traders ? app.traders.map : new Map(), {
+              presenceOf,
+          })
+        : null;
+
     updatePresence(
         [
-            ...(tab === 'bazaar' ? listedSellers(bazaarRows) : []),
-            ...listedTraders(bazaarRows.concat(marketRows)),
+            ...new Set([
+                ...(tab === 'bazaar' || board ? listedSellers(bazaarRows) : []),
+                ...listedTraders(bazaarRows.concat(marketRows)),
+                ...(board ? boardTraders(board) : []),
+            ]),
         ],
         now,
     );
@@ -809,6 +830,10 @@ function refreshView() {
         groups,
         tab,
         statuses: statusMap(now),
+        hidden: hiddenCounts(
+            tab === 'itemmarket' ? lists.itemmarket : tab === 'bazaar' ? lists.bazaar : [],
+            rankSettings(),
+        ),
         traderInfo: traderInfo(now),
         counts: {
             bazaar: bazaarRows.length,
@@ -826,7 +851,19 @@ function refreshView() {
         pageType: app.pageType,
         lastScanAt: app.lastScanAt,
         live: app.feed ? app.feed.status() : null,
+        tradersOpenMode: tradersPagePrefs().openMode,
     });
+
+    if (board && app.tradersPage) {
+        app.tradersPage.page.render({
+            board,
+            statuses: statusMap(now),
+            traderInfo: traderInfo(now),
+            live: app.feed ? app.feed.status() : null,
+            prefs: tradersPagePrefs(),
+            traderChipOn: Boolean(app.settings.sellToTrader),
+        });
+    }
 }
 
 /**
@@ -1071,7 +1108,9 @@ function updatePresence(ids, now) {
     }
 
     if (!app.client || !hasUsableKey()) return;
-    if (document.visibilityState !== 'visible' || app.panel.collapsed) return;
+    // The Traders page folds the panel but still needs statuses.
+    if (document.visibilityState !== 'visible') return;
+    if (app.panel.collapsed && !app.tradersPageOpen) return;
 
     let pending = 0;
     for (const s of app.presence.values()) if (s.pending) pending++;
@@ -1212,6 +1251,121 @@ async function refreshTraders({ force = false } = {}) {
     }
 }
 
+/** The Traders page's traders, most profitable deals first. */
+function boardTraders(board) {
+    const ids = [];
+    const sorted = board
+        .slice()
+        .sort((a, b) => (b.bestTrader ? b.bestTrader.profit : 0) - (a.bestTrader ? a.bestTrader.profit : 0));
+    for (const entry of sorted) {
+        for (const t of entry.traders) {
+            if (!ids.includes(t.trader.id)) ids.push(t.trader.id);
+            if (ids.length >= PAGE_TRADER_STATUS_MAX) return ids;
+        }
+    }
+    return ids;
+}
+
+/* ------------------------------------------------------------------ *
+ * The Traders page
+ * ------------------------------------------------------------------ */
+
+function tradersPagePrefs() {
+    const stored = gmGet(STORE_TRADERS_PAGE, {}) || {};
+    const out = { ...TRADERS_PAGE_DEFAULTS };
+    for (const key of Object.keys(TRADERS_PAGE_DEFAULTS)) {
+        if (Object.prototype.hasOwnProperty.call(stored, key)) out[key] = stored[key];
+    }
+    return out;
+}
+
+function setTradersPagePrefs(partial) {
+    gmSet(STORE_TRADERS_PAGE, { ...tradersPagePrefs(), ...partial });
+    refreshView();
+}
+
+/** The overlay's Traders button: open as remembered, or ask. */
+function onOpenTraders() {
+    const mode = tradersPagePrefs().openMode;
+    if (mode === 'tab') return openTradersInTab();
+    if (mode === 'overlay') return showTradersPage('overlay');
+
+    app.panel.showTradersPrompt((newTab, remember) => {
+        if (remember) setTradersPagePrefs({ openMode: newTab ? 'tab' : 'overlay' });
+        if (newTab) openTradersInTab();
+        else showTradersPage('overlay');
+    });
+    return undefined;
+}
+
+function openTradersInTab() {
+    gmOpenTab(tradersPageUrl());
+}
+
+/** Draw the page here: over this Torn page, or as this tab's whole page. */
+function showTradersPage(mode) {
+    if (!app.tradersPage) {
+        const page = new TradersPage({
+            onClose: closeTradersPage,
+            onNavigate: (row) => {
+                // A listing on the Torn page underneath: close, then point at it.
+                if (row.el && document.contains(row.el)) {
+                    closeTradersPage();
+                    revealRow(row.el);
+                    return;
+                }
+                onNavigate(row, { newTab: tradersPagePrefs().linksNewTab !== false });
+            },
+            onOpenProfile: (id) =>
+                openDeal(
+                    'https://www.torn.com/profiles.php?XID=' + encodeURIComponent(String(id)),
+                    tradersPagePrefs().linksNewTab !== false,
+                ),
+            onOpenPriceList,
+            onRefresh: () => {
+                // Statuses are due again now; trader prices only if their gap allows.
+                for (const s of app.presence.values()) s.fetchedAt = 0;
+                refreshTraders({ force: true });
+                refreshView();
+            },
+            onPrefsChange: setTradersPagePrefs,
+            onAddKey: () => app.panel.openSettings(),
+            onEnableTraders: () => {
+                onSettingsChange({ sellToTrader: true });
+                // Re-pick what the feed fetches now, not at its next summary.
+                if (app.feed) {
+                    app.feed.requestRefresh();
+                    app.feed.tick().catch(() => {});
+                }
+            },
+        });
+        app.tradersPage = { page, mode };
+    }
+
+    app.tradersPage.mode = mode;
+    app.tradersPage.page.mount(mode);
+    app.tradersPageOpen = true;
+
+    // Fold the overlay to its bar so it does not sit on the page (not saved;
+    // ` still toggles it). Unfolded again when the page closes.
+    if (!app.panel.collapsed && !app.tradersPage.foldedPanel) {
+        app.tradersPage.foldedPanel = true;
+        app.panel.setCollapsed(true);
+    }
+
+    refreshTraders();
+    refreshView();
+}
+
+function closeTradersPage() {
+    if (!app.tradersPage) return;
+    if (app.tradersPage.foldedPanel && app.panel.collapsed) app.panel.setCollapsed(false);
+    app.tradersPage.page.destroy();
+    app.tradersPage = null;
+    app.tradersPageOpen = false;
+    refreshView();
+}
+
 function onSaveTeKey(key) {
     key = String(key || '').trim();
     if (!key) {
@@ -1340,7 +1494,7 @@ function openedKey(row) {
     return [row.source, row.itemId, row.sellerId || '', row.profit.listingPrice].join(':');
 }
 
-function onNavigate(row) {
+function onNavigate(row, { newTab } = {}) {
     // One click, one navigation. Nothing is ever bought by the script.
     if (row.el && document.contains(row.el)) {
         revealRow(row.el);
@@ -1363,22 +1517,25 @@ function onNavigate(row) {
     }
 
     if (row.url) {
-        openDeal(row.url);
+        openDeal(row.url, newTab);
         return;
     }
 
     // A bazaar sighting goes back to that bazaar, not to the Item Market.
     if (row.source === SOURCE_BAZAAR && row.sellerId) {
-        openDeal(bazaarUrl(row.sellerId, row.itemId, row.profit.listingPrice));
+        openDeal(bazaarUrl(row.sellerId, row.itemId, row.profit.listingPrice), newTab);
         return;
     }
 
-    openDeal(itemMarketUrl(row.itemId, row.name));
+    openDeal(itemMarketUrl(row.itemId, row.name), newTab);
 }
 
-/** A new tab, or this one - Settings -> "Open deals in a new tab". */
-function openDeal(url) {
-    if (app.settings.openInNewTab !== false) {
+/**
+ * A new tab, or this one. The overlay follows Settings -> "Open deals in a
+ * new tab"; the Traders page passes its own preference.
+ */
+function openDeal(url, newTab = app.settings.openInNewTab !== false) {
+    if (newTab) {
         gmOpenTab(url);
         return;
     }
@@ -1657,6 +1814,8 @@ export function boot() {
         onRefreshTraders: () => refreshTraders({ force: true }),
         onOpenProfile,
         onOpenPriceList,
+        onOpenTraders,
+        onTradersOpenMode: (mode) => setTradersPagePrefs({ openMode: mode }),
     });
 
     app.panel.mount();
@@ -1667,6 +1826,9 @@ export function boot() {
     registerMenu();
 
     applyPageType(detectPage(location.href), { initial: true });
+
+    // A tab opened for the Traders page: this whole tab is the page.
+    if (isTradersPageUrl(location.href)) showTradersPage('tab');
 
     if (!getStoredKey()) {
         app.panel.setStatus(

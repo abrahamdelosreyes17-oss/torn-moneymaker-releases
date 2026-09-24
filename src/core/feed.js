@@ -107,7 +107,30 @@ export function exitsFor(item, settings = {}, traderPrice = 0) {
 }
 
 /**
+ * The most a listing at `price` can earn with the user's cash: profit per
+ * item x how many the cash buys (and no more than `qty`, when known).
+ * Infinity when neither cash nor quantity limits it.
+ *
+ * This is what makes discovery cash-aware. Ranking by profit PER ITEM always
+ * put the $200m items first; with $1m of cash every one of them was then
+ * filtered out, and the cheap deals that fit were never fetched at all.
+ */
+export function reachableProfit(profitPerUnit, price, settings = {}, qty = Infinity) {
+    let n = Number.isFinite(qty) && qty > 0 ? qty : Infinity;
+    const cash = Number(settings.cashOnHand);
+    if (cash > 0 && price > 0) n = Math.min(n, Math.floor(cash / price));
+    if (n === 0) return 0;
+    return profitPerUnit * n;
+}
+
+/**
  * Which items are worth a closer look, from TornW3B's one-call summary.
+ *
+ * Everything here is free - one summary for every item, plus the cached
+ * item database - so the Cash and Min filters are applied BEFORE any request:
+ * an item you cannot afford one of, or that cannot reach your Min with your
+ * cash, is never fetched. What is left is ranked by the profit your cash can
+ * actually make.
  *
  * One request covers every item; the friend's script made ~1,100 in a
  * 22-minute loop to answer the same question, and the answer was stale
@@ -141,14 +164,24 @@ export function selectCandidates(
 
         if (!best || best.profitPerUnit < 1) continue;
 
+        const reach = reachableProfit(best.profitPerUnit, s.lowestPrice, settings);
+        if (reach < 1) continue; // cannot afford even one
+        if (reach < (Number(settings.minTotalProfit) || 0)) continue;
+
         out.push({
             itemId: String(s.itemId),
             lowestPrice: s.lowestPrice,
             profitPerUnit: best.profitPerUnit,
+            reach,
         });
     }
 
-    out.sort((a, b) => b.profitPerUnit - a.profitPerUnit);
+    // With cash set, what your cash can make; without, profit per item.
+    out.sort((a, b) =>
+        Number.isFinite(a.reach) && Number.isFinite(b.reach)
+            ? b.reach - a.reach || b.profitPerUnit - a.profitPerUnit
+            : b.profitPerUnit - a.profitPerUnit,
+    );
     return max > 0 ? out.slice(0, max) : out;
 }
 
@@ -524,25 +557,43 @@ export function readFeedCacheEntry(entry, now = Date.now()) {
  * to what the item normally trades for.
  */
 export function itemMarketSweepList(index, settings = {}, traderPriceOf = () => 0) {
-    const out = [];
+    const scored = [];
+    const cash = Number(settings.cashOnHand) || 0;
 
     for (const item of (index && index.byId && index.byId.values()) || []) {
         const sell = Number(item.sellPrice);
         const mv = Number(item.marketValue);
         if (!(mv > 0)) continue;
 
-        // Probe: a listing 15% under market value - would it beat an exit?
-        const beats = (exitPrice, venue) => {
-            const probe = computeOpportunity({ listingPrice: mv * 0.85, exitPrice, venue });
-            return Boolean(probe && probe.profitPerUnit > 0);
+        // Probe: a listing 15% under market value - what would it make?
+        const probePrice = mv * 0.85;
+        const perUnit = (exitPrice, venue) => {
+            const probe = computeOpportunity({ listingPrice: probePrice, exitPrice, venue });
+            return probe ? probe.profitPerUnit : 0;
         };
 
-        if (settings.sellToNpc !== false && sell > 0 && beats(sell, 'NPC')) {
-            out.push(item.id);
-        } else if (settings.sellToTrader && beats(Number(traderPriceOf(item.id)) || 0, 'TRADER')) {
-            out.push(item.id);
+        let best = 0;
+        let floor = mv * 0.5; // the cheapest a real listing plausibly gets
+        if (settings.sellToNpc !== false && sell > 0) {
+            const p = perUnit(sell, 'NPC');
+            if (p > best) { best = p; floor = Math.min(sell, mv) * 0.5; }
         }
+        if (settings.sellToTrader) {
+            best = Math.max(best, perUnit(Number(traderPriceOf(item.id)) || 0, 'TRADER'));
+        }
+        // The Market / My bazaar chips used to add nothing here, so with them
+        // on, only NPC items were ever swept on the Item Market.
+        if (settings.resaleMarket) best = Math.max(best, perUnit(mv, 'ITEM_MARKET'));
+        if (settings.resaleBazaar) best = Math.max(best, perUnit(mv, 'BAZAAR_RESALE'));
+
+        if (!(best > 0)) continue;
+        // Not even one affordable at half its value: skip it.
+        if (cash > 0 && floor > cash) continue;
+
+        scored.push({ id: item.id, key: reachableProfit(best, probePrice, settings) || best });
     }
 
-    return out;
+    // What your cash could make first, so the likeliest deals are checked soonest.
+    scored.sort((a, b) => b.key - a.key);
+    return scored.map((s) => s.id);
 }

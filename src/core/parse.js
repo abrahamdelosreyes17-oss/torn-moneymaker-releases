@@ -85,6 +85,30 @@ export function parseQuantity(text) {
     return null;
 }
 
+/**
+ * A money amount typed by a person: "1000000", "1,000,000", "$1m", "1.5m",
+ * "500k", "2b", "1kk", "1 million". Returns null for anything else.
+ *
+ * The chips used to drop every non-digit, so "1m" became $1 - and a $1 cash
+ * cap hides every deal without saying why.
+ */
+export function parseMoneyInput(text) {
+    const raw = String(text == null ? '' : text).trim().toLowerCase().replace(/[$,\s_]/g, '');
+    if (!raw) return null;
+
+    const m = raw.match(/^(-?\d+(?:\.\d+)?)(k|kk|m|mil|mill|million|b|bil|bill|billion|thousand)?$/);
+    if (!m) return null;
+
+    const mult = {
+        k: 1e3, thousand: 1e3,
+        kk: 1e6, m: 1e6, mil: 1e6, mill: 1e6, million: 1e6,
+        b: 1e9, bil: 1e9, bill: 1e9, billion: 1e9,
+    }[m[2] || ''] || 1;
+
+    const n = Number(m[1]) * mult;
+    return Number.isFinite(n) ? Math.round(n) : null;
+}
+
 /** "$1,234" */
 export function formatMoney(value) {
     if (!Number.isFinite(value)) return '-';

@@ -186,3 +186,46 @@ test('trader price cache: round trip, and too old is dropped', () => {
     assert.equal(readTeCacheEntry(entry, now + TE_MAX_AGE_MS + 1), null);
     assert.equal(readTeCacheEntry({ version: 0 }, now), null);
 });
+
+import { buildTraderBoard } from '../src/core/traders.js';
+import { decorateBoardEntry } from '../src/ui/traders-page.js';
+import { tradersPageUrl, isTradersPageUrl, detectPage } from '../src/sources/route.js';
+
+test('Traders page board: every deal, its cheapest listing, ALL its traders online-first', () => {
+    const item = { id: '1', name: 'Hammer', sellPrice: 100, marketValue: 120 };
+    const deal = (price, qty) => ({
+        itemId: '1', name: 'Hammer', item, qtyAtPrice: true,
+        profit: bestVenue({ listingPrice: price, exits: { NPC: 100 }, qty }),
+    });
+    const beer = { itemId: '180', name: 'Beer', item: { id: '180', sellPrice: 50, marketValue: 55 }, qtyAtPrice: true,
+        profit: bestVenue({ listingPrice: 30, exits: { NPC: 50 }, qty: 1 }) };
+    const map = new Map([['1', [
+        { name: 'Alice', id: '12', price: 115, score: 40 },
+        { name: 'Bob', id: '11', price: 110, score: 214 },
+    ]]]);
+    const presenceOf = (id) => ({ 11: { online: 'Online' }, 12: { online: 'Offline' } })[id] || null;
+
+    const board = buildTraderBoard([deal(95, 1), deal(50, 4), beer], map, { presenceOf });
+    const hammer = board.find((e) => e.itemId === '1');
+    assert.equal(hammer.listing.profit.listingPrice, 50, 'cheapest listing leads');
+    assert.equal(hammer.listings.length, 2);
+    assert.deepEqual(hammer.traders.map((t) => t.trader.name), ['Bob', 'Alice'], 'online first, though Alice pays more');
+    assert.equal(hammer.bestTrader.trader.name, 'Bob');
+    assert.equal(hammer.traders[0].profit, (110 - 50) * 4);
+
+    const d = decorateBoardEntry(hammer);
+    assert.equal(d.traderWins, true, 'Bob +$240 beats NPC +$200');
+    assert.equal(d.headline, 240);
+    assert.equal(d.headlineTag, 'Trader');
+    assert.equal(d.cashNeeded, 200);
+
+    const b = decorateBoardEntry(board.find((e) => e.itemId === '180'));
+    assert.equal(b.traders.length, 0);
+    assert.equal(b.headlineTag, 'NPC');
+});
+
+test('Traders page URL: its own tab is recognised, and is not a market page', () => {
+    assert.equal(isTradersPageUrl(tradersPageUrl()), true);
+    assert.equal(isTradersPageUrl('https://www.torn.com/index.php'), false);
+    assert.equal(detectPage(tradersPageUrl()), null);
+});

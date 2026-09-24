@@ -113,6 +113,40 @@ scrolls to it when it is on the page you are viewing. Nothing is ever bought for
   - **By trader** tab: every trader deal grouped by the trader who buys it, so
     several items go in one trade. Online traders first, then biggest total.
     Each item keeps its own GO button.
+- **Traders page** (the blue **Traders** button): a full page of its own -
+  "which trader do I sell this to, right now?" - fed by the overlay's deal list,
+  trader prices and online statuses.
+  - The button asks *Open the Traders page in a new tab?* **Yes** gives it its own
+    tab (`index.php?ttv2=traders`, which the script turns into the page); **No,
+    here** draws it full screen over the page you are on, ✕ or Esc to close.
+    *Remember my choice* skips the question; change it in the page's ⚙ or reset
+    it under Settings → Links → *Ask again*.
+  - **By item** (default): every deal, where to buy it (with the seller's
+    status), what an NPC pays, and **all** its TornExchange traders - online
+    first - each with price, % of value, the profit of selling it to them, and
+    net score. The trader it should go to is marked *sell here*; prices over 105%
+    of value say *check list first*. Deals no trader buys fold into one line.
+  - **By trader**: the deals each trader should get - one trade each - with the
+    total and the **cash that trade needs**. Online traders first.
+  - The strip under the header: *N traders online · +$X sellable now*; click it
+    for online-only. Filters: Online only, Hide NPC-better, Hide no-trader,
+    search by item or trader, sort by profit / name / trader status.
+  - Clicking a trader's **name** or **Profile** opens their Torn profile (start
+    the trade there); **Price list** opens their TornExchange list in a new tab.
+  - The page has **its own preferences** (how it opens, whether its links open a
+    new tab, view, filters) - separate from the overlay's. Deals and the Sell
+    to / Min / Cash filters come from the overlay; with the Trader chip off, the
+    page says trader-only deals are hidden and offers to turn it on.
+  - While the page is open the overlay folds to its bar (not saved; ` still
+    toggles it). The page never fetches anything itself.
+- **Cash and Min steer what is checked, not just what is shown.** Every item's
+  cheapest bazaar price (one TornW3B summary) and value (the cached item
+  database) are free, so before any request: an item you cannot afford one of,
+  or that cannot reach your Min with your cash, is never fetched, and the rest
+  are checked in order of what your cash can make. The Item Market sweep now
+  includes the Market / My bazaar exits too. An empty list says what Cash and
+  Min hid - and the return they demand ($1m cash with a $1m Min means doubling
+  your money). The chips read `1m`, `1.5m`, `500k`, `2b`.
 - **Seller status on every bazaar deal:** each row in the Bazaars list shows the
   owner's status right after their name (*Bazaar - Garrett89 ● Offline 3h ago ·
   Traveling*; hover for the full line), so you know whether they are around
