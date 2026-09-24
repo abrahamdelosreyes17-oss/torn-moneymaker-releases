@@ -1178,7 +1178,7 @@ function traderInfo(now = Date.now()) {
  * both ask; failures wait TE_RETRY_MS, and a 429 waits what TornExchange says.
  */
 async function refreshTraders({ force = false } = {}) {
-    if (!app.settings.sellToTrader || !getTeKey() || app.teLoading) return;
+    if (!(app.settings.sellToTrader || app.tradersPageOpen) || !getTeKey() || app.teLoading) return;
     if (document.visibilityState !== 'visible') return;
 
     const now = Date.now();

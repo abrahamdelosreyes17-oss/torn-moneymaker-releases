@@ -90,3 +90,20 @@ export function bazaarTarget(href) {
         price: Number.isFinite(price) && price > 0 ? price : null,
     };
 }
+
+/*
+ * The Traders page in its own tab: Torn's home page with a marker the script
+ * recognises, and covers with the page. Nothing is fetched from Torn - this
+ * is a page the user opened, drawn over by the script, reading what the
+ * overlay already stored.
+ */
+export const TRADERS_PAGE_PARAM = 'ttv2';
+export const TRADERS_PAGE_VALUE = 'traders';
+
+export function tradersPageUrl() {
+    return 'https://www.torn.com/index.php?' + TRADERS_PAGE_PARAM + '=' + TRADERS_PAGE_VALUE;
+}
+
+export function isTradersPageUrl(href) {
+    return queryOf(href).get(TRADERS_PAGE_PARAM) === TRADERS_PAGE_VALUE;
+}

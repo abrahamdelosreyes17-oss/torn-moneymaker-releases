@@ -38,17 +38,11 @@ function isSuspect(price, marketValue) {
 }
 
 /**
- * @param {Array<{name, id, price, score}>} traders - TornExchange's top buyers
- * @param {object} ctx
- * @param {function} ctx.presenceOf - (traderId) => presence | null
- * @param {number} [ctx.marketValue]
- * @returns {null | {trader, level, suspect, pctOfValue, better}}
- *   better: a trader who pays more but is further down the order, or null
+ * Sane prices first, then online / idle / unknown / offline, then price, then score.
+ * @returns {Array<{trader, level, suspect}>}
  */
-export function pickTrader(traders, { presenceOf = () => null, marketValue = 0 } = {}) {
-    if (!Array.isArray(traders) || !traders.length) return null;
-
-    const ranked = traders.map((trader) => ({
+export function rankTraders(traders, { presenceOf = () => null, marketValue = 0 } = {}) {
+    const ranked = (traders || []).map((trader) => ({
         trader,
         level: presenceLevel(presenceOf(trader.id)),
         suspect: isSuspect(trader.price, marketValue),
@@ -61,7 +55,21 @@ export function pickTrader(traders, { presenceOf = () => null, marketValue = 0 }
             b.trader.price - a.trader.price ||
             b.trader.score - a.trader.score,
     );
+    return ranked;
+}
 
+/**
+ * @param {Array<{name, id, price, score}>} traders - TornExchange's top buyers
+ * @param {object} ctx
+ * @param {function} ctx.presenceOf - (traderId) => presence | null
+ * @param {number} [ctx.marketValue]
+ * @returns {null | {trader, level, suspect, pctOfValue, better}}
+ *   better: a trader who pays more but is further down the order, or null
+ */
+export function pickTrader(traders, { presenceOf = () => null, marketValue = 0 } = {}) {
+    if (!Array.isArray(traders) || !traders.length) return null;
+
+    const ranked = rankTraders(traders, { presenceOf, marketValue });
     const chosen = ranked[0];
 
     let better = null;
@@ -77,6 +85,67 @@ export function pickTrader(traders, { presenceOf = () => null, marketValue = 0 }
         pctOfValue: Number(marketValue) > 0 ? chosen.trader.price / marketValue : null,
         better: better ? { trader: better.trader, level: better.level } : null,
     };
+}
+
+/**
+ * The Traders page: every item in the deal list, the cheapest place to buy
+ * it, and ALL its TornExchange traders ranked the same way pickTrader does
+ * (sane price, online first, then price), each with the profit of selling
+ * that listing to them.
+ *
+ * @param {Array} rows - the deal list (bazaar + Item Market), any exit
+ * @param {Map} tradersMap - itemId -> traders, from TornExchange
+ * @param {object} ctx - { presenceOf }
+ * @returns {Array<{itemId, name, item, listing, listings, bestVenue, traders, bestTrader}>}
+ */
+export function buildTraderBoard(rows, tradersMap, { presenceOf = () => null } = {}) {
+    const byItem = new Map();
+
+    for (const row of rows || []) {
+        if (!row || !row.profit) continue;
+        const id = String(row.itemId);
+        if (!byItem.has(id)) byItem.set(id, []);
+        byItem.get(id).push(row);
+    }
+
+    const out = [];
+
+    for (const [itemId, listings] of byItem) {
+        listings.sort((a, b) => a.profit.listingPrice - b.profit.listingPrice);
+        const listing = listings[0];
+        const item = listing.item || {};
+        const value = Number(item.marketValue) || 0;
+        const qty = listing.profit.affordableQty || 1;
+
+        const traders = rankTraders((tradersMap && tradersMap.get(itemId)) || [], {
+            presenceOf,
+            marketValue: value,
+        }).map((r) => {
+            const perUnit = r.trader.price - listing.profit.listingPrice;
+            return {
+                ...r,
+                pctOfValue: value > 0 ? r.trader.price / value : null,
+                profitPerUnit: perUnit,
+                profit: perUnit * qty,
+            };
+        });
+
+        // The trader you would actually sell to: the first who pays more than it costs.
+        const bestTrader = traders.find((t) => !t.suspect && t.profitPerUnit > 0) || null;
+
+        out.push({
+            itemId,
+            name: listing.name,
+            item,
+            listing,
+            listings,
+            bestVenue: listing.profit.venue,
+            traders,
+            bestTrader,
+        });
+    }
+
+    return out;
 }
 
 /**
