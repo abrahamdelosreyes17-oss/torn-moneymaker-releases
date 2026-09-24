@@ -53,44 +53,55 @@ export async function fetchItems(client) {
 }
 
 /**
- * What an NPC shop pays for an item, and which shop - from `value.shops`.
+ * What an NPC shop in Torn pays for an item, and which shop.
  *
- * `value.sell_price` alone is NOT trustworthy. Captured live, 2026-09-24:
+ * Neither API field is trustworthy alone; each lies differently. Captured
+ * live, 2026-09-24, against the game's own "Sell:" line:
  *
- *   Beretta M9          shops: [Big Al's Gun Shop, sell 1300]  sell_price 1300
- *   Bottle of Champagne shops: [Bits 'n' Bobs, sell 3100]      sell_price 3100
- *   Companion Script    shops: []                              sell_price 12000000
+ *   item                sell_price  shops                                game
+ *   Beretta M9          1300        [Torn  Big Al's       sell 1300]     $1,300
+ *   Companion Script    12000000    []                                   N/A
+ *   Stick of Dynamite   null        [China General Store  sell 37500]    N/A
+ *   Pillow              150         [UAE sell 75, Torn Big Al's sell 150] $150
  *
- * The game shows the Companion Script as "Sell: N/A" - no NPC buys it - yet
- * the bare field says $12m, and the panel offered a $4m "NPC flip" on it.
- * The shops list is what the game's Sell line reflects ("$3,800 (Big Al's
- * Gun Shop)"), and it is the field Torn is moving to. So: no shop, no sale.
+ * Foreign shops' "sell" is a filler of 75% of their buy price (Dynamite
+ * 50,000 -> 37,500; Printing Paper 75,000 -> 56,250) - and nobody can sell
+ * abroad anyway: items are bought abroad and sold in Torn. So an item has
+ * an NPC buyer only when BOTH hold:
  *
- * Only if a payload predates `shops` entirely is the bare field used, and
- * then only when a vendor is named.
+ *   - `sell_price` is a positive number (rules out Dynamite & co.), and
+ *   - a shop in Torn lists a positive sell price (rules out the Companion
+ *     Scripts and anything sold only abroad).
+ *
+ * The price is that Torn shop's (preferring the one matching `sell_price`).
+ * A payload from before `shops` existed falls back to a vendor in Torn.
  *
  * @returns {{price: number|null, shop: string|null}}
  */
 export function npcSaleFromValue(value) {
     const v = value || {};
+    const none = { price: null, shop: null };
+    const listed = Number(v.sell_price);
+
+    if (!Number.isFinite(listed) || listed <= 0) return none;
 
     if (Array.isArray(v.shops)) {
-        let best = null;
+        const torn = [];
         for (const s of v.shops) {
             const price = Number(s && s.sell_price);
-            if (Number.isFinite(price) && price > 0 && (!best || price > best.price)) {
-                best = { price, shop: (s && s.shop) || null };
+            if (s && s.country === 'Torn' && Number.isFinite(price) && price > 0) {
+                torn.push({ price, shop: s.shop || null });
             }
         }
-        return best || { price: null, shop: null };
+        if (!torn.length) return none;
+        return torn.find((t) => t.price === listed) || torn.reduce((a, b) => (b.price > a.price ? b : a));
     }
 
-    const price = Number(v.sell_price);
-    if (v.vendor && Number.isFinite(price) && price > 0) {
-        return { price, shop: v.vendor.name || null };
+    if (v.vendor && v.vendor.country === 'Torn') {
+        return { price: listed, shop: v.vendor.name || null };
     }
 
-    return { price: null, shop: null };
+    return none;
 }
 
 /** v2 item list -> v1-shaped map. Follows `_metadata.links.next` if paged. */

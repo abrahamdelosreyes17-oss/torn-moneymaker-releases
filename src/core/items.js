@@ -8,7 +8,7 @@
  */
 
 /** Bump to invalidate every cached item database in the wild. */
-export const ITEMS_CACHE_VERSION = 'items-v4';
+export const ITEMS_CACHE_VERSION = 'items-v5';
 
 /**
  * One hour. sell_price barely moves, but market_value moves every day, and

@@ -33,6 +33,8 @@ const ITEMS = {
     180: { name: 'Bottle of Beer', sell_price: 50, market_value: 55 },
     // "Sell: N/A" in game. Listed cheap on TornW3B - must NEVER appear.
     900: { name: 'Companion Script : Test', sell_price: null, market_value: 10088888 },
+    // "Sell: N/A" too: only a foreign shop, whose "sell" is 75% filler.
+    335: { name: 'Stick of Dynamite', sell_price: null, foreign: true, market_value: 9172 },
 };
 
 window.__requests = [];
@@ -47,8 +49,10 @@ function respond(url) {
                 // Real v2 shape: the NPC price lives in value.shops. The N/A
                 // item keeps a bare sell_price but has no shop - like the
                 // live Companion Script.
-                value: i.sell_price
-                    ? { vendor: { name: 'Test Shop' }, shops: [{ shop: 'Test Shop', sell_price: i.sell_price }], sell_price: i.sell_price, market_price: i.market_value }
+                value: i.foreign
+                    ? { vendor: { country: 'China', name: 'General Store' }, shops: [{ country: 'China', shop: 'General Store', buy_price: 50000, sell_price: 37500 }], sell_price: null, market_price: i.market_value }
+                    : i.sell_price
+                    ? { vendor: { name: 'Test Shop' }, shops: [{ country: 'Torn', shop: 'Test Shop', sell_price: i.sell_price }], sell_price: i.sell_price, market_price: i.market_value }
                     : { vendor: null, shops: [], sell_price: 12000000, market_price: i.market_value },
             })), _metadata: { links: { next: null } } };
         }
@@ -70,6 +74,7 @@ function respond(url) {
                 { item_id: 1, item_name: 'Hammer', lowest_price: 50, market_price: 120, total_bazaars: 3 },
                 { item_id: 206, item_name: 'Xanax', lowest_price: 840000, market_price: 830000 },
                 { item_id: 900, item_name: 'Companion Script : Test', lowest_price: 5, market_price: 10088888 },
+                { item_id: 335, item_name: 'Stick of Dynamite', lowest_price: 17500, market_price: 9172 },
             ] };
         }
         if (u.pathname === '/api/marketplace/1') {
@@ -79,6 +84,9 @@ function respond(url) {
                 { player_id: null, price: 10, quantity: 99, last_checked: NOW_S },
                 { player_id: 555, player_name: 'OldNews', price: 40, quantity: 9, last_checked: NOW_S - 3600 },
             ] };
+        }
+        if (u.pathname === '/api/marketplace/335') {
+            return { total_listings: 1, listings: [{ player_id: 2, player_name: 'Y', price: 17500, quantity: 53, last_checked: NOW_S }] };
         }
         if (u.pathname === '/api/marketplace/900') {
             return { total_listings: 1, listings: [{ player_id: 1, player_name: 'X', price: 5, quantity: 3, last_checked: NOW_S }] };
@@ -118,7 +126,7 @@ setTimeout(() => {
     keyInputValue: ($p('.ttv2-settings input') || {}).value,
     requests: window.__requests.map(u => u.replace(KEY, '<KEY>')),
     keyEverSentToW3b: w3b.some(u => u.includes(KEY)),
-    naItemShown: $$p('.ttv2-row').some(r => r.textContent.includes('Companion Script')),
+    naItemShown: $$p('.ttv2-row').some(r => /Companion Script|Stick of Dynamite/.test(r.textContent)),
     rowsSeen: $$p('.ttv2-row').length,
   }, null, 1);
   window.__done = true;

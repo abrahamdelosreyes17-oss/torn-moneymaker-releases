@@ -643,17 +643,36 @@ const LIVE_VALUES = {
     15: { name: 'Beretta M9', value: { vendor: { country: 'Torn', name: "Big Al's Gun Shop" }, shops: [{ country: 'Torn', shop: "Big Al's Gun Shop", buy_price: 2000, sell_price: 1300 }], buy_price: 2000, sell_price: 1300, market_price: 1066 } },
     181: { name: 'Bottle of Champagne', value: { vendor: { country: 'Torn', name: "Bits 'n' Bobs" }, shops: [{ country: 'Torn', shop: "Bits 'n' Bobs", buy_price: 4500, sell_price: 3100 }], buy_price: 4500, sell_price: 3100, market_price: 2932 } },
     456: { name: 'Companion Script : Ubay', value: { vendor: null, shops: [], buy_price: null, sell_price: 12000000, market_price: 0 } },
+    335: { name: 'Stick of Dynamite', value: { vendor: { country: 'China', name: 'General Store' }, shops: [{ country: 'China', shop: 'General Store', buy_price: 50000, sell_price: 37500 }], buy_price: 50000, sell_price: null, market_price: 9172 } },
+    326: { name: 'Printing Paper', value: { vendor: { country: 'China', name: 'General Store' }, shops: [{ country: 'China', shop: 'General Store', buy_price: 75000, sell_price: 56250 }], buy_price: 75000, sell_price: null, market_price: 48977 } },
+    440: { name: 'Pillow', value: { vendor: { country: 'Torn', name: "Big Al's Gun Shop" }, shops: [{ country: 'UAE', shop: 'Arms Dealer', buy_price: null, sell_price: 75 }, { country: 'Torn', shop: "Big Al's Gun Shop", buy_price: null, sell_price: 150 }], buy_price: null, sell_price: 150, market_price: 880 } },
+    159: { name: 'Bolt Cutters', value: { vendor: { country: 'Mexico', name: 'General Store' }, shops: [{ country: 'Mexico', shop: 'General Store', buy_price: 25, sell_price: 15 }], buy_price: 25, sell_price: 15, market_price: 446 } },
+    4: { name: 'Knuckle Dusters', value: { vendor: { country: 'Torn', name: "Big Al's Gun Shop" }, shops: [{ country: 'South Africa', shop: 'Arms Dealer', buy_price: 750, sell_price: 500 }, { country: 'Torn', shop: "Big Al's Gun Shop", buy_price: null, sell_price: 500 }], buy_price: 750, sell_price: 500, market_price: 263 } },
+    1290: { name: 'Toner', value: { vendor: { country: 'Torn', name: 'Print Shop' }, shops: [{ country: 'Torn', shop: 'Print Shop', buy_price: 800, sell_price: null }], buy_price: 800, sell_price: null, market_price: 357 } },
 };
 
-test('the NPC price comes from value.shops - "Sell: N/A" items have none', () => {
-    assert.deepEqual(npcSaleFromValue(LIVE_VALUES[15].value), { price: 1300, shop: "Big Al's Gun Shop" });
-    assert.deepEqual(npcSaleFromValue(LIVE_VALUES[181].value), { price: 3100, shop: "Bits 'n' Bobs" });
+const npc = (id) => npcSaleFromValue(LIVE_VALUES[id].value);
 
-    // sell_price says $12m; the game says N/A; shops is empty. No sale.
-    assert.deepEqual(npcSaleFromValue(LIVE_VALUES[456].value), { price: null, shop: null });
+test('an NPC price needs sell_price AND a shop in Torn - each field lies alone', () => {
+    assert.deepEqual(npc(15), { price: 1300, shop: "Big Al's Gun Shop" });
+    assert.deepEqual(npc(181), { price: 3100, shop: "Bits 'n' Bobs" });
+    assert.deepEqual(npc(4), { price: 500, shop: "Big Al's Gun Shop" });
 
-    // A payload from before `shops` existed: trust the bare field only with a vendor.
-    assert.deepEqual(npcSaleFromValue({ vendor: { name: 'X' }, sell_price: 50 }), { price: 50, shop: 'X' });
+    // sell_price says $12m; the game says N/A; no shop at all.
+    assert.deepEqual(npc(456), { price: null, shop: null });
+    // A foreign shop lists 75% of its buy price; sell_price is null; game says N/A.
+    assert.deepEqual(npc(335), { price: null, shop: null });
+    assert.deepEqual(npc(326), { price: null, shop: null });
+    // Only sold abroad - you cannot sell abroad.
+    assert.deepEqual(npc(159), { price: null, shop: null });
+    // A Torn shop that only sells it, never buys it back.
+    assert.deepEqual(npc(1290), { price: null, shop: null });
+    // Two shops: the Torn one, not the foreign one.
+    assert.deepEqual(npc(440), { price: 150, shop: "Big Al's Gun Shop" });
+
+    // A payload from before `shops` existed: only a vendor in Torn counts.
+    assert.deepEqual(npcSaleFromValue({ vendor: { country: 'Torn', name: 'X' }, sell_price: 50 }), { price: 50, shop: 'X' });
+    assert.deepEqual(npcSaleFromValue({ vendor: { country: 'China', name: 'X' }, sell_price: 50 }), { price: null, shop: null });
     assert.deepEqual(npcSaleFromValue({ vendor: null, sell_price: 50 }), { price: null, shop: null });
 });
 
