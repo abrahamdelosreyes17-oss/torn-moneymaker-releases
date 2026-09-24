@@ -27,8 +27,8 @@ export const W3B_HOST = 'weav3r.dev';
 export const W3B_TERMS_URL = 'https://weav3r.dev/terms-of-service';
 export const W3B_SITE_URL = 'https://weav3r.dev';
 
-/** TornW3B enforces 100/min; stay well clear so other tools keep working. */
-export const W3B_MAX_PER_MINUTE = 40;
+/** TornW3B enforces 100/min per IP; leave 40 for TornTools and friends. */
+export const W3B_MAX_PER_MINUTE = 60;
 
 /** After a 429 or a challenge page, stop asking for this long. */
 export const W3B_COOLDOWN_MS = 60000;

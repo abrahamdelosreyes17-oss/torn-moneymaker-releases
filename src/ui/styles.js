@@ -249,6 +249,40 @@ export const STYLE_CSS = `
     font-size: 11px;
 }
 
+.ttv2-tabs {
+    display: flex;
+    gap: 6px;
+    padding: 8px 10px 0;
+    background: #292929;
+    border-bottom: 1px solid #444;
+}
+
+.ttv2-panel button.ttv2-tab {
+    flex: 1;
+    border-radius: 4px 4px 0 0;
+    border-bottom: 0;
+    background: #242424;
+    color: #aaa;
+    padding: 6px 8px;
+}
+
+.ttv2-panel button.ttv2-tab.ttv2-tab-on {
+    background: #1f1f1f;
+    color: #fff;
+    box-shadow: inset 0 2px 0 #65d27a;
+}
+
+.ttv2-credit {
+    padding: 5px 12px;
+    color: #888;
+    font-size: 10px;
+    border-bottom: 1px solid #383838;
+}
+
+.ttv2-credit a {
+    color: #65d27a;
+}
+
 .ttv2-list {
     overflow-y: auto;
     min-height: 0;

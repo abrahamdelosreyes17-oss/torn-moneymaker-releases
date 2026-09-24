@@ -1224,10 +1224,10 @@
      */
 
     /** A leader that has not renewed in this long is presumed gone. */
-    const LEADER_STALE_MS = 15000;
+    const LEADER_STALE_MS = 10000;
 
     /** How often the leader renews its claim. */
-    const LEADER_HEARTBEAT_MS = 5000;
+    const LEADER_HEARTBEAT_MS = 3000;
 
     /**
      * @param {object|null} record - { id, ts } as last stored
@@ -1382,7 +1382,21 @@
      * expire, because a price from an hour ago is a rumour rather than a listing.
      */
 
-    const LEDGER_VERSION = 'ledger-v2';
+    const LEDGER_VERSION = 'ledger-v3';
+
+    /**
+     * One entry per LISTING PLACE, not per item: the Item Market's Xanax and
+     * seller 42's Xanax are different listings. Keying by item alone let a
+     * bazaar sighting overwrite - or, as "no longer an opportunity", delete -
+     * the Item Market's entry for the same item.
+     *
+     * Item Market entries keep the bare item id as their key.
+     */
+    function ledgerKey(row) {
+        const id = String(row.itemId);
+        if (row.source === 'bazaar') return 'bazaar:' + (row.sellerId || '') + ':' + id;
+        return id;
+    }
 
     /**
      * After this an entry is dropped: the listing has probably gone.
@@ -1408,6 +1422,7 @@
 
         return {
             itemId: String(row.itemId),
+            key: ledgerKey(row),
             source: row.source || null,
             // Bazaar sightings remember whose bazaar, so the link goes back there
             // rather than to an Item Market page where that price never existed.
@@ -1456,15 +1471,17 @@
         for (const row of rows || []) {
             if (!row || !row.profit || !row.itemId) continue;
 
-            const id = String(row.itemId);
-            stillGood.add(id);
-            ledger.set(id, entryFrom(row, now));
+            const key = ledgerKey(row);
+            stillGood.add(key);
+            ledger.set(key, entryFrom(row, now));
         }
 
-        // Seen on this page, but no longer an opportunity: forget it.
+        // Seen on this page, but no longer an opportunity: forget it. Entries are
+        // ledger keys (ledgerKey of each listing on the page); a bare item id is
+        // an Item Market key.
         if (seenOnPage) {
-            for (const id of seenOnPage) {
-                const key = String(id);
+            for (const seen of seenOnPage) {
+                const key = String(seen);
                 if (!stillGood.has(key)) ledger.delete(key);
             }
         }
@@ -1487,7 +1504,7 @@
                 .slice(0, LEDGER_MAX_ENTRIES);
 
             ledger.clear();
-            for (const entry of kept) ledger.set(entry.itemId, entry);
+            for (const entry of kept) ledger.set(entry.key || entry.itemId, entry);
         }
 
         return ledger;
@@ -1545,7 +1562,7 @@
             if (!Number.isFinite(entry.seenAt)) continue;
             if (now - entry.seenAt > LEDGER_TTL_MS) continue;
 
-            ledger.set(String(entry.itemId), entry);
+            ledger.set(String(entry.key || entry.itemId), entry);
         }
 
         return ledger;
@@ -1927,8 +1944,8 @@
     const W3B_TERMS_URL = 'https://weav3r.dev/terms-of-service';
     const W3B_SITE_URL = 'https://weav3r.dev';
 
-    /** TornW3B enforces 100/min; stay well clear so other tools keep working. */
-    const W3B_MAX_PER_MINUTE = 40;
+    /** TornW3B enforces 100/min per IP; leave 40 for TornTools and friends. */
+    const W3B_MAX_PER_MINUTE = 60;
 
     /** After a 429 or a challenge page, stop asking for this long. */
     const W3B_COOLDOWN_MS = 60000;
@@ -3117,6 +3134,40 @@
         font-size: 11px;
     }
 
+    .ttv2-tabs {
+        display: flex;
+        gap: 6px;
+        padding: 8px 10px 0;
+        background: #292929;
+        border-bottom: 1px solid #444;
+    }
+
+    .ttv2-panel button.ttv2-tab {
+        flex: 1;
+        border-radius: 4px 4px 0 0;
+        border-bottom: 0;
+        background: #242424;
+        color: #aaa;
+        padding: 6px 8px;
+    }
+
+    .ttv2-panel button.ttv2-tab.ttv2-tab-on {
+        background: #1f1f1f;
+        color: #fff;
+        box-shadow: inset 0 2px 0 #65d27a;
+    }
+
+    .ttv2-credit {
+        padding: 5px 12px;
+        color: #888;
+        font-size: 10px;
+        border-bottom: 1px solid #383838;
+    }
+
+    .ttv2-credit a {
+        color: #65d27a;
+    }
+
     .ttv2-list {
         overflow-y: auto;
         min-height: 0;
@@ -3496,6 +3547,53 @@
              */
             this.summaryEl = el('div', { class: 'ttv2-status ttv2-summary' });
             this.liveEl = el('div', { class: 'ttv2-status ttv2-live' });
+
+            /*
+             * Two lists: bazaars and the Item Market. Never mixed - a bazaar page
+             * showing Item Market opportunities read as if they were in that
+             * bazaar.
+             */
+            this.tabBtns = {};
+            const tabBar = el('div', { class: 'ttv2-tabs' });
+            for (const [key, label] of [['bazaar', 'BAZAARS'], ['itemmarket', 'ITEM MARKET']]) {
+                const btn = el('button', {
+                    type: 'button',
+                    class: 'ttv2-tab',
+                    text: label,
+                    onclick: () =>
+                        this.handlers.onViewChange && this.handlers.onViewChange(key),
+                });
+                btn.dataset.label = label;
+                this.tabBtns[key] = btn;
+                tabBar.appendChild(btn);
+            }
+            this.tabBar = tabBar;
+
+            // Credit where the bazaar data comes from, on the list it feeds.
+            this.creditEl = el('div', { class: 'ttv2-credit' });
+            this.creditEl.appendChild(
+                document.createTextNode('Bazaar listings from '),
+            );
+            this.creditEl.appendChild(
+                el('a', {
+                    href: W3B_SITE_URL,
+                    target: '_blank',
+                    rel: 'noopener noreferrer',
+                    text: 'TornW3B',
+                }),
+            );
+            this.creditEl.appendChild(document.createTextNode(' ('));
+            this.creditEl.appendChild(
+                el('a', {
+                    href: W3B_TERMS_URL,
+                    target: '_blank',
+                    rel: 'noopener noreferrer',
+                    text: 'terms',
+                }),
+            );
+            this.creditEl.appendChild(
+                document.createTextNode(') and the bazaars you open.'),
+            );
             this.diagEl = el('div', { class: 'ttv2-diag' });
             this.filtersEl = el('div', { class: 'ttv2-filters' });
             this.settingsEl = el('div', { class: 'ttv2-settings' });
@@ -3569,6 +3667,8 @@
                 this.liveEl,
                 this.settingsEl,
                 this.filtersEl,
+                this.tabBar,
+                this.creditEl,
                 this.listEl,
                 this.diagEl,
             ]);
@@ -3578,7 +3678,8 @@
             this.enableDrag(head);
             parent.appendChild(this.root);
 
-            this.ticker = setInterval(() => this.refreshAges(), 5000);
+            // Every second: row ages are the "is this still there?" signal.
+            this.ticker = setInterval(() => this.refreshAges(), 1000);
 
             return this.root;
         }
@@ -3741,7 +3842,7 @@
 
             const w3bLabel = el('label', { class: 'ttv2-check' }, [this.useW3bInput]);
             w3bLabel.appendChild(
-                document.createTextNode(' Also watch bazaars, using TornW3B'),
+                document.createTextNode(' Watch bazaars too, using TornW3B'),
             );
 
             const w3bNote = el('div', { class: 'ttv2-note' });
@@ -3761,9 +3862,10 @@
             w3bNote.appendChild(
                 document.createTextNode(
                     '), a community service that TornTools also uses. Only item ' +
-                        'ids are sent to it - never your API key. Its prices are ' +
-                        'minutes old at best, so each row says how old. By ' +
-                        'enabling it you accept its ',
+                        'ids are sent to it - never your API key, and nothing about ' +
+                        'you. Its prices are seconds to minutes old, so each row ' +
+                        'says how old. On by default; untick to stop contacting it ' +
+                        'at all. Its '
                 ),
             );
             w3bNote.appendChild(
@@ -3774,7 +3876,7 @@
                     text: 'terms of service',
                 }),
             );
-            w3bNote.appendChild(document.createTextNode('.'));
+            w3bNote.appendChild(document.createTextNode(' apply to that data.'));
 
             this.settingsEl.appendChild(el('h4', { text: 'Live feed' }));
             this.settingsEl.appendChild(liveLabel);
@@ -3788,7 +3890,7 @@
                         'looking at it: a hidden tab stops. It never plays sounds ' +
                         'or sends notifications, and never buys or clicks ' +
                         'anything - each row is a link you choose to follow. It ' +
-                        'uses at most 20 Torn API calls a minute, leaving room ' +
+                        'uses at most 30 Torn API calls a minute, leaving room ' +
                         'for your other tools.',
                 }),
             );
@@ -3835,6 +3937,11 @@
                 [
                     'Key access level',
                     'Public (torn: items, cityshops; market: itemmarket; key: info)',
+                ],
+                [
+                    'Other services',
+                    'TornW3B (weav3r.dev), for bazaar prices. It receives item ids ' +
+                        'only - never your key or anything about you.',
                 ],
             ];
 
@@ -4164,9 +4271,27 @@
                 });
             }
 
+            this.renderTabs();
             this.renderDiagnostics();
             this.renderLive();
             this.refreshAges();
+        }
+
+        renderTabs() {
+            const tab = this.state.tab || 'bazaar';
+            const counts = this.state.counts || {};
+
+            for (const [key, btn] of Object.entries(this.tabBtns || {})) {
+                btn.classList.toggle('ttv2-tab-on', key === tab);
+                btn.textContent =
+                    btn.dataset.label + (counts[key] ? ' (' + counts[key] + ')' : '');
+            }
+
+            if (this.creditEl) {
+                const live = this.state.live;
+                this.creditEl.style.display =
+                    tab === 'bazaar' && live && live.w3b ? '' : 'none';
+            }
         }
 
         renderLive() {
@@ -4205,15 +4330,23 @@
         emptyReason() {
             const d = this.state.diagnostics;
             const live = this.state.live;
+            const tab = this.state.tab;
+
+            if (!d && tab === 'bazaar' && live && live.enabled && !live.w3b) {
+                return (
+                    'Bazaar watching is off. Tick "Watch bazaars too" in ' +
+                    'Settings, or open a bazaar to scan it.'
+                );
+            }
 
             if (!d) {
                 if (live && live.enabled && !live.itemMarket) {
                     return 'The live feed needs a Public API key - paste one under Settings.';
                 }
                 if (live && live.enabled && live.leading) {
-                    return live.candidates || live.itemMarket
-                        ? 'Watching the market - nothing profitable right now.'
-                        : 'Watching the market...';
+                    return tab === 'bazaar'
+                        ? 'Watching bazaars - nothing profitable right now.'
+                        : 'Watching the Item Market - nothing profitable right now.';
                 }
                 if (live && live.enabled) {
                     return 'Live feed runs in another Torn tab; results appear here.';
@@ -4484,12 +4617,12 @@
             this.renderLive();
 
             const summary = this.state.summary || { count: 0, totalProfit: 0 };
-            const where = this.state.pageType;
+            const where = this.state.tab;
             const age = this.state.lastScanAt ? now - this.state.lastScanAt : null;
             const stale = age !== null && age > PANEL_STALE_MS;
 
             this.summaryEl.textContent =
-                (where === 'bazaar' ? 'Bazaar' : where === 'itemmarket' ? 'Item Market' : 'Live feed') +
+                (where === 'itemmarket' ? 'Item Market' : 'Bazaars') +
                 '  |  ' +
                 summary.count +
                 ' opportunities  |  +' +
@@ -4642,7 +4775,7 @@
      * user across EVERY tool; this leaves most of it for TornTools, TornStats,
      * and the page scanner.
      */
-    const FEED_TORN_PER_MINUTE = 20;
+    const FEED_TORN_PER_MINUTE = 30;
 
     /** Per tick, so one cycle stays short and reacts to the tab being hidden. */
     const MAX_W3B_FETCHES_PER_CYCLE = 8;
@@ -5028,18 +5161,24 @@
         liveFeed: true,
 
         /*
-         * TornW3B bazaar prices. OFF until the user opts in: Torn's API terms
-         * require an opt-in integration to link the other service's ToS, and
-         * this is a third party, so the user should choose it knowingly.
+         * TornW3B bazaar prices. ON by default: bazaar opportunities are the
+         * point of the Bazaars list, and Torn has no per-listing bazaar data a
+         * Public key can trust. Torn's API terms allow an automatic integration
+         * when the tool's own terms cover it - the Settings disclosure names
+         * TornW3B, says it receives item ids only, and links its terms. The key
+         * never goes there. Untick to stop contacting it entirely.
          */
-        useW3b: false,
+        useW3b: true,
+
+        /* Which list the panel shows when you are on neither market page. */
+        viewTab: 'bazaar',
         collapsed: false,
     };
 
     const RESCAN_DEBOUNCE_MS = 400;
 
     /** How often every tab checks whether it should lead the live feed. */
-    const FEED_TICK_MS = 5000;
+    const FEED_TICK_MS = LEADER_HEARTBEAT_MS;
 
     /*
      * Item Market 2.0 and the bazaars re-render continuously, and a
@@ -5071,6 +5210,8 @@
         targetShown: null,
         /* After a failed load, the automatic retry waits until this time. */
         retryLoadAt: 0,
+        /* A tab the user clicked, until the page type next changes. */
+        tabOverride: null,
         npcShops: new Map(),
         ledger: new Map(),
         shopDataMissing: false,
@@ -5415,6 +5556,8 @@
         const current = detectPage(location.href);
         if (current !== app.pageType) {
             app.pageType = current;
+            // A new kind of page picks its own list again.
+            app.tabOverride = null;
             clearMarks();
         }
 
@@ -5464,12 +5607,7 @@
          * remembering. Browsing the categories once builds a view of the whole
          * market without a single extra request.
          */
-        recordSightings(
-            app.ledger,
-            ranked,
-            now,
-            new Set(listings.map((l) => String(l.itemId))),
-        );
+        recordSightings(app.ledger, ranked, now, new Set(listings.map(ledgerKey)));
         pruneLedger(app.ledger, now);
         persistLedger(now);
 
@@ -5556,7 +5694,14 @@
         if (!app.panel) return;
 
         const now = Date.now();
-        const onPage = new Set(app.pageRows.map((r) => String(r.itemId)));
+        const sellerHere =
+            app.pageType === PAGE_BAZAAR ? bazaarOwnerId(location.href) : null;
+
+        // Listings on the page you are viewing, by source - they win over any
+        // remembered or remote copy of the same listing.
+        const onPage = new Set(
+            app.pageRows.map((r) => (r.source || app.pageType) + ':' + r.itemId),
+        );
 
         /*
          * Remembered rows were priced under whatever settings applied when they
@@ -5579,13 +5724,12 @@
                   itemMarketUrl,
               }).filter((r) => {
                   // The page you are on already shows these, with fresher numbers.
-                  if (!onPage.has(String(r.itemId))) return true;
                   if (r.source === SOURCE_ITEM_MARKET) {
-                      return app.pageType !== 'itemmarket';
+                      return !onPage.has(SOURCE_ITEM_MARKET + ':' + r.itemId);
                   }
                   return !(
-                      app.pageType === PAGE_BAZAAR &&
-                      r.sellerId === bazaarOwnerId(location.href)
+                      r.sellerId === sellerHere &&
+                      onPage.has(SOURCE_BAZAAR + ':' + r.itemId)
                   );
               })
             : [];
@@ -5594,12 +5738,10 @@
         const inFeed = new Set(feedRows.map((r) => r.source + ':' + r.itemId));
 
         const remembered = app.settings.showAllSeen
-            ? ledgerRows(app.ledger).filter(
-                  (r) =>
-                      !onPage.has(String(r.itemId)) &&
-                      !inFeed.has((r.source || SOURCE_ITEM_MARKET) + ':' + r.itemId) &&
-                      venueAllowed(r.profit.venue),
-              )
+            ? ledgerRows(app.ledger).filter((r) => {
+                  const key = (r.source || SOURCE_ITEM_MARKET) + ':' + r.itemId;
+                  return !onPage.has(key) && !inFeed.has(key) && venueAllowed(r.profit.venue);
+              })
             : [];
 
         const opened = gmGet(STORE_OPENED, {}) || {};
@@ -5608,24 +5750,59 @@
             r.opened = Number.isFinite(at) && at >= r.dataAt;
         }
 
-        const combined = app.pageRows.concat(remembered, feedRows);
-        const shown = rankOpportunities(combined, rankSettings());
+        /*
+         * Two lists, never mixed. Arriving on a bazaar from the Item Market used
+         * to leave the Item Market's opportunities on screen, which read as if
+         * they were in this bazaar.
+         */
+        const all = app.pageRows.concat(remembered, feedRows);
+        const lists = { bazaar: [], itemmarket: [] };
+        for (const r of all) {
+            lists[r.source === SOURCE_BAZAAR ? 'bazaar' : 'itemmarket'].push(r);
+        }
+
+        const bazaarRows = rankOpportunities(lists.bazaar, rankSettings());
+        const marketRows = rankOpportunities(lists.itemmarket, rankSettings());
+
+        const tab = activeTab();
+        const shown = tab === 'bazaar' ? bazaarRows : marketRows;
 
         app.panel.render({
             rows: shown,
+            tab,
+            counts: { bazaar: bazaarRows.length, itemmarket: marketRows.length },
             summary: summarize(shown),
-            diagnostics: app.pageDiagnostics
-                ? {
-                      ...app.pageDiagnostics,
-                      ledgerSize: app.ledger.size,
-                      shopDataMissing: app.shopDataMissing,
-                      shopLoadError: app.shopLoadError || null,
-                  }
-                : null,
+            diagnostics:
+                app.pageDiagnostics && app.pageType === tab
+                    ? {
+                          ...app.pageDiagnostics,
+                          ledgerSize: app.ledger.size,
+                          shopDataMissing: app.shopDataMissing,
+                          shopLoadError: app.shopLoadError || null,
+                      }
+                    : null,
             pageType: app.pageType,
             lastScanAt: app.lastScanAt,
             live: app.feed ? app.feed.status() : null,
         });
+    }
+
+    /**
+     * Which list to show: the one matching the page you are on, unless you
+     * clicked the other tab since arriving. Elsewhere, the last one you chose.
+     */
+    function activeTab() {
+        if (app.tabOverride) return app.tabOverride;
+        if (app.pageType === PAGE_BAZAAR) return 'bazaar';
+        if (app.pageType === 'itemmarket') return 'itemmarket';
+        return app.settings.viewTab === 'itemmarket' ? 'itemmarket' : 'bazaar';
+    }
+
+    function onViewChange(tab) {
+        app.tabOverride = tab;
+        app.settings = { ...app.settings, viewTab: tab };
+        gmSet(STORE_SETTINGS, app.settings);
+        refreshView();
     }
 
     /** The Scan button: loads reference data once, then scans the page. */
@@ -5810,6 +5987,7 @@
     }
 
     function applyPageType(next, { initial = false } = {}) {
+        if (next !== app.pageType) app.tabOverride = null;
         app.pageType = next;
 
         if (!initial) clearMarks();
@@ -5957,6 +6135,7 @@
             onForgetKey,
             onClearCache,
             onClearList,
+            onViewChange,
             /*
              * The key is put into the field only when the user asks to see it.
              * A value sitting in an <input> on torn.com is readable by every

@@ -37,11 +37,15 @@ wider key can read your mail, money and inventory.
 
 ## Use
 
+The panel has two lists, **Bazaars** and **Item Market**, never mixed. It shows the
+one matching the page you are on (switching as you move between them), and the one
+you last picked anywhere else.
+
 - **On a Bazaar or the Item Market**, profitable listings on the page get a green
   highlight and a profit label, and the panel ranks them; `>` scrolls to one.
 - **Anywhere in Torn**, the live feed (on by default) watches the Item Market
-  through the Torn API. Tick *Settings → Also watch bazaars, using TornW3B* to add
-  bazaar listings. Each row says where it is (`Bazaar - SellerName` or
+  through the Torn API, and bazaars through TornW3B's feed (*Settings → Watch
+  bazaars too*) - on by default, untick it to stop. Each row says where it is (`Bazaar - SellerName` or
   `Item Market`), where the data came from, and **how old that data is**; `>`
   opens the seller's bazaar - with the listing highlighted - or the item's market
   page. Nothing is ever bought for you.
@@ -142,7 +146,7 @@ them.
 3. **Public API key only.** Nothing this script does needs more.
 4. **Rate-limit everything.** All Torn API calls pass through one queue capped at
    70/min, **shared by every open tab**, with dedup and backoff; the live feed
-   spends at most 20/min of it. Torn's 100/min is per user across all tools. Do not
+   spends at most 30/min of it; TornW3B gets at most 60/min of its 100/min. Torn's 100/min is per user across all tools. Do not
    add a code path that bypasses `TornApiClient`.
 5. **No captcha handling, no automating anything that looks like playing.**
 6. **Nothing from an unfocused page, and no alerts.** rules.php forbids software
@@ -150,9 +154,11 @@ them.
    or another window". The feed runs only in a visible tab (a hidden leader steps
    down), and results appear only in the panel: no notifications, sounds or title
    flashing. Do not add them.
-7. **Third parties are opt-in, and never get the key.** TornW3B is off until the
-   user ticks it, next to a link to its terms, as Torn's API ToS requires for an
-   opt-in integration. Only item ids are sent to it.
+7. **Third parties are disclosed, and never get the key.** TornW3B is on by
+   default, which Torn's API ToS allows for an automatic integration when the
+   tool's own terms cover it: Settings names it, says it receives item ids only,
+   and links its terms, and the Bazaars list credits it. Unticking it stops every
+   request to it. Only item ids are sent; never the key.
 8. **Stop on a dead key.** Torn error 2, 13 or 18 marks the key dead and nothing is
    sent until the user saves another. Torn warns that repeated invalid-key requests
    can earn an IP ban.
@@ -164,6 +170,10 @@ Shown in Settings next to the key field, as Torn requires:
 | Data storage | Data sharing | Purpose of use | Key storage & sharing | Key access level |
 |---|---|---|---|---|
 | Only locally | Nobody | Competitive advantage: finding Bazaar and Item Market listings below NPC / market value | Stored locally / Not shared | Public |
+
+Plus a line naming the automatic integration: *TornW3B (weav3r.dev), for bazaar
+prices; receives item ids only, never the key* - with a link to its terms beside
+the Settings toggle and on the Bazaars list.
 
 The research behind these rules - the rules.php and api.html text, how TornTools and
 others use TornW3B, and the data sources' real caching - is summarised in

@@ -128,6 +128,53 @@ export class Panel {
          */
         this.summaryEl = el('div', { class: 'ttv2-status ttv2-summary' });
         this.liveEl = el('div', { class: 'ttv2-status ttv2-live' });
+
+        /*
+         * Two lists: bazaars and the Item Market. Never mixed - a bazaar page
+         * showing Item Market opportunities read as if they were in that
+         * bazaar.
+         */
+        this.tabBtns = {};
+        const tabBar = el('div', { class: 'ttv2-tabs' });
+        for (const [key, label] of [['bazaar', 'BAZAARS'], ['itemmarket', 'ITEM MARKET']]) {
+            const btn = el('button', {
+                type: 'button',
+                class: 'ttv2-tab',
+                text: label,
+                onclick: () =>
+                    this.handlers.onViewChange && this.handlers.onViewChange(key),
+            });
+            btn.dataset.label = label;
+            this.tabBtns[key] = btn;
+            tabBar.appendChild(btn);
+        }
+        this.tabBar = tabBar;
+
+        // Credit where the bazaar data comes from, on the list it feeds.
+        this.creditEl = el('div', { class: 'ttv2-credit' });
+        this.creditEl.appendChild(
+            document.createTextNode('Bazaar listings from '),
+        );
+        this.creditEl.appendChild(
+            el('a', {
+                href: W3B_SITE_URL,
+                target: '_blank',
+                rel: 'noopener noreferrer',
+                text: 'TornW3B',
+            }),
+        );
+        this.creditEl.appendChild(document.createTextNode(' ('));
+        this.creditEl.appendChild(
+            el('a', {
+                href: W3B_TERMS_URL,
+                target: '_blank',
+                rel: 'noopener noreferrer',
+                text: 'terms',
+            }),
+        );
+        this.creditEl.appendChild(
+            document.createTextNode(') and the bazaars you open.'),
+        );
         this.diagEl = el('div', { class: 'ttv2-diag' });
         this.filtersEl = el('div', { class: 'ttv2-filters' });
         this.settingsEl = el('div', { class: 'ttv2-settings' });
@@ -201,6 +248,8 @@ export class Panel {
             this.liveEl,
             this.settingsEl,
             this.filtersEl,
+            this.tabBar,
+            this.creditEl,
             this.listEl,
             this.diagEl,
         ]);
@@ -210,7 +259,8 @@ export class Panel {
         this.enableDrag(head);
         parent.appendChild(this.root);
 
-        this.ticker = setInterval(() => this.refreshAges(), 5000);
+        // Every second: row ages are the "is this still there?" signal.
+        this.ticker = setInterval(() => this.refreshAges(), 1000);
 
         return this.root;
     }
@@ -373,7 +423,7 @@ export class Panel {
 
         const w3bLabel = el('label', { class: 'ttv2-check' }, [this.useW3bInput]);
         w3bLabel.appendChild(
-            document.createTextNode(' Also watch bazaars, using TornW3B'),
+            document.createTextNode(' Watch bazaars too, using TornW3B'),
         );
 
         const w3bNote = el('div', { class: 'ttv2-note' });
@@ -393,9 +443,10 @@ export class Panel {
         w3bNote.appendChild(
             document.createTextNode(
                 '), a community service that TornTools also uses. Only item ' +
-                    'ids are sent to it - never your API key. Its prices are ' +
-                    'minutes old at best, so each row says how old. By ' +
-                    'enabling it you accept its ',
+                    'ids are sent to it - never your API key, and nothing about ' +
+                    'you. Its prices are seconds to minutes old, so each row ' +
+                    'says how old. On by default; untick to stop contacting it ' +
+                    'at all. Its '
             ),
         );
         w3bNote.appendChild(
@@ -406,7 +457,7 @@ export class Panel {
                 text: 'terms of service',
             }),
         );
-        w3bNote.appendChild(document.createTextNode('.'));
+        w3bNote.appendChild(document.createTextNode(' apply to that data.'));
 
         this.settingsEl.appendChild(el('h4', { text: 'Live feed' }));
         this.settingsEl.appendChild(liveLabel);
@@ -420,7 +471,7 @@ export class Panel {
                     'looking at it: a hidden tab stops. It never plays sounds ' +
                     'or sends notifications, and never buys or clicks ' +
                     'anything - each row is a link you choose to follow. It ' +
-                    'uses at most 20 Torn API calls a minute, leaving room ' +
+                    'uses at most 30 Torn API calls a minute, leaving room ' +
                     'for your other tools.',
             }),
         );
@@ -467,6 +518,11 @@ export class Panel {
             [
                 'Key access level',
                 'Public (torn: items, cityshops; market: itemmarket; key: info)',
+            ],
+            [
+                'Other services',
+                'TornW3B (weav3r.dev), for bazaar prices. It receives item ids ' +
+                    'only - never your key or anything about you.',
             ],
         ];
 
@@ -796,9 +852,27 @@ export class Panel {
             });
         }
 
+        this.renderTabs();
         this.renderDiagnostics();
         this.renderLive();
         this.refreshAges();
+    }
+
+    renderTabs() {
+        const tab = this.state.tab || 'bazaar';
+        const counts = this.state.counts || {};
+
+        for (const [key, btn] of Object.entries(this.tabBtns || {})) {
+            btn.classList.toggle('ttv2-tab-on', key === tab);
+            btn.textContent =
+                btn.dataset.label + (counts[key] ? ' (' + counts[key] + ')' : '');
+        }
+
+        if (this.creditEl) {
+            const live = this.state.live;
+            this.creditEl.style.display =
+                tab === 'bazaar' && live && live.w3b ? '' : 'none';
+        }
     }
 
     renderLive() {
@@ -837,15 +911,23 @@ export class Panel {
     emptyReason() {
         const d = this.state.diagnostics;
         const live = this.state.live;
+        const tab = this.state.tab;
+
+        if (!d && tab === 'bazaar' && live && live.enabled && !live.w3b) {
+            return (
+                'Bazaar watching is off. Tick "Watch bazaars too" in ' +
+                'Settings, or open a bazaar to scan it.'
+            );
+        }
 
         if (!d) {
             if (live && live.enabled && !live.itemMarket) {
                 return 'The live feed needs a Public API key - paste one under Settings.';
             }
             if (live && live.enabled && live.leading) {
-                return live.candidates || live.itemMarket
-                    ? 'Watching the market - nothing profitable right now.'
-                    : 'Watching the market...';
+                return tab === 'bazaar'
+                    ? 'Watching bazaars - nothing profitable right now.'
+                    : 'Watching the Item Market - nothing profitable right now.';
             }
             if (live && live.enabled) {
                 return 'Live feed runs in another Torn tab; results appear here.';
@@ -1116,12 +1198,12 @@ export class Panel {
         this.renderLive();
 
         const summary = this.state.summary || { count: 0, totalProfit: 0 };
-        const where = this.state.pageType;
+        const where = this.state.tab;
         const age = this.state.lastScanAt ? now - this.state.lastScanAt : null;
         const stale = age !== null && age > PANEL_STALE_MS;
 
         this.summaryEl.textContent =
-            (where === 'bazaar' ? 'Bazaar' : where === 'itemmarket' ? 'Item Market' : 'Live feed') +
+            (where === 'itemmarket' ? 'Item Market' : 'Bazaars') +
             '  |  ' +
             summary.count +
             ' opportunities  |  +' +

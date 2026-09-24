@@ -34,6 +34,7 @@ import {
 } from '../src/core/feed.js';
 import { decideLeader, LEADER_STALE_MS } from '../src/core/leader.js';
 import {
+    ledgerKey,
     recordSightings,
     pruneLedger,
     ledgerRows,
@@ -686,4 +687,19 @@ test('the Item Market sweep covers every item, even with candidates queued', asy
     for (const id of ['a', 'b', 'c', 'd', 'e', 'hot']) {
         assert.ok(asked.includes(id), 'swept ' + id);
     }
+});
+
+test('a bazaar sighting never overwrites the Item Market entry for the same item', () => {
+    const ledger = new Map();
+
+    recordSightings(ledger, [pageRow('206', 'Xanax', 800000, 30000, { source: 'itemmarket', seenAt: 1 })], 1);
+
+    // Now on seller 42's bazaar: Xanax there is not a deal.
+    recordSightings(ledger, [], 2, new Set([ledgerKey({ itemId: '206', source: 'bazaar', sellerId: '42' })]));
+    assert.equal(ledger.get('206').listingPrice, 800000, 'Item Market entry untouched');
+
+    // And a good Xanax in that bazaar is its own entry.
+    recordSightings(ledger, [pageRow('206', 'Xanax', 790000, 40000, { source: 'bazaar', sellerId: '42', seenAt: 3 })], 3);
+    assert.equal(ledger.size, 2);
+    assert.deepEqual(ledgerRows(ledger).map((r) => r.source).sort(), ['bazaar', 'itemmarket']);
 });

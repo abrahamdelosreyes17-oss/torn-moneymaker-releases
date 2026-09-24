@@ -14,10 +14,10 @@
  */
 
 /** A leader that has not renewed in this long is presumed gone. */
-export const LEADER_STALE_MS = 15000;
+export const LEADER_STALE_MS = 10000;
 
 /** How often the leader renews its claim. */
-export const LEADER_HEARTBEAT_MS = 5000;
+export const LEADER_HEARTBEAT_MS = 3000;
 
 /**
  * @param {object|null} record - { id, ts } as last stored

@@ -15,7 +15,8 @@ const _store = {};
 const NS = 'tornTrading.v2.';
 const KEY = 'abcdefgh12345678';
 _store[NS + 'apiKey'] = JSON.stringify(KEY);
-_store[NS + 'settings'] = JSON.stringify({ liveFeed: true, useW3b: true });
+// Defaults only: TornW3B must be on without the user ticking anything.
+_store[NS + 'settings'] = JSON.stringify({});
 
 function GM_getValue(k, d) { return k in _store ? _store[k] : d; }
 function GM_setValue(k, v) { _store[k] = v; }
@@ -89,6 +90,7 @@ setTimeout(() => {
   const w3b = window.__requests.filter(u => u.includes('weav3r.dev'));
   out.textContent = JSON.stringify({
     live: (document.querySelector('.ttv2-live') || {}).textContent,
+    tabs: [...document.querySelectorAll('.ttv2-tab')].map(b => b.textContent + (b.classList.contains('ttv2-tab-on') ? ' *' : '')),
     status: (document.querySelector('.ttv2-status') || {}).textContent,
     rows,
     tosTable: document.querySelectorAll('.ttv2-tos tr').length,

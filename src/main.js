@@ -36,10 +36,11 @@ import {
     SOURCE_BAZAAR,
     SOURCE_ITEM_MARKET,
 } from './core/feed.js';
-import { makeTabId } from './core/leader.js';
+import { makeTabId, LEADER_HEARTBEAT_MS } from './core/leader.js';
 import { formatMoneyShort } from './core/parse.js';
 import { rankOpportunities, summarize } from './core/ranker.js';
 import {
+    ledgerKey,
     recordSightings,
     pruneLedger,
     ledgerRows,
@@ -141,18 +142,24 @@ const DEFAULT_SETTINGS = {
     liveFeed: true,
 
     /*
-     * TornW3B bazaar prices. OFF until the user opts in: Torn's API terms
-     * require an opt-in integration to link the other service's ToS, and
-     * this is a third party, so the user should choose it knowingly.
+     * TornW3B bazaar prices. ON by default: bazaar opportunities are the
+     * point of the Bazaars list, and Torn has no per-listing bazaar data a
+     * Public key can trust. Torn's API terms allow an automatic integration
+     * when the tool's own terms cover it - the Settings disclosure names
+     * TornW3B, says it receives item ids only, and links its terms. The key
+     * never goes there. Untick to stop contacting it entirely.
      */
-    useW3b: false,
+    useW3b: true,
+
+    /* Which list the panel shows when you are on neither market page. */
+    viewTab: 'bazaar',
     collapsed: false,
 };
 
 const RESCAN_DEBOUNCE_MS = 400;
 
 /** How often every tab checks whether it should lead the live feed. */
-const FEED_TICK_MS = 5000;
+const FEED_TICK_MS = LEADER_HEARTBEAT_MS;
 
 /*
  * Item Market 2.0 and the bazaars re-render continuously, and a
@@ -184,6 +191,8 @@ const app = {
     targetShown: null,
     /* After a failed load, the automatic retry waits until this time. */
     retryLoadAt: 0,
+    /* A tab the user clicked, until the page type next changes. */
+    tabOverride: null,
     npcShops: new Map(),
     ledger: new Map(),
     shopDataMissing: false,
@@ -528,6 +537,8 @@ function rescan() {
     const current = detectPage(location.href);
     if (current !== app.pageType) {
         app.pageType = current;
+        // A new kind of page picks its own list again.
+        app.tabOverride = null;
         clearMarks();
     }
 
@@ -577,12 +588,7 @@ function rescan() {
      * remembering. Browsing the categories once builds a view of the whole
      * market without a single extra request.
      */
-    recordSightings(
-        app.ledger,
-        ranked,
-        now,
-        new Set(listings.map((l) => String(l.itemId))),
-    );
+    recordSightings(app.ledger, ranked, now, new Set(listings.map(ledgerKey)));
     pruneLedger(app.ledger, now);
     persistLedger(now);
 
@@ -669,7 +675,14 @@ function refreshView() {
     if (!app.panel) return;
 
     const now = Date.now();
-    const onPage = new Set(app.pageRows.map((r) => String(r.itemId)));
+    const sellerHere =
+        app.pageType === PAGE_BAZAAR ? bazaarOwnerId(location.href) : null;
+
+    // Listings on the page you are viewing, by source - they win over any
+    // remembered or remote copy of the same listing.
+    const onPage = new Set(
+        app.pageRows.map((r) => (r.source || app.pageType) + ':' + r.itemId),
+    );
 
     /*
      * Remembered rows were priced under whatever settings applied when they
@@ -692,13 +705,12 @@ function refreshView() {
               itemMarketUrl,
           }).filter((r) => {
               // The page you are on already shows these, with fresher numbers.
-              if (!onPage.has(String(r.itemId))) return true;
               if (r.source === SOURCE_ITEM_MARKET) {
-                  return app.pageType !== 'itemmarket';
+                  return !onPage.has(SOURCE_ITEM_MARKET + ':' + r.itemId);
               }
               return !(
-                  app.pageType === PAGE_BAZAAR &&
-                  r.sellerId === bazaarOwnerId(location.href)
+                  r.sellerId === sellerHere &&
+                  onPage.has(SOURCE_BAZAAR + ':' + r.itemId)
               );
           })
         : [];
@@ -707,12 +719,10 @@ function refreshView() {
     const inFeed = new Set(feedRows.map((r) => r.source + ':' + r.itemId));
 
     const remembered = app.settings.showAllSeen
-        ? ledgerRows(app.ledger).filter(
-              (r) =>
-                  !onPage.has(String(r.itemId)) &&
-                  !inFeed.has((r.source || SOURCE_ITEM_MARKET) + ':' + r.itemId) &&
-                  venueAllowed(r.profit.venue),
-          )
+        ? ledgerRows(app.ledger).filter((r) => {
+              const key = (r.source || SOURCE_ITEM_MARKET) + ':' + r.itemId;
+              return !onPage.has(key) && !inFeed.has(key) && venueAllowed(r.profit.venue);
+          })
         : [];
 
     const opened = gmGet(STORE_OPENED, {}) || {};
@@ -721,24 +731,59 @@ function refreshView() {
         r.opened = Number.isFinite(at) && at >= r.dataAt;
     }
 
-    const combined = app.pageRows.concat(remembered, feedRows);
-    const shown = rankOpportunities(combined, rankSettings());
+    /*
+     * Two lists, never mixed. Arriving on a bazaar from the Item Market used
+     * to leave the Item Market's opportunities on screen, which read as if
+     * they were in this bazaar.
+     */
+    const all = app.pageRows.concat(remembered, feedRows);
+    const lists = { bazaar: [], itemmarket: [] };
+    for (const r of all) {
+        lists[r.source === SOURCE_BAZAAR ? 'bazaar' : 'itemmarket'].push(r);
+    }
+
+    const bazaarRows = rankOpportunities(lists.bazaar, rankSettings());
+    const marketRows = rankOpportunities(lists.itemmarket, rankSettings());
+
+    const tab = activeTab();
+    const shown = tab === 'bazaar' ? bazaarRows : marketRows;
 
     app.panel.render({
         rows: shown,
+        tab,
+        counts: { bazaar: bazaarRows.length, itemmarket: marketRows.length },
         summary: summarize(shown),
-        diagnostics: app.pageDiagnostics
-            ? {
-                  ...app.pageDiagnostics,
-                  ledgerSize: app.ledger.size,
-                  shopDataMissing: app.shopDataMissing,
-                  shopLoadError: app.shopLoadError || null,
-              }
-            : null,
+        diagnostics:
+            app.pageDiagnostics && app.pageType === tab
+                ? {
+                      ...app.pageDiagnostics,
+                      ledgerSize: app.ledger.size,
+                      shopDataMissing: app.shopDataMissing,
+                      shopLoadError: app.shopLoadError || null,
+                  }
+                : null,
         pageType: app.pageType,
         lastScanAt: app.lastScanAt,
         live: app.feed ? app.feed.status() : null,
     });
+}
+
+/**
+ * Which list to show: the one matching the page you are on, unless you
+ * clicked the other tab since arriving. Elsewhere, the last one you chose.
+ */
+function activeTab() {
+    if (app.tabOverride) return app.tabOverride;
+    if (app.pageType === PAGE_BAZAAR) return 'bazaar';
+    if (app.pageType === 'itemmarket') return 'itemmarket';
+    return app.settings.viewTab === 'itemmarket' ? 'itemmarket' : 'bazaar';
+}
+
+function onViewChange(tab) {
+    app.tabOverride = tab;
+    app.settings = { ...app.settings, viewTab: tab };
+    gmSet(STORE_SETTINGS, app.settings);
+    refreshView();
 }
 
 /** The Scan button: loads reference data once, then scans the page. */
@@ -923,6 +968,7 @@ function attachObserver(listings) {
 }
 
 function applyPageType(next, { initial = false } = {}) {
+    if (next !== app.pageType) app.tabOverride = null;
     app.pageType = next;
 
     if (!initial) clearMarks();
@@ -1070,6 +1116,7 @@ export function boot() {
         onForgetKey,
         onClearCache,
         onClearList,
+        onViewChange,
         /*
          * The key is put into the field only when the user asks to see it.
          * A value sitting in an <input> on torn.com is readable by every

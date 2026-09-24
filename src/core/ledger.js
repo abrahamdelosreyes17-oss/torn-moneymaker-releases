@@ -12,7 +12,21 @@
  * expire, because a price from an hour ago is a rumour rather than a listing.
  */
 
-export const LEDGER_VERSION = 'ledger-v2';
+export const LEDGER_VERSION = 'ledger-v3';
+
+/**
+ * One entry per LISTING PLACE, not per item: the Item Market's Xanax and
+ * seller 42's Xanax are different listings. Keying by item alone let a
+ * bazaar sighting overwrite - or, as "no longer an opportunity", delete -
+ * the Item Market's entry for the same item.
+ *
+ * Item Market entries keep the bare item id as their key.
+ */
+export function ledgerKey(row) {
+    const id = String(row.itemId);
+    if (row.source === 'bazaar') return 'bazaar:' + (row.sellerId || '') + ':' + id;
+    return id;
+}
 
 /**
  * After this an entry is dropped: the listing has probably gone.
@@ -38,6 +52,7 @@ function entryFrom(row, now) {
 
     return {
         itemId: String(row.itemId),
+        key: ledgerKey(row),
         source: row.source || null,
         // Bazaar sightings remember whose bazaar, so the link goes back there
         // rather than to an Item Market page where that price never existed.
@@ -86,15 +101,17 @@ export function recordSightings(ledger, rows, now = Date.now(), seenOnPage) {
     for (const row of rows || []) {
         if (!row || !row.profit || !row.itemId) continue;
 
-        const id = String(row.itemId);
-        stillGood.add(id);
-        ledger.set(id, entryFrom(row, now));
+        const key = ledgerKey(row);
+        stillGood.add(key);
+        ledger.set(key, entryFrom(row, now));
     }
 
-    // Seen on this page, but no longer an opportunity: forget it.
+    // Seen on this page, but no longer an opportunity: forget it. Entries are
+    // ledger keys (ledgerKey of each listing on the page); a bare item id is
+    // an Item Market key.
     if (seenOnPage) {
-        for (const id of seenOnPage) {
-            const key = String(id);
+        for (const seen of seenOnPage) {
+            const key = String(seen);
             if (!stillGood.has(key)) ledger.delete(key);
         }
     }
@@ -117,7 +134,7 @@ export function pruneLedger(ledger, now = Date.now(), ttl = LEDGER_TTL_MS) {
             .slice(0, LEDGER_MAX_ENTRIES);
 
         ledger.clear();
-        for (const entry of kept) ledger.set(entry.itemId, entry);
+        for (const entry of kept) ledger.set(entry.key || entry.itemId, entry);
     }
 
     return ledger;
@@ -175,7 +192,7 @@ export function readLedgerCacheEntry(cached, now = Date.now()) {
         if (!Number.isFinite(entry.seenAt)) continue;
         if (now - entry.seenAt > LEDGER_TTL_MS) continue;
 
-        ledger.set(String(entry.itemId), entry);
+        ledger.set(String(entry.key || entry.itemId), entry);
     }
 
     return ledger;

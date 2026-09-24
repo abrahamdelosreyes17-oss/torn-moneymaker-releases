@@ -42,7 +42,7 @@ export const SUMMARY_INTERVAL_MS = 60 * 1000;
  * user across EVERY tool; this leaves most of it for TornTools, TornStats,
  * and the page scanner.
  */
-export const FEED_TORN_PER_MINUTE = 20;
+export const FEED_TORN_PER_MINUTE = 30;
 
 /** Per tick, so one cycle stays short and reacts to the tab being hidden. */
 export const MAX_W3B_FETCHES_PER_CYCLE = 8;
