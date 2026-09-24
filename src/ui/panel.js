@@ -1,20 +1,17 @@
 /*
- * The panel: a floating window with two pages - the list, and Settings.
+ * The panel: a floating window with three pages.
  *
- *   header      title, and three icon buttons: refresh, settings, collapse
- *   status bar  ONE line: "5 deals · +$5.18m"  ...  "● live · refresh 12s"
- *   list page   sell-to chips, Bazaars / Item Market tabs, ranked cards
- *   settings    replaces the list (with Back) - never stacks on top of it
+ *   header      Torn-style title bar: Sell, Scan, refresh, settings, collapse
+ *   status bar  ONE line: "5 deals · +$5.18m"  ...  "● live · 12s"
+ *   list        sell-to chips, Bazaars / Item Market tabs, ranked deals
+ *   my bazaar   on your own bazaar's add / manage pages: what each item is
+ *               going for now, and what the script has recorded
+ *   settings    replaces the list (Back or Esc returns)
  *
- * The redesign answers specific complaints: Settings opened inline and
- * drowned the list; three status strips said the same thing; Clear and
- * Filter were buttons that did nothing lasting; collapse felt random and
- * the panel forgot where it was put. Every button now has one clear job,
- * shows its state, and every click does something visible.
- *
- * Nothing goes on Torn's item cards beyond one class; every number lives
- * here. All text goes in through textContent - names from Torn or TornW3B
- * never touch innerHTML. The panel is in a shadow root (see mount()).
+ * Every button has one job and shows its state. Nothing goes on Torn's item
+ * cards beyond one class; every number lives here. All text goes in through
+ * textContent - names from Torn or TornW3B never touch innerHTML. The panel
+ * is in a shadow root (see mount()).
  */
 
 import {
@@ -26,8 +23,9 @@ import {
 } from '../core/parse.js';
 import { VENUE_LABELS } from '../core/profit.js';
 import { W3B_TERMS_URL, W3B_SITE_URL } from '../api/w3b.js';
-import { TE_SITE_URL } from '../api/te.js';
+import { WINDOWS, coverageText } from '../core/history.js';
 import { panelStyleElement } from './styles.js';
+import { renderPriceGraph } from './graph.js';
 
 /** "last update 2m ago" turns the status amber after this. */
 export const PANEL_STALE_MS = 60000;
@@ -51,7 +49,8 @@ function el(tag, props = {}, children = []) {
     }
 
     for (const child of [].concat(children)) {
-        if (child) node.appendChild(child);
+        if (child === null || child === undefined || child === false) continue;
+        node.appendChild(typeof child === 'string' ? document.createTextNode(child) : child);
     }
 
     return node;
@@ -71,10 +70,7 @@ function guarded(panel, label, fn) {
             const result = fn(...args);
             if (result && typeof result.catch === 'function') {
                 result.catch((error) => {
-                    panel.setStatus(
-                        label + ' failed: ' + describeError(error),
-                        'error',
-                    );
+                    panel.setStatus(label + ' failed: ' + describeError(error), 'error');
                 });
             }
             return result;
@@ -88,11 +84,6 @@ function guarded(panel, label, fn) {
 function describeError(error) {
     if (!error) return 'unknown error';
     return String(error.message || error);
-}
-
-function numberFromInput(value, fallback) {
-    const n = parseMoneyInput(value);
-    return n === null ? fallback : n;
 }
 
 /** Keys typed into these belong to the page (or our fields), not the hotkey. */
@@ -118,6 +109,12 @@ export function isTypingTarget(event) {
 /** Long enough to see, short enough not to get in the way. */
 const SCAN_ANIMATION_MS = 800;
 
+/** A current asking price: "$30", "none" when nothing is listed, null until asked. */
+function priceText(entry) {
+    if (!entry) return null;
+    return entry.price > 0 ? formatMoney(entry.price) : 'none';
+}
+
 export class Panel {
     /**
      * @param {object} handlers
@@ -130,6 +127,9 @@ export class Panel {
      * @param {function} handlers.onForgetKey
      * @param {function} handlers.onClearCache
      * @param {function} handlers.onRevealKey      - () => stored key
+     * @param {function} handlers.onOpenSelling    - open the selling page
+     * @param {function} handlers.onSelectBazaarItem - (itemId) => void
+     * @param {function} handlers.onBazaarWindow   - ('24h'|'7d'|'30d') => void
      */
     constructor(handlers = {}) {
         this.handlers = handlers;
@@ -144,6 +144,7 @@ export class Panel {
             tab: 'bazaar',
             counts: {},
             live: null,
+            bazaar: null,
         };
 
         this.page = 'list';
@@ -162,30 +163,31 @@ export class Panel {
         this.backBtn = el('button', {
             type: 'button',
             class: 'ttv2-icon ttv2-back',
-            title: 'Back to the list (Esc)',
+            title: 'Back (Esc)',
             'aria-label': 'Back',
             text: '←',
-            onclick: () => this.showPage('list'),
+            onclick: () => this.showPage(this.homePage()),
         });
 
         this.titleEl = el('div', { class: 'ttv2-title' });
-        this.titleTextEl = el('span', { class: 'ttv2-title-text', text: 'NPC Arbitrage' });
-        this.versionEl = el('span', {
-            class: 'ttv2-ver',
-            title: 'Installed version',
-            text:
-                'v' +
-                (typeof TTV2_BUILD_VERSION === 'string' ? TTV2_BUILD_VERSION : 'dev'),
-        });
+        this.titleTextEl = el('span', { text: 'NPC Arbitrage' });
         // Shown only while collapsed: the headline, so a collapsed panel
         // still answers "is there anything to buy?".
         this.miniEl = el('span', { class: 'ttv2-mini' });
         this.titleEl.appendChild(this.titleTextEl);
-        this.titleEl.appendChild(this.versionEl);
         this.titleEl.appendChild(this.miniEl);
 
+        // The selling page: its own tab, for the items you hold.
+        this.sellBtn = el('button', {
+            type: 'button',
+            class: 'ttv2-sell',
+            title: 'Open the selling page in a new tab',
+            text: 'Sell',
+            onclick: guarded(this, 'Sell', () => this.handlers.onOpenSelling && this.handlers.onOpenSelling()),
+        });
+
         // Re-reads the listings on this page right away - no requests, so
-        // it can be pressed as often as you like. The feed refresh is ↻.
+        // it can be pressed as often as you like. The refresh is ↻.
         this.scanBtn = el('button', {
             type: 'button',
             class: 'ttv2-scan',
@@ -223,8 +225,7 @@ export class Panel {
             'aria-label': 'Settings',
             'aria-pressed': 'false',
             text: '⚙',
-            onclick: () =>
-                this.showPage(this.page === 'settings' ? 'list' : 'settings'),
+            onclick: () => this.showPage(this.page === 'settings' ? this.homePage() : 'settings'),
         });
 
         this.collapseBtn = el('button', {
@@ -240,19 +241,10 @@ export class Panel {
         // you can see a scan happened even when nothing on the list changed.
         this.sweepEl = el('div', { class: 'ttv2-sweep', 'aria-hidden': 'true' });
 
-        // The Traders page: its own full page, fed by this overlay.
-        this.tradersBtn = el('button', {
-            type: 'button',
-            class: 'ttv2-traders-btn',
-            title: 'Open the Traders page: every deal with the traders who buy it',
-            text: 'Traders',
-            onclick: guarded(this, 'Traders', () => this.handlers.onOpenTraders && this.handlers.onOpenTraders()),
-        });
-
         this.headEl = el('div', { class: 'ttv2-head' }, [
             this.backBtn,
             this.titleEl,
-            this.tradersBtn,
+            this.sellBtn,
             this.scanBtn,
             this.refreshBtn,
             this.settingsBtn,
@@ -276,14 +268,12 @@ export class Panel {
         for (const [key, label] of [
             ['bazaar', 'Bazaars'],
             ['itemmarket', 'Item Market'],
-            ['traders', 'By trader'],
         ]) {
             const btn = el('button', {
                 type: 'button',
                 class: 'ttv2-tab',
                 text: label,
-                onclick: () =>
-                    this.handlers.onViewChange && this.handlers.onViewChange(key),
+                onclick: () => this.handlers.onViewChange && this.handlers.onViewChange(key),
             });
             btn.dataset.label = label;
             this.tabBtns[key] = btn;
@@ -299,7 +289,7 @@ export class Panel {
                 title: 'Bazaar prices come from TornW3B',
                 text: 'via TornW3B',
             }),
-            document.createTextNode(' · '),
+            ' · ',
             el('a', {
                 href: W3B_TERMS_URL,
                 target: '_blank',
@@ -309,17 +299,10 @@ export class Panel {
         ]);
         this.tabsEl.appendChild(this.creditEl);
 
-        // Where trader prices come from, on the tab they feed.
-        this.teCreditEl = el('span', { class: 'ttv2-credit' }, [
-            el('a', {
-                href: TE_SITE_URL,
-                target: '_blank',
-                rel: 'noopener noreferrer',
-                title: 'Trader prices come from TornExchange',
-                text: 'via TornExchange',
-            }),
+        this.colsEl = el('div', { class: 'ttv2-cols' }, [
+            el('span', { class: 'ttv2-label', text: 'Deal' }),
+            el('span', { class: 'ttv2-label ttv2-money', text: 'Profit' }),
         ]);
-        this.tabsEl.appendChild(this.teCreditEl);
 
         this.listEl = el('div', { class: 'ttv2-list' });
 
@@ -333,6 +316,13 @@ export class Panel {
             this.listEl,
         ]);
 
+        /* ---- my bazaar page ---- */
+
+        this.bzListEl = el('div', { class: 'ttv2-bzlist' });
+        this.bzDetailEl = el('div', { class: 'ttv2-bzdetail' });
+        this.bazaarPage = el('div', { class: 'ttv2-page ttv2-page-bazaar' }, [this.bzListEl, this.bzDetailEl]);
+        this.bazaarPage.style.display = 'none';
+
         /* ---- settings page ---- */
 
         this.settingsPage = el('div', { class: 'ttv2-page ttv2-page-settings' });
@@ -341,6 +331,7 @@ export class Panel {
         this.bodyEl = el('div', { class: 'ttv2-body' }, [
             this.barEl,
             this.listPage,
+            this.bazaarPage,
             this.settingsPage,
         ]);
 
@@ -350,8 +341,7 @@ export class Panel {
         this.root.addEventListener('keydown', (event) => {
             if (event.key !== 'Escape') return;
             if (this.closeChipEditor()) return;
-            if (this.closeTradersPrompt()) return;
-            if (this.page === 'settings') this.showPage('list');
+            if (this.page === 'settings') this.showPage(this.homePage());
         });
 
         this.enableDrag(this.headEl);
@@ -381,12 +371,17 @@ export class Panel {
 
     /* ------------------------------------------------------------ pages */
 
+    /** The page Back returns to: My bazaar on your own bazaar, else the list. */
+    homePage() {
+        return this.state.bazaar ? 'mybazaar' : 'list';
+    }
+
     /**
-     * Switch between the list and Settings. Settings REPLACES the list, at
-     * the same panel size - it never stacks on top of it.
+     * Switch pages. Settings REPLACES the list, at the same panel size - it
+     * never stacks on top of it.
      */
     showPage(page, { focusKey = false } = {}) {
-        this.page = page === 'settings' ? 'settings' : 'list';
+        this.page = page === 'settings' ? 'settings' : page === 'mybazaar' ? 'mybazaar' : 'list';
         if (!this.root) return;
 
         const settings = this.page === 'settings';
@@ -407,8 +402,10 @@ export class Panel {
         }
 
         this.root.classList.toggle('ttv2-on-settings', settings);
+        this.listPage.style.display = this.page === 'list' ? '' : 'none';
+        this.bazaarPage.style.display = this.page === 'mybazaar' ? '' : 'none';
         this.settingsBtn.setAttribute('aria-pressed', String(settings));
-        this.titleTextEl.textContent = settings ? 'Settings' : 'NPC Arbitrage';
+        this.titleTextEl.textContent = settings ? 'Settings' : this.page === 'mybazaar' ? 'My bazaar' : 'NPC Arbitrage';
 
         // Opening a page from a collapsed panel should show it.
         if (this.collapsed) this.setCollapsed(false, { save: true });
@@ -416,13 +413,6 @@ export class Panel {
         if (settings && focusKey && this.keyInput) {
             setTimeout(() => this.keyInput.focus(), 0);
         }
-    }
-
-    /** Old name, kept for callers: open Settings. */
-    toggleView(which) {
-        this.showPage(which === 'settings' ? 'settings' : 'list', {
-            focusKey: which === 'settings' && !this.hasKey,
-        });
     }
 
     openSettings({ focusKey = false } = {}) {
@@ -454,58 +444,40 @@ export class Panel {
             return chip;
         };
 
-        this.chipNpc = toggle(
-            'sellToNpc',
-            'NPC',
-            "Sell to an NPC shop: listings cheaper than what an NPC shop pays (the item's Sell " +
-                'price). Guaranteed, no tax. Items whose Sell is N/A never appear.',
+        this.chipNpc = toggle('sellToNpc', 'NPC', 'Listings under the NPC sell price. Guaranteed, no tax.');
+        this.chipBazaar = toggle('resaleBazaar', 'My bazaar', 'Listings under value, to relist in your bazaar.');
+        this.chipMarket = toggle('resaleMarket', 'Market', 'Listings under value, to resell on the Item Market.');
+
+        this.chipMin = this.valueChip(
+            'minTotalProfit',
+            (v) => 'Min ' + formatMoneyShort(v || 0),
+            'Hide deals below this total profit',
         );
-        this.chipBazaar = toggle(
-            'resaleBazaar',
-            'My bazaar',
-            "Trading: listings under the item's average value, relisted in " +
-                'your own bazaar (no tax). Someone still has to buy.',
-        );
-        this.chipMarket = toggle(
-            'resaleMarket',
-            'Market',
-            "Trading: listings under the item's average value, sold on the " +
-                'Item Market after its 5% tax.',
+        this.chipCash = this.valueChip(
+            'cashOnHand',
+            (v) => (v ? 'Cash ' + formatMoneyShort(v) : 'Cash: any'),
+            'Show only what this cash can buy',
         );
 
-        this.chipTrader = toggle(
-            'sellToTrader',
-            'Trader',
-            'Sell to a player trader: listings cheaper than what a TornExchange ' +
-                'trader pays, online traders first. Instant cash, no tax - but an ' +
-                'offer, not a guarantee. Needs a TornExchange key (Settings).',
-        );
-
-        this.chipMin = this.valueChip('minTotalProfit', (v) =>
-            'Min ' + formatMoneyShort(v || 0),
-            'Hide listings whose total profit is below this',
-        );
-        this.chipCash = this.valueChip('cashOnHand', (v) =>
-            v ? 'Cash ' + formatMoneyShort(v) : 'Cash: any',
-            'Only count what you can afford (blank = no limit)',
-        );
-
-        this.chipsEl.appendChild(el('span', { class: 'ttv2-chips-label', text: 'Sell to' }));
         this.chipsEl.appendChild(this.chipNpc);
         this.chipsEl.appendChild(this.chipBazaar);
         this.chipsEl.appendChild(this.chipMarket);
-        this.chipsEl.appendChild(this.chipTrader);
         this.chipsEl.appendChild(el('span', { class: 'ttv2-chips-gap' }));
         this.chipsEl.appendChild(this.chipMin);
         this.chipsEl.appendChild(this.chipCash);
     }
 
-    /** A chip showing a number; click it to edit in place (Enter / Esc). */
+    /**
+     * A chip showing a number; click it to edit in place (Enter / Esc).
+     * Anything the editor cannot read keeps the old value and says so:
+     * a cash figure that silently became "no cap" showed every deal as
+     * affordable.
+     */
     valueChip(key, label, title) {
         const chip = el('button', {
             type: 'button',
             class: 'ttv2-chip ttv2-chip-value',
-            title: title + ' - click to change',
+            title,
         });
         chip.dataset.key = key;
         chip.labelFor = label;
@@ -518,7 +490,7 @@ export class Panel {
                 type: 'text',
                 inputmode: 'numeric',
                 class: 'ttv2-chip-input',
-                placeholder: key === 'cashOnHand' ? 'no cap' : '0',
+                placeholder: key === 'cashOnHand' ? 'any' : '0',
                 'aria-label': title,
             });
             const current = this.state.settings[key];
@@ -526,14 +498,24 @@ export class Panel {
 
             const commit = () => {
                 const raw = input.value.trim();
-                const value =
-                    key === 'cashOnHand'
-                        ? raw
-                            ? numberFromInput(raw, null)
-                            : null
-                        : numberFromInput(raw || '0', 0);
                 this.closeChipEditor();
-                this.emitSettings({ [key]: value });
+
+                if (!raw) {
+                    if (/must be a number/.test(this.state.status.text)) this.setStatus('');
+                    this.emitSettings({ [key]: key === 'cashOnHand' ? null : 0 });
+                    return;
+                }
+                const value = parseMoneyInput(raw);
+                if (value === null || value < 0) {
+                    this.setStatus(
+                        (key === 'cashOnHand' ? 'Cash' : 'Min') + ' must be a number like 1234567 or 1.5m.',
+                        'error',
+                    );
+                    return;
+                }
+                // A good value clears the complaint about a bad one.
+                if (/must be a number/.test(this.state.status.text)) this.setStatus('');
+                this.emitSettings({ [key]: key === 'cashOnHand' && value === 0 ? null : value });
             };
 
             input.addEventListener('keydown', (event) => {
@@ -572,9 +554,9 @@ export class Panel {
 
     /**
      * Settings, top to bottom: the key (with Torn's required disclosure
-     * right under it), and the live feed. Nothing else - maintenance
-     * (re-download item data, reset panel position, scan diagnostics) is in
-     * the Tampermonkey menu, out of the way.
+     * right under it), watching, and links. Maintenance (re-download item
+     * data, reset panel position, scan diagnostics) is in the Tampermonkey
+     * menu, out of the way. The selling page keeps its own settings.
      */
     buildSettings() {
         const section = (title, children) =>
@@ -596,7 +578,7 @@ export class Panel {
         this.keyInput = el('input', {
             type: 'text',
             class: 'ttv2-masked ttv2-key',
-            placeholder: 'Paste your Public API key',
+            placeholder: 'Public API key',
             autocomplete: 'off',
             autocapitalize: 'off',
             autocorrect: 'off',
@@ -638,27 +620,20 @@ export class Panel {
 
         this.keyStateEl = el('div', { class: 'ttv2-keystate', text: 'No key saved.' });
 
-        const keyHelp = el('div', { class: 'ttv2-note' });
-        keyHelp.appendChild(document.createTextNode('Needs a '));
-        keyHelp.appendChild(el('strong', { text: 'Public' }));
-        keyHelp.appendChild(document.createTextNode(' key - make one at '));
-        keyHelp.appendChild(
+        const keyHelp = el('div', { class: 'ttv2-note' }, [
+            'A Public key is enough. Make one at ',
             el('a', {
                 href: TORN_API_KEY_URL,
                 target: '_blank',
                 rel: 'noopener noreferrer',
                 text: 'Torn › Settings › API Key',
             }),
-        );
-        keyHelp.appendChild(
-            document.createTextNode(
-                ". A Public key can't read your money, mail or inventory.",
-            ),
-        );
+            '.',
+        ]);
 
         // Torn requires this where the key is entered; it stays right here.
         this.tosEl = el('details', { class: 'ttv2-tos-box', open: '' }, [
-            el('summary', { text: 'How this script uses your key (Torn API terms)' }),
+            el('summary', { text: 'Key use (Torn API terms)' }),
             this.buildTosTable(),
         ]);
 
@@ -679,7 +654,7 @@ export class Panel {
             ]),
         );
 
-        /* ---- live feed ---- */
+        /* ---- watching ---- */
 
         const check = (key, label, sub) => {
             const input = el('input', { type: 'checkbox' });
@@ -697,30 +672,24 @@ export class Panel {
 
         const im = check(
             'liveFeed',
-            'Watch the Item Market from any Torn page',
-            el('span', { class: 'ttv2-sub', text: 'Runs in one visible Torn tab, at most 30 API calls a minute.' }),
+            'Watch the Item Market anywhere',
+            el('span', { class: 'ttv2-sub', text: 'One visible Torn tab, at most 30 API calls a minute.' }),
         );
         this.liveFeedInput = im.input;
 
-        const w3bSub = el('span', { class: 'ttv2-sub' });
-        w3bSub.appendChild(document.createTextNode('Bazaar prices from '));
-        w3bSub.appendChild(el('a', { href: W3B_SITE_URL, target: '_blank', rel: 'noopener noreferrer', text: 'weav3r.dev' }));
-        w3bSub.appendChild(document.createTextNode(' ('));
-        w3bSub.appendChild(el('a', { href: W3B_TERMS_URL, target: '_blank', rel: 'noopener noreferrer', text: 'terms' }));
-        w3bSub.appendChild(document.createTextNode('). It gets item ids only - never your key.'));
+        const w3bSub = el('span', { class: 'ttv2-sub' }, [
+            'Bazaar prices from ',
+            el('a', { href: W3B_SITE_URL, target: '_blank', rel: 'noopener noreferrer', text: 'weav3r.dev' }),
+            ' (',
+            el('a', { href: W3B_TERMS_URL, target: '_blank', rel: 'noopener noreferrer', text: 'terms' }),
+            '). It gets item ids only, never your key.',
+        ]);
 
         const bz = check('useW3b', 'Watch bazaars via TornW3B', w3bSub);
         this.useW3bInput = bz.input;
 
         this.settingsPage.appendChild(
-            section('Live feed', [
-                im.row,
-                bz.row,
-                note(
-                    'Never buys, clicks, notifies or plays sounds. Every row is ' +
-                        'a link you follow yourself.',
-                ),
-            ]),
+            section('Watching', [im.row, bz.row, note('Nothing is bought, clicked or announced for you.')]),
         );
 
         /* ---- links ---- */
@@ -728,191 +697,23 @@ export class Panel {
         const nt = check(
             'openInNewTab',
             'Open deals in a new tab',
-            el('span', {
-                class: 'ttv2-sub',
-                text: 'Untick to open GO TO BAZAAR / GO TO MARKET in this tab instead.',
-            }),
+            el('span', { class: 'ttv2-sub', text: 'Off: Go opens the listing in this tab.' }),
         );
         this.newTabInput = nt.input;
 
-        // The Traders page keeps its own preferences; this only shows and
-        // resets how its button opens it.
-        this.tradersModeEl = el('span', { class: 'ttv2-sub' });
-        const tradersLine = el('div', { class: 'ttv2-note ttv2-traders-mode' }, [
-            this.tradersModeEl,
-            document.createTextNode(' '),
-            el('button', {
-                type: 'button',
-                class: 'ttv2-link',
-                text: 'Ask again',
-                onclick: () => this.handlers.onTradersOpenMode && this.handlers.onTradersOpenMode('ask'),
-            }),
-        ]);
-
-        this.settingsPage.appendChild(section('Links', [nt.row, tradersLine]));
-
-        /* ---- TornExchange ---- */
-
-        this.teKeyInput = el('input', {
-            type: 'text',
-            class: 'ttv2-masked ttv2-te-key',
-            placeholder: 'Paste your TornExchange key',
-            autocomplete: 'off',
-            autocapitalize: 'off',
-            autocorrect: 'off',
-            spellcheck: 'false',
-            'data-lpignore': 'true',
-            'data-1p-ignore': 'true',
-        });
-
-        this.teKeyRevealed = false;
-        const teShowBtn = el('button', {
-            type: 'button',
-            text: 'Show',
-            onclick: () => {
-                const hidden = this.teKeyInput.classList.toggle('ttv2-masked');
-                teShowBtn.textContent = hidden ? 'Show' : 'Hide';
-                if (!hidden && !this.teKeyInput.value && this.handlers.onRevealTeKey) {
-                    this.teKeyInput.value = this.handlers.onRevealTeKey() || '';
-                    this.teKeyRevealed = true;
-                } else if (hidden && this.teKeyRevealed) {
-                    this.teKeyInput.value = '';
-                    this.teKeyRevealed = false;
-                }
-            },
-        });
-
-        const teSave = guarded(this, 'Save', () => {
-            const key = this.teKeyInput.value.trim();
-            this.teKeyInput.value = '';
-            this.teKeyRevealed = false;
-            return this.handlers.onSaveTeKey ? this.handlers.onSaveTeKey(key) : undefined;
-        });
-        this.teKeyInput.addEventListener('keydown', (event) => {
-            if (event.key !== 'Enter') return;
-            event.preventDefault();
-            teSave();
-        });
-
-        this.teStateEl = el('div', { class: 'ttv2-keystate', text: 'No TornExchange key.' });
-
-        const teHelp = el('div', { class: 'ttv2-note' });
-        teHelp.appendChild(document.createTextNode(
-            "TornExchange only answers to the Torn key you log in there with. Make a " +
-                'second Public key, log in at ',
-        ));
-        teHelp.appendChild(el('a', { href: TE_SITE_URL, target: '_blank', rel: 'noopener noreferrer', text: 'tornexchange.com' }));
-        teHelp.appendChild(document.createTextNode(
-            ' with it, and paste that same key here. Your main key is never sent there. ' +
-                'Trader prices are fetched once every 30 minutes.',
-        ));
+        this.settingsPage.appendChild(section('Links', [nt.row]));
 
         this.settingsPage.appendChild(
-            section('Traders (TornExchange)', [
-                el('div', { class: 'ttv2-inline' }, [
-                    this.teKeyInput,
-                    teShowBtn,
-                    el('button', { type: 'button', class: 'ttv2-primary', text: 'Save', onclick: teSave }),
-                ]),
-                this.teStateEl,
-                teHelp,
-                el('div', { class: 'ttv2-inline' }, [
-                    el('button', {
-                        type: 'button',
-                        class: 'ttv2-link',
-                        text: 'Refresh trader prices',
-                        onclick: guarded(this, 'Refresh', () =>
-                            this.handlers.onRefreshTraders && this.handlers.onRefreshTraders(),
-                        ),
-                    }),
-                    el('button', {
-                        type: 'button',
-                        class: 'ttv2-link',
-                        text: 'Forget TornExchange key',
-                        onclick: () => this.handlers.onForgetTeKey && this.handlers.onForgetTeKey(),
-                    }),
-                ]),
+            section('Selling', [
+                note('The selling page has its own keys and settings.'),
+                el('button', {
+                    type: 'button',
+                    class: 'ttv2-link',
+                    text: 'Open the selling page',
+                    onclick: guarded(this, 'Sell', () => this.handlers.onOpenSelling && this.handlers.onOpenSelling()),
+                }),
             ]),
         );
-    }
-
-    renderTradersMode() {
-        if (!this.tradersModeEl) return;
-        const mode = this.state.tradersOpenMode || 'ask';
-        this.tradersModeEl.textContent =
-            'Traders page opens: ' +
-            (mode === 'tab' ? 'in a new tab' : mode === 'overlay' ? 'over the page' : 'ask each time') + '.';
-        this.tradersModeEl.parentNode.lastChild.hidden = mode === 'ask';
-    }
-
-    /**
-     * "Open the Traders page in a new tab?" - Yes / No, here / Remember.
-     * @param {function} onChoice - (newTab: boolean, remember: boolean)
-     */
-    showTradersPrompt(onChoice) {
-        this.closeTradersPrompt();
-        if (this.collapsed) this.setCollapsed(false, { save: true });
-
-        const remember = el('input', { type: 'checkbox' });
-        const choose = (newTab) => {
-            const keep = remember.checked;
-            this.closeTradersPrompt();
-            onChoice(newTab, keep);
-        };
-
-        const yes = el('button', { type: 'button', class: 'ttv2-primary', text: 'Yes', onclick: () => choose(true) });
-        this.tradersPrompt = el('div', { class: 'ttv2-prompt', role: 'dialog', 'aria-label': 'Open the Traders page' }, [
-            el('div', { class: 'ttv2-prompt-q', text: 'Open the Traders page in a new tab?' }),
-            el('div', {
-                class: 'ttv2-note',
-                text: 'Yes: its own tab, stays open while you browse Torn. No: full screen over this page, ✕ to close.',
-            }),
-            el('label', { class: 'ttv2-check ttv2-prompt-remember' }, [remember, el('span', { text: 'Remember my choice' })]),
-            el('div', { class: 'ttv2-prompt-btns' }, [
-                el('button', { type: 'button', text: 'No, here', onclick: () => choose(false) }),
-                yes,
-            ]),
-        ]);
-        this.root.appendChild(this.tradersPrompt);
-        yes.focus();
-    }
-
-    /** @returns {boolean} true if a prompt was open */
-    closeTradersPrompt() {
-        if (!this.tradersPrompt) return false;
-        this.tradersPrompt.remove();
-        this.tradersPrompt = null;
-        return true;
-    }
-
-    /** The TornExchange line in Settings: never the key, only its state. */
-    renderTraderInfo() {
-        const info = this.state.traderInfo;
-        if (!this.teStateEl || !info) return;
-
-        this.teStateEl.classList.remove('ttv2-ok', 'ttv2-bad');
-        let text;
-        if (!info.hasKey) {
-            text = 'No TornExchange key.';
-        } else if (info.badKey) {
-            text = info.error || 'TornExchange did not accept the key.';
-            this.teStateEl.classList.add('ttv2-bad');
-        } else if (info.loading) {
-            text = 'Loading trader prices...';
-        } else if (info.fetchedAt) {
-            text =
-                'Trader prices for ' + info.items.toLocaleString('en-US') + ' items, updated ' +
-                formatAge(Date.now() - info.fetchedAt) + '.';
-            this.teStateEl.classList.add('ttv2-ok');
-            if (info.error) text += ' Last refresh failed: ' + info.error;
-        } else {
-            text = info.error || 'Key saved. Turn on the Trader chip to load prices.';
-            if (info.error) this.teStateEl.classList.add('ttv2-bad');
-        }
-        if (info.waitUntil) {
-            text += ' Waiting ' + formatAge(info.waitUntil - Date.now()) + ' (TornExchange rate limit).';
-        }
-        this.teStateEl.textContent = text;
     }
 
     /**
@@ -921,40 +722,26 @@ export class Panel {
      */
     buildTosTable() {
         const rows = [
-            ['Data storage', 'Only locally (in this browser)'],
+            ['Data storage', 'Only locally, in this browser'],
             ['Data sharing', 'Nobody'],
-            [
-                'Purpose of use',
-                'Competitive advantage: finding Bazaar and Item Market ' +
-                    'listings priced below NPC / market value',
-            ],
+            ['Purpose of use', 'Competitive advantage: finding Bazaar and Item Market listings below NPC or market value'],
             ['Key storage & sharing', 'Stored locally / Not shared'],
             [
                 'Key access level',
-                'Public (torn: items, cityshops; market: itemmarket; key: info; ' +
-                    "user: profile - bazaar owners' public online status, for " +
-                    'the bazaar you view and the sellers on the Bazaars list)',
+                'Public (torn: items, cityshops; market: itemmarket; key: info; user: profile, for bazaar owners\' public status)',
             ],
             [
                 'Other services',
-                'TornW3B (weav3r.dev), for bazaar prices. It receives item ids ' +
-                    'only - never your key or anything about you. TornExchange ' +
-                    '(tornexchange.com), for traders\' buy prices, only if you add a ' +
-                    'TornExchange key: it receives that separate key - never your main key.',
+                'TornW3B (weav3r.dev) for bazaar prices. It receives item ids only, never your key.',
             ],
         ];
 
         const table = el('table', { class: 'ttv2-tos' });
         for (const [k, v] of rows) {
-            table.appendChild(
-                el('tr', {}, [el('th', { text: k }), el('td', { text: v })]),
-            );
+            table.appendChild(el('tr', {}, [el('th', { text: k }), el('td', { text: v })]));
         }
 
-        return el('div', {}, [
-            el('h4', { text: 'API key terms of use' }),
-            table,
-        ]);
+        return el('div', {}, [table]);
     }
 
     /**
@@ -979,16 +766,12 @@ export class Panel {
 
         if (overScoped) {
             this.keyStateEl.textContent =
-                'Saved - but this key has ' +
-                (accessName || 'more than Public') +
-                ' access. Public is enough. Revoke it and make a Public one.';
+                'Saved. This key has ' + (accessName || 'more than Public') + ' access; Public is enough.';
             this.keyStateEl.classList.add('ttv2-bad');
             return;
         }
 
-        this.keyStateEl.textContent =
-            (accessName ? 'Saved - ' + accessName + ' access.' : 'Saved.') +
-            ' Hidden from the page; press Show to see it.';
+        this.keyStateEl.textContent = accessName ? 'Saved · ' + accessName + ' access.' : 'Saved.';
         this.keyStateEl.classList.add('ttv2-ok');
     }
 
@@ -1114,22 +897,17 @@ export class Panel {
         this.sellerEl.classList.toggle('ttv2-shown', Boolean(info));
         if (!info) return;
 
-        const dot = el('span', { class: 'ttv2-dot' });
-        dot.dataset.level = info.level;
         this.sellerEl.appendChild(document.createTextNode('Seller: '));
         this.sellerEl.appendChild(el('b', { text: info.name || 'this bazaar' }));
-        this.sellerEl.appendChild(dot);
-        this.sellerEl.appendChild(document.createTextNode(info.text));
+        this.sellerEl.appendChild(this.statusWord(info.level, info.text));
         if (info.closed) {
-            this.sellerEl.appendChild(
-                el('span', { class: 'ttv2-closed', text: 'Bazaar closed - nothing here can be bought' }),
-            );
+            this.sellerEl.appendChild(el('span', { class: 'ttv2-closed', text: 'Bazaar closed' }));
         }
         this.sellerEl.title = this.sellerEl.textContent;
     }
 
     /**
-     * ` shows and hides the overlay, from anywhere on the page - except while
+     * ` shows and hides the panel, from anywhere on the page - except while
      * typing (chat, search, quantity boxes, our own fields), and never with
      * Ctrl / Alt / Cmd held.
      */
@@ -1175,7 +953,7 @@ export class Panel {
 
         this.refreshBtn.disabled = this.state.busy;
         this.refreshBtn.classList.toggle('ttv2-spin', this.state.busy);
-        this.refreshBtn.title = this.state.busy ? 'Refreshing...' : 'Refresh now';
+        this.refreshBtn.title = this.state.busy ? 'Refreshing' : 'Refresh now';
         this.renderBar();
     }
 
@@ -1215,7 +993,6 @@ export class Panel {
         this.chipNpc.setAttribute('aria-pressed', String(s.sellToNpc !== false));
         this.chipBazaar.setAttribute('aria-pressed', String(Boolean(s.resaleBazaar)));
         this.chipMarket.setAttribute('aria-pressed', String(Boolean(s.resaleMarket)));
-        this.chipTrader.setAttribute('aria-pressed', String(Boolean(s.sellToTrader)));
         this.chipMin.textContent = this.chipMin.labelFor(s.minTotalProfit);
         this.chipCash.textContent = this.chipCash.labelFor(s.cashOnHand);
         this.chipCash.classList.toggle('ttv2-chip-set', Boolean(s.cashOnHand));
@@ -1234,19 +1011,14 @@ export class Panel {
 
         if (rows.length === 0) {
             this.listEl.appendChild(this.renderEmpty());
-        } else if (this.state.tab === 'traders') {
-            (this.state.groups || []).forEach((g) => {
-                this.listEl.appendChild(this.renderGroup(g));
-            });
         } else {
-            rows.forEach((row, i) => {
-                this.listEl.appendChild(this.renderRow(row, i));
+            this.listEl.appendChild(this.colsEl);
+            rows.forEach((row) => {
+                this.listEl.appendChild(this.renderRow(row));
             });
         }
 
         this.renderTabs();
-        this.renderTraderInfo();
-        this.renderTradersMode();
         this.refreshAges();
     }
 
@@ -1265,14 +1037,11 @@ export class Panel {
             const live = this.state.live;
             this.creditEl.style.display = tab === 'bazaar' && live && live.w3b ? '' : 'none';
         }
-        if (this.teCreditEl) {
-            this.teCreditEl.style.display = tab === 'traders' ? '' : 'none';
-        }
     }
 
     /**
      * The one status line. Left: this list's deals and total - or a message.
-     * Right: whether the feed is live, and when it next refreshes.
+     * Right: whether watching is live, and when it next refreshes.
      */
     renderBar() {
         if (!this.barEl) return;
@@ -1281,16 +1050,19 @@ export class Panel {
         const st = this.state.status || {};
         const summary = this.state.summary || { count: 0, totalProfit: 0 };
         const headline =
-            summary.count === 1
-                ? '1 deal · +' + formatMoneyShort(summary.totalProfit)
-                : summary.count + ' deals · +' + formatMoneyShort(summary.totalProfit);
+            (summary.count === 1 ? '1 deal' : summary.count + ' deals') +
+            ' · +' + formatMoneyShort(summary.totalProfit);
 
         const showMessage =
             st.text &&
             (st.level !== 'info' || this.state.busy || now - st.at < INFO_STATUS_MS);
 
         this.barLeft.textContent = showMessage ? st.text : headline;
-        this.barLeft.title = showMessage ? st.text : '';
+        this.barLeft.title = showMessage
+            ? st.text
+            : summary.capped
+              ? 'Total for what your cash buys, best deals first'
+              : '';
         this.barEl.classList.toggle('ttv2-warn', showMessage && st.level === 'warn');
         this.barEl.classList.toggle('ttv2-error', showMessage && st.level === 'error');
 
@@ -1300,25 +1072,25 @@ export class Panel {
         /* ---- liveness ---- */
         const live = this.state.live;
         let dot = 'off';
-        let text = 'feed off';
-        let title = 'Live feed is off (Settings)';
+        let text = 'watching off';
+        let title = 'Watching is off. Turn it on under Settings.';
 
         if (live && live.enabled) {
             if (!live.itemMarket) {
                 dot = 'warn';
                 text = 'needs key';
-                title = 'Add a Public API key in Settings';
+                title = 'Add a Public API key under Settings.';
             } else if (live.leading) {
                 dot = live.lastError ? 'warn' : 'live';
                 const secs = live.nextRefreshAt
                     ? Math.max(0, Math.ceil((live.nextRefreshAt - now) / 1000))
                     : null;
-                text = 'live' + (secs !== null ? ' · refresh ' + secs + 's' : '');
-                title = live.lastError || 'Refreshes every 30 seconds';
+                text = 'live' + (secs !== null ? ' · ' + secs + 's' : '');
+                title = live.lastError || 'Refreshes every 30 seconds.';
             } else {
                 dot = 'other';
                 text = 'live in another tab';
-                title = 'Another visible Torn tab is running the feed; results show here too.';
+                title = 'Another visible Torn tab is watching. Results show here too.';
             }
         }
 
@@ -1348,7 +1120,7 @@ export class Panel {
         };
 
         if (!this.hasKey) {
-            return box('Needs a Public API key to start.', 'Add key', () =>
+            return box('Add a Public API key to start.', 'Add key', () =>
                 this.showPage('settings', { focusKey: true }),
             );
         }
@@ -1360,40 +1132,15 @@ export class Panel {
         }
 
         if (!d && live && !live.enabled) {
-            return box('The live feed is off, so only the page you are on is scanned.', 'Turn it on', () =>
+            return box('Watching is off. Only this page is scanned.', 'Turn it on', () =>
                 this.emitSettings({ liveFeed: true }),
             );
         }
 
         const s = this.state.settings;
-        const ti = this.state.traderInfo || {};
 
-        if (tab === 'traders' && !s.sellToTrader) {
-            return box(
-                'Groups deals by the trader who buys them - one trade each, online traders first.',
-                'Turn on Trader',
-                () => this.emitSettings({ sellToTrader: true }),
-            );
-        }
-        if (s.sellToTrader && !ti.hasKey && (tab === 'traders' || s.sellToNpc === false)) {
-            return box('Trader prices need a TornExchange key.', 'Add it', () =>
-                this.showPage('settings'),
-            );
-        }
-        if (tab === 'traders') {
-            return box(
-                ti.loading
-                    ? 'Loading trader prices...'
-                    : ti.error && !ti.fetchedAt
-                      ? 'No trader prices: ' + ti.error
-                      : 'No listing is cheaper than what a trader pays right now.',
-                ti.error && !ti.loading ? 'Open Settings' : null,
-                () => this.showPage('settings'),
-            );
-        }
-
-        if (s.sellToNpc === false && !s.resaleBazaar && !s.resaleMarket && !s.sellToTrader) {
-            return box('Nothing to sell to is selected.', 'Sell to NPC shops', () =>
+        if (s.sellToNpc === false && !s.resaleBazaar && !s.resaleMarket) {
+            return box('Pick where to sell first.', 'Sell to NPC', () =>
                 this.emitSettings({ sellToNpc: true }),
             );
         }
@@ -1421,9 +1168,8 @@ export class Panel {
 
         if (h.cash) {
             lines.push(
-                h.cash + (h.cash === 1 ? ' deal is' : ' deals are') + ' hidden by your ' +
-                    formatMoneyShort(cash) + ' cash: you cannot buy enough of ' +
-                    (h.cash === 1 ? 'it' : 'them') + ' to make ' + formatMoneyShort(min) + '.',
+                h.cash + (h.cash === 1 ? ' deal' : ' deals') + ' hidden: ' +
+                    formatMoneyShort(cash) + ' cash cannot buy enough.',
             );
         }
         if (h.min) {
@@ -1434,9 +1180,8 @@ export class Panel {
         }
         if (cash > 0 && min > 1 && min / cash >= 0.2) {
             lines.push(
-                'With ' + formatMoneyShort(cash) + ' cash, a ' + formatMoneyShort(min) +
-                    ' profit needs a ' + Math.round((min / cash) * 100) +
-                    '% return - that is rare. Try a lower Min.',
+                'A ' + formatMoneyShort(min) + ' Min on ' + formatMoneyShort(cash) + ' cash needs a ' +
+                    Math.round((min / cash) * 100) + '% return.',
             );
         }
         if (!lines.length) return null;
@@ -1455,44 +1200,28 @@ export class Panel {
         if (!d) {
             if (live && live.enabled && live.leading) {
                 return tab === 'bazaar'
-                    ? 'Watching bazaars - nothing profitable right now.'
-                    : 'Watching the Item Market - nothing profitable right now.';
+                    ? 'Watching bazaars. Nothing profitable right now.'
+                    : 'Watching the Item Market. Nothing profitable right now.';
             }
             if (live && live.enabled) {
-                return 'Live feed runs in another Torn tab; results appear here.';
+                return 'Watching runs in another Torn tab. Results show here.';
             }
             return 'Nothing yet.';
         }
 
         if (d.images === 0) {
-            return (
-                'No item images found on this page. Are there listings ' +
-                'showing? If so, Torn may have changed its markup.'
-            );
+            return 'No item images found on this page.';
         }
 
         if (d.listings === 0 && d.cards > 0) {
             if (d.noItem === d.cards) {
-                return (
-                    'Found ' +
-                    d.cards +
-                    ' listings but none matched the item database. Try ' +
-                    'Tampermonkey menu › Re-download item data.'
-                );
+                return d.cards + ' listings found, none in the item database.';
             }
-            return (
-                'Found ' +
-                d.cards +
-                ' listings but could not read a price from them.'
-            );
+            return d.cards + ' listings found, no price readable.';
         }
 
         if (d.priceAssumed > 0) {
-            return (
-                'Nothing above your threshold. ' +
-                d.priceAssumed +
-                ' row(s) were hidden because their price had to be guessed.'
-            );
+            return 'Nothing above Min. ' + d.priceAssumed + ' rows hidden: price guessed.';
         }
 
         return tab === 'bazaar'
@@ -1501,349 +1230,111 @@ export class Panel {
     }
 
     /**
-     * One opportunity, as a card - the layout the original ChatGPT script
-     * used and people liked:
+     * One deal, two lines:
      *
-     *     #1  Xanax                                  +$11,255
-     *         Bazaar - SellerName | via TornW3B | 40s   $11,255 / item
-     *         Buy $838,745 -> Market value $850,000
-     *         Qty: 390 | resell in your bazaar
-     *         [            GO TO BAZAAR             ]
+     *     Xanax ×390                                       +$11,255
+     *     $838,745 → NPC $850,000 · Garrett89 ● Offline 3h      40s
+     *                                                          [Go]
      *
      * Everything goes in through textContent; names from Torn or TornW3B
      * never touch innerHTML.
      */
-    renderRow(row, rank = 0) {
+    renderRow(row) {
         const p = row.profit;
         const venue = VENUE_LABELS[p.venue] || p.venue;
         const known = row.qtyAtPrice !== false;
 
-        /* ---- rank ---- */
-        const rankEl = el('div', { class: 'ttv2-rank', text: '#' + (rank + 1) });
+        /* ---- line 1: name ×qty, profit ---- */
+        const name = el('div', { class: 'ttv2-row-name' }, [
+            document.createTextNode(row.name),
+            known && (p.affordableQty > 1 || p.affordableQty < p.qty)
+                ? el('span', {
+                      class: 'ttv2-qty',
+                      text: '×' + p.affordableQty.toLocaleString('en-US') +
+                          (p.affordableQty < p.qty ? ' of ' + p.qty.toLocaleString('en-US') : ''),
+                  })
+                : null,
+        ]);
 
-        /* ---- name ---- */
-        const name = el('div', { class: 'ttv2-row-name', text: row.name });
+        // The age sits under the profit, so the details line keeps its room.
+        const profit = el('div', {
+            class: 'ttv2-row-profit ttv2-money',
+            title: formatMoney(p.profitPerUnit) + ' each · ROI ' + formatPct(p.roi),
+        }, [
+            document.createTextNode('+' + formatMoney(known ? p.realizableProfit : p.profitPerUnit) + (known ? '' : ' each')),
+            el('span', { class: 'ttv2-per' }, [row.el ? 'on this page' : el('span', { class: 'ttv2-age' })]),
+        ]);
 
-        /* ---- Buy $x -> Exit $y ---- */
-        const prices = el('div', { class: 'ttv2-row-prices' });
-        prices.appendChild(document.createTextNode('Buy '));
-        prices.appendChild(el('b', { text: formatMoney(p.listingPrice) }));
+        /* ---- line 2: prices, seller, age ---- */
+        const details = el('div', { class: 'ttv2-row-details' });
+        const sep = () => document.createTextNode(' · ');
+
+        details.appendChild(el('b', { text: formatMoney(p.listingPrice) }));
         if (row.priceAssumed) {
-            prices.appendChild(
-                el('span', {
-                    class: 'ttv2-guess',
-                    title:
-                        'This row showed more than one price and none was ' +
-                        'labelled. The lowest was taken as the unit price - ' +
-                        'check it on the card before buying.',
-                    text: ' ?',
-                }),
-            );
+            details.appendChild(el('span', {
+                class: 'ttv2-guess',
+                title: 'More than one price on the card. The lowest was taken.',
+                text: '?',
+            }));
         }
-        prices.appendChild(document.createTextNode('  ->  ' + venue + ' '));
-        prices.appendChild(el('b', { text: formatMoney(p.exitPrice) }));
+        details.appendChild(document.createTextNode(' → ' + venue + ' '));
+        details.appendChild(el('b', { text: formatMoney(p.exitPrice) }));
 
-        /* ---- Qty | exit note | shop ---- */
-        const qty = el('div', { class: 'ttv2-row-qty' });
-        const bits = [];
-
-        if (known) {
-            bits.push(
-                'Qty: ' +
-                    p.affordableQty.toLocaleString('en-US') +
-                    (p.affordableQty < p.qty
-                        ? ' of ' + p.qty.toLocaleString('en-US') + ' (cash)'
-                        : ''),
-            );
+        if (row.source === 'bazaar') {
+            const statuses = this.state.statuses;
+            const status = statuses && row.sellerId ? statuses.get(String(row.sellerId)) : null;
+            const sellerName = row.sellerName || (status && status.name) || null;
+            if (sellerName) {
+                details.appendChild(sep());
+                details.appendChild(el('b', { text: sellerName }));
+                if (status) {
+                    const word = this.statusWord(status.level, status.text);
+                    word.title = (sellerName ? sellerName + ': ' : '') + status.title;
+                    details.appendChild(word);
+                }
+            }
         }
-        if (p.venue === 'BAZAAR_RESALE') bits.push('resell in your bazaar, no tax');
-        if (p.venue === 'ITEM_MARKET') bits.push('resell on the Item Market, after 5% tax');
-        const shopName =
-            (row.item && row.item.npcShopName) ||
-            (row.npcShop && row.npcShop.shopName) ||
-            null;
-
-        if (p.venue === 'NPC' && shopName) {
-            bits.push('sell to ' + shopName);
-        } else if (p.venue === 'NPC') {
-            bits.push('sell to NPC');
-        }
-        if (p.venue === 'TRADER') bits.push('one trade, no tax');
-
-        qty.appendChild(document.createTextNode(bits.join('  |  ')));
 
         if (!known) {
-            qty.appendChild(
-                el('span', {
-                    class: 'ttv2-guess',
-                    title:
-                        'This is the cheapest listing, but Torn does not say ' +
-                        'how many are available AT this price - only the ' +
-                        'market-wide total' +
-                        (row.marketTotal
-                            ? ' (' + row.marketTotal.toLocaleString('en-US') + ')'
-                            : '') +
-                        '. Open the item to see each seller.',
-                    text: (bits.length ? '  |  ' : '') + 'qty unknown',
-                }),
-            );
+            details.appendChild(sep());
+            details.appendChild(el('span', {
+                class: 'ttv2-guess',
+                title: 'Torn shows only the cheapest price. Open the item for stock.',
+                text: 'qty unknown',
+            }));
         }
 
-        const main = el('div', { class: 'ttv2-row-main' }, [
-            name,
-            this.sourceLine(row),
-            prices,
-            p.venue === 'TRADER' && row.traderPick ? this.traderLine(row.traderPick) : null,
-            qty,
-        ]);
-
-        /* ---- profit column ---- */
-        const profit = el('div', { class: 'ttv2-row-profit' }, [
-            el('strong', {
-                text: known
-                    ? '+' + formatMoney(p.realizableProfit)
-                    : '+' + formatMoney(p.profitPerUnit),
-            }),
-            el('span', {
-                text: known
-                    ? formatMoney(p.profitPerUnit) + ' / item'
-                    : 'per item',
-            }),
-            el('span', { text: 'ROI ' + formatPct(p.roi) }),
-        ]);
-
         /* ---- the one action ---- */
-        const label = row.el
-            ? 'SCROLL TO LISTING'
-            : row.source === 'bazaar' && (row.url || row.sellerId)
-              ? 'GO TO BAZAAR'
-              : 'GO TO MARKET';
-
         const go = el('button', {
             type: 'button',
             class: 'ttv2-go',
             title: row.el
                 ? 'Scroll to this listing'
                 : row.source === 'bazaar'
-                  ? row.sellerName
-                      ? "Open " + row.sellerName + "'s bazaar"
-                      : 'Open this bazaar'
-                  : 'Open this item on the Item Market',
-            text: label,
-            onclick: () =>
-                this.handlers.onNavigate && this.handlers.onNavigate(row),
+                  ? 'Open this bazaar'
+                  : 'Open on the Item Market',
+            text: row.el ? 'Show' : 'Go',
+            onclick: () => this.handlers.onNavigate && this.handlers.onNavigate(row),
         });
 
-        const rowEl = el('div', { class: 'ttv2-row' }, [rankEl, main, profit, go]);
+        const rowEl = el('div', { class: 'ttv2-row' }, [name, profit, details, go]);
         rowEl.dataset.ttv2At = String(this.rowTime(row) || '');
         if (row.el) rowEl.classList.add('ttv2-onpage');
-        // An offer, not a guarantee: trader deals never look like NPC ones.
-        if (p.venue === 'TRADER') rowEl.classList.add('ttv2-row-trader');
 
         return rowEl;
     }
 
-    /**
-     * Who the deal would be sold to, and whether they are around:
-     *   Bob ● Online · net +214 · 98% of value   [Profile] [Price list]
-     *   best offline: Alice $24,500
-     */
-    traderLine(pick) {
-        const t = pick.trader;
-        const line = el('div', { class: 'ttv2-trader' });
-
-        const who = el('span', { class: 'ttv2-src-part' });
-        who.appendChild(el('b', { text: t.name }));
-        who.appendChild(this.statusBadge(t.id, t.name, pick.level));
-        line.appendChild(who);
-
-        const facts = ['net ' + (t.score >= 0 ? '+' : '') + t.score];
-        if (pick.pctOfValue) facts.push(Math.round(pick.pctOfValue * 100) + '% of value');
-        line.appendChild(el('span', { class: 'ttv2-src-part', text: ' · ' + facts.join(' · ') + ' ' }));
-
-        line.appendChild(this.traderLinks(t));
-
-        if (pick.suspect) {
-            line.appendChild(
-                el('div', {
-                    class: 'ttv2-trader-warn',
-                    title: 'Traders usually pay 94-100% of value. A higher price is often one they forgot to update.',
-                    text: 'Above value - check their list first',
-                }),
-            );
-        }
-        if (pick.better) {
-            const b = pick.better;
-            line.appendChild(
-                el('div', {
-                    class: 'ttv2-trader-alt',
-                    text:
-                        'best ' + (b.level === 'unknown' ? 'other' : b.level) + ': ' +
-                        b.trader.name + ' ' + formatMoney(b.trader.price),
-                }),
-            );
-        }
-        return line;
-    }
-
-    /** [Profile] opens their Torn profile (trade from there); [Price list] their TornExchange list. */
-    traderLinks(trader) {
-        return el('span', { class: 'ttv2-trader-links' }, [
-            el('button', {
-                type: 'button',
-                class: 'ttv2-mini-btn',
-                title: "Open " + trader.name + "'s Torn profile - start the trade from there",
-                text: 'Profile',
-                onclick: () => this.handlers.onOpenProfile && this.handlers.onOpenProfile(trader.id),
-            }),
-            el('button', {
-                type: 'button',
-                class: 'ttv2-mini-btn',
-                title: 'Open ' + trader.name + "'s price list on TornExchange (new tab)",
-                text: 'Price list',
-                onclick: () => this.handlers.onOpenPriceList && this.handlers.onOpenPriceList(trader.id),
-            }),
-        ]);
-    }
-
-    /** "● Online" for a player, from the known statuses; "● checking" until known. */
-    statusBadge(id, name, fallbackLevel) {
-        const statuses = this.state.statuses;
-        const status = statuses ? statuses.get(String(id)) : null;
-        const badge = el('span', {
-            class: 'ttv2-src-status',
-            title: status ? (name ? name + ': ' : '') + status.title + ' (Torn API)' : 'Checking status...',
-            text: status ? status.text : 'checking',
-        });
-        badge.dataset.level = status ? status.level : fallbackLevel || 'unknown';
-        return badge;
-    }
-
-    /**
-     * One trader, and every deal you could sell them in one trade:
-     *
-     *   Bob ● Online · net +214 · 4 deals · +$41,000   [Profile] [Price list]
-     *     Mountie Hat ×3   $20,000 -> $24,000   +$12,000   [GO]
-     *       Bazaar - Garrett89 ● Online | 1m ago
-     */
-    renderGroup(group) {
-        const t = group.trader;
-
-        const head = el('div', { class: 'ttv2-group-head' }, [
-            el('div', { class: 'ttv2-group-who' }, [
-                el('b', { text: t.name }),
-                this.statusBadge(t.id, t.name, group.level),
-                el('span', {
-                    class: 'ttv2-group-facts',
-                    text:
-                        ' · net ' + (t.score >= 0 ? '+' : '') + t.score + ' · ' +
-                        group.rows.length + (group.rows.length === 1 ? ' deal' : ' deals'),
-                }),
-            ]),
-            el('strong', { class: 'ttv2-group-total', text: '+' + formatMoney(group.totalProfit) }),
-            this.traderLinks(t),
-        ]);
-
-        const items = group.rows.map((row) => {
-            const p = row.profit;
-            const known = row.qtyAtPrice !== false;
-            const line = el('div', { class: 'ttv2-group-item' }, [
-                el('div', { class: 'ttv2-group-item-main' }, [
-                    el('div', {
-                        class: 'ttv2-row-name',
-                        text: row.name + (known && p.affordableQty > 1 ? ' ×' + p.affordableQty : ''),
-                    }),
-                    el('div', {
-                        class: 'ttv2-row-prices',
-                        text: 'Buy ' + formatMoney(p.listingPrice) + '  ->  ' + formatMoney(p.exitPrice),
-                    }),
-                    this.sourceLine(row),
-                ]),
-                el('strong', {
-                    class: 'ttv2-group-profit',
-                    text: '+' + formatMoney(known ? p.realizableProfit : p.profitPerUnit),
-                }),
-                el('button', {
-                    type: 'button',
-                    class: 'ttv2-mini-btn ttv2-group-go',
-                    title: row.el ? 'Scroll to this listing' : 'Go to this listing',
-                    text: 'GO',
-                    onclick: () => this.handlers.onNavigate && this.handlers.onNavigate(row),
-                }),
-            ]);
-            line.dataset.ttv2At = String(this.rowTime(row) || '');
-            line.classList.add('ttv2-row-lite');
-            return line;
-        });
-
-        return el('div', { class: 'ttv2-group' }, [head, ...items]);
+    /** "● Online" for a player: an 8px dot and a word. */
+    statusWord(level, text) {
+        const word = el('span', { class: 'ttv2-status', text: text || '' });
+        word.dataset.level = level || 'unknown';
+        return word;
     }
 
     /** When the data behind a row was true - not when we last looked. */
     rowTime(row) {
         if (row.fromFeed) return row.dataAt;
         return row.seenAt || null;
-    }
-
-    /**
-     * Where a row came from, and how old it is. Every row says this, because
-     * "is this still there?" is the question that matters most.
-     */
-    sourceLine(row) {
-        /*
-         * Two unbreakable pieces - who ("Bazaar - Name ● Offline 3h ago")
-         * and where-from/age ("via TornW3B | 42s ago") - that wrap onto a
-         * second line when the row is narrow, rather than cutting the age off.
-         */
-        const line = el('div', { class: 'ttv2-row-src' });
-        const who = el('span', { class: 'ttv2-src-part' });
-
-        if (row.source === 'bazaar') {
-            // The owner's status right after their name, so you know whether
-            // they are around before you click.
-            const statuses = this.state.statuses;
-            const status =
-                statuses && row.sellerId ? statuses.get(String(row.sellerId)) : null;
-            const name = row.sellerName || (status && status.name) || null;
-
-            who.appendChild(document.createTextNode('Bazaar' + (name ? ' - ' + name : '')));
-            if (status) {
-                const badge = el('span', {
-                    class: 'ttv2-src-status',
-                    title: (name ? name + ': ' : '') + status.title + ' (Torn API)',
-                    text: status.text,
-                });
-                badge.dataset.level = status.level;
-                who.appendChild(badge);
-            }
-        } else if (row.source === 'itemmarket') {
-            who.textContent = 'Item Market';
-        }
-
-        const from = row.el
-            ? 'on this page'
-            : row.fromFeed
-              ? row.source === 'bazaar' ? 'via TornW3B' : 'via Torn API'
-              : row.fromLedger
-                ? 'seen earlier'
-                : '';
-
-        const age = el('span', { class: 'ttv2-age' });
-        const where = el('span', { class: 'ttv2-src-part' }, [
-            document.createTextNode(from ? from + '  |  ' : ''),
-            age,
-        ]);
-
-        if (who.childNodes.length) {
-            line.appendChild(who);
-            line.appendChild(document.createTextNode('  |  '));
-        }
-        line.appendChild(where);
-
-        if (row.fromFeed && row.dataAgeKnown === false) {
-            age.title = 'TornW3B did not say when it last checked this.';
-        }
-        return line;
     }
 
     refreshAges() {
@@ -1853,14 +1344,142 @@ export class Panel {
 
         // Just the age. Nothing is greyed out: a listing the latest refresh
         // did not confirm is removed, not faded.
-        for (const rowEl of this.listEl.querySelectorAll('.ttv2-row, .ttv2-row-lite')) {
+        for (const rowEl of this.listEl.querySelectorAll('.ttv2-row')) {
             const at = Number(rowEl.dataset.ttv2At);
             const ageEl = rowEl.querySelector('.ttv2-age');
             const known = Number.isFinite(at) && at > 0;
-            if (ageEl) ageEl.textContent = known ? formatAge(now - at) : 'age unknown';
+            if (ageEl) ageEl.textContent = known ? formatAge(now - at).replace(' ago', '') : 'age unknown';
         }
 
         this.renderBar();
+    }
+
+    /* --------------------------------------------------------- my bazaar */
+
+    /**
+     * Your own bazaar's add / manage page: every item found in its rows,
+     * what it is going for now, and the selected item's record.
+     *
+     * @param {object|null} view - null leaves the page (back to the list)
+     *   items: [{itemId, name, im: {price, at}|null, bz: {price, at}|null}]
+     *   selected: itemId | null
+     *   marketValue: number | null
+     *   averages: from core/history.js averages()
+     *   series: from core/history.js series()
+     *   windowKey: '24h' | '7d' | '30d'
+     *   since: timestamp of the first record, or null
+     *   diagnostics: { page, rows, identified }
+     */
+    renderMyBazaar(view) {
+        this.state.bazaar = view;
+        if (!this.root) return;
+
+        if (!view) {
+            if (this.page === 'mybazaar') this.showPage('list');
+            return;
+        }
+        if (this.page === 'list') this.showPage('mybazaar');
+
+        const list = this.bzListEl;
+        list.textContent = '';
+
+        if (!view.items.length) {
+            list.appendChild(el('div', { class: 'ttv2-note', text: 'No items found on this page yet.' }));
+        } else {
+            list.appendChild(el('div', { class: 'ttv2-bzrow' }, [
+                el('span', { class: 'ttv2-label', text: 'Item' }),
+                el('span', { class: 'ttv2-label ttv2-money', text: 'Item Market' }),
+                el('span', { class: 'ttv2-label ttv2-money', text: 'Bazaars' }),
+            ]));
+            for (const it of view.items) {
+                const btn = el('button', {
+                    type: 'button',
+                    class: 'ttv2-bzrow',
+                    'aria-pressed': String(it.itemId === view.selected),
+                    title: 'Show averages and graph',
+                    onclick: () => this.handlers.onSelectBazaarItem && this.handlers.onSelectBazaarItem(it.itemId),
+                }, [
+                    el('span', { class: 'ttv2-name', text: it.name }),
+                    el('span', { class: 'ttv2-money', text: priceText(it.im) || '…' }),
+                    el('span', { class: 'ttv2-money', text: priceText(it.bz) || '…' }),
+                ]);
+                list.appendChild(btn);
+            }
+        }
+
+        const detail = this.bzDetailEl;
+        detail.textContent = '';
+        const sel = view.items.find((i) => i.itemId === view.selected);
+        if (!sel) {
+            detail.appendChild(el('div', { class: 'ttv2-note', text: 'Lowest asking prices now. Pick an item for its record.' }));
+            return;
+        }
+
+        detail.appendChild(el('h3', { text: sel.name }));
+
+        const now = el('div', { class: 'ttv2-note' }, [
+            'Lowest now: Item Market ',
+            el('b', { text: priceText(sel.im) || 'unknown' }),
+            sel.im && sel.im.at ? ' (' + formatAge(Date.now() - sel.im.at) + ')' : '',
+            ', bazaars ',
+            el('b', { text: priceText(sel.bz) || 'unknown' }),
+            sel.bz && sel.bz.at ? ' (' + formatAge(Date.now() - sel.bz.at) + ')' : '',
+            '.',
+        ]);
+        detail.appendChild(now);
+
+        detail.appendChild(el('div', { class: 'ttv2-note' }, [
+            'Market value ',
+            el('b', { text: view.marketValue ? formatMoney(view.marketValue) : 'unknown' }),
+            ' (Torn, daily sales average).',
+        ]));
+
+        /* averages */
+        const table = el('table', { class: 'ttv2-avg' });
+        table.appendChild(el('tr', {}, [
+            el('th', { class: 'ttv2-label', text: 'Average' }),
+            el('th', { class: 'ttv2-label ttv2-money', text: 'Item Market' }),
+            el('th', { class: 'ttv2-label ttv2-money', text: 'Bazaars' }),
+            el('th', { class: 'ttv2-label ttv2-money', text: 'Recorded' }),
+        ]));
+        const avgs = view.averages || {};
+        for (const w of WINDOWS) {
+            const a = avgs[w.key] || { im: null, bz: null, coverage: 0 };
+            const none = a.coverage <= 0;
+            table.appendChild(el('tr', {}, [
+                el('th', { text: w.label }),
+                el('td', { class: 'ttv2-money' + (a.im ? '' : ' ttv2-none'), text: a.im ? formatMoney(a.im) : 'no data' }),
+                el('td', { class: 'ttv2-money' + (a.bz ? '' : ' ttv2-none'), text: a.bz ? formatMoney(a.bz) : 'no data' }),
+                el('td', { class: 'ttv2-money' + (none ? ' ttv2-none' : ''), text: none ? '0%' : Math.round(a.coverage * 100) < 1 ? '<1%' : Math.round(a.coverage * 100) + '%' }),
+            ]));
+        }
+        detail.appendChild(table);
+
+        /* graph */
+        const windows = el('div', { class: 'ttv2-windows' });
+        for (const key of ['24h', '7d', '30d']) {
+            windows.appendChild(el('button', {
+                type: 'button',
+                class: 'ttv2-window',
+                'aria-pressed': String(key === view.windowKey),
+                text: key,
+                onclick: () => this.handlers.onBazaarWindow && this.handlers.onBazaarWindow(key),
+            }));
+        }
+        detail.appendChild(windows);
+
+        if (view.series) detail.appendChild(renderPriceGraph(view.series, { width: 400, height: 96 }));
+        detail.appendChild(el('div', { class: 'ttv2-graph-keys' }, [
+            el('span', { class: 'ttv2-key-im', text: '— Item Market ask' }),
+            el('span', { class: 'ttv2-key-bz', text: '— Bazaar ask' }),
+            el('span', { class: 'ttv2-key-mv', text: '- - Market value' }),
+        ]));
+
+        const cov = avgs[view.windowKey] ? coverageText(avgs[view.windowKey].coverage, view.windowKey) : '0%';
+        detail.appendChild(el('div', {
+            class: 'ttv2-note',
+            text: 'Asking prices this script recorded (' + cov + '). Sales are not published.',
+        }));
     }
 
     destroy() {

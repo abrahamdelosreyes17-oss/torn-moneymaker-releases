@@ -1,12 +1,13 @@
 /*
- * Clicks every control in the panel, in a real browser, against the built
- * userscript - the check that "every click does something".
+ * Clicks every control in the panel and the selling page, in a real
+ * browser, against the built userscript - the check that "every click does
+ * something".
  *
  *   npm run build
  *   PWPATH=$(npm root -g)/playwright node test/ux-check.mjs
  *
- * Needs Playwright (global install is fine). Screenshots go to the OS temp
- * directory. Exits non-zero if any check fails.
+ * Needs Playwright (global install is fine). Screenshots go to $SHOTS or the
+ * OS temp directory. Exits non-zero if any check fails.
  */
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
@@ -17,7 +18,7 @@ const { chromium } = require(process.env.PWPATH || 'playwright');
 import http from 'node:http';
 import { readFile } from 'node:fs/promises';
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const sp = tmpdir();
+const sp = process.env.SHOTS || tmpdir();
 const server = http.createServer(async (req, res) => {
   const path = req.url.split('?')[0];
   try { const body = await readFile(root + path); res.writeHead(200, {'content-type': path.endsWith('.js') ? 'text/javascript' : 'text/html'}); res.end(body); }
@@ -33,6 +34,25 @@ const q = (p, sel) => p.locator('#ttv2-host').locator(sel);
 const vis = async (p, sel) => (await q(p, sel).count()) > 0 && await q(p, sel).first().isVisible();
 const txt = async (p, sel) => (await q(p, sel).first().textContent()) || '';
 
+/*
+ * Design rules, checked on every screen: no text under 12px except 11px
+ * uppercase labels; nothing overflowing sideways.
+ */
+async function designCheck(p, hostSel, label) {
+  const bad = await p.locator(hostSel).evaluate((host) => {
+    const out = [];
+    for (const el of host.shadowRoot.querySelectorAll('*')) {
+      if (!el.textContent.trim() || !el.getClientRects().length) continue;
+      const cs = getComputedStyle(el);
+      const size = parseFloat(cs.fontSize);
+      if (size < 11) out.push(el.className + ' ' + size);
+      if (size < 12 && cs.textTransform !== 'uppercase') out.push(el.className + ' ' + size + ' not uppercase');
+    }
+    return out;
+  });
+  ok(bad.length === 0, label + ': no text under 12px except uppercase labels: ' + JSON.stringify(bad.slice(0, 5)));
+}
+
 /* ---------- first run: no key ---------- */
 let p = await b.newPage({ viewport: { width: 1280, height: 900 } });
 p.on('pageerror', e => errs.push(String(e)));
@@ -45,7 +65,7 @@ ok(await q(p, '.ttv2-tos-box').evaluate(e => e.open), 'no key: ToS table expande
 await p.screenshot({ path: sp + '/ux-firstrun.png' });
 await q(p, '.ttv2-back').click();
 ok(await vis(p, '.ttv2-page-list'), 'Back returns to the list');
-ok((await txt(p, '.ttv2-empty')).includes('Needs a Public API key'), 'empty list says a key is needed');
+ok((await txt(p, '.ttv2-empty')).includes('Add a Public API key'), 'empty list says a key is needed');
 await q(p, '.ttv2-empty button').click();
 ok(await vis(p, '.ttv2-page-settings'), '"Add key" opens Settings');
 await p.keyboard.press('Escape');
@@ -67,7 +87,16 @@ ok(!/Companion Script|Stick of Dynamite/.test(rowText0), '"Sell: N/A" items (Com
 ok(rows0 > 0, 'rows shown: ' + rows0);
 ok(/deal/.test(await txt(p, '.ttv2-bar-left')), 'status line: ' + (await txt(p, '.ttv2-bar-left')));
 ok(/live/.test(await txt(p, '.ttv2-bar-right')), 'live indicator: ' + (await txt(p, '.ttv2-bar-right')));
+ok(!/Trader|By trader/.test(await q(p, '.ttv2-panel').textContent()), 'no trader features in the overlay');
+ok((await q(p, '.ttv2-tab').count()) === 2, 'two tabs only');
 await p.screenshot({ path: sp + '/ux-list.png' });
+await designCheck(p, '#ttv2-host', 'list');
+
+// Money lines up: every profit figure is right-aligned in the same column.
+const rights = await q(p, '.ttv2-row-profit').evaluateAll((els) => els.map((e) => Math.round(e.getBoundingClientRect().right)));
+ok(new Set(rights).size === 1, 'profit column lines up row to row: ' + JSON.stringify(rights));
+const sizes = await q(p, '.ttv2-row-profit').evaluateAll((els) => els.map((e) => getComputedStyle(e).fontSize));
+ok(sizes.every((s) => s === '15px'), 'the key money number is 15px: ' + sizes[0]);
 
 // settings replaces the list, same size
 const box1 = await q(p, '.ttv2-panel').boundingBox();
@@ -77,18 +106,31 @@ const box2 = await q(p, '.ttv2-panel').boundingBox();
 ok(Math.abs(box2.height - box1.height) <= 4, 'panel height steady when opening Settings (' + Math.round(box1.height) + ' -> ' + Math.round(box2.height) + ')');
 ok((await q(p, 'button[title="Settings"]').getAttribute('aria-pressed')) === 'true', 'Settings button shows pressed');
 ok(!(await q(p, '.ttv2-tos-box').evaluate(e => e.open)), 'key saved: ToS folded but present');
+ok(!/TornExchange/.test(await txt(p, '.ttv2-page-settings')), 'overlay Settings has no TornExchange section');
+// The TornExchange key pasted as the Torn key is refused, like the reverse.
+await p.evaluate(() => GM_setValue('tornTrading.v2.teKey', JSON.stringify('TEKEYabcdefgh123')));
+await q(p, 'input.ttv2-key').fill('TEKEYabcdefgh123');
+await q(p, 'input.ttv2-key').press('Enter');
+await p.waitForTimeout(300);
+ok(/TornExchange key/.test(await txt(p, '.ttv2-bar-left')), 'the TornExchange key is refused as the Torn key: ' + (await txt(p, '.ttv2-bar-left')));
+ok((await p.evaluate(() => JSON.parse(GM_getValue('tornTrading.v2.apiKey')))) === 'abcdefgh12345678', 'the saved Torn key is untouched');
+await p.evaluate(() => GM_deleteValue('tornTrading.v2.teKey'));
 await p.screenshot({ path: sp + '/ux-settings.png' });
+await designCheck(p, '#ttv2-host', 'settings');
 await q(p, 'button[title="Settings"]').click();
 ok(await vis(p, '.ttv2-page-list'), 'Settings button again = Back');
 
 // chips
+ok(!(await vis(p, '.ttv2-chip[data-key="sellToTrader"]')), 'no Trader chip');
 await q(p, '.ttv2-chip[data-key="sellToNpc"]').click();
 await p.waitForTimeout(300);
 ok((await q(p, '.ttv2-chip[data-key="sellToNpc"]').getAttribute('aria-pressed')) === 'false', 'NPC chip toggles off');
-ok((await txt(p, '.ttv2-empty')).includes('Nothing to sell to'), 'no exits: explains, offers a fix');
+ok((await txt(p, '.ttv2-empty')).includes('Pick where to sell'), 'no exits: explains, offers a fix');
 await q(p, '.ttv2-empty button').click();
 await p.waitForTimeout(300);
 ok((await q(p, '.ttv2-row').count()) === rows0, 'fix button restores the list');
+const chipsWrap = await q(p, '.ttv2-chips').evaluate((n) => n.scrollWidth <= n.clientWidth);
+ok(chipsWrap, 'filters fit in one row');
 
 // value chip editor
 await q(p, '.ttv2-chip[data-key="minTotalProfit"]').click();
@@ -107,6 +149,41 @@ await q(p, '.ttv2-chip[data-key="minTotalProfit"]').click();
 await q(p, '.ttv2-chip-input').fill('1');
 await p.keyboard.press('Enter');
 
+// ---------- Cash ----------
+const cashChip = q(p, '.ttv2-chip[data-key="cashOnHand"]');
+await cashChip.click();
+await q(p, '.ttv2-chip-input').fill('1234567');
+await p.keyboard.press('Enter');
+await p.waitForTimeout(300);
+ok((await cashChip.textContent()) === 'Cash $1.23m', 'plain digits read as money: ' + (await cashChip.textContent()));
+ok((await p.evaluate(() => JSON.parse(GM_getValue('tornTrading.v2.settings')).cashOnHand)) === 1234567, 'cash saved as 1234567');
+await cashChip.click();
+await q(p, '.ttv2-chip-input').fill('lots');
+await p.keyboard.press('Enter');
+await p.waitForTimeout(300);
+ok(/must be a number/.test(await txt(p, '.ttv2-bar-left')), 'unreadable cash: visible error: ' + (await txt(p, '.ttv2-bar-left')));
+ok((await cashChip.textContent()) === 'Cash $1.23m', 'unreadable cash keeps the old value');
+// $40 buys nothing: Hammer costs $50 in the bazaar, Beer $30 on the market.
+await cashChip.click();
+await q(p, '.ttv2-chip-input').fill('40');
+await p.keyboard.press('Enter');
+await p.waitForTimeout(400);
+ok((await q(p, '.ttv2-row').count()) === 0, '$40 cash hides every bazaar deal it cannot buy one of');
+ok(/hidden/.test(await txt(p, '.ttv2-empty')), 'empty state says cash hid them: ' + (await txt(p, '.ttv2-empty')));
+await q(p, '.ttv2-tab[data-label="Item Market"]').click();
+await p.waitForTimeout(300);
+const beer = q(p, '.ttv2-row').filter({ hasText: 'Bottle of Beer' }).first();
+ok((await beer.count()) === 1 && /×1 of 10/.test(await beer.textContent()), '$40 buys one $30 Beer of ten: row priced for one: ' + (await beer.textContent()));
+ok(/1 deal · \+\$20$/.test(await txt(p, '.ttv2-bar-left')), 'header total is what the cash buys: ' + (await txt(p, '.ttv2-bar-left')));
+await p.screenshot({ path: sp + '/ux-cash.png' });
+await cashChip.click();
+await q(p, '.ttv2-chip-input').fill('');
+await p.keyboard.press('Enter');
+await p.waitForTimeout(300);
+ok((await cashChip.textContent()) === 'Cash: any', 'blank clears the cash cap');
+await q(p, '.ttv2-tab[data-label="Bazaars"]').click();
+await p.waitForTimeout(300);
+
 // tabs
 await q(p, '.ttv2-tab[data-label="Item Market"]').click();
 await p.waitForTimeout(200);
@@ -116,16 +193,18 @@ await q(p, '.ttv2-tab[data-label="Bazaars"]').click();
 // Seller status next to the seller's name on bazaar rows
 const cheap = q(p, '.ttv2-row', ).filter({ hasText: 'CheapSeller' }).first();
 ok((await cheap.count()) === 1, 'CheapSeller bazaar row listed');
-const src = (await cheap.locator('.ttv2-row-src').textContent()) || '';
-ok(/Bazaar - CheapSeller\s*Offline 3h ago · Traveling\s+\|\s+via TornW3B/.test(src), 'seller status right after the name: ' + src);
-ok((await cheap.locator('.ttv2-src-status').getAttribute('data-level')) === 'offline', 'status coloured by level');
-ok(/Traveling to Mexico/.test(await cheap.locator('.ttv2-src-status').getAttribute('title')), 'tooltip has the full status');
+const src = (await cheap.locator('.ttv2-row-details').textContent()) || '';
+ok(/^\$50 → NPC \$100 · CheapSeller\s*Traveling$/.test(src), 'details line: prices, seller with a one-word status: ' + src);
+ok(/^\+\$200\d+s$/.test((await cheap.locator('.ttv2-row-profit').textContent()) || ''), 'the age sits under the profit: ' + (await cheap.locator('.ttv2-row-profit').textContent()));
+ok((await cheap.locator('.ttv2-status').getAttribute('data-level')) === 'offline', 'status coloured by level');
+ok(/Traveling to Mexico/.test(await cheap.locator('.ttv2-status').getAttribute('title')), 'tooltip has the full status');
+ok(!/Bazaar|TornW3B/.test(src), 'the tab already says Bazaars and credits TornW3B; rows do not repeat it');
 const profileCalls = await p.evaluate(() => window.__requests.filter((u) => /\/v2\/user\/777\/profile/.test(u)).length);
 ok(profileCalls === 1, 'one profile call per seller, not one per render: ' + profileCalls);
 
 // GO
 await q(p, '.ttv2-go').first().click();
-ok((await p.evaluate(() => window.__opened.length)) === 1, 'GO opens the listing: ' + (await p.evaluate(() => window.__opened[0])));
+ok((await p.evaluate(() => window.__opened.length)) === 1, 'Go opens the listing: ' + (await p.evaluate(() => window.__opened[0])));
 
 // refresh
 await q(p, 'button[title="Refresh now"]').click();
@@ -156,7 +235,7 @@ ok(await vis(p, '.ttv2-body'), 'a drag is not a click (did not collapse)');
 const scanning = () => q(p, '.ttv2-panel').evaluate((n) => n.classList.contains('ttv2-scanning'));
 await q(p, 'button.ttv2-scan').click();
 ok(await scanning(), 'Scan plays the scan animation');
-ok(/Nothing to scan here/.test(await txt(p, '.ttv2-bar-left')), 'Scan off a market page says so: ' + (await txt(p, '.ttv2-bar-left')));
+ok(/Not a Bazaar or Item Market page/.test(await txt(p, '.ttv2-bar-left')), 'Scan off a market page says so: ' + (await txt(p, '.ttv2-bar-left')));
 await p.waitForTimeout(1000);
 ok(!(await scanning()), 'scan animation ends by itself');
 
@@ -215,8 +294,6 @@ ok(badge.length === 1, 'one owner badge on the page (not in the dropdown): ' + J
 ok(badge[0] && badge[0][0] === 'offline' && /Offline · 3h ago · Traveling to Mexico/.test(badge[0][1]) && /DixieNormousss/.test(badge[0][2]), 'badge sits after the name and reads the status');
 ok(/Seller: DixieNormousss.*Offline · 3h ago/.test(await txt(p, '.ttv2-seller')), 'panel seller line: ' + (await txt(p, '.ttv2-seller')));
 ok(!/closed/i.test(await txt(p, '.ttv2-seller')), 'open bazaar is not flagged closed');
-// A short window, so the list has to scroll: the seller line must keep its
-// full height, not get squeezed half-hidden between the status bar and chips.
 await p.setViewportSize({ width: 1280, height: 420 });
 await p.waitForTimeout(300);
 const sellerBox = await q(p, '.ttv2-seller').evaluate((n) => ({ h: n.getBoundingClientRect().height, need: n.scrollHeight }));
@@ -232,148 +309,106 @@ await p.waitForTimeout(800);
 ok(!(await vis(p, '.ttv2-seller')), 'seller line gone off the bazaar');
 ok((await p.evaluate(() => document.querySelectorAll('.ttv2-owner').length)) === 0, 'badge removed off the bazaar');
 
-// ` shows and hides the overlay - but not while typing
+// ` shows and hides the panel - but not while typing
 await p.evaluate(() => document.activeElement && document.activeElement.blur());
 await p.keyboard.press('Backquote');
-ok(!(await vis(p, '.ttv2-body')), '` collapses the overlay');
+ok(!(await vis(p, '.ttv2-body')), '` collapses the panel');
 await p.keyboard.press('Backquote');
 ok(await vis(p, '.ttv2-body'), '` expands it again');
 await p.evaluate(() => { const t = document.createElement('textarea'); t.id = 'fake-chat'; document.body.appendChild(t); t.focus(); });
 await p.keyboard.press('Backquote');
 ok(await vis(p, '.ttv2-body'), '` typed in a chat box does not toggle');
 ok((await p.evaluate(() => document.getElementById('fake-chat').value)) === '`', 'and the ` still reaches the chat box');
+await p.evaluate(() => { document.getElementById('fake-chat').blur(); document.getElementById('fake-bz')?.remove(); });
 
-// ---------- Traders (TornExchange) ----------
-await p.evaluate(() => document.getElementById('fake-chat').blur());
-await q(p, 'button[title="Settings"]').click();
-await q(p, '.ttv2-te-key').fill('abcdefgh12345678');
-await q(p, '.ttv2-te-key').press('Enter');
-ok(/different Public key/.test(await txt(p, '.ttv2-bar-left')), 'main key refused as the TornExchange key: ' + (await txt(p, '.ttv2-bar-left')));
-await q(p, '.ttv2-te-key').fill('TEKEYabcdefgh123');
-await q(p, '.ttv2-te-key').press('Enter');
-await q(p, 'button[title="Settings"]').click();
-await q(p, '.ttv2-chip[data-key="sellToTrader"]').click();
-await p.waitForTimeout(1500);
-await q(p, 'button[title="Refresh now"]').click(); // re-pick feed items with trader prices known
-await p.waitForTimeout(6000);
-const traderRows = q(p, '.ttv2-row.ttv2-row-trader');
-ok((await traderRows.count()) >= 2, 'trader deals listed: ' + (await traderRows.count()));
-const hammer = q(p, '.ttv2-row').filter({ hasText: 'CheapSeller' }).first();
-const hammerText = (await hammer.textContent()) || '';
-ok(/Buy \$50\s+->\s+Trader \$110/.test(hammerText), 'priced against the ONLINE trader (Bob $110), not offline Alice $115: ' + hammerText);
-ok(/Bob\s*Online · net \+214/.test(await hammer.locator('.ttv2-trader').textContent()), 'trader line: name, status, net score');
-ok(/best offline: Alice \$115/.test(hammerText), 'the higher offline trader is still mentioned');
-ok(/XanSeller/.test((await q(p, '.ttv2-list').textContent()) || ''), 'a listing only a trader makes profitable is found (Xanax $840k -> $850k)');
-await hammer.locator('button', { hasText: 'Profile' }).click();
-ok(/profiles\.php\?XID=11$/.test(await p.evaluate(() => window.__opened.at(-1))), 'Profile opens the trader\'s Torn profile');
-await hammer.locator('button', { hasText: 'Price list' }).click();
-ok((await p.evaluate(() => window.__opened.at(-1))) === 'https://www.tornexchange.com/prices/11/', 'Price list opens their TornExchange list');
-
-await q(p, '.ttv2-tab[data-label="By trader"]').click();
+// ---------- Your own bazaar: the pricing helper ----------
+const ownRows = `<ul class="items-cont">
+  <li class="clearfix"><div class="img-wrap"><img src="/images/items/180/large.png" alt="Bottle of Beer"></div><div class="title-wrap"><div class="name-wrap">Bottle of Beer x12</div></div><div class="amount-wrap"><input type="text" class="amount"></div></li>
+  <li class="clearfix"><div class="img-wrap"><img src="/images/items/206/large.png" alt="Xanax"></div><div class="title-wrap"><div class="name-wrap">Xanax</div></div><div class="amount-wrap"><input type="text" class="amount"></div></li>
+</ul>`;
+await p.evaluate((h) => { const d = document.createElement('div'); d.id = 'fake-own'; d.innerHTML = h; document.body.prepend(d); }, ownRows);
+const reqsBeforeOwn = await p.evaluate(() => window.__requests.length);
+await p.evaluate(() => history.pushState({}, '', '/test/harness-live.html?page=bazaar#/add'));
+await p.waitForTimeout(14000); // the helper asks one Item Market price per 10s, on a 2.5s poll
+const tags = await p.evaluate(() => [...document.querySelectorAll('.ttv2-bztag')].map((t) => t.textContent));
+ok(tags.length === 2, 'a price tag in each own-bazaar row: ' + JSON.stringify(tags));
+ok(await p.evaluate(() => [...document.querySelectorAll('.ttv2-bztag')].every((t) => t.previousElementSibling && t.previousElementSibling.classList.contains('name-wrap'))), 'the tag sits after the name element, not inside it');
+ok(await p.evaluate(() => [...document.querySelectorAll('#fake-own .name-wrap')].every((n) => !n.querySelector('.ttv2-bztag') && /^(Bottle of Beer x12|Xanax)$/.test(n.textContent.trim()))), 'the name element still reads as the name');
+ok(/IM \$30 · Bazaar none/.test(tags[0] || ''), 'Beer: lowest Item Market ask $30, no bazaar lists it: ' + tags[0]);
+ok(/IM \$9,999,999 · Bazaar \$840,000/.test(tags[1] || ''), 'Xanax: market $9,999,999, bazaar $840,000: ' + tags[1]);
+ok(/My bazaar/.test(await txt(p, '.ttv2-title')), 'panel switches to My bazaar');
+ok((await q(p, '.ttv2-bzrow').count()) === 3, 'panel lists both items under a header');
+ok((await q(p, '.ttv2-avg tr').count()) === 6, 'averages for 1h, 6h, 24h, 7d, 30d');
+const avgText = await txt(p, '.ttv2-avg');
+ok(/1 hour.*\$30.*no data/.test(avgText.replace(/\s+/g, ' ')), 'the hour has one sample; bazaar column says no data: ' + avgText.replace(/\s+/g, ' ').slice(0, 120));
+ok((avgText.match(/no data/g) || []).length >= 5 && /24 hours\$30no data<1%7 days\$30no data1%30 days\$30no data1%/.test(avgText.replace(/\s+/g, ' ')), 'a column with nothing recorded says no data; coverage is stated per window: ' + avgText.replace(/\s+/g, ' ').slice(-60));
+ok((await q(p, 'svg.ttv2-graph').count()) === 1, 'a graph is drawn');
+ok(/Asking prices this script recorded/.test(await txt(p, '.ttv2-bzdetail')), 'labelled as recorded asking prices');
+await p.evaluate(() => document.querySelectorAll('.ttv2-bztag')[1].click());
 await p.waitForTimeout(300);
-const groupHeads = await q(p, '.ttv2-group-head').allTextContents();
-ok(groupHeads.length === 1 && /^Bob\s*Online · net \+214 · 3 deals/.test(groupHeads[0]), 'By trader: one trade with Bob, 3 deals: ' + JSON.stringify(groupHeads));
-ok((await q(p, '.ttv2-group-item').count()) === 3 && /XanSeller/.test(await q(p, '.ttv2-group').first().textContent()), 'group lists each deal with where to buy it');
-await p.screenshot({ path: sp + '/ux-traders.png' });
+ok(/Xanax/.test(await txt(p, '.ttv2-bzdetail h3')), 'clicking a row tag selects that item in the panel');
+ok(/Market value \$830,000/.test(await txt(p, '.ttv2-bzdetail')), 'market value shown as the sale-based line');
+await q(p, '.ttv2-window[aria-pressed="false"]').first().click();
+ok((await q(p, '.ttv2-window[aria-pressed="true"]').textContent()) === '7d', 'graph window switches');
+await p.screenshot({ path: sp + '/ux-own-bazaar.png' });
+await designCheck(p, '#ttv2-host', 'my bazaar');
+const imCalls = await p.evaluate((n) => window.__requests.slice(n).filter((u) => /\/v2\/market\/(180|206)\/itemmarket/.test(u)).length, reqsBeforeOwn);
+ok(imCalls >= 1 && imCalls <= 3, 'at most one Item Market call per item on screen, not a loop: ' + imCalls);
+// Idle: the helper must not keep rewriting its own tags (each rewrite was a rescan, was a rewrite).
+const idle = await p.evaluate(() => new Promise((resolve) => {
+  let n = 0;
+  const mo = new MutationObserver((ms) => { n += ms.length; });
+  mo.observe(document.getElementById('fake-own'), { childList: true, subtree: true, characterData: true, attributes: true });
+  setTimeout(() => { mo.disconnect(); resolve(n); }, 10000);
+}));
+ok(idle < 5, 'fewer than 5 DOM mutations in 10s of idle on the own-bazaar rows: ' + idle);
+ok((await p.evaluate(() => Object.keys(JSON.parse(GM_getValue('tornTrading.v2.priceHistory') || '{"items":{}}').items).length)) >= 2, 'history recorded for both items');
+await p.evaluate(() => history.pushState({}, '', '/test/harness-live.html'));
+await p.waitForTimeout(1200);
+ok((await p.evaluate(() => document.querySelectorAll('.ttv2-bztag').length)) === 0, 'tags removed off the own bazaar');
+ok(/NPC Arbitrage/.test(await txt(p, '.ttv2-title')), 'panel back to the list');
+await p.evaluate(() => document.getElementById('fake-own')?.remove());
 
-const reqs = await p.evaluate(() => window.__requests);
-const teReqs = reqs.filter((u) => u.includes('tornexchange.com'));
-ok(teReqs.length === 1, 'one TornExchange call for all of this: ' + teReqs.length);
-ok(teReqs.every((u) => u.includes('key=TEKEYabcdefgh123') && !u.includes('abcdefgh12345678')), 'TornExchange gets only its own key');
-ok(!reqs.some((u) => u.includes('api.torn.com') && u.includes('TEKEY')), 'the TornExchange key never goes to the Torn API');
-
-await q(p, 'button[title="Settings"]').click();
-ok(/Trader prices for 2 items, updated/.test(await txt(p, '.ttv2-page-settings .ttv2-keystate >> nth=1')), 'Settings shows trader price freshness: ' + (await txt(p, '.ttv2-page-settings .ttv2-keystate >> nth=1')));
-await q(p, 'button[title="Settings"]').click();
-await q(p, '.ttv2-chip[data-key="sellToTrader"]').click();
-await p.waitForTimeout(300);
-ok(/Turn on Trader/.test(await txt(p, '.ttv2-empty')), 'By trader with the chip off explains and offers the fix');
-await q(p, '.ttv2-tab[data-label="Bazaars"]').click();
-
-// ---------- The Traders page ----------
-const tp = (sel) => p.locator('#ttv2-traders-host').locator(sel);
-await q(p, 'button.ttv2-traders-btn').click();
-ok(await vis(p, '.ttv2-prompt'), 'Traders button asks: new tab?');
-ok(/Open the Traders page in a new tab\?/.test(await txt(p, '.ttv2-prompt')), 'prompt text');
-await p.keyboard.press('Escape');
-ok(!(await vis(p, '.ttv2-prompt')), 'Esc cancels the prompt');
-
-await q(p, 'button.ttv2-traders-btn').click();
-await q(p, '.ttv2-prompt button', ).filter({ hasText: 'No, here' }).click();
-await p.waitForTimeout(2500);
-ok((await p.locator('#ttv2-traders-host').count()) === 1, '"No, here" draws the page over this one');
-ok(await tp('button[aria-label="Close"]').isVisible(), 'over-the-page mode has a close button');
-ok((await p.evaluate(() => JSON.parse(GM_getValue('tornTrading.v2.tradersPage') || '{}').openMode || 'ask')) === 'ask', 'not remembered unless ticked');
-ok(/Trader chip is off/.test(await tp('.tp-banner').textContent()), 'chip off: the page says trader-only deals are hidden');
-ok(/No trader buys these \(1\)/.test(await tp('.tp-notrader summary').textContent()), 'deals no trader buys are folded away, not lost');
-await tp('.tp-banner button').click();
-await p.waitForTimeout(6000);
-const cards = await tp('.tp-card:not(.tp-notrader)').allTextContents();
-ok(cards.length === 2 && cards.some((c) => /Xanax/.test(c)), '"Turn on Trader": the trader-only Xanax deal appears: ' + cards.length);
-ok(!(await tp('.tp-banner').isVisible()), 'and the banner goes');
-const hammerCard = tp('.tp-card').filter({ hasText: 'CheapSeller' }).first();
-const rowsText = await hammerCard.locator('.tp-tr:not(.tp-th)').allTextContents();
-ok(rowsText.length === 2 && /Bob/.test(rowsText[0]) && /Alice/.test(rowsText[1]), 'ALL its traders, online Bob above offline Alice: ' + JSON.stringify(rowsText));
-ok(/sell here/.test(rowsText[0]) && /Online/.test(rowsText[0]) && /Offline/.test(rowsText[1]), 'chosen trader tagged, statuses shown');
-ok(/traders? online · \+\$[\d,]+ sellable now/.test(await tp('.tp-strip').textContent()), 'reach strip: ' + (await tp('.tp-strip').textContent()));
-await hammerCard.locator('.tp-trader-name', { hasText: 'Bob' }).click();
-ok(/profiles\.php\?XID=11$/.test(await p.evaluate(() => window.__opened.at(-1))), 'clicking the trader\'s name opens their profile');
-await hammerCard.locator('button', { hasText: 'Price list' }).first().click();
-ok((await p.evaluate(() => window.__opened.at(-1))) === 'https://www.tornexchange.com/prices/11/', 'Price list opens their TornExchange list');
-await p.screenshot({ path: sp + '/ux-traders-page.png' });
-
-await tp('.tp-search').fill('xanax');
-await p.waitForTimeout(200);
-ok((await tp('.tp-card:not(.tp-notrader)').count()) === 1, 'search filters to one item');
-await tp('.tp-search').fill('');
-await tp('.tp-seg[data-view="trader"]').click();
-await p.waitForTimeout(300);
-const groupText = await tp('.tp-group').allTextContents();
-ok(groupText.length === 1 && /Bob/.test(groupText[0]) && /needs \$[\d.]+[km]? cash/.test(groupText[0]), 'By trader: one trade with Bob, and the cash it needs: ' + groupText[0]);
-await p.screenshot({ path: sp + '/ux-traders-page-bytrader.png' });
-await tp('.tp-seg[data-view="item"]').click();
-
-// The page's link preference is its own: off here, the overlay's stays on.
-await tp('button[title="Page preferences"]').click();
-await tp('.tp-prefs input[type="checkbox"]').uncheck();
-const prefs = await p.evaluate(() => JSON.parse(GM_getValue('tornTrading.v2.tradersPage')));
-const overlay = await p.evaluate(() => JSON.parse(GM_getValue('tornTrading.v2.settings')));
-ok(prefs.linksNewTab === false && overlay.openInNewTab !== false, 'page preferences are separate from the overlay\'s');
-await tp('.tp-prefs input[type="checkbox"]').check();
-await p.keyboard.press('Escape');
-await p.keyboard.press('Escape');
-ok((await p.locator('#ttv2-traders-host').count()) === 0, 'Esc closes the page');
-
-await q(p, 'button.ttv2-traders-btn').click();
-await q(p, '.ttv2-prompt-remember input').check();
-await q(p, '.ttv2-prompt button').filter({ hasText: 'Yes' }).click();
-ok(/index\.php\?ttv2=traders$/.test(await p.evaluate(() => window.__opened.at(-1))), '"Yes" opens it in its own tab');
-ok((await p.evaluate(() => JSON.parse(GM_getValue('tornTrading.v2.tradersPage')).openMode)) === 'tab', '"Remember" saves the choice');
-await q(p, 'button.ttv2-traders-btn').click();
-ok(!(await vis(p, '.ttv2-prompt')) && /ttv2=traders$/.test(await p.evaluate(() => window.__opened.at(-1))), 'remembered: no question next time');
-await q(p, 'button[title="Settings"]').click();
-ok(/Traders page opens: in a new tab/.test(await txt(p, '.ttv2-traders-mode')), 'overlay Settings shows the remembered choice');
-await q(p, '.ttv2-traders-mode button').click();
-ok((await p.evaluate(() => JSON.parse(GM_getValue('tornTrading.v2.tradersPage')).openMode)) === 'ask', '"Ask again" resets it');
-await q(p, 'button[title="Settings"]').click();
-
-// Its own tab: the URL alone turns the page into the Traders page.
+// The helper on its own (live feed and TornW3B off): one Item Market call per
+// item, 10s apart, and none again while the price is fresh (120s).
 {
-  const t = await b.newPage({ viewport: { width: 1280, height: 900 } });
-  t.on('pageerror', e => errs.push(String(e)));
-  await t.goto('http://localhost:8780/test/harness-live.html?ttv2=traders');
-  await t.waitForTimeout(3000);
-  ok((await t.locator('#ttv2-traders-host').count()) === 1, 'a ?ttv2=traders tab IS the Traders page');
-  ok(!(await t.locator('#ttv2-traders-host').locator('button[aria-label="Close"]').isVisible()), 'its own tab has no close button');
-  await t.setViewportSize({ width: 430, height: 800 });
-  await t.waitForTimeout(300);
-  const overflow = await t.locator('#ttv2-traders-host').evaluate((h) => { const pg = h.shadowRoot.querySelector('.tp-list'); return pg.scrollWidth - pg.clientWidth; });
-  ok(overflow <= 2, 'no sideways scroll at 430px: ' + overflow);
-  await t.screenshot({ path: sp + '/ux-traders-page-narrow.png' });
-  await t.close();
+  const h = await b.newPage({ viewport: { width: 1280, height: 900 } });
+  h.on('pageerror', e => errs.push(String(e)));
+  await h.goto('http://localhost:8780/test/harness-live.html?nofeed=1');
+  await h.waitForTimeout(2500);
+  await h.evaluate((html) => { const d = document.createElement('div'); d.id = 'fake-own'; d.innerHTML = html; document.body.prepend(d); }, ownRows);
+  const before = await h.evaluate(() => window.__requests.length);
+  await h.evaluate(() => history.pushState({}, '', '/test/harness-live.html?nofeed=1&page=bazaar#/add'));
+  await h.waitForTimeout(14000);
+  const helperCalls = () => h.evaluate((n) => window.__requests.slice(n).filter((u) => /\/v2\/market\/(180|206)\/itemmarket/.test(u)), before);
+  const first = await helperCalls();
+  ok(first.length === 2, 'helper alone: one Item Market call per item in the first 14s: ' + first.length);
+  ok(/IM \$30/.test((await h.evaluate(() => document.querySelectorAll('.ttv2-bztag')[0].textContent))) && /IM \$9,999,999/.test((await h.evaluate(() => document.querySelectorAll('.ttv2-bztag')[1].textContent))), 'both tags priced');
+  await h.waitForTimeout(10000);
+  const later = await helperCalls();
+  ok(later.length === 2, 'helper alone: no Item Market call again while the price is fresh: ' + later.length);
+  const w3bCalls = await h.evaluate((n) => window.__requests.slice(n).filter((u) => /weav3r\.dev/.test(u)).length, before);
+  ok(w3bCalls === 0, 'TornW3B off: never contacted: ' + w3bCalls);
+  await h.close();
 }
 
-// Settings -> "Open deals in a new tab" off: GO goes there in this tab.
+// The overlay's Sell button opens the selling page in a new tab.
+await q(p, 'button.ttv2-sell').click();
+ok(/index\.php\?ttv2=traders$/.test(await p.evaluate(() => window.__opened.at(-1))), 'Sell opens the selling page in its own tab');
+ok(!(await vis(p, '.ttv2-prompt')), 'no open-mode question');
+
+// Narrow: nothing overflows at 430px.
+await p.setViewportSize({ width: 430, height: 800 });
+await p.waitForTimeout(400);
+const panelBox = await q(p, '.ttv2-panel').boundingBox();
+ok(panelBox.x >= 0 && panelBox.x + panelBox.width <= 430, 'panel inside a 430px screen: ' + JSON.stringify(panelBox));
+const clipped = await q(p, '.ttv2-row-details').evaluateAll((els) => els.filter((e) => e.scrollWidth > e.clientWidth + 1).length);
+ok(clipped === 0, 'no details line is cut off at 430px');
+ok(await q(p, '.ttv2-chips').evaluate((n) => n.scrollWidth <= n.clientWidth), 'filters still one row at 430px');
+await p.screenshot({ path: sp + '/ux-list-430.png' });
+await p.setViewportSize({ width: 1280, height: 900 });
+
+// Settings -> "Open deals in a new tab" off: Go goes there in this tab.
 await q(p, 'button[title="Settings"]').click();
 const newTab = q(p, '.ttv2-check').filter({ hasText: 'Open deals in a new tab' }).locator('input');
 ok(await newTab.isChecked(), 'new-tab setting on by default');
@@ -383,7 +418,171 @@ await q(p, 'button[title="Settings"]').click();
 await p.route('https://www.torn.com/**', (route) => route.fulfill({ status: 200, contentType: 'text/html', body: '<p>torn</p>' }));
 // gmOpenTab would record the URL and leave this page; only assign() lands here.
 await Promise.all([p.waitForURL(/torn\.com/, { timeout: 5000 }), q(p, '.ttv2-go').first().click()]);
-ok(/torn\.com\/bazaar\.php\?userId=\d+/.test(p.url()), 'GO with new tab off navigates this tab: ' + p.url());
+ok(/torn\.com\/bazaar\.php\?userId=\d+/.test(p.url()), 'Go with new tab off navigates this tab: ' + p.url());
+await p.close();
+
+/* ---------- The selling page: its own tab, its own keys ---------- */
+{
+  const t = await b.newPage({ viewport: { width: 1280, height: 900 } });
+  t.on('pageerror', e => errs.push(String(e)));
+  const s = (sel) => t.locator('#ttv2-sell-host').locator(sel);
+  const stxt = async (sel) => (await s(sel).first().textContent()) || '';
+
+  // No keys yet: the page opens on its settings and says what it needs.
+  await t.goto('http://localhost:8780/test/harness-live.html?ttv2=traders');
+  await t.waitForTimeout(1500);
+  ok((await t.locator('#ttv2-sell-host').count()) === 1, 'a ?ttv2=traders tab IS the selling page');
+  ok((await t.locator('#ttv2-host').count()) === 0, 'the overlay does not draw on the selling tab');
+  ok(await s('.sp-settings').isVisible(), 'no keys: opens on its settings');
+  ok((await s('.sp-tos tr').count()) === 6, 'Torn ToS table beside the Limited key field');
+  ok(/Limited/.test(await stxt('.sp-tos')), 'ToS names Limited access and the selections used');
+  ok(/Add a Limited API key/.test(await stxt('.sp-banner')), 'banner asks for the Limited key');
+  await t.screenshot({ path: sp + '/ux-sell-settings.png' });
+  await designCheck(t, '#ttv2-sell-host', 'selling settings');
+  // The overlay's Public key cannot read an inventory: a clear message.
+  await s('input.sp-key').first().fill('abcdefgh12345678');
+  await s('input.sp-key').first().press('Enter');
+  await t.waitForTimeout(2500);
+  ok(/needs Limited access/.test(await stxt('.sp-banner')), 'a Public key: says it needs Limited access: ' + (await stxt('.sp-banner')));
+  await t.close();
+
+  const u = await b.newPage({ viewport: { width: 1280, height: 900 } });
+  u.on('pageerror', e => errs.push(String(e)));
+  const su = (sel) => u.locator('#ttv2-sell-host').locator(sel);
+  const utxt = async (sel) => (await su(sel).first().textContent()) || '';
+  await u.goto('http://localhost:8780/test/harness-live.html?ttv2=traders&sellkeys=1');
+  await u.waitForTimeout(4000);
+  ok(await su('.sp-table').isVisible(), 'with keys: the table shows');
+  const names = await su('.sp-row .sp-item').allTextContents();
+  ok(names.length === 3 && names[0] === 'Xanax' && names[1] === 'Hammer', 'one row per held item, best offer per item first: ' + JSON.stringify(names));
+  ok((await su('.sp-seg-btn[data-sort="item"]').getAttribute('aria-pressed')) === 'true' && (await su('.sp-seg-btn[data-sort="bundle"]').getAttribute('aria-pressed')) === 'false', 'the Per item | Bundle control shows Per item active');
+  const xan = su('.sp-row').filter({ hasText: 'Xanax' }).first();
+  const xanCells = await xan.locator('td').allTextContents();
+  ok(xanCells[1] === '15', 'stacks merged: 12 + 3 Xanax, equipped Hammer left out: ' + JSON.stringify(xanCells));
+  ok(xanCells[2] === '$850,000' && /Bob/.test(xanCells[3]), 'best offer and trader: ' + xanCells[2] + ' ' + xanCells[3]);
+  ok(xanCells[4] === '$830,000', 'market value from Torn: ' + xanCells[4]);
+  ok(/\$850,000/.test(xanCells[5]) && /top 3/.test(xanCells[5]), 'traders average, marked top 3 until the full list loads: ' + xanCells[5]);
+  ok(xanCells[6] === '$12,750,000', 'total = qty x best offer: ' + xanCells[6]);
+  const ham = su('.sp-row').filter({ hasText: 'Hammer' }).first();
+  const hamCells = await ham.locator('td').allTextContents();
+  ok(hamCells[1] === '150,000' && hamCells[2] === '$115' && /Alice/.test(hamCells[3]), 'Hammer: highest offer first even from an offline trader: ' + JSON.stringify(hamCells));
+  const beerRow = su('.sp-row').filter({ hasText: 'Bottle of Beer' }).first();
+  ok(/No buyer on TE/.test(await beerRow.textContent()), 'an item no trader buys says so, last');
+  await u.waitForTimeout(3000);
+  ok(/Alice\s*Offline 2h$/.test((await ham.locator('td').allTextContents())[3]), 'trader status next to the name: ' + (await ham.locator('td').allTextContents())[3]);
+  ok(/3 items · 2 with a buyer · \$30\.00m at best offers/.test(await utxt('.sp-bar-left')), 'summary line: ' + (await utxt('.sp-bar-left')));
+  await u.screenshot({ path: sp + '/ux-sell.png' });
+  await u.screenshot({ path: sp + '/sell-perItem.png', clip: { x: 0, y: 0, width: 1280, height: 120 } });
+  await designCheck(u, '#ttv2-sell-host', 'selling page');
+  const totals = await su('.sp-total').evaluateAll((els) => els.map((e) => Math.round(e.getBoundingClientRect().right)));
+  ok(new Set(totals).size === 1, 'totals right-aligned in one column: ' + JSON.stringify(totals));
+
+  // Per item | Bundle: 150,000 Hammers at $115 ($17.25m) outrank one stack of Xanax ($12.75m) as a bundle.
+  await su('.sp-seg-btn[data-sort="bundle"]').click();
+  await u.waitForTimeout(300);
+  const bundleNames = await su('.sp-row .sp-item').allTextContents();
+  ok(bundleNames[0] === 'Hammer' && bundleNames[1] === 'Xanax', 'Bundle: qty x offer, highest first: ' + JSON.stringify(bundleNames));
+  ok((await su('.sp-seg-btn[data-sort="bundle"]').getAttribute('aria-pressed')) === 'true' && (await su('.sp-seg-btn[data-sort="item"]').getAttribute('aria-pressed')) === 'false', 'Bundle shows active');
+  ok((await u.evaluate(() => JSON.parse(GM_getValue('tornTrading.v2.sellingPage')).sortBy)) === 'bundle', 'the order is remembered in the page\'s own preferences');
+  await u.screenshot({ path: sp + '/sell-bundle.png', clip: { x: 0, y: 0, width: 1280, height: 120 } });
+  await u.setViewportSize({ width: 430, height: 800 });
+  await u.waitForTimeout(400);
+  ok(await su('.sp-seg').isVisible() && await su('.sp-toggle').isVisible(), 'the order control and Online only are on screen at 430px');
+  ok(await u.locator('#ttv2-sell-host').evaluate((h) => { const s = h.shadowRoot; const head = s.querySelector('.sp-head'); return head.scrollWidth <= head.clientWidth + 1; }), 'the header does not overflow at 430px');
+  await u.screenshot({ path: sp + '/sell-430-toggle.png', clip: { x: 0, y: 0, width: 430, height: 140 } });
+  await u.setViewportSize({ width: 1280, height: 900 });
+  await u.waitForTimeout(300);
+  await su('.sp-seg-btn[data-sort="item"]').click();
+  await u.waitForTimeout(300);
+  ok((await su('.sp-row .sp-item').allTextContents())[0] === 'Xanax', 'Per item again: Xanax first');
+
+  // Online only: Hammer's best becomes Bob (online, $110); Xanax stays Bob.
+  await su('.sp-toggle').click();
+  await u.waitForTimeout(500);
+  const hamOnline = await su('.sp-row').filter({ hasText: 'Hammer' }).first().locator('td').allTextContents();
+  ok(hamOnline[2] === '$110' && /Bob/.test(hamOnline[3]), 'Online only: highest ONLINE trader: ' + JSON.stringify(hamOnline));
+  ok((await su('.sp-row').count()) === 2, 'Online only hides the item with no online buyer');
+  ok((await u.evaluate(() => JSON.parse(GM_getValue('tornTrading.v2.sellingPage')).onlineOnly)) === true, 'the toggle is remembered in the page\'s own preferences');
+  await su('.sp-toggle').click();
+  await u.waitForTimeout(300);
+
+  // Expand: every buyer, highest first, with Profile and TE list links.
+  await su('.sp-row').filter({ hasText: 'Xanax' }).first().click();
+  await u.waitForTimeout(300);
+  ok((await su('.sp-expanded').count()) === 1, 'clicking a row expands its traders');
+  let trs = await su('.sp-tr').allTextContents();
+  ok(trs.length === 1 && /Bob/.test(trs[0]), 'top-three traders shown at once');
+  await u.waitForTimeout(23000); // the TornExchange gap: active_traders, then the full list
+  trs = await su('.sp-tr').allTextContents();
+  ok(trs.length === 3 && /Bob/.test(trs[0]) && /Carol/.test(trs[1]) && /Alice/.test(trs[2]), 'full list: Bob $850k, Carol $845k, Alice $830k, highest first: ' + JSON.stringify(trs));
+  const xanAvg = (await su('.sp-row').filter({ hasText: 'Xanax' }).first().locator('td').allTextContents())[5];
+  ok(xanAvg === '$841,667', 'traders average now over all buyers: ' + xanAvg);
+  await u.waitForTimeout(2500);
+  ok(/Carol\s*Online/.test(trs[1]) || /Carol\s*Online/.test((await su('.sp-tr').allTextContents())[1]), 'a buyer from the full list got its id and status: ' + (await su('.sp-tr').allTextContents())[1]);
+  await su('.sp-tr').first().locator('a', { hasText: 'Profile' }).click();
+  ok(/profiles\.php\?XID=11$/.test(await u.evaluate(() => window.__opened.at(-1))), 'Profile opens the trader\'s Torn profile');
+  await su('.sp-tr').first().locator('a', { hasText: 'TE list' }).click();
+  ok((await u.evaluate(() => window.__opened.at(-1))) === 'https://www.tornexchange.com/prices/11/', 'TE list opens their TornExchange price list');
+  await u.screenshot({ path: sp + '/ux-sell-expanded.png' });
+
+  // Keys go where they belong and nowhere else.
+  const reqs = await u.evaluate(() => window.__requests);
+  const inv = reqs.filter((r) => r.includes('/v2/user/inventory'));
+  ok(inv.length >= 2 && inv.every((r) => r.includes('key=LIMITED123456789')), 'inventory read with the Limited key, paged: ' + inv.length);
+  ok(!reqs.some((r) => r.includes('api.torn.com') && r.includes('TEKEY')), 'the TornExchange key never goes to Torn');
+  ok(!reqs.some((r) => r.includes('tornexchange.com') && r.includes('LIMITED')), 'the Limited key never goes to TornExchange');
+  ok(!reqs.some((r) => r.includes('weav3r.dev')), 'the selling page never contacts TornW3B');
+  const teReqs = reqs.filter((r) => r.includes('tornexchange.com'));
+  ok(teReqs.length <= 4, 'few TornExchange calls: ' + teReqs.length);
+
+  // Narrow: stacked cards, no sideways scroll.
+  await u.setViewportSize({ width: 430, height: 800 });
+  await u.waitForTimeout(400);
+  const overflow = await u.locator('#ttv2-sell-host').evaluate((h) => { const m = h.shadowRoot.querySelector('.sp-main'); return m.scrollWidth - m.clientWidth; });
+  ok(overflow <= 2, 'no sideways scroll at 430px: ' + overflow);
+  await u.screenshot({ path: sp + '/ux-sell-430.png' });
+  await designCheck(u, '#ttv2-sell-host', 'selling page 430');
+  await u.setViewportSize({ width: 1280, height: 900 });
+
+  // Settings: the page's own; forgetting the TornExchange key clears traders.
+  await su('button[title="Settings"]').click();
+  ok(/Saved · Limited access/.test(await utxt('.sp-keystate >> nth=0')), 'key state names the access level: ' + (await utxt('.sp-keystate >> nth=0')));
+  ok(/Saved · prices/.test(await utxt('.sp-keystate >> nth=1')), 'TornExchange key state shows price age: ' + (await utxt('.sp-keystate >> nth=1')));
+  await su('.sp-check input').uncheck();
+  ok((await u.evaluate(() => JSON.parse(GM_getValue('tornTrading.v2.sellingPage')).linksNewTab)) === false, 'links preference saved in the page\'s own store');
+  ok((await u.evaluate(() => JSON.parse(GM_getValue('tornTrading.v2.settings') || '{}').openInNewTab)) !== false, 'the overlay\'s own setting untouched');
+  await u.keyboard.press('Escape');
+  ok(await su('.sp-table').isVisible(), 'Esc leaves settings');
+  await u.close();
+
+  // A remembered Bundle order opens in Bundle order.
+  const v = await b.newPage({ viewport: { width: 1280, height: 900 } });
+  v.on('pageerror', e => errs.push(String(e)));
+  const sv = (sel) => v.locator('#ttv2-sell-host').locator(sel);
+  await v.goto('http://localhost:8780/test/harness-live.html?ttv2=traders&sellkeys=1&sellprefs=' + encodeURIComponent(JSON.stringify({ sortBy: 'bundle' })));
+  await v.waitForTimeout(4000);
+  ok((await sv('.sp-row .sp-item').allTextContents())[0] === 'Hammer' && (await sv('.sp-seg-btn[data-sort="bundle"]').getAttribute('aria-pressed')) === 'true', 'a saved Bundle preference opens in Bundle order with Bundle active');
+  await v.close();
+
+  // Online only from the start, with slow status lookups: says it is checking,
+  // then shows the online buyers (it used to show nobody, forever).
+  const w = await b.newPage({ viewport: { width: 1280, height: 900 } });
+  w.on('pageerror', e => errs.push(String(e)));
+  const sw = (sel) => w.locator('#ttv2-sell-host').locator(sel);
+  await w.goto('http://localhost:8780/test/harness-live.html?ttv2=traders&sellkeys=1&slow=1&sellprefs=' + encodeURIComponent(JSON.stringify({ onlineOnly: true })));
+  let sawChecking = false;
+  let onlineRows = 0;
+  for (let i = 0; i < 200 && onlineRows === 0; i++) {
+    await w.waitForTimeout(50);
+    if ((await sw('.sp-empty').count()) && /Checking who's online/.test(await sw('.sp-empty').first().textContent())) sawChecking = true;
+    onlineRows = await sw('.sp-row').count();
+  }
+  ok(sawChecking, 'Online only while statuses load says "Checking who\'s online…"');
+  ok(onlineRows === 2, 'Online only then shows the items with an online buyer: ' + onlineRows);
+  ok((await sw('.sp-row').first().locator('td').allTextContents())[3].includes('Bob'), 'the online buyer: ' + (await sw('.sp-row').first().locator('td').allTextContents())[3]);
+  ok((await sw('.sp-toggle').getAttribute('aria-pressed')) === 'true', 'Online only shows active');
+  await w.close();
+}
 
 console.log('ERRORS', errs);
 console.log(failures ? failures + ' FAILED' : 'ALL PASSED');

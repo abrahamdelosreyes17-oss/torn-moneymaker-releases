@@ -65,6 +65,13 @@ export function rankOpportunities(opportunities, options = {}) {
         }
         if (row.profit.roi < opts.minRoi) return false;
 
+        /*
+         * Cash: a listing you cannot buy one of is not a deal for you, and
+         * is hidden - whether or not its quantity is known, and whatever Min
+         * is. A row you can afford part of stays, priced for that part.
+         */
+        if (!affordableRow(row, opts.cashOnHand)) return false;
+
         return true;
     });
 
@@ -79,11 +86,21 @@ export function rankOpportunities(opportunities, options = {}) {
     return opts.limit > 0 ? kept.slice(0, opts.limit) : kept;
 }
 
+/** Can this cash buy at least one unit of the row? No cash set = yes. */
+export function affordableRow(row, cashOnHand) {
+    const cash = Number(cashOnHand);
+    if (!(cash > 0)) return true;
+    const p = row.profit;
+    if (!p) return false;
+    if (row.qtyAtPrice === false) return Number(p.listingPrice) <= cash;
+    return Number(p.affordableQty) >= 1;
+}
+
 /**
  * What the Cash and Min filters took out of a list, so an empty list can say
  * why instead of looking like "no deals".
  * @returns {{cash: number, min: number}}
- *   cash: profitable, and would reach Min if you could afford more of them
+ *   cash: profitable, but you cannot afford enough of it (or any of it)
  *   min:  profitable, but under Min even buying every one
  */
 export function hiddenCounts(opportunities, options = {}) {
@@ -92,6 +109,10 @@ export function hiddenCounts(opportunities, options = {}) {
 
     for (const row of opportunities || []) {
         if (!row || !row.profit || row.profit.profitPerUnit <= 0) continue;
+        if (!affordableRow(row, options.cashOnHand)) {
+            out.cash++;
+            continue;
+        }
         if (row.qtyAtPrice === false) continue;
         if (row.profit.realizableProfit >= min) continue;
         if (row.profit.totalProfit >= min) out.cash++;
@@ -100,17 +121,49 @@ export function hiddenCounts(opportunities, options = {}) {
     return out;
 }
 
-/** Headline totals for the panel. */
-export function summarize(rankedRows) {
+/**
+ * Headline totals for the panel.
+ *
+ * With cash set, the total is what that cash can make: rows are taken best
+ * first, the last one that fits only for the units the remaining cash buys,
+ * and nothing after it. Summing every row's own capped profit claimed the
+ * cash could be spent on all of them at once.
+ *
+ * @returns {{count, totalProfit, cashRequired, capped: boolean}}
+ */
+export function summarize(rankedRows, options = {}) {
     const rows = rankedRows || [];
+    const cash = Number(options.cashOnHand);
+    const limited = cash > 0;
 
     let totalProfit = 0;
     let cashRequired = 0;
+    let capped = false;
 
     for (const row of rows) {
-        totalProfit += row.profit.realizableProfit;
-        cashRequired += row.profit.cashRequired;
+        const p = row.profit;
+        if (!limited) {
+            totalProfit += p.realizableProfit;
+            cashRequired += p.cashRequired;
+            continue;
+        }
+
+        const left = cash - cashRequired;
+        if (left <= 0) {
+            capped = true;
+            break;
+        }
+        if (p.cashRequired <= left) {
+            totalProfit += p.realizableProfit;
+            cashRequired += p.cashRequired;
+            continue;
+        }
+        const units = p.listingPrice > 0 ? Math.floor(left / p.listingPrice) : 0;
+        totalProfit += p.profitPerUnit * units;
+        cashRequired += p.listingPrice * units;
+        capped = true;
+        break;
     }
 
-    return { count: rows.length, totalProfit, cashRequired };
+    return { count: rows.length, totalProfit, cashRequired, capped };
 }

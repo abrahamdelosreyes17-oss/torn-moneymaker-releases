@@ -14,9 +14,23 @@
 const _store = {};
 const NS = 'tornTrading.v2.';
 const KEY = 'abcdefgh12345678';
+// The selling page's own keys: a Limited Torn key and a TornExchange key.
+const LIMITED = 'LIMITED123456789';
+const TEKEY = 'TEKEYabcdefgh123';
 _store[NS + 'apiKey'] = JSON.stringify(KEY);
 // Defaults only: TornW3B must be on without the user ticking anything.
-_store[NS + 'settings'] = JSON.stringify({});
+// ?nofeed=1 turns the live feed and TornW3B off, so only the page's own Torn calls are made.
+_store[NS + 'settings'] = JSON.stringify(/[?&]nofeed=1/.test(location.search) ? { liveFeed: false, useW3b: false } : {});
+// ?sellkeys=1 boots the selling page with both of its keys already saved.
+if (/[?&]sellkeys=1/.test(location.search)) {
+    _store[NS + 'sellKey'] = JSON.stringify(LIMITED);
+    _store[NS + 'teKey'] = JSON.stringify(TEKEY);
+}
+// ?sellprefs=<json> presets the selling page's own preferences.
+const _prefs = new URLSearchParams(location.search).get('sellprefs');
+if (_prefs) _store[NS + 'sellingPage'] = _prefs;
+// ?slow=1 answers profile (status) lookups after 2s, like a slow API.
+const SLOW = /[?&]slow=1/.test(location.search);
 
 function GM_getValue(k, d) { return k in _store ? _store[k] : d; }
 function GM_setValue(k, v) { _store[k] = v; }
@@ -60,7 +74,31 @@ function respond(url) {
         if (u.pathname === '/torn/' && sel === 'cityshops') {
             return { cityshops: { 1: { name: "Bits 'n' Bobs", inventory: { 1: { price: 90 } } } } };
         }
-        if (u.pathname === '/key/') return { access_level: 1, access_type: 'Public' };
+        if (u.pathname === '/key/') {
+            return u.searchParams.get('key') === LIMITED
+                ? { access_level: 3, access_type: 'Limited' }
+                : { access_level: 1, access_type: 'Public' };
+        }
+        // Your inventory: Limited key only, two pages.
+        if (u.pathname === '/v2/user/inventory') {
+            if (u.searchParams.get('key') !== LIMITED) {
+                return { error: { code: 16, error: 'Access level of this key is not high enough' } };
+            }
+            const offset = Number(u.searchParams.get('offset') || 0);
+            if (offset === 0) {
+                return { inventory: { items: [
+                    { id: 206, amount: 12, equipped: false, name: 'Xanax', faction_owned: false, uid: null },
+                    { id: 206, amount: 3, equipped: false, name: 'Xanax', faction_owned: false, uid: 7 },
+                    // A big stack: worth more as a bundle than a Xanax, less per item.
+                    { id: 1, amount: 150000, equipped: false, name: 'Hammer', faction_owned: false, uid: null },
+                    { id: 1, amount: 1, equipped: true, name: 'Hammer', faction_owned: false, uid: 8 },
+                    { id: 180, amount: 10, equipped: false, name: 'Bottle of Beer', faction_owned: true, uid: null },
+                ], timestamp: NOW_S }, _metadata: { links: { next: 'https://api.torn.com/v2/user/inventory?limit=250&offset=250', prev: null }, total: 6 } };
+            }
+            return { inventory: { items: [
+                { id: 180, amount: 2, equipped: false, name: 'Bottle of Beer', faction_owned: false, uid: null },
+            ], timestamp: NOW_S }, _metadata: { links: { next: null, prev: null }, total: 6 } };
+        }
         const who = u.pathname.match(/^\/v2\/user\/(\d+)\/profile$/);
         // Traders: Bob is online, Alice is not.
         if (who && who[1] === '11') {
@@ -68,6 +106,9 @@ function respond(url) {
         }
         if (who && who[1] === '12') {
             return { profile: { id: 12, name: 'Alice', last_action: { status: 'Offline', timestamp: NOW_S - 7200 }, status: { description: 'Okay', state: 'Okay' } } };
+        }
+        if (who && who[1] === '44') {
+            return { profile: { id: 44, name: 'Carol', last_action: { status: 'Online', timestamp: NOW_S }, status: { description: 'Okay', state: 'Okay' } } };
         }
         if (who) {
             return { profile: { id: +who[1], name: 'DixieNormousss',
@@ -82,8 +123,8 @@ function respond(url) {
         return { error: { code: 0, error: 'unknown in harness: ' + u.pathname } };
     }
     if (u.hostname === 'www.tornexchange.com') {
+        if (u.searchParams.get('key') !== TEKEY) return { status: 'error', message: 'Invalid API key', __http: 401 };
         if (u.pathname === '/api/all_best_listings') {
-            if (u.searchParams.get('key') !== 'TEKEYabcdefgh123') return { status: 'error', message: 'Invalid API key', __http: 401 };
             return { status: 'success', data: {
                 1: { item: 'Hammer', traders: [
                     { trader: 'Alice', trader_id: 12, price: 115, vote_score: 40 },
@@ -91,6 +132,22 @@ function respond(url) {
                 ] },
                 206: { item: 'Xanax', traders: [{ trader: 'Bob', trader_id: 11, price: 850000, vote_score: 214 }] },
             } };
+        }
+        if (u.pathname === '/api/listings') {
+            const id = u.searchParams.get('item_id');
+            const listings = id === '206'
+                ? [{ trader: 'Bob', price: 850000, item: 'Xanax' }, { trader: 'Carol', price: 845000, item: 'Xanax' }, { trader: 'Alice', price: 830000, item: 'Xanax' }]
+                : id === '1'
+                  ? [{ trader: 'Alice', price: 115, item: 'Hammer' }, { trader: 'Bob', price: 110, item: 'Hammer' }, { trader: 'Dave', price: 105, item: 'Hammer' }]
+                  : [];
+            return { status: 'success', data: { item: 'x', meta: { total_listings: listings.length, total_pages: 1, current_page: 1 }, listings } };
+        }
+        if (u.pathname === '/api/active_traders') {
+            return { status: 'success', data: { ids: [11, 12, 44], verbose: {
+                11: { name: 'Bob', torn_id: 11, last_trade: NOW_S },
+                12: { name: 'Alice', torn_id: 12, last_trade: NOW_S },
+                44: { name: 'Carol', torn_id: 44, last_trade: null },
+            } } };
         }
         return { status: 'error', message: 'Endpoint not found', __http: 404 };
     }
@@ -133,7 +190,7 @@ function GM_xmlhttpRequest(opts) {
         } catch (e) {
             opts.onerror(e);
         }
-    }, 5);
+    }, SLOW && /\/v2\/user\/\d+\/profile/.test(opts.url) ? 2000 : 5);
 }
 window.onerror = (m) => { document.getElementById('out').textContent = 'BOOT ERROR: ' + m; };
 </script>
@@ -154,8 +211,8 @@ setTimeout(() => {
     rows,
     tosTable: $$p('.ttv2-tos tr').length,
     keyInputValue: ($p('.ttv2-settings input') || {}).value,
-    requests: window.__requests.map(u => u.replace(KEY, '<KEY>')),
-    keyEverSentToW3b: w3b.some(u => u.includes(KEY)),
+    requests: window.__requests.map(u => u.replace(KEY, '<KEY>').replace(LIMITED, '<LIMITED>').replace(TEKEY, '<TEKEY>')),
+    keyEverSentToW3b: w3b.some(u => u.includes(KEY) || u.includes(LIMITED)),
     naItemShown: $$p('.ttv2-row').some(r => /Companion Script|Stick of Dynamite/.test(r.textContent)),
     rowsSeen: $$p('.ttv2-row').length,
   }, null, 1);

@@ -10,7 +10,7 @@ import {
 } from '../src/api/w3b.js';
 import { TornApiClient, KEY_DEAD_CODES } from '../src/api/client.js';
 import { fetchItemMarket, fetchItems, npcSaleFromValue, parseUserPresence } from '../src/api/torn.js';
-import { agoText, presenceText, presenceShort } from '../src/sources/dom/owner.js';
+import { agoText, presenceText, presenceShort, presenceWord } from '../src/sources/dom/owner.js';
 import { buildItemIndex } from '../src/core/items.js';
 import {
     emptyFeed,
@@ -837,6 +837,13 @@ test('seller status on a deal row: short words, full words in the tooltip', () =
 
     const here = parseUserPresence({ profile: { name: 'G', last_action: { status: 'Online', timestamp: now / 1000 }, status: { state: 'Okay', description: 'Okay' } } });
     assert.deepEqual(presenceShort(here, now), { level: 'online', text: 'Online', title: 'Online' });
+
+    // One word for a row: the state when it is not Okay, else status and age.
+    assert.deepEqual(presenceWord(away, now), { level: 'offline', text: 'Traveling', title: 'Offline · 3h ago · Traveling to Mexico' });
+    assert.deepEqual(presenceWord(here, now), { level: 'online', text: 'Online', title: 'Online' });
+    const idle = parseUserPresence({ profile: { name: 'G', last_action: { status: 'Idle', timestamp: now / 1000 - 600 }, status: { state: 'Okay', description: 'Okay' } } });
+    assert.deepEqual(presenceWord(idle, now).text, 'Idle 10m');
+    assert.equal(presenceWord(null).text, 'Unknown');
 
     assert.equal(presenceShort(null).level, 'unknown');
 });

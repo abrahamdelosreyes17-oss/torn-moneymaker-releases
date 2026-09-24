@@ -235,7 +235,7 @@ test('summarize totals the ranked rows', () => {
         row('b', 2000, 0.1, { cashRequired: 200 }),
     ]);
 
-    assert.deepEqual(s, { count: 2, totalProfit: 3000, cashRequired: 300 });
+    assert.deepEqual(s, { count: 2, totalProfit: 3000, cashRequired: 300, capped: false });
 });
 
 /* ---------------------------------------------------------------- items */

@@ -94,6 +94,25 @@ export function presenceShort(presence, now = Date.now()) {
     return { level: full.level, text, title: full.text };
 }
 
+/**
+ * One word for a row: "Online", "Idle", "Offline 3h", or the state when it
+ * is not Okay ("Traveling", "Hospital"). The full presenceText() goes in the
+ * tooltip. Rows have no room for more, and a word with a dot reads faster.
+ * @returns {{level: string, text: string, title: string}}
+ */
+export function presenceWord(presence, now = Date.now()) {
+    const full = presenceText(presence, now);
+    if (full.level === 'unknown') return { level: 'unknown', text: 'Unknown', title: full.text };
+
+    let text = presence.online;
+    if (presence.state && presence.state !== 'Okay') {
+        text = presence.state;
+    } else if (presence.online !== 'Online' && presence.lastActionAt) {
+        text += ' ' + agoText(presence.lastActionAt, now).replace(' ago', '').replace('just now', 'now');
+    }
+    return { level: full.level, text, title: full.text };
+}
+
 /** Put (or refresh) the badge after the owner's name. Returns true if shown. */
 export function renderOwnerBadge(root, ownerId, presence, now = Date.now()) {
     const link = findOwnerLink(root, ownerId);

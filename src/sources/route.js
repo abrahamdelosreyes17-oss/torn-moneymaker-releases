@@ -91,11 +91,29 @@ export function bazaarTarget(href) {
     };
 }
 
+/**
+ * Your OWN bazaar's add-listings (#/add) and manage-listings (#/manage)
+ * pages: bazaar.php with no userId, and that hash. Anything else - another
+ * player's bazaar, your own storefront - is null. The hash changes without a
+ * page load, so callers re-check on hashchange.
+ *
+ * @returns {'add'|'manage'|null}
+ */
+export function ownBazaarPage(href) {
+    if (typeof href !== 'string' || !href) return null;
+    if (detectPage(href) !== PAGE_BAZAAR) return null;
+    if (bazaarOwnerId(href)) return null;
+
+    const hash = (href.split('#')[1] || '').toLowerCase().replace(/^\/+/, '').split(/[?&]/)[0];
+    if (hash === 'add' || hash.startsWith('add/')) return 'add';
+    if (hash === 'manage' || hash.startsWith('manage/')) return 'manage';
+    return null;
+}
+
 /*
- * The Traders page in its own tab: Torn's home page with a marker the script
- * recognises, and covers with the page. Nothing is fetched from Torn - this
- * is a page the user opened, drawn over by the script, reading what the
- * overlay already stored.
+ * The selling page (Traders) in its own tab: Torn's home page with a marker the script
+ * recognises, and covers with the page. The page itself is one the user
+ * opened; the script draws over it and reads only the API.
  */
 export const TRADERS_PAGE_PARAM = 'ttv2';
 export const TRADERS_PAGE_VALUE = 'traders';

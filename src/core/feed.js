@@ -21,7 +21,7 @@
  * from that source. Merging is how a sold listing survives.
  */
 
-import { bestVenue, computeOpportunity } from './profit.js';
+import { bestVenue } from './profit.js';
 import { formatMoneyShort } from './parse.js';
 
 export const FEED_CACHE_VERSION = 'feed-v1';
@@ -83,14 +83,9 @@ export function emptyFeed() {
  * @param {object} item - record from buildItemIndex
  * @param {object} settings - sellToNpc, resaleBazaar, resaleMarket
  */
-export function exitsFor(item, settings = {}, traderPrice = 0) {
+export function exitsFor(item, settings = {}) {
     const exits = {};
     if (!item) return exits;
-
-    // What the chosen TornExchange trader pays - see core/traders.js.
-    if (settings.sellToTrader && Number(traderPrice) > 0) {
-        exits.TRADER = Number(traderPrice);
-    }
 
     if (settings.sellToNpc !== false) {
         const sell = Number(item.sellPrice);
@@ -141,13 +136,7 @@ export function reachableProfit(profitPerUnit, price, settings = {}, qty = Infin
  * @param {object} settings
  * @returns {Array<{itemId: string, lowestPrice: number, profitPerUnit: number}>}
  */
-export function selectCandidates(
-    summary,
-    index,
-    settings = {},
-    max = MAX_CANDIDATES,
-    traderPriceOf = () => 0,
-) {
+export function selectCandidates(summary, index, settings = {}, max = MAX_CANDIDATES) {
     const out = [];
 
     for (const s of summary || []) {
@@ -158,7 +147,7 @@ export function selectCandidates(
 
         const best = bestVenue({
             listingPrice: s.lowestPrice,
-            exits: exitsFor(item, settings, traderPriceOf(item.id)),
+            exits: exitsFor(item, settings),
             qty: 1,
         });
 
@@ -177,12 +166,16 @@ export function selectCandidates(
     }
 
     // With cash set, what your cash can make; without, profit per item.
-    out.sort((a, b) =>
-        Number.isFinite(a.reach) && Number.isFinite(b.reach)
-            ? b.reach - a.reach || b.profitPerUnit - a.profitPerUnit
-            : b.profitPerUnit - a.profitPerUnit,
-    );
+    // Infinity - Infinity is NaN, which breaks a sort: compare finitely.
+    out.sort((a, b) => finiteCmp(b.reach, a.reach) || b.profitPerUnit - a.profitPerUnit);
     return max > 0 ? out.slice(0, max) : out;
+}
+
+/** b - a for a sort, where either side may be Infinity (never NaN). */
+export function finiteCmp(a, b) {
+    if (a === b) return 0;
+    if (!Number.isFinite(a) && !Number.isFinite(b)) return 0;
+    return a > b ? 1 : -1;
 }
 
 /** Seconds, milliseconds, or nothing -> ms or null. Unknown is not "old". */
@@ -316,10 +309,21 @@ export function bazaarDue(feed, candidate, now = Date.now()) {
     return cheapest !== candidate.lowestPrice;
 }
 
-/** Items that currently have an Item Market opportunity: re-check first. */
-export function itemMarketLiveIds(feed) {
+/**
+ * Items whose Item Market snapshot holds a live opportunity - these are
+ * re-checked before they expire. A snapshot keeps EVERY listing Torn
+ * returned (the page-vs-feed correction needs them), so "has rows" is not
+ * "is a deal": judging liveness by rows alone made every swept item a
+ * re-check candidate, and after a dozen sweeps the whole Torn budget went
+ * to re-checking items that were never deals. The sweep then stood still.
+ *
+ * @param {function} isDeal - (itemId, cheapestPrice) => boolean
+ */
+export function itemMarketLiveIds(feed, isDeal = () => true) {
     const ids = [];
-    for (const [id, snap] of feed.itemmarket) if (snap.rows.length) ids.push(id);
+    for (const [id, snap] of feed.itemmarket) {
+        if (snap.rows.length && isDeal(id, snap.rows[0].price)) ids.push(id);
+    }
     return ids;
 }
 
@@ -455,14 +459,11 @@ export function feedOpportunities(feed, index, settings = {}, ctx = {}) {
     const shopOf = ctx.npcShopFor || (() => null);
     const out = [];
 
-    const traderFor = ctx.traderFor || (() => null);
-
     const price = (item, row, extra) => {
         const npcShop = shopOf(item.id);
-        const pick = traderFor(item);
         const profit = bestVenue({
             listingPrice: row.price,
-            exits: exitsFor(item, settings, pick && pick.trader.price),
+            exits: exitsFor(item, settings),
             qty: row.qty,
             cashOnHand: settings.cashOnHand,
         });
@@ -479,7 +480,6 @@ export function feedOpportunities(feed, index, settings = {}, ctx = {}) {
             npcShop,
             npcVerified: npcShop !== null,
             profit,
-            traderPick: profit.venue === 'TRADER' ? pick : null,
             cardLabel: '+' + formatMoneyShort(profit.totalProfit),
             ...extra,
         });
@@ -552,48 +552,71 @@ export function readFeedCacheEntry(entry, now = Date.now()) {
 }
 
 /**
- * Items worth sweeping on the Item Market when TornW3B has nothing to say
- * about them: an NPC hit there is only possible when the NPC price is close
- * to what the item normally trades for.
+ * Which items to sweep on the Item Market, likeliest deal first.
+ *
+ * Every item with an exit is a possible deal: someone may list it under its
+ * NPC price (or, with the Market / My bazaar chips, under its value). What
+ * differs is how LIKELY that is. A listing tends to sit near the item's
+ * value, so the closer the exit price is to the value, the smaller the
+ * discount a seller has to give before the listing beats the exit. So:
+ *
+ *   NPC items:          1 + NPC price / market value  (checked first)
+ *   resale-only items:  1 - the exit's fee
+ *
+ * and the sweep runs highest score first, then cheaper items first, so the
+ * items most likely to pay are checked soonest and the whole list is still
+ * covered. An NPC flip is guaranteed and untaxed - the job this tool is for
+ * - so every item with an NPC price goes before the resale-only ones. Two earlier versions got this wrong: 3.5/3.6 only swept items
+ * whose NPC price beat a probe at 85% of value, which dropped most NPC items
+ * outright; 3.7 swept every item with a value in id order, because its sort
+ * compared Infinity with Infinity (NaN) whenever no cash was set.
+ *
+ * With cash set, an item you cannot afford one of at half its value is
+ * skipped, and what your cash could make breaks ties.
+ *
+ * @returns {Array<string>} item ids
  */
-export function itemMarketSweepList(index, settings = {}, traderPriceOf = () => 0) {
+export function itemMarketSweepList(index, settings = {}) {
     const scored = [];
     const cash = Number(settings.cashOnHand) || 0;
 
     for (const item of (index && index.byId && index.byId.values()) || []) {
         const sell = Number(item.sellPrice);
         const mv = Number(item.marketValue);
-        if (!(mv > 0)) continue;
+        const npcOn = settings.sellToNpc !== false && sell > 0;
+        const resaleOn = Boolean(settings.resaleMarket || settings.resaleBazaar) && mv > 0;
+        if (!npcOn && !resaleOn) continue;
 
-        // Probe: a listing 15% under market value - what would it make?
-        const probePrice = mv * 0.85;
-        const perUnit = (exitPrice, venue) => {
-            const probe = computeOpportunity({ listingPrice: probePrice, exitPrice, venue });
-            return probe ? probe.profitPerUnit : 0;
-        };
-
-        let best = 0;
-        let floor = mv * 0.5; // the cheapest a real listing plausibly gets
-        if (settings.sellToNpc !== false && sell > 0) {
-            const p = perUnit(sell, 'NPC');
-            if (p > best) { best = p; floor = Math.min(sell, mv) * 0.5; }
+        const value = mv > 0 ? mv : sell;
+        let score = 0;
+        let exit = 0;
+        if (npcOn) {
+            // NPC flips first: guaranteed and untaxed, the job this tool is
+            // for. Among them, the closer the NPC price to the value, the
+            // likelier a listing beats it.
+            score = 1 + (mv > 0 ? Math.min(sell / mv, 2) : 1);
+            exit = sell;
         }
-        if (settings.sellToTrader) {
-            best = Math.max(best, perUnit(Number(traderPriceOf(item.id)) || 0, 'TRADER'));
+        if (resaleOn) {
+            const fee = settings.resaleBazaar ? 0 : 0.05;
+            score = Math.max(score, 1 - fee);
+            exit = Math.max(exit, mv * (1 - fee));
         }
-        // The Market / My bazaar chips used to add nothing here, so with them
-        // on, only NPC items were ever swept on the Item Market.
-        if (settings.resaleMarket) best = Math.max(best, perUnit(mv, 'ITEM_MARKET'));
-        if (settings.resaleBazaar) best = Math.max(best, perUnit(mv, 'BAZAAR_RESALE'));
 
-        if (!(best > 0)) continue;
-        // Not even one affordable at half its value: skip it.
+        // The cheapest a real listing plausibly gets: half its value.
+        const floor = value * 0.5;
         if (cash > 0 && floor > cash) continue;
 
-        scored.push({ id: item.id, key: reachableProfit(best, probePrice, settings) || best });
+        const reach = cash > 0 ? Math.floor(cash / floor) * Math.max(exit - floor, 1) : 0;
+        scored.push({ id: item.id, score, value, reach });
     }
 
-    // What your cash could make first, so the likeliest deals are checked soonest.
-    scored.sort((a, b) => b.key - a.key);
+    scored.sort(
+        (a, b) =>
+            b.score - a.score ||
+            b.reach - a.reach ||
+            a.value - b.value ||
+            String(a.id).localeCompare(String(b.id), undefined, { numeric: true }),
+    );
     return scored.map((s) => s.id);
 }

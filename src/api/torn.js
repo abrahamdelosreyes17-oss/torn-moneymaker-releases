@@ -2,15 +2,23 @@ import {
     KEY_DEAD_CODES,
     TORN_ERROR_RATE_LIMIT,
     TORN_ERROR_IP_BLOCK,
+    TornApiError,
 } from './client.js';
+import { parseInventoryPage, nextInventoryOffset } from '../core/inventory.js';
 
 /*
  * Thin wrappers over the Torn endpoints this tool uses. Every one of these
- * works with a Public access key - that is the point.
+ * works with a Public access key, except fetchInventory: reading your own
+ * inventory needs Limited access, and only the selling page calls it, with
+ * the separate key that page keeps.
  */
 
-/** Torn's access levels, lowest first. Public is all this tool needs. */
+/** Torn's access levels, lowest first. Public is all the overlay needs. */
 export const ACCESS_PUBLIC = 1;
+export const ACCESS_LIMITED = 3;
+
+/** "Access level of this key is not high enough". */
+export const TORN_ERROR_ACCESS_LEVEL = 16;
 
 export const ACCESS_LEVEL_NAMES = {
     1: 'Public',
@@ -306,4 +314,86 @@ export async function fetchUserPresence(client, userId) {
         }
         return parseUserPresence(await client.get('user/' + id, { selections: 'profile' }));
     }
+}
+
+/** "Wrong fields" and "Incorrect category": a parameter Torn did not accept. */
+export const TORN_ERROR_WRONG_FIELDS = 4;
+export const TORN_ERROR_INCORRECT_CATEGORY = 21;
+
+/**
+ * The `cat` values /v2/user/inventory accepts: TornInventoryItemType in
+ * Torn's published OpenAPI spec (@types/torn-api, components/schemas).
+ */
+export const TORN_INVENTORY_CATEGORIES = [
+    'Collectible', 'Clothing', 'Other', 'Tool', 'Melee', 'Defensive',
+    'Material', 'Car', 'Primary', 'Secondary', 'Book', 'Special',
+    'Supply Pack', 'Temporary', 'Enhancer', 'Artifact', 'Flower', 'Booster',
+    'Medical', 'Candy', 'Jewelry', 'Alcohol', 'Plushie', 'Drug', 'Energy Drink',
+];
+
+/** Torn refused the request for want of a (valid) `cat`. */
+function isCategoryError(error) {
+    const code = Number(error && error.code);
+    if (code === TORN_ERROR_INCORRECT_CATEGORY || code === TORN_ERROR_WRONG_FIELDS) return true;
+    return /categor/i.test(String((error && error.message) || ''));
+}
+
+/** Every page of one inventory request (with or without a category). */
+async function fetchInventoryPages(client, params, limit) {
+    const out = [];
+    let offset = 0;
+
+    for (let page = 0; page < 40; page += 1) {
+        let data;
+        try {
+            data = await client.get('v2/user/inventory', { ...params, limit, offset });
+        } catch (error) {
+            if (error && Number(error.code) === TORN_ERROR_ACCESS_LEVEL) {
+                throw new TornApiError('This key cannot read your inventory: it needs Limited access.', {
+                    code: TORN_ERROR_ACCESS_LEVEL,
+                });
+            }
+            throw error;
+        }
+
+        out.push(...parseInventoryPage(data));
+
+        const next = nextInventoryOffset(data);
+        if (next === null || next <= offset) break;
+        offset = next;
+    }
+
+    return out;
+}
+
+/**
+ * Your own inventory: GET /v2/user/inventory, paged with limit/offset.
+ * Needs a LIMITED key; Torn caches it for about an hour per category.
+ * Only the selling page calls this, with that page's own key. Error 16
+ * (access level too low) is reported as such, never retried.
+ *
+ * The spec says `cat` is optional, but Torn has been seen to answer
+ * "Incorrect category" without it. So: ask once without a category; if that
+ * is refused as a category or field error, ask once per category instead
+ * (25 calls, each paged, all through the shared limiter) and merge. A
+ * category Torn no longer knows is skipped, never fatal.
+ *
+ * @returns {Promise<Array>} rows from parseInventoryPage, every page
+ */
+export async function fetchInventory(client, { limit = 250, categories = TORN_INVENTORY_CATEGORIES } = {}) {
+    try {
+        return await fetchInventoryPages(client, {}, limit);
+    } catch (error) {
+        if (!isCategoryError(error)) throw error;
+    }
+
+    const out = [];
+    for (const cat of categories) {
+        try {
+            out.push(...(await fetchInventoryPages(client, { cat }, limit)));
+        } catch (error) {
+            if (!isCategoryError(error)) throw error;
+        }
+    }
+    return out;
 }

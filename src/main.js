@@ -2,6 +2,13 @@
  * Wiring. This file is the only part of the codebase that knows it is a
  * userscript; core/ and api/ are plain modules that would move to a web app
  * untouched.
+ *
+ * Two entry points share it:
+ *   - every Torn page: the overlay (deals below NPC / value, live from the
+ *     API), the bazaar owner badge, and on your OWN bazaar's add / manage
+ *     pages the pricing helper;
+ *   - the selling page tab (index.php?ttv2=traders): its own keys, its own
+ *     settings, its own requests. See bootSellingPage().
  */
 
 import {
@@ -42,45 +49,77 @@ import { makeTabId, LEADER_HEARTBEAT_MS } from './core/leader.js';
 import { formatMoneyShort } from './core/parse.js';
 import { rankOpportunities, summarize, hiddenCounts } from './core/ranker.js';
 import { TornApiClient, redactKey, KEY_DEAD_CODES } from './api/client.js';
-import { W3bClient } from './api/w3b.js';
-import { TeClient, fetchTeBestListings, tePriceListUrl } from './api/te.js';
+import { W3bClient, fetchW3bListings } from './api/w3b.js';
 import {
-    pickTrader,
-    maxTraderPrice,
-    groupByTrader,
-    buildTraderBoard,
+    TeClient,
+    TeQueue,
+    fetchTeBestListings,
+    fetchTeListings,
+    fetchTeActiveTraders,
+    tePriceListUrl,
+} from './api/te.js';
+import {
+    buildSellingRows,
+    mergeTraders,
+    tradersToWatch,
     makeTeCacheEntry,
     readTeCacheEntry,
+    readTeItemLists,
+    writeTeItemList,
     TE_REFRESH_MS,
-} from './core/traders.js';
+    SORT_BUNDLE,
+    SORT_ITEM,
+} from './core/selling.js';
+import {
+    mergeInventory,
+    makeInventoryCacheEntry,
+    readInventoryCacheEntry,
+    inventoryRefreshDue,
+    INVENTORY_RETRY_MS,
+} from './core/inventory.js';
+import {
+    readHistory,
+    mergeHistory,
+    recordSample,
+    recordMarketValue,
+    touchItem,
+    pruneHistory,
+    averages,
+    series,
+} from './core/history.js';
 import {
     fetchItems,
     fetchShops,
     fetchKeyAccess,
     fetchUserPresence,
+    fetchItemMarket,
+    fetchInventory,
     ACCESS_PUBLIC,
+    TORN_ERROR_ACCESS_LEVEL,
 } from './api/torn.js';
 import {
     detectPage,
     itemMarketUrl,
     bazaarOwnerId,
     bazaarTarget,
+    ownBazaarPage,
     tradersPageUrl,
     isTradersPageUrl,
     PAGE_NONE,
     PAGE_BAZAAR,
 } from './sources/route.js';
 import { scanDom } from './sources/dom/scan.js';
+import { scanOwnBazaar, ensureRowTag, removeRowTags, OWN_BAZAAR_TAG_CLASS } from './sources/dom/ownbazaar.js';
 import {
     readBazaarOpen,
     renderOwnerBadge,
     removeOwnerBadges,
     presenceText,
-    presenceShort,
+    presenceWord,
 } from './sources/dom/owner.js';
 import { injectStyles } from './ui/styles.js';
 import { Panel, TORN_API_KEY_URL } from './ui/panel.js';
-import { TradersPage, TRADERS_PAGE_DEFAULTS } from './ui/traders-page.js';
+import { SellingPage, SELLING_PAGE_DEFAULTS } from './ui/selling-page.js';
 import {
     markRows,
     clearMarks,
@@ -91,6 +130,7 @@ import {
     LiveFeed,
     FEED_STORE_KEY,
 } from './feed/controller.js';
+import { formatMoney } from './core/parse.js';
 
 const STORE_KEY = 'apiKey';
 const STORE_ITEMS = 'itemsCache';
@@ -101,12 +141,22 @@ const STORE_KEY_ACCESS = 'keyAccess';
 const STORE_API_WINDOW = 'apiWindow';
 const STORE_KEY_DEAD = 'keyDead';
 const STORE_OPENED = 'opened';
-/* TornExchange: its own key (never the main one), its prices, and its backoff. */
+
+/* The selling page's own keys, caches and preferences - never the overlay's. */
+const STORE_SELL_KEY = 'sellKey';
+const STORE_SELL_KEY_DEAD = 'sellKeyDead';
+const STORE_SELL_KEY_ACCESS = 'sellKeyAccess';
 const STORE_TE_KEY = 'teKey';
 const STORE_TE = 'teCache';
 const STORE_TE_STATE = 'teState';
-/* The Traders page's own preferences - never mixed with the overlay's settings. */
-const STORE_TRADERS_PAGE = 'tradersPage';
+const STORE_TE_LISTS = 'teLists';
+const STORE_TE_IDS = 'teIds';
+const STORE_INVENTORY = 'inventory';
+const STORE_SELL_PREFS = 'sellingPage';
+
+/* Price history the script records itself, and TornW3B's latest summary. */
+const STORE_HISTORY = 'priceHistory';
+const STORE_W3B_SUMMARY = 'w3bSummary';
 
 const DEFAULT_SETTINGS = {
     /*
@@ -126,17 +176,11 @@ const DEFAULT_SETTINGS = {
     sellToNpc: true,
     resaleBazaar: false,
     resaleMarket: false,
-    /*
-     * Sell to a player trader, at the price on their TornExchange list. Off
-     * by default: it needs a TornExchange key, and a trader's price is an
-     * offer, not a guarantee.
-     */
-    sellToTrader: false,
 
     /*
-     * The live feed: watch the market from ANY Torn page, not just the one
-     * you are on. Runs in one visible tab only, polls the Torn API well
-     * inside the rate limit, and never raises alerts - see README.
+     * Watching: the market from ANY Torn page, not just the one you are on.
+     * Runs in one visible tab only, polls the Torn API well inside the rate
+     * limit, and never raises alerts - see README.
      */
     liveFeed: true,
 
@@ -151,9 +195,9 @@ const DEFAULT_SETTINGS = {
     useW3b: true,
 
     /*
-     * GO TO BAZAAR / GO TO MARKET open a new tab (on), or go there in this
-     * tab (off). A preference, not a safety setting: either way it is one
-     * click, one page load, and nothing is bought.
+     * Go opens a new tab (on), or goes there in this tab (off). A
+     * preference, not a safety setting: either way it is one click, one
+     * page load, and nothing is bought.
      */
     openInNewTab: true,
 
@@ -167,12 +211,6 @@ const DEFAULT_SETTINGS = {
 const RESCAN_DEBOUNCE_MS = 400;
 
 /*
- * Torn changes pages with pushState, which fires no event, and draws the
- * listings a moment after the address changes. Checking the address is a
- * string compare, so it is done often; on a change the page is scanned at
- * once and a few more times while the listings finish drawing.
- */
-/*
  * The viewed bazaar's owner: one public-profile call when you open it, then
  * at most once per OWNER_REFRESH_MS while you stay. A failure waits a minute.
  */
@@ -180,25 +218,17 @@ const OWNER_REFRESH_MS = 30000;
 const OWNER_RETRY_MS = 60000;
 
 /*
- * Online status for players on the lists: the first SELLER_STATUS_MAX bazaar
- * sellers (while the Bazaars list is on screen) and the first
- * TRADER_STATUS_MAX traders deals would be sold to (while the Trader chip is
- * on). One public-profile call each, then at most once per
- * PRESENCE_REFRESH_MS while they stay listed - at most 25 calls a minute,
- * inside the shared 70/min budget next to the feed's 30. Visible tab only.
+ * Online status for bazaar sellers on the list: the first SELLER_STATUS_MAX
+ * while the Bazaars list is on screen. One public-profile call each, then
+ * at most once per PRESENCE_REFRESH_MS while they stay listed - inside the
+ * shared 70/min budget next to the feed's 30. Visible tab only.
  */
 const SELLER_STATUS_MAX = 10;
-const TRADER_STATUS_MAX = 15;
-/* While the Traders page is open: its top traders, in page order. */
-const PAGE_TRADER_STATUS_MAX = 20;
 const PRESENCE_REFRESH_MS = 60000;
 const PRESENCE_RETRY_MS = 120000;
 const PRESENCE_MAX_PENDING = 3;
 /* Players not on a list this long are forgotten. */
 const PRESENCE_FORGET_MS = 10 * 60 * 1000;
-
-/* A failed TornExchange call is not retried sooner than this. */
-const TE_RETRY_MS = 5 * 60 * 1000;
 
 /* A bazaar seen closed keeps its feed deals hidden this long (or until seen open). */
 const CLOSED_MEMORY_MS = 10 * 60 * 1000;
@@ -218,6 +248,21 @@ const FEED_TICK_MS = LEADER_HEARTBEAT_MS;
  */
 const POLL_INTERVAL_MS = 2500;
 
+/*
+ * Your own bazaar's pricing helper: one Item Market call per item on screen,
+ * at most one every BZ_FETCH_GAP_MS (6 a minute), each answer kept
+ * BZ_IM_TTL_MS; a fresher snapshot the feed already holds is used instead of
+ * a call. Bazaar prices come from the TornW3B summary the feed already
+ * fetches; a per-item TornW3B call only when that summary is missing or old.
+ */
+const BZ_FETCH_GAP_MS = 10000;
+const BZ_IM_TTL_MS = 120000;
+const BZ_SUMMARY_MAX_AGE_MS = 5 * 60 * 1000;
+const BZ_W3B_TTL_MS = 60000;
+/* History: one sample per item per 5 minutes from the summary; saved at most every 30s. */
+const HISTORY_SAMPLE_MS = 5 * 60 * 1000;
+const HISTORY_SAVE_MS = 30000;
+
 const app = {
     tabId: makeTabId(),
     index: null,
@@ -236,15 +281,8 @@ const app = {
     pageRows: [],
     /* { id, presence, fetchedAt, pending, retryAt, open } for the viewed bazaar. */
     owner: null,
-    /* playerId -> { presence, fetchedAt, pending, retryAt, listedAt }: list sellers and traders. */
+    /* playerId -> { presence, fetchedAt, pending, retryAt, listedAt }: list sellers. */
     presence: new Map(),
-    te: null,
-    /* { fetchedAt, map: itemId -> traders } from TornExchange, or null. */
-    traders: null,
-    teLoading: false,
-    /* The Traders page, while it is open here: { page, mode }. */
-    tradersPage: null,
-    tradersPageOpen: false,
     /* sellerId -> time until which their bazaar counts as closed. */
     closedSellers: new Map(),
     pageDiagnostics: null,
@@ -263,12 +301,25 @@ const app = {
     observerTarget: null,
     lastScanAt: null,
     loading: false,
+    /* Your own bazaar's add / manage page, while you are on it. */
+    ownBazaar: null,
+    bzRows: [],
+    bzDiagnostics: null,
+    /* itemId -> { im: {price, at}|null, bz: {price, at}|null, imAt, bzAt, pending } */
+    bzPrices: new Map(),
+    bzSelected: null,
+    bzWindow: '24h',
+    bzLastFetchAt: 0,
+    /* The recorded price history, loaded once, saved on a timer. */
+    history: null,
+    historyDirty: false,
+    historySavedAt: 0,
+    historySampledAt: 0,
 };
 
 /**
  * Stored settings over the defaults, keeping only settings that still exist.
- * The shop-stock filters, "show unverified", "show everything seen" and the
- * old compare switches were removed; an old stored value must not linger.
+ * Removed settings (the Trader chip, among others) must not linger.
  */
 function loadSettings() {
     const stored = gmGet(STORE_SETTINGS, {}) || {};
@@ -280,6 +331,7 @@ function loadSettings() {
 
     // The NPC switch was called compareNpc.
     if (stored.compareNpc === false && !('sellToNpc' in stored)) out.sellToNpc = false;
+    if (out.viewTab !== 'bazaar' && out.viewTab !== 'itemmarket') out.viewTab = 'bazaar';
 
     return out;
 }
@@ -307,10 +359,9 @@ function markKeyDead(error) {
     gmSet(STORE_KEY_DEAD, true);
 
     app.panel.setStatus(
-        'Torn rejected this API key (' +
+        'Torn rejected this key (' +
             redactKey((error && error.message) || 'invalid key', getStoredKey()) +
-            '). Nothing more will be sent with it - paste a new Public key ' +
-            'under Settings.',
+            '). Paste a new Public key.',
         'error',
     );
 }
@@ -336,8 +387,7 @@ function refreshKeyState() {
  *
  * The key is stored locally and used against api.torn.com. Nothing here, and
  * nothing anywhere else in this codebase, sends it to a server of ours -
- * there is no server of ours. That is the main difference between this and a
- * hosted tool like TornStats, where the key lives on someone else's machine.
+ * there is no server of ours.
  */
 async function onSaveKey(key) {
     if (!key) {
@@ -345,21 +395,14 @@ async function onSaveKey(key) {
         return;
     }
 
-    if (!looksLikeTornKey(key)) {
-        app.panel.setStatus(
-            'That does not look like a Torn API key (16 letters/numbers). ' +
-                'Saved anyway - if calls fail, check it.',
-            'warn',
-        );
+    // The TornExchange key is not a Torn key and must never reach Torn.
+    if (key === getTeKey()) {
+        app.panel.setStatus('That is the TornExchange key. Paste your Torn Public key.', 'error');
+        return;
     }
 
-    if (key === getTeKey()) {
-        app.panel.setStatus(
-            'That is your TornExchange key. Use a different Public key here - ' +
-                'the main key never goes to TornExchange.',
-            'error',
-        );
-        return;
+    if (!looksLikeTornKey(key)) {
+        app.panel.setStatus('Saved. Torn keys are 16 letters and digits; check it if calls fail.', 'warn');
     }
 
     gmSet(STORE_KEY, key);
@@ -372,7 +415,7 @@ async function onSaveKey(key) {
     refreshKeyState();
 
     // Key accepted: back to the list, which is now loading.
-    if (!app.keyDead && app.index) app.panel.showPage('list');
+    if (!app.keyDead && app.index) app.panel.showPage(app.panel.homePage());
 }
 
 function onForgetKey() {
@@ -384,9 +427,8 @@ function onForgetKey() {
     if (app.panel.keyInput) app.panel.keyInput.value = '';
 
     refreshKeyState();
-    app.panel.setStatus('API key removed from this script.');
+    app.panel.setStatus('API key removed.');
 }
-
 
 function onClearCache() {
     gmDel(STORE_ITEMS);
@@ -395,7 +437,7 @@ function onClearCache() {
     app.index = null;
     app.npcShops = new Map();
 
-    app.panel.setStatus('Re-downloading item data...');
+    app.panel.setStatus('Re-downloading item data.');
     if (hasUsableKey()) onScan();
 }
 
@@ -415,9 +457,7 @@ async function checkKeyAccess() {
 
     if (access && access.level !== null && access.level > ACCESS_PUBLIC) {
         app.panel.setStatus(
-            'Warning: this key has ' +
-                (access.name || 'level ' + access.level) +
-                ' access. Public is enough - revoke it and make a Public one.',
+            'This key has ' + (access.name || 'level ' + access.level) + ' access. Public is enough.',
             'warn',
         );
     }
@@ -436,7 +476,7 @@ async function loadReferenceData() {
         app.index = buildItemIndex(cachedItems.items);
         app.itemsFetchedAt = cachedItems.fetchedAt;
     } else {
-        app.panel.setStatus('Downloading item database...');
+        app.panel.setStatus('Downloading item database.');
         const raw = await fetchItems(app.client);
         const entry = makeItemsCacheEntry(raw);
         gmSet(STORE_ITEMS, entry);
@@ -449,7 +489,7 @@ async function loadReferenceData() {
     if (isNpcCacheFresh(cachedNpc)) {
         app.npcShops = readNpcCacheEntry(cachedNpc);
     } else {
-        app.panel.setStatus('Downloading shop inventories...');
+        app.panel.setStatus('Downloading shop inventories.');
         try {
             const shops = await fetchShops(app.client);
             const index = buildNpcShopIndex(shops);
@@ -468,13 +508,6 @@ async function loadReferenceData() {
                 (error && error.message) || 'shop data unavailable';
         }
     }
-
-    /*
-     * If shop data is unavailable, every item is "unverified" - and hiding
-     * unverified items would then hide EVERYTHING, which reads as "no
-     * opportunities" when it really means "could not verify any". Degrade to
-     * showing them, flagged, and say why.
-     */
 
     app.manualNpc = gmGet(STORE_MANUAL_NPC, {}) || {};
 }
@@ -520,14 +553,6 @@ async function refreshItemsIfStale() {
 function buildOpportunities(listings) {
     const rows = [];
 
-    /*
-     * The best NON-profitable listing, kept so the panel can prove the
-     * pipeline works. "0 opportunities" and "0 listings parsed" look
-     * identical to a user, and they mean completely different things.
-     */
-    app.nearMiss = null;
-    app.pricedCount = 0;
-
     for (const listing of listings) {
         /*
          * Compare against BOTH exits and keep whichever pays more:
@@ -537,14 +562,9 @@ function buildOpportunities(listings) {
          * exitsFor() is shared with the live feed, so a listing is priced
          * the same whether it was read off this page or found elsewhere.
          */
-        const npcShop = npcShopFor(
-            listing.itemId,
-            app.npcShops,
-            app.manualNpc,
-        );
+        const npcShop = npcShopFor(listing.itemId, app.npcShops, app.manualNpc);
 
-        const pick = traderFor(listing.item);
-        const exits = exitsFor(listing.item, app.settings, pick && pick.trader.price);
+        const exits = exitsFor(listing.item, app.settings);
         if (Object.keys(exits).length === 0) continue;
 
         const profit = bestVenue({
@@ -557,7 +577,6 @@ function buildOpportunities(listings) {
         rows.push({
             ...listing,
             profit,
-            traderPick: profit && profit.venue === 'TRADER' ? pick : null,
             npcShop,
             npcVerified: npcShop !== null,
             /*
@@ -631,6 +650,23 @@ function rescan() {
     updateOwner(Date.now());
 
     if (!app.index) return;
+
+    // Your own bazaar's add / manage page: the pricing helper, not the scanner.
+    const own = ownBazaarPage(location.href);
+    if (own !== app.ownBazaar) {
+        if (app.ownBazaar) removeRowTags(document);
+        app.ownBazaar = own;
+        app.bzRows = [];
+        app.bzDiagnostics = null;
+        if (!own) app.panel.renderMyBazaar(null);
+    }
+    if (own) {
+        scanOwnBazaarPage(own);
+        app.pageRows = [];
+        app.pageDiagnostics = null;
+        refreshView();
+        return;
+    }
 
     if (app.pageType === PAGE_NONE) {
         app.pageRows = [];
@@ -733,9 +769,7 @@ function showBazaarTarget(listings) {
 
     if (firstTime) {
         app.panel.setStatus(
-            'That listing is no longer at ' +
-                formatMoneyShort(target.price) +
-                ' here - it sold or was repriced. Removed from the list.',
+            'That listing is no longer at ' + formatMoneyShort(target.price) + ' here.',
             'warn',
         );
     }
@@ -745,7 +779,7 @@ function showBazaarTarget(listings) {
  * Everything the panel shows: this page, what you saw elsewhere, and the
  * live feed. Never reads the DOM, so the feed can re-render it whenever
  * another tab updates storage. Its only requests are the rate-limited seller
- * status lookups in updateSellerStatus().
+ * status lookups in updatePresence().
  */
 function refreshView() {
     if (!app.panel) return;
@@ -766,7 +800,6 @@ function refreshView() {
               now,
               npcShopFor: (id) => npcShopFor(id, app.npcShops, app.manualNpc),
               itemMarketUrl,
-              traderFor,
           }).filter((r) => {
               // The page you are on already shows these, with fresher numbers.
               if (r.source === SOURCE_ITEM_MARKET) {
@@ -794,53 +827,21 @@ function refreshView() {
     const bazaarRows = rankOpportunities(lists.bazaar, rankSettings());
     const marketRows = rankOpportunities(lists.itemmarket, rankSettings());
 
-    // One trade window per trader, from both lists.
-    const groups = app.settings.sellToTrader
-        ? groupByTrader(bazaarRows.concat(marketRows))
-        : [];
-
     const tab = activeTab();
-    const shown =
-        tab === 'bazaar'
-            ? bazaarRows
-            : tab === 'traders'
-              ? groups.flatMap((g) => g.rows)
-              : marketRows;
+    const shown = tab === 'bazaar' ? bazaarRows : marketRows;
 
-    // The Traders page: every deal in both lists, with all its traders.
-    const board = app.tradersPageOpen
-        ? buildTraderBoard(bazaarRows.concat(marketRows), app.traders ? app.traders.map : new Map(), {
-              presenceOf,
-          })
-        : null;
-
-    updatePresence(
-        [
-            ...new Set([
-                ...(tab === 'bazaar' || board ? listedSellers(bazaarRows) : []),
-                ...listedTraders(bazaarRows.concat(marketRows)),
-                ...(board ? boardTraders(board) : []),
-            ]),
-        ],
-        now,
-    );
+    updatePresence(tab === 'bazaar' ? listedSellers(bazaarRows) : [], now);
 
     app.panel.render({
         rows: shown,
-        groups,
         tab,
         statuses: statusMap(now),
-        hidden: hiddenCounts(
-            tab === 'itemmarket' ? lists.itemmarket : tab === 'bazaar' ? lists.bazaar : [],
-            rankSettings(),
-        ),
-        traderInfo: traderInfo(now),
+        hidden: hiddenCounts(tab === 'itemmarket' ? lists.itemmarket : lists.bazaar, rankSettings()),
         counts: {
             bazaar: bazaarRows.length,
             itemmarket: marketRows.length,
-            traders: groups.length,
         },
-        summary: summarize(shown),
+        summary: summarize(shown, { cashOnHand: app.settings.cashOnHand }),
         diagnostics:
             app.pageDiagnostics && app.pageType === tab
                 ? {
@@ -851,19 +852,9 @@ function refreshView() {
         pageType: app.pageType,
         lastScanAt: app.lastScanAt,
         live: app.feed ? app.feed.status() : null,
-        tradersOpenMode: tradersPagePrefs().openMode,
     });
 
-    if (board && app.tradersPage) {
-        app.tradersPage.page.render({
-            board,
-            statuses: statusMap(now),
-            traderInfo: traderInfo(now),
-            live: app.feed ? app.feed.status() : null,
-            prefs: tradersPagePrefs(),
-            traderChipOn: Boolean(app.settings.sellToTrader),
-        });
-    }
+    if (app.ownBazaar) renderMyBazaar();
 }
 
 /**
@@ -874,8 +865,7 @@ function activeTab() {
     if (app.tabOverride) return app.tabOverride;
     if (app.pageType === PAGE_BAZAAR) return 'bazaar';
     if (app.pageType === 'itemmarket') return 'itemmarket';
-    const v = app.settings.viewTab;
-    return v === 'itemmarket' || v === 'traders' ? v : 'bazaar';
+    return app.settings.viewTab === 'itemmarket' ? 'itemmarket' : 'bazaar';
 }
 
 function onViewChange(tab) {
@@ -885,24 +875,18 @@ function onViewChange(tab) {
     refreshView();
 }
 
-/** The Scan button: loads reference data once, then scans the page. */
+/** The refresh button: loads reference data once, then scans the page. */
 async function onScan() {
     if (app.loading) return;
 
     if (!getStoredKey()) {
-        app.panel.setStatus(
-            'No API key yet - paste a Public key under Settings.',
-            'error',
-        );
+        app.panel.setStatus('No API key yet. Paste a Public key.', 'error');
         app.panel.openSettings({ focusKey: !getStoredKey() });
         return;
     }
 
     if (app.keyDead) {
-        app.panel.setStatus(
-            'Torn rejected the saved key. Paste a new Public key under Settings.',
-            'error',
-        );
+        app.panel.setStatus('Torn rejected the saved key. Paste a new Public key.', 'error');
         return;
     }
 
@@ -926,7 +910,7 @@ async function onScan() {
         }
         rescan();
 
-        // Replace "Downloading..." - it is done. A key warning set by
+        // Replace "Downloading" - it is done. A key warning set by
         // checkKeyAccess is left in place.
         if (firstLoad && !app.panel.state.status.level.match(/warn|error/)) {
             app.panel.setStatus('Ready.');
@@ -934,7 +918,7 @@ async function onScan() {
         if (app.pageType === PAGE_NONE) {
             app.panel.setStatus(
                 app.settings.liveFeed
-                    ? 'Not a Bazaar or Item Market page - showing the live feed.'
+                    ? 'Not a Bazaar or Item Market page. Showing what is watched.'
                     : 'Not a Bazaar or Item Market page.',
             );
         }
@@ -954,7 +938,6 @@ async function onScan() {
         app.panel.setBusy(false);
     }
 }
-
 
 /* ------------------------------------------------------------------ *
  * Bazaar owner: online status and open/closed
@@ -1039,7 +1022,7 @@ function paintOwner(now) {
     if (!app.panel) return;
     const words = owner.presence
         ? presenceText(owner.presence, now)
-        : { level: 'unknown', text: owner.pending || !owner.fetchedAt ? 'checking...' : 'status unknown' };
+        : { level: 'unknown', text: owner.pending || !owner.fetchedAt ? 'checking' : 'unknown' };
 
     app.panel.setSeller({
         name: (owner.presence && owner.presence.name) || null,
@@ -1050,7 +1033,7 @@ function paintOwner(now) {
 }
 
 /* ------------------------------------------------------------------ *
- * Online status: bazaar sellers and traders on the lists
+ * Online status: bazaar sellers on the list
  * ------------------------------------------------------------------ */
 
 /** The first SELLER_STATUS_MAX distinct sellers on the list, in list order. */
@@ -1061,24 +1044,6 @@ function listedSellers(rows) {
         const id = String(r.sellerId);
         if (!ids.includes(id)) ids.push(id);
         if (ids.length >= SELLER_STATUS_MAX) break;
-    }
-    return ids;
-}
-
-/**
- * The traders behind trader deals - every one of the top three for each
- * item, since who is online decides which of them the deal goes to.
- */
-function listedTraders(rows) {
-    const ids = [];
-    if (!app.settings.sellToTrader || !app.traders) return ids;
-
-    for (const r of rows) {
-        if (!r.traderPick) continue;
-        for (const t of app.traders.map.get(String(r.itemId)) || []) {
-            if (!ids.includes(t.id)) ids.push(t.id);
-            if (ids.length >= TRADER_STATUS_MAX) return ids;
-        }
     }
     return ids;
 }
@@ -1108,9 +1073,8 @@ function updatePresence(ids, now) {
     }
 
     if (!app.client || !hasUsableKey()) return;
-    // The Traders page folds the panel but still needs statuses.
     if (document.visibilityState !== 'visible') return;
-    if (app.panel.collapsed && !app.tradersPageOpen) return;
+    if (app.panel.collapsed) return;
 
     let pending = 0;
     for (const s of app.presence.values()) if (s.pending) pending++;
@@ -1137,9 +1101,7 @@ function updatePresence(ids, now) {
             })
             .finally(() => {
                 s.pending = false;
-                // A trader coming online can change who a deal goes to.
-                if (app.index && app.settings.sellToTrader) rescan();
-                else refreshView();
+                refreshView();
             });
     }
 }
@@ -1149,268 +1111,288 @@ function statusMap(now) {
     const out = new Map();
     for (const id of app.presence.keys()) {
         const presence = presenceOf(id);
-        if (presence) out.set(id, { name: presence.name, ...presenceShort(presence, now) });
+        if (presence) out.set(id, { name: presence.name, ...presenceWord(presence, now) });
     }
     if (app.owner && app.owner.presence) {
-        out.set(app.owner.id, { name: app.owner.presence.name, ...presenceShort(app.owner.presence, now) });
+        out.set(app.owner.id, { name: app.owner.presence.name, ...presenceWord(app.owner.presence, now) });
     }
     return out;
 }
 
 /* ------------------------------------------------------------------ *
- * Traders (TornExchange)
+ * Your own bazaar: the pricing helper
  * ------------------------------------------------------------------ */
 
-function getTeKey() {
-    return gmGet(STORE_TE_KEY, '') || '';
+/** Read the rows, tag each with its current asking prices, queue what is missing. */
+function scanOwnBazaarPage(which) {
+    const { rows, diagnostics } = scanOwnBazaar(which, document, app.index);
+    app.bzRows = rows;
+    app.bzDiagnostics = { ...diagnostics, tags: 0 };
+
+    const now = Date.now();
+    const hist = loadHistory();
+    let changed = false;
+
+    for (const row of rows) {
+        touchItem(hist, row.itemId, now);
+        changed = true;
+        const item = app.index.byId.get(row.itemId);
+        if (item && item.marketValue > 0) recordMarketValue(hist, row.itemId, now, item.marketValue);
+
+        const tag = ensureRowTag(row, document);
+        app.bzDiagnostics.tags += 1;
+        paintRowTag(tag, row.itemId);
+        if (!tag.dataset.bound) {
+            tag.dataset.bound = '1';
+            tag.title = 'Show averages and graph';
+            tag.addEventListener('click', (event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                // The row's item NOW: #/manage reuses row elements as you scroll.
+                app.bzSelected = tag.dataset.itemId || row.itemId;
+                if (app.panel.collapsed) app.panel.setCollapsed(false, { save: true });
+                if (app.panel.page !== 'mybazaar') app.panel.showPage('mybazaar');
+                repaintOwnBazaar();
+            });
+        }
+    }
+    if (changed) markHistoryDirty();
+
+    if (!app.bzSelected && rows.length) app.bzSelected = rows[0].itemId;
+
+    attachObserver(rows);
+    fetchOwnBazaarPrices();
 }
 
-function teState() {
-    return gmGet(STORE_TE_STATE, {}) || {};
+/** The current prices for one item, from the caches: { im, bz }. */
+function bzPriceOf(itemId) {
+    const now = Date.now();
+    const rec = app.bzPrices.get(itemId) || {};
+
+    // Bazaars: the stored TornW3B summary first (one call covers every item).
+    const summary = gmGet(STORE_W3B_SUMMARY, null);
+    let bz = rec.bz || null;
+    if (summary && summary.lowest && now - summary.fetchedAt < BZ_SUMMARY_MAX_AGE_MS) {
+        // Absent from a fresh summary = no bazaar lists it: price null, known.
+        const p = Number(summary.lowest[itemId]) || null;
+        if (!bz || summary.fetchedAt >= bz.at) bz = { price: p, at: summary.fetchedAt };
+    }
+
+    return { im: rec.im || null, bz };
 }
 
-function setTeState(patch) {
-    gmSet(STORE_TE_STATE, { ...teState(), ...patch });
-}
-
-/** Re-read the stored trader prices (another tab may have fetched them). */
-function loadTraders(now = Date.now()) {
-    const entry = gmGet(STORE_TE, null);
-    const fetchedAt = entry && entry.fetchedAt;
-    if (app.traders && app.traders.fetchedAt === fetchedAt) return;
-    app.traders = readTeCacheEntry(entry, now);
-}
-
-/** Who a deal on this item would be sold to, or null. */
-function traderFor(item) {
-    if (!item || !app.settings.sellToTrader || !app.traders) return null;
-    return pickTrader(app.traders.map.get(String(item.id)), {
-        presenceOf,
-        marketValue: Number(item.marketValue) || 0,
-    });
-}
-
-/** What the best sane trader pays for an item - for choosing what to fetch. */
-function traderPriceOf(itemId) {
-    if (!app.settings.sellToTrader || !app.traders || !app.index) return 0;
-    const item = app.index.byId.get(String(itemId));
-    return maxTraderPrice(app.traders.map.get(String(itemId)), item ? Number(item.marketValue) : 0);
-}
-
-/** For the panel: key, freshness and trouble, never the key itself. */
-function traderInfo(now = Date.now()) {
-    const st = teState();
-    return {
-        hasKey: Boolean(getTeKey()),
-        items: app.traders ? app.traders.map.size : 0,
-        fetchedAt: app.traders ? app.traders.fetchedAt : null,
-        error: st.error || null,
-        badKey: Boolean(st.badKey),
-        waitUntil: st.blockedUntil > now ? st.blockedUntil : null,
-        loading: app.teLoading,
-    };
+/** "$30" when known, "none" when the source lists nothing, "…" until asked. */
+function bzPriceWord(entry) {
+    if (!entry) return '…';
+    return entry.price > 0 ? formatMoney(entry.price) : 'none';
 }
 
 /**
- * One TornExchange call every TE_REFRESH_MS, from whichever visible tab gets
- * there first. `lastAttemptAt` is stored BEFORE the call, so two tabs cannot
- * both ask; failures wait TE_RETRY_MS, and a 429 waits what TornExchange says.
+ * Only touched when its words or its selected state change: the tags sit
+ * inside the observed rows, so every paint would otherwise be a mutation,
+ * and every mutation a rescan, and every rescan a paint.
  */
-async function refreshTraders({ force = false } = {}) {
-    if (!(app.settings.sellToTrader || app.tradersPageOpen) || !getTeKey() || app.teLoading) return;
+function paintRowTag(tag, itemId) {
+    const { im, bz } = bzPriceOf(itemId);
+    const words = 'IM ' + bzPriceWord(im) + ' · Bazaar ' + bzPriceWord(bz);
+    if (tag.dataset.words !== words) {
+        tag.dataset.words = words;
+        tag.textContent = '';
+        tag.appendChild(document.createTextNode('IM '));
+        tag.appendChild(Object.assign(document.createElement('b'), { textContent: bzPriceWord(im) }));
+        tag.appendChild(document.createTextNode(' · Bazaar '));
+        tag.appendChild(Object.assign(document.createElement('b'), { textContent: bzPriceWord(bz) }));
+    }
+    const selected = String(itemId === app.bzSelected);
+    if (tag.dataset.selected !== selected) tag.dataset.selected = selected;
+}
+
+/**
+ * Fetch the lowest Item Market ask for the items on screen, one at a time,
+ * never faster than BZ_FETCH_GAP_MS, only while this tab is visible. A
+ * bazaar price is asked of TornW3B per item only when the shared summary is
+ * missing or old. Nothing loops: an item is asked again only after its TTL.
+ */
+function fetchOwnBazaarPrices() {
+    if (!app.ownBazaar || !app.client || !hasUsableKey()) return;
     if (document.visibilityState !== 'visible') return;
 
     const now = Date.now();
-    loadTraders(now);
+    if (now - app.bzLastFetchAt < BZ_FETCH_GAP_MS) return;
 
-    const st = teState();
-    if (st.badKey) return;
-    if (st.blockedUntil && now < st.blockedUntil) return;
-    if (now - (st.lastAttemptAt || 0) < (force ? 30000 : TE_RETRY_MS)) return;
-    if (!force && app.traders && now - app.traders.fetchedAt < TE_REFRESH_MS) return;
+    const summary = gmGet(STORE_W3B_SUMMARY, null);
+    const summaryFresh = Boolean(summary && summary.lowest && now - summary.fetchedAt < BZ_SUMMARY_MAX_AGE_MS);
 
-    setTeState({ lastAttemptAt: now });
-    app.teLoading = true;
-    refreshView();
+    // A fresh feed snapshot answers without a request.
+    const feed = readFeedCacheEntry(gmGet(FEED_STORE_KEY, null), now);
 
-    try {
-        const map = await fetchTeBestListings(app.te);
-        gmSet(STORE_TE, makeTeCacheEntry(map, Date.now()));
-        setTeState({ error: null });
-        app.traders = null;
-        loadTraders();
-    } catch (error) {
-        const patch = { error: (error && error.message) || 'TornExchange failed.' };
-        if (error && error.badKey) patch.badKey = true;
-        if (error && error.http === 429) patch.blockedUntil = Date.now() + error.retryAfterMs;
-        setTeState(patch);
-    } finally {
-        app.teLoading = false;
-        if (app.index) rescan();
-        else refreshView();
+    for (const row of app.bzRows) {
+        const id = row.itemId;
+        const rec = app.bzPrices.get(id) || { im: null, bz: null, imAt: 0, bzAt: 0, pending: false };
+        app.bzPrices.set(id, rec);
+        if (rec.pending) continue;
+
+        const snap = feed.itemmarket.get(id);
+        if (snap && snap.rows.length && snap.dataAt > (rec.imAt || 0)) {
+            rec.im = { price: snap.rows[0].price, at: snap.dataAt };
+            rec.imAt = snap.fetchedAt;
+            recordSample(loadHistory(), id, snap.dataAt, { im: snap.rows[0].price });
+            markHistoryDirty();
+        }
+
+        if (now - (rec.imAt || 0) >= BZ_IM_TTL_MS) {
+            rec.pending = true;
+            app.bzLastFetchAt = now;
+            fetchItemMarket(app.client, id, { now })
+                .then((market) => {
+                    const at = Date.now();
+                    rec.imAt = at;
+                    if (market.listings.length) {
+                        const lowest = Math.min(...market.listings.map((l) => l.price));
+                        rec.im = { price: lowest, at: market.cacheTimestamp || at };
+                        recordSample(loadHistory(), id, at, { im: lowest });
+                        markHistoryDirty();
+                    } else {
+                        rec.im = { price: null, at };
+                    }
+                })
+                .catch((error) => {
+                    if (isKeyDeadError(error)) markKeyDead(error);
+                    rec.imAt = Date.now();
+                })
+                .finally(() => {
+                    rec.pending = false;
+                    repaintOwnBazaar();
+                });
+            return;
+        }
+
+        if (!summaryFresh && app.w3b && app.settings.useW3b && now - (rec.bzAt || 0) >= BZ_W3B_TTL_MS) {
+            rec.pending = true;
+            app.bzLastFetchAt = now;
+            fetchW3bListings(app.w3b, id)
+                .then(({ listings }) => {
+                    const at = Date.now();
+                    rec.bzAt = at;
+                    const prices = listings.map((l) => Number(l && l.price)).filter((p) => p > 1);
+                    if (prices.length) {
+                        const lowest = Math.min(...prices);
+                        rec.bz = { price: lowest, at };
+                        recordSample(loadHistory(), id, at, { bz: lowest });
+                        markHistoryDirty();
+                    } else {
+                        rec.bz = { price: null, at };
+                    }
+                })
+                .catch(() => {
+                    rec.bzAt = Date.now();
+                })
+                .finally(() => {
+                    rec.pending = false;
+                    repaintOwnBazaar();
+                });
+            return;
+        }
     }
 }
 
-/** The Traders page's traders, most profitable deals first. */
-function boardTraders(board) {
-    const ids = [];
-    const sorted = board
-        .slice()
-        .sort((a, b) => (b.bestTrader ? b.bestTrader.profit : 0) - (a.bestTrader ? a.bestTrader.profit : 0));
-    for (const entry of sorted) {
-        for (const t of entry.traders) {
-            if (!ids.includes(t.trader.id)) ids.push(t.trader.id);
-            if (ids.length >= PAGE_TRADER_STATUS_MAX) return ids;
-        }
+function repaintOwnBazaar() {
+    if (!app.ownBazaar) return;
+    for (const row of app.bzRows) {
+        if (!document.contains(row.el)) continue;
+        paintRowTag(ensureRowTag(row, document), row.itemId);
     }
-    return ids;
+    renderMyBazaar();
+}
+
+function renderMyBazaar() {
+    if (!app.ownBazaar) return;
+    const now = Date.now();
+    const hist = loadHistory();
+    const items = app.bzRows.map((r) => ({ itemId: r.itemId, name: r.name, ...bzPriceOf(r.itemId) }));
+    const selected = items.some((i) => i.itemId === app.bzSelected) ? app.bzSelected : items.length ? items[0].itemId : null;
+    app.bzSelected = selected;
+    const item = selected ? app.index.byId.get(selected) : null;
+
+    app.panel.renderMyBazaar({
+        items,
+        selected,
+        marketValue: item ? Number(item.marketValue) || null : null,
+        averages: selected ? averages(hist, selected, now) : null,
+        series: selected ? series(hist, selected, now, app.bzWindow) : null,
+        windowKey: app.bzWindow,
+        diagnostics: app.bzDiagnostics,
+    });
 }
 
 /* ------------------------------------------------------------------ *
- * The Traders page
+ * Price history: recorded by this script, from now on
  * ------------------------------------------------------------------ */
 
-function tradersPagePrefs() {
-    const stored = gmGet(STORE_TRADERS_PAGE, {}) || {};
-    const out = { ...TRADERS_PAGE_DEFAULTS };
-    for (const key of Object.keys(TRADERS_PAGE_DEFAULTS)) {
-        if (Object.prototype.hasOwnProperty.call(stored, key)) out[key] = stored[key];
-    }
-    return out;
+function loadHistory() {
+    if (!app.history) app.history = readHistory(gmGet(STORE_HISTORY, null));
+    return app.history;
 }
 
-function setTradersPagePrefs(partial) {
-    gmSet(STORE_TRADERS_PAGE, { ...tradersPagePrefs(), ...partial });
-    refreshView();
-}
-
-/** The overlay's Traders button: open as remembered, or ask. */
-function onOpenTraders() {
-    const mode = tradersPagePrefs().openMode;
-    if (mode === 'tab') return openTradersInTab();
-    if (mode === 'overlay') return showTradersPage('overlay');
-
-    app.panel.showTradersPrompt((newTab, remember) => {
-        if (remember) setTradersPagePrefs({ openMode: newTab ? 'tab' : 'overlay' });
-        if (newTab) openTradersInTab();
-        else showTradersPage('overlay');
-    });
-    return undefined;
-}
-
-function openTradersInTab() {
-    gmOpenTab(tradersPageUrl());
-}
-
-/** Draw the page here: over this Torn page, or as this tab's whole page. */
-function showTradersPage(mode) {
-    if (!app.tradersPage) {
-        const page = new TradersPage({
-            onClose: closeTradersPage,
-            onNavigate: (row) => {
-                // A listing on the Torn page underneath: close, then point at it.
-                if (row.el && document.contains(row.el)) {
-                    closeTradersPage();
-                    revealRow(row.el);
-                    return;
-                }
-                onNavigate(row, { newTab: tradersPagePrefs().linksNewTab !== false });
-            },
-            onOpenProfile: (id) =>
-                openDeal(
-                    'https://www.torn.com/profiles.php?XID=' + encodeURIComponent(String(id)),
-                    tradersPagePrefs().linksNewTab !== false,
-                ),
-            onOpenPriceList,
-            onRefresh: () => {
-                // Statuses are due again now; trader prices only if their gap allows.
-                for (const s of app.presence.values()) s.fetchedAt = 0;
-                refreshTraders({ force: true });
-                refreshView();
-            },
-            onPrefsChange: setTradersPagePrefs,
-            onAddKey: () => app.panel.openSettings(),
-            onEnableTraders: () => {
-                onSettingsChange({ sellToTrader: true });
-                // Re-pick what the feed fetches now, not at its next summary.
-                if (app.feed) {
-                    app.feed.requestRefresh();
-                    app.feed.tick().catch(() => {});
-                }
-            },
-        });
-        app.tradersPage = { page, mode };
-    }
-
-    app.tradersPage.mode = mode;
-    app.tradersPage.page.mount(mode);
-    app.tradersPageOpen = true;
-
-    // Fold the overlay to its bar so it does not sit on the page (not saved;
-    // ` still toggles it). Unfolded again when the page closes.
-    if (!app.panel.collapsed && !app.tradersPage.foldedPanel) {
-        app.tradersPage.foldedPanel = true;
-        app.panel.setCollapsed(true);
-    }
-
-    refreshTraders();
-    refreshView();
-}
-
-function closeTradersPage() {
-    if (!app.tradersPage) return;
-    if (app.tradersPage.foldedPanel && app.panel.collapsed) app.panel.setCollapsed(false);
-    app.tradersPage.page.destroy();
-    app.tradersPage = null;
-    app.tradersPageOpen = false;
-    refreshView();
-}
-
-function onSaveTeKey(key) {
-    key = String(key || '').trim();
-    if (!key) {
-        app.panel.setStatus('Paste your TornExchange key first.', 'error');
-        return;
-    }
-    // The main key is never sent to a third party - not even this one.
-    if (key === getStoredKey()) {
-        app.panel.setStatus(
-            'Use a different Public key for TornExchange than your main key - ' +
-                'the main key never leaves api.torn.com.',
-            'error',
-        );
-        return;
-    }
-
-    gmSet(STORE_TE_KEY, key);
-    gmDel(STORE_TE_STATE);
-    app.panel.setStatus('TornExchange key saved. Loading trader prices...');
-    refreshTraders({ force: true });
-    refreshView();
-}
-
-function onForgetTeKey() {
-    gmDel(STORE_TE_KEY);
-    gmDel(STORE_TE_STATE);
-    gmDel(STORE_TE);
-    app.traders = null;
-    if (app.panel.teKeyInput) app.panel.teKeyInput.value = '';
-    app.panel.setStatus('TornExchange key and trader prices removed.');
-    if (app.index) rescan();
-    else refreshView();
-}
-
-function onOpenProfile(playerId) {
-    openDeal('https://www.torn.com/profiles.php?XID=' + encodeURIComponent(String(playerId)));
-}
-
-/** Their TornExchange list - another site, so always a new tab. */
-function onOpenPriceList(traderId) {
-    gmOpenTab(tePriceListUrl(traderId));
+function markHistoryDirty() {
+    app.historyDirty = true;
+    saveHistoryIfDue();
 }
 
 /**
- * The small Scan button: re-read this page now. No requests - just the DOM
+ * Every tab holds its own copy, so storage is re-read and merged before a
+ * save: the selling tab's inventory items and a bazaar tab's samples both
+ * survive whichever saves last.
+ */
+function saveHistoryIfDue(force = false) {
+    if (!app.history || !app.historyDirty) return;
+    const now = Date.now();
+    if (!force && now - app.historySavedAt < HISTORY_SAVE_MS) return;
+    app.history = mergeHistory(gmGet(STORE_HISTORY, null), app.history);
+    pruneHistory(app.history, now);
+    gmSet(STORE_HISTORY, app.history);
+    app.historySavedAt = now;
+    app.historyDirty = false;
+}
+
+/**
+ * Every TornW3B summary (the feed fetches one every 30s in the leading tab):
+ * keep the lowest bazaar price of every item for the helper, and every 5
+ * minutes record a sample for each tracked item - its bazaar ask from the
+ * summary, its Item Market ask from the feed's snapshot when that is recent.
+ */
+function onW3bSummary(summary, at) {
+    const lowest = {};
+    for (const s of summary || []) if (s.lowestPrice > 0) lowest[s.itemId] = s.lowestPrice;
+    gmSet(STORE_W3B_SUMMARY, { fetchedAt: at, lowest });
+
+    if (at - app.historySampledAt < HISTORY_SAMPLE_MS) return;
+    app.historySampledAt = at;
+
+    const hist = loadHistory();
+    const ids = Object.keys(hist.items);
+    if (!ids.length) return;
+
+    const feed = readFeedCacheEntry(gmGet(FEED_STORE_KEY, null), at);
+    for (const id of ids) {
+        const sample = {};
+        if (lowest[id] > 0) sample.bz = lowest[id];
+        const snap = feed.itemmarket.get(id);
+        if (snap && snap.rows.length && at - snap.dataAt < HISTORY_SAMPLE_MS) sample.im = snap.rows[0].price;
+        if (sample.bz || sample.im) recordSample(hist, id, at, sample);
+        const item = app.index && app.index.byId.get(id);
+        if (item && item.marketValue > 0) recordMarketValue(hist, id, at, item.marketValue);
+    }
+    app.historyDirty = true;
+    saveHistoryIfDue();
+}
+
+/* ------------------------------------------------------------------ *
+ * Navigation
+ * ------------------------------------------------------------------ */
+
+/**
+ * The Scan button: re-read this page now. No requests - just the DOM
  * already on screen - so it can be pressed freely. Always animates, so a
  * press visibly did something even when the list does not change.
  */
@@ -1424,17 +1406,21 @@ function onScanPage() {
 }
 
 function scanSummary() {
+    if (app.ownBazaar) {
+        const d = app.bzDiagnostics || { rows: 0, identified: 0 };
+        return 'Your bazaar: ' + d.identified + ' of ' + d.rows + ' rows priced.';
+    }
     if (app.pageType === PAGE_NONE) {
-        return 'Nothing to scan here - not a Bazaar or Item Market page.';
+        return 'Not a Bazaar or Item Market page.';
     }
 
     const found = (app.pageDiagnostics && app.pageDiagnostics.listings) || 0;
     const lockedOnly = (app.pageDiagnostics && app.pageDiagnostics.locked) || 0;
     if (!found && lockedOnly) {
-        return 'Scanned: ' + lockedOnly + ' locked ($1) listing' + (lockedOnly === 1 ? '' : 's') + ' - none buyable by you.';
+        return 'Scanned: ' + lockedOnly + ' locked $1 listing' + (lockedOnly === 1 ? '' : 's') + ', none for you.';
     }
     if (!found) {
-        return 'Scanned: no listings found on this page yet.';
+        return 'Scanned: no listings on this page yet.';
     }
 
     const deals = (app.pageRows || []).length;
@@ -1446,8 +1432,7 @@ function scanSummary() {
         ' · ' +
         deals +
         (deals === 1 ? ' deal' : ' deals') +
-        (locked ? ' · ' + locked + ' locked (skipped)' : '') +
-        ' on this page.'
+        (locked ? ' · ' + locked + ' locked' : '')
     );
 }
 
@@ -1530,10 +1515,7 @@ function onNavigate(row, { newTab } = {}) {
     openDeal(itemMarketUrl(row.itemId, row.name), newTab);
 }
 
-/**
- * A new tab, or this one. The overlay follows Settings -> "Open deals in a
- * new tab"; the Traders page passes its own preference.
- */
+/** A new tab, or this one, per Settings -> "Open deals in a new tab". */
 function openDeal(url, newTab = app.settings.openInNewTab !== false) {
     if (newTab) {
         gmOpenTab(url);
@@ -1552,8 +1534,6 @@ function onSettingsChange(partial) {
 
     // Position and collapse are chrome: nothing to re-price.
     if (Object.keys(partial).every((k) => k === 'panelPos' || k === 'collapsed')) return;
-
-    if (partial.sellToTrader) refreshTraders();
 
     if (app.index) rescan();
     else refreshView();
@@ -1586,10 +1566,23 @@ function onMutations(mutations) {
     const panelRoot = app.panel && app.panel.root;
 
     const fromPage = mutations.some(
-        (m) => !panelRoot || !panelRoot.contains(m.target),
+        (m) => (!panelRoot || !panelRoot.contains(m.target)) && !isOwnTagMutation(m),
     );
 
     if (fromPage) debouncedRescan();
+}
+
+/** A change to, or inside, one of the helper's own price tags is not the page changing. */
+function isOwnTagMutation(m) {
+    const isTag = (n) =>
+        n && n.nodeType === 1 && n.classList && n.classList.contains(OWN_BAZAAR_TAG_CLASS);
+    const inTag = (n) => {
+        const el = n && n.nodeType === 1 ? n : n && n.parentElement;
+        return Boolean(el && el.closest && el.closest('.' + OWN_BAZAAR_TAG_CLASS));
+    };
+    if (inTag(m.target)) return true;
+    const nodes = [...(m.addedNodes || []), ...(m.removedNodes || [])];
+    return nodes.length > 0 && nodes.every((n) => isTag(n) || inTag(n));
 }
 
 /**
@@ -1655,13 +1648,6 @@ function handleRouteChange() {
 
 function startLiveFeed() {
     app.w3b = new W3bClient();
-    app.te = new TeClient({ getKey: getTeKey });
-    loadTraders();
-    // Another tab fetched trader prices: use them here too.
-    gmOnChange(STORE_TE, () => {
-        loadTraders();
-        if (app.index) rescan();
-    });
 
     app.feed = new LiveFeed({
         tabId: app.tabId,
@@ -1676,9 +1662,7 @@ function startLiveFeed() {
         onChange: () => refreshView(),
         isKeyDead: isKeyDeadError,
         onKeyDead: markKeyDead,
-        traderPriceOf,
-        traderVersion: () =>
-            app.settings.sellToTrader && app.traders ? app.traders.fetchedAt : 0,
+        onSummary: onW3bSummary,
     });
 
     // Follower tabs re-render the moment the leader stores something new.
@@ -1704,6 +1688,7 @@ function startLiveFeed() {
         if (document.visibilityState !== 'visible') {
             // Step down at once rather than waiting for the next tick.
             tick();
+            saveHistoryIfDue(true);
             return;
         }
 
@@ -1731,12 +1716,12 @@ function registerMenu() {
     gmMenu('Key safety / rotate key', () => {
         alert(
             'Key safety\n\n' +
-                '1. This script needs PUBLIC access only.\n' +
-                '2. If you ever pasted a Limited or Full key into a script,\n' +
-                '   revoke it and create a new Public one.\n' +
-                '3. Your key stays in this browser. It is sent only to\n' +
-                '   api.torn.com over HTTPS, is never written to the console,\n' +
-                '   and never reaches any third-party server.\n\n' +
+                '1. The panel needs PUBLIC access only.\n' +
+                '2. The selling page keeps a separate LIMITED key, used only\n' +
+                '   there to read your inventory.\n' +
+                '3. Both keys stay in this browser. They are sent only to\n' +
+                '   api.torn.com over HTTPS, never written to the console,\n' +
+                '   and never reach any third-party server.\n\n' +
                 'Opening your API key settings.',
         );
         gmOpenTab(TORN_API_KEY_URL);
@@ -1770,6 +1755,543 @@ function registerMenu() {
                 : 'Open a Bazaar or the Item Market first.',
         );
     });
+
+    gmMenu('Show my bazaar diagnostics', () => {
+        const d = app.bzDiagnostics;
+        const own = ownBazaarPage(location.href);
+        alert(
+            'Your own bazaar\n\n' +
+                [
+                    'page detected: ' + (own || 'none (needs bazaar.php with #/add or #/manage, no userId)'),
+                    'rows found: ' + (d ? d.rows : 0),
+                    'rows with an item image: ' + (d ? d.withImage : 0),
+                    'items identified: ' + (d ? d.identified : 0),
+                    'rows skipped - item unknown: ' + (d ? d.noItem : 0),
+                    'price tags placed: ' + (d ? d.tags : 0),
+                    'items with a price history: ' + Object.keys(loadHistory().items).length,
+                ].join('\n'),
+        );
+    });
+}
+
+/* ------------------------------------------------------------------ *
+ * The selling page (its own tab)
+ * ------------------------------------------------------------------ */
+
+const sell = {
+    client: null,
+    te: null,
+    page: null,
+    index: null,
+    inventory: null,
+    inventoryAt: null,
+    traders: null,
+    idsByName: new Map(),
+    lists: new Map(),
+    listState: new Map(),
+    /* The paced TornExchange queue: one call per slot, shared pace with every tab. */
+    queue: null,
+    expanded: new Set(),
+    presence: new Map(),
+    keyDead: false,
+    keyError: null,
+    error: null,
+    loading: false,
+    /* After a failed inventory read, the timer does not ask again before this. */
+    inventoryRetryAt: 0,
+};
+
+/* The selling page asks for traders' statuses this often, visible tab only. */
+const SELL_PRESENCE_REFRESH_MS = 60000;
+const SELL_PRESENCE_MAX_PENDING = 3;
+/* A failed TornExchange call is not retried sooner than this. */
+const TE_RETRY_MS = 5 * 60 * 1000;
+/* Inventory is asked again after this, or on Refresh. */
+const INVENTORY_REFRESH_MS = 15 * 60 * 1000;
+
+function getSellKey() {
+    return gmGet(STORE_SELL_KEY, '') || '';
+}
+
+function getTeKey() {
+    return gmGet(STORE_TE_KEY, '') || '';
+}
+
+function sellPrefs() {
+    const stored = gmGet(STORE_SELL_PREFS, {}) || {};
+    const out = { ...SELLING_PAGE_DEFAULTS };
+    for (const key of Object.keys(SELLING_PAGE_DEFAULTS)) {
+        if (Object.prototype.hasOwnProperty.call(stored, key)) out[key] = stored[key];
+    }
+    return out;
+}
+
+function teState() {
+    return gmGet(STORE_TE_STATE, {}) || {};
+}
+
+function setTeState(patch) {
+    gmSet(STORE_TE_STATE, { ...teState(), ...patch });
+}
+
+function sellPresenceOf(id) {
+    const entry = sell.presence.get(String(id));
+    return (entry && entry.presence) || null;
+}
+
+function sellStatusMap(now) {
+    const out = new Map();
+    for (const [id, s] of sell.presence) {
+        if (s.presence) out.set(id, { name: s.presence.name, ...presenceWord(s.presence, now) });
+    }
+    return out;
+}
+
+/** Everything the page shows, from what is loaded now. */
+function renderSelling() {
+    if (!sell.page) return;
+    const now = Date.now();
+    const prefs = sellPrefs();
+    const st = teState();
+    const access = gmGet(STORE_SELL_KEY_ACCESS, null);
+
+    const tradersFor = (itemId) => {
+        const best = sell.traders ? sell.traders.map.get(String(itemId)) || [] : [];
+        const full = sell.lists.get(String(itemId));
+        return mergeTraders(best, full ? full.traders : null, sell.idsByName);
+    };
+    const sortBy = prefs.sortBy === SORT_BUNDLE ? SORT_BUNDLE : SORT_ITEM;
+    const build = (onlineOnly) =>
+        sell.inventory && sell.index
+            ? buildSellingRows(sell.inventory, sell.index, { tradersFor, presenceOf: sellPresenceOf, onlineOnly, sortBy })
+            : [];
+
+    /*
+     * Statuses are asked for from the rows with EVERY trader on them. With
+     * Online only, rows drop the traders whose status is not known yet -
+     * which, built from those, would be everyone, and nobody would ever be
+     * asked about.
+     */
+    const allRows = build(false);
+    const rows = prefs.onlineOnly ? build(true).filter((r) => r.best) : allRows;
+    const watch = tradersToWatch(allRows, { expanded: sell.expanded });
+    updateSellPresence(watch, now);
+
+    // Online only, nobody shown yet, and statuses still on their way.
+    const checkingOnline =
+        Boolean(prefs.onlineOnly) &&
+        watch.some((id) => {
+            const s = sell.presence.get(String(id));
+            return !s || (!s.presence && (s.pending || !s.fetchedAt) && now >= s.retryAt);
+        });
+
+    const itemLists = new Map();
+    for (const [id, s] of sell.listState) itemLists.set(id, s);
+
+    sell.page.render({
+        rows,
+        statuses: sellStatusMap(now),
+        prefs: { ...prefs, sortBy },
+        expanded: sell.expanded,
+        info: {
+            hasKey: Boolean(getSellKey()),
+            keyAccess: access && access.name,
+            keyError: sell.keyError,
+            hasTeKey: Boolean(getTeKey()),
+            teError: st.error || null,
+            teBadKey: Boolean(st.badKey),
+            teWaitUntil: st.blockedUntil > now ? st.blockedUntil : null,
+            teAt: sell.traders ? sell.traders.fetchedAt : null,
+            inventoryAt: sell.inventoryAt,
+            loading: sell.loading,
+            checkingOnline,
+            error: sell.error,
+            itemLists,
+        },
+    });
+}
+
+/** The item database, shared with the overlay's cache; fetched with this page's key if stale. */
+async function loadSellIndex() {
+    const cached = gmGet(STORE_ITEMS, null);
+    if (isItemsCacheFresh(cached)) {
+        sell.index = buildItemIndex(cached.items);
+        return;
+    }
+    const raw = await fetchItems(sell.client);
+    gmSet(STORE_ITEMS, makeItemsCacheEntry(raw));
+    sell.index = buildItemIndex(raw);
+}
+
+function sellKeyErrorText(error) {
+    if (error && Number(error.code) === TORN_ERROR_ACCESS_LEVEL) {
+        return 'This key cannot read your inventory. It needs Limited access.';
+    }
+    if (isKeyDeadError(error)) return 'Torn rejected this key. Paste a new Limited key.';
+    return redactKey((error && error.message) || String(error), getSellKey());
+}
+
+async function loadSellInventory({ force = false } = {}) {
+    if (!getSellKey() || sell.keyDead) return;
+
+    const cached = readInventoryCacheEntry(gmGet(STORE_INVENTORY, null), Date.now(), INVENTORY_REFRESH_MS);
+    if (cached && !force) {
+        sell.inventory = cached.items;
+        sell.inventoryAt = cached.fetchedAt;
+        return;
+    }
+
+    sell.loading = true;
+    renderSelling();
+    try {
+        if (!sell.index) await loadSellIndex();
+        const raw = await fetchInventory(sell.client);
+        const merged = mergeInventory(raw);
+        gmSet(STORE_INVENTORY, makeInventoryCacheEntry(merged));
+        sell.inventory = merged;
+        sell.inventoryAt = Date.now();
+        sell.keyError = null;
+
+        const access = await fetchKeyAccess(sell.client);
+        if (access && access.level !== null) gmSet(STORE_SELL_KEY_ACCESS, access);
+
+        const hist = loadHistory();
+        for (const it of merged) touchItem(hist, it.id, Date.now());
+        markHistoryDirty();
+        saveHistoryIfDue(true);
+    } catch (error) {
+        sell.keyError = sellKeyErrorText(error);
+        // Not again for a while; a rejected key, not until a new one is saved.
+        sell.inventoryRetryAt = Date.now() + INVENTORY_RETRY_MS;
+        if (isKeyDeadError(error)) {
+            sell.keyDead = true;
+            gmSet(STORE_SELL_KEY_DEAD, true);
+        }
+    } finally {
+        sell.loading = false;
+        renderSelling();
+    }
+}
+
+/** Re-read the stored trader prices (another tab may have fetched them). */
+function loadSellTraders(now = Date.now()) {
+    const entry = gmGet(STORE_TE, null);
+    const fetchedAt = entry && entry.fetchedAt;
+    if (sell.traders && sell.traders.fetchedAt === fetchedAt) return;
+    sell.traders = readTeCacheEntry(entry, now);
+
+    const ids = gmGet(STORE_TE_IDS, null);
+    if (ids && ids.map && now - ids.fetchedAt < TE_REFRESH_MS) {
+        sell.idsByName = new Map(Object.entries(ids.map));
+    }
+    sell.lists = readTeItemLists(gmGet(STORE_TE_LISTS, null), now);
+}
+
+/**
+ * One TornExchange call for the top buyers every TE_REFRESH_MS, from
+ * whichever visible tab gets there first, plus one for the trader id list.
+ * `lastAttemptAt` is stored BEFORE the call, so two tabs cannot both ask;
+ * failures wait TE_RETRY_MS, and a 429 waits what TornExchange says. Both
+ * calls go through the paced queue like every other.
+ */
+async function refreshSellTraders({ force = false } = {}) {
+    if (!getTeKey() || sell.teLoading) return;
+    if (document.visibilityState !== 'visible') return;
+
+    const now = Date.now();
+    loadSellTraders(now);
+
+    const st = teState();
+    if (st.badKey) return;
+    if (st.blockedUntil && now < st.blockedUntil) return;
+    if (now - (st.lastAttemptAt || 0) < (force ? 30000 : TE_RETRY_MS)) return;
+    if (!force && sell.traders && now - sell.traders.fetchedAt < TE_REFRESH_MS) return;
+
+    setTeState({ lastAttemptAt: now });
+    sell.teLoading = true;
+    renderSelling();
+
+    try {
+        const map = await sell.queue.enqueue(() => fetchTeBestListings(sell.te));
+        gmSet(STORE_TE, makeTeCacheEntry(map, Date.now()));
+        setTeState({ error: null });
+        sell.traders = null;
+        loadSellTraders();
+    } catch {
+        // Recorded by the queue's onSettled.
+    } finally {
+        sell.teLoading = false;
+        renderSelling();
+    }
+
+    // Trader ids by name, for buyers the top-three list does not carry.
+    const ids = gmGet(STORE_TE_IDS, null);
+    if (!teState().badKey && (!ids || Date.now() - ids.fetchedAt >= TE_REFRESH_MS)) {
+        sell.queue
+            .enqueue(() => fetchTeActiveTraders(sell.te))
+            .then((map) => {
+                gmSet(STORE_TE_IDS, { fetchedAt: Date.now(), map: Object.fromEntries(map) });
+                sell.idsByName = map;
+                renderSelling();
+            })
+            .catch(() => {});
+    }
+}
+
+/** A TornExchange call failed: a 429 wait or a bad key is kept for every tab. */
+function onTeSettled(error) {
+    if (error && error.http === 429) {
+        setTeState({ blockedUntil: Date.now() + error.retryAfterMs, error: error.message });
+    } else if (error && error.badKey) {
+        setTeState({ badKey: true, error: error.message });
+    }
+    renderSelling();
+}
+
+/**
+ * The full buyer list for one item, when its row is opened: every page its
+ * own slot in the queue. Not asked during a TornExchange wait, and a failed
+ * list is not asked again before its retry time.
+ */
+function loadTeItemList(itemId) {
+    const id = String(itemId);
+    if (sell.lists.has(id)) return;
+    const now = Date.now();
+    const st = sell.listState.get(id);
+    if (st && (st.loading || now < (st.retryAt || 0))) return;
+    if (!getTeKey() || teState().badKey) return;
+
+    const blockedUntil = Number(teState().blockedUntil) || 0;
+    if (now < blockedUntil) {
+        sell.listState.set(id, { loading: false, error: 'TornExchange asked us to wait.', at: now, retryAt: blockedUntil });
+        return;
+    }
+
+    sell.listState.set(id, { loading: true, error: null, at: now, retryAt: 0 });
+    fetchTeListings(sell.te, id, { schedule: (fn) => sell.queue.enqueue(fn) })
+        .then(({ traders }) => {
+            gmSet(STORE_TE_LISTS, writeTeItemList(gmGet(STORE_TE_LISTS, null), id, traders));
+            sell.lists.set(id, { at: Date.now(), traders });
+            sell.listState.set(id, { loading: false, error: null, at: Date.now(), retryAt: 0 });
+        })
+        .catch((error) => {
+            const at = Date.now();
+            const retryAt = error && error.http === 429 ? at + (error.retryAfterMs || TE_RETRY_MS) : at + TE_RETRY_MS;
+            sell.listState.set(id, { loading: false, error: (error && error.message) || 'TornExchange failed.', at, retryAt });
+        })
+        .finally(() => renderSelling());
+}
+
+/** Traders' public statuses, when due: visible tab only, inside the shared budget. */
+function updateSellPresence(ids, now) {
+    for (const id of ids) {
+        if (!sell.presence.has(id)) {
+            sell.presence.set(id, { presence: null, fetchedAt: 0, pending: false, retryAt: 0 });
+        }
+    }
+    if (!getSellKey() || sell.keyDead || document.visibilityState !== 'visible') return;
+
+    let pending = 0;
+    for (const s of sell.presence.values()) if (s.pending) pending++;
+
+    for (const id of ids) {
+        if (pending >= SELL_PRESENCE_MAX_PENDING) break;
+        const s = sell.presence.get(id);
+        if (s.pending || now < s.retryAt || now - s.fetchedAt < SELL_PRESENCE_REFRESH_MS) continue;
+
+        pending++;
+        s.pending = true;
+        fetchUserPresence(sell.client, id)
+            .then((presence) => {
+                s.fetchedAt = Date.now();
+                if (presence) s.presence = presence;
+                else s.retryAt = Date.now() + PRESENCE_RETRY_MS;
+            })
+            .catch((error) => {
+                if (isKeyDeadError(error)) {
+                    sell.keyDead = true;
+                    sell.keyError = sellKeyErrorText(error);
+                    gmSet(STORE_SELL_KEY_DEAD, true);
+                }
+                s.retryAt = Date.now() + PRESENCE_RETRY_MS;
+            })
+            .finally(() => {
+                s.pending = false;
+                renderSelling();
+            });
+    }
+}
+
+function onSellSaveKey(key) {
+    key = String(key || '').trim();
+    if (!key) {
+        sell.keyError = 'Paste a key first.';
+        renderSelling();
+        return;
+    }
+    if (key === getTeKey()) {
+        sell.keyError = 'That is the TornExchange key. Paste your Torn key here.';
+        renderSelling();
+        return;
+    }
+    gmSet(STORE_SELL_KEY, key);
+    gmDel(STORE_SELL_KEY_DEAD);
+    gmDel(STORE_SELL_KEY_ACCESS);
+    gmDel(STORE_INVENTORY);
+    sell.keyDead = false;
+    sell.keyError = null;
+    sell.inventory = null;
+    sell.inventoryAt = null;
+    sell.inventoryRetryAt = 0;
+    sell.page.showView('list');
+    loadSellInventory({ force: true }).then(() => refreshSellTraders());
+}
+
+function onSellForgetKey() {
+    gmDel(STORE_SELL_KEY);
+    gmDel(STORE_SELL_KEY_DEAD);
+    gmDel(STORE_SELL_KEY_ACCESS);
+    gmDel(STORE_INVENTORY);
+    sell.keyDead = false;
+    sell.keyError = null;
+    sell.inventory = null;
+    sell.inventoryAt = null;
+    renderSelling();
+}
+
+function onSellSaveTeKey(key) {
+    key = String(key || '').trim();
+    if (!key) {
+        setTeState({ error: 'Paste a key first.' });
+        renderSelling();
+        return;
+    }
+    // The Torn key is never sent to a third party - not even this one.
+    if (key === getSellKey() || key === getStoredKey()) {
+        setTeState({ error: 'That is a Torn key. Paste the key from tornexchange.com.' });
+        renderSelling();
+        return;
+    }
+    gmSet(STORE_TE_KEY, key);
+    gmDel(STORE_TE_STATE);
+    sell.page.showView('list');
+    refreshSellTraders({ force: true });
+    renderSelling();
+}
+
+function onSellForgetTeKey() {
+    gmDel(STORE_TE_KEY);
+    gmDel(STORE_TE_STATE);
+    gmDel(STORE_TE);
+    gmDel(STORE_TE_LISTS);
+    gmDel(STORE_TE_IDS);
+    sell.traders = null;
+    sell.lists = new Map();
+    sell.idsByName = new Map();
+    renderSelling();
+}
+
+function onSellRefresh() {
+    for (const s of sell.presence.values()) s.fetchedAt = 0;
+    loadSellInventory({ force: true }).then(() => refreshSellTraders({ force: true }));
+}
+
+function onSellExpand(itemId) {
+    const id = String(itemId);
+    if (sell.expanded.has(id)) sell.expanded.delete(id);
+    else {
+        sell.expanded.add(id);
+        loadTeItemList(id);
+    }
+    renderSelling();
+}
+
+function openSellLink(url) {
+    if (sellPrefs().linksNewTab !== false) gmOpenTab(url);
+    else location.assign(url);
+}
+
+function bootSellingPage() {
+    sell.client = new TornApiClient({
+        getKey: getSellKey,
+        loadWindow: () => gmGet(STORE_API_WINDOW, []),
+        saveWindow: (recent) => gmSet(STORE_API_WINDOW, recent),
+    });
+    /*
+     * The pace and any penalty wait live in storage, shared by every tab:
+     * a reload or a second selling tab carries on from the same clock.
+     */
+    sell.te = new TeClient({
+        getKey: getTeKey,
+        loadState: () => teState(),
+        saveState: (state) => setTeState(state),
+    });
+    sell.queue = new TeQueue({
+        client: sell.te,
+        isVisible: () => document.visibilityState === 'visible',
+        onSettled: onTeSettled,
+    });
+    sell.keyDead = Boolean(gmGet(STORE_SELL_KEY_DEAD, false));
+    if (sell.keyDead) sell.keyError = 'Torn rejected this key. Paste a new Limited key.';
+
+    sell.page = new SellingPage({
+        onSaveKey: onSellSaveKey,
+        onForgetKey: onSellForgetKey,
+        onRevealKey: () => getSellKey(),
+        onSaveTeKey: onSellSaveTeKey,
+        onForgetTeKey: onSellForgetTeKey,
+        onRevealTeKey: () => getTeKey(),
+        onRefresh: onSellRefresh,
+        onPrefsChange: (partial) => {
+            gmSet(STORE_SELL_PREFS, { ...sellPrefs(), ...partial });
+            renderSelling();
+        },
+        onExpand: onSellExpand,
+        onOpenProfile: (id) => openSellLink('https://www.torn.com/profiles.php?XID=' + encodeURIComponent(String(id))),
+        onOpenList: (idOrName) => openSellLink(tePriceListUrl(idOrName)),
+    });
+    sell.page.mount();
+
+    loadSellTraders();
+    gmOnChange(STORE_TE, () => {
+        loadSellTraders();
+        renderSelling();
+    });
+
+    renderSelling();
+    if (!getSellKey() || !getTeKey()) sell.page.openSettings();
+
+    (async () => {
+        try {
+            if (getSellKey() && !sell.keyDead) await loadSellIndex();
+        } catch (error) {
+            sell.keyError = sellKeyErrorText(error);
+            if (isKeyDeadError(error)) {
+                sell.keyDead = true;
+                gmSet(STORE_SELL_KEY_DEAD, true);
+            }
+        }
+        await loadSellInventory();
+        await refreshSellTraders();
+        renderSelling();
+    })();
+
+    setInterval(() => {
+        if (document.visibilityState !== 'visible') return;
+        refreshSellTraders();
+        const due = inventoryRefreshDue({
+            inventoryAt: sell.inventoryAt,
+            retryAt: sell.inventoryRetryAt,
+            keyDead: sell.keyDead,
+            refreshMs: INVENTORY_REFRESH_MS,
+        });
+        if (due && !sell.loading && getSellKey()) loadSellInventory({ force: true });
+        renderSelling();
+    }, 15000);
+
+    document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') renderSelling();
+    });
 }
 
 /* ------------------------------------------------------------------ *
@@ -1777,6 +2299,12 @@ function registerMenu() {
  * ------------------------------------------------------------------ */
 
 export function boot() {
+    // A tab opened for the selling page: this whole tab is the page.
+    if (isTradersPageUrl(location.href)) {
+        bootSellingPage();
+        return;
+    }
+
     injectStyles();
 
     app.settings = loadSettings();
@@ -1808,14 +2336,15 @@ export function boot() {
          * script on the page, including other userscripts.
          */
         onRevealKey: () => getStoredKey(),
-        onSaveTeKey,
-        onForgetTeKey,
-        onRevealTeKey: () => getTeKey(),
-        onRefreshTraders: () => refreshTraders({ force: true }),
-        onOpenProfile,
-        onOpenPriceList,
-        onOpenTraders,
-        onTradersOpenMode: (mode) => setTradersPagePrefs({ openMode: mode }),
+        onOpenSelling: () => gmOpenTab(tradersPageUrl()),
+        onSelectBazaarItem: (itemId) => {
+            app.bzSelected = String(itemId);
+            repaintOwnBazaar();
+        },
+        onBazaarWindow: (key) => {
+            app.bzWindow = key;
+            renderMyBazaar();
+        },
     });
 
     app.panel.mount();
@@ -1827,20 +2356,11 @@ export function boot() {
 
     applyPageType(detectPage(location.href), { initial: true });
 
-    // A tab opened for the Traders page: this whole tab is the page.
-    if (isTradersPageUrl(location.href)) showTradersPage('tab');
-
     if (!getStoredKey()) {
-        app.panel.setStatus(
-            'Paste a Public API key under Settings to begin.',
-            'warn',
-        );
+        app.panel.setStatus('Paste a Public API key to begin.', 'warn');
         app.panel.openSettings({ focusKey: !getStoredKey() });
     } else if (app.keyDead) {
-        app.panel.setStatus(
-            'Torn rejected the saved key. Paste a new Public key under Settings.',
-            'error',
-        );
+        app.panel.setStatus('Torn rejected the saved key. Paste a new Public key.', 'error');
     }
 
     window.addEventListener('hashchange', handleRouteChange);
@@ -1859,7 +2379,7 @@ export function boot() {
         }
 
         refreshItemsIfStale();
-        refreshTraders();
+        saveHistoryIfDue();
 
         if (detectPage(location.href) === PAGE_NONE) {
             if (app.pageType !== PAGE_NONE) rescan();

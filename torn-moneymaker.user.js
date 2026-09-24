@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      3.7.0
+// @version      3.8.0
 // @description  Finds Bazaar and Item Market listings below NPC / market value - on the page you are viewing, and live from the Torn API and TornW3B - ranked by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -38,7 +38,7 @@
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '3.7.0';
+    const TTV2_BUILD_VERSION = '3.8.0';
 
     /* ===== src/platform/gm.js ===== */
     /*
@@ -864,14 +864,9 @@
      * @param {object} item - record from buildItemIndex
      * @param {object} settings - sellToNpc, resaleBazaar, resaleMarket
      */
-    function exitsFor(item, settings = {}, traderPrice = 0) {
+    function exitsFor(item, settings = {}) {
         const exits = {};
         if (!item) return exits;
-
-        // What the chosen TornExchange trader pays - see core/traders.js.
-        if (settings.sellToTrader && Number(traderPrice) > 0) {
-            exits.TRADER = Number(traderPrice);
-        }
 
         if (settings.sellToNpc !== false) {
             const sell = Number(item.sellPrice);
@@ -922,13 +917,7 @@
      * @param {object} settings
      * @returns {Array<{itemId: string, lowestPrice: number, profitPerUnit: number}>}
      */
-    function selectCandidates(
-        summary,
-        index,
-        settings = {},
-        max = MAX_CANDIDATES,
-        traderPriceOf = () => 0,
-    ) {
+    function selectCandidates(summary, index, settings = {}, max = MAX_CANDIDATES) {
         const out = [];
 
         for (const s of summary || []) {
@@ -939,7 +928,7 @@
 
             const best = bestVenue({
                 listingPrice: s.lowestPrice,
-                exits: exitsFor(item, settings, traderPriceOf(item.id)),
+                exits: exitsFor(item, settings),
                 qty: 1,
             });
 
@@ -958,12 +947,16 @@
         }
 
         // With cash set, what your cash can make; without, profit per item.
-        out.sort((a, b) =>
-            Number.isFinite(a.reach) && Number.isFinite(b.reach)
-                ? b.reach - a.reach || b.profitPerUnit - a.profitPerUnit
-                : b.profitPerUnit - a.profitPerUnit,
-        );
+        // Infinity - Infinity is NaN, which breaks a sort: compare finitely.
+        out.sort((a, b) => finiteCmp(b.reach, a.reach) || b.profitPerUnit - a.profitPerUnit);
         return max > 0 ? out.slice(0, max) : out;
+    }
+
+    /** b - a for a sort, where either side may be Infinity (never NaN). */
+    function finiteCmp(a, b) {
+        if (a === b) return 0;
+        if (!Number.isFinite(a) && !Number.isFinite(b)) return 0;
+        return a > b ? 1 : -1;
     }
 
     /** Seconds, milliseconds, or nothing -> ms or null. Unknown is not "old". */
@@ -1097,10 +1090,21 @@
         return cheapest !== candidate.lowestPrice;
     }
 
-    /** Items that currently have an Item Market opportunity: re-check first. */
-    function itemMarketLiveIds(feed) {
+    /**
+     * Items whose Item Market snapshot holds a live opportunity - these are
+     * re-checked before they expire. A snapshot keeps EVERY listing Torn
+     * returned (the page-vs-feed correction needs them), so "has rows" is not
+     * "is a deal": judging liveness by rows alone made every swept item a
+     * re-check candidate, and after a dozen sweeps the whole Torn budget went
+     * to re-checking items that were never deals. The sweep then stood still.
+     *
+     * @param {function} isDeal - (itemId, cheapestPrice) => boolean
+     */
+    function itemMarketLiveIds(feed, isDeal = () => true) {
         const ids = [];
-        for (const [id, snap] of feed.itemmarket) if (snap.rows.length) ids.push(id);
+        for (const [id, snap] of feed.itemmarket) {
+            if (snap.rows.length && isDeal(id, snap.rows[0].price)) ids.push(id);
+        }
         return ids;
     }
 
@@ -1236,14 +1240,11 @@
         const shopOf = ctx.npcShopFor || (() => null);
         const out = [];
 
-        const traderFor = ctx.traderFor || (() => null);
-
         const price = (item, row, extra) => {
             const npcShop = shopOf(item.id);
-            const pick = traderFor(item);
             const profit = bestVenue({
                 listingPrice: row.price,
-                exits: exitsFor(item, settings, pick && pick.trader.price),
+                exits: exitsFor(item, settings),
                 qty: row.qty,
                 cashOnHand: settings.cashOnHand,
             });
@@ -1260,7 +1261,6 @@
                 npcShop,
                 npcVerified: npcShop !== null,
                 profit,
-                traderPick: profit.venue === 'TRADER' ? pick : null,
                 cardLabel: '+' + formatMoneyShort(profit.totalProfit),
                 ...extra,
             });
@@ -1333,49 +1333,72 @@
     }
 
     /**
-     * Items worth sweeping on the Item Market when TornW3B has nothing to say
-     * about them: an NPC hit there is only possible when the NPC price is close
-     * to what the item normally trades for.
+     * Which items to sweep on the Item Market, likeliest deal first.
+     *
+     * Every item with an exit is a possible deal: someone may list it under its
+     * NPC price (or, with the Market / My bazaar chips, under its value). What
+     * differs is how LIKELY that is. A listing tends to sit near the item's
+     * value, so the closer the exit price is to the value, the smaller the
+     * discount a seller has to give before the listing beats the exit. So:
+     *
+     *   NPC items:          1 + NPC price / market value  (checked first)
+     *   resale-only items:  1 - the exit's fee
+     *
+     * and the sweep runs highest score first, then cheaper items first, so the
+     * items most likely to pay are checked soonest and the whole list is still
+     * covered. An NPC flip is guaranteed and untaxed - the job this tool is for
+     * - so every item with an NPC price goes before the resale-only ones. Two earlier versions got this wrong: 3.5/3.6 only swept items
+     * whose NPC price beat a probe at 85% of value, which dropped most NPC items
+     * outright; 3.7 swept every item with a value in id order, because its sort
+     * compared Infinity with Infinity (NaN) whenever no cash was set.
+     *
+     * With cash set, an item you cannot afford one of at half its value is
+     * skipped, and what your cash could make breaks ties.
+     *
+     * @returns {Array<string>} item ids
      */
-    function itemMarketSweepList(index, settings = {}, traderPriceOf = () => 0) {
+    function itemMarketSweepList(index, settings = {}) {
         const scored = [];
         const cash = Number(settings.cashOnHand) || 0;
 
         for (const item of (index && index.byId && index.byId.values()) || []) {
             const sell = Number(item.sellPrice);
             const mv = Number(item.marketValue);
-            if (!(mv > 0)) continue;
+            const npcOn = settings.sellToNpc !== false && sell > 0;
+            const resaleOn = Boolean(settings.resaleMarket || settings.resaleBazaar) && mv > 0;
+            if (!npcOn && !resaleOn) continue;
 
-            // Probe: a listing 15% under market value - what would it make?
-            const probePrice = mv * 0.85;
-            const perUnit = (exitPrice, venue) => {
-                const probe = computeOpportunity({ listingPrice: probePrice, exitPrice, venue });
-                return probe ? probe.profitPerUnit : 0;
-            };
-
-            let best = 0;
-            let floor = mv * 0.5; // the cheapest a real listing plausibly gets
-            if (settings.sellToNpc !== false && sell > 0) {
-                const p = perUnit(sell, 'NPC');
-                if (p > best) { best = p; floor = Math.min(sell, mv) * 0.5; }
+            const value = mv > 0 ? mv : sell;
+            let score = 0;
+            let exit = 0;
+            if (npcOn) {
+                // NPC flips first: guaranteed and untaxed, the job this tool is
+                // for. Among them, the closer the NPC price to the value, the
+                // likelier a listing beats it.
+                score = 1 + (mv > 0 ? Math.min(sell / mv, 2) : 1);
+                exit = sell;
             }
-            if (settings.sellToTrader) {
-                best = Math.max(best, perUnit(Number(traderPriceOf(item.id)) || 0, 'TRADER'));
+            if (resaleOn) {
+                const fee = settings.resaleBazaar ? 0 : 0.05;
+                score = Math.max(score, 1 - fee);
+                exit = Math.max(exit, mv * (1 - fee));
             }
-            // The Market / My bazaar chips used to add nothing here, so with them
-            // on, only NPC items were ever swept on the Item Market.
-            if (settings.resaleMarket) best = Math.max(best, perUnit(mv, 'ITEM_MARKET'));
-            if (settings.resaleBazaar) best = Math.max(best, perUnit(mv, 'BAZAAR_RESALE'));
 
-            if (!(best > 0)) continue;
-            // Not even one affordable at half its value: skip it.
+            // The cheapest a real listing plausibly gets: half its value.
+            const floor = value * 0.5;
             if (cash > 0 && floor > cash) continue;
 
-            scored.push({ id: item.id, key: reachableProfit(best, probePrice, settings) || best });
+            const reach = cash > 0 ? Math.floor(cash / floor) * Math.max(exit - floor, 1) : 0;
+            scored.push({ id: item.id, score, value, reach });
         }
 
-        // What your cash could make first, so the likeliest deals are checked soonest.
-        scored.sort((a, b) => b.key - a.key);
+        scored.sort(
+            (a, b) =>
+                b.score - a.score ||
+                b.reach - a.reach ||
+                a.value - b.value ||
+                String(a.id).localeCompare(String(b.id), undefined, { numeric: true }),
+        );
         return scored.map((s) => s.id);
     }
 
@@ -1510,6 +1533,13 @@
             }
             if (row.profit.roi < opts.minRoi) return false;
 
+            /*
+             * Cash: a listing you cannot buy one of is not a deal for you, and
+             * is hidden - whether or not its quantity is known, and whatever Min
+             * is. A row you can afford part of stays, priced for that part.
+             */
+            if (!affordableRow(row, opts.cashOnHand)) return false;
+
             return true;
         });
 
@@ -1524,11 +1554,21 @@
         return opts.limit > 0 ? kept.slice(0, opts.limit) : kept;
     }
 
+    /** Can this cash buy at least one unit of the row? No cash set = yes. */
+    function affordableRow(row, cashOnHand) {
+        const cash = Number(cashOnHand);
+        if (!(cash > 0)) return true;
+        const p = row.profit;
+        if (!p) return false;
+        if (row.qtyAtPrice === false) return Number(p.listingPrice) <= cash;
+        return Number(p.affordableQty) >= 1;
+    }
+
     /**
      * What the Cash and Min filters took out of a list, so an empty list can say
      * why instead of looking like "no deals".
      * @returns {{cash: number, min: number}}
-     *   cash: profitable, and would reach Min if you could afford more of them
+     *   cash: profitable, but you cannot afford enough of it (or any of it)
      *   min:  profitable, but under Min even buying every one
      */
     function hiddenCounts(opportunities, options = {}) {
@@ -1537,6 +1577,10 @@
 
         for (const row of opportunities || []) {
             if (!row || !row.profit || row.profit.profitPerUnit <= 0) continue;
+            if (!affordableRow(row, options.cashOnHand)) {
+                out.cash++;
+                continue;
+            }
             if (row.qtyAtPrice === false) continue;
             if (row.profit.realizableProfit >= min) continue;
             if (row.profit.totalProfit >= min) out.cash++;
@@ -1545,19 +1589,51 @@
         return out;
     }
 
-    /** Headline totals for the panel. */
-    function summarize(rankedRows) {
+    /**
+     * Headline totals for the panel.
+     *
+     * With cash set, the total is what that cash can make: rows are taken best
+     * first, the last one that fits only for the units the remaining cash buys,
+     * and nothing after it. Summing every row's own capped profit claimed the
+     * cash could be spent on all of them at once.
+     *
+     * @returns {{count, totalProfit, cashRequired, capped: boolean}}
+     */
+    function summarize(rankedRows, options = {}) {
         const rows = rankedRows || [];
+        const cash = Number(options.cashOnHand);
+        const limited = cash > 0;
 
         let totalProfit = 0;
         let cashRequired = 0;
+        let capped = false;
 
         for (const row of rows) {
-            totalProfit += row.profit.realizableProfit;
-            cashRequired += row.profit.cashRequired;
+            const p = row.profit;
+            if (!limited) {
+                totalProfit += p.realizableProfit;
+                cashRequired += p.cashRequired;
+                continue;
+            }
+
+            const left = cash - cashRequired;
+            if (left <= 0) {
+                capped = true;
+                break;
+            }
+            if (p.cashRequired <= left) {
+                totalProfit += p.realizableProfit;
+                cashRequired += p.cashRequired;
+                continue;
+            }
+            const units = p.listingPrice > 0 ? Math.floor(left / p.listingPrice) : 0;
+            totalProfit += p.profitPerUnit * units;
+            cashRequired += p.listingPrice * units;
+            capped = true;
+            break;
         }
 
-        return { count: rows.length, totalProfit, cashRequired };
+        return { count: rows.length, totalProfit, cashRequired, capped };
     }
 
     /* ===== src/api/client.js ===== */
@@ -2147,7 +2223,9 @@
      *
      * One call, /api/all_best_listings, returns the top three buyers for EVERY
      * item (active traders with a non-negative score only). The server caches it
-     * for 5 minutes; we ask every 30.
+     * for 5 minutes; we ask every 30. /api/listings?item_id= lists every buyer
+     * of one item (names and prices only, 20 a page), fetched only when the user
+     * opens that item and kept for 30 minutes.
      */
 
 
@@ -2161,16 +2239,21 @@
         return TE_SITE_URL + '/prices/' + encodeURIComponent(String(traderId)) + '/';
     }
 
-    /** Never two requests closer than this, from any code path. */
-    const TE_MIN_GAP_MS = 20000;
+    /**
+     * Never two requests closer than this, from any code path: at most 6 a
+     * minute against TornExchange's 10, leaving room for its own site.
+     */
+    const TE_MIN_GAP_MS = 10000;
 
     class TeError extends Error {
-        constructor(message, { http = null, retryAfterMs = 0, badKey = false } = {}) {
+        constructor(message, { http = null, retryAfterMs = 0, badKey = false, tooSoon = false } = {}) {
             super(message);
             this.name = 'TeError';
             this.http = http;
             this.retryAfterMs = retryAfterMs;
             this.badKey = badKey;
+            /** Refused by this client for pacing, never sent: ask again later. */
+            this.tooSoon = tooSoon;
         }
     }
 
@@ -2180,13 +2263,44 @@
          * @param {function} options.getKey      - () => the TornExchange key ('' = none)
          * @param {function} [options.fetchImpl] - injectable for tests
          * @param {function} [options.now]
+         * @param {function} [options.loadState] - () => { lastRequestAt, blockedUntil }
+         *   shared by every tab, so a reload or a second selling tab keeps the
+         *   same pace and the same penalty wait as this one.
+         * @param {function} [options.saveState] - (state) => void
          */
-        constructor({ getKey, fetchImpl = gmFetch, now = () => Date.now() } = {}) {
+        constructor({ getKey, fetchImpl = gmFetch, now = () => Date.now(), loadState = null, saveState = null } = {}) {
             this.getKey = getKey || (() => '');
             this.fetchImpl = fetchImpl;
             this.now = now;
+            this.loadState = loadState;
+            this.saveState = saveState;
             this.lastRequestAt = 0;
             this.blockedUntil = 0;
+        }
+
+        /** Adopt the shared state: the later of what this tab and storage know. */
+        syncState() {
+            if (!this.loadState) return;
+            let shared;
+            try {
+                shared = this.loadState();
+            } catch {
+                return;
+            }
+            if (!shared || typeof shared !== 'object') return;
+            const last = Number(shared.lastRequestAt);
+            const blocked = Number(shared.blockedUntil);
+            if (Number.isFinite(last) && last > this.lastRequestAt) this.lastRequestAt = last;
+            if (Number.isFinite(blocked) && blocked > this.blockedUntil) this.blockedUntil = blocked;
+        }
+
+        persistState() {
+            if (!this.saveState) return;
+            try {
+                this.saveState({ lastRequestAt: this.lastRequestAt, blockedUntil: this.blockedUntil });
+            } catch {
+                // Sharing is best-effort; this tab still paces itself.
+            }
         }
 
         /** Build and check a URL. The key is attached here and nowhere else. */
@@ -2202,10 +2316,17 @@
             return url;
         }
 
-        async get(path) {
+        /** When the next request may go, given the gap and any 429 wait. */
+        nextAllowedAt() {
+            this.syncState();
+            return Math.max(this.blockedUntil, this.lastRequestAt + TE_MIN_GAP_MS);
+        }
+
+        async get(path, params = {}) {
             const key = String(this.getKey() || '').trim();
             if (!key) throw new TeError('No TornExchange key.', { badKey: true });
 
+            this.syncState();
             const t = this.now();
             if (t < this.blockedUntil) {
                 throw new TeError('TornExchange asked us to wait.', {
@@ -2216,11 +2337,18 @@
             if (t - this.lastRequestAt < TE_MIN_GAP_MS) {
                 throw new TeError('Too soon to ask TornExchange again.', {
                     retryAfterMs: TE_MIN_GAP_MS - (t - this.lastRequestAt),
+                    tooSoon: true,
                 });
             }
 
             const url = this.buildUrl(path, key);
+            for (const [name, value] of Object.entries(params || {})) {
+                if (value !== undefined && value !== null && name !== 'key') {
+                    url.searchParams.set(name, String(value));
+                }
+            }
             this.lastRequestAt = t;
+            this.persistState();
 
             let response;
             try {
@@ -2241,6 +2369,7 @@
                 const seconds = Number(body && body.retry_after);
                 const wait = (Number.isFinite(seconds) && seconds > 0 ? seconds : 60) * 1000;
                 this.blockedUntil = this.now() + wait;
+                this.persistState();
                 throw new TeError('TornExchange rate limit - waiting ' + Math.ceil(wait / 1000) + 's.', {
                     http: 429,
                     retryAfterMs: wait,
@@ -2313,27 +2442,174 @@
         return out;
     }
 
-    /* ===== src/core/traders.js ===== */
+    /**
+     * Every buyer of one item, highest price first: /api/listings?item_id=.
+     * Names and prices only - the endpoint carries no trader id - and 20 a page;
+     * up to `maxPages` pages are read. Each page is its own request, handed to
+     * `schedule` (a TeQueue's enqueue) so pages go one per slot: asked directly,
+     * page 2 would follow page 1 inside the gap and be refused.
+     *
+     * @returns {Promise<{traders: Array<{name: string, price: number}>, total: number, complete: boolean}>}
+     */
+    async function fetchTeListings(client, itemId, { maxPages = 3, schedule = (fn) => fn() } = {}) {
+        const traders = [];
+        let total = 0;
+        let pages = 1;
+
+        for (let page = 1; page <= maxPages && page <= pages; page += 1) {
+            const body = await schedule(() =>
+                client.get('listings', {
+                    item_id: String(itemId),
+                    sort_by: 'price',
+                    order: 'desc',
+                    page,
+                }),
+            );
+            const parsed = parseTeListings(body);
+            traders.push(...parsed.traders);
+            total = parsed.total;
+            pages = parsed.pages;
+        }
+
+        traders.sort((a, b) => b.price - a.price);
+        return { traders, total, complete: pages <= maxPages };
+    }
+
+    /**
+     * TornExchange calls one at a time, each in its own slot: the next runs no
+     * sooner than the client's nextAllowedAt(), which includes the shared pace
+     * and any 429 wait. A call the client refuses as too soon goes back to the
+     * front of the line; anything else fails that call only. Nothing runs while
+     * the tab is hidden.
+     */
+    class TeQueue {
+        /**
+         * @param {object} options
+         * @param {TeClient} options.client
+         * @param {function} [options.now]
+         * @param {function} [options.setTimer]  - (fn, ms) => void; injectable for tests
+         * @param {function} [options.isVisible] - () => boolean
+         * @param {function} [options.onSettled] - (error|null) after every call
+         */
+        constructor({ client, now = () => Date.now(), setTimer = (fn, ms) => setTimeout(fn, ms), isVisible = () => true, onSettled = () => {} }) {
+            this.client = client;
+            this.now = now;
+            this.setTimer = setTimer;
+            this.isVisible = isVisible;
+            this.onSettled = onSettled;
+            this.jobs = [];
+            this.waiting = false;
+        }
+
+        get length() {
+            return this.jobs.length;
+        }
+
+        /** @returns {Promise} what `fn` returns, once its slot has come. */
+        enqueue(fn) {
+            return new Promise((resolve, reject) => {
+                this.jobs.push({ fn, resolve, reject });
+                this.run();
+            });
+        }
+
+        run() {
+            if (this.waiting || !this.jobs.length) return;
+            this.waiting = true;
+            const wait = Math.max(0, this.client.nextAllowedAt() - this.now());
+            this.setTimer(() => this.step(), wait);
+        }
+
+        async step() {
+            this.waiting = false;
+            if (!this.isVisible()) {
+                this.waiting = true;
+                this.setTimer(() => {
+                    this.waiting = false;
+                    this.run();
+                }, 5000);
+                return;
+            }
+            // Another tab may have used the slot since the timer was set.
+            if (this.client.nextAllowedAt() > this.now()) {
+                this.run();
+                return;
+            }
+            const job = this.jobs.shift();
+            if (!job) return;
+            try {
+                const result = await job.fn();
+                job.resolve(result);
+                this.onSettled(null);
+            } catch (error) {
+                if (error && error.tooSoon) {
+                    this.jobs.unshift(job);
+                } else {
+                    job.reject(error);
+                    this.onSettled(error);
+                }
+            }
+            this.run();
+        }
+    }
+
+    /** Exposed for tests. */
+    function parseTeListings(body) {
+        const data = body && body.data;
+        if (!data || !Array.isArray(data.listings)) {
+            throw new TeError('TornExchange returned no buyer list.');
+        }
+
+        const traders = [];
+        for (const l of data.listings) {
+            const price = Number(l && l.price);
+            if (!l || typeof l.trader !== 'string' || !l.trader || !Number.isFinite(price) || price <= 0) continue;
+            traders.push({ name: l.trader, price });
+        }
+        traders.sort((a, b) => b.price - a.price);
+
+        const meta = data.meta || {};
+        return {
+            traders,
+            total: Number(meta.total_listings) || traders.length,
+            pages: Number(meta.total_pages) || 1,
+        };
+    }
+
+    /**
+     * Every active trader's name and Torn id: /api/active_traders. Used to give
+     * a name from a buyer list its id (for the profile link and online status).
+     * @returns {Promise<Map<string, string>>} lowercase name -> torn id
+     */
+    async function fetchTeActiveTraders(client) {
+        return parseTeActiveTraders(await client.get('active_traders'));
+    }
+
+    function parseTeActiveTraders(body) {
+        const verbose = body && body.data && body.data.verbose;
+        const out = new Map();
+        if (!verbose || typeof verbose !== 'object') return out;
+        for (const t of Object.values(verbose)) {
+            const id = String((t && t.torn_id) || '').replace(/\D/g, '');
+            if (t && typeof t.name === 'string' && t.name && id) out.set(t.name.toLowerCase(), id);
+        }
+        return out;
+    }
+
+    /* ===== src/core/selling.js ===== */
     /*
-     * Traders: which one to sell to, and the "By trader" grouping. Pure, no DOM.
+     * The selling page's logic: which trader pays most for each item you hold.
+     * Pure - no DOM, no network.
      *
-     * A trader's price is an OFFER, not a fact like an NPC's Sell price: the
-     * trader may be offline, may have changed the price, or may refuse. So the
-     * trader a deal is priced against is the one you can most likely sell to NOW:
-     *
-     *   1. a sane price first - more than TRADER_SUSPECT_RATIO x the item's value
-     *      is usually a price the trader forgot to update, not a real bid;
-     *   2. then online, idle, not-yet-known, offline - in that order;
-     *   3. then the highest price, then the best TornExchange score.
-     *
-     * If someone further down that order pays more, the row says so ("best
-     * offline: Alice $24,500") rather than hiding it.
+     * Traders are ALWAYS ranked highest price first. "Online only" drops the
+     * traders who are not online and ranks the rest the same way; it never
+     * reorders by status. A trader's price is an offer on their TornExchange
+     * list, so every row also shows what the item usually goes for (Torn's
+     * market value, the daily average of actual sales) and what traders offer
+     * on average, for a sense of whether the best offer is out of line.
      */
 
-    /** Above this multiple of the item's value, a trader's price gets a "check" flag. */
-    const TRADER_SUSPECT_RATIO = 1.05;
-
-    /** Ask TornExchange this often. It caches for 5 min; prices move slowly. */
+    /** Ask TornExchange for the top buyers this often. It caches for 5 min. */
     const TE_REFRESH_MS = 30 * 60 * 1000;
 
     /** Trader prices older than this are not used at all. */
@@ -2341,7 +2617,8 @@
 
     const TE_CACHE_VERSION = 1;
 
-    const LEVEL_RANK = { online: 0, idle: 1, unknown: 2, offline: 3 };
+    /** A per-item full buyer list is kept this long before it is asked again. */
+    const TE_ITEM_TTL_MS = 30 * 60 * 1000;
 
     /** 'online' | 'idle' | 'offline' | 'unknown' from a parsed presence. */
     function presenceLevel(presence) {
@@ -2349,176 +2626,170 @@
         return s ? String(s).toLowerCase() : 'unknown';
     }
 
-    function isSuspect(price, marketValue) {
-        return Number(marketValue) > 0 && price > marketValue * TRADER_SUSPECT_RATIO;
-    }
-
     /**
-     * Sane prices first, then online / idle / unknown / offline, then price, then score.
-     * @returns {Array<{trader, level, suspect}>}
+     * Highest price first; ties by TornExchange score. With onlineOnly, only
+     * traders known to be online are kept.
+     *
+     * @param {Array<{name, id, price, score}>} traders
+     * @param {object} ctx
+     * @param {function} ctx.presenceOf - (traderId) => presence | null
+     * @param {boolean} [ctx.onlineOnly]
+     * @returns {Array<{trader, level}>}
      */
-    function rankTraders(traders, { presenceOf = () => null, marketValue = 0 } = {}) {
-        const ranked = (traders || []).map((trader) => ({
-            trader,
-            level: presenceLevel(presenceOf(trader.id)),
-            suspect: isSuspect(trader.price, marketValue),
-        }));
+    function rankOffers(traders, { presenceOf = () => null, onlineOnly = false } = {}) {
+        const ranked = [];
+        for (const trader of traders || []) {
+            if (!trader || !(trader.price > 0)) continue;
+            const level = trader.id ? presenceLevel(presenceOf(trader.id)) : 'unknown';
+            if (onlineOnly && level !== 'online') continue;
+            ranked.push({ trader, level });
+        }
 
         ranked.sort(
             (a, b) =>
-                Number(a.suspect) - Number(b.suspect) ||
-                (LEVEL_RANK[a.level] ?? 2) - (LEVEL_RANK[b.level] ?? 2) ||
                 b.trader.price - a.trader.price ||
-                b.trader.score - a.trader.score,
+                (b.trader.score || 0) - (a.trader.score || 0) ||
+                String(a.trader.name).localeCompare(String(b.trader.name)),
         );
         return ranked;
     }
 
-    /**
-     * @param {Array<{name, id, price, score}>} traders - TornExchange's top buyers
-     * @param {object} ctx
-     * @param {function} ctx.presenceOf - (traderId) => presence | null
-     * @param {number} [ctx.marketValue]
-     * @returns {null | {trader, level, suspect, pctOfValue, better}}
-     *   better: a trader who pays more but is further down the order, or null
-     */
-    function pickTrader(traders, { presenceOf = () => null, marketValue = 0 } = {}) {
-        if (!Array.isArray(traders) || !traders.length) return null;
-
-        const ranked = rankTraders(traders, { presenceOf, marketValue });
-        const chosen = ranked[0];
-
-        let better = null;
-        for (const r of ranked.slice(1)) {
-            if (r.suspect || r.trader.price <= chosen.trader.price) continue;
-            if (!better || r.trader.price > better.trader.price) better = r;
-        }
-
-        return {
-            trader: chosen.trader,
-            level: chosen.level,
-            suspect: chosen.suspect,
-            pctOfValue: Number(marketValue) > 0 ? chosen.trader.price / marketValue : null,
-            better: better ? { trader: better.trader, level: better.level } : null,
-        };
-    }
-
-    /**
-     * The Traders page: every item in the deal list, the cheapest place to buy
-     * it, and ALL its TornExchange traders ranked the same way pickTrader does
-     * (sane price, online first, then price), each with the profit of selling
-     * that listing to them.
-     *
-     * @param {Array} rows - the deal list (bazaar + Item Market), any exit
-     * @param {Map} tradersMap - itemId -> traders, from TornExchange
-     * @param {object} ctx - { presenceOf }
-     * @returns {Array<{itemId, name, item, listing, listings, bestVenue, traders, bestTrader}>}
-     */
-    function buildTraderBoard(rows, tradersMap, { presenceOf = () => null } = {}) {
-        const byItem = new Map();
-
-        for (const row of rows || []) {
-            if (!row || !row.profit) continue;
-            const id = String(row.itemId);
-            if (!byItem.has(id)) byItem.set(id, []);
-            byItem.get(id).push(row);
-        }
-
-        const out = [];
-
-        for (const [itemId, listings] of byItem) {
-            listings.sort((a, b) => a.profit.listingPrice - b.profit.listingPrice);
-            const listing = listings[0];
-            const item = listing.item || {};
-            const value = Number(item.marketValue) || 0;
-            const qty = listing.profit.affordableQty || 1;
-
-            const traders = rankTraders((tradersMap && tradersMap.get(itemId)) || [], {
-                presenceOf,
-                marketValue: value,
-            }).map((r) => {
-                const perUnit = r.trader.price - listing.profit.listingPrice;
-                return {
-                    ...r,
-                    pctOfValue: value > 0 ? r.trader.price / value : null,
-                    profitPerUnit: perUnit,
-                    profit: perUnit * qty,
-                };
-            });
-
-            // The trader you would actually sell to: the first who pays more than it costs.
-            const bestTrader = traders.find((t) => !t.suspect && t.profitPerUnit > 0) || null;
-
-            out.push({
-                itemId,
-                name: listing.name,
-                item,
-                listing,
-                listings,
-                bestVenue: listing.profit.venue,
-                traders,
-                bestTrader,
-            });
-        }
-
-        return out;
-    }
-
-    /**
-     * The most any sane trader pays - used to decide which items are worth
-     * fetching listings for, before anyone's online status is known.
-     */
-    function maxTraderPrice(traders, marketValue = 0) {
-        let best = 0;
+    /** Plain average of every trader's price, or null with nothing to average. */
+    function tradersAverage(traders) {
+        let sum = 0;
+        let n = 0;
         for (const t of traders || []) {
-            if (isSuspect(t.price, marketValue)) continue;
-            if (t.price > best) best = t.price;
+            if (t && t.price > 0) {
+                sum += t.price;
+                n += 1;
+            }
         }
-        return best;
+        return n ? Math.round(sum / n) : null;
     }
 
     /**
-     * Deals sold to a trader, grouped by that trader: one trade window each.
-     * Online traders first, then the biggest total.
+     * Traders from two sources, merged by name: TornExchange's top-three list
+     * (with ids) and an item's full buyer list (names and prices only). A name
+     * on the full list that the top-three or the active-traders list knows gets
+     * its id; the rest keep no id and so no profile link or online status.
      *
-     * @param {Array} rows - priced rows; only those whose best exit is TRADER count
-     * @returns {Array<{trader, level, score, rows, totalProfit, cashRequired}>}
+     * The full list carries everyone, where the top-three list carries only
+     * active traders with a non-negative score. So when the active-traders list
+     * is known, a full-list name on neither it nor the top three is left out
+     * (an inactive trader), and a known negative score is left out too.
+     *
+     * @param {Array} best - top-three traders for the item (name, id, price, score)
+     * @param {Array|null} full - the full buyer list (name, price), or null if not loaded
+     * @param {Map} [idsByName] - lowercase active trader name -> torn id
+     * @returns {{traders: Array, partial: boolean}} partial = only the top three are known
      */
-    function groupByTrader(rows) {
-        const groups = new Map();
+    function mergeTraders(best, full, idsByName = new Map()) {
+        const known = new Map();
+        const negative = new Set();
+        for (const t of best || []) {
+            if (!t || !t.name) continue;
+            const key = String(t.name).toLowerCase();
+            if (t.score < 0) negative.add(key);
+            else known.set(key, { ...t });
+        }
 
-        for (const row of rows || []) {
-            if (!row || !row.profit || row.profit.venue !== 'TRADER' || !row.traderPick) continue;
+        if (!Array.isArray(full)) {
+            return { traders: [...known.values()], partial: true };
+        }
 
-            const pick = row.traderPick;
-            const id = pick.trader.id;
-            if (!groups.has(id)) {
-                groups.set(id, {
-                    trader: pick.trader,
-                    level: pick.level,
-                    rows: [],
-                    totalProfit: 0,
-                    cashRequired: 0,
-                });
+        const activeKnown = idsByName && idsByName.size > 0;
+        const out = new Map();
+        for (const t of full) {
+            if (!t || !t.name || !(t.price > 0)) continue;
+            const key = String(t.name).toLowerCase();
+            if (negative.has(key)) continue;
+            const b = known.get(key);
+            if (!b && activeKnown && !idsByName.has(key)) continue;
+            out.set(key, {
+                name: b ? b.name : t.name,
+                id: (b && b.id) || idsByName.get(key) || null,
+                price: t.price,
+                score: b ? b.score : 0,
+            });
+        }
+        // A top-three trader missing from the full list (paging, a hidden
+        // listing) is still a buyer.
+        for (const [key, b] of known) if (!out.has(key)) out.set(key, b);
+
+        return { traders: [...out.values()], partial: false };
+    }
+
+    /** How the item list is ordered: by the best single-item offer, or by the bundle (qty x offer). */
+    const SORT_ITEM = 'item';
+    const SORT_BUNDLE = 'bundle';
+
+    /**
+     * One row per item you hold, with its best offer.
+     *
+     * @param {Array<{id, name, qty}>} inventory - from mergeInventory
+     * @param {object} index - item index (market values, names)
+     * @param {object} ctx
+     * @param {function} ctx.tradersFor - (itemId) => {traders, partial}
+     * @param {function} ctx.presenceOf
+     * @param {boolean} [ctx.onlineOnly]
+     * @param {string} [ctx.sortBy] - SORT_ITEM (default): best offer per item,
+     *   highest first; SORT_BUNDLE: qty x best offer, highest first. Items with
+     *   no buyer come last either way, by value.
+     * @returns {Array<object>}
+     */
+    function buildSellingRows(inventory, index, { tradersFor, presenceOf = () => null, onlineOnly = false, sortBy = SORT_ITEM }) {
+        const rows = [];
+
+        for (const held of inventory || []) {
+            const item = index && index.byId ? index.byId.get(String(held.id)) : null;
+            const { traders, partial } = tradersFor(held.id) || { traders: [], partial: true };
+            const offers = rankOffers(traders, { presenceOf, onlineOnly });
+            const best = offers[0] || null;
+            const marketValue = item ? Number(item.marketValue) || null : null;
+
+            rows.push({
+                itemId: String(held.id),
+                name: (item && item.name) || held.name || 'Item ' + held.id,
+                qty: held.qty,
+                marketValue,
+                offers,
+                best,
+                bestPrice: best ? best.trader.price : null,
+                total: best ? best.trader.price * held.qty : null,
+                tradersAvg: tradersAverage(traders),
+                avgPartial: partial,
+                buyers: traders.length,
+            });
+        }
+
+        const bundle = sortBy === SORT_BUNDLE;
+        rows.sort((a, b) => {
+            if ((a.total === null) !== (b.total === null)) return a.total === null ? 1 : -1;
+            if (a.total !== null) {
+                return bundle
+                    ? b.total - a.total || b.bestPrice - a.bestPrice
+                    : b.bestPrice - a.bestPrice || b.total - a.total;
             }
+            const av = (a.marketValue || 0) * (bundle ? a.qty : 1);
+            const bv = (b.marketValue || 0) * (bundle ? b.qty : 1);
+            return bv - av || String(a.name).localeCompare(String(b.name));
+        });
+        return rows;
+    }
 
-            const g = groups.get(id);
-            g.rows.push(row);
-            g.totalProfit += row.profit.realizableProfit;
-            g.cashRequired += row.profit.cashRequired;
+    /** Everyone a selling list would like a status for: best traders first. */
+    function tradersToWatch(rows, { expanded = new Set(), max = 20 } = {}) {
+        const ids = [];
+        const push = (id) => {
+            if (id && !ids.includes(id) && ids.length < max) ids.push(String(id));
+        };
+        for (const r of rows) if (r.best) push(r.best.trader.id);
+        for (const r of rows) {
+            if (!expanded.has(r.itemId)) continue;
+            for (const o of r.offers) push(o.trader.id);
         }
-
-        const out = [...groups.values()];
-        for (const g of out) {
-            g.rows.sort((a, b) => b.profit.realizableProfit - a.profit.realizableProfit);
-        }
-
-        out.sort(
-            (a, b) =>
-                (LEVEL_RANK[a.level] ?? 2) - (LEVEL_RANK[b.level] ?? 2) ||
-                b.totalProfit - a.totalProfit,
-        );
-        return out;
+        for (const r of rows) for (const o of r.offers) push(o.trader.id);
+        return ids;
     }
 
     /* -------------------------------------------------------------- storage */
@@ -2557,14 +2828,458 @@
         return { fetchedAt, map };
     }
 
+    /** Per-item full buyer lists: {itemId: {at, traders: [[name, price], ...]}}. */
+    function readTeItemLists(entry, now = Date.now()) {
+        const out = new Map();
+        if (!entry || typeof entry !== 'object') return out;
+        for (const [itemId, rec] of Object.entries(entry)) {
+            if (!rec || !Array.isArray(rec.traders)) continue;
+            const at = Number(rec.at);
+            if (!Number.isFinite(at) || now - at > TE_ITEM_TTL_MS) continue;
+            out.set(itemId, {
+                at,
+                traders: rec.traders
+                    .filter((r) => Array.isArray(r) && r.length >= 2)
+                    .map(([name, price]) => ({ name: String(name), price: Number(price) }))
+                    .filter((t) => t.name && t.price > 0),
+            });
+        }
+        return out;
+    }
+
+    function writeTeItemList(entry, itemId, traders, now = Date.now(), max = 200) {
+        const next = { ...(entry && typeof entry === 'object' ? entry : {}) };
+        next[String(itemId)] = { at: now, traders: (traders || []).map((t) => [t.name, t.price]) };
+        const keys = Object.keys(next);
+        if (keys.length > max) {
+            keys.sort((a, b) => Number(next[a].at) - Number(next[b].at));
+            for (const k of keys.slice(0, keys.length - max)) delete next[k];
+        }
+        return next;
+    }
+
+    /* ===== src/core/inventory.js ===== */
+    /*
+     * Your inventory, from GET /v2/user/inventory (Limited key). Pure.
+     *
+     * Torn returns one entry per stack: the same item can appear several times
+     * (different uids, an equipped copy, a faction-owned copy). The selling page
+     * wants one line per item with the quantity you could actually hand over,
+     * so stacks are merged by item id, and equipped and faction-owned copies are
+     * left out: you cannot trade what you are wearing or what is the faction's.
+     */
+
+    const INVENTORY_CACHE_VERSION = 1;
+
+    /** Torn caches the selection for an hour; re-asking sooner returns the same. */
+    const INVENTORY_TTL_MS = 60 * 60 * 1000;
+
+    /**
+     * One response page -> plain rows. Bad rows are dropped, never guessed.
+     * @returns {Array<{id: string, name: string, amount: number, equipped: boolean, factionOwned: boolean}>}
+     */
+    function parseInventoryPage(body) {
+        const inv = body && body.inventory;
+        const items = inv && Array.isArray(inv.items) ? inv.items : null;
+        if (!items) throw new Error('Torn API returned no inventory.');
+
+        const out = [];
+        for (const raw of items) {
+            if (!raw) continue;
+            const id = Number(raw.id);
+            const amount = Number(raw.amount);
+            if (!Number.isFinite(id) || id <= 0) continue;
+            if (!Number.isFinite(amount) || amount <= 0) continue;
+
+            out.push({
+                id: String(id),
+                name: typeof raw.name === 'string' ? raw.name : '',
+                amount: Math.floor(amount),
+                equipped: Boolean(raw.equipped),
+                factionOwned: Boolean(raw.faction_owned),
+            });
+        }
+        return out;
+    }
+
+    /**
+     * Merge stacks by item id; equipped and faction-owned copies are excluded.
+     * @returns {Array<{id: string, name: string, qty: number}>} sorted by id
+     */
+    function mergeInventory(rows) {
+        const byId = new Map();
+
+        for (const r of rows || []) {
+            if (!r || r.equipped || r.factionOwned) continue;
+            if (!(r.amount > 0)) continue;
+
+            const cur = byId.get(r.id);
+            if (cur) {
+                cur.qty += r.amount;
+                if (!cur.name && r.name) cur.name = r.name;
+            } else {
+                byId.set(r.id, { id: r.id, name: r.name || '', qty: r.amount });
+            }
+        }
+
+        return [...byId.values()].sort((a, b) => Number(a.id) - Number(b.id));
+    }
+
+    /** The `_metadata.links.next` offset, or null when this was the last page. */
+    function nextInventoryOffset(body) {
+        const next = body && body._metadata && body._metadata.links && body._metadata.links.next;
+        if (!next) return null;
+        try {
+            const offset = Number(new URL(String(next), 'https://api.torn.com/').searchParams.get('offset'));
+            return Number.isFinite(offset) && offset > 0 ? offset : null;
+        } catch {
+            return null;
+        }
+    }
+
+    /** A failed inventory read is not asked again sooner than this. */
+    const INVENTORY_RETRY_MS = 5 * 60 * 1000;
+
+    /**
+     * Whether the inventory should be read again now, on the timer: it is old,
+     * the last failure's wait is over, and the key is not one Torn rejected
+     * (that waits for a new key, not for time).
+     */
+    function inventoryRefreshDue({ inventoryAt, retryAt = 0, keyDead = false, now = Date.now(), refreshMs = INVENTORY_TTL_MS }) {
+        if (keyDead) return false;
+        if (now < (Number(retryAt) || 0)) return false;
+        const at = Number(inventoryAt) || 0;
+        return now - at >= refreshMs;
+    }
+
+    function makeInventoryCacheEntry(items, now = Date.now()) {
+        return { version: INVENTORY_CACHE_VERSION, fetchedAt: now, items };
+    }
+
+    /** @returns {{fetchedAt: number, items: Array}|null} */
+    function readInventoryCacheEntry(entry, now = Date.now(), ttl = INVENTORY_TTL_MS) {
+        if (!entry || entry.version !== INVENTORY_CACHE_VERSION || !Array.isArray(entry.items)) return null;
+        const at = Number(entry.fetchedAt);
+        if (!Number.isFinite(at) || now - at > ttl) return null;
+        return { fetchedAt: at, items: entry.items };
+    }
+
+    /* ===== src/core/history.js ===== */
+    /*
+     * Price history the script records itself. Pure - the caller stores it.
+     *
+     * No API gives an item's price history: Torn's market value is a single
+     * daily average of sales, and TornW3B publishes only what is listed now. So
+     * the only way to say "what did this go for over the past week" is to write
+     * down what was asked, regularly, from now on. What is recorded:
+     *
+     *   im  - the lowest Item Market asking price (one Torn call per item)
+     *   bz  - the lowest bazaar asking price (TornW3B's one-call summary)
+     *   mv  - Torn's market value, once a day (the one sale-based number)
+     *
+     * Three resolutions, each a fixed window, so storage stays small:
+     *
+     *   5-minute buckets for the last 24 hours   (288 buckets)
+     *   hourly buckets    for the last 7 days    (168)
+     *   6-hourly buckets  for the last 30 days   (120)
+     *
+     * A bucket is [bucketNumber, im, bz] - the LAST sample in that bucket for
+     * 5-minute buckets, the average of samples for the coarser ones ([n, im, bz,
+     * count]). Only items the user has shown interest in (their own bazaar, their
+     * inventory) are tracked, up to HISTORY_MAX_ITEMS, oldest interest dropped.
+     *
+     * An average is only as good as its coverage: every average carries the
+     * share of its window that actually has data, and callers must show it.
+     */
+
+    const HISTORY_VERSION = 1;
+    const HISTORY_MAX_ITEMS = 60;
+
+    const RES = {
+        m5: { ms: 5 * 60 * 1000, keep: 288 },
+        h1: { ms: 60 * 60 * 1000, keep: 168 },
+        h6: { ms: 6 * 60 * 60 * 1000, keep: 120 },
+    };
+
+    const DAY_MS = 24 * 60 * 60 * 1000;
+
+    /** The windows the UI shows, with the resolution that spans each. */
+    const WINDOWS = [
+        { key: '1h', label: '1 hour', ms: 60 * 60 * 1000, res: 'm5' },
+        { key: '6h', label: '6 hours', ms: 6 * 60 * 60 * 1000, res: 'm5' },
+        { key: '24h', label: '24 hours', ms: DAY_MS, res: 'm5' },
+        { key: '7d', label: '7 days', ms: 7 * DAY_MS, res: 'h1' },
+        { key: '30d', label: '30 days', ms: 30 * DAY_MS, res: 'h6' },
+    ];
+
+    function emptyHistory() {
+        return { version: HISTORY_VERSION, items: {} };
+    }
+
+    function readHistory(entry) {
+        if (!entry || entry.version !== HISTORY_VERSION || !entry.items || typeof entry.items !== 'object') {
+            return emptyHistory();
+        }
+        return entry;
+    }
+
+    function itemRec(store, itemId, now) {
+        const id = String(itemId);
+        if (!store.items[id]) store.items[id] = { m5: [], h1: [], h6: [], mv: [], seen: now };
+        const rec = store.items[id];
+        rec.seen = now;
+        return rec;
+    }
+
+    function positive(v) {
+        const n = Number(v);
+        return Number.isFinite(n) && n > 0 ? Math.round(n) : null;
+    }
+
+    /**
+     * Record one observation. Missing values (null) leave that column alone.
+     * @param {object} sample - { im?: number, bz?: number }
+     */
+    function recordSample(store, itemId, now, sample) {
+        const im = positive(sample && sample.im);
+        const bz = positive(sample && sample.bz);
+        if (im === null && bz === null) return store;
+
+        const rec = itemRec(store, itemId, now);
+
+        // 5-minute: the last sample wins.
+        {
+            const n = Math.floor(now / RES.m5.ms);
+            const last = rec.m5[rec.m5.length - 1];
+            if (last && last[0] === n) {
+                if (im !== null) last[1] = im;
+                if (bz !== null) last[2] = bz;
+            } else {
+                rec.m5.push([n, im, bz]);
+            }
+        }
+
+        // Coarser: running averages per column, with separate counts.
+        for (const key of ['h1', 'h6']) {
+            const n = Math.floor(now / RES[key].ms);
+            const arr = rec[key];
+            let last = arr[arr.length - 1];
+            if (!last || last[0] !== n) {
+                last = [n, null, null, 0, 0];
+                arr.push(last);
+            }
+            if (im !== null) {
+                last[1] = last[3] ? Math.round((last[1] * last[3] + im) / (last[3] + 1)) : im;
+                last[3] += 1;
+            }
+            if (bz !== null) {
+                last[2] = last[4] ? Math.round((last[2] * last[4] + bz) / (last[4] + 1)) : bz;
+                last[4] += 1;
+            }
+        }
+
+        return store;
+    }
+
+    /** Torn's market value, once per day. */
+    function recordMarketValue(store, itemId, now, value) {
+        const v = positive(value);
+        if (v === null) return store;
+        const rec = itemRec(store, itemId, now);
+        const day = Math.floor(now / DAY_MS);
+        const last = rec.mv[rec.mv.length - 1];
+        if (last && last[0] === day) last[1] = v;
+        else rec.mv.push([day, v]);
+        if (rec.mv.length > 31) rec.mv.splice(0, rec.mv.length - 31);
+        return store;
+    }
+
+    /** Mark an item as one worth keeping (seen in your bazaar or inventory). */
+    function touchItem(store, itemId, now) {
+        itemRec(store, itemId, now);
+        return store;
+    }
+
+    /** Drop buckets outside their window, and the least recently seen items over the cap. */
+    function pruneHistory(store, now, maxItems = HISTORY_MAX_ITEMS) {
+        for (const rec of Object.values(store.items)) {
+            for (const key of Object.keys(RES)) {
+                const oldest = Math.floor(now / RES[key].ms) - RES[key].keep + 1;
+                rec[key] = (rec[key] || []).filter((b) => b[0] >= oldest);
+            }
+            const oldestDay = Math.floor(now / DAY_MS) - 30;
+            rec.mv = (rec.mv || []).filter((b) => b[0] >= oldestDay);
+        }
+
+        const ids = Object.keys(store.items);
+        if (ids.length > maxItems) {
+            ids.sort((a, b) => (store.items[a].seen || 0) - (store.items[b].seen || 0));
+            for (const id of ids.slice(0, ids.length - maxItems)) delete store.items[id];
+        }
+        return store;
+    }
+
+    /**
+     * Averages for every window, each with its coverage.
+     *
+     * @returns {Object<string, {im: number|null, bz: number|null, coverage: number, buckets: number}>}
+     *   coverage: buckets with any data / buckets in the window (0..1)
+     */
+    function averages(store, itemId, now) {
+        const rec = store.items[String(itemId)];
+        const out = {};
+
+        for (const w of WINDOWS) {
+            const res = RES[w.res];
+            const total = Math.round(w.ms / res.ms);
+            const oldest = Math.floor(now / res.ms) - total + 1;
+            const buckets = rec ? (rec[w.res] || []).filter((b) => b[0] >= oldest) : [];
+
+            let imSum = 0;
+            let imN = 0;
+            let bzSum = 0;
+            let bzN = 0;
+            let filled = 0;
+            for (const b of buckets) {
+                const im = b[1];
+                const bz = b[2];
+                if (im !== null || bz !== null) filled += 1;
+                if (im !== null) {
+                    imSum += im;
+                    imN += 1;
+                }
+                if (bz !== null) {
+                    bzSum += bz;
+                    bzN += 1;
+                }
+            }
+
+            out[w.key] = {
+                im: imN ? Math.round(imSum / imN) : null,
+                bz: bzN ? Math.round(bzSum / bzN) : null,
+                coverage: total ? filled / total : 0,
+                buckets: total,
+            };
+        }
+        return out;
+    }
+
+    /**
+     * Points for a graph over one window: [{t, im, bz}] oldest first, plus the
+     * market value line as [{t, mv}].
+     */
+    function series(store, itemId, now, windowKey) {
+        const w = WINDOWS.find((x) => x.key === windowKey) || WINDOWS[2];
+        const res = RES[w.res];
+        const total = Math.round(w.ms / res.ms);
+        const oldest = Math.floor(now / res.ms) - total + 1;
+        const rec = store.items[String(itemId)];
+
+        const points = rec
+            ? (rec[w.res] || [])
+                  .filter((b) => b[0] >= oldest)
+                  .map((b) => ({ t: b[0] * res.ms, im: b[1], bz: b[2] }))
+            : [];
+
+        const oldestDay = Math.floor((now - w.ms) / DAY_MS);
+        const mv = rec ? (rec.mv || []).filter((b) => b[0] >= oldestDay).map((b) => ({ t: b[0] * DAY_MS, mv: b[1] })) : [];
+
+        return { from: now - w.ms, to: now, points, mv, step: res.ms };
+    }
+
+    /**
+     * Two copies of the history, one from storage and one from this tab, as
+     * one. Every tab keeps its own copy and saves the whole thing, so without
+     * this the selling tab's inventory items and the bazaar tab's samples
+     * overwrite each other. Per item: buckets are the union by bucket number;
+     * where both have a bucket, each column keeps the value backed by more
+     * samples (coarse buckets) or the local one (5-minute buckets, where the
+     * last sample wins and this tab's is the one it just took); `seen` is the
+     * later. Neither input is changed.
+     */
+    function mergeHistory(stored, local) {
+        const a = readHistory(stored);
+        const b = readHistory(local);
+        const out = emptyHistory();
+
+        const ids = new Set([...Object.keys(a.items), ...Object.keys(b.items)]);
+        for (const id of ids) {
+            const ra = a.items[id];
+            const rb = b.items[id];
+            if (!ra || !rb) {
+                out.items[id] = cloneRec(ra || rb);
+                continue;
+            }
+            const rec = { m5: [], h1: [], h6: [], mv: [], seen: Math.max(Number(ra.seen) || 0, Number(rb.seen) || 0) };
+            rec.m5 = mergeBuckets(ra.m5, rb.m5, mergeLast);
+            rec.h1 = mergeBuckets(ra.h1, rb.h1, mergeAvg);
+            rec.h6 = mergeBuckets(ra.h6, rb.h6, mergeAvg);
+            rec.mv = mergeBuckets(ra.mv, rb.mv, (x, y) => [y[0], y[1]]);
+            out.items[id] = rec;
+        }
+        return out;
+    }
+
+    function cloneRec(rec) {
+        return {
+            m5: (rec.m5 || []).map((b) => [...b]),
+            h1: (rec.h1 || []).map((b) => [...b]),
+            h6: (rec.h6 || []).map((b) => [...b]),
+            mv: (rec.mv || []).map((b) => [...b]),
+            seen: Number(rec.seen) || 0,
+        };
+    }
+
+    /** Union by bucket number, ascending; `both(stored, local)` where both have one. */
+    function mergeBuckets(stored, local, both) {
+        const byN = new Map();
+        for (const b of stored || []) if (Array.isArray(b)) byN.set(b[0], [...b]);
+        for (const b of local || []) {
+            if (!Array.isArray(b)) continue;
+            const s = byN.get(b[0]);
+            byN.set(b[0], s ? both(s, [...b]) : [...b]);
+        }
+        return [...byN.values()].sort((x, y) => x[0] - y[0]);
+    }
+
+    /** 5-minute bucket: a column this tab has wins; a column it lacks comes from storage. */
+    function mergeLast(s, l) {
+        const col = (i) => (l[i] !== null && l[i] !== undefined ? l[i] : s[i] ?? null);
+        return [l[0], col(1), col(2)];
+    }
+
+    /** Averaged bucket: per column, the value backed by more samples (ties to this tab). */
+    function mergeAvg(s, l) {
+        const pick = (vi, ci) => {
+            const sc = Number(s[ci]) || 0;
+            const lc = Number(l[ci]) || 0;
+            return lc >= sc ? [l[vi] ?? null, lc] : [s[vi] ?? null, sc];
+        };
+        const im = pick(1, 3);
+        const bz = pick(2, 4);
+        return [l[0], im[0], bz[0], im[1], bz[1]];
+    }
+
+    /** How much of the window has data, as words: "40% of 24h". */
+    function coverageText(cov, windowKey) {
+        const pct = Math.round((Number(cov) || 0) * 100);
+        return pct + '% of ' + windowKey;
+    }
+
     /* ===== src/api/torn.js ===== */
     /*
      * Thin wrappers over the Torn endpoints this tool uses. Every one of these
-     * works with a Public access key - that is the point.
+     * works with a Public access key, except fetchInventory: reading your own
+     * inventory needs Limited access, and only the selling page calls it, with
+     * the separate key that page keeps.
      */
 
-    /** Torn's access levels, lowest first. Public is all this tool needs. */
+    /** Torn's access levels, lowest first. Public is all the overlay needs. */
     const ACCESS_PUBLIC = 1;
+    const ACCESS_LIMITED = 3;
+
+    /** "Access level of this key is not high enough". */
+    const TORN_ERROR_ACCESS_LEVEL = 16;
 
     const ACCESS_LEVEL_NAMES = {
         1: 'Public',
@@ -2862,6 +3577,88 @@
         }
     }
 
+    /** "Wrong fields" and "Incorrect category": a parameter Torn did not accept. */
+    const TORN_ERROR_WRONG_FIELDS = 4;
+    const TORN_ERROR_INCORRECT_CATEGORY = 21;
+
+    /**
+     * The `cat` values /v2/user/inventory accepts: TornInventoryItemType in
+     * Torn's published OpenAPI spec (@types/torn-api, components/schemas).
+     */
+    const TORN_INVENTORY_CATEGORIES = [
+        'Collectible', 'Clothing', 'Other', 'Tool', 'Melee', 'Defensive',
+        'Material', 'Car', 'Primary', 'Secondary', 'Book', 'Special',
+        'Supply Pack', 'Temporary', 'Enhancer', 'Artifact', 'Flower', 'Booster',
+        'Medical', 'Candy', 'Jewelry', 'Alcohol', 'Plushie', 'Drug', 'Energy Drink',
+    ];
+
+    /** Torn refused the request for want of a (valid) `cat`. */
+    function isCategoryError(error) {
+        const code = Number(error && error.code);
+        if (code === TORN_ERROR_INCORRECT_CATEGORY || code === TORN_ERROR_WRONG_FIELDS) return true;
+        return /categor/i.test(String((error && error.message) || ''));
+    }
+
+    /** Every page of one inventory request (with or without a category). */
+    async function fetchInventoryPages(client, params, limit) {
+        const out = [];
+        let offset = 0;
+
+        for (let page = 0; page < 40; page += 1) {
+            let data;
+            try {
+                data = await client.get('v2/user/inventory', { ...params, limit, offset });
+            } catch (error) {
+                if (error && Number(error.code) === TORN_ERROR_ACCESS_LEVEL) {
+                    throw new TornApiError('This key cannot read your inventory: it needs Limited access.', {
+                        code: TORN_ERROR_ACCESS_LEVEL,
+                    });
+                }
+                throw error;
+            }
+
+            out.push(...parseInventoryPage(data));
+
+            const next = nextInventoryOffset(data);
+            if (next === null || next <= offset) break;
+            offset = next;
+        }
+
+        return out;
+    }
+
+    /**
+     * Your own inventory: GET /v2/user/inventory, paged with limit/offset.
+     * Needs a LIMITED key; Torn caches it for about an hour per category.
+     * Only the selling page calls this, with that page's own key. Error 16
+     * (access level too low) is reported as such, never retried.
+     *
+     * The spec says `cat` is optional, but Torn has been seen to answer
+     * "Incorrect category" without it. So: ask once without a category; if that
+     * is refused as a category or field error, ask once per category instead
+     * (25 calls, each paged, all through the shared limiter) and merge. A
+     * category Torn no longer knows is skipped, never fatal.
+     *
+     * @returns {Promise<Array>} rows from parseInventoryPage, every page
+     */
+    async function fetchInventory(client, { limit = 250, categories = TORN_INVENTORY_CATEGORIES } = {}) {
+        try {
+            return await fetchInventoryPages(client, {}, limit);
+        } catch (error) {
+            if (!isCategoryError(error)) throw error;
+        }
+
+        const out = [];
+        for (const cat of categories) {
+            try {
+                out.push(...(await fetchInventoryPages(client, { cat }, limit)));
+            } catch (error) {
+                if (!isCategoryError(error)) throw error;
+            }
+        }
+        return out;
+    }
+
     /* ===== src/sources/route.js ===== */
     /*
      * Which Torn page are we on? Pure string work, so it is testable.
@@ -2956,11 +3753,29 @@
         };
     }
 
+    /**
+     * Your OWN bazaar's add-listings (#/add) and manage-listings (#/manage)
+     * pages: bazaar.php with no userId, and that hash. Anything else - another
+     * player's bazaar, your own storefront - is null. The hash changes without a
+     * page load, so callers re-check on hashchange.
+     *
+     * @returns {'add'|'manage'|null}
+     */
+    function ownBazaarPage(href) {
+        if (typeof href !== 'string' || !href) return null;
+        if (detectPage(href) !== PAGE_BAZAAR) return null;
+        if (bazaarOwnerId(href)) return null;
+
+        const hash = (href.split('#')[1] || '').toLowerCase().replace(/^\/+/, '').split(/[?&]/)[0];
+        if (hash === 'add' || hash.startsWith('add/')) return 'add';
+        if (hash === 'manage' || hash.startsWith('manage/')) return 'manage';
+        return null;
+    }
+
     /*
-     * The Traders page in its own tab: Torn's home page with a marker the script
-     * recognises, and covers with the page. Nothing is fetched from Torn - this
-     * is a page the user opened, drawn over by the script, reading what the
-     * overlay already stored.
+     * The selling page (Traders) in its own tab: Torn's home page with a marker the script
+     * recognises, and covers with the page. The page itself is one the user
+     * opened; the script draws over it and reads only the API.
      */
     const TRADERS_PAGE_PARAM = 'ttv2';
     const TRADERS_PAGE_VALUE = 'traders';
@@ -3522,6 +4337,113 @@
         return { listings, diagnostics };
     }
 
+    /* ===== src/sources/dom/ownbazaar.js ===== */
+    /*
+     * Reading the rows of YOUR OWN bazaar's add-listings and manage-listings
+     * pages. Selectors come from a working 2026 price-filler script for these
+     * pages (the real markup has not been captured here, so the Tampermonkey
+     * menu has a diagnostics readout saying what was found):
+     *
+     *   #/add     ul.items-cont li.clearfix, name in div.title-wrap div.name-wrap
+     *   #/manage  div[data-testid="sortable-item"] or div[class*="row___"]
+     *             (a virtualised list: rows mount and unmount as you scroll)
+     *
+     * The item id comes from the item image path (/images/items/{id}/), as the
+     * market scanner does. Only the page you are viewing is read; nothing is
+     * clicked, filled in or listed for you.
+     */
+
+
+
+
+    const OWN_BAZAAR_ROW_SELECTORS = {
+        add: 'ul.items-cont li.clearfix',
+        manage: 'div[data-testid="sortable-item"], div[class*="row___"]',
+    };
+
+    const OWN_BAZAAR_NAME_SELECTORS = {
+        add: 'div.title-wrap div.name-wrap',
+        manage: 'div[class*="item___"] div[class*="desc___"], div[class*="name___"], div[class*="title___"]',
+    };
+
+    /** Where the price tag goes in a row: after the name. */
+    const OWN_BAZAAR_TAG_CLASS = 'ttv2-bztag';
+
+    function cleanText(node) {
+        return ((node && node.textContent) || '').replace(/\s+/g, ' ').trim();
+    }
+
+    /**
+     * Read every row on the page.
+     *
+     * @param {'add'|'manage'} which
+     * @param {Document|Element} root
+     * @param {object} index - item index
+     * @returns {{rows: Array<{el, nameEl, itemId, name, item}>, diagnostics: object}}
+     */
+    function scanOwnBazaar(which, root, index) {
+        const diagnostics = { page: which, rows: 0, withImage: 0, identified: 0, noItem: 0 };
+        const rows = [];
+        if (!root || !index || !OWN_BAZAAR_ROW_SELECTORS[which]) return { rows, diagnostics };
+
+        const seen = new Set();
+        for (const el of root.querySelectorAll(OWN_BAZAAR_ROW_SELECTORS[which])) {
+            // The manage selectors can both match the same row.
+            if (seen.has(el) || (el.closest && el.closest('#ttv2-host'))) continue;
+            seen.add(el);
+            diagnostics.rows += 1;
+
+            const img = el.querySelector(ITEM_IMAGE_SELECTOR) || el.querySelector('img');
+            const id = img ? itemIdFromImage(img) : null;
+            if (id) diagnostics.withImage += 1;
+
+            const nameEl = el.querySelector(OWN_BAZAAR_NAME_SELECTORS[which]);
+            const nameText = cleanText(nameEl).replace(/\s*(x|×)\s*\d[\d,]*\s*$/i, '');
+            const alt = img ? (img.getAttribute('alt') || '').trim() : '';
+
+            const item =
+                (id && findItemById(index, id)) ||
+                findItemByName(index, nameText) ||
+                findItemByName(index, alt) ||
+                null;
+
+            if (!item) {
+                diagnostics.noItem += 1;
+                continue;
+            }
+
+            diagnostics.identified += 1;
+            rows.push({ el, nameEl: nameEl || el, itemId: item.id, name: item.name, item });
+        }
+
+        return { rows, diagnostics };
+    }
+
+    /**
+     * The tag element in a row, created if missing. Text is set by the caller.
+     * Paint-only: a span AFTER the name element (never inside it, so the name
+     * still reads as the name on the next scan); never a form field, never a
+     * click on Torn's controls. The row's item id is kept on the tag, so a
+     * click reads the item of the row as it is NOW: #/manage is a virtualised
+     * list whose row elements are reused for other items as you scroll.
+     */
+    function ensureRowTag(row, doc = document) {
+        let tag = row.el.querySelector('.' + OWN_BAZAAR_TAG_CLASS);
+        if (!tag) {
+            tag = doc.createElement('span');
+            tag.className = OWN_BAZAAR_TAG_CLASS;
+            const nameEl = row.nameEl && row.nameEl !== row.el ? row.nameEl : null;
+            if (nameEl && nameEl.parentNode) nameEl.parentNode.insertBefore(tag, nameEl.nextSibling);
+            else row.el.appendChild(tag);
+        }
+        if (tag.dataset.itemId !== String(row.itemId)) tag.dataset.itemId = String(row.itemId);
+        return tag;
+    }
+
+    function removeRowTags(root = document) {
+        for (const t of root.querySelectorAll('.' + OWN_BAZAAR_TAG_CLASS)) t.remove();
+    }
+
     /* ===== src/sources/dom/owner.js ===== */
     /*
      * The bazaar owner banner, captured live 2026-09-24:
@@ -3619,6 +4541,25 @@
         return { level: full.level, text, title: full.text };
     }
 
+    /**
+     * One word for a row: "Online", "Idle", "Offline 3h", or the state when it
+     * is not Okay ("Traveling", "Hospital"). The full presenceText() goes in the
+     * tooltip. Rows have no room for more, and a word with a dot reads faster.
+     * @returns {{level: string, text: string, title: string}}
+     */
+    function presenceWord(presence, now = Date.now()) {
+        const full = presenceText(presence, now);
+        if (full.level === 'unknown') return { level: 'unknown', text: 'Unknown', title: full.text };
+
+        let text = presence.online;
+        if (presence.state && presence.state !== 'Okay') {
+            text = presence.state;
+        } else if (presence.online !== 'Online' && presence.lastActionAt) {
+            text += ' ' + agoText(presence.lastActionAt, now).replace(' ago', '').replace('just now', 'now');
+        }
+        return { level: full.level, text, title: full.text };
+    }
+
     /** Put (or refresh) the badge after the owner's name. Returns true if shown. */
     function renderOwnerBadge(root, ownerId, presence, now = Date.now()) {
         const link = findOwnerLink(root, ownerId);
@@ -3654,9 +4595,34 @@
      * `!important` appears only on the marker's own box-shadow and tint, because
      * Torn's row styles set box-shadow themselves. It is deliberately not used on
      * `outline`, and the marker never touches `position`.
+     *
+     * Design rules the panel and the selling page share (see README):
+     *   font Arial; sizes 11px (uppercase labels only), 12px (secondary), 13px
+     *   (body), 15px bold (the key money number); line-height 1.4; spacing in
+     *   4/8/12/16px; money right-aligned in tabular figures; colours only from
+     *   the tokens below; a Torn-style striped title bar.
      */
 
     const UI_PREFIX = 'ttv2';
+
+    /*
+     * Colour tokens, shared by the panel and the selling page. Torn's own panel
+     * colour is used for the background where Torn defines it (dark mode);
+     * everything else is fixed so the text stays readable on it.
+     */
+    const TOKENS_CSS = `
+        --bg: var(--default-bg-panel-color, #2e2e2e);
+        --row: #2b2b2b;
+        --line: #444;
+        --text: #ddd;
+        --muted: #999;
+        --profit: #99cc00;
+        --offer: #74c0fc;
+        --warn: #e0a000;
+        --bad: #d83500;
+        --on-profit: #1b1b1b;
+        --title: repeating-linear-gradient(90deg, #242424 0 2px, #2e2e2e 0 4px);
+    `;
 
     /*
      * Two stylesheets, deliberately apart.
@@ -3733,7 +4699,6 @@
         pointer-events: none !important;
     }
 
-    /* The best few opportunities on the page get a warmer fill. */
     /* The listing a feed link was opened for. Paint-only, like .ttv2-hit. */
     .ttv2-target {
         box-shadow:
@@ -3750,10 +4715,10 @@
     /* Bazaar owner status, right after their name in the page banner. */
     .ttv2-owner {
         display: inline-block;
-        margin: 0 4px 0 6px;
-        padding: 0 7px 0 6px;
+        margin: 0 4px 0 8px;
+        padding: 0 8px;
         border-radius: 9px;
-        font: bold 11px/17px Arial, Helvetica, sans-serif;
+        font: bold 12px/18px Arial, Helvetica, sans-serif;
         color: #ddd;
         background: rgba(0, 0, 0, 0.35);
         white-space: nowrap;
@@ -3765,15 +4730,44 @@
         display: inline-block;
         width: 8px;
         height: 8px;
-        margin-right: 5px;
+        margin-right: 4px;
         border-radius: 50%;
-        background: #888;
+        background: #999;
         vertical-align: 0;
     }
 
-    .ttv2-owner[data-level="online"]::before { background: #5ed36f; }
-    .ttv2-owner[data-level="idle"]::before { background: #f0c040; }
-    .ttv2-owner[data-level="offline"]::before { background: #777; }
+    .ttv2-owner[data-level="online"]::before { background: #99cc00; }
+    .ttv2-owner[data-level="idle"]::before { background: #e0a000; }
+    .ttv2-owner[data-level="offline"]::before { background: #999; }
+
+    /*
+     * Your own bazaar's add / manage rows: the current asking prices, after the
+     * item name. Text only; nothing is filled in or clicked.
+     */
+    .ttv2-bztag {
+        display: inline-block;
+        margin-left: 8px;
+        padding: 0 8px;
+        border: 1px solid #444;
+        border-radius: 4px;
+        font: 12px/20px Arial, Helvetica, sans-serif;
+        font-variant-numeric: tabular-nums;
+        color: #ddd;
+        background: #2b2b2b;
+        white-space: nowrap;
+        vertical-align: middle;
+        cursor: pointer;
+    }
+
+    .ttv2-bztag:hover,
+    .ttv2-bztag[data-selected="true"] {
+        border-color: #99cc00;
+    }
+
+    .ttv2-bztag b {
+        color: #74c0fc;
+        font-weight: bold;
+    }
     `;
 
     const PANEL_CSS = `
@@ -3782,31 +4776,14 @@
         all: initial;
     }
 
-    /*
-     * Neutral greys, cards with a rank, a green profit column and a full-width
-     * GO button - the original script's look, which people liked.
-     */
     .ttv2-panel {
-        --bg: #1f1f1f;
-        --bg2: #262626;
-        --bg3: #2d2d2d;
-        --line: #3a3a3a;
-        --line2: #4a4a4a;
-        --text: #eee;
-        --muted: #9a9a9a;
-        --faint: #777;
-        --green: #65d27a;
-        --amber: #ffcc4d;
-        /* Trader offers: cooler than NPC green, which means "guaranteed". */
-        --trader: #7ec8ff;
-        --red: #ff8f7a;
-
+    ${TOKENS_CSS}
         position: fixed;
         right: 16px;
         bottom: 16px;
         z-index: 2147483000;
         width: 430px;
-        max-width: calc(100vw - 32px);
+        max-width: calc(100vw - 16px);
         /* Fits its content; the list scrolls beyond this. */
         max-height: min(75vh, 720px);
         min-height: 220px;
@@ -3814,10 +4791,10 @@
         flex-direction: column;
         background: var(--bg);
         color: var(--text);
-        border: 1px solid #555;
-        border-radius: 8px;
-        box-shadow: 0 10px 34px rgba(0, 0, 0, 0.6);
-        font: 12px/1.35 Arial, Helvetica, sans-serif;
+        border: 1px solid var(--line);
+        border-radius: 4px;
+        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+        font: 13px/1.4 Arial, Helvetica, sans-serif;
         text-align: left;
         overflow: hidden;
     }
@@ -3829,23 +4806,33 @@
     }
 
     .ttv2-panel a {
-        color: var(--green);
+        color: var(--offer);
+        text-decoration: none;
+    }
+
+    .ttv2-panel a:hover {
+        text-decoration: underline;
+    }
+
+    .ttv2-panel b,
+    .ttv2-panel strong {
+        font-weight: bold;
     }
 
     .ttv2-panel button {
-        font: inherit;
-        font-size: 11px;
-        font-weight: bold;
+        font: bold 12px/1 Arial, Helvetica, sans-serif;
+        height: 28px;
+        padding: 0 12px;
         color: var(--text);
-        background: #353535;
-        border: 1px solid #555;
+        background: var(--line);
+        border: 1px solid var(--line);
         border-radius: 4px;
-        padding: 5px 9px;
         cursor: pointer;
+        white-space: nowrap;
     }
 
     .ttv2-panel button:hover:not(:disabled) {
-        background: #444;
+        border-color: var(--muted);
     }
 
     .ttv2-panel button:disabled {
@@ -3856,42 +4843,58 @@
     .ttv2-panel button:focus-visible,
     .ttv2-panel input:focus-visible,
     .ttv2-panel summary:focus-visible {
-        outline: 2px solid var(--green);
+        outline: 2px solid var(--profit);
         outline-offset: 1px;
     }
 
     .ttv2-panel button.ttv2-primary {
-        background: #2f5d38;
-        border-color: #3f7d4b;
-    }
-
-    .ttv2-panel button.ttv2-primary:hover:not(:disabled) {
-        background: #37703f;
+        color: var(--on-profit);
+        background: var(--profit);
+        border-color: var(--profit);
     }
 
     .ttv2-panel button.ttv2-link {
+        height: auto;
+        padding: 0;
         background: none;
         border: 0;
-        padding: 2px 0;
-        color: var(--muted);
+        color: var(--offer);
         font-weight: normal;
+        font-size: 12px;
+    }
+
+    .ttv2-panel button.ttv2-link:hover:not(:disabled) {
         text-decoration: underline;
-        align-self: flex-start;
     }
 
     .ttv2-panel input[type="text"] {
-        font: inherit;
+        font: 13px/1.4 Arial, Helvetica, sans-serif;
+        height: 28px;
         color: var(--text);
-        background: #181818;
-        border: 1px solid #555;
+        background: var(--row);
+        border: 1px solid var(--line);
         border-radius: 4px;
-        padding: 5px 7px;
+        padding: 0 8px;
         width: 100%;
     }
 
     .ttv2-panel input[type="checkbox"] {
-        accent-color: var(--green);
-        margin: 2px 0 0;
+        accent-color: var(--profit);
+        margin: 3px 0 0;
+    }
+
+    .ttv2-money {
+        font-variant-numeric: tabular-nums;
+        text-align: right;
+        white-space: nowrap;
+    }
+
+    .ttv2-label {
+        font-size: 11px;
+        font-weight: bold;
+        letter-spacing: 0.5px;
+        text-transform: uppercase;
+        color: var(--muted);
     }
 
     /* ---------------------------------------------------------------- header */
@@ -3900,9 +4903,10 @@
         display: flex;
         align-items: center;
         gap: 4px;
-        padding: 6px 6px 6px 12px;
-        background: #292929;
-        border-bottom: 1px solid #444;
+        height: 30px;
+        padding: 0 4px 0 12px;
+        background: var(--title);
+        border-bottom: 1px solid var(--line);
         cursor: move;
         user-select: none;
         flex: 0 0 auto;
@@ -3915,51 +4919,44 @@
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
-    }
-
-    .ttv2-title-text {
         font-size: 13px;
         font-weight: bold;
-    }
-
-    .ttv2-ver {
-        margin-left: 6px;
-        color: var(--faint);
-        font-size: 10px;
+        letter-spacing: 1px;
+        color: #fff;
+        text-shadow: 1px 1px 2px rgba(0, 0, 0, 0.65);
     }
 
     .ttv2-mini {
-        margin-left: 6px;
-        color: var(--green);
-        font-weight: bold;
+        margin-left: 8px;
+        color: var(--profit);
+        letter-spacing: 0;
+        font-variant-numeric: tabular-nums;
     }
 
     .ttv2-panel button.ttv2-icon {
-        width: 28px;
-        height: 28px;
+        width: 24px;
+        height: 24px;
         padding: 0;
         font-size: 15px;
-        line-height: 26px;
+        line-height: 22px;
         text-align: center;
         background: transparent;
         border-color: transparent;
-        color: #ccc;
+        color: var(--text);
     }
 
     .ttv2-panel button.ttv2-icon:hover:not(:disabled) {
-        background: #3a3a3a;
-        color: #fff;
+        background: rgba(255, 255, 255, 0.08);
+        border-color: transparent;
     }
 
     .ttv2-panel button.ttv2-icon[aria-pressed="true"] {
-        background: #3a3a3a;
-        border-color: #555;
-        color: var(--green);
+        color: var(--profit);
     }
 
     .ttv2-panel button.ttv2-back {
         display: none;
-        margin-left: -6px;
+        margin-left: -8px;
     }
 
     .ttv2-on-settings button.ttv2-back {
@@ -3968,17 +4965,18 @@
 
     .ttv2-panel button.ttv2-scan {
         height: 24px;
-        padding: 0 9px;
-        margin-right: 2px;
-        font-size: 12px;
-        font-weight: bold;
-        color: var(--green);
-        background: transparent;
-        border-color: #4a6a4a;
+        padding: 0 12px;
+        color: var(--on-profit);
+        background: var(--profit);
+        border-color: var(--profit);
     }
 
-    .ttv2-panel button.ttv2-scan:hover:not(:disabled) {
-        background: #2f3d2f;
+    .ttv2-panel button.ttv2-sell {
+        height: 24px;
+        padding: 0 8px;
+        background: transparent;
+        border-color: var(--offer);
+        color: var(--offer);
     }
 
     .ttv2-scanning button.ttv2-scan {
@@ -3986,8 +4984,8 @@
     }
 
     @keyframes ttv2-pulse {
-        0% { box-shadow: 0 0 0 0 rgba(120, 200, 120, 0.7); background: #2f4a2f; }
-        100% { box-shadow: 0 0 0 8px rgba(120, 200, 120, 0); }
+        0% { box-shadow: 0 0 0 0 rgba(153, 204, 0, 0.7); }
+        100% { box-shadow: 0 0 0 8px rgba(153, 204, 0, 0); }
     }
 
     .ttv2-sweep {
@@ -3996,7 +4994,7 @@
         bottom: -1px;
         height: 2px;
         width: 30%;
-        background: linear-gradient(90deg, transparent, var(--green), transparent);
+        background: linear-gradient(90deg, transparent, var(--profit), transparent);
         opacity: 0;
         pointer-events: none;
     }
@@ -4008,46 +5006,6 @@
     @keyframes ttv2-sweep {
         0% { left: -30%; opacity: 1; }
         100% { left: 100%; opacity: 1; }
-    }
-
-    .ttv2-seller {
-        display: none;
-        padding: 5px 12px;
-        font-size: 12px;
-        color: #ccc;
-        border-bottom: 1px solid var(--line);
-        white-space: nowrap;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        /* Never squeezed by a long list: overflow:hidden lets flex shrink it to nothing. */
-        flex: 0 0 auto;
-    }
-
-    .ttv2-seller.ttv2-shown {
-        display: block;
-    }
-
-    .ttv2-seller b {
-        color: #fff;
-    }
-
-    .ttv2-seller .ttv2-dot {
-        display: inline-block;
-        width: 8px;
-        height: 8px;
-        margin: 0 4px 0 6px;
-        border-radius: 50%;
-        background: #888;
-    }
-
-    .ttv2-seller .ttv2-dot[data-level="online"] { background: #5ed36f; }
-    .ttv2-seller .ttv2-dot[data-level="idle"] { background: #f0c040; }
-    .ttv2-seller .ttv2-dot[data-level="offline"] { background: #777; }
-
-    .ttv2-seller .ttv2-closed {
-        margin-left: 6px;
-        color: #ff8a80;
-        font-weight: bold;
     }
 
     .ttv2-spin {
@@ -4073,10 +5031,6 @@
         cursor: pointer;
     }
 
-    .ttv2-collapsed .ttv2-ver {
-        display: none;
-    }
-
     /* ------------------------------------------------------------ status bar */
 
     .ttv2-body {
@@ -4089,9 +5043,8 @@
     .ttv2-bar {
         display: flex;
         align-items: center;
-        gap: 10px;
-        padding: 6px 12px;
-        background: var(--bg2);
+        gap: 8px;
+        padding: 8px 12px;
         border-bottom: 1px solid var(--line);
         font-size: 12px;
         flex: 0 0 auto;
@@ -4104,37 +5057,64 @@
         overflow: hidden;
         text-overflow: ellipsis;
         font-weight: bold;
+        font-variant-numeric: tabular-nums;
     }
 
     .ttv2-bar.ttv2-warn .ttv2-bar-left {
-        color: var(--amber);
+        color: var(--warn);
         font-weight: normal;
     }
 
     .ttv2-bar.ttv2-error .ttv2-bar-left {
-        color: var(--red);
+        color: var(--bad);
         font-weight: normal;
     }
 
     .ttv2-bar-right {
         color: var(--muted);
-        font-size: 11px;
         white-space: nowrap;
     }
 
     .ttv2-dot {
         display: inline-block;
-        width: 7px;
-        height: 7px;
-        margin-right: 5px;
+        width: 8px;
+        height: 8px;
+        margin-right: 4px;
         border-radius: 50%;
-        background: #666;
+        background: var(--muted);
         vertical-align: 0;
     }
 
-    .ttv2-dot-live { background: var(--green); box-shadow: 0 0 5px var(--green); }
-    .ttv2-dot-warn { background: var(--amber); }
-    .ttv2-dot-other { background: #7aa7d6; }
+    .ttv2-dot-live { background: var(--profit); }
+    .ttv2-dot-warn { background: var(--warn); }
+    .ttv2-dot-other { background: var(--offer); }
+
+    /* Seller of the bazaar you are on. */
+    .ttv2-seller {
+        display: none;
+        padding: 8px 12px;
+        font-size: 12px;
+        color: var(--muted);
+        border-bottom: 1px solid var(--line);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        flex: 0 0 auto;
+    }
+
+    .ttv2-seller.ttv2-shown {
+        display: block;
+    }
+
+    .ttv2-seller b {
+        color: var(--text);
+    }
+
+    .ttv2-seller .ttv2-closed {
+        margin-left: 8px;
+        color: var(--bad);
+        font-weight: bold;
+    }
 
     /* ------------------------------------------------------------------ pages */
 
@@ -4153,26 +5133,21 @@
     .ttv2-on-settings .ttv2-page-settings {
         display: flex;
         overflow-y: auto;
-        padding: 10px 12px 14px;
-        gap: 14px;
+        padding: 12px;
+        gap: 16px;
     }
 
     /* ------------------------------------------------------------------ chips */
 
     .ttv2-chips {
         display: flex;
-        flex-wrap: wrap;
+        flex-wrap: nowrap;
         align-items: center;
-        gap: 5px;
-        padding: 7px 10px;
+        gap: 8px;
+        padding: 8px 12px;
         border-bottom: 1px solid var(--line);
         flex: 0 0 auto;
-    }
-
-    .ttv2-chips-label {
-        color: var(--muted);
-        font-size: 11px;
-        margin-right: 2px;
+        overflow: hidden;
     }
 
     .ttv2-chips-gap {
@@ -4180,69 +5155,67 @@
     }
 
     .ttv2-panel button.ttv2-chip {
-        padding: 3px 9px;
+        height: 24px;
+        padding: 0 8px;
         border-radius: 12px;
-        font-size: 11px;
         font-weight: normal;
         background: transparent;
-        border-color: #555;
+        border-color: var(--line);
         color: var(--muted);
     }
 
     .ttv2-panel button.ttv2-chip[aria-pressed="true"] {
-        color: #fff;
-        border-color: var(--green);
-        background: rgba(101, 210, 122, 0.14);
-    }
-
-    .ttv2-panel button.ttv2-chip[aria-pressed="true"]::before {
-        content: '✓ ';
-        color: var(--green);
+        color: var(--text);
+        border-color: var(--profit);
+        background: rgba(153, 204, 0, 0.12);
     }
 
     .ttv2-panel button.ttv2-chip-set {
-        color: #fff;
-        border-color: #777;
+        color: var(--text);
+        border-color: var(--muted);
     }
 
     .ttv2-panel input.ttv2-chip-input {
-        width: 90px;
-        padding: 3px 8px;
+        width: 96px;
+        height: 24px;
+        padding: 0 8px;
         border-radius: 12px;
-        font-size: 11px;
+        font-size: 12px;
     }
 
     /* ------------------------------------------------------------------- tabs */
 
     .ttv2-tabs {
         display: flex;
-        align-items: flex-end;
+        align-items: center;
         gap: 4px;
-        padding: 6px 10px 0;
-        background: #292929;
-        border-bottom: 1px solid #444;
+        padding: 8px 12px 0;
+        border-bottom: 1px solid var(--line);
         flex: 0 0 auto;
     }
 
     .ttv2-panel button.ttv2-tab {
-        border-radius: 5px 5px 0 0;
+        height: 28px;
+        border-radius: 4px 4px 0 0;
         border-bottom: 0;
-        background: #242424;
+        background: transparent;
         color: var(--muted);
-        padding: 6px 12px;
+        font-weight: normal;
     }
 
     .ttv2-panel button.ttv2-tab.ttv2-tab-on {
-        background: var(--bg);
-        color: #fff;
-        box-shadow: inset 0 2px 0 var(--green);
+        background: var(--row);
+        color: var(--text);
+        font-weight: bold;
+        box-shadow: inset 0 2px 0 var(--profit);
     }
 
     .ttv2-credit {
         margin-left: auto;
-        padding-bottom: 6px;
-        color: var(--faint);
-        font-size: 10px;
+        padding-bottom: 8px;
+        color: var(--muted);
+        font-size: 12px;
+        white-space: nowrap;
     }
 
     /* ------------------------------------------------------------------- list */
@@ -4251,274 +5224,270 @@
         flex: 1;
         min-height: 0;
         overflow-y: auto;
-        padding: 7px;
+        padding: 8px 12px;
     }
 
+    .ttv2-cols {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) 96px;
+        gap: 8px;
+        padding: 0 12px 4px;
+    }
+
+    .ttv2-cols .ttv2-money {
+        color: var(--muted);
+    }
+
+    /*
+     * One deal, two lines:
+     *   Xanax ×390                                   +$11,255
+     *   Bazaar · Garrett89 ● Offline 3h · Buy $838,745 · 40s     [Go]
+     */
     .ttv2-row {
         display: grid;
-        grid-template-columns: 25px minmax(0, 1fr) 105px;
-        gap: 4px 7px;
-        padding: 9px 8px;
-        margin-bottom: 6px;
-        background: #292929;
-        border: 1px solid #444;
-        border-radius: 5px;
+        grid-template-columns: minmax(0, 1fr) auto;
+        grid-template-rows: auto auto;
+        align-items: start;
+        column-gap: 8px;
+        row-gap: 4px;
+        padding: 8px 12px;
+        margin-bottom: 8px;
+        background: var(--row);
+        border: 1px solid var(--line);
+        border-radius: 4px;
     }
 
     .ttv2-row.ttv2-onpage {
-        border-color: #3f6b48;
-    }
-
-    .ttv2-rank {
-        color: #888;
-        font-weight: bold;
-        padding-top: 2px;
-    }
-
-    .ttv2-row-main {
-        min-width: 0;
+        border-color: var(--profit);
     }
 
     .ttv2-row-name {
-        font-size: 13px;
+        min-width: 0;
         font-weight: bold;
-        color: #fff;
-        margin-bottom: 2px;
+        color: var(--text);
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
     }
 
-    .ttv2-row-src {
+    .ttv2-row-name .ttv2-qty {
+        margin-left: 4px;
+        font-weight: normal;
         color: var(--muted);
-        font-size: 10px;
-        white-space: pre-wrap;
-    }
-
-    /* Each part stays whole; a narrow row wraps between them. */
-    .ttv2-src-part {
-        display: inline-block;
-        max-width: 100%;
-        vertical-align: top;
-        white-space: pre;
-        overflow: hidden;
-        text-overflow: ellipsis;
-    }
-
-    /* The seller's status, right after their name: "● Offline 3h ago". */
-    .ttv2-src-status {
-        margin-left: 5px;
-        font-weight: bold;
-        color: #aaa;
-    }
-
-    .ttv2-src-status::before {
-        content: "";
-        display: inline-block;
-        width: 7px;
-        height: 7px;
-        margin-right: 3px;
-        border-radius: 50%;
-        background: #777;
-        vertical-align: 0;
-    }
-
-    .ttv2-src-status[data-level="online"] { color: var(--green); }
-    .ttv2-src-status[data-level="online"]::before { background: var(--green); }
-    .ttv2-src-status[data-level="idle"] { color: var(--amber); }
-    .ttv2-src-status[data-level="idle"]::before { background: var(--amber); }
-
-    /* ---- Traders page button and its prompt ---- */
-
-    .ttv2-panel button.ttv2-traders-btn {
-        padding: 3px 9px;
-        border-color: var(--trader);
-        color: var(--trader);
-        font-weight: bold;
-    }
-
-    .ttv2-prompt {
-        position: absolute;
-        top: 46px;
-        left: 10px;
-        right: 10px;
-        z-index: 5;
-        display: grid;
-        gap: 8px;
-        padding: 12px;
-        background: #2a2a2a;
-        border: 1px solid #666;
-        border-radius: 6px;
-        box-shadow: 0 8px 24px rgba(0, 0, 0, 0.55);
-    }
-
-    .ttv2-prompt-q {
-        font-weight: bold;
-        font-size: 13px;
-        color: #fff;
-    }
-
-    .ttv2-prompt-btns {
-        display: flex;
-        justify-content: flex-end;
-        gap: 8px;
-    }
-
-    /* ---- traders ---- */
-
-    .ttv2-row-trader .ttv2-row-profit,
-    .ttv2-group-total,
-    .ttv2-group-profit {
-        color: var(--trader);
-    }
-
-    .ttv2-trader {
-        font-size: 11px;
-        color: #bbb;
-    }
-
-    .ttv2-trader b,
-    .ttv2-group-who b {
-        color: #fff;
-    }
-
-    .ttv2-trader-links {
-        display: inline-flex;
-        gap: 4px;
-        vertical-align: middle;
-    }
-
-    .ttv2-panel button.ttv2-mini-btn {
-        padding: 1px 7px;
-        font-size: 10px;
-        font-weight: bold;
-        line-height: 16px;
-        color: #ddd;
-    }
-
-    .ttv2-trader-warn {
-        color: var(--amber);
-        font-size: 10px;
-        cursor: help;
-    }
-
-    .ttv2-trader-alt {
-        color: var(--muted);
-        font-size: 10px;
-    }
-
-    .ttv2-group {
-        margin-bottom: 8px;
-        background: #292929;
-        border: 1px solid #444;
-        border-left: 3px solid var(--trader);
-        border-radius: 5px;
-    }
-
-    .ttv2-group-head {
-        display: grid;
-        grid-template-columns: minmax(0, 1fr) auto;
-        gap: 4px 8px;
-        align-items: center;
-        padding: 8px 9px 6px;
-        border-bottom: 1px solid var(--line);
-        font-size: 12px;
-    }
-
-    .ttv2-group-head .ttv2-trader-links {
-        grid-column: 1 / 3;
-    }
-
-    .ttv2-group-facts {
-        color: var(--muted);
-        font-size: 11px;
-    }
-
-    .ttv2-group-total {
-        font-size: 14px;
-        text-align: right;
-    }
-
-    .ttv2-group-item {
-        display: grid;
-        grid-template-columns: minmax(0, 1fr) auto auto;
-        gap: 2px 8px;
-        align-items: center;
-        padding: 6px 9px;
-        border-bottom: 1px solid #333;
-    }
-
-    .ttv2-group-item:last-child {
-        border-bottom: 0;
-    }
-
-    .ttv2-group-item .ttv2-row-name {
-        font-size: 12px;
-    }
-
-    .ttv2-group-profit {
-        font-size: 12px;
-    }
-
-    .ttv2-row-prices {
-        color: #bbb;
-        font-size: 11px;
-        margin-top: 3px;
-    }
-
-    .ttv2-row-prices b {
-        color: #fff;
-    }
-
-    .ttv2-row-qty {
-        margin-top: 3px;
-        color: var(--faint);
-        font-size: 10px;
+        font-variant-numeric: tabular-nums;
     }
 
     .ttv2-row-profit {
-        display: flex;
-        flex-direction: column;
-        justify-content: center;
-        text-align: right;
-        color: var(--green);
+        font-size: 15px;
+        font-weight: bold;
+        color: var(--profit);
+        min-width: 96px;
     }
 
-    .ttv2-row-profit strong {
-        font-size: 14px;
+    .ttv2-row-profit .ttv2-per {
+        display: block;
+        font-size: 12px;
+        font-weight: normal;
+        color: var(--muted);
     }
 
-    .ttv2-row-profit span {
-        color: #aaa;
-        font-size: 10px;
-        margin-top: 2px;
+    .ttv2-row-details {
+        align-self: center;
+    }
+
+    .ttv2-row-details {
+        min-width: 0;
+        font-size: 12px;
+        color: var(--muted);
+        overflow-wrap: anywhere;
+        font-variant-numeric: tabular-nums;
+    }
+
+    .ttv2-row-details b {
+        color: var(--text);
+        font-weight: normal;
+    }
+
+    .ttv2-row-details .ttv2-guess {
+        color: var(--warn);
+        cursor: help;
+    }
+
+    /* "● Online" / "● Offline 3h" - an 8px dot and a word. */
+    .ttv2-status::before {
+        content: "";
+        display: inline-block;
+        width: 8px;
+        height: 8px;
+        margin: 0 4px 0 4px;
+        border-radius: 50%;
+        background: var(--muted);
+        vertical-align: 0;
+    }
+
+    .ttv2-status[data-level="online"]::before { background: var(--profit); }
+    .ttv2-status[data-level="idle"]::before { background: var(--warn); }
+    .ttv2-status[data-level="unknown"]::before {
+        background: transparent;
+        border: 1px solid var(--muted);
     }
 
     .ttv2-panel button.ttv2-go {
-        grid-column: 2 / 4;
-        width: 100%;
-        text-align: center;
-        padding: 5px 7px;
-        color: #ddd;
-    }
-
-    .ttv2-guess {
-        color: var(--amber);
-        cursor: help;
+        justify-self: end;
+        min-width: 40px;
+        padding: 0 8px;
     }
 
     .ttv2-empty {
         display: flex;
         flex-direction: column;
         align-items: center;
-        gap: 10px;
-        padding: 28px 16px;
+        gap: 12px;
+        padding: 24px 16px;
         text-align: center;
     }
 
     .ttv2-empty-text {
         color: var(--muted);
-        max-width: 300px;
+        max-width: 320px;
+    }
+
+    /* --------------------------------------------------------- my bazaar view */
+
+    .ttv2-bzlist {
+        padding: 8px 12px;
+        border-bottom: 1px solid var(--line);
+        flex: 0 0 auto;
+        max-height: 40%;
+        overflow-y: auto;
+    }
+
+    .ttv2-bzrow {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) 96px 96px;
+        gap: 8px;
+        align-items: center;
+        width: 100%;
+        height: auto;
+        padding: 4px 8px;
+        margin-bottom: 4px;
+        text-align: left;
+        font-weight: normal;
+        background: transparent;
+        border-color: transparent;
+    }
+
+    .ttv2-panel button.ttv2-bzrow {
+        height: auto;
+        padding: 4px 8px;
+        font-weight: normal;
+        font-size: 13px;
+        background: transparent;
+        border-color: transparent;
+    }
+
+    .ttv2-panel button.ttv2-bzrow[aria-pressed="true"] {
+        background: var(--row);
+        border-color: var(--line);
+    }
+
+    .ttv2-bzrow .ttv2-name {
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        color: var(--text);
+    }
+
+    .ttv2-bzrow .ttv2-money {
+        color: var(--offer);
+    }
+
+    .ttv2-bzdetail {
+        flex: 1;
+        min-height: 0;
+        overflow-y: auto;
+        padding: 12px;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+    }
+
+    .ttv2-bzdetail h3 {
+        margin: 0;
+        font-size: 13px;
+        font-weight: bold;
+    }
+
+    .ttv2-avg {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 12px;
+    }
+
+    .ttv2-avg th,
+    .ttv2-avg td {
+        padding: 4px 8px;
+        border-top: 1px solid var(--line);
+        text-align: left;
+        white-space: nowrap;
+    }
+
+    .ttv2-avg th {
+        color: var(--muted);
+        font-weight: normal;
+    }
+
+    .ttv2-avg td.ttv2-money,
+    .ttv2-avg th.ttv2-money {
+        text-align: right;
+    }
+
+    .ttv2-avg .ttv2-none {
+        color: var(--muted);
+    }
+
+    .ttv2-graph {
+        width: 100%;
+        height: 96px;
+        display: block;
+        background: var(--row);
+        border: 1px solid var(--line);
+        border-radius: 4px;
+    }
+
+    .ttv2-graph-keys {
+        display: flex;
+        gap: 12px;
+        font-size: 12px;
+        color: var(--muted);
+    }
+
+    .ttv2-graph-keys .ttv2-key-im { color: var(--offer); }
+    .ttv2-graph-keys .ttv2-key-bz { color: var(--profit); }
+    .ttv2-graph-keys .ttv2-key-mv { color: var(--warn); }
+
+    .ttv2-windows {
+        display: flex;
+        gap: 4px;
+    }
+
+    .ttv2-panel button.ttv2-window {
+        height: 24px;
+        padding: 0 8px;
+        font-weight: normal;
+        background: transparent;
+    }
+
+    .ttv2-panel button.ttv2-window[aria-pressed="true"] {
+        background: var(--row);
+        border-color: var(--muted);
+        font-weight: bold;
+    }
+
+    .ttv2-note {
+        color: var(--muted);
+        font-size: 12px;
     }
 
     /* --------------------------------------------------------------- settings */
@@ -4526,7 +5495,7 @@
     .ttv2-section {
         display: flex;
         flex-direction: column;
-        gap: 7px;
+        gap: 8px;
     }
 
     .ttv2-h {
@@ -4537,18 +5506,6 @@
         text-transform: uppercase;
         letter-spacing: 0.5px;
         color: var(--muted);
-    }
-
-    .ttv2-note,
-    .ttv2-sub {
-        color: var(--muted);
-        font-size: 11px;
-    }
-
-    .ttv2-sub {
-        display: block;
-        margin-top: 2px;
-        font-size: 10.5px;
     }
 
     .ttv2-check {
@@ -4562,9 +5519,15 @@
         color: var(--text);
     }
 
+    .ttv2-sub {
+        display: block;
+        color: var(--muted);
+        font-size: 12px;
+    }
+
     .ttv2-inline {
         display: flex;
-        gap: 5px;
+        gap: 8px;
         align-items: center;
     }
 
@@ -4578,39 +5541,39 @@
     }
 
     .ttv2-keystate {
-        font-size: 11px;
+        font-size: 12px;
         color: var(--muted);
     }
 
-    .ttv2-keystate.ttv2-ok { color: var(--green); }
-    .ttv2-keystate.ttv2-bad { color: var(--red); }
+    .ttv2-keystate.ttv2-ok { color: var(--profit); }
+    .ttv2-keystate.ttv2-bad { color: var(--bad); }
 
     .ttv2-tos-box {
         border: 1px solid var(--line);
-        border-radius: 5px;
-        padding: 6px 8px;
-        background: var(--bg2);
+        border-radius: 4px;
+        padding: 8px;
+        background: var(--row);
     }
 
     .ttv2-tos-box summary {
         cursor: pointer;
         color: var(--text);
-        font-size: 11px;
+        font-size: 12px;
     }
 
     .ttv2-tos {
         width: 100%;
-        margin-top: 6px;
+        margin-top: 8px;
         border-collapse: collapse;
-        font-size: 10.5px;
-        color: #bbb;
+        font-size: 12px;
+        color: var(--text);
     }
 
     .ttv2-tos th,
     .ttv2-tos td {
         text-align: left;
         vertical-align: top;
-        padding: 3px 4px;
+        padding: 4px;
         border-top: 1px solid var(--line);
     }
 
@@ -4640,25 +5603,150 @@
         return style;
     }
 
+    /* ===== src/ui/graph.js ===== */
+    /*
+     * A small SVG line graph of recorded asking prices, built as DOM nodes
+     * (never innerHTML). Two lines - the lowest Item Market ask and the lowest
+     * bazaar ask - and Torn's daily market value as a dashed step line. Gaps in
+     * the record stay gaps: a line is broken where a bucket has no data, so the
+     * picture never pretends to know more than was recorded.
+     */
+
+    const SVG_NS = 'http://www.w3.org/2000/svg';
+
+    function svgEl(tag, attrs = {}) {
+        const node = document.createElementNS(SVG_NS, tag);
+        for (const [k, v] of Object.entries(attrs)) node.setAttribute(k, String(v));
+        return node;
+    }
+
+    /** The smallest spacing between points: the bucket width, when `step` is not given. */
+    function inferStep(points) {
+        let min = 0;
+        for (let i = 1; i < points.length; i += 1) {
+            const gap = points[i].t - points[i - 1].t;
+            if (gap > 0 && (!min || gap < min)) min = gap;
+        }
+        return min;
+    }
+
+    /**
+     * @param {object} data - from core/history.js series(): { from, to, points, mv, step }
+     * @param {object} [opts] - { width, height, colors: { im, bz, mv } }
+     * @returns {SVGElement}
+     */
+    function renderPriceGraph(data, opts = {}) {
+        const width = opts.width || 400;
+        const height = opts.height || 96;
+        const pad = { l: 8, r: 8, t: 8, b: 8 };
+        const colors = { im: '#74c0fc', bz: '#99cc00', mv: '#e0a000', ...(opts.colors || {}) };
+
+        const svg = svgEl('svg', {
+            viewBox: '0 0 ' + width + ' ' + height,
+            preserveAspectRatio: 'none',
+            class: 'ttv2-graph',
+            role: 'img',
+        });
+
+        const values = [];
+        for (const p of data.points || []) {
+            if (p.im !== null && p.im !== undefined) values.push(p.im);
+            if (p.bz !== null && p.bz !== undefined) values.push(p.bz);
+        }
+        for (const m of data.mv || []) if (m.mv) values.push(m.mv);
+
+        if (values.length < 1) {
+            const t = svgEl('text', { x: width / 2, y: height / 2 + 4, 'text-anchor': 'middle', fill: '#999', 'font-size': 12, 'font-family': 'Arial' });
+            t.textContent = 'Nothing recorded yet';
+            svg.appendChild(t);
+            return svg;
+        }
+
+        let min = Math.min(...values);
+        let max = Math.max(...values);
+        if (min === max) {
+            min *= 0.95;
+            max *= 1.05;
+        }
+        const span = data.to - data.from || 1;
+        const x = (t) => pad.l + ((t - data.from) / span) * (width - pad.l - pad.r);
+        const y = (v) => height - pad.b - ((v - min) / (max - min)) * (height - pad.t - pad.b);
+
+        // A bucket with nothing recorded is simply absent from the points, so a
+        // jump of more than one bucket between neighbours is a gap too.
+        const step = Number(data.step) || inferStep(data.points || []);
+
+        const line = (key, color, dashed) => {
+            let d = '';
+            let pen = false;
+            let run = 0;
+            const lone = [];
+            let prev = null;
+            let prevT = null;
+            for (const p of data.points || []) {
+                const v = p[key];
+                if (v === null || v === undefined) {
+                    if (run === 1 && prev) lone.push(prev);
+                    pen = false;
+                    run = 0;
+                    continue;
+                }
+                if (pen && step && prevT !== null && p.t - prevT > step * 1.5) {
+                    if (run === 1 && prev) lone.push(prev);
+                    pen = false;
+                    run = 0;
+                }
+                d += (pen ? ' L' : ' M') + x(p.t).toFixed(1) + ' ' + y(v).toFixed(1);
+                pen = true;
+                run += 1;
+                prev = { cx: x(p.t), cy: y(v) };
+                prevT = p.t;
+            }
+            if (run === 1 && prev) lone.push(prev);
+            if (!d) return;
+            const attrs = { d: d.trim(), fill: 'none', stroke: color, 'stroke-width': 1.5, 'vector-effect': 'non-scaling-stroke' };
+            if (dashed) attrs['stroke-dasharray'] = '4 3';
+            svg.appendChild(svgEl('path', attrs));
+            // A sample with no neighbour would be an invisible zero-length line.
+            for (const c of lone) svg.appendChild(svgEl('circle', { cx: c.cx.toFixed(1), cy: c.cy.toFixed(1), r: 2, fill: color }));
+        };
+
+        line('im', colors.im, false);
+        line('bz', colors.bz, false);
+
+        // Market value: one value a day, drawn as steps to the next day.
+        const mv = (data.mv || []).filter((m) => m.mv);
+        if (mv.length) {
+            let d = '';
+            for (let i = 0; i < mv.length; i += 1) {
+                const start = Math.max(mv[i].t, data.from);
+                const end = i + 1 < mv.length ? mv[i + 1].t : data.to;
+                d += (d ? ' L' : 'M') + x(start).toFixed(1) + ' ' + y(mv[i].mv).toFixed(1);
+                d += ' L' + x(Math.min(end, data.to)).toFixed(1) + ' ' + y(mv[i].mv).toFixed(1);
+            }
+            svg.appendChild(svgEl('path', { d, fill: 'none', stroke: colors.mv, 'stroke-width': 1, 'stroke-dasharray': '4 3', 'vector-effect': 'non-scaling-stroke' }));
+        }
+
+        return svg;
+    }
+
     /* ===== src/ui/panel.js ===== */
     /*
-     * The panel: a floating window with two pages - the list, and Settings.
+     * The panel: a floating window with three pages.
      *
-     *   header      title, and three icon buttons: refresh, settings, collapse
-     *   status bar  ONE line: "5 deals · +$5.18m"  ...  "● live · refresh 12s"
-     *   list page   sell-to chips, Bazaars / Item Market tabs, ranked cards
-     *   settings    replaces the list (with Back) - never stacks on top of it
+     *   header      Torn-style title bar: Sell, Scan, refresh, settings, collapse
+     *   status bar  ONE line: "5 deals · +$5.18m"  ...  "● live · 12s"
+     *   list        sell-to chips, Bazaars / Item Market tabs, ranked deals
+     *   my bazaar   on your own bazaar's add / manage pages: what each item is
+     *               going for now, and what the script has recorded
+     *   settings    replaces the list (Back or Esc returns)
      *
-     * The redesign answers specific complaints: Settings opened inline and
-     * drowned the list; three status strips said the same thing; Clear and
-     * Filter were buttons that did nothing lasting; collapse felt random and
-     * the panel forgot where it was put. Every button now has one clear job,
-     * shows its state, and every click does something visible.
-     *
-     * Nothing goes on Torn's item cards beyond one class; every number lives
-     * here. All text goes in through textContent - names from Torn or TornW3B
-     * never touch innerHTML. The panel is in a shadow root (see mount()).
+     * Every button has one job and shows its state. Nothing goes on Torn's item
+     * cards beyond one class; every number lives here. All text goes in through
+     * textContent - names from Torn or TornW3B never touch innerHTML. The panel
+     * is in a shadow root (see mount()).
      */
+
 
 
 
@@ -4688,7 +5776,8 @@
         }
 
         for (const child of [].concat(children)) {
-            if (child) node.appendChild(child);
+            if (child === null || child === undefined || child === false) continue;
+            node.appendChild(typeof child === 'string' ? document.createTextNode(child) : child);
         }
 
         return node;
@@ -4708,10 +5797,7 @@
                 const result = fn(...args);
                 if (result && typeof result.catch === 'function') {
                     result.catch((error) => {
-                        panel.setStatus(
-                            label + ' failed: ' + describeError(error),
-                            'error',
-                        );
+                        panel.setStatus(label + ' failed: ' + describeError(error), 'error');
                     });
                 }
                 return result;
@@ -4725,11 +5811,6 @@
     function describeError(error) {
         if (!error) return 'unknown error';
         return String(error.message || error);
-    }
-
-    function numberFromInput(value, fallback) {
-        const n = parseMoneyInput(value);
-        return n === null ? fallback : n;
     }
 
     /** Keys typed into these belong to the page (or our fields), not the hotkey. */
@@ -4755,6 +5836,12 @@
     /** Long enough to see, short enough not to get in the way. */
     const SCAN_ANIMATION_MS = 800;
 
+    /** A current asking price: "$30", "none" when nothing is listed, null until asked. */
+    function priceText(entry) {
+        if (!entry) return null;
+        return entry.price > 0 ? formatMoney(entry.price) : 'none';
+    }
+
     class Panel {
         /**
          * @param {object} handlers
@@ -4767,6 +5854,9 @@
          * @param {function} handlers.onForgetKey
          * @param {function} handlers.onClearCache
          * @param {function} handlers.onRevealKey      - () => stored key
+         * @param {function} handlers.onOpenSelling    - open the selling page
+         * @param {function} handlers.onSelectBazaarItem - (itemId) => void
+         * @param {function} handlers.onBazaarWindow   - ('24h'|'7d'|'30d') => void
          */
         constructor(handlers = {}) {
             this.handlers = handlers;
@@ -4781,6 +5871,7 @@
                 tab: 'bazaar',
                 counts: {},
                 live: null,
+                bazaar: null,
             };
 
             this.page = 'list';
@@ -4799,30 +5890,31 @@
             this.backBtn = el('button', {
                 type: 'button',
                 class: 'ttv2-icon ttv2-back',
-                title: 'Back to the list (Esc)',
+                title: 'Back (Esc)',
                 'aria-label': 'Back',
                 text: '←',
-                onclick: () => this.showPage('list'),
+                onclick: () => this.showPage(this.homePage()),
             });
 
             this.titleEl = el('div', { class: 'ttv2-title' });
-            this.titleTextEl = el('span', { class: 'ttv2-title-text', text: 'NPC Arbitrage' });
-            this.versionEl = el('span', {
-                class: 'ttv2-ver',
-                title: 'Installed version',
-                text:
-                    'v' +
-                    (typeof TTV2_BUILD_VERSION === 'string' ? TTV2_BUILD_VERSION : 'dev'),
-            });
+            this.titleTextEl = el('span', { text: 'NPC Arbitrage' });
             // Shown only while collapsed: the headline, so a collapsed panel
             // still answers "is there anything to buy?".
             this.miniEl = el('span', { class: 'ttv2-mini' });
             this.titleEl.appendChild(this.titleTextEl);
-            this.titleEl.appendChild(this.versionEl);
             this.titleEl.appendChild(this.miniEl);
 
+            // The selling page: its own tab, for the items you hold.
+            this.sellBtn = el('button', {
+                type: 'button',
+                class: 'ttv2-sell',
+                title: 'Open the selling page in a new tab',
+                text: 'Sell',
+                onclick: guarded(this, 'Sell', () => this.handlers.onOpenSelling && this.handlers.onOpenSelling()),
+            });
+
             // Re-reads the listings on this page right away - no requests, so
-            // it can be pressed as often as you like. The feed refresh is ↻.
+            // it can be pressed as often as you like. The refresh is ↻.
             this.scanBtn = el('button', {
                 type: 'button',
                 class: 'ttv2-scan',
@@ -4860,8 +5952,7 @@
                 'aria-label': 'Settings',
                 'aria-pressed': 'false',
                 text: '⚙',
-                onclick: () =>
-                    this.showPage(this.page === 'settings' ? 'list' : 'settings'),
+                onclick: () => this.showPage(this.page === 'settings' ? this.homePage() : 'settings'),
             });
 
             this.collapseBtn = el('button', {
@@ -4877,19 +5968,10 @@
             // you can see a scan happened even when nothing on the list changed.
             this.sweepEl = el('div', { class: 'ttv2-sweep', 'aria-hidden': 'true' });
 
-            // The Traders page: its own full page, fed by this overlay.
-            this.tradersBtn = el('button', {
-                type: 'button',
-                class: 'ttv2-traders-btn',
-                title: 'Open the Traders page: every deal with the traders who buy it',
-                text: 'Traders',
-                onclick: guarded(this, 'Traders', () => this.handlers.onOpenTraders && this.handlers.onOpenTraders()),
-            });
-
             this.headEl = el('div', { class: 'ttv2-head' }, [
                 this.backBtn,
                 this.titleEl,
-                this.tradersBtn,
+                this.sellBtn,
                 this.scanBtn,
                 this.refreshBtn,
                 this.settingsBtn,
@@ -4913,14 +5995,12 @@
             for (const [key, label] of [
                 ['bazaar', 'Bazaars'],
                 ['itemmarket', 'Item Market'],
-                ['traders', 'By trader'],
             ]) {
                 const btn = el('button', {
                     type: 'button',
                     class: 'ttv2-tab',
                     text: label,
-                    onclick: () =>
-                        this.handlers.onViewChange && this.handlers.onViewChange(key),
+                    onclick: () => this.handlers.onViewChange && this.handlers.onViewChange(key),
                 });
                 btn.dataset.label = label;
                 this.tabBtns[key] = btn;
@@ -4936,7 +6016,7 @@
                     title: 'Bazaar prices come from TornW3B',
                     text: 'via TornW3B',
                 }),
-                document.createTextNode(' · '),
+                ' · ',
                 el('a', {
                     href: W3B_TERMS_URL,
                     target: '_blank',
@@ -4946,17 +6026,10 @@
             ]);
             this.tabsEl.appendChild(this.creditEl);
 
-            // Where trader prices come from, on the tab they feed.
-            this.teCreditEl = el('span', { class: 'ttv2-credit' }, [
-                el('a', {
-                    href: TE_SITE_URL,
-                    target: '_blank',
-                    rel: 'noopener noreferrer',
-                    title: 'Trader prices come from TornExchange',
-                    text: 'via TornExchange',
-                }),
+            this.colsEl = el('div', { class: 'ttv2-cols' }, [
+                el('span', { class: 'ttv2-label', text: 'Deal' }),
+                el('span', { class: 'ttv2-label ttv2-money', text: 'Profit' }),
             ]);
-            this.tabsEl.appendChild(this.teCreditEl);
 
             this.listEl = el('div', { class: 'ttv2-list' });
 
@@ -4970,6 +6043,13 @@
                 this.listEl,
             ]);
 
+            /* ---- my bazaar page ---- */
+
+            this.bzListEl = el('div', { class: 'ttv2-bzlist' });
+            this.bzDetailEl = el('div', { class: 'ttv2-bzdetail' });
+            this.bazaarPage = el('div', { class: 'ttv2-page ttv2-page-bazaar' }, [this.bzListEl, this.bzDetailEl]);
+            this.bazaarPage.style.display = 'none';
+
             /* ---- settings page ---- */
 
             this.settingsPage = el('div', { class: 'ttv2-page ttv2-page-settings' });
@@ -4978,6 +6058,7 @@
             this.bodyEl = el('div', { class: 'ttv2-body' }, [
                 this.barEl,
                 this.listPage,
+                this.bazaarPage,
                 this.settingsPage,
             ]);
 
@@ -4987,8 +6068,7 @@
             this.root.addEventListener('keydown', (event) => {
                 if (event.key !== 'Escape') return;
                 if (this.closeChipEditor()) return;
-                if (this.closeTradersPrompt()) return;
-                if (this.page === 'settings') this.showPage('list');
+                if (this.page === 'settings') this.showPage(this.homePage());
             });
 
             this.enableDrag(this.headEl);
@@ -5018,12 +6098,17 @@
 
         /* ------------------------------------------------------------ pages */
 
+        /** The page Back returns to: My bazaar on your own bazaar, else the list. */
+        homePage() {
+            return this.state.bazaar ? 'mybazaar' : 'list';
+        }
+
         /**
-         * Switch between the list and Settings. Settings REPLACES the list, at
-         * the same panel size - it never stacks on top of it.
+         * Switch pages. Settings REPLACES the list, at the same panel size - it
+         * never stacks on top of it.
          */
         showPage(page, { focusKey = false } = {}) {
-            this.page = page === 'settings' ? 'settings' : 'list';
+            this.page = page === 'settings' ? 'settings' : page === 'mybazaar' ? 'mybazaar' : 'list';
             if (!this.root) return;
 
             const settings = this.page === 'settings';
@@ -5044,8 +6129,10 @@
             }
 
             this.root.classList.toggle('ttv2-on-settings', settings);
+            this.listPage.style.display = this.page === 'list' ? '' : 'none';
+            this.bazaarPage.style.display = this.page === 'mybazaar' ? '' : 'none';
             this.settingsBtn.setAttribute('aria-pressed', String(settings));
-            this.titleTextEl.textContent = settings ? 'Settings' : 'NPC Arbitrage';
+            this.titleTextEl.textContent = settings ? 'Settings' : this.page === 'mybazaar' ? 'My bazaar' : 'NPC Arbitrage';
 
             // Opening a page from a collapsed panel should show it.
             if (this.collapsed) this.setCollapsed(false, { save: true });
@@ -5053,13 +6140,6 @@
             if (settings && focusKey && this.keyInput) {
                 setTimeout(() => this.keyInput.focus(), 0);
             }
-        }
-
-        /** Old name, kept for callers: open Settings. */
-        toggleView(which) {
-            this.showPage(which === 'settings' ? 'settings' : 'list', {
-                focusKey: which === 'settings' && !this.hasKey,
-            });
         }
 
         openSettings({ focusKey = false } = {}) {
@@ -5091,58 +6171,40 @@
                 return chip;
             };
 
-            this.chipNpc = toggle(
-                'sellToNpc',
-                'NPC',
-                "Sell to an NPC shop: listings cheaper than what an NPC shop pays (the item's Sell " +
-                    'price). Guaranteed, no tax. Items whose Sell is N/A never appear.',
+            this.chipNpc = toggle('sellToNpc', 'NPC', 'Listings under the NPC sell price. Guaranteed, no tax.');
+            this.chipBazaar = toggle('resaleBazaar', 'My bazaar', 'Listings under value, to relist in your bazaar.');
+            this.chipMarket = toggle('resaleMarket', 'Market', 'Listings under value, to resell on the Item Market.');
+
+            this.chipMin = this.valueChip(
+                'minTotalProfit',
+                (v) => 'Min ' + formatMoneyShort(v || 0),
+                'Hide deals below this total profit',
             );
-            this.chipBazaar = toggle(
-                'resaleBazaar',
-                'My bazaar',
-                "Trading: listings under the item's average value, relisted in " +
-                    'your own bazaar (no tax). Someone still has to buy.',
-            );
-            this.chipMarket = toggle(
-                'resaleMarket',
-                'Market',
-                "Trading: listings under the item's average value, sold on the " +
-                    'Item Market after its 5% tax.',
+            this.chipCash = this.valueChip(
+                'cashOnHand',
+                (v) => (v ? 'Cash ' + formatMoneyShort(v) : 'Cash: any'),
+                'Show only what this cash can buy',
             );
 
-            this.chipTrader = toggle(
-                'sellToTrader',
-                'Trader',
-                'Sell to a player trader: listings cheaper than what a TornExchange ' +
-                    'trader pays, online traders first. Instant cash, no tax - but an ' +
-                    'offer, not a guarantee. Needs a TornExchange key (Settings).',
-            );
-
-            this.chipMin = this.valueChip('minTotalProfit', (v) =>
-                'Min ' + formatMoneyShort(v || 0),
-                'Hide listings whose total profit is below this',
-            );
-            this.chipCash = this.valueChip('cashOnHand', (v) =>
-                v ? 'Cash ' + formatMoneyShort(v) : 'Cash: any',
-                'Only count what you can afford (blank = no limit)',
-            );
-
-            this.chipsEl.appendChild(el('span', { class: 'ttv2-chips-label', text: 'Sell to' }));
             this.chipsEl.appendChild(this.chipNpc);
             this.chipsEl.appendChild(this.chipBazaar);
             this.chipsEl.appendChild(this.chipMarket);
-            this.chipsEl.appendChild(this.chipTrader);
             this.chipsEl.appendChild(el('span', { class: 'ttv2-chips-gap' }));
             this.chipsEl.appendChild(this.chipMin);
             this.chipsEl.appendChild(this.chipCash);
         }
 
-        /** A chip showing a number; click it to edit in place (Enter / Esc). */
+        /**
+         * A chip showing a number; click it to edit in place (Enter / Esc).
+         * Anything the editor cannot read keeps the old value and says so:
+         * a cash figure that silently became "no cap" showed every deal as
+         * affordable.
+         */
         valueChip(key, label, title) {
             const chip = el('button', {
                 type: 'button',
                 class: 'ttv2-chip ttv2-chip-value',
-                title: title + ' - click to change',
+                title,
             });
             chip.dataset.key = key;
             chip.labelFor = label;
@@ -5155,7 +6217,7 @@
                     type: 'text',
                     inputmode: 'numeric',
                     class: 'ttv2-chip-input',
-                    placeholder: key === 'cashOnHand' ? 'no cap' : '0',
+                    placeholder: key === 'cashOnHand' ? 'any' : '0',
                     'aria-label': title,
                 });
                 const current = this.state.settings[key];
@@ -5163,14 +6225,24 @@
 
                 const commit = () => {
                     const raw = input.value.trim();
-                    const value =
-                        key === 'cashOnHand'
-                            ? raw
-                                ? numberFromInput(raw, null)
-                                : null
-                            : numberFromInput(raw || '0', 0);
                     this.closeChipEditor();
-                    this.emitSettings({ [key]: value });
+
+                    if (!raw) {
+                        if (/must be a number/.test(this.state.status.text)) this.setStatus('');
+                        this.emitSettings({ [key]: key === 'cashOnHand' ? null : 0 });
+                        return;
+                    }
+                    const value = parseMoneyInput(raw);
+                    if (value === null || value < 0) {
+                        this.setStatus(
+                            (key === 'cashOnHand' ? 'Cash' : 'Min') + ' must be a number like 1234567 or 1.5m.',
+                            'error',
+                        );
+                        return;
+                    }
+                    // A good value clears the complaint about a bad one.
+                    if (/must be a number/.test(this.state.status.text)) this.setStatus('');
+                    this.emitSettings({ [key]: key === 'cashOnHand' && value === 0 ? null : value });
                 };
 
                 input.addEventListener('keydown', (event) => {
@@ -5209,9 +6281,9 @@
 
         /**
          * Settings, top to bottom: the key (with Torn's required disclosure
-         * right under it), and the live feed. Nothing else - maintenance
-         * (re-download item data, reset panel position, scan diagnostics) is in
-         * the Tampermonkey menu, out of the way.
+         * right under it), watching, and links. Maintenance (re-download item
+         * data, reset panel position, scan diagnostics) is in the Tampermonkey
+         * menu, out of the way. The selling page keeps its own settings.
          */
         buildSettings() {
             const section = (title, children) =>
@@ -5233,7 +6305,7 @@
             this.keyInput = el('input', {
                 type: 'text',
                 class: 'ttv2-masked ttv2-key',
-                placeholder: 'Paste your Public API key',
+                placeholder: 'Public API key',
                 autocomplete: 'off',
                 autocapitalize: 'off',
                 autocorrect: 'off',
@@ -5275,27 +6347,20 @@
 
             this.keyStateEl = el('div', { class: 'ttv2-keystate', text: 'No key saved.' });
 
-            const keyHelp = el('div', { class: 'ttv2-note' });
-            keyHelp.appendChild(document.createTextNode('Needs a '));
-            keyHelp.appendChild(el('strong', { text: 'Public' }));
-            keyHelp.appendChild(document.createTextNode(' key - make one at '));
-            keyHelp.appendChild(
+            const keyHelp = el('div', { class: 'ttv2-note' }, [
+                'A Public key is enough. Make one at ',
                 el('a', {
                     href: TORN_API_KEY_URL,
                     target: '_blank',
                     rel: 'noopener noreferrer',
                     text: 'Torn › Settings › API Key',
                 }),
-            );
-            keyHelp.appendChild(
-                document.createTextNode(
-                    ". A Public key can't read your money, mail or inventory.",
-                ),
-            );
+                '.',
+            ]);
 
             // Torn requires this where the key is entered; it stays right here.
             this.tosEl = el('details', { class: 'ttv2-tos-box', open: '' }, [
-                el('summary', { text: 'How this script uses your key (Torn API terms)' }),
+                el('summary', { text: 'Key use (Torn API terms)' }),
                 this.buildTosTable(),
             ]);
 
@@ -5316,7 +6381,7 @@
                 ]),
             );
 
-            /* ---- live feed ---- */
+            /* ---- watching ---- */
 
             const check = (key, label, sub) => {
                 const input = el('input', { type: 'checkbox' });
@@ -5334,30 +6399,24 @@
 
             const im = check(
                 'liveFeed',
-                'Watch the Item Market from any Torn page',
-                el('span', { class: 'ttv2-sub', text: 'Runs in one visible Torn tab, at most 30 API calls a minute.' }),
+                'Watch the Item Market anywhere',
+                el('span', { class: 'ttv2-sub', text: 'One visible Torn tab, at most 30 API calls a minute.' }),
             );
             this.liveFeedInput = im.input;
 
-            const w3bSub = el('span', { class: 'ttv2-sub' });
-            w3bSub.appendChild(document.createTextNode('Bazaar prices from '));
-            w3bSub.appendChild(el('a', { href: W3B_SITE_URL, target: '_blank', rel: 'noopener noreferrer', text: 'weav3r.dev' }));
-            w3bSub.appendChild(document.createTextNode(' ('));
-            w3bSub.appendChild(el('a', { href: W3B_TERMS_URL, target: '_blank', rel: 'noopener noreferrer', text: 'terms' }));
-            w3bSub.appendChild(document.createTextNode('). It gets item ids only - never your key.'));
+            const w3bSub = el('span', { class: 'ttv2-sub' }, [
+                'Bazaar prices from ',
+                el('a', { href: W3B_SITE_URL, target: '_blank', rel: 'noopener noreferrer', text: 'weav3r.dev' }),
+                ' (',
+                el('a', { href: W3B_TERMS_URL, target: '_blank', rel: 'noopener noreferrer', text: 'terms' }),
+                '). It gets item ids only, never your key.',
+            ]);
 
             const bz = check('useW3b', 'Watch bazaars via TornW3B', w3bSub);
             this.useW3bInput = bz.input;
 
             this.settingsPage.appendChild(
-                section('Live feed', [
-                    im.row,
-                    bz.row,
-                    note(
-                        'Never buys, clicks, notifies or plays sounds. Every row is ' +
-                            'a link you follow yourself.',
-                    ),
-                ]),
+                section('Watching', [im.row, bz.row, note('Nothing is bought, clicked or announced for you.')]),
             );
 
             /* ---- links ---- */
@@ -5365,191 +6424,23 @@
             const nt = check(
                 'openInNewTab',
                 'Open deals in a new tab',
-                el('span', {
-                    class: 'ttv2-sub',
-                    text: 'Untick to open GO TO BAZAAR / GO TO MARKET in this tab instead.',
-                }),
+                el('span', { class: 'ttv2-sub', text: 'Off: Go opens the listing in this tab.' }),
             );
             this.newTabInput = nt.input;
 
-            // The Traders page keeps its own preferences; this only shows and
-            // resets how its button opens it.
-            this.tradersModeEl = el('span', { class: 'ttv2-sub' });
-            const tradersLine = el('div', { class: 'ttv2-note ttv2-traders-mode' }, [
-                this.tradersModeEl,
-                document.createTextNode(' '),
-                el('button', {
-                    type: 'button',
-                    class: 'ttv2-link',
-                    text: 'Ask again',
-                    onclick: () => this.handlers.onTradersOpenMode && this.handlers.onTradersOpenMode('ask'),
-                }),
-            ]);
-
-            this.settingsPage.appendChild(section('Links', [nt.row, tradersLine]));
-
-            /* ---- TornExchange ---- */
-
-            this.teKeyInput = el('input', {
-                type: 'text',
-                class: 'ttv2-masked ttv2-te-key',
-                placeholder: 'Paste your TornExchange key',
-                autocomplete: 'off',
-                autocapitalize: 'off',
-                autocorrect: 'off',
-                spellcheck: 'false',
-                'data-lpignore': 'true',
-                'data-1p-ignore': 'true',
-            });
-
-            this.teKeyRevealed = false;
-            const teShowBtn = el('button', {
-                type: 'button',
-                text: 'Show',
-                onclick: () => {
-                    const hidden = this.teKeyInput.classList.toggle('ttv2-masked');
-                    teShowBtn.textContent = hidden ? 'Show' : 'Hide';
-                    if (!hidden && !this.teKeyInput.value && this.handlers.onRevealTeKey) {
-                        this.teKeyInput.value = this.handlers.onRevealTeKey() || '';
-                        this.teKeyRevealed = true;
-                    } else if (hidden && this.teKeyRevealed) {
-                        this.teKeyInput.value = '';
-                        this.teKeyRevealed = false;
-                    }
-                },
-            });
-
-            const teSave = guarded(this, 'Save', () => {
-                const key = this.teKeyInput.value.trim();
-                this.teKeyInput.value = '';
-                this.teKeyRevealed = false;
-                return this.handlers.onSaveTeKey ? this.handlers.onSaveTeKey(key) : undefined;
-            });
-            this.teKeyInput.addEventListener('keydown', (event) => {
-                if (event.key !== 'Enter') return;
-                event.preventDefault();
-                teSave();
-            });
-
-            this.teStateEl = el('div', { class: 'ttv2-keystate', text: 'No TornExchange key.' });
-
-            const teHelp = el('div', { class: 'ttv2-note' });
-            teHelp.appendChild(document.createTextNode(
-                "TornExchange only answers to the Torn key you log in there with. Make a " +
-                    'second Public key, log in at ',
-            ));
-            teHelp.appendChild(el('a', { href: TE_SITE_URL, target: '_blank', rel: 'noopener noreferrer', text: 'tornexchange.com' }));
-            teHelp.appendChild(document.createTextNode(
-                ' with it, and paste that same key here. Your main key is never sent there. ' +
-                    'Trader prices are fetched once every 30 minutes.',
-            ));
+            this.settingsPage.appendChild(section('Links', [nt.row]));
 
             this.settingsPage.appendChild(
-                section('Traders (TornExchange)', [
-                    el('div', { class: 'ttv2-inline' }, [
-                        this.teKeyInput,
-                        teShowBtn,
-                        el('button', { type: 'button', class: 'ttv2-primary', text: 'Save', onclick: teSave }),
-                    ]),
-                    this.teStateEl,
-                    teHelp,
-                    el('div', { class: 'ttv2-inline' }, [
-                        el('button', {
-                            type: 'button',
-                            class: 'ttv2-link',
-                            text: 'Refresh trader prices',
-                            onclick: guarded(this, 'Refresh', () =>
-                                this.handlers.onRefreshTraders && this.handlers.onRefreshTraders(),
-                            ),
-                        }),
-                        el('button', {
-                            type: 'button',
-                            class: 'ttv2-link',
-                            text: 'Forget TornExchange key',
-                            onclick: () => this.handlers.onForgetTeKey && this.handlers.onForgetTeKey(),
-                        }),
-                    ]),
+                section('Selling', [
+                    note('The selling page has its own keys and settings.'),
+                    el('button', {
+                        type: 'button',
+                        class: 'ttv2-link',
+                        text: 'Open the selling page',
+                        onclick: guarded(this, 'Sell', () => this.handlers.onOpenSelling && this.handlers.onOpenSelling()),
+                    }),
                 ]),
             );
-        }
-
-        renderTradersMode() {
-            if (!this.tradersModeEl) return;
-            const mode = this.state.tradersOpenMode || 'ask';
-            this.tradersModeEl.textContent =
-                'Traders page opens: ' +
-                (mode === 'tab' ? 'in a new tab' : mode === 'overlay' ? 'over the page' : 'ask each time') + '.';
-            this.tradersModeEl.parentNode.lastChild.hidden = mode === 'ask';
-        }
-
-        /**
-         * "Open the Traders page in a new tab?" - Yes / No, here / Remember.
-         * @param {function} onChoice - (newTab: boolean, remember: boolean)
-         */
-        showTradersPrompt(onChoice) {
-            this.closeTradersPrompt();
-            if (this.collapsed) this.setCollapsed(false, { save: true });
-
-            const remember = el('input', { type: 'checkbox' });
-            const choose = (newTab) => {
-                const keep = remember.checked;
-                this.closeTradersPrompt();
-                onChoice(newTab, keep);
-            };
-
-            const yes = el('button', { type: 'button', class: 'ttv2-primary', text: 'Yes', onclick: () => choose(true) });
-            this.tradersPrompt = el('div', { class: 'ttv2-prompt', role: 'dialog', 'aria-label': 'Open the Traders page' }, [
-                el('div', { class: 'ttv2-prompt-q', text: 'Open the Traders page in a new tab?' }),
-                el('div', {
-                    class: 'ttv2-note',
-                    text: 'Yes: its own tab, stays open while you browse Torn. No: full screen over this page, ✕ to close.',
-                }),
-                el('label', { class: 'ttv2-check ttv2-prompt-remember' }, [remember, el('span', { text: 'Remember my choice' })]),
-                el('div', { class: 'ttv2-prompt-btns' }, [
-                    el('button', { type: 'button', text: 'No, here', onclick: () => choose(false) }),
-                    yes,
-                ]),
-            ]);
-            this.root.appendChild(this.tradersPrompt);
-            yes.focus();
-        }
-
-        /** @returns {boolean} true if a prompt was open */
-        closeTradersPrompt() {
-            if (!this.tradersPrompt) return false;
-            this.tradersPrompt.remove();
-            this.tradersPrompt = null;
-            return true;
-        }
-
-        /** The TornExchange line in Settings: never the key, only its state. */
-        renderTraderInfo() {
-            const info = this.state.traderInfo;
-            if (!this.teStateEl || !info) return;
-
-            this.teStateEl.classList.remove('ttv2-ok', 'ttv2-bad');
-            let text;
-            if (!info.hasKey) {
-                text = 'No TornExchange key.';
-            } else if (info.badKey) {
-                text = info.error || 'TornExchange did not accept the key.';
-                this.teStateEl.classList.add('ttv2-bad');
-            } else if (info.loading) {
-                text = 'Loading trader prices...';
-            } else if (info.fetchedAt) {
-                text =
-                    'Trader prices for ' + info.items.toLocaleString('en-US') + ' items, updated ' +
-                    formatAge(Date.now() - info.fetchedAt) + '.';
-                this.teStateEl.classList.add('ttv2-ok');
-                if (info.error) text += ' Last refresh failed: ' + info.error;
-            } else {
-                text = info.error || 'Key saved. Turn on the Trader chip to load prices.';
-                if (info.error) this.teStateEl.classList.add('ttv2-bad');
-            }
-            if (info.waitUntil) {
-                text += ' Waiting ' + formatAge(info.waitUntil - Date.now()) + ' (TornExchange rate limit).';
-            }
-            this.teStateEl.textContent = text;
         }
 
         /**
@@ -5558,40 +6449,26 @@
          */
         buildTosTable() {
             const rows = [
-                ['Data storage', 'Only locally (in this browser)'],
+                ['Data storage', 'Only locally, in this browser'],
                 ['Data sharing', 'Nobody'],
-                [
-                    'Purpose of use',
-                    'Competitive advantage: finding Bazaar and Item Market ' +
-                        'listings priced below NPC / market value',
-                ],
+                ['Purpose of use', 'Competitive advantage: finding Bazaar and Item Market listings below NPC or market value'],
                 ['Key storage & sharing', 'Stored locally / Not shared'],
                 [
                     'Key access level',
-                    'Public (torn: items, cityshops; market: itemmarket; key: info; ' +
-                        "user: profile - bazaar owners' public online status, for " +
-                        'the bazaar you view and the sellers on the Bazaars list)',
+                    'Public (torn: items, cityshops; market: itemmarket; key: info; user: profile, for bazaar owners\' public status)',
                 ],
                 [
                     'Other services',
-                    'TornW3B (weav3r.dev), for bazaar prices. It receives item ids ' +
-                        'only - never your key or anything about you. TornExchange ' +
-                        '(tornexchange.com), for traders\' buy prices, only if you add a ' +
-                        'TornExchange key: it receives that separate key - never your main key.',
+                    'TornW3B (weav3r.dev) for bazaar prices. It receives item ids only, never your key.',
                 ],
             ];
 
             const table = el('table', { class: 'ttv2-tos' });
             for (const [k, v] of rows) {
-                table.appendChild(
-                    el('tr', {}, [el('th', { text: k }), el('td', { text: v })]),
-                );
+                table.appendChild(el('tr', {}, [el('th', { text: k }), el('td', { text: v })]));
             }
 
-            return el('div', {}, [
-                el('h4', { text: 'API key terms of use' }),
-                table,
-            ]);
+            return el('div', {}, [table]);
         }
 
         /**
@@ -5616,16 +6493,12 @@
 
             if (overScoped) {
                 this.keyStateEl.textContent =
-                    'Saved - but this key has ' +
-                    (accessName || 'more than Public') +
-                    ' access. Public is enough. Revoke it and make a Public one.';
+                    'Saved. This key has ' + (accessName || 'more than Public') + ' access; Public is enough.';
                 this.keyStateEl.classList.add('ttv2-bad');
                 return;
             }
 
-            this.keyStateEl.textContent =
-                (accessName ? 'Saved - ' + accessName + ' access.' : 'Saved.') +
-                ' Hidden from the page; press Show to see it.';
+            this.keyStateEl.textContent = accessName ? 'Saved · ' + accessName + ' access.' : 'Saved.';
             this.keyStateEl.classList.add('ttv2-ok');
         }
 
@@ -5751,22 +6624,17 @@
             this.sellerEl.classList.toggle('ttv2-shown', Boolean(info));
             if (!info) return;
 
-            const dot = el('span', { class: 'ttv2-dot' });
-            dot.dataset.level = info.level;
             this.sellerEl.appendChild(document.createTextNode('Seller: '));
             this.sellerEl.appendChild(el('b', { text: info.name || 'this bazaar' }));
-            this.sellerEl.appendChild(dot);
-            this.sellerEl.appendChild(document.createTextNode(info.text));
+            this.sellerEl.appendChild(this.statusWord(info.level, info.text));
             if (info.closed) {
-                this.sellerEl.appendChild(
-                    el('span', { class: 'ttv2-closed', text: 'Bazaar closed - nothing here can be bought' }),
-                );
+                this.sellerEl.appendChild(el('span', { class: 'ttv2-closed', text: 'Bazaar closed' }));
             }
             this.sellerEl.title = this.sellerEl.textContent;
         }
 
         /**
-         * ` shows and hides the overlay, from anywhere on the page - except while
+         * ` shows and hides the panel, from anywhere on the page - except while
          * typing (chat, search, quantity boxes, our own fields), and never with
          * Ctrl / Alt / Cmd held.
          */
@@ -5812,7 +6680,7 @@
 
             this.refreshBtn.disabled = this.state.busy;
             this.refreshBtn.classList.toggle('ttv2-spin', this.state.busy);
-            this.refreshBtn.title = this.state.busy ? 'Refreshing...' : 'Refresh now';
+            this.refreshBtn.title = this.state.busy ? 'Refreshing' : 'Refresh now';
             this.renderBar();
         }
 
@@ -5852,7 +6720,6 @@
             this.chipNpc.setAttribute('aria-pressed', String(s.sellToNpc !== false));
             this.chipBazaar.setAttribute('aria-pressed', String(Boolean(s.resaleBazaar)));
             this.chipMarket.setAttribute('aria-pressed', String(Boolean(s.resaleMarket)));
-            this.chipTrader.setAttribute('aria-pressed', String(Boolean(s.sellToTrader)));
             this.chipMin.textContent = this.chipMin.labelFor(s.minTotalProfit);
             this.chipCash.textContent = this.chipCash.labelFor(s.cashOnHand);
             this.chipCash.classList.toggle('ttv2-chip-set', Boolean(s.cashOnHand));
@@ -5871,19 +6738,14 @@
 
             if (rows.length === 0) {
                 this.listEl.appendChild(this.renderEmpty());
-            } else if (this.state.tab === 'traders') {
-                (this.state.groups || []).forEach((g) => {
-                    this.listEl.appendChild(this.renderGroup(g));
-                });
             } else {
-                rows.forEach((row, i) => {
-                    this.listEl.appendChild(this.renderRow(row, i));
+                this.listEl.appendChild(this.colsEl);
+                rows.forEach((row) => {
+                    this.listEl.appendChild(this.renderRow(row));
                 });
             }
 
             this.renderTabs();
-            this.renderTraderInfo();
-            this.renderTradersMode();
             this.refreshAges();
         }
 
@@ -5902,14 +6764,11 @@
                 const live = this.state.live;
                 this.creditEl.style.display = tab === 'bazaar' && live && live.w3b ? '' : 'none';
             }
-            if (this.teCreditEl) {
-                this.teCreditEl.style.display = tab === 'traders' ? '' : 'none';
-            }
         }
 
         /**
          * The one status line. Left: this list's deals and total - or a message.
-         * Right: whether the feed is live, and when it next refreshes.
+         * Right: whether watching is live, and when it next refreshes.
          */
         renderBar() {
             if (!this.barEl) return;
@@ -5918,16 +6777,19 @@
             const st = this.state.status || {};
             const summary = this.state.summary || { count: 0, totalProfit: 0 };
             const headline =
-                summary.count === 1
-                    ? '1 deal · +' + formatMoneyShort(summary.totalProfit)
-                    : summary.count + ' deals · +' + formatMoneyShort(summary.totalProfit);
+                (summary.count === 1 ? '1 deal' : summary.count + ' deals') +
+                ' · +' + formatMoneyShort(summary.totalProfit);
 
             const showMessage =
                 st.text &&
                 (st.level !== 'info' || this.state.busy || now - st.at < INFO_STATUS_MS);
 
             this.barLeft.textContent = showMessage ? st.text : headline;
-            this.barLeft.title = showMessage ? st.text : '';
+            this.barLeft.title = showMessage
+                ? st.text
+                : summary.capped
+                  ? 'Total for what your cash buys, best deals first'
+                  : '';
             this.barEl.classList.toggle('ttv2-warn', showMessage && st.level === 'warn');
             this.barEl.classList.toggle('ttv2-error', showMessage && st.level === 'error');
 
@@ -5937,25 +6799,25 @@
             /* ---- liveness ---- */
             const live = this.state.live;
             let dot = 'off';
-            let text = 'feed off';
-            let title = 'Live feed is off (Settings)';
+            let text = 'watching off';
+            let title = 'Watching is off. Turn it on under Settings.';
 
             if (live && live.enabled) {
                 if (!live.itemMarket) {
                     dot = 'warn';
                     text = 'needs key';
-                    title = 'Add a Public API key in Settings';
+                    title = 'Add a Public API key under Settings.';
                 } else if (live.leading) {
                     dot = live.lastError ? 'warn' : 'live';
                     const secs = live.nextRefreshAt
                         ? Math.max(0, Math.ceil((live.nextRefreshAt - now) / 1000))
                         : null;
-                    text = 'live' + (secs !== null ? ' · refresh ' + secs + 's' : '');
-                    title = live.lastError || 'Refreshes every 30 seconds';
+                    text = 'live' + (secs !== null ? ' · ' + secs + 's' : '');
+                    title = live.lastError || 'Refreshes every 30 seconds.';
                 } else {
                     dot = 'other';
                     text = 'live in another tab';
-                    title = 'Another visible Torn tab is running the feed; results show here too.';
+                    title = 'Another visible Torn tab is watching. Results show here too.';
                 }
             }
 
@@ -5985,7 +6847,7 @@
             };
 
             if (!this.hasKey) {
-                return box('Needs a Public API key to start.', 'Add key', () =>
+                return box('Add a Public API key to start.', 'Add key', () =>
                     this.showPage('settings', { focusKey: true }),
                 );
             }
@@ -5997,40 +6859,15 @@
             }
 
             if (!d && live && !live.enabled) {
-                return box('The live feed is off, so only the page you are on is scanned.', 'Turn it on', () =>
+                return box('Watching is off. Only this page is scanned.', 'Turn it on', () =>
                     this.emitSettings({ liveFeed: true }),
                 );
             }
 
             const s = this.state.settings;
-            const ti = this.state.traderInfo || {};
 
-            if (tab === 'traders' && !s.sellToTrader) {
-                return box(
-                    'Groups deals by the trader who buys them - one trade each, online traders first.',
-                    'Turn on Trader',
-                    () => this.emitSettings({ sellToTrader: true }),
-                );
-            }
-            if (s.sellToTrader && !ti.hasKey && (tab === 'traders' || s.sellToNpc === false)) {
-                return box('Trader prices need a TornExchange key.', 'Add it', () =>
-                    this.showPage('settings'),
-                );
-            }
-            if (tab === 'traders') {
-                return box(
-                    ti.loading
-                        ? 'Loading trader prices...'
-                        : ti.error && !ti.fetchedAt
-                          ? 'No trader prices: ' + ti.error
-                          : 'No listing is cheaper than what a trader pays right now.',
-                    ti.error && !ti.loading ? 'Open Settings' : null,
-                    () => this.showPage('settings'),
-                );
-            }
-
-            if (s.sellToNpc === false && !s.resaleBazaar && !s.resaleMarket && !s.sellToTrader) {
-                return box('Nothing to sell to is selected.', 'Sell to NPC shops', () =>
+            if (s.sellToNpc === false && !s.resaleBazaar && !s.resaleMarket) {
+                return box('Pick where to sell first.', 'Sell to NPC', () =>
                     this.emitSettings({ sellToNpc: true }),
                 );
             }
@@ -6058,9 +6895,8 @@
 
             if (h.cash) {
                 lines.push(
-                    h.cash + (h.cash === 1 ? ' deal is' : ' deals are') + ' hidden by your ' +
-                        formatMoneyShort(cash) + ' cash: you cannot buy enough of ' +
-                        (h.cash === 1 ? 'it' : 'them') + ' to make ' + formatMoneyShort(min) + '.',
+                    h.cash + (h.cash === 1 ? ' deal' : ' deals') + ' hidden: ' +
+                        formatMoneyShort(cash) + ' cash cannot buy enough.',
                 );
             }
             if (h.min) {
@@ -6071,9 +6907,8 @@
             }
             if (cash > 0 && min > 1 && min / cash >= 0.2) {
                 lines.push(
-                    'With ' + formatMoneyShort(cash) + ' cash, a ' + formatMoneyShort(min) +
-                        ' profit needs a ' + Math.round((min / cash) * 100) +
-                        '% return - that is rare. Try a lower Min.',
+                    'A ' + formatMoneyShort(min) + ' Min on ' + formatMoneyShort(cash) + ' cash needs a ' +
+                        Math.round((min / cash) * 100) + '% return.',
                 );
             }
             if (!lines.length) return null;
@@ -6092,44 +6927,28 @@
             if (!d) {
                 if (live && live.enabled && live.leading) {
                     return tab === 'bazaar'
-                        ? 'Watching bazaars - nothing profitable right now.'
-                        : 'Watching the Item Market - nothing profitable right now.';
+                        ? 'Watching bazaars. Nothing profitable right now.'
+                        : 'Watching the Item Market. Nothing profitable right now.';
                 }
                 if (live && live.enabled) {
-                    return 'Live feed runs in another Torn tab; results appear here.';
+                    return 'Watching runs in another Torn tab. Results show here.';
                 }
                 return 'Nothing yet.';
             }
 
             if (d.images === 0) {
-                return (
-                    'No item images found on this page. Are there listings ' +
-                    'showing? If so, Torn may have changed its markup.'
-                );
+                return 'No item images found on this page.';
             }
 
             if (d.listings === 0 && d.cards > 0) {
                 if (d.noItem === d.cards) {
-                    return (
-                        'Found ' +
-                        d.cards +
-                        ' listings but none matched the item database. Try ' +
-                        'Tampermonkey menu › Re-download item data.'
-                    );
+                    return d.cards + ' listings found, none in the item database.';
                 }
-                return (
-                    'Found ' +
-                    d.cards +
-                    ' listings but could not read a price from them.'
-                );
+                return d.cards + ' listings found, no price readable.';
             }
 
             if (d.priceAssumed > 0) {
-                return (
-                    'Nothing above your threshold. ' +
-                    d.priceAssumed +
-                    ' row(s) were hidden because their price had to be guessed.'
-                );
+                return 'Nothing above Min. ' + d.priceAssumed + ' rows hidden: price guessed.';
             }
 
             return tab === 'bazaar'
@@ -6138,349 +6957,111 @@
         }
 
         /**
-         * One opportunity, as a card - the layout the original ChatGPT script
-         * used and people liked:
+         * One deal, two lines:
          *
-         *     #1  Xanax                                  +$11,255
-         *         Bazaar - SellerName | via TornW3B | 40s   $11,255 / item
-         *         Buy $838,745 -> Market value $850,000
-         *         Qty: 390 | resell in your bazaar
-         *         [            GO TO BAZAAR             ]
+         *     Xanax ×390                                       +$11,255
+         *     $838,745 → NPC $850,000 · Garrett89 ● Offline 3h      40s
+         *                                                          [Go]
          *
          * Everything goes in through textContent; names from Torn or TornW3B
          * never touch innerHTML.
          */
-        renderRow(row, rank = 0) {
+        renderRow(row) {
             const p = row.profit;
             const venue = VENUE_LABELS[p.venue] || p.venue;
             const known = row.qtyAtPrice !== false;
 
-            /* ---- rank ---- */
-            const rankEl = el('div', { class: 'ttv2-rank', text: '#' + (rank + 1) });
+            /* ---- line 1: name ×qty, profit ---- */
+            const name = el('div', { class: 'ttv2-row-name' }, [
+                document.createTextNode(row.name),
+                known && (p.affordableQty > 1 || p.affordableQty < p.qty)
+                    ? el('span', {
+                          class: 'ttv2-qty',
+                          text: '×' + p.affordableQty.toLocaleString('en-US') +
+                              (p.affordableQty < p.qty ? ' of ' + p.qty.toLocaleString('en-US') : ''),
+                      })
+                    : null,
+            ]);
 
-            /* ---- name ---- */
-            const name = el('div', { class: 'ttv2-row-name', text: row.name });
+            // The age sits under the profit, so the details line keeps its room.
+            const profit = el('div', {
+                class: 'ttv2-row-profit ttv2-money',
+                title: formatMoney(p.profitPerUnit) + ' each · ROI ' + formatPct(p.roi),
+            }, [
+                document.createTextNode('+' + formatMoney(known ? p.realizableProfit : p.profitPerUnit) + (known ? '' : ' each')),
+                el('span', { class: 'ttv2-per' }, [row.el ? 'on this page' : el('span', { class: 'ttv2-age' })]),
+            ]);
 
-            /* ---- Buy $x -> Exit $y ---- */
-            const prices = el('div', { class: 'ttv2-row-prices' });
-            prices.appendChild(document.createTextNode('Buy '));
-            prices.appendChild(el('b', { text: formatMoney(p.listingPrice) }));
+            /* ---- line 2: prices, seller, age ---- */
+            const details = el('div', { class: 'ttv2-row-details' });
+            const sep = () => document.createTextNode(' · ');
+
+            details.appendChild(el('b', { text: formatMoney(p.listingPrice) }));
             if (row.priceAssumed) {
-                prices.appendChild(
-                    el('span', {
-                        class: 'ttv2-guess',
-                        title:
-                            'This row showed more than one price and none was ' +
-                            'labelled. The lowest was taken as the unit price - ' +
-                            'check it on the card before buying.',
-                        text: ' ?',
-                    }),
-                );
+                details.appendChild(el('span', {
+                    class: 'ttv2-guess',
+                    title: 'More than one price on the card. The lowest was taken.',
+                    text: '?',
+                }));
             }
-            prices.appendChild(document.createTextNode('  ->  ' + venue + ' '));
-            prices.appendChild(el('b', { text: formatMoney(p.exitPrice) }));
+            details.appendChild(document.createTextNode(' → ' + venue + ' '));
+            details.appendChild(el('b', { text: formatMoney(p.exitPrice) }));
 
-            /* ---- Qty | exit note | shop ---- */
-            const qty = el('div', { class: 'ttv2-row-qty' });
-            const bits = [];
-
-            if (known) {
-                bits.push(
-                    'Qty: ' +
-                        p.affordableQty.toLocaleString('en-US') +
-                        (p.affordableQty < p.qty
-                            ? ' of ' + p.qty.toLocaleString('en-US') + ' (cash)'
-                            : ''),
-                );
+            if (row.source === 'bazaar') {
+                const statuses = this.state.statuses;
+                const status = statuses && row.sellerId ? statuses.get(String(row.sellerId)) : null;
+                const sellerName = row.sellerName || (status && status.name) || null;
+                if (sellerName) {
+                    details.appendChild(sep());
+                    details.appendChild(el('b', { text: sellerName }));
+                    if (status) {
+                        const word = this.statusWord(status.level, status.text);
+                        word.title = (sellerName ? sellerName + ': ' : '') + status.title;
+                        details.appendChild(word);
+                    }
+                }
             }
-            if (p.venue === 'BAZAAR_RESALE') bits.push('resell in your bazaar, no tax');
-            if (p.venue === 'ITEM_MARKET') bits.push('resell on the Item Market, after 5% tax');
-            const shopName =
-                (row.item && row.item.npcShopName) ||
-                (row.npcShop && row.npcShop.shopName) ||
-                null;
-
-            if (p.venue === 'NPC' && shopName) {
-                bits.push('sell to ' + shopName);
-            } else if (p.venue === 'NPC') {
-                bits.push('sell to NPC');
-            }
-            if (p.venue === 'TRADER') bits.push('one trade, no tax');
-
-            qty.appendChild(document.createTextNode(bits.join('  |  ')));
 
             if (!known) {
-                qty.appendChild(
-                    el('span', {
-                        class: 'ttv2-guess',
-                        title:
-                            'This is the cheapest listing, but Torn does not say ' +
-                            'how many are available AT this price - only the ' +
-                            'market-wide total' +
-                            (row.marketTotal
-                                ? ' (' + row.marketTotal.toLocaleString('en-US') + ')'
-                                : '') +
-                            '. Open the item to see each seller.',
-                        text: (bits.length ? '  |  ' : '') + 'qty unknown',
-                    }),
-                );
+                details.appendChild(sep());
+                details.appendChild(el('span', {
+                    class: 'ttv2-guess',
+                    title: 'Torn shows only the cheapest price. Open the item for stock.',
+                    text: 'qty unknown',
+                }));
             }
 
-            const main = el('div', { class: 'ttv2-row-main' }, [
-                name,
-                this.sourceLine(row),
-                prices,
-                p.venue === 'TRADER' && row.traderPick ? this.traderLine(row.traderPick) : null,
-                qty,
-            ]);
-
-            /* ---- profit column ---- */
-            const profit = el('div', { class: 'ttv2-row-profit' }, [
-                el('strong', {
-                    text: known
-                        ? '+' + formatMoney(p.realizableProfit)
-                        : '+' + formatMoney(p.profitPerUnit),
-                }),
-                el('span', {
-                    text: known
-                        ? formatMoney(p.profitPerUnit) + ' / item'
-                        : 'per item',
-                }),
-                el('span', { text: 'ROI ' + formatPct(p.roi) }),
-            ]);
-
             /* ---- the one action ---- */
-            const label = row.el
-                ? 'SCROLL TO LISTING'
-                : row.source === 'bazaar' && (row.url || row.sellerId)
-                  ? 'GO TO BAZAAR'
-                  : 'GO TO MARKET';
-
             const go = el('button', {
                 type: 'button',
                 class: 'ttv2-go',
                 title: row.el
                     ? 'Scroll to this listing'
                     : row.source === 'bazaar'
-                      ? row.sellerName
-                          ? "Open " + row.sellerName + "'s bazaar"
-                          : 'Open this bazaar'
-                      : 'Open this item on the Item Market',
-                text: label,
-                onclick: () =>
-                    this.handlers.onNavigate && this.handlers.onNavigate(row),
+                      ? 'Open this bazaar'
+                      : 'Open on the Item Market',
+                text: row.el ? 'Show' : 'Go',
+                onclick: () => this.handlers.onNavigate && this.handlers.onNavigate(row),
             });
 
-            const rowEl = el('div', { class: 'ttv2-row' }, [rankEl, main, profit, go]);
+            const rowEl = el('div', { class: 'ttv2-row' }, [name, profit, details, go]);
             rowEl.dataset.ttv2At = String(this.rowTime(row) || '');
             if (row.el) rowEl.classList.add('ttv2-onpage');
-            // An offer, not a guarantee: trader deals never look like NPC ones.
-            if (p.venue === 'TRADER') rowEl.classList.add('ttv2-row-trader');
 
             return rowEl;
         }
 
-        /**
-         * Who the deal would be sold to, and whether they are around:
-         *   Bob ● Online · net +214 · 98% of value   [Profile] [Price list]
-         *   best offline: Alice $24,500
-         */
-        traderLine(pick) {
-            const t = pick.trader;
-            const line = el('div', { class: 'ttv2-trader' });
-
-            const who = el('span', { class: 'ttv2-src-part' });
-            who.appendChild(el('b', { text: t.name }));
-            who.appendChild(this.statusBadge(t.id, t.name, pick.level));
-            line.appendChild(who);
-
-            const facts = ['net ' + (t.score >= 0 ? '+' : '') + t.score];
-            if (pick.pctOfValue) facts.push(Math.round(pick.pctOfValue * 100) + '% of value');
-            line.appendChild(el('span', { class: 'ttv2-src-part', text: ' · ' + facts.join(' · ') + ' ' }));
-
-            line.appendChild(this.traderLinks(t));
-
-            if (pick.suspect) {
-                line.appendChild(
-                    el('div', {
-                        class: 'ttv2-trader-warn',
-                        title: 'Traders usually pay 94-100% of value. A higher price is often one they forgot to update.',
-                        text: 'Above value - check their list first',
-                    }),
-                );
-            }
-            if (pick.better) {
-                const b = pick.better;
-                line.appendChild(
-                    el('div', {
-                        class: 'ttv2-trader-alt',
-                        text:
-                            'best ' + (b.level === 'unknown' ? 'other' : b.level) + ': ' +
-                            b.trader.name + ' ' + formatMoney(b.trader.price),
-                    }),
-                );
-            }
-            return line;
-        }
-
-        /** [Profile] opens their Torn profile (trade from there); [Price list] their TornExchange list. */
-        traderLinks(trader) {
-            return el('span', { class: 'ttv2-trader-links' }, [
-                el('button', {
-                    type: 'button',
-                    class: 'ttv2-mini-btn',
-                    title: "Open " + trader.name + "'s Torn profile - start the trade from there",
-                    text: 'Profile',
-                    onclick: () => this.handlers.onOpenProfile && this.handlers.onOpenProfile(trader.id),
-                }),
-                el('button', {
-                    type: 'button',
-                    class: 'ttv2-mini-btn',
-                    title: 'Open ' + trader.name + "'s price list on TornExchange (new tab)",
-                    text: 'Price list',
-                    onclick: () => this.handlers.onOpenPriceList && this.handlers.onOpenPriceList(trader.id),
-                }),
-            ]);
-        }
-
-        /** "● Online" for a player, from the known statuses; "● checking" until known. */
-        statusBadge(id, name, fallbackLevel) {
-            const statuses = this.state.statuses;
-            const status = statuses ? statuses.get(String(id)) : null;
-            const badge = el('span', {
-                class: 'ttv2-src-status',
-                title: status ? (name ? name + ': ' : '') + status.title + ' (Torn API)' : 'Checking status...',
-                text: status ? status.text : 'checking',
-            });
-            badge.dataset.level = status ? status.level : fallbackLevel || 'unknown';
-            return badge;
-        }
-
-        /**
-         * One trader, and every deal you could sell them in one trade:
-         *
-         *   Bob ● Online · net +214 · 4 deals · +$41,000   [Profile] [Price list]
-         *     Mountie Hat ×3   $20,000 -> $24,000   +$12,000   [GO]
-         *       Bazaar - Garrett89 ● Online | 1m ago
-         */
-        renderGroup(group) {
-            const t = group.trader;
-
-            const head = el('div', { class: 'ttv2-group-head' }, [
-                el('div', { class: 'ttv2-group-who' }, [
-                    el('b', { text: t.name }),
-                    this.statusBadge(t.id, t.name, group.level),
-                    el('span', {
-                        class: 'ttv2-group-facts',
-                        text:
-                            ' · net ' + (t.score >= 0 ? '+' : '') + t.score + ' · ' +
-                            group.rows.length + (group.rows.length === 1 ? ' deal' : ' deals'),
-                    }),
-                ]),
-                el('strong', { class: 'ttv2-group-total', text: '+' + formatMoney(group.totalProfit) }),
-                this.traderLinks(t),
-            ]);
-
-            const items = group.rows.map((row) => {
-                const p = row.profit;
-                const known = row.qtyAtPrice !== false;
-                const line = el('div', { class: 'ttv2-group-item' }, [
-                    el('div', { class: 'ttv2-group-item-main' }, [
-                        el('div', {
-                            class: 'ttv2-row-name',
-                            text: row.name + (known && p.affordableQty > 1 ? ' ×' + p.affordableQty : ''),
-                        }),
-                        el('div', {
-                            class: 'ttv2-row-prices',
-                            text: 'Buy ' + formatMoney(p.listingPrice) + '  ->  ' + formatMoney(p.exitPrice),
-                        }),
-                        this.sourceLine(row),
-                    ]),
-                    el('strong', {
-                        class: 'ttv2-group-profit',
-                        text: '+' + formatMoney(known ? p.realizableProfit : p.profitPerUnit),
-                    }),
-                    el('button', {
-                        type: 'button',
-                        class: 'ttv2-mini-btn ttv2-group-go',
-                        title: row.el ? 'Scroll to this listing' : 'Go to this listing',
-                        text: 'GO',
-                        onclick: () => this.handlers.onNavigate && this.handlers.onNavigate(row),
-                    }),
-                ]);
-                line.dataset.ttv2At = String(this.rowTime(row) || '');
-                line.classList.add('ttv2-row-lite');
-                return line;
-            });
-
-            return el('div', { class: 'ttv2-group' }, [head, ...items]);
+        /** "● Online" for a player: an 8px dot and a word. */
+        statusWord(level, text) {
+            const word = el('span', { class: 'ttv2-status', text: text || '' });
+            word.dataset.level = level || 'unknown';
+            return word;
         }
 
         /** When the data behind a row was true - not when we last looked. */
         rowTime(row) {
             if (row.fromFeed) return row.dataAt;
             return row.seenAt || null;
-        }
-
-        /**
-         * Where a row came from, and how old it is. Every row says this, because
-         * "is this still there?" is the question that matters most.
-         */
-        sourceLine(row) {
-            /*
-             * Two unbreakable pieces - who ("Bazaar - Name ● Offline 3h ago")
-             * and where-from/age ("via TornW3B | 42s ago") - that wrap onto a
-             * second line when the row is narrow, rather than cutting the age off.
-             */
-            const line = el('div', { class: 'ttv2-row-src' });
-            const who = el('span', { class: 'ttv2-src-part' });
-
-            if (row.source === 'bazaar') {
-                // The owner's status right after their name, so you know whether
-                // they are around before you click.
-                const statuses = this.state.statuses;
-                const status =
-                    statuses && row.sellerId ? statuses.get(String(row.sellerId)) : null;
-                const name = row.sellerName || (status && status.name) || null;
-
-                who.appendChild(document.createTextNode('Bazaar' + (name ? ' - ' + name : '')));
-                if (status) {
-                    const badge = el('span', {
-                        class: 'ttv2-src-status',
-                        title: (name ? name + ': ' : '') + status.title + ' (Torn API)',
-                        text: status.text,
-                    });
-                    badge.dataset.level = status.level;
-                    who.appendChild(badge);
-                }
-            } else if (row.source === 'itemmarket') {
-                who.textContent = 'Item Market';
-            }
-
-            const from = row.el
-                ? 'on this page'
-                : row.fromFeed
-                  ? row.source === 'bazaar' ? 'via TornW3B' : 'via Torn API'
-                  : row.fromLedger
-                    ? 'seen earlier'
-                    : '';
-
-            const age = el('span', { class: 'ttv2-age' });
-            const where = el('span', { class: 'ttv2-src-part' }, [
-                document.createTextNode(from ? from + '  |  ' : ''),
-                age,
-            ]);
-
-            if (who.childNodes.length) {
-                line.appendChild(who);
-                line.appendChild(document.createTextNode('  |  '));
-            }
-            line.appendChild(where);
-
-            if (row.fromFeed && row.dataAgeKnown === false) {
-                age.title = 'TornW3B did not say when it last checked this.';
-            }
-            return line;
         }
 
         refreshAges() {
@@ -6490,14 +7071,142 @@
 
             // Just the age. Nothing is greyed out: a listing the latest refresh
             // did not confirm is removed, not faded.
-            for (const rowEl of this.listEl.querySelectorAll('.ttv2-row, .ttv2-row-lite')) {
+            for (const rowEl of this.listEl.querySelectorAll('.ttv2-row')) {
                 const at = Number(rowEl.dataset.ttv2At);
                 const ageEl = rowEl.querySelector('.ttv2-age');
                 const known = Number.isFinite(at) && at > 0;
-                if (ageEl) ageEl.textContent = known ? formatAge(now - at) : 'age unknown';
+                if (ageEl) ageEl.textContent = known ? formatAge(now - at).replace(' ago', '') : 'age unknown';
             }
 
             this.renderBar();
+        }
+
+        /* --------------------------------------------------------- my bazaar */
+
+        /**
+         * Your own bazaar's add / manage page: every item found in its rows,
+         * what it is going for now, and the selected item's record.
+         *
+         * @param {object|null} view - null leaves the page (back to the list)
+         *   items: [{itemId, name, im: {price, at}|null, bz: {price, at}|null}]
+         *   selected: itemId | null
+         *   marketValue: number | null
+         *   averages: from core/history.js averages()
+         *   series: from core/history.js series()
+         *   windowKey: '24h' | '7d' | '30d'
+         *   since: timestamp of the first record, or null
+         *   diagnostics: { page, rows, identified }
+         */
+        renderMyBazaar(view) {
+            this.state.bazaar = view;
+            if (!this.root) return;
+
+            if (!view) {
+                if (this.page === 'mybazaar') this.showPage('list');
+                return;
+            }
+            if (this.page === 'list') this.showPage('mybazaar');
+
+            const list = this.bzListEl;
+            list.textContent = '';
+
+            if (!view.items.length) {
+                list.appendChild(el('div', { class: 'ttv2-note', text: 'No items found on this page yet.' }));
+            } else {
+                list.appendChild(el('div', { class: 'ttv2-bzrow' }, [
+                    el('span', { class: 'ttv2-label', text: 'Item' }),
+                    el('span', { class: 'ttv2-label ttv2-money', text: 'Item Market' }),
+                    el('span', { class: 'ttv2-label ttv2-money', text: 'Bazaars' }),
+                ]));
+                for (const it of view.items) {
+                    const btn = el('button', {
+                        type: 'button',
+                        class: 'ttv2-bzrow',
+                        'aria-pressed': String(it.itemId === view.selected),
+                        title: 'Show averages and graph',
+                        onclick: () => this.handlers.onSelectBazaarItem && this.handlers.onSelectBazaarItem(it.itemId),
+                    }, [
+                        el('span', { class: 'ttv2-name', text: it.name }),
+                        el('span', { class: 'ttv2-money', text: priceText(it.im) || '…' }),
+                        el('span', { class: 'ttv2-money', text: priceText(it.bz) || '…' }),
+                    ]);
+                    list.appendChild(btn);
+                }
+            }
+
+            const detail = this.bzDetailEl;
+            detail.textContent = '';
+            const sel = view.items.find((i) => i.itemId === view.selected);
+            if (!sel) {
+                detail.appendChild(el('div', { class: 'ttv2-note', text: 'Lowest asking prices now. Pick an item for its record.' }));
+                return;
+            }
+
+            detail.appendChild(el('h3', { text: sel.name }));
+
+            const now = el('div', { class: 'ttv2-note' }, [
+                'Lowest now: Item Market ',
+                el('b', { text: priceText(sel.im) || 'unknown' }),
+                sel.im && sel.im.at ? ' (' + formatAge(Date.now() - sel.im.at) + ')' : '',
+                ', bazaars ',
+                el('b', { text: priceText(sel.bz) || 'unknown' }),
+                sel.bz && sel.bz.at ? ' (' + formatAge(Date.now() - sel.bz.at) + ')' : '',
+                '.',
+            ]);
+            detail.appendChild(now);
+
+            detail.appendChild(el('div', { class: 'ttv2-note' }, [
+                'Market value ',
+                el('b', { text: view.marketValue ? formatMoney(view.marketValue) : 'unknown' }),
+                ' (Torn, daily sales average).',
+            ]));
+
+            /* averages */
+            const table = el('table', { class: 'ttv2-avg' });
+            table.appendChild(el('tr', {}, [
+                el('th', { class: 'ttv2-label', text: 'Average' }),
+                el('th', { class: 'ttv2-label ttv2-money', text: 'Item Market' }),
+                el('th', { class: 'ttv2-label ttv2-money', text: 'Bazaars' }),
+                el('th', { class: 'ttv2-label ttv2-money', text: 'Recorded' }),
+            ]));
+            const avgs = view.averages || {};
+            for (const w of WINDOWS) {
+                const a = avgs[w.key] || { im: null, bz: null, coverage: 0 };
+                const none = a.coverage <= 0;
+                table.appendChild(el('tr', {}, [
+                    el('th', { text: w.label }),
+                    el('td', { class: 'ttv2-money' + (a.im ? '' : ' ttv2-none'), text: a.im ? formatMoney(a.im) : 'no data' }),
+                    el('td', { class: 'ttv2-money' + (a.bz ? '' : ' ttv2-none'), text: a.bz ? formatMoney(a.bz) : 'no data' }),
+                    el('td', { class: 'ttv2-money' + (none ? ' ttv2-none' : ''), text: none ? '0%' : Math.round(a.coverage * 100) < 1 ? '<1%' : Math.round(a.coverage * 100) + '%' }),
+                ]));
+            }
+            detail.appendChild(table);
+
+            /* graph */
+            const windows = el('div', { class: 'ttv2-windows' });
+            for (const key of ['24h', '7d', '30d']) {
+                windows.appendChild(el('button', {
+                    type: 'button',
+                    class: 'ttv2-window',
+                    'aria-pressed': String(key === view.windowKey),
+                    text: key,
+                    onclick: () => this.handlers.onBazaarWindow && this.handlers.onBazaarWindow(key),
+                }));
+            }
+            detail.appendChild(windows);
+
+            if (view.series) detail.appendChild(renderPriceGraph(view.series, { width: 400, height: 96 }));
+            detail.appendChild(el('div', { class: 'ttv2-graph-keys' }, [
+                el('span', { class: 'ttv2-key-im', text: '— Item Market ask' }),
+                el('span', { class: 'ttv2-key-bz', text: '— Bazaar ask' }),
+                el('span', { class: 'ttv2-key-mv', text: '- - Market value' }),
+            ]));
+
+            const cov = avgs[view.windowKey] ? coverageText(avgs[view.windowKey].coverage, view.windowKey) : '0%';
+            detail.appendChild(el('div', {
+                class: 'ttv2-note',
+                text: 'Asking prices this script recorded (' + cov + '). Sales are not published.',
+            }));
         }
 
         destroy() {
@@ -6514,49 +7223,36 @@
         }
     }
 
-    /* ===== src/ui/traders-page.js ===== */
+    /* ===== src/ui/selling-page.js ===== */
     /*
-     * The Traders page: "which trader do I sell this to, right now?"
+     * The selling page: which trader pays most for each item you hold.
      *
-     * A full page of its own - in its own tab (index.php?ttv2=traders) or over
-     * the Torn page you are on - fed by the overlay: the same deal list, trader
-     * prices and online statuses, all read from this browser. It never fetches
-     * anything itself; main.js hands it a board to draw.
+     * Its own tab (index.php?ttv2=traders): a Torn page the user opened, drawn
+     * over by the script. It reads only the API - your inventory with the
+     * Limited key kept here (never the overlay's Public key), traders' prices
+     * from TornExchange with the TornExchange key kept here - and never a Torn
+     * page you are not on. Nothing is traded, listed or clicked for you.
      *
-     *   By item (default): every deal, where to buy it, and ALL its TornExchange
-     *     traders - online first - each with the profit of selling it to them.
-     *   By trader: the deals each trader should get, so several items go in ONE
-     *     trade, with the cash that trade needs.
-     *
-     * Clicking a trader's name opens their Torn profile (start the trade there);
-     * [Price list] opens their TornExchange list. Nothing is bought or clicked
-     * for you. Names from Torn / TornExchange only ever go in via textContent.
-     *
-     * It has its OWN preferences (how it opens, whether its links open a new
-     * tab, view, filters) - separate from the overlay's settings.
+     * Every trader list is highest price first. "Online only" keeps only the
+     * traders known to be online, still highest first. Clicking a trader offers
+     * their Torn profile and their TornExchange price list. Names from Torn or
+     * TornExchange only ever go in via textContent.
      */
 
 
 
-    const TRADERS_PAGE_DEFAULTS = {
-        /* How the overlay's Traders button opens this page: ask | tab | overlay. */
-        openMode: 'ask',
-        /* Profile and GO open a new tab. On by default: in "over the page" mode a
-           same-tab navigation would take the page away underneath you. */
-        linksNewTab: true,
-        view: 'item',
-        sort: 'profit',
+
+
+
+    const SELLING_PAGE_DEFAULTS = {
         onlineOnly: false,
-        hideNpcBetter: false,
-        hideNoTrader: false,
+        /* Item order: 'item' = best single-item offer first; 'bundle' = qty x offer first. */
+        sortBy: 'item',
+        /* Profile and price-list links open a new tab. */
+        linksNewTab: true,
     };
 
-    /* Deal list from the overlay can be long; the page keeps its DOM bounded. */
-    const TP_MAX_CARDS = 150;
-
-    const TP_LEVEL_RANK = { online: 0, idle: 1, unknown: 2, checking: 2, offline: 3 };
-
-    function tpEl(tag, props = {}, children = []) {
+    function spEl(tag, props = {}, children = []) {
         const node = document.createElement(tag);
         for (const [key, value] of Object.entries(props)) {
             if (key === 'class') node.className = value;
@@ -6574,76 +7270,79 @@
         return node;
     }
 
-    function tpProfileUrl(id) {
+    function spProfileUrl(id) {
         return 'https://www.torn.com/profiles.php?XID=' + encodeURIComponent(String(id));
     }
 
-    function tpSigned(n) {
-        return (n >= 0 ? '+' : '-') + formatMoney(Math.abs(n));
-    }
-
-    /**
-     * What the page needs per deal, on top of buildTraderBoard(): the best
-     * non-trader exit, whether a trader beats it, and the headline number.
-     */
-    function decorateBoardEntry(entry) {
-        const p = entry.listing.profit;
-        const known = entry.listing.qtyAtPrice !== false;
-        const qty = known ? Math.max(1, p.affordableQty || 0) : 1;
-        const sell = Number(entry.item && entry.item.sellPrice) || 0;
-        const npc = sell > 0 ? { price: sell, profit: (sell - p.listingPrice) * qty } : null;
-
-        let other = null;
-        if (p.venue !== 'TRADER') {
-            other = {
-                tag: p.venue === 'NPC' ? 'NPC' : 'Resale',
-                profit: known ? p.realizableProfit : p.profitPerUnit,
-            };
-        } else if (npc && npc.profit > 0) {
-            other = { tag: 'NPC', profit: npc.profit };
-        }
-
-        const best = entry.bestTrader;
-        const traderWins = Boolean(best && (!other || best.profit > other.profit));
-
-        return {
-            ...entry,
-            qty,
-            known,
-            npc,
-            other,
-            traderWins,
-            headline: traderWins ? best.profit : other ? other.profit : 0,
-            headlineTag: traderWins ? 'Trader' : other ? other.tag : '',
-            cashNeeded: p.listingPrice * qty,
+    /** A masked key field with Show / Save. The saved key is never left in the field. */
+    function keyField(page, { placeholder, onSave, onReveal }) {
+        const input = spEl('input', {
+            type: 'text',
+            class: 'sp-masked sp-key',
+            placeholder,
+            autocomplete: 'off',
+            autocapitalize: 'off',
+            autocorrect: 'off',
+            spellcheck: 'false',
+            'data-lpignore': 'true',
+            'data-1p-ignore': 'true',
+        });
+        let revealed = false;
+        const show = spEl('button', {
+            type: 'button',
+            class: 'sp-btn',
+            text: 'Show',
+            onclick: () => {
+                const hidden = input.classList.toggle('sp-masked');
+                show.textContent = hidden ? 'Show' : 'Hide';
+                if (!hidden && !input.value && onReveal) {
+                    input.value = onReveal() || '';
+                    revealed = true;
+                } else if (hidden && revealed) {
+                    input.value = '';
+                    revealed = false;
+                }
+            },
+        });
+        const save = () => {
+            const key = input.value.trim();
+            input.value = '';
+            revealed = false;
+            input.classList.add('sp-masked');
+            show.textContent = 'Show';
+            onSave(key);
         };
+        input.addEventListener('keydown', (event) => {
+            if (event.key !== 'Enter') return;
+            event.preventDefault();
+            save();
+        });
+        const saveBtn = spEl('button', { type: 'button', class: 'sp-btn sp-primary', text: 'Save', onclick: save });
+        return { input, row: spEl('div', { class: 'sp-inline' }, [input, show, saveBtn]) };
     }
 
-    class TradersPage {
+    class SellingPage {
         /**
          * @param {object} handlers
-         *   onClose, onNavigate(row), onOpenProfile(id), onOpenPriceList(id),
-         *   onRefresh, onPrefsChange(partial), onAddKey
+         *   onSaveKey(key), onForgetKey(), onRevealKey()
+         *   onSaveTeKey(key), onForgetTeKey(), onRevealTeKey()
+         *   onRefresh(), onPrefsChange(partial), onExpand(itemId)
+         *   onOpenProfile(id), onOpenList(idOrName)
          */
         constructor(handlers = {}) {
             this.h = handlers;
-            this.state = { board: [], prefs: { ...TRADERS_PAGE_DEFAULTS } };
-            this.compact = new Set();
-            this.noTraderOpen = false;
-            this.query = '';
+            this.state = { rows: [], prefs: { ...SELLING_PAGE_DEFAULTS }, info: {}, expanded: new Set(), statuses: new Map() };
+            this.view = 'list';
         }
 
-        /** @param {'tab'|'overlay'} mode - a tab of its own has no close button */
-        mount(mode = 'overlay') {
-            this.mode = mode;
+        mount() {
             if (this.host) return;
 
             this.host = document.createElement('div');
-            this.host.id = 'ttv2-traders-host';
-            // Below the overlay panel (2147483000), above everything of Torn's.
+            this.host.id = 'ttv2-sell-host';
             this.host.style.cssText = 'position:fixed;inset:0;z-index:2147482000;';
             const shadow = this.host.attachShadow({ mode: 'open' });
-            shadow.appendChild(tpEl('style', { text: TRADERS_PAGE_CSS }));
+            shadow.appendChild(spEl('style', { text: SELLING_PAGE_CSS }));
 
             this.build();
             shadow.appendChild(this.root);
@@ -6654,18 +7353,15 @@
             document.documentElement.style.overflow = 'hidden';
 
             this.keyHandler = (event) => {
-                if (event.key !== 'Escape') return;
-                if (this.prefsEl && !this.prefsEl.hidden) {
-                    this.prefsEl.hidden = true;
-                    return;
-                }
-                if (this.mode === 'overlay' && this.h.onClose) this.h.onClose();
+                if (event.key === 'Escape' && this.view === 'settings') this.showView('list');
             };
             document.addEventListener('keydown', this.keyHandler);
+            this.ticker = setInterval(() => this.renderBar(), 1000);
         }
 
         destroy() {
             if (this.keyHandler) document.removeEventListener('keydown', this.keyHandler);
+            if (this.ticker) clearInterval(this.ticker);
             if (this.host && this.host.parentNode) this.host.parentNode.removeChild(this.host);
             document.documentElement.style.overflow = this.prevOverflow || '';
             this.host = null;
@@ -6675,715 +7371,591 @@
         /* ------------------------------------------------------------ build */
 
         build() {
-            const prefs = () => this.state.prefs;
             const set = (partial) => this.h.onPrefsChange && this.h.onPrefsChange(partial);
 
-            /* header */
-            this.summaryEl = tpEl('span', { class: 'tp-summary' });
-            this.freshEl = tpEl('span', { class: 'tp-fresh' });
-            this.refreshBtn = tpEl('button', {
-                type: 'button', class: 'tp-icon', title: 'Refresh statuses now (trader prices refresh every 30 min)',
-                text: '↻', onclick: () => this.h.onRefresh && this.h.onRefresh(),
-            });
-            this.prefsBtn = tpEl('button', {
-                type: 'button', class: 'tp-icon', title: 'Page preferences', text: '⚙',
-                onclick: () => { this.prefsEl.hidden = !this.prefsEl.hidden; },
-            });
-            this.closeBtn = tpEl('button', {
-                type: 'button', class: 'tp-icon', title: 'Close (Esc)', 'aria-label': 'Close', text: '✕',
-                onclick: () => this.h.onClose && this.h.onClose(),
-            });
-            this.closeBtn.hidden = this.mode !== 'overlay';
-
-            const header = tpEl('header', { class: 'tp-head' }, [
-                tpEl('h1', { text: 'Traders' }),
-                this.summaryEl,
-                tpEl('span', { class: 'tp-grow' }),
-                this.freshEl,
-                this.refreshBtn,
-                this.prefsBtn,
-                this.closeBtn,
-            ]);
-
-            /* preferences popover */
-            const radio = (value, label) => {
-                const input = tpEl('input', { type: 'radio', name: 'tp-open', value });
-                input.addEventListener('change', () => input.checked && set({ openMode: value }));
-                return { input, row: tpEl('label', { class: 'tp-radio' }, [input, label]) };
-            };
-            this.openRadios = [radio('ask', 'Ask'), radio('tab', 'New tab'), radio('overlay', 'Over the page')];
-            this.linksInput = tpEl('input', { type: 'checkbox' });
-            this.linksInput.addEventListener('change', () => set({ linksNewTab: this.linksInput.checked }));
-
-            this.prefsEl = tpEl('div', { class: 'tp-prefs', role: 'dialog', 'aria-label': 'Page preferences' }, [
-                tpEl('div', { class: 'tp-prefs-h', text: 'Open from the overlay' }),
-                tpEl('div', { class: 'tp-radios' }, this.openRadios.map((r) => r.row)),
-                tpEl('label', { class: 'tp-check' }, [this.linksInput, 'Open Profile and GO in a new tab']),
-                tpEl('div', { class: 'tp-note', text: 'Deals and filters (Sell to, Min, Cash) come from the overlay. These settings are this page\'s own.' }),
-            ]);
-            this.prefsEl.hidden = true;
-
-            /* reach strip: the number that matters most */
-            this.stripEl = tpEl('button', {
-                type: 'button', class: 'tp-strip', title: 'Show only deals an online trader buys',
-                onclick: () => set({ onlineOnly: !prefs().onlineOnly }),
-            });
-
-            /* controls */
-            const seg = (value, label) => tpEl('button', {
-                type: 'button', class: 'tp-seg', 'data-view': value, text: label,
-                onclick: () => set({ view: value }),
-            });
-            this.segBtns = [seg('item', 'By item'), seg('trader', 'By trader')];
-
-            const chip = (key, label, title) => {
-                const b = tpEl('button', {
-                    type: 'button', class: 'tp-chip', 'data-key': key, title, text: label,
-                    onclick: () => set({ [key]: !prefs()[key] }),
+            /* title bar */
+            this.sortBtns = {};
+            const sortBtn = (key, text, title) => {
+                const btn = spEl('button', {
+                    type: 'button',
+                    class: 'sp-seg-btn',
+                    'data-sort': key,
+                    'aria-pressed': 'false',
+                    title,
+                    text,
+                    onclick: () => set({ sortBy: key }),
                 });
-                return b;
+                this.sortBtns[key] = btn;
+                return btn;
             };
-            this.chips = [
-                chip('onlineOnly', 'Online only', 'Only deals an online trader buys'),
-                chip('hideNpcBetter', 'Hide NPC-better', 'Hide deals where an NPC or resale pays more than any trader'),
-                chip('hideNoTrader', 'Hide no-trader', 'Hide items no TornExchange trader buys'),
-            ];
-
-            this.searchEl = tpEl('input', {
-                type: 'search', class: 'tp-search', placeholder: 'Search item or trader',
-                'aria-label': 'Search item or trader',
-            });
-            this.searchEl.addEventListener('input', () => {
-                this.query = this.searchEl.value.trim().toLowerCase();
-                this.renderList();
-            });
-
-            this.sortEl = tpEl('select', { class: 'tp-sort', 'aria-label': 'Sort' }, [
-                tpEl('option', { value: 'profit', text: 'Sort: Profit' }),
-                tpEl('option', { value: 'name', text: 'Sort: Item name' }),
-                tpEl('option', { value: 'status', text: 'Sort: Trader status' }),
+            this.sortEl = spEl('div', { class: 'sp-seg', role: 'group', 'aria-label': 'Order items by' }, [
+                sortBtn('item', 'Per item', 'Best offer for one, highest first'),
+                sortBtn('bundle', 'Bundle', 'Quantity times best offer, highest first'),
             ]);
-            this.sortEl.addEventListener('change', () => set({ sort: this.sortEl.value }));
+            this.onlineBtn = spEl('button', {
+                type: 'button',
+                class: 'sp-btn sp-toggle',
+                'aria-pressed': 'false',
+                title: 'Show only traders who are online',
+                text: 'Online only',
+                onclick: () => set({ onlineOnly: !this.state.prefs.onlineOnly }),
+            });
+            this.refreshBtn = spEl('button', {
+                type: 'button',
+                class: 'sp-icon',
+                title: 'Refresh now',
+                'aria-label': 'Refresh now',
+                text: '↻',
+                onclick: () => this.h.onRefresh && this.h.onRefresh(),
+            });
+            this.settingsBtn = spEl('button', {
+                type: 'button',
+                class: 'sp-icon',
+                title: 'Settings',
+                'aria-label': 'Settings',
+                'aria-pressed': 'false',
+                text: '⚙',
+                onclick: () => this.showView(this.view === 'settings' ? 'list' : 'settings'),
+            });
+            this.backBtn = spEl('button', {
+                type: 'button',
+                class: 'sp-icon sp-back',
+                title: 'Back (Esc)',
+                'aria-label': 'Back',
+                text: '←',
+                onclick: () => this.showView('list'),
+            });
 
-            const controls = tpEl('div', { class: 'tp-controls' }, [
-                tpEl('div', { class: 'tp-segs' }, this.segBtns),
-                ...this.chips,
-                tpEl('span', { class: 'tp-grow' }),
-                this.searchEl,
-                this.sortEl,
+            this.titleEl = spEl('h1', { text: 'Sell to traders' });
+            this.toolsEl = spEl('div', { class: 'sp-tools' }, [this.sortEl, this.onlineBtn]);
+            this.headEl = spEl('header', { class: 'sp-head' }, [
+                this.backBtn,
+                this.titleEl,
+                spEl('span', { class: 'sp-grow' }),
+                this.toolsEl,
+                this.refreshBtn,
+                this.settingsBtn,
             ]);
 
-            this.bannerEl = tpEl('div', { class: 'tp-banner' });
-            this.listEl = tpEl('main', { class: 'tp-list' });
+            /* status bar */
+            this.barLeft = spEl('span', { class: 'sp-bar-left' });
+            this.barRight = spEl('span', { class: 'sp-bar-right' });
+            this.barEl = spEl('div', { class: 'sp-bar' }, [this.barLeft, this.barRight]);
 
-            this.root = tpEl('div', { class: 'tp-page' }, [
-                header,
-                this.prefsEl,
-                this.stripEl,
-                controls,
+            this.bannerEl = spEl('div', { class: 'sp-banner' });
+
+            /* list */
+            this.listEl = spEl('main', { class: 'sp-main' });
+
+            /* settings */
+            this.settingsEl = spEl('main', { class: 'sp-main sp-settings' });
+            this.buildSettings();
+            this.settingsEl.hidden = true;
+
+            this.root = spEl('div', { class: 'sp-page' }, [
+                this.headEl,
+                this.barEl,
                 this.bannerEl,
                 this.listEl,
+                this.settingsEl,
             ]);
+        }
+
+        buildSettings() {
+            const section = (title, children) =>
+                spEl('section', { class: 'sp-section' }, [spEl('h2', { class: 'sp-label', text: title }), ...children]);
+            const note = (children) => spEl('div', { class: 'sp-note' }, children);
+
+            /* Torn key (Limited) */
+            const torn = keyField(this, {
+                placeholder: 'Limited API key',
+                onSave: (key) => this.h.onSaveKey && this.h.onSaveKey(key),
+                onReveal: () => this.h.onRevealKey && this.h.onRevealKey(),
+            });
+            this.keyInput = torn.input;
+            this.keyStateEl = spEl('div', { class: 'sp-keystate', text: 'No key saved.' });
+
+            const tos = spEl('table', { class: 'sp-tos' });
+            for (const [k, v] of [
+                ['Data storage', 'Only locally, in this browser'],
+                ['Data sharing', 'Nobody'],
+                ['Purpose of use', 'Personal gain: pricing the items you hold against traders\' offers'],
+                ['Key storage & sharing', 'Stored locally / Not shared'],
+                [
+                    'Key access level',
+                    'Limited (user: inventory, your own items; torn: items, market values; user: profile, traders\' public status)',
+                ],
+                ['Other services', 'TornExchange (tornexchange.com), with the separate key below. This key never goes there.'],
+            ]) {
+                tos.appendChild(spEl('tr', {}, [spEl('th', { text: k }), spEl('td', { text: v })]));
+            }
+            this.tosEl = spEl('details', { class: 'sp-tos-box', open: '' }, [
+                spEl('summary', { text: 'Key use (Torn API terms)' }),
+                tos,
+            ]);
+
+            this.settingsEl.appendChild(
+                section('Torn API key for this page', [
+                    torn.row,
+                    this.keyStateEl,
+                    note([
+                        'Limited access is needed to read your inventory. Make one at ',
+                        spEl('a', { href: TORN_API_KEY_URL, target: '_blank', rel: 'noopener noreferrer', text: 'Torn › Settings › API Key' }),
+                        '. Used on this page only.',
+                    ]),
+                    this.tosEl,
+                    spEl('button', { type: 'button', class: 'sp-link', text: 'Forget key', onclick: () => this.h.onForgetKey && this.h.onForgetKey() }),
+                ]),
+            );
+
+            /* TornExchange key */
+            const te = keyField(this, {
+                placeholder: 'TornExchange API key',
+                onSave: (key) => this.h.onSaveTeKey && this.h.onSaveTeKey(key),
+                onReveal: () => this.h.onRevealTeKey && this.h.onRevealTeKey(),
+            });
+            this.teKeyInput = te.input;
+            this.teStateEl = spEl('div', { class: 'sp-keystate', text: 'No TornExchange key saved.' });
+
+            this.settingsEl.appendChild(
+                section('TornExchange API key', [
+                    te.row,
+                    this.teStateEl,
+                    note([
+                        'The API key from your ',
+                        spEl('a', { href: TE_SITE_URL, target: '_blank', rel: 'noopener noreferrer', text: 'tornexchange.com' }),
+                        ' account. Sent to tornexchange.com only, at most 6 calls a minute.',
+                    ]),
+                    spEl('button', { type: 'button', class: 'sp-link', text: 'Forget key', onclick: () => this.h.onForgetTeKey && this.h.onForgetTeKey() }),
+                ]),
+            );
+
+            /* preferences */
+            this.linksInput = spEl('input', { type: 'checkbox' });
+            this.linksInput.addEventListener('change', () => this.h.onPrefsChange && this.h.onPrefsChange({ linksNewTab: this.linksInput.checked }));
+            this.settingsEl.appendChild(
+                section('Links', [
+                    spEl('label', { class: 'sp-check' }, [this.linksInput, spEl('span', { text: 'Open links in a new tab' })]),
+                ]),
+            );
+        }
+
+        showView(view) {
+            this.view = view === 'settings' ? 'settings' : 'list';
+            if (!this.root) return;
+            const settings = this.view === 'settings';
+            this.settingsEl.hidden = !settings;
+            this.listEl.hidden = settings;
+            this.backBtn.hidden = !settings;
+            this.settingsBtn.setAttribute('aria-pressed', String(settings));
+            this.toolsEl.hidden = settings;
+            this.titleEl.textContent = settings ? 'Settings' : 'Sell to traders';
+            this.renderBanner();
+        }
+
+        openSettings() {
+            this.showView('settings');
         }
 
         /* ----------------------------------------------------------- render */
 
         /**
          * @param {object} view
-         *   board      - buildTraderBoard() output
-         *   statuses   - Map playerId -> {level, text, title}
-         *   traderInfo - {hasKey, fetchedAt, error, badKey, waitUntil, loading}
-         *   live       - the feed's status, for the empty state
+         *   rows       - buildSellingRows() output
+         *   statuses   - Map traderId -> {level, text, title}
          *   prefs      - this page's preferences
+         *   info       - { hasKey, keyAccess, keyError, hasTeKey, teError, teBadKey,
+         *                  teWaitUntil, teAt, inventoryAt, loading, itemLists: Map }
+         *   expanded   - Set of item ids whose traders are shown
          */
         render(view) {
             Object.assign(this.state, view);
             if (!this.root) return;
 
             const p = this.state.prefs;
-            this.entries = (this.state.board || []).map(decorateBoardEntry);
-
-            for (const r of this.openRadios) r.input.checked = r.input.value === p.openMode;
+            this.onlineBtn.setAttribute('aria-pressed', String(Boolean(p.onlineOnly)));
+            const sortBy = p.sortBy === 'bundle' ? 'bundle' : 'item';
+            for (const [key, btn] of Object.entries(this.sortBtns)) btn.setAttribute('aria-pressed', String(key === sortBy));
             this.linksInput.checked = p.linksNewTab !== false;
-            for (const b of this.segBtns) b.setAttribute('aria-pressed', String(b.dataset.view === p.view));
-            for (const c of this.chips) c.setAttribute('aria-pressed', String(Boolean(p[c.dataset.key])));
-            this.sortEl.value = p.sort || 'profit';
-            this.sortEl.hidden = p.view === 'trader';
-            this.closeBtn.hidden = this.mode !== 'overlay';
 
-            const total = this.entries.reduce((sum, e) => sum + Math.max(0, e.headline), 0);
-            this.summaryEl.textContent =
-                this.entries.length + (this.entries.length === 1 ? ' deal' : ' deals') +
-                ' · +' + formatMoneyShort(total);
-
-            this.renderFresh();
-            this.renderStrip();
+            this.renderKeyStates();
+            this.renderBar();
             this.renderBanner();
             this.renderList();
         }
 
-        renderFresh() {
-            const ti = this.state.traderInfo || {};
-            const el = this.freshEl;
-            el.className = 'tp-fresh';
-            if (!ti.hasKey) {
-                el.textContent = 'TE: no key';
-            } else if (ti.loading) {
-                el.textContent = 'TE: loading';
-            } else if (ti.fetchedAt) {
-                const age = Date.now() - ti.fetchedAt;
-                el.textContent = 'TE prices ' + formatAge(age);
-                if (age > 30 * 60 * 1000) el.classList.add('tp-amber');
+        renderKeyStates() {
+            const info = this.state.info || {};
+
+            this.keyStateEl.className = 'sp-keystate';
+            if (!info.hasKey) {
+                this.keyStateEl.textContent = 'No key saved.';
+            } else if (info.keyError) {
+                this.keyStateEl.textContent = info.keyError;
+                this.keyStateEl.classList.add('sp-bad');
             } else {
-                el.textContent = 'TE: no prices';
-                el.classList.add('tp-red');
+                this.keyStateEl.textContent = 'Saved' + (info.keyAccess ? ' · ' + info.keyAccess + ' access' : '') + '.';
+                this.keyStateEl.classList.add('sp-ok');
+            }
+            if (this.tosEl) this.tosEl.open = !info.hasKey;
+
+            this.teStateEl.className = 'sp-keystate';
+            if (!info.hasTeKey) {
+                this.teStateEl.textContent = 'No TornExchange key saved.';
+            } else if (info.teBadKey) {
+                this.teStateEl.textContent = info.teError || 'TornExchange rejected this key.';
+                this.teStateEl.classList.add('sp-bad');
+            } else if (info.teAt) {
+                this.teStateEl.textContent = 'Saved · prices ' + formatAge(Date.now() - info.teAt) + '.';
+                this.teStateEl.classList.add('sp-ok');
+            } else {
+                this.teStateEl.textContent = info.teError || 'Saved.';
+                if (info.teError) this.teStateEl.classList.add('sp-bad');
             }
         }
 
-        renderStrip() {
-            const online = new Set();
-            let now = 0;
-            for (const e of this.entries) {
-                for (const t of e.traders) if (t.level === 'online') online.add(t.trader.id);
-                if (e.traderWins && e.bestTrader.level === 'online') now += e.headline;
-            }
-            this.stripEl.textContent = '';
-            this.stripEl.appendChild(tpEl('span', { class: 'tp-dot', 'data-level': online.size ? 'online' : 'offline' }));
-            this.stripEl.appendChild(document.createTextNode(
-                online.size + (online.size === 1 ? ' trader' : ' traders') + ' online · +' +
-                    formatMoney(now) + ' sellable now',
-            ));
-            this.stripEl.setAttribute('aria-pressed', String(Boolean(this.state.prefs.onlineOnly)));
+        renderBar() {
+            if (!this.root) return;
+            const rows = this.state.rows || [];
+            const info = this.state.info || {};
+            const withOffer = rows.filter((r) => r.total !== null);
+            const total = withOffer.reduce((sum, r) => sum + r.total, 0);
+
+            this.barLeft.textContent = info.loading
+                ? 'Loading'
+                : rows.length
+                  ? rows.length + (rows.length === 1 ? ' item' : ' items') + ' · ' +
+                    withOffer.length + ' with a buyer · ' + formatMoneyShort(total) + ' at best offers'
+                  : '';
+
+            const bits = [];
+            if (info.inventoryAt) bits.push('inventory ' + formatAge(Date.now() - info.inventoryAt));
+            if (info.teAt) bits.push('TE prices ' + formatAge(Date.now() - info.teAt));
+            this.barRight.textContent = bits.join(' · ');
         }
 
         renderBanner() {
-            const ti = this.state.traderInfo || {};
+            const info = this.state.info || {};
             const b = this.bannerEl;
             b.textContent = '';
-            b.className = 'tp-banner';
+            b.className = 'sp-banner';
 
-            if (!ti.hasKey) {
-                b.classList.add('tp-banner-on');
-                b.appendChild(document.createTextNode('Trader prices need a TornExchange key. '));
-                b.appendChild(tpEl('button', { type: 'button', class: 'tp-btn', text: 'Add key', onclick: () => this.h.onAddKey && this.h.onAddKey() }));
-            } else if (ti.badKey) {
-                b.classList.add('tp-banner-on', 'tp-banner-bad');
-                b.appendChild(document.createTextNode((ti.error || 'TornExchange did not accept the key.') + ' '));
-                b.appendChild(tpEl('button', { type: 'button', class: 'tp-btn', text: 'Open Settings', onclick: () => this.h.onAddKey && this.h.onAddKey() }));
-            } else if (ti.waitUntil) {
-                b.classList.add('tp-banner-on', 'tp-banner-warn');
-                b.textContent =
-                    'TornExchange asked us to wait ' + formatAge(ti.waitUntil - Date.now()).replace(' ago', '') +
-                    (ti.fetchedAt ? ' - showing prices from ' + formatAge(Date.now() - ti.fetchedAt) + '.' : '.');
-            } else if (!ti.fetchedAt && ti.error && !ti.loading) {
-                b.classList.add('tp-banner-on', 'tp-banner-bad');
-                b.textContent = 'No trader prices: ' + ti.error;
-            } else if (this.state.traderChipOn === false) {
-                // The deal list is the overlay's: with its Trader chip off, deals
-                // only a trader makes profitable are not in it. Say so.
-                b.classList.add('tp-banner-on');
-                b.appendChild(document.createTextNode(
-                    'Deals only a trader makes profitable are hidden - the Trader chip is off in the overlay. ',
-                ));
-                b.appendChild(tpEl('button', {
-                    type: 'button', class: 'tp-btn', text: 'Turn on Trader',
-                    onclick: () => this.h.onEnableTraders && this.h.onEnableTraders(),
-                }));
+            const say = (text, level, label, fn) => {
+                b.classList.add('sp-banner-on');
+                if (level) b.classList.add('sp-banner-' + level);
+                b.appendChild(spEl('span', { text }));
+                if (label && this.view !== 'settings') b.appendChild(spEl('button', { type: 'button', class: 'sp-btn sp-primary', text: label, onclick: fn }));
+            };
+            const toSettings = () => this.showView('settings');
+
+            if (!info.hasKey) {
+                say('Add a Limited API key to read your inventory.', null, 'Add key', toSettings);
+            } else if (info.keyError) {
+                say(info.keyError, 'bad', 'Open Settings', toSettings);
+            } else if (!info.hasTeKey) {
+                say('Add your TornExchange API key to see traders.', null, 'Add key', toSettings);
+            } else if (info.teBadKey) {
+                say(info.teError || 'TornExchange rejected this key.', 'bad', 'Open Settings', toSettings);
+            } else if (info.teWaitUntil && info.teWaitUntil > Date.now()) {
+                say('TornExchange asked us to wait ' + formatAge(info.teWaitUntil - Date.now()).replace(' ago', '') + '.', 'warn');
+            } else if (info.teError) {
+                say(info.teError, 'warn');
+            } else if (info.error) {
+                say(info.error, 'bad');
             }
-        }
-
-        /** Filters and search, shared by both views. */
-        visibleEntries() {
-            const p = this.state.prefs;
-            const q = this.query;
-
-            return this.entries.filter((e) => {
-                if (q) {
-                    const hit =
-                        String(e.name || '').toLowerCase().includes(q) ||
-                        e.traders.some((t) => t.trader.name.toLowerCase().includes(q));
-                    if (!hit) return false;
-                }
-                if (p.onlineOnly && !e.traders.some((t) => t.level === 'online' && !t.suspect && t.profitPerUnit > 0)) {
-                    return false;
-                }
-                if (p.hideNpcBetter && e.traders.length && !e.traderWins) return false;
-                return true;
-            });
         }
 
         renderList() {
-            if (!this.listEl) return;
-            const top = this.listEl.scrollTop;
-            this.listEl.textContent = '';
-
-            const entries = this.visibleEntries();
+            const list = this.listEl;
+            list.textContent = '';
+            const rows = this.state.rows || [];
+            const info = this.state.info || {};
             const p = this.state.prefs;
 
-            if (!this.entries.length) {
-                this.listEl.appendChild(this.renderEmpty('No deals right now. The overlay keeps scanning; this page updates itself.'));
-            } else if (!entries.length) {
-                this.listEl.appendChild(this.renderEmpty('Nothing matches the filters above.'));
-            } else if (p.view === 'trader') {
-                this.renderByTrader(entries);
-            } else {
-                this.renderByItem(entries);
-            }
-
-            this.listEl.scrollTop = top;
-        }
-
-        renderEmpty(text) {
-            const live = this.state.live;
-            return tpEl('div', { class: 'tp-empty' }, [
-                tpEl('div', { text }),
-                live
-                    ? tpEl('div', {
-                          class: 'tp-muted',
-                          text: live.enabled ? '● live feed on' : 'Live feed is off - turn it on in the overlay.',
-                      })
-                    : null,
-            ]);
-        }
-
-        /* ---------------------------------------------------------- by item */
-
-        renderByItem(entries) {
-            const p = this.state.prefs;
-            // Before any trader prices exist, every deal is still a full card.
-            const pricesKnown = Boolean((this.state.traderInfo || {}).fetchedAt);
-            const withTraders = pricesKnown ? entries.filter((e) => e.traders.length) : entries.slice();
-            const without = pricesKnown ? entries.filter((e) => !e.traders.length) : [];
-
-            const sorters = {
-                profit: (a, b) => b.headline - a.headline,
-                name: (a, b) => String(a.name).localeCompare(String(b.name)),
-                status: (a, b) =>
-                    (TP_LEVEL_RANK[a.bestTrader ? a.bestTrader.level : 'offline'] ?? 3) -
-                        (TP_LEVEL_RANK[b.bestTrader ? b.bestTrader.level : 'offline'] ?? 3) ||
-                    b.headline - a.headline,
-            };
-            withTraders.sort(sorters[p.sort] || sorters.profit);
-
-            let headerShown = false;
-
-            for (const e of withTraders.slice(0, TP_MAX_CARDS)) {
-                this.listEl.appendChild(this.renderCard(e, !headerShown && e.traders.length > 0));
-                if (e.traders.length) headerShown = true;
-            }
-
-            if (without.length && !p.hideNoTrader) {
-                const details = tpEl('details', { class: 'tp-card tp-notrader' });
-                if (this.noTraderOpen) details.open = true;
-                details.addEventListener('toggle', () => { this.noTraderOpen = details.open; });
-                details.appendChild(tpEl('summary', {
-                    text: 'No trader buys these (' + without.length + ')',
-                }));
-                for (const e of without.slice(0, TP_MAX_CARDS)) {
-                    details.appendChild(tpEl('div', { class: 'tp-mini' }, [
-                        tpEl('span', { class: 'tp-mini-name', text: e.name + (e.qty > 1 ? ' ×' + e.qty : '') }),
-                        tpEl('span', { class: 'tp-muted', text: this.exitText(e) }),
-                        tpEl('span', { class: 'tp-grow' }),
-                        tpEl('strong', { class: 'tp-green', text: tpSigned(e.headline) }),
-                        this.goButton(e.listing, true),
-                    ]));
-                }
-                this.listEl.appendChild(details);
-            }
-        }
-
-        renderCard(e, withHeader) {
-            const compact = this.compact.has(e.itemId);
-
-            const title = tpEl('div', { class: 'tp-card-title' }, [
-                tpEl('button', {
-                    type: 'button', class: 'tp-name', title: compact ? 'Show traders' : 'Hide traders',
-                    text: e.name + (e.qty > 1 ? ' ×' + e.qty : ''),
-                    onclick: () => {
-                        if (this.compact.has(e.itemId)) this.compact.delete(e.itemId);
-                        else this.compact.add(e.itemId);
-                        this.renderList();
-                    },
-                }),
-                tpEl('span', { class: 'tp-grow' }),
-                tpEl('strong', {
-                    class: 'tp-headline ' + (e.traderWins ? 'tp-blue' : 'tp-green'),
-                    text: tpSigned(e.headline),
-                }),
-                e.headlineTag ? tpEl('span', { class: 'tp-tag', text: e.headlineTag }) : null,
-            ]);
-
-            const buy = this.buyLine(e);
-
-            const exit = tpEl('div', {
-                class: 'tp-exit' + (!e.traderWins && e.other ? ' tp-green' : ''),
-                text: this.exitText(e) + (!e.traderWins && e.other && e.traders.length ? ' - better than any trader' : ''),
-            });
-
-            const card = tpEl('section', { class: 'tp-card' + (e.traderWins ? ' tp-card-trader' : '') }, [title, buy, exit]);
-            if (!compact) card.appendChild(this.traderTable(e, withHeader));
-            return card;
-        }
-
-        exitText(e) {
-            const parts = [];
-            parts.push(
-                !e.npc
-                    ? 'NPC pays -'
-                    : 'NPC pays ' + formatMoney(e.npc.price) +
-                          (e.npc.profit > 0 ? ' (' + tpSigned(e.npc.profit) + ')' : ' - a loss'),
-            );
-            if (e.other && e.other.tag === 'Resale') parts.push('Resale ' + tpSigned(e.other.profit));
-            const mv = Number(e.item && e.item.marketValue);
-            if (mv > 0) parts.push('Value ' + formatMoney(mv));
-            return parts.join(' · ');
-        }
-
-        buyLine(e) {
-            const row = e.listing;
-            const line = tpEl('div', { class: 'tp-buy' });
-            line.appendChild(tpEl('span', { text: 'Buy ' }));
-            line.appendChild(tpEl('b', { text: formatMoney(row.profit.listingPrice) }));
-            line.appendChild(tpEl('span', { class: 'tp-muted', text: ' · ' }));
-            line.appendChild(this.sourceBits(row));
-            line.appendChild(tpEl('span', { class: 'tp-grow' }));
-            line.appendChild(this.goButton(row, false));
-            return line;
-        }
-
-        /** "Bazaar - XanSeller ● Online · via TornW3B · 43s ago" */
-        sourceBits(row) {
-            const span = tpEl('span', { class: 'tp-src' });
-            if (row.source === 'bazaar') {
-                const statuses = this.state.statuses;
-                const st = statuses && row.sellerId ? statuses.get(String(row.sellerId)) : null;
-                const name = row.sellerName || (st && st.name) || null;
-                span.appendChild(document.createTextNode('Bazaar' + (name ? ' - ' + name : '')));
-                if (st) span.appendChild(this.badge(st.level, st.text, st.title));
-            } else {
-                span.appendChild(document.createTextNode('Item Market'));
-            }
-            const via = row.el ? 'on the page you were on' : row.fromFeed ? (row.source === 'bazaar' ? 'via TornW3B' : 'via Torn API') : '';
-            const at = row.fromFeed ? row.dataAt : row.seenAt;
-            const bits = [via, at ? formatAge(Date.now() - at) : ''].filter(Boolean);
-            if (bits.length) span.appendChild(tpEl('span', { class: 'tp-muted', text: ' · ' + bits.join(' · ') }));
-            return span;
-        }
-
-        goButton(row, small) {
-            const bazaar = row.source === 'bazaar';
-            return tpEl('button', {
-                type: 'button',
-                class: small ? 'tp-btn tp-btn-small' : 'tp-btn',
-                text: small ? 'GO' : bazaar ? 'GO TO BAZAAR' : 'GO TO MARKET',
-                title: bazaar ? 'Open this bazaar' : 'Open this item on the Item Market',
-                onclick: () => this.h.onNavigate && this.h.onNavigate(row),
-            });
-        }
-
-        badge(level, text, title) {
-            return tpEl('span', { class: 'tp-status', 'data-level': level || 'unknown', title: title || '', text: text || '' });
-        }
-
-        /** A trader's status as the overlay last saw it, or "checking…". */
-        traderBadge(t) {
-            const statuses = this.state.statuses;
-            const st = statuses ? statuses.get(String(t.trader.id)) : null;
-            if (st) return this.badge(st.level, st.text, t.trader.name + ': ' + st.title + ' (Torn API)');
-            return this.badge('checking', 'checking…', 'Not checked yet - refreshes every minute while this page is visible');
-        }
-
-        traderLinks(trader) {
-            return tpEl('span', { class: 'tp-links' }, [
-                tpEl('button', {
-                    type: 'button', class: 'tp-btn tp-btn-small', text: 'Profile',
-                    title: "Open " + trader.name + "'s Torn profile - start the trade there",
-                    onclick: () => this.h.onOpenProfile && this.h.onOpenProfile(trader.id),
-                }),
-                tpEl('button', {
-                    type: 'button', class: 'tp-btn tp-btn-small', text: 'Price list ↗',
-                    title: 'Open ' + trader.name + "'s TornExchange price list (new tab)",
-                    onclick: () => this.h.onOpenPriceList && this.h.onOpenPriceList(trader.id),
-                }),
-            ]);
-        }
-
-        /** The trader's name: a real link to their profile, so middle-click works too. */
-        traderName(trader) {
-            const a = tpEl('a', { class: 'tp-trader-name', href: tpProfileUrl(trader.id), text: trader.name });
-            a.addEventListener('click', (event) => {
-                if (event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey) return;
-                event.preventDefault();
-                if (this.h.onOpenProfile) this.h.onOpenProfile(trader.id);
-            });
-            return a;
-        }
-
-        traderTable(e, withHeader) {
-            const table = tpEl('div', { class: 'tp-table' + (!e.traderWins && e.other ? ' tp-dim' : ''), role: 'table' });
-
-            if (!e.traders.length) {
-                const ti = this.state.traderInfo || {};
-                table.appendChild(tpEl('div', {
-                    class: 'tp-tr-note tp-muted',
-                    text: ti.loading ? 'Loading trader prices…' : ti.hasKey ? 'No trader prices yet.' : 'Add a TornExchange key to see traders.',
-                }));
-                return table;
-            }
-
-            if (withHeader) {
-                table.appendChild(tpEl('div', { class: 'tp-tr tp-th', role: 'row' }, [
-                    tpEl('span', { text: 'Status' }), tpEl('span', { text: 'Trader' }), tpEl('span', { text: 'Price' }),
-                    tpEl('span', { text: '% value' }), tpEl('span', { text: 'Profit' + (e.qty > 1 ? ' ×' + e.qty : '') }),
-                    tpEl('span', { text: 'Net' }), tpEl('span', { text: '' }),
-                ]));
-            }
-
-            for (const t of e.traders) {
-                const chosen = e.bestTrader && t.trader.id === e.bestTrader.trader.id;
-                const tr = tpEl('div', { class: 'tp-tr' + (chosen ? ' tp-chosen' : ''), role: 'row' }, [
-                    this.traderBadge(t),
-                    tpEl('span', { class: 'tp-tname' }, [
-                        this.traderName(t.trader),
-                        chosen ? tpEl('span', { class: 'tp-tag tp-tag-blue', text: 'sell here' }) : null,
-                    ]),
-                    tpEl('span', { class: 'tp-num' + (t.suspect ? ' tp-amber' : ''), text: formatMoney(t.trader.price) }),
-                    tpEl('span', { class: 'tp-num tp-muted', text: t.pctOfValue ? Math.round(t.pctOfValue * 100) + '%' + (t.suspect ? ' ⚠' : '') : '-' }),
-                    tpEl('span', { class: 'tp-num ' + (t.profit > 0 ? 'tp-blue' : 'tp-muted'), text: tpSigned(t.profit) }),
-                    tpEl('span', { class: 'tp-num tp-muted', text: (t.trader.score >= 0 ? '+' : '') + t.trader.score }),
-                    tpEl('span', { class: 'tp-actions' }, [
-                        this.traderLinks(t.trader),
-                        t.suspect ? tpEl('span', { class: 'tp-tag tp-tag-amber', title: 'Traders usually pay 94-100% of value. A higher price is often one they forgot to update.', text: 'check list first' }) : null,
-                    ]),
-                ]);
-                table.appendChild(tr);
-            }
-            return table;
-        }
-
-        /* ------------------------------------------------------- by trader */
-
-        renderByTrader(entries) {
-            const groups = new Map();
-            for (const e of entries) {
-                if (!e.traderWins) continue;
-                const t = e.bestTrader;
-                if (!groups.has(t.trader.id)) {
-                    groups.set(t.trader.id, { trader: t.trader, level: t.level, rows: [], total: 0, cash: 0 });
-                }
-                const g = groups.get(t.trader.id);
-                g.rows.push(e);
-                g.total += e.headline;
-                g.cash += e.cashNeeded;
-            }
-
-            const list = [...groups.values()].sort(
-                (a, b) => (TP_LEVEL_RANK[a.level] ?? 2) - (TP_LEVEL_RANK[b.level] ?? 2) || b.total - a.total,
-            );
-
-            if (!list.length) {
-                this.listEl.appendChild(this.renderEmpty('No deal is best sold to a trader right now.'));
+            if (!rows.length) {
+                let text = 'Nothing to show yet.';
+                if (info.loading) text = 'Loading your inventory.';
+                else if (info.checkingOnline) text = 'Checking who\'s online…';
+                else if (info.inventoryAt && p.onlineOnly) text = 'No online trader buys anything you hold.';
+                else if (info.inventoryAt) text = 'Nothing sellable in your inventory.';
+                list.appendChild(spEl('div', { class: 'sp-empty', text }));
                 return;
             }
 
-            for (const g of list.slice(0, TP_MAX_CARDS)) {
-                g.rows.sort((a, b) => b.headline - a.headline);
-                const head = tpEl('div', { class: 'tp-group-head' }, [
-                    tpEl('span', { class: 'tp-group-who' }, [
-                        this.traderName(g.trader),
-                        this.traderBadge({ trader: g.trader, level: g.level }),
-                        tpEl('span', {
-                            class: 'tp-muted',
-                            text: ' · net ' + (g.trader.score >= 0 ? '+' : '') + g.trader.score + ' · ' +
-                                g.rows.length + (g.rows.length === 1 ? ' item' : ' items') +
-                                ' · needs ' + formatMoneyShort(g.cash) + ' cash',
-                        }),
-                    ]),
-                    tpEl('span', { class: 'tp-grow' }),
-                    tpEl('strong', { class: 'tp-headline tp-blue', text: tpSigned(g.total) }),
-                    this.traderLinks(g.trader),
-                ]);
+            const table = spEl('table', { class: 'sp-table' });
+            table.appendChild(spEl('thead', {}, [
+                spEl('tr', {}, [
+                    spEl('th', { class: 'sp-label', text: 'Item' }),
+                    spEl('th', { class: 'sp-label sp-money', text: 'Qty' }),
+                    spEl('th', { class: 'sp-label sp-money', text: 'Best offer' }),
+                    spEl('th', { class: 'sp-label', text: 'Trader' }),
+                    spEl('th', { class: 'sp-label sp-money', text: 'Market value' }),
+                    spEl('th', { class: 'sp-label sp-money', text: 'Traders avg' }),
+                    spEl('th', { class: 'sp-label sp-money', text: 'Total' }),
+                ]),
+            ]));
 
-                const rows = g.rows.map((e) => tpEl('div', { class: 'tp-group-row' }, [
-                    tpEl('span', { class: 'tp-mini-name', text: e.name + (e.qty > 1 ? ' ×' + e.qty : '') }),
-                    tpEl('span', { class: 'tp-muted', text: 'Buy ' + formatMoney(e.listing.profit.listingPrice) + ' → ' + formatMoney(e.bestTrader.trader.price) }),
-                    this.sourceBits(e.listing),
-                    tpEl('span', { class: 'tp-grow' }),
-                    tpEl('strong', { class: 'tp-blue', text: tpSigned(e.headline) }),
-                    this.goButton(e.listing, true),
-                ]));
-
-                this.listEl.appendChild(tpEl('section', { class: 'tp-card tp-group' }, [head, ...rows]));
+            const body = spEl('tbody');
+            for (const r of rows) {
+                body.appendChild(this.renderRow(r));
+                if (this.state.expanded.has(r.itemId)) body.appendChild(this.renderTraders(r));
             }
+            table.appendChild(body);
+            list.appendChild(table);
+        }
+
+        renderRow(r) {
+            const open = this.state.expanded.has(r.itemId);
+            const best = r.best;
+            const tr = spEl('tr', {
+                class: 'sp-row' + (open ? ' sp-open' : '') + (best ? '' : ' sp-nobuyer'),
+                tabindex: '0',
+                'aria-expanded': String(open),
+                title: open ? 'Hide traders' : 'Show every trader who buys it',
+                onclick: () => this.h.onExpand && this.h.onExpand(r.itemId),
+                onkeydown: (event) => {
+                    if (event.key === 'Enter' || event.key === ' ') {
+                        event.preventDefault();
+                        if (this.h.onExpand) this.h.onExpand(r.itemId);
+                    }
+                },
+            }, [
+                spEl('td', { class: 'sp-item', 'data-qty': r.qty.toLocaleString('en-US') }, [spEl('b', { text: r.name })]),
+                spEl('td', { class: 'sp-money', text: r.qty.toLocaleString('en-US') }),
+                spEl('td', { class: 'sp-money sp-offer', text: best ? formatMoney(best.trader.price) : '–' }),
+                spEl('td', { class: 'sp-trader' }, best ? [spEl('b', { text: best.trader.name }), this.statusWord(best)] : [spEl('span', { class: 'sp-muted', text: 'No buyer on TE' })]),
+                spEl('td', { class: 'sp-money', text: r.marketValue ? formatMoney(r.marketValue) : '–' }),
+                spEl('td', { class: 'sp-money', title: r.avgPartial ? 'Top three buyers only' : 'All ' + r.buyers + ' buyers' }, [
+                    document.createTextNode(r.tradersAvg ? formatMoney(r.tradersAvg) : '–'),
+                    r.tradersAvg && r.avgPartial ? spEl('span', { class: 'sp-muted sp-small', text: ' top 3' }) : null,
+                ]),
+                spEl('td', { class: 'sp-money sp-total', text: r.total !== null ? formatMoney(r.total) : '–' }),
+            ]);
+            return tr;
+        }
+
+        /** Every trader who buys the item, highest first, with profile and list links. */
+        renderTraders(r) {
+            const info = this.state.info || {};
+            const lists = info.itemLists || new Map();
+            const st = lists.get(r.itemId) || {};
+            const p = this.state.prefs;
+
+            const box = spEl('div', { class: 'sp-traders' });
+
+            if (st.loading) box.appendChild(spEl('div', { class: 'sp-note', text: 'Loading every buyer from TornExchange.' }));
+            else if (st.error) box.appendChild(spEl('div', { class: 'sp-note sp-bad', text: st.error }));
+            else if (r.avgPartial) box.appendChild(spEl('div', { class: 'sp-note', text: 'Top three buyers. The full list loads next.' }));
+
+            if (!r.offers.length) {
+                box.appendChild(spEl('div', { class: 'sp-note', text: p.onlineOnly ? 'No online trader buys this.' : 'No trader buys this.' }));
+            }
+
+            for (const o of r.offers) {
+                const t = o.trader;
+                const links = spEl('span', { class: 'sp-links' });
+                if (t.id) {
+                    const a = spEl('a', { class: 'sp-link', href: spProfileUrl(t.id), text: 'Profile' });
+                    a.addEventListener('click', (event) => {
+                        if (event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey) return;
+                        event.preventDefault();
+                        if (this.h.onOpenProfile) this.h.onOpenProfile(t.id);
+                    });
+                    links.appendChild(a);
+                }
+                const list = spEl('a', {
+                    class: 'sp-link',
+                    href: TE_SITE_URL + '/prices/' + encodeURIComponent(String(t.id || t.name)) + '/',
+                    text: 'TE list',
+                });
+                list.addEventListener('click', (event) => {
+                    if (event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey) return;
+                    event.preventDefault();
+                    if (this.h.onOpenList) this.h.onOpenList(t.id || t.name);
+                });
+                links.appendChild(list);
+
+                box.appendChild(spEl('div', { class: 'sp-tr' }, [
+                    spEl('span', { class: 'sp-tname' }, [spEl('b', { text: t.name }), this.statusWord(o)]),
+                    spEl('span', { class: 'sp-money sp-offer', text: formatMoney(t.price) }),
+                    spEl('span', { class: 'sp-money sp-muted', text: formatMoney(t.price * r.qty) }),
+                    links,
+                ]));
+            }
+
+            return spEl('tr', { class: 'sp-expanded' }, [spEl('td', { colspan: '7' }, [box])]);
+        }
+
+        /** "● Online" for a trader, from the known statuses. */
+        statusWord(offer) {
+            const t = offer.trader;
+            const status = t.id && this.state.statuses ? this.state.statuses.get(String(t.id)) : null;
+            const word = spEl('span', {
+                class: 'sp-status',
+                title: status ? t.name + ': ' + status.title : t.id ? 'Status not checked yet' : 'No Torn id on TornExchange',
+                text: status ? status.text : t.id ? 'checking' : 'unknown',
+            });
+            word.dataset.level = status ? status.level : 'unknown';
+            return word;
         }
     }
 
-    const TRADERS_PAGE_CSS = `
+    const SELLING_PAGE_CSS = `
     :host { all: initial; }
     * { box-sizing: border-box; }
-    .tp-page {
-        --bg: #1b1b1b; --bg2: #242424; --card: #292929; --line: #3a3a3a;
-        --text: #eee; --muted: #9a9a9a; --green: #65d27a; --amber: #ffcc4d;
-        --red: #ff8f7a; --blue: #7ec8ff;
+    .sp-page {
+    ${TOKENS_CSS}
         position: absolute; inset: 0; display: flex; flex-direction: column;
         background: var(--bg); color: var(--text);
         font: 13px/1.4 Arial, Helvetica, sans-serif;
     }
-    button, input, select { font: inherit; color: inherit; }
-    .tp-grow { flex: 1; }
-    .tp-muted { color: var(--muted); }
-    .tp-green { color: var(--green); }
-    .tp-blue { color: var(--blue); }
-    .tp-amber { color: var(--amber); }
-    .tp-red { color: var(--red); }
-
-    .tp-head {
-        display: flex; align-items: center; gap: 12px; height: 48px; flex: 0 0 auto;
-        padding: 0 16px; background: var(--bg2); border-bottom: 1px solid var(--line);
-    }
-    .tp-head h1 { margin: 0; font-size: 18px; }
-    .tp-summary { color: var(--muted); }
-    .tp-fresh { color: var(--muted); font-size: 12px; }
-    .tp-icon {
-        width: 30px; height: 30px; border: 1px solid var(--line); border-radius: 5px;
-        background: #2d2d2d; cursor: pointer; font-size: 15px;
-    }
-    .tp-icon:hover, .tp-btn:hover, .tp-chip:hover, .tp-seg:hover { border-color: #666; }
-
-    .tp-prefs {
-        position: absolute; top: 52px; right: 16px; z-index: 2; width: 300px;
-        padding: 12px; background: #2a2a2a; border: 1px solid #555; border-radius: 6px;
-        box-shadow: 0 8px 24px rgba(0,0,0,.5);
-    }
-    .tp-prefs[hidden] { display: none; }
-    .tp-prefs-h { font-weight: bold; margin-bottom: 6px; }
-    .tp-radios { display: flex; gap: 12px; margin-bottom: 10px; flex-wrap: wrap; }
-    .tp-radio, .tp-check { display: flex; align-items: center; gap: 5px; cursor: pointer; }
-    .tp-note { margin-top: 10px; color: var(--muted); font-size: 12px; }
-    input[type="radio"], input[type="checkbox"] { accent-color: var(--green); }
-
-    .tp-strip {
-        display: flex; align-items: center; gap: 7px; flex: 0 0 auto; width: 100%;
-        padding: 8px 16px; border: 0; border-bottom: 1px solid var(--line);
-        background: #1f2a22; color: var(--green); font-weight: bold; text-align: left; cursor: pointer;
-    }
-    .tp-strip[aria-pressed="true"] { background: #25402d; }
-    .tp-dot { width: 9px; height: 9px; border-radius: 50%; background: #777; }
-    .tp-dot[data-level="online"] { background: var(--green); box-shadow: 0 0 5px var(--green); }
-
-    .tp-controls {
-        display: flex; align-items: center; gap: 6px; flex-wrap: wrap; flex: 0 0 auto;
-        padding: 8px 16px; border-bottom: 1px solid var(--line);
-    }
-    .tp-segs { display: inline-flex; margin-right: 6px; }
-    .tp-seg {
-        padding: 4px 12px; border: 1px solid var(--line); background: #2d2d2d; cursor: pointer;
-    }
-    .tp-seg:first-child { border-radius: 5px 0 0 5px; }
-    .tp-seg:last-child { border-radius: 0 5px 5px 0; border-left: 0; }
-    .tp-seg[aria-pressed="true"] { background: #3a3a3a; color: #fff; font-weight: bold; }
-    .tp-chip {
-        padding: 3px 10px; border: 1px solid var(--line); border-radius: 14px;
-        background: none; color: var(--muted); cursor: pointer;
-    }
-    .tp-chip[aria-pressed="true"] { color: var(--green); border-color: var(--green); background: #1f2a22; }
-    .tp-search {
-        width: 220px; padding: 5px 8px; border: 1px solid var(--line); border-radius: 5px; background: #111;
-    }
-    .tp-sort { padding: 4px 6px; border: 1px solid var(--line); border-radius: 5px; background: #2d2d2d; }
-    .tp-sort[hidden] { display: none; }
-
-    .tp-banner { display: none; flex: 0 0 auto; padding: 8px 16px; border-bottom: 1px solid var(--line); background: #262626; }
-    .tp-banner-on { display: block; }
-    .tp-banner-warn { color: var(--amber); background: #2f2a1a; }
-    .tp-banner-bad { color: var(--red); background: #2f1f1c; }
-
-    .tp-list { flex: 1; min-height: 0; overflow-y: auto; padding: 12px 16px 40px; }
-    .tp-empty { padding: 40px 10px; text-align: center; color: #ccc; display: grid; gap: 8px; }
-
-    .tp-card {
-        margin: 0 auto 10px; max-width: 1200px; padding: 10px 12px;
-        background: var(--card); border: 1px solid #444; border-radius: 6px;
-    }
-    .tp-card-trader { border-left: 3px solid var(--blue); }
-    .tp-card-title { display: flex; align-items: baseline; gap: 8px; }
-    .tp-name {
-        padding: 0; border: 0; background: none; cursor: pointer;
-        font-size: 15px; font-weight: bold; color: #fff; text-align: left;
-    }
-    .tp-headline { font-size: 16px; }
-    .tp-tag {
-        padding: 0 6px; border-radius: 8px; font-size: 10px; font-weight: bold; line-height: 16px;
-        color: #ccc; background: #3a3a3a; white-space: nowrap;
-    }
-    .tp-tag-blue { color: #0d2233; background: var(--blue); margin-left: 6px; }
-    .tp-tag-amber { color: #332800; background: var(--amber); }
-    .tp-buy { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; margin-top: 4px; }
-    .tp-src { color: #ccc; }
-    .tp-exit { margin-top: 3px; font-size: 12px; color: var(--muted); }
-    .tp-exit.tp-green { color: var(--green); }
-
-    .tp-btn {
-        padding: 4px 10px; border: 1px solid #555; border-radius: 5px; background: #333;
-        cursor: pointer; font-weight: bold; font-size: 12px; white-space: nowrap;
-    }
-    .tp-btn-small { padding: 1px 8px; font-size: 11px; }
-
-    .tp-status { margin-left: 5px; font-weight: bold; color: #aaa; white-space: nowrap; }
-    .tp-status::before {
-        content: ""; display: inline-block; width: 8px; height: 8px; margin-right: 4px;
-        border-radius: 50%; background: #777;
-    }
-    .tp-status[data-level="online"] { color: var(--green); }
-    .tp-status[data-level="online"]::before { background: var(--green); }
-    .tp-status[data-level="idle"] { color: var(--amber); }
-    .tp-status[data-level="idle"]::before { background: var(--amber); }
-    .tp-status[data-level="checking"], .tp-status[data-level="unknown"] { color: var(--muted); font-weight: normal; }
-    .tp-status[data-level="checking"]::before, .tp-status[data-level="unknown"]::before {
-        background: none; border: 1px solid #888; width: 6px; height: 6px;
+    button, input { font: inherit; color: inherit; }
+    a { color: var(--offer); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    b { font-weight: bold; }
+    [hidden] { display: none !important; }
+    .sp-grow { flex: 1; }
+    .sp-muted { color: var(--muted); }
+    .sp-bad { color: var(--bad); }
+    .sp-ok { color: var(--profit); }
+    .sp-small { font-size: 12px; }
+    .sp-money { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .sp-label {
+        font-size: 11px; font-weight: bold; letter-spacing: 0.5px; text-transform: uppercase; color: var(--muted);
     }
 
-    .tp-table { margin-top: 8px; border-top: 1px solid var(--line); }
-    .tp-dim { opacity: .7; }
-    .tp-tr {
-        display: grid; align-items: center; gap: 4px 10px;
-        grid-template-columns: 130px minmax(110px, 1.4fr) 100px 70px 110px 60px minmax(200px, 1.6fr);
-        padding: 5px 6px; border-bottom: 1px solid #333; border-left: 3px solid transparent;
+    .sp-head {
+        display: flex; align-items: center; gap: 8px; height: 30px; flex: 0 0 auto;
+        padding: 0 8px 0 16px; background: var(--title); border-bottom: 1px solid var(--line);
     }
-    .tp-tr.tp-chosen { border-left-color: var(--blue); background: #22303a; }
-    .tp-tr-note { padding: 6px; }
-    .tp-th { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .03em; }
-    .tp-num { text-align: right; font-variant-numeric: tabular-nums; }
-    .tp-tr .tp-status { margin-left: 0; }
-    .tp-trader-name { color: #fff; font-weight: bold; text-decoration: none; }
-    .tp-trader-name:hover { text-decoration: underline; }
-    .tp-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
-    .tp-links { display: inline-flex; gap: 4px; }
-
-    .tp-notrader summary { cursor: pointer; color: var(--muted); font-weight: bold; }
-    .tp-mini, .tp-group-row {
-        display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
-        padding: 5px 0; border-bottom: 1px solid #333;
+    .sp-head h1 {
+        margin: 0; font-size: 20px; font-weight: bold; letter-spacing: 1px; color: #fff;
+        text-shadow: 1px 1px 2px rgba(0, 0, 0, 0.65); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
     }
-    .tp-mini:last-child, .tp-group-row:last-child { border-bottom: 0; }
-    .tp-mini-name { font-weight: bold; color: #fff; }
-
-    .tp-group-head {
-        display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
-        padding-bottom: 8px; border-bottom: 1px solid var(--line); font-size: 14px;
+    .sp-btn {
+        height: 28px; padding: 0 12px; font-size: 12px; font-weight: bold; color: var(--text);
+        background: var(--line); border: 1px solid var(--line); border-radius: 4px; cursor: pointer; white-space: nowrap;
     }
-    .tp-group { border-left: 3px solid var(--blue); }
+    .sp-btn:hover { border-color: var(--muted); }
+    .sp-btn.sp-primary { color: var(--on-profit); background: var(--profit); border-color: var(--profit); }
+    .sp-btn.sp-toggle { height: 24px; background: transparent; color: var(--muted); }
+    .sp-btn.sp-toggle[aria-pressed="true"] { color: var(--text); border-color: var(--profit); background: rgba(153, 204, 0, 0.12); }
+    .sp-tools { display: flex; align-items: center; gap: 8px; }
+    .sp-seg { display: inline-flex; height: 24px; border: 1px solid var(--line); border-radius: 4px; overflow: hidden; }
+    .sp-seg-btn {
+        height: 22px; padding: 0 12px; font-size: 12px; font-weight: bold; color: var(--muted);
+        background: transparent; border: 0; cursor: pointer; white-space: nowrap;
+    }
+    .sp-seg-btn + .sp-seg-btn { border-left: 1px solid var(--line); }
+    .sp-seg-btn:hover { color: var(--text); }
+    .sp-seg-btn[aria-pressed="true"] { color: var(--text); background: rgba(153, 204, 0, 0.12); box-shadow: inset 0 -2px 0 var(--profit); }
+    .sp-icon {
+        width: 24px; height: 24px; padding: 0; font-size: 15px; line-height: 22px; text-align: center;
+        color: var(--text); background: transparent; border: 1px solid transparent; border-radius: 4px; cursor: pointer;
+    }
+    .sp-icon:hover { background: rgba(255, 255, 255, 0.08); }
+    .sp-icon[aria-pressed="true"] { color: var(--profit); }
+    button:focus-visible, input:focus-visible, .sp-row:focus-visible, summary:focus-visible {
+        outline: 2px solid var(--profit); outline-offset: 1px;
+    }
 
-    @media (max-width: 600px) {
-        .tp-head { padding: 0 10px; gap: 8px; }
-        .tp-summary { display: none; }
-        .tp-controls, .tp-list, .tp-strip { padding-left: 10px; padding-right: 10px; }
-        .tp-search { width: 100%; order: 10; }
-        .tp-th { display: none; }
-        .tp-tr { grid-template-columns: auto 1fr auto auto; }
-        .tp-tr > :nth-child(4), .tp-tr > :nth-child(6) { font-size: 11px; }
-        .tp-tr > .tp-actions { grid-column: 1 / -1; }
-        .tp-buy > .tp-btn { width: 100%; }
+    .sp-bar {
+        display: flex; align-items: center; gap: 8px; flex: 0 0 auto;
+        padding: 8px 16px; border-bottom: 1px solid var(--line); font-size: 12px;
+    }
+    .sp-bar-left { flex: 1; min-width: 0; font-weight: bold; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
+    .sp-bar-right { color: var(--muted); white-space: nowrap; }
+
+    .sp-banner { display: none; align-items: center; gap: 12px; flex: 0 0 auto; padding: 8px 16px; border-bottom: 1px solid var(--line); background: var(--row); }
+    .sp-banner-on { display: flex; }
+    .sp-banner-warn { color: var(--warn); }
+    .sp-banner-bad { color: var(--bad); }
+
+    .sp-main { flex: 1; min-height: 0; overflow-y: auto; padding: 12px 16px 40px; }
+    .sp-empty { padding: 40px 16px; text-align: center; color: var(--muted); }
+
+    .sp-table { width: 100%; max-width: 1100px; margin: 0 auto; border-collapse: separate; border-spacing: 0; }
+    .sp-table th {
+        position: sticky; top: 0; z-index: 1; padding: 8px 12px; text-align: left;
+        background: var(--bg); border-bottom: 1px solid var(--line);
+    }
+    .sp-table th.sp-money { text-align: right; }
+    .sp-table td { padding: 8px 12px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+    .sp-row { cursor: pointer; }
+    .sp-row:hover td { background: var(--row); }
+    .sp-row.sp-open td { background: var(--row); border-bottom-color: transparent; }
+    .sp-row.sp-nobuyer td { color: var(--muted); }
+    .sp-offer { color: var(--offer); }
+    .sp-total { font-size: 15px; font-weight: bold; color: var(--profit); }
+    .sp-row.sp-nobuyer .sp-total { color: var(--muted); font-weight: normal; font-size: 13px; }
+    .sp-trader { white-space: nowrap; }
+
+    .sp-status { white-space: nowrap; }
+    .sp-status::before {
+        content: ""; display: inline-block; width: 8px; height: 8px; margin: 0 4px 0 8px;
+        border-radius: 50%; background: var(--muted); vertical-align: 0;
+    }
+    .sp-status[data-level="online"]::before { background: var(--profit); }
+    .sp-status[data-level="idle"]::before { background: var(--warn); }
+    .sp-status[data-level="unknown"]::before { background: transparent; border: 1px solid var(--muted); }
+
+    .sp-expanded > td { padding: 0 12px 12px; background: var(--row); }
+    .sp-traders { display: flex; flex-direction: column; gap: 4px; padding: 8px 12px; border: 1px solid var(--line); border-radius: 4px; }
+    .sp-tr { display: grid; grid-template-columns: minmax(0, 1fr) 120px 120px 130px; gap: 8px; align-items: center; padding: 4px 0; }
+    .sp-tname { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .sp-links { display: flex; gap: 12px; justify-content: flex-end; font-size: 12px; }
+    .sp-note { font-size: 12px; color: var(--muted); }
+
+    .sp-settings { display: flex; flex-direction: column; gap: 16px; max-width: 640px; margin: 0 auto; width: 100%; }
+    .sp-section { display: flex; flex-direction: column; gap: 8px; }
+    .sp-section h2 { margin: 0; }
+    .sp-inline { display: flex; gap: 8px; align-items: center; }
+    .sp-inline input { flex: 1; min-width: 0; }
+    input.sp-key { height: 28px; padding: 0 8px; background: var(--row); border: 1px solid var(--line); border-radius: 4px; color: var(--text); }
+    .sp-masked { -webkit-text-security: disc; }
+    .sp-keystate { font-size: 12px; color: var(--muted); }
+    .sp-keystate.sp-ok { color: var(--profit); }
+    .sp-keystate.sp-bad { color: var(--bad); }
+    .sp-link { background: none; border: 0; padding: 0; color: var(--offer); font-size: 12px; cursor: pointer; text-align: left; }
+    .sp-link:hover { text-decoration: underline; }
+    .sp-check { display: flex; gap: 8px; align-items: flex-start; cursor: pointer; }
+    input[type="checkbox"] { accent-color: var(--profit); margin: 3px 0 0; }
+    .sp-tos-box { border: 1px solid var(--line); border-radius: 4px; padding: 8px; background: var(--row); }
+    .sp-tos-box summary { cursor: pointer; font-size: 12px; }
+    .sp-tos { width: 100%; margin-top: 8px; border-collapse: collapse; font-size: 12px; }
+    .sp-tos th, .sp-tos td { text-align: left; vertical-align: top; padding: 4px; border-top: 1px solid var(--line); }
+    .sp-tos th { width: 36%; color: var(--muted); font-weight: normal; }
+
+    @media (max-width: 700px) {
+        .sp-head { flex-wrap: wrap; height: auto; min-height: 30px; padding: 4px 8px 4px 12px; row-gap: 4px; }
+        .sp-head h1 { flex: 1; font-size: 15px; }
+        .sp-grow { display: none; }
+        .sp-tools { flex: 0 0 100%; order: 10; justify-content: space-between; padding-bottom: 4px; }
+        .sp-bar, .sp-banner, .sp-main { padding-left: 12px; padding-right: 12px; }
+        .sp-bar-right { display: none; }
+        .sp-table, .sp-table tbody { display: block; }
+        .sp-table thead { display: none; }
+        .sp-row {
+            display: grid; grid-template-columns: minmax(0, 1fr) auto; column-gap: 8px; row-gap: 4px;
+            padding: 8px 12px; margin-bottom: 8px; background: var(--row); border: 1px solid var(--line); border-radius: 4px;
+        }
+        .sp-row.sp-open { margin-bottom: 0; border-radius: 4px 4px 0 0; }
+        .sp-row td { display: block; padding: 0; border: 0; background: none !important; }
+        .sp-row .sp-item { grid-column: 1; grid-row: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .sp-row .sp-item::after { content: " ×" attr(data-qty); color: var(--muted); font-weight: normal; }
+        .sp-row td:nth-child(2) { display: none; }
+        .sp-row .sp-total { grid-column: 2; grid-row: 1; }
+        .sp-row .sp-trader { grid-column: 1; grid-row: 2; font-size: 12px; overflow: hidden; text-overflow: ellipsis; }
+        .sp-row .sp-offer { grid-column: 2; grid-row: 2; font-size: 12px; }
+        .sp-row td:nth-child(5), .sp-row td:nth-child(6) { grid-column: 1 / 3; font-size: 12px; color: var(--muted); text-align: left; }
+        .sp-row td:nth-child(5)::before { content: "Value "; }
+        .sp-row td:nth-child(6)::before { content: "Traders avg "; }
+        .sp-expanded { display: block; margin-bottom: 8px; }
+        .sp-expanded > td { display: block; padding: 0; border: 1px solid var(--line); border-top: 0; border-radius: 0 0 4px 4px; }
+        .sp-traders { border: 0; }
+        .sp-tr { grid-template-columns: minmax(0, 1fr) auto; }
+        .sp-tr > .sp-money:nth-child(3) { display: none; }
+        .sp-tr > .sp-links { grid-column: 1 / 3; justify-content: flex-start; }
     }
     `;
 
@@ -7512,6 +8084,7 @@
 
 
 
+
     /** TornW3B's one-call summary: re-read on every 30s refresh. */
     const SUMMARY_INTERVAL_MS = REFRESH_MS;
 
@@ -7526,8 +8099,16 @@
     const MAX_W3B_FETCHES_PER_CYCLE = 8;
     const MAX_TORN_FETCHES_PER_CYCLE = 2;
 
-    /** How many TornW3B candidates also get an Item Market check each cycle. */
+    /** How many TornW3B candidates also get an Item Market check, and how often. */
     const CANDIDATE_MARKET_CHECKS = 5;
+    const CANDIDATE_MARKET_INTERVAL_MS = 2 * 60 * 1000;
+
+    /**
+     * A live Item Market row is re-checked before it can expire: once its data
+     * is this old it goes ahead of discovery. Younger rows are re-checked only
+     * with spare budget. Torn serves the same snapshot for 30s anyway.
+     */
+    const LIVE_ROW_URGENT_MS = 55 * 1000;
 
     const FEED_STORE_KEY = 'feed';
     const FEED_LEADER_KEY = 'feedLeader';
@@ -7552,8 +8133,7 @@
          * @param {function} [deps.isKeyDead] - (error) => boolean
          * @param {function} [deps.onKeyDead] - (error) => void
          * @param {function} [deps.now]
-         * @param {function} [deps.traderPriceOf] - (itemId) => best trader price, or 0
-         * @param {function} [deps.traderVersion] - changes when trader prices do
+         * @param {function} [deps.onSummary] - (summary, now) => void, each TornW3B summary
          */
         constructor(deps) {
             this.d = deps;
@@ -7569,6 +8149,9 @@
             this.lastError = null;
             this.lastCycleAt = null;
             this.lastRefreshSeen = 0;
+            this.cycleCount = 0;
+            /** itemId -> when its "cheaper on the market too?" check last ran. */
+            this.candidateCheckedAt = new Map();
         }
 
         /**
@@ -7579,11 +8162,6 @@
             this.d.save(FEED_STORE_KEY, null);
             this.d.save(FEED_REFRESH_KEY, this.now());
             if (this.d.onChange) this.d.onChange();
-        }
-
-        /** (itemId) => what the best sane trader pays, or 0. */
-        traderPriceOf() {
-            return this.d.traderPriceOf || (() => 0);
         }
 
         /* ------------------------------------------------------ storage */
@@ -7696,19 +8274,16 @@
             }
 
             if (this.d.hasUsableKey()) {
-                // Rebuilt when what counts as an exit changes (a chip, new
-                // trader prices), not just once.
+                // Rebuilt when what counts as an exit changes (a chip), not just once.
                 const sig = [
                     settings.sellToNpc !== false,
-                    Boolean(settings.sellToTrader),
                     Boolean(settings.resaleMarket),
                     Boolean(settings.resaleBazaar),
                     Number(settings.cashOnHand) || 0,
-                    this.d.traderVersion ? this.d.traderVersion() : 0,
                 ].join('|');
                 if (this.sweepSig === undefined) this.sweepSig = sig;
                 if (!this.sweep.length || sig !== this.sweepSig) {
-                    this.sweep = itemMarketSweepList(index, settings, this.traderPriceOf());
+                    this.sweep = itemMarketSweepList(index, settings);
                     this.sweepSig = sig;
                     this.sweepPos = 0;
                 }
@@ -7722,14 +8297,15 @@
             try {
                 const summary = await fetchW3bSummary(this.d.w3b);
                 this.lastSummaryAt = this.now();
-                this.candidates = selectCandidates(
-                    summary,
-                    index,
-                    settings,
-                    undefined,
-                    this.traderPriceOf(),
-                );
+                this.candidates = selectCandidates(summary, index, settings);
                 this.lastError = null;
+                if (this.d.onSummary) {
+                    try {
+                        this.d.onSummary(summary, this.lastSummaryAt);
+                    } catch {
+                        // A listener's failure is not the feed's.
+                    }
+                }
 
                 /*
                  * The summary is authoritative about what is NOT a deal: if an
@@ -7787,56 +8363,101 @@
             return FEED_TORN_PER_MINUTE - this.tornSpent.length;
         }
 
+        /**
+         * Which Item Market items to fetch this cycle, in order. Pure planning,
+         * exposed for tests.
+         *
+         * The Torn budget is small (30/min) and everything wants it: rows already
+         * on the list must be re-checked before they expire, TornW3B candidates
+         * may be cheaper on the market too, and discovery has to keep moving or
+         * nothing new is ever found. 3.7 let re-checks and candidates take both
+         * slots every cycle and gave discovery one slot every other cycle, then
+         * ran out of budget before reaching it: the sweep starved. Now:
+         *
+         *   1. what a tab explicitly asked to re-check (a listing someone opened)
+         *   2. live rows about to expire, oldest data first
+         *   3. ONE sweep item, so discovery advances every cycle
+         *   4. a top TornW3B candidate, at most every 2 minutes each
+         *   5. more sweep items
+         *   6. with spare budget, other live rows past Torn's 30s cache
+         *
+         * @returns {Array<string>} item ids, at most `slots` of them
+         */
+        planItemMarket(feedNow, rechecks, now, slots) {
+            const order = [];
+            const add = (id) => {
+                if (order.length >= slots) return false;
+                if (!order.includes(id) && itemMarketDue(feedNow, id, now)) order.push(id);
+                return true;
+            };
+
+            for (const id of rechecks) add(id);
+
+            const live = itemMarketLiveIds(feedNow, (id, price) => this.isMarketDeal(id, price))
+                .map((id) => ({ id, at: feedNow.itemmarket.get(id).dataAt || 0 }))
+                .sort((a, b) => a.at - b.at);
+            for (const l of live) {
+                if (now - l.at >= LIVE_ROW_URGENT_MS) add(l.id);
+            }
+
+            const takeSweep = (want) => {
+                const len = this.sweep.length;
+                let examined = 0;
+                let taken = 0;
+                while (len && examined < len && taken < want && order.length < slots) {
+                    const id = this.sweep[(this.sweepPos + examined) % len];
+                    examined += 1;
+                    if (!order.includes(id) && itemMarketDue(feedNow, id, now)) {
+                        order.push(id);
+                        taken += 1;
+                    }
+                }
+                // The cursor moves past what it LOOKED at, so an item still inside
+                // its cache window cannot stall the sweep.
+                if (len) this.sweepPos = (this.sweepPos + examined) % len;
+            };
+
+            takeSweep(1);
+
+            for (const c of this.candidates.slice(0, CANDIDATE_MARKET_CHECKS)) {
+                if (order.length >= slots) break;
+                const last = this.candidateCheckedAt.get(c.itemId);
+                if (last !== undefined && now - last < CANDIDATE_MARKET_INTERVAL_MS) continue;
+                const before = order.length;
+                add(c.itemId);
+                if (order.length > before) this.candidateCheckedAt.set(c.itemId, now);
+            }
+
+            if (order.length < slots) takeSweep(slots - order.length);
+
+            // Spare budget only: live rows past Torn's 30s cache, oldest first.
+            for (const l of live) add(l.id);
+
+            return order.slice(0, slots);
+        }
+
+        /** Does a listing at this price beat one of the chosen exits? */
+        isMarketDeal(itemId, price) {
+            const index = this.d.getIndex();
+            const item = index && index.byId && index.byId.get(String(itemId));
+            if (!item) return false;
+            const best = bestVenue({
+                listingPrice: price,
+                exits: exitsFor(item, this.d.getSettings()),
+                qty: 1,
+            });
+            return Boolean(best && best.profitPerUnit > 0);
+        }
+
         async refreshItemMarket(rechecks) {
             const feedNow = this.readFeed();
             const now = this.now();
+            this.cycleCount += 1;
 
-            /*
-             * Rechecks first, then the top few TornW3B candidates (is it cheaper
-             * on the market too?), then the rotating sweep. Candidates are capped
-             * so they cannot starve the sweep of the whole budget.
-             */
-            const priority = [];
-            const add = (id) => {
-                if (!priority.includes(id) && itemMarketDue(feedNow, id, now)) priority.push(id);
-            };
+            const slots = Math.min(MAX_TORN_FETCHES_PER_CYCLE, this.tornBudgetLeft());
+            if (slots <= 0) return;
 
-            /*
-             * Items with a live Item Market opportunity are re-checked on every
-             * refresh: that is what keeps a sold listing from staying on screen.
-             */
-            for (const id of rechecks) add(id);
-            for (const id of itemMarketLiveIds(feedNow)) add(id);
-            for (const c of this.candidates.slice(0, CANDIDATE_MARKET_CHECKS)) add(c.itemId);
-
-            /*
-             * Every other cycle, one slot belongs to the sweep, so discovery never
-             * stops; the rest go to keeping live rows live.
-             */
-            this.cycleCount = (this.cycleCount || 0) + 1;
-            const reserve = this.cycleCount % 2 === 0 ? 1 : 0;
-            const order = priority.slice(0, MAX_TORN_FETCHES_PER_CYCLE - reserve);
-            const sweepSlots = MAX_TORN_FETCHES_PER_CYCLE - order.length;
-
-            /*
-             * The sweep cursor advances past everything it LOOKED at, due or not,
-             * and stops at the last item it took. Advancing only on a fetch of the
-             * exact item under the cursor stalled it whenever that item was still
-             * inside its 30s cache window, and the sweep circled the same handful
-             * of items forever.
-             */
-            const len = this.sweep.length;
-            let examined = 0;
-            let taken = 0;
-            while (len && examined < len && taken < sweepSlots) {
-                const id = this.sweep[(this.sweepPos + examined) % len];
-                examined += 1;
-                if (!order.includes(id) && itemMarketDue(feedNow, id, now)) {
-                    order.push(id);
-                    taken += 1;
-                }
-            }
-            if (len) this.sweepPos = (this.sweepPos + examined) % len;
+            const order = this.planItemMarket(feedNow, rechecks, now, slots);
 
             let fetched = 0;
 
@@ -7879,7 +8500,18 @@
      * Wiring. This file is the only part of the codebase that knows it is a
      * userscript; core/ and api/ are plain modules that would move to a web app
      * untouched.
+     *
+     * Two entry points share it:
+     *   - every Torn page: the overlay (deals below NPC / value, live from the
+     *     API), the bazaar owner badge, and on your OWN bazaar's add / manage
+     *     pages the pricing helper;
+     *   - the selling page tab (index.php?ttv2=traders): its own keys, its own
+     *     settings, its own requests. See bootSellingPage().
      */
+
+
+
+
 
 
 
@@ -7912,12 +8544,22 @@
     const STORE_API_WINDOW = 'apiWindow';
     const STORE_KEY_DEAD = 'keyDead';
     const STORE_OPENED = 'opened';
-    /* TornExchange: its own key (never the main one), its prices, and its backoff. */
+
+    /* The selling page's own keys, caches and preferences - never the overlay's. */
+    const STORE_SELL_KEY = 'sellKey';
+    const STORE_SELL_KEY_DEAD = 'sellKeyDead';
+    const STORE_SELL_KEY_ACCESS = 'sellKeyAccess';
     const STORE_TE_KEY = 'teKey';
     const STORE_TE = 'teCache';
     const STORE_TE_STATE = 'teState';
-    /* The Traders page's own preferences - never mixed with the overlay's settings. */
-    const STORE_TRADERS_PAGE = 'tradersPage';
+    const STORE_TE_LISTS = 'teLists';
+    const STORE_TE_IDS = 'teIds';
+    const STORE_INVENTORY = 'inventory';
+    const STORE_SELL_PREFS = 'sellingPage';
+
+    /* Price history the script records itself, and TornW3B's latest summary. */
+    const STORE_HISTORY = 'priceHistory';
+    const STORE_W3B_SUMMARY = 'w3bSummary';
 
     const DEFAULT_SETTINGS = {
         /*
@@ -7937,17 +8579,11 @@
         sellToNpc: true,
         resaleBazaar: false,
         resaleMarket: false,
-        /*
-         * Sell to a player trader, at the price on their TornExchange list. Off
-         * by default: it needs a TornExchange key, and a trader's price is an
-         * offer, not a guarantee.
-         */
-        sellToTrader: false,
 
         /*
-         * The live feed: watch the market from ANY Torn page, not just the one
-         * you are on. Runs in one visible tab only, polls the Torn API well
-         * inside the rate limit, and never raises alerts - see README.
+         * Watching: the market from ANY Torn page, not just the one you are on.
+         * Runs in one visible tab only, polls the Torn API well inside the rate
+         * limit, and never raises alerts - see README.
          */
         liveFeed: true,
 
@@ -7962,9 +8598,9 @@
         useW3b: true,
 
         /*
-         * GO TO BAZAAR / GO TO MARKET open a new tab (on), or go there in this
-         * tab (off). A preference, not a safety setting: either way it is one
-         * click, one page load, and nothing is bought.
+         * Go opens a new tab (on), or goes there in this tab (off). A
+         * preference, not a safety setting: either way it is one click, one
+         * page load, and nothing is bought.
          */
         openInNewTab: true,
 
@@ -7978,12 +8614,6 @@
     const RESCAN_DEBOUNCE_MS = 400;
 
     /*
-     * Torn changes pages with pushState, which fires no event, and draws the
-     * listings a moment after the address changes. Checking the address is a
-     * string compare, so it is done often; on a change the page is scanned at
-     * once and a few more times while the listings finish drawing.
-     */
-    /*
      * The viewed bazaar's owner: one public-profile call when you open it, then
      * at most once per OWNER_REFRESH_MS while you stay. A failure waits a minute.
      */
@@ -7991,25 +8621,17 @@
     const OWNER_RETRY_MS = 60000;
 
     /*
-     * Online status for players on the lists: the first SELLER_STATUS_MAX bazaar
-     * sellers (while the Bazaars list is on screen) and the first
-     * TRADER_STATUS_MAX traders deals would be sold to (while the Trader chip is
-     * on). One public-profile call each, then at most once per
-     * PRESENCE_REFRESH_MS while they stay listed - at most 25 calls a minute,
-     * inside the shared 70/min budget next to the feed's 30. Visible tab only.
+     * Online status for bazaar sellers on the list: the first SELLER_STATUS_MAX
+     * while the Bazaars list is on screen. One public-profile call each, then
+     * at most once per PRESENCE_REFRESH_MS while they stay listed - inside the
+     * shared 70/min budget next to the feed's 30. Visible tab only.
      */
     const SELLER_STATUS_MAX = 10;
-    const TRADER_STATUS_MAX = 15;
-    /* While the Traders page is open: its top traders, in page order. */
-    const PAGE_TRADER_STATUS_MAX = 20;
     const PRESENCE_REFRESH_MS = 60000;
     const PRESENCE_RETRY_MS = 120000;
     const PRESENCE_MAX_PENDING = 3;
     /* Players not on a list this long are forgotten. */
     const PRESENCE_FORGET_MS = 10 * 60 * 1000;
-
-    /* A failed TornExchange call is not retried sooner than this. */
-    const TE_RETRY_MS = 5 * 60 * 1000;
 
     /* A bazaar seen closed keeps its feed deals hidden this long (or until seen open). */
     const CLOSED_MEMORY_MS = 10 * 60 * 1000;
@@ -8029,6 +8651,21 @@
      */
     const POLL_INTERVAL_MS = 2500;
 
+    /*
+     * Your own bazaar's pricing helper: one Item Market call per item on screen,
+     * at most one every BZ_FETCH_GAP_MS (6 a minute), each answer kept
+     * BZ_IM_TTL_MS; a fresher snapshot the feed already holds is used instead of
+     * a call. Bazaar prices come from the TornW3B summary the feed already
+     * fetches; a per-item TornW3B call only when that summary is missing or old.
+     */
+    const BZ_FETCH_GAP_MS = 10000;
+    const BZ_IM_TTL_MS = 120000;
+    const BZ_SUMMARY_MAX_AGE_MS = 5 * 60 * 1000;
+    const BZ_W3B_TTL_MS = 60000;
+    /* History: one sample per item per 5 minutes from the summary; saved at most every 30s. */
+    const HISTORY_SAMPLE_MS = 5 * 60 * 1000;
+    const HISTORY_SAVE_MS = 30000;
+
     const app = {
         tabId: makeTabId(),
         index: null,
@@ -8047,15 +8684,8 @@
         pageRows: [],
         /* { id, presence, fetchedAt, pending, retryAt, open } for the viewed bazaar. */
         owner: null,
-        /* playerId -> { presence, fetchedAt, pending, retryAt, listedAt }: list sellers and traders. */
+        /* playerId -> { presence, fetchedAt, pending, retryAt, listedAt }: list sellers. */
         presence: new Map(),
-        te: null,
-        /* { fetchedAt, map: itemId -> traders } from TornExchange, or null. */
-        traders: null,
-        teLoading: false,
-        /* The Traders page, while it is open here: { page, mode }. */
-        tradersPage: null,
-        tradersPageOpen: false,
         /* sellerId -> time until which their bazaar counts as closed. */
         closedSellers: new Map(),
         pageDiagnostics: null,
@@ -8074,12 +8704,25 @@
         observerTarget: null,
         lastScanAt: null,
         loading: false,
+        /* Your own bazaar's add / manage page, while you are on it. */
+        ownBazaar: null,
+        bzRows: [],
+        bzDiagnostics: null,
+        /* itemId -> { im: {price, at}|null, bz: {price, at}|null, imAt, bzAt, pending } */
+        bzPrices: new Map(),
+        bzSelected: null,
+        bzWindow: '24h',
+        bzLastFetchAt: 0,
+        /* The recorded price history, loaded once, saved on a timer. */
+        history: null,
+        historyDirty: false,
+        historySavedAt: 0,
+        historySampledAt: 0,
     };
 
     /**
      * Stored settings over the defaults, keeping only settings that still exist.
-     * The shop-stock filters, "show unverified", "show everything seen" and the
-     * old compare switches were removed; an old stored value must not linger.
+     * Removed settings (the Trader chip, among others) must not linger.
      */
     function loadSettings() {
         const stored = gmGet(STORE_SETTINGS, {}) || {};
@@ -8091,6 +8734,7 @@
 
         // The NPC switch was called compareNpc.
         if (stored.compareNpc === false && !('sellToNpc' in stored)) out.sellToNpc = false;
+        if (out.viewTab !== 'bazaar' && out.viewTab !== 'itemmarket') out.viewTab = 'bazaar';
 
         return out;
     }
@@ -8118,10 +8762,9 @@
         gmSet(STORE_KEY_DEAD, true);
 
         app.panel.setStatus(
-            'Torn rejected this API key (' +
+            'Torn rejected this key (' +
                 redactKey((error && error.message) || 'invalid key', getStoredKey()) +
-                '). Nothing more will be sent with it - paste a new Public key ' +
-                'under Settings.',
+                '). Paste a new Public key.',
             'error',
         );
     }
@@ -8147,8 +8790,7 @@
      *
      * The key is stored locally and used against api.torn.com. Nothing here, and
      * nothing anywhere else in this codebase, sends it to a server of ours -
-     * there is no server of ours. That is the main difference between this and a
-     * hosted tool like TornStats, where the key lives on someone else's machine.
+     * there is no server of ours.
      */
     async function onSaveKey(key) {
         if (!key) {
@@ -8156,21 +8798,14 @@
             return;
         }
 
-        if (!looksLikeTornKey(key)) {
-            app.panel.setStatus(
-                'That does not look like a Torn API key (16 letters/numbers). ' +
-                    'Saved anyway - if calls fail, check it.',
-                'warn',
-            );
+        // The TornExchange key is not a Torn key and must never reach Torn.
+        if (key === getTeKey()) {
+            app.panel.setStatus('That is the TornExchange key. Paste your Torn Public key.', 'error');
+            return;
         }
 
-        if (key === getTeKey()) {
-            app.panel.setStatus(
-                'That is your TornExchange key. Use a different Public key here - ' +
-                    'the main key never goes to TornExchange.',
-                'error',
-            );
-            return;
+        if (!looksLikeTornKey(key)) {
+            app.panel.setStatus('Saved. Torn keys are 16 letters and digits; check it if calls fail.', 'warn');
         }
 
         gmSet(STORE_KEY, key);
@@ -8183,7 +8818,7 @@
         refreshKeyState();
 
         // Key accepted: back to the list, which is now loading.
-        if (!app.keyDead && app.index) app.panel.showPage('list');
+        if (!app.keyDead && app.index) app.panel.showPage(app.panel.homePage());
     }
 
     function onForgetKey() {
@@ -8195,9 +8830,8 @@
         if (app.panel.keyInput) app.panel.keyInput.value = '';
 
         refreshKeyState();
-        app.panel.setStatus('API key removed from this script.');
+        app.panel.setStatus('API key removed.');
     }
-
 
     function onClearCache() {
         gmDel(STORE_ITEMS);
@@ -8206,7 +8840,7 @@
         app.index = null;
         app.npcShops = new Map();
 
-        app.panel.setStatus('Re-downloading item data...');
+        app.panel.setStatus('Re-downloading item data.');
         if (hasUsableKey()) onScan();
     }
 
@@ -8226,9 +8860,7 @@
 
         if (access && access.level !== null && access.level > ACCESS_PUBLIC) {
             app.panel.setStatus(
-                'Warning: this key has ' +
-                    (access.name || 'level ' + access.level) +
-                    ' access. Public is enough - revoke it and make a Public one.',
+                'This key has ' + (access.name || 'level ' + access.level) + ' access. Public is enough.',
                 'warn',
             );
         }
@@ -8247,7 +8879,7 @@
             app.index = buildItemIndex(cachedItems.items);
             app.itemsFetchedAt = cachedItems.fetchedAt;
         } else {
-            app.panel.setStatus('Downloading item database...');
+            app.panel.setStatus('Downloading item database.');
             const raw = await fetchItems(app.client);
             const entry = makeItemsCacheEntry(raw);
             gmSet(STORE_ITEMS, entry);
@@ -8260,7 +8892,7 @@
         if (isNpcCacheFresh(cachedNpc)) {
             app.npcShops = readNpcCacheEntry(cachedNpc);
         } else {
-            app.panel.setStatus('Downloading shop inventories...');
+            app.panel.setStatus('Downloading shop inventories.');
             try {
                 const shops = await fetchShops(app.client);
                 const index = buildNpcShopIndex(shops);
@@ -8279,13 +8911,6 @@
                     (error && error.message) || 'shop data unavailable';
             }
         }
-
-        /*
-         * If shop data is unavailable, every item is "unverified" - and hiding
-         * unverified items would then hide EVERYTHING, which reads as "no
-         * opportunities" when it really means "could not verify any". Degrade to
-         * showing them, flagged, and say why.
-         */
 
         app.manualNpc = gmGet(STORE_MANUAL_NPC, {}) || {};
     }
@@ -8331,14 +8956,6 @@
     function buildOpportunities(listings) {
         const rows = [];
 
-        /*
-         * The best NON-profitable listing, kept so the panel can prove the
-         * pipeline works. "0 opportunities" and "0 listings parsed" look
-         * identical to a user, and they mean completely different things.
-         */
-        app.nearMiss = null;
-        app.pricedCount = 0;
-
         for (const listing of listings) {
             /*
              * Compare against BOTH exits and keep whichever pays more:
@@ -8348,14 +8965,9 @@
              * exitsFor() is shared with the live feed, so a listing is priced
              * the same whether it was read off this page or found elsewhere.
              */
-            const npcShop = npcShopFor(
-                listing.itemId,
-                app.npcShops,
-                app.manualNpc,
-            );
+            const npcShop = npcShopFor(listing.itemId, app.npcShops, app.manualNpc);
 
-            const pick = traderFor(listing.item);
-            const exits = exitsFor(listing.item, app.settings, pick && pick.trader.price);
+            const exits = exitsFor(listing.item, app.settings);
             if (Object.keys(exits).length === 0) continue;
 
             const profit = bestVenue({
@@ -8368,7 +8980,6 @@
             rows.push({
                 ...listing,
                 profit,
-                traderPick: profit && profit.venue === 'TRADER' ? pick : null,
                 npcShop,
                 npcVerified: npcShop !== null,
                 /*
@@ -8442,6 +9053,23 @@
         updateOwner(Date.now());
 
         if (!app.index) return;
+
+        // Your own bazaar's add / manage page: the pricing helper, not the scanner.
+        const own = ownBazaarPage(location.href);
+        if (own !== app.ownBazaar) {
+            if (app.ownBazaar) removeRowTags(document);
+            app.ownBazaar = own;
+            app.bzRows = [];
+            app.bzDiagnostics = null;
+            if (!own) app.panel.renderMyBazaar(null);
+        }
+        if (own) {
+            scanOwnBazaarPage(own);
+            app.pageRows = [];
+            app.pageDiagnostics = null;
+            refreshView();
+            return;
+        }
 
         if (app.pageType === PAGE_NONE) {
             app.pageRows = [];
@@ -8544,9 +9172,7 @@
 
         if (firstTime) {
             app.panel.setStatus(
-                'That listing is no longer at ' +
-                    formatMoneyShort(target.price) +
-                    ' here - it sold or was repriced. Removed from the list.',
+                'That listing is no longer at ' + formatMoneyShort(target.price) + ' here.',
                 'warn',
             );
         }
@@ -8556,7 +9182,7 @@
      * Everything the panel shows: this page, what you saw elsewhere, and the
      * live feed. Never reads the DOM, so the feed can re-render it whenever
      * another tab updates storage. Its only requests are the rate-limited seller
-     * status lookups in updateSellerStatus().
+     * status lookups in updatePresence().
      */
     function refreshView() {
         if (!app.panel) return;
@@ -8577,7 +9203,6 @@
                   now,
                   npcShopFor: (id) => npcShopFor(id, app.npcShops, app.manualNpc),
                   itemMarketUrl,
-                  traderFor,
               }).filter((r) => {
                   // The page you are on already shows these, with fresher numbers.
                   if (r.source === SOURCE_ITEM_MARKET) {
@@ -8605,53 +9230,21 @@
         const bazaarRows = rankOpportunities(lists.bazaar, rankSettings());
         const marketRows = rankOpportunities(lists.itemmarket, rankSettings());
 
-        // One trade window per trader, from both lists.
-        const groups = app.settings.sellToTrader
-            ? groupByTrader(bazaarRows.concat(marketRows))
-            : [];
-
         const tab = activeTab();
-        const shown =
-            tab === 'bazaar'
-                ? bazaarRows
-                : tab === 'traders'
-                  ? groups.flatMap((g) => g.rows)
-                  : marketRows;
+        const shown = tab === 'bazaar' ? bazaarRows : marketRows;
 
-        // The Traders page: every deal in both lists, with all its traders.
-        const board = app.tradersPageOpen
-            ? buildTraderBoard(bazaarRows.concat(marketRows), app.traders ? app.traders.map : new Map(), {
-                  presenceOf,
-              })
-            : null;
-
-        updatePresence(
-            [
-                ...new Set([
-                    ...(tab === 'bazaar' || board ? listedSellers(bazaarRows) : []),
-                    ...listedTraders(bazaarRows.concat(marketRows)),
-                    ...(board ? boardTraders(board) : []),
-                ]),
-            ],
-            now,
-        );
+        updatePresence(tab === 'bazaar' ? listedSellers(bazaarRows) : [], now);
 
         app.panel.render({
             rows: shown,
-            groups,
             tab,
             statuses: statusMap(now),
-            hidden: hiddenCounts(
-                tab === 'itemmarket' ? lists.itemmarket : tab === 'bazaar' ? lists.bazaar : [],
-                rankSettings(),
-            ),
-            traderInfo: traderInfo(now),
+            hidden: hiddenCounts(tab === 'itemmarket' ? lists.itemmarket : lists.bazaar, rankSettings()),
             counts: {
                 bazaar: bazaarRows.length,
                 itemmarket: marketRows.length,
-                traders: groups.length,
             },
-            summary: summarize(shown),
+            summary: summarize(shown, { cashOnHand: app.settings.cashOnHand }),
             diagnostics:
                 app.pageDiagnostics && app.pageType === tab
                     ? {
@@ -8662,19 +9255,9 @@
             pageType: app.pageType,
             lastScanAt: app.lastScanAt,
             live: app.feed ? app.feed.status() : null,
-            tradersOpenMode: tradersPagePrefs().openMode,
         });
 
-        if (board && app.tradersPage) {
-            app.tradersPage.page.render({
-                board,
-                statuses: statusMap(now),
-                traderInfo: traderInfo(now),
-                live: app.feed ? app.feed.status() : null,
-                prefs: tradersPagePrefs(),
-                traderChipOn: Boolean(app.settings.sellToTrader),
-            });
-        }
+        if (app.ownBazaar) renderMyBazaar();
     }
 
     /**
@@ -8685,8 +9268,7 @@
         if (app.tabOverride) return app.tabOverride;
         if (app.pageType === PAGE_BAZAAR) return 'bazaar';
         if (app.pageType === 'itemmarket') return 'itemmarket';
-        const v = app.settings.viewTab;
-        return v === 'itemmarket' || v === 'traders' ? v : 'bazaar';
+        return app.settings.viewTab === 'itemmarket' ? 'itemmarket' : 'bazaar';
     }
 
     function onViewChange(tab) {
@@ -8696,24 +9278,18 @@
         refreshView();
     }
 
-    /** The Scan button: loads reference data once, then scans the page. */
+    /** The refresh button: loads reference data once, then scans the page. */
     async function onScan() {
         if (app.loading) return;
 
         if (!getStoredKey()) {
-            app.panel.setStatus(
-                'No API key yet - paste a Public key under Settings.',
-                'error',
-            );
+            app.panel.setStatus('No API key yet. Paste a Public key.', 'error');
             app.panel.openSettings({ focusKey: !getStoredKey() });
             return;
         }
 
         if (app.keyDead) {
-            app.panel.setStatus(
-                'Torn rejected the saved key. Paste a new Public key under Settings.',
-                'error',
-            );
+            app.panel.setStatus('Torn rejected the saved key. Paste a new Public key.', 'error');
             return;
         }
 
@@ -8737,7 +9313,7 @@
             }
             rescan();
 
-            // Replace "Downloading..." - it is done. A key warning set by
+            // Replace "Downloading" - it is done. A key warning set by
             // checkKeyAccess is left in place.
             if (firstLoad && !app.panel.state.status.level.match(/warn|error/)) {
                 app.panel.setStatus('Ready.');
@@ -8745,7 +9321,7 @@
             if (app.pageType === PAGE_NONE) {
                 app.panel.setStatus(
                     app.settings.liveFeed
-                        ? 'Not a Bazaar or Item Market page - showing the live feed.'
+                        ? 'Not a Bazaar or Item Market page. Showing what is watched.'
                         : 'Not a Bazaar or Item Market page.',
                 );
             }
@@ -8765,7 +9341,6 @@
             app.panel.setBusy(false);
         }
     }
-
 
     /* ------------------------------------------------------------------ *
      * Bazaar owner: online status and open/closed
@@ -8850,7 +9425,7 @@
         if (!app.panel) return;
         const words = owner.presence
             ? presenceText(owner.presence, now)
-            : { level: 'unknown', text: owner.pending || !owner.fetchedAt ? 'checking...' : 'status unknown' };
+            : { level: 'unknown', text: owner.pending || !owner.fetchedAt ? 'checking' : 'unknown' };
 
         app.panel.setSeller({
             name: (owner.presence && owner.presence.name) || null,
@@ -8861,7 +9436,7 @@
     }
 
     /* ------------------------------------------------------------------ *
-     * Online status: bazaar sellers and traders on the lists
+     * Online status: bazaar sellers on the list
      * ------------------------------------------------------------------ */
 
     /** The first SELLER_STATUS_MAX distinct sellers on the list, in list order. */
@@ -8872,24 +9447,6 @@
             const id = String(r.sellerId);
             if (!ids.includes(id)) ids.push(id);
             if (ids.length >= SELLER_STATUS_MAX) break;
-        }
-        return ids;
-    }
-
-    /**
-     * The traders behind trader deals - every one of the top three for each
-     * item, since who is online decides which of them the deal goes to.
-     */
-    function listedTraders(rows) {
-        const ids = [];
-        if (!app.settings.sellToTrader || !app.traders) return ids;
-
-        for (const r of rows) {
-            if (!r.traderPick) continue;
-            for (const t of app.traders.map.get(String(r.itemId)) || []) {
-                if (!ids.includes(t.id)) ids.push(t.id);
-                if (ids.length >= TRADER_STATUS_MAX) return ids;
-            }
         }
         return ids;
     }
@@ -8919,9 +9476,8 @@
         }
 
         if (!app.client || !hasUsableKey()) return;
-        // The Traders page folds the panel but still needs statuses.
         if (document.visibilityState !== 'visible') return;
-        if (app.panel.collapsed && !app.tradersPageOpen) return;
+        if (app.panel.collapsed) return;
 
         let pending = 0;
         for (const s of app.presence.values()) if (s.pending) pending++;
@@ -8948,9 +9504,7 @@
                 })
                 .finally(() => {
                     s.pending = false;
-                    // A trader coming online can change who a deal goes to.
-                    if (app.index && app.settings.sellToTrader) rescan();
-                    else refreshView();
+                    refreshView();
                 });
         }
     }
@@ -8960,268 +9514,288 @@
         const out = new Map();
         for (const id of app.presence.keys()) {
             const presence = presenceOf(id);
-            if (presence) out.set(id, { name: presence.name, ...presenceShort(presence, now) });
+            if (presence) out.set(id, { name: presence.name, ...presenceWord(presence, now) });
         }
         if (app.owner && app.owner.presence) {
-            out.set(app.owner.id, { name: app.owner.presence.name, ...presenceShort(app.owner.presence, now) });
+            out.set(app.owner.id, { name: app.owner.presence.name, ...presenceWord(app.owner.presence, now) });
         }
         return out;
     }
 
     /* ------------------------------------------------------------------ *
-     * Traders (TornExchange)
+     * Your own bazaar: the pricing helper
      * ------------------------------------------------------------------ */
 
-    function getTeKey() {
-        return gmGet(STORE_TE_KEY, '') || '';
+    /** Read the rows, tag each with its current asking prices, queue what is missing. */
+    function scanOwnBazaarPage(which) {
+        const { rows, diagnostics } = scanOwnBazaar(which, document, app.index);
+        app.bzRows = rows;
+        app.bzDiagnostics = { ...diagnostics, tags: 0 };
+
+        const now = Date.now();
+        const hist = loadHistory();
+        let changed = false;
+
+        for (const row of rows) {
+            touchItem(hist, row.itemId, now);
+            changed = true;
+            const item = app.index.byId.get(row.itemId);
+            if (item && item.marketValue > 0) recordMarketValue(hist, row.itemId, now, item.marketValue);
+
+            const tag = ensureRowTag(row, document);
+            app.bzDiagnostics.tags += 1;
+            paintRowTag(tag, row.itemId);
+            if (!tag.dataset.bound) {
+                tag.dataset.bound = '1';
+                tag.title = 'Show averages and graph';
+                tag.addEventListener('click', (event) => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    // The row's item NOW: #/manage reuses row elements as you scroll.
+                    app.bzSelected = tag.dataset.itemId || row.itemId;
+                    if (app.panel.collapsed) app.panel.setCollapsed(false, { save: true });
+                    if (app.panel.page !== 'mybazaar') app.panel.showPage('mybazaar');
+                    repaintOwnBazaar();
+                });
+            }
+        }
+        if (changed) markHistoryDirty();
+
+        if (!app.bzSelected && rows.length) app.bzSelected = rows[0].itemId;
+
+        attachObserver(rows);
+        fetchOwnBazaarPrices();
     }
 
-    function teState() {
-        return gmGet(STORE_TE_STATE, {}) || {};
+    /** The current prices for one item, from the caches: { im, bz }. */
+    function bzPriceOf(itemId) {
+        const now = Date.now();
+        const rec = app.bzPrices.get(itemId) || {};
+
+        // Bazaars: the stored TornW3B summary first (one call covers every item).
+        const summary = gmGet(STORE_W3B_SUMMARY, null);
+        let bz = rec.bz || null;
+        if (summary && summary.lowest && now - summary.fetchedAt < BZ_SUMMARY_MAX_AGE_MS) {
+            // Absent from a fresh summary = no bazaar lists it: price null, known.
+            const p = Number(summary.lowest[itemId]) || null;
+            if (!bz || summary.fetchedAt >= bz.at) bz = { price: p, at: summary.fetchedAt };
+        }
+
+        return { im: rec.im || null, bz };
     }
 
-    function setTeState(patch) {
-        gmSet(STORE_TE_STATE, { ...teState(), ...patch });
-    }
-
-    /** Re-read the stored trader prices (another tab may have fetched them). */
-    function loadTraders(now = Date.now()) {
-        const entry = gmGet(STORE_TE, null);
-        const fetchedAt = entry && entry.fetchedAt;
-        if (app.traders && app.traders.fetchedAt === fetchedAt) return;
-        app.traders = readTeCacheEntry(entry, now);
-    }
-
-    /** Who a deal on this item would be sold to, or null. */
-    function traderFor(item) {
-        if (!item || !app.settings.sellToTrader || !app.traders) return null;
-        return pickTrader(app.traders.map.get(String(item.id)), {
-            presenceOf,
-            marketValue: Number(item.marketValue) || 0,
-        });
-    }
-
-    /** What the best sane trader pays for an item - for choosing what to fetch. */
-    function traderPriceOf(itemId) {
-        if (!app.settings.sellToTrader || !app.traders || !app.index) return 0;
-        const item = app.index.byId.get(String(itemId));
-        return maxTraderPrice(app.traders.map.get(String(itemId)), item ? Number(item.marketValue) : 0);
-    }
-
-    /** For the panel: key, freshness and trouble, never the key itself. */
-    function traderInfo(now = Date.now()) {
-        const st = teState();
-        return {
-            hasKey: Boolean(getTeKey()),
-            items: app.traders ? app.traders.map.size : 0,
-            fetchedAt: app.traders ? app.traders.fetchedAt : null,
-            error: st.error || null,
-            badKey: Boolean(st.badKey),
-            waitUntil: st.blockedUntil > now ? st.blockedUntil : null,
-            loading: app.teLoading,
-        };
+    /** "$30" when known, "none" when the source lists nothing, "…" until asked. */
+    function bzPriceWord(entry) {
+        if (!entry) return '…';
+        return entry.price > 0 ? formatMoney(entry.price) : 'none';
     }
 
     /**
-     * One TornExchange call every TE_REFRESH_MS, from whichever visible tab gets
-     * there first. `lastAttemptAt` is stored BEFORE the call, so two tabs cannot
-     * both ask; failures wait TE_RETRY_MS, and a 429 waits what TornExchange says.
+     * Only touched when its words or its selected state change: the tags sit
+     * inside the observed rows, so every paint would otherwise be a mutation,
+     * and every mutation a rescan, and every rescan a paint.
      */
-    async function refreshTraders({ force = false } = {}) {
-        if (!(app.settings.sellToTrader || app.tradersPageOpen) || !getTeKey() || app.teLoading) return;
+    function paintRowTag(tag, itemId) {
+        const { im, bz } = bzPriceOf(itemId);
+        const words = 'IM ' + bzPriceWord(im) + ' · Bazaar ' + bzPriceWord(bz);
+        if (tag.dataset.words !== words) {
+            tag.dataset.words = words;
+            tag.textContent = '';
+            tag.appendChild(document.createTextNode('IM '));
+            tag.appendChild(Object.assign(document.createElement('b'), { textContent: bzPriceWord(im) }));
+            tag.appendChild(document.createTextNode(' · Bazaar '));
+            tag.appendChild(Object.assign(document.createElement('b'), { textContent: bzPriceWord(bz) }));
+        }
+        const selected = String(itemId === app.bzSelected);
+        if (tag.dataset.selected !== selected) tag.dataset.selected = selected;
+    }
+
+    /**
+     * Fetch the lowest Item Market ask for the items on screen, one at a time,
+     * never faster than BZ_FETCH_GAP_MS, only while this tab is visible. A
+     * bazaar price is asked of TornW3B per item only when the shared summary is
+     * missing or old. Nothing loops: an item is asked again only after its TTL.
+     */
+    function fetchOwnBazaarPrices() {
+        if (!app.ownBazaar || !app.client || !hasUsableKey()) return;
         if (document.visibilityState !== 'visible') return;
 
         const now = Date.now();
-        loadTraders(now);
+        if (now - app.bzLastFetchAt < BZ_FETCH_GAP_MS) return;
 
-        const st = teState();
-        if (st.badKey) return;
-        if (st.blockedUntil && now < st.blockedUntil) return;
-        if (now - (st.lastAttemptAt || 0) < (force ? 30000 : TE_RETRY_MS)) return;
-        if (!force && app.traders && now - app.traders.fetchedAt < TE_REFRESH_MS) return;
+        const summary = gmGet(STORE_W3B_SUMMARY, null);
+        const summaryFresh = Boolean(summary && summary.lowest && now - summary.fetchedAt < BZ_SUMMARY_MAX_AGE_MS);
 
-        setTeState({ lastAttemptAt: now });
-        app.teLoading = true;
-        refreshView();
+        // A fresh feed snapshot answers without a request.
+        const feed = readFeedCacheEntry(gmGet(FEED_STORE_KEY, null), now);
 
-        try {
-            const map = await fetchTeBestListings(app.te);
-            gmSet(STORE_TE, makeTeCacheEntry(map, Date.now()));
-            setTeState({ error: null });
-            app.traders = null;
-            loadTraders();
-        } catch (error) {
-            const patch = { error: (error && error.message) || 'TornExchange failed.' };
-            if (error && error.badKey) patch.badKey = true;
-            if (error && error.http === 429) patch.blockedUntil = Date.now() + error.retryAfterMs;
-            setTeState(patch);
-        } finally {
-            app.teLoading = false;
-            if (app.index) rescan();
-            else refreshView();
+        for (const row of app.bzRows) {
+            const id = row.itemId;
+            const rec = app.bzPrices.get(id) || { im: null, bz: null, imAt: 0, bzAt: 0, pending: false };
+            app.bzPrices.set(id, rec);
+            if (rec.pending) continue;
+
+            const snap = feed.itemmarket.get(id);
+            if (snap && snap.rows.length && snap.dataAt > (rec.imAt || 0)) {
+                rec.im = { price: snap.rows[0].price, at: snap.dataAt };
+                rec.imAt = snap.fetchedAt;
+                recordSample(loadHistory(), id, snap.dataAt, { im: snap.rows[0].price });
+                markHistoryDirty();
+            }
+
+            if (now - (rec.imAt || 0) >= BZ_IM_TTL_MS) {
+                rec.pending = true;
+                app.bzLastFetchAt = now;
+                fetchItemMarket(app.client, id, { now })
+                    .then((market) => {
+                        const at = Date.now();
+                        rec.imAt = at;
+                        if (market.listings.length) {
+                            const lowest = Math.min(...market.listings.map((l) => l.price));
+                            rec.im = { price: lowest, at: market.cacheTimestamp || at };
+                            recordSample(loadHistory(), id, at, { im: lowest });
+                            markHistoryDirty();
+                        } else {
+                            rec.im = { price: null, at };
+                        }
+                    })
+                    .catch((error) => {
+                        if (isKeyDeadError(error)) markKeyDead(error);
+                        rec.imAt = Date.now();
+                    })
+                    .finally(() => {
+                        rec.pending = false;
+                        repaintOwnBazaar();
+                    });
+                return;
+            }
+
+            if (!summaryFresh && app.w3b && app.settings.useW3b && now - (rec.bzAt || 0) >= BZ_W3B_TTL_MS) {
+                rec.pending = true;
+                app.bzLastFetchAt = now;
+                fetchW3bListings(app.w3b, id)
+                    .then(({ listings }) => {
+                        const at = Date.now();
+                        rec.bzAt = at;
+                        const prices = listings.map((l) => Number(l && l.price)).filter((p) => p > 1);
+                        if (prices.length) {
+                            const lowest = Math.min(...prices);
+                            rec.bz = { price: lowest, at };
+                            recordSample(loadHistory(), id, at, { bz: lowest });
+                            markHistoryDirty();
+                        } else {
+                            rec.bz = { price: null, at };
+                        }
+                    })
+                    .catch(() => {
+                        rec.bzAt = Date.now();
+                    })
+                    .finally(() => {
+                        rec.pending = false;
+                        repaintOwnBazaar();
+                    });
+                return;
+            }
         }
     }
 
-    /** The Traders page's traders, most profitable deals first. */
-    function boardTraders(board) {
-        const ids = [];
-        const sorted = board
-            .slice()
-            .sort((a, b) => (b.bestTrader ? b.bestTrader.profit : 0) - (a.bestTrader ? a.bestTrader.profit : 0));
-        for (const entry of sorted) {
-            for (const t of entry.traders) {
-                if (!ids.includes(t.trader.id)) ids.push(t.trader.id);
-                if (ids.length >= PAGE_TRADER_STATUS_MAX) return ids;
-            }
+    function repaintOwnBazaar() {
+        if (!app.ownBazaar) return;
+        for (const row of app.bzRows) {
+            if (!document.contains(row.el)) continue;
+            paintRowTag(ensureRowTag(row, document), row.itemId);
         }
-        return ids;
+        renderMyBazaar();
+    }
+
+    function renderMyBazaar() {
+        if (!app.ownBazaar) return;
+        const now = Date.now();
+        const hist = loadHistory();
+        const items = app.bzRows.map((r) => ({ itemId: r.itemId, name: r.name, ...bzPriceOf(r.itemId) }));
+        const selected = items.some((i) => i.itemId === app.bzSelected) ? app.bzSelected : items.length ? items[0].itemId : null;
+        app.bzSelected = selected;
+        const item = selected ? app.index.byId.get(selected) : null;
+
+        app.panel.renderMyBazaar({
+            items,
+            selected,
+            marketValue: item ? Number(item.marketValue) || null : null,
+            averages: selected ? averages(hist, selected, now) : null,
+            series: selected ? series(hist, selected, now, app.bzWindow) : null,
+            windowKey: app.bzWindow,
+            diagnostics: app.bzDiagnostics,
+        });
     }
 
     /* ------------------------------------------------------------------ *
-     * The Traders page
+     * Price history: recorded by this script, from now on
      * ------------------------------------------------------------------ */
 
-    function tradersPagePrefs() {
-        const stored = gmGet(STORE_TRADERS_PAGE, {}) || {};
-        const out = { ...TRADERS_PAGE_DEFAULTS };
-        for (const key of Object.keys(TRADERS_PAGE_DEFAULTS)) {
-            if (Object.prototype.hasOwnProperty.call(stored, key)) out[key] = stored[key];
-        }
-        return out;
+    function loadHistory() {
+        if (!app.history) app.history = readHistory(gmGet(STORE_HISTORY, null));
+        return app.history;
     }
 
-    function setTradersPagePrefs(partial) {
-        gmSet(STORE_TRADERS_PAGE, { ...tradersPagePrefs(), ...partial });
-        refreshView();
-    }
-
-    /** The overlay's Traders button: open as remembered, or ask. */
-    function onOpenTraders() {
-        const mode = tradersPagePrefs().openMode;
-        if (mode === 'tab') return openTradersInTab();
-        if (mode === 'overlay') return showTradersPage('overlay');
-
-        app.panel.showTradersPrompt((newTab, remember) => {
-            if (remember) setTradersPagePrefs({ openMode: newTab ? 'tab' : 'overlay' });
-            if (newTab) openTradersInTab();
-            else showTradersPage('overlay');
-        });
-        return undefined;
-    }
-
-    function openTradersInTab() {
-        gmOpenTab(tradersPageUrl());
-    }
-
-    /** Draw the page here: over this Torn page, or as this tab's whole page. */
-    function showTradersPage(mode) {
-        if (!app.tradersPage) {
-            const page = new TradersPage({
-                onClose: closeTradersPage,
-                onNavigate: (row) => {
-                    // A listing on the Torn page underneath: close, then point at it.
-                    if (row.el && document.contains(row.el)) {
-                        closeTradersPage();
-                        revealRow(row.el);
-                        return;
-                    }
-                    onNavigate(row, { newTab: tradersPagePrefs().linksNewTab !== false });
-                },
-                onOpenProfile: (id) =>
-                    openDeal(
-                        'https://www.torn.com/profiles.php?XID=' + encodeURIComponent(String(id)),
-                        tradersPagePrefs().linksNewTab !== false,
-                    ),
-                onOpenPriceList,
-                onRefresh: () => {
-                    // Statuses are due again now; trader prices only if their gap allows.
-                    for (const s of app.presence.values()) s.fetchedAt = 0;
-                    refreshTraders({ force: true });
-                    refreshView();
-                },
-                onPrefsChange: setTradersPagePrefs,
-                onAddKey: () => app.panel.openSettings(),
-                onEnableTraders: () => {
-                    onSettingsChange({ sellToTrader: true });
-                    // Re-pick what the feed fetches now, not at its next summary.
-                    if (app.feed) {
-                        app.feed.requestRefresh();
-                        app.feed.tick().catch(() => {});
-                    }
-                },
-            });
-            app.tradersPage = { page, mode };
-        }
-
-        app.tradersPage.mode = mode;
-        app.tradersPage.page.mount(mode);
-        app.tradersPageOpen = true;
-
-        // Fold the overlay to its bar so it does not sit on the page (not saved;
-        // ` still toggles it). Unfolded again when the page closes.
-        if (!app.panel.collapsed && !app.tradersPage.foldedPanel) {
-            app.tradersPage.foldedPanel = true;
-            app.panel.setCollapsed(true);
-        }
-
-        refreshTraders();
-        refreshView();
-    }
-
-    function closeTradersPage() {
-        if (!app.tradersPage) return;
-        if (app.tradersPage.foldedPanel && app.panel.collapsed) app.panel.setCollapsed(false);
-        app.tradersPage.page.destroy();
-        app.tradersPage = null;
-        app.tradersPageOpen = false;
-        refreshView();
-    }
-
-    function onSaveTeKey(key) {
-        key = String(key || '').trim();
-        if (!key) {
-            app.panel.setStatus('Paste your TornExchange key first.', 'error');
-            return;
-        }
-        // The main key is never sent to a third party - not even this one.
-        if (key === getStoredKey()) {
-            app.panel.setStatus(
-                'Use a different Public key for TornExchange than your main key - ' +
-                    'the main key never leaves api.torn.com.',
-                'error',
-            );
-            return;
-        }
-
-        gmSet(STORE_TE_KEY, key);
-        gmDel(STORE_TE_STATE);
-        app.panel.setStatus('TornExchange key saved. Loading trader prices...');
-        refreshTraders({ force: true });
-        refreshView();
-    }
-
-    function onForgetTeKey() {
-        gmDel(STORE_TE_KEY);
-        gmDel(STORE_TE_STATE);
-        gmDel(STORE_TE);
-        app.traders = null;
-        if (app.panel.teKeyInput) app.panel.teKeyInput.value = '';
-        app.panel.setStatus('TornExchange key and trader prices removed.');
-        if (app.index) rescan();
-        else refreshView();
-    }
-
-    function onOpenProfile(playerId) {
-        openDeal('https://www.torn.com/profiles.php?XID=' + encodeURIComponent(String(playerId)));
-    }
-
-    /** Their TornExchange list - another site, so always a new tab. */
-    function onOpenPriceList(traderId) {
-        gmOpenTab(tePriceListUrl(traderId));
+    function markHistoryDirty() {
+        app.historyDirty = true;
+        saveHistoryIfDue();
     }
 
     /**
-     * The small Scan button: re-read this page now. No requests - just the DOM
+     * Every tab holds its own copy, so storage is re-read and merged before a
+     * save: the selling tab's inventory items and a bazaar tab's samples both
+     * survive whichever saves last.
+     */
+    function saveHistoryIfDue(force = false) {
+        if (!app.history || !app.historyDirty) return;
+        const now = Date.now();
+        if (!force && now - app.historySavedAt < HISTORY_SAVE_MS) return;
+        app.history = mergeHistory(gmGet(STORE_HISTORY, null), app.history);
+        pruneHistory(app.history, now);
+        gmSet(STORE_HISTORY, app.history);
+        app.historySavedAt = now;
+        app.historyDirty = false;
+    }
+
+    /**
+     * Every TornW3B summary (the feed fetches one every 30s in the leading tab):
+     * keep the lowest bazaar price of every item for the helper, and every 5
+     * minutes record a sample for each tracked item - its bazaar ask from the
+     * summary, its Item Market ask from the feed's snapshot when that is recent.
+     */
+    function onW3bSummary(summary, at) {
+        const lowest = {};
+        for (const s of summary || []) if (s.lowestPrice > 0) lowest[s.itemId] = s.lowestPrice;
+        gmSet(STORE_W3B_SUMMARY, { fetchedAt: at, lowest });
+
+        if (at - app.historySampledAt < HISTORY_SAMPLE_MS) return;
+        app.historySampledAt = at;
+
+        const hist = loadHistory();
+        const ids = Object.keys(hist.items);
+        if (!ids.length) return;
+
+        const feed = readFeedCacheEntry(gmGet(FEED_STORE_KEY, null), at);
+        for (const id of ids) {
+            const sample = {};
+            if (lowest[id] > 0) sample.bz = lowest[id];
+            const snap = feed.itemmarket.get(id);
+            if (snap && snap.rows.length && at - snap.dataAt < HISTORY_SAMPLE_MS) sample.im = snap.rows[0].price;
+            if (sample.bz || sample.im) recordSample(hist, id, at, sample);
+            const item = app.index && app.index.byId.get(id);
+            if (item && item.marketValue > 0) recordMarketValue(hist, id, at, item.marketValue);
+        }
+        app.historyDirty = true;
+        saveHistoryIfDue();
+    }
+
+    /* ------------------------------------------------------------------ *
+     * Navigation
+     * ------------------------------------------------------------------ */
+
+    /**
+     * The Scan button: re-read this page now. No requests - just the DOM
      * already on screen - so it can be pressed freely. Always animates, so a
      * press visibly did something even when the list does not change.
      */
@@ -9235,17 +9809,21 @@
     }
 
     function scanSummary() {
+        if (app.ownBazaar) {
+            const d = app.bzDiagnostics || { rows: 0, identified: 0 };
+            return 'Your bazaar: ' + d.identified + ' of ' + d.rows + ' rows priced.';
+        }
         if (app.pageType === PAGE_NONE) {
-            return 'Nothing to scan here - not a Bazaar or Item Market page.';
+            return 'Not a Bazaar or Item Market page.';
         }
 
         const found = (app.pageDiagnostics && app.pageDiagnostics.listings) || 0;
         const lockedOnly = (app.pageDiagnostics && app.pageDiagnostics.locked) || 0;
         if (!found && lockedOnly) {
-            return 'Scanned: ' + lockedOnly + ' locked ($1) listing' + (lockedOnly === 1 ? '' : 's') + ' - none buyable by you.';
+            return 'Scanned: ' + lockedOnly + ' locked $1 listing' + (lockedOnly === 1 ? '' : 's') + ', none for you.';
         }
         if (!found) {
-            return 'Scanned: no listings found on this page yet.';
+            return 'Scanned: no listings on this page yet.';
         }
 
         const deals = (app.pageRows || []).length;
@@ -9257,8 +9835,7 @@
             ' · ' +
             deals +
             (deals === 1 ? ' deal' : ' deals') +
-            (locked ? ' · ' + locked + ' locked (skipped)' : '') +
-            ' on this page.'
+            (locked ? ' · ' + locked + ' locked' : '')
         );
     }
 
@@ -9341,10 +9918,7 @@
         openDeal(itemMarketUrl(row.itemId, row.name), newTab);
     }
 
-    /**
-     * A new tab, or this one. The overlay follows Settings -> "Open deals in a
-     * new tab"; the Traders page passes its own preference.
-     */
+    /** A new tab, or this one, per Settings -> "Open deals in a new tab". */
     function openDeal(url, newTab = app.settings.openInNewTab !== false) {
         if (newTab) {
             gmOpenTab(url);
@@ -9363,8 +9937,6 @@
 
         // Position and collapse are chrome: nothing to re-price.
         if (Object.keys(partial).every((k) => k === 'panelPos' || k === 'collapsed')) return;
-
-        if (partial.sellToTrader) refreshTraders();
 
         if (app.index) rescan();
         else refreshView();
@@ -9397,10 +9969,23 @@
         const panelRoot = app.panel && app.panel.root;
 
         const fromPage = mutations.some(
-            (m) => !panelRoot || !panelRoot.contains(m.target),
+            (m) => (!panelRoot || !panelRoot.contains(m.target)) && !isOwnTagMutation(m),
         );
 
         if (fromPage) debouncedRescan();
+    }
+
+    /** A change to, or inside, one of the helper's own price tags is not the page changing. */
+    function isOwnTagMutation(m) {
+        const isTag = (n) =>
+            n && n.nodeType === 1 && n.classList && n.classList.contains(OWN_BAZAAR_TAG_CLASS);
+        const inTag = (n) => {
+            const el = n && n.nodeType === 1 ? n : n && n.parentElement;
+            return Boolean(el && el.closest && el.closest('.' + OWN_BAZAAR_TAG_CLASS));
+        };
+        if (inTag(m.target)) return true;
+        const nodes = [...(m.addedNodes || []), ...(m.removedNodes || [])];
+        return nodes.length > 0 && nodes.every((n) => isTag(n) || inTag(n));
     }
 
     /**
@@ -9466,13 +10051,6 @@
 
     function startLiveFeed() {
         app.w3b = new W3bClient();
-        app.te = new TeClient({ getKey: getTeKey });
-        loadTraders();
-        // Another tab fetched trader prices: use them here too.
-        gmOnChange(STORE_TE, () => {
-            loadTraders();
-            if (app.index) rescan();
-        });
 
         app.feed = new LiveFeed({
             tabId: app.tabId,
@@ -9487,9 +10065,7 @@
             onChange: () => refreshView(),
             isKeyDead: isKeyDeadError,
             onKeyDead: markKeyDead,
-            traderPriceOf,
-            traderVersion: () =>
-                app.settings.sellToTrader && app.traders ? app.traders.fetchedAt : 0,
+            onSummary: onW3bSummary,
         });
 
         // Follower tabs re-render the moment the leader stores something new.
@@ -9515,6 +10091,7 @@
             if (document.visibilityState !== 'visible') {
                 // Step down at once rather than waiting for the next tick.
                 tick();
+                saveHistoryIfDue(true);
                 return;
             }
 
@@ -9542,12 +10119,12 @@
         gmMenu('Key safety / rotate key', () => {
             alert(
                 'Key safety\n\n' +
-                    '1. This script needs PUBLIC access only.\n' +
-                    '2. If you ever pasted a Limited or Full key into a script,\n' +
-                    '   revoke it and create a new Public one.\n' +
-                    '3. Your key stays in this browser. It is sent only to\n' +
-                    '   api.torn.com over HTTPS, is never written to the console,\n' +
-                    '   and never reaches any third-party server.\n\n' +
+                    '1. The panel needs PUBLIC access only.\n' +
+                    '2. The selling page keeps a separate LIMITED key, used only\n' +
+                    '   there to read your inventory.\n' +
+                    '3. Both keys stay in this browser. They are sent only to\n' +
+                    '   api.torn.com over HTTPS, never written to the console,\n' +
+                    '   and never reach any third-party server.\n\n' +
                     'Opening your API key settings.',
             );
             gmOpenTab(TORN_API_KEY_URL);
@@ -9581,6 +10158,543 @@
                     : 'Open a Bazaar or the Item Market first.',
             );
         });
+
+        gmMenu('Show my bazaar diagnostics', () => {
+            const d = app.bzDiagnostics;
+            const own = ownBazaarPage(location.href);
+            alert(
+                'Your own bazaar\n\n' +
+                    [
+                        'page detected: ' + (own || 'none (needs bazaar.php with #/add or #/manage, no userId)'),
+                        'rows found: ' + (d ? d.rows : 0),
+                        'rows with an item image: ' + (d ? d.withImage : 0),
+                        'items identified: ' + (d ? d.identified : 0),
+                        'rows skipped - item unknown: ' + (d ? d.noItem : 0),
+                        'price tags placed: ' + (d ? d.tags : 0),
+                        'items with a price history: ' + Object.keys(loadHistory().items).length,
+                    ].join('\n'),
+            );
+        });
+    }
+
+    /* ------------------------------------------------------------------ *
+     * The selling page (its own tab)
+     * ------------------------------------------------------------------ */
+
+    const sell = {
+        client: null,
+        te: null,
+        page: null,
+        index: null,
+        inventory: null,
+        inventoryAt: null,
+        traders: null,
+        idsByName: new Map(),
+        lists: new Map(),
+        listState: new Map(),
+        /* The paced TornExchange queue: one call per slot, shared pace with every tab. */
+        queue: null,
+        expanded: new Set(),
+        presence: new Map(),
+        keyDead: false,
+        keyError: null,
+        error: null,
+        loading: false,
+        /* After a failed inventory read, the timer does not ask again before this. */
+        inventoryRetryAt: 0,
+    };
+
+    /* The selling page asks for traders' statuses this often, visible tab only. */
+    const SELL_PRESENCE_REFRESH_MS = 60000;
+    const SELL_PRESENCE_MAX_PENDING = 3;
+    /* A failed TornExchange call is not retried sooner than this. */
+    const TE_RETRY_MS = 5 * 60 * 1000;
+    /* Inventory is asked again after this, or on Refresh. */
+    const INVENTORY_REFRESH_MS = 15 * 60 * 1000;
+
+    function getSellKey() {
+        return gmGet(STORE_SELL_KEY, '') || '';
+    }
+
+    function getTeKey() {
+        return gmGet(STORE_TE_KEY, '') || '';
+    }
+
+    function sellPrefs() {
+        const stored = gmGet(STORE_SELL_PREFS, {}) || {};
+        const out = { ...SELLING_PAGE_DEFAULTS };
+        for (const key of Object.keys(SELLING_PAGE_DEFAULTS)) {
+            if (Object.prototype.hasOwnProperty.call(stored, key)) out[key] = stored[key];
+        }
+        return out;
+    }
+
+    function teState() {
+        return gmGet(STORE_TE_STATE, {}) || {};
+    }
+
+    function setTeState(patch) {
+        gmSet(STORE_TE_STATE, { ...teState(), ...patch });
+    }
+
+    function sellPresenceOf(id) {
+        const entry = sell.presence.get(String(id));
+        return (entry && entry.presence) || null;
+    }
+
+    function sellStatusMap(now) {
+        const out = new Map();
+        for (const [id, s] of sell.presence) {
+            if (s.presence) out.set(id, { name: s.presence.name, ...presenceWord(s.presence, now) });
+        }
+        return out;
+    }
+
+    /** Everything the page shows, from what is loaded now. */
+    function renderSelling() {
+        if (!sell.page) return;
+        const now = Date.now();
+        const prefs = sellPrefs();
+        const st = teState();
+        const access = gmGet(STORE_SELL_KEY_ACCESS, null);
+
+        const tradersFor = (itemId) => {
+            const best = sell.traders ? sell.traders.map.get(String(itemId)) || [] : [];
+            const full = sell.lists.get(String(itemId));
+            return mergeTraders(best, full ? full.traders : null, sell.idsByName);
+        };
+        const sortBy = prefs.sortBy === SORT_BUNDLE ? SORT_BUNDLE : SORT_ITEM;
+        const build = (onlineOnly) =>
+            sell.inventory && sell.index
+                ? buildSellingRows(sell.inventory, sell.index, { tradersFor, presenceOf: sellPresenceOf, onlineOnly, sortBy })
+                : [];
+
+        /*
+         * Statuses are asked for from the rows with EVERY trader on them. With
+         * Online only, rows drop the traders whose status is not known yet -
+         * which, built from those, would be everyone, and nobody would ever be
+         * asked about.
+         */
+        const allRows = build(false);
+        const rows = prefs.onlineOnly ? build(true).filter((r) => r.best) : allRows;
+        const watch = tradersToWatch(allRows, { expanded: sell.expanded });
+        updateSellPresence(watch, now);
+
+        // Online only, nobody shown yet, and statuses still on their way.
+        const checkingOnline =
+            Boolean(prefs.onlineOnly) &&
+            watch.some((id) => {
+                const s = sell.presence.get(String(id));
+                return !s || (!s.presence && (s.pending || !s.fetchedAt) && now >= s.retryAt);
+            });
+
+        const itemLists = new Map();
+        for (const [id, s] of sell.listState) itemLists.set(id, s);
+
+        sell.page.render({
+            rows,
+            statuses: sellStatusMap(now),
+            prefs: { ...prefs, sortBy },
+            expanded: sell.expanded,
+            info: {
+                hasKey: Boolean(getSellKey()),
+                keyAccess: access && access.name,
+                keyError: sell.keyError,
+                hasTeKey: Boolean(getTeKey()),
+                teError: st.error || null,
+                teBadKey: Boolean(st.badKey),
+                teWaitUntil: st.blockedUntil > now ? st.blockedUntil : null,
+                teAt: sell.traders ? sell.traders.fetchedAt : null,
+                inventoryAt: sell.inventoryAt,
+                loading: sell.loading,
+                checkingOnline,
+                error: sell.error,
+                itemLists,
+            },
+        });
+    }
+
+    /** The item database, shared with the overlay's cache; fetched with this page's key if stale. */
+    async function loadSellIndex() {
+        const cached = gmGet(STORE_ITEMS, null);
+        if (isItemsCacheFresh(cached)) {
+            sell.index = buildItemIndex(cached.items);
+            return;
+        }
+        const raw = await fetchItems(sell.client);
+        gmSet(STORE_ITEMS, makeItemsCacheEntry(raw));
+        sell.index = buildItemIndex(raw);
+    }
+
+    function sellKeyErrorText(error) {
+        if (error && Number(error.code) === TORN_ERROR_ACCESS_LEVEL) {
+            return 'This key cannot read your inventory. It needs Limited access.';
+        }
+        if (isKeyDeadError(error)) return 'Torn rejected this key. Paste a new Limited key.';
+        return redactKey((error && error.message) || String(error), getSellKey());
+    }
+
+    async function loadSellInventory({ force = false } = {}) {
+        if (!getSellKey() || sell.keyDead) return;
+
+        const cached = readInventoryCacheEntry(gmGet(STORE_INVENTORY, null), Date.now(), INVENTORY_REFRESH_MS);
+        if (cached && !force) {
+            sell.inventory = cached.items;
+            sell.inventoryAt = cached.fetchedAt;
+            return;
+        }
+
+        sell.loading = true;
+        renderSelling();
+        try {
+            if (!sell.index) await loadSellIndex();
+            const raw = await fetchInventory(sell.client);
+            const merged = mergeInventory(raw);
+            gmSet(STORE_INVENTORY, makeInventoryCacheEntry(merged));
+            sell.inventory = merged;
+            sell.inventoryAt = Date.now();
+            sell.keyError = null;
+
+            const access = await fetchKeyAccess(sell.client);
+            if (access && access.level !== null) gmSet(STORE_SELL_KEY_ACCESS, access);
+
+            const hist = loadHistory();
+            for (const it of merged) touchItem(hist, it.id, Date.now());
+            markHistoryDirty();
+            saveHistoryIfDue(true);
+        } catch (error) {
+            sell.keyError = sellKeyErrorText(error);
+            // Not again for a while; a rejected key, not until a new one is saved.
+            sell.inventoryRetryAt = Date.now() + INVENTORY_RETRY_MS;
+            if (isKeyDeadError(error)) {
+                sell.keyDead = true;
+                gmSet(STORE_SELL_KEY_DEAD, true);
+            }
+        } finally {
+            sell.loading = false;
+            renderSelling();
+        }
+    }
+
+    /** Re-read the stored trader prices (another tab may have fetched them). */
+    function loadSellTraders(now = Date.now()) {
+        const entry = gmGet(STORE_TE, null);
+        const fetchedAt = entry && entry.fetchedAt;
+        if (sell.traders && sell.traders.fetchedAt === fetchedAt) return;
+        sell.traders = readTeCacheEntry(entry, now);
+
+        const ids = gmGet(STORE_TE_IDS, null);
+        if (ids && ids.map && now - ids.fetchedAt < TE_REFRESH_MS) {
+            sell.idsByName = new Map(Object.entries(ids.map));
+        }
+        sell.lists = readTeItemLists(gmGet(STORE_TE_LISTS, null), now);
+    }
+
+    /**
+     * One TornExchange call for the top buyers every TE_REFRESH_MS, from
+     * whichever visible tab gets there first, plus one for the trader id list.
+     * `lastAttemptAt` is stored BEFORE the call, so two tabs cannot both ask;
+     * failures wait TE_RETRY_MS, and a 429 waits what TornExchange says. Both
+     * calls go through the paced queue like every other.
+     */
+    async function refreshSellTraders({ force = false } = {}) {
+        if (!getTeKey() || sell.teLoading) return;
+        if (document.visibilityState !== 'visible') return;
+
+        const now = Date.now();
+        loadSellTraders(now);
+
+        const st = teState();
+        if (st.badKey) return;
+        if (st.blockedUntil && now < st.blockedUntil) return;
+        if (now - (st.lastAttemptAt || 0) < (force ? 30000 : TE_RETRY_MS)) return;
+        if (!force && sell.traders && now - sell.traders.fetchedAt < TE_REFRESH_MS) return;
+
+        setTeState({ lastAttemptAt: now });
+        sell.teLoading = true;
+        renderSelling();
+
+        try {
+            const map = await sell.queue.enqueue(() => fetchTeBestListings(sell.te));
+            gmSet(STORE_TE, makeTeCacheEntry(map, Date.now()));
+            setTeState({ error: null });
+            sell.traders = null;
+            loadSellTraders();
+        } catch {
+            // Recorded by the queue's onSettled.
+        } finally {
+            sell.teLoading = false;
+            renderSelling();
+        }
+
+        // Trader ids by name, for buyers the top-three list does not carry.
+        const ids = gmGet(STORE_TE_IDS, null);
+        if (!teState().badKey && (!ids || Date.now() - ids.fetchedAt >= TE_REFRESH_MS)) {
+            sell.queue
+                .enqueue(() => fetchTeActiveTraders(sell.te))
+                .then((map) => {
+                    gmSet(STORE_TE_IDS, { fetchedAt: Date.now(), map: Object.fromEntries(map) });
+                    sell.idsByName = map;
+                    renderSelling();
+                })
+                .catch(() => {});
+        }
+    }
+
+    /** A TornExchange call failed: a 429 wait or a bad key is kept for every tab. */
+    function onTeSettled(error) {
+        if (error && error.http === 429) {
+            setTeState({ blockedUntil: Date.now() + error.retryAfterMs, error: error.message });
+        } else if (error && error.badKey) {
+            setTeState({ badKey: true, error: error.message });
+        }
+        renderSelling();
+    }
+
+    /**
+     * The full buyer list for one item, when its row is opened: every page its
+     * own slot in the queue. Not asked during a TornExchange wait, and a failed
+     * list is not asked again before its retry time.
+     */
+    function loadTeItemList(itemId) {
+        const id = String(itemId);
+        if (sell.lists.has(id)) return;
+        const now = Date.now();
+        const st = sell.listState.get(id);
+        if (st && (st.loading || now < (st.retryAt || 0))) return;
+        if (!getTeKey() || teState().badKey) return;
+
+        const blockedUntil = Number(teState().blockedUntil) || 0;
+        if (now < blockedUntil) {
+            sell.listState.set(id, { loading: false, error: 'TornExchange asked us to wait.', at: now, retryAt: blockedUntil });
+            return;
+        }
+
+        sell.listState.set(id, { loading: true, error: null, at: now, retryAt: 0 });
+        fetchTeListings(sell.te, id, { schedule: (fn) => sell.queue.enqueue(fn) })
+            .then(({ traders }) => {
+                gmSet(STORE_TE_LISTS, writeTeItemList(gmGet(STORE_TE_LISTS, null), id, traders));
+                sell.lists.set(id, { at: Date.now(), traders });
+                sell.listState.set(id, { loading: false, error: null, at: Date.now(), retryAt: 0 });
+            })
+            .catch((error) => {
+                const at = Date.now();
+                const retryAt = error && error.http === 429 ? at + (error.retryAfterMs || TE_RETRY_MS) : at + TE_RETRY_MS;
+                sell.listState.set(id, { loading: false, error: (error && error.message) || 'TornExchange failed.', at, retryAt });
+            })
+            .finally(() => renderSelling());
+    }
+
+    /** Traders' public statuses, when due: visible tab only, inside the shared budget. */
+    function updateSellPresence(ids, now) {
+        for (const id of ids) {
+            if (!sell.presence.has(id)) {
+                sell.presence.set(id, { presence: null, fetchedAt: 0, pending: false, retryAt: 0 });
+            }
+        }
+        if (!getSellKey() || sell.keyDead || document.visibilityState !== 'visible') return;
+
+        let pending = 0;
+        for (const s of sell.presence.values()) if (s.pending) pending++;
+
+        for (const id of ids) {
+            if (pending >= SELL_PRESENCE_MAX_PENDING) break;
+            const s = sell.presence.get(id);
+            if (s.pending || now < s.retryAt || now - s.fetchedAt < SELL_PRESENCE_REFRESH_MS) continue;
+
+            pending++;
+            s.pending = true;
+            fetchUserPresence(sell.client, id)
+                .then((presence) => {
+                    s.fetchedAt = Date.now();
+                    if (presence) s.presence = presence;
+                    else s.retryAt = Date.now() + PRESENCE_RETRY_MS;
+                })
+                .catch((error) => {
+                    if (isKeyDeadError(error)) {
+                        sell.keyDead = true;
+                        sell.keyError = sellKeyErrorText(error);
+                        gmSet(STORE_SELL_KEY_DEAD, true);
+                    }
+                    s.retryAt = Date.now() + PRESENCE_RETRY_MS;
+                })
+                .finally(() => {
+                    s.pending = false;
+                    renderSelling();
+                });
+        }
+    }
+
+    function onSellSaveKey(key) {
+        key = String(key || '').trim();
+        if (!key) {
+            sell.keyError = 'Paste a key first.';
+            renderSelling();
+            return;
+        }
+        if (key === getTeKey()) {
+            sell.keyError = 'That is the TornExchange key. Paste your Torn key here.';
+            renderSelling();
+            return;
+        }
+        gmSet(STORE_SELL_KEY, key);
+        gmDel(STORE_SELL_KEY_DEAD);
+        gmDel(STORE_SELL_KEY_ACCESS);
+        gmDel(STORE_INVENTORY);
+        sell.keyDead = false;
+        sell.keyError = null;
+        sell.inventory = null;
+        sell.inventoryAt = null;
+        sell.inventoryRetryAt = 0;
+        sell.page.showView('list');
+        loadSellInventory({ force: true }).then(() => refreshSellTraders());
+    }
+
+    function onSellForgetKey() {
+        gmDel(STORE_SELL_KEY);
+        gmDel(STORE_SELL_KEY_DEAD);
+        gmDel(STORE_SELL_KEY_ACCESS);
+        gmDel(STORE_INVENTORY);
+        sell.keyDead = false;
+        sell.keyError = null;
+        sell.inventory = null;
+        sell.inventoryAt = null;
+        renderSelling();
+    }
+
+    function onSellSaveTeKey(key) {
+        key = String(key || '').trim();
+        if (!key) {
+            setTeState({ error: 'Paste a key first.' });
+            renderSelling();
+            return;
+        }
+        // The Torn key is never sent to a third party - not even this one.
+        if (key === getSellKey() || key === getStoredKey()) {
+            setTeState({ error: 'That is a Torn key. Paste the key from tornexchange.com.' });
+            renderSelling();
+            return;
+        }
+        gmSet(STORE_TE_KEY, key);
+        gmDel(STORE_TE_STATE);
+        sell.page.showView('list');
+        refreshSellTraders({ force: true });
+        renderSelling();
+    }
+
+    function onSellForgetTeKey() {
+        gmDel(STORE_TE_KEY);
+        gmDel(STORE_TE_STATE);
+        gmDel(STORE_TE);
+        gmDel(STORE_TE_LISTS);
+        gmDel(STORE_TE_IDS);
+        sell.traders = null;
+        sell.lists = new Map();
+        sell.idsByName = new Map();
+        renderSelling();
+    }
+
+    function onSellRefresh() {
+        for (const s of sell.presence.values()) s.fetchedAt = 0;
+        loadSellInventory({ force: true }).then(() => refreshSellTraders({ force: true }));
+    }
+
+    function onSellExpand(itemId) {
+        const id = String(itemId);
+        if (sell.expanded.has(id)) sell.expanded.delete(id);
+        else {
+            sell.expanded.add(id);
+            loadTeItemList(id);
+        }
+        renderSelling();
+    }
+
+    function openSellLink(url) {
+        if (sellPrefs().linksNewTab !== false) gmOpenTab(url);
+        else location.assign(url);
+    }
+
+    function bootSellingPage() {
+        sell.client = new TornApiClient({
+            getKey: getSellKey,
+            loadWindow: () => gmGet(STORE_API_WINDOW, []),
+            saveWindow: (recent) => gmSet(STORE_API_WINDOW, recent),
+        });
+        /*
+         * The pace and any penalty wait live in storage, shared by every tab:
+         * a reload or a second selling tab carries on from the same clock.
+         */
+        sell.te = new TeClient({
+            getKey: getTeKey,
+            loadState: () => teState(),
+            saveState: (state) => setTeState(state),
+        });
+        sell.queue = new TeQueue({
+            client: sell.te,
+            isVisible: () => document.visibilityState === 'visible',
+            onSettled: onTeSettled,
+        });
+        sell.keyDead = Boolean(gmGet(STORE_SELL_KEY_DEAD, false));
+        if (sell.keyDead) sell.keyError = 'Torn rejected this key. Paste a new Limited key.';
+
+        sell.page = new SellingPage({
+            onSaveKey: onSellSaveKey,
+            onForgetKey: onSellForgetKey,
+            onRevealKey: () => getSellKey(),
+            onSaveTeKey: onSellSaveTeKey,
+            onForgetTeKey: onSellForgetTeKey,
+            onRevealTeKey: () => getTeKey(),
+            onRefresh: onSellRefresh,
+            onPrefsChange: (partial) => {
+                gmSet(STORE_SELL_PREFS, { ...sellPrefs(), ...partial });
+                renderSelling();
+            },
+            onExpand: onSellExpand,
+            onOpenProfile: (id) => openSellLink('https://www.torn.com/profiles.php?XID=' + encodeURIComponent(String(id))),
+            onOpenList: (idOrName) => openSellLink(tePriceListUrl(idOrName)),
+        });
+        sell.page.mount();
+
+        loadSellTraders();
+        gmOnChange(STORE_TE, () => {
+            loadSellTraders();
+            renderSelling();
+        });
+
+        renderSelling();
+        if (!getSellKey() || !getTeKey()) sell.page.openSettings();
+
+        (async () => {
+            try {
+                if (getSellKey() && !sell.keyDead) await loadSellIndex();
+            } catch (error) {
+                sell.keyError = sellKeyErrorText(error);
+                if (isKeyDeadError(error)) {
+                    sell.keyDead = true;
+                    gmSet(STORE_SELL_KEY_DEAD, true);
+                }
+            }
+            await loadSellInventory();
+            await refreshSellTraders();
+            renderSelling();
+        })();
+
+        setInterval(() => {
+            if (document.visibilityState !== 'visible') return;
+            refreshSellTraders();
+            const due = inventoryRefreshDue({
+                inventoryAt: sell.inventoryAt,
+                retryAt: sell.inventoryRetryAt,
+                keyDead: sell.keyDead,
+                refreshMs: INVENTORY_REFRESH_MS,
+            });
+            if (due && !sell.loading && getSellKey()) loadSellInventory({ force: true });
+            renderSelling();
+        }, 15000);
+
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'visible') renderSelling();
+        });
     }
 
     /* ------------------------------------------------------------------ *
@@ -9588,6 +10702,12 @@
      * ------------------------------------------------------------------ */
 
     function boot() {
+        // A tab opened for the selling page: this whole tab is the page.
+        if (isTradersPageUrl(location.href)) {
+            bootSellingPage();
+            return;
+        }
+
         injectStyles();
 
         app.settings = loadSettings();
@@ -9619,14 +10739,15 @@
              * script on the page, including other userscripts.
              */
             onRevealKey: () => getStoredKey(),
-            onSaveTeKey,
-            onForgetTeKey,
-            onRevealTeKey: () => getTeKey(),
-            onRefreshTraders: () => refreshTraders({ force: true }),
-            onOpenProfile,
-            onOpenPriceList,
-            onOpenTraders,
-            onTradersOpenMode: (mode) => setTradersPagePrefs({ openMode: mode }),
+            onOpenSelling: () => gmOpenTab(tradersPageUrl()),
+            onSelectBazaarItem: (itemId) => {
+                app.bzSelected = String(itemId);
+                repaintOwnBazaar();
+            },
+            onBazaarWindow: (key) => {
+                app.bzWindow = key;
+                renderMyBazaar();
+            },
         });
 
         app.panel.mount();
@@ -9638,20 +10759,11 @@
 
         applyPageType(detectPage(location.href), { initial: true });
 
-        // A tab opened for the Traders page: this whole tab is the page.
-        if (isTradersPageUrl(location.href)) showTradersPage('tab');
-
         if (!getStoredKey()) {
-            app.panel.setStatus(
-                'Paste a Public API key under Settings to begin.',
-                'warn',
-            );
+            app.panel.setStatus('Paste a Public API key to begin.', 'warn');
             app.panel.openSettings({ focusKey: !getStoredKey() });
         } else if (app.keyDead) {
-            app.panel.setStatus(
-                'Torn rejected the saved key. Paste a new Public key under Settings.',
-                'error',
-            );
+            app.panel.setStatus('Torn rejected the saved key. Paste a new Public key.', 'error');
         }
 
         window.addEventListener('hashchange', handleRouteChange);
@@ -9670,7 +10782,7 @@
             }
 
             refreshItemsIfStale();
-            refreshTraders();
+            saveHistoryIfDue();
 
             if (detectPage(location.href) === PAGE_NONE) {
                 if (app.pageType !== PAGE_NONE) rescan();
