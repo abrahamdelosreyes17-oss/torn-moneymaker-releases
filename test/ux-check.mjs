@@ -113,6 +113,16 @@ await p.waitForTimeout(200);
 ok((await q(p, '.ttv2-tab-on').textContent()).startsWith('Item Market'), 'tab switches');
 await q(p, '.ttv2-tab[data-label="Bazaars"]').click();
 
+// Seller status next to the seller's name on bazaar rows
+const cheap = q(p, '.ttv2-row', ).filter({ hasText: 'CheapSeller' }).first();
+ok((await cheap.count()) === 1, 'CheapSeller bazaar row listed');
+const src = (await cheap.locator('.ttv2-row-src').textContent()) || '';
+ok(/Bazaar - CheapSeller\s*Offline 3h ago · Traveling\s+\|\s+via TornW3B/.test(src), 'seller status right after the name: ' + src);
+ok((await cheap.locator('.ttv2-src-status').getAttribute('data-level')) === 'offline', 'status coloured by level');
+ok(/Traveling to Mexico/.test(await cheap.locator('.ttv2-src-status').getAttribute('title')), 'tooltip has the full status');
+const profileCalls = await p.evaluate(() => window.__requests.filter((u) => /\/v2\/user\/777\/profile/.test(u)).length);
+ok(profileCalls === 1, 'one profile call per seller, not one per render: ' + profileCalls);
+
 // GO
 await q(p, '.ttv2-go').first().click();
 ok((await p.evaluate(() => window.__opened.length)) === 1, 'GO opens the listing: ' + (await p.evaluate(() => window.__opened[0])));
@@ -205,6 +215,13 @@ ok(badge.length === 1, 'one owner badge on the page (not in the dropdown): ' + J
 ok(badge[0] && badge[0][0] === 'offline' && /Offline · 3h ago · Traveling to Mexico/.test(badge[0][1]) && /DixieNormousss/.test(badge[0][2]), 'badge sits after the name and reads the status');
 ok(/Seller: DixieNormousss.*Offline · 3h ago/.test(await txt(p, '.ttv2-seller')), 'panel seller line: ' + (await txt(p, '.ttv2-seller')));
 ok(!/closed/i.test(await txt(p, '.ttv2-seller')), 'open bazaar is not flagged closed');
+// A short window, so the list has to scroll: the seller line must keep its
+// full height, not get squeezed half-hidden between the status bar and chips.
+await p.setViewportSize({ width: 1280, height: 420 });
+await p.waitForTimeout(300);
+const sellerBox = await q(p, '.ttv2-seller').evaluate((n) => ({ h: n.getBoundingClientRect().height, need: n.scrollHeight }));
+ok(sellerBox.h >= 20 && sellerBox.h >= sellerBox.need, 'seller line not squeezed by a long list: ' + JSON.stringify(sellerBox));
+await p.setViewportSize({ width: 1280, height: 900 });
 await p.screenshot({ path: sp + '/ux-owner.png' });
 await p.evaluate((h) => { document.getElementById('fake-bz').innerHTML = h; }, banner('closed'));
 await p.waitForTimeout(3000);
@@ -225,6 +242,19 @@ await p.evaluate(() => { const t = document.createElement('textarea'); t.id = 'f
 await p.keyboard.press('Backquote');
 ok(await vis(p, '.ttv2-body'), '` typed in a chat box does not toggle');
 ok((await p.evaluate(() => document.getElementById('fake-chat').value)) === '`', 'and the ` still reaches the chat box');
+
+// Settings -> "Open deals in a new tab" off: GO goes there in this tab.
+await p.evaluate(() => document.getElementById('fake-chat').blur());
+await q(p, 'button[title="Settings"]').click();
+const newTab = q(p, '.ttv2-check').filter({ hasText: 'Open deals in a new tab' }).locator('input');
+ok(await newTab.isChecked(), 'new-tab setting on by default');
+await newTab.uncheck();
+ok((await p.evaluate(() => JSON.parse(GM_getValue('tornTrading.v2.settings')).openInNewTab)) === false, 'new-tab setting saved off');
+await q(p, 'button[title="Settings"]').click();
+await p.route('https://www.torn.com/**', (route) => route.fulfill({ status: 200, contentType: 'text/html', body: '<p>torn</p>' }));
+// gmOpenTab would record the URL and leave this page; only assign() lands here.
+await Promise.all([p.waitForURL(/torn\.com/, { timeout: 5000 }), q(p, '.ttv2-go').first().click()]);
+ok(/torn\.com\/bazaar\.php\?userId=\d+/.test(p.url()), 'GO with new tab off navigates this tab: ' + p.url());
 
 console.log('ERRORS', errs);
 console.log(failures ? failures + ' FAILED' : 'ALL PASSED');

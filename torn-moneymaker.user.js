@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      3.4.1
+// @version      3.5.0
 // @description  Finds Bazaar and Item Market listings below NPC / market value - on the page you are viewing, and live from the Torn API and TornW3B - ranked by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -37,7 +37,7 @@
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '3.4.1';
+    const TTV2_BUILD_VERSION = '3.5.0';
 
     /* ===== src/platform/gm.js ===== */
     /*
@@ -3035,6 +3035,24 @@
         return { level, text: parts.join(' · ') };
     }
 
+    /**
+     * The short form for a deal row, where space is tight: "Offline 3h ago",
+     * "Online · Hospital". The full presenceText() goes in the tooltip.
+     * @returns {{level: string, text: string, title: string}}
+     */
+    function presenceShort(presence, now = Date.now()) {
+        const full = presenceText(presence, now);
+        if (full.level === 'unknown') return { ...full, title: full.text };
+
+        let text = presence.online;
+        if (presence.online !== 'Online' && presence.lastActionAt) {
+            text += ' ' + agoText(presence.lastActionAt, now);
+        }
+        if (presence.state && presence.state !== 'Okay') text += ' · ' + presence.state;
+
+        return { level: full.level, text, title: full.text };
+    }
+
     /** Put (or refresh) the badge after the owner's name. Returns true if shown. */
     function renderOwnerBadge(root, ownerId, presence, now = Date.now()) {
         const link = findOwnerLink(root, ownerId);
@@ -3433,6 +3451,8 @@
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
+        /* Never squeezed by a long list: overflow:hidden lets flex shrink it to nothing. */
+        flex: 0 0 auto;
     }
 
     .ttv2-seller.ttv2-shown {
@@ -3704,10 +3724,41 @@
     .ttv2-row-src {
         color: var(--muted);
         font-size: 10px;
-        white-space: nowrap;
+        white-space: pre-wrap;
+    }
+
+    /* Each part stays whole; a narrow row wraps between them. */
+    .ttv2-src-part {
+        display: inline-block;
+        max-width: 100%;
+        vertical-align: top;
+        white-space: pre;
         overflow: hidden;
         text-overflow: ellipsis;
     }
+
+    /* The seller's status, right after their name: "● Offline 3h ago". */
+    .ttv2-src-status {
+        margin-left: 5px;
+        font-weight: bold;
+        color: #aaa;
+    }
+
+    .ttv2-src-status::before {
+        content: "";
+        display: inline-block;
+        width: 7px;
+        height: 7px;
+        margin-right: 3px;
+        border-radius: 50%;
+        background: #777;
+        vertical-align: 0;
+    }
+
+    .ttv2-src-status[data-level="online"] { color: var(--green); }
+    .ttv2-src-status[data-level="online"]::before { background: var(--green); }
+    .ttv2-src-status[data-level="idle"] { color: var(--amber); }
+    .ttv2-src-status[data-level="idle"]::before { background: var(--amber); }
 
     .ttv2-row-prices {
         color: #bbb;
@@ -4250,14 +4301,18 @@
             const settings = this.page === 'settings';
 
             /*
-             * Keep the panel's height steady across the switch: Settings is
-             * shorter than a full list, and a panel that jumps in size on every
-             * click is the kind of jumpiness this redesign is meant to remove.
+             * Keep the panel's height steady across the switch: Settings may be
+             * shorter or taller than the list (it scrolls), and a panel that
+             * jumps in size on every click is the kind of jumpiness this
+             * redesign is meant to remove.
              */
             if (settings && !this.root.classList.contains('ttv2-on-settings')) {
-                this.root.style.minHeight = this.root.getBoundingClientRect().height + 'px';
+                const h = this.root.getBoundingClientRect().height + 'px';
+                this.root.style.minHeight = h;
+                this.root.style.height = h;
             } else if (!settings) {
                 this.root.style.minHeight = '';
+                this.root.style.height = '';
             }
 
             this.root.classList.toggle('ttv2-on-settings', settings);
@@ -4567,6 +4622,20 @@
                     ),
                 ]),
             );
+
+            /* ---- links ---- */
+
+            const nt = check(
+                'openInNewTab',
+                'Open deals in a new tab',
+                el('span', {
+                    class: 'ttv2-sub',
+                    text: 'Untick to open GO TO BAZAAR / GO TO MARKET in this tab instead.',
+                }),
+            );
+            this.newTabInput = nt.input;
+
+            this.settingsPage.appendChild(section('Links', [nt.row]));
         }
 
         /**
@@ -4586,8 +4655,8 @@
                 [
                     'Key access level',
                     'Public (torn: items, cityshops; market: itemmarket; key: info; ' +
-                        "user: profile - only the viewed bazaar owner's public " +
-                        'online status)',
+                        "user: profile - bazaar owners' public online status, for " +
+                        'the bazaar you view and the sellers on the Bazaars list)',
                 ],
                 [
                     'Other services',
@@ -4852,6 +4921,9 @@
             }
             if (this.useW3bInput && settings.useW3b !== undefined) {
                 this.useW3bInput.checked = Boolean(settings.useW3b);
+            }
+            if (this.newTabInput && settings.openInNewTab !== undefined) {
+                this.newTabInput.checked = settings.openInNewTab !== false;
             }
             if (settings.collapsed !== undefined) this.setCollapsed(settings.collapsed);
             if (settings.panelPos !== undefined) this.applyPosition(settings.panelPos);
@@ -5219,26 +5291,55 @@
          * "is this still there?" is the question that matters most.
          */
         sourceLine(row) {
-            const parts = [];
+            /*
+             * Two unbreakable pieces - who ("Bazaar - Name ● Offline 3h ago")
+             * and where-from/age ("via TornW3B | 42s ago") - that wrap onto a
+             * second line when the row is narrow, rather than cutting the age off.
+             */
+            const line = el('div', { class: 'ttv2-row-src' });
+            const who = el('span', { class: 'ttv2-src-part' });
 
             if (row.source === 'bazaar') {
-                parts.push('Bazaar' + (row.sellerName ? ' - ' + row.sellerName : ''));
+                // The owner's status right after their name, so you know whether
+                // they are around before you click.
+                const statuses = this.state.sellerStatus;
+                const status =
+                    statuses && row.sellerId ? statuses.get(String(row.sellerId)) : null;
+                const name = row.sellerName || (status && status.name) || null;
+
+                who.appendChild(document.createTextNode('Bazaar' + (name ? ' - ' + name : '')));
+                if (status) {
+                    const badge = el('span', {
+                        class: 'ttv2-src-status',
+                        title: (name ? name + ': ' : '') + status.title + ' (Torn API)',
+                        text: status.text,
+                    });
+                    badge.dataset.level = status.level;
+                    who.appendChild(badge);
+                }
             } else if (row.source === 'itemmarket') {
-                parts.push('Item Market');
+                who.textContent = 'Item Market';
             }
 
-            if (row.el) parts.push('on this page');
-            else if (row.fromFeed) parts.push(row.source === 'bazaar' ? 'via TornW3B' : 'via Torn API');
-            else if (row.fromLedger) parts.push('seen earlier');
-
-            const line = el('div', {
-                class: 'ttv2-row-src',
-                text: parts.join('  |  '),
-            });
+            const from = row.el
+                ? 'on this page'
+                : row.fromFeed
+                  ? row.source === 'bazaar' ? 'via TornW3B' : 'via Torn API'
+                  : row.fromLedger
+                    ? 'seen earlier'
+                    : '';
 
             const age = el('span', { class: 'ttv2-age' });
-            line.appendChild(document.createTextNode(parts.length ? '  |  ' : ''));
-            line.appendChild(age);
+            const where = el('span', { class: 'ttv2-src-part' }, [
+                document.createTextNode(from ? from + '  |  ' : ''),
+                age,
+            ]);
+
+            if (who.childNodes.length) {
+                line.appendChild(who);
+                line.appendChild(document.createTextNode('  |  '));
+            }
+            line.appendChild(where);
 
             if (row.fromFeed && row.dataAgeKnown === false) {
                 age.title = 'TornW3B did not say when it last checked this.';
@@ -5808,6 +5909,13 @@
          */
         useW3b: true,
 
+        /*
+         * GO TO BAZAAR / GO TO MARKET open a new tab (on), or go there in this
+         * tab (off). A preference, not a safety setting: either way it is one
+         * click, one page load, and nothing is bought.
+         */
+        openInNewTab: true,
+
         /* Which list the panel shows when you are on neither market page. */
         viewTab: 'bazaar',
         collapsed: false,
@@ -5829,6 +5937,20 @@
      */
     const OWNER_REFRESH_MS = 30000;
     const OWNER_RETRY_MS = 60000;
+
+    /*
+     * Status next to each seller in the Bazaars list: the first
+     * SELLER_STATUS_MAX sellers shown, one public-profile call each, then at most
+     * once per SELLER_REFRESH_MS while they stay on the list - so a full list
+     * costs about 10 calls a minute, inside the shared 70/min budget. Only while
+     * the Bazaars list is on screen in a visible tab.
+     */
+    const SELLER_STATUS_MAX = 10;
+    const SELLER_REFRESH_MS = 60000;
+    const SELLER_RETRY_MS = 120000;
+    const SELLER_MAX_PENDING = 3;
+    /* Sellers not on the list this long are forgotten. */
+    const SELLER_FORGET_MS = 10 * 60 * 1000;
 
     /* A bazaar seen closed keeps its feed deals hidden this long (or until seen open). */
     const CLOSED_MEMORY_MS = 10 * 60 * 1000;
@@ -5866,6 +5988,8 @@
         pageRows: [],
         /* { id, presence, fetchedAt, pending, retryAt, open } for the viewed bazaar. */
         owner: null,
+        /* sellerId -> { presence, fetchedAt, pending, retryAt, listedAt } for the Bazaars list. */
+        sellers: new Map(),
         /* sellerId -> time until which their bazaar counts as closed. */
         closedSellers: new Map(),
         pageDiagnostics: null,
@@ -6353,8 +6477,9 @@
 
     /**
      * Everything the panel shows: this page, what you saw elsewhere, and the
-     * live feed. Never makes a request and never reads the DOM, so the feed can
-     * re-render it whenever another tab updates storage.
+     * live feed. Never reads the DOM, so the feed can re-render it whenever
+     * another tab updates storage. Its only requests are the rate-limited seller
+     * status lookups in updateSellerStatus().
      */
     function refreshView() {
         if (!app.panel) return;
@@ -6405,9 +6530,12 @@
         const tab = activeTab();
         const shown = tab === 'bazaar' ? bazaarRows : marketRows;
 
+        if (tab === 'bazaar') updateSellerStatus(bazaarRows, now);
+
         app.panel.render({
             rows: shown,
             tab,
+            sellerStatus: tab === 'bazaar' ? sellerStatusMap(bazaarRows, now) : null,
             counts: { bazaar: bazaarRows.length, itemmarket: marketRows.length },
             summary: summarize(shown),
             diagnostics:
@@ -6605,6 +6733,91 @@
         });
     }
 
+    /* ------------------------------------------------------------------ *
+     * Seller status on the Bazaars list
+     * ------------------------------------------------------------------ */
+
+    /** The first SELLER_STATUS_MAX distinct sellers on the list, in list order. */
+    function listedSellers(rows) {
+        const ids = [];
+        for (const r of rows) {
+            if (r.source !== SOURCE_BAZAAR || !r.sellerId) continue;
+            const id = String(r.sellerId);
+            if (!ids.includes(id)) ids.push(id);
+            if (ids.length >= SELLER_STATUS_MAX) break;
+        }
+        return ids;
+    }
+
+    /**
+     * Look up the public status of the sellers on the Bazaars list, when due.
+     * The viewed bazaar's owner is skipped: updateOwner() already has it.
+     */
+    function updateSellerStatus(rows, now) {
+        for (const [id, s] of app.sellers) {
+            if (!s.pending && now - s.listedAt > SELLER_FORGET_MS) app.sellers.delete(id);
+        }
+
+        const ids = listedSellers(rows);
+        for (const id of ids) {
+            if (!app.sellers.has(id)) {
+                app.sellers.set(id, { presence: null, fetchedAt: 0, pending: false, retryAt: 0, listedAt: now });
+            }
+            app.sellers.get(id).listedAt = now;
+        }
+
+        if (!app.client || !hasUsableKey()) return;
+        if (document.visibilityState !== 'visible' || app.panel.collapsed) return;
+
+        let pending = 0;
+        for (const s of app.sellers.values()) if (s.pending) pending++;
+
+        const ownerId = app.owner && app.owner.id;
+        for (const id of ids) {
+            if (pending >= SELLER_MAX_PENDING) break;
+            if (id === ownerId) continue;
+
+            const s = app.sellers.get(id);
+            if (s.pending || now < s.retryAt || now - s.fetchedAt < SELLER_REFRESH_MS) continue;
+
+            pending++;
+            s.pending = true;
+            fetchUserPresence(app.client, id)
+                .then((presence) => {
+                    s.fetchedAt = Date.now();
+                    if (presence) s.presence = presence;
+                    else s.retryAt = Date.now() + SELLER_RETRY_MS;
+                })
+                .catch((error) => {
+                    if (isKeyDeadError(error)) markKeyDead(error);
+                    s.retryAt = Date.now() + SELLER_RETRY_MS;
+                })
+                .finally(() => {
+                    s.pending = false;
+                    refreshView();
+                });
+        }
+    }
+
+    /** sellerId -> { name, level, text, title } for every seller whose status is known. */
+    function sellerStatusMap(rows, now) {
+        const out = new Map();
+        for (const r of rows) {
+            if (r.source !== SOURCE_BAZAAR || !r.sellerId) continue;
+            const id = String(r.sellerId);
+            if (out.has(id)) continue;
+
+            const presence =
+                app.owner && app.owner.id === id && app.owner.presence
+                    ? app.owner.presence
+                    : app.sellers.has(id) && app.sellers.get(id).presence;
+            if (!presence) continue;
+
+            out.set(id, { name: presence.name, ...presenceShort(presence, now) });
+        }
+        return out;
+    }
+
     /**
      * The small Scan button: re-read this page now. No requests - just the DOM
      * already on screen - so it can be pressed freely. Always animates, so a
@@ -6713,17 +6926,26 @@
         }
 
         if (row.url) {
-            gmOpenTab(row.url);
+            openDeal(row.url);
             return;
         }
 
         // A bazaar sighting goes back to that bazaar, not to the Item Market.
         if (row.source === SOURCE_BAZAAR && row.sellerId) {
-            gmOpenTab(bazaarUrl(row.sellerId, row.itemId, row.profit.listingPrice));
+            openDeal(bazaarUrl(row.sellerId, row.itemId, row.profit.listingPrice));
             return;
         }
 
-        gmOpenTab(itemMarketUrl(row.itemId, row.name));
+        openDeal(itemMarketUrl(row.itemId, row.name));
+    }
+
+    /** A new tab, or this one - Settings -> "Open deals in a new tab". */
+    function openDeal(url) {
+        if (app.settings.openInNewTab !== false) {
+            gmOpenTab(url);
+            return;
+        }
+        location.assign(url);
     }
 
     function onSettingsChange(partial) {

@@ -94,6 +94,13 @@ scrolls to it when it is on the page you are viewing. Nothing is ever bought for
   One public-profile call when you open it, then at most every 30 s while you
   stay. If the banner says the bazaar is **closed**, its listings are not shown
   as deals, here or in the feed, until it is seen open again.
+- **Seller status on every bazaar deal:** each row in the Bazaars list shows the
+  owner's status right after their name (*Bazaar - Garrett89 ● Offline 3h ago ·
+  Traveling*; hover for the full line), so you know whether they are around
+  before you click. One public-profile call per seller for the first 10 sellers
+  on the list, then at most once a minute each - about 10 calls a minute for a
+  full list, inside the shared budget - and only while the Bazaars list is on
+  screen in a visible tab.
 - **Status line:** this list's deals and total on the left; on the right whether
   the feed is live and when it next refreshes (hover for the last error).
 - **Sell to** chips, always visible - one click each:
@@ -104,7 +111,9 @@ scrolls to it when it is on the page you are viewing. Nothing is ever bought for
   - **Min** and **Cash** chips: click to type a minimum total profit or the cash
     you have; Enter saves, Esc cancels.
 - **Settings** replaces the list (← Back or Esc returns): the API key with Torn's
-  key-use disclosure, and the live feed switches. That is all.
+  key-use disclosure, the live feed switches, and **Open deals in a new tab**
+  (on by default; untick it and GO TO BAZAAR / GO TO MARKET open in the tab
+  you are in).
 - **Tampermonkey menu** (maintenance, out of the way): Open settings, Re-download
   item data, Reset panel position, Show scan diagnostics, Key safety.
 - An empty list always says why and offers the one button that would help.
@@ -201,7 +210,7 @@ Shown in Settings next to the key field, as Torn requires:
 
 | Data storage | Data sharing | Purpose of use | Key storage & sharing | Key access level |
 |---|---|---|---|---|
-| Only locally | Nobody | Competitive advantage: finding Bazaar and Item Market listings below NPC / market value | Stored locally / Not shared | Public (torn: items, cityshops; market: itemmarket; key: info; user: profile - only the viewed bazaar owner's public online status) |
+| Only locally | Nobody | Competitive advantage: finding Bazaar and Item Market listings below NPC / market value | Stored locally / Not shared | Public (torn: items, cityshops; market: itemmarket; key: info; user: profile - bazaar owners' public online status, for the bazaar you view and the sellers on the Bazaars list) |
 
 Plus a line naming the automatic integration: *TornW3B (weav3r.dev), for bazaar
 prices; receives item ids only, never the key* - with a link to its terms beside

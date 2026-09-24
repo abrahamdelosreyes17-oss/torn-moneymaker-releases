@@ -64,6 +64,7 @@ import {
     renderOwnerBadge,
     removeOwnerBadges,
     presenceText,
+    presenceShort,
 } from './sources/dom/owner.js';
 import { injectStyles } from './ui/styles.js';
 import { Panel, TORN_API_KEY_URL } from './ui/panel.js';
@@ -124,6 +125,13 @@ const DEFAULT_SETTINGS = {
      */
     useW3b: true,
 
+    /*
+     * GO TO BAZAAR / GO TO MARKET open a new tab (on), or go there in this
+     * tab (off). A preference, not a safety setting: either way it is one
+     * click, one page load, and nothing is bought.
+     */
+    openInNewTab: true,
+
     /* Which list the panel shows when you are on neither market page. */
     viewTab: 'bazaar',
     collapsed: false,
@@ -145,6 +153,20 @@ const RESCAN_DEBOUNCE_MS = 400;
  */
 const OWNER_REFRESH_MS = 30000;
 const OWNER_RETRY_MS = 60000;
+
+/*
+ * Status next to each seller in the Bazaars list: the first
+ * SELLER_STATUS_MAX sellers shown, one public-profile call each, then at most
+ * once per SELLER_REFRESH_MS while they stay on the list - so a full list
+ * costs about 10 calls a minute, inside the shared 70/min budget. Only while
+ * the Bazaars list is on screen in a visible tab.
+ */
+const SELLER_STATUS_MAX = 10;
+const SELLER_REFRESH_MS = 60000;
+const SELLER_RETRY_MS = 120000;
+const SELLER_MAX_PENDING = 3;
+/* Sellers not on the list this long are forgotten. */
+const SELLER_FORGET_MS = 10 * 60 * 1000;
 
 /* A bazaar seen closed keeps its feed deals hidden this long (or until seen open). */
 const CLOSED_MEMORY_MS = 10 * 60 * 1000;
@@ -182,6 +204,8 @@ const app = {
     pageRows: [],
     /* { id, presence, fetchedAt, pending, retryAt, open } for the viewed bazaar. */
     owner: null,
+    /* sellerId -> { presence, fetchedAt, pending, retryAt, listedAt } for the Bazaars list. */
+    sellers: new Map(),
     /* sellerId -> time until which their bazaar counts as closed. */
     closedSellers: new Map(),
     pageDiagnostics: null,
@@ -669,8 +693,9 @@ function showBazaarTarget(listings) {
 
 /**
  * Everything the panel shows: this page, what you saw elsewhere, and the
- * live feed. Never makes a request and never reads the DOM, so the feed can
- * re-render it whenever another tab updates storage.
+ * live feed. Never reads the DOM, so the feed can re-render it whenever
+ * another tab updates storage. Its only requests are the rate-limited seller
+ * status lookups in updateSellerStatus().
  */
 function refreshView() {
     if (!app.panel) return;
@@ -721,9 +746,12 @@ function refreshView() {
     const tab = activeTab();
     const shown = tab === 'bazaar' ? bazaarRows : marketRows;
 
+    if (tab === 'bazaar') updateSellerStatus(bazaarRows, now);
+
     app.panel.render({
         rows: shown,
         tab,
+        sellerStatus: tab === 'bazaar' ? sellerStatusMap(bazaarRows, now) : null,
         counts: { bazaar: bazaarRows.length, itemmarket: marketRows.length },
         summary: summarize(shown),
         diagnostics:
@@ -921,6 +949,91 @@ function paintOwner(now) {
     });
 }
 
+/* ------------------------------------------------------------------ *
+ * Seller status on the Bazaars list
+ * ------------------------------------------------------------------ */
+
+/** The first SELLER_STATUS_MAX distinct sellers on the list, in list order. */
+function listedSellers(rows) {
+    const ids = [];
+    for (const r of rows) {
+        if (r.source !== SOURCE_BAZAAR || !r.sellerId) continue;
+        const id = String(r.sellerId);
+        if (!ids.includes(id)) ids.push(id);
+        if (ids.length >= SELLER_STATUS_MAX) break;
+    }
+    return ids;
+}
+
+/**
+ * Look up the public status of the sellers on the Bazaars list, when due.
+ * The viewed bazaar's owner is skipped: updateOwner() already has it.
+ */
+function updateSellerStatus(rows, now) {
+    for (const [id, s] of app.sellers) {
+        if (!s.pending && now - s.listedAt > SELLER_FORGET_MS) app.sellers.delete(id);
+    }
+
+    const ids = listedSellers(rows);
+    for (const id of ids) {
+        if (!app.sellers.has(id)) {
+            app.sellers.set(id, { presence: null, fetchedAt: 0, pending: false, retryAt: 0, listedAt: now });
+        }
+        app.sellers.get(id).listedAt = now;
+    }
+
+    if (!app.client || !hasUsableKey()) return;
+    if (document.visibilityState !== 'visible' || app.panel.collapsed) return;
+
+    let pending = 0;
+    for (const s of app.sellers.values()) if (s.pending) pending++;
+
+    const ownerId = app.owner && app.owner.id;
+    for (const id of ids) {
+        if (pending >= SELLER_MAX_PENDING) break;
+        if (id === ownerId) continue;
+
+        const s = app.sellers.get(id);
+        if (s.pending || now < s.retryAt || now - s.fetchedAt < SELLER_REFRESH_MS) continue;
+
+        pending++;
+        s.pending = true;
+        fetchUserPresence(app.client, id)
+            .then((presence) => {
+                s.fetchedAt = Date.now();
+                if (presence) s.presence = presence;
+                else s.retryAt = Date.now() + SELLER_RETRY_MS;
+            })
+            .catch((error) => {
+                if (isKeyDeadError(error)) markKeyDead(error);
+                s.retryAt = Date.now() + SELLER_RETRY_MS;
+            })
+            .finally(() => {
+                s.pending = false;
+                refreshView();
+            });
+    }
+}
+
+/** sellerId -> { name, level, text, title } for every seller whose status is known. */
+function sellerStatusMap(rows, now) {
+    const out = new Map();
+    for (const r of rows) {
+        if (r.source !== SOURCE_BAZAAR || !r.sellerId) continue;
+        const id = String(r.sellerId);
+        if (out.has(id)) continue;
+
+        const presence =
+            app.owner && app.owner.id === id && app.owner.presence
+                ? app.owner.presence
+                : app.sellers.has(id) && app.sellers.get(id).presence;
+        if (!presence) continue;
+
+        out.set(id, { name: presence.name, ...presenceShort(presence, now) });
+    }
+    return out;
+}
+
 /**
  * The small Scan button: re-read this page now. No requests - just the DOM
  * already on screen - so it can be pressed freely. Always animates, so a
@@ -1029,17 +1142,26 @@ function onNavigate(row) {
     }
 
     if (row.url) {
-        gmOpenTab(row.url);
+        openDeal(row.url);
         return;
     }
 
     // A bazaar sighting goes back to that bazaar, not to the Item Market.
     if (row.source === SOURCE_BAZAAR && row.sellerId) {
-        gmOpenTab(bazaarUrl(row.sellerId, row.itemId, row.profit.listingPrice));
+        openDeal(bazaarUrl(row.sellerId, row.itemId, row.profit.listingPrice));
         return;
     }
 
-    gmOpenTab(itemMarketUrl(row.itemId, row.name));
+    openDeal(itemMarketUrl(row.itemId, row.name));
+}
+
+/** A new tab, or this one - Settings -> "Open deals in a new tab". */
+function openDeal(url) {
+    if (app.settings.openInNewTab !== false) {
+        gmOpenTab(url);
+        return;
+    }
+    location.assign(url);
 }
 
 function onSettingsChange(partial) {

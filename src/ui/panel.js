@@ -363,14 +363,18 @@ export class Panel {
         const settings = this.page === 'settings';
 
         /*
-         * Keep the panel's height steady across the switch: Settings is
-         * shorter than a full list, and a panel that jumps in size on every
-         * click is the kind of jumpiness this redesign is meant to remove.
+         * Keep the panel's height steady across the switch: Settings may be
+         * shorter or taller than the list (it scrolls), and a panel that
+         * jumps in size on every click is the kind of jumpiness this
+         * redesign is meant to remove.
          */
         if (settings && !this.root.classList.contains('ttv2-on-settings')) {
-            this.root.style.minHeight = this.root.getBoundingClientRect().height + 'px';
+            const h = this.root.getBoundingClientRect().height + 'px';
+            this.root.style.minHeight = h;
+            this.root.style.height = h;
         } else if (!settings) {
             this.root.style.minHeight = '';
+            this.root.style.height = '';
         }
 
         this.root.classList.toggle('ttv2-on-settings', settings);
@@ -680,6 +684,20 @@ export class Panel {
                 ),
             ]),
         );
+
+        /* ---- links ---- */
+
+        const nt = check(
+            'openInNewTab',
+            'Open deals in a new tab',
+            el('span', {
+                class: 'ttv2-sub',
+                text: 'Untick to open GO TO BAZAAR / GO TO MARKET in this tab instead.',
+            }),
+        );
+        this.newTabInput = nt.input;
+
+        this.settingsPage.appendChild(section('Links', [nt.row]));
     }
 
     /**
@@ -699,8 +717,8 @@ export class Panel {
             [
                 'Key access level',
                 'Public (torn: items, cityshops; market: itemmarket; key: info; ' +
-                    "user: profile - only the viewed bazaar owner's public " +
-                    'online status)',
+                    "user: profile - bazaar owners' public online status, for " +
+                    'the bazaar you view and the sellers on the Bazaars list)',
             ],
             [
                 'Other services',
@@ -965,6 +983,9 @@ export class Panel {
         }
         if (this.useW3bInput && settings.useW3b !== undefined) {
             this.useW3bInput.checked = Boolean(settings.useW3b);
+        }
+        if (this.newTabInput && settings.openInNewTab !== undefined) {
+            this.newTabInput.checked = settings.openInNewTab !== false;
         }
         if (settings.collapsed !== undefined) this.setCollapsed(settings.collapsed);
         if (settings.panelPos !== undefined) this.applyPosition(settings.panelPos);
@@ -1332,26 +1353,55 @@ export class Panel {
      * "is this still there?" is the question that matters most.
      */
     sourceLine(row) {
-        const parts = [];
+        /*
+         * Two unbreakable pieces - who ("Bazaar - Name ● Offline 3h ago")
+         * and where-from/age ("via TornW3B | 42s ago") - that wrap onto a
+         * second line when the row is narrow, rather than cutting the age off.
+         */
+        const line = el('div', { class: 'ttv2-row-src' });
+        const who = el('span', { class: 'ttv2-src-part' });
 
         if (row.source === 'bazaar') {
-            parts.push('Bazaar' + (row.sellerName ? ' - ' + row.sellerName : ''));
+            // The owner's status right after their name, so you know whether
+            // they are around before you click.
+            const statuses = this.state.sellerStatus;
+            const status =
+                statuses && row.sellerId ? statuses.get(String(row.sellerId)) : null;
+            const name = row.sellerName || (status && status.name) || null;
+
+            who.appendChild(document.createTextNode('Bazaar' + (name ? ' - ' + name : '')));
+            if (status) {
+                const badge = el('span', {
+                    class: 'ttv2-src-status',
+                    title: (name ? name + ': ' : '') + status.title + ' (Torn API)',
+                    text: status.text,
+                });
+                badge.dataset.level = status.level;
+                who.appendChild(badge);
+            }
         } else if (row.source === 'itemmarket') {
-            parts.push('Item Market');
+            who.textContent = 'Item Market';
         }
 
-        if (row.el) parts.push('on this page');
-        else if (row.fromFeed) parts.push(row.source === 'bazaar' ? 'via TornW3B' : 'via Torn API');
-        else if (row.fromLedger) parts.push('seen earlier');
-
-        const line = el('div', {
-            class: 'ttv2-row-src',
-            text: parts.join('  |  '),
-        });
+        const from = row.el
+            ? 'on this page'
+            : row.fromFeed
+              ? row.source === 'bazaar' ? 'via TornW3B' : 'via Torn API'
+              : row.fromLedger
+                ? 'seen earlier'
+                : '';
 
         const age = el('span', { class: 'ttv2-age' });
-        line.appendChild(document.createTextNode(parts.length ? '  |  ' : ''));
-        line.appendChild(age);
+        const where = el('span', { class: 'ttv2-src-part' }, [
+            document.createTextNode(from ? from + '  |  ' : ''),
+            age,
+        ]);
+
+        if (who.childNodes.length) {
+            line.appendChild(who);
+            line.appendChild(document.createTextNode('  |  '));
+        }
+        line.appendChild(where);
 
         if (row.fromFeed && row.dataAgeKnown === false) {
             age.title = 'TornW3B did not say when it last checked this.';

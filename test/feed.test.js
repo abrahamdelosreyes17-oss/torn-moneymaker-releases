@@ -10,7 +10,7 @@ import {
 } from '../src/api/w3b.js';
 import { TornApiClient, KEY_DEAD_CODES } from '../src/api/client.js';
 import { fetchItemMarket, fetchItems, npcSaleFromValue, parseUserPresence } from '../src/api/torn.js';
-import { agoText, presenceText } from '../src/sources/dom/owner.js';
+import { agoText, presenceText, presenceShort } from '../src/sources/dom/owner.js';
 import { buildItemIndex } from '../src/core/items.js';
 import {
     emptyFeed,
@@ -824,6 +824,21 @@ test('bazaar owner presence: v2 and v1 shapes, and the words shown', () => {
     assert.equal(agoText(now - 30_000, now), 'just now');
     assert.equal(agoText(now - 3 * 3600_000, now), '3h ago');
     assert.equal(agoText(now - 2 * 86400_000, now), '2d ago');
+});
+
+test('seller status on a deal row: short words, full words in the tooltip', () => {
+    const now = 1_800_000_000_000;
+    const away = parseUserPresence({ profile: { name: 'G', last_action: { status: 'Offline', timestamp: now / 1000 - 3 * 3600 }, status: { state: 'Traveling', description: 'Traveling to Mexico' } } });
+    assert.deepEqual(presenceShort(away, now), {
+        level: 'offline',
+        text: 'Offline 3h ago · Traveling',
+        title: 'Offline · 3h ago · Traveling to Mexico',
+    });
+
+    const here = parseUserPresence({ profile: { name: 'G', last_action: { status: 'Online', timestamp: now / 1000 }, status: { state: 'Okay', description: 'Okay' } } });
+    assert.deepEqual(presenceShort(here, now), { level: 'online', text: 'Online', title: 'Online' });
+
+    assert.equal(presenceShort(null).level, 'unknown');
 });
 
 test('TornW3B $1 bazaar listings are never offered - Torn locks $1 to a random few', () => {

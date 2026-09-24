@@ -372,6 +372,8 @@ export const PANEL_CSS = `
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+    /* Never squeezed by a long list: overflow:hidden lets flex shrink it to nothing. */
+    flex: 0 0 auto;
 }
 
 .ttv2-seller.ttv2-shown {
@@ -643,10 +645,41 @@ export const PANEL_CSS = `
 .ttv2-row-src {
     color: var(--muted);
     font-size: 10px;
-    white-space: nowrap;
+    white-space: pre-wrap;
+}
+
+/* Each part stays whole; a narrow row wraps between them. */
+.ttv2-src-part {
+    display: inline-block;
+    max-width: 100%;
+    vertical-align: top;
+    white-space: pre;
     overflow: hidden;
     text-overflow: ellipsis;
 }
+
+/* The seller's status, right after their name: "● Offline 3h ago". */
+.ttv2-src-status {
+    margin-left: 5px;
+    font-weight: bold;
+    color: #aaa;
+}
+
+.ttv2-src-status::before {
+    content: "";
+    display: inline-block;
+    width: 7px;
+    height: 7px;
+    margin-right: 3px;
+    border-radius: 50%;
+    background: #777;
+    vertical-align: 0;
+}
+
+.ttv2-src-status[data-level="online"] { color: var(--green); }
+.ttv2-src-status[data-level="online"]::before { background: var(--green); }
+.ttv2-src-status[data-level="idle"] { color: var(--amber); }
+.ttv2-src-status[data-level="idle"]::before { background: var(--amber); }
 
 .ttv2-row-prices {
     color: #bbb;

@@ -76,6 +76,24 @@ export function presenceText(presence, now = Date.now()) {
     return { level, text: parts.join(' · ') };
 }
 
+/**
+ * The short form for a deal row, where space is tight: "Offline 3h ago",
+ * "Online · Hospital". The full presenceText() goes in the tooltip.
+ * @returns {{level: string, text: string, title: string}}
+ */
+export function presenceShort(presence, now = Date.now()) {
+    const full = presenceText(presence, now);
+    if (full.level === 'unknown') return { ...full, title: full.text };
+
+    let text = presence.online;
+    if (presence.online !== 'Online' && presence.lastActionAt) {
+        text += ' ' + agoText(presence.lastActionAt, now);
+    }
+    if (presence.state && presence.state !== 'Okay') text += ' · ' + presence.state;
+
+    return { level: full.level, text, title: full.text };
+}
+
 /** Put (or refresh) the badge after the owner's name. Returns true if shown. */
 export function renderOwnerBadge(root, ownerId, presence, now = Date.now()) {
     const link = findOwnerLink(root, ownerId);
