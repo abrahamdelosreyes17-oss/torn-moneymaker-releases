@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      3.2.0
+// @version      3.2.1
 // @description  Finds Bazaar and Item Market listings below NPC / market value - on the page you are viewing, and live from the Torn API and TornW3B - ranked by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -37,7 +37,7 @@
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '3.2.0';
+    const TTV2_BUILD_VERSION = '3.2.1';
 
     /* ===== src/platform/gm.js ===== */
     /*
@@ -2872,7 +2872,15 @@
 
     const UI_PREFIX = 'ttv2';
 
-    const STYLE_CSS = `
+    /*
+     * Two stylesheets, deliberately apart.
+     *
+     * PAGE_CSS marks Torn's own item cards, so it must live in the page.
+     * PANEL_CSS styles the panel, which lives in a shadow root: Torn's page CSS
+     * cannot reach in (it had been restyling our headings to giant type), and
+     * ours cannot leak out.
+     */
+    const PAGE_CSS = `
     .ttv2-hit {
         position: relative !important;
 
@@ -2951,6 +2959,13 @@
         box-shadow:
             inset 0 0 0 3px #7ee08f,
             inset 0 0 0 9999px rgba(126, 224, 143, 0.24) !important;
+    }
+    `;
+
+    const PANEL_CSS = `
+    /* Nothing from the page is inherited into the panel. */
+    :host {
+        all: initial;
     }
 
     /*
@@ -3380,16 +3395,23 @@
     }
     `;
 
-    /** Inject the stylesheet once. */
+    /** Inject the page (card marker) stylesheet once. */
     function injectStyles(doc = document) {
         const id = UI_PREFIX + '-styles';
         if (doc.getElementById(id)) return;
 
         const style = doc.createElement('style');
         style.id = id;
-        style.textContent = STYLE_CSS;
+        style.textContent = PAGE_CSS;
 
         (doc.head || doc.documentElement).appendChild(style);
+    }
+
+    /** A <style> for the panel's shadow root. */
+    function panelStyleElement(doc = document) {
+        const style = doc.createElement('style');
+        style.textContent = PANEL_CSS;
+        return style;
     }
 
     /* ===== src/ui/panel.js ===== */
@@ -3409,6 +3431,7 @@
      * All text goes in through textContent. Item names and shop names come from
      * Torn's data and are never interpolated into innerHTML.
      */
+
 
 
 
@@ -3647,7 +3670,18 @@
             this.root = el('div', { class: 'ttv2-panel' }, [head, this.bodyEl]);
 
             this.enableDrag(head);
-            parent.appendChild(this.root);
+
+            /*
+             * The panel lives in a shadow root. Torn's stylesheet cannot reach
+             * into it - it had been turning our section headings into giant
+             * type - and nothing of ours leaks onto Torn's page.
+             */
+            this.host = document.createElement('div');
+            this.host.id = 'ttv2-host';
+            this.shadow = this.host.attachShadow({ mode: 'open' });
+            this.shadow.appendChild(panelStyleElement(document));
+            this.shadow.appendChild(this.root);
+            parent.appendChild(this.host);
 
             // Every second: row ages are the "is this still there?" signal.
             this.ticker = setInterval(() => this.refreshAges(), 1000);
@@ -4540,8 +4574,8 @@
 
         destroy() {
             if (this.ticker) clearInterval(this.ticker);
-            if (this.root && this.root.parentNode) {
-                this.root.parentNode.removeChild(this.root);
+            if (this.host && this.host.parentNode) {
+                this.host.parentNode.removeChild(this.host);
             }
             this.root = null;
         }

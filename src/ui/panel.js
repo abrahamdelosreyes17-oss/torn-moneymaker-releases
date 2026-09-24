@@ -23,6 +23,7 @@ import {
 } from '../core/parse.js';
 import { VENUE_LABELS } from '../core/profit.js';
 import { W3B_TERMS_URL, W3B_SITE_URL } from '../api/w3b.js';
+import { panelStyleElement } from './styles.js';
 
 /** Rows fade once the scan behind them is older than this. */
 export const PANEL_STALE_MS = 60000;
@@ -257,7 +258,18 @@ export class Panel {
         this.root = el('div', { class: 'ttv2-panel' }, [head, this.bodyEl]);
 
         this.enableDrag(head);
-        parent.appendChild(this.root);
+
+        /*
+         * The panel lives in a shadow root. Torn's stylesheet cannot reach
+         * into it - it had been turning our section headings into giant
+         * type - and nothing of ours leaks onto Torn's page.
+         */
+        this.host = document.createElement('div');
+        this.host.id = 'ttv2-host';
+        this.shadow = this.host.attachShadow({ mode: 'open' });
+        this.shadow.appendChild(panelStyleElement(document));
+        this.shadow.appendChild(this.root);
+        parent.appendChild(this.host);
 
         // Every second: row ages are the "is this still there?" signal.
         this.ticker = setInterval(() => this.refreshAges(), 1000);
@@ -1150,8 +1162,8 @@ export class Panel {
 
     destroy() {
         if (this.ticker) clearInterval(this.ticker);
-        if (this.root && this.root.parentNode) {
-            this.root.parentNode.removeChild(this.root);
+        if (this.host && this.host.parentNode) {
+            this.host.parentNode.removeChild(this.host);
         }
         this.root = null;
     }

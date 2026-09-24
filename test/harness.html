@@ -14,17 +14,20 @@ window.onerror = (m) => { document.getElementById('out').textContent = 'BOOT ERR
 </script>
 <script src="../torn-moneymaker.user.js"></script>
 <script>
+// The panel is in a shadow root; look inside it.
+const $p = (sel) => (document.getElementById('ttv2-host') || {}).shadowRoot?.querySelector(sel);
+const $$p = (sel) => [...((document.getElementById('ttv2-host') || {}).shadowRoot?.querySelectorAll(sel) || [])];
 setTimeout(() => {
-  const p = document.querySelector('.ttv2-panel');
+  const p = $p('.ttv2-panel');
   const out = document.getElementById('out');
   if (out.textContent.startsWith('BOOT ERROR')) return;
   out.textContent = JSON.stringify({
     panelMounted: !!p,
-    title: (document.querySelector('.ttv2-title') || {}).textContent,
-    buttons: [...document.querySelectorAll('.ttv2-head button')].map(b => b.textContent),
-    filterControls: document.querySelectorAll('.ttv2-filters input, .ttv2-filters button').length,
-    settingsControls: document.querySelectorAll('.ttv2-settings input, .ttv2-settings button').length,
-    status: (document.querySelector('.ttv2-status') || {}).textContent,
+    title: ($p('.ttv2-title') || {}).textContent,
+    buttons: [...$$p('.ttv2-head button')].map(b => b.textContent),
+    filterControls: $$p('.ttv2-filters input, .ttv2-filters button').length,
+    settingsControls: $$p('.ttv2-settings input, .ttv2-settings button').length,
+    status: ($p('.ttv2-status') || {}).textContent,
   }, null, 1);
 }, 1200);
 </script>

@@ -13,7 +13,15 @@
 
 export const UI_PREFIX = 'ttv2';
 
-export const STYLE_CSS = `
+/*
+ * Two stylesheets, deliberately apart.
+ *
+ * PAGE_CSS marks Torn's own item cards, so it must live in the page.
+ * PANEL_CSS styles the panel, which lives in a shadow root: Torn's page CSS
+ * cannot reach in (it had been restyling our headings to giant type), and
+ * ours cannot leak out.
+ */
+export const PAGE_CSS = `
 .ttv2-hit {
     position: relative !important;
 
@@ -92,6 +100,13 @@ export const STYLE_CSS = `
     box-shadow:
         inset 0 0 0 3px #7ee08f,
         inset 0 0 0 9999px rgba(126, 224, 143, 0.24) !important;
+}
+`;
+
+export const PANEL_CSS = `
+/* Nothing from the page is inherited into the panel. */
+:host {
+    all: initial;
 }
 
 /*
@@ -521,14 +536,21 @@ export const STYLE_CSS = `
 }
 `;
 
-/** Inject the stylesheet once. */
+/** Inject the page (card marker) stylesheet once. */
 export function injectStyles(doc = document) {
     const id = UI_PREFIX + '-styles';
     if (doc.getElementById(id)) return;
 
     const style = doc.createElement('style');
     style.id = id;
-    style.textContent = STYLE_CSS;
+    style.textContent = PAGE_CSS;
 
     (doc.head || doc.documentElement).appendChild(style);
+}
+
+/** A <style> for the panel's shadow root. */
+export function panelStyleElement(doc = document) {
+    const style = doc.createElement('style');
+    style.textContent = PANEL_CSS;
+    return style;
 }

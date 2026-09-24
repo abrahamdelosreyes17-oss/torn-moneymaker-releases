@@ -101,21 +101,25 @@ window.onerror = (m) => { document.getElementById('out').textContent = 'BOOT ERR
 </script>
 <script src="../torn-moneymaker.user.js"></script>
 <script>
+// The panel is in a shadow root; look inside it.
+const $p = (sel) => (document.getElementById('ttv2-host') || {}).shadowRoot?.querySelector(sel);
+const $$p = (sel) => [...((document.getElementById('ttv2-host') || {}).shadowRoot?.querySelectorAll(sel) || [])];
 setTimeout(() => {
   const out = document.getElementById('out');
   if (out.textContent.startsWith('BOOT ERROR')) return;
-  const rows = [...document.querySelectorAll('.ttv2-row')].map(r => r.innerText.replace(/\n+/g, ' / '));
+  const rows = [...$$p('.ttv2-row')].map(r => r.innerText.replace(/\n+/g, ' / '));
   const w3b = window.__requests.filter(u => u.includes('weav3r.dev'));
   out.textContent = JSON.stringify({
-    live: (document.querySelector('.ttv2-live') || {}).textContent,
-    tabs: [...document.querySelectorAll('.ttv2-tab')].map(b => b.textContent + (b.classList.contains('ttv2-tab-on') ? ' *' : '')),
-    status: (document.querySelector('.ttv2-status') || {}).textContent,
+    live: ($p('.ttv2-live') || {}).textContent,
+    tabs: [...$$p('.ttv2-tab')].map(b => b.textContent + (b.classList.contains('ttv2-tab-on') ? ' *' : '')),
+    status: ($p('.ttv2-status') || {}).textContent,
     rows,
-    tosTable: document.querySelectorAll('.ttv2-tos tr').length,
-    keyInputValue: (document.querySelector('.ttv2-settings input') || {}).value,
+    tosTable: $$p('.ttv2-tos tr').length,
+    keyInputValue: ($p('.ttv2-settings input') || {}).value,
     requests: window.__requests.map(u => u.replace(KEY, '<KEY>')),
     keyEverSentToW3b: w3b.some(u => u.includes(KEY)),
-    naItemShown: document.body.innerText.includes('Companion Script'),
+    naItemShown: $$p('.ttv2-row').some(r => r.textContent.includes('Companion Script')),
+    rowsSeen: $$p('.ttv2-row').length,
   }, null, 1);
   window.__done = true;
 }, 12000);
