@@ -9,7 +9,7 @@ import {
     fetchW3bListings,
 } from '../src/api/w3b.js';
 import { TornApiClient, KEY_DEAD_CODES } from '../src/api/client.js';
-import { fetchItemMarket, fetchItems } from '../src/api/torn.js';
+import { fetchItemMarket, fetchItems, npcSaleFromValue } from '../src/api/torn.js';
 import { buildItemIndex } from '../src/core/items.js';
 import {
     emptyFeed,
@@ -638,28 +638,48 @@ test('the Item Market sweep covers every item, even with candidates queued', asy
     }
 });
 
-test('the item list comes from v2, where "Sell: N/A" is null', async () => {
+// Captured from the live API, 2026-09-24 (trimmed to `value`).
+const LIVE_VALUES = {
+    15: { name: 'Beretta M9', value: { vendor: { country: 'Torn', name: "Big Al's Gun Shop" }, shops: [{ country: 'Torn', shop: "Big Al's Gun Shop", buy_price: 2000, sell_price: 1300 }], buy_price: 2000, sell_price: 1300, market_price: 1066 } },
+    181: { name: 'Bottle of Champagne', value: { vendor: { country: 'Torn', name: "Bits 'n' Bobs" }, shops: [{ country: 'Torn', shop: "Bits 'n' Bobs", buy_price: 4500, sell_price: 3100 }], buy_price: 4500, sell_price: 3100, market_price: 2932 } },
+    456: { name: 'Companion Script : Ubay', value: { vendor: null, shops: [], buy_price: null, sell_price: 12000000, market_price: 0 } },
+};
+
+test('the NPC price comes from value.shops - "Sell: N/A" items have none', () => {
+    assert.deepEqual(npcSaleFromValue(LIVE_VALUES[15].value), { price: 1300, shop: "Big Al's Gun Shop" });
+    assert.deepEqual(npcSaleFromValue(LIVE_VALUES[181].value), { price: 3100, shop: "Bits 'n' Bobs" });
+
+    // sell_price says $12m; the game says N/A; shops is empty. No sale.
+    assert.deepEqual(npcSaleFromValue(LIVE_VALUES[456].value), { price: null, shop: null });
+
+    // A payload from before `shops` existed: trust the bare field only with a vendor.
+    assert.deepEqual(npcSaleFromValue({ vendor: { name: 'X' }, sell_price: 50 }), { price: 50, shop: 'X' });
+    assert.deepEqual(npcSaleFromValue({ vendor: null, sell_price: 50 }), { price: null, shop: null });
+});
+
+test('the item list comes from v2 and never prices a shop-less item for an NPC', async () => {
     const asked = [];
     const client = {
-        get: async (path, params) => {
+        get: async (path) => {
             asked.push(path);
             return {
-                items: [
-                    { id: 18, name: 'Beretta M9', type: 'Primary', value: { vendor: { name: "Big Al's Gun Shop" }, buy_price: 5600, sell_price: 3800, market_price: 3542 } },
-                    { id: 900, name: 'Companion Script : Ubay', type: 'Special', value: { vendor: null, buy_price: null, sell_price: null, market_price: 10088888 } },
-                ],
+                items: Object.entries(LIVE_VALUES).map(([id, i]) => ({ id: +id, name: i.name, type: 'Other', value: i.value })),
                 _metadata: { links: { next: null } },
             };
         },
     };
 
-    const raw = await fetchItems(client);
+    const idx = buildItemIndex(await fetchItems(client));
     assert.deepEqual(asked, ['v2/torn/items']);
 
-    const idx = buildItemIndex(raw);
-    assert.equal(idx.byId.get('18').sellPrice, 3800);
-    assert.equal(idx.byId.get('18').marketValue, 3542);
-    assert.equal(idx.byId.get('900').sellPrice, 0, 'N/A -> no NPC price');
+    assert.equal(idx.byId.get('15').sellPrice, 1300);
+    assert.equal(idx.byId.get('15').npcShopName, "Big Al's Gun Shop");
+    assert.equal(idx.byId.get('181').sellPrice, 3100);
+    assert.equal(idx.byId.get('456').sellPrice, 0);
+
+    // The exact row from the screenshot: $11,000,000 on the Item Market.
+    const c = selectCandidates([{ itemId: '456', lowestPrice: 11000000 }], idx, {});
+    assert.equal(c.length, 0, 'no NPC flip on a Sell: N/A item');
 });
 
 test('if v2 fails for a non-key reason, v1 is used instead', async () => {

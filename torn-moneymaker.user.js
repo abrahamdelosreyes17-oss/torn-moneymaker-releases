@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      3.1.0
+// @version      3.2.0
 // @description  Finds Bazaar and Item Market listings below NPC / market value - on the page you are viewing, and live from the Torn API and TornW3B - ranked by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -37,7 +37,7 @@
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '3.1.0';
+    const TTV2_BUILD_VERSION = '3.2.0';
 
     /* ===== src/platform/gm.js ===== */
     /*
@@ -198,7 +198,7 @@
      */
 
     /** Bump to invalidate every cached item database in the wild. */
-    const ITEMS_CACHE_VERSION = 'items-v3';
+    const ITEMS_CACHE_VERSION = 'items-v4';
 
     /**
      * One hour. sell_price barely moves, but market_value moves every day, and
@@ -234,8 +234,10 @@
                 name: item.name,
                 type: item.type || null,
                 buyPrice: Number(item.buy_price) || 0,
-                // 0 when there is no NPC sell price ("Sell: N/A" in game).
+                // 0 when no NPC shop buys it ("Sell: N/A" in game).
                 sellPrice: Number(item.sell_price) || 0,
+                // Which NPC shop buys it, when the item data names one.
+                npcShopName: item.npc_shop || null,
                 marketValue: Number(item.market_value) || 0,
                 circulation: Number(item.circulation) || 0,
             };
@@ -2047,6 +2049,47 @@
         return data.items;
     }
 
+    /**
+     * What an NPC shop pays for an item, and which shop - from `value.shops`.
+     *
+     * `value.sell_price` alone is NOT trustworthy. Captured live, 2026-09-24:
+     *
+     *   Beretta M9          shops: [Big Al's Gun Shop, sell 1300]  sell_price 1300
+     *   Bottle of Champagne shops: [Bits 'n' Bobs, sell 3100]      sell_price 3100
+     *   Companion Script    shops: []                              sell_price 12000000
+     *
+     * The game shows the Companion Script as "Sell: N/A" - no NPC buys it - yet
+     * the bare field says $12m, and the panel offered a $4m "NPC flip" on it.
+     * The shops list is what the game's Sell line reflects ("$3,800 (Big Al's
+     * Gun Shop)"), and it is the field Torn is moving to. So: no shop, no sale.
+     *
+     * Only if a payload predates `shops` entirely is the bare field used, and
+     * then only when a vendor is named.
+     *
+     * @returns {{price: number|null, shop: string|null}}
+     */
+    function npcSaleFromValue(value) {
+        const v = value || {};
+
+        if (Array.isArray(v.shops)) {
+            let best = null;
+            for (const s of v.shops) {
+                const price = Number(s && s.sell_price);
+                if (Number.isFinite(price) && price > 0 && (!best || price > best.price)) {
+                    best = { price, shop: (s && s.shop) || null };
+                }
+            }
+            return best || { price: null, shop: null };
+        }
+
+        const price = Number(v.sell_price);
+        if (v.vendor && Number.isFinite(price) && price > 0) {
+            return { price, shop: v.vendor.name || null };
+        }
+
+        return { price: null, shop: null };
+    }
+
     /** v2 item list -> v1-shaped map. Follows `_metadata.links.next` if paged. */
     async function fetchItemsV2(client) {
         const out = {};
@@ -2062,12 +2105,14 @@
             for (const item of data.items) {
                 if (!item || !Number.isFinite(Number(item.id))) continue;
                 const value = item.value || {};
+                const npc = npcSaleFromValue(value);
 
                 out[String(item.id)] = {
                     name: item.name,
                     type: item.type || null,
-                    // null = "N/A": no NPC buys it.
-                    sell_price: value.sell_price ?? null,
+                    // null = "Sell: N/A": no NPC shop buys it.
+                    sell_price: npc.price,
+                    npc_shop: npc.shop,
                     buy_price: value.buy_price ?? null,
                     market_value: value.market_price ?? 0,
                     circulation: item.circulation ?? 0,
@@ -4313,8 +4358,13 @@
             }
             if (p.venue === 'BAZAAR_RESALE') bits.push('resell in your bazaar, no tax');
             if (p.venue === 'ITEM_MARKET') bits.push('resell on the Item Market, after 5% tax');
-            if (p.venue === 'NPC' && row.npcShop && row.npcShop.shopName) {
-                bits.push('NPC shop: ' + row.npcShop.shopName);
+            const shopName =
+                (row.item && row.item.npcShopName) ||
+                (row.npcShop && row.npcShop.shopName) ||
+                null;
+
+            if (p.venue === 'NPC' && shopName) {
+                bits.push('sell to ' + shopName);
             } else if (p.venue === 'NPC') {
                 bits.push('sell to NPC');
             }

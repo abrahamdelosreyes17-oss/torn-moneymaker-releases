@@ -8,7 +8,7 @@
  */
 
 /** Bump to invalidate every cached item database in the wild. */
-export const ITEMS_CACHE_VERSION = 'items-v3';
+export const ITEMS_CACHE_VERSION = 'items-v4';
 
 /**
  * One hour. sell_price barely moves, but market_value moves every day, and
@@ -44,8 +44,10 @@ export function buildItemIndex(rawItems) {
             name: item.name,
             type: item.type || null,
             buyPrice: Number(item.buy_price) || 0,
-            // 0 when there is no NPC sell price ("Sell: N/A" in game).
+            // 0 when no NPC shop buys it ("Sell: N/A" in game).
             sellPrice: Number(item.sell_price) || 0,
+            // Which NPC shop buys it, when the item data names one.
+            npcShopName: item.npc_shop || null,
             marketValue: Number(item.market_value) || 0,
             circulation: Number(item.circulation) || 0,
         };

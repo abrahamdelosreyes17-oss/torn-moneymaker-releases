@@ -52,6 +52,47 @@ export async function fetchItems(client) {
     return data.items;
 }
 
+/**
+ * What an NPC shop pays for an item, and which shop - from `value.shops`.
+ *
+ * `value.sell_price` alone is NOT trustworthy. Captured live, 2026-09-24:
+ *
+ *   Beretta M9          shops: [Big Al's Gun Shop, sell 1300]  sell_price 1300
+ *   Bottle of Champagne shops: [Bits 'n' Bobs, sell 3100]      sell_price 3100
+ *   Companion Script    shops: []                              sell_price 12000000
+ *
+ * The game shows the Companion Script as "Sell: N/A" - no NPC buys it - yet
+ * the bare field says $12m, and the panel offered a $4m "NPC flip" on it.
+ * The shops list is what the game's Sell line reflects ("$3,800 (Big Al's
+ * Gun Shop)"), and it is the field Torn is moving to. So: no shop, no sale.
+ *
+ * Only if a payload predates `shops` entirely is the bare field used, and
+ * then only when a vendor is named.
+ *
+ * @returns {{price: number|null, shop: string|null}}
+ */
+export function npcSaleFromValue(value) {
+    const v = value || {};
+
+    if (Array.isArray(v.shops)) {
+        let best = null;
+        for (const s of v.shops) {
+            const price = Number(s && s.sell_price);
+            if (Number.isFinite(price) && price > 0 && (!best || price > best.price)) {
+                best = { price, shop: (s && s.shop) || null };
+            }
+        }
+        return best || { price: null, shop: null };
+    }
+
+    const price = Number(v.sell_price);
+    if (v.vendor && Number.isFinite(price) && price > 0) {
+        return { price, shop: v.vendor.name || null };
+    }
+
+    return { price: null, shop: null };
+}
+
 /** v2 item list -> v1-shaped map. Follows `_metadata.links.next` if paged. */
 export async function fetchItemsV2(client) {
     const out = {};
@@ -67,12 +108,14 @@ export async function fetchItemsV2(client) {
         for (const item of data.items) {
             if (!item || !Number.isFinite(Number(item.id))) continue;
             const value = item.value || {};
+            const npc = npcSaleFromValue(value);
 
             out[String(item.id)] = {
                 name: item.name,
                 type: item.type || null,
-                // null = "N/A": no NPC buys it.
-                sell_price: value.sell_price ?? null,
+                // null = "Sell: N/A": no NPC shop buys it.
+                sell_price: npc.price,
+                npc_shop: npc.shop,
                 buy_price: value.buy_price ?? null,
                 market_value: value.market_price ?? 0,
                 circulation: item.circulation ?? 0,

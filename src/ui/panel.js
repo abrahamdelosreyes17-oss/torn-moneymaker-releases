@@ -968,8 +968,13 @@ export class Panel {
         }
         if (p.venue === 'BAZAAR_RESALE') bits.push('resell in your bazaar, no tax');
         if (p.venue === 'ITEM_MARKET') bits.push('resell on the Item Market, after 5% tax');
-        if (p.venue === 'NPC' && row.npcShop && row.npcShop.shopName) {
-            bits.push('NPC shop: ' + row.npcShop.shopName);
+        const shopName =
+            (row.item && row.item.npcShopName) ||
+            (row.npcShop && row.npcShop.shopName) ||
+            null;
+
+        if (p.venue === 'NPC' && shopName) {
+            bits.push('sell to ' + shopName);
         } else if (p.venue === 'NPC') {
             bits.push('sell to NPC');
         }

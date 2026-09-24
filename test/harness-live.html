@@ -44,7 +44,12 @@ function respond(url) {
             // v2 shape: an array, sell_price null where the game says "Sell: N/A".
             return { items: Object.entries(ITEMS).map(([id, i]) => ({
                 id: +id, name: i.name, type: 'Other',
-                value: { vendor: null, buy_price: null, sell_price: i.sell_price, market_price: i.market_value },
+                // Real v2 shape: the NPC price lives in value.shops. The N/A
+                // item keeps a bare sell_price but has no shop - like the
+                // live Companion Script.
+                value: i.sell_price
+                    ? { vendor: { name: 'Test Shop' }, shops: [{ shop: 'Test Shop', sell_price: i.sell_price }], sell_price: i.sell_price, market_price: i.market_value }
+                    : { vendor: null, shops: [], sell_price: 12000000, market_price: i.market_value },
             })), _metadata: { links: { next: null } } };
         }
         if (u.pathname === '/torn/' && sel === 'items') return { items: ITEMS };
