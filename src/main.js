@@ -941,11 +941,16 @@ function scanSummary() {
     }
 
     const found = (app.pageDiagnostics && app.pageDiagnostics.listings) || 0;
+    const lockedOnly = (app.pageDiagnostics && app.pageDiagnostics.locked) || 0;
+    if (!found && lockedOnly) {
+        return 'Scanned: ' + lockedOnly + ' locked ($1) listing' + (lockedOnly === 1 ? '' : 's') + ' - none buyable by you.';
+    }
     if (!found) {
         return 'Scanned: no listings found on this page yet.';
     }
 
     const deals = (app.pageRows || []).length;
+    const locked = (app.pageDiagnostics && app.pageDiagnostics.locked) || 0;
     return (
         'Scanned: ' +
         found +
@@ -953,6 +958,7 @@ function scanSummary() {
         ' · ' +
         deals +
         (deals === 1 ? ' deal' : ' deals') +
+        (locked ? ' · ' + locked + ' locked (skipped)' : '') +
         ' on this page.'
     );
 }
@@ -1245,6 +1251,7 @@ function registerMenu() {
                           'parsed: ' + d.listings,
                           'skipped - item not in database: ' + d.noItem,
                           'skipped - no price: ' + d.noPrice,
+                          'skipped - locked ($1, padlocked for you): ' + (d.locked || 0),
                           'price inferred: ' + d.priceAssumed,
                           'quantity assumed: ' + d.qtyAssumed,
                       ].join('\n')

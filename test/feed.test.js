@@ -825,3 +825,12 @@ test('bazaar owner presence: v2 and v1 shapes, and the words shown', () => {
     assert.equal(agoText(now - 3 * 3600_000, now), '3h ago');
     assert.equal(agoText(now - 2 * 86400_000, now), '2d ago');
 });
+
+test('TornW3B $1 bazaar listings are never offered - Torn locks $1 to a random few', () => {
+    const rows = normalizeW3bListings([
+        { player_id: 1, price: 1, quantity: 5 },
+        { player_id: 2, price: 0.5, quantity: 1 },
+        { player_id: 3, price: 2, quantity: 1 },
+    ]);
+    assert.deepEqual(rows.map((r) => r.sellerId), ['3']);
+});

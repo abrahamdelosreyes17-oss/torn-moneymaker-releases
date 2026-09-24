@@ -114,11 +114,40 @@ function resolveItem(card, index, buy) {
     return findItemByName(index, name);
 }
 
+/*
+ * A bazaar item the viewer cannot buy: Torn's $1 "Dollar Sale" lock. A $1
+ * listing is open only to a random few percent of players (by ID); for
+ * everyone else the card shows a red padlock, rendered as an element whose
+ * class starts with isBlockedForBuying___. There is no seller-set lock, and
+ * neither the Torn API nor TornW3B carries a lock flag - the page is the only
+ * source, so the page is what is checked. Same selector TornTools uses for
+ * its identical "cheaper than the NPC" highlight.
+ *
+ * Never inferred from a missing price: a card can lack a readable price for
+ * other reasons, and that is reported as noPrice, not as locked.
+ */
+export const LOCKED_SELECTOR = '[class*="isBlockedForBuying"]';
+
+/** Is this card (or the bazaar item tile around it) locked for the viewer? */
+export function isLockedCard(card) {
+    if (!card || typeof card.querySelector !== 'function') return false;
+    if (card.matches && card.matches(LOCKED_SELECTOR)) return true;
+    if (card.querySelector(LOCKED_SELECTOR)) return true;
+
+    // The card found may be the description inside a bazaar tile, with the
+    // padlock drawn elsewhere in the tile.
+    const tile = card.closest && card.closest('[class*="item___"]');
+    return Boolean(tile && tile !== card && tile.querySelector(LOCKED_SELECTOR));
+}
+
 /**
  * Read one card.
  * @returns {object|null}
  */
 export function readCard(card, index, pageType) {
+    // Locked first: never priced, never highlighted, whatever price it shows.
+    if (isLockedCard(card)) return { skipped: 'locked' };
+
     const buyNode = card.querySelector(BUY_CONTROL_SELECTOR);
     const buy = buyNode
         ? parseBuyLabel(buyNode.getAttribute('aria-label'))
@@ -263,6 +292,7 @@ export function scanDom(pageType, root, { index } = {}) {
         fromAria: 0,
         noItem: 0,
         noPrice: 0,
+        locked: 0,
         priceAssumed: 0,
         qtyAssumed: 0,
         listings: 0,
@@ -284,6 +314,7 @@ export function scanDom(pageType, root, { index } = {}) {
         if (!result || result.skipped) {
             if (result && result.skipped === 'noItem') diagnostics.noItem += 1;
             if (result && result.skipped === 'noPrice') diagnostics.noPrice += 1;
+            if (result && result.skipped === 'locked') diagnostics.locked += 1;
             continue;
         }
 

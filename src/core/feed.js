@@ -166,6 +166,14 @@ export function normalizeW3bListings(raw) {
         if (!Number.isFinite(sellerId) || sellerId <= 0) continue;
         if (!Number.isFinite(price) || price <= 0) continue;
         if (!Number.isFinite(qty) || qty <= 0) continue;
+        /*
+         * $1 is Torn's locked "Dollar Sale" price: buyable by a random few
+         * percent of players, and the usual price of a target trade meant for
+         * one person. TornW3B cannot say which, so none are offered from the
+         * feed. (On the page itself, an unlocked $1 card IS yours to buy and
+         * is read normally.)
+         */
+        if (price <= 1) continue;
 
         rows.push({
             sellerId: String(sellerId),

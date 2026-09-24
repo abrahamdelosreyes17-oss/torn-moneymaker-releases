@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      3.4.0
+// @version      3.4.1
 // @description  Finds Bazaar and Item Market listings below NPC / market value - on the page you are viewing, and live from the Torn API and TornW3B - ranked by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -37,7 +37,7 @@
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '3.4.0';
+    const TTV2_BUILD_VERSION = '3.4.1';
 
     /* ===== src/platform/gm.js ===== */
     /*
@@ -918,6 +918,14 @@
             if (!Number.isFinite(sellerId) || sellerId <= 0) continue;
             if (!Number.isFinite(price) || price <= 0) continue;
             if (!Number.isFinite(qty) || qty <= 0) continue;
+            /*
+             * $1 is Torn's locked "Dollar Sale" price: buyable by a random few
+             * percent of players, and the usual price of a target trade meant for
+             * one person. TornW3B cannot say which, so none are offered from the
+             * feed. (On the page itself, an unlocked $1 card IS yours to buy and
+             * is read normally.)
+             */
+            if (price <= 1) continue;
 
             rows.push({
                 sellerId: String(sellerId),
@@ -2730,11 +2738,40 @@
         return findItemByName(index, name);
     }
 
+    /*
+     * A bazaar item the viewer cannot buy: Torn's $1 "Dollar Sale" lock. A $1
+     * listing is open only to a random few percent of players (by ID); for
+     * everyone else the card shows a red padlock, rendered as an element whose
+     * class starts with isBlockedForBuying___. There is no seller-set lock, and
+     * neither the Torn API nor TornW3B carries a lock flag - the page is the only
+     * source, so the page is what is checked. Same selector TornTools uses for
+     * its identical "cheaper than the NPC" highlight.
+     *
+     * Never inferred from a missing price: a card can lack a readable price for
+     * other reasons, and that is reported as noPrice, not as locked.
+     */
+    const LOCKED_SELECTOR = '[class*="isBlockedForBuying"]';
+
+    /** Is this card (or the bazaar item tile around it) locked for the viewer? */
+    function isLockedCard(card) {
+        if (!card || typeof card.querySelector !== 'function') return false;
+        if (card.matches && card.matches(LOCKED_SELECTOR)) return true;
+        if (card.querySelector(LOCKED_SELECTOR)) return true;
+
+        // The card found may be the description inside a bazaar tile, with the
+        // padlock drawn elsewhere in the tile.
+        const tile = card.closest && card.closest('[class*="item___"]');
+        return Boolean(tile && tile !== card && tile.querySelector(LOCKED_SELECTOR));
+    }
+
     /**
      * Read one card.
      * @returns {object|null}
      */
     function readCard(card, index, pageType) {
+        // Locked first: never priced, never highlighted, whatever price it shows.
+        if (isLockedCard(card)) return { skipped: 'locked' };
+
         const buyNode = card.querySelector(BUY_CONTROL_SELECTOR);
         const buy = buyNode
             ? parseBuyLabel(buyNode.getAttribute('aria-label'))
@@ -2879,6 +2916,7 @@
             fromAria: 0,
             noItem: 0,
             noPrice: 0,
+            locked: 0,
             priceAssumed: 0,
             qtyAssumed: 0,
             listings: 0,
@@ -2900,6 +2938,7 @@
             if (!result || result.skipped) {
                 if (result && result.skipped === 'noItem') diagnostics.noItem += 1;
                 if (result && result.skipped === 'noPrice') diagnostics.noPrice += 1;
+                if (result && result.skipped === 'locked') diagnostics.locked += 1;
                 continue;
             }
 
@@ -6586,11 +6625,16 @@
         }
 
         const found = (app.pageDiagnostics && app.pageDiagnostics.listings) || 0;
+        const lockedOnly = (app.pageDiagnostics && app.pageDiagnostics.locked) || 0;
+        if (!found && lockedOnly) {
+            return 'Scanned: ' + lockedOnly + ' locked ($1) listing' + (lockedOnly === 1 ? '' : 's') + ' - none buyable by you.';
+        }
         if (!found) {
             return 'Scanned: no listings found on this page yet.';
         }
 
         const deals = (app.pageRows || []).length;
+        const locked = (app.pageDiagnostics && app.pageDiagnostics.locked) || 0;
         return (
             'Scanned: ' +
             found +
@@ -6598,6 +6642,7 @@
             ' · ' +
             deals +
             (deals === 1 ? ' deal' : ' deals') +
+            (locked ? ' · ' + locked + ' locked (skipped)' : '') +
             ' on this page.'
         );
     }
@@ -6890,6 +6935,7 @@
                               'parsed: ' + d.listings,
                               'skipped - item not in database: ' + d.noItem,
                               'skipped - no price: ' + d.noPrice,
+                              'skipped - locked ($1, padlocked for you): ' + (d.locked || 0),
                               'price inferred: ' + d.priceAssumed,
                               'quantity assumed: ' + d.qtyAssumed,
                           ].join('\n')

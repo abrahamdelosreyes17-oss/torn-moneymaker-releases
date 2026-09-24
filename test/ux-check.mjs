@@ -167,6 +167,30 @@ ok(caught, 'new page auto-scanned (with animation) within ~1s of its listings dr
 await p.waitForTimeout(900);
 await q(p, 'button.ttv2-scan').click();
 ok(/Scanned: \d+ listing/.test(await txt(p, '.ttv2-bar-left')), 'Scan on a market page counts listings: ' + (await txt(p, '.ttv2-bar-left')));
+
+// A padlocked ($1 Dollar Sale) card is skipped outright - never priced,
+// never highlighted - even though its price is far below the NPC price.
+// Control: an identical UNLOCKED card at that price is highlighted.
+const beforeLock = await txt(p, '.ttv2-bar-left');
+const nBefore = Number((beforeLock.match(/Scanned: (\d+) listing/) || [])[1]);
+await p.evaluate(() => {
+  const make = (id, locked) => {
+    const tile = document.querySelector('#fake-market .itemTile___gJeSo').cloneNode(true);
+    tile.id = id;
+    for (const b of tile.querySelectorAll('[aria-label^="Buy item"]')) b.setAttribute('aria-label', 'Buy item Hammer, $1, 1 in total.');
+    tile.querySelector('.price').textContent = '$1';
+    if (locked) { const l = document.createElement('span'); l.className = 'isBlockedForBuying___x1Y2z'; tile.querySelector('.actionsWrapper___t9l4N').appendChild(l); }
+    document.getElementById('fake-market').appendChild(tile);
+  };
+  make('open-tile', false);
+  make('locked-tile', true);
+});
+await q(p, 'button.ttv2-scan').click();
+const afterLock = await txt(p, '.ttv2-bar-left');
+const hit = (id) => p.evaluate((id) => { const t = document.getElementById(id); return [t, ...t.querySelectorAll('*')].some((n) => n.classList.contains('ttv2-hit') || n.hasAttribute('data-ttv2-hit')); }, id);
+ok(nBefore > 0 && new RegExp('Scanned: ' + (nBefore + 1) + ' listing.*1 locked').test(afterLock), 'locked card skipped and counted: ' + afterLock);
+ok(await hit('open-tile'), 'control: the unlocked $1 card below NPC IS highlighted');
+ok(!(await hit('locked-tile')), 'the padlocked $1 card is NOT highlighted');
 await p.screenshot({ path: sp + '/ux-scan.png' });
 
 // Bazaar owner: status badge after the name in the page banner, the same

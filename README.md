@@ -67,6 +67,13 @@ scrolls to it when it is on the page you are viewing. Nothing is ever bought for
     page contradicts is removed, and a listing on the page that a later re-check
     shows has sold is removed (and loses its highlight) - Torn's page does not
     update itself, and this script may not reload it.
+- **Locked listings are never shown.** Torn locks every **$1** bazaar item to a
+  random few percent of players; for everyone else the card shows a red padlock
+  (an `isBlockedForBuying___` element). A padlocked card is skipped before it is
+  priced, so it is never highlighted however cheap it looks. There is no
+  seller-set lock, and neither the Torn API nor TornW3B flags locked items, so
+  **TornW3B's $1 bazaar listings are never offered from the feed** - there is no
+  way to know if you could buy one. A missing price is never read as "locked".
 - **Two limits no script can get past:** TornW3B serves each answer for 60 s and
   checks each bazaar every 30 s-5 min; Torn refreshes the Item Market every 30 s.
   Every row shows its real age rather than pretending to be newer.
