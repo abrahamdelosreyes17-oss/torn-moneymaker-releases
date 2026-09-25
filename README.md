@@ -1,14 +1,14 @@
-# Torn Trading — buyer-side opportunity scanner, and a selling page
+# Torn Trading — buyer-side opportunity scanner, and a traders page
 
 Finds Bazaar and Item Market listings priced below what an NPC shop pays (or below
 market value), ranks them by the profit you could actually realize, and links you
 straight to them - from the page you are viewing, **and live from any Torn page**
 via the Torn API and, if you opt in, TornW3B's bazaar feed.
 
-Two more things, since 3.8.0: on **your own bazaar's add / manage pages** it shows
-what each item is currently going for (and what it has gone for, recorded by the
-script), and a **selling page** in its own tab lists every item you hold with the
-TornExchange trader who pays most for it.
+Two more things: on **your own bazaar's add / manage pages** it shows each item's
+**Item Market Average** with a graph, and a **traders page** in its own tab lists
+every item you hold with the trader who pays most for it - from TornExchange and
+TornW3B price lists.
 
 This is a rewrite of an earlier "NPC Arbitrage Scanner" userscript, rebuilt around
 one idea: the item card stays untouched, and every number lives in a side panel
@@ -100,25 +100,26 @@ scrolls to it when it is on the page you are viewing. Nothing is ever bought for
   One public-profile call when you open it, then at most every 30 s while you
   stay. If the banner says the bazaar is **closed**, its listings are not shown
   as deals, here or in the feed, until it is seen open again.
-- **Your own bazaar** (bazaar.php, no `userId`, `#/add` or `#/manage`): a price
-  tag after each item's name - *IM $30 · Bazaar $28* - the lowest current Item
-  Market ask (Torn API, one call per item on screen, 30 s cache) and the lowest
-  current bazaar ask (TornW3B's one-call summary, which the watcher already has).
-  The panel switches to **My bazaar**: every item found, and for the selected one
-  the averages over the past 1 hour, 6 hours, 24 hours, 7 days and 30 days, with a
-  graph. **No API publishes price or sale history for ordinary items**, so those
-  averages are of asking prices *this script recorded itself, from the moment it
-  was installed* - 5-minute points for 24 h, hourly for 7 days, 6-hourly for 30 -
-  and every window says how much of it is actually covered ("Recorded 8%"); a
-  window with nothing recorded says *no data* rather than a number. Torn's market
-  value (the daily average of actual sales) is the one sale-based line. The
-  hash changes without a page load, so the tags follow `#/add` ↔ `#/manage`.
+- **Your own bazaar** (bazaar.php, no `userId`, `#/add` or `#/manage`): a tag
+  after each item's name - *Item Market Average $830,000* - Torn's market value,
+  its average of what the item actually sold for (refreshed hourly with the item
+  list). The panel switches to **My bazaar**: every item with its average, and
+  for the one picked, the average in large type over a graph (24 h / 7 d / 30 d)
+  with a price scale and time marks. The graph's two lines: the **Item Market
+  Average**, one value a day, and the **lowest listing** this script saw (one
+  Item Market call per item on screen, recorded since install - 5-minute points
+  for 24 h, hourly for 7 days, 6-hourly for 30). **No API publishes sale history
+  for ordinary items**, so this record is the script's own; hours with nothing
+  recorded are bridged with a faint dotted line, a troll listing far off the
+  scale is pinned to the edge as an arrow, and pointing at the graph reads out
+  the date, the average and the lowest price there. The hash changes without a
+  page load, so the tags follow `#/add` ↔ `#/manage`.
   Tampermonkey menu › *Show my bazaar diagnostics* says which page was detected
   and how many rows were read - the real markup has not been captured here; the
   selectors come from a working 2026 price-filler script for these pages.
-- **Sell** (the blue button; also under Settings): the selling page, always in
+- **Sell** (the blue button; also under Settings): the traders page, always in
   its own tab (`index.php?ttv2=traders`, which the script turns into the page).
-  Everything about it is its own - see *The selling page* below.
+  Everything about it is its own - see *The traders page* below.
 - **Cash and Min steer what is checked, not just what is shown.** Every item's
   cheapest bazaar price (one TornW3B summary) and value (the cached item
   database) are free, so before any request: an item you cannot afford one of,
@@ -150,7 +151,7 @@ scrolls to it when it is on the page you are viewing. Nothing is ever bought for
 - **Settings** replaces the list (← Back or Esc returns): the Public API key with
   Torn's key-use disclosure, the watching switches, and **Open deals in a new
   tab** (on by default; untick it and Go opens the listing in the tab you are
-  in). The selling page's keys are not here: it has its own settings.
+  in). The traders page's keys are not here: it has its own settings.
 - **Tampermonkey menu** (maintenance, out of the way): Open settings, Re-download
   item data, Reset panel position, Show scan diagnostics, Show my bazaar
   diagnostics, Key safety.
@@ -158,47 +159,69 @@ scrolls to it when it is on the page you are viewing. Nothing is ever bought for
 
 Item data (Sell price, Value) is refreshed hourly.
 
-### The selling page
+### The traders page
 
-"Which trader pays most for what I already hold?" Its own tab, its own keys, its
-own settings and preferences - nothing is shared with the panel except the cached
-item database (market values).
+"Which trader pays the most for what I hold?" Its own tab, its own keys, its own
+settings - nothing is shared with the panel except the cached item database.
+Nothing is traded, listed or clicked for you; in Torn you trade by messaging the
+trader, and every link here is one you follow yourself.
 
-- **Settings** (⚙, and where the page opens until both keys are saved):
-  - **Torn API key for this page - a Limited key.** Used only here, only to read
-    your inventory (`/v2/user/inventory`, which needs Limited access), the item
-    database when the shared cache is stale, and traders' public profiles for
-    their online status. Torn's key-use table sits beside the field. Sent to
-    `api.torn.com` and nowhere else; the same hostname assertion as the panel's
-    client. Torn error 2/13/18 stops it until a new key is saved; error 16 says
-    the key needs Limited access.
-  - **TornExchange API key** - the key from your tornexchange.com account. Sent
-    to `www.tornexchange.com` and nowhere else, never to Torn. The page refuses
-    to save a Torn key in this field.
-  - *Open links in a new tab* (on by default), and *Online only* is remembered.
-- **Items** = your inventory, stacks merged by item, equipped and faction-owned
-  copies left out; cached 15 minutes (Torn caches it an hour), ↻ re-reads it.
-- **Each row**: item, quantity, **best offer** (always the highest price), the
-  trader with their online status, **market value** (Torn's daily sales average,
-  `value.market_price`), **traders avg** (the average of every TornExchange buy
-  price for the item - marked *top 3* until the full list is loaded) and
-  **total** (quantity × best offer). Best totals first; items no trader buys last.
-- **Click a row** for every trader who buys it, highest first, each with status,
-  price, total, **Profile** (their Torn profile, `profiles.php?XID=`) and
-  **TE list** (`tornexchange.com/prices/{id}/`). A trader known only by name from
-  the full list gets their id from TornExchange's active-traders list; failing
-  that, the TE list link still works by name and the status reads *unknown*.
-- **Online only** keeps only traders known to be online - still highest price
-  first - and hides items with no online buyer. Statuses come from public
-  profiles with the page's key: the best traders first, at most 20, refreshed
-  every 60 s, only while the tab is visible, inside the shared 70/min budget.
-- **TornExchange calls**: one `/api/all_best_listings` (the top three buyers of
-  every item) every 30 minutes, one `/api/active_traders` every 30 minutes, and
-  `/api/listings?item_id=` only for an item you open, kept 30 minutes. Never
-  closer than 10 s apart (at most 6 a minute against its 10), never retried on
-  their own, and a 429 waits out `retry_after`.
-- Below ~700px the table becomes stacked cards. Nothing is traded or listed for
-  you; every link is one you follow yourself.
+- **My items** first: everything in your inventory (stacks merged, equipped and
+  faction-owned copies left out), each with its **best price per item** and who
+  pays it, their online status beside the name. Items with a trader first,
+  highest price first; an item nobody buys says **No Trader Found** - but only
+  once every source has answered ("Checking…" until then, "No traders yet" when
+  no trader is known at all). A **filter** narrows it: typing *xanax* shows
+  only Xanax and its traders.
+- **All items** next: every item any known trader buys, with a **search box**,
+  50 at a time.
+- **Open an item** for every trader buying it, **highest price first**, each
+  with name, online status, price per item, and fixed link slots - **Profile**
+  (their Torn profile), **TE list** (their TornExchange price list) and
+  **W3B list** (their TornW3B price list) - so each link sits in the same place
+  on every row and the prices stay in one column.
+- **One row per trader**: a trader on both TornExchange and TornW3B shows once,
+  at the higher of their two prices, with both lists linked.
+- **Online only** keeps only traders known to be online, order unchanged.
+  Statuses come from public profiles with the page's key: open rows first, then
+  the top three for each item you hold, at most 20, refreshed every 90 s, only
+  while the tab is visible, inside the shared 70/min budget.
+- No quantities, totals or bundle maths: a price list is prices per item.
+- **Built to be read** (eye-tracking and layout research): pictures and names
+  down the left edge where the eye scans first, the answer (best price) as the
+  largest, brightest figure in one right-aligned column of tabular numbers, who
+  pays it right beneath it, colour only where it means something (green = best
+  price / online, blue = link), whole rows as click targets, and a list's order
+  frozen while the pointer is over it so a row never moves under a click.
+
+**Where traders come from - our own trader database.** Traders publish buy
+prices in two places, and TornW3B has no list of its traders, so the script
+keeps its own:
+- every active **TornExchange** trader (`/api/active_traders`, with ids), and
+  the top three buyers of every item (`/api/all_best_listings`, every 10 min);
+- every trader a **TornW3B** page you open links to (`/pricelist/{id}` links:
+  its Highest Rated and Most Trades lists, Search Deals). On weav3r.dev the
+  script only reads the page you are on, sends nothing and changes nothing;
+- each known trader's **TornW3B price list** (`/api/pricelist/{id}`, no key) is
+  read one at a time, at most 24 a minute: never-read lists first, then lists
+  of traders who buy something you hold (every 10 min), then the rest (hourly);
+  a trader with no list is checked again daily. A list older than 6 hours is
+  not shown.
+
+**Settings** (⚙, and where the page opens until the Limited key is saved):
+- **Torn API key - a Limited key.** Used only here: your inventory
+  (`/v2/user/inventory`), the item database when the shared cache is stale, and
+  traders' public profiles. Torn's key-use table sits beside the field. Sent to
+  `api.torn.com` only. Error 2/13/18 stops it until a new key is saved; error 16
+  says the key needs Limited access.
+- **TornExchange** - TornExchange's API key *is* the Torn key you log into
+  tornexchange.com with (it checks `?key=` against the key you logged in with),
+  so it is often your Limited key: *Use my Limited key* fills it in. It goes to
+  `www.tornexchange.com` only, which already has it. Calls are at least 10 s
+  apart (6 a minute against its 10 per IP), never retried on their own, shared
+  by every tab, and a 429 waits out `retry_after`; saving or forgetting the key
+  never resets that wait.
+- *Open links in a new tab* (on by default); *Online only* is remembered.
 
 ---
 
@@ -216,8 +239,9 @@ src/
                  order, and the two-way correction between the page and the feed
     leader.js    which tab runs the feed (one, visible)
     inventory.js your inventory: parsing, merging stacks, cache
-    selling.js   the selling page: offers highest-first, online filter,
-                 traders' average, merging TornExchange's lists
+    selling.js   the traders page: TornExchange caches and timing
+    traders.js   our trader database (TornExchange + TornW3B), one row per
+                 trader per item, highest first, which price list to read next
     history.js   the price history the script records (buckets, averages,
                  coverage)
   feed/
@@ -227,16 +251,18 @@ src/
                  queue shared by every tab, dedup, backoff, dead-key detection
     torn.js      endpoint wrappers (items, shops, key access, item market,
                  profiles, inventory)
-    w3b.js       TornW3B client: weav3r.dev only, never holds the key
-    te.js        TornExchange client: tornexchange.com only, its own key
+    w3b.js       TornW3B client: weav3r.dev only, never holds a key;
+                 bazaar prices and traders' price lists
+    te.js        TornExchange client: tornexchange.com only, with the key
+                 you log into TornExchange with
   sources/
     route.js     which Torn page are we on
     dom/         reading listings (and your own bazaar's rows) out of the
                  page being viewed
   ui/
     panel.js     the ranked list, My bazaar, settings
-    selling-page.js  the selling page (its own tab)
-    graph.js     the recorded-price graph (SVG)
+    selling-page.js  the traders page (its own tab)
+    graph.js     the add-page graph: scale, gaps, outliers, hover readout
     overlay.js   row marking
     styles.js    all CSS and the colour tokens
   platform/
@@ -274,9 +300,11 @@ them.
    `torn.com` anywhere — only `api.torn.com` (from `src/api/client.js`),
    `weav3r.dev` (from `src/api/w3b.js`) and `www.tornexchange.com` (from
    `src/api/te.js`). Do not add page scraping, and do not
-   "verify" a listing by loading a bazaar in a hidden tab or iframe.
+   "verify" a listing by loading a bazaar in a hidden tab or iframe. On
+   weav3r.dev (not a Torn page) the script only reads the page you opened for
+   the traders it links to; it sends nothing from there.
 3. **Public API key only for the panel.** Nothing the panel does needs more. The
-   selling page keeps a **separate Limited key**, used only there and only for
+   traders page keeps a **separate Limited key**, used only there and only for
    your own inventory, the item database and public profiles - the selections
    its disclosure table names. Neither key is ever used for the other's job.
 4. **Rate-limit everything.** All Torn API calls pass through one queue capped at
@@ -289,16 +317,19 @@ them.
    or another window". The feed runs only in a visible tab (a hidden leader steps
    down), and results appear only in the panel: no notifications, sounds or title
    flashing. Do not add them.
-7. **Third parties are disclosed, and never get a Torn key.** TornW3B is on by
+7. **Third parties are disclosed, and never get a key they do not already have.** TornW3B is on by
    default, which Torn's API ToS allows for an automatic integration when the
    tool's own terms cover it: Settings names it, says it receives item ids only,
    and links its terms, and the Bazaars list credits it. Unticking it stops every
    request to it. Only item ids are sent; never a key.
-   **TornExchange** is used only by the selling page, only with the TornExchange
-   API key from the user's own tornexchange.com account, saved in that page's
-   settings. That key goes to `www.tornexchange.com` (asserted on the resolved
-   hostname) and nowhere else; no Torn key ever goes there (the page refuses to
-   save one in that field). At most 6 calls a minute, never retried on their
+   The traders page reads traders' public TornW3B price lists the same way: no
+   key, only the trader's id in the path.
+   **TornExchange** is used only by the traders page. Its API key *is* the Torn
+   key the user logs into tornexchange.com with (TornExchange checks `?key=`
+   against it), so that key - often the same Limited key - is sent to
+   `www.tornexchange.com` (asserted on the resolved hostname) and nowhere else,
+   which already holds it. (3.8.1 refused a Torn key there, which left the page
+   with no traders at all.) At most 6 calls a minute, never retried on their
    own, and a 429 waits out TornExchange's `retry_after`: it allows 10 requests
    a minute per IP, and every request over that doubles a penalty that reaches
    48 hours.
@@ -325,14 +356,13 @@ Plus a line naming the automatic integration: *TornW3B (weav3r.dev), for bazaar
 prices; receives item ids only, never the key* - with a link to its terms beside
 the Settings toggle and on the Bazaars list.
 
-The selling page's key (a separate table beside its own field):
+The traders page's key (a separate table beside its own field):
 
 | Data storage | Data sharing | Purpose of use | Key storage & sharing | Key access level |
 |---|---|---|---|---|
-| Only locally | Nobody | Personal gain: pricing the items you hold against traders' offers | Stored locally / Not shared | Limited (user: inventory - your own items; torn: items - market values; user: profile - traders' public online status) |
+| Only locally | Nobody | Personal gain: finding who pays most for your items | Stored locally / Not shared | Limited (user: inventory - your own items; torn: items - item names; user: profile - traders' public online status) |
 
-Plus: *TornExchange (tornexchange.com), with the separate TornExchange key entered
-below; this Torn key never goes there.*
+Plus: *TornExchange, only with the key you log in there with.*
 
 ### On the bootstrap requests
 
@@ -375,7 +405,7 @@ code flaw. These measures address both halves.
    (`src/api/w3b.js`) makes the same assertion for `weav3r.dev`, has no key
    parameter at all, and strips every query parameter except `comment`. The
    TornExchange client (`src/api/te.js`) asserts `www.tornexchange.com` and only
-   ever holds the TornExchange key. The selling page's Limited key lives in its
+   ever holds the key you log into TornExchange with. The traders page's Limited key lives in its
    own `TornApiClient` (same assertion, same shared request window). All tested.
 5. **Rate limit + backoff**, so the key cannot trip Torn's abuse detection.
 6. **No auto-actions**, so the account cannot be flagged as botting.
@@ -384,7 +414,7 @@ code flaw. These measures address both halves.
 8. **No key is left in the page.** A value in an `<input>` on torn.com is
    readable by every script on the page, so a saved key is only put into its
    field while the user has pressed *Show* - the panel's Public key and both of
-   the selling page's keys alike. Error text is redacted with `redactKey()` for
+   the traders page's keys alike. Error text is redacted with `redactKey()` for
    whichever key a client holds.
 
 ### Out of scope, deliberately
@@ -433,11 +463,11 @@ throws on load, so this is the one that catches "installed, and nothing appears"
 Torn API, TornW3B and TornExchange responses (including `/v2/user/inventory`,
 which only answers the Limited key), waits for the live feed, and prints the
 rows, every request URL, and whether a key ever reached weav3r.dev (it must
-not). With `?ttv2=traders&sellkeys=1` it boots the selling page with its keys.
+not). With `?ttv2=traders&sellkeys=1` it boots the traders page with its keys (`&sellsame=1`: the same Limited key for both; `&w3btrader=1`: a trader known only from TornW3B; `?ownbazaar=1&page=bazaar#/add`: your own add page with a week of recorded prices).
 
-`test/ux-check.mjs` clicks every control in the panel and the selling page in
+`test/ux-check.mjs` clicks every control in the panel and the traders page in
 Chromium against the built script - the cash rules, your own bazaar's add page
-(fixture rows), the selling page's table, Online only, Profile / TE list links
+(fixture rows), the traders page (same-key setup, My items / All items, filter, Online only, Profile / TE list / W3B list links)
 and where each key goes - and fails if any click does nothing visible or any
 text is under 12px (11px uppercase labels excepted). `SHOTS=<dir>` keeps the
 screenshots.

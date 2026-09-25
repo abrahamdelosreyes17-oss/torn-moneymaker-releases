@@ -382,12 +382,25 @@ export async function fetchTeActiveTraders(client) {
 }
 
 export function parseTeActiveTraders(body) {
-    const verbose = body && body.data && body.data.verbose;
     const out = new Map();
+    for (const t of parseTeActiveTraderList(body)) out.set(t.name.toLowerCase(), t.id);
+    return out;
+}
+
+/** Every active trader as {id, name}, the name as they wrote it. */
+export function parseTeActiveTraderList(body) {
+    const verbose = body && body.data && body.data.verbose;
+    const out = [];
     if (!verbose || typeof verbose !== 'object') return out;
     for (const t of Object.values(verbose)) {
         const id = String((t && t.torn_id) || '').replace(/\D/g, '');
-        if (t && typeof t.name === 'string' && t.name && id) out.set(t.name.toLowerCase(), id);
+        if (t && typeof t.name === 'string' && t.name && id) out.push({ id, name: t.name, source: 'te' });
     }
     return out;
+}
+
+/** Both forms from one call: {byName: lowercase name -> id, list: [{id, name}]}. */
+export async function fetchTeActiveTraderList(client) {
+    const body = await client.get('active_traders');
+    return { byName: parseTeActiveTraders(body), list: parseTeActiveTraderList(body) };
 }

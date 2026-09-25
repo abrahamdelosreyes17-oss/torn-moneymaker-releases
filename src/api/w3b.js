@@ -211,6 +211,30 @@ export async function fetchW3bListings(client, itemId) {
     };
 }
 
+/** A trader's price list, as a person sees it on TornW3B. */
+export function w3bPriceListUrl(traderId) {
+    return W3B_SITE_URL + '/pricelist/' + encodeURIComponent(String(traderId));
+}
+
+/**
+ * One trader's TornW3B price list: GET /api/pricelist/{tornId}, which returns
+ * [{itemId, name, buyPrice, ...}] (buyPrice 0 = not buying). A player with no
+ * list gets [] or a 404; both come back as an empty body, not an error.
+ *
+ * @returns {Promise<Array>} the raw rows (see parseW3bPriceList)
+ */
+export async function fetchW3bPriceList(client, traderId) {
+    const id = String(traderId).replace(/\D/g, '');
+    if (!id) throw new W3bError('No trader id.');
+    try {
+        const body = await client.get('pricelist/' + id);
+        return Array.isArray(body) ? body : [];
+    } catch (error) {
+        if (error && error.http === 404) return [];
+        throw error;
+    }
+}
+
 function positiveOrNull(value) {
     const n = Number(value);
     return Number.isFinite(n) && n > 0 ? n : null;

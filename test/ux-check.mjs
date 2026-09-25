@@ -347,16 +347,13 @@ const tags = await p.evaluate(() => [...document.querySelectorAll('.ttv2-bztag')
 ok(tags.length === 2, 'a price tag in each own-bazaar row: ' + JSON.stringify(tags));
 ok(await p.evaluate(() => [...document.querySelectorAll('.ttv2-bztag')].every((t) => t.previousElementSibling && t.previousElementSibling.classList.contains('name-wrap'))), 'the tag sits after the name element, not inside it');
 ok(await p.evaluate(() => [...document.querySelectorAll('#fake-own .name-wrap')].every((n) => !n.querySelector('.ttv2-bztag') && /^(Bottle of Beer x12|Xanax)$/.test(n.textContent.trim()))), 'the name element still reads as the name');
-ok(/IM \$30 · Bazaar none/.test(tags[0] || ''), 'Beer: lowest Item Market ask $30, no bazaar lists it: ' + tags[0]);
-ok(/IM \$9,999,999 · Bazaar \$840,000/.test(tags[1] || ''), 'Xanax: market $9,999,999, bazaar $840,000: ' + tags[1]);
+ok(/^Item Market Average \$55$/.test(tags[0] || ''), 'Beer: its Item Market Average: ' + tags[0]);
+ok(/^Item Market Average \$830,000$/.test(tags[1] || ''), 'Xanax: its Item Market Average, not the $9,999,999 troll listing: ' + tags[1]);
 ok(/My bazaar/.test(await txt(p, '.ttv2-title')), 'panel switches to My bazaar');
 ok((await q(p, '.ttv2-bzrow').count()) === 3, 'panel lists both items under a header');
-ok((await q(p, '.ttv2-avg tr').count()) === 6, 'averages for 1h, 6h, 24h, 7d, 30d');
-const avgText = await txt(p, '.ttv2-avg');
-ok(/1 hour.*\$30.*no data/.test(avgText.replace(/\s+/g, ' ')), 'the hour has one sample; bazaar column says no data: ' + avgText.replace(/\s+/g, ' ').slice(0, 120));
-ok((avgText.match(/no data/g) || []).length >= 5 && /24 hours\$30no data<1%7 days\$30no data1%30 days\$30no data1%/.test(avgText.replace(/\s+/g, ' ')), 'a column with nothing recorded says no data; coverage is stated per window: ' + avgText.replace(/\s+/g, ' ').slice(-60));
+ok(/Item Market Average\s*\$55/.test(await txt(p, '.ttv2-bzhero')), 'the picked item leads with its Item Market Average');
 ok((await q(p, 'svg.ttv2-graph').count()) === 1, 'a graph is drawn');
-ok(/Asking prices this script recorded/.test(await txt(p, '.ttv2-bzdetail')), 'labelled as recorded asking prices');
+ok((await q(p, '.ttv2-graph-label').count()) === 6, 'the graph has a price scale and time marks');
 // Like Torn's add page: pressing a row redraws it (the item opens for
 // pricing), which throws away anything added to it. A real mouse click on
 // the tag must still open that item - element.click() alone would skip the
@@ -372,7 +369,7 @@ await p.evaluate(() => {
 await p.locator('.ttv2-bztag').nth(1).click();
 await p.waitForTimeout(300);
 ok(/Xanax/.test(await txt(p, '.ttv2-bzdetail h3')), 'a real mouse click on a row tag opens that item, even when Torn redraws the row');
-ok(/Market value \$830,000/.test(await txt(p, '.ttv2-bzdetail')), 'market value shown as the sale-based line');
+ok(/\$830,000/.test(await txt(p, '.ttv2-bzavg')), 'Xanax: Item Market Average $830,000');
 await q(p, '.ttv2-window[aria-pressed="false"]').first().click();
 ok((await q(p, '.ttv2-window[aria-pressed="true"]').textContent()) === '7d', 'graph window switches');
 await p.screenshot({ path: sp + '/ux-own-bazaar.png' });
@@ -408,7 +405,7 @@ await p.evaluate(() => document.getElementById('fake-own')?.remove());
   const helperCalls = () => h.evaluate((n) => window.__requests.slice(n).filter((u) => /\/v2\/market\/(180|206)\/itemmarket/.test(u)), before);
   const first = await helperCalls();
   ok(first.length === 2, 'helper alone: one Item Market call per item in the first 14s: ' + first.length);
-  ok(/IM \$30/.test((await h.evaluate(() => document.querySelectorAll('.ttv2-bztag')[0].textContent))) && /IM \$9,999,999/.test((await h.evaluate(() => document.querySelectorAll('.ttv2-bztag')[1].textContent))), 'both tags priced');
+  ok(/Item Market Average \$55/.test((await h.evaluate(() => document.querySelectorAll('.ttv2-bztag')[0].textContent))) && /Item Market Average \$830,000/.test((await h.evaluate(() => document.querySelectorAll('.ttv2-bztag')[1].textContent))), 'both tags show their Item Market Average');
   await h.waitForTimeout(10000);
   const later = await helperCalls();
   ok(later.length === 2, 'helper alone: no Item Market call again while the price is fresh: ' + later.length);
@@ -446,7 +443,7 @@ await Promise.all([p.waitForURL(/torn\.com/, { timeout: 5000 }), q(p, '.ttv2-go'
 ok(/torn\.com\/bazaar\.php\?userId=\d+/.test(p.url()), 'Go with new tab off navigates this tab: ' + p.url());
 await p.close();
 
-/* ---------- The selling page: its own tab, its own keys ---------- */
+/* ---------- The traders page: its own tab, its own keys ---------- */
 {
   const t = await b.newPage({ viewport: { width: 1280, height: 900 } });
   t.on('pageerror', e => errs.push(String(e)));
@@ -454,105 +451,106 @@ await p.close();
   const stxt = async (sel) => (await s(sel).first().textContent()) || '';
 
   // No keys yet: the page opens on its settings and says what it needs.
-  await t.goto('http://localhost:8780/test/harness-live.html?ttv2=traders');
+  await t.goto('http://localhost:8780/test/harness-live.html?ttv2=traders&sellsame=1');
   await t.waitForTimeout(1500);
-  ok((await t.locator('#ttv2-sell-host').count()) === 1, 'a ?ttv2=traders tab IS the selling page');
-  ok((await t.locator('#ttv2-host').count()) === 0, 'the overlay does not draw on the selling tab');
+  ok((await t.locator('#ttv2-sell-host').count()) === 1, 'a ?ttv2=traders tab IS the traders page');
+  ok((await t.locator('#ttv2-host').count()) === 0, 'the overlay does not draw on the traders tab');
   ok(await s('.sp-settings').isVisible(), 'no keys: opens on its settings');
   const spLum = await t.locator('#ttv2-sell-host').evaluate((h) => {
-    const m = getComputedStyle(h.shadowRoot.firstElementChild.nextElementSibling || h.shadowRoot.lastElementChild).backgroundColor.match(/\d+/g).map(Number);
+    const m = getComputedStyle(h.shadowRoot.querySelector('.sp-page')).backgroundColor.match(/\d+/g).map(Number);
     return 0.2126 * m[0] + 0.7152 * m[1] + 0.0722 * m[2];
   });
-  ok(spLum < 80, 'selling page background is dark: ' + Math.round(spLum));
+  ok(spLum < 80, 'traders page background is dark: ' + Math.round(spLum));
   ok((await s('.sp-tos tr').count()) === 6, 'Torn ToS table beside the Limited key field');
-  ok(/Limited/.test(await stxt('.sp-tos')), 'ToS names Limited access and the selections used');
-  ok(/Add a Limited API key/.test(await stxt('.sp-banner')), 'banner asks for the Limited key');
+  ok(/Limited/.test(await stxt('.sp-tos')), 'ToS names Limited access');
+  ok(/Add your Limited key/.test(await stxt('.sp-banner')), 'banner asks for the Limited key');
   await t.screenshot({ path: sp + '/ux-sell-settings.png' });
-  await designCheck(t, '#ttv2-sell-host', 'selling settings');
-  // The overlay's Public key cannot read an inventory: a clear message.
-  await s('input.sp-key').first().fill('abcdefgh12345678');
+  await designCheck(t, '#ttv2-sell-host', 'traders settings');
+
+  // The same key for Torn and TornExchange (you log into TornExchange with
+  // your Limited key): accepted, and TornExchange is asked with it. 3.8.1
+  // refused this and the page showed no traders at all.
+  await s('input.sp-key').first().fill('LIMITED123456789');
   await s('input.sp-key').first().press('Enter');
-  await t.waitForTimeout(2500);
-  ok(/needs Limited access/.test(await stxt('.sp-banner')), 'a Public key: says it needs Limited access: ' + (await stxt('.sp-banner')));
+  await t.waitForTimeout(1500);
+  await s('button[title="Settings"]').click();
+  await s('.sp-link', { hasText: 'Use my Limited key' }).first().click();
+  await t.waitForTimeout(4000);
+  ok((await t.evaluate(() => JSON.parse(GM_getValue('tornTrading.v2.teKey')))) === 'LIMITED123456789', 'the Limited key is saved as the TornExchange key');
+  const teSame = await t.evaluate(() => window.__requests.filter((r) => r.includes('tornexchange.com')));
+  ok(teSame.length >= 1 && teSame.every((r) => r.includes('key=LIMITED123456789')), 'TornExchange is asked with that key: ' + teSame.length);
   await t.close();
+
+  // The overlay's Public key cannot read an inventory: a clear message.
+  const t2 = await b.newPage({ viewport: { width: 1280, height: 900 } });
+  t2.on('pageerror', e => errs.push(String(e)));
+  await t2.goto('http://localhost:8780/test/harness-live.html?ttv2=traders');
+  await t2.waitForTimeout(1500);
+  const s2 = (sel) => t2.locator('#ttv2-sell-host').locator(sel);
+  await s2('input.sp-key').first().fill('abcdefgh12345678');
+  await s2('input.sp-key').first().press('Enter');
+  await t2.waitForTimeout(2500);
+  ok(/needs Limited access/.test((await s2('.sp-banner').first().textContent()) || ''), 'a Public key: says it needs Limited access');
+  await t2.close();
 
   const u = await b.newPage({ viewport: { width: 1280, height: 900 } });
   u.on('pageerror', e => errs.push(String(e)));
   const su = (sel) => u.locator('#ttv2-sell-host').locator(sel);
   const utxt = async (sel) => (await su(sel).first().textContent()) || '';
+  const my = (sel) => su('section[aria-label="My items"]').locator(sel);
+  const all = (sel) => su('section[aria-label="All items"]').locator(sel);
   await u.goto('http://localhost:8780/test/harness-live.html?ttv2=traders&sellkeys=1');
-  await u.waitForTimeout(4000);
-  ok(await su('.sp-table').isVisible(), 'with keys: the table shows');
-  const names = await su('.sp-row .sp-item').allTextContents();
-  ok(names.length === 3 && names[0] === 'Xanax' && names[1] === 'Hammer', 'one row per held item, best offer per item first: ' + JSON.stringify(names));
-  ok((await su('.sp-seg-btn[data-sort="item"]').getAttribute('aria-pressed')) === 'true' && (await su('.sp-seg-btn[data-sort="bundle"]').getAttribute('aria-pressed')) === 'false', 'the Per item | Bundle control shows Per item active');
-  const xan = su('.sp-row').filter({ hasText: 'Xanax' }).first();
-  const xanCells = await xan.locator('td').allTextContents();
-  ok(xanCells[1] === '15', 'stacks merged: 12 + 3 Xanax, equipped Hammer left out: ' + JSON.stringify(xanCells));
-  ok(xanCells[2] === '$850,000' && /Bob/.test(xanCells[3]), 'best offer and trader: ' + xanCells[2] + ' ' + xanCells[3]);
-  ok(xanCells[4] === '$830,000', 'market value from Torn: ' + xanCells[4]);
-  ok(/\$850,000/.test(xanCells[5]) && /top 3/.test(xanCells[5]), 'traders average, marked top 3 until the full list loads: ' + xanCells[5]);
-  ok(xanCells[6] === '$12,750,000', 'total = qty x best offer: ' + xanCells[6]);
-  const ham = su('.sp-row').filter({ hasText: 'Hammer' }).first();
-  const hamCells = await ham.locator('td').allTextContents();
-  ok(hamCells[1] === '150,000' && hamCells[2] === '$115' && /Alice/.test(hamCells[3]), 'Hammer: highest offer first even from an offline trader: ' + JSON.stringify(hamCells));
-  const beerRow = su('.sp-row').filter({ hasText: 'Bottle of Beer' }).first();
-  ok(/No buyer on TE/.test(await beerRow.textContent()), 'an item no trader buys says so, last');
-  await u.waitForTimeout(3000);
-  ok(/Alice\s*Offline 2h$/.test((await ham.locator('td').allTextContents())[3]), 'trader status next to the name: ' + (await ham.locator('td').allTextContents())[3]);
-  ok(/3 items · 2 with a buyer · \$30\.00m at best offers/.test(await utxt('.sp-bar-left')), 'summary line: ' + (await utxt('.sp-bar-left')));
+  await u.waitForTimeout(1500);
+  ok(/Checking…/.test(await my('.sp-card-item').filter({ hasText: 'Bottle of Beer' }).first().textContent()), 'before every source has answered, an item says Checking…, not No Trader Found');
+  // TornExchange first, its active traders 10s later, then Carol\'s TornW3B list.
+  await u.waitForTimeout(24000);
+  const names = await my('.sp-name b').allTextContents();
+  ok(JSON.stringify(names) === JSON.stringify(['Xanax', 'Hammer', 'Bottle of Beer']), 'My items: every held item, best price first, no trader last: ' + JSON.stringify(names));
+  const xan = my('.sp-card-item').filter({ hasText: 'Xanax' }).first();
+  ok((await xan.locator('.sp-price').textContent()) === '$852,000' && /Bob/.test(await xan.locator('.sp-who').textContent()), 'Xanax: Bob, at his higher TornW3B price: ' + (await xan.locator('.sp-best').textContent()));
+  const ham = my('.sp-card-item').filter({ hasText: 'Hammer' }).first();
+  ok((await ham.locator('.sp-price').textContent()) === '$118' && /Carol/.test(await ham.locator('.sp-who').textContent()), 'Hammer: Carol, found through her TornW3B list: ' + (await ham.locator('.sp-best').textContent()));
+  ok(/No Trader Found/.test(await my('.sp-card-item').filter({ hasText: 'Bottle of Beer' }).first().textContent()), 'an item no trader buys says No Trader Found');
+  const pageText = await utxt('.sp-page');
+  ok(!/Bundle|Per item|Total|Qty|Traders avg|No buyer on TE/.test(pageText), 'no Qty, Total, Bundle or traders average');
+  const allNames = await all('.sp-name b').allTextContents();
+  ok(allNames.includes('Xanax') && allNames.includes('Hammer') && !allNames.includes('Bottle of Beer'), 'All items: every item a trader buys: ' + JSON.stringify(allNames));
+  const rights = await my('.sp-price').evaluateAll((els) => els.map((e) => Math.round(e.getBoundingClientRect().right)));
+  ok(new Set(rights).size === 1, 'best prices right-aligned in one column: ' + JSON.stringify(rights));
+  ok(/traders/.test(await utxt('.sp-bar')), 'status line counts traders and says how fresh: ' + (await utxt('.sp-bar')));
   await u.screenshot({ path: sp + '/ux-sell.png' });
-  await u.screenshot({ path: sp + '/sell-perItem.png', clip: { x: 0, y: 0, width: 1280, height: 120 } });
-  await designCheck(u, '#ttv2-sell-host', 'selling page');
-  const totals = await su('.sp-total').evaluateAll((els) => els.map((e) => Math.round(e.getBoundingClientRect().right)));
-  ok(new Set(totals).size === 1, 'totals right-aligned in one column: ' + JSON.stringify(totals));
+  await designCheck(u, '#ttv2-sell-host', 'traders page');
 
-  // Per item | Bundle: 150,000 Hammers at $115 ($17.25m) outrank one stack of Xanax ($12.75m) as a bundle.
-  await su('.sp-seg-btn[data-sort="bundle"]').click();
+  // The filter: "xan" shows only Xanax.
+  await my('.sp-filter').fill('xan');
   await u.waitForTimeout(300);
-  const bundleNames = await su('.sp-row .sp-item').allTextContents();
-  ok(bundleNames[0] === 'Hammer' && bundleNames[1] === 'Xanax', 'Bundle: qty x offer, highest first: ' + JSON.stringify(bundleNames));
-  ok((await su('.sp-seg-btn[data-sort="bundle"]').getAttribute('aria-pressed')) === 'true' && (await su('.sp-seg-btn[data-sort="item"]').getAttribute('aria-pressed')) === 'false', 'Bundle shows active');
-  ok((await u.evaluate(() => JSON.parse(GM_getValue('tornTrading.v2.sellingPage')).sortBy)) === 'bundle', 'the order is remembered in the page\'s own preferences');
-  await u.screenshot({ path: sp + '/sell-bundle.png', clip: { x: 0, y: 0, width: 1280, height: 120 } });
-  await u.setViewportSize({ width: 430, height: 800 });
-  await u.waitForTimeout(400);
-  ok(await su('.sp-seg').isVisible() && await su('.sp-toggle').isVisible(), 'the order control and Online only are on screen at 430px');
-  ok(await u.locator('#ttv2-sell-host').evaluate((h) => { const s = h.shadowRoot; const head = s.querySelector('.sp-head'); return head.scrollWidth <= head.clientWidth + 1; }), 'the header does not overflow at 430px');
-  await u.screenshot({ path: sp + '/sell-430-toggle.png', clip: { x: 0, y: 0, width: 430, height: 140 } });
-  await u.setViewportSize({ width: 1280, height: 900 });
+  ok(JSON.stringify(await my('.sp-name b').allTextContents()) === '["Xanax"]', 'filtering My items by "xan" shows only Xanax');
+  await my('.sp-filter').fill('');
   await u.waitForTimeout(300);
-  await su('.sp-seg-btn[data-sort="item"]').click();
-  await u.waitForTimeout(300);
-  ok((await su('.sp-row .sp-item').allTextContents())[0] === 'Xanax', 'Per item again: Xanax first');
 
-  // Online only: Hammer's best becomes Bob (online, $110); Xanax stays Bob.
+  // Online only: Hammer stays Carol (online); Alice (offline) drops out.
   await su('.sp-toggle').click();
   await u.waitForTimeout(500);
-  const hamOnline = await su('.sp-row').filter({ hasText: 'Hammer' }).first().locator('td').allTextContents();
-  ok(hamOnline[2] === '$110' && /Bob/.test(hamOnline[3]), 'Online only: highest ONLINE trader: ' + JSON.stringify(hamOnline));
-  ok((await su('.sp-row').count()) === 2, 'Online only hides the item with no online buyer');
+  ok((await ham.locator('.sp-price').textContent()) === '$118', 'Online only: Hammer still Carol, who is online');
   ok((await u.evaluate(() => JSON.parse(GM_getValue('tornTrading.v2.sellingPage')).onlineOnly)) === true, 'the toggle is remembered in the page\'s own preferences');
   await su('.sp-toggle').click();
   await u.waitForTimeout(300);
 
-  // Expand: every buyer, highest first, with Profile and TE list links.
-  await su('.sp-row').filter({ hasText: 'Xanax' }).first().click();
-  await u.waitForTimeout(300);
-  ok((await su('.sp-expanded').count()) === 1, 'clicking a row expands its traders');
-  let trs = await su('.sp-tr').allTextContents();
-  ok(trs.length === 1 && /Bob/.test(trs[0]), 'top-three traders shown at once');
-  await u.waitForTimeout(23000); // the TornExchange gap: active_traders, then the full list
-  trs = await su('.sp-tr').allTextContents();
-  ok(trs.length === 3 && /Bob/.test(trs[0]) && /Carol/.test(trs[1]) && /Alice/.test(trs[2]), 'full list: Bob $850k, Carol $845k, Alice $830k, highest first: ' + JSON.stringify(trs));
-  const xanAvg = (await su('.sp-row').filter({ hasText: 'Xanax' }).first().locator('td').allTextContents())[5];
-  ok(xanAvg === '$841,667', 'traders average now over all buyers: ' + xanAvg);
-  await u.waitForTimeout(2500);
-  ok(/Carol\s*Online/.test(trs[1]) || /Carol\s*Online/.test((await su('.sp-tr').allTextContents())[1]), 'a buyer from the full list got its id and status: ' + (await su('.sp-tr').allTextContents())[1]);
-  await su('.sp-tr').first().locator('a', { hasText: 'Profile' }).click();
+  // Open a row: every buyer, highest first, one row per trader, fixed link slots.
+  await xan.locator('.sp-item').click();
+  await u.waitForTimeout(12000); // the full TornExchange list, one page per 10s slot
+  const trs = await xan.locator('.sp-tr').allTextContents();
+  ok(trs.length === 3 && /Bob/.test(trs[0]) && /Carol/.test(trs[1]) && /Alice/.test(trs[2]), 'Bob $852k, Carol $845k, Alice $830k, highest first: ' + JSON.stringify(trs));
+  const bob = xan.locator('.sp-tr').first();
+  ok((await bob.locator('a').allTextContents()).join('|') === 'Profile|TE list|W3B list', 'Bob is on both sites: both price lists linked');
+  await bob.locator('a', { hasText: 'Profile' }).click();
   ok(/profiles\.php\?XID=11$/.test(await u.evaluate(() => window.__opened.at(-1))), 'Profile opens the trader\'s Torn profile');
-  await su('.sp-tr').first().locator('a', { hasText: 'TE list' }).click();
-  ok((await u.evaluate(() => window.__opened.at(-1))) === 'https://www.tornexchange.com/prices/11/', 'TE list opens their TornExchange price list');
+  await bob.locator('a', { hasText: 'TE list' }).click();
+  ok((await u.evaluate(() => window.__opened.at(-1))) === 'https://www.tornexchange.com/prices/Bob/', 'TE list opens their TornExchange price list');
+  await bob.locator('a', { hasText: 'W3B list' }).click();
+  ok((await u.evaluate(() => window.__opened.at(-1))) === 'https://weav3r.dev/pricelist/11', 'W3B list opens their TornW3B price list');
+  const chipLefts = await xan.locator('.sp-tprice').evaluateAll((els) => els.map((e) => Math.round(e.getBoundingClientRect().right)));
+  ok(new Set(chipLefts).size === 1, 'trader prices line up whatever links a trader has: ' + JSON.stringify(chipLefts));
   await u.screenshot({ path: sp + '/ux-sell-expanded.png' });
 
   // Keys go where they belong and nowhere else.
@@ -560,21 +558,21 @@ await p.close();
   const inv = reqs.filter((r) => r.includes('/v2/user/inventory'));
   ok(inv.length >= 2 && inv.every((r) => r.includes('key=LIMITED123456789')), 'inventory read with the Limited key, paged: ' + inv.length);
   ok(!reqs.some((r) => r.includes('api.torn.com') && r.includes('TEKEY')), 'the TornExchange key never goes to Torn');
-  ok(!reqs.some((r) => r.includes('tornexchange.com') && r.includes('LIMITED')), 'the Limited key never goes to TornExchange');
-  ok(!reqs.some((r) => r.includes('weav3r.dev')), 'the selling page never contacts TornW3B');
+  ok(!reqs.some((r) => r.includes('weav3r.dev') && /key=/.test(r)), 'no key ever goes to TornW3B');
+  ok(reqs.some((r) => r.includes('weav3r.dev/api/pricelist/')), 'traders\' TornW3B price lists are read');
   const teReqs = reqs.filter((r) => r.includes('tornexchange.com'));
-  ok(teReqs.length <= 4, 'few TornExchange calls: ' + teReqs.length);
+  ok(teReqs.length <= 5, 'few TornExchange calls: ' + teReqs.length);
 
-  // Narrow: stacked cards, no sideways scroll.
+  // Narrow: no sideways scroll.
   await u.setViewportSize({ width: 430, height: 800 });
   await u.waitForTimeout(400);
   const overflow = await u.locator('#ttv2-sell-host').evaluate((h) => { const m = h.shadowRoot.querySelector('.sp-main'); return m.scrollWidth - m.clientWidth; });
   ok(overflow <= 2, 'no sideways scroll at 430px: ' + overflow);
   await u.screenshot({ path: sp + '/ux-sell-430.png' });
-  await designCheck(u, '#ttv2-sell-host', 'selling page 430');
+  await designCheck(u, '#ttv2-sell-host', 'traders page 430');
   await u.setViewportSize({ width: 1280, height: 900 });
 
-  // Settings: the page's own; forgetting the TornExchange key clears traders.
+  // Settings: the page's own.
   await su('button[title="Settings"]').click();
   ok(/Saved · Limited access/.test(await utxt('.sp-keystate >> nth=0')), 'key state names the access level: ' + (await utxt('.sp-keystate >> nth=0')));
   ok(/Saved · prices/.test(await utxt('.sp-keystate >> nth=1')), 'TornExchange key state shows price age: ' + (await utxt('.sp-keystate >> nth=1')));
@@ -582,35 +580,18 @@ await p.close();
   ok((await u.evaluate(() => JSON.parse(GM_getValue('tornTrading.v2.sellingPage')).linksNewTab)) === false, 'links preference saved in the page\'s own store');
   ok((await u.evaluate(() => JSON.parse(GM_getValue('tornTrading.v2.settings') || '{}').openInNewTab)) !== false, 'the overlay\'s own setting untouched');
   await u.keyboard.press('Escape');
-  ok(await su('.sp-table').isVisible(), 'Esc leaves settings');
+  ok(await su('section[aria-label="My items"]').isVisible(), 'Esc leaves settings');
   await u.close();
 
-  // A remembered Bundle order opens in Bundle order.
-  const v = await b.newPage({ viewport: { width: 1280, height: 900 } });
-  v.on('pageerror', e => errs.push(String(e)));
-  const sv = (sel) => v.locator('#ttv2-sell-host').locator(sel);
-  await v.goto('http://localhost:8780/test/harness-live.html?ttv2=traders&sellkeys=1&sellprefs=' + encodeURIComponent(JSON.stringify({ sortBy: 'bundle' })));
-  await v.waitForTimeout(4000);
-  ok((await sv('.sp-row .sp-item').allTextContents())[0] === 'Hammer' && (await sv('.sp-seg-btn[data-sort="bundle"]').getAttribute('aria-pressed')) === 'true', 'a saved Bundle preference opens in Bundle order with Bundle active');
-  await v.close();
-
-  // Online only from the start, with slow status lookups: says it is checking,
-  // then shows the online buyers (it used to show nobody, forever).
+  // A trader known only from a TornW3B page: read, named from Torn, shown.
   const w = await b.newPage({ viewport: { width: 1280, height: 900 } });
   w.on('pageerror', e => errs.push(String(e)));
   const sw = (sel) => w.locator('#ttv2-sell-host').locator(sel);
-  await w.goto('http://localhost:8780/test/harness-live.html?ttv2=traders&sellkeys=1&slow=1&sellprefs=' + encodeURIComponent(JSON.stringify({ onlineOnly: true })));
-  let sawChecking = false;
-  let onlineRows = 0;
-  for (let i = 0; i < 200 && onlineRows === 0; i++) {
-    await w.waitForTimeout(50);
-    if ((await sw('.sp-empty').count()) && /Checking who's online/.test(await sw('.sp-empty').first().textContent())) sawChecking = true;
-    onlineRows = await sw('.sp-row').count();
-  }
-  ok(sawChecking, 'Online only while statuses load says "Checking who\'s online…"');
-  ok(onlineRows === 2, 'Online only then shows the items with an online buyer: ' + onlineRows);
-  ok((await sw('.sp-row').first().locator('td').allTextContents())[3].includes('Bob'), 'the online buyer: ' + (await sw('.sp-row').first().locator('td').allTextContents())[3]);
-  ok((await sw('.sp-toggle').getAttribute('aria-pressed')) === 'true', 'Online only shows active');
+  await w.goto('http://localhost:8780/test/harness-live.html?ttv2=traders&sellkeys=1&w3btrader=1');
+  await w.waitForTimeout(8000);
+  const beer = sw('section[aria-label="My items"] .sp-card-item').filter({ hasText: 'Bottle of Beer' }).first();
+  ok((await beer.locator('.sp-price').textContent()) === '$61', 'Bottle of Beer: bought only by a TornW3B-only trader, $61');
+  ok(!/Trader 77/.test(await beer.textContent()), 'that trader is shown by their Torn name, not an id: ' + (await beer.locator('.sp-who').textContent()));
   await w.close();
 }
 

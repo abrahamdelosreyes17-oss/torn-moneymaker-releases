@@ -180,7 +180,7 @@ export const PAGE_CSS = `
 }
 
 .ttv2-bztag b {
-    color: #74c0fc;
+    color: #a8dd1c;
     font-weight: bold;
 }
 `;
@@ -778,7 +778,7 @@ ${TOKENS_CSS}
 
 .ttv2-bzrow {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) 96px 96px;
+    grid-template-columns: minmax(0, 1fr) 120px;
     gap: 8px;
     align-items: center;
     width: 100%;
@@ -814,7 +814,13 @@ ${TOKENS_CSS}
 }
 
 .ttv2-bzrow .ttv2-money {
-    color: var(--offer);
+    color: var(--text);
+    font-variant-numeric: tabular-nums;
+}
+
+.ttv2-panel button.ttv2-bzrow[aria-pressed="true"] .ttv2-money {
+    color: #a8dd1c;
+    font-weight: bold;
 }
 
 .ttv2-bzdetail {
@@ -827,59 +833,76 @@ ${TOKENS_CSS}
     gap: 8px;
 }
 
-.ttv2-bzdetail h3 {
-    margin: 0;
-    font-size: 13px;
+.ttv2-bzhero {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.ttv2-bzhero h3 {
+    margin: 0 0 4px;
+    font-size: 15px;
     font-weight: bold;
+    color: #fff;
 }
 
-.ttv2-avg {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 12px;
+.ttv2-bzavg {
+    font-size: 20px;
+    font-weight: bold;
+    line-height: 1.2;
+    color: #a8dd1c;
+    font-variant-numeric: tabular-nums;
 }
 
-.ttv2-avg th,
-.ttv2-avg td {
-    padding: 4px 8px;
-    border-top: 1px solid var(--line);
-    text-align: left;
-    white-space: nowrap;
-}
-
-.ttv2-avg th {
-    color: var(--muted);
-    font-weight: normal;
-}
-
-.ttv2-avg td.ttv2-money,
-.ttv2-avg th.ttv2-money {
-    text-align: right;
-}
-
-.ttv2-avg .ttv2-none {
-    color: var(--muted);
+.ttv2-graph-box {
+    position: relative;
 }
 
 .ttv2-graph {
-    width: 100%;
-    height: 96px;
     display: block;
-    background: var(--row);
+    width: 100%;
+    height: auto;
+    background: #262626;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    cursor: crosshair;
+}
+
+.ttv2-graph-grid { stroke: #3a3a3a; stroke-width: 1; }
+.ttv2-graph-label { fill: #999; font: 11px Arial, Helvetica, sans-serif; font-variant-numeric: tabular-nums; }
+.ttv2-graph-empty { fill: #999; font: 12px Arial, Helvetica, sans-serif; }
+.ttv2-graph-cursor { stroke: #777; stroke-width: 1; }
+
+.ttv2-graph-tip {
+    position: absolute;
+    top: 8px;
+    min-width: 120px;
+    padding: 4px 8px;
+    font-size: 12px;
+    line-height: 1.4;
+    background: rgba(20, 20, 20, 0.92);
     border: 1px solid var(--line);
     border-radius: 4px;
+    pointer-events: none;
+    white-space: nowrap;
 }
+
+.ttv2-graph-tip[hidden] { display: none; }
+.ttv2-tip-when { color: var(--muted); }
+.ttv2-tip-mv { color: #a8dd1c; font-weight: bold; }
+.ttv2-tip-im { color: var(--offer); }
 
 .ttv2-graph-keys {
     display: flex;
-    gap: 12px;
+    gap: 16px;
     font-size: 12px;
     color: var(--muted);
 }
 
-.ttv2-graph-keys .ttv2-key-im { color: var(--offer); }
-.ttv2-graph-keys .ttv2-key-bz { color: var(--profit); }
-.ttv2-graph-keys .ttv2-key-mv { color: var(--warn); }
+.ttv2-graph-keys span { display: inline-flex; align-items: center; gap: 4px; }
+.ttv2-graph-keys i { display: inline-block; width: 16px; height: 0; border-top: 2px solid; }
+.ttv2-graph-keys .ttv2-key-mv i { border-color: #a8dd1c; }
+.ttv2-graph-keys .ttv2-key-im i { border-color: var(--offer); border-top-width: 1px; }
 
 .ttv2-windows {
     display: flex;

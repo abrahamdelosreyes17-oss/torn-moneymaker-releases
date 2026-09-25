@@ -1,30 +1,39 @@
 /*
- * The selling page: which trader pays most for each item you hold.
+ * The traders page: who pays most for each item you hold.
  *
  * Its own tab (index.php?ttv2=traders): a Torn page the user opened, drawn
- * over by the script. It reads only the API - your inventory with the
- * Limited key kept here (never the overlay's Public key), traders' prices
- * from TornExchange with the TornExchange key kept here - and never a Torn
- * page you are not on. Nothing is traded, listed or clicked for you.
+ * over by the script. It reads only the Torn API (your inventory, with the
+ * Limited key kept here), TornExchange and TornW3B - never a Torn page you
+ * are not on. Nothing is traded, listed or clicked for you.
  *
- * Every trader list is highest price first. "Online only" keeps only the
- * traders known to be online, still highest first. Clicking a trader offers
- * their Torn profile and their TornExchange price list. Names from Torn or
- * TornExchange only ever go in via textContent.
+ * Laid out for how eyes read a list:
+ *   - Item pictures and names run down the left edge, where the eye scans
+ *     first (the F pattern), so an item is found by its picture.
+ *   - The answer - the best price - is the biggest, brightest thing in each
+ *     row, in one right-aligned column of tabular figures, so prices compare
+ *     at a glance. Who pays it sits right under it (proximity).
+ *   - Colour means something: green is the best price and "online", blue is
+ *     a link, grey is everything secondary. Nothing else is coloured.
+ *   - Few controls (a filter per section, one toggle), and whole rows are the
+ *     click target.
+ *
+ * Names from Torn, TornExchange or TornW3B only ever go in via textContent.
  */
 
-import { formatMoney, formatMoneyShort, formatAge } from '../core/parse.js';
+import { formatMoney, formatAge } from '../core/parse.js';
 import { TOKENS_CSS } from './styles.js';
 import { TORN_API_KEY_URL } from './panel.js';
-import { TE_SITE_URL } from '../api/te.js';
+import { TE_SITE_URL, tePriceListUrl } from '../api/te.js';
+import { w3bPriceListUrl } from '../api/w3b.js';
 
 export const SELLING_PAGE_DEFAULTS = {
     onlineOnly: false,
-    /* Item order: 'item' = best single-item offer first; 'bundle' = qty x offer first. */
-    sortBy: 'item',
     /* Profile and price-list links open a new tab. */
     linksNewTab: true,
 };
+
+/** All items shows this many rows at a time. */
+export const ALL_ITEMS_PAGE = 50;
 
 function spEl(tag, props = {}, children = []) {
     const node = document.createElement(tag);
@@ -48,8 +57,13 @@ export function spProfileUrl(id) {
     return 'https://www.torn.com/profiles.php?XID=' + encodeURIComponent(String(id));
 }
 
+/** Torn's own picture of an item, as its pages show it. */
+export function itemImageUrl(itemId) {
+    return 'https://www.torn.com/images/items/' + encodeURIComponent(String(itemId)) + '/small.png';
+}
+
 /** A masked key field with Show / Save. The saved key is never left in the field. */
-function keyField(page, { placeholder, onSave, onReveal }) {
+function keyField({ placeholder, onSave, onReveal, primary = false }) {
     const input = spEl('input', {
         type: 'text',
         class: 'sp-masked sp-key',
@@ -91,7 +105,7 @@ function keyField(page, { placeholder, onSave, onReveal }) {
         event.preventDefault();
         save();
     });
-    const saveBtn = spEl('button', { type: 'button', class: 'sp-btn sp-primary', text: 'Save', onclick: save });
+    const saveBtn = spEl('button', { type: 'button', class: 'sp-btn' + (primary ? ' sp-primary' : ''), text: 'Save', onclick: save });
     return { input, row: spEl('div', { class: 'sp-inline' }, [input, show, saveBtn]) };
 }
 
@@ -100,13 +114,53 @@ export class SellingPage {
      * @param {object} handlers
      *   onSaveKey(key), onForgetKey(), onRevealKey()
      *   onSaveTeKey(key), onForgetTeKey(), onRevealTeKey()
-     *   onRefresh(), onPrefsChange(partial), onExpand(itemId)
-     *   onOpenProfile(id), onOpenList(idOrName)
+     *   onRefresh(), onPrefsChange(partial), onExpand(section, itemId)
+     *   onQuery(section, text), onMore()
+     *   onOpenUrl(url)
      */
     constructor(handlers = {}) {
         this.h = handlers;
-        this.state = { rows: [], prefs: { ...SELLING_PAGE_DEFAULTS }, info: {}, expanded: new Set(), statuses: new Map() };
+        this.state = {
+            my: [],
+            all: [],
+            allTotal: 0,
+            prefs: { ...SELLING_PAGE_DEFAULTS },
+            info: {},
+            expanded: new Set(),
+            statuses: new Map(),
+        };
         this.view = 'list';
+        this.images = new Map();
+        /* Row order last drawn, and which list the pointer is over. */
+        this.order = { my: [], all: [] };
+        this.hover = { my: false, all: false };
+    }
+
+    /**
+     * Rows re-sort as prices arrive. Under the pointer that would move the
+     * row you are about to click, so while the pointer is over a list its
+     * order is kept; it re-sorts when the pointer leaves. New rows go last.
+     */
+    stableOrder(section, rows) {
+        if (!this.hover[section] || !this.order[section].length) {
+            this.order[section] = rows.map((r) => r.itemId);
+            return rows;
+        }
+        const at = new Map(this.order[section].map((id, i) => [id, i]));
+        const kept = rows.slice().sort((a, b) => (at.has(a.itemId) ? at.get(a.itemId) : 1e9) - (at.has(b.itemId) ? at.get(b.itemId) : 1e9));
+        this.order[section] = kept.map((r) => r.itemId);
+        return kept;
+    }
+
+    watchHover(section, el) {
+        el.addEventListener('pointerenter', () => {
+            this.hover[section] = true;
+        });
+        el.addEventListener('pointerleave', () => {
+            this.hover[section] = false;
+            this.lastSig = null;
+            this.renderSections();
+        });
     }
 
     mount() {
@@ -127,7 +181,16 @@ export class SellingPage {
         document.documentElement.style.overflow = 'hidden';
 
         this.keyHandler = (event) => {
-            if (event.key === 'Escape' && this.view === 'settings') this.showView('list');
+            if (event.key === 'Escape' && this.view === 'settings') {
+                this.showView('list');
+                return;
+            }
+            // "/" jumps to the filter, as on most sites with a search box.
+            const typing = event.composedPath().some((n) => n && (n.tagName === 'INPUT' || n.tagName === 'TEXTAREA'));
+            if (event.key === '/' && !typing && this.view === 'list') {
+                event.preventDefault();
+                this.myFilter.focus();
+            }
         };
         document.addEventListener('keydown', this.keyHandler);
         this.ticker = setInterval(() => this.renderBar(), 1000);
@@ -147,33 +210,6 @@ export class SellingPage {
     build() {
         const set = (partial) => this.h.onPrefsChange && this.h.onPrefsChange(partial);
 
-        /* title bar */
-        this.sortBtns = {};
-        const sortBtn = (key, text, title) => {
-            const btn = spEl('button', {
-                type: 'button',
-                class: 'sp-seg-btn',
-                'data-sort': key,
-                'aria-pressed': 'false',
-                title,
-                text,
-                onclick: () => set({ sortBy: key }),
-            });
-            this.sortBtns[key] = btn;
-            return btn;
-        };
-        this.sortEl = spEl('div', { class: 'sp-seg', role: 'group', 'aria-label': 'Order items by' }, [
-            sortBtn('item', 'Per item', 'Best offer for one, highest first'),
-            sortBtn('bundle', 'Bundle', 'Quantity times best offer, highest first'),
-        ]);
-        this.onlineBtn = spEl('button', {
-            type: 'button',
-            class: 'sp-btn sp-toggle',
-            'aria-pressed': 'false',
-            title: 'Show only traders who are online',
-            text: 'Online only',
-            onclick: () => set({ onlineOnly: !this.state.prefs.onlineOnly }),
-        });
         this.refreshBtn = spEl('button', {
             type: 'button',
             class: 'sp-icon',
@@ -193,38 +229,92 @@ export class SellingPage {
         });
         this.backBtn = spEl('button', {
             type: 'button',
-            class: 'sp-icon sp-back',
+            class: 'sp-icon',
             title: 'Back (Esc)',
             'aria-label': 'Back',
             text: '←',
+            hidden: '',
             onclick: () => this.showView('list'),
         });
 
         this.titleEl = spEl('h1', { text: 'Sell to traders' });
-        this.toolsEl = spEl('div', { class: 'sp-tools' }, [this.sortEl, this.onlineBtn]);
         this.headEl = spEl('header', { class: 'sp-head' }, [
-            this.backBtn,
-            this.titleEl,
-            spEl('span', { class: 'sp-grow' }),
-            this.toolsEl,
-            this.refreshBtn,
-            this.settingsBtn,
+            spEl('div', { class: 'sp-head-in' }, [
+                this.backBtn,
+                this.titleEl,
+                spEl('span', { class: 'sp-grow' }),
+                this.refreshBtn,
+                this.settingsBtn,
+            ]),
         ]);
 
-        /* status bar */
-        this.barLeft = spEl('span', { class: 'sp-bar-left' });
-        this.barRight = spEl('span', { class: 'sp-bar-right' });
-        this.barEl = spEl('div', { class: 'sp-bar' }, [this.barLeft, this.barRight]);
+        this.barEl = spEl('div', { class: 'sp-bar' });
+        this.bannerEl = spEl('div', { class: 'sp-banner', role: 'status' });
 
-        this.bannerEl = spEl('div', { class: 'sp-banner' });
+        /* list view: My items, then All items */
+        this.onlineBtn = spEl('button', {
+            type: 'button',
+            class: 'sp-toggle',
+            'aria-pressed': 'false',
+            title: 'Show only traders who are online',
+            onclick: () => set({ onlineOnly: !this.state.prefs.onlineOnly }),
+        }, [spEl('span', { class: 'sp-dot', 'data-level': 'online' }), 'Online only']);
 
-        /* list */
-        this.listEl = spEl('main', { class: 'sp-main' });
+        const filter = (section, placeholder) => {
+            const input = spEl('input', {
+                type: 'search',
+                class: 'sp-filter',
+                placeholder,
+                'aria-label': placeholder,
+                autocomplete: 'off',
+                spellcheck: 'false',
+            });
+            input.addEventListener('input', () => this.h.onQuery && this.h.onQuery(section, input.value));
+            return input;
+        };
+        this.myFilter = filter('my', 'Filter my items');
+        this.allFilter = filter('all', 'Search all items');
+
+        this.myCount = spEl('span', { class: 'sp-count' });
+        this.allCount = spEl('span', { class: 'sp-count' });
+        this.myList = spEl('div', { class: 'sp-list' });
+        this.allList = spEl('div', { class: 'sp-list' });
+        this.watchHover('my', this.myList);
+        this.watchHover('all', this.allList);
+        this.moreBtn = spEl('button', {
+            type: 'button',
+            class: 'sp-btn sp-more',
+            text: 'Show more',
+            hidden: '',
+            onclick: () => this.h.onMore && this.h.onMore(),
+        });
+
+        this.listEl = spEl('main', { class: 'sp-main' }, [
+            spEl('div', { class: 'sp-wrap' }, [
+                spEl('section', { class: 'sp-section', 'aria-label': 'My items' }, [
+                    spEl('div', { class: 'sp-shead' }, [
+                        spEl('h2', {}, ['My items', this.myCount]),
+                        spEl('span', { class: 'sp-grow' }),
+                        this.myFilter,
+                        this.onlineBtn,
+                    ]),
+                    this.myList,
+                ]),
+                spEl('section', { class: 'sp-section', 'aria-label': 'All items' }, [
+                    spEl('div', { class: 'sp-shead' }, [
+                        spEl('h2', {}, ['All items', this.allCount]),
+                        spEl('span', { class: 'sp-grow' }),
+                        this.allFilter,
+                    ]),
+                    this.allList,
+                    this.moreBtn,
+                ]),
+            ]),
+        ]);
 
         /* settings */
-        this.settingsEl = spEl('main', { class: 'sp-main sp-settings' });
+        this.settingsEl = spEl('main', { class: 'sp-main', hidden: '' });
         this.buildSettings();
-        this.settingsEl.hidden = true;
 
         this.root = spEl('div', { class: 'sp-page' }, [
             this.headEl,
@@ -236,30 +326,28 @@ export class SellingPage {
     }
 
     buildSettings() {
+        const box = spEl('div', { class: 'sp-wrap sp-settings' });
         const section = (title, children) =>
-            spEl('section', { class: 'sp-section' }, [spEl('h2', { class: 'sp-label', text: title }), ...children]);
-        const note = (children) => spEl('div', { class: 'sp-note' }, children);
+            spEl('section', { class: 'sp-card' }, [spEl('h2', { text: title }), ...children]);
+        const note = (children) => spEl('p', { class: 'sp-note' }, children);
 
         /* Torn key (Limited) */
-        const torn = keyField(this, {
+        const torn = keyField({
             placeholder: 'Limited API key',
+            primary: true,
             onSave: (key) => this.h.onSaveKey && this.h.onSaveKey(key),
             onReveal: () => this.h.onRevealKey && this.h.onRevealKey(),
         });
-        this.keyInput = torn.input;
         this.keyStateEl = spEl('div', { class: 'sp-keystate', text: 'No key saved.' });
 
         const tos = spEl('table', { class: 'sp-tos' });
         for (const [k, v] of [
             ['Data storage', 'Only locally, in this browser'],
             ['Data sharing', 'Nobody'],
-            ['Purpose of use', 'Personal gain: pricing the items you hold against traders\' offers'],
+            ['Purpose of use', 'Personal gain: finding who pays most for your items'],
             ['Key storage & sharing', 'Stored locally / Not shared'],
-            [
-                'Key access level',
-                'Limited (user: inventory, your own items; torn: items, market values; user: profile, traders\' public status)',
-            ],
-            ['Other services', 'TornExchange (tornexchange.com), with the separate key below. This key never goes there.'],
+            ['Key access level', 'Limited (your inventory; item names; traders\' public status)'],
+            ['Other services', 'TornExchange, only with the key you log in there with'],
         ]) {
             tos.appendChild(spEl('tr', {}, [spEl('th', { text: k }), spEl('td', { text: v })]));
         }
@@ -268,14 +356,14 @@ export class SellingPage {
             tos,
         ]);
 
-        this.settingsEl.appendChild(
-            section('Torn API key for this page', [
+        box.appendChild(
+            section('Torn API key', [
                 torn.row,
                 this.keyStateEl,
                 note([
-                    'Limited access is needed to read your inventory. Make one at ',
+                    'Limited access reads your inventory. Make one at ',
                     spEl('a', { href: TORN_API_KEY_URL, target: '_blank', rel: 'noopener noreferrer', text: 'Torn › Settings › API Key' }),
-                    '. Used on this page only.',
+                    '.',
                 ]),
                 this.tosEl,
                 spEl('button', { type: 'button', class: 'sp-link', text: 'Forget key', onclick: () => this.h.onForgetKey && this.h.onForgetKey() }),
@@ -283,35 +371,51 @@ export class SellingPage {
         );
 
         /* TornExchange key */
-        const te = keyField(this, {
-            placeholder: 'TornExchange API key',
+        const te = keyField({
+            placeholder: 'Key you log into TornExchange with',
             onSave: (key) => this.h.onSaveTeKey && this.h.onSaveTeKey(key),
             onReveal: () => this.h.onRevealTeKey && this.h.onRevealTeKey(),
         });
-        this.teKeyInput = te.input;
         this.teStateEl = spEl('div', { class: 'sp-keystate', text: 'No TornExchange key saved.' });
+        this.teSameBtn = spEl('button', {
+            type: 'button',
+            class: 'sp-link',
+            text: 'Use my Limited key',
+            onclick: () => this.h.onSaveTeKey && this.h.onSaveTeKey(this.h.onRevealKey ? this.h.onRevealKey() : ''),
+        });
 
-        this.settingsEl.appendChild(
-            section('TornExchange API key', [
+        box.appendChild(
+            section('TornExchange', [
                 te.row,
                 this.teStateEl,
                 note([
-                    'The API key from your ',
+                    'The Torn key you log into ',
                     spEl('a', { href: TE_SITE_URL, target: '_blank', rel: 'noopener noreferrer', text: 'tornexchange.com' }),
-                    ' account. Sent to tornexchange.com only, at most 6 calls a minute.',
+                    ' with. Often your Limited key.',
                 ]),
-                spEl('button', { type: 'button', class: 'sp-link', text: 'Forget key', onclick: () => this.h.onForgetTeKey && this.h.onForgetTeKey() }),
+                spEl('div', { class: 'sp-inline sp-actions' }, [
+                    this.teSameBtn,
+                    spEl('button', { type: 'button', class: 'sp-link', text: 'Forget key', onclick: () => this.h.onForgetTeKey && this.h.onForgetTeKey() }),
+                ]),
+            ]),
+        );
+
+        box.appendChild(
+            section('TornW3B', [
+                note(['Price lists are read from weav3r.dev. No key needed.']),
             ]),
         );
 
         /* preferences */
         this.linksInput = spEl('input', { type: 'checkbox' });
         this.linksInput.addEventListener('change', () => this.h.onPrefsChange && this.h.onPrefsChange({ linksNewTab: this.linksInput.checked }));
-        this.settingsEl.appendChild(
+        box.appendChild(
             section('Links', [
                 spEl('label', { class: 'sp-check' }, [this.linksInput, spEl('span', { text: 'Open links in a new tab' })]),
             ]),
         );
+
+        this.settingsEl.appendChild(box);
     }
 
     showView(view) {
@@ -321,8 +425,8 @@ export class SellingPage {
         this.settingsEl.hidden = !settings;
         this.listEl.hidden = settings;
         this.backBtn.hidden = !settings;
+        this.refreshBtn.hidden = settings;
         this.settingsBtn.setAttribute('aria-pressed', String(settings));
-        this.toolsEl.hidden = settings;
         this.titleEl.textContent = settings ? 'Settings' : 'Sell to traders';
         this.renderBanner();
     }
@@ -335,12 +439,15 @@ export class SellingPage {
 
     /**
      * @param {object} view
-     *   rows       - buildSellingRows() output
+     *   my, all    - itemRows() output: {itemId, name, buyers, best}
+     *   allTotal   - how many items All items has before the page cut
+     *   myTotal    - how many items you hold
      *   statuses   - Map traderId -> {level, text, title}
      *   prefs      - this page's preferences
+     *   expanded   - Set of "section:itemId" rows that are open
      *   info       - { hasKey, keyAccess, keyError, hasTeKey, teError, teBadKey,
-     *                  teWaitUntil, teAt, inventoryAt, loading, itemLists: Map }
-     *   expanded   - Set of item ids whose traders are shown
+     *                  teWaitUntil, teAt, inventoryAt, loading, tradersLoading,
+     *                  traderCount, w3bAt, w3bChecking, itemLists: Map }
      */
     render(view) {
         Object.assign(this.state, view);
@@ -348,25 +455,23 @@ export class SellingPage {
 
         const p = this.state.prefs;
         this.onlineBtn.setAttribute('aria-pressed', String(Boolean(p.onlineOnly)));
-        const sortBy = p.sortBy === 'bundle' ? 'bundle' : 'item';
-        for (const [key, btn] of Object.entries(this.sortBtns)) btn.setAttribute('aria-pressed', String(key === sortBy));
         this.linksInput.checked = p.linksNewTab !== false;
 
         this.renderKeyStates();
         this.renderBar();
         this.renderBanner();
-        this.renderList();
+        this.renderSections();
     }
 
     renderKeyStates() {
         const info = this.state.info || {};
 
         this.keyStateEl.className = 'sp-keystate';
-        if (!info.hasKey) {
-            this.keyStateEl.textContent = 'No key saved.';
-        } else if (info.keyError) {
+        if (info.keyError) {
             this.keyStateEl.textContent = info.keyError;
             this.keyStateEl.classList.add('sp-bad');
+        } else if (!info.hasKey) {
+            this.keyStateEl.textContent = 'No key saved.';
         } else {
             this.keyStateEl.textContent = 'Saved' + (info.keyAccess ? ' · ' + info.keyAccess + ' access' : '') + '.';
             this.keyStateEl.classList.add('sp-ok');
@@ -374,11 +479,11 @@ export class SellingPage {
         if (this.tosEl) this.tosEl.open = !info.hasKey;
 
         this.teStateEl.className = 'sp-keystate';
-        if (!info.hasTeKey) {
-            this.teStateEl.textContent = 'No TornExchange key saved.';
-        } else if (info.teBadKey) {
-            this.teStateEl.textContent = info.teError || 'TornExchange rejected this key.';
+        if (info.teBadKey || (info.teError && !info.hasTeKey)) {
+            this.teStateEl.textContent = info.teError || 'TornExchange did not accept this key.';
             this.teStateEl.classList.add('sp-bad');
+        } else if (!info.hasTeKey) {
+            this.teStateEl.textContent = 'No key saved.';
         } else if (info.teAt) {
             this.teStateEl.textContent = 'Saved · prices ' + formatAge(Date.now() - info.teAt) + '.';
             this.teStateEl.classList.add('sp-ok');
@@ -386,26 +491,22 @@ export class SellingPage {
             this.teStateEl.textContent = info.teError || 'Saved.';
             if (info.teError) this.teStateEl.classList.add('sp-bad');
         }
+        this.teSameBtn.hidden = !info.hasKey || Boolean(info.teSameAsLimited);
     }
 
+    /** One quiet line: how much we know, and how fresh it is. */
     renderBar() {
         if (!this.root) return;
-        const rows = this.state.rows || [];
         const info = this.state.info || {};
-        const withOffer = rows.filter((r) => r.total !== null);
-        const total = withOffer.reduce((sum, r) => sum + r.total, 0);
-
-        this.barLeft.textContent = info.loading
-            ? 'Loading'
-            : rows.length
-              ? rows.length + (rows.length === 1 ? ' item' : ' items') + ' · ' +
-                withOffer.length + ' with a buyer · ' + formatMoneyShort(total) + ' at best offers'
-              : '';
-
+        const now = Date.now();
         const bits = [];
-        if (info.inventoryAt) bits.push('inventory ' + formatAge(Date.now() - info.inventoryAt));
-        if (info.teAt) bits.push('TE prices ' + formatAge(Date.now() - info.teAt));
-        this.barRight.textContent = bits.join(' · ');
+        if (info.traderCount) bits.push(info.traderCount.toLocaleString('en-US') + ' traders');
+        if (info.teAt) bits.push('TE ' + formatAge(now - info.teAt));
+        if (info.w3bAt) bits.push('W3B ' + formatAge(now - info.w3bAt));
+        if (info.w3bChecking) bits.push('reading ' + info.w3bChecking + ' more lists');
+        if (info.inventoryAt) bits.push('inventory ' + formatAge(now - info.inventoryAt));
+        this.barEl.textContent = bits.join(' · ');
+        this.barEl.hidden = !bits.length || this.view === 'settings';
     }
 
     renderBanner() {
@@ -418,159 +519,221 @@ export class SellingPage {
             b.classList.add('sp-banner-on');
             if (level) b.classList.add('sp-banner-' + level);
             b.appendChild(spEl('span', { text }));
-            if (label && this.view !== 'settings') b.appendChild(spEl('button', { type: 'button', class: 'sp-btn sp-primary', text: label, onclick: fn }));
+            if (label && this.view !== 'settings') {
+                b.appendChild(spEl('button', { type: 'button', class: 'sp-btn sp-primary', text: label, onclick: fn }));
+            }
         };
         const toSettings = () => this.showView('settings');
 
-        if (!info.hasKey) {
-            say('Add a Limited API key to read your inventory.', null, 'Add key', toSettings);
-        } else if (info.keyError) {
+        if (info.keyError) {
             say(info.keyError, 'bad', 'Open Settings', toSettings);
-        } else if (!info.hasTeKey) {
-            say('Add your TornExchange API key to see traders.', null, 'Add key', toSettings);
+        } else if (!info.hasKey) {
+            say('Add your Limited key to see your items.', null, 'Add key', toSettings);
         } else if (info.teBadKey) {
-            say(info.teError || 'TornExchange rejected this key.', 'bad', 'Open Settings', toSettings);
+            say(info.teError || 'TornExchange did not accept this key.', 'bad', 'Open Settings', toSettings);
         } else if (info.teWaitUntil && info.teWaitUntil > Date.now()) {
             say('TornExchange asked us to wait ' + formatAge(info.teWaitUntil - Date.now()).replace(' ago', '') + '.', 'warn');
         } else if (info.teError) {
             say(info.teError, 'warn');
-        } else if (info.error) {
-            say(info.error, 'bad');
+        } else if (!info.hasTeKey) {
+            say('Add your TornExchange key for more traders.', null, 'Add key', toSettings);
         }
     }
 
-    renderList() {
-        const list = this.listEl;
-        list.textContent = '';
-        const rows = this.state.rows || [];
-        const info = this.state.info || {};
-        const p = this.state.prefs;
+    /**
+     * What the lists show, as one string. The page is re-rendered whenever a
+     * price or a status arrives; rows are only rebuilt when this changes, so
+     * a row is never swapped out from under a click or a hover.
+     */
+    sectionsSignature(my, all) {
+        const s = this.state;
+        const info = s.info || {};
+        const lists = info.itemLists || new Map();
+        const statusOf = (b) => {
+            const st = b && b.id && s.statuses ? s.statuses.get(String(b.id)) : null;
+            return st ? st.level + st.text : '';
+        };
+        const rowSig = (section) => (r) => {
+            const open = s.expanded.has(section + ':' + r.itemId);
+            const l = open ? lists.get(r.itemId) || {} : {};
+            return [
+                r.itemId,
+                r.name,
+                r.buyers.length,
+                r.best ? [r.best.id, r.best.name, r.best.price, statusOf(r.best)] : 0,
+                open ? [Boolean(l.loading), l.error || '', r.buyers.map((b) => [b.id, b.name, b.price, b.te, b.w3b, statusOf(b)])] : 0,
+            ];
+        };
+        return JSON.stringify([
+            this.myFilter.value,
+            this.allFilter.value,
+            Boolean(s.prefs.onlineOnly),
+            s.allTotal,
+            info.hasKey,
+            info.loading,
+            info.tradersLoading,
+            Boolean(info.knownTraders),
+            Boolean(info.traderCount),
+            Boolean(info.inventoryAt),
+            my.map(rowSig('my')),
+            all.map(rowSig('all')),
+        ]);
+    }
 
-        if (!rows.length) {
+    renderSections() {
+        const s = this.state;
+        const info = s.info || {};
+        const p = s.prefs;
+
+        const my = this.stableOrder('my', s.my);
+        const all = this.stableOrder('all', s.all);
+        const sig = this.sectionsSignature(my, all);
+        if (sig === this.lastSig) return;
+        this.lastSig = sig;
+
+        this.myCount.textContent = s.my.length ? String(s.my.length) : '';
+        this.allCount.textContent = s.allTotal ? s.allTotal.toLocaleString('en-US') : '';
+
+        /* My items */
+        this.myList.textContent = '';
+        if (!s.my.length) {
             let text = 'Nothing to show yet.';
-            if (info.loading) text = 'Loading your inventory.';
-            else if (info.checkingOnline) text = 'Checking who\'s online…';
-            else if (info.inventoryAt && p.onlineOnly) text = 'No online trader buys anything you hold.';
-            else if (info.inventoryAt) text = 'Nothing sellable in your inventory.';
-            list.appendChild(spEl('div', { class: 'sp-empty', text }));
-            return;
+            if (!info.hasKey) text = 'Add your Limited key to see your items.';
+            else if (info.loading) text = 'Loading your inventory…';
+            else if (this.myFilter.value.trim()) text = 'No item matches "' + this.myFilter.value.trim() + '".';
+            else if (info.inventoryAt) text = 'Your inventory has nothing to sell.';
+            this.myList.appendChild(spEl('div', { class: 'sp-empty', text }));
+        } else {
+            for (const r of my) this.myList.appendChild(this.renderItem('my', r));
         }
 
-        const table = spEl('table', { class: 'sp-table' });
-        table.appendChild(spEl('thead', {}, [
-            spEl('tr', {}, [
-                spEl('th', { class: 'sp-label', text: 'Item' }),
-                spEl('th', { class: 'sp-label sp-money', text: 'Qty' }),
-                spEl('th', { class: 'sp-label sp-money', text: 'Best offer' }),
-                spEl('th', { class: 'sp-label', text: 'Trader' }),
-                spEl('th', { class: 'sp-label sp-money', text: 'Market value' }),
-                spEl('th', { class: 'sp-label sp-money', text: 'Traders avg' }),
-                spEl('th', { class: 'sp-label sp-money', text: 'Total' }),
-            ]),
-        ]));
-
-        const body = spEl('tbody');
-        for (const r of rows) {
-            body.appendChild(this.renderRow(r));
-            if (this.state.expanded.has(r.itemId)) body.appendChild(this.renderTraders(r));
+        /* All items */
+        this.allList.textContent = '';
+        if (!s.all.length) {
+            let text = 'Loading traders…';
+            if (this.allFilter.value.trim()) text = 'No trader buys "' + this.allFilter.value.trim() + '".';
+            else if (!info.tradersLoading && !info.traderCount) text = 'No traders loaded yet.';
+            else if (p.onlineOnly && !info.tradersLoading) text = 'No online trader found yet.';
+            this.allList.appendChild(spEl('div', { class: 'sp-empty', text }));
+        } else {
+            for (const r of all) this.allList.appendChild(this.renderItem('all', r));
         }
-        table.appendChild(body);
-        list.appendChild(table);
+        this.moreBtn.hidden = !(s.allTotal > s.all.length);
     }
 
-    renderRow(r) {
-        const open = this.state.expanded.has(r.itemId);
+    /** A picture, kept per row so a re-render never reloads it. */
+    image(section, itemId) {
+        const key = section + ':' + itemId;
+        let img = this.images.get(key);
+        if (!img) {
+            img = spEl('img', { class: 'sp-img', alt: '', loading: 'lazy', src: itemImageUrl(itemId) });
+            img.addEventListener('error', () => img.classList.add('sp-img-none'));
+            this.images.set(key, img);
+        }
+        return img;
+    }
+
+    /** One item: picture, name, and its best price with who pays it. */
+    renderItem(section, r) {
+        const key = section + ':' + r.itemId;
+        const open = this.state.expanded.has(key);
         const best = r.best;
-        const tr = spEl('tr', {
-            class: 'sp-row' + (open ? ' sp-open' : '') + (best ? '' : ' sp-nobuyer'),
+        const toggle = () => this.h.onExpand && this.h.onExpand(section, r.itemId);
+
+        const count = r.buyers.length;
+        const head = spEl('div', {
+            class: 'sp-item',
+            role: 'button',
             tabindex: '0',
             'aria-expanded': String(open),
-            title: open ? 'Hide traders' : 'Show every trader who buys it',
-            onclick: () => this.h.onExpand && this.h.onExpand(r.itemId),
+            title: best ? (open ? 'Hide traders' : 'Show every trader') : '',
+            onclick: toggle,
             onkeydown: (event) => {
                 if (event.key === 'Enter' || event.key === ' ') {
                     event.preventDefault();
-                    if (this.h.onExpand) this.h.onExpand(r.itemId);
+                    toggle();
                 }
             },
         }, [
-            spEl('td', { class: 'sp-item', 'data-qty': r.qty.toLocaleString('en-US') }, [spEl('b', { text: r.name })]),
-            spEl('td', { class: 'sp-money', text: r.qty.toLocaleString('en-US') }),
-            spEl('td', { class: 'sp-money sp-offer', text: best ? formatMoney(best.trader.price) : '–' }),
-            spEl('td', { class: 'sp-trader' }, best ? [spEl('b', { text: best.trader.name }), this.statusWord(best)] : [spEl('span', { class: 'sp-muted', text: 'No buyer on TE' })]),
-            spEl('td', { class: 'sp-money', text: r.marketValue ? formatMoney(r.marketValue) : '–' }),
-            spEl('td', { class: 'sp-money', title: r.avgPartial ? 'Top three buyers only' : 'All ' + r.buyers + ' buyers' }, [
-                document.createTextNode(r.tradersAvg ? formatMoney(r.tradersAvg) : '–'),
-                r.tradersAvg && r.avgPartial ? spEl('span', { class: 'sp-muted sp-small', text: ' top 3' }) : null,
+            spEl('span', { class: 'sp-pic' }, [this.image(section, r.itemId)]),
+            spEl('span', { class: 'sp-name' }, [
+                spEl('b', { text: r.name }),
+                spEl('span', { class: 'sp-sub', text: count ? count + (count === 1 ? ' trader' : ' traders') : '' }),
             ]),
-            spEl('td', { class: 'sp-money sp-total', text: r.total !== null ? formatMoney(r.total) : '–' }),
+            best
+                ? spEl('span', { class: 'sp-best' }, [
+                      spEl('span', { class: 'sp-price', text: formatMoney(best.price) }),
+                      spEl('span', { class: 'sp-who' }, [spEl('span', { class: 'sp-tname', text: best.name }), this.status(best)]),
+                  ])
+                : spEl('span', { class: 'sp-best' }, [
+                      spEl('span', { class: 'sp-none', text: this.noTraderText() }),
+                  ]),
+            spEl('span', { class: 'sp-chev', 'aria-hidden': 'true', text: best ? '›' : '' }),
         ]);
-        return tr;
+
+        const card = spEl('div', { class: 'sp-card-item' + (open ? ' sp-open' : '') + (best ? '' : ' sp-nobuyer') }, [head]);
+        if (open && best) card.appendChild(this.renderTraders(r));
+        return card;
     }
 
-    /** Every trader who buys the item, highest first, with profile and list links. */
-    renderTraders(r) {
+    /** What an item with no trader says: only "No Trader Found" once every source has answered. */
+    noTraderText() {
         const info = this.state.info || {};
-        const lists = info.itemLists || new Map();
-        const st = lists.get(r.itemId) || {};
-        const p = this.state.prefs;
+        if (!info.knownTraders) return 'No traders yet';
+        if (info.tradersLoading) return 'Checking…';
+        return this.state.prefs.onlineOnly ? 'No trader online' : 'No Trader Found';
+    }
 
+    /** Every trader who buys the item, highest first, with their links. */
+    renderTraders(r) {
+        const lists = (this.state.info && this.state.info.itemLists) || new Map();
+        const st = lists.get(r.itemId) || {};
         const box = spEl('div', { class: 'sp-traders' });
 
-        if (st.loading) box.appendChild(spEl('div', { class: 'sp-note', text: 'Loading every buyer from TornExchange.' }));
+        if (st.loading) box.appendChild(spEl('div', { class: 'sp-note', text: 'Loading more buyers from TornExchange…' }));
         else if (st.error) box.appendChild(spEl('div', { class: 'sp-note sp-bad', text: st.error }));
-        else if (r.avgPartial) box.appendChild(spEl('div', { class: 'sp-note', text: 'Top three buyers. The full list loads next.' }));
 
-        if (!r.offers.length) {
-            box.appendChild(spEl('div', { class: 'sp-note', text: p.onlineOnly ? 'No online trader buys this.' : 'No trader buys this.' }));
-        }
-
-        for (const o of r.offers) {
-            const t = o.trader;
+        r.buyers.forEach((b, i) => {
+            // Three fixed slots, always in the same order, so each link sits
+            // in the same place on every row and the prices stay in line.
             const links = spEl('span', { class: 'sp-links' });
-            if (t.id) {
-                const a = spEl('a', { class: 'sp-link', href: spProfileUrl(t.id), text: 'Profile' });
+            const link = (text, url, title) => {
+                if (!url) {
+                    links.appendChild(spEl('span', { class: 'sp-chip sp-chip-none', 'aria-hidden': 'true' }));
+                    return;
+                }
+                const a = spEl('a', { class: 'sp-chip', href: url, text, title, target: '_blank', rel: 'noopener noreferrer' });
                 a.addEventListener('click', (event) => {
+                    event.stopPropagation();
                     if (event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey) return;
                     event.preventDefault();
-                    if (this.h.onOpenProfile) this.h.onOpenProfile(t.id);
+                    if (this.h.onOpenUrl) this.h.onOpenUrl(url);
                 });
                 links.appendChild(a);
-            }
-            const list = spEl('a', {
-                class: 'sp-link',
-                href: TE_SITE_URL + '/prices/' + encodeURIComponent(String(t.id || t.name)) + '/',
-                text: 'TE list',
-            });
-            list.addEventListener('click', (event) => {
-                if (event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey) return;
-                event.preventDefault();
-                if (this.h.onOpenList) this.h.onOpenList(t.id || t.name);
-            });
-            links.appendChild(list);
+            };
+            link('Profile', b.id ? spProfileUrl(b.id) : null, 'Torn profile');
+            link('TE list', b.te ? tePriceListUrl(b.teName || b.name) : null, 'TornExchange price list: ' + formatMoney(b.te || 0));
+            link('W3B list', b.w3b && b.id ? w3bPriceListUrl(b.id) : null, 'TornW3B price list: ' + formatMoney(b.w3b || 0));
 
-            box.appendChild(spEl('div', { class: 'sp-tr' }, [
-                spEl('span', { class: 'sp-tname' }, [spEl('b', { text: t.name }), this.statusWord(o)]),
-                spEl('span', { class: 'sp-money sp-offer', text: formatMoney(t.price) }),
-                spEl('span', { class: 'sp-money sp-muted', text: formatMoney(t.price * r.qty) }),
+            box.appendChild(spEl('div', { class: 'sp-tr' + (i === 0 ? ' sp-top' : '') }, [
+                spEl('span', { class: 'sp-rank', text: String(i + 1) }),
+                spEl('span', { class: 'sp-trader' }, [spEl('span', { class: 'sp-tname', text: b.name }), this.status(b)]),
+                spEl('span', { class: 'sp-tprice', text: formatMoney(b.price) }),
                 links,
             ]));
-        }
+        });
 
-        return spEl('tr', { class: 'sp-expanded' }, [spEl('td', { colspan: '7' }, [box])]);
+        return box;
     }
 
-    /** "● Online" for a trader, from the known statuses. */
-    statusWord(offer) {
-        const t = offer.trader;
-        const status = t.id && this.state.statuses ? this.state.statuses.get(String(t.id)) : null;
-        const word = spEl('span', {
+    /** A dot and a word: Online, Idle 5m, Offline 3h, Traveling. */
+    status(buyer) {
+        const st = buyer.id && this.state.statuses ? this.state.statuses.get(String(buyer.id)) : null;
+        const level = st ? st.level : 'unknown';
+        return spEl('span', {
             class: 'sp-status',
-            title: status ? t.name + ': ' + status.title : t.id ? 'Status not checked yet' : 'No Torn id on TornExchange',
-            text: status ? status.text : t.id ? 'checking' : 'unknown',
-        });
-        word.dataset.level = status ? status.level : 'unknown';
-        return word;
+            title: st ? buyer.name + ': ' + st.title : buyer.id ? 'Checking' : 'No Torn id known',
+        }, [spEl('span', { class: 'sp-dot', 'data-level': level }), st ? st.text : buyer.id ? '…' : '']);
     }
 }
 
@@ -579,8 +742,13 @@ export const SELLING_PAGE_CSS = `
 * { box-sizing: border-box; }
 .sp-page {
 ${TOKENS_CSS}
+    --card: #262626;
+    --card-hover: #2d2d2d;
+    --card-line: #3a3a3a;
+    --page: #1c1c1c;
+    --price: #a8dd1c;
     position: absolute; inset: 0; display: flex; flex-direction: column;
-    background: var(--bg); color: var(--text);
+    background: var(--page); color: var(--text);
     font: 13px/1.4 Arial, Helvetica, sans-serif;
 }
 button, input { font: inherit; color: inherit; }
@@ -589,146 +757,167 @@ a:hover { text-decoration: underline; }
 b { font-weight: bold; }
 [hidden] { display: none !important; }
 .sp-grow { flex: 1; }
-.sp-muted { color: var(--muted); }
 .sp-bad { color: var(--bad); }
 .sp-ok { color: var(--profit); }
-.sp-small { font-size: 12px; }
-.sp-money { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
-.sp-label {
-    font-size: 11px; font-weight: bold; letter-spacing: 0.5px; text-transform: uppercase; color: var(--muted);
-}
+.sp-wrap { width: 100%; max-width: 760px; margin: 0 auto; }
 
-.sp-head {
-    display: flex; align-items: center; gap: 8px; height: 30px; flex: 0 0 auto;
-    padding: 0 8px 0 16px; background: var(--title); border-bottom: 1px solid var(--line);
-}
+/* ---------------------------------------------------------------- head */
+.sp-head { flex: 0 0 auto; background: var(--title); border-bottom: 1px solid var(--line); }
+.sp-head-in { display: flex; align-items: center; gap: 8px; max-width: 760px; height: 44px; margin: 0 auto; padding: 0 16px; }
 .sp-head h1 {
-    margin: 0; font-size: 20px; font-weight: bold; letter-spacing: 1px; color: #fff;
+    margin: 0; font-size: 20px; font-weight: bold; color: #fff;
     text-shadow: 1px 1px 2px rgba(0, 0, 0, 0.65); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.sp-btn {
-    height: 28px; padding: 0 12px; font-size: 12px; font-weight: bold; color: var(--text);
-    background: var(--line); border: 1px solid var(--line); border-radius: 4px; cursor: pointer; white-space: nowrap;
-}
-.sp-btn:hover { border-color: var(--muted); }
-.sp-btn.sp-primary { color: var(--on-profit); background: var(--profit); border-color: var(--profit); }
-.sp-btn.sp-toggle { height: 24px; background: transparent; color: var(--muted); }
-.sp-btn.sp-toggle[aria-pressed="true"] { color: var(--text); border-color: var(--profit); background: rgba(153, 204, 0, 0.12); }
-.sp-tools { display: flex; align-items: center; gap: 8px; }
-.sp-seg { display: inline-flex; height: 24px; border: 1px solid var(--line); border-radius: 4px; overflow: hidden; }
-.sp-seg-btn {
-    height: 22px; padding: 0 12px; font-size: 12px; font-weight: bold; color: var(--muted);
-    background: transparent; border: 0; cursor: pointer; white-space: nowrap;
-}
-.sp-seg-btn + .sp-seg-btn { border-left: 1px solid var(--line); }
-.sp-seg-btn:hover { color: var(--text); }
-.sp-seg-btn[aria-pressed="true"] { color: var(--text); background: rgba(153, 204, 0, 0.12); box-shadow: inset 0 -2px 0 var(--profit); }
 .sp-icon {
-    width: 24px; height: 24px; padding: 0; font-size: 15px; line-height: 22px; text-align: center;
-    color: var(--text); background: transparent; border: 1px solid transparent; border-radius: 4px; cursor: pointer;
+    width: 32px; height: 32px; padding: 0; font-size: 15px; line-height: 30px; text-align: center;
+    color: var(--text); background: transparent; border: 1px solid transparent; border-radius: 8px; cursor: pointer;
 }
 .sp-icon:hover { background: rgba(255, 255, 255, 0.08); }
 .sp-icon[aria-pressed="true"] { color: var(--profit); }
-button:focus-visible, input:focus-visible, .sp-row:focus-visible, summary:focus-visible {
-    outline: 2px solid var(--profit); outline-offset: 1px;
-}
 
 .sp-bar {
-    display: flex; align-items: center; gap: 8px; flex: 0 0 auto;
-    padding: 8px 16px; border-bottom: 1px solid var(--line); font-size: 12px;
+    flex: 0 0 auto; max-width: 760px; width: 100%; margin: 0 auto; padding: 8px 16px 0;
+    font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.sp-bar-left { flex: 1; min-width: 0; font-weight: bold; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
-.sp-bar-right { color: var(--muted); white-space: nowrap; }
-
-.sp-banner { display: none; align-items: center; gap: 12px; flex: 0 0 auto; padding: 8px 16px; border-bottom: 1px solid var(--line); background: var(--row); }
+.sp-banner {
+    display: none; align-items: center; gap: 12px; flex: 0 0 auto;
+    max-width: 728px; width: calc(100% - 32px); margin: 8px auto 0; padding: 8px 12px;
+    background: var(--card); border: 1px solid var(--card-line); border-left: 4px solid var(--offer); border-radius: 8px;
+}
+.sp-banner > span { flex: 1; }
 .sp-banner-on { display: flex; }
-.sp-banner-warn { color: var(--warn); }
-.sp-banner-bad { color: var(--bad); }
+.sp-banner-warn { border-left-color: var(--warn); }
+.sp-banner-bad { border-left-color: var(--bad); }
 
-.sp-main { flex: 1; min-height: 0; overflow-y: auto; padding: 12px 16px 40px; }
-.sp-empty { padding: 40px 16px; text-align: center; color: var(--muted); }
-
-.sp-table { width: 100%; max-width: 1100px; margin: 0 auto; border-collapse: separate; border-spacing: 0; }
-.sp-table th {
-    position: sticky; top: 0; z-index: 1; padding: 8px 12px; text-align: left;
-    background: var(--bg); border-bottom: 1px solid var(--line);
+/* ------------------------------------------------------------- buttons */
+.sp-btn {
+    height: 32px; padding: 0 12px; font-size: 13px; font-weight: bold; color: var(--text);
+    background: #3a3a3a; border: 1px solid #4a4a4a; border-radius: 8px; cursor: pointer; white-space: nowrap;
 }
-.sp-table th.sp-money { text-align: right; }
-.sp-table td { padding: 8px 12px; border-bottom: 1px solid var(--line); vertical-align: middle; }
-.sp-row { cursor: pointer; }
-.sp-row:hover td { background: var(--row); }
-.sp-row.sp-open td { background: var(--row); border-bottom-color: transparent; }
-.sp-row.sp-nobuyer td { color: var(--muted); }
-.sp-offer { color: var(--offer); }
-.sp-total { font-size: 15px; font-weight: bold; color: var(--profit); }
-.sp-row.sp-nobuyer .sp-total { color: var(--muted); font-weight: normal; font-size: 13px; }
-.sp-trader { white-space: nowrap; }
-
-.sp-status { white-space: nowrap; }
-.sp-status::before {
-    content: ""; display: inline-block; width: 8px; height: 8px; margin: 0 4px 0 8px;
-    border-radius: 50%; background: var(--muted); vertical-align: 0;
+.sp-btn:hover { border-color: var(--muted); }
+.sp-btn.sp-primary { color: var(--on-profit); background: var(--profit); border-color: var(--profit); }
+.sp-toggle {
+    display: inline-flex; align-items: center; gap: 8px; height: 32px; padding: 0 12px;
+    font-size: 13px; font-weight: bold; color: var(--muted); white-space: nowrap;
+    background: transparent; border: 1px solid #4a4a4a; border-radius: 16px; cursor: pointer;
 }
-.sp-status[data-level="online"]::before { background: var(--profit); }
-.sp-status[data-level="idle"]::before { background: var(--warn); }
-.sp-status[data-level="unknown"]::before { background: transparent; border: 1px solid var(--muted); }
+.sp-toggle:hover { color: var(--text); }
+.sp-toggle[aria-pressed="true"] { color: var(--text); border-color: var(--profit); background: rgba(153, 204, 0, 0.12); }
+.sp-toggle .sp-dot { margin: 0; }
+.sp-toggle[aria-pressed="false"] .sp-dot { background: var(--muted); }
+button:focus-visible, input:focus-visible, summary:focus-visible, .sp-item:focus-visible, a:focus-visible {
+    outline: 2px solid var(--profit); outline-offset: 2px;
+}
 
-.sp-expanded > td { padding: 0 12px 12px; background: var(--row); }
-.sp-traders { display: flex; flex-direction: column; gap: 4px; padding: 8px 12px; border: 1px solid var(--line); border-radius: 4px; }
-.sp-tr { display: grid; grid-template-columns: minmax(0, 1fr) 120px 120px 130px; gap: 8px; align-items: center; padding: 4px 0; }
+/* ------------------------------------------------------------ sections */
+.sp-main { flex: 1; min-height: 0; overflow-y: auto; padding: 16px 16px 48px; }
+.sp-section + .sp-section { margin-top: 32px; }
+.sp-shead {
+    position: sticky; top: -16px; z-index: 2; display: flex; align-items: center; gap: 8px;
+    margin: -16px -4px 8px; padding: 16px 4px 8px; background: var(--page);
+}
+.sp-shead h2 { display: flex; align-items: baseline; gap: 8px; margin: 0; font-size: 15px; font-weight: bold; color: #fff; }
+.sp-count { font-size: 12px; font-weight: normal; color: var(--muted); }
+.sp-filter {
+    width: 220px; height: 32px; padding: 0 12px; color: var(--text);
+    background: var(--card); border: 1px solid #4a4a4a; border-radius: 16px;
+}
+.sp-filter::placeholder { color: var(--muted); }
+.sp-list { display: flex; flex-direction: column; gap: 8px; }
+.sp-empty { padding: 24px 16px; text-align: center; color: var(--muted); background: var(--card); border: 1px dashed var(--card-line); border-radius: 8px; }
+.sp-more { display: block; margin: 12px auto 0; }
+
+/* ---------------------------------------------------------------- item */
+.sp-card-item { background: var(--card); border: 1px solid var(--card-line); border-radius: 8px; overflow: hidden; }
+.sp-card-item.sp-open { border-color: #4f4f4f; }
+.sp-item {
+    display: grid; grid-template-columns: 60px minmax(0, 1fr) auto 16px; align-items: center; gap: 12px;
+    min-height: 56px; padding: 8px 12px; cursor: pointer;
+}
+.sp-nobuyer .sp-item { cursor: default; }
+.sp-item:hover { background: var(--card-hover); }
+.sp-nobuyer .sp-item:hover { background: transparent; }
+.sp-pic { display: flex; align-items: center; justify-content: center; width: 60px; height: 30px; }
+.sp-img { width: 60px; height: 30px; object-fit: contain; }
+.sp-img-none { visibility: hidden; }
+.sp-nobuyer .sp-img { opacity: 0.5; }
+.sp-name { display: flex; flex-direction: column; min-width: 0; }
+.sp-name b { font-size: 15px; color: #fff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sp-nobuyer .sp-name b { color: var(--muted); font-weight: normal; font-size: 13px; }
+.sp-sub { font-size: 12px; color: var(--muted); }
+.sp-best { display: flex; flex-direction: column; align-items: flex-end; min-width: 0; }
+.sp-price { font-size: 15px; font-weight: bold; color: var(--price); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.sp-who { display: flex; align-items: center; gap: 8px; max-width: 240px; font-size: 12px; color: var(--text); }
+.sp-none { font-size: 13px; color: var(--muted); }
+.sp-chev { font-size: 20px; line-height: 1; color: var(--muted); transition: transform 0.15s ease; }
+.sp-open .sp-chev { transform: rotate(90deg); }
+
 .sp-tname { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.sp-links { display: flex; gap: 12px; justify-content: flex-end; font-size: 12px; }
-.sp-note { font-size: 12px; color: var(--muted); }
+.sp-status { display: inline-flex; align-items: center; gap: 4px; flex: 0 0 auto; font-size: 12px; color: var(--muted); white-space: nowrap; }
+.sp-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #666; }
+.sp-dot[data-level="online"] { background: var(--profit); box-shadow: 0 0 0 2px rgba(153, 204, 0, 0.2); }
+.sp-dot[data-level="idle"] { background: var(--warn); }
+.sp-dot[data-level="offline"] { background: #666; }
+.sp-dot[data-level="unknown"] { background: transparent; border: 1px solid #777; }
 
-.sp-settings { display: flex; flex-direction: column; gap: 16px; max-width: 640px; margin: 0 auto; width: 100%; }
-.sp-section { display: flex; flex-direction: column; gap: 8px; }
-.sp-section h2 { margin: 0; }
+/* ------------------------------------------------------------- traders */
+.sp-traders { display: flex; flex-direction: column; padding: 4px 12px 12px; border-top: 1px solid var(--card-line); background: #222; }
+.sp-tr {
+    display: grid; grid-template-columns: 24px minmax(0, 1fr) auto auto; align-items: center; gap: 12px;
+    min-height: 40px; padding: 4px 8px; border-radius: 8px;
+}
+.sp-tr + .sp-tr { border-top: 1px solid #2e2e2e; }
+.sp-tr.sp-top { background: rgba(153, 204, 0, 0.08); border-top-color: transparent; }
+.sp-tr.sp-top + .sp-tr { border-top-color: transparent; }
+.sp-rank { font-size: 12px; color: var(--muted); text-align: right; font-variant-numeric: tabular-nums; }
+.sp-trader { display: flex; align-items: center; gap: 8px; min-width: 0; font-weight: bold; }
+.sp-tprice { font-weight: bold; text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.sp-top .sp-tprice { color: var(--price); }
+.sp-links { display: grid; grid-template-columns: 60px 60px 72px; gap: 4px; }
+.sp-chip {
+    display: inline-flex; align-items: center; justify-content: center; height: 28px; font-size: 12px; white-space: nowrap;
+    color: var(--offer); border: 1px solid #3d4f5c; border-radius: 8px;
+}
+.sp-chip-none { visibility: hidden; }
+.sp-chip:hover { text-decoration: none; background: rgba(116, 192, 252, 0.12); }
+.sp-note { margin: 0; padding: 8px 0 4px; font-size: 12px; color: var(--muted); }
+
+/* ------------------------------------------------------------ settings */
+.sp-settings { display: flex; flex-direction: column; gap: 12px; }
+.sp-card { display: flex; flex-direction: column; gap: 8px; padding: 16px; background: var(--card); border: 1px solid var(--card-line); border-radius: 8px; }
+.sp-card h2 { margin: 0; font-size: 15px; color: #fff; }
+.sp-card .sp-note { padding: 0; }
 .sp-inline { display: flex; gap: 8px; align-items: center; }
 .sp-inline input { flex: 1; min-width: 0; }
-input.sp-key { height: 28px; padding: 0 8px; background: var(--row); border: 1px solid var(--line); border-radius: 4px; color: var(--text); }
+.sp-inline.sp-actions { gap: 16px; }
+input.sp-key { height: 32px; padding: 0 12px; background: #1f1f1f; border: 1px solid #4a4a4a; border-radius: 8px; color: var(--text); }
 .sp-masked { -webkit-text-security: disc; }
 .sp-keystate { font-size: 12px; color: var(--muted); }
 .sp-keystate.sp-ok { color: var(--profit); }
 .sp-keystate.sp-bad { color: var(--bad); }
-.sp-link { background: none; border: 0; padding: 0; color: var(--offer); font-size: 12px; cursor: pointer; text-align: left; }
+.sp-link { align-self: flex-start; background: none; border: 0; padding: 0; color: var(--offer); font-size: 12px; cursor: pointer; text-align: left; }
 .sp-link:hover { text-decoration: underline; }
 .sp-check { display: flex; gap: 8px; align-items: flex-start; cursor: pointer; }
 input[type="checkbox"] { accent-color: var(--profit); margin: 3px 0 0; }
-.sp-tos-box { border: 1px solid var(--line); border-radius: 4px; padding: 8px; background: var(--row); }
+.sp-tos-box { border: 1px solid var(--card-line); border-radius: 8px; padding: 8px 12px; background: #1f1f1f; }
 .sp-tos-box summary { cursor: pointer; font-size: 12px; }
 .sp-tos { width: 100%; margin-top: 8px; border-collapse: collapse; font-size: 12px; }
-.sp-tos th, .sp-tos td { text-align: left; vertical-align: top; padding: 4px; border-top: 1px solid var(--line); }
+.sp-tos th, .sp-tos td { text-align: left; vertical-align: top; padding: 4px; border-top: 1px solid var(--card-line); }
 .sp-tos th { width: 36%; color: var(--muted); font-weight: normal; }
 
 @media (max-width: 700px) {
-    .sp-head { flex-wrap: wrap; height: auto; min-height: 30px; padding: 4px 8px 4px 12px; row-gap: 4px; }
-    .sp-head h1 { flex: 1; font-size: 15px; }
-    .sp-grow { display: none; }
-    .sp-tools { flex: 0 0 100%; order: 10; justify-content: space-between; padding-bottom: 4px; }
-    .sp-bar, .sp-banner, .sp-main { padding-left: 12px; padding-right: 12px; }
-    .sp-bar-right { display: none; }
-    .sp-table, .sp-table tbody { display: block; }
-    .sp-table thead { display: none; }
-    .sp-row {
-        display: grid; grid-template-columns: minmax(0, 1fr) auto; column-gap: 8px; row-gap: 4px;
-        padding: 8px 12px; margin-bottom: 8px; background: var(--row); border: 1px solid var(--line); border-radius: 4px;
-    }
-    .sp-row.sp-open { margin-bottom: 0; border-radius: 4px 4px 0 0; }
-    .sp-row td { display: block; padding: 0; border: 0; background: none !important; }
-    .sp-row .sp-item { grid-column: 1; grid-row: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .sp-row .sp-item::after { content: " ×" attr(data-qty); color: var(--muted); font-weight: normal; }
-    .sp-row td:nth-child(2) { display: none; }
-    .sp-row .sp-total { grid-column: 2; grid-row: 1; }
-    .sp-row .sp-trader { grid-column: 1; grid-row: 2; font-size: 12px; overflow: hidden; text-overflow: ellipsis; }
-    .sp-row .sp-offer { grid-column: 2; grid-row: 2; font-size: 12px; }
-    .sp-row td:nth-child(5), .sp-row td:nth-child(6) { grid-column: 1 / 3; font-size: 12px; color: var(--muted); text-align: left; }
-    .sp-row td:nth-child(5)::before { content: "Value "; }
-    .sp-row td:nth-child(6)::before { content: "Traders avg "; }
-    .sp-expanded { display: block; margin-bottom: 8px; }
-    .sp-expanded > td { display: block; padding: 0; border: 1px solid var(--line); border-top: 0; border-radius: 0 0 4px 4px; }
-    .sp-traders { border: 0; }
-    .sp-tr { grid-template-columns: minmax(0, 1fr) auto; }
-    .sp-tr > .sp-money:nth-child(3) { display: none; }
-    .sp-tr > .sp-links { grid-column: 1 / 3; justify-content: flex-start; }
+    .sp-head-in { padding: 0 8px 0 12px; }
+    .sp-main { padding: 12px 12px 48px; }
+    .sp-bar { padding: 8px 12px 0; }
+    .sp-shead { flex-wrap: wrap; top: -12px; margin-top: -12px; padding-top: 12px; }
+    .sp-shead h2 { flex: 1 0 auto; }
+    .sp-shead .sp-grow { display: none; }
+    .sp-filter { flex: 1 1 100%; width: auto; order: 5; }
+    .sp-item { grid-template-columns: 44px minmax(0, 1fr) auto; gap: 8px; padding: 8px; }
+    .sp-pic, .sp-img { width: 44px; height: 22px; }
+    .sp-chev { display: none; }
+    .sp-who { max-width: 150px; }
+    .sp-tr { grid-template-columns: 16px minmax(0, 1fr) auto; row-gap: 4px; padding: 8px 4px; }
+    .sp-links { grid-column: 2 / 4; }
 }
 `;

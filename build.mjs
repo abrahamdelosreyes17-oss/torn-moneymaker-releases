@@ -45,6 +45,7 @@ const HEADER = `// ==UserScript==
 // @description  Finds Bazaar and Item Market listings below NPC / market value - on the page you are viewing, and live from the Torn API and TornW3B - ranked by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
+// @match        https://weav3r.dev/*
 // @run-at       document-idle
 // @grant        GM_getValue
 // @grant        GM_setValue

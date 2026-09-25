@@ -24,9 +24,58 @@ _store[NS + 'apiKey'] = JSON.stringify(KEY);
 // ?nofeed=1 turns the live feed and TornW3B off, so only the page's own Torn calls are made.
 _store[NS + 'settings'] = JSON.stringify(/[?&]nofeed=1/.test(location.search) ? { liveFeed: false, useW3b: false } : {});
 // ?sellkeys=1 boots the selling page with both of its keys already saved.
+// ?sellsame=1 saves the SAME Limited key for both, as when you log into
+// TornExchange with your Limited key (TornExchange accepts either here).
+const SAME = /[?&]sellsame=1/.test(location.search);
 if (/[?&]sellkeys=1/.test(location.search)) {
     _store[NS + 'sellKey'] = JSON.stringify(LIMITED);
-    _store[NS + 'teKey'] = JSON.stringify(TEKEY);
+    _store[NS + 'teKey'] = JSON.stringify(SAME ? LIMITED : TEKEY);
+}
+// ?w3btrader=1: our trader database already knows trader 77, found on a
+// TornW3B page and on no TornExchange list.
+if (/[?&]w3btrader=1/.test(location.search)) {
+    _store[NS + 'traderDb'] = JSON.stringify({ version: 1, traders: { 77: { name: 'Trader 77', from: 'w3b', seenAt: Date.now(), w3b: null } } });
+}
+// ?ownbazaar=1: your own bazaar's add page (open it with page=bazaar#/add),
+// with a week of recorded prices the way a real player's record looks:
+// a few hours each evening with Torn open, nothing in between.
+if (/[?&]ownbazaar=1/.test(location.search)) {
+    const M5 = 300000, H1 = 3600000, H6 = 21600000, DAY = 86400000, now = Date.now();
+    const rec = () => ({ m5: [], h1: [], h6: [], mv: [], seen: now });
+    const items = { 206: rec(), 180: rec() };
+    const base = { 206: [840000, 846000], 180: [30, 52] };
+    for (let t = now - 7 * DAY; t <= now; t += M5) {
+        const hour = new Date(t).getHours();
+        if (!(hour >= 18 && hour <= 22) && now - t > 2 * H1) continue;
+        for (const id of [206, 180]) {
+            const wave = Math.sin(t / (9 * H1)) * 0.012 + Math.sin(t / (31 * H1)) * 0.02;
+            const im = Math.round(base[id][0] * (1 + wave));
+            const bz = Math.round(base[id][1] * (1 + wave * 0.8));
+            const r = items[id];
+            if (now - t <= DAY) r.m5.push([Math.floor(t / M5), im, bz]);
+            for (const [key, ms] of [['h1', H1], ['h6', H6]]) {
+                const n = Math.floor(t / ms), arr = r[key];
+                let last = arr[arr.length - 1];
+                if (!last || last[0] !== n) arr.push(last = [n, null, null, 0, 0]);
+                last[1] = last[3] ? Math.round((last[1] * last[3] + im) / (last[3] + 1)) : im; last[3]++;
+                last[2] = last[4] ? Math.round((last[2] * last[4] + bz) / (last[4] + 1)) : bz; last[4]++;
+            }
+        }
+    }
+    for (let d = 7; d >= 0; d--) {
+        items[206].mv.push([Math.floor((now - d * DAY) / DAY), 830000 + d * 1500]);
+        items[180].mv.push([Math.floor((now - d * DAY) / DAY), 55]);
+    }
+    _store[NS + 'priceHistory'] = JSON.stringify({ version: 1, items });
+    document.addEventListener('DOMContentLoaded', () => {
+        const d = document.createElement('div');
+        d.id = 'fake-own';
+        d.innerHTML = '<ul class="items-cont">' +
+            '<li class="clearfix"><div class="img-wrap"><img src="https://www.torn.com/images/items/180/large.png" alt="Bottle of Beer" width="60"></div><div class="title-wrap"><div class="name-wrap">Bottle of Beer x12</div></div><div class="amount-wrap"><input type="text" class="amount"></div></li>' +
+            '<li class="clearfix"><div class="img-wrap"><img src="https://www.torn.com/images/items/206/large.png" alt="Xanax" width="60"></div><div class="title-wrap"><div class="name-wrap">Xanax</div></div><div class="amount-wrap"><input type="text" class="amount"></div></li>' +
+            '</ul>';
+        document.body.prepend(d);
+    });
 }
 // ?sellprefs=<json> presets the selling page's own preferences.
 const _prefs = new URLSearchParams(location.search).get('sellprefs');
@@ -125,7 +174,7 @@ function respond(url) {
         return { error: { code: 0, error: 'unknown in harness: ' + u.pathname } };
     }
     if (u.hostname === 'www.tornexchange.com') {
-        if (u.searchParams.get('key') !== TEKEY) return { status: 'error', message: 'Invalid API key', __http: 401 };
+        if (u.searchParams.get('key') !== TEKEY && !(SAME && u.searchParams.get('key') === LIMITED)) return { status: 'error', message: 'Invalid API key', __http: 401 };
         if (u.pathname === '/api/all_best_listings') {
             return { status: 'success', data: {
                 1: { item: 'Hammer', traders: [
@@ -179,6 +228,17 @@ function respond(url) {
         if (u.pathname === '/api/marketplace/900') {
             return { total_listings: 1, listings: [{ player_id: 1, player_name: 'X', price: 5, quantity: 3, last_checked: NOW_S }] };
         }
+        // Traders' own price lists: Bob pays more here than on TornExchange;
+        // Alice has no TornW3B list; trader 77 is only on TornW3B.
+        const pl = u.pathname.match(/^\/api\/pricelist\/(\d+)$/);
+        if (pl) {
+            const lists = {
+                11: [{ itemId: 206, name: 'Xanax', buyPrice: 852000 }, { itemId: 1, name: 'Hammer', buyPrice: 0 }, { itemId: -1, name: 'Flower Set', buyPrice: 300000 }],
+                44: [{ itemId: 1, name: 'Hammer', buyPrice: 118 }],
+                77: [{ itemId: 206, name: 'Xanax', buyPrice: 849500 }, { itemId: 180, name: 'Bottle of Beer', buyPrice: 61 }, { itemId: 335, name: 'Stick of Dynamite', buyPrice: 9000 }],
+            };
+            return lists[pl[1]] || { error: 'Pricelist not found for this user', __http: 404 };
+        }
         return { total_listings: 0, listings: [] };
     }
     throw new Error('Unexpected host ' + u.hostname);
@@ -196,7 +256,10 @@ function GM_xmlhttpRequest(opts) {
 }
 window.onerror = (m) => { document.getElementById('out').textContent = 'BOOT ERROR: ' + m; };
 </script>
-<script src="../torn-moneymaker.user.js"></script>
+<script>
+// Always the build just made, never a cached copy.
+document.write('<script src="../torn-moneymaker.user.js?v=' + Date.now() + '"><' + '/script>');
+</script>
 <script>
 // The panel is in a shadow root; look inside it.
 const $p = (sel) => (document.getElementById('ttv2-host') || {}).shadowRoot?.querySelector(sel);

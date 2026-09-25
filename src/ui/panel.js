@@ -23,7 +23,6 @@ import {
 } from '../core/parse.js';
 import { VENUE_LABELS } from '../core/profit.js';
 import { W3B_TERMS_URL, W3B_SITE_URL } from '../api/w3b.js';
-import { WINDOWS, coverageText } from '../core/history.js';
 import { panelStyleElement } from './styles.js';
 import { renderPriceGraph } from './graph.js';
 
@@ -108,12 +107,6 @@ export function isTypingTarget(event) {
 
 /** Long enough to see, short enough not to get in the way. */
 const SCAN_ANIMATION_MS = 800;
-
-/** A current asking price: "$30", "none" when nothing is listed, null until asked. */
-function priceText(entry) {
-    if (!entry) return null;
-    return entry.price > 0 ? formatMoney(entry.price) : 'none';
-}
 
 export class Panel {
     /**
@@ -1345,28 +1338,43 @@ export class Panel {
     /* --------------------------------------------------------- my bazaar */
 
     /**
-     * Your own bazaar's add / manage page: every item found in its rows,
-     * what it is going for now, and the selected item's record.
+     * Your own bazaar's add / manage page: each item's Item Market Average,
+     * and for the one picked, that number large with its graph.
      *
-     * @param {object|null} view - null leaves the page (back to the list)
-     *   items: [{itemId, name, im: {price, at}|null, bz: {price, at}|null}]
-     *   selected: itemId | null
-     *   marketValue: number | null
-     *   averages: from core/history.js averages()
+     * @param {object|null} view - null leaves the view
+     *   items: [{ itemId, name, avg }] - avg: Torn's market value
+     *   selected: itemId
+     *   avgAt: when the averages were fetched
      *   series: from core/history.js series()
      *   windowKey: '24h' | '7d' | '30d'
-     *   since: timestamp of the first record, or null
-     *   diagnostics: { page, rows, identified }
      */
     renderMyBazaar(view) {
         this.state.bazaar = view;
         if (!this.root) return;
 
         if (!view) {
+            this.bzSig = null;
             if (this.page === 'mybazaar') this.showPage('list');
             return;
         }
         if (this.page === 'list') this.showPage('mybazaar');
+
+        const updated = view.avgAt ? 'What it sold for, on average · updated ' + formatAge(Date.now() - view.avgAt) + '.' : 'What it sold for, on average.';
+
+        // Redrawn only when what it shows changes: the helper repaints every
+        // few seconds, and a redraw would drop the graph's hover readout.
+        const s = view.series;
+        const sig = JSON.stringify([
+            view.items,
+            view.selected,
+            view.windowKey,
+            s ? [s.points.length, s.points[s.points.length - 1], s.mv.length, s.mv[s.mv.length - 1], Math.floor(s.to / 300000)] : null,
+        ]);
+        if (sig === this.bzSig && this.bzUpdatedEl) {
+            this.bzUpdatedEl.textContent = updated;
+            return;
+        }
+        this.bzSig = sig;
 
         const list = this.bzListEl;
         list.textContent = '';
@@ -1374,77 +1382,39 @@ export class Panel {
         if (!view.items.length) {
             list.appendChild(el('div', { class: 'ttv2-note', text: 'No items found on this page yet.' }));
         } else {
-            list.appendChild(el('div', { class: 'ttv2-bzrow' }, [
+            list.appendChild(el('div', { class: 'ttv2-bzrow ttv2-bzhead' }, [
                 el('span', { class: 'ttv2-label', text: 'Item' }),
-                el('span', { class: 'ttv2-label ttv2-money', text: 'Item Market' }),
-                el('span', { class: 'ttv2-label ttv2-money', text: 'Bazaars' }),
+                el('span', { class: 'ttv2-label ttv2-money', text: 'IM average' }),
             ]));
             for (const it of view.items) {
-                const btn = el('button', {
+                list.appendChild(el('button', {
                     type: 'button',
                     class: 'ttv2-bzrow',
                     'aria-pressed': String(it.itemId === view.selected),
-                    title: 'Show averages and graph',
+                    title: 'Show its graph',
                     onclick: () => this.handlers.onSelectBazaarItem && this.handlers.onSelectBazaarItem(it.itemId),
                 }, [
                     el('span', { class: 'ttv2-name', text: it.name }),
-                    el('span', { class: 'ttv2-money', text: priceText(it.im) || '…' }),
-                    el('span', { class: 'ttv2-money', text: priceText(it.bz) || '…' }),
-                ]);
-                list.appendChild(btn);
+                    el('span', { class: 'ttv2-money', text: it.avg ? formatMoney(it.avg) : '…' }),
+                ]));
             }
         }
 
         const detail = this.bzDetailEl;
         detail.textContent = '';
         const sel = view.items.find((i) => i.itemId === view.selected);
-        if (!sel) {
-            detail.appendChild(el('div', { class: 'ttv2-note', text: 'Lowest asking prices now. Pick an item for its record.' }));
-            return;
-        }
+        if (!sel) return;
 
-        detail.appendChild(el('h3', { text: sel.name }));
-
-        const now = el('div', { class: 'ttv2-note' }, [
-            'Lowest now: Item Market ',
-            el('b', { text: priceText(sel.im) || 'unknown' }),
-            sel.im && sel.im.at ? ' (' + formatAge(Date.now() - sel.im.at) + ')' : '',
-            ', bazaars ',
-            el('b', { text: priceText(sel.bz) || 'unknown' }),
-            sel.bz && sel.bz.at ? ' (' + formatAge(Date.now() - sel.bz.at) + ')' : '',
-            '.',
-        ]);
-        detail.appendChild(now);
-
-        detail.appendChild(el('div', { class: 'ttv2-note' }, [
-            'Market value ',
-            el('b', { text: view.marketValue ? formatMoney(view.marketValue) : 'unknown' }),
-            ' (Torn, daily sales average).',
+        /* the answer first: one big number, what it is, how fresh */
+        detail.appendChild(el('div', { class: 'ttv2-bzhero' }, [
+            el('h3', { text: sel.name }),
+            el('div', { class: 'ttv2-label', text: 'Item Market Average' }),
+            el('div', { class: 'ttv2-bzavg', text: sel.avg ? formatMoney(sel.avg) : 'Loading…' }),
+            (this.bzUpdatedEl = el('div', { class: 'ttv2-note', text: updated })),
         ]));
 
-        /* averages */
-        const table = el('table', { class: 'ttv2-avg' });
-        table.appendChild(el('tr', {}, [
-            el('th', { class: 'ttv2-label', text: 'Average' }),
-            el('th', { class: 'ttv2-label ttv2-money', text: 'Item Market' }),
-            el('th', { class: 'ttv2-label ttv2-money', text: 'Bazaars' }),
-            el('th', { class: 'ttv2-label ttv2-money', text: 'Recorded' }),
-        ]));
-        const avgs = view.averages || {};
-        for (const w of WINDOWS) {
-            const a = avgs[w.key] || { im: null, bz: null, coverage: 0 };
-            const none = a.coverage <= 0;
-            table.appendChild(el('tr', {}, [
-                el('th', { text: w.label }),
-                el('td', { class: 'ttv2-money' + (a.im ? '' : ' ttv2-none'), text: a.im ? formatMoney(a.im) : 'no data' }),
-                el('td', { class: 'ttv2-money' + (a.bz ? '' : ' ttv2-none'), text: a.bz ? formatMoney(a.bz) : 'no data' }),
-                el('td', { class: 'ttv2-money' + (none ? ' ttv2-none' : ''), text: none ? '0%' : Math.round(a.coverage * 100) < 1 ? '<1%' : Math.round(a.coverage * 100) + '%' }),
-            ]));
-        }
-        detail.appendChild(table);
-
-        /* graph */
-        const windows = el('div', { class: 'ttv2-windows' });
+        /* the graph, with its window */
+        const windows = el('div', { class: 'ttv2-windows', role: 'group', 'aria-label': 'Graph window' });
         for (const key of ['24h', '7d', '30d']) {
             windows.appendChild(el('button', {
                 type: 'button',
@@ -1456,18 +1426,11 @@ export class Panel {
         }
         detail.appendChild(windows);
 
-        if (view.series) detail.appendChild(renderPriceGraph(view.series, { width: 400, height: 96 }));
+        if (view.series) detail.appendChild(renderPriceGraph(view.series, { width: 404, height: 160 }));
         detail.appendChild(el('div', { class: 'ttv2-graph-keys' }, [
-            el('span', { class: 'ttv2-key-im', text: '— Item Market ask' }),
-            el('span', { class: 'ttv2-key-bz', text: '— Bazaar ask' }),
-            el('span', { class: 'ttv2-key-mv', text: '- - Market value' }),
+            el('span', { class: 'ttv2-key-mv' }, [el('i'), 'Item Market Average']),
+            el('span', { class: 'ttv2-key-im' }, [el('i'), 'Lowest listing we saw']),
         ]));
-
-        const cov = avgs[view.windowKey] ? coverageText(avgs[view.windowKey].coverage, view.windowKey) : '0%';
-        detail.appendChild(el('div', {
-            class: 'ttv2-note',
-            text: 'Asking prices this script recorded (' + cov + '). Sales are not published.',
-        }));
     }
 
     destroy() {

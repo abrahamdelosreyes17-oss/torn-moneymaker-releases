@@ -171,12 +171,14 @@ function fakeDocument() {
         const node = { tag, attrs: {}, children: [], textContent: '' };
         node.setAttribute = (k, v) => (node.attrs[k] = v);
         node.appendChild = (c) => node.children.push(c);
+        node.addEventListener = () => {};
+        node.style = {};
         return node;
     };
     return { createElementNS: (_ns, tag) => make(tag), createElement: make };
 }
 
-test('graph: the line breaks where buckets are missing, not only where a bucket is null', () => {
+test('graph: recorded runs are solid, gaps are bridged by a dotted line, a lone sample is a dot', () => {
     const prev = globalThis.document;
     globalThis.document = fakeDocument();
     try {
@@ -191,16 +193,28 @@ test('graph: the line breaks where buckets are missing, not only where a bucket 
             // a lone sample after a gap
             { t: t0 + 9 * step, im: 14, bz: null },
         ];
-        const svg = renderPriceGraph({ from: t0, to: t0 + 10 * step, points, mv: [], step });
-        const paths = svg.children.filter((c) => c.tag === 'path');
-        assert.equal(paths.length, 1);
-        const segments = paths[0].attrs.d.split('M').filter(Boolean);
-        assert.equal(segments.length, 3, 'three runs: ' + paths[0].attrs.d);
-        assert.equal(svg.children.filter((c) => c.tag === 'circle').length, 1, 'the lone sample is a dot');
+        const svgOf = (fig) => fig.children.find((c) => c.tag === 'svg');
+        const runs = (svg) => {
+            const paths = svg.children.filter((c) => c.tag === 'path');
+            const solid = paths.find((p) => !p.attrs['stroke-dasharray']);
+            const dotted = paths.find((p) => p.attrs['stroke-dasharray']);
+            return {
+                solid: solid.attrs.d.split('M').filter(Boolean).length,
+                dotted: dotted ? dotted.attrs.d.split('M').filter(Boolean).length : 0,
+            };
+        };
+        const svg = svgOf(renderPriceGraph({ from: t0, to: t0 + 10 * step, points, mv: [], step }));
+        assert.deepEqual(runs(svg), { solid: 3, dotted: 2 }, 'three recorded runs, two gaps bridged');
+        const dots = svg.children.filter((c) => c.tag === 'circle' && c.attrs.visibility !== 'hidden');
+        assert.equal(dots.length, 1, 'the lone sample is a dot');
+        // A price scale and time marks are drawn, so the graph can be read.
+        const labels = svg.children.filter((c) => c.tag === 'text').map((c) => c.textContent);
+        assert.equal(labels.length, 6);
+        assert.ok(labels.includes('now'));
 
         // Without `step`, the bucket width is inferred from the closest neighbours.
-        const inferred = renderPriceGraph({ from: t0, to: t0 + 10 * step, points, mv: [] });
-        assert.equal(inferred.children.find((c) => c.tag === 'path').attrs.d.split('M').filter(Boolean).length, 3);
+        const inferred = svgOf(renderPriceGraph({ from: t0, to: t0 + 10 * step, points, mv: [] }));
+        assert.deepEqual(runs(inferred), { solid: 3, dotted: 2 });
     } finally {
         globalThis.document = prev;
     }

@@ -3,327 +3,227 @@
 Read this first, then `README.md`. The README holds the product and the binding
 rules; this file holds where we are, how the owner works, and what is settled.
 
-## READ FIRST: corrections from the owner (after 3.8.1)
+## Where things stand (3.9.0, 2026-09-25)
 
-The selling page as built does NOT match what he wants. He said the previous
-session misunderstood him and should have asked instead of guessing. **If
-anything below is unclear, ask him before coding. Asking is free; wrong builds
-cost him real money.**
-
-### 1. The TornExchange key: there is no separate key (likely root cause)
-- Checked in TornExchange's source (`users/views.py`): at login TE takes the
-  Torn API key you type in, checks it against Torn, and saves it as
-  `profile.api_key`. The API's `?key=` must equal that key. So the "TE API
-  key" **is the Torn API key he logged into tornexchange.com with**.
-- He logged in with his **Limited** key, so both fields should hold the
-  **same key**. The page refuses that (`src/main.js` ~2205, and the reverse
-  checks at ~2167 and ~399). So TE gets no key, no traders load, every item
-  says "No buyer on TE", and no online statuses are fetched. That matches
-  everything he saw. Confirm live, then fix: allow the same key, or use one
-  field for both. TE already holds this key, since he logged in with it.
-
-### 2. What the selling page must show (his words)
-> "I just want the information from their page and from the traders' links.
-> Of course they will have 0 buyers. I am the buyer. In Torn we buy by
-> messaging the trader and creating the trade. No one else can track it.
-> Thus I just want the trader's name, their link, profile link, what they're
-> selling and how much."
-
-- Per item: each TornExchange trader for it, with **name**, **TE price list
-  link**, **Torn profile link**, and the **price** from their list. Their
-  **online status**, fetched the same way as bazaar sellers' status.
-- TE doesn't track trades. They happen by message in Torn, so there are no
-  "buyer" counts. Drop wording like "No buyer on TE"; ask him what an item
-  with no trader should say.
-
-### 3. Replace "Traders avg"
-> "Why do I care about traders avg? I want the item's average on the Item
-> Market, from any information we have on the item."
-
-- Show the item's **Item Market average**, from what we have: Torn's market
-  value (daily average of real sales), the v2 `itemmarket` `average_price`,
-  and the script's own recorded asks. **Ask him which of these to show and
-  how to label them before building.**
-
-### 4. Remove Qty, Total and the "Per item | Bundle" switch
-> "I don't want that bundle, I only care about their price PER item. I don't
-> care how much they have. We're not checking their bazaar."
-
-- A trader's price list only has **prices per item**, and no quantities. His
-  example: https://weav3r.dev/pricelist/3727302, one trader's list on TornW3B.
-- Remove the **Qty** column, the **Total** column and the **"Per item |
-  Bundle"** switch. The page is about the **best trader and best price per
-  item**, not quantities.
-
-### 4a. Page layout (his latest words, confirmed)
-> "It should have a page of the list of items that traders buy, but on the
-> first one, we prioritize our items. Now we can have a separate area where we
-> can check what other traders buy, filterable by a search button. It
-> shouldn't be items that I add myself; hence I have the Limited key. The
-> part where I can only see my items and finding the best trader for it, I can
-> also filter out what items I like, so if I wanna sell a Xanax I only see
-> the traders with Xanax."
-
-1. **"My items" section, first:** the items he holds (from his inventory,
-   via the Limited key) that traders buy. Each shows the best trader and
-   price per item. A **filter** narrows it: typing "xanax" shows only Xanax
-   and the traders buying it.
-2. **"All items" section:** every item any trader buys, with a **search
-   box**.
-3. **For every item:** its traders, **highest price first**, each with name,
-   **price per item**, online status (checked the same way as bazaar
-   sellers), **Profile** link and **price list** link.
-4. **Items are never added by hand.** They come from the traders' lists and
-   his inventory.
-
-### 4b. Trader price lists live on TornW3B too, not only TornExchange
-- Traders publish price lists on **TornW3B** (`weav3r.dev/pricelist/{traderId}`)
-  as well as TornExchange. Earlier research, from third-party code and not
-  verified: TornW3B has `GET /api/pricelist/{traderId}` returning
-  `[{itemId, name, buyPrice}]`, but **no endpoint listing all traders**.
-- He wants traders' prices "from their page and from the traders' links", so
-  both sources probably matter. **Research cheaply and ask him** before
-  building: which sources, and how to find the traders (TornExchange's
-  `active_traders` gives ids; TornW3B has no list).
-
-### 5. Graphs, when selling
-- He can't see graphs when selling. The facts:
-  - No API has past price history. Only the script's own recordings exist,
-    since he installed 3.8.0: every 5 min, with a Torn tab open and TornW3B
-    on, for items seen on the own-bazaar add/manage page or in the selling
-    page's inventory.
-  - The graph is only in the overlay's "My bazaar" view, opened by clicking
-    a price tag on `bazaar.php#/add` or `#/manage`. The selling page has no
-    graph at all. Tag clicks were broken in 3.8.0 and fixed in 3.8.1.
-  - Unresearched idea: read Torn's in-game market-value graph when *he* opens
-    an item's info (reading a page he's viewing is allowed).
-- **Ask him** whether he wants a graph or averages on the selling page.
-
-### 6. Process: budget is tight
-- Research only the specific question, cheaply.
-- Restate his words back and get a yes before building.
-- One focused change at a time.
-
-## Where things stand
-
-- **Version 3.8.1**, branch `claude/optimistic-ride-1gqguu`, commit `0210c53`.
+- **Version 3.9.0** on branch `claude/optimistic-ride-1gqguu`, on top of 3.8.1
+  (`0210c53`) and the cloud session's handoff commits.
 - **`main` is still at 2.9.3.** The script's `@updateURL` points at `main`, so
   installs are done from **pinned links**:
   `https://raw.githubusercontent.com/abrahamdelosreyes17-oss/torn-moneymaker-releases/<commit>/torn-moneymaker.user.js`
   Merging to `main` would make every install auto-update. Only do that when
   the owner asks.
-- `claude/trusting-ride-m6bvhg` is an older branch (3.4.1). It is fully
-  contained in this one.
-- Who uses it: the owner and his friend, who plays Torn. "He" in the owner's
-  messages usually means the friend.
+- `claude/trusting-ride-m6bvhg` (3.4.1) is fully contained in this branch.
+- Who uses it: the owner and a friend who plays Torn.
+
+### What 3.9.0 did (the owner's corrections after 3.8.1)
+
+1. **The TornExchange key.** TornExchange's API key *is* the Torn key you log
+   into tornexchange.com with. 3.8.1 refused to save a key equal to a Torn
+   key, so traders never loaded. Now the same key is accepted, and the page
+   has a *Use my Limited key* button. Saving or forgetting the key no longer
+   resets TornExchange's shared wait.
+2. **The traders page, rebuilt to the owner's spec, in the owner's words:**
+   - "My items" first: every held item, its best trader and price per item,
+     with a filter ("xanax" shows only Xanax);
+   - "All items" after: every item any trader buys, with a search box;
+   - per item, every trader highest price first, with name, price per item,
+     online status, Profile, TE list and W3B list;
+   - "No Trader Found" for an item nobody buys; items are never added by hand.
+3. **Removed:** Qty, Total, the Per item | Bundle switch, and "Traders avg".
+4. **Our own trader database**, built from:
+   - TornExchange's active traders and its top buyers;
+   - every `/pricelist/{id}` link on a TornW3B page the owner opens (the script
+     now also runs on weav3r.dev, only to note those traders);
+   - each trader's TornW3B price list (`/api/pricelist/{id}`, no key), read one
+     at a time.
+
+   A trader on both sites shows once, at their higher price, with both links.
+   The owner asked for that.
+5. **Item Market Average, on the add-listing page only (for now).**
+   - It's Torn's market value, "what it sold for, on average", refreshed hourly.
+   - The row tag says "Item Market Average $830,000".
+   - The panel shows the average in large type over one graph.
+6. **The add-page graph was rebuilt** (the owner said it didn't render well):
+   - the old version had no scale, no time labels, lines squashed flat, and
+     one $9,999,999 troll listing flattened everything;
+   - now it has a price scale and time marks, and two lines: the daily Item
+     Market Average and the lowest listing seen;
+   - gaps are bridged with a dotted line, off-scale outliers are pinned as
+     arrows, and pointing at the graph reads out the values;
+   - the old 15-number averages table and the bazaar-ask column are gone.
+7. **UI, per the owner's request ("easy to look at, not stale, research how
+   eyes read").** Applied:
+   - F-pattern: pictures and names on the left;
+   - the answer is the biggest, brightest number, in one right-aligned column;
+   - proximity: who pays sits under the price;
+   - colour only where it means something;
+   - big click targets, and fixed link slots so the prices line up;
+   - Torn's item pictures;
+   - a list's order is frozen while the pointer is over it, so a row never
+     moves under a click;
+   - "Checking…" instead of "No Trader Found" until every source has answered.
+
+## Not done / open
+
+- **Not verified live** (only in the harness). Please check in the owner's
+  Chrome, reading only pages the owner opened:
+  - the real TornExchange responses with the owner's key;
+  - `/v2/user/inventory`;
+  - the real `#/add` and `#/manage` markup.
+
+  weav3r.dev was checked live on 2026-09-25: its `/api/pricelist/{id}`, the
+  home-page leaderboards and Search Deals links all work as coded.
+- **`test/ux-check.mjs` was rewritten** for the new traders page and add page
+  but **not run**: Playwright isn't installed on this machine. Run it:
+  `PWPATH=$(npm root -g)/playwright node test/ux-check.mjs`.
+- **TornW3B-only traders** (not on TornExchange, not on TornW3B's top-40 lists)
+  are found only once the owner opens a TornW3B page that links to them, such
+  as Search Deals for an item. TornW3B has no public list of traders. Its
+  Search Deals data comes from a Next.js server action, not a public API, so
+  we don't call it.
+- **Idea, not built:** read Torn's own market-value graph when the owner opens
+  an item's info in game (a page they're viewing, so allowed). That would give
+  the add-page graph real sale history. Research the data format first, and
+  ask before building.
+- **Findings from the 2026-09-25 code review, not fixed yet** (ask which to do):
+  - the header total stops at the first row the cash can't fully buy
+    (`ranker.js summarize`);
+  - the green label on the page ignores Cash (`main.js cardLabel`);
+  - the TornW3B refetch loop when the summary's lowest price is a $1 listing
+    (`feed.js bazaarDue`);
+  - the dead-key state isn't shared between tabs;
+  - no feed backoff on Torn errors 5, 8 and 9;
+  - the shared 70/min window can lose writes between tabs;
+  - requests already waiting can still go out after their tab is hidden;
+  - a crash on the own-bazaar page after "Re-download item data";
+  - `userID` in a URL is matched case-sensitively.
+- **Own storefront:** `bazaar.php` with no hash can mark the owner's own
+  listings as deals. **The owner said to leave this alone for now.**
 
 ## How the owner works (follow these exactly)
 
 1. **Commit only when told.** "Don't code yet" means brainstorm only.
 2. **Bump the version on every release**, and give the **pinned install link**.
-3. **Research first, then build exactly what he said.** Don't swap in your own
-   design. If something looks necessary but is outside what he asked, **stop
-   and ask**. At the end, report honestly anything that was out of scope.
-4. **Restate his spec in his words before building a large feature,** and get
-   a yes. Past failures:
-   - a buying page built when he asked for a selling page;
-   - a panel tab built instead of the separate page he asked for;
-   - a question about his Cash chip, which he'd typed in digits, answered
-     with a shorthand-parsing ("1m") explanation that didn't apply.
-
-   Read what he actually wrote.
+3. **Research first, then build exactly what the owner said.** Don't swap in
+   your own design. If something looks necessary but is outside what they
+   asked, **stop and ask**. At the end, report honestly anything that was out
+   of scope.
+4. **Restate the spec in the owner's words before building a large feature,**
+   and get a yes. Read what they actually wrote, not what an earlier session
+   wrote about them.
 5. **Tests pass ≠ it works.** Reproduce the bug first. Prove each new check
    **fails without the fix**. Look at screenshots yourself.
-6. **The UI must look professional and native to Torn,** not "AI-made": see
-   the design rules below. He notices small text, bad alignment and AI-sounding
-   wording immediately.
-7. For the 3.8 build he had a **Fable** agent implement, and the session
-   reviewed and tested its work. He has also asked for Fable to be consulted
-   on UI.
+6. **The UI must look professional, native to Torn, and easy to read.** Follow
+   the design rules below. The owner notices small text, bad alignment and
+   AI-sounding wording immediately.
+7. **Stay within Torn's rules, always.** Verifying in the owner's Chrome is
+   welcome: read or screenshot pages the owner opened. Don't automate
+   navigation on torn.com, forums included.
 
 ## Build and test
 
 ```bash
 npm run build      # src/ -> dist/ and torn-moneymaker.user.js (the release file)
-npm test           # unit tests (125)
+npm test           # unit tests (133)
 npm run check      # build + syntax check + unit tests
 PWPATH=$(npm root -g)/playwright node test/ux-check.mjs   # real-browser checks
 ```
 
 - **The bundler** (`build.mjs`) flattens every module into one scope. It fails
   the build on duplicate top-level names.
-- **`test/harness-live.html`** boots the real built script. It stubs GM_* and
-  answers GM_xmlhttpRequest with canned Torn API, TornW3B and TornExchange
-  data. URL parameters:
-  - `?ttv2=traders` boots the selling page;
-  - `&sellkeys=1` saves both of its keys;
-  - `&sellprefs=<json>` sets its preferences;
+- **`test/harness-live.html`** boots the real built script, always a fresh
+  copy. It stubs GM_* and answers GM_xmlhttpRequest with canned Torn API,
+  TornW3B and TornExchange data. URL parameters:
+  - `?ttv2=traders` boots the traders page;
+  - `&sellkeys=1` saves both keys;
+  - `&sellsame=1` makes both keys the same Limited key;
+  - `&w3btrader=1` adds a TornW3B-only trader;
+  - `&sellprefs=<json>` sets the page's preferences;
   - `&slow=1` answers status lookups slowly;
-  - `&nofeed=1` turns the feed off.
-- **The harness sets Torn's light `--default-bg-panel-color` on `:root`**, as
-  torn.com does, to catch theme leaks.
-- **`test/discovery.test.js`** simulates 10 minutes of the feed. It must find at
-  least 12 of 20 hidden Item Market deals. 3.7.0 found 0; 3.8.x finds 14.
-
-## What the product is (3.8.1)
-
-### Overlay: buying, with a **Public** key
-- Finds Bazaar and Item Market listings below an exit price.
-- **Sell to chips:** NPC (on by default), My bazaar, Market. **Min** and
-  **Cash** chips.
-- **Cash accepts any value:** `1234567`, `1,234,567`, `$1m`, `1.5m`.
-  Unreadable input keeps the old value and shows an error.
-  - Items you can't buy at least one of are always hidden.
-  - Partly affordable rows show "×2 of 10", with the profit for those 2.
-  - The header total stops at your cash.
-- **Discovery respects Cash and Min.** Unaffordable items are never fetched, and
-  the rest are ranked by what your cash can make.
-- **Other features:**
-  - the seller's online status on each bazaar row;
-  - the bazaar owner's badge on Torn's banner;
-  - closed bazaars are hidden;
-  - padlocked $1 listings are skipped;
-  - the ` key toggles the panel;
-  - the "Open deals in a new tab" setting.
-- **Fixed panel height:** 75% of the window, up to 640px, the same on every
-  tab. Always dark.
-- **Own-bazaar pricing helper** on `bazaar.php#/add` and `#/manage`: the pages
-  with no `userId`, detected by `route.ownBazaarPage`.
-  - Each row gets a tag after the item name: "IM $x · Bazaar $y".
-  - Pressing the tag opens the panel's "My bazaar" view:
-    - current lowest asks;
-    - Torn's market value;
-    - 1h / 6h / 24h / 7d / 30d averages, each with the share of the window
-      actually recorded;
-    - a 24h / 7d / 30d graph.
-  - Tag presses are caught on `window` in the capture phase, because Torn
-    redraws the row on the press.
-
-### Selling page ("Sell" button → always its own tab, `index.php?ttv2=traders`)
-- For **selling what he holds.** There is no buying on it.
-- **Its own settings:**
-  - his **Limited** Torn key: inventory, market values and traders' status,
-    sent only to api.torn.com;
-  - his **TornExchange API key**: sent only to tornexchange.com.
-
-  Torn's key-use table sits beside the Limited key. Its preferences are
-  separate from the overlay's (GM key `sellingPage`).
-- **Each held item** shows: best trader offer (**always highest first**), trader
-  and status, market value, traders' average (marked "top 3" until the full
-  list loads), and total.
-  - Clicking an item shows every buyer, highest first, with **Profile** and
-    **TE list** links.
-- **Sort:** "Per item | Bundle". Per item by default; Bundle means quantity ×
-  offer.
-- **"Online only"** removes offline traders and keeps highest-first order.
+  - `&nofeed=1` turns the feed off;
+  - `?ownbazaar=1&page=bazaar#/add` opens your own add page with a week of
+    recorded prices.
+- **The traders page pauses every request while its tab is hidden** (Torn's
+  rules). In a background preview it looks stuck until brought forward.
 
 ## Settled facts (don't reopen these)
 
 - **NPC price:** an item has one only if it has a `sell_price` **and** a Torn
-  city shop stocks it. "Sell: N/A" items never appear.
+  city shop stocks it.
 - **$1 listings:** Torn locks every $1 bazaar listing to a random few players.
   Padlocked cards are skipped, and TornW3B $1 rows are dropped.
 - **Torn rules:**
-  - Use only the API or the page he is viewing.
+  - Use only the API or the page the owner is viewing.
   - Never fetch a torn.com page yourself.
   - Never auto-buy or chain actions.
   - No alerts from an unfocused tab.
+- **API limit:** 100 calls a minute per **player**, across all their keys. Our
+  limit is 70 a minute shared by all tabs, and the feed uses up to 30 of it.
+- **TornExchange:**
+  - its key = the Torn key you log in there with;
+  - 10 requests a minute per IP, and every request over the limit doubles a
+    penalty, up to 48 hours;
+  - we pace at 10 s per request, shared across tabs and reloads, and honour
+    `retry_after`;
+  - `all_best_listings` gives the top 3 buyers per item;
+  - `listings?item_id` gives every buyer, with names only;
+  - `active_traders` gives names and ids.
+- **TornW3B:**
+  - `GET /api/pricelist/{id}` returns `[{itemId, name, buyPrice,
+    bulkThreshold, bulkBuyPrice}]`; buyPrice 0 means not buying; no list gives
+    `[]` or a 404;
+  - no key is needed, and Cloudflare blocks HTML pages to scripts, not the
+    `/api/`;
+  - 100 requests a minute per IP: the traders page uses at most 24, and the
+    feed at most 60.
+- **Price history:** no API gives sale history for ordinary items. The script
+  records the lowest listing itself. Torn's market value is the one number
+  based on actual sales, and it is what "Item Market Average" shows.
+- **Inventory:** `/v2/user/inventory` needs a Limited key. Torn caches it for
+  about an hour.
 
-  Details are in the README.
-- **API limit:** 100 calls a minute per **player**, across all of his keys.
-  Extra keys add nothing; extra accounts are banned. Don't add key rotation.
-  Our limit is 70 a minute shared by all tabs, and the feed uses up to 30 of it.
-- **Inventory:** v2 `GET /v2/user/inventory` needs a Minimal key or higher, and
-  Torn caches it for about an hour per category. The old v1 inventory selection
-  has been dead since October 2023.
-- **TornExchange API:**
-  - It needs `?key=`: his TornExchange key.
-  - Its limit is **10 requests a minute per IP**. Every request over the limit
-    doubles a penalty, up to 48 hours.
-  - We pace at 10 seconds per request (6 a minute), shared across tabs and
-    reloads, and honour `retry_after`.
-  - `all_best_listings` returns the top 3 buyers per item. `listings?item_id`
-    returns every buyer, with names only; ids come from `active_traders`.
-- **Price history:**
-  - No API gives item price or sale history for ordinary items.
-  - TornW3B, TornExchange and YATA keep history but don't expose it.
-  - The helper therefore **records asking prices itself** from 3.8.0 onward.
-    It samples every 5 minutes from the TornW3B summary on any Torn page, for
-    up to 60 items seen in his bazaar or inventory.
-  - Torn's market value is the one number based on actual sales.
-
-## Unverified live (couldn't reach torn.com or tornexchange.com from the cloud)
-
-1. **Whether `/v2/user/inventory` needs `cat`.** The spec says it's optional.
-   The code falls back to asking category by category.
-2. **His real TornExchange key and its responses.**
-3. **The real `#/add` and `#/manage` markup.** The selectors come from a working
-   2026 filler script. If the tags are missing, use Tampermonkey menu →
-   **Show my bazaar diagnostics**.
-
-## Open items (not done, or waiting on the owner)
-
-- **Idea, not researched or built:** when he opens an item's info in game,
-  Torn shows a market-value graph over time. The script might read that data
-  from the page he opened (allowed), which would give the helper past trends.
-  Research the data format first, and ask before building.
-- **Item Market history is patchier than bazaar history.** It's only recorded
-  when the feed or the helper happened to check that item.
-- **README:** doesn't mention the Per item / Bundle switch yet.
-- **Minor:** the selling page's "←" shows briefly before it's needed.
-- **Own storefront:** `bazaar.php` with no hash can mark his own listings as
-  deals. **The owner said to leave this alone for now.**
-
-## Design rules (the UI checklist; reject a release that fails any)
+## Design rules (the UI checklist)
 
 **Type**
-- Arial, and only four sizes: 11px (uppercase labels), 12px, 13px, and 15px
-  bold for the key number. Page titles are 20px.
-- Nothing under 12px except those 11px labels.
+- Arial, 11px uppercase labels, 12px secondary, 13px body, 15px bold for key
+  figures and item names.
+- 20px for page titles and the add page's average.
 
-**Spacing:** steps of 4, 8, 12 and 16px only.
+**Spacing:** steps of 4, 8, 12 and 16px.
 
-**Money:** right-aligned, tabular figures, in columns that line up.
+**Money:** right-aligned tabular figures, in one column.
 
-**Colours:** tokens only, and always dark. Never borrow Torn's CSS variables for
-backgrounds (that caused the 3.8.0 light-mode regression). Text contrast at
-least 4.5:1.
-
-**Buttons:** one primary button per view, and no full-width button in every row.
-
-**Separators:** one kind per line, and no dangling ones.
+**Colour**
+- Tokens only, always dark.
+- Green is the best price, the average and "online"; blue is a link; grey is
+  secondary.
 
 **Copy**
-- Labels of 6 words or fewer, messages of 12 or fewer, in players' words (IM,
-  TE, NPC, bazaar).
-- No " - " clauses, no "X, not Y", and no explaining how the script works.
-- Never "overlay", "chip" or "feed" in the UI.
+- Players' words (IM, TE, W3B, NPC).
+- Labels of 6 words or fewer, and no explaining how the script works.
 
-**Layout:** nothing wraps onto an orphan line at 430px.
+**Layout**
+- Nothing wraps onto an orphan line at 430px.
+- No sideways scroll.
 
 ## Code map
 
 - **`src/core/`** holds pure logic, tested under node:
-  - `feed.js`: exits, candidates, sweep, feed rows;
-  - `ranker.js`: filtering, cash, totals;
-  - `profit.js`, `npc.js`, `items.js`, `parse.js`;
-  - `selling.js`: selling page rows;
-  - `inventory.js`;
-  - `history.js`: the price-history store.
+  - `traders.js`: the trader database, merging, ranking, which list is next;
+  - `selling.js`: TornExchange caches;
+  - `feed.js`, `ranker.js`, `profit.js`, `npc.js`, `items.js`, `parse.js`,
+    `inventory.js`, `history.js`.
 - **`src/api/`** holds network clients:
-  - `client.js`: Torn, with the host check and the shared rate limit;
-  - `torn.js`: endpoint wrappers;
-  - `w3b.js`: TornW3B;
-  - `te.js`: TornExchange, its client and paced queue.
-- **`src/feed/controller.js`** is the live feed: leader tab, budget and planner.
-- **`src/sources/`** holds page detection and DOM reading:
-  - `route.js`;
-  - `dom/scan.js`: the buying scanner;
-  - `dom/owner.js`: bazaar owner status;
-  - `dom/ownbazaar.js`: the helper's rows.
+  - `client.js`: Torn;
+  - `torn.js`;
+  - `w3b.js`: TornW3B, including price lists;
+  - `te.js`: TornExchange.
+- **`src/feed/controller.js`** is the live feed.
+- **`src/sources/`** holds page detection and DOM reading.
 - **`src/ui/`** holds the interface:
-  - `panel.js`: the overlay;
-  - `selling-page.js`;
-  - `graph.js`;
-  - `styles.js`: tokens and CSS.
-- **`src/main.js`** wires everything together.
+  - `panel.js`: the overlay and My bazaar;
+  - `selling-page.js`: the traders page;
+  - `graph.js`: the add-page graph;
+  - `styles.js`.
+- **`src/main.js`** wires everything, including `bootSellingPage()` and
+  `bootW3bHarvest()` (weav3r.dev).

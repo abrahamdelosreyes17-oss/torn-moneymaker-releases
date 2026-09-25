@@ -25,17 +25,11 @@ import {
     TE_MIN_GAP_MS,
 } from '../src/api/te.js';
 import {
-    rankOffers,
-    tradersAverage,
-    mergeTraders,
-    buildSellingRows,
-    tradersToWatch,
     makeTeCacheEntry,
     readTeCacheEntry,
     readTeItemLists,
     writeTeItemList,
     TE_MAX_AGE_MS,
-    SORT_BUNDLE,
 } from '../src/core/selling.js';
 import { tradersPageUrl, isTradersPageUrl, detectPage } from '../src/sources/route.js';
 
@@ -383,119 +377,7 @@ test('the queue: a too-soon refusal goes back to the front; another error fails 
     assert.equal(queue.length, 0);
 });
 
-/* ================================================================ ranking */
-
-const traders = parseTeBestListings(BEST).get('206');
-const levels = { 11: 'Online', 12: 'Offline', 13: 'Idle' };
-const presenceOf = (id) => (levels[id] ? { online: levels[id] } : null);
-
-test('offers rank highest price first, whatever the status; Online only filters, never reorders', () => {
-    const all = rankOffers(traders, { presenceOf });
-    assert.deepEqual(all.map((o) => o.trader.name), ['Stale', 'Alice', 'Bob']);
-    assert.deepEqual(all.map((o) => o.level), ['idle', 'offline', 'online']);
-
-    const online = rankOffers(traders, { presenceOf, onlineOnly: true });
-    assert.deepEqual(online.map((o) => o.trader.name), ['Bob']);
-
-    const unknown = rankOffers(traders, { presenceOf: () => null, onlineOnly: true });
-    assert.equal(unknown.length, 0, 'not known online = not online');
-
-    assert.equal(tradersAverage(traders), Math.round((990000 + 830000 + 820000) / 3));
-    assert.equal(tradersAverage([]), null);
-});
-
-test('the full buyer list merges with the top three by name, keeping ids where known', () => {
-    const full = parseTeListings(LISTINGS).traders;
-    const ids = new Map([['carol', '44']]);
-    const { traders: merged, partial } = mergeTraders(traders, full, ids);
-    assert.equal(partial, false);
-    const carol = merged.find((t) => t.name === 'Carol');
-    assert.equal(carol.id, '44');
-    assert.equal(merged.find((t) => t.name === 'Bob').id, '11');
-    assert.equal(merged.find((t) => t.name === 'Bob').score, 214);
-    assert.equal(merged.length, 4);
-
-    const noId = mergeTraders(traders, full);
-    assert.equal(noId.traders.find((t) => t.name === 'Carol').id, null);
-
-    const top = mergeTraders(traders, null);
-    assert.equal(top.partial, true);
-    assert.equal(top.traders.length, 3);
-});
-
-test('buyers known inactive, or with a negative score, are left out like all_best_listings leaves them out', () => {
-    const full = [...parseTeListings(LISTINGS).traders, { name: 'Dave', price: 700000 }];
-    // Active traders known, Dave not among them: gone. Carol is active.
-    const active = new Map([['carol', '44'], ['bob', '11']]);
-    const { traders: merged } = mergeTraders(traders, full, active);
-    assert.deepEqual(merged.map((t) => t.name).sort(), ['Alice', 'Bob', 'Carol', 'Stale'], 'top-three names stay even off the active list');
-    // Active traders not known: nobody can be called inactive.
-    assert.ok(mergeTraders(traders, full).traders.some((t) => t.name === 'Dave'));
-    // A known negative score is never a buyer.
-    const neg = [...traders, { name: 'Dave', id: '99', price: 700000, score: -3 }];
-    assert.ok(!mergeTraders(neg, full).traders.some((t) => t.name === 'Dave'));
-    assert.ok(!mergeTraders(neg, null).traders.some((t) => t.name === 'Dave'));
-});
-
-test('selling rows: one per held item, best offer x qty, no-buyer items last', () => {
-    const index = {
-        byId: new Map([
-            ['206', { id: '206', name: 'Xanax', marketValue: 830000 }],
-            ['1', { id: '1', name: 'Hammer', marketValue: 120 }],
-            ['5', { id: '5', name: 'Nothing', marketValue: 50 }],
-        ]),
-    };
-    const map = parseTeBestListings(BEST);
-    const inventory = [{ id: '1', name: 'Hammer', qty: 10 }, { id: '5', name: 'Nothing', qty: 1 }, { id: '206', name: 'Xanax', qty: 2 }];
-    const tradersFor = (id) => mergeTraders(map.get(id) || [], null);
-
-    const rows = buildSellingRows(inventory, index, { tradersFor, presenceOf });
-    assert.deepEqual(rows.map((r) => r.itemId), ['206', '1', '5']);
-    assert.equal(rows[0].bestPrice, 990000, 'highest offer, even from an idle trader');
-    assert.equal(rows[0].best.trader.name, 'Stale');
-    assert.equal(rows[0].total, 1980000);
-    assert.equal(rows[0].marketValue, 830000);
-    assert.equal(rows[0].tradersAvg, 880000);
-    assert.equal(rows[0].avgPartial, true, 'top three only until the full list loads');
-    assert.equal(rows[1].total, 1100);
-    assert.equal(rows[2].best, null);
-    assert.equal(rows[2].total, null);
-
-    const online = buildSellingRows(inventory, index, { tradersFor, presenceOf, onlineOnly: true });
-    assert.equal(online[0].best.trader.name, 'Bob', 'with Online only, the best ONLINE trader');
-    assert.equal(online[0].bestPrice, 820000);
-
-    assert.deepEqual(tradersToWatch(rows).slice(0, 2), ['13', '11'], 'best traders first');
-
-    // Statuses must be asked for from the rows with everyone on them: with
-    // Online only, unknown traders are already gone, so nobody would be asked.
-    const unknown = () => null;
-    assert.deepEqual(tradersToWatch(buildSellingRows(inventory, index, { tradersFor, presenceOf: unknown, onlineOnly: true })), []);
-    assert.deepEqual(tradersToWatch(buildSellingRows(inventory, index, { tradersFor, presenceOf: unknown })).sort(), ['11', '12', '13']);
-});
-
-test('item order: per item = best single offer first (default); bundle = qty x offer first', () => {
-    const index = {
-        byId: new Map([
-            ['206', { id: '206', name: 'Xanax', marketValue: 830000 }],
-            ['1', { id: '1', name: 'Hammer', marketValue: 120 }],
-            ['5', { id: '5', name: 'Nothing', marketValue: 50 }],
-            ['6', { id: '6', name: 'Zilch', marketValue: 10 }],
-        ]),
-    };
-    const map = parseTeBestListings(BEST);
-    const tradersFor = (id) => mergeTraders(map.get(id) || [], null);
-    // 100,000 Hammers at $110 = $11m beats one Xanax at $990,000; per item it does not.
-    const inventory = [{ id: '1', name: 'Hammer', qty: 100000 }, { id: '5', name: 'Nothing', qty: 1 }, { id: '6', name: 'Zilch', qty: 100 }, { id: '206', name: 'Xanax', qty: 1 }];
-
-    const perItem = buildSellingRows(inventory, index, { tradersFor, presenceOf });
-    assert.deepEqual(perItem.map((r) => r.itemId), ['206', '1', '5', '6'], 'per item: Xanax, Hammer; no-buyer items by value');
-
-    const bundle = buildSellingRows(inventory, index, { tradersFor, presenceOf, sortBy: SORT_BUNDLE });
-    assert.deepEqual(bundle.map((r) => r.itemId), ['1', '206', '6', '5'], 'bundle: Hammer x 100,000 first; no-buyer items by value x qty');
-    assert.deepEqual(bundle[0].offers.map((o) => o.trader.price), [110], 'traders within an item stay highest first');
-    assert.deepEqual(perItem[0].offers.map((o) => o.trader.price), [990000, 830000, 820000]);
-});
+/* ================================================================= caches */
 
 test('trader price caches: round trips, ages out; per-item lists capped', () => {
     const now = 1_900_000_000_000;
