@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      3.9.0
+// @version      3.9.1
 // @description  Finds Bazaar and Item Market listings below NPC / market value - on the page you are viewing, and live from the Torn API and TornW3B - ranked by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -39,7 +39,7 @@
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '3.9.0';
+    const TTV2_BUILD_VERSION = '3.9.1';
 
     /* ===== src/platform/gm.js ===== */
     /*
@@ -8122,19 +8122,24 @@
                 }
             };
             const toSettings = () => this.showView('settings');
+            // Most traders come from TornExchange, whose key is the Torn key you
+            // log in there with: usually this same Limited key, one press away.
+            const useLimited = () => this.h.onSaveTeKey && this.h.onSaveTeKey(this.h.onRevealKey ? this.h.onRevealKey() : '');
 
             if (info.keyError) {
                 say(info.keyError, 'bad', 'Open Settings', toSettings);
             } else if (!info.hasKey) {
                 say('Add your Limited key to see your items.', null, 'Add key', toSettings);
+            } else if (!info.hasTeKey) {
+                say('Traders load from TornExchange with the key you log in there with.', null, 'Use my Limited key', useLimited);
+            } else if (info.teBadKey && !info.teSameAsLimited) {
+                say(info.teError || 'TornExchange did not accept this key.', 'bad', 'Use my Limited key', useLimited);
             } else if (info.teBadKey) {
                 say(info.teError || 'TornExchange did not accept this key.', 'bad', 'Open Settings', toSettings);
             } else if (info.teWaitUntil && info.teWaitUntil > Date.now()) {
                 say('TornExchange asked us to wait ' + formatAge(info.teWaitUntil - Date.now()).replace(' ago', '') + '.', 'warn');
             } else if (info.teError) {
                 say(info.teError, 'warn');
-            } else if (!info.hasTeKey) {
-                say('Add your TornExchange key for more traders.', null, 'Add key', toSettings);
             }
         }
 
@@ -11397,6 +11402,9 @@
         if (sell.keyDead) sell.keyError = 'Torn rejected this key. Paste a new Limited key.';
 
         loadTraderDb();
+        // An error message is about the last call, not this visit: a stored one
+        // (3.8.1 kept "That is a Torn key" forever) would outlive its cause.
+        if (teState().error) setTeState({ error: null });
 
         sell.page = new SellingPage({
             onSaveKey: onSellSaveKey,

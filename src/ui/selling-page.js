@@ -524,19 +524,24 @@ export class SellingPage {
             }
         };
         const toSettings = () => this.showView('settings');
+        // Most traders come from TornExchange, whose key is the Torn key you
+        // log in there with: usually this same Limited key, one press away.
+        const useLimited = () => this.h.onSaveTeKey && this.h.onSaveTeKey(this.h.onRevealKey ? this.h.onRevealKey() : '');
 
         if (info.keyError) {
             say(info.keyError, 'bad', 'Open Settings', toSettings);
         } else if (!info.hasKey) {
             say('Add your Limited key to see your items.', null, 'Add key', toSettings);
+        } else if (!info.hasTeKey) {
+            say('Traders load from TornExchange with the key you log in there with.', null, 'Use my Limited key', useLimited);
+        } else if (info.teBadKey && !info.teSameAsLimited) {
+            say(info.teError || 'TornExchange did not accept this key.', 'bad', 'Use my Limited key', useLimited);
         } else if (info.teBadKey) {
             say(info.teError || 'TornExchange did not accept this key.', 'bad', 'Open Settings', toSettings);
         } else if (info.teWaitUntil && info.teWaitUntil > Date.now()) {
             say('TornExchange asked us to wait ' + formatAge(info.teWaitUntil - Date.now()).replace(' ago', '') + '.', 'warn');
         } else if (info.teError) {
             say(info.teError, 'warn');
-        } else if (!info.hasTeKey) {
-            say('Add your TornExchange key for more traders.', null, 'Add key', toSettings);
         }
     }
 

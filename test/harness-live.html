@@ -77,6 +77,13 @@ if (/[?&]ownbazaar=1/.test(location.search)) {
         document.body.prepend(d);
     });
 }
+// ?from381=1: left as 3.8.1 left it when it refused the Limited key as the
+// TornExchange key - the Limited key saved, no TornExchange key, and its
+// refusal message still stored.
+if (/[?&]from381=1/.test(location.search)) {
+    _store[NS + 'sellKey'] = JSON.stringify(LIMITED);
+    _store[NS + 'teState'] = JSON.stringify({ error: 'That is a Torn key. Paste the key from tornexchange.com.' });
+}
 // ?sellprefs=<json> presets the selling page's own preferences.
 const _prefs = new URLSearchParams(location.search).get('sellprefs');
 if (_prefs) _store[NS + 'sellingPage'] = _prefs;

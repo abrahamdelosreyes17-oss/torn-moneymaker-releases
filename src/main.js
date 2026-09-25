@@ -2444,6 +2444,9 @@ function bootSellingPage() {
     if (sell.keyDead) sell.keyError = 'Torn rejected this key. Paste a new Limited key.';
 
     loadTraderDb();
+    // An error message is about the last call, not this visit: a stored one
+    // (3.8.1 kept "That is a Torn key" forever) would outlive its cause.
+    if (teState().error) setTeState({ error: null });
 
     sell.page = new SellingPage({
         onSaveKey: onSellSaveKey,

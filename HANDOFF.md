@@ -3,9 +3,9 @@
 Read this first, then `README.md`. The README holds the product and the binding
 rules; this file holds where we are, how the owner works, and what is settled.
 
-## Where things stand (3.9.0, 2026-09-25)
+## Where things stand (3.9.1, 2026-09-25)
 
-- **Version 3.9.0** on branch `claude/optimistic-ride-1gqguu`, on top of 3.8.1
+- **Version 3.9.1** on branch `claude/optimistic-ride-1gqguu`, on top of 3.8.1
   (`0210c53`) and the cloud session's handoff commits.
 - **`main` is still at 2.9.3.** The script's `@updateURL` points at `main`, so
   installs are done from **pinned links**:
@@ -14,6 +14,11 @@ rules; this file holds where we are, how the owner works, and what is settled.
   the owner asks.
 - `claude/trusting-ride-m6bvhg` (3.4.1) is fully contained in this branch.
 - Who uses it: the owner and a friend who plays Torn.
+
+**3.9.1:** 3.8.1 had stored its refusal ("That is a Torn key...") in `teState`, and
+3.9.0 kept showing it, with no TornExchange key saved, so every item said
+"No traders yet". Stored TornExchange errors are now cleared when the page opens,
+and with no TornExchange key the banner offers **Use my Limited key** in one press.
 
 ### What 3.9.0 did (the owner's corrections after 3.8.1)
 
@@ -141,6 +146,8 @@ PWPATH=$(npm root -g)/playwright node test/ux-check.mjs   # real-browser checks
   - `&sellprefs=<json>` sets the page's preferences;
   - `&slow=1` answers status lookups slowly;
   - `&nofeed=1` turns the feed off;
+  - `&from381=1` reproduces what 3.8.1 left behind (the Limited key saved, no
+    TornExchange key, and its refusal message stored);
   - `?ownbazaar=1&page=bazaar#/add` opens your own add page with a week of
     recorded prices.
 - **The traders page pauses every request while its tab is hidden** (Torn's
