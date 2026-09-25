@@ -17,6 +17,7 @@
 import {
     formatMoney,
     formatMoneyShort,
+    formatMoneyCompact,
     formatPct,
     formatAge,
     parseMoneyInput,
@@ -395,6 +396,8 @@ export class Panel {
         if (settings && focusKey && this.keyInput) {
             setTimeout(() => this.keyInput.focus(), 0);
         }
+        // A new title, and the chips and tabs shown or not: fit to them.
+        this.fit();
     }
 
     openSettings({ focusKey = false } = {}) {
@@ -432,19 +435,20 @@ export class Panel {
 
         this.chipMin = this.valueChip(
             'minTotalProfit',
-            (v) => 'Min ' + formatMoneyShort(v || 0),
+            (v) => 'Min ' + formatMoneyCompact(v || 0),
             'Hide deals below this total profit',
         );
         this.chipCash = this.valueChip(
             'cashOnHand',
-            (v) => (v ? 'Cash ' + formatMoneyShort(v) : 'Cash: any'),
+            (v) => (v ? 'Cash ' + formatMoneyCompact(v) : 'Cash: any'),
             'Show only what this cash can buy',
         );
 
         this.chipsEl.appendChild(this.chipNpc);
         this.chipsEl.appendChild(this.chipBazaar);
         this.chipsEl.appendChild(this.chipMarket);
-        this.chipsEl.appendChild(el('span', { class: 'ttv2-chips-gap' }));
+        // Min and Cash sit at the right end (a margin, not a spacer: no extra gap).
+        this.chipMin.classList.add('ttv2-chips-end');
         this.chipsEl.appendChild(this.chipMin);
         this.chipsEl.appendChild(this.chipCash);
     }
@@ -512,6 +516,8 @@ export class Panel {
             });
 
             chip.style.display = 'none';
+            // In the chip's place, right end included.
+            if (chip.classList.contains('ttv2-chips-end')) input.style.marginLeft = 'auto';
             chip.parentNode.insertBefore(input, chip.nextSibling);
             this.chipEditor = { chip, input };
             input.focus();
@@ -885,18 +891,24 @@ export class Panel {
         this.root.classList.toggle('ttv2-narrow', width < TWO_ROW_BELOW);
         this.root.classList.remove('ttv2-tight');
         this.root.style.removeProperty('--fit-right');
-        const overflows = () => this.headEl && this.headEl.scrollWidth > this.headEl.clientWidth + 1;
+        // The header, the filter chips and the tabs: each is one row.
+        const rows = [this.headEl, this.chipsEl, this.tabsEl].filter(Boolean);
+        const overBy = () => Math.max(0, ...rows.map((row) => (row.clientWidth ? row.scrollWidth - row.clientWidth : 0)));
+        const overflows = () => overBy() > 1;
+        this.root.classList.remove('ttv2-tighter');
         if (this.root.classList.contains('ttv2-narrow') && overflows()) this.root.classList.add('ttv2-tight');
+        if (this.root.classList.contains('ttv2-tight') && overflows()) this.root.classList.add('ttv2-tighter');
 
-        // A very long headline in very little room: borrow the few pixels it
-        // needs from the window-edge margin first, then from the gap - still
-        // one row, still nothing cut.
+        // Still a few pixels short: borrow them from the window-edge margin
+        // first, then from the gap - never more than the gap, so the panel
+        // still never crosses Torn's content. Still one row, nothing cut.
         if (overflows() && !this.root.style.left) {
-            const extra = this.headEl.scrollWidth - this.headEl.clientWidth;
+            const extra = overBy();
             const fromEdge = Math.min(extra, 12);
-            this.root.style.setProperty('--fit-width', width + extra + 'px');
+            const fromGap = this.minLeft ? Math.min(extra - fromEdge, FIT_GAP - 2) : extra - fromEdge;
+            this.root.style.setProperty('--fit-width', width + fromEdge + fromGap + 'px');
             this.root.style.setProperty('--fit-right', 16 - fromEdge + 'px');
-            this.minLeft = Math.max(0, this.minLeft - (extra - fromEdge));
+            this.minLeft = Math.max(0, this.minLeft - fromGap);
         }
     }
 
@@ -1031,6 +1043,8 @@ export class Panel {
         this.chipCash.textContent = this.chipCash.labelFor(s.cashOnHand);
         this.chipCash.classList.toggle('ttv2-chip-set', Boolean(s.cashOnHand));
         this.chipMin.classList.toggle('ttv2-chip-set', Number(s.minTotalProfit) > 1);
+        // "Min 0" can become "Min 1.5m": the row must still fit on one line.
+        this.fit();
     }
 
     /* ------------------------------------------------------------ render */

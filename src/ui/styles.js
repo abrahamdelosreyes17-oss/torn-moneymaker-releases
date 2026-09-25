@@ -523,29 +523,77 @@ ${TOKENS_CSS}
     margin-left: 2px;
 }
 
-/* The filter chips wrap to a second row rather than running off the edge. */
+/*
+ * The filter chips and the tabs: one row each, like the header. In less
+ * room the chips and their spacing get smaller, never wrapped or cut.
+ */
 .ttv2-panel.ttv2-narrow .ttv2-chips {
-    flex-wrap: wrap;
-    row-gap: 4px;
+    gap: 4px;
+    padding: 6px 8px;
 }
 
-/* ...with Min and Cash together on the second row: the gap takes a row. */
-.ttv2-panel.ttv2-narrow .ttv2-chips-gap {
-    flex: 1 0 100%;
-    height: 0;
+.ttv2-panel.ttv2-narrow button.ttv2-chip {
+    height: 22px;
+    padding: 0 6px;
+    font-size: 12px;
 }
 
-/* The tab row too: the TornW3B credit moves under the tabs rather than off the edge. */
+.ttv2-panel.ttv2-narrow input.ttv2-chip-input {
+    width: 72px;
+    height: 22px;
+    padding: 0 6px;
+}
+
 .ttv2-panel.ttv2-narrow .ttv2-tabs {
-    flex-wrap: wrap;
+    gap: 2px;
+    padding: 6px 8px 0;
+}
+
+.ttv2-panel.ttv2-narrow button.ttv2-tab {
+    padding: 0 8px;
+    font-size: 12px;
 }
 
 .ttv2-panel.ttv2-narrow .ttv2-credit {
-    order: -1;
-    flex: 1 0 100%;
-    margin-left: 0;
-    padding-bottom: 4px;
-    text-align: right;
+    font-size: 11px;
+}
+
+.ttv2-panel.ttv2-tight .ttv2-chips {
+    gap: 3px;
+    padding: 6px;
+}
+
+.ttv2-panel.ttv2-tight button.ttv2-chip {
+    padding: 0 5px;
+    font-size: 11px;
+}
+
+.ttv2-panel.ttv2-tight .ttv2-tabs {
+    padding: 6px 6px 0;
+}
+
+.ttv2-panel.ttv2-tight button.ttv2-tab {
+    padding: 0 6px;
+    font-size: 11px;
+}
+
+/* The last step, for the least room: tighter spacing again, and the chips a size smaller. */
+.ttv2-panel.ttv2-tighter .ttv2-chips {
+    gap: 2px;
+    padding: 6px 4px;
+}
+
+.ttv2-panel.ttv2-tighter button.ttv2-chip {
+    padding: 0 3px;
+    font-size: 10px;
+}
+
+.ttv2-panel.ttv2-tighter .ttv2-tabs {
+    padding: 6px 4px 0;
+}
+
+.ttv2-panel.ttv2-tighter button.ttv2-tab {
+    padding: 0 4px;
 }
 
 /* The status line wraps rather than cutting its message short. */
@@ -674,11 +722,13 @@ ${TOKENS_CSS}
     overflow: hidden;
 }
 
-.ttv2-chips-gap {
-    flex: 1;
+.ttv2-panel button.ttv2-chips-end {
+    margin-left: auto;
 }
 
 .ttv2-panel button.ttv2-chip {
+    flex: 0 0 auto;
+    white-space: nowrap;
     height: 24px;
     padding: 0 8px;
     border-radius: 12px;
@@ -719,6 +769,7 @@ ${TOKENS_CSS}
 }
 
 .ttv2-panel button.ttv2-tab {
+    flex: 0 0 auto;
     height: 28px;
     border-radius: 4px 4px 0 0;
     border-bottom: 0;
@@ -735,6 +786,7 @@ ${TOKENS_CSS}
 }
 
 .ttv2-credit {
+    flex: 0 0 auto;
     margin-left: auto;
     padding-bottom: 8px;
     color: var(--muted);

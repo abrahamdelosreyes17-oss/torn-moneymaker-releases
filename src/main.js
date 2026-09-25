@@ -86,6 +86,9 @@ import {
     votesByTrader,
     bestTradersFor,
     ratingsInText,
+    trustedOnly,
+    nextSort,
+    sortItemRows,
 } from './core/traders.js';
 import {
     mergeInventory,
@@ -1855,6 +1858,8 @@ const sell = {
     teOneBusy: false,
     /* "Best trader for you": show only the items this trader pays most for. */
     traderFilter: null,
+    /* How the Rows and Table views sort; Cards follow it too. */
+    sort: { key: 'price', dir: -1 },
     /* When statuses were asked, for the per-minute limit. */
     presenceAsked: [],
     /* Our trader database (TornW3B lists), and its item index for this render. */
@@ -2126,7 +2131,13 @@ function renderSelling() {
         return b;
     };
     const levelOf = (id) => presenceLevel(sellPresenceOf(id));
-    const buyersOf = (id) => (prefs.onlineOnly ? onlineOnly(buyersAll(id), levelOf) : buyersAll(id));
+    // What the Show toggles keep: online buyers, trusted buyers, or both.
+    const buyersOf = (id) => {
+        let b = buyersAll(id);
+        if (prefs.onlineOnly) b = onlineOnly(b, levelOf);
+        if (prefs.trustedOnly) b = trustedOnly(b);
+        return b;
+    };
     const heldNames = new Map((sell.inventory || []).map((it) => [String(it.id), it.name]));
     const nameOf = (id) => {
         const item = sell.index && sell.index.byId ? sell.index.byId.get(String(id)) : null;
@@ -2154,14 +2165,16 @@ function renderSelling() {
      * online checker and "best trader for you" work from.
      */
     const myAll = sell.inventory ? itemRows(heldIds(), { buyersOf: buyersAll, nameOf }) : [];
-    const best = bestTradersFor(myAll, 3);
+    // Who to message follows the Show toggles: an offline trader is no one to message.
+    const myShown = prefs.onlineOnly || prefs.trustedOnly ? itemRows(heldIds(), { buyersOf, nameOf }) : myAll;
+    const best = bestTradersFor(myShown, 5);
     const traderKey = (b) => (b.id ? String(b.id) : 'name:' + String(b.name).toLowerCase());
     const filterTrader = sell.traderFilter ? best.find((e) => traderKey(e.trader) === sell.traderFilter) : null;
     if (sell.traderFilter && !filterTrader) sell.traderFilter = null;
     const onlyItems = filterTrader ? new Set(filterTrader.bestOn) : null;
 
     /* My items: everything you hold, those with a trader first. */
-    let my = sell.inventory ? itemRows(heldIds(), { buyersOf, nameOf, query: sell.queries.my }) : [];
+    let my = sell.inventory ? sortItemRows(itemRows(heldIds(), { buyersOf, nameOf, query: sell.queries.my }), sell.sort) : [];
     if (onlyItems) my = my.filter((r) => onlyItems.has(r.itemId));
     for (const r of my) {
         // With Online only, not knowing a trader's status yet is not "nobody online".
@@ -2172,10 +2185,25 @@ function renderSelling() {
     /* All items: every item any trader buys. */
     const oneIds = [...sell.teOne].filter(([, rec]) => rec.best).map(([id]) => id);
     const allIds = new Set([...teMap.keys(), ...w3bByItem.keys(), ...oneIds]);
-    const allRows = itemRows(allIds, { buyersOf, nameOf, query: sell.queries.all }).filter((r) => r.best);
+    const allRows = sortItemRows(itemRows(allIds, { buyersOf, nameOf, query: sell.queries.all }).filter((r) => r.best), sell.sort);
     const all = allRows.slice(0, sell.allShown);
 
-    const watch = tradersToCheck(myAll, all, best);
+    /*
+     * The item open in the side panel, whatever the search or filter now
+     * shows: it stays open until closed.
+     */
+    const [openKey] = sell.expanded;
+    let detail = null;
+    if (openKey) {
+        const at = openKey.indexOf(':');
+        const section = openKey.slice(0, at);
+        const itemId = openKey.slice(at + 1);
+        const buyers = buyersOf(itemId);
+        const statusPending = prefs.onlineOnly && buyersAll(itemId).some((b) => b.id && presenceUnknown(b.id));
+        detail = { section, itemId, name: nameOf(itemId), buyers, best: buyers[0] || null, pending: !buyers.length && (pendingFor(itemId) || statusPending) };
+    }
+
+    const watch = tradersToCheck(myAll, all, best, detail ? buyersAll(detail.itemId) : []);
     updateSellPresence(watch, now);
     const statusesKnown = watch.ids.filter((id) => !presenceUnknown(id)).length;
 
@@ -2184,6 +2212,9 @@ function renderSelling() {
     const heldCount = sell.inventory ? sell.inventory.length : 0;
     const teOneDone = sell.inventory ? [...heldIds()].filter((i) => sell.teOne.has(i) && !sell.teOne.get(i).failed).length : 0;
 
+    const statuses = sellStatusMap(now);
+    const traderCount = countTraders(allIds, buyersAll);
+
     sell.page.render({
         my,
         all,
@@ -2191,7 +2222,10 @@ function renderSelling() {
         myTotal: myAll.length,
         best: best.map((e) => ({ trader: e.trader, bestOn: e.bestOn.length, buys: e.buys, key: traderKey(e.trader) })),
         traderFilter: filterTrader ? { key: sell.traderFilter, name: filterTrader.trader.name, count: filterTrader.bestOn.length } : null,
-        statuses: sellStatusMap(now),
+        detail,
+        sort: sell.sort,
+        stats: sellStats(myAll, statuses, traderCount),
+        statuses,
         prefs,
         expanded: sell.expanded,
         info: {
@@ -2208,7 +2242,7 @@ function renderSelling() {
             loading: sell.loading,
             // Until every source has answered once, "no trader" is not known yet.
             tradersLoading: sell.teLoading || w3bPending || (!teUnusable && !sell.traders) || (teUnusable && teOneDone < heldCount),
-            traderCount: countTraders(allIds, buyersAll),
+            traderCount,
             knownTraders: stats.total + sell.idsByName.size + teMap.size + oneIds.length,
             w3bAt: stats.newestW3bAt,
             w3bChecking: stats.unchecked,
@@ -2226,6 +2260,23 @@ function renderSelling() {
     });
 }
 
+/** The headline numbers over the lists. */
+function sellStats(myAll, statuses, traderCount) {
+    const online = new Set();
+    for (const r of myAll) {
+        for (const b of r.buyers) {
+            const st = b.id ? statuses.get(String(b.id)) : null;
+            if (st && (st.level === 'online' || st.level === 'busy')) online.add(String(b.id));
+        }
+    }
+    return {
+        held: sell.inventory ? myAll.length : null,
+        withBuyer: sell.inventory ? myAll.filter((r) => r.best).length : null,
+        buyersOnline: online.size,
+        known: traderCount,
+    };
+}
+
 /** Distinct traders buying anything, for the status line. */
 function countTraders(itemIds, buyersAll) {
     const seen = new Set();
@@ -2239,7 +2290,7 @@ function countTraders(itemIds, buyersAll) {
  * of the first items in All items. Built from the rows as shown, so an open
  * row is never starved by the rest.
  */
-function tradersToCheck(my, all, best = []) {
+function tradersToCheck(my, all, best = [], openBuyers = []) {
     const ids = [];
     const seen = new Set();
     const open = new Set();
@@ -2252,6 +2303,9 @@ function tradersToCheck(my, all, best = []) {
         ids.push(id);
     };
     const rowsAll = (section, rows) => rows.filter((r) => sell.expanded.has(section + ':' + r.itemId));
+    // Every trader of the item open in the side panel first, even ones the
+    // Show toggles hide now: Online only needs to know about them.
+    openBuyers.forEach((b) => push(b, true));
     for (const r of [...rowsAll('my', my), ...rowsAll('all', all)]) r.buyers.forEach((b) => push(b, true));
     for (const e of best) push(e.trader);
     // Every trader of every item you hold, best first per item: Online only
@@ -2606,17 +2660,23 @@ function onSellRefresh() {
 }
 
 /**
- * Open or close an item. On a wide screen its traders show in the side
- * panel, one item at a time (`single`); on a narrow one, under the item.
+ * Open an item's traders in the side panel, one item at a time; the same
+ * item again (or ✕ / Esc) closes it.
  */
-function onSellExpand(section, itemId, { single = false } = {}) {
+function onSellExpand(section, itemId) {
     const key = section + ':' + String(itemId);
-    if (sell.expanded.has(key)) sell.expanded.delete(key);
-    else {
-        if (single) sell.expanded.clear();
+    const wasOpen = sell.expanded.has(key);
+    sell.expanded.clear();
+    if (!wasOpen) {
         sell.expanded.add(key);
         loadTeItemList(itemId);
     }
+    renderSelling();
+}
+
+/** A column header pressed: sort by it, or the other way round. */
+function onSellSort(key) {
+    sell.sort = nextSort(sell.sort, key);
     renderSelling();
 }
 
@@ -2693,6 +2753,7 @@ function bootSellingPage() {
             renderSelling();
         },
         onExpand: onSellExpand,
+        onSort: onSellSort,
         onQuery: onSellQuery,
         onMore: () => {
             sell.allShown += ALL_ITEMS_PAGE;

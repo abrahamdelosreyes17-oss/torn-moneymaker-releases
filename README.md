@@ -1,4 +1,4 @@
-# Torn Trading — buyer-side opportunity scanner, and a traders page
+# Torn Trading — buyer-side opportunity scanner, and Torn Bids
 
 Finds Bazaar and Item Market listings priced below what an NPC shop pays (or below
 market value), ranks them by the profit you could actually realize, and links you
@@ -6,7 +6,7 @@ straight to them - from the page you are viewing, **and live from any Torn page*
 via the Torn API and, if you opt in, TornW3B's bazaar feed.
 
 Two more things: on **your own bazaar's add / manage pages** it shows each item's
-**Item Market Average** with a graph, and a **traders page** in its own tab lists
+**Item Market Average** with a graph, and **Torn Bids** (the traders page) in its own tab lists
 every item you hold with the trader who pays most for it - from TornExchange and
 TornW3B price lists.
 
@@ -89,11 +89,14 @@ scrolls to it when it is on the page you are viewing. Nothing is ever bought for
 - **Never over Torn's content.** The panel floats in front of the page, in the
   empty space to the right of Torn's content: it is sized to that space (up to
   430px) and can't be placed or dragged across Torn's content. Torn's page is
-  never moved or resized. The header is always ONE row: in less room it uses
-  slightly smaller type and tighter spacing (measured, one step at a time),
-  never cutting or wrapping anything; inside the open panel the chips, the
-  status line and the tab row wrap instead. With no usable space (a very
-  narrow window) it floats bottom-right as it always did.
+  never moved or resized. The header, the filter chips and the tab row are
+  each always ONE row: in less room they use slightly smaller type and tighter
+  spacing (measured, three steps at most), never cutting or wrapping anything,
+  and a few pixels may be borrowed from the window edge and the gap - never
+  from Torn's content. Min and Cash show as few characters as say the amount
+  ($1.5m, $25m). Only the status line wraps, rather than cut its message. With
+  less than 240px of room (a very narrow window) it floats bottom-right as it
+  always did.
 - **Header:** **Sell** · **Scan** (re-reads this page and refreshes every price -
   one button, it used to be Scan and ↻) · ⚙ Settings ·
   – collapse. Drag it anywhere; the position is remembered. Collapsed, it still
@@ -175,7 +178,7 @@ scrolls to it when it is on the page you are viewing. Nothing is ever bought for
 
 Item data (Sell price, Value) is refreshed hourly.
 
-### The traders page
+### The traders page: Torn Bids
 
 "Which trader pays the most for what I hold?" Its own tab, its own keys, its own
 settings - nothing is shared with the panel except the cached item database.
@@ -187,10 +190,10 @@ trader, and every link here is one you follow yourself.
   pays it, their online status beside the name. Items with a trader first,
   highest price first; an item nobody buys says **No Trader Found** - but only
   once every source has answered ("Checking…" until then, "No traders yet" when
-  no trader is known at all). A **filter** narrows it: typing *xanax* shows
-  only Xanax and its traders.
-- **All items** next: every item any known trader buys, with a **search box**,
-  50 at a time.
+  no trader is known at all). The **search box** narrows it: typing *xanax*
+  shows only Xanax and its traders.
+- **All items** (the other tab): every item any known trader buys, searched
+  with the same box (each tab keeps its own search), 50 at a time.
 - **Open an item** for every trader buying it, **highest price first**, each
   with name, online status, price per item, and fixed link slots - **Profile**
   (their Torn profile), **TE list** (their TornExchange price list) and
@@ -198,18 +201,31 @@ trader, and every link here is one you follow yourself.
   on every row and the prices stay in one column.
 - **One row per trader**: a trader on both TornExchange and TornW3B shows once,
   at the higher of their two prices, with both lists linked.
-- **Online only** keeps only traders known to be online, order unchanged. Our
+- **Show** (right column): **Buyers online only** keeps only traders known to
+  be online, order unchanged; **Trusted buyers only** keeps traders with the
+  Trusted badge. Both apply to the whole page, Who to message included. Our
   own online checker asks Torn's public profile for every trader of every item
   you hold (best first), at most 30 a minute inside the shared 70/min, each
   again every 10 minutes (90 s while its item is open), visible tab only; an
   item says "Checking…" until its traders are known. Online but in hospital,
-  in jail or flying shows orange, "Online · Hospital".
-- **Wide screens** (1100px and up): the list, and beside it the item you pick
-  with every trader (the list never jumps open), **Best trader for you** (who
-  has the best price on the most of your items - in Torn you trade with one
-  person at a time; *Show these items* filters to them) and **Sources** (each
-  source with a dot and progress). My items and All items are tabs. Narrow
-  screens keep one column.
+  in jail or flying shows orange, "Online · Hospital". A status not known yet
+  shows nothing.
+- **Layout** (the owner picked mockup E): the full width of the window. A
+  header with the name, one search box (`/` jumps to it) and every source as a
+  pill (dot, progress, the detail on hover); a line of headline numbers (items
+  you hold, with a buyer, buyers online, traders known); your items on the
+  left; **Who to message** pinned on the right (the five traders with the best
+  price on the most of your items - in Torn you trade with one person at a
+  time; click one to see just their items). One scrollbar: the page scrolls,
+  the right column stays put.
+- **Three views, switched like a file explorer's**: **Cards** (a tile per
+  item), **Rows** (item, top bid, buyer, next bid, traders) and **Table** (the
+  same, dense). Click a column header in Rows or Table to sort by it, again to
+  turn it round; items nobody buys stay last. The view is remembered.
+- **Click an item**: its traders slide in from the right, over the page -
+  nothing under it moves. ✕ or Esc closes it. On a phone it takes the screen.
+- **Phones** (under 1000px): one column, Who to message (top three) above the
+  items, the view switch on its own row.
 - **Trust badge** beside a trader: Trusted (100+), Known (20+), New (0-19) or
   Caution (below 0), from the better of their TornExchange vote score and
   their TornW3B rating (ups minus downs); hover for the numbers.
@@ -224,7 +240,7 @@ trader, and every link here is one you follow yourself.
 **No one source can empty the page.** It starts from a built-in list of TornW3B's
 public traders (no key needed); while TornExchange has no working key it asks
 TornExchange's keyless `/api/best_listing` for the best buyer of each item you
-hold; and the status line reports each source on its own. A rejected
+hold; and each source has its own pill in the header. A rejected
 TornExchange key shows TornExchange's own words, is retried every 10 minutes,
 and can be retried at once with **Try again**.
 

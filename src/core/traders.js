@@ -431,6 +431,51 @@ export function onlineOnly(buyers, levelOf) {
     return buyers.filter((b) => b.id && levelOf(b.id) === 'online');
 }
 
+/** "Trusted buyers only": keep traders whose trust badge says Trusted, order unchanged. */
+export function trustedOnly(buyers) {
+    return buyers.filter((b) => b.trust && b.trust.level === 'Trusted');
+}
+
+/** What each column sorts by first: prices and counts high to low, names A to Z. */
+export const SORT_FIRST_DIR = { name: 1, price: -1, buyer: 1, next: -1, traders: -1 };
+
+/**
+ * Pressing a column's header: a new column sorts its natural way first, the
+ * same column again turns it around.
+ */
+export function nextSort(current, key) {
+    if (!Object.prototype.hasOwnProperty.call(SORT_FIRST_DIR, key)) return current;
+    if (current && current.key === key) return { key, dir: -current.dir };
+    return { key, dir: SORT_FIRST_DIR[key] };
+}
+
+/**
+ * Item rows in the order the Rows and Table views' headers ask for. Items
+ * nobody buys stay at the end whatever the order, by name; ties fall back to
+ * the best price, then the name, so the order never jumps between renders.
+ *
+ * @param {Array<{name, buyers, best}>} rows
+ * @param {{key: string, dir: 1|-1}} sort
+ */
+export function sortItemRows(rows, sort) {
+    const key = sort && SORT_FIRST_DIR[sort.key] !== undefined ? sort.key : 'price';
+    const dir = sort && sort.dir === 1 ? 1 : -1;
+    const text = (a, b) => String(a).localeCompare(String(b), 'en', { sensitivity: 'base' });
+    const num = (a, b) => (Number(a) || 0) - (Number(b) || 0);
+    const by = {
+        name: (a, b) => text(a.name, b.name),
+        price: (a, b) => num(a.best.price, b.best.price),
+        buyer: (a, b) => text(a.best.name, b.best.name),
+        next: (a, b) => num(a.buyers[1] ? a.buyers[1].price : 0, b.buyers[1] ? b.buyers[1].price : 0),
+        traders: (a, b) => a.buyers.length - b.buyers.length,
+    }[key];
+    return rows.slice().sort((a, b) => {
+        if (Boolean(a.best) !== Boolean(b.best)) return a.best ? -1 : 1;
+        if (!a.best) return text(a.name, b.name);
+        return dir * by(a, b) || b.best.price - a.best.price || text(a.name, b.name);
+    });
+}
+
 /**
  * Item rows for a section: best buyer first in each, items with a buyer
  * first (highest best price), the rest after by name.

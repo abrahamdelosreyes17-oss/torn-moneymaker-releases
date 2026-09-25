@@ -133,6 +133,14 @@ export function formatMoneyShort(value) {
     return formatMoney(value);
 }
 
+/**
+ * formatMoneyShort without zeros that say nothing: "$1.5m", "$25m", "$12k".
+ * The same amount, in fewer characters - for the panel's one-row chips.
+ */
+export function formatMoneyCompact(value) {
+    return formatMoneyShort(value).replace(/\.0+([kmb])$/, '$1').replace(/(\.\d)0([kmb])$/, '$1$2');
+}
+
 /** "4.2%" */
 export function formatPct(ratio) {
     if (!Number.isFinite(ratio)) return '-';

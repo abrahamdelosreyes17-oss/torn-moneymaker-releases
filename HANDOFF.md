@@ -3,9 +3,9 @@
 Read this first, then `README.md`. The README holds the product and the binding
 rules; this file holds where we are, how the owner works, and what is settled.
 
-## Where things stand (3.9.6, 2026-09-25)
+## Where things stand (3.10.0, 2026-09-25)
 
-- **Version 3.9.6** on branch `claude/optimistic-ride-1gqguu`, on top of 3.8.1
+- **Version 3.10.0** on branch `claude/optimistic-ride-1gqguu`, on top of 3.8.1
   (`0210c53`) and the cloud session's handoff commits.
 - **`main` is still at 2.9.3.** The script's `@updateURL` points at `main`, so
   installs are done from **pinned links**:
@@ -14,6 +14,31 @@ rules; this file holds where we are, how the owner works, and what is settled.
   the owner asks.
 - `claude/trusting-ride-m6bvhg` (3.4.1) is fully contained in this branch.
 - Who uses it: the owner and a friend who plays Torn.
+
+**3.10.0 - Torn Bids, and the panel's chips on one row.**
+- The traders page is now **Torn Bids** (the owner rejected "Sell to traders"
+  as a title and picked mockup E of five; the mockups are in `mockups/`,
+  untracked). Full width; header with the name, one search box, a pill per
+  source, ↻ and ⚙; headline numbers; your items on the left in **Cards / Rows /
+  Table** (the owner asked for a file-explorer-style view switch; pref
+  `view`); **Who to message** (top 5) and **Show** (Buyers online only, new
+  **Trusted buyers only**, pref `trustedOnly`) pinned on the right; an item's
+  traders slide in from the right (one item at a time, ✕ / Esc). Rows and
+  Table sort by any column (`sortItemRows` / `nextSort` in `traders.js`,
+  state `sell.sort`, not saved). One page scrollbar (the owner disliked
+  mockup C's inner scroll). Phone (<1000px): one column, Who to message's top
+  three first; the side panel takes the screen. The page adds a viewport
+  meta tag (the gh-pages page has none), or phones lay it out 980px wide.
+- The owner's layout rules for this page: full width, no inner scrollbars,
+  nothing cut with "…", no placeholder for an unknown status.
+- **Overlay:** the filter chips and the tab row are ONE row at every fitted
+  width (240-430px), like the header: `fit()` measures all three rows and
+  steps `ttv2-narrow` → `ttv2-tight` → `ttv2-tighter` (the last makes the
+  chips 10px, which the owner allowed: "you can make the font a bit
+  smaller"), then borrows at most 12px from the window edge and 6px from the
+  gap - never from Torn's content. Min / Cash use `formatMoneyCompact`
+  ($1.5m, not $1.50m). Checked in the harness at 430, 288 and 240px free,
+  with Min $12.35m and Cash $1.23b.
 
 **3.9.3 - the traders page moved off Torn** to our own GitHub Pages page,
 `https://abrahamdelosreyes17-oss.github.io/torn-moneymaker-releases/traders.html`
@@ -156,8 +181,8 @@ floating bar was right, but its left end crossed into Torn's content):
   12px type and tighter spacing (`ttv2-narrow`); if it still overflows, 11px
   (`ttv2-tight`); a very long headline then borrows a few px from the
   window-edge margin. This is measured in `fit()`, and re-checked whenever the
-  headline changes. In the open panel, the chips (sell-to, then Min and Cash),
-  the status line and the tab row (TornW3B credit above the tabs) wrap.
+  headline changes. 3.10.0: the chips and the tab row are one row too (the
+  owner: "now you ruined this" at 3.9.6's wrapped chips); see 3.10.0 above.
 - **Scan and ↻ are one button** (3.9.6, the owner: "it's the same thing"): Scan
   re-reads the page and refreshes every price, then says what it found.
 - With less than 240px of room (a very narrow window), it floats as it

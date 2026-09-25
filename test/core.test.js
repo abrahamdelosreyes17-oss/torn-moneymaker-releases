@@ -6,6 +6,7 @@ import {
     parseQuantity,
     formatMoney,
     formatMoneyShort,
+    formatMoneyCompact,
     formatPct,
 } from '../src/core/parse.js';
 
@@ -495,4 +496,15 @@ test('the item id comes from the image path', () => {
 
     assert.equal(itemIdFromImage(avatar), null);
     assert.equal(itemIdFromImage(null), null);
+});
+
+test('compact money drops only zeros that say nothing', () => {
+    assert.equal(formatMoneyCompact(1500000), '$1.5m');
+    assert.equal(formatMoneyCompact(25000000), '$25m');
+    assert.equal(formatMoneyCompact(1234567), '$1.23m');
+    assert.equal(formatMoneyCompact(1050000), '$1.05m');
+    assert.equal(formatMoneyCompact(12000), '$12k');
+    assert.equal(formatMoneyCompact(12500), '$12.5k');
+    assert.equal(formatMoneyCompact(2e9), '$2b');
+    assert.equal(formatMoneyCompact(1), '$1');
 });

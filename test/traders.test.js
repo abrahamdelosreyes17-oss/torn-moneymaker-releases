@@ -394,7 +394,7 @@ test('below Min but profitable: marked in the second colour, never in the list; 
 
 /* ======================================= 3.9.4: trust and best trader */
 
-import { trustOf, votesByTrader, bestTradersFor, ratingsInText } from '../src/core/traders.js';
+import { trustOf, votesByTrader, bestTradersFor, ratingsInText, trustedOnly, nextSort, sortItemRows } from '../src/core/traders.js';
 
 test('trust: the better of TornExchange votes and TornW3B rating; nothing known is no badge', () => {
     assert.equal(trustOf(null, null), null);
@@ -433,4 +433,47 @@ test('TornW3B ratings are read off its leaderboards', () => {
     const r = ratingsInText('Highest Rated Traders\n1\nClouds\n523↑ · 7↓\n+516\n2\n7ZP\n468↑ · 9↓');
     assert.deepEqual(r.get('Clouds'), { up: 523, down: 7 });
     assert.deepEqual(r.get('7ZP'), { up: 468, down: 9 });
+});
+
+test('Trusted buyers only keeps the Trusted badge, order unchanged', () => {
+    const t = (level) => ({ level });
+    const buyers = [
+        { id: '1', name: 'A', trust: t('Known') },
+        { id: '2', name: 'B', trust: t('Trusted') },
+        { id: '3', name: 'C', trust: null },
+        { id: '4', name: 'D', trust: t('Trusted') },
+    ];
+    assert.deepEqual(trustedOnly(buyers).map((b) => b.name), ['B', 'D']);
+});
+
+test('a column header sorts its natural way first, then turns round', () => {
+    let sort = { key: 'price', dir: -1 };
+    sort = nextSort(sort, 'name');
+    assert.deepEqual(sort, { key: 'name', dir: 1 });
+    sort = nextSort(sort, 'name');
+    assert.deepEqual(sort, { key: 'name', dir: -1 });
+    sort = nextSort(sort, 'traders');
+    assert.deepEqual(sort, { key: 'traders', dir: -1 });
+    assert.deepEqual(nextSort(sort, 'nonsense'), sort);
+});
+
+test('item rows sort by any column; items nobody buys stay last', () => {
+    const b = (name, price) => ({ id: name, name, price });
+    const rows = [
+        { itemId: '1', name: 'Xanax', buyers: [b('Bob', 850000)], best: b('Bob', 850000) },
+        { itemId: '2', name: 'Hammer', buyers: [b('Carol', 118), b('Alice', 115), b('Bob', 110)], best: b('Carol', 118) },
+        { itemId: '3', name: 'Beer', buyers: [], best: null },
+        { itemId: '4', name: 'apple', buyers: [b('Alice', 5000), b('Zed', 4000)], best: b('Alice', 5000) },
+    ];
+    const names = (sort) => sortItemRows(rows, sort).map((r) => r.name);
+    assert.deepEqual(names({ key: 'price', dir: -1 }), ['Xanax', 'apple', 'Hammer', 'Beer']);
+    assert.deepEqual(names({ key: 'price', dir: 1 }), ['Hammer', 'apple', 'Xanax', 'Beer']);
+    // Names A to Z whatever their case; Beer has no buyer, so it stays last.
+    assert.deepEqual(names({ key: 'name', dir: 1 }), ['apple', 'Hammer', 'Xanax', 'Beer']);
+    assert.deepEqual(names({ key: 'buyer', dir: 1 }), ['apple', 'Xanax', 'Hammer', 'Beer']);
+    assert.deepEqual(names({ key: 'next', dir: -1 }), ['apple', 'Hammer', 'Xanax', 'Beer']);
+    assert.deepEqual(names({ key: 'traders', dir: -1 }), ['Hammer', 'apple', 'Xanax', 'Beer']);
+    // Unknown sorts fall back to the best price; the input is not changed.
+    assert.deepEqual(names(null), ['Xanax', 'apple', 'Hammer', 'Beer']);
+    assert.equal(rows[0].name, 'Xanax');
 });
