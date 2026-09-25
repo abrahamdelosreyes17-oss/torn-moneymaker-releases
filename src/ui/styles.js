@@ -127,6 +127,24 @@ export const PAGE_CSS = `
         inset 0 0 0 9999px rgba(126, 224, 143, 0.24) !important;
 }
 
+/*
+ * Profitable, but below your Min: amber, thinner and fainter than green, so
+ * the deals that meet your Min still stand out first. (Yellow is taken: it
+ * marks the listing a panel link was opened for.)
+ */
+.ttv2-hit.ttv2-hit-low {
+    box-shadow:
+        inset 0 0 0 2px #f0a020,
+        inset 0 0 0 9999px rgba(240, 160, 32, 0.12) !important;
+}
+
+.ttv2-hit.ttv2-hit-low.ttv2-hit-low::after {
+    background: rgba(48, 30, 4, 0.9) !important;
+    border-color: #f0a020 !important;
+    color: #f5c060 !important;
+    font-weight: 700 !important;
+}
+
 /* Bazaar owner status, right after their name in the page banner. */
 .ttv2-owner {
     display: inline-block;

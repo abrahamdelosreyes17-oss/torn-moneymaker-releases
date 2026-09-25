@@ -115,7 +115,7 @@ export class SellingPage {
      *   onSaveKey(key), onForgetKey(), onRevealKey()
      *   onSaveTeKey(key), onForgetTeKey(), onRevealTeKey()
      *   onRefresh(), onPrefsChange(partial), onExpand(section, itemId)
-     *   onQuery(section, text), onMore()
+     *   onQuery(section, text), onMore(), onRetryTe()
      *   onOpenUrl(url)
      */
     constructor(handlers = {}) {
@@ -491,19 +491,31 @@ export class SellingPage {
             this.teStateEl.textContent = info.teError || 'Saved.';
             if (info.teError) this.teStateEl.classList.add('sp-bad');
         }
-        this.teSameBtn.hidden = !info.hasKey || Boolean(info.teSameAsLimited);
+        this.teSameBtn.hidden = !info.hasKey;
     }
 
-    /** One quiet line: how much we know, and how fresh it is. */
+    /**
+     * One quiet line, one part per source, so a source that fails says so
+     * while the others keep working: "TornW3B 97 traders · TornExchange: key
+     * not accepted, best per item 40/222 · inventory 2m ago".
+     */
     renderBar() {
         if (!this.root) return;
         const info = this.state.info || {};
         const now = Date.now();
         const bits = [];
-        if (info.traderCount) bits.push(info.traderCount.toLocaleString('en-US') + ' traders');
-        if (info.teAt) bits.push('TE ' + formatAge(now - info.teAt));
-        if (info.w3bAt) bits.push('W3B ' + formatAge(now - info.w3bAt));
-        if (info.w3bChecking) bits.push('reading ' + info.w3bChecking + ' more lists');
+
+        let w3b = 'TornW3B ' + (info.w3bTraders || 0) + ' traders';
+        if (info.w3bChecking) w3b += ', reading ' + info.w3bChecking + ' lists';
+        else if (info.w3bAt) w3b += ' ' + formatAge(now - info.w3bAt);
+        bits.push(w3b);
+
+        const perItem = info.heldCount ? ', best per item ' + (info.teOneDone || 0) + '/' + info.heldCount : '';
+        if (info.teStatus === 'ok') bits.push('TornExchange ' + (info.teAt ? formatAge(now - info.teAt) : ''));
+        else if (info.teStatus === 'badkey') bits.push('TornExchange: key not accepted' + perItem);
+        else if (info.teStatus === 'nokey') bits.push('TornExchange: no key' + perItem);
+        else if (info.teStatus === 'loading') bits.push('TornExchange loading');
+
         if (info.inventoryAt) bits.push('inventory ' + formatAge(now - info.inventoryAt));
         this.barEl.textContent = bits.join(' · ');
         this.barEl.hidden = !bits.length || this.view === 'settings';
@@ -533,11 +545,11 @@ export class SellingPage {
         } else if (!info.hasKey) {
             say('Add your Limited key to see your items.', null, 'Add key', toSettings);
         } else if (!info.hasTeKey) {
-            say('Traders load from TornExchange with the key you log in there with.', null, 'Use my Limited key', useLimited);
+            say('For every TornExchange trader, add the key you log in there with.', null, 'Use my Limited key', useLimited);
         } else if (info.teBadKey && !info.teSameAsLimited) {
             say(info.teError || 'TornExchange did not accept this key.', 'bad', 'Use my Limited key', useLimited);
         } else if (info.teBadKey) {
-            say(info.teError || 'TornExchange did not accept this key.', 'bad', 'Open Settings', toSettings);
+            say(info.teError || 'TornExchange did not accept this key.', 'bad', 'Try again', () => this.h.onRetryTe && this.h.onRetryTe());
         } else if (info.teWaitUntil && info.teWaitUntil > Date.now()) {
             say('TornExchange asked us to wait ' + formatAge(info.teWaitUntil - Date.now()).replace(' ago', '') + '.', 'warn');
         } else if (info.teError) {
@@ -565,7 +577,7 @@ export class SellingPage {
                 r.itemId,
                 r.name,
                 r.buyers.length,
-                r.best ? [r.best.id, r.best.name, r.best.price, statusOf(r.best)] : 0,
+                r.best ? [r.best.id, r.best.name, r.best.price, statusOf(r.best)] : Boolean(r.pending),
                 open ? [Boolean(l.loading), l.error || '', r.buyers.map((b) => [b.id, b.name, b.price, b.te, b.w3b, statusOf(b)])] : 0,
             ];
         };
@@ -671,7 +683,7 @@ export class SellingPage {
                       spEl('span', { class: 'sp-who' }, [spEl('span', { class: 'sp-tname', text: best.name }), this.status(best)]),
                   ])
                 : spEl('span', { class: 'sp-best' }, [
-                      spEl('span', { class: 'sp-none', text: this.noTraderText() }),
+                      spEl('span', { class: 'sp-none', text: this.noTraderText(r) }),
                   ]),
             spEl('span', { class: 'sp-chev', 'aria-hidden': 'true', text: best ? '›' : '' }),
         ]);
@@ -682,10 +694,11 @@ export class SellingPage {
     }
 
     /** What an item with no trader says: only "No Trader Found" once every source has answered. */
-    noTraderText() {
+    noTraderText(r) {
         const info = this.state.info || {};
         if (!info.knownTraders) return 'No traders yet';
-        if (info.tradersLoading) return 'Checking…';
+        // Per item when known (My items), else for the page as a whole.
+        if (r && r.pending !== undefined ? r.pending : info.tradersLoading) return 'Checking…';
         return this.state.prefs.onlineOnly ? 'No trader online' : 'No Trader Found';
     }
 

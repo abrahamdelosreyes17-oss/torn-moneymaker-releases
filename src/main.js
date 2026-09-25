@@ -47,7 +47,7 @@ import {
 } from './core/feed.js';
 import { makeTabId, LEADER_HEARTBEAT_MS } from './core/leader.js';
 import { formatMoneyShort } from './core/parse.js';
-import { rankOpportunities, summarize, hiddenCounts } from './core/ranker.js';
+import { rankOpportunities, summarize, hiddenCounts, belowMinRows } from './core/ranker.js';
 import { TornApiClient, redactKey, KEY_DEAD_CODES } from './api/client.js';
 import { W3bClient, fetchW3bListings, fetchW3bPriceList } from './api/w3b.js';
 import {
@@ -56,6 +56,7 @@ import {
     fetchTeBestListings,
     fetchTeListings,
     fetchTeActiveTraderList,
+    fetchTeBestListing,
 } from './api/te.js';
 import {
     makeTeCacheEntry,
@@ -132,6 +133,7 @@ import {
 import { injectStyles } from './ui/styles.js';
 import { Panel, TORN_API_KEY_URL } from './ui/panel.js';
 import { SellingPage, SELLING_PAGE_DEFAULTS, ALL_ITEMS_PAGE } from './ui/selling-page.js';
+import { SEED_TRADERS } from './core/seed-traders.js';
 import {
     markRows,
     clearMarks,
@@ -167,6 +169,8 @@ const STORE_INVENTORY = 'inventory';
 const STORE_SELL_PREFS = 'sellingPage';
 /* Our own trader database: every trader we know of, and their TornW3B list. */
 const STORE_TRADER_DB = 'traderDb';
+/* TornExchange's best buyer per item you hold, asked without a key. */
+const STORE_TE_ONE = 'teOne';
 
 /* Price history the script records itself, and TornW3B's latest summary. */
 const STORE_HISTORY = 'priceHistory';
@@ -741,7 +745,13 @@ function rescan() {
         app.feed.requestRecheck(live.slice(0, 10).map((r) => r.itemId));
     }
 
-    markRows(live.slice(0, 100));
+    // Below your Min but still profitable: marked on the page in a second
+    // colour, never added to the list.
+    const lower = closedHere
+        ? []
+        : belowMinRows(priced, rankSettings({ limit: 0 }), ranked).filter((row) => !pageRowContradicted(feed, row));
+
+    markRows(live.slice(0, 100), document, lower.slice(0, 100));
     showBazaarTarget(listings);
 
     app.lastScanAt = now;
@@ -1821,6 +1831,13 @@ const sell = {
     listState: new Map(),
     teLoading: false,
     teIdsLoading: false,
+    /*
+     * TornExchange without a key: the best buyer of each item you hold, one
+     * item per slot. Used while there is no working key, so a key problem
+     * costs detail, never every TornExchange trader.
+     */
+    teOne: new Map(),
+    teOneBusy: false,
     /* Our trader database (TornW3B lists), and its item index for this render. */
     db: null,
     dbDirty: false,
@@ -1858,6 +1875,66 @@ const W3B_LIST_STEP_MS = 2500;
 const TRADER_DB_SAVE_MS = 60000;
 /* TornExchange's active traders (names -> ids) are used for this long. */
 const TE_IDS_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+/* A key TornExchange rejected is tried again after this, by itself. */
+const TE_BADKEY_RETRY_MS = 10 * 60 * 1000;
+/* A keyless best-buyer answer is used for this long (TornExchange caches 5 min). */
+const TE_ONE_TTL_MS = 30 * 60 * 1000;
+/* The keyless fallback asks for its next item this often (the queue paces it). */
+const TE_ONE_STEP_MS = 5000;
+
+/** Is TornExchange's keyed API unusable right now (no key, or rejected)? */
+function teKeyUnusable() {
+    return !getTeKey() || Boolean(teState().badKey);
+}
+
+/** Keyless best buyers still fresh: itemId -> {at, best|null}. */
+function loadTeOne(now = Date.now()) {
+    const stored = gmGet(STORE_TE_ONE, null) || {};
+    const out = new Map();
+    for (const [id, rec] of Object.entries(stored)) {
+        if (rec && now - Number(rec.at) < TE_ONE_TTL_MS) out.set(id, rec);
+    }
+    return out;
+}
+
+/**
+ * The next item you hold with no fresh keyless answer, asked through the
+ * shared TornExchange queue: visible tab only, one at a time, and only while
+ * the keyed API is unusable.
+ */
+function stepTeOne() {
+    if (sell.teOneBusy || !sell.queue || document.visibilityState !== 'visible') return;
+    if (!teKeyUnusable() || sell.queue.length > 0) return;
+    const now = Date.now();
+    const blockedUntil = Number(teState().blockedUntil) || 0;
+    if (now < blockedUntil) return;
+
+    const id = [...heldIds()].find((i) => {
+        const rec = sell.teOne.get(i);
+        return !rec || now - rec.at >= TE_ONE_TTL_MS;
+    });
+    if (!id) return;
+
+    sell.teOneBusy = true;
+    sell.queue
+        .enqueue(() => fetchTeBestListing(sell.te, id))
+        .then((best) => {
+            const rec = { at: Date.now(), best };
+            sell.teOne.set(id, rec);
+            const stored = gmGet(STORE_TE_ONE, null) || {};
+            stored[id] = rec;
+            gmSet(STORE_TE_ONE, stored);
+            if (best) learnTraders([{ id: best.id, name: best.name, source: 'te' }]);
+        })
+        .catch(() => {
+            // Recorded by the queue's onSettled; this item is asked again later.
+            sell.teOne.set(id, { at: Date.now() - TE_ONE_TTL_MS + TE_RETRY_MS, best: null, failed: true });
+        })
+        .finally(() => {
+            sell.teOneBusy = false;
+            renderSelling();
+        });
+}
 
 function getSellKey() {
     return gmGet(STORE_SELL_KEY, '') || '';
@@ -1987,8 +2064,11 @@ function renderSelling() {
         let b = buyersCache.get(id);
         if (!b) {
             const full = sell.lists.get(id);
+            const one = sell.teOne.get(id);
             b = buyersForItem(id, {
-                teBest: teMap.get(id) || [],
+                // The keyed top three when TornExchange has them; else its
+                // keyless best buyer for this item.
+                teBest: teMap.get(id) || (one && one.best ? [one.best] : []),
                 teFull: full ? full.traders : null,
                 idsByName: sell.idsByName,
                 db: sell.db,
@@ -2007,11 +2087,29 @@ function renderSelling() {
         return (item && item.name) || heldNames.get(String(id)) || 'Item ' + id;
     };
 
+    const stats = traderDbStats(sell.db, now);
+    const teKey = getTeKey();
+    const teUnusable = teKeyUnusable();
+    /*
+     * "No Trader Found" only once every source has answered for that item:
+     * TornW3B has read every list it knows of, and TornExchange has answered
+     * either for every item (the keyed top three) or for this one (keyless).
+     */
+    const w3bPending = stats.unchecked > 0;
+    const pendingFor = (id) => {
+        if (w3bPending) return true;
+        if (!teUnusable) return !sell.traders;
+        const one = sell.teOne.get(String(id));
+        return !one || Boolean(one.failed);
+    };
+
     /* My items: everything you hold, those with a trader first. */
     const my = sell.inventory ? itemRows(heldIds(), { buyersOf, nameOf, query: sell.queries.my }) : [];
+    for (const r of my) r.pending = !r.best && pendingFor(r.itemId);
 
     /* All items: every item any trader buys. */
-    const allIds = new Set([...teMap.keys(), ...w3bByItem.keys()]);
+    const oneIds = [...sell.teOne].filter(([, rec]) => rec.best).map(([id]) => id);
+    const allIds = new Set([...teMap.keys(), ...w3bByItem.keys(), ...oneIds]);
     const allRows = itemRows(allIds, { buyersOf, nameOf, query: sell.queries.all }).filter((r) => r.best);
     const all = allRows.slice(0, sell.allShown);
 
@@ -2019,8 +2117,8 @@ function renderSelling() {
 
     const itemLists = new Map();
     for (const [id, s] of sell.listState) itemLists.set(id, s);
-    const stats = traderDbStats(sell.db, now);
-    const teKey = getTeKey();
+    const heldCount = sell.inventory ? sell.inventory.length : 0;
+    const teOneDone = sell.inventory ? [...heldIds()].filter((i) => sell.teOne.has(i) && !sell.teOne.get(i).failed).length : 0;
 
     sell.page.render({
         my,
@@ -2042,11 +2140,16 @@ function renderSelling() {
             inventoryAt: sell.inventoryAt,
             loading: sell.loading,
             // Until every source has answered once, "no trader" is not known yet.
-            tradersLoading: sell.teLoading || stats.unchecked > 0 || (Boolean(teKey) && !sell.traders && !teState().badKey),
+            tradersLoading: sell.teLoading || w3bPending || (!teUnusable && !sell.traders) || (teUnusable && teOneDone < heldCount),
             traderCount: countTraders(allIds, buyersAll),
-            knownTraders: stats.total + sell.idsByName.size + teMap.size,
+            knownTraders: stats.total + sell.idsByName.size + teMap.size + oneIds.length,
             w3bAt: stats.newestW3bAt,
             w3bChecking: stats.unchecked,
+            w3bTraders: stats.withW3b,
+            // Each source on its own: one failing never hides the others.
+            teStatus: !teKey ? 'nokey' : st.badKey ? 'badkey' : sell.traders ? 'ok' : 'loading',
+            teOneDone,
+            heldCount,
             itemLists,
         },
     });
@@ -2170,8 +2273,14 @@ async function refreshSellTraders({ force = false } = {}) {
     const now = Date.now();
     loadSellTraders(now);
 
-    const st = teState();
-    if (st.badKey) return;
+    let st = teState();
+    if (st.badKey) {
+        // A rejection is not forever: you may have logged in there since.
+        if (now - (Number(st.badAt) || 0) < TE_BADKEY_RETRY_MS) return;
+        setTeState({ badKey: false, lastAttemptAt: 0, idsAttemptAt: 0 });
+        st = teState();
+        force = true;
+    }
     if (st.blockedUntil && now < st.blockedUntil) return;
     refreshTeActiveTraders();
     if (now - (st.lastAttemptAt || 0) < (force ? 30000 : TE_RETRY_MS)) return;
@@ -2230,11 +2339,13 @@ function refreshTeActiveTraders() {
  */
 function onTeSettled(error) {
     if (!error) {
-        if (teState().error) setTeState({ error: null });
+        // A keyless call working says nothing about the key: keep its verdict.
+        const st = teState();
+        if (st.error && !st.badKey) setTeState({ error: null });
     } else if (error.http === 429) {
         setTeState({ blockedUntil: Date.now() + error.retryAfterMs, error: null });
     } else if (error.badKey) {
-        setTeState({ badKey: true, error: error.message });
+        setTeState({ badKey: true, badAt: Date.now(), error: error.message });
     } else {
         setTeState({ error: 'TornExchange did not answer. Trying again soon.' });
     }
@@ -2374,6 +2485,13 @@ function onSellSaveTeKey(key) {
     renderSelling();
 }
 
+/** "Try again": ask TornExchange with the saved key now (after logging in there again). */
+function onSellRetryTe() {
+    setTeState({ badKey: false, error: null, lastAttemptAt: 0, idsAttemptAt: 0 });
+    refreshSellTraders({ force: true });
+    renderSelling();
+}
+
 function onSellForgetTeKey() {
     gmDel(STORE_TE_KEY);
     setTeState({ badKey: false, error: null });
@@ -2444,6 +2562,10 @@ function bootSellingPage() {
     if (sell.keyDead) sell.keyError = 'Torn rejected this key. Paste a new Limited key.';
 
     loadTraderDb();
+    // Start from TornW3B's public traders, so no one source (or key) is
+    // needed to see traders at all.
+    learnTraders(SEED_TRADERS.map(([id, name]) => ({ id, name, source: 'seed' })));
+    sell.teOne = loadTeOne();
     // An error message is about the last call, not this visit: a stored one
     // (3.8.1 kept "That is a Torn key" forever) would outlive its cause.
     if (teState().error) setTeState({ error: null });
@@ -2454,6 +2576,7 @@ function bootSellingPage() {
         onRevealKey: () => getSellKey(),
         onSaveTeKey: onSellSaveTeKey,
         onForgetTeKey: onSellForgetTeKey,
+        onRetryTe: onSellRetryTe,
         onRevealTeKey: () => getTeKey(),
         onRefresh: onSellRefresh,
         onPrefsChange: (partial) => {
@@ -2502,6 +2625,7 @@ function bootSellingPage() {
     })();
 
     setInterval(stepW3bLists, W3B_LIST_STEP_MS);
+    setInterval(stepTeOne, TE_ONE_STEP_MS);
 
     setInterval(() => {
         if (document.visibilityState !== 'visible') return;

@@ -98,7 +98,7 @@ export function addTraders(db, found, now = Date.now()) {
         if (!t) {
             db.traders[id] = { name: name || 'Trader ' + id, from: f.source || null, seenAt: now, w3b: null };
             changed = true;
-        } else if (name && t.name !== name && (f.source !== 'w3b' || t.name.startsWith('Trader '))) {
+        } else if (name && t.name !== name && ((f.source !== 'w3b' && f.source !== 'seed') || t.name.startsWith('Trader '))) {
             t.name = name;
             changed = true;
         }

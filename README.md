@@ -117,6 +117,10 @@ scrolls to it when it is on the page you are viewing. Nothing is ever bought for
   Tampermonkey menu › *Show my bazaar diagnostics* says which page was detected
   and how many rows were read - the real markup has not been captured here; the
   selectors come from a working 2026 price-filler script for these pages.
+- **Highlights on the page:** green for listings that meet your Min (the brighter
+  green for the top three), **amber** for listings below your Min that still
+  make a profit. The list shows only what meets your Min; Cash still hides what
+  you cannot afford one of.
 - **Sell** (the blue button; also under Settings): the traders page, always in
   its own tab (`index.php?ttv2=traders`, which the script turns into the page).
   Everything about it is its own - see *The traders page* below.
@@ -193,6 +197,13 @@ trader, and every link here is one you follow yourself.
   pays it right beneath it, colour only where it means something (green = best
   price / online, blue = link), whole rows as click targets, and a list's order
   frozen while the pointer is over it so a row never moves under a click.
+
+**No one source can empty the page.** It starts from a built-in list of TornW3B's
+public traders (no key needed); while TornExchange has no working key it asks
+TornExchange's keyless `/api/best_listing` for the best buyer of each item you
+hold; and the status line reports each source on its own. A rejected
+TornExchange key shows TornExchange's own words, is retried every 10 minutes,
+and can be retried at once with **Try again**.
 
 **Where traders come from - our own trader database.** Traders publish buy
 prices in two places, and TornW3B has no list of its traders, so the script

@@ -323,3 +323,71 @@ test('graph scale: one troll listing never sets the scale, with or without an av
     assert.deepEqual(scaleRange([], [55]), { min: 55, max: 55 });
     assert.deepEqual(scaleRange([], []), { min: null, max: null });
 });
+
+/* ============================== 3.9.2: no single source can empty the page */
+
+import { parseTeBestListing, fetchTeBestListing, TeClient } from '../src/api/te.js';
+import { SEED_TRADERS } from '../src/core/seed-traders.js';
+import { belowMinRows } from '../src/core/ranker.js';
+
+test('the built-in TornW3B traders: real ids, no repeats, and they never rename a trader', () => {
+    const ids = SEED_TRADERS.map(([id]) => String(id));
+    assert.ok(ids.length >= 100);
+    assert.equal(new Set(ids).size, ids.length);
+    assert.ok(SEED_TRADERS.every(([id, name]) => Number.isInteger(id) && id > 0 && /^[A-Za-z0-9_-]{1,20}$/.test(name)));
+    const db = emptyTraderDb();
+    addTraders(db, [{ id: 3727302, name: 'RealName', source: 'te' }], NOW);
+    addTraders(db, SEED_TRADERS.map(([id, name]) => ({ id, name, source: 'seed' })), NOW);
+    assert.equal(db.traders[3727302].name, 'RealName');
+    // With no TornExchange at all, every one of them is queued for its list.
+    assert.equal(traderDbStats(db, NOW).unchecked, db.traders ? Object.keys(db.traders).length : 0);
+    assert.ok(nextW3bTrader(db, new Set(), NOW));
+});
+
+test('TornExchange without a key: best_listing is sent with no key, and "no listings" is null', async () => {
+    const seen = [];
+    const client = new TeClient({
+        getKey: () => '',
+        fetchImpl: async (url) => {
+            seen.push(url);
+            if (url.includes('item_id=999')) return response(400, { status: 'error', message: 'No listings found for the specified item' });
+            return response(200, { status: 'success', data: { item: 'Xanax', trader: 'MaxLEXO', trader_id: '3922958', vote: 1, price: 839004 } });
+        },
+    });
+    assert.deepEqual(await fetchTeBestListing(client, 206), { name: 'MaxLEXO', id: '3922958', price: 839004 });
+    assert.ok(!seen[0].includes('key='), 'no key in ' + seen[0]);
+    assert.equal(new URL(seen[0]).hostname, 'www.tornexchange.com');
+    client.lastRequestAt = 0;
+    assert.equal(await fetchTeBestListing(client, 999), null);
+    assert.equal(parseTeBestListing({ data: { trader: 'X', trader_id: '', price: 5 } }), null);
+});
+
+test('a rejected key says what TornExchange said, and what to do', async () => {
+    const client = new TeClient({
+        getKey: () => 'LIMITED123456789',
+        fetchImpl: async () => response(401, { status: 'error', message: 'Invalid API key' }),
+    });
+    await assert.rejects(client.get('all_best_listings'), (e) => e.badKey && /"Invalid API key"/.test(e.message) && /log in with this key/.test(e.message));
+});
+
+test('below Min but profitable: marked in the second colour, never in the list; Cash still applies', () => {
+    const row = (id, perUnit, qty, price) => ({
+        itemId: id,
+        profit: {
+            profitPerUnit: perUnit,
+            realizableProfit: perUnit * Math.min(qty, Math.floor(1000 / price)),
+            cashRequired: price * qty,
+            listingPrice: price,
+            affordableQty: Math.min(qty, Math.floor(1000 / price)),
+            roi: 1,
+        },
+        qtyAtPrice: qty,
+        npcVerified: true,
+    });
+    const big = row('1', 50, 5, 100); // +250
+    const small = row('2', 40, 1, 100); // +40
+    const loss = row('3', -10, 1, 100);
+    const pricey = row('4', 40, 1, 5000); // +40, but you cannot afford one
+    const opts = { minTotalProfit: 100, cashOnHand: 1000 };
+    assert.deepEqual(belowMinRows([big, small, loss, pricey], opts).map((r) => r.itemId), ['2']);
+});

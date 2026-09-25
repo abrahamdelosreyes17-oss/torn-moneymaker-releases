@@ -3,9 +3,9 @@
 Read this first, then `README.md`. The README holds the product and the binding
 rules; this file holds where we are, how the owner works, and what is settled.
 
-## Where things stand (3.9.1, 2026-09-25)
+## Where things stand (3.9.2, 2026-09-25)
 
-- **Version 3.9.1** on branch `claude/optimistic-ride-1gqguu`, on top of 3.8.1
+- **Version 3.9.2** on branch `claude/optimistic-ride-1gqguu`, on top of 3.8.1
   (`0210c53`) and the cloud session's handoff commits.
 - **`main` is still at 2.9.3.** The script's `@updateURL` points at `main`, so
   installs are done from **pinned links**:
@@ -14,6 +14,22 @@ rules; this file holds where we are, how the owner works, and what is settled.
   the owner asks.
 - `claude/trusting-ride-m6bvhg` (3.4.1) is fully contained in this branch.
 - Who uses it: the owner and a friend who plays Torn.
+
+**3.9.2 - no single source can empty the traders page** (the owner saw only
+"No traders yet" while TornExchange rejected the key; they had logged in there
+with the same Limited key, so the cause on TornExchange's side is still unknown):
+- a built-in list of 108 public TornW3B traders (`src/core/seed-traders.js`,
+  from TornW3B's leaderboards and Search Deals on 2026-09-25), so TornW3B works
+  with no key and no setup; refresh it now and then;
+- TornExchange's keyless `/api/best_listing` gives the best TornExchange buyer
+  of each item you hold while the key is missing or rejected;
+- a rejected key shows TornExchange's own words ("Invalid API key"), is tried
+  again by itself every 10 minutes, and the banner has **Try again**;
+- the status line reports each source on its own;
+- "Checking…" is per item, until every source has answered for it;
+- the owner's friend: on a bazaar or the Item Market, listings below Min that
+  still profit are marked **amber** (green = meets Min); the list is unchanged,
+  and Cash still hides what you cannot afford.
 
 **3.9.1:** 3.8.1 had stored its refusal ("That is a Torn key...") in `teState`, and
 3.9.0 kept showing it, with no TornExchange key saved, so every item said
@@ -146,6 +162,7 @@ PWPATH=$(npm root -g)/playwright node test/ux-check.mjs   # real-browser checks
   - `&sellprefs=<json>` sets the page's preferences;
   - `&slow=1` answers status lookups slowly;
   - `&nofeed=1` turns the feed off;
+  - `&tebad=1` saves a TornExchange key it rejects;
   - `&from381=1` reproduces what 3.8.1 left behind (the Limited key saved, no
     TornExchange key, and its refusal message stored);
   - `?ownbazaar=1&page=bazaar#/add` opens your own add page with a week of

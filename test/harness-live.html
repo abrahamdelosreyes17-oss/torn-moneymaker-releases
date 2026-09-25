@@ -29,7 +29,8 @@ _store[NS + 'settings'] = JSON.stringify(/[?&]nofeed=1/.test(location.search) ? 
 const SAME = /[?&]sellsame=1/.test(location.search);
 if (/[?&]sellkeys=1/.test(location.search)) {
     _store[NS + 'sellKey'] = JSON.stringify(LIMITED);
-    _store[NS + 'teKey'] = JSON.stringify(SAME ? LIMITED : TEKEY);
+    // &tebad=1: a TornExchange key it rejects ("Invalid API key").
+    _store[NS + 'teKey'] = JSON.stringify(/[?&]tebad=1/.test(location.search) ? 'WRONGKEY12345678' : SAME ? LIMITED : TEKEY);
 }
 // ?w3btrader=1: our trader database already knows trader 77, found on a
 // TornW3B page and on no TornExchange list.
@@ -181,6 +182,11 @@ function respond(url) {
         return { error: { code: 0, error: 'unknown in harness: ' + u.pathname } };
     }
     if (u.hostname === 'www.tornexchange.com') {
+        // The one call that needs no key: an item's best buyer.
+        if (u.pathname === '/api/best_listing') {
+            const best = { 206: { trader: 'Bob', trader_id: '11', price: 850000 }, 1: { trader: 'Alice', trader_id: '12', price: 115 } }[u.searchParams.get('item_id')];
+            return best ? { status: 'success', data: { item: 'x', vote: 1, ...best } } : { status: 'error', message: 'No listings found for the specified item', __http: 400 };
+        }
         if (u.searchParams.get('key') !== TEKEY && !(SAME && u.searchParams.get('key') === LIMITED)) return { status: 'error', message: 'Invalid API key', __http: 401 };
         if (u.pathname === '/api/all_best_listings') {
             return { status: 'success', data: {

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      3.9.1
+// @version      3.9.2
 // @description  Finds Bazaar and Item Market listings below NPC / market value - on the page you are viewing, and live from the Torn API and TornW3B - ranked by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -39,7 +39,7 @@
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '3.9.1';
+    const TTV2_BUILD_VERSION = '3.9.2';
 
     /* ===== src/platform/gm.js ===== */
     /*
@@ -1556,6 +1556,23 @@
     }
 
     /** Can this cash buy at least one unit of the row? No cash set = yes. */
+    /**
+     * Listings the Min keeps out of the list but that still make money: the
+     * page marks these in a second colour, so a bazaar you are looking at shows
+     * every profitable listing while the list shows only what meets your Min.
+     * Every other rule (Cash, verified prices) still applies.
+     *
+     * @param {Array<object>} opportunities
+     * @param {object} options - as rankOpportunities
+     * @param {Array<object>} [kept] - what rankOpportunities kept (left out here)
+     */
+    function belowMinRows(opportunities, options = {}, kept = null) {
+        const shown = new Set(kept || rankOpportunities(opportunities, { ...options, limit: 0 }));
+        return rankOpportunities(opportunities, { ...options, minTotalProfit: 0, limit: 0 }).filter(
+            (row) => !shown.has(row) && row.profit.profitPerUnit > 0 && row.profit.realizableProfit > 0,
+        );
+    }
+
     function affordableRow(row, cashOnHand) {
         const cash = Number(cashOnHand);
         if (!(cash > 0)) return true;
@@ -2337,7 +2354,7 @@
             }
 
             url.search = '';
-            url.searchParams.set('key', key);
+            if (key) url.searchParams.set('key', key);
             return url;
         }
 
@@ -2347,9 +2364,16 @@
             return Math.max(this.blockedUntil, this.lastRequestAt + TE_MIN_GAP_MS);
         }
 
-        async get(path, params = {}) {
-            const key = String(this.getKey() || '').trim();
-            if (!key) throw new TeError('No TornExchange key.', { badKey: true });
+        /**
+         * @param {string} path
+         * @param {object} [params]
+         * @param {object} [options]
+         * @param {boolean} [options.keyless] - an endpoint that needs no key
+         *   (best_listing): sent without one, on the same shared pace.
+         */
+        async get(path, params = {}, { keyless = false } = {}) {
+            const key = keyless ? '' : String(this.getKey() || '').trim();
+            if (!key && !keyless) throw new TeError('No TornExchange key.', { badKey: true });
 
             this.syncState();
             const t = this.now();
@@ -2402,9 +2426,12 @@
             }
 
             if (response.status === 401) {
+                // TornExchange says which: "Missing API key" or "Invalid API key"
+                // (a key other than the one you last logged in there with).
+                const said = body && typeof body.message === 'string' ? body.message.slice(0, 60) : 'Invalid API key';
                 throw new TeError(
-                    'TornExchange did not accept the key. Log in at tornexchange.com ' +
-                        'with this same key, then save it again.',
+                    'TornExchange says "' + said + '". It only knows the key you last logged in there with: ' +
+                        'log out of tornexchange.com, log in with this key, then Try again.',
                     { http: 401, badKey: true },
                 );
             }
@@ -2465,6 +2492,33 @@
         }
 
         return out;
+    }
+
+    /**
+     * The best TornExchange buyer of one item, with no key: /api/best_listing.
+     * TornExchange answers 400 "No listings found" for an item nobody buys; that
+     * is null, not an error.
+     *
+     * @returns {Promise<{name: string, id: string, price: number}|null>}
+     */
+    async function fetchTeBestListing(client, itemId) {
+        let body;
+        try {
+            body = await client.get('best_listing', { item_id: String(itemId) }, { keyless: true });
+        } catch (error) {
+            if (error && error.http === 400) return null;
+            throw error;
+        }
+        return parseTeBestListing(body);
+    }
+
+    /** Exposed for tests. */
+    function parseTeBestListing(body) {
+        const d = body && body.data;
+        const id = String((d && d.trader_id) || '').replace(/\D/g, '');
+        const price = Number(d && d.price);
+        if (!d || !id || !Number.isFinite(price) || price <= 0) return null;
+        return { name: typeof d.trader === 'string' && d.trader ? d.trader : 'Trader ' + id, id, price };
     }
 
     /**
@@ -2824,7 +2878,7 @@
             if (!t) {
                 db.traders[id] = { name: name || 'Trader ' + id, from: f.source || null, seenAt: now, w3b: null };
                 changed = true;
-            } else if (name && t.name !== name && (f.source !== 'w3b' || t.name.startsWith('Trader '))) {
+            } else if (name && t.name !== name && ((f.source !== 'w3b' && f.source !== 'seed') || t.name.startsWith('Trader '))) {
                 t.name = name;
                 changed = true;
             }
@@ -4973,6 +5027,24 @@
         box-shadow:
             inset 0 0 0 3px #7ee08f,
             inset 0 0 0 9999px rgba(126, 224, 143, 0.24) !important;
+    }
+
+    /*
+     * Profitable, but below your Min: amber, thinner and fainter than green, so
+     * the deals that meet your Min still stand out first. (Yellow is taken: it
+     * marks the listing a panel link was opened for.)
+     */
+    .ttv2-hit.ttv2-hit-low {
+        box-shadow:
+            inset 0 0 0 2px #f0a020,
+            inset 0 0 0 9999px rgba(240, 160, 32, 0.12) !important;
+    }
+
+    .ttv2-hit.ttv2-hit-low.ttv2-hit-low::after {
+        background: rgba(48, 30, 4, 0.9) !important;
+        border-color: #f0a020 !important;
+        color: #f5c060 !important;
+        font-weight: 700 !important;
     }
 
     /* Bazaar owner status, right after their name in the page banner. */
@@ -7713,7 +7785,7 @@
          *   onSaveKey(key), onForgetKey(), onRevealKey()
          *   onSaveTeKey(key), onForgetTeKey(), onRevealTeKey()
          *   onRefresh(), onPrefsChange(partial), onExpand(section, itemId)
-         *   onQuery(section, text), onMore()
+         *   onQuery(section, text), onMore(), onRetryTe()
          *   onOpenUrl(url)
          */
         constructor(handlers = {}) {
@@ -8089,19 +8161,31 @@
                 this.teStateEl.textContent = info.teError || 'Saved.';
                 if (info.teError) this.teStateEl.classList.add('sp-bad');
             }
-            this.teSameBtn.hidden = !info.hasKey || Boolean(info.teSameAsLimited);
+            this.teSameBtn.hidden = !info.hasKey;
         }
 
-        /** One quiet line: how much we know, and how fresh it is. */
+        /**
+         * One quiet line, one part per source, so a source that fails says so
+         * while the others keep working: "TornW3B 97 traders · TornExchange: key
+         * not accepted, best per item 40/222 · inventory 2m ago".
+         */
         renderBar() {
             if (!this.root) return;
             const info = this.state.info || {};
             const now = Date.now();
             const bits = [];
-            if (info.traderCount) bits.push(info.traderCount.toLocaleString('en-US') + ' traders');
-            if (info.teAt) bits.push('TE ' + formatAge(now - info.teAt));
-            if (info.w3bAt) bits.push('W3B ' + formatAge(now - info.w3bAt));
-            if (info.w3bChecking) bits.push('reading ' + info.w3bChecking + ' more lists');
+
+            let w3b = 'TornW3B ' + (info.w3bTraders || 0) + ' traders';
+            if (info.w3bChecking) w3b += ', reading ' + info.w3bChecking + ' lists';
+            else if (info.w3bAt) w3b += ' ' + formatAge(now - info.w3bAt);
+            bits.push(w3b);
+
+            const perItem = info.heldCount ? ', best per item ' + (info.teOneDone || 0) + '/' + info.heldCount : '';
+            if (info.teStatus === 'ok') bits.push('TornExchange ' + (info.teAt ? formatAge(now - info.teAt) : ''));
+            else if (info.teStatus === 'badkey') bits.push('TornExchange: key not accepted' + perItem);
+            else if (info.teStatus === 'nokey') bits.push('TornExchange: no key' + perItem);
+            else if (info.teStatus === 'loading') bits.push('TornExchange loading');
+
             if (info.inventoryAt) bits.push('inventory ' + formatAge(now - info.inventoryAt));
             this.barEl.textContent = bits.join(' · ');
             this.barEl.hidden = !bits.length || this.view === 'settings';
@@ -8131,11 +8215,11 @@
             } else if (!info.hasKey) {
                 say('Add your Limited key to see your items.', null, 'Add key', toSettings);
             } else if (!info.hasTeKey) {
-                say('Traders load from TornExchange with the key you log in there with.', null, 'Use my Limited key', useLimited);
+                say('For every TornExchange trader, add the key you log in there with.', null, 'Use my Limited key', useLimited);
             } else if (info.teBadKey && !info.teSameAsLimited) {
                 say(info.teError || 'TornExchange did not accept this key.', 'bad', 'Use my Limited key', useLimited);
             } else if (info.teBadKey) {
-                say(info.teError || 'TornExchange did not accept this key.', 'bad', 'Open Settings', toSettings);
+                say(info.teError || 'TornExchange did not accept this key.', 'bad', 'Try again', () => this.h.onRetryTe && this.h.onRetryTe());
             } else if (info.teWaitUntil && info.teWaitUntil > Date.now()) {
                 say('TornExchange asked us to wait ' + formatAge(info.teWaitUntil - Date.now()).replace(' ago', '') + '.', 'warn');
             } else if (info.teError) {
@@ -8163,7 +8247,7 @@
                     r.itemId,
                     r.name,
                     r.buyers.length,
-                    r.best ? [r.best.id, r.best.name, r.best.price, statusOf(r.best)] : 0,
+                    r.best ? [r.best.id, r.best.name, r.best.price, statusOf(r.best)] : Boolean(r.pending),
                     open ? [Boolean(l.loading), l.error || '', r.buyers.map((b) => [b.id, b.name, b.price, b.te, b.w3b, statusOf(b)])] : 0,
                 ];
             };
@@ -8269,7 +8353,7 @@
                           spEl('span', { class: 'sp-who' }, [spEl('span', { class: 'sp-tname', text: best.name }), this.status(best)]),
                       ])
                     : spEl('span', { class: 'sp-best' }, [
-                          spEl('span', { class: 'sp-none', text: this.noTraderText() }),
+                          spEl('span', { class: 'sp-none', text: this.noTraderText(r) }),
                       ]),
                 spEl('span', { class: 'sp-chev', 'aria-hidden': 'true', text: best ? '›' : '' }),
             ]);
@@ -8280,10 +8364,11 @@
         }
 
         /** What an item with no trader says: only "No Trader Found" once every source has answered. */
-        noTraderText() {
+        noTraderText(r) {
             const info = this.state.info || {};
             if (!info.knownTraders) return 'No traders yet';
-            if (info.tradersLoading) return 'Checking…';
+            // Per item when known (My items), else for the page as a whole.
+            if (r && r.pending !== undefined ? r.pending : info.tradersLoading) return 'Checking…';
             return this.state.prefs.onlineOnly ? 'No trader online' : 'No Trader Found';
         }
 
@@ -8525,6 +8610,49 @@
     }
     `;
 
+    /* ===== src/core/seed-traders.js ===== */
+    /*
+     * Traders the traders page starts from, so it is never empty: TornW3B has no
+     * list of its traders, and TornExchange (the other way we learn who trades)
+     * needs a key that can fail. These are public: every trader on TornW3B's
+     * Highest Rated and Most Trades lists and on its Search Deals pages for
+     * Xanax, Feathery Hotel Coupon and Camel Plushie, read on 2026-09-25. Each
+     * one's price list is then read from TornW3B like any other trader's, and a
+     * trader who has since stopped simply has no list. Refresh this list now and
+     * then; traders found on TornW3B pages you open are added on top of it.
+     */
+    const SEED_TRADERS_AT = '2026-09-25';
+
+    const SEED_TRADERS = [
+        [49405, '04doolant'], [578524, 'CrazyK'], [593790, 'office_kitty'], [1195734, 'Friends'],
+        [1740317, 'TheWorldEater'], [1853324, 'Weav3r'], [1884573, 'Muckamuck'], [1889185, 'tuChico'],
+        [1893918, 'destroyer1'], [1944994, 'Slay'], [1955915, 'Valiantus'], [1967952, '-YouKai-'],
+        [2048821, 'uselessrancho'], [2097793, 'Unique'], [2224491, 'vavi'], [2321305, 'VladBull'],
+        [2557282, 'Qfiffle'], [2560768, 'Deadringers'], [2593645, 'KatieWalker'], [2620755, 'feneath'],
+        [2626587, 'Heartflower'], [2659469, 'Butang'], [2671892, 'Nulaxy-Dimplex'], [2746488, 'Chocolatymilk'],
+        [2775485, 'Lone_Wanderer'], [2798021, 'DFire'], [2810641, 'MrsPuff'], [2819595, 'ColdLand'],
+        [2820931, 'Tatam'], [2850973, 'NaughtySkeleton'], [2896648, 'theOldWang'], [2918061, 'Tarlyne'],
+        [2955278, 'BatWalker'], [2982905, 'Clouds'], [3028721, 'DrTomato'], [3034011, 'Heart'],
+        [3067397, '-KAngel'], [3139304, 'Ryng'], [3170298, 'Mil-Soul'], [3249836, 'Chawarma'],
+        [3260999, 'Piemancer'], [3395089, 'Hazy'], [3459156, 'BenMitN'], [3463955, 'Apothe'],
+        [3517419, 'BangHammer'], [3519237, 'Boobypins'], [3521529, 'Picex'], [3527044, 'Zielikak'],
+        [3546645, 'Brittany8781'], [3564733, 'Darth_Primal'], [3567722, 'Turkeybop6141'], [3608714, 'FItFullSend'],
+        [3619104, 'UKDanny666'], [3626229, 'MrReeko'], [3647423, 'SPIDERNNAM'], [3713792, 'Edvinito'],
+        [3714036, 'LeahQvQQQQ'], [3727302, 'WoogBenz-x'], [3742399, '7ZP'], [3757699, 'YeXiua'],
+        [3799057, 'Benna33'], [3809686, 'Dangerous_Dan'], [3826751, 'Gustyke'], [3828441, 'Tareks'],
+        [3834137, 'Ronaldo10345PT'], [3840107, 'Korrvack'], [3856420, 'Zypheresque'], [3878295, 'DeathWalker'],
+        [3878831, 'Shekels'], [3889332, 'Finnalandem'], [3891863, 'HiImAlex'], [3897823, 'FrugalWhorz'],
+        [3899426, 'Raviloli'], [3921912, 'KOMBAJN1'], [3922958, 'MaxLEXO'], [3940389, 'Zega'],
+        [3943045, 'Snickey'], [3960421, 'DonGong'], [3961564, 'Jekyll7'], [3962517, 'Imnotapro_'],
+        [3982209, 'V0L'], [3982492, 'Deathbladee'], [3997042, 'Faded-'], [4006299, 'Pierzzz'],
+        [4021804, 'Stevia567'], [4040949, 'ankitjainaj'], [4053619, '_Solenya_'], [4103083, 'makepeace'],
+        [4103865, 'Cannonballlll'], [4104381, 'jinjin25'], [4113947, 'Oops_I'], [4203184, 'ekewalls'],
+        [4213240, 'Bielus'], [4213516, 'Khawun'], [4239607, 'SimSOp'], [4250160, 'WIT-Jimmy'],
+        [4250450, 'HammondArcanum'], [4255265, 'Obironos'], [4260076, 'Rembrandt'], [4286823, 'ThePixelPundit'],
+        [4295665, 'DonRon46'], [4298171, 'Butter_My_Buns_'], [4315363, 'Moitzi'], [4342484, 'Zombie_Cage'],
+        [4354832, 'Viduata'], [4371231, 'Sortis'], [4375700, 'Rippler1985'], [4429820, 'AlekseiNamaste'],
+    ];
+
     /* ===== src/ui/overlay.js ===== */
     /*
      * Row marking.
@@ -8541,6 +8669,8 @@
 
     const HIT_CLASS = 'ttv2-hit';
     const HIT_TOP_CLASS = 'ttv2-hit-top';
+    /** Profitable, but below your Min: a second colour. */
+    const HIT_LOW_CLASS = 'ttv2-hit-low';
 
     /** dataset key `ttv2Hit` <-> attribute `data-ttv2-hit`. */
     const HIT_DATA_KEY = 'ttv2Hit';
@@ -8552,11 +8682,12 @@
     /** Rows ranked this high get the brighter stripe. */
     const TOP_HIT_COUNT = 3;
 
-    function markRow(el, { top = false, label = '' } = {}) {
+    function markRow(el, { top = false, low = false, label = '' } = {}) {
         if (!el || !el.classList) return;
 
         el.classList.add(HIT_CLASS);
-        el.classList.toggle(HIT_TOP_CLASS, Boolean(top));
+        el.classList.toggle(HIT_TOP_CLASS, Boolean(top) && !low);
+        el.classList.toggle(HIT_LOW_CLASS, Boolean(low));
         el.dataset[HIT_DATA_KEY] = '1';
 
         // Read back by the ::after rule in styles.js.
@@ -8568,25 +8699,36 @@
 
         el.classList.remove(HIT_CLASS);
         el.classList.remove(HIT_TOP_CLASS);
+        el.classList.remove(HIT_LOW_CLASS);
         delete el.dataset[HIT_DATA_KEY];
         delete el.dataset[PROFIT_DATA_KEY];
     }
 
     /**
      * Mark a ranked set of rows, clearing anything previously marked.
-     * @param {Array<object>} rankedRows - rows carrying an `el`
+     * @param {Array<object>} rankedRows - rows carrying an `el` (green)
+     * @param {Document|Element} [root]
+     * @param {Array<object>} [lowRows] - profitable but below Min (second colour);
+     *   a card that is also in rankedRows stays green
      */
-    function markRows(rankedRows, root = document) {
+    function markRows(rankedRows, root = document, lowRows = []) {
         clearMarks(root);
 
+        const green = new Set();
         rankedRows.forEach((row, i) => {
             if (!row || !row.el) return;
+            green.add(row.el);
 
             markRow(row.el, {
                 top: i < TOP_HIT_COUNT,
                 label: row.cardLabel || '',
             });
         });
+
+        for (const row of lowRows || []) {
+            if (!row || !row.el || green.has(row.el)) continue;
+            markRow(row.el, { low: true, label: row.cardLabel || '' });
+        }
     }
 
     /** Remove every marker AND every scan flag, so a rescan starts clean. */
@@ -9102,6 +9244,7 @@
 
 
 
+
     const STORE_KEY = 'apiKey';
     const STORE_ITEMS = 'itemsCache';
     const STORE_NPC = 'npcCache';
@@ -9125,6 +9268,8 @@
     const STORE_SELL_PREFS = 'sellingPage';
     /* Our own trader database: every trader we know of, and their TornW3B list. */
     const STORE_TRADER_DB = 'traderDb';
+    /* TornExchange's best buyer per item you hold, asked without a key. */
+    const STORE_TE_ONE = 'teOne';
 
     /* Price history the script records itself, and TornW3B's latest summary. */
     const STORE_HISTORY = 'priceHistory';
@@ -9699,7 +9844,13 @@
             app.feed.requestRecheck(live.slice(0, 10).map((r) => r.itemId));
         }
 
-        markRows(live.slice(0, 100));
+        // Below your Min but still profitable: marked on the page in a second
+        // colour, never added to the list.
+        const lower = closedHere
+            ? []
+            : belowMinRows(priced, rankSettings({ limit: 0 }), ranked).filter((row) => !pageRowContradicted(feed, row));
+
+        markRows(live.slice(0, 100), document, lower.slice(0, 100));
         showBazaarTarget(listings);
 
         app.lastScanAt = now;
@@ -10779,6 +10930,13 @@
         listState: new Map(),
         teLoading: false,
         teIdsLoading: false,
+        /*
+         * TornExchange without a key: the best buyer of each item you hold, one
+         * item per slot. Used while there is no working key, so a key problem
+         * costs detail, never every TornExchange trader.
+         */
+        teOne: new Map(),
+        teOneBusy: false,
         /* Our trader database (TornW3B lists), and its item index for this render. */
         db: null,
         dbDirty: false,
@@ -10816,6 +10974,66 @@
     const TRADER_DB_SAVE_MS = 60000;
     /* TornExchange's active traders (names -> ids) are used for this long. */
     const TE_IDS_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+    /* A key TornExchange rejected is tried again after this, by itself. */
+    const TE_BADKEY_RETRY_MS = 10 * 60 * 1000;
+    /* A keyless best-buyer answer is used for this long (TornExchange caches 5 min). */
+    const TE_ONE_TTL_MS = 30 * 60 * 1000;
+    /* The keyless fallback asks for its next item this often (the queue paces it). */
+    const TE_ONE_STEP_MS = 5000;
+
+    /** Is TornExchange's keyed API unusable right now (no key, or rejected)? */
+    function teKeyUnusable() {
+        return !getTeKey() || Boolean(teState().badKey);
+    }
+
+    /** Keyless best buyers still fresh: itemId -> {at, best|null}. */
+    function loadTeOne(now = Date.now()) {
+        const stored = gmGet(STORE_TE_ONE, null) || {};
+        const out = new Map();
+        for (const [id, rec] of Object.entries(stored)) {
+            if (rec && now - Number(rec.at) < TE_ONE_TTL_MS) out.set(id, rec);
+        }
+        return out;
+    }
+
+    /**
+     * The next item you hold with no fresh keyless answer, asked through the
+     * shared TornExchange queue: visible tab only, one at a time, and only while
+     * the keyed API is unusable.
+     */
+    function stepTeOne() {
+        if (sell.teOneBusy || !sell.queue || document.visibilityState !== 'visible') return;
+        if (!teKeyUnusable() || sell.queue.length > 0) return;
+        const now = Date.now();
+        const blockedUntil = Number(teState().blockedUntil) || 0;
+        if (now < blockedUntil) return;
+
+        const id = [...heldIds()].find((i) => {
+            const rec = sell.teOne.get(i);
+            return !rec || now - rec.at >= TE_ONE_TTL_MS;
+        });
+        if (!id) return;
+
+        sell.teOneBusy = true;
+        sell.queue
+            .enqueue(() => fetchTeBestListing(sell.te, id))
+            .then((best) => {
+                const rec = { at: Date.now(), best };
+                sell.teOne.set(id, rec);
+                const stored = gmGet(STORE_TE_ONE, null) || {};
+                stored[id] = rec;
+                gmSet(STORE_TE_ONE, stored);
+                if (best) learnTraders([{ id: best.id, name: best.name, source: 'te' }]);
+            })
+            .catch(() => {
+                // Recorded by the queue's onSettled; this item is asked again later.
+                sell.teOne.set(id, { at: Date.now() - TE_ONE_TTL_MS + TE_RETRY_MS, best: null, failed: true });
+            })
+            .finally(() => {
+                sell.teOneBusy = false;
+                renderSelling();
+            });
+    }
 
     function getSellKey() {
         return gmGet(STORE_SELL_KEY, '') || '';
@@ -10945,8 +11163,11 @@
             let b = buyersCache.get(id);
             if (!b) {
                 const full = sell.lists.get(id);
+                const one = sell.teOne.get(id);
                 b = buyersForItem(id, {
-                    teBest: teMap.get(id) || [],
+                    // The keyed top three when TornExchange has them; else its
+                    // keyless best buyer for this item.
+                    teBest: teMap.get(id) || (one && one.best ? [one.best] : []),
                     teFull: full ? full.traders : null,
                     idsByName: sell.idsByName,
                     db: sell.db,
@@ -10965,11 +11186,29 @@
             return (item && item.name) || heldNames.get(String(id)) || 'Item ' + id;
         };
 
+        const stats = traderDbStats(sell.db, now);
+        const teKey = getTeKey();
+        const teUnusable = teKeyUnusable();
+        /*
+         * "No Trader Found" only once every source has answered for that item:
+         * TornW3B has read every list it knows of, and TornExchange has answered
+         * either for every item (the keyed top three) or for this one (keyless).
+         */
+        const w3bPending = stats.unchecked > 0;
+        const pendingFor = (id) => {
+            if (w3bPending) return true;
+            if (!teUnusable) return !sell.traders;
+            const one = sell.teOne.get(String(id));
+            return !one || Boolean(one.failed);
+        };
+
         /* My items: everything you hold, those with a trader first. */
         const my = sell.inventory ? itemRows(heldIds(), { buyersOf, nameOf, query: sell.queries.my }) : [];
+        for (const r of my) r.pending = !r.best && pendingFor(r.itemId);
 
         /* All items: every item any trader buys. */
-        const allIds = new Set([...teMap.keys(), ...w3bByItem.keys()]);
+        const oneIds = [...sell.teOne].filter(([, rec]) => rec.best).map(([id]) => id);
+        const allIds = new Set([...teMap.keys(), ...w3bByItem.keys(), ...oneIds]);
         const allRows = itemRows(allIds, { buyersOf, nameOf, query: sell.queries.all }).filter((r) => r.best);
         const all = allRows.slice(0, sell.allShown);
 
@@ -10977,8 +11216,8 @@
 
         const itemLists = new Map();
         for (const [id, s] of sell.listState) itemLists.set(id, s);
-        const stats = traderDbStats(sell.db, now);
-        const teKey = getTeKey();
+        const heldCount = sell.inventory ? sell.inventory.length : 0;
+        const teOneDone = sell.inventory ? [...heldIds()].filter((i) => sell.teOne.has(i) && !sell.teOne.get(i).failed).length : 0;
 
         sell.page.render({
             my,
@@ -11000,11 +11239,16 @@
                 inventoryAt: sell.inventoryAt,
                 loading: sell.loading,
                 // Until every source has answered once, "no trader" is not known yet.
-                tradersLoading: sell.teLoading || stats.unchecked > 0 || (Boolean(teKey) && !sell.traders && !teState().badKey),
+                tradersLoading: sell.teLoading || w3bPending || (!teUnusable && !sell.traders) || (teUnusable && teOneDone < heldCount),
                 traderCount: countTraders(allIds, buyersAll),
-                knownTraders: stats.total + sell.idsByName.size + teMap.size,
+                knownTraders: stats.total + sell.idsByName.size + teMap.size + oneIds.length,
                 w3bAt: stats.newestW3bAt,
                 w3bChecking: stats.unchecked,
+                w3bTraders: stats.withW3b,
+                // Each source on its own: one failing never hides the others.
+                teStatus: !teKey ? 'nokey' : st.badKey ? 'badkey' : sell.traders ? 'ok' : 'loading',
+                teOneDone,
+                heldCount,
                 itemLists,
             },
         });
@@ -11128,8 +11372,14 @@
         const now = Date.now();
         loadSellTraders(now);
 
-        const st = teState();
-        if (st.badKey) return;
+        let st = teState();
+        if (st.badKey) {
+            // A rejection is not forever: you may have logged in there since.
+            if (now - (Number(st.badAt) || 0) < TE_BADKEY_RETRY_MS) return;
+            setTeState({ badKey: false, lastAttemptAt: 0, idsAttemptAt: 0 });
+            st = teState();
+            force = true;
+        }
         if (st.blockedUntil && now < st.blockedUntil) return;
         refreshTeActiveTraders();
         if (now - (st.lastAttemptAt || 0) < (force ? 30000 : TE_RETRY_MS)) return;
@@ -11188,11 +11438,13 @@
      */
     function onTeSettled(error) {
         if (!error) {
-            if (teState().error) setTeState({ error: null });
+            // A keyless call working says nothing about the key: keep its verdict.
+            const st = teState();
+            if (st.error && !st.badKey) setTeState({ error: null });
         } else if (error.http === 429) {
             setTeState({ blockedUntil: Date.now() + error.retryAfterMs, error: null });
         } else if (error.badKey) {
-            setTeState({ badKey: true, error: error.message });
+            setTeState({ badKey: true, badAt: Date.now(), error: error.message });
         } else {
             setTeState({ error: 'TornExchange did not answer. Trying again soon.' });
         }
@@ -11332,6 +11584,13 @@
         renderSelling();
     }
 
+    /** "Try again": ask TornExchange with the saved key now (after logging in there again). */
+    function onSellRetryTe() {
+        setTeState({ badKey: false, error: null, lastAttemptAt: 0, idsAttemptAt: 0 });
+        refreshSellTraders({ force: true });
+        renderSelling();
+    }
+
     function onSellForgetTeKey() {
         gmDel(STORE_TE_KEY);
         setTeState({ badKey: false, error: null });
@@ -11402,6 +11661,10 @@
         if (sell.keyDead) sell.keyError = 'Torn rejected this key. Paste a new Limited key.';
 
         loadTraderDb();
+        // Start from TornW3B's public traders, so no one source (or key) is
+        // needed to see traders at all.
+        learnTraders(SEED_TRADERS.map(([id, name]) => ({ id, name, source: 'seed' })));
+        sell.teOne = loadTeOne();
         // An error message is about the last call, not this visit: a stored one
         // (3.8.1 kept "That is a Torn key" forever) would outlive its cause.
         if (teState().error) setTeState({ error: null });
@@ -11412,6 +11675,7 @@
             onRevealKey: () => getSellKey(),
             onSaveTeKey: onSellSaveTeKey,
             onForgetTeKey: onSellForgetTeKey,
+            onRetryTe: onSellRetryTe,
             onRevealTeKey: () => getTeKey(),
             onRefresh: onSellRefresh,
             onPrefsChange: (partial) => {
@@ -11460,6 +11724,7 @@
         })();
 
         setInterval(stepW3bLists, W3B_LIST_STEP_MS);
+        setInterval(stepTeOne, TE_ONE_STEP_MS);
 
         setInterval(() => {
             if (document.visibilityState !== 'visible') return;

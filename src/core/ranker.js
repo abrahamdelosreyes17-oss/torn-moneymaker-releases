@@ -87,6 +87,23 @@ export function rankOpportunities(opportunities, options = {}) {
 }
 
 /** Can this cash buy at least one unit of the row? No cash set = yes. */
+/**
+ * Listings the Min keeps out of the list but that still make money: the
+ * page marks these in a second colour, so a bazaar you are looking at shows
+ * every profitable listing while the list shows only what meets your Min.
+ * Every other rule (Cash, verified prices) still applies.
+ *
+ * @param {Array<object>} opportunities
+ * @param {object} options - as rankOpportunities
+ * @param {Array<object>} [kept] - what rankOpportunities kept (left out here)
+ */
+export function belowMinRows(opportunities, options = {}, kept = null) {
+    const shown = new Set(kept || rankOpportunities(opportunities, { ...options, limit: 0 }));
+    return rankOpportunities(opportunities, { ...options, minTotalProfit: 0, limit: 0 }).filter(
+        (row) => !shown.has(row) && row.profit.profitPerUnit > 0 && row.profit.realizableProfit > 0,
+    );
+}
+
 export function affordableRow(row, cashOnHand) {
     const cash = Number(cashOnHand);
     if (!(cash > 0)) return true;

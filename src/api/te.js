@@ -108,7 +108,7 @@ export class TeClient {
         }
 
         url.search = '';
-        url.searchParams.set('key', key);
+        if (key) url.searchParams.set('key', key);
         return url;
     }
 
@@ -118,9 +118,16 @@ export class TeClient {
         return Math.max(this.blockedUntil, this.lastRequestAt + TE_MIN_GAP_MS);
     }
 
-    async get(path, params = {}) {
-        const key = String(this.getKey() || '').trim();
-        if (!key) throw new TeError('No TornExchange key.', { badKey: true });
+    /**
+     * @param {string} path
+     * @param {object} [params]
+     * @param {object} [options]
+     * @param {boolean} [options.keyless] - an endpoint that needs no key
+     *   (best_listing): sent without one, on the same shared pace.
+     */
+    async get(path, params = {}, { keyless = false } = {}) {
+        const key = keyless ? '' : String(this.getKey() || '').trim();
+        if (!key && !keyless) throw new TeError('No TornExchange key.', { badKey: true });
 
         this.syncState();
         const t = this.now();
@@ -173,9 +180,12 @@ export class TeClient {
         }
 
         if (response.status === 401) {
+            // TornExchange says which: "Missing API key" or "Invalid API key"
+            // (a key other than the one you last logged in there with).
+            const said = body && typeof body.message === 'string' ? body.message.slice(0, 60) : 'Invalid API key';
             throw new TeError(
-                'TornExchange did not accept the key. Log in at tornexchange.com ' +
-                    'with this same key, then save it again.',
+                'TornExchange says "' + said + '". It only knows the key you last logged in there with: ' +
+                    'log out of tornexchange.com, log in with this key, then Try again.',
                 { http: 401, badKey: true },
             );
         }
@@ -236,6 +246,33 @@ export function parseTeBestListings(body) {
     }
 
     return out;
+}
+
+/**
+ * The best TornExchange buyer of one item, with no key: /api/best_listing.
+ * TornExchange answers 400 "No listings found" for an item nobody buys; that
+ * is null, not an error.
+ *
+ * @returns {Promise<{name: string, id: string, price: number}|null>}
+ */
+export async function fetchTeBestListing(client, itemId) {
+    let body;
+    try {
+        body = await client.get('best_listing', { item_id: String(itemId) }, { keyless: true });
+    } catch (error) {
+        if (error && error.http === 400) return null;
+        throw error;
+    }
+    return parseTeBestListing(body);
+}
+
+/** Exposed for tests. */
+export function parseTeBestListing(body) {
+    const d = body && body.data;
+    const id = String((d && d.trader_id) || '').replace(/\D/g, '');
+    const price = Number(d && d.price);
+    if (!d || !id || !Number.isFinite(price) || price <= 0) return null;
+    return { name: typeof d.trader === 'string' && d.trader ? d.trader : 'Trader ' + id, id, price };
 }
 
 /**
