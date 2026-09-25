@@ -142,3 +142,32 @@ test('money input: digits, commas, $, and shorthand read as people mean them; ju
     assert.equal(parseMoneyInput('12x'), null);
     assert.equal(parseMoneyInput(''), null);
 });
+
+/*
+ * The owner's report (3.10.1): NPC deals showing - Travel Visa $120,000 ->
+ * $122,500, Magnum $15,500 -> $16,000 - and all gone the moment Cash was set
+ * to $2m. Discovery ranked by profit x how many the cash buys, as if every
+ * listing had unlimited stock: a $10 item making $1 scored 200,000, beating
+ * the Visa's 40,000, so 25 cheap items took every slot and the feed then
+ * dropped the real deals.
+ */
+test('discovery: setting Cash never pushes out deals you can afford', () => {
+    const byId = new Map();
+    const summary = [];
+    byId.set('visa', { id: 'visa', name: 'Travel Visa', sellPrice: 122500, marketValue: 130000 });
+    summary.push({ itemId: 'visa', lowestPrice: 120000 });
+    byId.set('magnum', { id: 'magnum', name: 'Magnum', sellPrice: 16000, marketValue: 17000 });
+    summary.push({ itemId: 'magnum', lowestPrice: 15500 });
+    for (let i = 1; i <= 40; i++) {
+        byId.set('j' + i, { id: 'j' + i, name: 'Junk' + i, sellPrice: 12, marketValue: 12 });
+        summary.push({ itemId: 'j' + i, lowestPrice: 10 + (i % 2) });
+    }
+    const index = { byId };
+    const settings = { sellToNpc: true, minTotalProfit: 1 };
+    const ids = (cash) => selectCandidates(summary, index, { ...settings, cashOnHand: cash }).map((c) => c.itemId);
+
+    assert.deepEqual(ids(null).slice(0, 2), ['visa', 'magnum'], 'no cash: best profit per item first');
+    assert.deepEqual(ids(2e6).slice(0, 2), ['visa', 'magnum'], '$2m: the same deals, still first');
+    // Cash still drops what it cannot buy one of.
+    assert.ok(!ids(100000).includes('visa') && ids(100000)[0] === 'magnum', '$100k: the Visa goes, the Magnum stays');
+});

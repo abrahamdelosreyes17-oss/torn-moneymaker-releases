@@ -3,10 +3,12 @@
 Read this first, then `README.md`. The README holds the product and the binding
 rules; this file holds where we are, how the owner works, and what is settled.
 
-## Where things stand (3.10.1, 2026-09-25)
+## Where things stand (3.10.2, 2026-09-26)
 
-- **Version 3.10.1** on branch `claude/optimistic-ride-1gqguu`, on top of 3.8.1
-  (`0210c53`) and the cloud session's handoff commits.
+- **Version 3.10.2** (not committed yet; 3.10.1 is `b24aa28`) on branch `claude/optimistic-ride-1gqguu`,
+  on top of 3.8.1 (`0210c53`) and the cloud session's handoff commits.
+  Last install link given to the owner (3.10.1):
+  `https://raw.githubusercontent.com/abrahamdelosreyes17-oss/torn-moneymaker-releases/b24aa28574036bc78eaeafea59dd440b18445ab9/torn-moneymaker.user.js`
 - **`main` is still at 2.9.3.** The script's `@updateURL` points at `main`, so
   installs are done from **pinned links**:
   `https://raw.githubusercontent.com/abrahamdelosreyes17-oss/torn-moneymaker-releases/<commit>/torn-moneymaker.user.js`
@@ -14,6 +16,37 @@ rules; this file holds where we are, how the owner works, and what is settled.
   the owner asks.
 - `claude/trusting-ride-m6bvhg` (3.4.1) is fully contained in this branch.
 - Who uses it: the owner and a friend who plays Torn.
+- The owner's last word on 3.10.1: "nice, good work". Nothing is waiting on
+  an answer from them.
+
+### Start here next session
+
+1. Ask the owner to install 3.10.2, set Cash, and open Torn Bids and a Torn page, then
+   look in their Chrome (pages they opened only): Torn Bids with their 222
+   items at their screen width, and the panel beside Torn's real content.
+   Everything since 3.9.4 is checked in the harness only.
+2. Run `test/ux-check.mjs` once Playwright is available (updated for Torn
+   Bids, never run).
+3. Then the open list at the end of "Not done / open" - ask which first.
+
+**3.10.2 - Cash no longer empties the deals (the owner's report, 2026-09-26).**
+- What the owner saw: NPC deals on screen (Travel Visa $120,000 → $122,500
+  ×4, Magnum $15,500 → $16,000, ...). The moment Cash was set to $2m, every
+  deal was gone; Refresh brought nothing back. A regression since 3.8.0.
+- Cause: `selectCandidates()` (`core/feed.js`) ranked TornW3B's summary by
+  profit × how many your cash buys (`reachableProfit`), as if every listing
+  had unlimited stock. With $2m, a $10 item making $1 scored 200,000 and the
+  Visa 40,000, so cheap junk took all 25 slots, and `refreshSummary()`
+  (`feed/controller.js`) then deletes every bazaar row outside the
+  candidates - the real deals included.
+- Fix: rank by profit per item, cash or no cash; Cash (and Min) only leave
+  out what you cannot buy one of / cannot reach. The Item Market sweep's
+  tie-break had the same unlimited-stock assumption; now per item too.
+- Test: `test/cash.test.js` "setting Cash never pushes out deals you can
+  afford" - it failed before the fix (junk first) and passes after.
+- Not verified on real Torn yet. The Item Market tab also went empty in the
+  owner's screenshot: its rows are only removed by age, and Cash hides
+  listings over $2m, so check whether those two deals cost more than $2m.
 
 **3.10.0 - Torn Bids, and the panel's chips on one row.**
 - The traders page is now **Torn Bids** (the owner rejected "Sell to traders"
@@ -164,7 +197,7 @@ Fixed and built in 3.9.4:
 3. **"Limited Access access"** is fixed.
 4. **The per-item line** shows "3 traders · 1 online", and nothing for a
    single trader.
-5. **The wide layout** (at 1100px and up):
+5. **The wide layout** (at 1100px and up) - *replaced by Torn Bids in 3.10.0*:
    - the list, plus a 380px side column: the item picked with all its traders
      (the list no longer jumps open), Best trader for you, and Sources;
    - Sources shows each source with a dot and a progress bar, replacing the
@@ -173,7 +206,7 @@ Fixed and built in 3.9.4:
 
    Narrow screens keep one column, with only the top "best trader" above the
    list.
-6. **Best trader for you:** who has the best price on the most of your items,
+6. **Best trader for you** (*"Who to message" since 3.10.0*): who has the best price on the most of your items,
    with trust, status and Profile / TE / W3B links. **Show these items**
    filters My items to them. In Torn you trade with one person at a time.
 7. **Trust badge** (Trusted / Known / New / Caution; the numbers show on
@@ -226,14 +259,17 @@ Still ideas, not built:
 
 - **Not verified live** (only in the harness). Please check in the owner's
   Chrome, reading only pages the owner opened:
+  - Torn Bids (3.10) and the panel's fit beside Torn's real content (3.9.5+);
   - the real TornExchange responses with the owner's key;
   - `/v2/user/inventory`;
   - the real `#/add` and `#/manage` markup.
 
   weav3r.dev was checked live on 2026-09-25: its `/api/pricelist/{id}`, the
   home-page leaderboards and Search Deals links all work as coded.
-- **`test/ux-check.mjs` was rewritten** for the new traders page and add page
-  but **not run**: Playwright isn't installed on this machine. Run it:
+- **`test/ux-check.mjs` was updated for Torn Bids** (3.10.1: views, sorting,
+  both Show toggles, the side panel, Esc) and the add page, but **never run**:
+  Playwright isn't installed on this machine. The same checks were run by hand
+  in the harness through the browser pane. Run it:
   `PWPATH=$(npm root -g)/playwright node test/ux-check.mjs`.
 - **TornW3B-only traders** (not on TornExchange, not on TornW3B's top-40 lists)
   are found only once the owner opens a TornW3B page that links to them, such
@@ -278,12 +314,16 @@ Still ideas, not built:
 7. **Stay within Torn's rules, always.** Verifying in the owner's Chrome is
    welcome: read or screenshot pages the owner opened. Don't automate
    navigation on torn.com, forums included.
+8. **Redesigns start as HTML mockups** the owner opens and picks from (see
+   `mockups/`, untracked); build only the one they pick, then self-review
+   at every width and say what you found. "Be thorough": measure overflow,
+   don't eyeball it.
 
 ## Build and test
 
 ```bash
 npm run build      # src/ -> dist/ and torn-moneymaker.user.js (the release file)
-npm test           # unit tests (148)
+npm test           # unit tests (153)
 npm run check      # build + syntax check + unit tests
 PWPATH=$(npm root -g)/playwright node test/ux-check.mjs   # real-browser checks
 ```
@@ -370,6 +410,12 @@ PWPATH=$(npm root -g)/playwright node test/ux-check.mjs   # real-browser checks
 **Layout**
 - Nothing wraps onto an orphan line at 430px.
 - No sideways scroll.
+- Nothing cut with "…"; the panel's header, chips and tabs are one row each.
+- Pages use the full width; no inner scrollbars (one page scroll).
+
+**Torn Bids** follows the approved mockup E, which adds a few sizes to the
+type scale above: 14px card names, 18px side-panel title, 21px card prices,
+22px headline numbers, 10px trust badges. Keep them unless the owner asks.
 
 ## Code map
 
@@ -387,7 +433,8 @@ PWPATH=$(npm root -g)/playwright node test/ux-check.mjs   # real-browser checks
 - **`src/sources/`** holds page detection and DOM reading.
 - **`src/ui/`** holds the interface:
   - `panel.js`: the overlay and My bazaar;
-  - `selling-page.js`: the traders page;
+  - `selling-page.js`: Torn Bids, the traders page (views, sort headers,
+    Who to message, the side panel, settings);
   - `graph.js`: the add-page graph;
   - `styles.js`.
 - **`src/main.js`** wires everything, including `bootSellingPage()` and

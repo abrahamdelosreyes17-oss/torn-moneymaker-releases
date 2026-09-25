@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      3.10.1
+// @version      3.10.2
 // @description  Finds Bazaar and Item Market listings below NPC / market value - on the page you are viewing, and live from the Torn API and TornW3B - ranked by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -40,7 +40,7 @@
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '3.10.1';
+    const TTV2_BUILD_VERSION = '3.10.2';
 
     /* ===== src/platform/gm.js ===== */
     /*
@@ -915,8 +915,7 @@
      * Everything here is free - one summary for every item, plus the cached
      * item database - so the Cash and Min filters are applied BEFORE any request:
      * an item you cannot afford one of, or that cannot reach your Min with your
-     * cash, is never fetched. What is left is ranked by the profit your cash can
-     * actually make.
+     * cash, is never fetched. What is left is ranked by profit per item.
      *
      * One request covers every item; the friend's script made ~1,100 in a
      * 22-minute loop to answer the same question, and the answer was stale
@@ -956,9 +955,15 @@
             });
         }
 
-        // With cash set, what your cash can make; without, profit per item.
-        // Infinity - Infinity is NaN, which breaks a sort: compare finitely.
-        out.sort((a, b) => finiteCmp(b.reach, a.reach) || b.profitPerUnit - a.profitPerUnit);
+        /*
+         * Best profit per item first, cash or no cash. Cash only decides what is
+         * left out (above). Ranking by "what your cash can make" assumed every
+         * listing had unlimited stock: with $2m a $10 item making $1 scored
+         * 200,000 and pushed a $2,500-a-piece Travel Visa out of the 25 slots -
+         * and the feed then dropped the Visa's rows. The summary only knows the
+         * cheapest price, not how many are there, so it can only rank per item.
+         */
+        out.sort((a, b) => b.profitPerUnit - a.profitPerUnit || finiteCmp(b.reach, a.reach));
         return max > 0 ? out.slice(0, max) : out;
     }
 
@@ -1363,7 +1368,7 @@
      * compared Infinity with Infinity (NaN) whenever no cash was set.
      *
      * With cash set, an item you cannot afford one of at half its value is
-     * skipped, and what your cash could make breaks ties.
+     * skipped; ties go to the bigger profit per item.
      *
      * @returns {Array<string>} item ids
      */
@@ -1398,7 +1403,9 @@
             const floor = value * 0.5;
             if (cash > 0 && floor > cash) continue;
 
-            const reach = cash > 0 ? Math.floor(cash / floor) * Math.max(exit - floor, 1) : 0;
+            // Ties go to the bigger profit per item. Not "x how many your cash
+            // buys": that assumes unlimited stock and put $10 junk first.
+            const reach = Math.max(exit - floor, 0);
             scored.push({ id: item.id, score, value, reach });
         }
 
