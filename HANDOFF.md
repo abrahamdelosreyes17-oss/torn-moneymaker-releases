@@ -3,9 +3,9 @@
 Read this first, then `README.md`. The README holds the product and the binding
 rules; this file holds where we are, how the owner works, and what is settled.
 
-## Where things stand (3.9.2, 2026-09-25)
+## Where things stand (3.9.3, 2026-09-25)
 
-- **Version 3.9.2** on branch `claude/optimistic-ride-1gqguu`, on top of 3.8.1
+- **Version 3.9.3** on branch `claude/optimistic-ride-1gqguu`, on top of 3.8.1
   (`0210c53`) and the cloud session's handoff commits.
 - **`main` is still at 2.9.3.** The script's `@updateURL` points at `main`, so
   installs are done from **pinned links**:
@@ -14,6 +14,13 @@ rules; this file holds where we are, how the owner works, and what is settled.
   the owner asks.
 - `claude/trusting-ride-m6bvhg` (3.4.1) is fully contained in this branch.
 - Who uses it: the owner and a friend who plays Torn.
+
+**3.9.3 - the traders page moved off Torn** to our own GitHub Pages page,
+`https://abrahamdelosreyes17-oss.github.io/torn-moneymaker-releases/traders.html`
+(branch `gh-pages`, a blank page the script draws over), so it can be opened
+and checked in the owner's Chrome like any site, and never loads Torn's home
+page. The old `torn.com/index.php?ttv2=traders` forwards there. The harness
+still boots it with `?ttv2=traders` on its own page.
 
 **3.9.2 - no single source can empty the traders page** (the owner saw only
 "No traders yet" while TornExchange rejected the key; they had logged in there

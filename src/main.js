@@ -118,6 +118,7 @@ import {
     ownBazaarPage,
     tradersPageUrl,
     isTradersPageUrl,
+    isOldTradersPageUrl,
     PAGE_NONE,
     PAGE_BAZAAR,
 } from './sources/route.js';
@@ -2693,6 +2694,12 @@ export function boot() {
     // On TornW3B: only note the traders its pages link to.
     if (location.hostname === 'weav3r.dev') {
         bootW3bHarvest();
+        return;
+    }
+
+    // The traders page moved off Torn: its old address forwards there.
+    if (isOldTradersPageUrl(location.href)) {
+        location.replace(tradersPageUrl());
         return;
     }
 

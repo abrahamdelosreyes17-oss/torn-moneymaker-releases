@@ -416,7 +416,7 @@ await p.evaluate(() => document.getElementById('fake-own')?.remove());
 
 // The overlay's Sell button opens the selling page in a new tab.
 await q(p, 'button.ttv2-sell').click();
-ok(/index\.php\?ttv2=traders$/.test(await p.evaluate(() => window.__opened.at(-1))), 'Sell opens the selling page in its own tab');
+ok(/github\.io\/torn-moneymaker-releases\/traders\.html$/.test(await p.evaluate(() => window.__opened.at(-1))), 'Sell opens the traders page, off Torn, in its own tab');
 ok(!(await vis(p, '.ttv2-prompt')), 'no open-mode question');
 
 // Narrow: nothing overflows at 430px.

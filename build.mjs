@@ -46,6 +46,7 @@ const HEADER = `// ==UserScript==
 // @author       -
 // @match        https://www.torn.com/*
 // @match        https://weav3r.dev/*
+// @match        https://abrahamdelosreyes17-oss.github.io/torn-moneymaker-releases/traders.html*
 // @run-at       document-idle
 // @grant        GM_getValue
 // @grant        GM_setValue

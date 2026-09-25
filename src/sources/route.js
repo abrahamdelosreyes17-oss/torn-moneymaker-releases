@@ -111,17 +111,35 @@ export function ownBazaarPage(href) {
 }
 
 /*
- * The selling page (Traders) in its own tab: Torn's home page with a marker the script
- * recognises, and covers with the page. The page itself is one the user
- * opened; the script draws over it and reads only the API.
+ * The traders page in its own tab, on a page of our own (GitHub Pages), not
+ * on Torn: the script draws the page over a blank one there. Nothing on
+ * torn.com is loaded for it, and it can be opened and checked like any site.
+ * Up to 3.9.2 it lived on Torn's home page with a marker (?ttv2=traders);
+ * that address now forwards here.
  */
+export const TRADERS_PAGE_URL = 'https://abrahamdelosreyes17-oss.github.io/torn-moneymaker-releases/traders.html';
 export const TRADERS_PAGE_PARAM = 'ttv2';
 export const TRADERS_PAGE_VALUE = 'traders';
 
 export function tradersPageUrl() {
-    return 'https://www.torn.com/index.php?' + TRADERS_PAGE_PARAM + '=' + TRADERS_PAGE_VALUE;
+    return TRADERS_PAGE_URL;
+}
+
+function isTornHost(href) {
+    try {
+        return /(^|\.)torn\.com$/.test(new URL(href).hostname);
+    } catch {
+        return false;
+    }
 }
 
 export function isTradersPageUrl(href) {
-    return queryOf(href).get(TRADERS_PAGE_PARAM) === TRADERS_PAGE_VALUE;
+    if (String(href || '').split(/[?#]/)[0] === TRADERS_PAGE_URL) return true;
+    // The test harness boots it on its own page with the old marker.
+    return queryOf(href).get(TRADERS_PAGE_PARAM) === TRADERS_PAGE_VALUE && !isTornHost(href);
+}
+
+/** The old address, on Torn's home page: forwarded to the new one. */
+export function isOldTradersPageUrl(href) {
+    return queryOf(href).get(TRADERS_PAGE_PARAM) === TRADERS_PAGE_VALUE && isTornHost(href);
 }

@@ -122,7 +122,10 @@ scrolls to it when it is on the page you are viewing. Nothing is ever bought for
   make a profit. The list shows only what meets your Min; Cash still hides what
   you cannot afford one of.
 - **Sell** (the blue button; also under Settings): the traders page, always in
-  its own tab (`index.php?ttv2=traders`, which the script turns into the page).
+  its own tab, on a page of our own rather than Torn's
+  (`abrahamdelosreyes17-oss.github.io/torn-moneymaker-releases/traders.html`, a
+  blank GitHub Pages page the script draws over; the old `torn.com/?ttv2=traders`
+  address forwards there).
   Everything about it is its own - see *The traders page* below.
 - **Cash and Min steer what is checked, not just what is shown.** Every item's
   cheapest bazaar price (one TornW3B summary) and value (the cached item

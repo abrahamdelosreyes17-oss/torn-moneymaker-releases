@@ -1,11 +1,12 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      3.9.2
+// @version      3.9.3
 // @description  Finds Bazaar and Item Market listings below NPC / market value - on the page you are viewing, and live from the Torn API and TornW3B - ranked by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
 // @match        https://weav3r.dev/*
+// @match        https://abrahamdelosreyes17-oss.github.io/torn-moneymaker-releases/traders.html*
 // @run-at       document-idle
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -39,7 +40,7 @@
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '3.9.2';
+    const TTV2_BUILD_VERSION = '3.9.3';
 
     /* ===== src/platform/gm.js ===== */
     /*
@@ -4089,19 +4090,37 @@
     }
 
     /*
-     * The selling page (Traders) in its own tab: Torn's home page with a marker the script
-     * recognises, and covers with the page. The page itself is one the user
-     * opened; the script draws over it and reads only the API.
+     * The traders page in its own tab, on a page of our own (GitHub Pages), not
+     * on Torn: the script draws the page over a blank one there. Nothing on
+     * torn.com is loaded for it, and it can be opened and checked like any site.
+     * Up to 3.9.2 it lived on Torn's home page with a marker (?ttv2=traders);
+     * that address now forwards here.
      */
+    const TRADERS_PAGE_URL = 'https://abrahamdelosreyes17-oss.github.io/torn-moneymaker-releases/traders.html';
     const TRADERS_PAGE_PARAM = 'ttv2';
     const TRADERS_PAGE_VALUE = 'traders';
 
     function tradersPageUrl() {
-        return 'https://www.torn.com/index.php?' + TRADERS_PAGE_PARAM + '=' + TRADERS_PAGE_VALUE;
+        return TRADERS_PAGE_URL;
+    }
+
+    function isTornHost(href) {
+        try {
+            return /(^|\.)torn\.com$/.test(new URL(href).hostname);
+        } catch {
+            return false;
+        }
     }
 
     function isTradersPageUrl(href) {
-        return queryOf(href).get(TRADERS_PAGE_PARAM) === TRADERS_PAGE_VALUE;
+        if (String(href || '').split(/[?#]/)[0] === TRADERS_PAGE_URL) return true;
+        // The test harness boots it on its own page with the old marker.
+        return queryOf(href).get(TRADERS_PAGE_PARAM) === TRADERS_PAGE_VALUE && !isTornHost(href);
+    }
+
+    /** The old address, on Torn's home page: forwarded to the new one. */
+    function isOldTradersPageUrl(href) {
+        return queryOf(href).get(TRADERS_PAGE_PARAM) === TRADERS_PAGE_VALUE && isTornHost(href);
     }
 
     /* ===== src/sources/dom/detect.js ===== */
@@ -11792,6 +11811,12 @@
         // On TornW3B: only note the traders its pages link to.
         if (location.hostname === 'weav3r.dev') {
             bootW3bHarvest();
+            return;
+        }
+
+        // The traders page moved off Torn: its old address forwards there.
+        if (isOldTradersPageUrl(location.href)) {
+            location.replace(tradersPageUrl());
             return;
         }
 

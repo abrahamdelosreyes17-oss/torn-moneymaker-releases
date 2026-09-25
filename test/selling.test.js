@@ -31,7 +31,7 @@ import {
     writeTeItemList,
     TE_MAX_AGE_MS,
 } from '../src/core/selling.js';
-import { tradersPageUrl, isTradersPageUrl, detectPage } from '../src/sources/route.js';
+import { tradersPageUrl, isTradersPageUrl, isOldTradersPageUrl, detectPage } from '../src/sources/route.js';
 
 const KEY = 'abcdef1234567890';
 
@@ -398,8 +398,16 @@ test('trader price caches: round trips, ages out; per-item lists capped', () => 
     assert.equal(many['0'], undefined, 'oldest dropped');
 });
 
-test('selling page URL: its own tab is recognised, and is not a market page', () => {
+test('traders page URL: our own page, not Torn; the old Torn address forwards to it', () => {
+    assert.equal(new URL(tradersPageUrl()).hostname, 'abrahamdelosreyes17-oss.github.io');
     assert.equal(isTradersPageUrl(tradersPageUrl()), true);
+    assert.equal(isTradersPageUrl(tradersPageUrl() + '?x=1#top'), true);
     assert.equal(isTradersPageUrl('https://www.torn.com/index.php'), false);
     assert.equal(detectPage(tradersPageUrl()), null);
+    // 3.9.2 and before: Torn's home page with ?ttv2=traders is not drawn over any more.
+    assert.equal(isTradersPageUrl('https://www.torn.com/index.php?ttv2=traders'), false);
+    assert.equal(isOldTradersPageUrl('https://www.torn.com/index.php?ttv2=traders'), true);
+    assert.equal(isOldTradersPageUrl(tradersPageUrl()), false);
+    // The test harness keeps booting it with the marker on its own page.
+    assert.equal(isTradersPageUrl('http://localhost:8765/test/harness-live.html?ttv2=traders'), true);
 });
