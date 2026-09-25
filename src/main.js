@@ -1448,13 +1448,14 @@ function onW3bSummary(summary, at) {
  * already on screen - so it can be pressed freely. Always animates, so a
  * press visibly did something even when the list does not change.
  */
-function onScanPage() {
-    // Nothing loaded yet: the first load IS the scan.
-    if (!app.index) return onScan();
-
-    rescan();
-    app.panel.showScan(scanSummary());
-    return undefined;
+/**
+ * Scan: one button for "look again". It re-reads this page and refreshes
+ * every price (the old separate ↻ did the second half), then says what it
+ * found.
+ */
+async function onScanPage() {
+    await onScan();
+    if (app.index) app.panel.showScan(scanSummary());
 }
 
 function scanSummary() {

@@ -89,11 +89,13 @@ scrolls to it when it is on the page you are viewing. Nothing is ever bought for
 - **Never over Torn's content.** The panel floats in front of the page, in the
   empty space to the right of Torn's content: it is sized to that space (up to
   430px) and can't be placed or dragged across Torn's content. Torn's page is
-  never moved or resized. Where the space is narrower than the one-line
-  header, the header takes two rows (name and deals, then every button) and
-  the chips and status line wrap - nothing is cut short. With no usable space
-  (a very narrow window) it floats bottom-right as it always did.
-- **Header:** **Scan** (re-read this page now) · ↻ refresh everything · ⚙ Settings ·
+  never moved or resized. The header is always ONE row: in less room it uses
+  slightly smaller type and tighter spacing (measured, one step at a time),
+  never cutting or wrapping anything; inside the open panel the chips, the
+  status line and the tab row wrap instead. With no usable space (a very
+  narrow window) it floats bottom-right as it always did.
+- **Header:** **Sell** · **Scan** (re-reads this page and refreshes every price -
+  one button, it used to be Scan and ↻) · ⚙ Settings ·
   – collapse. Drag it anywhere; the position is remembered. Collapsed, it still
   shows *N deals · +$total*; click it to expand.
 - **` (backtick)** shows and hides the panel from anywhere on the page - except

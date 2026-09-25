@@ -121,7 +121,7 @@ export class Panel {
     /**
      * @param {object} handlers
      * @param {function} handlers.onScan           - refresh everything now
-     * @param {function} handlers.onScanPage       - re-read this page now
+     * @param {function} handlers.onScanPage       - Scan: re-read this page and refresh prices
      * @param {function} handlers.onNavigate       - (row) => void
      * @param {function} handlers.onSettingsChange - (partialSettings) => void
      * @param {function} handlers.onViewChange     - ('bazaar'|'itemmarket')
@@ -188,13 +188,13 @@ export class Panel {
             onclick: guarded(this, 'Sell', () => this.handlers.onOpenSelling && this.handlers.onOpenSelling()),
         });
 
-        // Re-reads the listings on this page right away - no requests, so
-        // it can be pressed as often as you like. The refresh is ↻.
+        // One button for "look again": re-reads this page and refreshes every
+        // price (it used to be two, Scan and ↻, doing halves of the same job).
         this.scanBtn = el('button', {
             type: 'button',
             class: 'ttv2-scan',
-            title: 'Scan this page now',
-            'aria-label': 'Scan this page now',
+            title: 'Scan this page and refresh prices',
+            'aria-label': 'Scan this page and refresh prices',
             text: 'Scan',
             onclick: guarded(this, 'Scan', () => {
                 if (!this.hasKey) {
@@ -202,21 +202,6 @@ export class Panel {
                     return undefined;
                 }
                 return this.handlers.onScanPage ? this.handlers.onScanPage() : undefined;
-            }),
-        });
-
-        this.refreshBtn = el('button', {
-            type: 'button',
-            class: 'ttv2-icon',
-            title: 'Refresh now',
-            'aria-label': 'Refresh now',
-            text: '↻',
-            onclick: guarded(this, 'Refresh', () => {
-                if (!this.hasKey) {
-                    this.showPage('settings', { focusKey: true });
-                    return undefined;
-                }
-                return this.handlers.onScan ? this.handlers.onScan() : undefined;
             }),
         });
 
@@ -248,7 +233,6 @@ export class Panel {
             this.titleEl,
             this.sellBtn,
             this.scanBtn,
-            this.refreshBtn,
             this.settingsBtn,
             this.collapseBtn,
             this.sweepEl,
@@ -895,7 +879,25 @@ export class Panel {
             this.minLeft = Math.ceil(contentRight + FIT_GAP);
         }
         this.root.style.setProperty('--fit-width', width + 'px');
+
+        // One row, always: in less room, smaller type and tighter spacing,
+        // one step at a time, measured - never cut, never wrapped.
         this.root.classList.toggle('ttv2-narrow', width < TWO_ROW_BELOW);
+        this.root.classList.remove('ttv2-tight');
+        this.root.style.removeProperty('--fit-right');
+        const overflows = () => this.headEl && this.headEl.scrollWidth > this.headEl.clientWidth + 1;
+        if (this.root.classList.contains('ttv2-narrow') && overflows()) this.root.classList.add('ttv2-tight');
+
+        // A very long headline in very little room: borrow the few pixels it
+        // needs from the window-edge margin first, then from the gap - still
+        // one row, still nothing cut.
+        if (overflows() && !this.root.style.left) {
+            const extra = this.headEl.scrollWidth - this.headEl.clientWidth;
+            const fromEdge = Math.min(extra, 12);
+            this.root.style.setProperty('--fit-width', width + extra + 'px');
+            this.root.style.setProperty('--fit-right', 16 - fromEdge + 'px');
+            this.minLeft = Math.max(0, this.minLeft - (extra - fromEdge));
+        }
     }
 
     setCollapsed(collapsed, { save = false } = {}) {
@@ -981,11 +983,11 @@ export class Panel {
 
     setBusy(busy) {
         this.state.busy = Boolean(busy);
-        if (!this.refreshBtn) return;
+        if (!this.scanBtn) return;
 
-        this.refreshBtn.disabled = this.state.busy;
-        this.refreshBtn.classList.toggle('ttv2-spin', this.state.busy);
-        this.refreshBtn.title = this.state.busy ? 'Refreshing' : 'Refresh now';
+        // Scan is the one refresh button: disabled while it works (its label
+        // stays, so the header never changes width).
+        this.scanBtn.disabled = this.state.busy;
         this.renderBar();
     }
 
@@ -1098,8 +1100,13 @@ export class Panel {
         this.barEl.classList.toggle('ttv2-warn', showMessage && st.level === 'warn');
         this.barEl.classList.toggle('ttv2-error', showMessage && st.level === 'error');
 
-        // Collapsed: the headline rides in the header.
-        this.miniEl.textContent = this.collapsed ? '· ' + headline : '';
+        // Collapsed: the headline rides in the header - and a longer one may
+        // need the tighter type to stay on one row.
+        const mini = this.collapsed ? '· ' + headline : '';
+        if (this.miniEl.textContent !== mini) {
+            this.miniEl.textContent = mini;
+            this.fit();
+        }
 
         /* ---- liveness ---- */
         const live = this.state.live;

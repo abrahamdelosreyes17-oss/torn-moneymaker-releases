@@ -212,7 +212,7 @@ export const PANEL_CSS = `
 .ttv2-panel {
 ${TOKENS_CSS}
     position: fixed;
-    right: 16px;
+    right: var(--fit-right, 16px);
     bottom: 16px;
     z-index: 2147483000;
     /* Its usual 430px, or the free space beside Torn's content when that is less. */
@@ -466,32 +466,61 @@ ${TOKENS_CSS}
 
 /*
  * Fitted beside Torn's content (see fit() in panel.js): where the free space
- * is narrower than the one-line header, the header takes two rows - the name
- * and the deals on top, every button below - so nothing is ever cut short.
+ * is narrower than the usual header, the header stays ONE row with slightly
+ * smaller type and tighter spacing - nothing is cut short and nothing wraps.
  */
 .ttv2-panel.ttv2-narrow .ttv2-head {
-    flex-wrap: wrap;
-    height: auto;
-    min-height: 30px;
-    padding: 4px 4px 4px 12px;
-    row-gap: 4px;
+    gap: 4px;
+    padding: 0 4px 0 8px;
 }
 
 .ttv2-panel.ttv2-narrow .ttv2-title {
-    flex: 1 0 100%;
-    white-space: normal;
+    flex: 1 0 auto;
+    min-width: max-content;
     overflow: visible;
     text-overflow: clip;
-    line-height: 22px;
+    font-size: 12px;
+    letter-spacing: 0;
 }
 
 .ttv2-panel.ttv2-narrow .ttv2-mini {
-    white-space: nowrap;
+    margin-left: 4px;
 }
 
-/* The buttons row sits to the right, where they were. */
-.ttv2-panel.ttv2-narrow .ttv2-sell {
-    margin-left: auto;
+.ttv2-panel.ttv2-narrow button.ttv2-sell,
+.ttv2-panel.ttv2-narrow button.ttv2-scan {
+    height: 22px;
+    padding: 0 8px;
+    font-size: 12px;
+}
+
+.ttv2-panel.ttv2-narrow button.ttv2-icon {
+    width: 20px;
+}
+
+/* Still too little room: one step smaller, still one row, nothing cut. */
+.ttv2-panel.ttv2-tight .ttv2-head {
+    gap: 2px;
+    padding: 0 2px 0 6px;
+}
+
+.ttv2-panel.ttv2-tight .ttv2-title,
+.ttv2-panel.ttv2-tight button.ttv2-sell,
+.ttv2-panel.ttv2-tight button.ttv2-scan {
+    font-size: 11px;
+}
+
+.ttv2-panel.ttv2-tight button.ttv2-sell,
+.ttv2-panel.ttv2-tight button.ttv2-scan {
+    padding: 0 5px;
+}
+
+.ttv2-panel.ttv2-tight button.ttv2-icon {
+    width: 18px;
+}
+
+.ttv2-panel.ttv2-tight .ttv2-mini {
+    margin-left: 2px;
 }
 
 /* The filter chips wrap to a second row rather than running off the edge. */
@@ -504,6 +533,19 @@ ${TOKENS_CSS}
 .ttv2-panel.ttv2-narrow .ttv2-chips-gap {
     flex: 1 0 100%;
     height: 0;
+}
+
+/* The tab row too: the TornW3B credit moves under the tabs rather than off the edge. */
+.ttv2-panel.ttv2-narrow .ttv2-tabs {
+    flex-wrap: wrap;
+}
+
+.ttv2-panel.ttv2-narrow .ttv2-credit {
+    order: -1;
+    flex: 1 0 100%;
+    margin-left: 0;
+    padding-bottom: 4px;
+    text-align: right;
 }
 
 /* The status line wraps rather than cutting its message short. */

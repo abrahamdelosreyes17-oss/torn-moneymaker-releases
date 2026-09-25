@@ -70,7 +70,7 @@ await q(p, '.ttv2-empty button').click();
 ok(await vis(p, '.ttv2-page-settings'), '"Add key" opens Settings');
 await p.keyboard.press('Escape');
 ok(await vis(p, '.ttv2-page-list'), 'Esc closes Settings');
-await q(p, 'button[title="Refresh now"]').click();
+await q(p, 'button[title="Scan this page and refresh prices"]').click();
 ok(await vis(p, '.ttv2-page-settings'), 'Refresh with no key goes to Settings (never a dead click)');
 await p.close();
 
@@ -220,9 +220,9 @@ await q(p, '.ttv2-go').first().click();
 ok((await p.evaluate(() => window.__opened.length)) === 1, 'Go opens the listing: ' + (await p.evaluate(() => window.__opened[0])));
 
 // refresh
-await q(p, 'button[title="Refresh now"]').click();
+await q(p, 'button[title="Scan this page and refresh prices"]').click();
 await p.waitForTimeout(1500);
-ok(!(await q(p, 'button[title="Refresh now"]').isDisabled()), 'Refresh completes');
+ok(!(await q(p, 'button[title="Scan this page and refresh prices"]').isDisabled()), 'Scan (with refresh) completes');
 
 // collapse / expand
 await q(p, 'button[aria-label="Collapse"]').click();

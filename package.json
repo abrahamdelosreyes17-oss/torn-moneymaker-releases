@@ -1,6 +1,6 @@
 {
   "name": "torn-trading",
-  "version": "3.9.5",
+  "version": "3.9.6",
   "private": true,
   "type": "module",
   "description": "Buyer-side Torn trading helper: ranks listings by realizable profit.",

@@ -3,9 +3,9 @@
 Read this first, then `README.md`. The README holds the product and the binding
 rules; this file holds where we are, how the owner works, and what is settled.
 
-## Where things stand (3.9.5, 2026-09-25)
+## Where things stand (3.9.6, 2026-09-25)
 
-- **Version 3.9.5** on branch `claude/optimistic-ride-1gqguu`, on top of 3.8.1
+- **Version 3.9.6** on branch `claude/optimistic-ride-1gqguu`, on top of 3.8.1
   (`0210c53`) and the cloud session's handoff commits.
 - **`main` is still at 2.9.3.** The script's `@updateURL` points at `main`, so
   installs are done from **pinned links**:
@@ -151,9 +151,15 @@ floating bar was right, but its left end crossed into Torn's content):
   the free space on the right (up to 430px, 8px clear of the content).
 - `placeAt()` never lets it be placed or dragged across the content.
 - It fits again on resize and when Torn changes its layout (ResizeObserver).
-- **Nothing is shortened** (the owner's rule). Under 420px the header takes
-  two rows (name and deals, then every button), and the chips (sell-to, then
-  Min and Cash) and the status line wrap.
+- **Nothing is shortened** (the owner's rule), and the header is always ONE
+  row (3.9.6: the owner rejected 3.9.5's two-row header). Under 420px it uses
+  12px type and tighter spacing (`ttv2-narrow`); if it still overflows, 11px
+  (`ttv2-tight`); a very long headline then borrows a few px from the
+  window-edge margin. This is measured in `fit()`, and re-checked whenever the
+  headline changes. In the open panel, the chips (sell-to, then Min and Cash),
+  the status line and the tab row (TornW3B credit above the tabs) wrap.
+- **Scan and ↻ are one button** (3.9.6, the owner: "it's the same thing"): Scan
+  re-reads the page and refreshes every price, then says what it found.
 - With less than 240px of room (a very narrow window), it floats as it
   always did.
 - **Not verified on a real Torn page:** the selectors are Torn's usual ones.
