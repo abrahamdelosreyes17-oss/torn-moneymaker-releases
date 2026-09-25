@@ -3,9 +3,9 @@
 Read this first, then `README.md`. The README holds the product and the binding
 rules; this file holds where we are, how the owner works, and what is settled.
 
-## Where things stand (3.10.0, 2026-09-25)
+## Where things stand (3.10.1, 2026-09-25)
 
-- **Version 3.10.0** on branch `claude/optimistic-ride-1gqguu`, on top of 3.8.1
+- **Version 3.10.1** on branch `claude/optimistic-ride-1gqguu`, on top of 3.8.1
   (`0210c53`) and the cloud session's handoff commits.
 - **`main` is still at 2.9.3.** The script's `@updateURL` points at `main`, so
   installs are done from **pinned links**:
@@ -28,7 +28,9 @@ rules; this file holds where we are, how the owner works, and what is settled.
   state `sell.sort`, not saved). One page scrollbar (the owner disliked
   mockup C's inner scroll). Phone (<1000px): one column, Who to message's top
   three first; the side panel takes the screen. The page adds a viewport
-  meta tag (the gh-pages page has none), or phones lay it out 980px wide.
+  meta tag when there is none (the harness has none; gh-pages `traders.html`
+  has one, and its fallback text now says "Torn Bids"), or phones lay it out
+  980px wide.
 - The owner's layout rules for this page: full width, no inner scrollbars,
   nothing cut with "…", no placeholder for an unknown status.
 - **Overlay:** the filter chips and the tab row are ONE row at every fitted
@@ -38,7 +40,28 @@ rules; this file holds where we are, how the owner works, and what is settled.
   smaller"), then borrows at most 12px from the window edge and 6px from the
   gap - never from Torn's content. Min / Cash use `formatMoneyCompact`
   ($1.5m, not $1.50m). Checked in the harness at 430, 288 and 240px free,
-  with Min $12.35m and Cash $1.23b.
+  with Min $12.35m and Cash $1.23b, while editing a chip, and dragged.
+- **3.10.1, after a self-review and an independent code review:**
+  - a sort, search, filter or Show toggle applies at once even with the
+    pointer over the list (the frozen order is only for prices arriving);
+  - Rows / Table columns can shrink (names and counts wrap, prices never do),
+    so nothing overflows sideways at any width (checked at 1210, 1280, 430);
+  - keyboard: focus survives redraws (`data-focus` keys), moves to the side
+    panel's ✕ when it opens and back to the item when it closes; on a phone
+    the page behind the side panel is `inert`, and "/" is ignored there;
+    sort headers are real buttons, table rows keep their row role;
+  - the side panel redraws when the Show toggles change its empty message,
+    and hides only after sliding out;
+  - a trader picked in Who to message stays picked when a Show toggle
+    hides them for a moment;
+  - overlay: the chip editor re-fits the row (its box is narrower in the
+    last step), and a dragged panel borrows the same few px, still clear of
+    Torn's content.
+- **Known, accepted:** Esc in the search box also clears it (the browser's
+  own behaviour for search boxes); on a very short window the right column's
+  Show box can sit below the fold until the list ends; with less than 240px
+  free the panel still floats over Torn's content (as since 3.9.5 - there is
+  no room for one-row chips).
 
 **3.9.3 - the traders page moved off Torn** to our own GitHub Pages page,
 `https://abrahamdelosreyes17-oss.github.io/torn-moneymaker-releases/traders.html`

@@ -520,6 +520,8 @@ export class Panel {
             if (chip.classList.contains('ttv2-chips-end')) input.style.marginLeft = 'auto';
             chip.parentNode.insertBefore(input, chip.nextSibling);
             this.chipEditor = { chip, input };
+            // The editor is wider than "Min $0": the row must still fit.
+            this.clampIntoView();
             input.focus();
             input.select();
         });
@@ -535,6 +537,7 @@ export class Panel {
         this.chipEditor = null;
         editor.chip.style.display = '';
         if (editor.input.parentNode) editor.input.parentNode.removeChild(editor.input);
+        this.clampIntoView();
         return true;
     }
 
@@ -862,10 +865,10 @@ export class Panel {
      * The panel floats in front of the page, but only in the empty space to
      * the right of Torn's content: it is sized to that space (up to its usual
      * 430px) and can never be placed or dragged across Torn's content. Torn's
-     * page itself is never touched. Where that space is narrower than the
-     * one-line header, the header takes two rows - name and deals on top,
-     * the buttons below - so nothing is cut short. With no usable space at
-     * all (a very narrow window), it floats as it always did.
+     * page itself is never touched. Where that space is narrower than usual,
+     * the header, the filter chips and the tabs stay one row each, in smaller
+     * steps of type and spacing - nothing is cut short. With less than
+     * FIT_MIN_WIDTH of room (a very narrow window), it floats as it always did.
      */
     fit() {
         if (!this.root) return;
@@ -902,7 +905,9 @@ export class Panel {
         // Still a few pixels short: borrow them from the window-edge margin
         // first, then from the gap - never more than the gap, so the panel
         // still never crosses Torn's content. Still one row, nothing cut.
-        if (overflows() && !this.root.style.left) {
+        // A panel you dragged keeps its left edge and grows to the right,
+        // and clampIntoView keeps it on screen and clear of Torn's content.
+        if (overflows()) {
             const extra = overBy();
             const fromEdge = Math.min(extra, 12);
             const fromGap = this.minLeft ? Math.min(extra - fromEdge, FIT_GAP - 2) : extra - fromEdge;
@@ -1044,7 +1049,7 @@ export class Panel {
         this.chipCash.classList.toggle('ttv2-chip-set', Boolean(s.cashOnHand));
         this.chipMin.classList.toggle('ttv2-chip-set', Number(s.minTotalProfit) > 1);
         // "Min 0" can become "Min 1.5m": the row must still fit on one line.
-        this.fit();
+        this.clampIntoView();
     }
 
     /* ------------------------------------------------------------ render */

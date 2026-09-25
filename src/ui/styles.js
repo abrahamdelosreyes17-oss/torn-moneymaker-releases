@@ -588,6 +588,13 @@ ${TOKENS_CSS}
     font-size: 10px;
 }
 
+/* A number being typed scrolls inside its box; the box can be narrow. */
+.ttv2-panel.ttv2-tighter input.ttv2-chip-input {
+    width: 56px;
+    padding: 0 4px;
+    font-size: 11px;
+}
+
 .ttv2-panel.ttv2-tighter .ttv2-tabs {
     padding: 6px 4px 0;
 }

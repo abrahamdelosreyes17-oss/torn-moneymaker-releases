@@ -2167,10 +2167,13 @@ function renderSelling() {
     const myAll = sell.inventory ? itemRows(heldIds(), { buyersOf: buyersAll, nameOf }) : [];
     // Who to message follows the Show toggles: an offline trader is no one to message.
     const myShown = prefs.onlineOnly || prefs.trustedOnly ? itemRows(heldIds(), { buyersOf, nameOf }) : myAll;
-    const best = bestTradersFor(myShown, 5);
+    const ranked = bestTradersFor(myShown, Infinity);
+    const best = ranked.slice(0, 5);
     const traderKey = (b) => (b.id ? String(b.id) : 'name:' + String(b.name).toLowerCase());
-    const filterTrader = sell.traderFilter ? best.find((e) => traderKey(e.trader) === sell.traderFilter) : null;
-    if (sell.traderFilter && !filterTrader) sell.traderFilter = null;
+    // The trader you picked stays picked while they still have the best price
+    // on something, in the top five or not. A Show toggle that hides them for
+    // now does not forget the choice: switching it back brings it back.
+    const filterTrader = sell.traderFilter ? ranked.find((e) => traderKey(e.trader) === sell.traderFilter) : null;
     const onlyItems = filterTrader ? new Set(filterTrader.bestOn) : null;
 
     /* My items: everything you hold, those with a trader first. */

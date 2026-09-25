@@ -186,15 +186,22 @@ export class SellingPage {
         /* Row order last drawn, and which list the pointer is over. */
         this.order = { my: [], all: [] };
         this.hover = { my: false, all: false };
+        this.orderAsked = { my: '', all: '' };
     }
 
     /**
      * Rows re-sort as prices arrive. Under the pointer that would move the
      * row you are about to click, so while the pointer is over a list its
      * order is kept; it re-sorts when the pointer leaves. New rows go last.
+     * Only prices arriving are held back: a new sort, search, filter or Show
+     * toggle is something you asked for, and it applies at once.
      */
     stableOrder(section, rows) {
-        if (!this.hover[section] || !this.order[section].length) {
+        const s = this.state;
+        const asked = JSON.stringify([s.sort, this.queries[section], s.traderFilter && s.traderFilter.key, s.prefs.onlineOnly, s.prefs.trustedOnly]);
+        const changed = asked !== this.orderAsked[section];
+        this.orderAsked[section] = asked;
+        if (changed || !this.hover[section] || !this.order[section].length) {
             this.order[section] = rows.map((r) => r.itemId);
             return rows;
         }
@@ -249,20 +256,27 @@ export class SellingPage {
                 if (this.view === 'settings') this.showView('list');
                 return;
             }
-            // "/" jumps to the search box, as on most sites with one.
+            // "/" jumps to the search box, as on most sites with one - not
+            // while a phone's full-screen side panel covers it.
             const typing = event.composedPath().some((n) => n && (n.tagName === 'INPUT' || n.tagName === 'TEXTAREA'));
-            if (event.key === '/' && !typing && this.view === 'list') {
+            if (event.key === '/' && !typing && this.view === 'list' && !this.drawerCovers()) {
                 event.preventDefault();
                 this.searchEl.focus();
             }
         };
         document.addEventListener('keydown', this.keyHandler);
+        if (typeof window.matchMedia === 'function') {
+            this.coverQuery = window.matchMedia('(max-width: 1000px)');
+            this.coverListener = () => this.coverCheck();
+            if (this.coverQuery.addEventListener) this.coverQuery.addEventListener('change', this.coverListener);
+        }
         this.ticker = setInterval(() => this.renderPills(), 1000);
     }
 
     destroy() {
         if (this.keyHandler) document.removeEventListener('keydown', this.keyHandler);
         if (this.ticker) clearInterval(this.ticker);
+        if (this.coverQuery && this.coverQuery.removeEventListener) this.coverQuery.removeEventListener('change', this.coverListener);
         if (this.host && this.host.parentNode) this.host.parentNode.removeChild(this.host);
         document.documentElement.style.overflow = this.prevOverflow || '';
         this.host = null;
@@ -760,6 +774,13 @@ export class SellingPage {
         if (sig === this.lastSig) return;
         this.lastSig = sig;
 
+        // A rebuild replaces the item or header you had focused (Enter to
+        // open, Enter to sort): focus its new copy, so Tab carries on from it.
+        const shadow = this.root.getRootNode();
+        const active = shadow && shadow.activeElement;
+        const focusKey = active && active.dataset ? active.dataset.focus : null;
+        const focusList = focusKey && [this.myList, this.allList].find((l) => l.contains(active));
+
         this.myCount.textContent = s.myTotal ? s.myTotal.toLocaleString('en-US') : '';
         this.allCount.textContent = s.allTotal ? s.allTotal.toLocaleString('en-US') : '';
 
@@ -800,6 +821,11 @@ export class SellingPage {
             this.allList.appendChild(this.renderView('all', all));
         }
         this.moreBtn.hidden = !(s.allTotal > s.all.length);
+
+        if (focusList) {
+            const again = [...focusList.querySelectorAll('[data-focus]')].find((n) => n.dataset.focus === focusKey);
+            if (again) again.focus({ preventScroll: true });
+        }
     }
 
     /** The items in the view you chose. */
@@ -811,13 +837,15 @@ export class SellingPage {
     }
 
     /** Open an item: a click, or Enter / Space on the focused item. */
-    itemProps(section, r, cls) {
+    itemProps(section, r, cls, { row = false } = {}) {
         const open = () => this.h.onExpand && this.h.onExpand(section, r.itemId);
         const picked = this.state.expanded.has(section + ':' + r.itemId);
         return {
             class: cls + (picked ? ' sp-sel' : '') + (r.best ? '' : ' sp-nobuyer'),
+            'data-focus': 'item:' + r.itemId,
             tabindex: '0',
-            role: 'button',
+            // A table row keeps its row role; tiles and rows are buttons.
+            role: row ? null : 'button',
             'aria-pressed': String(picked),
             title: r.best ? 'Show every trader who buys it' : '',
             onclick: open,
@@ -848,19 +876,16 @@ export class SellingPage {
     sortHeader(tag, key, label, cls = '') {
         const sort = this.state.sort || {};
         const on = sort.key === key;
-        return spEl(tag, {
-            class: cls + (on ? ' sp-sorted' : ''),
-            role: 'button',
-            tabindex: '0',
-            title: 'Sort by ' + label.toLowerCase(),
-            onclick: () => this.h.onSort && this.h.onSort(key),
-            onkeydown: (event) => {
-                if (event.key === 'Enter' || event.key === ' ') {
-                    event.preventDefault();
-                    if (this.h.onSort) this.h.onSort(key);
-                }
-            },
-        }, [label, on ? (sort.dir < 0 ? ' ▾' : ' ▴') : '']);
+        const cell = spEl(tag, { class: cls + (on ? ' sp-sorted' : ''), 'aria-sort': tag === 'th' && on ? (sort.dir < 0 ? 'descending' : 'ascending') : null }, [
+            spEl('button', {
+                type: 'button',
+                class: 'sp-sort',
+                'data-focus': 'sort:' + key,
+                title: 'Sort by ' + label.toLowerCase(),
+                onclick: () => this.h.onSort && this.h.onSort(key),
+            }, [label, on ? (sort.dir < 0 ? ' ▾' : ' ▴') : '']),
+        ]);
+        return cell;
     }
 
     renderRows(section, rows) {
@@ -872,6 +897,7 @@ export class SellingPage {
             this.sortHeader('span', 'buyer', 'Buyer', 'sp-c-who'),
             this.sortHeader('span', 'next', 'Next bid', 'sp-r sp-c-next'),
             this.sortHeader('span', 'traders', 'Traders', 'sp-r sp-c-traders'),
+            spEl('span'),
         ]));
         for (const r of rows) {
             const b = r.best;
@@ -883,6 +909,7 @@ export class SellingPage {
                 spEl('span', { class: 'sp-c-who' }, [b ? this.buyerCell(b) : null]),
                 spEl('span', { class: 'sp-r sp-c-next sp-num', text: next ? formatMoney(next.price) : '' }),
                 spEl('span', { class: 'sp-r sp-c-traders sp-num', text: r.buyers.length ? String(r.buyers.length) : '' }),
+                spEl('span', { class: 'sp-chev', 'aria-hidden': 'true', text: '›' }),
             ]));
         }
         return box;
@@ -900,7 +927,7 @@ export class SellingPage {
         for (const r of rows) {
             const b = r.best;
             const next = r.buyers[1];
-            const props = this.itemProps(section, r, '');
+            const props = this.itemProps(section, r, '', { row: true });
             body.appendChild(spEl('tr', props, [
                 spEl('td', {}, [spEl('span', { class: 'sp-titem' }, [spEl('span', { class: 'sp-pic sp-pic-s' }, [this.image(section, r.itemId)]), spEl('b', { class: 'sp-iname', text: r.name })])]),
                 spEl('td', { class: 'sp-r' }, [b ? spEl('span', { class: 'sp-price', text: formatMoney(b.price) }) : spEl('span', { class: 'sp-none', text: this.noTraderText(r) })]),
@@ -970,7 +997,7 @@ export class SellingPage {
             return;
         }
         const filter = this.state.traderFilter;
-        for (const [i, e] of best.entries()) {
+        for (const e of best) {
             const on = Boolean(filter && filter.key === e.key);
             const st = this.status(e.trader);
             box.appendChild(spEl('div', {
@@ -990,7 +1017,7 @@ export class SellingPage {
                     this.showTab('my');
                 },
             }, [
-                spEl('span', { class: 'sp-rk', text: String(i + 1) }),
+                spEl('span', { class: 'sp-rk', title: 'Best price on ' + e.bestOn + ' of your items', text: String(e.bestOn) }),
                 spEl('span', { class: 'sp-trader-l' }, [spEl('b', { text: e.trader.name }), this.trustBadge(e.trader)]),
                 spEl('small', {}, [
                     'Best price on ' + e.bestOn + ' of your items' + (e.buys > e.bestOn ? ' · buys ' + e.buys : ''),
@@ -1009,8 +1036,15 @@ export class SellingPage {
         const open = Boolean(d) && this.view === 'list';
         box.classList.toggle('sp-open', open);
         box.setAttribute('aria-hidden', String(!open));
+        const wasFor = this.drawerFor;
+        this.drawerFor = open ? d.section + ':' + d.itemId : null;
+        this.coverCheck();
+        const shadow = this.root.getRootNode();
+        const active = shadow && shadow.activeElement;
         if (!open) {
             this.drawerSig = null;
+            // Closed: focus goes back to the item it was opened from.
+            if (wasFor && (!active || box.contains(active))) this.focusItem(wasFor);
             return;
         }
 
@@ -1019,16 +1053,21 @@ export class SellingPage {
             return st ? st.level + st.text : '';
         };
         const load = lists.get(d.itemId) || {};
+        const p = this.state.prefs;
+        const info = this.state.info || {};
         const sig = JSON.stringify([d.section, d.itemId, d.name, Boolean(d.pending), Boolean(load.loading), load.error || '',
+            Boolean(p.onlineOnly), Boolean(p.trustedOnly), Boolean(info.knownTraders),
             d.buyers.map((b) => [b.id, b.name, b.price, b.te, b.w3b, statusOf(b), b.trust ? b.trust.level : ''])]);
         if (sig === this.drawerSig) return;
         this.drawerSig = sig;
+        // Newly opened: focus its ✕. Rebuilt while you were in it: stay where you were.
+        const keep = box.contains(active) && active.dataset ? active.dataset.focus : null;
 
         box.textContent = '';
         box.appendChild(spEl('div', { class: 'sp-dhead' }, [
             spEl('span', { class: 'sp-pic sp-pic-l' }, [this.image('detail', d.itemId)]),
             spEl('span', { class: 'sp-dtitle' }, [spEl('b', { text: d.name }), spEl('small', { text: d.buyers.length ? this.countText(d) + ' · highest first' : '' })]),
-            spEl('button', { type: 'button', class: 'sp-icon', title: 'Close (Esc)', 'aria-label': 'Close', text: '✕', onclick: () => this.closeDetail() }),
+            spEl('button', { type: 'button', class: 'sp-icon', 'data-focus': 'close', title: 'Close (Esc)', 'aria-label': 'Close', text: '✕', onclick: () => this.closeDetail() }),
         ]));
         const body = spEl('div', { class: 'sp-dbody' });
         if (load.loading) body.appendChild(spEl('p', { class: 'sp-note', text: 'Loading more buyers from TornExchange…' }));
@@ -1043,6 +1082,35 @@ export class SellingPage {
             ]));
         });
         box.appendChild(body);
+
+        const want = this.drawerFor !== wasFor ? 'close' : keep;
+        if (want) {
+            const node = [...box.querySelectorAll('[data-focus]')].find((n) => n.dataset.focus === want) || box.querySelector('[data-focus="close"]');
+            if (node) node.focus({ preventScroll: true });
+        }
+    }
+
+    /** Focus an item in the list ("section:itemId"), when it is there. */
+    focusItem(key) {
+        const at = key.indexOf(':');
+        const list = key.slice(0, at) === 'all' ? this.allList : this.myList;
+        const want = 'item:' + key.slice(at + 1);
+        const node = [...list.querySelectorAll('[data-focus]')].find((n) => n.dataset.focus === want);
+        if (node) node.focus({ preventScroll: true });
+    }
+
+    /** Does the side panel cover the whole page (a phone)? */
+    drawerCovers() {
+        return Boolean(this.drawerFor) && typeof window.matchMedia === 'function' && window.matchMedia('(max-width: 1000px)').matches;
+    }
+
+    /** While the side panel covers the page, Tab stays in it. */
+    coverCheck() {
+        const covered = this.drawerCovers();
+        for (const node of [this.headEl, this.bannerEl, this.listEl]) {
+            if (covered) node.setAttribute('inert', '');
+            else node.removeAttribute('inert');
+        }
     }
 
     /** Trusted / Known / New / Caution, from other players' votes; the numbers on hover. */
@@ -1063,7 +1131,7 @@ export class SellingPage {
                 links.appendChild(spEl('span', { class: 'sp-chip sp-chip-none', 'aria-hidden': 'true' }));
                 return;
             }
-            const a = spEl('a', { class: 'sp-chip', href: url, text, title, target: '_blank', rel: 'noopener noreferrer' });
+            const a = spEl('a', { class: 'sp-chip', 'data-focus': 'link:' + (b.id || b.name) + ':' + text, href: url, text, title, target: '_blank', rel: 'noopener noreferrer' });
             a.addEventListener('click', (event) => {
                 event.stopPropagation();
                 if (event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey) return;
@@ -1223,7 +1291,9 @@ button:focus-visible, input:focus-visible, summary:focus-visible, a:focus-visibl
 .sp-trust[data-level="known"] { color: #a7d4ff; border-color: #3d5a74; }
 .sp-trust[data-level="caution"] { color: #f0a020; border-color: #7a5210; }
 .sp-buyer { display: flex; flex-direction: column; gap: 2px; }
-.sp-buyer-l { display: flex; align-items: center; gap: 8px; white-space: nowrap; }
+/* Name and badge side by side; in a narrow column the badge goes under - never cut. */
+.sp-buyer-l { display: flex; align-items: center; flex-wrap: wrap; gap: 2px 8px; }
+.sp-buyer-l > * { white-space: nowrap; }
 
 /* view 1: Cards */
 .sp-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(236px, 1fr)); gap: 12px; }
@@ -1240,10 +1310,13 @@ button:focus-visible, input:focus-visible, summary:focus-visible, a:focus-visibl
 .sp-foot:empty { display: none; }
 
 /* view 2: Rows */
-.sp-rowhead, .sp-row { display: grid; grid-template-columns: 60px minmax(180px, 1.4fr) 150px minmax(170px, 1fr) 130px 90px; gap: 16px; align-items: center; }
+/* Text columns can shrink (names wrap); the figures keep their room. */
+.sp-rowhead, .sp-row { display: grid; grid-template-columns: 60px minmax(0, 1.4fr) minmax(110px, 150px) minmax(0, 1fr) minmax(100px, 130px) 72px 12px; gap: 16px; align-items: center; }
+.sp-chev { font-size: 20px; line-height: 1; color: #6b6b6b; }
+.sp-row:hover .sp-chev, .sp-row.sp-sel .sp-chev { color: var(--profit); }
 .sp-rowhead { padding: 0 16px 8px; font-size: 11px; font-weight: bold; letter-spacing: 0.5px; text-transform: uppercase; color: #6b6b6b; }
-.sp-rowhead [role="button"] { cursor: pointer; user-select: none; }
-.sp-rowhead [role="button"]:hover, .sp-sorted { color: var(--text); }
+.sp-sort { padding: 0; border: 0; background: none; font: inherit; letter-spacing: inherit; text-transform: inherit; color: inherit; cursor: pointer; white-space: nowrap; }
+.sp-sort:hover, .sp-sorted { color: var(--text); }
 .sp-row { min-height: 60px; padding: 8px 16px; margin-bottom: 6px; background: var(--card); border: 1px solid var(--cline); border-radius: 10px; cursor: pointer; }
 .sp-row:hover { background: var(--card2); }
 .sp-row.sp-sel { background: #232a17; }
@@ -1253,10 +1326,12 @@ button:focus-visible, input:focus-visible, summary:focus-visible, a:focus-visibl
 
 /* view 3: Table */
 .sp-table { width: 100%; border-collapse: separate; border-spacing: 0; }
-.sp-table th { position: sticky; top: 0; z-index: 2; background: var(--page); text-align: left; padding: 8px 12px; font-size: 11px; font-weight: bold; letter-spacing: 0.5px; text-transform: uppercase; color: #6b6b6b; border-bottom: 1px solid var(--cline2); cursor: pointer; white-space: nowrap; user-select: none; }
-.sp-table th:hover { color: var(--text); }
+.sp-table th { position: sticky; top: 0; z-index: 2; background: var(--page); text-align: left; padding: 8px 12px; font-size: 11px; font-weight: bold; letter-spacing: 0.5px; text-transform: uppercase; color: #6b6b6b; border-bottom: 1px solid var(--cline2); white-space: nowrap; }
 .sp-table th.sp-r, .sp-table td.sp-r { text-align: right; }
-.sp-table td { padding: 6px 12px; border-bottom: 1px solid var(--cline); white-space: nowrap; vertical-align: middle; }
+.sp-table td { padding: 6px 12px; border-bottom: 1px solid var(--cline); vertical-align: middle; }
+/* Prices stay on one line; names and counts wrap in a narrow window. */
+.sp-table td.sp-r { white-space: nowrap; }
+.sp-table td.sp-c-traders { white-space: normal; }
 .sp-table tbody tr { cursor: pointer; }
 .sp-table tbody tr:nth-child(even) td { background: var(--row2); }
 .sp-table tbody tr:hover td { background: #232323; }
@@ -1267,9 +1342,9 @@ button:focus-visible, input:focus-visible, summary:focus-visible, a:focus-visibl
 .sp-drawer {
     position: absolute; top: var(--head-h); right: 0; bottom: 0; z-index: 10; width: min(460px, 100%);
     display: flex; flex-direction: column; background: #1b1b1b; border-left: 1px solid var(--cline2);
-    box-shadow: -16px 0 40px rgba(0, 0, 0, 0.55); transform: translateX(105%); transition: transform 0.18s ease; visibility: hidden;
+    box-shadow: -16px 0 40px rgba(0, 0, 0, 0.55); transform: translateX(105%); transition: transform 0.18s ease, visibility 0s linear 0.18s; visibility: hidden;
 }
-.sp-drawer.sp-open { transform: none; visibility: visible; }
+.sp-drawer.sp-open { transform: none; visibility: visible; transition: transform 0.18s ease, visibility 0s; }
 .sp-dhead { display: flex; align-items: center; gap: 12px; padding: 16px; border-bottom: 1px solid var(--cline); }
 .sp-dtitle { display: flex; flex-direction: column; min-width: 0; flex: 1; }
 .sp-dtitle b { font-size: 18px; color: #fff; }
@@ -1313,7 +1388,7 @@ input[type="checkbox"] { accent-color: var(--profit); margin: 3px 0 0; }
 
 /* ---------------------------------------------------------- narrower */
 @media (max-width: 1200px) {
-    .sp-rowhead, .sp-row { grid-template-columns: 48px minmax(0, 1fr) 130px minmax(140px, 1fr); }
+    .sp-rowhead, .sp-row { grid-template-columns: 48px minmax(0, 1fr) 130px minmax(140px, 1fr) 12px; }
     .sp-rows .sp-c-next, .sp-rows .sp-c-traders { display: none; }
     .sp-row .sp-pic, .sp-rowhead > span:first-child { width: 48px; }
     .sp-tagline { display: none; }
@@ -1336,11 +1411,11 @@ input[type="checkbox"] { accent-color: var(--profit); margin: 3px 0 0; }
     .sp-chipbar { order: 6; flex: 1 0 100%; }
     .sp-grid { grid-template-columns: minmax(0, 1fr); }
     .sp-rowhead { display: none; }
-    .sp-row { grid-template-columns: 44px minmax(0, 1fr) auto; gap: 10px; padding: 8px 10px; }
+    .sp-row { grid-template-columns: 44px minmax(0, 1fr) auto 12px; gap: 10px; padding: 8px 10px; }
     .sp-row .sp-pic { width: 44px; height: 22px; }
     .sp-row .sp-c-who { display: none; }
     .sp-table .sp-c-next, .sp-table .sp-c-traders { display: none; }
-    .sp-table td, .sp-table th { white-space: normal; padding: 6px; }
+    .sp-table td, .sp-table th { padding: 6px; }
     .sp-settings { padding: 12px 12px 48px; }
 }
 `;
