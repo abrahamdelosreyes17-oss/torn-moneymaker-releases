@@ -39,3 +39,14 @@ export const SEED_TRADERS = [
     [4295665, 'DonRon46'], [4298171, 'Butter_My_Buns_'], [4315363, 'Moitzi'], [4342484, 'Zombie_Cage'],
     [4354832, 'Viduata'], [4371231, 'Sortis'], [4375700, 'Rippler1985'], [4429820, 'AlekseiNamaste'],
 ];
+
+/*
+ * TornW3B's Highest Rated list on the same day: [ups, downs]. Used for the
+ * trust badge until a TornW3B page you open shows newer numbers.
+ */
+export const SEED_RATINGS = {
+    2982905: [523, 7], 3742399: [468, 9], 2560768: [438, 14], 3997042: [226, 2], 3840107: [226, 11],
+    3626229: [210, 3], 1889185: [207, 7], 1195734: [207, 15], 3982492: [199, 10], 2097793: [190, 6],
+    3897823: [186, 6], 593790: [184, 5], 3395089: [174, 2], 2048821: [167, 2], 3809686: [166, 2],
+    4213516: [170, 7], 3459156: [168, 10], 4298171: [163, 7], 1853324: [156, 5], 2810641: [148, 5],
+};

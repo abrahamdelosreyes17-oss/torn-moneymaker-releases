@@ -86,6 +86,10 @@ scrolls to it when it is on the page you are viewing. Nothing is ever bought for
 
 ### The panel
 
+- **Never over Torn's content.** Unless you drag it somewhere, the panel takes a
+  column at the right edge and Torn's page is narrowed by that much, so nothing
+  of Torn's is covered, open or collapsed. With no room for it (a narrow
+  window), it floats bottom-right as before.
 - **Header:** **Scan** (re-read this page now) · ↻ refresh everything · ⚙ Settings ·
   – collapse. Drag it anywhere; the position is remembered. Collapsed, it still
   shows *N deals · +$total*; click it to expand.
@@ -189,10 +193,21 @@ trader, and every link here is one you follow yourself.
   on every row and the prices stay in one column.
 - **One row per trader**: a trader on both TornExchange and TornW3B shows once,
   at the higher of their two prices, with both lists linked.
-- **Online only** keeps only traders known to be online, order unchanged.
-  Statuses come from public profiles with the page's key: open rows first, then
-  the top three for each item you hold, at most 20, refreshed every 90 s, only
-  while the tab is visible, inside the shared 70/min budget.
+- **Online only** keeps only traders known to be online, order unchanged. Our
+  own online checker asks Torn's public profile for every trader of every item
+  you hold (best first), at most 30 a minute inside the shared 70/min, each
+  again every 10 minutes (90 s while its item is open), visible tab only; an
+  item says "Checking…" until its traders are known. Online but in hospital,
+  in jail or flying shows orange, "Online · Hospital".
+- **Wide screens** (1100px and up): the list, and beside it the item you pick
+  with every trader (the list never jumps open), **Best trader for you** (who
+  has the best price on the most of your items - in Torn you trade with one
+  person at a time; *Show these items* filters to them) and **Sources** (each
+  source with a dot and progress). My items and All items are tabs. Narrow
+  screens keep one column.
+- **Trust badge** beside a trader: Trusted (100+), Known (20+), New (0-19) or
+  Caution (below 0), from the better of their TornExchange vote score and
+  their TornW3B rating (ups minus downs); hover for the numbers.
 - No quantities, totals or bundle maths: a price list is prices per item.
 - **Built to be read** (eye-tracking and layout research): pictures and names
   down the left edge where the eye scans first, the answer (best price) as the

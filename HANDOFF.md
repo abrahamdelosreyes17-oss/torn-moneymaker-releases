@@ -3,9 +3,9 @@
 Read this first, then `README.md`. The README holds the product and the binding
 rules; this file holds where we are, how the owner works, and what is settled.
 
-## Where things stand (3.9.3, 2026-09-25)
+## Where things stand (3.9.4, 2026-09-25)
 
-- **Version 3.9.3** on branch `claude/optimistic-ride-1gqguu`, on top of 3.8.1
+- **Version 3.9.4** on branch `claude/optimistic-ride-1gqguu`, on top of 3.8.1
   (`0210c53`) and the cloud session's handoff commits.
 - **`main` is still at 2.9.3.** The script's `@updateURL` points at `main`, so
   installs are done from **pinned links**:
@@ -91,6 +91,77 @@ and with no TornExchange key the banner offers **Use my Limited key** in one pre
      moves under a click;
    - "Checking…" instead of "No Trader Found" until every source has answered.
 
+## 3.9.4: the owner's notes of 2026-09-25, built
+
+Found on the live traders page (3.9.3, the owner's real data):
+- It worked: 222 items, TornExchange working after the owner logged in there
+  again, the key boxes empty and masked, and no key text in the page.
+- Very high prices such as a Balaclava bought at $12.7m are real. They match
+  the trader's public TornExchange list; these are Organized Crime tools.
+
+Fixed and built in 3.9.4:
+1. **Online only works: our own online checker.** Every trader of every item
+   you hold is checked, best first, from Torn's public profile with the
+   Limited key:
+   - at most 30 a minute, inside the shared 70/min;
+   - each re-checked every 10 minutes (every 90 s while its item is open),
+     like TornExchange's own job;
+   - with Online only on, an item says "Checking…" until its traders'
+     statuses are known.
+
+   TornExchange checks with each trader's own key, which we don't have;
+   TornW3B publishes no status.
+2. **A new status colour.** Online but in hospital, in jail or flying is
+   orange and reads "Online · Hospital". Plain online stays green.
+3. **"Limited Access access"** is fixed.
+4. **The per-item line** shows "3 traders · 1 online", and nothing for a
+   single trader.
+5. **The wide layout** (at 1100px and up):
+   - the list, plus a 380px side column: the item picked with all its traders
+     (the list no longer jumps open), Best trader for you, and Sources;
+   - Sources shows each source with a dot and a progress bar, replacing the
+     grey line;
+   - My items and All items are tabs.
+
+   Narrow screens keep one column, with only the top "best trader" above the
+   list.
+6. **Best trader for you:** who has the best price on the most of your items,
+   with trust, status and Profile / TE / W3B links. **Show these items**
+   filters My items to them. In Torn you trade with one person at a time.
+7. **Trust badge** (Trusted / Known / New / Caution; the numbers show on
+   hover):
+   - the better of the trader's TornExchange vote score (it comes with
+     `all_best_listings` and `best_listing`) and their TornW3B rating (ups
+     minus downs), so a trader known on one site only is not marked down;
+   - Trusted is 100 or more, Known 20 or more, New 0 to 19, Caution below 0;
+   - TornW3B ratings come from its leaderboards when the owner opens
+     weav3r.dev, plus a built-in copy of the top 20 (`SEED_RATINGS`).
+
+   The owner asked for "more successful trades = more trusted". Trade counts
+   are only on TornExchange's and TornW3B's HTML pages, so votes stand in for
+   them. **Ask** whether to also read trade counts.
+8. **The panel on Torn pages no longer covers Torn's content.**
+   - With no position of your own, it takes a column at the right edge, and
+     Torn's page is narrowed by that much (padding on `<html>`).
+   - Open or collapsed, it keeps its full bar; the owner did NOT want a small
+     pill.
+   - When there's no room, or Torn's content isn't where we expect
+     (`.content-wrapper` plus `#sidebarroot`), nothing is reserved and it
+     floats as before. That is checked after docking, not assumed.
+   - A position dragged before 3.9.4 is let go once (`settings.docked`).
+   - **Not verified on a real Torn page:** the selectors are Torn's usual
+     ones. If Torn's content still sits under the panel, the fallback floats
+     it instead.
+
+Still ideas, not built:
+- TornExchange's `/api/profile?user_id=` gives a trader's online status,
+  votes and reviews link, one call per trader (TornExchange allows 10 calls a
+  minute). Useful only for a handful of traders.
+- The public `tornexchange.com/listings?item_name=` HTML shows every buyer
+  with an online dot. It is fragile and loads their site; a last resort.
+- TornExchange's all-time leaderboard (top 50 by votes) and 30-day trade
+  counts are on HTML pages only (`main/model_utils.py` in `torn-exchange/web`).
+
 ## Not done / open
 
 - **Not verified live** (only in the harness). Please check in the owner's
@@ -152,7 +223,7 @@ and with no TornExchange key the banner offers **Use my Limited key** in one pre
 
 ```bash
 npm run build      # src/ -> dist/ and torn-moneymaker.user.js (the release file)
-npm test           # unit tests (133)
+npm test           # unit tests (148)
 npm run check      # build + syntax check + unit tests
 PWPATH=$(npm root -g)/playwright node test/ux-check.mjs   # real-browser checks
 ```
@@ -170,6 +241,8 @@ PWPATH=$(npm root -g)/playwright node test/ux-check.mjs   # real-browser checks
   - `&slow=1` answers status lookups slowly;
   - `&nofeed=1` turns the feed off;
   - `&tebad=1` saves a TornExchange key it rejects;
+  - `?tornlayout=1` (not on the traders page) puts a Torn-like 976px content
+    column on the page, to check the panel docks beside it;
   - `&from381=1` reproduces what 3.8.1 left behind (the Limited key saved, no
     TornExchange key, and its refusal message stored);
   - `?ownbazaar=1&page=bazaar#/add` opens your own add page with a week of

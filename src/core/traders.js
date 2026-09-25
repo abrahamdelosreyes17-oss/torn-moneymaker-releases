@@ -94,12 +94,18 @@ export function addTraders(db, found, now = Date.now()) {
         const id = cleanId(f && f.id);
         if (!id) continue;
         const name = f.name ? String(f.name).trim() : '';
-        const t = db.traders[id];
+        let t = db.traders[id];
         if (!t) {
-            db.traders[id] = { name: name || 'Trader ' + id, from: f.source || null, seenAt: now, w3b: null };
+            t = db.traders[id] = { name: name || 'Trader ' + id, from: f.source || null, seenAt: now, w3b: null };
             changed = true;
         } else if (name && t.name !== name && ((f.source !== 'w3b' && f.source !== 'seed') || t.name.startsWith('Trader '))) {
             t.name = name;
+            changed = true;
+        }
+        // TornW3B's rating ("523↑ · 7↓"), when the page we read showed it.
+        const r = f.rating;
+        if (r && Number.isFinite(r.up) && Number.isFinite(r.down) && (!t.rating || t.rating.up !== r.up || t.rating.down !== r.down)) {
+            t.rating = { up: r.up, down: r.down, at: now };
             changed = true;
         }
     }
@@ -238,7 +244,7 @@ export function traderDbStats(db, now = Date.now()) {
  * @param {Map}    [src.w3bByItem]  - itemId -> [{id, price}], from indexW3bByItem
  * @returns {Array<{id, name, price, te: number|null, w3b: number|null, teName: string|null}>}
  */
-export function buyersForItem(itemId, { teBest = [], teFull = null, idsByName = new Map(), db = null, w3bByItem = null, dbIdsByName = null } = {}) {
+export function buyersForItem(itemId, { teBest = [], teFull = null, idsByName = new Map(), db = null, w3bByItem = null, dbIdsByName = null, votesById = null } = {}) {
     const key = String(itemId);
     const rows = new Map();
     const byName = new Map();
@@ -247,7 +253,7 @@ export function buyersForItem(itemId, { teBest = [], teFull = null, idsByName = 
         const k = id ? 'id:' + id : 'name:' + String(name).toLowerCase();
         let r = rows.get(k);
         if (!r) {
-            r = { id: id || null, name: name || (id ? 'Trader ' + id : '?'), price: 0, te: null, w3b: null, teName: null };
+            r = { id: id || null, name: name || (id ? 'Trader ' + id : '?'), price: 0, te: null, w3b: null, teName: null, votes: null };
             rows.set(k, r);
         }
         if (name && r.name.startsWith('Trader ') && !String(name).startsWith('Trader ')) r.name = name;
@@ -263,7 +269,10 @@ export function buyersForItem(itemId, { teBest = [], teFull = null, idsByName = 
         if (!t || !(t.price > 0) || !t.name) continue;
         const lower = String(t.name).toLowerCase();
         const id = cleanId(t.id) || cleanId(idsByName.get(lower)) || cleanId(dbIdsByName && dbIdsByName.get(lower));
-        setTe(row(id, t.name), t.name, t.price);
+        const r = row(id, t.name);
+        setTe(r, t.name, t.price);
+        // TornExchange's vote score comes with its top buyers.
+        if (Number.isFinite(t.score)) r.votes = t.score;
     }
     if (Array.isArray(teFull)) {
         // The full list carries everyone ever listed; once the active traders
@@ -302,9 +311,94 @@ export function buyersForItem(itemId, { teBest = [], teFull = null, idsByName = 
     const out = [];
     for (const r of rows.values()) {
         r.price = Math.max(r.te || 0, r.w3b || 0);
-        if (r.price > 0) out.push(r);
+        if (r.price <= 0) continue;
+        // What we know of how they trade: TornExchange votes (from any item's
+        // top three) and TornW3B's rating.
+        if (r.votes === null && r.id && votesById && votesById.has(r.id)) r.votes = votesById.get(r.id);
+        const t = r.id && db ? db.traders[r.id] : null;
+        r.rating = (t && t.rating) || null;
+        r.trust = trustOf(r.votes, r.rating);
+        out.push(r);
     }
     out.sort((a, b) => b.price - a.price || String(a.name).localeCompare(String(b.name)));
+    return out;
+}
+
+/**
+ * A trader's trust, from the votes other players left after trading with
+ * them: TornExchange's vote score and TornW3B's rating (ups minus downs). The
+ * better of the two counts, so a trader known on one site only is not
+ * marked down for missing from the other.
+ *
+ *   Trusted  - 100 or more
+ *   Known    - 20 or more
+ *   New      - 0 to 19
+ *   Caution  - below 0
+ *   null     - nothing known
+ *
+ * @returns {{level: string, score: number, votes: number|null, up: number|null, down: number|null}|null}
+ */
+export function trustOf(votes, rating) {
+    const te = Number.isFinite(votes) ? votes : null;
+    const w3b = rating && Number.isFinite(rating.up) && Number.isFinite(rating.down) ? rating.up - rating.down : null;
+    if (te === null && w3b === null) return null;
+    const score = Math.max(te === null ? -Infinity : te, w3b === null ? -Infinity : w3b);
+    const level = score >= 100 ? 'Trusted' : score >= 20 ? 'Known' : score >= 0 ? 'New' : 'Caution';
+    return { level, score, votes: te, up: rating ? rating.up : null, down: rating ? rating.down : null };
+}
+
+/**
+ * TornExchange vote scores by trader id, from every item's top buyers and
+ * the keyless best-buyer answers: one pass, for every row.
+ * @param {Iterable<Array>} lists - arrays of {id, score}
+ */
+export function votesByTrader(lists) {
+    const out = new Map();
+    for (const list of lists) {
+        for (const t of list || []) {
+            const id = cleanId(t && t.id);
+            if (id && Number.isFinite(t.score) && !out.has(id)) out.set(id, t.score);
+        }
+    }
+    return out;
+}
+
+/**
+ * Who pays the most for the most of your items. In Torn you trade with one
+ * person at a time, so the trader with the best price on many of your items
+ * is the one to message first.
+ *
+ * @param {Array<{itemId, buyers, best}>} rows - My items
+ * @param {number} [limit]
+ * @returns {Array<{trader, bestOn: string[], buys: number}>} most best-prices first
+ */
+export function bestTradersFor(rows, limit = 3) {
+    const byId = new Map();
+    for (const r of rows || []) {
+        for (const [i, b] of (r.buyers || []).entries()) {
+            const key = b.id || 'name:' + String(b.name).toLowerCase();
+            let e = byId.get(key);
+            if (!e) byId.set(key, (e = { trader: b, bestOn: [], buys: 0 }));
+            e.buys += 1;
+            if (i === 0) e.bestOn.push(r.itemId);
+        }
+    }
+    return [...byId.values()]
+        .filter((e) => e.bestOn.length > 0)
+        .sort((a, b) => b.bestOn.length - a.bestOn.length || b.buys - a.buys || String(a.trader.name).localeCompare(String(b.trader.name)))
+        .slice(0, limit);
+}
+
+/**
+ * TornW3B's ratings as its leaderboards print them: a name, then
+ * "523↑ · 7↓" on the next line.
+ * @returns {Map<string, {up: number, down: number}>} name -> rating
+ */
+export function ratingsInText(text) {
+    const out = new Map();
+    const re = /([A-Za-z0-9_-]{1,20})\s*\n\s*(\d+)\s*↑\s*·\s*(\d+)\s*↓/g;
+    let m;
+    while ((m = re.exec(String(text || '')))) out.set(m[1], { up: Number(m[2]), down: Number(m[3]) });
     return out;
 }
 

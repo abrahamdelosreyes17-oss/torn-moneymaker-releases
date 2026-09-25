@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      3.9.3
+// @version      3.9.4
 // @description  Finds Bazaar and Item Market listings below NPC / market value - on the page you are viewing, and live from the Torn API and TornW3B - ranked by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -40,7 +40,7 @@
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '3.9.3';
+    const TTV2_BUILD_VERSION = '3.9.4';
 
     /* ===== src/platform/gm.js ===== */
     /*
@@ -2519,7 +2519,9 @@
         const id = String((d && d.trader_id) || '').replace(/\D/g, '');
         const price = Number(d && d.price);
         if (!d || !id || !Number.isFinite(price) || price <= 0) return null;
-        return { name: typeof d.trader === 'string' && d.trader ? d.trader : 'Trader ' + id, id, price };
+        const out = { name: typeof d.trader === 'string' && d.trader ? d.trader : 'Trader ' + id, id, price };
+        if (Number.isFinite(Number(d.vote)) && d.vote !== null) out.score = Number(d.vote);
+        return out;
     }
 
     /**
@@ -2875,12 +2877,18 @@
             const id = cleanId(f && f.id);
             if (!id) continue;
             const name = f.name ? String(f.name).trim() : '';
-            const t = db.traders[id];
+            let t = db.traders[id];
             if (!t) {
-                db.traders[id] = { name: name || 'Trader ' + id, from: f.source || null, seenAt: now, w3b: null };
+                t = db.traders[id] = { name: name || 'Trader ' + id, from: f.source || null, seenAt: now, w3b: null };
                 changed = true;
             } else if (name && t.name !== name && ((f.source !== 'w3b' && f.source !== 'seed') || t.name.startsWith('Trader '))) {
                 t.name = name;
+                changed = true;
+            }
+            // TornW3B's rating ("523↑ · 7↓"), when the page we read showed it.
+            const r = f.rating;
+            if (r && Number.isFinite(r.up) && Number.isFinite(r.down) && (!t.rating || t.rating.up !== r.up || t.rating.down !== r.down)) {
+                t.rating = { up: r.up, down: r.down, at: now };
                 changed = true;
             }
         }
@@ -3019,7 +3027,7 @@
      * @param {Map}    [src.w3bByItem]  - itemId -> [{id, price}], from indexW3bByItem
      * @returns {Array<{id, name, price, te: number|null, w3b: number|null, teName: string|null}>}
      */
-    function buyersForItem(itemId, { teBest = [], teFull = null, idsByName = new Map(), db = null, w3bByItem = null, dbIdsByName = null } = {}) {
+    function buyersForItem(itemId, { teBest = [], teFull = null, idsByName = new Map(), db = null, w3bByItem = null, dbIdsByName = null, votesById = null } = {}) {
         const key = String(itemId);
         const rows = new Map();
         const byName = new Map();
@@ -3028,7 +3036,7 @@
             const k = id ? 'id:' + id : 'name:' + String(name).toLowerCase();
             let r = rows.get(k);
             if (!r) {
-                r = { id: id || null, name: name || (id ? 'Trader ' + id : '?'), price: 0, te: null, w3b: null, teName: null };
+                r = { id: id || null, name: name || (id ? 'Trader ' + id : '?'), price: 0, te: null, w3b: null, teName: null, votes: null };
                 rows.set(k, r);
             }
             if (name && r.name.startsWith('Trader ') && !String(name).startsWith('Trader ')) r.name = name;
@@ -3044,7 +3052,10 @@
             if (!t || !(t.price > 0) || !t.name) continue;
             const lower = String(t.name).toLowerCase();
             const id = cleanId(t.id) || cleanId(idsByName.get(lower)) || cleanId(dbIdsByName && dbIdsByName.get(lower));
-            setTe(row(id, t.name), t.name, t.price);
+            const r = row(id, t.name);
+            setTe(r, t.name, t.price);
+            // TornExchange's vote score comes with its top buyers.
+            if (Number.isFinite(t.score)) r.votes = t.score;
         }
         if (Array.isArray(teFull)) {
             // The full list carries everyone ever listed; once the active traders
@@ -3083,9 +3094,94 @@
         const out = [];
         for (const r of rows.values()) {
             r.price = Math.max(r.te || 0, r.w3b || 0);
-            if (r.price > 0) out.push(r);
+            if (r.price <= 0) continue;
+            // What we know of how they trade: TornExchange votes (from any item's
+            // top three) and TornW3B's rating.
+            if (r.votes === null && r.id && votesById && votesById.has(r.id)) r.votes = votesById.get(r.id);
+            const t = r.id && db ? db.traders[r.id] : null;
+            r.rating = (t && t.rating) || null;
+            r.trust = trustOf(r.votes, r.rating);
+            out.push(r);
         }
         out.sort((a, b) => b.price - a.price || String(a.name).localeCompare(String(b.name)));
+        return out;
+    }
+
+    /**
+     * A trader's trust, from the votes other players left after trading with
+     * them: TornExchange's vote score and TornW3B's rating (ups minus downs). The
+     * better of the two counts, so a trader known on one site only is not
+     * marked down for missing from the other.
+     *
+     *   Trusted  - 100 or more
+     *   Known    - 20 or more
+     *   New      - 0 to 19
+     *   Caution  - below 0
+     *   null     - nothing known
+     *
+     * @returns {{level: string, score: number, votes: number|null, up: number|null, down: number|null}|null}
+     */
+    function trustOf(votes, rating) {
+        const te = Number.isFinite(votes) ? votes : null;
+        const w3b = rating && Number.isFinite(rating.up) && Number.isFinite(rating.down) ? rating.up - rating.down : null;
+        if (te === null && w3b === null) return null;
+        const score = Math.max(te === null ? -Infinity : te, w3b === null ? -Infinity : w3b);
+        const level = score >= 100 ? 'Trusted' : score >= 20 ? 'Known' : score >= 0 ? 'New' : 'Caution';
+        return { level, score, votes: te, up: rating ? rating.up : null, down: rating ? rating.down : null };
+    }
+
+    /**
+     * TornExchange vote scores by trader id, from every item's top buyers and
+     * the keyless best-buyer answers: one pass, for every row.
+     * @param {Iterable<Array>} lists - arrays of {id, score}
+     */
+    function votesByTrader(lists) {
+        const out = new Map();
+        for (const list of lists) {
+            for (const t of list || []) {
+                const id = cleanId(t && t.id);
+                if (id && Number.isFinite(t.score) && !out.has(id)) out.set(id, t.score);
+            }
+        }
+        return out;
+    }
+
+    /**
+     * Who pays the most for the most of your items. In Torn you trade with one
+     * person at a time, so the trader with the best price on many of your items
+     * is the one to message first.
+     *
+     * @param {Array<{itemId, buyers, best}>} rows - My items
+     * @param {number} [limit]
+     * @returns {Array<{trader, bestOn: string[], buys: number}>} most best-prices first
+     */
+    function bestTradersFor(rows, limit = 3) {
+        const byId = new Map();
+        for (const r of rows || []) {
+            for (const [i, b] of (r.buyers || []).entries()) {
+                const key = b.id || 'name:' + String(b.name).toLowerCase();
+                let e = byId.get(key);
+                if (!e) byId.set(key, (e = { trader: b, bestOn: [], buys: 0 }));
+                e.buys += 1;
+                if (i === 0) e.bestOn.push(r.itemId);
+            }
+        }
+        return [...byId.values()]
+            .filter((e) => e.bestOn.length > 0)
+            .sort((a, b) => b.bestOn.length - a.bestOn.length || b.buys - a.buys || String(a.trader.name).localeCompare(String(b.trader.name)))
+            .slice(0, limit);
+    }
+
+    /**
+     * TornW3B's ratings as its leaderboards print them: a name, then
+     * "523↑ · 7↓" on the next line.
+     * @returns {Map<string, {up: number, down: number}>} name -> rating
+     */
+    function ratingsInText(text) {
+        const out = new Map();
+        const re = /([A-Za-z0-9_-]{1,20})\s*\n\s*(\d+)\s*↑\s*·\s*(\d+)\s*↓/g;
+        let m;
+        while ((m = re.exec(String(text || '')))) out.set(m[1], { up: Number(m[2]), down: Number(m[3]) });
         return out;
     }
 
@@ -5384,6 +5480,23 @@
         cursor: pointer;
     }
 
+    /*
+     * Docked: the panel has its own column at the right edge, and Torn's page is
+     * narrowed by that much (see dock() in panel.js), so the two never overlap -
+     * open or collapsed. It stops above the bottom edge, where Torn keeps chat.
+     */
+    .ttv2-panel.ttv2-docked {
+        width: var(--dock-width, 430px);
+        top: 8px;
+        right: 8px;
+        bottom: 48px;
+        height: auto;
+    }
+
+    .ttv2-panel.ttv2-docked.ttv2-collapsed {
+        bottom: auto;
+    }
+
     /* ------------------------------------------------------------ status bar */
 
     .ttv2-body {
@@ -6344,6 +6457,9 @@
         return false;
     }
 
+    /** The panel docks beside Torn's content only when at least this wide fits. */
+    const DOCK_MIN_WIDTH = 300;
+
     /** Long enough to see, short enough not to get in the way. */
     const SCAN_ANIMATION_MS = 800;
 
@@ -6591,6 +6707,9 @@
             parent.appendChild(this.host);
 
             window.addEventListener('resize', () => this.clampIntoView());
+            // Torn lays its page out after load: dock again once it has.
+            this.dock();
+            setTimeout(() => this.dock(), 1500);
 
             this.showPage('list');
 
@@ -7078,12 +7197,71 @@
             this.root.style.top = '';
             this.root.style.right = '';
             this.root.style.bottom = '';
+            this.dock();
         }
 
         clampIntoView() {
+            this.dock();
             if (!this.root || !this.root.style.left) return;
             const rect = this.root.getBoundingClientRect();
             this.placeAt(rect.left, rect.top);
+        }
+
+        /**
+         * Keep the panel off Torn's content. With no position of your own, it
+         * takes a column at the right edge and Torn's page is narrowed by that
+         * much (padding on <html>), so Torn's centred content moves over and
+         * nothing is covered - open or collapsed. The column is as wide as the
+         * window allows (up to 430px) while Torn's content still fits. If it does
+         * not fit, or Torn's content is not where we expect, nothing is reserved
+         * and the panel floats bottom-right as before. A position you dragged it
+         * to is always kept, and then nothing is reserved.
+         */
+        dock() {
+            if (!this.root) return;
+            const doc = this.root.ownerDocument || document;
+            const content = doc.querySelector('.content-wrapper');
+            let width = 0;
+            if (!this.root.style.left && content) {
+                // Torn's page is its sidebar plus its content column: both must fit.
+                const parts = [content, doc.getElementById('sidebarroot'), doc.getElementById('sidebar')].filter(Boolean);
+                const rects = parts.map((el) => el.getBoundingClientRect()).filter((r) => r.width > 0);
+                const contentWidth = Math.max(...rects.map((r) => r.right)) - Math.min(...rects.map((r) => r.left));
+                const free = window.innerWidth - contentWidth - 24;
+                width = Math.min(430, Math.floor(free - 16));
+                if (width < DOCK_MIN_WIDTH) width = 0;
+            }
+            this.reserve(doc, width ? width + 16 : 0);
+            this.root.classList.toggle('ttv2-docked', width > 0);
+            if (!width) return;
+            this.root.style.setProperty('--dock-width', width + 'px');
+
+            // Proof, not hope: if Torn's content still reaches under the panel,
+            // give the space back and float instead.
+            requestAnimationFrame(() => {
+                const c = content.getBoundingClientRect();
+                const p = this.root.getBoundingClientRect();
+                if (c.right > p.left + 1) {
+                    this.reserve(doc, 0);
+                    this.root.classList.remove('ttv2-docked');
+                }
+            });
+        }
+
+        /** Narrow Torn's page by `px` on the right (0 gives the space back). */
+        reserve(doc, px) {
+            let style = doc.getElementById('ttv2-dock-space');
+            if (!px) {
+                if (style) style.remove();
+                return;
+            }
+            if (!style) {
+                style = doc.createElement('style');
+                style.id = 'ttv2-dock-space';
+                (doc.head || doc.documentElement).appendChild(style);
+            }
+            const css = 'html { padding-right: ' + px + 'px !important; box-sizing: border-box !important; }';
+            if (style.textContent !== css) style.textContent = css;
         }
 
         setCollapsed(collapsed, { save = false } = {}) {
@@ -7675,6 +7853,7 @@
         destroy() {
             if (this.ticker) clearInterval(this.ticker);
             clearTimeout(this.scanTimer);
+            if (this.root) this.reserve(this.root.ownerDocument || document, 0);
             if (this.hotkeyHandler && this.hotkeyTarget) {
                 this.hotkeyTarget.removeEventListener('keydown', this.hotkeyHandler);
                 this.hotkeyHandler = null;
@@ -7804,7 +7983,7 @@
          *   onSaveKey(key), onForgetKey(), onRevealKey()
          *   onSaveTeKey(key), onForgetTeKey(), onRevealTeKey()
          *   onRefresh(), onPrefsChange(partial), onExpand(section, itemId)
-         *   onQuery(section, text), onMore(), onRetryTe()
+         *   onQuery(section, text), onMore(), onRetryTe(), onTraderFilter(key|null)
          *   onOpenUrl(url)
          */
         constructor(handlers = {}) {
@@ -7978,28 +8157,58 @@
                 onclick: () => this.h.onMore && this.h.onMore(),
             });
 
+            /* My items | All items: one list at a time, no scrolling past the other. */
+            this.tab = 'my';
+            const tabBtn = (key, label, count) =>
+                spEl('button', {
+                    type: 'button',
+                    class: 'sp-tab',
+                    role: 'tab',
+                    'data-tab': key,
+                    onclick: () => this.showTab(key),
+                }, [label, count]);
+            this.tabBtns = { my: tabBtn('my', 'My items', this.myCount), all: tabBtn('all', 'All items', this.allCount) };
+
+            // "Showing Typing-error's 38 items ✕", from the best-trader card.
+            this.chipEl = spEl('div', { class: 'sp-chipbar', hidden: '' });
+
+            this.mySection = spEl('section', { class: 'sp-section', 'aria-label': 'My items' }, [this.chipEl, this.myList]);
+            this.allSection = spEl('section', { class: 'sp-section', 'aria-label': 'All items', hidden: '' }, [this.allList, this.moreBtn]);
+
+            /* the side column: best trader for you, the item picked, the sources */
+            this.bestEl = spEl('section', { class: 'sp-card sp-side-card', 'aria-label': 'Best trader for you' });
+            this.detailEl = spEl('section', { class: 'sp-card sp-side-card sp-detail', 'aria-label': 'Traders for the item picked' });
+            this.sourcesEl = spEl('section', { class: 'sp-card sp-side-card sp-sources', 'aria-label': 'Sources' });
+
             this.listEl = spEl('main', { class: 'sp-main' }, [
-                spEl('div', { class: 'sp-wrap' }, [
-                    spEl('section', { class: 'sp-section', 'aria-label': 'My items' }, [
+                spEl('div', { class: 'sp-wrap sp-layout' }, [
+                    spEl('div', { class: 'sp-col-list' }, [
                         spEl('div', { class: 'sp-shead' }, [
-                            spEl('h2', {}, ['My items', this.myCount]),
+                            spEl('div', { class: 'sp-tabs', role: 'tablist' }, [this.tabBtns.my, this.tabBtns.all]),
                             spEl('span', { class: 'sp-grow' }),
                             this.myFilter,
+                            this.allFilter,
                             this.onlineBtn,
                         ]),
-                        this.myList,
+                        this.mySection,
+                        this.allSection,
                     ]),
-                    spEl('section', { class: 'sp-section', 'aria-label': 'All items' }, [
-                        spEl('div', { class: 'sp-shead' }, [
-                            spEl('h2', {}, ['All items', this.allCount]),
-                            spEl('span', { class: 'sp-grow' }),
-                            this.allFilter,
-                        ]),
-                        this.allList,
-                        this.moreBtn,
-                    ]),
+                    // The item you pick shows first, beside where you clicked.
+                    spEl('aside', { class: 'sp-col-side' }, [this.detailEl, this.bestEl, this.sourcesEl]),
                 ]),
             ]);
+
+            // Wide screens get the side column and pick one item at a time into
+            // it; narrow ones open an item under itself.
+            this.wideQuery = typeof matchMedia === 'function' ? matchMedia('(min-width: 1100px)') : null;
+            if (this.wideQuery) {
+                const onChange = () => {
+                    this.lastSig = null;
+                    this.renderSections();
+                };
+                if (this.wideQuery.addEventListener) this.wideQuery.addEventListener('change', onChange);
+            }
+            this.showTab('my');
 
             /* settings */
             this.settingsEl = spEl('main', { class: 'sp-main', hidden: '' });
@@ -8162,7 +8371,9 @@
             } else if (!info.hasKey) {
                 this.keyStateEl.textContent = 'No key saved.';
             } else {
-                this.keyStateEl.textContent = 'Saved' + (info.keyAccess ? ' · ' + info.keyAccess + ' access' : '') + '.';
+                // Torn names it "Limited Access" already: never "Limited Access access".
+                const access = info.keyAccess ? String(info.keyAccess).replace(/\s*access$/i, '') : '';
+                this.keyStateEl.textContent = 'Saved' + (access ? ' · ' + access + ' access' : '') + '.';
                 this.keyStateEl.classList.add('sp-ok');
             }
             if (this.tosEl) this.tosEl.open = !info.hasKey;
@@ -8207,7 +8418,68 @@
 
             if (info.inventoryAt) bits.push('inventory ' + formatAge(now - info.inventoryAt));
             this.barEl.textContent = bits.join(' · ');
-            this.barEl.hidden = !bits.length || this.view === 'settings';
+            // On a wide screen the Sources card says all this, and more.
+            this.barEl.hidden = !bits.length || this.view === 'settings' || this.isWide();
+            if (this.isWide() && this.view !== 'settings') this.renderSources();
+        }
+
+        isWide() {
+            return Boolean(this.wideQuery && this.wideQuery.matches);
+        }
+
+        /** My items or All items, and the filter box that goes with it. */
+        showTab(tab) {
+            this.tab = tab === 'all' ? 'all' : 'my';
+            for (const [key, btn] of Object.entries(this.tabBtns)) btn.setAttribute('aria-selected', String(key === this.tab));
+            this.mySection.hidden = this.tab !== 'my';
+            this.allSection.hidden = this.tab !== 'all';
+            this.myFilter.hidden = this.tab !== 'my';
+            this.allFilter.hidden = this.tab !== 'all';
+        }
+
+        /**
+         * Where each source stands, one line each with a dot: TornW3B (and how
+         * many of its lists are read), TornExchange (and its key), online
+         * statuses, inventory. A source that fails says so here; the others
+         * carry on.
+         */
+        renderSources() {
+            const info = this.state.info || {};
+            const now = Date.now();
+            const box = this.sourcesEl;
+            box.textContent = '';
+            box.appendChild(spEl('h2', { text: 'Sources' }));
+
+            const line = (level, label, text, progress) => {
+                const row = spEl('div', { class: 'sp-src' }, [
+                    spEl('span', { class: 'sp-dot', 'data-level': level }),
+                    spEl('b', { text: label }),
+                    spEl('span', { class: 'sp-src-text', text }),
+                ]);
+                if (progress && progress.of > 0 && progress.done < progress.of) {
+                    const bar = spEl('span', { class: 'sp-progress' }, [spEl('i')]);
+                    bar.firstChild.style.width = Math.round((progress.done / progress.of) * 100) + '%';
+                    row.appendChild(bar);
+                }
+                box.appendChild(row);
+            };
+
+            const reading = info.w3bKnown ? info.w3bRead + ' of ' + info.w3bKnown + ' lists read' : 'no traders yet';
+            line(info.w3bTraders ? 'online' : 'unknown', 'TornW3B', (info.w3bTraders || 0) + ' traders · ' + reading, { done: info.w3bRead || 0, of: info.w3bKnown || 0 });
+
+            const perItem = info.heldCount ? 'best per item ' + (info.teOneDone || 0) + ' of ' + info.heldCount : '';
+            if (info.teStatus === 'ok') line('online', 'TornExchange', 'prices ' + (info.teAt ? formatAge(now - info.teAt) : 'loaded'));
+            else if (info.teStatus === 'badkey') line('bad', 'TornExchange', 'key not accepted · ' + perItem, { done: info.teOneDone || 0, of: info.heldCount || 0 });
+            else if (info.teStatus === 'nokey') line('unknown', 'TornExchange', 'no key · ' + perItem, { done: info.teOneDone || 0, of: info.heldCount || 0 });
+            else line('idle', 'TornExchange', 'loading');
+
+            line(
+                info.statusesWanted && info.statusesKnown >= info.statusesWanted ? 'online' : 'idle',
+                'Online status',
+                (info.statusesKnown || 0) + ' of ' + (info.statusesWanted || 0) + ' traders checked',
+                { done: info.statusesKnown || 0, of: info.statusesWanted || 0 },
+            );
+            line(info.inventoryAt ? 'online' : 'unknown', 'Inventory', info.inventoryAt ? (info.heldCount || 0) + ' items · ' + formatAge(now - info.inventoryAt) : 'not read yet');
         }
 
         renderBanner() {
@@ -8259,6 +8531,7 @@
                 const st = b && b.id && s.statuses ? s.statuses.get(String(b.id)) : null;
                 return st ? st.level + st.text : '';
             };
+            const trustOf = (b) => (b && b.trust ? b.trust.level + b.trust.score : '');
             const rowSig = (section) => (r) => {
                 const open = s.expanded.has(section + ':' + r.itemId);
                 const l = open ? lists.get(r.itemId) || {} : {};
@@ -8266,11 +8539,17 @@
                     r.itemId,
                     r.name,
                     r.buyers.length,
+                    this.onlineCount(r),
                     r.best ? [r.best.id, r.best.name, r.best.price, statusOf(r.best)] : Boolean(r.pending),
-                    open ? [Boolean(l.loading), l.error || '', r.buyers.map((b) => [b.id, b.name, b.price, b.te, b.w3b, statusOf(b)])] : 0,
+                    open ? [Boolean(l.loading), l.error || '', r.buyers.map((b) => [b.id, b.name, b.price, b.te, b.w3b, statusOf(b), trustOf(b)])] : 0,
                 ];
             };
             return JSON.stringify([
+                this.isWide(),
+                this.tab,
+                (s.best || []).map((e) => [e.key, e.trader.name, e.bestOn, e.buys, statusOf(e.trader), trustOf(e.trader)]),
+                s.traderFilter ? s.traderFilter.key : '',
+                s.myTotal,
                 this.myFilter.value,
                 this.allFilter.value,
                 Boolean(s.prefs.onlineOnly),
@@ -8297,8 +8576,26 @@
             if (sig === this.lastSig) return;
             this.lastSig = sig;
 
-            this.myCount.textContent = s.my.length ? String(s.my.length) : '';
+            this.myCount.textContent = s.myTotal ? String(s.myTotal) : '';
             this.allCount.textContent = s.allTotal ? s.allTotal.toLocaleString('en-US') : '';
+
+            this.renderBest();
+            this.renderDetail(my, all);
+
+            /* the trader filter, from the best-trader card */
+            this.chipEl.textContent = '';
+            this.chipEl.hidden = !s.traderFilter;
+            if (s.traderFilter) {
+                this.chipEl.append(
+                    spEl('span', { text: 'Showing the ' + s.traderFilter.count + ' items ' + s.traderFilter.name + ' pays most for' }),
+                    spEl('button', {
+                        type: 'button',
+                        class: 'sp-link',
+                        text: 'Show all',
+                        onclick: () => this.h.onTraderFilter && this.h.onTraderFilter(null),
+                    }),
+                );
+            }
 
             /* My items */
             this.myList.textContent = '';
@@ -8339,14 +8636,32 @@
             return img;
         }
 
+        /** How many of an item's traders are known to be online. */
+        onlineCount(r) {
+            const statuses = this.state.statuses;
+            if (!statuses) return 0;
+            return r.buyers.filter((b) => {
+                const st = b.id ? statuses.get(String(b.id)) : null;
+                return st && (st.level === 'online' || st.level === 'busy');
+            }).length;
+        }
+
+        /** "3 traders · 1 online": nothing for a single trader, whose name is right there. */
+        subText(r) {
+            const count = r.buyers.length;
+            if (count <= 1) return '';
+            const online = this.onlineCount(r);
+            return count + ' traders' + (online ? ' · ' + online + ' online' : '');
+        }
+
         /** One item: picture, name, and its best price with who pays it. */
         renderItem(section, r) {
             const key = section + ':' + r.itemId;
             const open = this.state.expanded.has(key);
             const best = r.best;
-            const toggle = () => this.h.onExpand && this.h.onExpand(section, r.itemId);
+            const wide = this.isWide();
+            const toggle = () => this.h.onExpand && this.h.onExpand(section, r.itemId, { single: wide });
 
-            const count = r.buyers.length;
             const head = spEl('div', {
                 class: 'sp-item',
                 role: 'button',
@@ -8364,7 +8679,7 @@
                 spEl('span', { class: 'sp-pic' }, [this.image(section, r.itemId)]),
                 spEl('span', { class: 'sp-name' }, [
                     spEl('b', { text: r.name }),
-                    spEl('span', { class: 'sp-sub', text: count ? count + (count === 1 ? ' trader' : ' traders') : '' }),
+                    spEl('span', { class: 'sp-sub', text: this.subText(r) }),
                 ]),
                 best
                     ? spEl('span', { class: 'sp-best' }, [
@@ -8378,8 +8693,105 @@
             ]);
 
             const card = spEl('div', { class: 'sp-card-item' + (open ? ' sp-open' : '') + (best ? '' : ' sp-nobuyer') }, [head]);
-            if (open && best) card.appendChild(this.renderTraders(r));
+            // Wide: its traders show in the side panel instead, so the list never moves.
+            if (open && best && !wide) card.appendChild(this.renderTraders(r));
             return card;
+        }
+
+        /**
+         * Who pays the most for the most of your items: in Torn you trade with
+         * one person at a time, so this is who to message first.
+         */
+        renderBest() {
+            const box = this.bestEl;
+            const best = this.state.best || [];
+            box.textContent = '';
+            box.hidden = !best.length;
+            if (!best.length) return;
+            box.appendChild(spEl('h2', { text: 'Best trader for you' }));
+            const filter = this.state.traderFilter;
+            best.forEach((e, i) => {
+                const t = e.trader;
+                const on = filter && filter.key === e.key;
+                box.appendChild(spEl('div', { class: 'sp-bt' + (i === 0 ? ' sp-bt-top' : '') }, [
+                    spEl('div', { class: 'sp-bt-head' }, [
+                        spEl('span', { class: 'sp-tname', text: t.name }),
+                        this.trustBadge(t),
+                        this.status(t),
+                    ]),
+                    spEl('div', { class: 'sp-bt-text', text: 'Best price on ' + e.bestOn + ' of your items' + (e.buys > e.bestOn ? ' · buys ' + e.buys : '') }),
+                    spEl('div', { class: 'sp-bt-actions' }, [
+                        spEl('button', {
+                            type: 'button',
+                            class: 'sp-chip sp-chip-btn',
+                            'aria-pressed': String(Boolean(on)),
+                            text: on ? 'Show all items' : 'Show these items',
+                            onclick: () => {
+                                if (this.h.onTraderFilter) this.h.onTraderFilter(on ? null : e.key);
+                                this.showTab('my');
+                            },
+                        }),
+                        this.linkChips(t),
+                    ]),
+                ]));
+            });
+        }
+
+        /** Wide screens: the item picked, with every trader who buys it. */
+        renderDetail(my, all) {
+            const box = this.detailEl;
+            box.textContent = '';
+            if (!this.isWide()) {
+                box.hidden = true;
+                return;
+            }
+            box.hidden = false;
+            const pick = [...this.state.expanded][0] || '';
+            const [section, itemId] = pick.split(':');
+            const r = (section === 'all' ? all : my).find((x) => x.itemId === itemId) || null;
+            if (!r || !r.best) {
+                box.appendChild(spEl('h2', { text: 'Traders' }));
+                box.appendChild(spEl('p', { class: 'sp-note', text: 'Pick an item to see every trader who buys it.' }));
+                return;
+            }
+            box.appendChild(spEl('div', { class: 'sp-detail-head' }, [
+                spEl('span', { class: 'sp-pic' }, [this.image('detail', r.itemId)]),
+                spEl('span', { class: 'sp-name' }, [spEl('b', { text: r.name }), spEl('span', { class: 'sp-sub', text: this.subText(r) || '1 trader' })]),
+            ]));
+            box.appendChild(this.renderTraders(r));
+        }
+
+        /** Trusted / Known / New / Caution, from other players' votes; the numbers on hover. */
+        trustBadge(b) {
+            const t = b && b.trust;
+            if (!t) return null;
+            const parts = [];
+            if (t.votes !== null) parts.push('TornExchange votes ' + (t.votes >= 0 ? '+' : '') + t.votes);
+            if (t.up !== null) parts.push('TornW3B rating ' + t.up + '↑ ' + t.down + '↓');
+            return spEl('span', { class: 'sp-trust', 'data-level': t.level.toLowerCase(), title: parts.join(' · '), text: t.level });
+        }
+
+        /** Profile, TE list and W3B list, in fixed slots so they line up row to row. */
+        linkChips(b) {
+            const links = spEl('span', { class: 'sp-links' });
+            const link = (text, url, title) => {
+                if (!url) {
+                    links.appendChild(spEl('span', { class: 'sp-chip sp-chip-none', 'aria-hidden': 'true' }));
+                    return;
+                }
+                const a = spEl('a', { class: 'sp-chip', href: url, text, title, target: '_blank', rel: 'noopener noreferrer' });
+                a.addEventListener('click', (event) => {
+                    event.stopPropagation();
+                    if (event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey) return;
+                    event.preventDefault();
+                    if (this.h.onOpenUrl) this.h.onOpenUrl(url);
+                });
+                links.appendChild(a);
+            };
+            link('Profile', b.id ? spProfileUrl(b.id) : null, 'Torn profile');
+            link('TE list', b.te ? tePriceListUrl(b.teName || b.name) : null, 'TornExchange price list: ' + formatMoney(b.te || 0));
+            link('W3B list', b.w3b && b.id ? w3bPriceListUrl(b.id) : null, 'TornW3B price list: ' + formatMoney(b.w3b || 0));
+            return links;
         }
 
         /** What an item with no trader says: only "No Trader Found" once every source has answered. */
@@ -8401,32 +8813,11 @@
             else if (st.error) box.appendChild(spEl('div', { class: 'sp-note sp-bad', text: st.error }));
 
             r.buyers.forEach((b, i) => {
-                // Three fixed slots, always in the same order, so each link sits
-                // in the same place on every row and the prices stay in line.
-                const links = spEl('span', { class: 'sp-links' });
-                const link = (text, url, title) => {
-                    if (!url) {
-                        links.appendChild(spEl('span', { class: 'sp-chip sp-chip-none', 'aria-hidden': 'true' }));
-                        return;
-                    }
-                    const a = spEl('a', { class: 'sp-chip', href: url, text, title, target: '_blank', rel: 'noopener noreferrer' });
-                    a.addEventListener('click', (event) => {
-                        event.stopPropagation();
-                        if (event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey) return;
-                        event.preventDefault();
-                        if (this.h.onOpenUrl) this.h.onOpenUrl(url);
-                    });
-                    links.appendChild(a);
-                };
-                link('Profile', b.id ? spProfileUrl(b.id) : null, 'Torn profile');
-                link('TE list', b.te ? tePriceListUrl(b.teName || b.name) : null, 'TornExchange price list: ' + formatMoney(b.te || 0));
-                link('W3B list', b.w3b && b.id ? w3bPriceListUrl(b.id) : null, 'TornW3B price list: ' + formatMoney(b.w3b || 0));
-
                 box.appendChild(spEl('div', { class: 'sp-tr' + (i === 0 ? ' sp-top' : '') }, [
                     spEl('span', { class: 'sp-rank', text: String(i + 1) }),
-                    spEl('span', { class: 'sp-trader' }, [spEl('span', { class: 'sp-tname', text: b.name }), this.status(b)]),
+                    spEl('span', { class: 'sp-trader' }, [spEl('span', { class: 'sp-tname', text: b.name }), this.trustBadge(b), this.status(b)]),
                     spEl('span', { class: 'sp-tprice', text: formatMoney(b.price) }),
-                    links,
+                    this.linkChips(b),
                 ]));
             });
 
@@ -8466,11 +8857,13 @@
     .sp-grow { flex: 1; }
     .sp-bad { color: var(--bad); }
     .sp-ok { color: var(--profit); }
-    .sp-wrap { width: 100%; max-width: 760px; margin: 0 auto; }
+    .sp-page { --page-w: 760px; }
+    @media (min-width: 1100px) { .sp-page { --page-w: 1180px; } }
+    .sp-wrap { width: 100%; max-width: var(--page-w); margin: 0 auto; }
 
     /* ---------------------------------------------------------------- head */
     .sp-head { flex: 0 0 auto; background: var(--title); border-bottom: 1px solid var(--line); }
-    .sp-head-in { display: flex; align-items: center; gap: 8px; max-width: 760px; height: 44px; margin: 0 auto; padding: 0 16px; }
+    .sp-head-in { display: flex; align-items: center; gap: 8px; max-width: var(--page-w); height: 44px; margin: 0 auto; padding: 0 16px; }
     .sp-head h1 {
         margin: 0; font-size: 20px; font-weight: bold; color: #fff;
         text-shadow: 1px 1px 2px rgba(0, 0, 0, 0.65); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
@@ -8483,12 +8876,12 @@
     .sp-icon[aria-pressed="true"] { color: var(--profit); }
 
     .sp-bar {
-        flex: 0 0 auto; max-width: 760px; width: 100%; margin: 0 auto; padding: 8px 16px 0;
+        flex: 0 0 auto; max-width: var(--page-w); width: 100%; margin: 0 auto; padding: 8px 16px 0;
         font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
     }
     .sp-banner {
         display: none; align-items: center; gap: 12px; flex: 0 0 auto;
-        max-width: 728px; width: calc(100% - 32px); margin: 8px auto 0; padding: 8px 12px;
+        max-width: calc(var(--page-w) - 32px); width: calc(100% - 32px); margin: 8px auto 0; padding: 8px 12px;
         background: var(--card); border: 1px solid var(--card-line); border-left: 4px solid var(--offer); border-radius: 8px;
     }
     .sp-banner > span { flex: 1; }
@@ -8524,6 +8917,7 @@
         margin: -16px -4px 8px; padding: 16px 4px 8px; background: var(--page);
     }
     .sp-shead h2 { display: flex; align-items: baseline; gap: 8px; margin: 0; font-size: 15px; font-weight: bold; color: #fff; }
+    .sp-filter[hidden] { display: none; }
     .sp-count { font-size: 12px; font-weight: normal; color: var(--muted); }
     .sp-filter {
         width: 220px; height: 32px; padding: 0 12px; color: var(--text);
@@ -8565,6 +8959,73 @@
     .sp-dot[data-level="online"] { background: var(--profit); box-shadow: 0 0 0 2px rgba(153, 204, 0, 0.2); }
     .sp-dot[data-level="idle"] { background: var(--warn); }
     .sp-dot[data-level="offline"] { background: #666; }
+    /* Online, but in hospital, in jail or flying: may not trade right now. */
+    .sp-dot[data-level="busy"] { background: #e07b39; }
+    .sp-dot[data-level="bad"] { background: var(--bad); }
+
+    /* ------------------------------------------------------------- layout */
+    .sp-layout { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; align-items: start; }
+    .sp-col-list { min-width: 0; }
+    .sp-col-side { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+    /* Narrow: one column, the best-trader card above the list. */
+    .sp-col-side { order: -1; }
+    .sp-col-side .sp-detail, .sp-col-side .sp-sources { display: none; }
+    /* Narrow: only the top trader, so your items stay near the top. */
+    @media (max-width: 1099px) { .sp-bt:not(.sp-bt-top) { display: none; } }
+    @media (min-width: 1100px) {
+        .sp-layout { grid-template-columns: minmax(0, 1fr) 380px; }
+        .sp-col-side { order: 0; position: sticky; top: 0; max-height: calc(100vh - 140px); overflow-y: auto; }
+        .sp-col-side .sp-detail, .sp-col-side .sp-sources { display: flex; }
+        .sp-col-side .sp-detail[hidden] { display: none; }
+    }
+    .sp-side-card { gap: 8px; }
+    .sp-side-card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--muted); }
+
+    /* tabs */
+    .sp-tabs { display: flex; gap: 4px; }
+    .sp-tab {
+        display: inline-flex; align-items: baseline; gap: 8px; height: 32px; padding: 0 12px;
+        font-size: 15px; font-weight: bold; color: var(--muted); background: transparent;
+        border: 0; border-bottom: 2px solid transparent; cursor: pointer;
+    }
+    .sp-tab:hover { color: var(--text); }
+    .sp-tab[aria-selected="true"] { color: #fff; border-bottom-color: var(--profit); }
+    .sp-chipbar { display: flex; align-items: center; gap: 12px; margin: 0 0 8px; padding: 8px 12px; background: rgba(153, 204, 0, 0.08); border: 1px solid #3d4a1f; border-radius: 8px; font-size: 13px; }
+    .sp-chipbar span { flex: 1; }
+    .sp-chipbar[hidden] { display: none; }
+
+    /* best trader for you */
+    .sp-bt { display: flex; flex-direction: column; gap: 4px; padding: 8px; border-radius: 8px; }
+    .sp-bt + .sp-bt { border-top: 1px solid var(--card-line); border-radius: 0; }
+    .sp-bt-top { background: rgba(153, 204, 0, 0.08); }
+    .sp-bt-head { display: flex; align-items: center; gap: 8px; min-width: 0; font-weight: bold; font-size: 13px; }
+    .sp-bt-text { font-size: 12px; color: var(--muted); }
+    .sp-bt-actions { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+    .sp-chip-btn { padding: 0 8px; background: transparent; cursor: pointer; font: inherit; font-size: 12px; }
+    .sp-chip-btn[aria-pressed="true"] { color: var(--on-profit); background: var(--profit); border-color: var(--profit); }
+
+    /* the item picked (wide) */
+    .sp-detail-head { display: flex; align-items: center; gap: 12px; }
+    .sp-detail .sp-traders { padding: 4px 0 0; background: none; border-top: 0; }
+    .sp-detail .sp-tr { grid-template-columns: 20px minmax(0, 1fr) auto; row-gap: 4px; padding: 8px 4px; }
+    .sp-detail .sp-links { grid-column: 2 / 4; }
+
+    /* sources */
+    .sp-src { display: grid; grid-template-columns: 8px auto minmax(0, 1fr); align-items: center; gap: 4px 8px; font-size: 12px; }
+    .sp-src b { font-size: 12px; }
+    .sp-src-text { color: var(--muted); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .sp-progress { grid-column: 2 / 4; height: 4px; background: #333; border-radius: 2px; overflow: hidden; }
+    .sp-progress i { display: block; height: 100%; background: var(--profit); }
+
+    /* trust */
+    .sp-trust {
+        display: inline-flex; align-items: center; height: 18px; padding: 0 6px; flex: 0 0 auto;
+        font-size: 11px; font-weight: bold; text-transform: uppercase; letter-spacing: 0.3px;
+        border-radius: 9px; border: 1px solid #555; color: var(--muted); cursor: help;
+    }
+    .sp-trust[data-level="trusted"] { color: #bfe86a; border-color: #5c7a1e; background: rgba(153, 204, 0, 0.1); }
+    .sp-trust[data-level="known"] { color: #9fd0ff; border-color: #3d5a74; }
+    .sp-trust[data-level="caution"] { color: #f0a020; border-color: #7a5210; }
     .sp-dot[data-level="unknown"] { background: transparent; border: 1px solid #777; }
 
     /* ------------------------------------------------------------- traders */
@@ -8617,7 +9078,7 @@
         .sp-main { padding: 12px 12px 48px; }
         .sp-bar { padding: 8px 12px 0; }
         .sp-shead { flex-wrap: wrap; top: -12px; margin-top: -12px; padding-top: 12px; }
-        .sp-shead h2 { flex: 1 0 auto; }
+        .sp-shead .sp-tabs { flex: 1 0 auto; }
         .sp-shead .sp-grow { display: none; }
         .sp-filter { flex: 1 1 100%; width: auto; order: 5; }
         .sp-item { grid-template-columns: 44px minmax(0, 1fr) auto; gap: 8px; padding: 8px; }
@@ -8671,6 +9132,17 @@
         [4295665, 'DonRon46'], [4298171, 'Butter_My_Buns_'], [4315363, 'Moitzi'], [4342484, 'Zombie_Cage'],
         [4354832, 'Viduata'], [4371231, 'Sortis'], [4375700, 'Rippler1985'], [4429820, 'AlekseiNamaste'],
     ];
+
+    /*
+     * TornW3B's Highest Rated list on the same day: [ups, downs]. Used for the
+     * trust badge until a TornW3B page you open shows newer numbers.
+     */
+    const SEED_RATINGS = {
+        2982905: [523, 7], 3742399: [468, 9], 2560768: [438, 14], 3997042: [226, 2], 3840107: [226, 11],
+        3626229: [210, 3], 1889185: [207, 7], 1195734: [207, 15], 3982492: [199, 10], 2097793: [190, 6],
+        3897823: [186, 6], 593790: [184, 5], 3395089: [174, 2], 2048821: [167, 2], 3809686: [166, 2],
+        4213516: [170, 7], 3459156: [168, 10], 4298171: [163, 7], 1853324: [156, 5], 2810641: [148, 5],
+    };
 
     /* ===== src/ui/overlay.js ===== */
     /*
@@ -9340,8 +9812,10 @@
         /* Which list the panel shows when you are on neither market page. */
         viewTab: 'bazaar',
         collapsed: false,
-        /* Where the panel was dragged to; null = bottom-right. */
+        /* Where the panel was dragged to; null = docked beside Torn's content. */
         panelPos: null,
+        /* Set once 3.9.4 has let go of an older dragged position. */
+        docked: false,
     };
 
     const RESCAN_DEBOUNCE_MS = 400;
@@ -9468,6 +9942,14 @@
         // The NPC switch was called compareNpc.
         if (stored.compareNpc === false && !('sellToNpc' in stored)) out.sellToNpc = false;
         if (out.viewTab !== 'bazaar' && out.viewTab !== 'itemmarket') out.viewTab = 'bazaar';
+
+        // 3.9.4: the panel docks beside Torn's content by default. A spot it was
+        // dragged to before then (often over Torn's page) is let go once.
+        if (!out.docked) {
+            out.panelPos = null;
+            out.docked = true;
+            gmSet(STORE_SETTINGS, { ...stored, panelPos: null, docked: true });
+        }
 
         return out;
     }
@@ -10956,6 +11438,10 @@
          */
         teOne: new Map(),
         teOneBusy: false,
+        /* "Best trader for you": show only the items this trader pays most for. */
+        traderFilter: null,
+        /* When statuses were asked, for the per-minute limit. */
+        presenceAsked: [],
         /* Our trader database (TornW3B lists), and its item index for this render. */
         db: null,
         dbDirty: false,
@@ -10978,11 +11464,17 @@
         inventoryRetryAt: 0,
     };
 
-    /* Traders' statuses are asked for this often, visible tab only. */
-    const SELL_PRESENCE_REFRESH_MS = 90000;
+    /*
+     * Our own online checker: every trader the page shows, from Torn's public
+     * profile with your Limited key. Like TornExchange's own job, each is
+     * re-checked every 10 minutes (every 90 s while its item is open), and no
+     * more than SELL_PRESENCE_PER_MIN a minute are asked - inside the shared
+     * 70/min, leaving room for the panel in other tabs. Visible tab only.
+     */
+    const SELL_PRESENCE_REFRESH_MS = 10 * 60 * 1000;
+    const SELL_PRESENCE_OPEN_REFRESH_MS = 90000;
     const SELL_PRESENCE_MAX_PENDING = 3;
-    /* At most this many traders' statuses are kept fresh at once. */
-    const SELL_PRESENCE_MAX = 20;
+    const SELL_PRESENCE_PER_MIN = 30;
     /* A failed TornExchange call is not retried sooner than this. */
     const TE_RETRY_MS = 5 * 60 * 1000;
     /* Inventory is asked again after this, or on Refresh. */
@@ -11087,9 +11579,24 @@
     function sellStatusMap(now) {
         const out = new Map();
         for (const [id, s] of sell.presence) {
-            if (s.presence) out.set(id, { name: s.presence.name, ...presenceWord(s.presence, now) });
+            if (!s.presence) continue;
+            const word = presenceWord(s.presence, now);
+            // Online but in hospital, in jail or flying: they may not trade right
+            // now, so not the plain green of "Online".
+            const state = s.presence.state;
+            if (state && state !== 'Okay' && word.level !== 'offline') {
+                out.set(id, { name: s.presence.name, ...word, level: 'busy', text: s.presence.online + ' · ' + state });
+            } else {
+                out.set(id, { name: s.presence.name, ...word });
+            }
         }
         return out;
+    }
+
+    /** Is a trader's status unknown (never answered yet)? */
+    function presenceUnknown(id) {
+        const s = sell.presence.get(String(id));
+        return !s || (!s.presence && !s.retryAt);
     }
 
     /* ---------------------------------------------------- trader database */
@@ -11176,6 +11683,11 @@
 
         const w3bByItem = w3bIndex(now);
         const teMap = sell.traders ? sell.traders.map : new Map();
+        // TornExchange's votes for the trust badge, from every answer we have.
+        const votesById = votesByTrader([
+            ...teMap.values(),
+            ...[...sell.teOne.values()].filter((rec) => rec.best).map((rec) => [rec.best]),
+        ]);
         const buyersCache = new Map();
         const buyersAll = (itemId) => {
             const id = String(itemId);
@@ -11192,6 +11704,7 @@
                     db: sell.db,
                     w3bByItem,
                     dbIdsByName: sell.dbIdsByName,
+                    votesById,
                 });
                 buyersCache.set(id, b);
             }
@@ -11221,9 +11734,25 @@
             return !one || Boolean(one.failed);
         };
 
+        /*
+         * Every item you hold with every trader, whatever the filters: what the
+         * online checker and "best trader for you" work from.
+         */
+        const myAll = sell.inventory ? itemRows(heldIds(), { buyersOf: buyersAll, nameOf }) : [];
+        const best = bestTradersFor(myAll, 3);
+        const traderKey = (b) => (b.id ? String(b.id) : 'name:' + String(b.name).toLowerCase());
+        const filterTrader = sell.traderFilter ? best.find((e) => traderKey(e.trader) === sell.traderFilter) : null;
+        if (sell.traderFilter && !filterTrader) sell.traderFilter = null;
+        const onlyItems = filterTrader ? new Set(filterTrader.bestOn) : null;
+
         /* My items: everything you hold, those with a trader first. */
-        const my = sell.inventory ? itemRows(heldIds(), { buyersOf, nameOf, query: sell.queries.my }) : [];
-        for (const r of my) r.pending = !r.best && pendingFor(r.itemId);
+        let my = sell.inventory ? itemRows(heldIds(), { buyersOf, nameOf, query: sell.queries.my }) : [];
+        if (onlyItems) my = my.filter((r) => onlyItems.has(r.itemId));
+        for (const r of my) {
+            // With Online only, not knowing a trader's status yet is not "nobody online".
+            const statusPending = prefs.onlineOnly && buyersAll(r.itemId).some((b) => b.id && presenceUnknown(b.id));
+            r.pending = !r.best && (pendingFor(r.itemId) || statusPending);
+        }
 
         /* All items: every item any trader buys. */
         const oneIds = [...sell.teOne].filter(([, rec]) => rec.best).map(([id]) => id);
@@ -11231,7 +11760,9 @@
         const allRows = itemRows(allIds, { buyersOf, nameOf, query: sell.queries.all }).filter((r) => r.best);
         const all = allRows.slice(0, sell.allShown);
 
-        updateSellPresence(tradersToCheck(my, all), now);
+        const watch = tradersToCheck(myAll, all, best);
+        updateSellPresence(watch, now);
+        const statusesKnown = watch.ids.filter((id) => !presenceUnknown(id)).length;
 
         const itemLists = new Map();
         for (const [id, s] of sell.listState) itemLists.set(id, s);
@@ -11242,6 +11773,9 @@
             my,
             all,
             allTotal: allRows.length,
+            myTotal: myAll.length,
+            best: best.map((e) => ({ trader: e.trader, bestOn: e.bestOn.length, buys: e.buys, key: traderKey(e.trader) })),
+            traderFilter: filterTrader ? { key: sell.traderFilter, name: filterTrader.trader.name, count: filterTrader.bestOn.length } : null,
             statuses: sellStatusMap(now),
             prefs,
             expanded: sell.expanded,
@@ -11268,6 +11802,10 @@
                 teStatus: !teKey ? 'nokey' : st.badKey ? 'badkey' : sell.traders ? 'ok' : 'loading',
                 teOneDone,
                 heldCount,
+                w3bKnown: stats.total,
+                w3bRead: stats.total - stats.unchecked,
+                statusesKnown,
+                statusesWanted: watch.ids.length,
                 itemLists,
             },
         });
@@ -11286,16 +11824,27 @@
      * of the first items in All items. Built from the rows as shown, so an open
      * row is never starved by the rest.
      */
-    function tradersToCheck(my, all) {
+    function tradersToCheck(my, all, best = []) {
         const ids = [];
-        const push = (b) => {
-            if (b && b.id && !ids.includes(String(b.id)) && ids.length < SELL_PRESENCE_MAX) ids.push(String(b.id));
+        const seen = new Set();
+        const open = new Set();
+        const push = (b, isOpen = false) => {
+            if (!b || !b.id) return;
+            const id = String(b.id);
+            if (isOpen) open.add(id);
+            if (seen.has(id)) return;
+            seen.add(id);
+            ids.push(id);
         };
         const rowsAll = (section, rows) => rows.filter((r) => sell.expanded.has(section + ':' + r.itemId));
-        for (const r of [...rowsAll('my', my), ...rowsAll('all', all)]) r.buyers.forEach(push);
-        for (const r of my) r.buyers.slice(0, 3).forEach(push);
+        for (const r of [...rowsAll('my', my), ...rowsAll('all', all)]) r.buyers.forEach((b) => push(b, true));
+        for (const e of best) push(e.trader);
+        // Every trader of every item you hold, best first per item: Online only
+        // needs to know about all of them.
+        const depth = Math.max(0, ...my.map((r) => r.buyers.length));
+        for (let i = 0; i < depth; i++) for (const r of my) push(r.buyers[i]);
         for (const r of all) push(r.best);
-        return ids;
+        return { ids, open };
     }
 
     /* ----------------------------------------------------------- loading */
@@ -11504,8 +12053,12 @@
             .finally(() => renderSelling());
     }
 
-    /** Traders' public statuses, when due: visible tab only, inside the shared budget. */
-    function updateSellPresence(ids, now) {
+    /**
+     * Traders' public statuses, when due, in the order given (most useful
+     * first): visible tab only, at most SELL_PRESENCE_PER_MIN a minute.
+     * @param {{ids: string[], open: Set<string>}} watch - from tradersToCheck
+     */
+    function updateSellPresence({ ids, open }, now) {
         for (const id of ids) {
             if (!sell.presence.has(id)) {
                 sell.presence.set(id, { presence: null, fetchedAt: 0, pending: false, retryAt: 0 });
@@ -11515,13 +12068,17 @@
 
         let pending = 0;
         for (const s of sell.presence.values()) if (s.pending) pending++;
+        sell.presenceAsked = (sell.presenceAsked || []).filter((t) => now - t < 60000);
 
         for (const id of ids) {
             if (pending >= SELL_PRESENCE_MAX_PENDING) break;
+            if (sell.presenceAsked.length >= SELL_PRESENCE_PER_MIN) break;
             const s = sell.presence.get(id);
-            if (s.pending || now < s.retryAt || now - s.fetchedAt < SELL_PRESENCE_REFRESH_MS) continue;
+            const every = open.has(id) ? SELL_PRESENCE_OPEN_REFRESH_MS : SELL_PRESENCE_REFRESH_MS;
+            if (s.pending || now < s.retryAt || now - s.fetchedAt < every) continue;
 
             pending++;
+            sell.presenceAsked.push(now);
             s.pending = true;
             fetchUserPresence(sell.client, id)
                 .then((presence) => {
@@ -11633,13 +12190,24 @@
         loadSellInventory({ force: true }).then(() => refreshSellTraders({ force: true }));
     }
 
-    function onSellExpand(section, itemId) {
+    /**
+     * Open or close an item. On a wide screen its traders show in the side
+     * panel, one item at a time (`single`); on a narrow one, under the item.
+     */
+    function onSellExpand(section, itemId, { single = false } = {}) {
         const key = section + ':' + String(itemId);
         if (sell.expanded.has(key)) sell.expanded.delete(key);
         else {
+            if (single) sell.expanded.clear();
             sell.expanded.add(key);
             loadTeItemList(itemId);
         }
+        renderSelling();
+    }
+
+    /** Show only the items a trader pays the most for (null shows them all again). */
+    function onSellTraderFilter(key) {
+        sell.traderFilter = key && key !== sell.traderFilter ? key : null;
         renderSelling();
     }
 
@@ -11682,7 +12250,14 @@
         loadTraderDb();
         // Start from TornW3B's public traders, so no one source (or key) is
         // needed to see traders at all.
-        learnTraders(SEED_TRADERS.map(([id, name]) => ({ id, name, source: 'seed' })));
+        learnTraders(
+            SEED_TRADERS.map(([id, name]) => {
+                // A seed rating only where we have none: a TornW3B page you opened is newer.
+                const known = sell.db.traders[String(id)];
+                const r = SEED_RATINGS[id];
+                return { id, name, source: 'seed', rating: r && !(known && known.rating) ? { up: r[0], down: r[1] } : null };
+            }),
+        );
         sell.teOne = loadTeOne();
         // An error message is about the last call, not this visit: a stored one
         // (3.8.1 kept "That is a Torn key" forever) would outlive its cause.
@@ -11695,6 +12270,7 @@
             onSaveTeKey: onSellSaveTeKey,
             onForgetTeKey: onSellForgetTeKey,
             onRetryTe: onSellRetryTe,
+            onTraderFilter: onSellTraderFilter,
             onRevealTeKey: () => getTeKey(),
             onRefresh: onSellRefresh,
             onPrefsChange: (partial) => {
@@ -11782,9 +12358,14 @@
             const anchors = document.querySelectorAll('a[href*="/pricelist/"]');
             const found = traderLinksIn(anchors);
             if (!found.length) return;
-            const names = traderNamesInText(document.body ? document.body.innerText : '');
-            for (const f of found) if (!f.name && names.has(f.id)) f.name = names.get(f.id);
-            const sig = found.map((f) => f.id + ':' + f.name).join(',');
+            const text = document.body ? document.body.innerText : '';
+            const names = traderNamesInText(text);
+            const ratings = ratingsInText(text);
+            for (const f of found) {
+                if (!f.name && names.has(f.id)) f.name = names.get(f.id);
+                if (f.name && ratings.has(f.name)) f.rating = ratings.get(f.name);
+            }
+            const sig = found.map((f) => f.id + ':' + f.name + ':' + (f.rating ? f.rating.up + '/' + f.rating.down : '')).join(',');
             if (sig === last) return;
             last = sig;
             const db = readTraderDb(gmGet(STORE_TRADER_DB, null));

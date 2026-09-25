@@ -105,6 +105,9 @@ export function isTypingTarget(event) {
     return false;
 }
 
+/** The panel docks beside Torn's content only when at least this wide fits. */
+const DOCK_MIN_WIDTH = 300;
+
 /** Long enough to see, short enough not to get in the way. */
 const SCAN_ANIMATION_MS = 800;
 
@@ -352,6 +355,9 @@ export class Panel {
         parent.appendChild(this.host);
 
         window.addEventListener('resize', () => this.clampIntoView());
+        // Torn lays its page out after load: dock again once it has.
+        this.dock();
+        setTimeout(() => this.dock(), 1500);
 
         this.showPage('list');
 
@@ -839,12 +845,71 @@ export class Panel {
         this.root.style.top = '';
         this.root.style.right = '';
         this.root.style.bottom = '';
+        this.dock();
     }
 
     clampIntoView() {
+        this.dock();
         if (!this.root || !this.root.style.left) return;
         const rect = this.root.getBoundingClientRect();
         this.placeAt(rect.left, rect.top);
+    }
+
+    /**
+     * Keep the panel off Torn's content. With no position of your own, it
+     * takes a column at the right edge and Torn's page is narrowed by that
+     * much (padding on <html>), so Torn's centred content moves over and
+     * nothing is covered - open or collapsed. The column is as wide as the
+     * window allows (up to 430px) while Torn's content still fits. If it does
+     * not fit, or Torn's content is not where we expect, nothing is reserved
+     * and the panel floats bottom-right as before. A position you dragged it
+     * to is always kept, and then nothing is reserved.
+     */
+    dock() {
+        if (!this.root) return;
+        const doc = this.root.ownerDocument || document;
+        const content = doc.querySelector('.content-wrapper');
+        let width = 0;
+        if (!this.root.style.left && content) {
+            // Torn's page is its sidebar plus its content column: both must fit.
+            const parts = [content, doc.getElementById('sidebarroot'), doc.getElementById('sidebar')].filter(Boolean);
+            const rects = parts.map((el) => el.getBoundingClientRect()).filter((r) => r.width > 0);
+            const contentWidth = Math.max(...rects.map((r) => r.right)) - Math.min(...rects.map((r) => r.left));
+            const free = window.innerWidth - contentWidth - 24;
+            width = Math.min(430, Math.floor(free - 16));
+            if (width < DOCK_MIN_WIDTH) width = 0;
+        }
+        this.reserve(doc, width ? width + 16 : 0);
+        this.root.classList.toggle('ttv2-docked', width > 0);
+        if (!width) return;
+        this.root.style.setProperty('--dock-width', width + 'px');
+
+        // Proof, not hope: if Torn's content still reaches under the panel,
+        // give the space back and float instead.
+        requestAnimationFrame(() => {
+            const c = content.getBoundingClientRect();
+            const p = this.root.getBoundingClientRect();
+            if (c.right > p.left + 1) {
+                this.reserve(doc, 0);
+                this.root.classList.remove('ttv2-docked');
+            }
+        });
+    }
+
+    /** Narrow Torn's page by `px` on the right (0 gives the space back). */
+    reserve(doc, px) {
+        let style = doc.getElementById('ttv2-dock-space');
+        if (!px) {
+            if (style) style.remove();
+            return;
+        }
+        if (!style) {
+            style = doc.createElement('style');
+            style.id = 'ttv2-dock-space';
+            (doc.head || doc.documentElement).appendChild(style);
+        }
+        const css = 'html { padding-right: ' + px + 'px !important; box-sizing: border-box !important; }';
+        if (style.textContent !== css) style.textContent = css;
     }
 
     setCollapsed(collapsed, { save = false } = {}) {
@@ -1436,6 +1501,7 @@ export class Panel {
     destroy() {
         if (this.ticker) clearInterval(this.ticker);
         clearTimeout(this.scanTimer);
+        if (this.root) this.reserve(this.root.ownerDocument || document, 0);
         if (this.hotkeyHandler && this.hotkeyTarget) {
             this.hotkeyTarget.removeEventListener('keydown', this.hotkeyHandler);
             this.hotkeyHandler = null;

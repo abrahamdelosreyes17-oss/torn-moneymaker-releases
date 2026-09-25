@@ -272,7 +272,9 @@ export function parseTeBestListing(body) {
     const id = String((d && d.trader_id) || '').replace(/\D/g, '');
     const price = Number(d && d.price);
     if (!d || !id || !Number.isFinite(price) || price <= 0) return null;
-    return { name: typeof d.trader === 'string' && d.trader ? d.trader : 'Trader ' + id, id, price };
+    const out = { name: typeof d.trader === 'string' && d.trader ? d.trader : 'Trader ' + id, id, price };
+    if (Number.isFinite(Number(d.vote)) && d.vote !== null) out.score = Number(d.vote);
+    return out;
 }
 
 /**

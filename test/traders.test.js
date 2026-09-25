@@ -354,7 +354,7 @@ test('TornExchange without a key: best_listing is sent with no key, and "no list
             return response(200, { status: 'success', data: { item: 'Xanax', trader: 'MaxLEXO', trader_id: '3922958', vote: 1, price: 839004 } });
         },
     });
-    assert.deepEqual(await fetchTeBestListing(client, 206), { name: 'MaxLEXO', id: '3922958', price: 839004 });
+    assert.deepEqual(await fetchTeBestListing(client, 206), { name: 'MaxLEXO', id: '3922958', price: 839004, score: 1 });
     assert.ok(!seen[0].includes('key='), 'no key in ' + seen[0]);
     assert.equal(new URL(seen[0]).hostname, 'www.tornexchange.com');
     client.lastRequestAt = 0;
@@ -390,4 +390,47 @@ test('below Min but profitable: marked in the second colour, never in the list; 
     const pricey = row('4', 40, 1, 5000); // +40, but you cannot afford one
     const opts = { minTotalProfit: 100, cashOnHand: 1000 };
     assert.deepEqual(belowMinRows([big, small, loss, pricey], opts).map((r) => r.itemId), ['2']);
+});
+
+/* ======================================= 3.9.4: trust and best trader */
+
+import { trustOf, votesByTrader, bestTradersFor, ratingsInText } from '../src/core/traders.js';
+
+test('trust: the better of TornExchange votes and TornW3B rating; nothing known is no badge', () => {
+    assert.equal(trustOf(null, null), null);
+    assert.equal(trustOf(214, null).level, 'Trusted');
+    assert.equal(trustOf(5, { up: 523, down: 7 }).level, 'Trusted', 'known on one site is enough');
+    assert.equal(trustOf(25, null).level, 'Known');
+    assert.equal(trustOf(3, null).level, 'New');
+    assert.equal(trustOf(-4, null).level, 'Caution');
+    assert.deepEqual(trustOf(null, { up: 30, down: 2 }), { level: 'Known', score: 28, votes: null, up: 30, down: 2 });
+});
+
+test('trust reaches every row: votes from any item, ratings from our database', () => {
+    const db = dbWithLists();
+    addTraders(db, [{ id: 77, name: 'Zed', rating: { up: 200, down: 3 } }], NOW);
+    const votes = votesByTrader([[{ id: '11', score: 40 }], [{ id: '11', score: 99 }]]);
+    assert.equal(votes.get('11'), 40, 'first answer wins');
+    const buyers = buyersForItem('206', { db, w3bByItem: indexW3bByItem(db, NOW), votesById: votes });
+    assert.equal(buyers.find((b) => b.id === '11').trust.level, 'Known');
+    assert.equal(buyers.find((b) => b.id === '77').trust.level, 'Trusted');
+});
+
+test('best trader for you: most best-prices first, then most items bought', () => {
+    const bob = { id: '11', name: 'Bob' };
+    const zed = { id: '77', name: 'Zed' };
+    const rows = [
+        { itemId: '1', buyers: [bob, zed] },
+        { itemId: '2', buyers: [bob] },
+        { itemId: '3', buyers: [zed, bob] },
+        { itemId: '4', buyers: [] },
+    ];
+    const best = bestTradersFor(rows);
+    assert.deepEqual(best.map((e) => [e.trader.name, e.bestOn, e.buys]), [['Bob', ['1', '2'], 3], ['Zed', ['3'], 2]]);
+});
+
+test('TornW3B ratings are read off its leaderboards', () => {
+    const r = ratingsInText('Highest Rated Traders\n1\nClouds\n523↑ · 7↓\n+516\n2\n7ZP\n468↑ · 9↓');
+    assert.deepEqual(r.get('Clouds'), { up: 523, down: 7 });
+    assert.deepEqual(r.get('7ZP'), { up: 468, down: 9 });
 });

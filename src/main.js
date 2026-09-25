@@ -83,6 +83,9 @@ import {
     traderIdsByName,
     markW3bDue,
     pruneTraderDb,
+    votesByTrader,
+    bestTradersFor,
+    ratingsInText,
 } from './core/traders.js';
 import {
     mergeInventory,
@@ -134,7 +137,7 @@ import {
 import { injectStyles } from './ui/styles.js';
 import { Panel, TORN_API_KEY_URL } from './ui/panel.js';
 import { SellingPage, SELLING_PAGE_DEFAULTS, ALL_ITEMS_PAGE } from './ui/selling-page.js';
-import { SEED_TRADERS } from './core/seed-traders.js';
+import { SEED_TRADERS, SEED_RATINGS } from './core/seed-traders.js';
 import {
     markRows,
     clearMarks,
@@ -223,8 +226,10 @@ const DEFAULT_SETTINGS = {
     /* Which list the panel shows when you are on neither market page. */
     viewTab: 'bazaar',
     collapsed: false,
-    /* Where the panel was dragged to; null = bottom-right. */
+    /* Where the panel was dragged to; null = docked beside Torn's content. */
     panelPos: null,
+    /* Set once 3.9.4 has let go of an older dragged position. */
+    docked: false,
 };
 
 const RESCAN_DEBOUNCE_MS = 400;
@@ -351,6 +356,14 @@ function loadSettings() {
     // The NPC switch was called compareNpc.
     if (stored.compareNpc === false && !('sellToNpc' in stored)) out.sellToNpc = false;
     if (out.viewTab !== 'bazaar' && out.viewTab !== 'itemmarket') out.viewTab = 'bazaar';
+
+    // 3.9.4: the panel docks beside Torn's content by default. A spot it was
+    // dragged to before then (often over Torn's page) is let go once.
+    if (!out.docked) {
+        out.panelPos = null;
+        out.docked = true;
+        gmSet(STORE_SETTINGS, { ...stored, panelPos: null, docked: true });
+    }
 
     return out;
 }
@@ -1839,6 +1852,10 @@ const sell = {
      */
     teOne: new Map(),
     teOneBusy: false,
+    /* "Best trader for you": show only the items this trader pays most for. */
+    traderFilter: null,
+    /* When statuses were asked, for the per-minute limit. */
+    presenceAsked: [],
     /* Our trader database (TornW3B lists), and its item index for this render. */
     db: null,
     dbDirty: false,
@@ -1861,11 +1878,17 @@ const sell = {
     inventoryRetryAt: 0,
 };
 
-/* Traders' statuses are asked for this often, visible tab only. */
-const SELL_PRESENCE_REFRESH_MS = 90000;
+/*
+ * Our own online checker: every trader the page shows, from Torn's public
+ * profile with your Limited key. Like TornExchange's own job, each is
+ * re-checked every 10 minutes (every 90 s while its item is open), and no
+ * more than SELL_PRESENCE_PER_MIN a minute are asked - inside the shared
+ * 70/min, leaving room for the panel in other tabs. Visible tab only.
+ */
+const SELL_PRESENCE_REFRESH_MS = 10 * 60 * 1000;
+const SELL_PRESENCE_OPEN_REFRESH_MS = 90000;
 const SELL_PRESENCE_MAX_PENDING = 3;
-/* At most this many traders' statuses are kept fresh at once. */
-const SELL_PRESENCE_MAX = 20;
+const SELL_PRESENCE_PER_MIN = 30;
 /* A failed TornExchange call is not retried sooner than this. */
 const TE_RETRY_MS = 5 * 60 * 1000;
 /* Inventory is asked again after this, or on Refresh. */
@@ -1970,9 +1993,24 @@ function sellPresenceOf(id) {
 function sellStatusMap(now) {
     const out = new Map();
     for (const [id, s] of sell.presence) {
-        if (s.presence) out.set(id, { name: s.presence.name, ...presenceWord(s.presence, now) });
+        if (!s.presence) continue;
+        const word = presenceWord(s.presence, now);
+        // Online but in hospital, in jail or flying: they may not trade right
+        // now, so not the plain green of "Online".
+        const state = s.presence.state;
+        if (state && state !== 'Okay' && word.level !== 'offline') {
+            out.set(id, { name: s.presence.name, ...word, level: 'busy', text: s.presence.online + ' · ' + state });
+        } else {
+            out.set(id, { name: s.presence.name, ...word });
+        }
     }
     return out;
+}
+
+/** Is a trader's status unknown (never answered yet)? */
+function presenceUnknown(id) {
+    const s = sell.presence.get(String(id));
+    return !s || (!s.presence && !s.retryAt);
 }
 
 /* ---------------------------------------------------- trader database */
@@ -2059,6 +2097,11 @@ function renderSelling() {
 
     const w3bByItem = w3bIndex(now);
     const teMap = sell.traders ? sell.traders.map : new Map();
+    // TornExchange's votes for the trust badge, from every answer we have.
+    const votesById = votesByTrader([
+        ...teMap.values(),
+        ...[...sell.teOne.values()].filter((rec) => rec.best).map((rec) => [rec.best]),
+    ]);
     const buyersCache = new Map();
     const buyersAll = (itemId) => {
         const id = String(itemId);
@@ -2075,6 +2118,7 @@ function renderSelling() {
                 db: sell.db,
                 w3bByItem,
                 dbIdsByName: sell.dbIdsByName,
+                votesById,
             });
             buyersCache.set(id, b);
         }
@@ -2104,9 +2148,25 @@ function renderSelling() {
         return !one || Boolean(one.failed);
     };
 
+    /*
+     * Every item you hold with every trader, whatever the filters: what the
+     * online checker and "best trader for you" work from.
+     */
+    const myAll = sell.inventory ? itemRows(heldIds(), { buyersOf: buyersAll, nameOf }) : [];
+    const best = bestTradersFor(myAll, 3);
+    const traderKey = (b) => (b.id ? String(b.id) : 'name:' + String(b.name).toLowerCase());
+    const filterTrader = sell.traderFilter ? best.find((e) => traderKey(e.trader) === sell.traderFilter) : null;
+    if (sell.traderFilter && !filterTrader) sell.traderFilter = null;
+    const onlyItems = filterTrader ? new Set(filterTrader.bestOn) : null;
+
     /* My items: everything you hold, those with a trader first. */
-    const my = sell.inventory ? itemRows(heldIds(), { buyersOf, nameOf, query: sell.queries.my }) : [];
-    for (const r of my) r.pending = !r.best && pendingFor(r.itemId);
+    let my = sell.inventory ? itemRows(heldIds(), { buyersOf, nameOf, query: sell.queries.my }) : [];
+    if (onlyItems) my = my.filter((r) => onlyItems.has(r.itemId));
+    for (const r of my) {
+        // With Online only, not knowing a trader's status yet is not "nobody online".
+        const statusPending = prefs.onlineOnly && buyersAll(r.itemId).some((b) => b.id && presenceUnknown(b.id));
+        r.pending = !r.best && (pendingFor(r.itemId) || statusPending);
+    }
 
     /* All items: every item any trader buys. */
     const oneIds = [...sell.teOne].filter(([, rec]) => rec.best).map(([id]) => id);
@@ -2114,7 +2174,9 @@ function renderSelling() {
     const allRows = itemRows(allIds, { buyersOf, nameOf, query: sell.queries.all }).filter((r) => r.best);
     const all = allRows.slice(0, sell.allShown);
 
-    updateSellPresence(tradersToCheck(my, all), now);
+    const watch = tradersToCheck(myAll, all, best);
+    updateSellPresence(watch, now);
+    const statusesKnown = watch.ids.filter((id) => !presenceUnknown(id)).length;
 
     const itemLists = new Map();
     for (const [id, s] of sell.listState) itemLists.set(id, s);
@@ -2125,6 +2187,9 @@ function renderSelling() {
         my,
         all,
         allTotal: allRows.length,
+        myTotal: myAll.length,
+        best: best.map((e) => ({ trader: e.trader, bestOn: e.bestOn.length, buys: e.buys, key: traderKey(e.trader) })),
+        traderFilter: filterTrader ? { key: sell.traderFilter, name: filterTrader.trader.name, count: filterTrader.bestOn.length } : null,
         statuses: sellStatusMap(now),
         prefs,
         expanded: sell.expanded,
@@ -2151,6 +2216,10 @@ function renderSelling() {
             teStatus: !teKey ? 'nokey' : st.badKey ? 'badkey' : sell.traders ? 'ok' : 'loading',
             teOneDone,
             heldCount,
+            w3bKnown: stats.total,
+            w3bRead: stats.total - stats.unchecked,
+            statusesKnown,
+            statusesWanted: watch.ids.length,
             itemLists,
         },
     });
@@ -2169,16 +2238,27 @@ function countTraders(itemIds, buyersAll) {
  * of the first items in All items. Built from the rows as shown, so an open
  * row is never starved by the rest.
  */
-function tradersToCheck(my, all) {
+function tradersToCheck(my, all, best = []) {
     const ids = [];
-    const push = (b) => {
-        if (b && b.id && !ids.includes(String(b.id)) && ids.length < SELL_PRESENCE_MAX) ids.push(String(b.id));
+    const seen = new Set();
+    const open = new Set();
+    const push = (b, isOpen = false) => {
+        if (!b || !b.id) return;
+        const id = String(b.id);
+        if (isOpen) open.add(id);
+        if (seen.has(id)) return;
+        seen.add(id);
+        ids.push(id);
     };
     const rowsAll = (section, rows) => rows.filter((r) => sell.expanded.has(section + ':' + r.itemId));
-    for (const r of [...rowsAll('my', my), ...rowsAll('all', all)]) r.buyers.forEach(push);
-    for (const r of my) r.buyers.slice(0, 3).forEach(push);
+    for (const r of [...rowsAll('my', my), ...rowsAll('all', all)]) r.buyers.forEach((b) => push(b, true));
+    for (const e of best) push(e.trader);
+    // Every trader of every item you hold, best first per item: Online only
+    // needs to know about all of them.
+    const depth = Math.max(0, ...my.map((r) => r.buyers.length));
+    for (let i = 0; i < depth; i++) for (const r of my) push(r.buyers[i]);
     for (const r of all) push(r.best);
-    return ids;
+    return { ids, open };
 }
 
 /* ----------------------------------------------------------- loading */
@@ -2387,8 +2467,12 @@ function loadTeItemList(itemId) {
         .finally(() => renderSelling());
 }
 
-/** Traders' public statuses, when due: visible tab only, inside the shared budget. */
-function updateSellPresence(ids, now) {
+/**
+ * Traders' public statuses, when due, in the order given (most useful
+ * first): visible tab only, at most SELL_PRESENCE_PER_MIN a minute.
+ * @param {{ids: string[], open: Set<string>}} watch - from tradersToCheck
+ */
+function updateSellPresence({ ids, open }, now) {
     for (const id of ids) {
         if (!sell.presence.has(id)) {
             sell.presence.set(id, { presence: null, fetchedAt: 0, pending: false, retryAt: 0 });
@@ -2398,13 +2482,17 @@ function updateSellPresence(ids, now) {
 
     let pending = 0;
     for (const s of sell.presence.values()) if (s.pending) pending++;
+    sell.presenceAsked = (sell.presenceAsked || []).filter((t) => now - t < 60000);
 
     for (const id of ids) {
         if (pending >= SELL_PRESENCE_MAX_PENDING) break;
+        if (sell.presenceAsked.length >= SELL_PRESENCE_PER_MIN) break;
         const s = sell.presence.get(id);
-        if (s.pending || now < s.retryAt || now - s.fetchedAt < SELL_PRESENCE_REFRESH_MS) continue;
+        const every = open.has(id) ? SELL_PRESENCE_OPEN_REFRESH_MS : SELL_PRESENCE_REFRESH_MS;
+        if (s.pending || now < s.retryAt || now - s.fetchedAt < every) continue;
 
         pending++;
+        sell.presenceAsked.push(now);
         s.pending = true;
         fetchUserPresence(sell.client, id)
             .then((presence) => {
@@ -2516,13 +2604,24 @@ function onSellRefresh() {
     loadSellInventory({ force: true }).then(() => refreshSellTraders({ force: true }));
 }
 
-function onSellExpand(section, itemId) {
+/**
+ * Open or close an item. On a wide screen its traders show in the side
+ * panel, one item at a time (`single`); on a narrow one, under the item.
+ */
+function onSellExpand(section, itemId, { single = false } = {}) {
     const key = section + ':' + String(itemId);
     if (sell.expanded.has(key)) sell.expanded.delete(key);
     else {
+        if (single) sell.expanded.clear();
         sell.expanded.add(key);
         loadTeItemList(itemId);
     }
+    renderSelling();
+}
+
+/** Show only the items a trader pays the most for (null shows them all again). */
+function onSellTraderFilter(key) {
+    sell.traderFilter = key && key !== sell.traderFilter ? key : null;
     renderSelling();
 }
 
@@ -2565,7 +2664,14 @@ function bootSellingPage() {
     loadTraderDb();
     // Start from TornW3B's public traders, so no one source (or key) is
     // needed to see traders at all.
-    learnTraders(SEED_TRADERS.map(([id, name]) => ({ id, name, source: 'seed' })));
+    learnTraders(
+        SEED_TRADERS.map(([id, name]) => {
+            // A seed rating only where we have none: a TornW3B page you opened is newer.
+            const known = sell.db.traders[String(id)];
+            const r = SEED_RATINGS[id];
+            return { id, name, source: 'seed', rating: r && !(known && known.rating) ? { up: r[0], down: r[1] } : null };
+        }),
+    );
     sell.teOne = loadTeOne();
     // An error message is about the last call, not this visit: a stored one
     // (3.8.1 kept "That is a Torn key" forever) would outlive its cause.
@@ -2578,6 +2684,7 @@ function bootSellingPage() {
         onSaveTeKey: onSellSaveTeKey,
         onForgetTeKey: onSellForgetTeKey,
         onRetryTe: onSellRetryTe,
+        onTraderFilter: onSellTraderFilter,
         onRevealTeKey: () => getTeKey(),
         onRefresh: onSellRefresh,
         onPrefsChange: (partial) => {
@@ -2665,9 +2772,14 @@ function bootW3bHarvest() {
         const anchors = document.querySelectorAll('a[href*="/pricelist/"]');
         const found = traderLinksIn(anchors);
         if (!found.length) return;
-        const names = traderNamesInText(document.body ? document.body.innerText : '');
-        for (const f of found) if (!f.name && names.has(f.id)) f.name = names.get(f.id);
-        const sig = found.map((f) => f.id + ':' + f.name).join(',');
+        const text = document.body ? document.body.innerText : '';
+        const names = traderNamesInText(text);
+        const ratings = ratingsInText(text);
+        for (const f of found) {
+            if (!f.name && names.has(f.id)) f.name = names.get(f.id);
+            if (f.name && ratings.has(f.name)) f.rating = ratings.get(f.name);
+        }
+        const sig = found.map((f) => f.id + ':' + f.name + ':' + (f.rating ? f.rating.up + '/' + f.rating.down : '')).join(',');
         if (sig === last) return;
         last = sig;
         const db = readTraderDb(gmGet(STORE_TRADER_DB, null));

@@ -85,6 +85,17 @@ if (/[?&]from381=1/.test(location.search)) {
     _store[NS + 'sellKey'] = JSON.stringify(LIMITED);
     _store[NS + 'teState'] = JSON.stringify({ error: 'That is a Torn key. Paste the key from tornexchange.com.' });
 }
+// ?tornlayout=1: a Torn-like page - content centred in a 976px column - to
+// check the panel docks beside it without covering it.
+if (/[?&]tornlayout=1/.test(location.search)) {
+    document.addEventListener('DOMContentLoaded', () => {
+        const c = document.createElement('div');
+        c.className = 'content-wrapper';
+        c.style.cssText = 'width:976px;margin:0 auto;min-height:600px;background:#333;color:#ddd;padding:16px;box-sizing:border-box';
+        c.textContent = 'Torn content (976px, centred). The panel must never cover this box.';
+        document.body.prepend(c);
+    });
+}
 // ?sellprefs=<json> presets the selling page's own preferences.
 const _prefs = new URLSearchParams(location.search).get('sellprefs');
 if (_prefs) _store[NS + 'sellingPage'] = _prefs;

@@ -463,6 +463,23 @@ ${TOKENS_CSS}
     cursor: pointer;
 }
 
+/*
+ * Docked: the panel has its own column at the right edge, and Torn's page is
+ * narrowed by that much (see dock() in panel.js), so the two never overlap -
+ * open or collapsed. It stops above the bottom edge, where Torn keeps chat.
+ */
+.ttv2-panel.ttv2-docked {
+    width: var(--dock-width, 430px);
+    top: 8px;
+    right: 8px;
+    bottom: 48px;
+    height: auto;
+}
+
+.ttv2-panel.ttv2-docked.ttv2-collapsed {
+    bottom: auto;
+}
+
 /* ------------------------------------------------------------ status bar */
 
 .ttv2-body {
