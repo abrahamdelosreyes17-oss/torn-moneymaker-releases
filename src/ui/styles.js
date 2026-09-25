@@ -215,7 +215,8 @@ ${TOKENS_CSS}
     right: 16px;
     bottom: 16px;
     z-index: 2147483000;
-    width: 430px;
+    /* Its usual 430px, or the free space beside Torn's content when that is less. */
+    width: var(--fit-width, 430px);
     max-width: calc(100vw - 16px);
     /* One fixed height on every tab and page; lists scroll inside it. */
     height: min(75vh, 640px);
@@ -464,20 +465,52 @@ ${TOKENS_CSS}
 }
 
 /*
- * Docked: the panel has its own column at the right edge, and Torn's page is
- * narrowed by that much (see dock() in panel.js), so the two never overlap -
- * open or collapsed. It stops above the bottom edge, where Torn keeps chat.
+ * Fitted beside Torn's content (see fit() in panel.js): where the free space
+ * is narrower than the one-line header, the header takes two rows - the name
+ * and the deals on top, every button below - so nothing is ever cut short.
  */
-.ttv2-panel.ttv2-docked {
-    width: var(--dock-width, 430px);
-    top: 8px;
-    right: 8px;
-    bottom: 48px;
+.ttv2-panel.ttv2-narrow .ttv2-head {
+    flex-wrap: wrap;
     height: auto;
+    min-height: 30px;
+    padding: 4px 4px 4px 12px;
+    row-gap: 4px;
 }
 
-.ttv2-panel.ttv2-docked.ttv2-collapsed {
-    bottom: auto;
+.ttv2-panel.ttv2-narrow .ttv2-title {
+    flex: 1 0 100%;
+    white-space: normal;
+    overflow: visible;
+    text-overflow: clip;
+    line-height: 22px;
+}
+
+.ttv2-panel.ttv2-narrow .ttv2-mini {
+    white-space: nowrap;
+}
+
+/* The buttons row sits to the right, where they were. */
+.ttv2-panel.ttv2-narrow .ttv2-sell {
+    margin-left: auto;
+}
+
+/* The filter chips wrap to a second row rather than running off the edge. */
+.ttv2-panel.ttv2-narrow .ttv2-chips {
+    flex-wrap: wrap;
+    row-gap: 4px;
+}
+
+/* ...with Min and Cash together on the second row: the gap takes a row. */
+.ttv2-panel.ttv2-narrow .ttv2-chips-gap {
+    flex: 1 0 100%;
+    height: 0;
+}
+
+/* The status line wraps rather than cutting its message short. */
+.ttv2-panel.ttv2-narrow .ttv2-bar-left {
+    white-space: normal;
+    overflow: visible;
+    text-overflow: clip;
 }
 
 /* ------------------------------------------------------------ status bar */

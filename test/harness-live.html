@@ -87,12 +87,14 @@ if (/[?&]from381=1/.test(location.search)) {
 }
 // ?tornlayout=1: a Torn-like page - content centred in a 976px column - to
 // check the panel docks beside it without covering it.
-if (/[?&]tornlayout=1/.test(location.search)) {
+if (/[?&]tornlayout=\d/.test(location.search)) {
     document.addEventListener('DOMContentLoaded', () => {
         const c = document.createElement('div');
         c.className = 'content-wrapper';
-        c.style.cssText = 'width:976px;margin:0 auto;min-height:600px;background:#333;color:#ddd;padding:16px;box-sizing:border-box';
-        c.textContent = 'Torn content (976px, centred). The panel must never cover this box.';
+        // ?tornlayout=1: 976px, centred. ?tornlayout=<n> (n > 1): content up to n px from the right edge.
+        const gutter = Number(new URLSearchParams(location.search).get('tornlayout'));
+        c.style.cssText = (gutter > 1 ? 'width:calc(100% - ' + gutter + 'px);margin:0;' : 'width:976px;margin:0 auto;') + 'min-height:600px;background:#333;color:#ddd;padding:16px;box-sizing:border-box';
+        c.textContent = 'Torn content. The panel must never cover this box.';
         document.body.prepend(c);
     });
 }

@@ -105,8 +105,14 @@ export function isTypingTarget(event) {
     return false;
 }
 
-/** The panel docks beside Torn's content only when at least this wide fits. */
-const DOCK_MIN_WIDTH = 300;
+/** The panel's usual width. */
+const PANEL_WIDTH = 430;
+/** It fits beside Torn's content when at least this much room is there. */
+const FIT_MIN_WIDTH = 240;
+/** Space kept between it and Torn's content, and the window edge. */
+const FIT_GAP = 8;
+/** Narrower than this, the header takes two rows instead of cutting anything. */
+const TWO_ROW_BELOW = 420;
 
 /** Long enough to see, short enough not to get in the way. */
 const SCAN_ANIMATION_MS = 800;
@@ -355,9 +361,14 @@ export class Panel {
         parent.appendChild(this.host);
 
         window.addEventListener('resize', () => this.clampIntoView());
-        // Torn lays its page out after load: dock again once it has.
-        this.dock();
-        setTimeout(() => this.dock(), 1500);
+        // Torn lays its page out after load, and changes it without reloading:
+        // fit again once it has, and whenever the window or its content resizes.
+        this.fit();
+        setTimeout(() => this.clampIntoView(), 1500);
+        if (typeof ResizeObserver === 'function') {
+            this.fitObserver = new ResizeObserver(() => this.clampIntoView());
+            this.fitObserver.observe(document.documentElement);
+        }
 
         this.showPage('list');
 
@@ -820,13 +831,15 @@ export class Panel {
         handle.addEventListener('pointercancel', end);
     }
 
-    /** Put the panel's top-left corner here, kept fully on screen. */
+    /** Put the panel's top-left corner here: on screen, and never over Torn's content. */
     placeAt(left, top) {
+        this.fit();
         const rect = this.root.getBoundingClientRect();
-        const maxLeft = Math.max(0, window.innerWidth - rect.width);
+        const minLeft = this.minLeft || 0;
+        const maxLeft = Math.max(minLeft, window.innerWidth - rect.width);
         const maxTop = Math.max(0, window.innerHeight - Math.min(rect.height, 60));
 
-        this.root.style.left = Math.min(Math.max(0, left), maxLeft) + 'px';
+        this.root.style.left = Math.min(Math.max(minLeft, left), maxLeft) + 'px';
         this.root.style.top = Math.min(Math.max(0, top), maxTop) + 'px';
         this.root.style.right = 'auto';
         this.root.style.bottom = 'auto';
@@ -845,71 +858,44 @@ export class Panel {
         this.root.style.top = '';
         this.root.style.right = '';
         this.root.style.bottom = '';
-        this.dock();
+        this.fit();
     }
 
     clampIntoView() {
-        this.dock();
+        this.fit();
         if (!this.root || !this.root.style.left) return;
         const rect = this.root.getBoundingClientRect();
         this.placeAt(rect.left, rect.top);
     }
 
     /**
-     * Keep the panel off Torn's content. With no position of your own, it
-     * takes a column at the right edge and Torn's page is narrowed by that
-     * much (padding on <html>), so Torn's centred content moves over and
-     * nothing is covered - open or collapsed. The column is as wide as the
-     * window allows (up to 430px) while Torn's content still fits. If it does
-     * not fit, or Torn's content is not where we expect, nothing is reserved
-     * and the panel floats bottom-right as before. A position you dragged it
-     * to is always kept, and then nothing is reserved.
+     * The panel floats in front of the page, but only in the empty space to
+     * the right of Torn's content: it is sized to that space (up to its usual
+     * 430px) and can never be placed or dragged across Torn's content. Torn's
+     * page itself is never touched. Where that space is narrower than the
+     * one-line header, the header takes two rows - name and deals on top,
+     * the buttons below - so nothing is cut short. With no usable space at
+     * all (a very narrow window), it floats as it always did.
      */
-    dock() {
+    fit() {
         if (!this.root) return;
         const doc = this.root.ownerDocument || document;
-        const content = doc.querySelector('.content-wrapper');
-        let width = 0;
-        if (!this.root.style.left && content) {
-            // Torn's page is its sidebar plus its content column: both must fit.
-            const parts = [content, doc.getElementById('sidebarroot'), doc.getElementById('sidebar')].filter(Boolean);
-            const rects = parts.map((el) => el.getBoundingClientRect()).filter((r) => r.width > 0);
-            const contentWidth = Math.max(...rects.map((r) => r.right)) - Math.min(...rects.map((r) => r.left));
-            const free = window.innerWidth - contentWidth - 24;
-            width = Math.min(430, Math.floor(free - 16));
-            if (width < DOCK_MIN_WIDTH) width = 0;
-        }
-        this.reserve(doc, width ? width + 16 : 0);
-        this.root.classList.toggle('ttv2-docked', width > 0);
-        if (!width) return;
-        this.root.style.setProperty('--dock-width', width + 'px');
+        // Torn's page: its content column and its sidebar.
+        const parts = [doc.querySelector('.content-wrapper'), doc.getElementById('sidebarroot'), doc.getElementById('sidebar')].filter(Boolean);
+        const rects = parts.map((el) => el.getBoundingClientRect()).filter((r) => r.width > 0 && r.height > 0);
+        const contentRight = rects.length ? Math.max(...rects.map((r) => r.right)) : 0;
+        // Its resting place is 16px from the window's right edge (styles.js),
+        // and it keeps FIT_GAP clear of Torn's content on the left.
+        const free = Math.floor(window.innerWidth - contentRight - FIT_GAP - 16);
 
-        // Proof, not hope: if Torn's content still reaches under the panel,
-        // give the space back and float instead.
-        requestAnimationFrame(() => {
-            const c = content.getBoundingClientRect();
-            const p = this.root.getBoundingClientRect();
-            if (c.right > p.left + 1) {
-                this.reserve(doc, 0);
-                this.root.classList.remove('ttv2-docked');
-            }
-        });
-    }
-
-    /** Narrow Torn's page by `px` on the right (0 gives the space back). */
-    reserve(doc, px) {
-        let style = doc.getElementById('ttv2-dock-space');
-        if (!px) {
-            if (style) style.remove();
-            return;
+        let width = PANEL_WIDTH;
+        this.minLeft = 0;
+        if (rects.length && free >= FIT_MIN_WIDTH) {
+            width = Math.min(PANEL_WIDTH, free);
+            this.minLeft = Math.ceil(contentRight + FIT_GAP);
         }
-        if (!style) {
-            style = doc.createElement('style');
-            style.id = 'ttv2-dock-space';
-            (doc.head || doc.documentElement).appendChild(style);
-        }
-        const css = 'html { padding-right: ' + px + 'px !important; box-sizing: border-box !important; }';
-        if (style.textContent !== css) style.textContent = css;
+        this.root.style.setProperty('--fit-width', width + 'px');
+        this.root.classList.toggle('ttv2-narrow', width < TWO_ROW_BELOW);
     }
 
     setCollapsed(collapsed, { save = false } = {}) {
@@ -1500,8 +1486,8 @@ export class Panel {
 
     destroy() {
         if (this.ticker) clearInterval(this.ticker);
+        if (this.fitObserver) this.fitObserver.disconnect();
         clearTimeout(this.scanTimer);
-        if (this.root) this.reserve(this.root.ownerDocument || document, 0);
         if (this.hotkeyHandler && this.hotkeyTarget) {
             this.hotkeyTarget.removeEventListener('keydown', this.hotkeyHandler);
             this.hotkeyHandler = null;

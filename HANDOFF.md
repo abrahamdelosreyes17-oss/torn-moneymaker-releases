@@ -3,9 +3,9 @@
 Read this first, then `README.md`. The README holds the product and the binding
 rules; this file holds where we are, how the owner works, and what is settled.
 
-## Where things stand (3.9.4, 2026-09-25)
+## Where things stand (3.9.5, 2026-09-25)
 
-- **Version 3.9.4** on branch `claude/optimistic-ride-1gqguu`, on top of 3.8.1
+- **Version 3.9.5** on branch `claude/optimistic-ride-1gqguu`, on top of 3.8.1
   (`0210c53`) and the cloud session's handoff commits.
 - **`main` is still at 2.9.3.** The script's `@updateURL` points at `main`, so
   installs are done from **pinned links**:
@@ -140,18 +140,24 @@ Fixed and built in 3.9.4:
    The owner asked for "more successful trades = more trusted". Trade counts
    are only on TornExchange's and TornW3B's HTML pages, so votes stand in for
    them. **Ask** whether to also read trade counts.
-8. **The panel on Torn pages no longer covers Torn's content.**
-   - With no position of your own, it takes a column at the right edge, and
-     Torn's page is narrowed by that much (padding on `<html>`).
-   - Open or collapsed, it keeps its full bar; the owner did NOT want a small
-     pill.
-   - When there's no room, or Torn's content isn't where we expect
-     (`.content-wrapper` plus `#sidebarroot`), nothing is reserved and it
-     floats as before. That is checked after docking, not assumed.
-   - A position dragged before 3.9.4 is let go once (`settings.docked`).
-   - **Not verified on a real Torn page:** the selectors are Torn's usual
-     ones. If Torn's content still sits under the panel, the fallback floats
-     it instead.
+8. **The panel on Torn pages: see 3.9.5.** 3.9.4 narrowed Torn's page to make
+   room; the owner rejected that. It is gone.
+
+**3.9.5 - the panel fits beside Torn's content** (the owner's screenshots: the
+floating bar was right, but its left end crossed into Torn's content):
+- It floats in front, as before. Torn's page is never moved or resized.
+- `fit()` in `panel.js` measures where Torn's content ends (the union of
+  `.content-wrapper`, `#sidebarroot` and `#sidebar`) and sizes the panel to
+  the free space on the right (up to 430px, 8px clear of the content).
+- `placeAt()` never lets it be placed or dragged across the content.
+- It fits again on resize and when Torn changes its layout (ResizeObserver).
+- **Nothing is shortened** (the owner's rule). Under 420px the header takes
+  two rows (name and deals, then every button), and the chips (sell-to, then
+  Min and Cash) and the status line wrap.
+- With less than 240px of room (a very narrow window), it floats as it
+  always did.
+- **Not verified on a real Torn page:** the selectors are Torn's usual ones.
+  The harness checks it with `?tornlayout=<free px>`.
 
 Still ideas, not built:
 - TornExchange's `/api/profile?user_id=` gives a trader's online status,
@@ -241,8 +247,9 @@ PWPATH=$(npm root -g)/playwright node test/ux-check.mjs   # real-browser checks
   - `&slow=1` answers status lookups slowly;
   - `&nofeed=1` turns the feed off;
   - `&tebad=1` saves a TornExchange key it rejects;
-  - `?tornlayout=1` (not on the traders page) puts a Torn-like 976px content
-    column on the page, to check the panel docks beside it;
+  - `?tornlayout=<n>` (not on the traders page) puts Torn-like content on the
+    page, leaving n px free on the right (1 means a centred 976px column), to
+    check the panel fits beside it;
   - `&from381=1` reproduces what 3.8.1 left behind (the Limited key saved, no
     TornExchange key, and its refusal message stored);
   - `?ownbazaar=1&page=bazaar#/add` opens your own add page with a week of
