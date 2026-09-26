@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      3.10.3
+// @version      3.11.0
 // @description  Finds Bazaar and Item Market listings below NPC / market value - on the page you are viewing, and live from the Torn API and TornW3B - ranked by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -40,7 +40,7 @@
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '3.10.3';
+    const TTV2_BUILD_VERSION = '3.11.0';
 
     /* ===== src/platform/gm.js ===== */
     /*
@@ -1417,6 +1417,168 @@
                 String(a.id).localeCompare(String(b.id), undefined, { numeric: true }),
         );
         return scored.map((s) => s.id);
+    }
+
+    /* ===== src/core/flips.js ===== */
+    /*
+     * Torn Bids' buy side: flips, and where to sell what you hold. Pure - no
+     * DOM, no network. Who pays what is worked out in core/traders.js; the
+     * bazaar listings come from TornW3B (core/feed.js normalizes them).
+     *
+     *   - A flip buys from bazaars, cheapest first, only below a trader's price,
+     *     only with the cash you set, and only listings TornW3B saw lately.
+     *   - Where to sell: a trader pays now; your bazaar and the Item Market pay
+     *     only when someone buys, so the trader wins unless waiting pays at
+     *     least LIST_EDGE more.
+     */
+
+
+
+
+    /** A listing TornW3B has not re-checked for this long may have sold: no flip is planned on it. */
+    const FLIP_FRESH_MS = 30 * 60 * 1000;
+
+    /** Waiting for a buyer must pay at least this much more than a trader pays now. */
+    const LIST_EDGE = 0.01;
+
+    /** How many flip candidates are checked against TornW3B's listings, best first. */
+    const FLIP_CANDIDATES = 30;
+
+    /**
+     * Bazaar listings to show and to plan on: your own left out (you cannot buy
+     * from yourself, and you would not undercut yourself), each marked stale
+     * when TornW3B has not seen it lately. Cheapest first.
+     *
+     * @param {Array<{sellerId, sellerName, price, qty, dataAt}>} rows - normalizeW3bListings output
+     * @param {object} [opts]
+     * @param {string|null} [opts.selfId] - your Torn id, when known
+     */
+    function bazaarSellers(rows, { selfId = null, now = Date.now(), freshMs = FLIP_FRESH_MS } = {}) {
+        const self = selfId ? String(selfId) : null;
+        return (rows || [])
+            .filter((r) => r && r.price > 0 && r.qty > 0 && (!self || String(r.sellerId) !== self))
+            .map((r) => ({ ...r, stale: !(r.dataAt && now - r.dataAt <= freshMs) }))
+            .sort((a, b) => a.price - b.price);
+    }
+
+    /**
+     * Buy from the cheapest fresh listings first, while they cost less than the
+     * trader pays and the cash lasts. A listing only partly affordable is bought
+     * in part, and nothing after it.
+     *
+     * @param {Array} sellers - bazaarSellers output
+     * @param {number} bid - what the trader pays per item
+     * @param {object} [opts]
+     * @param {number|null} [opts.cash] - null or 0: no limit
+     * @returns {null|{units, cost, profit, each, firstPrice, needs, steps: Array<{sellerId, sellerName, qty, price}>}}
+     *   null when no fresh listing is under the bid. `units` 0 with `needs` set:
+     *   the cheapest one costs more than your cash.
+     */
+    function flipPlan(sellers, bid, { cash = null } = {}) {
+        if (!(bid > 0)) return null;
+        const under = (sellers || []).filter((s) => !s.stale && s.price < bid);
+        if (!under.length) return null;
+
+        const limit = cash > 0 ? cash : Infinity;
+        let left = limit;
+        let units = 0;
+        let cost = 0;
+        let profit = 0;
+        const steps = [];
+        for (const s of under) {
+            const n = Math.min(s.qty, Math.floor(left / s.price));
+            if (n <= 0) break;
+            steps.push({ sellerId: s.sellerId, sellerName: s.sellerName, qty: n, price: s.price });
+            units += n;
+            cost += n * s.price;
+            profit += n * (bid - s.price);
+            left -= n * s.price;
+            if (n < s.qty) break;
+        }
+        return {
+            units,
+            cost,
+            profit,
+            steps,
+            each: bid - under[0].price,
+            firstPrice: under[0].price,
+            needs: units ? 0 : under[0].price,
+        };
+    }
+
+    /**
+     * Where to sell what you hold, per item and for all of it.
+     *
+     * @param {object} p
+     * @param {number} p.held
+     * @param {number|null} p.bid           - the best trader's price (after your Show choices)
+     * @param {number|null} p.bazaarLowest  - the cheapest bazaar listing, not yours
+     * @param {number|null} p.marketLowest  - the cheapest Item Market listing
+     * @returns {{options: Array<{venue, each}>, best: string|null, gain: number}}
+     *   options in a fixed order (trader, bazaar, market), `each` null where not
+     *   known; `best` the venue to use; `gain` what it makes over the trader for
+     *   everything you hold (0 when the trader is best or there is none).
+     */
+    function whereToSell({ held, bid = null, bazaarLowest = null, marketLowest = null, edge = LIST_EDGE }) {
+        const options = [
+            { venue: 'trader', each: bid > 0 ? bid : null },
+            // $1 under the cheapest; never below $1.
+            { venue: 'bazaar', each: bazaarLowest > 1 ? bazaarLowest - 1 : null },
+            { venue: 'market', each: marketLowest > 1 ? Math.floor((marketLowest - 1) * (1 - VENUE_FEES.ITEM_MARKET)) : null },
+        ];
+        const known = options.filter((o) => o.each !== null);
+        if (!known.length) return { options, best: null, gain: 0 };
+
+        let best = options[0].each !== null ? options[0] : null;
+        for (const o of options.slice(1)) {
+            if (o.each === null) continue;
+            // Against a trader, waiting has to pay enough to be worth it.
+            const floor = options[0].each !== null ? options[0].each * (1 + edge) : 0;
+            if (o.each >= floor && (!best || o.each > best.each)) best = o;
+        }
+        const gain = best && options[0].each !== null && best.venue !== 'trader' ? (best.each - options[0].each) * (held || 0) : 0;
+        return { options, best: best ? best.venue : null, gain };
+    }
+
+    /**
+     * Items worth checking for a flip, from TornW3B's one-call summary (whose
+     * lowest price can lag, so a candidate is only a candidate until its own
+     * listings are read). Items you cannot afford one of are left out.
+     *
+     * @param {Map<string, {lowestPrice: number|null}>} summary
+     * @param {function} bidOf - (itemId) => the best trader price or null
+     * @param {object} [opts]
+     * @param {number|null} [opts.cash]
+     * @param {number} [opts.limit]
+     * @returns {Array<{itemId, lowest, bid, each, score}>} best first
+     */
+    function flipCandidates(summary, bidOf, { cash = null, limit = FLIP_CANDIDATES } = {}) {
+        const out = [];
+        for (const [itemId, s] of summary || []) {
+            const lowest = s && s.lowestPrice;
+            if (!(lowest > 1)) continue;
+            const bid = bidOf(itemId);
+            if (!(bid > lowest)) continue;
+            const afford = cash > 0 ? Math.floor(cash / lowest) : 100;
+            if (afford <= 0) continue;
+            const each = bid - lowest;
+            out.push({ itemId: String(itemId), lowest, bid, each, score: each * Math.min(afford, 100) });
+        }
+        out.sort((a, b) => b.score - a.score || b.each - a.each);
+        return out.slice(0, limit);
+    }
+
+    /**
+     * The words on a bazaar card a trusted trader pays more for, or null.
+     * Two lines, never cut: the card is narrow, so the line breaks instead.
+     *
+     * @param {{name, price, trust}|null} buyer - the best buyer
+     * @param {number} listingPrice
+     */
+    function traderTagLabel(buyer, listingPrice) {
+        if (!buyer || !buyer.trust || buyer.trust.level !== 'Trusted') return null;
+        if (!(buyer.price > listingPrice) || !(listingPrice > 0)) return null;
+        return buyer.name + ' pays ' + formatMoney(buyer.price) + '\n+' + formatMoney(buyer.price - listingPrice) + ' each';
     }
 
     /* ===== src/core/leader.js ===== */
@@ -5222,6 +5384,57 @@
         pointer-events: none !important;
     }
 
+    /*
+     * A trusted trader pays more than this listing asks: "FAFFO pays $73,500 /
+     * +$3,500 each", drawn the same way as the profit label and just as unable
+     * to catch a click. Two lines that wrap inside the card - never cut. On a
+     * card that is also a deal, the trader line goes under the profit.
+     */
+    .ttv2-trader {
+        position: relative !important;
+    }
+
+    .ttv2-trader.ttv2-trader::after {
+        content: attr(data-ttv2-trader) !important;
+
+        display: block !important;
+        position: absolute !important;
+        top: 0 !important;
+        right: 0 !important;
+        left: auto !important;
+        bottom: auto !important;
+
+        width: auto !important;
+        height: auto !important;
+        min-width: 0 !important;
+        max-width: 100% !important;
+        margin: 0 !important;
+        padding: 1px 4px !important;
+        transform: none !important;
+
+        overflow: visible !important;
+        white-space: pre-line !important;
+        text-align: right !important;
+        opacity: 1 !important;
+        visibility: visible !important;
+        z-index: 2147483000 !important;
+
+        background: rgba(10, 40, 16, 0.92) !important;
+        border: 1px solid #35d35a !important;
+        border-radius: 0 0 0 5px !important;
+
+        color: #7ee08f !important;
+        font: 800 11px/14px Arial, Helvetica, sans-serif !important;
+
+        pointer-events: none !important;
+    }
+
+    .ttv2-hit.ttv2-trader.ttv2-trader::after {
+        content: attr(data-ttv2-profit) "\\A" attr(data-ttv2-trader) !important;
+        white-space: pre-line !important;
+        text-align: right !important;
+    }
+
     /* The listing a feed link was opened for. Paint-only, like .ttv2-hit. */
     .ttv2-target {
         box-shadow:
@@ -8103,29 +8316,30 @@
 
     /* ===== src/ui/selling-page.js ===== */
     /*
-     * Torn Bids: who pays most for each item you hold.
+     * Torn Bids: every item, both sides - who pays most for it, who sells it
+     * cheapest, the flips in between, and where to sell what you hold.
      *
      * Its own tab, on a page of our own (see route.js): the script draws the
-     * whole page. It reads only the Torn API (your inventory, with the Limited
-     * key kept here), TornExchange and TornW3B. Nothing is traded, listed or
-     * clicked for you.
+     * whole page. It reads only the Torn API (with the Limited key kept here),
+     * TornExchange and TornW3B. Nothing is traded, listed or clicked for you:
+     * every link is one you follow yourself.
      *
-     * The layout (the owner picked it from mockups, mockups/E-torn-bids.html):
+     * The layout (the owner picked it from mockups, mockups/H-item-desk.html):
      *   - a header with the name, one search box, every source as a pill;
-     *   - a line of headline numbers;
-     *   - your items on the left, in the view you choose - Cards, Rows or a
-     *     sortable Table, switched like a file explorer's views - and "Who to
-     *     message" pinned on the right;
-     *   - clicking an item slides its traders in from the right; nothing under
-     *     it moves; ✕ or Esc closes it;
-     *   - one scrollbar: the page scrolls, the right column stays put.
+     *   - the best flips your cash can make, across the top;
+     *   - the desk: every item on the left (All / Mine / Flips), and on the
+     *     right everything about the one picked, at once - traders pay, bazaars
+     *     sell, the flip plan and, for what you hold, where to sell it;
+     *   - one scrollbar: the page scrolls, the desk stays in view.
      *
-     * Colour means something: green is the best price and "online", orange is
-     * online but busy (hospital, jail, flying), blue is a link, grey is the rest.
-     * A status we do not know yet shows nothing - never a placeholder. Nothing is
-     * cut short with an ellipsis. Names from Torn, TornExchange or TornW3B only
-     * ever go in via textContent.
+     * Colour means something: green is the best price, the money made and
+     * "online", orange is online but busy (hospital, jail, flying), blue is a
+     * link, grey is the rest. A status we do not know yet shows nothing - never a
+     * placeholder. Nothing is cut short with an ellipsis. Names from Torn,
+     * TornExchange or TornW3B only ever go in via textContent.
      */
+
+
 
 
 
@@ -8138,21 +8352,42 @@
     const SELLING_PAGE_DEFAULTS = {
         /* Only traders known to be online. */
         onlineOnly: false,
-        /* Only traders whose trust badge is Trusted. */
-        trustedOnly: false,
-        /* 'cards' | 'rows' | 'table' */
-        view: 'cards',
-        /* Profile and price-list links open a new tab. */
+        /* Only traders whose trust badge is Trusted. On from the start: money changes hands on trust. */
+        trustedOnly: true,
+        /* Flips never plan to spend more than this; null is no limit. */
+        cash: null,
+        /* Every link opens a new tab. */
         linksNewTab: true,
     };
 
-    const SELLING_VIEWS = ['cards', 'rows', 'table'];
-
-    /** All items shows this many rows at a time. */
+    /** The item list shows this many at a time. */
     const ALL_ITEMS_PAGE = 50;
 
-    /** Columns the Rows and Table views sort by (main.js does the sorting). */
-    const SORT_KEYS = ['name', 'price', 'buyer', 'next', 'traders'];
+    /** Traders and bazaars shown per item before "Show all". */
+    const DESK_ROWS = 5;
+
+    /** The item list's filters. */
+    const SELL_FILTERS = ['all', 'mine', 'flips'];
+
+    /** Your own bazaar's add page, where you list what you hold. */
+    const MY_BAZAAR_ADD_URL = 'https://www.torn.com/bazaar.php#/add';
+
+    /** The Item Market's add-listing page. */
+    const MARKET_ADD_URL = 'https://www.torn.com/page.php?sid=ItemMarket#/addListing';
+
+    function spProfileUrl(id) {
+        return 'https://www.torn.com/profiles.php?XID=' + encodeURIComponent(String(id));
+    }
+
+    /** Torn's trade page, started with one player. */
+    function tradeUrl(id) {
+        return 'https://www.torn.com/trade.php#step=start&userID=' + encodeURIComponent(String(id));
+    }
+
+    /** Torn's own picture of an item, as its pages show it. */
+    function itemImageUrl(itemId) {
+        return 'https://www.torn.com/images/items/' + encodeURIComponent(String(itemId)) + '/small.png';
+    }
 
     function spEl(tag, props = {}, children = []) {
         const node = document.createElement(tag);
@@ -8172,41 +8407,13 @@
         return node;
     }
 
-    const SP_SVG_NS = 'http://www.w3.org/2000/svg';
-
-    /** The view icons, like a file explorer's: four tiles, three bars, a grid. */
-    function viewIcon(view) {
-        const svg = document.createElementNS(SP_SVG_NS, 'svg');
-        svg.setAttribute('viewBox', '0 0 16 16');
-        svg.setAttribute('aria-hidden', 'true');
-        const rect = (x, y, w, h, rx = 1) => {
-            const r = document.createElementNS(SP_SVG_NS, 'rect');
-            for (const [k, v] of Object.entries({ x, y, width: w, height: h, rx })) r.setAttribute(k, String(v));
-            svg.appendChild(r);
-        };
-        if (view === 'cards') {
-            rect(1, 1, 6, 6);
-            rect(9, 1, 6, 6);
-            rect(1, 9, 6, 6);
-            rect(9, 9, 6, 6);
-        } else if (view === 'rows') {
-            rect(1, 1.5, 14, 3.5);
-            rect(1, 6.25, 14, 3.5);
-            rect(1, 11, 14, 3.5);
-        } else {
-            rect(1, 1, 14, 2, 0.5);
-            for (const y of [5, 8, 11, 14]) rect(1, y, 14, 1.4, 0);
-        }
-        return svg;
+    /** "+$3,500" / "−$60,005": money made or lost. */
+    function signed(n) {
+        return (n >= 0 ? '+' : '−') + formatMoney(Math.abs(n));
     }
 
-    function spProfileUrl(id) {
-        return 'https://www.torn.com/profiles.php?XID=' + encodeURIComponent(String(id));
-    }
-
-    /** Torn's own picture of an item, as its pages show it. */
-    function itemImageUrl(itemId) {
-        return 'https://www.torn.com/images/items/' + encodeURIComponent(String(itemId)) + '/small.png';
+    function count(n) {
+        return Number(n).toLocaleString('en-US');
     }
 
     /** A masked key field with Show / Save. The saved key is never left in the field. */
@@ -8262,69 +8469,55 @@
          *   onSaveKey(key), onForgetKey(), onRevealKey()
          *   onSaveTeKey(key), onForgetTeKey(), onRevealTeKey(), onRetryTe()
          *   onRefresh(), onPrefsChange(partial)
-         *   onExpand(section, itemId)   - open (or close) an item's traders
-         *   onQuery(section, text), onMore(), onSort(key)
-         *   onTraderFilter(key|null), onOpenUrl(url)
+         *   onSelect(itemId)            - pick an item for the desk
+         *   onFilter(key), onQuery(text), onMore()
+         *   onOpenUrl(url)
          */
         constructor(handlers = {}) {
             this.h = handlers;
             this.state = {
-                my: [],
-                all: [],
-                allTotal: 0,
-                myTotal: 0,
-                best: [],
-                traderFilter: null,
-                detail: null,
-                stats: {},
-                sort: { key: 'price', dir: -1 },
+                strip: [],
+                list: [],
+                listTotal: 0,
+                counts: { all: 0, mine: 0, flips: 0 },
+                filter: 'all',
+                desk: null,
                 prefs: { ...SELLING_PAGE_DEFAULTS },
                 info: {},
-                expanded: new Set(),
                 statuses: new Map(),
             };
             this.view = 'list';
-            this.tab = 'my';
-            this.queries = { my: '', all: '' };
+            this.query = '';
             this.images = new Map();
-            /* Row order last drawn, and which list the pointer is over. */
-            this.order = { my: [], all: [] };
-            this.hover = { my: false, all: false };
-            this.orderAsked = { my: '', all: '' };
+            /* Row order last drawn, and whether the pointer is over the list. */
+            this.order = [];
+            this.hover = false;
+            this.orderAsked = '';
+            /* "Show all" in the desk, for the item it was pressed on. */
+            this.showAll = { item: null, buyers: false, sellers: false };
         }
 
         /**
          * Rows re-sort as prices arrive. Under the pointer that would move the
-         * row you are about to click, so while the pointer is over a list its
+         * row you are about to click, so while the pointer is over the list its
          * order is kept; it re-sorts when the pointer leaves. New rows go last.
-         * Only prices arriving are held back: a new sort, search, filter or Show
+         * Only prices arriving are held back: a new filter, search or Show
          * toggle is something you asked for, and it applies at once.
          */
-        stableOrder(section, rows) {
+        stableOrder(rows) {
             const s = this.state;
-            const asked = JSON.stringify([s.sort, this.queries[section], s.traderFilter && s.traderFilter.key, s.prefs.onlineOnly, s.prefs.trustedOnly]);
-            const changed = asked !== this.orderAsked[section];
-            this.orderAsked[section] = asked;
-            if (changed || !this.hover[section] || !this.order[section].length) {
-                this.order[section] = rows.map((r) => r.itemId);
+            const asked = JSON.stringify([s.filter, this.query, s.prefs.onlineOnly, s.prefs.trustedOnly, s.prefs.cash]);
+            const changed = asked !== this.orderAsked;
+            this.orderAsked = asked;
+            if (changed || !this.hover || !this.order.length) {
+                this.order = rows.map((r) => r.itemId);
                 return rows;
             }
-            const at = new Map(this.order[section].map((id, i) => [id, i]));
+            const at = new Map(this.order.map((id, i) => [id, i]));
             const pos = (r) => (at.has(r.itemId) ? at.get(r.itemId) : 1e9);
             const kept = rows.slice().sort((a, b) => pos(a) - pos(b));
-            this.order[section] = kept.map((r) => r.itemId);
+            this.order = kept.map((r) => r.itemId);
             return kept;
-        }
-
-        watchHover(section, el) {
-            el.addEventListener('pointerenter', () => {
-                this.hover[section] = true;
-            });
-            el.addEventListener('pointerleave', () => {
-                this.hover[section] = false;
-                this.lastSig = null;
-                this.renderSections();
-            });
         }
 
         mount() {
@@ -8353,34 +8546,26 @@
 
             this.keyHandler = (event) => {
                 if (event.key === 'Escape') {
-                    if (this.state.detail && this.view === 'list') {
-                        this.closeDetail();
-                        return;
-                    }
                     if (this.view === 'settings') this.showView('list');
                     return;
                 }
-                // "/" jumps to the search box, as on most sites with one - not
-                // while a phone's full-screen side panel covers it.
+                // "/" jumps to the search box, as on most sites with one.
                 const typing = event.composedPath().some((n) => n && (n.tagName === 'INPUT' || n.tagName === 'TEXTAREA'));
-                if (event.key === '/' && !typing && this.view === 'list' && !this.drawerCovers()) {
+                if (event.key === '/' && !typing && this.view === 'list') {
                     event.preventDefault();
                     this.searchEl.focus();
                 }
             };
             document.addEventListener('keydown', this.keyHandler);
-            if (typeof window.matchMedia === 'function') {
-                this.coverQuery = window.matchMedia('(max-width: 1000px)');
-                this.coverListener = () => this.coverCheck();
-                if (this.coverQuery.addEventListener) this.coverQuery.addEventListener('change', this.coverListener);
-            }
+            this.resizeHandler = () => this.fitDesk();
+            window.addEventListener('resize', this.resizeHandler);
             this.ticker = setInterval(() => this.renderPills(), 1000);
         }
 
         destroy() {
             if (this.keyHandler) document.removeEventListener('keydown', this.keyHandler);
+            if (this.resizeHandler) window.removeEventListener('resize', this.resizeHandler);
             if (this.ticker) clearInterval(this.ticker);
-            if (this.coverQuery && this.coverQuery.removeEventListener) this.coverQuery.removeEventListener('change', this.coverListener);
             if (this.host && this.host.parentNode) this.host.parentNode.removeChild(this.host);
             document.documentElement.style.overflow = this.prevOverflow || '';
             this.host = null;
@@ -8403,18 +8588,18 @@
                 onclick: () => this.showView('list'),
             });
             this.titleEl = spEl('h1', { text: SELLING_PAGE_TITLE });
-            this.taglineEl = spEl('span', { class: 'sp-tagline', text: 'Who pays most for what you hold' });
+            this.taglineEl = spEl('span', { class: 'sp-tagline', text: 'Every item, both sides' });
             this.searchEl = spEl('input', {
                 type: 'search',
                 class: 'sp-search',
-                placeholder: 'Search your items… ( / )',
+                placeholder: 'Search items… ( / )',
                 'aria-label': 'Search items',
                 autocomplete: 'off',
                 spellcheck: 'false',
             });
             this.searchEl.addEventListener('input', () => {
-                this.queries[this.tab] = this.searchEl.value;
-                if (this.h.onQuery) this.h.onQuery(this.tab, this.searchEl.value);
+                this.query = this.searchEl.value;
+                if (this.h.onQuery) this.h.onQuery(this.searchEl.value);
             });
             this.pillsEl = spEl('div', { class: 'sp-pills' });
             this.refreshBtn = spEl('button', {
@@ -8445,51 +8630,7 @@
 
             this.bannerEl = spEl('div', { class: 'sp-banner', role: 'status' });
 
-            /* the headline numbers */
-            this.statsEl = spEl('section', { class: 'sp-stats', 'aria-label': 'Summary' });
-
-            /* the items: tabs, the trader filter, the view switch, then the view */
-            this.myCount = spEl('small');
-            this.allCount = spEl('small');
-            const tab = (key, label, count) =>
-                spEl('button', { type: 'button', class: 'sp-tab', role: 'tab', onclick: () => this.showTab(key) }, [label, count]);
-            this.tabBtns = { my: tab('my', 'My items', this.myCount), all: tab('all', 'All items', this.allCount) };
-            this.chipEl = spEl('div', { class: 'sp-chipbar', hidden: '' });
-
-            this.viewBtns = {};
-            const viewBtn = (key, label) => {
-                const btn = spEl('button', {
-                    type: 'button',
-                    title: label,
-                    'aria-pressed': 'false',
-                    onclick: () => set({ view: key }),
-                }, [viewIcon(key), label]);
-                this.viewBtns[key] = btn;
-                return btn;
-            };
-            this.viewsEl = spEl('div', { class: 'sp-views', role: 'group', 'aria-label': 'View' }, [
-                spEl('span', { text: 'View' }),
-                viewBtn('cards', 'Cards'),
-                viewBtn('rows', 'Rows'),
-                viewBtn('table', 'Table'),
-            ]);
-
-            this.myList = spEl('div', { class: 'sp-list' });
-            this.allList = spEl('div', { class: 'sp-list' });
-            this.watchHover('my', this.myList);
-            this.watchHover('all', this.allList);
-            this.moreBtn = spEl('button', {
-                type: 'button',
-                class: 'sp-btn sp-more',
-                text: 'Show more',
-                hidden: '',
-                onclick: () => this.h.onMore && this.h.onMore(),
-            });
-            this.mySection = spEl('section', { 'aria-label': 'My items' }, [this.myList]);
-            this.allSection = spEl('section', { 'aria-label': 'All items', hidden: '' }, [this.allList, this.moreBtn]);
-
-            /* the right column: who to message, and what to show */
-            this.whoEl = spEl('div', { class: 'sp-who-list' });
+            /* the best flips, and what the whole page shows */
             this.onlineBtn = spEl('button', {
                 type: 'button',
                 class: 'sp-toggle',
@@ -8502,35 +8643,65 @@
                 'aria-pressed': 'false',
                 onclick: () => set({ trustedOnly: !this.state.prefs.trustedOnly }),
             }, [spEl('span', { class: 'sp-trust', 'data-level': 'trusted', text: 'T' }), 'Trusted buyers only']);
+            this.stripEl = spEl('div', { class: 'sp-strip' });
+
+            /* the desk: every item, and the one picked */
+            this.chipBtns = {};
+            this.chipCounts = {};
+            const chip = (key, label) => {
+                this.chipCounts[key] = spEl('small');
+                const btn = spEl('button', {
+                    type: 'button',
+                    class: 'sp-chip-f',
+                    'aria-pressed': 'false',
+                    onclick: () => this.h.onFilter && this.h.onFilter(key),
+                }, [label, this.chipCounts[key]]);
+                this.chipBtns[key] = btn;
+                return btn;
+            };
+            this.listBox = spEl('div', { class: 'sp-list' });
+            this.listBox.addEventListener('pointerenter', () => {
+                this.hover = true;
+            });
+            this.listBox.addEventListener('pointerleave', () => {
+                this.hover = false;
+                this.listSig = null;
+                this.renderList();
+            });
+            this.moreBtn = spEl('button', {
+                type: 'button',
+                class: 'sp-btn sp-more',
+                text: 'Show more',
+                hidden: '',
+                onclick: () => this.h.onMore && this.h.onMore(),
+            });
+            this.deskEl = spEl('section', { class: 'sp-ws', 'aria-label': 'The item picked' });
 
             this.listEl = spEl('main', { class: 'sp-main' }, [
-                this.statsEl,
-                spEl('div', { class: 'sp-layout' }, [
-                    spEl('div', { class: 'sp-col-list' }, [
-                        spEl('div', { class: 'sp-top' }, [
-                            spEl('div', { class: 'sp-tabs', role: 'tablist' }, [this.tabBtns.my, this.tabBtns.all]),
-                            this.chipEl,
-                            this.viewsEl,
-                        ]),
-                        this.mySection,
-                        this.allSection,
+                spEl('div', { class: 'sp-wrap' }, [
+                    spEl('div', { class: 'sp-sec' }, [
+                        spEl('h2', { text: 'Best flips with your cash' }),
+                        spEl('span', { class: 'sp-sp' }),
+                        this.onlineBtn,
+                        this.trustedBtn,
                     ]),
-                    spEl('aside', { class: 'sp-rail' }, [
-                        spEl('section', { class: 'sp-box', 'aria-label': 'Who to message' }, [spEl('h2', { text: 'Who to message' }), this.whoEl]),
-                        spEl('section', { class: 'sp-box', 'aria-label': 'Show' }, [spEl('h2', { text: 'Show' }), this.onlineBtn, this.trustedBtn]),
+                    this.stripEl,
+                    spEl('div', { class: 'sp-desk' }, [
+                        spEl('div', { class: 'sp-col-list' }, [
+                            spEl('div', { class: 'sp-chips', role: 'group', 'aria-label': 'Show items' }, [chip('all', 'All'), chip('mine', 'Mine'), chip('flips', 'Flips')]),
+                            this.listBox,
+                            this.moreBtn,
+                        ]),
+                        this.deskEl,
                     ]),
                 ]),
             ]);
-
-            /* the item you pick: slides in from the right, over the page */
-            this.drawerEl = spEl('aside', { class: 'sp-drawer', 'aria-label': 'Traders for the item picked', 'aria-hidden': 'true' });
 
             /* settings */
             this.settingsEl = spEl('main', { class: 'sp-main', hidden: '' });
             this.buildSettings();
 
-            this.root = spEl('div', { class: 'sp-page' }, [this.headEl, this.bannerEl, this.listEl, this.settingsEl, this.drawerEl]);
-            this.showTab('my');
+            this.root = spEl('div', { class: 'sp-page' }, [this.headEl, this.bannerEl, this.listEl, this.settingsEl]);
         }
 
         buildSettings() {
@@ -8552,9 +8723,9 @@
             for (const [k, v] of [
                 ['Data storage', 'Only locally, in this browser'],
                 ['Data sharing', 'Nobody'],
-                ['Purpose of use', 'Personal gain: finding who pays most for your items'],
+                ['Purpose of use', 'Personal gain: who pays most for your items, and flips'],
                 ['Key storage & sharing', 'Stored locally / Not shared'],
-                ['Key access level', 'Limited (your inventory; item names; traders\' public status)'],
+                ['Key access level', 'Limited (your inventory and your own id; item names; Item Market prices; traders\' public status)'],
                 ['Other services', 'TornExchange, only with the key you log in there with'],
             ]) {
                 tos.appendChild(spEl('tr', {}, [spEl('th', { text: k }), spEl('td', { text: v })]));
@@ -8608,7 +8779,45 @@
                 ]),
             );
 
-            box.appendChild(section('TornW3B', [note(['Price lists are read from weav3r.dev. No key needed.'])]));
+            box.appendChild(section('TornW3B', [note(['Bazaar prices and traders\' price lists are read from weav3r.dev. No key needed.'])]));
+
+            /* Cash for flips */
+            this.cashInput = spEl('input', {
+                type: 'text',
+                class: 'sp-key',
+                placeholder: 'No limit',
+                'aria-label': 'Cash for flips',
+                autocomplete: 'off',
+                spellcheck: 'false',
+            });
+            this.cashStateEl = spEl('div', { class: 'sp-keystate' });
+            const saveCash = () => {
+                const text = this.cashInput.value.trim();
+                const cash = text ? parseMoneyInput(text) : null;
+                if (text && !(cash > 0)) {
+                    this.cashStateEl.textContent = 'Could not read "' + text + '". Try 5000000, 5m or 500k.';
+                    this.cashStateEl.className = 'sp-keystate sp-bad';
+                    return;
+                }
+                this.cashInput.value = '';
+                this.cashDirty = false;
+                if (this.h.onPrefsChange) this.h.onPrefsChange({ cash: cash || null });
+            };
+            this.cashInput.addEventListener('input', () => {
+                this.cashDirty = true;
+            });
+            this.cashInput.addEventListener('keydown', (event) => {
+                if (event.key !== 'Enter') return;
+                event.preventDefault();
+                saveCash();
+            });
+            box.appendChild(
+                section('Cash for flips', [
+                    spEl('div', { class: 'sp-inline' }, [this.cashInput, spEl('button', { type: 'button', class: 'sp-btn sp-primary', text: 'Save', onclick: saveCash })]),
+                    this.cashStateEl,
+                    note(['Flips never plan to spend more than this. Blank: no limit. Reads 5000000, 5,000,000, 5m or 500k.']),
+                ]),
+            );
 
             /* preferences */
             this.linksInput = spEl('input', { type: 'checkbox' });
@@ -8634,42 +8843,27 @@
             this.settingsBtn.setAttribute('aria-pressed', String(settings));
             this.titleEl.textContent = settings ? 'Settings' : SELLING_PAGE_TITLE;
             this.taglineEl.hidden = settings;
-            if (settings) this.closeDetail();
             this.renderBanner();
+            if (!settings) this.fitDesk();
         }
 
         openSettings() {
             this.showView('settings');
         }
 
-        /** My items or All items; the search box shows that tab's search. */
-        showTab(tab) {
-            this.tab = tab === 'all' ? 'all' : 'my';
-            for (const [key, btn] of Object.entries(this.tabBtns)) btn.setAttribute('aria-selected', String(key === this.tab));
-            this.mySection.hidden = this.tab !== 'my';
-            this.allSection.hidden = this.tab !== 'all';
-            if (this.searchEl.value !== this.queries[this.tab]) this.searchEl.value = this.queries[this.tab];
-        }
-
-        closeDetail() {
-            if (this.state.detail && this.h.onExpand) this.h.onExpand(this.state.detail.section, this.state.detail.itemId);
-        }
-
         /* ----------------------------------------------------------- render */
 
         /**
          * @param {object} view
-         *   my, all      - item rows: {itemId, name, buyers, best, pending}
-         *   allTotal     - items in All items before the page cut
-         *   myTotal      - items you hold
-         *   best         - who to message: [{trader, bestOn, buys, key}]
-         *   traderFilter - {key, name, count} while one trader's items are shown
-         *   detail       - the item picked: {section, itemId, name, buyers}
-         *   stats        - {held, withBuyer, buyersOnline, known}
-         *   sort         - {key, dir}
-         *   statuses     - Map traderId -> {level, text, title}
-         *   prefs        - this page's preferences
-         *   info         - key states, sources, loading
+         *   strip     - the best flips: [{itemId, name, plan, buyer}]
+         *   list      - item rows: [{itemId, name, held, lowest, badge, pending}]
+         *   listTotal - rows before the page cut
+         *   counts    - {all, mine, flips}
+         *   filter    - 'all' | 'mine' | 'flips'
+         *   desk      - the item picked (see renderDesk), or null
+         *   statuses  - Map traderId -> {level, text, title}
+         *   prefs     - this page's preferences
+         *   info      - key states, sources, loading
          */
         render(view) {
             Object.assign(this.state, view);
@@ -8678,20 +8872,20 @@
             const p = this.state.prefs;
             this.onlineBtn.setAttribute('aria-pressed', String(Boolean(p.onlineOnly)));
             this.trustedBtn.setAttribute('aria-pressed', String(Boolean(p.trustedOnly)));
-            for (const [key, btn] of Object.entries(this.viewBtns)) btn.setAttribute('aria-pressed', String(key === this.currentView()));
             this.linksInput.checked = p.linksNewTab !== false;
+            if (!this.cashDirty) {
+                this.cashInput.placeholder = p.cash > 0 ? formatMoney(p.cash) : 'No limit';
+                this.cashStateEl.className = 'sp-keystate';
+                this.cashStateEl.textContent = p.cash > 0 ? 'Saved: ' + formatMoney(p.cash) + '.' : 'No limit set.';
+            }
 
             this.renderKeyStates();
             this.renderPills();
             this.renderBanner();
-            this.renderStats();
-            this.renderSections();
-            this.renderDrawer();
-        }
-
-        currentView() {
-            const v = this.state.prefs.view;
-            return SELLING_VIEWS.includes(v) ? v : 'cards';
+            this.renderStrip();
+            this.renderList();
+            this.renderDesk();
+            this.fitDesk();
         }
 
         renderKeyStates() {
@@ -8730,7 +8924,8 @@
         /**
          * Every source as a small pill: a dot and a few words, the detail on
          * hover. A source in trouble turns amber here - it never takes over the
-         * page with a banner while the others are working.
+         * page with a banner while the others are working. The last one is your
+         * cash for flips: press it to change it.
          */
         renderPills() {
             if (!this.root) return;
@@ -8738,6 +8933,7 @@
             const now = Date.now();
             const pills = [];
             const pill = (level, label, text, title) => pills.push({ level, label, text, title });
+            const age = (at) => formatAge(now - at).replace(' ago', '');
 
             const known = info.w3bKnown || 0;
             const read = info.w3bRead || 0;
@@ -8745,18 +8941,26 @@
             else if (read < known) pill('idle', 'TornW3B', read + '/' + known, 'Reading traders\' TornW3B price lists: ' + read + ' of ' + known);
             else pill('online', 'TornW3B', (info.w3bTraders || 0) + ' lists', 'Every known trader\'s TornW3B list read; ' + (info.w3bTraders || 0) + ' have one');
 
+            const checked = info.flipsChecked || 0;
+            const wanted = info.flipsWanted || 0;
+            const flips = wanted ? ' · ' + checked + '/' + wanted : '';
+            if (info.bazaarsError && !info.bazaarsAt) pill('bad', 'Bazaars', 'not loaded', info.bazaarsError);
+            else if (!info.bazaarsAt) pill('idle', 'Bazaars', 'loading', 'Loading bazaar prices from TornW3B');
+            else pill(checked < wanted ? 'idle' : 'online', 'Bazaars', age(info.bazaarsAt) + flips, 'TornW3B bazaar prices, ' + formatAge(now - info.bazaarsAt) + (wanted ? '. Possible flips checked against every bazaar: ' + checked + ' of ' + wanted : ''));
+
             const perItem = info.heldCount ? ' Best buyer per item, without a key: ' + (info.teOneDone || 0) + ' of ' + info.heldCount + '.' : '';
-            if (info.teStatus === 'ok' && info.teError) pill('idle', 'TornExchange', info.teAt ? formatAge(now - info.teAt).replace(' ago', '') : '', info.teError);
-            else if (info.teStatus === 'ok') pill('online', 'TornExchange', info.teAt ? formatAge(now - info.teAt).replace(' ago', '') : '', 'TornExchange prices ' + (info.teAt ? formatAge(now - info.teAt) : ''));
+            if (info.teStatus === 'ok' && info.teError) pill('idle', 'TornExchange', info.teAt ? age(info.teAt) : '', info.teError);
+            else if (info.teStatus === 'ok') pill('online', 'TornExchange', info.teAt ? age(info.teAt) : '', 'TornExchange prices ' + (info.teAt ? formatAge(now - info.teAt) : ''));
             else if (info.teStatus === 'badkey') pill('bad', 'TornExchange', 'key', 'Key not accepted.' + perItem);
             else if (info.teStatus === 'nokey') pill('unknown', 'TornExchange', 'no key', 'No TornExchange key.' + perItem);
             else pill('idle', 'TornExchange', 'loading', 'Loading TornExchange prices');
 
-            const wanted = info.statusesWanted || 0;
-            const checked = info.statusesKnown || 0;
-            pill(wanted && checked >= wanted ? 'online' : 'idle', 'Online', checked + '/' + wanted, 'Traders\' online status checked: ' + checked + ' of ' + wanted);
+            const want = info.statusesWanted || 0;
+            const got = info.statusesKnown || 0;
+            pill(want && got >= want ? 'online' : 'idle', 'Online', got + '/' + want, 'Traders\' online status checked: ' + got + ' of ' + want);
 
-            const sig = JSON.stringify(pills);
+            const cash = this.state.prefs.cash;
+            const sig = JSON.stringify([pills, cash]);
             if (sig === this.pillSig) return;
             this.pillSig = sig;
             this.pillsEl.textContent = '';
@@ -8767,6 +8971,15 @@
                     p.text ? ' ' + p.text : '',
                 ]));
             }
+            this.pillsEl.appendChild(spEl('button', {
+                type: 'button',
+                class: 'sp-pill sp-pill-btn',
+                title: 'Flips never plan to spend more than this. Press to change it.',
+                onclick: () => {
+                    this.showView('settings');
+                    this.cashInput.focus();
+                },
+            }, [spEl('b', { text: 'Cash' }), ' ' + (cash > 0 ? formatMoney(cash) : 'no limit')]));
         }
 
         /** Only what stops the page working: a key missing or refused, or a wait. */
@@ -8804,271 +9017,439 @@
             }
         }
 
-        renderStats() {
-            const s = this.state.stats || {};
-            const stat = (label, value, hi) =>
-                spEl('div', { class: 'sp-stat' + (hi ? ' sp-stat-hi' : '') }, [
-                    spEl('small', { text: label }),
-                    spEl('b', { text: Number.isFinite(value) ? value.toLocaleString('en-US') : '–' }),
-                ]);
-            const sig = JSON.stringify(s);
-            if (sig === this.statSig) return;
-            this.statSig = sig;
-            this.statsEl.textContent = '';
-            this.statsEl.append(
-                stat('Items you hold', s.held),
-                stat('With a buyer', s.withBuyer),
-                stat('Buyers online', s.buyersOnline, true),
-                stat('Traders known', s.known),
-            );
-        }
+        /* ------------------------------------------------------------ links */
 
         /**
-         * What the lists show, as one string. The page is re-rendered whenever a
-         * price or a status arrives; the lists are only rebuilt when this changes,
-         * so a row is never swapped out from under a click or a hover.
+         * A link that goes through onOpenUrl (a new tab, or this one, as you
+         * set), never through the row it sits in.
          */
-        sectionsSignature(my, all) {
-            const s = this.state;
-            const info = s.info || {};
-            const statusOf = (b) => {
-                const st = b && b.id && s.statuses ? s.statuses.get(String(b.id)) : null;
-                return st ? st.level + st.text : '';
-            };
-            const trustOf = (b) => (b && b.trust ? b.trust.level + b.trust.score : '');
-            const rowSig = (section) => (r) => [
-                r.itemId,
-                r.name,
-                r.buyers.length,
-                this.onlineCount(r),
-                s.expanded.has(section + ':' + r.itemId),
-                r.best ? [r.best.id, r.best.name, r.best.price, statusOf(r.best), trustOf(r.best)] : Boolean(r.pending),
-                r.buyers[1] ? r.buyers[1].price : 0,
-            ];
-            return JSON.stringify([
-                this.currentView(),
-                this.tab,
-                s.sort,
-                (s.best || []).map((e) => [e.key, e.trader.name, e.bestOn, e.buys, statusOf(e.trader), trustOf(e.trader)]),
-                s.traderFilter ? s.traderFilter.key : '',
-                s.myTotal,
-                s.allTotal,
-                this.queries,
-                Boolean(s.prefs.onlineOnly),
-                Boolean(s.prefs.trustedOnly),
-                info.hasKey,
-                info.loading,
-                info.tradersLoading,
-                Boolean(info.knownTraders),
-                Boolean(info.traderCount),
-                Boolean(info.inventoryAt),
-                my.map(rowSig('my')),
-                all.map(rowSig('all')),
-            ]);
+        link(text, url, { cls = 'sp-chip', title = '', focus = '', children = null } = {}) {
+            const a = spEl('a', { class: cls, href: url, title: title || null, 'data-focus': focus || null, target: '_blank', rel: 'noopener noreferrer' }, children || [text]);
+            a.addEventListener('click', (event) => {
+                event.stopPropagation();
+                if (event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey) return;
+                event.preventDefault();
+                if (this.h.onOpenUrl) this.h.onOpenUrl(url);
+            });
+            return a;
         }
 
-        renderSections() {
+        /** A player's name, linking to their Torn profile when their id is known. */
+        playerName(name, id, focus) {
+            if (!id) return spEl('b', { text: name });
+            return this.link(name, spProfileUrl(id), { cls: 'sp-pname', title: 'Torn profile', focus });
+        }
+
+        /* ------------------------------------------------------------ strip */
+
+        renderStrip() {
             const s = this.state;
             const info = s.info || {};
-            const p = s.prefs;
+            const sig = JSON.stringify([
+                s.strip.map((f) => [f.itemId, f.name, f.plan.profit, f.plan.units, f.plan.steps.map((st) => st.sellerName), f.buyer.name, f.buyer.price, f.buyer.trust && f.buyer.trust.level]),
+                s.desk && s.desk.itemId,
+                info.flipsChecked,
+                info.flipsWanted,
+                Boolean(info.bazaarsAt),
+                info.tradersLoading,
+                s.prefs.onlineOnly,
+                s.prefs.trustedOnly,
+            ]);
+            if (sig === this.stripSig) return;
+            this.stripSig = sig;
 
-            const my = this.stableOrder('my', s.my);
-            const all = this.stableOrder('all', s.all);
-            const sig = this.sectionsSignature(my, all);
-            if (sig === this.lastSig) return;
-            this.lastSig = sig;
+            const box = this.stripEl;
+            box.textContent = '';
+            if (!s.strip.length) {
+                const text = this.noFlipsText();
+                box.appendChild(spEl('div', { class: 'sp-empty sp-strip-empty', text }));
+                return;
+            }
+            for (const f of s.strip) {
+                const on = Boolean(s.desk && s.desk.itemId === f.itemId);
+                box.appendChild(spEl('button', {
+                    type: 'button',
+                    class: 'sp-fc' + (on ? ' sp-sel' : ''),
+                    'aria-pressed': String(on),
+                    title: 'Show its flip plan',
+                    onclick: () => this.select(f.itemId),
+                }, [
+                    spEl('span', { class: 'sp-fc-top' }, [spEl('span', { class: 'sp-pic sp-pic-s' }, [this.image('strip', f.itemId)]), spEl('b', { class: 'sp-iname', text: f.name })]),
+                    spEl('span', { class: 'sp-fc-p', text: signed(f.plan.profit) }),
+                    spEl('small', {}, ['Buy ', spEl('b', { text: count(f.plan.units) }), ' from ' + f.plan.steps.map((st) => st.sellerName || 'a bazaar').join(', ')]),
+                    spEl('small', { class: 'sp-fc-sell' }, ['Sell to ', spEl('b', { text: f.buyer.name }), ' at ' + formatMoney(f.buyer.price), this.trustBadge(f.buyer)]),
+                ]));
+            }
+        }
 
-            // A rebuild replaces the item or header you had focused (Enter to
-            // open, Enter to sort): focus its new copy, so Tab carries on from it.
+        /* ------------------------------------------------------------- list */
+
+        renderList() {
+            const s = this.state;
+            const info = s.info || {};
+            const list = this.stableOrder(s.list);
+            const sig = JSON.stringify([
+                s.filter,
+                s.counts,
+                s.listTotal,
+                s.desk && s.desk.itemId,
+                info.hasKey,
+                info.loading,
+                info.inventoryAt ? 1 : 0,
+                info.tradersLoading,
+                Boolean(info.bazaarsAt),
+                this.query,
+                list.map((r) => [r.itemId, r.name, r.held, r.lowest, r.badge && [r.badge.kind, r.badge.amount], r.pending]),
+            ]);
+            if (sig === this.listSig) return;
+            this.listSig = sig;
+
+            // A rebuild replaces the item you had focused: focus its new copy.
             const shadow = this.root.getRootNode();
             const active = shadow && shadow.activeElement;
-            const focusKey = active && active.dataset ? active.dataset.focus : null;
-            const focusList = focusKey && [this.myList, this.allList].find((l) => l.contains(active));
+            const focusKey = active && this.listBox.contains(active) && active.dataset ? active.dataset.focus : null;
 
-            this.myCount.textContent = s.myTotal ? s.myTotal.toLocaleString('en-US') : '';
-            this.allCount.textContent = s.allTotal ? s.allTotal.toLocaleString('en-US') : '';
-
-            this.renderWho();
-
-            /* the trader filter, from "Who to message" */
-            this.chipEl.textContent = '';
-            this.chipEl.hidden = !s.traderFilter;
-            if (s.traderFilter) {
-                this.chipEl.append(
-                    spEl('span', { text: 'Items ' + s.traderFilter.name + ' pays most for (' + s.traderFilter.count + ')' }),
-                    spEl('button', { type: 'button', class: 'sp-link', text: 'Show all', onclick: () => this.h.onTraderFilter && this.h.onTraderFilter(null) }),
-                );
+            for (const key of SELL_FILTERS) {
+                this.chipBtns[key].setAttribute('aria-pressed', String(s.filter === key));
+                this.chipCounts[key].textContent = count(s.counts[key] || 0);
             }
 
-            /* My items */
-            this.myList.textContent = '';
-            if (!s.my.length) {
-                let text = 'Nothing to show yet.';
-                if (!info.hasKey) text = 'Add your Limited key to see your items.';
-                else if (info.loading) text = 'Loading your inventory…';
-                else if (this.queries.my.trim()) text = 'No item matches "' + this.queries.my.trim() + '".';
-                else if (info.inventoryAt) text = 'Your inventory has nothing to sell.';
-                this.myList.appendChild(spEl('div', { class: 'sp-empty', text }));
-            } else {
-                this.myList.appendChild(this.renderView('my', my));
+            this.listBox.textContent = '';
+            if (!list.length) {
+                let text = 'Loading…';
+                const q = this.query.trim();
+                if (q) text = 'No item matches "' + q + '".';
+                else if (s.filter === 'mine' && !info.hasKey) text = 'Add your Limited key to see your items.';
+                else if (s.filter === 'mine' && info.loading) text = 'Loading your inventory…';
+                else if (s.filter === 'mine' && info.inventoryAt) text = 'Your inventory has nothing to sell.';
+                else if (s.filter === 'flips') text = this.noFlipsText();
+                else if (!info.tradersLoading && !info.traderCount && !info.hasKey) text = 'No traders loaded yet.';
+                this.listBox.appendChild(spEl('div', { class: 'sp-empty', text }));
             }
-
-            /* All items */
-            this.allList.textContent = '';
-            if (!s.all.length) {
-                let text = 'Loading traders…';
-                if (this.queries.all.trim()) text = 'No trader buys "' + this.queries.all.trim() + '".';
-                else if (!info.tradersLoading && !info.traderCount) text = 'No traders loaded yet.';
-                else if ((p.onlineOnly || p.trustedOnly) && !info.tradersLoading) text = 'No buyer matches what you chose to show.';
-                this.allList.appendChild(spEl('div', { class: 'sp-empty', text }));
-            } else {
-                this.allList.appendChild(this.renderView('all', all));
+            for (const r of list) {
+                const on = Boolean(s.desk && s.desk.itemId === r.itemId);
+                const sub = [];
+                if (r.held) sub.push('You hold ' + count(r.held));
+                if (r.lowest) sub.push('from ' + formatMoney(r.lowest));
+                this.listBox.appendChild(spEl('div', {
+                    class: 'sp-it' + (on ? ' sp-sel' : ''),
+                    role: 'button',
+                    tabindex: '0',
+                    'aria-pressed': String(on),
+                    'data-focus': 'item:' + r.itemId,
+                    onclick: () => this.select(r.itemId),
+                    onkeydown: (event) => {
+                        if (event.key !== 'Enter' && event.key !== ' ') return;
+                        event.preventDefault();
+                        this.select(r.itemId);
+                    },
+                }, [
+                    spEl('span', { class: 'sp-pic sp-pic-s' }, [this.image('list', r.itemId)]),
+                    spEl('b', { class: 'sp-iname', text: r.name }),
+                    this.badge(r),
+                    spEl('small', { text: sub.join(' · ') || (r.pending ? 'Checking…' : '') }),
+                ]));
             }
-            this.moreBtn.hidden = !(s.allTotal > s.all.length);
+            this.moreBtn.hidden = !(s.listTotal > list.length);
 
-            if (focusList) {
-                const again = [...focusList.querySelectorAll('[data-focus]')].find((n) => n.dataset.focus === focusKey);
+            if (focusKey) {
+                const again = [...this.listBox.querySelectorAll('[data-focus]')].find((n) => n.dataset.focus === focusKey);
                 if (again) again.focus({ preventScroll: true });
             }
         }
 
-        /** The items in the view you chose. */
-        renderView(section, rows) {
-            const view = this.currentView();
-            if (view === 'rows') return this.renderRows(section, rows);
-            if (view === 'table') return this.renderTable(section, rows);
-            return this.renderCards(section, rows);
+        /** Why there is no flip to show: still loading, still checking, or none. */
+        noFlipsText() {
+            const info = this.state.info || {};
+            if (!info.bazaarsAt) return 'Loading bazaar prices…';
+            if (info.flipsChecked < info.flipsWanted) return 'No flips found yet. Checking ' + info.flipsChecked + ' of ' + info.flipsWanted + '.';
+            if (info.tradersLoading) return 'Looking for traders…';
+            return 'No flips with these settings right now.';
         }
 
-        /** Open an item: a click, or Enter / Space on the focused item. */
-        itemProps(section, r, cls, { row = false } = {}) {
-            const open = () => this.h.onExpand && this.h.onExpand(section, r.itemId);
-            const picked = this.state.expanded.has(section + ':' + r.itemId);
-            return {
-                class: cls + (picked ? ' sp-sel' : '') + (r.best ? '' : ' sp-nobuyer'),
-                'data-focus': 'item:' + r.itemId,
-                tabindex: '0',
-                // A table row keeps its row role; tiles and rows are buttons.
-                role: row ? null : 'button',
-                'aria-pressed': String(picked),
-                title: r.best ? 'Show every trader who buys it' : '',
-                onclick: open,
-                onkeydown: (event) => {
-                    if (event.key === 'Enter' || event.key === ' ') {
-                        event.preventDefault();
-                        open();
-                    }
-                },
+        /** Flip +$X / List +$X / Sell to trader, or nothing. */
+        badge(r) {
+            const b = r.badge;
+            if (!b) return spEl('span');
+            if (b.kind === 'flip') return spEl('span', { class: 'sp-badge sp-badge-flip', text: 'Flip ' + signed(b.amount) });
+            if (b.kind === 'list') return spEl('span', { class: 'sp-badge sp-badge-list', text: 'List ' + signed(b.amount) });
+            return spEl('span', { class: 'sp-badge sp-badge-sell', text: 'Sell to trader' });
+        }
+
+        select(itemId) {
+            if (this.h.onSelect) this.h.onSelect(itemId);
+            // On a phone the desk sits above the list: bring it into view.
+            if (typeof window.matchMedia === 'function' && window.matchMedia('(max-width: 1000px)').matches && this.deskEl.scrollIntoView) {
+                this.deskEl.scrollIntoView({ block: 'start' });
+            }
+        }
+
+        /* ------------------------------------------------------------- desk */
+
+        /**
+         * Everything about the item picked, at once.
+         *
+         * desk: {itemId, name, held, avg, bazaars,
+         *   buyers, buyersTotal, buyersLoading, pending,
+         *   sellers: {state: 'loading'|'error'|'ok', rows, error},
+         *   plan, planWhy: 'nobuyer'|'nounder'|'loading'|null,
+         *   where: {options, best, gain}|null, market: {state, lowest}}
+         */
+        renderDesk() {
+            const d = this.state.desk;
+            const box = this.deskEl;
+            if (d && this.showAll.item !== d.itemId) this.showAll = { item: d.itemId, buyers: false, sellers: false };
+            const statusOf = (b) => {
+                const st = b.id && this.state.statuses ? this.state.statuses.get(String(b.id)) : null;
+                return st ? st.level + st.text : '';
             };
-        }
+            const now = Date.now();
+            const p = this.state.prefs;
+            const info = this.state.info || {};
+            const sig = d
+                ? JSON.stringify([
+                    d.itemId, d.name, d.held, d.avg, d.bazaars, d.buyersTotal, d.buyersLoading, d.pending, d.planWhy,
+                    d.buyers.map((b) => [b.id, b.name, b.price, b.te, b.w3b, statusOf(b), b.trust ? b.trust.level + b.trust.score : '']),
+                    d.sellers.state, d.sellers.error,
+                    d.sellers.rows.map((r) => [r.sellerId, r.sellerName, r.price, r.qty, r.stale, Math.floor((now - (r.dataAt || 0)) / 60000)]),
+                    d.plan, d.where, d.market,
+                    this.showAll, p.onlineOnly, p.trustedOnly, p.cash, Boolean(info.knownTraders), info.tradersLoading,
+                ])
+                : JSON.stringify([info.hasKey, info.loading, Boolean(info.bazaarsAt), info.tradersLoading, this.state.counts]);
+            if (sig === this.deskSig) return;
+            this.deskSig = sig;
 
-        renderCards(section, rows) {
-            const grid = spEl('div', { class: 'sp-grid' });
-            for (const r of rows) {
-                const b = r.best;
-                grid.appendChild(spEl('div', this.itemProps(section, r, 'sp-tile'), [
-                    spEl('div', { class: 'sp-tile-top' }, [spEl('span', { class: 'sp-pic' }, [this.image(section, r.itemId)]), spEl('b', { class: 'sp-iname', text: r.name })]),
-                    b ? spEl('div', { class: 'sp-price', text: formatMoney(b.price) }) : spEl('div', { class: 'sp-none', text: this.noTraderText(r) }),
-                    b ? spEl('div', { class: 'sp-who' }, [spEl('b', { text: b.name }), this.trustBadge(b), this.status(b)]) : null,
-                    spEl('div', { class: 'sp-foot', text: this.countText(r) }),
-                ]));
+            const shadow = this.root.getRootNode();
+            const active = shadow && shadow.activeElement;
+            const keep = active && box.contains(active) && active.dataset ? active.dataset.focus : null;
+
+            box.textContent = '';
+            if (!d) {
+                const none = !(this.state.counts && this.state.counts.all);
+                box.appendChild(spEl('p', { class: 'sp-note', text: none ? (info.tradersLoading ? 'Looking for traders…' : 'Nothing to show yet.') : 'Pick an item.' }));
+                return;
             }
-            return grid;
-        }
 
-        /** Column headers that sort, for Rows and Table. */
-        sortHeader(tag, key, label, cls = '') {
-            const sort = this.state.sort || {};
-            const on = sort.key === key;
-            const cell = spEl(tag, { class: cls + (on ? ' sp-sorted' : ''), 'aria-sort': tag === 'th' && on ? (sort.dir < 0 ? 'descending' : 'ascending') : null }, [
-                spEl('button', {
-                    type: 'button',
-                    class: 'sp-sort',
-                    'data-focus': 'sort:' + key,
-                    title: 'Sort by ' + label.toLowerCase(),
-                    onclick: () => this.h.onSort && this.h.onSort(key),
-                }, [label, on ? (sort.dir < 0 ? ' ▾' : ' ▴') : '']),
-            ]);
-            return cell;
-        }
-
-        renderRows(section, rows) {
-            const box = spEl('div', { class: 'sp-rows' });
-            box.appendChild(spEl('div', { class: 'sp-rowhead' }, [
-                spEl('span'),
-                this.sortHeader('span', 'name', 'Item'),
-                this.sortHeader('span', 'price', 'Top bid', 'sp-r'),
-                this.sortHeader('span', 'buyer', 'Buyer', 'sp-c-who'),
-                this.sortHeader('span', 'next', 'Next bid', 'sp-r sp-c-next'),
-                this.sortHeader('span', 'traders', 'Traders', 'sp-r sp-c-traders'),
-                spEl('span'),
+            const facts = ['Item Market Average ' + (d.avg ? formatMoney(d.avg) : '–')];
+            if (d.bazaars) facts.push(count(d.bazaars) + (d.bazaars === 1 ? ' bazaar' : ' bazaars'));
+            if (d.held) facts.push('you hold ' + count(d.held));
+            box.appendChild(spEl('div', { class: 'sp-wsh' }, [
+                spEl('span', { class: 'sp-pic sp-pic-l' }, [this.image('desk', d.itemId)]),
+                spEl('span', { class: 'sp-wst' }, [
+                    this.link(d.name, itemMarketUrl(d.itemId, d.name), { cls: 'sp-wsname', title: 'Open it on the Item Market', focus: 'desk:name' }),
+                    spEl('small', { text: facts.join(' · ') }),
+                ]),
             ]));
-            for (const r of rows) {
-                const b = r.best;
-                const next = r.buyers[1];
-                box.appendChild(spEl('div', this.itemProps(section, r, 'sp-row'), [
-                    spEl('span', { class: 'sp-pic' }, [this.image(section, r.itemId)]),
-                    spEl('span', { class: 'sp-name' }, [spEl('b', { class: 'sp-iname', text: r.name }), spEl('small', { text: this.countText(r) })]),
-                    spEl('span', { class: 'sp-r' }, [b ? spEl('span', { class: 'sp-price', text: formatMoney(b.price) }) : spEl('span', { class: 'sp-none', text: this.noTraderText(r) })]),
-                    spEl('span', { class: 'sp-c-who' }, [b ? this.buyerCell(b) : null]),
-                    spEl('span', { class: 'sp-r sp-c-next sp-num', text: next ? formatMoney(next.price) : '' }),
-                    spEl('span', { class: 'sp-r sp-c-traders sp-num', text: r.buyers.length ? String(r.buyers.length) : '' }),
-                    spEl('span', { class: 'sp-chev', 'aria-hidden': 'true', text: '›' }),
-                ]));
+
+            const quad = spEl('div', { class: 'sp-quad' });
+            quad.append(this.buyersCard(d), this.sellersCard(d), this.planCard(d));
+            if (d.held) quad.appendChild(this.whereCard(d));
+            box.appendChild(quad);
+
+            if (keep) {
+                const node = [...box.querySelectorAll('[data-focus]')].find((n) => n.dataset.focus === keep);
+                if (node) node.focus({ preventScroll: true });
             }
-            return box;
         }
 
-        renderTable(section, rows) {
-            const head = spEl('tr', {}, [
-                this.sortHeader('th', 'name', 'Item'),
-                this.sortHeader('th', 'price', 'Top bid', 'sp-r'),
-                this.sortHeader('th', 'buyer', 'Buyer'),
-                this.sortHeader('th', 'next', 'Next bid', 'sp-r sp-c-next'),
-                this.sortHeader('th', 'traders', 'Traders', 'sp-r sp-c-traders'),
-            ]);
-            const body = spEl('tbody');
-            for (const r of rows) {
-                const b = r.best;
-                const next = r.buyers[1];
-                const props = this.itemProps(section, r, '', { row: true });
-                body.appendChild(spEl('tr', props, [
-                    spEl('td', {}, [spEl('span', { class: 'sp-titem' }, [spEl('span', { class: 'sp-pic sp-pic-s' }, [this.image(section, r.itemId)]), spEl('b', { class: 'sp-iname', text: r.name })])]),
-                    spEl('td', { class: 'sp-r' }, [b ? spEl('span', { class: 'sp-price', text: formatMoney(b.price) }) : spEl('span', { class: 'sp-none', text: this.noTraderText(r) })]),
-                    spEl('td', {}, [b ? this.buyerCell(b) : null]),
-                    spEl('td', { class: 'sp-r sp-c-next sp-num', text: next ? formatMoney(next.price) : '' }),
-                    spEl('td', { class: 'sp-r sp-c-traders sp-num', text: this.countText(r) }),
+        /** Traders pay, highest first: name (their profile), trust, status, price; Trade and both price lists. */
+        buyersCard(d) {
+            const card = spEl('div', { class: 'sp-q' }, [spEl('h3', { text: 'Traders pay · highest first' })]);
+            const all = this.showAll.buyers;
+            const rows = all ? d.buyers : d.buyers.slice(0, DESK_ROWS);
+            if (d.buyersLoading) card.appendChild(spEl('p', { class: 'sp-note', text: 'Loading more buyers from TornExchange…' }));
+            if (!rows.length) card.appendChild(spEl('p', { class: 'sp-note', text: this.noTraderText(d) }));
+            rows.forEach((b, i) => {
+                card.appendChild(spEl('div', { class: 'sp-tr' + (i === 0 ? ' sp-top' : '') }, [
+                    spEl('span', { class: 'sp-tr-l' }, [
+                        spEl('span', { class: 'sp-trader-l' }, [this.playerName(b.name, b.id, 'buyer:' + (b.id || b.name)), this.trustBadge(b)]),
+                        this.status(b),
+                    ]),
+                    spEl('span', { class: 'sp-tprice', text: formatMoney(b.price) }),
+                    this.traderLinks(b),
                 ]));
+            });
+            if (d.buyers.length > DESK_ROWS) {
+                card.appendChild(spEl('button', {
+                    type: 'button',
+                    class: 'sp-link sp-showall',
+                    'data-focus': 'desk:buyers-all',
+                    text: all ? 'Show the top ' + DESK_ROWS : 'Show all ' + count(d.buyers.length) + ' traders',
+                    onclick: () => {
+                        this.showAll.buyers = !all;
+                        this.renderDesk();
+                        this.fitDesk();
+                    },
+                }));
             }
-            return spEl('table', { class: 'sp-table' }, [spEl('thead', {}, [head]), body]);
+            return card;
         }
 
-        /** The buyer: name and trust, and under it their status (when known). */
-        buyerCell(b) {
-            return spEl('span', { class: 'sp-buyer' }, [spEl('span', { class: 'sp-buyer-l' }, [spEl('b', { text: b.name }), this.trustBadge(b)]), this.status(b)]);
+        /** Trade, TE list and W3B list, in fixed slots so they line up row to row. */
+        traderLinks(b) {
+            const links = spEl('span', { class: 'sp-links' });
+            const slot = (text, url, title) => {
+                if (!url) {
+                    links.appendChild(spEl('span', { class: 'sp-chip sp-chip-none', 'aria-hidden': 'true' }));
+                    return;
+                }
+                links.appendChild(this.link(text, url, { title, focus: 'link:' + (b.id || b.name) + ':' + text }));
+            };
+            slot('Trade', b.id ? tradeUrl(b.id) : null, 'Start a trade with ' + b.name);
+            slot('TE list', b.te ? tePriceListUrl(b.teName || b.name) : null, 'TornExchange price list: ' + formatMoney(b.te || 0));
+            slot('W3B list', b.w3b && b.id ? w3bPriceListUrl(b.id) : null, 'TornW3B price list: ' + formatMoney(b.w3b || 0));
+            return links;
         }
 
-        /** "34 traders · 1 online", "1 trader". */
-        countText(r) {
-            const count = r.buyers.length;
-            if (!count) return '';
-            const online = this.onlineCount(r);
-            return count + (count === 1 ? ' trader' : ' traders') + (online ? ' · ' + online + ' online' : '');
+        /** Bazaars sell, cheapest first: seller (their profile), stock, when TornW3B saw it, price; Open bazaar. */
+        sellersCard(d) {
+            const card = spEl('div', { class: 'sp-q' }, [spEl('h3', { text: 'Bazaars sell · cheapest first' })]);
+            const sel = d.sellers;
+            if (sel.state === 'loading' && !sel.rows.length) card.appendChild(spEl('p', { class: 'sp-note', text: 'Loading bazaars from TornW3B…' }));
+            else if (sel.state === 'error' && !sel.rows.length) card.appendChild(spEl('p', { class: 'sp-note sp-bad', text: sel.error || 'TornW3B did not answer. Trying again soon.' }));
+            else if (!sel.rows.length) card.appendChild(spEl('p', { class: 'sp-note', text: 'No bazaar is selling it.' }));
+            const all = this.showAll.sellers;
+            const rows = all ? sel.rows : sel.rows.slice(0, DESK_ROWS);
+            const now = Date.now();
+            rows.forEach((r, i) => {
+                const seen = r.dataAt ? 'seen ' + formatAge(now - r.dataAt) : 'not seen lately';
+                card.appendChild(spEl('div', { class: 'sp-tr' + (i === 0 && !r.stale ? ' sp-top' : '') + (r.stale ? ' sp-stale' : '') }, [
+                    spEl('span', { class: 'sp-tr-l' }, [
+                        this.playerName(r.sellerName || 'Player ' + r.sellerId, r.sellerId, 'seller:' + r.sellerId),
+                        spEl('small', { text: count(r.qty) + ' in stock · ' + seen }),
+                    ]),
+                    spEl('span', { class: 'sp-tprice', text: formatMoney(r.price) }),
+                    spEl('span', { class: 'sp-links sp-links-one' }, [this.link('Open bazaar', bazaarUrl(r.sellerId, d.itemId, r.price), { title: 'Open ' + (r.sellerName || 'their') + '\'s bazaar', focus: 'bazaar:' + r.sellerId })]),
+                ]));
+            });
+            if (sel.rows.length > DESK_ROWS) {
+                card.appendChild(spEl('button', {
+                    type: 'button',
+                    class: 'sp-link sp-showall',
+                    'data-focus': 'desk:sellers-all',
+                    text: all ? 'Show the cheapest ' + DESK_ROWS : 'Show all ' + count(sel.rows.length) + ' bazaars',
+                    onclick: () => {
+                        this.showAll.sellers = !all;
+                        this.renderDesk();
+                        this.fitDesk();
+                    },
+                }));
+            }
+            return card;
         }
 
-        /** How many of an item's traders are known to be online. */
-        onlineCount(r) {
-            const statuses = this.state.statuses;
-            if (!statuses) return 0;
-            return r.buyers.filter((b) => {
-                const st = b.id ? statuses.get(String(b.id)) : null;
-                return st && (st.level === 'online' || st.level === 'busy');
-            }).length;
+        /** The flip plan: buy from these bazaars, sell to this trader, what it makes and costs. */
+        planCard(d) {
+            const wide = d.held ? '' : ' sp-wide';
+            const f = d.plan;
+            if (f && f.units > 0) {
+                const b = d.buyers[0];
+                const card = spEl('div', { class: 'sp-q sp-hot' + wide }, [
+                    spEl('h3', { text: 'Flip plan' }),
+                    spEl('div', { class: 'sp-big', text: signed(f.profit) }),
+                    spEl('p', { class: 'sp-note', text: count(f.units) + ' flipped · cash needed ' + formatMoney(f.cost) }),
+                ]);
+                f.steps.forEach((st, i) => {
+                    card.appendChild(spEl('div', { class: 'sp-step' }, [
+                        spEl('span', { class: 'sp-n', text: String(i + 1) }),
+                        spEl('span', {}, ['Buy ', spEl('b', { text: count(st.qty) }), ' from ', this.playerName(st.sellerName || 'Player ' + st.sellerId, st.sellerId, 'step-seller:' + st.sellerId), ' at ' + formatMoney(st.price)]),
+                        this.link('Open bazaar', bazaarUrl(st.sellerId, d.itemId, st.price), { focus: 'step-bazaar:' + st.sellerId }),
+                    ]));
+                });
+                card.appendChild(spEl('div', { class: 'sp-step' }, [
+                    spEl('span', { class: 'sp-n', text: String(f.steps.length + 1) }),
+                    spEl('span', {}, ['Sell ', spEl('b', { text: count(f.units) }), ' to ', this.playerName(b.name, b.id, 'step-buyer'), ' at ' + formatMoney(b.price) + ' ', this.trustBadge(b)]),
+                    b.id ? this.link('Trade', tradeUrl(b.id), { title: 'Start a trade with ' + b.name, focus: 'step-trade' }) : spEl('span'),
+                ]));
+                return card;
+            }
+            const card = spEl('div', { class: 'sp-q' + wide }, [spEl('h3', { text: 'Flip plan' })]);
+            let text;
+            const top = d.buyers[0];
+            const who = this.state.prefs.trustedOnly ? 'trusted buyer' : 'buyer';
+            if (f && f.units === 0) text = 'One costs ' + formatMoney(f.needs) + ', more than your cash (' + formatMoney(this.state.prefs.cash) + ').';
+            else if (d.planWhy === 'loading') text = 'Loading bazaars from TornW3B…';
+            else if (!top) text = 'No flip: no ' + who + ' for this item.';
+            else if (d.sellers.rows.some((r) => !r.stale)) text = 'No flip: the cheapest bazaar is ' + formatMoney(d.sellers.rows.find((r) => !r.stale).price - top.price) + ' over the best ' + who + '.';
+            else if (d.sellers.rows.length) text = 'No flip: TornW3B has not seen these bazaars in the last 30 minutes.';
+            else text = 'No flip: no bazaar is selling it.';
+            card.appendChild(spEl('p', { class: 'sp-note', text }));
+            return card;
         }
 
-        /** A picture, kept per row so a re-render never reloads it. */
-        image(section, itemId) {
-            const key = section + ':' + itemId;
+        /** Where to sell your N: a trader now, or wait in your bazaar or on the Item Market. Each row is its link. */
+        whereCard(d) {
+            const w = d.where;
+            const card = spEl('div', { class: 'sp-q' }, [spEl('h3', { text: 'Where to sell your ' + count(d.held) })]);
+            const b = d.buyers[0];
+            const n = d.held;
+            const rows = [
+                {
+                    venue: 'trader',
+                    name: 'Sell to trader' + (b ? ' ' + b.name : ''),
+                    when: 'Paid now, in one trade',
+                    url: b && b.id ? tradeUrl(b.id) : null,
+                    missing: 'No ' + (this.state.prefs.trustedOnly ? 'trusted ' : '') + 'trader buys it',
+                },
+                {
+                    venue: 'bazaar',
+                    name: 'Your bazaar',
+                    when: 'Paid when someone buys it · $1 under the cheapest',
+                    url: MY_BAZAAR_ADD_URL,
+                    missing: 'No bazaar listing to price against',
+                },
+                {
+                    venue: 'market',
+                    name: 'Item Market',
+                    when: 'Paid when someone buys it · after the 5% fee',
+                    url: MARKET_ADD_URL,
+                    missing: d.market.state === 'loading' ? 'Checking the Item Market…' : 'No Item Market listing to price against',
+                },
+            ];
+            for (const r of rows) {
+                const o = w.options.find((x) => x.venue === r.venue);
+                const each = o ? o.each : null;
+                const win = w.best === r.venue;
+                const listAt = r.venue === 'bazaar' && each !== null ? ' at ' + formatMoney(each) : r.venue === 'market' && d.market.lowest > 1 ? ' at ' + formatMoney(d.market.lowest - 1) : '';
+                const inner = [
+                    spEl('span', { class: 'sp-opt-l' }, [spEl('b', { text: r.name + listAt }), spEl('small', { text: each === null ? r.missing : r.when })]),
+                    spEl('span', { class: 'sp-opt-p' }, each === null ? ['–'] : [formatMoney(each * n), n > 1 ? spEl('small', { text: formatMoney(each) + ' each' }) : null]),
+                ];
+                if (r.url && each !== null) card.appendChild(this.link('', r.url, { cls: 'sp-opt' + (win ? ' sp-win' : ''), title: r.venue === 'trader' ? 'Start a trade' : r.venue === 'bazaar' ? 'Open your bazaar\'s add page' : 'Open the Item Market\'s add page', focus: 'where:' + r.venue, children: inner }));
+                else card.appendChild(spEl('div', { class: 'sp-opt sp-opt-none' }, inner));
+            }
+
+            const bazaar = w.options.find((x) => x.venue === 'bazaar');
+            let verdict = '';
+            if (w.best === 'bazaar' || w.best === 'market') {
+                const place = w.best === 'bazaar' ? 'your bazaar' : 'the Item Market';
+                verdict = b ? 'Best: ' + place + ', ' + signed(w.gain) + ' more than the trader, but you wait for a buyer.' : 'Best: ' + place + '. ' + rows[0].missing + '.';
+            } else if (w.best === 'trader') {
+                verdict = 'Best: sell to trader ' + b.name + '.';
+                if (bazaar && bazaar.each !== null) {
+                    const diff = (bazaar.each - b.price) * n;
+                    verdict += diff > 0 ? ' Your bazaar would get only ' + signed(diff) + ' more, and you would wait.' : ' Your bazaar would get ' + formatMoney(-diff) + ' less.';
+                }
+            }
+            if (verdict) card.appendChild(spEl('p', { class: 'sp-verdict' + (w.best && w.best !== 'trader' ? ' sp-win' : ''), text: verdict }));
+            return card;
+        }
+
+        /**
+         * The desk stays in view while the list scrolls. When it is taller than
+         * the window, it scrolls with the page until its bottom shows, then stays.
+         */
+        fitDesk() {
+            if (!this.root || this.view !== 'list') return;
+            const room = this.listEl.clientHeight;
+            const h = this.deskEl.offsetHeight;
+            if (!room || !h) return;
+            this.deskEl.style.top = Math.min(16, room - h - 16) + 'px';
+        }
+
+        /** A picture, kept per place so a re-render never reloads it. */
+        image(place, itemId) {
+            const key = place + ':' + itemId;
             let img = this.images.get(key);
             if (!img) {
                 img = spEl('img', { class: 'sp-img', alt: '', loading: 'lazy', src: itemImageUrl(itemId) });
@@ -9079,142 +9460,15 @@
         }
 
         /** What an item with no trader says: only "No Trader Found" once every source has answered. */
-        noTraderText(r) {
+        noTraderText(d) {
             const info = this.state.info || {};
             const p = this.state.prefs;
             if (!info.knownTraders) return 'No traders yet';
-            // Per item when known (My items), else for the page as a whole.
-            if (r && r.pending !== undefined ? r.pending : info.tradersLoading) return 'Checking…';
+            if (d && d.pending) return 'Checking…';
             if (p.onlineOnly && p.trustedOnly) return 'No trusted buyer online';
             if (p.onlineOnly) return 'No trader online';
             if (p.trustedOnly) return 'No trusted trader';
             return 'No Trader Found';
-        }
-
-        /** Who to message: the traders with the best price on the most of your items. */
-        renderWho() {
-            const box = this.whoEl;
-            const best = this.state.best || [];
-            box.textContent = '';
-            if (!best.length) {
-                box.appendChild(spEl('p', { class: 'sp-note', text: 'Once traders load, the ones who pay most for your items show here.' }));
-                return;
-            }
-            const filter = this.state.traderFilter;
-            for (const e of best) {
-                const on = Boolean(filter && filter.key === e.key);
-                const st = this.status(e.trader);
-                box.appendChild(spEl('div', {
-                    class: 'sp-trader' + (on ? ' sp-on' : ''),
-                    role: 'button',
-                    tabindex: '0',
-                    'aria-pressed': String(on),
-                    title: on ? 'Show all your items again' : 'Show the items ' + e.trader.name + ' pays most for',
-                    onclick: () => {
-                        if (this.h.onTraderFilter) this.h.onTraderFilter(on ? null : e.key);
-                        this.showTab('my');
-                    },
-                    onkeydown: (event) => {
-                        if (event.key !== 'Enter' && event.key !== ' ') return;
-                        event.preventDefault();
-                        if (this.h.onTraderFilter) this.h.onTraderFilter(on ? null : e.key);
-                        this.showTab('my');
-                    },
-                }, [
-                    spEl('span', { class: 'sp-rk', title: 'Best price on ' + e.bestOn + ' of your items', text: String(e.bestOn) }),
-                    spEl('span', { class: 'sp-trader-l' }, [spEl('b', { text: e.trader.name }), this.trustBadge(e.trader)]),
-                    spEl('small', {}, [
-                        'Best price on ' + e.bestOn + ' of your items' + (e.buys > e.bestOn ? ' · buys ' + e.buys : ''),
-                        st.childNodes.length ? spEl('br') : null,
-                        st.childNodes.length ? st : null,
-                    ]),
-                ]));
-            }
-        }
-
-        /** The item picked, sliding in from the right: every trader, highest first. */
-        renderDrawer() {
-            const d = this.state.detail;
-            const box = this.drawerEl;
-            const lists = (this.state.info && this.state.info.itemLists) || new Map();
-            const open = Boolean(d) && this.view === 'list';
-            box.classList.toggle('sp-open', open);
-            box.setAttribute('aria-hidden', String(!open));
-            const wasFor = this.drawerFor;
-            this.drawerFor = open ? d.section + ':' + d.itemId : null;
-            this.coverCheck();
-            const shadow = this.root.getRootNode();
-            const active = shadow && shadow.activeElement;
-            if (!open) {
-                this.drawerSig = null;
-                // Closed: focus goes back to the item it was opened from.
-                if (wasFor && (!active || box.contains(active))) this.focusItem(wasFor);
-                return;
-            }
-
-            const statusOf = (b) => {
-                const st = b.id && this.state.statuses ? this.state.statuses.get(String(b.id)) : null;
-                return st ? st.level + st.text : '';
-            };
-            const load = lists.get(d.itemId) || {};
-            const p = this.state.prefs;
-            const info = this.state.info || {};
-            const sig = JSON.stringify([d.section, d.itemId, d.name, Boolean(d.pending), Boolean(load.loading), load.error || '',
-                Boolean(p.onlineOnly), Boolean(p.trustedOnly), Boolean(info.knownTraders),
-                d.buyers.map((b) => [b.id, b.name, b.price, b.te, b.w3b, statusOf(b), b.trust ? b.trust.level : ''])]);
-            if (sig === this.drawerSig) return;
-            this.drawerSig = sig;
-            // Newly opened: focus its ✕. Rebuilt while you were in it: stay where you were.
-            const keep = box.contains(active) && active.dataset ? active.dataset.focus : null;
-
-            box.textContent = '';
-            box.appendChild(spEl('div', { class: 'sp-dhead' }, [
-                spEl('span', { class: 'sp-pic sp-pic-l' }, [this.image('detail', d.itemId)]),
-                spEl('span', { class: 'sp-dtitle' }, [spEl('b', { text: d.name }), spEl('small', { text: d.buyers.length ? this.countText(d) + ' · highest first' : '' })]),
-                spEl('button', { type: 'button', class: 'sp-icon', 'data-focus': 'close', title: 'Close (Esc)', 'aria-label': 'Close', text: '✕', onclick: () => this.closeDetail() }),
-            ]));
-            const body = spEl('div', { class: 'sp-dbody' });
-            if (load.loading) body.appendChild(spEl('p', { class: 'sp-note', text: 'Loading more buyers from TornExchange…' }));
-            else if (load.error) body.appendChild(spEl('p', { class: 'sp-note sp-bad', text: load.error }));
-            if (!d.buyers.length) body.appendChild(spEl('p', { class: 'sp-note', text: this.noTraderText(d) }));
-            d.buyers.forEach((b, i) => {
-                body.appendChild(spEl('div', { class: 'sp-tr' + (i === 0 ? ' sp-top' : '') }, [
-                    spEl('span', { class: 'sp-rank', text: String(i + 1) }),
-                    spEl('span', { class: 'sp-trader-l' }, [spEl('b', { text: b.name }), this.trustBadge(b), this.status(b)]),
-                    spEl('span', { class: 'sp-tprice', text: formatMoney(b.price) }),
-                    this.linkChips(b),
-                ]));
-            });
-            box.appendChild(body);
-
-            const want = this.drawerFor !== wasFor ? 'close' : keep;
-            if (want) {
-                const node = [...box.querySelectorAll('[data-focus]')].find((n) => n.dataset.focus === want) || box.querySelector('[data-focus="close"]');
-                if (node) node.focus({ preventScroll: true });
-            }
-        }
-
-        /** Focus an item in the list ("section:itemId"), when it is there. */
-        focusItem(key) {
-            const at = key.indexOf(':');
-            const list = key.slice(0, at) === 'all' ? this.allList : this.myList;
-            const want = 'item:' + key.slice(at + 1);
-            const node = [...list.querySelectorAll('[data-focus]')].find((n) => n.dataset.focus === want);
-            if (node) node.focus({ preventScroll: true });
-        }
-
-        /** Does the side panel cover the whole page (a phone)? */
-        drawerCovers() {
-            return Boolean(this.drawerFor) && typeof window.matchMedia === 'function' && window.matchMedia('(max-width: 1000px)').matches;
-        }
-
-        /** While the side panel covers the page, Tab stays in it. */
-        coverCheck() {
-            const covered = this.drawerCovers();
-            for (const node of [this.headEl, this.bannerEl, this.listEl]) {
-                if (covered) node.setAttribute('inert', '');
-                else node.removeAttribute('inert');
-            }
         }
 
         /** Trusted / Known / New / Caution, from other players' votes; the numbers on hover. */
@@ -9225,29 +9479,6 @@
             if (t.votes !== null) parts.push('TornExchange votes ' + (t.votes >= 0 ? '+' : '') + t.votes);
             if (t.up !== null) parts.push('TornW3B rating ' + t.up + '↑ ' + t.down + '↓');
             return spEl('span', { class: 'sp-trust', 'data-level': t.level.toLowerCase(), title: parts.join(' · '), text: t.level });
-        }
-
-        /** Profile, TE list and W3B list, in fixed slots so they line up row to row. */
-        linkChips(b) {
-            const links = spEl('span', { class: 'sp-links' });
-            const link = (text, url, title) => {
-                if (!url) {
-                    links.appendChild(spEl('span', { class: 'sp-chip sp-chip-none', 'aria-hidden': 'true' }));
-                    return;
-                }
-                const a = spEl('a', { class: 'sp-chip', 'data-focus': 'link:' + (b.id || b.name) + ':' + text, href: url, text, title, target: '_blank', rel: 'noopener noreferrer' });
-                a.addEventListener('click', (event) => {
-                    event.stopPropagation();
-                    if (event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey) return;
-                    event.preventDefault();
-                    if (this.h.onOpenUrl) this.h.onOpenUrl(url);
-                });
-                links.appendChild(a);
-            };
-            link('Profile', b.id ? spProfileUrl(b.id) : null, 'Torn profile');
-            link('TE list', b.te ? tePriceListUrl(b.teName || b.name) : null, 'TornExchange price list: ' + formatMoney(b.te || 0));
-            link('W3B list', b.w3b && b.id ? w3bPriceListUrl(b.id) : null, 'TornW3B price list: ' + formatMoney(b.w3b || 0));
-            return links;
         }
 
         /** A dot and a word: Online, Idle 5m, Offline 3h, Online · Hospital. Nothing when not known yet. */
@@ -9264,9 +9495,9 @@
     * { box-sizing: border-box; }
     .sp-page {
     ${TOKENS_CSS}
-        --page: #131313; --rail: #171717; --card: #1f1f1f; --card2: #252525; --row2: #1a1a1a;
+        --page: #131313; --rail: #171717; --card: #1f1f1f; --card2: #252525;
         --cline: #2b2b2b; --cline2: #393939; --price: #a8dd1c; --green-bg: rgba(153, 204, 0, 0.10);
-        --orange: #e07b39; --head-h: 60px;
+        --hot: #1f2616; --hot-line: #4a5d20; --orange: #e07b39; --head-h: 60px;
         position: absolute; inset: 0; display: flex; flex-direction: column;
         background: var(--page); color: var(--text);
         font: 13px/1.45 Arial, Helvetica, sans-serif;
@@ -9290,11 +9521,13 @@
     .sp-mark { width: 32px; height: 32px; border-radius: 9px; background: var(--profit); color: #131313; display: grid; place-items: center; font-weight: 900; font-size: 17px; }
     .sp-brand h1 { margin: 0; font-size: 20px; color: #fff; letter-spacing: 0.3px; }
     .sp-tagline { color: var(--muted); font-size: 13px; }
-    .sp-search { flex: 1; min-width: 0; max-width: 460px; height: 36px; padding: 0 16px; border-radius: 18px; border: 1px solid var(--cline2); background: #0f0f0f; color: var(--text); }
+    .sp-search { flex: 1; min-width: 0; max-width: 420px; height: 36px; padding: 0 16px; border-radius: 18px; border: 1px solid var(--cline2); background: #0f0f0f; color: var(--text); }
     .sp-search::placeholder { color: var(--muted); }
     .sp-pills { margin-left: auto; display: flex; gap: 6px; }
     .sp-pill { display: inline-flex; align-items: center; gap: 7px; height: 28px; padding: 0 11px; border-radius: 14px; background: var(--card); border: 1px solid var(--cline); font-size: 12px; color: var(--muted); white-space: nowrap; cursor: default; }
     .sp-pill b { color: var(--text); }
+    .sp-pill-btn { cursor: pointer; }
+    .sp-pill-btn:hover { border-color: var(--muted); color: var(--text); }
     .sp-icon { width: 34px; height: 34px; flex: 0 0 auto; border-radius: 9px; border: 1px solid var(--cline2); background: none; cursor: pointer; font-size: 15px; color: var(--text); }
     .sp-icon:hover { background: #242424; }
     .sp-icon[aria-pressed="true"] { color: var(--profit); border-color: var(--profit); }
@@ -9318,64 +9551,108 @@
     .sp-btn.sp-primary { color: var(--on-profit); background: var(--profit); border-color: var(--profit); }
     .sp-link { background: none; border: 0; padding: 0; color: var(--offer); font-size: 12px; cursor: pointer; text-align: left; }
     .sp-link:hover { text-decoration: underline; }
-
-    /* ----------------------------------------------------- one scroll, full width */
-    .sp-main { flex: 1; min-height: 0; overflow-y: auto; }
-    .sp-stats { display: flex; gap: 32px; padding: 14px 24px; border-bottom: 1px solid var(--cline); }
-    .sp-stat small { display: block; font-size: 11px; letter-spacing: 0.5px; text-transform: uppercase; color: var(--muted); }
-    .sp-stat b { font-size: 22px; color: #fff; font-variant-numeric: tabular-nums; }
-    .sp-stat-hi b { color: var(--price); }
-    .sp-layout { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 24px; align-items: start; padding: 16px 24px 64px; }
-    .sp-col-list { min-width: 0; }
-
-    /* the right column: pinned while the page scrolls, never scrolling on its own */
-    .sp-rail { position: sticky; top: 16px; display: flex; flex-direction: column; gap: 16px; }
-    .sp-box { background: var(--rail); border: 1px solid var(--cline); border-radius: 12px; padding: 14px; }
-    .sp-box h2 { margin: 0 0 10px; font-size: 11px; letter-spacing: 0.6px; text-transform: uppercase; color: var(--muted); }
-    .sp-trader { display: grid; grid-template-columns: 28px minmax(0, 1fr); gap: 2px 10px; align-items: start; padding: 8px; border-radius: 9px; cursor: pointer; }
-    .sp-trader:hover { background: var(--card); }
-    .sp-trader.sp-on { background: var(--green-bg); box-shadow: inset 0 0 0 1px #4a5d20; }
-    .sp-rk { grid-row: span 2; margin-top: 2px; width: 28px; height: 28px; border-radius: 50%; background: #262626; display: grid; place-items: center; font-weight: bold; font-size: 12px; color: var(--muted); }
-    .sp-trader:first-child .sp-rk, .sp-trader.sp-on .sp-rk { background: var(--profit); color: #131313; }
-    .sp-trader-l { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 8px; min-width: 0; }
-    .sp-trader-l b { color: #fff; }
-    .sp-trader small { font-size: 12px; color: var(--muted); }
-    .sp-toggle { display: flex; align-items: center; gap: 10px; width: 100%; height: 34px; padding: 0 12px; border-radius: 9px; border: 1px solid var(--cline2); background: none; color: var(--muted); font-weight: bold; cursor: pointer; text-align: left; }
-    .sp-toggle + .sp-toggle { margin-top: 8px; }
+    .sp-toggle { display: inline-flex; align-items: center; gap: 8px; height: 32px; padding: 0 12px; border-radius: 9px; border: 1px solid var(--cline2); background: none; color: var(--muted); font-weight: bold; cursor: pointer; white-space: nowrap; }
     .sp-toggle:hover { color: var(--text); }
     .sp-toggle[aria-pressed="true"] { color: #fff; border-color: var(--profit); background: var(--green-bg); }
 
-    /* the toolbar: tabs, the trader filter, the view switch */
-    .sp-top { display: flex; align-items: center; gap: 8px; margin-bottom: 14px; }
-    .sp-tabs { display: flex; gap: 4px; }
-    .sp-tab { height: 36px; padding: 0 14px; border: 0; border-bottom: 2px solid transparent; background: none; font-size: 15px; font-weight: bold; color: var(--muted); cursor: pointer; white-space: nowrap; }
-    .sp-tab:hover { color: var(--text); }
-    .sp-tab[aria-selected="true"] { color: #fff; border-color: var(--profit); }
-    .sp-tab small { font-weight: normal; font-size: 12px; margin-left: 6px; }
-    .sp-chipbar { display: flex; align-items: center; gap: 10px; padding: 6px 12px; border-radius: 8px; background: var(--green-bg); border: 1px solid #3d4a1f; }
-    .sp-views { margin-left: auto; display: inline-flex; align-items: center; gap: 2px; padding: 3px; border: 1px solid var(--cline2); border-radius: 10px; background: #0f0f0f; }
-    .sp-views > span { padding: 0 8px 0 6px; font-size: 11px; letter-spacing: 0.5px; text-transform: uppercase; color: #6b6b6b; }
-    .sp-views button { display: inline-flex; align-items: center; gap: 6px; height: 30px; padding: 0 12px; border: 0; border-radius: 7px; background: none; color: var(--muted); cursor: pointer; font-weight: bold; }
-    .sp-views button:hover { color: var(--text); }
-    .sp-views button[aria-pressed="true"] { background: #2b3319; color: #fff; box-shadow: inset 0 0 0 1px #4a5d20; }
-    .sp-views svg { width: 16px; height: 16px; fill: currentColor; }
+    /* ----------------------------------------------------- one scroll, full width */
+    .sp-main { flex: 1; min-height: 0; overflow-y: auto; }
+    .sp-wrap { padding: 16px 24px 64px; }
+    .sp-sec { display: flex; align-items: center; gap: 8px; margin: 0 0 10px; }
+    .sp-sec h2 { margin: 0; font-size: 11px; letter-spacing: 0.6px; text-transform: uppercase; color: var(--muted); white-space: nowrap; }
+    .sp-sp { flex: 1; }
+    .sp-empty { padding: 24px 16px; text-align: center; color: var(--muted); background: var(--card); border: 1px dashed var(--cline2); border-radius: 12px; }
+    .sp-more { display: block; margin: 12px auto 0; }
 
-    .sp-empty { padding: 32px 16px; text-align: center; color: var(--muted); background: var(--card); border: 1px dashed var(--cline2); border-radius: 12px; }
-    .sp-more { display: block; margin: 16px auto 0; }
+    /* the strip: the best flips, whatever item they are */
+    .sp-strip { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 24px; }
+    .sp-strip-empty { grid-column: 1 / -1; }
+    .sp-fc { display: flex; flex-direction: column; align-items: stretch; gap: 6px; padding: 12px 14px; text-align: left; background: var(--hot); border: 1px solid var(--hot-line); border-radius: 12px; cursor: pointer; }
+    .sp-fc:hover { background: #232d18; }
+    .sp-fc.sp-sel { box-shadow: 0 0 0 2px var(--profit); }
+    .sp-fc-top { display: flex; align-items: center; gap: 10px; }
+    .sp-fc .sp-iname { font-size: 14px; }
+    .sp-fc-p { font-size: 21px; font-weight: bold; color: var(--price); font-variant-numeric: tabular-nums; }
+    .sp-fc small { font-size: 12px; color: var(--muted); }
+    .sp-fc small b { color: var(--text); }
+    .sp-fc-sell { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
+    .sp-fc-sell .sp-trust { margin-left: 2px; }
+
+    /* the desk: every item on the left, the one picked on the right */
+    .sp-desk { display: grid; grid-template-columns: 340px minmax(0, 1fr); gap: 24px; align-items: start; }
+    .sp-col-list { min-width: 0; }
+    .sp-chips { display: flex; gap: 6px; margin-bottom: 10px; }
+    .sp-chip-f { flex: 1; height: 32px; border-radius: 16px; border: 1px solid var(--cline2); background: none; color: var(--muted); font-weight: bold; cursor: pointer; white-space: nowrap; }
+    .sp-chip-f small { font-weight: normal; font-size: 12px; margin-left: 4px; }
+    .sp-chip-f:hover { color: var(--text); }
+    .sp-chip-f[aria-pressed="true"] { color: #fff; border-color: var(--profit); background: var(--green-bg); }
+    .sp-it { display: grid; grid-template-columns: 44px minmax(0, 1fr) auto; gap: 2px 10px; align-items: center; padding: 8px 10px; margin-bottom: 4px; border-radius: 10px; border: 1px solid transparent; cursor: pointer; }
+    .sp-it:hover { background: var(--card); }
+    .sp-it.sp-sel { background: #232a17; border-color: var(--profit); }
+    .sp-it .sp-pic { grid-row: span 2; }
+    .sp-it small { grid-column: 2 / 4; font-size: 12px; color: var(--muted); }
+    .sp-it small:empty { display: none; }
+    .sp-badge { font-size: 12px; font-weight: bold; padding: 3px 8px; border-radius: 10px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+    .sp-badge:empty { display: none; }
+    .sp-badge-flip { color: var(--price); background: var(--green-bg); }
+    .sp-badge-list { color: var(--offer); background: rgba(116, 192, 252, 0.10); }
+    .sp-badge-sell { color: var(--muted); background: #262626; }
+
+    .sp-ws { position: sticky; top: 16px; min-width: 0; background: var(--rail); border: 1px solid var(--cline); border-radius: 14px; padding: 16px; }
+    .sp-wsh { display: flex; align-items: center; gap: 14px; margin-bottom: 14px; }
+    .sp-wst { display: flex; flex-direction: column; min-width: 0; }
+    .sp-wsname { font-size: 20px; font-weight: bold; color: #fff; }
+    .sp-wst small { color: var(--muted); font-size: 12px; }
+    .sp-quad { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; align-items: start; }
+    .sp-q { min-width: 0; background: var(--card); border: 1px solid var(--cline); border-radius: 12px; padding: 12px 14px; }
+    .sp-q h3 { margin: 0 0 8px; font-size: 11px; letter-spacing: 0.6px; text-transform: uppercase; color: var(--muted); }
+    .sp-q.sp-hot { background: var(--hot); border-color: var(--hot-line); }
+    .sp-q.sp-wide { grid-column: 1 / -1; }
+    .sp-q > .sp-note + .sp-note { margin-top: 6px; }
+    .sp-tr { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 10px; align-items: center; padding: 8px 6px; border-top: 1px solid var(--cline); }
+    .sp-q h3 + .sp-tr, .sp-q .sp-note + .sp-tr { border-top: 0; }
+    .sp-tr.sp-top { background: var(--green-bg); border-radius: 9px; border-top-color: transparent; }
+    .sp-tr.sp-top + .sp-tr { border-top-color: transparent; }
+    .sp-tr.sp-stale { opacity: 0.6; }
+    .sp-tr-l { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+    .sp-tr-l small { font-size: 12px; color: var(--muted); }
+    .sp-trader-l { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 8px; min-width: 0; }
+    .sp-pname { color: #fff; font-weight: bold; }
+    .sp-tprice { font-weight: bold; text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .sp-top .sp-tprice { color: var(--price); }
+    .sp-links { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 6px; }
+    .sp-tr .sp-links { display: grid; grid-template-columns: 64px 64px 76px; }
+    .sp-tr .sp-links.sp-links-one { display: flex; }
+    .sp-chip {
+        display: inline-flex; align-items: center; justify-content: center; height: 30px; padding: 0 10px; font-size: 12px; white-space: nowrap;
+        color: var(--offer); border: 1px solid #3d4f5c; border-radius: 8px;
+    }
+    .sp-chip:hover { text-decoration: none; background: rgba(116, 192, 252, 0.12); }
+    .sp-chip-none { visibility: hidden; }
+    .sp-showall { margin-top: 8px; }
+    .sp-big { font-size: 22px; font-weight: bold; color: var(--price); font-variant-numeric: tabular-nums; }
+    .sp-step { display: grid; grid-template-columns: 22px minmax(0, 1fr) auto; gap: 4px 10px; align-items: center; padding: 8px 0; border-top: 1px solid #2f3a1c; }
+    .sp-q .sp-note + .sp-step { margin-top: 6px; }
+    .sp-n { width: 22px; height: 22px; border-radius: 50%; background: var(--profit); color: #131313; font-weight: bold; font-size: 12px; display: grid; place-items: center; }
+    .sp-step .sp-trust { margin-left: 2px; }
+    .sp-opt { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 12px; align-items: center; padding: 8px 10px; margin-bottom: 6px; border-radius: 9px; border: 1px solid var(--cline); color: var(--text); }
+    a.sp-opt:hover { text-decoration: none; border-color: #3d4f5c; background: rgba(116, 192, 252, 0.06); }
+    .sp-opt-l { display: flex; flex-direction: column; min-width: 0; }
+    .sp-opt-l small, .sp-opt-p small { font-size: 12px; color: var(--muted); font-weight: normal; }
+    .sp-opt-p { display: flex; flex-direction: column; align-items: flex-end; font-size: 15px; font-weight: bold; font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .sp-opt.sp-win { border-color: var(--hot-line); background: var(--green-bg); }
+    .sp-opt.sp-win .sp-opt-p { color: var(--price); }
+    .sp-opt-none { color: var(--muted); }
+    .sp-verdict { margin: 4px 0 0; font-weight: bold; }
+    .sp-verdict.sp-win { color: var(--price); }
 
     /* shared pieces */
     .sp-pic { display: inline-flex; align-items: center; justify-content: center; width: 60px; height: 30px; flex: 0 0 auto; }
     .sp-pic-s { width: 44px; height: 22px; }
-    .sp-pic-l { width: 76px; height: 38px; }
+    .sp-pic-l { width: 80px; height: 40px; }
     .sp-img { width: 100%; height: 100%; object-fit: contain; }
     .sp-img-none { visibility: hidden; }
     .sp-iname { color: #fff; }
-    .sp-price { font-size: 15px; font-weight: bold; color: var(--price); font-variant-numeric: tabular-nums; white-space: nowrap; }
-    .sp-none { color: var(--muted); }
-    .sp-num { color: var(--muted); font-variant-numeric: tabular-nums; }
-    .sp-r { text-align: right; }
-    .sp-sel { border-color: var(--profit) !important; }
-    .sp-nobuyer { opacity: 0.75; }
     .sp-status { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); white-space: nowrap; }
     .sp-status:empty { display: none; }
     .sp-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #666; flex: 0 0 auto; }
@@ -9394,81 +9671,6 @@
     .sp-trust[data-level="trusted"] { color: #c3ea6f; border-color: #5c7a1e; background: rgba(153, 204, 0, 0.12); }
     .sp-trust[data-level="known"] { color: #a7d4ff; border-color: #3d5a74; }
     .sp-trust[data-level="caution"] { color: #f0a020; border-color: #7a5210; }
-    .sp-buyer { display: flex; flex-direction: column; gap: 2px; }
-    /* Name and badge side by side; in a narrow column the badge goes under - never cut. */
-    .sp-buyer-l { display: flex; align-items: center; flex-wrap: wrap; gap: 2px 8px; }
-    .sp-buyer-l > * { white-space: nowrap; }
-
-    /* view 1: Cards */
-    .sp-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(236px, 1fr)); gap: 12px; }
-    .sp-tile { display: flex; flex-direction: column; gap: 8px; padding: 14px; background: var(--card); border: 1px solid var(--cline); border-radius: 12px; cursor: pointer; }
-    .sp-tile:hover { background: var(--card2); }
-    .sp-tile.sp-sel { background: #232a17; }
-    .sp-tile-top { display: flex; align-items: center; gap: 12px; }
-    .sp-tile .sp-iname { font-size: 14px; }
-    .sp-tile .sp-price { font-size: 21px; }
-    .sp-tile .sp-none { font-size: 14px; }
-    .sp-who { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 8px; font-size: 12px; color: var(--muted); }
-    .sp-who b { color: var(--text); }
-    .sp-foot { font-size: 12px; color: var(--muted); }
-    .sp-foot:empty { display: none; }
-
-    /* view 2: Rows */
-    /* Text columns can shrink (names wrap); the figures keep their room. */
-    .sp-rowhead, .sp-row { display: grid; grid-template-columns: 60px minmax(0, 1.4fr) minmax(110px, 150px) minmax(0, 1fr) minmax(100px, 130px) 72px 12px; gap: 16px; align-items: center; }
-    .sp-chev { font-size: 20px; line-height: 1; color: #6b6b6b; }
-    .sp-row:hover .sp-chev, .sp-row.sp-sel .sp-chev { color: var(--profit); }
-    .sp-rowhead { padding: 0 16px 8px; font-size: 11px; font-weight: bold; letter-spacing: 0.5px; text-transform: uppercase; color: #6b6b6b; }
-    .sp-sort { padding: 0; border: 0; background: none; font: inherit; letter-spacing: inherit; text-transform: inherit; color: inherit; cursor: pointer; white-space: nowrap; }
-    .sp-sort:hover, .sp-sorted { color: var(--text); }
-    .sp-row { min-height: 60px; padding: 8px 16px; margin-bottom: 6px; background: var(--card); border: 1px solid var(--cline); border-radius: 10px; cursor: pointer; }
-    .sp-row:hover { background: var(--card2); }
-    .sp-row.sp-sel { background: #232a17; }
-    .sp-name { display: flex; flex-direction: column; min-width: 0; }
-    .sp-row .sp-iname { font-size: 15px; }
-    .sp-name small { font-size: 12px; color: var(--muted); }
-
-    /* view 3: Table */
-    .sp-table { width: 100%; border-collapse: separate; border-spacing: 0; }
-    .sp-table th { position: sticky; top: 0; z-index: 2; background: var(--page); text-align: left; padding: 8px 12px; font-size: 11px; font-weight: bold; letter-spacing: 0.5px; text-transform: uppercase; color: #6b6b6b; border-bottom: 1px solid var(--cline2); white-space: nowrap; }
-    .sp-table th.sp-r, .sp-table td.sp-r { text-align: right; }
-    .sp-table td { padding: 6px 12px; border-bottom: 1px solid var(--cline); vertical-align: middle; }
-    /* Prices stay on one line; names and counts wrap in a narrow window. */
-    .sp-table td.sp-r { white-space: nowrap; }
-    .sp-table td.sp-c-traders { white-space: normal; }
-    .sp-table tbody tr { cursor: pointer; }
-    .sp-table tbody tr:nth-child(even) td { background: var(--row2); }
-    .sp-table tbody tr:hover td { background: #232323; }
-    .sp-table tbody tr.sp-sel td { background: #232a17; }
-    .sp-titem { display: flex; align-items: center; gap: 12px; }
-
-    /* ------------------------------------ the side pop-out: over the page, nothing moves */
-    .sp-drawer {
-        position: absolute; top: var(--head-h); right: 0; bottom: 0; z-index: 10; width: min(460px, 100%);
-        display: flex; flex-direction: column; background: #1b1b1b; border-left: 1px solid var(--cline2);
-        box-shadow: -16px 0 40px rgba(0, 0, 0, 0.55); transform: translateX(105%); transition: transform 0.18s ease, visibility 0s linear 0.18s; visibility: hidden;
-    }
-    .sp-drawer.sp-open { transform: none; visibility: visible; transition: transform 0.18s ease, visibility 0s; }
-    .sp-dhead { display: flex; align-items: center; gap: 12px; padding: 16px; border-bottom: 1px solid var(--cline); }
-    .sp-dtitle { display: flex; flex-direction: column; min-width: 0; flex: 1; }
-    .sp-dtitle b { font-size: 18px; color: #fff; }
-    .sp-dtitle small { color: var(--muted); }
-    .sp-dbody { flex: 1; min-height: 0; overflow-y: auto; padding: 8px 16px 24px; }
-    .sp-dbody > .sp-note { padding: 8px 6px; }
-    .sp-tr { display: grid; grid-template-columns: 22px minmax(0, 1fr) auto; gap: 6px 10px; align-items: center; padding: 10px 6px; border-top: 1px solid var(--cline); }
-    .sp-tr:first-of-type { border-top: 0; }
-    .sp-tr.sp-top { background: var(--green-bg); border-radius: 9px; border-top-color: transparent; }
-    .sp-tr.sp-top + .sp-tr { border-top-color: transparent; }
-    .sp-rank { font-size: 12px; color: #6b6b6b; text-align: right; }
-    .sp-tprice { font-weight: bold; text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
-    .sp-top .sp-tprice { color: var(--price); }
-    .sp-links { grid-column: 2 / 4; display: grid; grid-template-columns: 64px 64px 76px; gap: 6px; }
-    .sp-chip {
-        display: inline-flex; align-items: center; justify-content: center; height: 30px; font-size: 12px; white-space: nowrap;
-        color: var(--offer); border: 1px solid #3d4f5c; border-radius: 8px;
-    }
-    .sp-chip:hover { text-decoration: none; background: rgba(116, 192, 252, 0.12); }
-    .sp-chip-none { visibility: hidden; }
 
     /* ------------------------------------------------------------ settings */
     .sp-settings { display: flex; flex-direction: column; gap: 12px; max-width: 760px; margin: 0 auto; padding: 16px 24px 64px; }
@@ -9478,6 +9680,7 @@
     .sp-inline input { flex: 1; min-width: 0; }
     .sp-inline.sp-actions { gap: 16px; }
     input.sp-key { height: 34px; padding: 0 12px; background: #0f0f0f; border: 1px solid #444; border-radius: 9px; color: var(--text); }
+    input.sp-key::placeholder { color: var(--muted); }
     .sp-masked { -webkit-text-security: disc; }
     .sp-keystate { font-size: 12px; color: var(--muted); }
     .sp-keystate.sp-ok { color: var(--profit); }
@@ -9491,35 +9694,26 @@
     .sp-tos th { width: 36%; color: var(--muted); font-weight: normal; }
 
     /* ---------------------------------------------------------- narrower */
+    @media (max-width: 1300px) {
+        .sp-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
     @media (max-width: 1200px) {
-        .sp-rowhead, .sp-row { grid-template-columns: 48px minmax(0, 1fr) 130px minmax(140px, 1fr) 12px; }
-        .sp-rows .sp-c-next, .sp-rows .sp-c-traders { display: none; }
-        .sp-row .sp-pic, .sp-rowhead > span:first-child { width: 48px; }
         .sp-tagline { display: none; }
+        .sp-quad { grid-template-columns: minmax(0, 1fr); }
     }
     @media (max-width: 1000px) {
         .sp-head { flex-wrap: wrap; height: auto; min-height: var(--head-h); padding: 10px 12px; gap: 8px 10px; }
         .sp-brand { flex: 1; }
         .sp-search { order: 10; flex: 1 0 100%; max-width: none; }
         .sp-pills { order: 11; flex: 1 0 100%; flex-wrap: wrap; margin-left: 0; }
-        /* The picked item takes the whole screen, header and all. */
-        .sp-drawer { top: 0; z-index: 20; }
-        .sp-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px 24px; padding: 12px; }
-        .sp-layout { grid-template-columns: minmax(0, 1fr); padding: 12px 12px 48px; }
-        .sp-rail { position: static; order: -1; }
-        .sp-trader:nth-child(n+4) { display: none; }
-        .sp-top { flex-wrap: wrap; }
-        .sp-views { order: 5; flex: 1 0 100%; margin-left: 0; }
-        .sp-views > span { display: none; }
-        .sp-views button { flex: 1; justify-content: center; }
-        .sp-chipbar { order: 6; flex: 1 0 100%; }
-        .sp-grid { grid-template-columns: minmax(0, 1fr); }
-        .sp-rowhead { display: none; }
-        .sp-row { grid-template-columns: 44px minmax(0, 1fr) auto 12px; gap: 10px; padding: 8px 10px; }
-        .sp-row .sp-pic { width: 44px; height: 22px; }
-        .sp-row .sp-c-who { display: none; }
-        .sp-table .sp-c-next, .sp-table .sp-c-traders { display: none; }
-        .sp-table td, .sp-table th { padding: 6px; }
+        .sp-wrap { padding: 12px 12px 48px; }
+        .sp-sec { flex-wrap: wrap; }
+        .sp-sec h2 { flex: 1 0 100%; }
+        .sp-sp { display: none; }
+        .sp-toggle { flex: 1; justify-content: center; }
+        .sp-strip { grid-template-columns: minmax(0, 1fr); }
+        .sp-desk { grid-template-columns: minmax(0, 1fr); }
+        .sp-ws { position: static; order: -1; }
         .sp-settings { padding: 12px 12px 48px; }
     }
     `;
@@ -9673,6 +9867,34 @@
     function revealRow(el) {
         if (!el || typeof el.scrollIntoView !== 'function') return;
         el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    }
+
+    /*
+     * A trusted trader pays more than this listing asks: their name and price,
+     * drawn on the card from a data attribute like the profit label. Same
+     * contract: one class, one data attribute, nothing appended.
+     */
+    const TRADER_CLASS = 'ttv2-trader';
+    const TRADER_DATA_KEY = 'ttv2Trader';
+    const TRADER_DATA_ATTR = 'data-ttv2-trader';
+
+    /**
+     * Tag these cards, and untag every other one.
+     * @param {Array<{el: Element, label: string}>} rows
+     */
+    function markTraderTags(rows, root = document) {
+        const keep = new Set();
+        for (const row of rows || []) {
+            if (!row || !row.el || !row.el.classList || !row.label) continue;
+            keep.add(row.el);
+            row.el.classList.add(TRADER_CLASS);
+            if (row.el.dataset[TRADER_DATA_KEY] !== row.label) row.el.dataset[TRADER_DATA_KEY] = row.label;
+        }
+        for (const el of root.querySelectorAll('[' + TRADER_DATA_ATTR + ']')) {
+            if (keep.has(el)) continue;
+            el.classList.remove(TRADER_CLASS);
+            delete el.dataset[TRADER_DATA_KEY];
+        }
     }
 
     const TARGET_CLASS = 'ttv2-target';
@@ -10170,6 +10392,7 @@
 
 
 
+
     const STORE_KEY = 'apiKey';
     const STORE_ITEMS = 'itemsCache';
     const STORE_NPC = 'npcCache';
@@ -10195,6 +10418,8 @@
     const STORE_TRADER_DB = 'traderDb';
     /* TornExchange's best buyer per item you hold, asked without a key. */
     const STORE_TE_ONE = 'teOne';
+    /* The traders page: your own Torn id, read once with its Limited key. */
+    const STORE_SELL_SELF = 'sellSelf';
 
     /* Price history the script records itself, and TornW3B's latest summary. */
     const STORE_HISTORY = 'priceHistory';
@@ -10310,6 +10535,8 @@
     const app = {
         tabId: makeTabId(),
         index: null,
+        /* Who buys what, from what the traders page stored: for the bazaar tags. */
+        traderLookup: null,
         feed: null,
         w3b: null,
         /*
@@ -10689,6 +10916,7 @@
             // A new kind of page picks its own list again.
             app.tabOverride = null;
             clearMarks();
+            markTraderTags([]);
         }
 
         if (location.href !== app.pageHref) {
@@ -10786,6 +11014,8 @@
             : belowMinRows(priced, rankSettings({ limit: 0 }), ranked).filter((row) => !pageRowContradicted(feed, row));
 
         markRows(live.slice(0, 100), document, lower.slice(0, 100));
+        // A trusted trader pays more than a listing here asks: named on its card.
+        markTraderTags(app.pageType === PAGE_BAZAAR && sellerId && !closedHere ? traderTags(listings) : []);
         showBazaarTarget(listings);
 
         app.lastScanAt = now;
@@ -10794,6 +11024,51 @@
 
         refreshView();
         attachObserver(listings);
+    }
+
+    /* What the traders page stored is read again at most this often. */
+    const TRADER_TAG_REFRESH_MS = 60000;
+
+    /**
+     * The best Trusted trader for an item, from what the traders page stored:
+     * TornExchange's buyers and our trader database. No request of its own - if
+     * the traders page has never been opened, no card is tagged.
+     */
+    function trustedBuyerOf(itemId) {
+        const now = Date.now();
+        if (!app.traderLookup || now - app.traderLookup.at > TRADER_TAG_REFRESH_MS) {
+            const db = readTraderDb(gmGet(STORE_TRADER_DB, null));
+            const te = readTeCacheEntry(gmGet(STORE_TE, null), now);
+            const ids = gmGet(STORE_TE_IDS, null);
+            app.traderLookup = {
+                at: now,
+                best: new Map(),
+                buyersAll: buyerLookup({
+                    teMap: te ? te.map : new Map(),
+                    lists: readTeItemLists(gmGet(STORE_TE_LISTS, null), now),
+                    teOne: loadTeOne(now),
+                    idsByName: ids && ids.map && now - ids.fetchedAt < TE_IDS_MAX_AGE_MS ? new Map(Object.entries(ids.map)) : new Map(),
+                    db,
+                    w3bByItem: indexW3bByItem(db, now),
+                    dbIdsByName: traderIdsByName(db),
+                }),
+            };
+        }
+        const id = String(itemId);
+        const lookup = app.traderLookup;
+        if (!lookup.best.has(id)) lookup.best.set(id, trustedOnly(lookup.buyersAll(id))[0] || null);
+        return lookup.best.get(id);
+    }
+
+    /** The cards on this bazaar a trusted trader pays more for, with the words for each. */
+    function traderTags(listings) {
+        const rows = [];
+        for (const l of listings) {
+            if (!l.el) continue;
+            const label = traderTagLabel(trustedBuyerOf(l.itemId), l.listingPrice);
+            if (label) rows.push({ el: l.el, label });
+        }
+        return rows;
     }
 
     /**
@@ -11873,10 +12148,28 @@
          */
         teOne: new Map(),
         teOneBusy: false,
-        /* "Best trader for you": show only the items this trader pays most for. */
-        traderFilter: null,
-        /* How the Rows and Table views sort; Cards follow it too. */
-        sort: { key: 'price', dir: -1 },
+        /* TornW3B's one-call bazaar summary: itemId -> {lowestPrice, totalBazaars, ...}. */
+        summary: null,
+        summaryAt: 0,
+        summaryTriedAt: 0,
+        summaryError: null,
+        /* Every bazaar listing of an item, once read: itemId -> {at, triedAt, rows, error, loading}. */
+        bazaars: new Map(),
+        /* Items worth reading every bazaar of, for a flip: from the summary, best first. */
+        candidates: [],
+        /* Flips and traders' price lists take turns for TornW3B's slots. */
+        w3bTurn: 0,
+        /* The Item Market's cheapest listing of the item picked, when you hold it. */
+        market: new Map(),
+        marketBusy: false,
+        /* Your own Torn id: your listings are never "the cheapest", nor a bazaar to buy from. */
+        selfId: null,
+        selfTried: false,
+        /* The item on the desk (and whether you picked it), the list's filter and search. */
+        selected: null,
+        pickedByYou: false,
+        filter: 'all',
+        query: '',
         /* When statuses were asked, for the per-minute limit. */
         presenceAsked: [],
         /* Our trader database (TornW3B lists), and its item index for this render. */
@@ -11890,8 +12183,6 @@
         w3bPauseUntil: 0,
         /* The paced TornExchange queue: one call per slot, shared pace with every tab. */
         queue: null,
-        expanded: new Set(),
-        queries: { my: '', all: '' },
         allShown: ALL_ITEMS_PAGE,
         presence: new Map(),
         keyDead: false,
@@ -12080,34 +12371,214 @@
         return new Set((sell.inventory || []).map((it) => String(it.id)));
     }
 
-    /**
-     * Read the next TornW3B price list that is due: never read, then the traders
-     * who buy what you hold, then everyone else. One at a time, visible tab only.
+    /*
+     * TornW3B for the traders page: one request per step, W3B_LIST_STEP_MS
+     * apart, so everything here stays inside its 24 a minute - the bazaar
+     * summary, every bazaar of the item picked, the possible flips, and
+     * traders' price lists all share those slots. Visible tab only.
      */
-    function stepW3bLists() {
+    const W3B_SUMMARY_MS = 5 * 60 * 1000;
+    /* The item picked: its bazaars read again after this. */
+    const W3B_SELECTED_MS = 2 * 60 * 1000;
+    /* A possible flip: its bazaars read again after this. */
+    const W3B_CANDIDATE_MS = 10 * 60 * 1000;
+    /* A TornW3B request that failed is not asked again before this. */
+    const W3B_FAILED_RETRY_MS = 60 * 1000;
+    /* Bazaar listings nobody is looking at any more are dropped after this. */
+    const W3B_BAZAARS_FORGET_MS = 30 * 60 * 1000;
+    /* The Item Market's cheapest listing of the item picked, read again after this. */
+    const SELL_MARKET_REFRESH_MS = 2 * 60 * 1000;
+
+    function stepW3b() {
         if (sell.w3bBusy || document.visibilityState !== 'visible') return;
         const now = Date.now();
         if (now < sell.w3bPauseUntil) return;
-        const id = nextW3bTrader(sell.db, heldIds(), now);
-        if (!id) return;
+        const job = nextW3bJob(now);
+        if (!job) return;
 
         sell.w3bBusy = true;
-        fetchW3bPriceList(sell.w3b, id)
+        job().finally(() => {
+            sell.w3bBusy = false;
+            renderSelling();
+        });
+    }
+
+    /** Are an item's bazaar listings due to be read? */
+    function bazaarsDue(itemId, every, now) {
+        const b = sell.bazaars.get(String(itemId));
+        if (!b) return true;
+        if (b.loading) return false;
+        if (b.error) return now - b.triedAt >= W3B_FAILED_RETRY_MS;
+        return now - b.at >= every;
+    }
+
+    /**
+     * The next TornW3B request: the summary when old, then the item picked, then
+     * possible flips and price lists taking turns, so neither waits on the other.
+     */
+    function nextW3bJob(now) {
+        if (now - sell.summaryAt >= W3B_SUMMARY_MS && now - sell.summaryTriedAt >= W3B_FAILED_RETRY_MS) return loadBazaarSummary;
+        const picked = sell.selected;
+        if (picked && bazaarsDue(picked, W3B_SELECTED_MS, now)) return () => loadBazaars(picked);
+
+        const cand = sell.candidates.find((c) => bazaarsDue(c.itemId, W3B_CANDIDATE_MS, now));
+        const list = nextW3bTrader(sell.db, heldIds(), now);
+        sell.w3bTurn ^= 1;
+        if (cand && (sell.w3bTurn || !list)) return () => loadBazaars(cand.itemId);
+        if (list) return () => loadW3bList(list);
+        if (cand) return () => loadBazaars(cand.itemId);
+        return null;
+    }
+
+    /** One trader's TornW3B price list. */
+    function loadW3bList(id) {
+        return fetchW3bPriceList(sell.w3b, id)
             .then((body) => recordW3bList(sell.db, id, { prices: parseW3bPriceList(body) }, Date.now()))
             .catch((error) => {
                 recordW3bList(sell.db, id, { error: true }, Date.now());
                 if (error && error.blocked) sell.w3bPauseUntil = Date.now() + 60000;
             })
             .finally(() => {
-                sell.w3bBusy = false;
                 sell.dbDirty = true;
                 sell.w3bIndex = null;
                 saveTraderDb();
+            });
+    }
+
+    /** The cheapest bazaar price of every item, in one request. */
+    function loadBazaarSummary() {
+        sell.summaryTriedAt = Date.now();
+        return fetchW3bSummary(sell.w3b)
+            .then((rows) => {
+                const map = new Map();
+                for (const r of rows) map.set(r.itemId, r);
+                sell.summary = map;
+                sell.summaryAt = Date.now();
+                sell.summaryError = null;
+                // Listings of items no longer picked or possible flips are let go.
+                const keep = new Set([sell.selected, ...sell.candidates.map((c) => c.itemId)]);
+                for (const [id, b] of sell.bazaars) {
+                    if (!keep.has(id) && Date.now() - (b.at || b.triedAt || 0) > W3B_BAZAARS_FORGET_MS) sell.bazaars.delete(id);
+                }
+            })
+            .catch((error) => {
+                sell.summaryError = 'TornW3B did not answer. Trying again soon.';
+                if (error && error.blocked) sell.w3bPauseUntil = Date.now() + 60000;
+            });
+    }
+
+    /** Every bazaar listing of one item. */
+    function loadBazaars(itemId) {
+        const id = String(itemId);
+        const prev = sell.bazaars.get(id) || { at: 0, rows: [], error: null };
+        sell.bazaars.set(id, { ...prev, loading: true, triedAt: Date.now() });
+        return fetchW3bListings(sell.w3b, id)
+            .then(({ listings }) => {
+                sell.bazaars.set(id, { at: Date.now(), triedAt: Date.now(), rows: normalizeW3bListings(listings), error: null, loading: false });
+            })
+            .catch((error) => {
+                sell.bazaars.set(id, { ...prev, triedAt: Date.now(), error: 'TornW3B did not answer. Trying again soon.', loading: false });
+                if (error && error.blocked) sell.w3bPauseUntil = Date.now() + 60000;
+            });
+    }
+
+    /**
+     * The Item Market's cheapest listing of the item picked, when you hold it:
+     * one call with this page's key, again after SELL_MARKET_REFRESH_MS while it
+     * stays picked. Visible tab only.
+     */
+    function loadSellMarket(itemId) {
+        const id = String(itemId);
+        if (!getSellKey() || sell.keyDead || sell.marketBusy || document.visibilityState !== 'visible') return;
+        const now = Date.now();
+        const m = sell.market.get(id);
+        if (m && (m.error ? now - m.triedAt < W3B_FAILED_RETRY_MS : now - m.at < SELL_MARKET_REFRESH_MS)) return;
+
+        sell.marketBusy = true;
+        sell.market.set(id, { ...(m || { at: 0, lowest: null }), loading: true, triedAt: now });
+        fetchItemMarket(sell.client, id, { limit: 5 })
+            .then((r) => {
+                const lowest = r.listings.length ? Math.min(...r.listings.map((l) => l.price)) : null;
+                sell.market.set(id, { at: Date.now(), triedAt: Date.now(), lowest, loading: false, error: null });
+            })
+            .catch((error) => {
+                if (isKeyDeadError(error)) {
+                    sell.keyDead = true;
+                    sell.keyError = sellKeyErrorText(error);
+                    gmSet(STORE_SELL_KEY_DEAD, true);
+                }
+                sell.market.set(id, { ...(m || { at: 0, lowest: null }), triedAt: Date.now(), loading: false, error: true });
+            })
+            .finally(() => {
+                sell.marketBusy = false;
                 renderSelling();
             });
     }
 
+    /**
+     * Your own Torn id, once per key (`user` basic, v1): so your own listing is
+     * never shown as the cheapest bazaar to buy from or to undercut.
+     */
+    function loadSelfId() {
+        if (sell.selfId || sell.selfTried || !getSellKey() || sell.keyDead) return;
+        const stored = gmGet(STORE_SELL_SELF, null);
+        if (stored && stored.id) {
+            sell.selfId = String(stored.id);
+            return;
+        }
+        sell.selfTried = true;
+        sell.client
+            .get('user', { selections: 'basic' })
+            .then((data) => {
+                const id = Number(data && data.player_id);
+                if (Number.isFinite(id) && id > 0) {
+                    sell.selfId = String(id);
+                    gmSet(STORE_SELL_SELF, { id: sell.selfId });
+                    renderSelling();
+                }
+            })
+            .catch(() => {
+                // Without it your own listing can show; nothing else depends on it.
+            });
+    }
+
     /* --------------------------------------------------------------- view */
+
+    /**
+     * Who buys an item, one row per trader, highest first - from TornExchange's
+     * top three (keyed, or the keyless best buyer), its full lists, and our
+     * trader database's TornW3B lists. Answers are kept per item for one pass.
+     * The traders page and the panel's bazaar tags both use it.
+     */
+    function buyerLookup({ teMap, lists, teOne, idsByName, db, w3bByItem, dbIdsByName }) {
+        // TornExchange's votes for the trust badge, from every answer we have.
+        const votesById = votesByTrader([
+            ...teMap.values(),
+            ...[...teOne.values()].filter((rec) => rec.best).map((rec) => [rec.best]),
+        ]);
+        const cache = new Map();
+        return (itemId) => {
+            const id = String(itemId);
+            let b = cache.get(id);
+            if (!b) {
+                const full = lists.get(id);
+                const one = teOne.get(id);
+                b = buyersForItem(id, {
+                    // The keyed top three when TornExchange has them; else its
+                    // keyless best buyer for this item.
+                    teBest: teMap.get(id) || (one && one.best ? [one.best] : []),
+                    teFull: full ? full.traders : null,
+                    idsByName,
+                    db,
+                    w3bByItem,
+                    dbIdsByName,
+                    votesById,
+                });
+                cache.set(id, b);
+            }
+            return b;
+        };
+    }
 
     /** Everything the page shows, from what is loaded now. */
     function renderSelling() {
@@ -12120,45 +12591,29 @@
 
         const w3bByItem = w3bIndex(now);
         const teMap = sell.traders ? sell.traders.map : new Map();
-        // TornExchange's votes for the trust badge, from every answer we have.
-        const votesById = votesByTrader([
-            ...teMap.values(),
-            ...[...sell.teOne.values()].filter((rec) => rec.best).map((rec) => [rec.best]),
-        ]);
-        const buyersCache = new Map();
-        const buyersAll = (itemId) => {
-            const id = String(itemId);
-            let b = buyersCache.get(id);
+        const buyersAll = buyerLookup({ teMap, lists: sell.lists, teOne: sell.teOne, idsByName: sell.idsByName, db: sell.db, w3bByItem, dbIdsByName: sell.dbIdsByName });
+        const levelOf = (id) => presenceLevel(sellPresenceOf(id));
+        // What the Show toggles keep: online buyers, trusted buyers, or both.
+        const shownCache = new Map();
+        const buyersOf = (id) => {
+            const key = String(id);
+            let b = shownCache.get(key);
             if (!b) {
-                const full = sell.lists.get(id);
-                const one = sell.teOne.get(id);
-                b = buyersForItem(id, {
-                    // The keyed top three when TornExchange has them; else its
-                    // keyless best buyer for this item.
-                    teBest: teMap.get(id) || (one && one.best ? [one.best] : []),
-                    teFull: full ? full.traders : null,
-                    idsByName: sell.idsByName,
-                    db: sell.db,
-                    w3bByItem,
-                    dbIdsByName: sell.dbIdsByName,
-                    votesById,
-                });
-                buyersCache.set(id, b);
+                b = buyersAll(key);
+                if (prefs.onlineOnly) b = onlineOnly(b, levelOf);
+                if (prefs.trustedOnly) b = trustedOnly(b);
+                shownCache.set(key, b);
             }
             return b;
         };
-        const levelOf = (id) => presenceLevel(sellPresenceOf(id));
-        // What the Show toggles keep: online buyers, trusted buyers, or both.
-        const buyersOf = (id) => {
-            let b = buyersAll(id);
-            if (prefs.onlineOnly) b = onlineOnly(b, levelOf);
-            if (prefs.trustedOnly) b = trustedOnly(b);
-            return b;
-        };
+        const heldQty = new Map((sell.inventory || []).map((it) => [String(it.id), Number(it.qty) || 0]));
         const heldNames = new Map((sell.inventory || []).map((it) => [String(it.id), it.name]));
+        const summary = sell.summary || new Map();
+        const itemOf = (id) => (sell.index && sell.index.byId ? sell.index.byId.get(String(id)) : null);
         const nameOf = (id) => {
-            const item = sell.index && sell.index.byId ? sell.index.byId.get(String(id)) : null;
-            return (item && item.name) || heldNames.get(String(id)) || 'Item ' + id;
+            const item = itemOf(id);
+            const s = summary.get(String(id));
+            return (item && item.name) || heldNames.get(String(id)) || (s && s.name) || 'Item ' + id;
         };
 
         const stats = traderDbStats(sell.db, now);
@@ -12177,77 +12632,147 @@
             return !one || Boolean(one.failed);
         };
 
-        /*
-         * Every item you hold with every trader, whatever the filters: what the
-         * online checker and "best trader for you" work from.
-         */
-        const myAll = sell.inventory ? itemRows(heldIds(), { buyersOf: buyersAll, nameOf }) : [];
-        // Who to message follows the Show toggles: an offline trader is no one to message.
-        const myShown = prefs.onlineOnly || prefs.trustedOnly ? itemRows(heldIds(), { buyersOf, nameOf }) : myAll;
-        const ranked = bestTradersFor(myShown, Infinity);
-        const best = ranked.slice(0, 5);
-        const traderKey = (b) => (b.id ? String(b.id) : 'name:' + String(b.name).toLowerCase());
-        // The trader you picked stays picked while they still have the best price
-        // on something, in the top five or not. A Show toggle that hides them for
-        // now does not forget the choice: switching it back brings it back.
-        const filterTrader = sell.traderFilter ? ranked.find((e) => traderKey(e.trader) === sell.traderFilter) : null;
-        const onlyItems = filterTrader ? new Set(filterTrader.bestOn) : null;
+        /* The bazaar side: every listing once read, else the summary's cheapest. */
+        const sellersOf = (id) => {
+            const b = sell.bazaars.get(String(id));
+            return b && b.at ? bazaarSellers(b.rows, { selfId: sell.selfId, now }) : null;
+        };
+        const lowestOf = (id) => {
+            const rows = sellersOf(id);
+            if (rows) {
+                const fresh = rows.find((r) => !r.stale) || rows[0];
+                return fresh ? fresh.price : null;
+            }
+            const s = summary.get(String(id));
+            return s ? s.lowestPrice : null;
+        };
+        const planOf = (id) => {
+            const rows = sellersOf(id);
+            const b = buyersOf(id)[0];
+            return rows && b ? flipPlan(rows, b.price, { cash: prefs.cash }) : null;
+        };
 
-        /* My items: everything you hold, those with a trader first. */
-        let my = sell.inventory ? sortItemRows(itemRows(heldIds(), { buyersOf, nameOf, query: sell.queries.my }), sell.sort) : [];
-        if (onlyItems) my = my.filter((r) => onlyItems.has(r.itemId));
-        for (const r of my) {
-            // With Online only, not knowing a trader's status yet is not "nobody online".
-            const statusPending = prefs.onlineOnly && buyersAll(r.itemId).some((b) => b.id && presenceUnknown(b.id));
-            r.pending = !r.best && (pendingFor(r.itemId) || statusPending);
-        }
+        // Which items' bazaars to read for a flip: where a buyer you would sell
+        // to pays more than the summary's cheapest.
+        sell.candidates = sell.summary
+            ? flipCandidates(summary, (id) => {
+                const b = buyersOf(id)[0];
+                return b ? b.price : null;
+            }, { cash: prefs.cash })
+            : [];
+        const flipsChecked = sell.candidates.filter((c) => {
+            const b = sell.bazaars.get(c.itemId);
+            return b && b.at && now - b.at < W3B_CANDIDATE_MS * 2;
+        }).length;
 
-        /* All items: every item any trader buys. */
+        /* Every item: what you hold, and everything any trader buys. */
         const oneIds = [...sell.teOne].filter(([, rec]) => rec.best).map(([id]) => id);
-        const allIds = new Set([...teMap.keys(), ...w3bByItem.keys(), ...oneIds]);
-        const allRows = sortItemRows(itemRows(allIds, { buyersOf, nameOf, query: sell.queries.all }).filter((r) => r.best), sell.sort);
-        const all = allRows.slice(0, sell.allShown);
+        const allIds = new Set([...heldQty.keys(), ...teMap.keys(), ...w3bByItem.keys(), ...oneIds]);
+        const q = String(sell.query || '').trim().toLowerCase();
+        const rows = [];
+        for (const id of allIds) {
+            const name = nameOf(id);
+            if (q && !String(name).toLowerCase().includes(q)) continue;
+            const best = buyersOf(id)[0] || null;
+            const held = heldQty.get(id) || 0;
+            const plan = planOf(id);
+            const lowest = lowestOf(id);
+            let badge = null;
+            let value = 0;
+            if (plan && plan.units > 0) {
+                badge = { kind: 'flip', amount: plan.profit };
+                value = plan.profit;
+            } else if (held && best) {
+                const w = whereToSell({ held, bid: best.price, bazaarLowest: lowest });
+                if (w.best === 'bazaar') {
+                    badge = { kind: 'list', amount: w.gain };
+                    value = w.gain;
+                } else {
+                    badge = { kind: 'sell' };
+                }
+            }
+            rows.push({ itemId: id, name, held, lowest, badge, value, bid: best ? best.price : 0, pending: !best && pendingFor(id), plan, best });
+        }
+        const counts = {
+            all: rows.length,
+            mine: rows.filter((r) => r.held).length,
+            flips: rows.filter((r) => r.badge && r.badge.kind === 'flip').length,
+        };
+        const pass = (r) => (sell.filter === 'mine' ? r.held > 0 : sell.filter === 'flips' ? Boolean(r.badge && r.badge.kind === 'flip') : true);
+        // Money to be made first, then what you hold, then the best price.
+        const listed = rows
+            .filter(pass)
+            .sort((a, b) => b.value - a.value || (b.held > 0) - (a.held > 0) || b.bid - a.bid || String(a.name).localeCompare(String(b.name)));
+        const strip = rows
+            .filter((r) => r.badge && r.badge.kind === 'flip')
+            .sort((a, b) => b.plan.profit - a.plan.profit)
+            .slice(0, 4)
+            .map((r) => ({ itemId: r.itemId, name: r.name, plan: r.plan, buyer: r.best }));
 
-        /*
-         * The item open in the side panel, whatever the search or filter now
-         * shows: it stays open until closed.
-         */
-        const [openKey] = sell.expanded;
-        let detail = null;
-        if (openKey) {
-            const at = openKey.indexOf(':');
-            const section = openKey.slice(0, at);
-            const itemId = openKey.slice(at + 1);
-            const buyers = buyersOf(itemId);
-            const statusPending = prefs.onlineOnly && buyersAll(itemId).some((b) => b.id && presenceUnknown(b.id));
-            detail = { section, itemId, name: nameOf(itemId), buyers, best: buyers[0] || null, pending: !buyers.length && (pendingFor(itemId) || statusPending) };
+        // The item you picked stays picked. Until you pick one, the desk shows
+        // the best flip (or the first item), following it as flips are found.
+        // Only an item you pick asks TornExchange for its full buyer list: its
+        // 10 a minute are not spent on the desk following flips.
+        if (sell.selected && !allIds.has(sell.selected)) {
+            sell.selected = null;
+            sell.pickedByYou = false;
+        }
+        if (!sell.pickedByYou) {
+            sell.selected = sell.filter !== 'mine' && strip.length ? strip[0].itemId : listed.length ? listed[0].itemId : null;
         }
 
-        const watch = tradersToCheck(myAll, all, best, detail ? buyersAll(detail.itemId) : []);
+        let desk = null;
+        const pick = sell.selected;
+        if (pick) {
+            const buyers = buyersOf(pick);
+            const b = sell.bazaars.get(pick);
+            const held = heldQty.get(pick) || 0;
+            const m = sell.market.get(pick);
+            const s = summary.get(pick);
+            const item = itemOf(pick);
+            const load = sell.listState.get(pick) || {};
+            const statusPending = prefs.onlineOnly && buyersAll(pick).some((x) => x.id && presenceUnknown(x.id));
+            desk = {
+                itemId: pick,
+                name: nameOf(pick),
+                held,
+                avg: item ? Number(item.marketValue) || null : null,
+                bazaars: s ? s.totalBazaars : 0,
+                buyers,
+                buyersTotal: buyers.length,
+                buyersLoading: Boolean(load.loading),
+                pending: !buyers.length && (pendingFor(pick) || statusPending),
+                sellers: {
+                    state: b && b.at ? 'ok' : b && b.error ? 'error' : 'loading',
+                    rows: sellersOf(pick) || [],
+                    error: b ? b.error : null,
+                },
+                plan: planOf(pick),
+                planWhy: b && b.at ? null : 'loading',
+                where: held ? whereToSell({ held, bid: buyers[0] ? buyers[0].price : null, bazaarLowest: lowestOf(pick), marketLowest: m ? m.lowest : null }) : null,
+                market: { state: m && m.at ? 'ok' : m && m.error ? 'error' : 'loading', lowest: m ? m.lowest : null },
+            };
+            if (held) loadSellMarket(pick);
+        }
+
+        const watch = sellWatch({ desk, strip, listed, held: [...heldQty.keys()], buyersAll });
         updateSellPresence(watch, now);
         const statusesKnown = watch.ids.filter((id) => !presenceUnknown(id)).length;
 
-        const itemLists = new Map();
-        for (const [id, s] of sell.listState) itemLists.set(id, s);
         const heldCount = sell.inventory ? sell.inventory.length : 0;
         const teOneDone = sell.inventory ? [...heldIds()].filter((i) => sell.teOne.has(i) && !sell.teOne.get(i).failed).length : 0;
-
         const statuses = sellStatusMap(now);
         const traderCount = countTraders(allIds, buyersAll);
 
         sell.page.render({
-            my,
-            all,
-            allTotal: allRows.length,
-            myTotal: myAll.length,
-            best: best.map((e) => ({ trader: e.trader, bestOn: e.bestOn.length, buys: e.buys, key: traderKey(e.trader) })),
-            traderFilter: filterTrader ? { key: sell.traderFilter, name: filterTrader.trader.name, count: filterTrader.bestOn.length } : null,
-            detail,
-            sort: sell.sort,
-            stats: sellStats(myAll, statuses, traderCount),
+            strip,
+            list: listed.slice(0, sell.allShown).map((r) => ({ itemId: r.itemId, name: r.name, held: r.held, lowest: r.lowest, badge: r.badge, pending: r.pending })),
+            listTotal: listed.length,
+            counts,
+            filter: sell.filter,
+            desk,
             statuses,
             prefs,
-            expanded: sell.expanded,
             info: {
                 hasKey: Boolean(getSellKey()),
                 keyAccess: access && access.name,
@@ -12264,8 +12789,6 @@
                 tradersLoading: sell.teLoading || w3bPending || (!teUnusable && !sell.traders) || (teUnusable && teOneDone < heldCount),
                 traderCount,
                 knownTraders: stats.total + sell.idsByName.size + teMap.size + oneIds.length,
-                w3bAt: stats.newestW3bAt,
-                w3bChecking: stats.unchecked,
                 w3bTraders: stats.withW3b,
                 // Each source on its own: one failing never hides the others.
                 teStatus: !teKey ? 'nokey' : st.badKey ? 'badkey' : sell.traders ? 'ok' : 'loading',
@@ -12273,28 +12796,14 @@
                 heldCount,
                 w3bKnown: stats.total,
                 w3bRead: stats.total - stats.unchecked,
+                bazaarsAt: sell.summaryAt || null,
+                bazaarsError: sell.summaryError,
+                flipsChecked,
+                flipsWanted: sell.candidates.length,
                 statusesKnown,
                 statusesWanted: watch.ids.length,
-                itemLists,
             },
         });
-    }
-
-    /** The headline numbers over the lists. */
-    function sellStats(myAll, statuses, traderCount) {
-        const online = new Set();
-        for (const r of myAll) {
-            for (const b of r.buyers) {
-                const st = b.id ? statuses.get(String(b.id)) : null;
-                if (st && (st.level === 'online' || st.level === 'busy')) online.add(String(b.id));
-            }
-        }
-        return {
-            held: sell.inventory ? myAll.length : null,
-            withBuyer: sell.inventory ? myAll.filter((r) => r.best).length : null,
-            buyersOnline: online.size,
-            known: traderCount,
-        };
     }
 
     /** Distinct traders buying anything, for the status line. */
@@ -12305,12 +12814,13 @@
     }
 
     /**
-     * Whose online status to keep fresh, most useful first: every trader in an
-     * open row, then the top three for each item you hold, then the best buyer
-     * of the first items in All items. Built from the rows as shown, so an open
-     * row is never starved by the rest.
+     * Whose online status to keep fresh, most useful first: every trader of the
+     * item on the desk (even ones the Show toggles hide: Online only needs to
+     * know about them), the buyers in the best flips, every trader of every item
+     * you hold (best first per item), then the best buyer of the first items in
+     * the list.
      */
-    function tradersToCheck(my, all, best = [], openBuyers = []) {
+    function sellWatch({ desk, strip, listed, held, buyersAll }) {
         const ids = [];
         const seen = new Set();
         const open = new Set();
@@ -12322,17 +12832,12 @@
             seen.add(id);
             ids.push(id);
         };
-        const rowsAll = (section, rows) => rows.filter((r) => sell.expanded.has(section + ':' + r.itemId));
-        // Every trader of the item open in the side panel first, even ones the
-        // Show toggles hide now: Online only needs to know about them.
-        openBuyers.forEach((b) => push(b, true));
-        for (const r of [...rowsAll('my', my), ...rowsAll('all', all)]) r.buyers.forEach((b) => push(b, true));
-        for (const e of best) push(e.trader);
-        // Every trader of every item you hold, best first per item: Online only
-        // needs to know about all of them.
-        const depth = Math.max(0, ...my.map((r) => r.buyers.length));
-        for (let i = 0; i < depth; i++) for (const r of my) push(r.buyers[i]);
-        for (const r of all) push(r.best);
+        if (desk) buyersAll(desk.itemId).forEach((b) => push(b, true));
+        for (const f of strip) push(f.buyer);
+        const lists = held.map((id) => buyersAll(id));
+        const depth = Math.max(0, ...lists.map((l) => l.length));
+        for (let i = 0; i < depth; i++) for (const l of lists) push(l[i]);
+        for (const r of listed.slice(0, 20)) push(r.best);
         return { ids, open };
     }
 
@@ -12545,7 +13050,7 @@
     /**
      * Traders' public statuses, when due, in the order given (most useful
      * first): visible tab only, at most SELL_PRESENCE_PER_MIN a minute.
-     * @param {{ids: string[], open: Set<string>}} watch - from tradersToCheck
+     * @param {{ids: string[], open: Set<string>}} watch - from sellWatch
      */
     function updateSellPresence({ ids, open }, now) {
         for (const id of ids) {
@@ -12613,6 +13118,7 @@
         sell.inventory = null;
         sell.inventoryAt = null;
         sell.inventoryRetryAt = 0;
+        forgetSelf();
         sell.page.showView('list');
         loadSellInventory({ force: true }).then(() => refreshSellTraders());
     }
@@ -12626,7 +13132,16 @@
         sell.keyError = null;
         sell.inventory = null;
         sell.inventoryAt = null;
+        forgetSelf();
         renderSelling();
+    }
+
+    /** A new key may be another player: whose listings are "yours" is asked again. */
+    function forgetSelf() {
+        gmDel(STORE_SELL_SELF);
+        sell.selfId = null;
+        sell.selfTried = false;
+        sell.market = new Map();
     }
 
     /**
@@ -12676,39 +13191,41 @@
             const prices = t.w3b && t.w3b.found && t.w3b.prices;
             if (prices && Object.keys(prices).some((i) => held.has(i))) markW3bDue(sell.db, id);
         }
+        // Bazaar prices, and every bazaar of the item picked, are read again too.
+        sell.summaryAt = 0;
+        sell.summaryTriedAt = 0;
+        if (sell.selected) {
+            sell.bazaars.delete(sell.selected);
+            sell.market.delete(sell.selected);
+        }
         loadSellInventory({ force: true }).then(() => refreshSellTraders({ force: true }));
+        renderSelling();
     }
 
     /**
-     * Open an item's traders in the side panel, one item at a time; the same
-     * item again (or ✕ / Esc) closes it.
+     * Put an item on the desk: its full TornExchange buyer list and its bazaars
+     * are asked for straight away (each through its own paced queue).
      */
-    function onSellExpand(section, itemId) {
-        const key = section + ':' + String(itemId);
-        const wasOpen = sell.expanded.has(key);
-        sell.expanded.clear();
-        if (!wasOpen) {
-            sell.expanded.add(key);
-            loadTeItemList(itemId);
-        }
+    function onSellSelect(itemId) {
+        sell.selected = String(itemId);
+        sell.pickedByYou = true;
+        loadTeItemList(sell.selected);
+        renderSelling();
+        stepW3b();
+    }
+
+    /** All, Mine or Flips: the desk moves to the first item there. */
+    function onSellFilter(key) {
+        sell.filter = key === 'mine' || key === 'flips' ? key : 'all';
+        sell.selected = null;
+        sell.pickedByYou = false;
+        sell.allShown = ALL_ITEMS_PAGE;
         renderSelling();
     }
 
-    /** A column header pressed: sort by it, or the other way round. */
-    function onSellSort(key) {
-        sell.sort = nextSort(sell.sort, key);
-        renderSelling();
-    }
-
-    /** Show only the items a trader pays the most for (null shows them all again). */
-    function onSellTraderFilter(key) {
-        sell.traderFilter = key && key !== sell.traderFilter ? key : null;
-        renderSelling();
-    }
-
-    function onSellQuery(section, text) {
-        sell.queries[section === 'all' ? 'all' : 'my'] = String(text || '');
-        if (section === 'all') sell.allShown = ALL_ITEMS_PAGE;
+    function onSellQuery(text) {
+        sell.query = String(text || '');
+        sell.allShown = ALL_ITEMS_PAGE;
         renderSelling();
     }
 
@@ -12765,15 +13282,14 @@
             onSaveTeKey: onSellSaveTeKey,
             onForgetTeKey: onSellForgetTeKey,
             onRetryTe: onSellRetryTe,
-            onTraderFilter: onSellTraderFilter,
             onRevealTeKey: () => getTeKey(),
             onRefresh: onSellRefresh,
             onPrefsChange: (partial) => {
                 gmSet(STORE_SELL_PREFS, { ...sellPrefs(), ...partial });
                 renderSelling();
             },
-            onExpand: onSellExpand,
-            onSort: onSellSort,
+            onSelect: onSellSelect,
+            onFilter: onSellFilter,
             onQuery: onSellQuery,
             onMore: () => {
                 sell.allShown += ALL_ITEMS_PAGE;
@@ -12810,11 +13326,12 @@
                 }
             }
             await loadSellInventory();
+            loadSelfId();
             await refreshSellTraders();
             renderSelling();
         })();
 
-        setInterval(stepW3bLists, W3B_LIST_STEP_MS);
+        setInterval(stepW3b, W3B_LIST_STEP_MS);
         setInterval(stepTeOne, TE_ONE_STEP_MS);
 
         setInterval(() => {
@@ -12827,6 +13344,7 @@
                 refreshMs: INVENTORY_REFRESH_MS,
             });
             if (due && !sell.loading && getSellKey()) loadSellInventory({ force: true });
+            loadSelfId();
             saveTraderDb();
             renderSelling();
         }, 15000);

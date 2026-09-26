@@ -94,6 +94,34 @@ export function revealRow(el) {
     el.scrollIntoView({ behavior: 'smooth', block: 'center' });
 }
 
+/*
+ * A trusted trader pays more than this listing asks: their name and price,
+ * drawn on the card from a data attribute like the profit label. Same
+ * contract: one class, one data attribute, nothing appended.
+ */
+export const TRADER_CLASS = 'ttv2-trader';
+export const TRADER_DATA_KEY = 'ttv2Trader';
+export const TRADER_DATA_ATTR = 'data-ttv2-trader';
+
+/**
+ * Tag these cards, and untag every other one.
+ * @param {Array<{el: Element, label: string}>} rows
+ */
+export function markTraderTags(rows, root = document) {
+    const keep = new Set();
+    for (const row of rows || []) {
+        if (!row || !row.el || !row.el.classList || !row.label) continue;
+        keep.add(row.el);
+        row.el.classList.add(TRADER_CLASS);
+        if (row.el.dataset[TRADER_DATA_KEY] !== row.label) row.el.dataset[TRADER_DATA_KEY] = row.label;
+    }
+    for (const el of root.querySelectorAll('[' + TRADER_DATA_ATTR + ']')) {
+        if (keep.has(el)) continue;
+        el.classList.remove(TRADER_CLASS);
+        delete el.dataset[TRADER_DATA_KEY];
+    }
+}
+
 export const TARGET_CLASS = 'ttv2-target';
 
 /**

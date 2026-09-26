@@ -3,10 +3,10 @@
 Read this first, then `README.md`. The README holds the product and the binding
 rules; this file holds where we are, how the owner works, and what is settled.
 
-## Where things stand (3.10.3, 2026-09-26)
+## Where things stand (3.11.0, 2026-09-26)
 
-- **Version 3.10.3** (`f48072c`) on branch `claude/optimistic-ride-1gqguu`,
-  on top of 3.8.1 (`0210c53`) and the cloud session's handoff commits.
+- **Version 3.11.0** on branch `claude/optimistic-ride-1gqguu`, **not committed
+  yet** (the owner commits when they say so). 3.10.3 is `f48072c`.
   Last install link given to the owner (3.10.3):
   `https://raw.githubusercontent.com/abrahamdelosreyes17-oss/torn-moneymaker-releases/f48072c53287869ddc31e18fda945c898f43dc92/torn-moneymaker.user.js`
 - **`main` is still at 2.9.3.** The script's `@updateURL` points at `main`, so
@@ -16,18 +16,109 @@ rules; this file holds where we are, how the owner works, and what is settled.
   the owner asks.
 - `claude/trusting-ride-m6bvhg` (3.4.1) is fully contained in this branch.
 - Who uses it: the owner and a friend who plays Torn.
-- The owner's last word on 3.10.1: "nice, good work". Nothing is waiting on
-  an answer from them.
+- **Waiting on the owner:** their look at 3.11.0, then the Fill-button mockups
+  (3.12.0, below).
 
 ### Start here next session
 
-1. Ask the owner to install 3.10.2, set Cash, and open Torn Bids and a Torn page, then
-   look in their Chrome (pages they opened only): Torn Bids with their 222
-   items at their screen width, and the panel beside Torn's real content.
-   Everything since 3.9.4 is checked in the harness only.
-2. Run `test/ux-check.mjs` once Playwright is available (updated for Torn
-   Bids, never run).
-3. Then the open list at the end of "Not done / open" - ask which first.
+1. If 3.11.0 is not committed, ask whether to commit and push it and give the
+   pinned link.
+2. Ask the owner to install it, open Torn Bids and a player's bazaar, and
+   look in their Chrome (pages they opened only): Torn Bids at their screen
+   width with real traders and bazaars, and the trader tag on real bazaar
+   cards. Everything since 3.9.4 is checked in the harness only.
+3. **3.12.0, the Fill button:** make the mockups first (the list is below),
+   then build the one the owner picks.
+4. Run `test/ux-check.mjs` once Playwright is available (rewritten for Torn
+   Bids H in 3.11.0; never run - every check in it was run by hand in the
+   harness through the browser pane).
+
+**3.11.0 - Torn Bids is the item desk (mockup H, picked 2026-09-26).**
+- What the owner asked: the bazaar side next to the trader side - the cheapest
+  bazaars to buy from, "is it better to sell to a trader or in my bazaar", and
+  the combination (buy from this bazaar, sell to this trader), prioritising
+  trusted traders; fewer pages; every link clickable. Three mockups (F four
+  tabs, G one board, H item desk, in `mockups/`); the owner picked H, asked
+  for "Sell to trader" (not "Sell now") and found the old "sell or list" card
+  confusing - it became "Where to sell your N" (totals, when you get paid).
+- Built (`src/core/flips.js`, `src/ui/selling-page.js` rewritten,
+  `renderSelling` and a shared TornW3B scheduler in `main.js`):
+  - **Best flips with your cash** across the top; **the desk**: All / Mine /
+    Flips on the left with badges, and on the right Traders pay, Bazaars sell,
+    Flip plan and (for what you hold) Where to sell - all at once.
+  - Flips: cheapest first, only under a trader's price, only listings TornW3B
+    saw in 30 min, never more than **Cash** (Torn Bids' own setting - the
+    owner chose that over the panel's Cash), your own listings left out (your
+    id from one `user` basic call).
+  - Where to sell: trader now vs your bazaar at cheapest − $1 vs the Item
+    Market after 5% (one Item Market call for the item on the desk); the
+    trader wins unless waiting pays 1% more.
+  - **Trusted buyers only is on by default** (the owner: "we prioritize
+    trusted"). **Buyers online only** kept (the owner chose it); **Who to
+    message, Cards/Rows/Table, the drawer and the stats line are gone** (the
+    owner chose to drop Who to message and the views; H had no stats line).
+  - Every link opens through `onOpenUrl`: item name → Item Market; trader
+    name → profile, Trade (`trade.php#step=start&userID=`), TE list, W3B list;
+    seller name → profile, Open bazaar (`bazaarUrl`, points at the listing);
+    flip steps; each Where-to-sell row → Trade / `bazaar.php#/add` /
+    `page.php?sid=ItemMarket#/addListing`.
+  - Data: TornW3B `/api/marketplace` (every 5 min), `/api/marketplace/{id}`
+    for the desk item (2 min) and up to 30 possible flips (10 min), sharing
+    the 24/min with price lists (strict turns). TornExchange's full buyer list
+    only for an item **you** pick (the desk following flips never spends it).
+  - **The panel tag** (the owner said yes): on a player's bazaar, a listing a
+    **Trusted** trader buys for more gets "NAME pays $X / +$Y each" on its
+    card (`markTraderTags`, `.ttv2-trader::after`; combined with the profit
+    label on a deal card). Reads only what Torn Bids stored.
+- H shows quantities and totals (flip units, cash needed, Where-to-sell
+  totals): this reverses the 3.10 "prices per item only" rule, because the
+  owner picked H.
+- Checked in the harness (browser pane, 1600/1200/430): every number, every
+  link (14 on one desk), filters, search, both toggles, Cash (bad input,
+  500k, blank), own listing skipped, stale listing skipped, the tag on a
+  123px card, the panel's feed unchanged; each new unit test fails when its
+  rule is broken. 163 unit tests.
+- **Not verified live:** `user` basic's `player_id` (v1, believed right);
+  the trade URL (taken from another Torn script); the Item Market
+  `#/addListing` hash; the tag on real Torn bazaar cards (their `::after`);
+  Torn Bids with a real trader database's size.
+
+**Next: 3.12.0 - the Fill button (agreed 2026-09-26, mockups first).** The
+friend's request, modelled on Greasy Fork's "Customizable Bazaar Filler"
+(527925) and "Torn Market Filler" (513920) - an add-on to My bazaar, not a
+copy. The owner chose **fill on click** (one click fills one row; the player
+presses Torn's confirm). Deliverables:
+1. My bazaar stays (tags, average, graph); the row tag adds *Lowest bazaar $Y*.
+2. A Fill button per row on `#/add` (price + quantity) and `#/manage` (price);
+   clicking again restores what was there; never presses Torn's buttons. On
+   weapon/armour rows the player ticks Torn's box; Fill types the price only
+   (one click, one action).
+3. Prices read fresh at the click (TornW3B listings, the Item Market), 60 s
+   reuse, through the existing limits.
+4. Only real competition: skip $1 padlocked, sponsored, stale (30 min),
+   troll (under 25% of the average) and **your own** listing.
+5. Floors: never below the NPC price; optional floor at the Item Market
+   Average.
+6. After filling, a line vs the average (green/amber) and any floor applied.
+7. Weapons/armour: stats differ - say so, don't blindly undercut.
+8. My bazaar panel: the 5 lowest bazaar and Item Market listings (IM after
+   the fee), yours marked; clicking a price uses it.
+9. A marker on the graph at the price about to be listed.
+10. Item Market pages (add listing, your listings) in the same release: the
+    same button, the same rules, after-fee price shown.
+11. Settings, two rows (bazaar, Item Market): undercut the [lowest / 2nd /
+    3rd…] listing by [amount] [$ / %] (default lowest, $1) - the friend's
+    "listing index" and "margin"; quantity all / all but 1; floor at the
+    average on/off.
+12. README rules 1 and 10 rewritten (fills only on your click, one row, never
+    presses Torn's buttons); the key disclosure updated.
+13. Mockups first (button, row tag, lowest-5, settings) at 1600/1200/430.
+14. Live checks in the owner's Chrome: `#/manage` and the Item Market
+    add-listing markup, that Torn accepts a filled box, the IM fee and how IM
+    listings are grouped, the armour label (3.10.3).
+15. Tests (each shown to fail without its fix); release 3.12.0, pinned link.
+Left out on purpose: Fill All / Select All, "Black Friday" $1, the formula
+language, favourites/exclude stars, the floating bar, random delays.
 
 **3.10.3 - weapon and armour listings get amber below Min (the owner's report, 2026-09-26).**
 - What the owner saw: Item Market, Fiveseven, Min $1,000. A listing at
@@ -283,7 +374,8 @@ Still ideas, not built:
 
 - **Not verified live** (only in the harness). Please check in the owner's
   Chrome, reading only pages the owner opened:
-  - Torn Bids (3.10) and the panel's fit beside Torn's real content (3.9.5+);
+  - Torn Bids (3.11: the desk, flips, where to sell), the trader tag on real
+    bazaar cards, and the panel's fit beside Torn's real content (3.9.5+);
   - the real TornExchange responses with the owner's key;
   - `/v2/user/inventory`;
   - the real `#/add` and `#/manage` markup.
@@ -347,7 +439,7 @@ Still ideas, not built:
 
 ```bash
 npm run build      # src/ -> dist/ and torn-moneymaker.user.js (the release file)
-npm test           # unit tests (155)
+npm test           # unit tests (163)
 npm run check      # build + syntax check + unit tests
 PWPATH=$(npm root -g)/playwright node test/ux-check.mjs   # real-browser checks
 ```
@@ -437,15 +529,18 @@ PWPATH=$(npm root -g)/playwright node test/ux-check.mjs   # real-browser checks
 - Nothing cut with "…"; the panel's header, chips and tabs are one row each.
 - Pages use the full width; no inner scrollbars (one page scroll).
 
-**Torn Bids** follows the approved mockup E, which adds a few sizes to the
-type scale above: 14px card names, 18px side-panel title, 21px card prices,
-22px headline numbers, 10px trust badges. Keep them unless the owner asks.
+**Torn Bids** follows the approved mockup H (3.11.0; E before it), which adds
+a few sizes to the type scale above: 14px names on the flip cards, 20px for
+the item on the desk, 21px flip-card money, 22px for the flip plan's total,
+10px trust badges. Keep them unless the owner asks.
 
 ## Code map
 
 - **`src/core/`** holds pure logic, tested under node:
   - `traders.js`: the trader database, merging, ranking, which list is next;
   - `selling.js`: TornExchange caches;
+  - `flips.js`: Torn Bids' buy side - flip plans, where to sell, which items
+    to check, the bazaar-page trader tag's words;
   - `feed.js`, `ranker.js`, `profit.js`, `npc.js`, `items.js`, `parse.js`,
     `inventory.js`, `history.js`.
 - **`src/api/`** holds network clients:
@@ -457,8 +552,9 @@ type scale above: 14px card names, 18px side-panel title, 21px card prices,
 - **`src/sources/`** holds page detection and DOM reading.
 - **`src/ui/`** holds the interface:
   - `panel.js`: the overlay and My bazaar;
-  - `selling-page.js`: Torn Bids, the traders page (views, sort headers,
-    Who to message, the side panel, settings);
+  - `selling-page.js`: Torn Bids, the traders page (the best flips, the
+    item list, the desk's four cards, settings);
+  - `overlay.js`: marks on Torn's cards (deals, the trader tag);
   - `graph.js`: the add-page graph;
   - `styles.js`.
 - **`src/main.js`** wires everything, including `bootSellingPage()` and

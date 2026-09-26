@@ -45,6 +45,8 @@ async function designCheck(p, hostSel, label) {
       if (!el.textContent.trim() || !el.getClientRects().length) continue;
       const cs = getComputedStyle(el);
       const size = parseFloat(cs.fontSize);
+      // Torn Bids' trust badges are 10px uppercase, as in the picked mockup.
+      if (el.classList.contains('sp-trust') && size >= 10 && cs.textTransform === 'uppercase') continue;
       if (size < 11) out.push(el.className + ' ' + size);
       if (size < 12 && cs.textTransform !== 'uppercase') out.push(el.className + ' ' + size + ' not uppercase');
     }
@@ -495,111 +497,147 @@ await p.close();
 
   const u = await b.newPage({ viewport: { width: 1280, height: 900 } });
   u.on('pageerror', e => errs.push(String(e)));
-  const su = (sel) => u.locator('#ttv2-sell-host').locator(sel);
+  const su = (sel, opts) => u.locator('#ttv2-sell-host').locator(sel, opts);
   const utxt = async (sel) => (await su(sel).first().textContent()) || '';
-  const my = (sel) => su('section[aria-label="My items"]').locator(sel);
-  const all = (sel) => su('section[aria-label="All items"]').locator(sel);
-  const tile = (name) => my('.sp-tile').filter({ hasText: name }).first();
+  const item = (name) => su('.sp-it').filter({ hasText: name }).first();
+  const desk = (sel, opts) => su('.sp-ws').locator(sel, opts);
+  const card = (title) => su('.sp-q').filter({ has: u.locator('h3', { hasText: title }) }).first();
+  const names = () => su('.sp-it .sp-iname').allTextContents();
+  const opened = () => u.evaluate(() => window.__opened.at(-1));
+  const prefs = () => u.evaluate(() => JSON.parse(GM_getValue('tornTrading.v2.sellingPage') || '{}'));
   await u.goto('http://localhost:8780/test/harness-live.html?ttv2=traders&sellkeys=1');
   await u.waitForTimeout(1500);
   ok((await u.title()) === 'Torn Bids', 'the page is called Torn Bids: ' + (await u.title()));
-  ok(/Checking…/.test(await tile('Bottle of Beer').textContent()), 'before every source has answered, an item says Checking…, not No Trader Found');
-  // TornExchange first, its active traders 10s later, then Carol's TornW3B list.
-  await u.waitForTimeout(24000);
-  const names = await my('.sp-iname').allTextContents();
-  ok(JSON.stringify(names) === JSON.stringify(['Xanax', 'Hammer', 'Bottle of Beer']), 'My items: every held item, best price first, no trader last: ' + JSON.stringify(names));
-  const xan = tile('Xanax');
-  ok((await xan.locator('.sp-price').textContent()) === '$852,000' && /Bob/.test(await xan.locator('.sp-who').textContent()), 'Xanax: Bob, at his higher TornW3B price');
-  const ham = tile('Hammer');
-  ok((await ham.locator('.sp-price').textContent()) === '$118' && /Carol/.test(await ham.locator('.sp-who').textContent()), 'Hammer: Carol, found through her TornW3B list');
-  ok(/No Trader Found/.test(await tile('Bottle of Beer').textContent()), 'an item no trader buys says No Trader Found');
-  const pageText = await utxt('.sp-page');
-  ok(!/Bundle|Per item|Total|Qty|Traders avg|No buyer on TE/.test(pageText), 'no Qty, Total, Bundle or traders average');
-  ok(/Bob/.test(await utxt('.sp-who-list')), 'Who to message names the trader to message first: ' + (await utxt('.sp-who-list')));
-  ok((await su('.sp-pill').count()) === 3, 'every source has its own pill');
-  await su('.sp-tab', { hasText: 'All items' }).click();
-  const allNames = await all('.sp-iname').allTextContents();
-  ok(allNames.includes('Xanax') && allNames.includes('Hammer') && !allNames.includes('Bottle of Beer'), 'All items: every item a trader buys: ' + JSON.stringify(allNames));
-  await su('.sp-tab', { hasText: 'My items' }).click();
+  // TornExchange, its active traders 10s later, TornW3B's bazaar summary, then
+  // every possible flip's bazaars, one TornW3B slot at a time.
+  await u.waitForTimeout(40000);
+
+  // The best flips across the top: trusted buyers only, from the start.
+  const strip = await su('.sp-fc').allTextContents();
+  ok(strip.length === 3 && /Stick of Dynamite.*\+\$26,500/.test(strip[0]) && /Xanax.*\+\$24,000/.test(strip[1]) && /Hammer.*\+\$255/.test(strip[2]), 'the best flips, most money first: ' + JSON.stringify(strip));
+  ok(/Buy 2 from XanSeller/.test(strip[1]), 'your own cheaper Xanax listing is never one to buy');
+  ok(/Buy 5 from CheapSeller, Sponsored/.test(strip[2]), 'Hammer: the fresh listings under the bid, not the one TornW3B has not seen in an hour');
+  ok(strip.every((f) => /Sell to Bob/.test(f)), 'every flip sells to Bob, the trusted buyer');
+  ok((await prefs()).trustedOnly !== false && (await su('.sp-toggle', { hasText: 'Trusted' }).getAttribute('aria-pressed')) === 'true', 'Trusted buyers only is on by default');
+
+  // Every item on the left, money to be made first; the desk follows the best flip.
+  ok(JSON.stringify(await names()) === '["Stick of Dynamite","Xanax","Hammer","Bottle of Beer"]', 'every item, money to be made first: ' + JSON.stringify(await names()));
+  ok((await utxt('.sp-wsname')) === 'Stick of Dynamite', 'until you pick one, the desk shows the best flip');
+  ok(/You hold 15 · from \$840,000/.test(await item('Xanax').textContent()), 'Xanax: what you hold and the cheapest bazaar that is not yours');
+  ok((await su('.sp-pill').count()) === 5, 'a pill per source, and your cash');
   await u.screenshot({ path: sp + '/ux-sell.png' });
   await designCheck(u, '#ttv2-sell-host', 'traders page');
 
-  // Rows: prices in one right-aligned column; a header sorts, twice turns it round.
-  await su('.sp-views button', { hasText: 'Rows' }).click();
+  // Mine: what you hold; the desk moves to the first of it.
+  await su('.sp-chip-f', { hasText: 'Mine' }).click();
   await u.waitForTimeout(300);
-  ok((await u.evaluate(() => JSON.parse(GM_getValue('tornTrading.v2.sellingPage')).view)) === 'rows', 'the view is remembered');
-  const rights = await my('.sp-row .sp-price').evaluateAll((els) => els.map((e) => Math.round(e.getBoundingClientRect().right)));
-  ok(rights.length === 2 && new Set(rights).size === 1, 'best prices right-aligned in one column: ' + JSON.stringify(rights));
-  await my('.sp-rowhead button', { hasText: 'Item' }).click();
+  ok(JSON.stringify(await names()) === '["Xanax","Hammer","Bottle of Beer"]', 'Mine: what you hold: ' + JSON.stringify(await names()));
+  ok((await utxt('.sp-wsname')) === 'Xanax', 'the desk moves to the first of them');
+  const titles = await su('.sp-q h3').allTextContents();
+  ok(JSON.stringify(titles) === JSON.stringify(['Traders pay · highest first', 'Bazaars sell · cheapest first', 'Flip plan', 'Where to sell your 15']), 'an item you hold: all four cards: ' + JSON.stringify(titles));
+  ok((await card('Traders pay').locator('.sp-tr').count()) === 1 && /Bob/.test(await card('Traders pay').textContent()), 'Trusted only: Bob alone buys it');
+  const where = await card('Where to sell').textContent();
+  ok(/Sell to trader Bob.*\$12,780,000/.test(where), 'where to sell: the trader, for all 15: ' + where);
+  ok(/Your bazaar at \$839,999/.test(where) && /Item Market at \$844,999.*\$802,749 each/.test(where), 'your bazaar $1 under the cheapest; the Item Market after its 5% fee');
+  ok(/Best: sell to trader Bob\. Your bazaar would get \$180,015 less\./.test(where), 'the verdict names the trader and what waiting would cost: ' + where);
+  await u.screenshot({ path: sp + '/ux-sell-desk.png' });
+
+  // Every link opens the right page.
+  await desk('a.sp-wsname').click();
+  ok(/page\.php\?sid=ItemMarket#\/market\/view=search&itemID=206/.test(await opened()), 'the item name opens it on the Item Market');
+  await card('Traders pay').locator('a.sp-pname', { hasText: 'Bob' }).click();
+  ok((await opened()) === 'https://www.torn.com/profiles.php?XID=11', "a trader's name opens their profile");
+  await card('Traders pay').locator('a', { hasText: 'Trade' }).click();
+  ok((await opened()) === 'https://www.torn.com/trade.php#step=start&userID=11', 'Trade starts a trade with them');
+  await card('Traders pay').locator('a', { hasText: 'TE list' }).click();
+  ok((await opened()) === 'https://www.tornexchange.com/prices/Bob/', 'TE list opens their TornExchange price list');
+  await card('Traders pay').locator('a', { hasText: 'W3B list' }).click();
+  ok((await opened()) === 'https://weav3r.dev/pricelist/11', 'W3B list opens their TornW3B price list');
+  await card('Bazaars sell').locator('a.sp-pname', { hasText: 'XanSeller' }).click();
+  ok((await opened()) === 'https://www.torn.com/profiles.php?XID=888', "a seller's name opens their profile");
+  await card('Bazaars sell').locator('a', { hasText: 'Open bazaar' }).click();
+  ok((await opened()) === 'https://www.torn.com/bazaar.php?userId=888&ttItem=206&ttPrice=840000#/', 'Open bazaar opens their bazaar, pointing at the listing');
+  await card('Flip plan').locator('a', { hasText: 'Open bazaar' }).click();
+  ok((await opened()) === 'https://www.torn.com/bazaar.php?userId=888&ttItem=206&ttPrice=840000#/', 'each flip step links to its bazaar');
+  await card('Where to sell').locator('a.sp-opt', { hasText: 'Your bazaar' }).click();
+  ok((await opened()) === 'https://www.torn.com/bazaar.php#/add', 'your bazaar opens its add page');
+  await card('Where to sell').locator('a.sp-opt', { hasText: 'Item Market' }).click();
+  ok((await opened()) === 'https://www.torn.com/page.php?sid=ItemMarket#/addListing', "the Item Market opens its add-listing page");
+  const clicksOpened = await u.evaluate(() => window.__opened.length);
+  await card('Where to sell').locator('a.sp-opt', { hasText: 'Sell to trader' }).click();
+  ok((await u.evaluate(() => window.__opened.length)) === clicksOpened + 1 && (await opened()) === 'https://www.torn.com/trade.php#step=start&userID=11', 'one click, one page: the trader row starts the trade');
+
+  // Trusted buyers only, off: every buyer, highest first. Picking an item
+  // yourself asks TornExchange for its full buyer list; the desk following
+  // the best flip never does.
+  ok(!(await u.evaluate(() => window.__requests.some((r) => r.includes('tornexchange.com/api/listings')))), 'no full buyer list asked before you pick an item');
+  await item('Xanax').click();
+  await su('.sp-toggle', { hasText: 'Trusted' }).click();
+  await u.waitForTimeout(12000); // the full TornExchange list, one page per 10s slot
+  const trs = await card('Traders pay').locator('.sp-tr').allTextContents();
+  ok(trs.length === 3 && /Bob/.test(trs[0]) && /Carol/.test(trs[1]) && /Alice/.test(trs[2]), 'Bob $852k, Carol $845k, Alice $830k, highest first: ' + JSON.stringify(trs));
+  const priceRights = await card('Traders pay').locator('.sp-tprice').evaluateAll((els) => els.map((e) => Math.round(e.getBoundingClientRect().right)));
+  ok(new Set(priceRights).size === 1, 'trader prices line up whatever links a trader has: ' + JSON.stringify(priceRights));
+  await item('Hammer').click();
   await u.waitForTimeout(300);
-  ok(JSON.stringify(await my('.sp-iname').allTextContents()) === '["Hammer","Xanax","Bottle of Beer"]', 'sorted by name, A to Z, no-trader item last');
-  await my('.sp-rowhead button', { hasText: 'Item' }).click();
-  await u.waitForTimeout(300);
-  ok(JSON.stringify(await my('.sp-iname').allTextContents()) === '["Xanax","Hammer","Bottle of Beer"]', 'the same header again: Z to A');
-  await su('.sp-views button', { hasText: 'Table' }).click();
-  await u.waitForTimeout(300);
-  ok((await my('.sp-table tbody tr').count()) === 3, 'Table view: a row per item');
-  await su('.sp-views button', { hasText: 'Cards' }).click();
+  ok(/Carol/.test(await card('Traders pay').locator('.sp-tr').first().textContent()), 'Hammer: Carol, found through her TornW3B list, at $118');
+  ok((await prefs()).trustedOnly === false, "the toggle is remembered in the page's own preferences");
+  await su('.sp-toggle', { hasText: 'Trusted' }).click();
   await u.waitForTimeout(300);
 
   // The search box: "xan" shows only Xanax.
+  await su('.sp-chip-f', { hasText: 'All' }).click();
   await su('input.sp-search').fill('xan');
   await u.waitForTimeout(300);
-  ok(JSON.stringify(await my('.sp-iname').allTextContents()) === '["Xanax"]', 'searching My items for "xan" shows only Xanax');
+  ok(JSON.stringify(await names()) === '["Xanax"]', 'searching for "xan" shows only Xanax');
   await su('input.sp-search').fill('');
   await u.waitForTimeout(300);
 
-  // Buyers online only: Hammer stays Carol (online); Alice (offline) drops out.
-  await su('.sp-toggle', { hasText: 'online' }).click();
-  await u.waitForTimeout(500);
-  ok((await ham.locator('.sp-price').textContent()) === '$118', 'Online only: Hammer still Carol, who is online');
-  ok((await u.evaluate(() => JSON.parse(GM_getValue('tornTrading.v2.sellingPage')).onlineOnly)) === true, "the toggle is remembered in the page's own preferences");
-  await su('.sp-toggle', { hasText: 'online' }).click();
+  // Cash for flips: press the pill, type an amount; flips never spend more.
+  await su('.sp-pill-btn').click();
+  ok(await su('.sp-settings').isVisible(), 'the Cash pill opens settings');
+  const cashBox = su('input[aria-label="Cash for flips"]');
+  await cashBox.fill('abc');
+  await cashBox.press('Enter');
+  ok(/Could not read "abc"/.test(await su('.sp-keystate', { hasText: 'Could not' }).first().textContent()), 'an amount it cannot read is refused, and says so');
+  await cashBox.fill('500k');
+  await cashBox.press('Enter');
   await u.waitForTimeout(300);
-  // Trusted buyers only: Bob (Trusted) now tops Hammer.
-  await su('.sp-toggle', { hasText: 'Trusted' }).click();
-  await u.waitForTimeout(500);
-  ok(/Bob/.test(await ham.locator('.sp-who').textContent()), 'Trusted only: Hammer goes to Bob, the trusted buyer');
-  await su('.sp-toggle', { hasText: 'Trusted' }).click();
-  await u.waitForTimeout(300);
-
-  // Open an item: its traders slide in, highest first, one row per trader, fixed link slots.
-  await xan.click();
-  await u.waitForTimeout(12000); // the full TornExchange list, one page per 10s slot
-  const drawer = (sel) => su('.sp-drawer').locator(sel);
-  ok(await su('.sp-drawer.sp-open').isVisible(), 'clicking an item opens its side panel');
-  const trs = await drawer('.sp-tr').allTextContents();
-  ok(trs.length === 3 && /Bob/.test(trs[0]) && /Carol/.test(trs[1]) && /Alice/.test(trs[2]), 'Bob $852k, Carol $845k, Alice $830k, highest first: ' + JSON.stringify(trs));
-  const bob = drawer('.sp-tr').first();
-  ok((await bob.locator('a').allTextContents()).join('|') === 'Profile|TE list|W3B list', 'Bob is on both sites: both price lists linked');
-  await bob.locator('a', { hasText: 'Profile' }).click();
-  ok(/profiles\.php\?XID=11$/.test(await u.evaluate(() => window.__opened.at(-1))), "Profile opens the trader's Torn profile");
-  await bob.locator('a', { hasText: 'TE list' }).click();
-  ok((await u.evaluate(() => window.__opened.at(-1))) === 'https://www.tornexchange.com/prices/Bob/', 'TE list opens their TornExchange price list');
-  await bob.locator('a', { hasText: 'W3B list' }).click();
-  ok((await u.evaluate(() => window.__opened.at(-1))) === 'https://weav3r.dev/pricelist/11', 'W3B list opens their TornW3B price list');
-  const priceRights = await drawer('.sp-tprice').evaluateAll((els) => els.map((e) => Math.round(e.getBoundingClientRect().right)));
-  ok(new Set(priceRights).size === 1, 'trader prices line up whatever links a trader has: ' + JSON.stringify(priceRights));
-  await u.screenshot({ path: sp + '/ux-sell-expanded.png' });
+  ok((await prefs()).cash === 500000, 'Cash saved: $500,000');
   await u.keyboard.press('Escape');
-  await u.waitForTimeout(400);
-  ok(!(await su('.sp-drawer.sp-open').count()), 'Esc closes the side panel');
+  await u.waitForTimeout(300);
+  const capped = await su('.sp-fc').allTextContents();
+  ok(/Stick of Dynamite.*\+\$14,000/.test(capped[0]) && !capped.some((f) => /Xanax/.test(f)), 'with $500,000: 28 sticks, and no Xanax flip: ' + JSON.stringify(capped));
+  await item('Xanax').click();
+  await u.waitForTimeout(300);
+  ok(/One costs \$840,000, more than your cash \(\$500,000\)\./.test(await card('Flip plan').textContent()), 'the flip plan says why there is none');
+  await su('.sp-pill-btn').click();
+  await cashBox.fill('');
+  await cashBox.press('Enter');
+  await u.waitForTimeout(300);
+  ok((await prefs()).cash === null, 'blank Cash is no limit');
+  await u.keyboard.press('Escape');
 
   // Keys go where they belong and nowhere else.
   const reqs = await u.evaluate(() => window.__requests);
   const inv = reqs.filter((r) => r.includes('/v2/user/inventory'));
   ok(inv.length >= 2 && inv.every((r) => r.includes('key=LIMITED123456789')), 'inventory read with the Limited key, paged: ' + inv.length);
+  ok(reqs.some((r) => r.includes('api.torn.com/user/') && r.includes('selections=basic') && r.includes('key=LIMITED123456789')), 'your own id read once, with the Limited key');
+  ok(reqs.some((r) => r.includes('/v2/market/206/itemmarket') && r.includes('key=LIMITED123456789')), "the Item Market read for the item you hold that's picked");
   ok(!reqs.some((r) => r.includes('api.torn.com') && r.includes('TEKEY')), 'the TornExchange key never goes to Torn');
   ok(!reqs.some((r) => r.includes('weav3r.dev') && /key=/.test(r)), 'no key ever goes to TornW3B');
   ok(reqs.some((r) => r.includes('weav3r.dev/api/pricelist/')), 'traders\' TornW3B price lists are read');
+  ok(reqs.some((r) => /weav3r\.dev\/api\/marketplace\?/.test(r)) && reqs.some((r) => r.includes('weav3r.dev/api/marketplace/335')), 'bazaar prices: the summary, then a possible flip\'s bazaars');
   const teReqs = reqs.filter((r) => r.includes('tornexchange.com'));
   ok(teReqs.length <= 5, 'few TornExchange calls: ' + teReqs.length);
 
-  // Narrow: no sideways scroll.
+  // Narrow: no sideways scroll; the desk above the list.
   await u.setViewportSize({ width: 430, height: 800 });
   await u.waitForTimeout(400);
   const overflow = await u.locator('#ttv2-sell-host').evaluate((h) => { const m = h.shadowRoot.querySelector('.sp-main'); return m.scrollWidth - m.clientWidth; });
   ok(overflow <= 2, 'no sideways scroll at 430px: ' + overflow);
+  const deskFirst = await u.locator('#ttv2-sell-host').evaluate((h) => { const r = h.shadowRoot; return r.querySelector('.sp-ws').getBoundingClientRect().top < r.querySelector('.sp-col-list').getBoundingClientRect().top; });
+  ok(deskFirst, 'on a phone the desk sits above the list');
   await u.screenshot({ path: sp + '/ux-sell-430.png' });
   await designCheck(u, '#ttv2-sell-host', 'traders page 430');
   await u.setViewportSize({ width: 1280, height: 900 });
@@ -609,22 +647,41 @@ await p.close();
   ok(/Saved · Limited access/.test(await utxt('.sp-keystate >> nth=0')), 'key state names the access level: ' + (await utxt('.sp-keystate >> nth=0')));
   ok(/Saved · prices/.test(await utxt('.sp-keystate >> nth=1')), 'TornExchange key state shows price age: ' + (await utxt('.sp-keystate >> nth=1')));
   await su('.sp-check input').uncheck();
-  ok((await u.evaluate(() => JSON.parse(GM_getValue('tornTrading.v2.sellingPage')).linksNewTab)) === false, 'links preference saved in the page\'s own store');
+  ok((await prefs()).linksNewTab === false, 'links preference saved in the page\'s own store');
   ok((await u.evaluate(() => JSON.parse(GM_getValue('tornTrading.v2.settings') || '{}').openInNewTab)) !== false, 'the overlay\'s own setting untouched');
   await u.keyboard.press('Escape');
-  ok(await su('section[aria-label="My items"]').isVisible(), 'Esc leaves settings');
+  ok(await su('.sp-desk').isVisible(), 'Esc leaves settings');
   await u.close();
 
   // A trader known only from a TornW3B page: read, named from Torn, shown.
   const w = await b.newPage({ viewport: { width: 1280, height: 900 } });
   w.on('pageerror', e => errs.push(String(e)));
-  const sw = (sel) => w.locator('#ttv2-sell-host').locator(sel);
-  await w.goto('http://localhost:8780/test/harness-live.html?ttv2=traders&sellkeys=1&w3btrader=1');
-  await w.waitForTimeout(8000);
-  const beer = sw('section[aria-label="My items"] .sp-tile').filter({ hasText: 'Bottle of Beer' }).first();
-  ok((await beer.locator('.sp-price').textContent()) === '$61', 'Bottle of Beer: bought only by a TornW3B-only trader, $61');
-  ok(!/Trader 77/.test(await beer.textContent()), 'that trader is shown by their Torn name, not an id: ' + (await beer.locator('.sp-who').textContent()));
+  const sw = (sel, opts) => w.locator('#ttv2-sell-host').locator(sel, opts);
+  await w.goto('http://localhost:8780/test/harness-live.html?ttv2=traders&sellkeys=1&w3btrader=1&sellprefs=' + encodeURIComponent('{"trustedOnly":false}'));
+  await w.waitForTimeout(20000); // its list takes its turn with the bazaar reads, then Torn names it
+  await sw('.sp-it').filter({ hasText: 'Bottle of Beer' }).first().click();
+  await w.waitForTimeout(500);
+  const beer = sw('.sp-q').filter({ has: w.locator('h3', { hasText: 'Traders pay' }) }).first();
+  ok((await beer.locator('.sp-tprice').first().textContent()) === '$61', 'Bottle of Beer: bought only by a TornW3B-only trader, $61');
+  ok(!/Trader 77/.test(await beer.textContent()), 'that trader is shown by their Torn name, not an id: ' + (await beer.locator('.sp-tr').first().textContent()));
   await w.close();
+
+  // A player's bazaar: a listing a trusted trader pays more for is named on its card.
+  const z = await b.newPage({ viewport: { width: 1280, height: 900 } });
+  z.on('pageerror', e => errs.push(String(e)));
+  await z.goto('http://localhost:8780/test/harness-live.html?traders=1&nofeed=1');
+  await z.waitForTimeout(1500);
+  await z.evaluate((h) => { const d = document.createElement('div'); d.id = 'fake-bz'; d.innerHTML = h; document.body.appendChild(d); }, tiles);
+  await z.evaluate(() => history.pushState({}, '', '/test/harness-live.html?traders=1&nofeed=1&page=bazaar&userId=4254715'));
+  await z.waitForTimeout(3000);
+  const tags = await z.evaluate(() => [...document.querySelectorAll('#fake-bz .itemTile___gJeSo')].map((t) => t.dataset.ttv2Trader || ''));
+  ok(tags[0] === 'Bob pays $110\n+$10 each', 'the $100 Hammer: Bob (Trusted) pays $110, not Alice (Known) at $115: ' + JSON.stringify(tags[0]));
+  ok(tags[1] === '', 'the $2,500 Hammer: no trader pays more, no tag');
+  ok((await z.evaluate(() => getComputedStyle(document.querySelector('#fake-bz .itemTile___gJeSo'), '::after').pointerEvents)) === 'none', 'the tag can never catch a click');
+  await z.evaluate(() => history.pushState({}, '', '/test/harness-live.html?traders=1&nofeed=1'));
+  await z.waitForTimeout(1500);
+  ok((await z.evaluate(() => document.querySelectorAll('[data-ttv2-trader]').length)) === 0, 'off the bazaar, no tag is left behind');
+  await z.close();
 }
 
 console.log('ERRORS', errs);

@@ -6,9 +6,10 @@ straight to them - from the page you are viewing, **and live from any Torn page*
 via the Torn API and, if you opt in, TornW3B's bazaar feed.
 
 Two more things: on **your own bazaar's add / manage pages** it shows each item's
-**Item Market Average** with a graph, and **Torn Bids** (the traders page) in its own tab lists
-every item you hold with the trader who pays most for it - from TornExchange and
-TornW3B price lists.
+**Item Market Average** with a graph, and **Torn Bids** (the traders page) in its own tab shows
+every item from both sides - who pays most for it (TornExchange and TornW3B
+price lists), who sells it cheapest (TornW3B's bazaar prices), the flips in
+between, and where to sell what you hold.
 
 This is a rewrite of an earlier "NPC Arbitrage Scanner" userscript, rebuilt around
 one idea: the item card stays untouched, and every number lives in a side panel
@@ -112,6 +113,13 @@ scrolls to it when it is on the page you are viewing. Nothing is ever bought for
   One public-profile call when you open it, then at most every 30 s while you
   stay. If the banner says the bazaar is **closed**, its listings are not shown
   as deals, here or in the feed, until it is seen open again.
+- **A trusted trader pays more:** on a player's bazaar, a listing a **Trusted**
+  trader buys for more than it asks is named on its card - *FAFFO pays $73,500
+  / +$3,500 each* - drawn like the profit label (it cannot catch a click, and
+  wraps in the card rather than being cut). Only Trusted traders count. It uses
+  only what Torn Bids stored (TornExchange's buyers and our trader database),
+  re-read every minute; no request of its own, so until Torn Bids has been
+  opened no card is tagged. Not on a closed bazaar.
 - **Your own bazaar** (bazaar.php, no `userId`, `#/add` or `#/manage`): a tag
   after each item's name - *Item Market Average $830,000* - Torn's market value,
   its average of what the item actually sold for (refreshed hourly with the item
@@ -180,62 +188,70 @@ Item data (Sell price, Value) is refreshed hourly.
 
 ### The traders page: Torn Bids
 
-"Which trader pays the most for what I hold?" Its own tab, its own keys, its own
-settings - nothing is shared with the panel except the cached item database.
-Nothing is traded, listed or clicked for you; in Torn you trade by messaging the
-trader, and every link here is one you follow yourself.
+Every item, both sides: who pays most for it, who sells it cheapest, the flips
+in between (buy from a bazaar, sell to a trader), and where to sell what you
+hold. Its own tab, its own keys, its own settings - nothing is shared with the
+panel except the cached item database. Nothing is traded, listed or clicked for
+you: every link is one you follow yourself, one page per click.
 
-- **My items** first: everything in your inventory (stacks merged, equipped and
-  faction-owned copies left out), each with its **best price per item** and who
-  pays it, their online status beside the name. Items with a trader first,
-  highest price first; an item nobody buys says **No Trader Found** - but only
-  once every source has answered ("Checking…" until then, "No traders yet" when
-  no trader is known at all). The **search box** narrows it: typing *xanax*
-  shows only Xanax and its traders.
-- **All items** (the other tab): every item any known trader buys, searched
-  with the same box (each tab keeps its own search), 50 at a time.
-- **Open an item** for every trader buying it, **highest price first**, each
-  with name, online status, price per item, and fixed link slots - **Profile**
-  (their Torn profile), **TE list** (their TornExchange price list) and
-  **W3B list** (their TornW3B price list) - so each link sits in the same place
-  on every row and the prices stay in one column.
-- **One row per trader**: a trader on both TornExchange and TornW3B shows once,
-  at the higher of their two prices, with both lists linked.
-- **Show** (right column): **Buyers online only** keeps only traders known to
-  be online, order unchanged; **Trusted buyers only** keeps traders with the
-  Trusted badge. Both apply to the whole page, Who to message included. Our
-  own online checker asks Torn's public profile for every trader of every item
-  you hold (best first), at most 30 a minute inside the shared 70/min, each
-  again every 10 minutes (90 s while its item is open), visible tab only; an
-  item says "Checking…" until its traders are known. Online but in hospital,
-  in jail or flying shows orange, "Online · Hospital". A status not known yet
-  shows nothing.
-- **Layout** (the owner picked mockup E): the full width of the window. A
-  header with the name, one search box (`/` jumps to it) and every source as a
-  pill (dot, progress, the detail on hover); a line of headline numbers (items
-  you hold, with a buyer, buyers online, traders known); your items on the
-  left; **Who to message** pinned on the right (the five traders with the best
-  price on the most of your items - in Torn you trade with one person at a
-  time; click one to see just their items). One scrollbar: the page scrolls,
-  the right column stays put.
-- **Three views, switched like a file explorer's**: **Cards** (a tile per
-  item), **Rows** (item, top bid, buyer, next bid, traders) and **Table** (the
-  same, dense). Click a column header in Rows or Table to sort by it, again to
-  turn it round; items nobody buys stay last. The view is remembered.
-- **Click an item**: its traders slide in from the right, over the page -
-  nothing under it moves. ✕ or Esc closes it. On a phone it takes the screen.
-- **Phones** (under 1000px): one column, Who to message (top three) above the
-  items, the view switch on its own row.
-- **Trust badge** beside a trader: Trusted (100+), Known (20+), New (0-19) or
-  Caution (below 0), from the better of their TornExchange vote score and
-  their TornW3B rating (ups minus downs); hover for the numbers.
-- No quantities, totals or bundle maths: a price list is prices per item.
-- **Built to be read** (eye-tracking and layout research): pictures and names
-  down the left edge where the eye scans first, the answer (best price) as the
-  largest, brightest figure in one right-aligned column of tabular numbers, who
-  pays it right beneath it, colour only where it means something (green = best
-  price / online, blue = link), whole rows as click targets, and a list's order
-  frozen while the pointer is over it so a row never moves under a click.
+- **Best flips with your cash** (across the top): the four flips that make the
+  most. A flip buys from bazaars **cheapest first**, only listings that cost
+  **less than a trader pays**, only listings **TornW3B saw in the last 30
+  minutes**, and never more than your **Cash** (Settings; blank is no limit).
+  Your own listings are never a bazaar to buy from. Each card says how many,
+  from whom, and to whom; press it to put that item on the desk.
+- **The desk.** On the left, every item: **All** (what you hold and everything
+  any trader buys), **Mine**, **Flips** - money to be made first, each with a
+  badge (*Flip +$26,500*, *List +$749,998*, *Sell to trader*), what you hold
+  and the cheapest bazaar price. The search box (`/` jumps to it) narrows it.
+  On the right, **everything about the item picked, at once**:
+  - **Traders pay · highest first**: name (their Torn profile), trust badge,
+    online status, price, and fixed link slots - **Trade** (starts a trade
+    with them), **TE list**, **W3B list**. One row per trader: on both sites,
+    at the higher of their two prices.
+  - **Bazaars sell · cheapest first**: seller (their profile), how many, when
+    TornW3B last saw it (older than 30 minutes is greyed and never planned
+    on), price, and **Open bazaar** (their bazaar, pointing at the listing).
+  - **Flip plan**: what it makes, how many, the cash it needs, and each step
+    with its link - *Buy 26 from X at $70,000 [Open bazaar]* ... *Sell 70 to
+    FAFFO at $73,500 [Trade]*. Or why there is none: over the best buyer,
+    more than your cash, not seen lately.
+  - **Where to sell your N** (only for what you hold): **Sell to trader**
+    (paid now, in one trade), **your bazaar** at $1 under the cheapest (paid
+    when someone buys it), and **the Item Market** after its 5% fee (paid when
+    someone buys it) - totals for everything you hold. The trader wins unless
+    waiting pays at least 1% more; the verdict says which and by how much.
+    Each row is its link: Trade, your bazaar's add page, the Item Market's
+    add-listing page.
+  - The item's name opens it on the Item Market.
+  Until you pick an item, the desk shows the best flip.
+- **Trusted buyers only** (on from the start: money changes hands on trust)
+  and **Buyers online only** apply to the whole page - flips, the desk, the
+  badges. A trader's status comes from Torn's public profile, at most 30 a
+  minute inside the shared 70/min, visible tab only.
+- **Trust badge**: Trusted (100+), Known (20+), New (0-19) or Caution (below
+  0), from the better of their TornExchange vote score and their TornW3B
+  rating (ups minus downs); hover for the numbers.
+- **Layout** (the owner picked mockup H): the full width of the window, one
+  scrollbar; the desk stays in view while the list scrolls. On a phone
+  (under 1000px) the desk sits above the list, and picking an item scrolls to
+  it.
+
+**Where the prices come from.**
+- **Bazaar prices: TornW3B only** - TornExchange's API has none, and Torn's
+  `market/{id}/bazaar` lists bazaars without prices. One call gives every
+  item's cheapest price (every 5 minutes); since that lags, an item is a flip
+  only once its own listings are read (`/api/marketplace/{id}`: seller,
+  quantity, price, when seen). Those are read for the item on the desk (every
+  2 minutes) and for up to 30 possible flips (where a buyer you would sell to
+  pays more than the cheapest price; every 10 minutes). The summary, those
+  listings and traders' price lists share one budget: one TornW3B call every
+  2.5 s, 24 a minute at most, visible tab only.
+- **Trader prices: TornExchange and TornW3B together**, as below.
+- **The Item Market**: one call with the Limited key for the item on the desk,
+  when you hold it (every 2 minutes while it stays there).
+- **Your own id**: one `user` basic call with the Limited key, once per key,
+  so your own listing is never "the cheapest" or a bazaar to buy from.
 
 **No one source can empty the page.** It starts from a built-in list of TornW3B's
 public traders (no key needed); while TornExchange has no working key it asks
@@ -249,21 +265,23 @@ prices in two places, and TornW3B has no list of its traders, so the script
 keeps its own:
 - every active **TornExchange** trader (`/api/active_traders`, with ids), and
   the top three buyers of every item (`/api/all_best_listings`, every 10 min);
+  an item's **full** buyer list (`/api/listings`) only when you pick it;
 - every trader a **TornW3B** page you open links to (`/pricelist/{id}` links:
   its Highest Rated and Most Trades lists, Search Deals). On weav3r.dev the
   script only reads the page you are on, sends nothing and changes nothing;
-- each known trader's **TornW3B price list** (`/api/pricelist/{id}`, no key) is
-  read one at a time, at most 24 a minute: never-read lists first, then lists
-  of traders who buy something you hold (every 10 min), then the rest (hourly);
+- each known trader's **TornW3B price list** (`/api/pricelist/{id}`, no key),
+  taking turns with the bazaar reads: never-read lists first, then lists of
+  traders who buy something you hold (every 10 min), then the rest (hourly);
   a trader with no list is checked again daily. A list older than 6 hours is
   not shown.
 
 **Settings** (⚙, and where the page opens until the Limited key is saved):
 - **Torn API key - a Limited key.** Used only here: your inventory
-  (`/v2/user/inventory`), the item database when the shared cache is stale, and
-  traders' public profiles. Torn's key-use table sits beside the field. Sent to
-  `api.torn.com` only. Error 2/13/18 stops it until a new key is saved; error 16
-  says the key needs Limited access.
+  (`/v2/user/inventory`), your own id (`user` basic), the item database when
+  the shared cache is stale, the Item Market for the item on the desk, and
+  traders' public profiles. Torn's key-use table sits beside the field. Sent
+  to `api.torn.com` only. Error 2/13/18 stops it until a new key is saved;
+  error 16 says the key needs Limited access.
 - **TornExchange** - TornExchange's API key *is* the Torn key you log into
   tornexchange.com with (it checks `?key=` against the key you logged in with),
   so it is often your Limited key: *Use my Limited key* fills it in. It goes to
@@ -271,7 +289,12 @@ keeps its own:
   apart (6 a minute against its 10 per IP), never retried on their own, shared
   by every tab, and a 429 waits out `retry_after`; saving or forgetting the key
   never resets that wait.
-- *Open links in a new tab* (on by default); *Online only* is remembered.
+- **Cash for flips** - flips never plan to spend more (reads `5000000`,
+  `5,000,000`, `5m`, `500k`; blank is no limit). The **Cash** pill in the
+  header shows it; press it to change it. Its own setting, apart from the
+  panel's Cash.
+- *Open links in a new tab* (on by default); *Trusted buyers only* and
+  *Buyers online only* are remembered.
 
 ---
 
@@ -290,6 +313,8 @@ src/
     leader.js    which tab runs the feed (one, visible)
     inventory.js your inventory: parsing, merging stacks, cache
     selling.js   the traders page: TornExchange caches and timing
+    flips.js     the traders page's buy side: flip plans, where to sell,
+                 which items to check, the bazaar-page trader tag
     traders.js   our trader database (TornExchange + TornW3B), one row per
                  trader per item, highest first, which price list to read next
     history.js   the price history the script records (buckets, averages,
@@ -410,7 +435,7 @@ The traders page's key (a separate table beside its own field):
 
 | Data storage | Data sharing | Purpose of use | Key storage & sharing | Key access level |
 |---|---|---|---|---|
-| Only locally | Nobody | Personal gain: finding who pays most for your items | Stored locally / Not shared | Limited (user: inventory - your own items; torn: items - item names; user: profile - traders' public online status) |
+| Only locally | Nobody | Personal gain: who pays most for your items, and flips | Stored locally / Not shared | Limited (user: inventory - your own items; user: basic - your own id; torn: items - item names; market: itemmarket - the Item Market for the item on the desk; user: profile - traders' public online status) |
 
 Plus: *TornExchange, only with the key you log in there with.*
 
@@ -513,11 +538,11 @@ throws on load, so this is the one that catches "installed, and nothing appears"
 Torn API, TornW3B and TornExchange responses (including `/v2/user/inventory`,
 which only answers the Limited key), waits for the live feed, and prints the
 rows, every request URL, and whether a key ever reached weav3r.dev (it must
-not). With `?ttv2=traders&sellkeys=1` it boots the traders page with its keys (`&sellsame=1`: the same Limited key for both; `&w3btrader=1`: a trader known only from TornW3B; `?ownbazaar=1&page=bazaar#/add`: your own add page with a week of recorded prices).
+not). With `?ttv2=traders&sellkeys=1` it boots the traders page with its keys (`&sellsame=1`: the same Limited key for both; `&w3btrader=1`: a trader known only from TornW3B; `&sellprefs=<json>`: the page's preferences; `?ownbazaar=1&page=bazaar#/add`: your own add page with a week of recorded prices; `?traders=1`: trader prices already stored, for the bazaar-page tag; `&awake=1`: the page reports itself visible, for a background preview where the traders page would rightly pause).
 
 `test/ux-check.mjs` clicks every control in the panel and the traders page in
 Chromium against the built script - the cash rules, your own bazaar's add page
-(fixture rows), the traders page (same-key setup, My items / All items, filter, Online only, Profile / TE list / W3B list links)
+(fixture rows), the traders page (same-key setup, the best flips, All / Mine / Flips, the desk's four cards and every link on it, Trusted and Online only, Cash for flips), the trusted-trader tag on a player's bazaar
 and where each key goes - and fails if any click does nothing visible or any
 text is under 12px (11px uppercase labels excepted). `SHOTS=<dir>` keeps the
 screenshots.

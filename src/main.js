@@ -42,14 +42,16 @@ import {
     pageRowContradicted,
     REFRESH_MS,
     bazaarUrl,
+    normalizeW3bListings,
     SOURCE_BAZAAR,
     SOURCE_ITEM_MARKET,
 } from './core/feed.js';
+import { bazaarSellers, flipPlan, whereToSell, flipCandidates, traderTagLabel } from './core/flips.js';
 import { makeTabId, LEADER_HEARTBEAT_MS } from './core/leader.js';
 import { formatMoneyShort } from './core/parse.js';
 import { rankOpportunities, summarize, hiddenCounts, belowMinRows } from './core/ranker.js';
 import { TornApiClient, redactKey, KEY_DEAD_CODES } from './api/client.js';
-import { W3bClient, fetchW3bListings, fetchW3bPriceList } from './api/w3b.js';
+import { W3bClient, fetchW3bSummary, fetchW3bListings, fetchW3bPriceList } from './api/w3b.js';
 import {
     TeClient,
     TeQueue,
@@ -77,18 +79,14 @@ import {
     buyersForItem,
     indexW3bByItem,
     onlineOnly,
-    itemRows,
     traderLinksIn,
     traderNamesInText,
     traderIdsByName,
     markW3bDue,
     pruneTraderDb,
     votesByTrader,
-    bestTradersFor,
     ratingsInText,
     trustedOnly,
-    nextSort,
-    sortItemRows,
 } from './core/traders.js';
 import {
     mergeInventory,
@@ -146,6 +144,7 @@ import {
     clearMarks,
     revealRow,
     markTarget,
+    markTraderTags,
 } from './ui/overlay.js';
 import {
     LiveFeed,
@@ -178,6 +177,8 @@ const STORE_SELL_PREFS = 'sellingPage';
 const STORE_TRADER_DB = 'traderDb';
 /* TornExchange's best buyer per item you hold, asked without a key. */
 const STORE_TE_ONE = 'teOne';
+/* The traders page: your own Torn id, read once with its Limited key. */
+const STORE_SELL_SELF = 'sellSelf';
 
 /* Price history the script records itself, and TornW3B's latest summary. */
 const STORE_HISTORY = 'priceHistory';
@@ -293,6 +294,8 @@ const HISTORY_SAVE_MS = 30000;
 const app = {
     tabId: makeTabId(),
     index: null,
+    /* Who buys what, from what the traders page stored: for the bazaar tags. */
+    traderLookup: null,
     feed: null,
     w3b: null,
     /*
@@ -672,6 +675,7 @@ function rescan() {
         // A new kind of page picks its own list again.
         app.tabOverride = null;
         clearMarks();
+        markTraderTags([]);
     }
 
     if (location.href !== app.pageHref) {
@@ -769,6 +773,8 @@ function rescan() {
         : belowMinRows(priced, rankSettings({ limit: 0 }), ranked).filter((row) => !pageRowContradicted(feed, row));
 
     markRows(live.slice(0, 100), document, lower.slice(0, 100));
+    // A trusted trader pays more than a listing here asks: named on its card.
+    markTraderTags(app.pageType === PAGE_BAZAAR && sellerId && !closedHere ? traderTags(listings) : []);
     showBazaarTarget(listings);
 
     app.lastScanAt = now;
@@ -777,6 +783,51 @@ function rescan() {
 
     refreshView();
     attachObserver(listings);
+}
+
+/* What the traders page stored is read again at most this often. */
+const TRADER_TAG_REFRESH_MS = 60000;
+
+/**
+ * The best Trusted trader for an item, from what the traders page stored:
+ * TornExchange's buyers and our trader database. No request of its own - if
+ * the traders page has never been opened, no card is tagged.
+ */
+function trustedBuyerOf(itemId) {
+    const now = Date.now();
+    if (!app.traderLookup || now - app.traderLookup.at > TRADER_TAG_REFRESH_MS) {
+        const db = readTraderDb(gmGet(STORE_TRADER_DB, null));
+        const te = readTeCacheEntry(gmGet(STORE_TE, null), now);
+        const ids = gmGet(STORE_TE_IDS, null);
+        app.traderLookup = {
+            at: now,
+            best: new Map(),
+            buyersAll: buyerLookup({
+                teMap: te ? te.map : new Map(),
+                lists: readTeItemLists(gmGet(STORE_TE_LISTS, null), now),
+                teOne: loadTeOne(now),
+                idsByName: ids && ids.map && now - ids.fetchedAt < TE_IDS_MAX_AGE_MS ? new Map(Object.entries(ids.map)) : new Map(),
+                db,
+                w3bByItem: indexW3bByItem(db, now),
+                dbIdsByName: traderIdsByName(db),
+            }),
+        };
+    }
+    const id = String(itemId);
+    const lookup = app.traderLookup;
+    if (!lookup.best.has(id)) lookup.best.set(id, trustedOnly(lookup.buyersAll(id))[0] || null);
+    return lookup.best.get(id);
+}
+
+/** The cards on this bazaar a trusted trader pays more for, with the words for each. */
+function traderTags(listings) {
+    const rows = [];
+    for (const l of listings) {
+        if (!l.el) continue;
+        const label = traderTagLabel(trustedBuyerOf(l.itemId), l.listingPrice);
+        if (label) rows.push({ el: l.el, label });
+    }
+    return rows;
 }
 
 /**
@@ -1856,10 +1907,28 @@ const sell = {
      */
     teOne: new Map(),
     teOneBusy: false,
-    /* "Best trader for you": show only the items this trader pays most for. */
-    traderFilter: null,
-    /* How the Rows and Table views sort; Cards follow it too. */
-    sort: { key: 'price', dir: -1 },
+    /* TornW3B's one-call bazaar summary: itemId -> {lowestPrice, totalBazaars, ...}. */
+    summary: null,
+    summaryAt: 0,
+    summaryTriedAt: 0,
+    summaryError: null,
+    /* Every bazaar listing of an item, once read: itemId -> {at, triedAt, rows, error, loading}. */
+    bazaars: new Map(),
+    /* Items worth reading every bazaar of, for a flip: from the summary, best first. */
+    candidates: [],
+    /* Flips and traders' price lists take turns for TornW3B's slots. */
+    w3bTurn: 0,
+    /* The Item Market's cheapest listing of the item picked, when you hold it. */
+    market: new Map(),
+    marketBusy: false,
+    /* Your own Torn id: your listings are never "the cheapest", nor a bazaar to buy from. */
+    selfId: null,
+    selfTried: false,
+    /* The item on the desk (and whether you picked it), the list's filter and search. */
+    selected: null,
+    pickedByYou: false,
+    filter: 'all',
+    query: '',
     /* When statuses were asked, for the per-minute limit. */
     presenceAsked: [],
     /* Our trader database (TornW3B lists), and its item index for this render. */
@@ -1873,8 +1942,6 @@ const sell = {
     w3bPauseUntil: 0,
     /* The paced TornExchange queue: one call per slot, shared pace with every tab. */
     queue: null,
-    expanded: new Set(),
-    queries: { my: '', all: '' },
     allShown: ALL_ITEMS_PAGE,
     presence: new Map(),
     keyDead: false,
@@ -2063,34 +2130,214 @@ function heldIds() {
     return new Set((sell.inventory || []).map((it) => String(it.id)));
 }
 
-/**
- * Read the next TornW3B price list that is due: never read, then the traders
- * who buy what you hold, then everyone else. One at a time, visible tab only.
+/*
+ * TornW3B for the traders page: one request per step, W3B_LIST_STEP_MS
+ * apart, so everything here stays inside its 24 a minute - the bazaar
+ * summary, every bazaar of the item picked, the possible flips, and
+ * traders' price lists all share those slots. Visible tab only.
  */
-function stepW3bLists() {
+const W3B_SUMMARY_MS = 5 * 60 * 1000;
+/* The item picked: its bazaars read again after this. */
+const W3B_SELECTED_MS = 2 * 60 * 1000;
+/* A possible flip: its bazaars read again after this. */
+const W3B_CANDIDATE_MS = 10 * 60 * 1000;
+/* A TornW3B request that failed is not asked again before this. */
+const W3B_FAILED_RETRY_MS = 60 * 1000;
+/* Bazaar listings nobody is looking at any more are dropped after this. */
+const W3B_BAZAARS_FORGET_MS = 30 * 60 * 1000;
+/* The Item Market's cheapest listing of the item picked, read again after this. */
+const SELL_MARKET_REFRESH_MS = 2 * 60 * 1000;
+
+function stepW3b() {
     if (sell.w3bBusy || document.visibilityState !== 'visible') return;
     const now = Date.now();
     if (now < sell.w3bPauseUntil) return;
-    const id = nextW3bTrader(sell.db, heldIds(), now);
-    if (!id) return;
+    const job = nextW3bJob(now);
+    if (!job) return;
 
     sell.w3bBusy = true;
-    fetchW3bPriceList(sell.w3b, id)
+    job().finally(() => {
+        sell.w3bBusy = false;
+        renderSelling();
+    });
+}
+
+/** Are an item's bazaar listings due to be read? */
+function bazaarsDue(itemId, every, now) {
+    const b = sell.bazaars.get(String(itemId));
+    if (!b) return true;
+    if (b.loading) return false;
+    if (b.error) return now - b.triedAt >= W3B_FAILED_RETRY_MS;
+    return now - b.at >= every;
+}
+
+/**
+ * The next TornW3B request: the summary when old, then the item picked, then
+ * possible flips and price lists taking turns, so neither waits on the other.
+ */
+function nextW3bJob(now) {
+    if (now - sell.summaryAt >= W3B_SUMMARY_MS && now - sell.summaryTriedAt >= W3B_FAILED_RETRY_MS) return loadBazaarSummary;
+    const picked = sell.selected;
+    if (picked && bazaarsDue(picked, W3B_SELECTED_MS, now)) return () => loadBazaars(picked);
+
+    const cand = sell.candidates.find((c) => bazaarsDue(c.itemId, W3B_CANDIDATE_MS, now));
+    const list = nextW3bTrader(sell.db, heldIds(), now);
+    sell.w3bTurn ^= 1;
+    if (cand && (sell.w3bTurn || !list)) return () => loadBazaars(cand.itemId);
+    if (list) return () => loadW3bList(list);
+    if (cand) return () => loadBazaars(cand.itemId);
+    return null;
+}
+
+/** One trader's TornW3B price list. */
+function loadW3bList(id) {
+    return fetchW3bPriceList(sell.w3b, id)
         .then((body) => recordW3bList(sell.db, id, { prices: parseW3bPriceList(body) }, Date.now()))
         .catch((error) => {
             recordW3bList(sell.db, id, { error: true }, Date.now());
             if (error && error.blocked) sell.w3bPauseUntil = Date.now() + 60000;
         })
         .finally(() => {
-            sell.w3bBusy = false;
             sell.dbDirty = true;
             sell.w3bIndex = null;
             saveTraderDb();
+        });
+}
+
+/** The cheapest bazaar price of every item, in one request. */
+function loadBazaarSummary() {
+    sell.summaryTriedAt = Date.now();
+    return fetchW3bSummary(sell.w3b)
+        .then((rows) => {
+            const map = new Map();
+            for (const r of rows) map.set(r.itemId, r);
+            sell.summary = map;
+            sell.summaryAt = Date.now();
+            sell.summaryError = null;
+            // Listings of items no longer picked or possible flips are let go.
+            const keep = new Set([sell.selected, ...sell.candidates.map((c) => c.itemId)]);
+            for (const [id, b] of sell.bazaars) {
+                if (!keep.has(id) && Date.now() - (b.at || b.triedAt || 0) > W3B_BAZAARS_FORGET_MS) sell.bazaars.delete(id);
+            }
+        })
+        .catch((error) => {
+            sell.summaryError = 'TornW3B did not answer. Trying again soon.';
+            if (error && error.blocked) sell.w3bPauseUntil = Date.now() + 60000;
+        });
+}
+
+/** Every bazaar listing of one item. */
+function loadBazaars(itemId) {
+    const id = String(itemId);
+    const prev = sell.bazaars.get(id) || { at: 0, rows: [], error: null };
+    sell.bazaars.set(id, { ...prev, loading: true, triedAt: Date.now() });
+    return fetchW3bListings(sell.w3b, id)
+        .then(({ listings }) => {
+            sell.bazaars.set(id, { at: Date.now(), triedAt: Date.now(), rows: normalizeW3bListings(listings), error: null, loading: false });
+        })
+        .catch((error) => {
+            sell.bazaars.set(id, { ...prev, triedAt: Date.now(), error: 'TornW3B did not answer. Trying again soon.', loading: false });
+            if (error && error.blocked) sell.w3bPauseUntil = Date.now() + 60000;
+        });
+}
+
+/**
+ * The Item Market's cheapest listing of the item picked, when you hold it:
+ * one call with this page's key, again after SELL_MARKET_REFRESH_MS while it
+ * stays picked. Visible tab only.
+ */
+function loadSellMarket(itemId) {
+    const id = String(itemId);
+    if (!getSellKey() || sell.keyDead || sell.marketBusy || document.visibilityState !== 'visible') return;
+    const now = Date.now();
+    const m = sell.market.get(id);
+    if (m && (m.error ? now - m.triedAt < W3B_FAILED_RETRY_MS : now - m.at < SELL_MARKET_REFRESH_MS)) return;
+
+    sell.marketBusy = true;
+    sell.market.set(id, { ...(m || { at: 0, lowest: null }), loading: true, triedAt: now });
+    fetchItemMarket(sell.client, id, { limit: 5 })
+        .then((r) => {
+            const lowest = r.listings.length ? Math.min(...r.listings.map((l) => l.price)) : null;
+            sell.market.set(id, { at: Date.now(), triedAt: Date.now(), lowest, loading: false, error: null });
+        })
+        .catch((error) => {
+            if (isKeyDeadError(error)) {
+                sell.keyDead = true;
+                sell.keyError = sellKeyErrorText(error);
+                gmSet(STORE_SELL_KEY_DEAD, true);
+            }
+            sell.market.set(id, { ...(m || { at: 0, lowest: null }), triedAt: Date.now(), loading: false, error: true });
+        })
+        .finally(() => {
+            sell.marketBusy = false;
             renderSelling();
         });
 }
 
+/**
+ * Your own Torn id, once per key (`user` basic, v1): so your own listing is
+ * never shown as the cheapest bazaar to buy from or to undercut.
+ */
+function loadSelfId() {
+    if (sell.selfId || sell.selfTried || !getSellKey() || sell.keyDead) return;
+    const stored = gmGet(STORE_SELL_SELF, null);
+    if (stored && stored.id) {
+        sell.selfId = String(stored.id);
+        return;
+    }
+    sell.selfTried = true;
+    sell.client
+        .get('user', { selections: 'basic' })
+        .then((data) => {
+            const id = Number(data && data.player_id);
+            if (Number.isFinite(id) && id > 0) {
+                sell.selfId = String(id);
+                gmSet(STORE_SELL_SELF, { id: sell.selfId });
+                renderSelling();
+            }
+        })
+        .catch(() => {
+            // Without it your own listing can show; nothing else depends on it.
+        });
+}
+
 /* --------------------------------------------------------------- view */
+
+/**
+ * Who buys an item, one row per trader, highest first - from TornExchange's
+ * top three (keyed, or the keyless best buyer), its full lists, and our
+ * trader database's TornW3B lists. Answers are kept per item for one pass.
+ * The traders page and the panel's bazaar tags both use it.
+ */
+function buyerLookup({ teMap, lists, teOne, idsByName, db, w3bByItem, dbIdsByName }) {
+    // TornExchange's votes for the trust badge, from every answer we have.
+    const votesById = votesByTrader([
+        ...teMap.values(),
+        ...[...teOne.values()].filter((rec) => rec.best).map((rec) => [rec.best]),
+    ]);
+    const cache = new Map();
+    return (itemId) => {
+        const id = String(itemId);
+        let b = cache.get(id);
+        if (!b) {
+            const full = lists.get(id);
+            const one = teOne.get(id);
+            b = buyersForItem(id, {
+                // The keyed top three when TornExchange has them; else its
+                // keyless best buyer for this item.
+                teBest: teMap.get(id) || (one && one.best ? [one.best] : []),
+                teFull: full ? full.traders : null,
+                idsByName,
+                db,
+                w3bByItem,
+                dbIdsByName,
+                votesById,
+            });
+            cache.set(id, b);
+        }
+        return b;
+    };
+}
 
 /** Everything the page shows, from what is loaded now. */
 function renderSelling() {
@@ -2103,45 +2350,29 @@ function renderSelling() {
 
     const w3bByItem = w3bIndex(now);
     const teMap = sell.traders ? sell.traders.map : new Map();
-    // TornExchange's votes for the trust badge, from every answer we have.
-    const votesById = votesByTrader([
-        ...teMap.values(),
-        ...[...sell.teOne.values()].filter((rec) => rec.best).map((rec) => [rec.best]),
-    ]);
-    const buyersCache = new Map();
-    const buyersAll = (itemId) => {
-        const id = String(itemId);
-        let b = buyersCache.get(id);
+    const buyersAll = buyerLookup({ teMap, lists: sell.lists, teOne: sell.teOne, idsByName: sell.idsByName, db: sell.db, w3bByItem, dbIdsByName: sell.dbIdsByName });
+    const levelOf = (id) => presenceLevel(sellPresenceOf(id));
+    // What the Show toggles keep: online buyers, trusted buyers, or both.
+    const shownCache = new Map();
+    const buyersOf = (id) => {
+        const key = String(id);
+        let b = shownCache.get(key);
         if (!b) {
-            const full = sell.lists.get(id);
-            const one = sell.teOne.get(id);
-            b = buyersForItem(id, {
-                // The keyed top three when TornExchange has them; else its
-                // keyless best buyer for this item.
-                teBest: teMap.get(id) || (one && one.best ? [one.best] : []),
-                teFull: full ? full.traders : null,
-                idsByName: sell.idsByName,
-                db: sell.db,
-                w3bByItem,
-                dbIdsByName: sell.dbIdsByName,
-                votesById,
-            });
-            buyersCache.set(id, b);
+            b = buyersAll(key);
+            if (prefs.onlineOnly) b = onlineOnly(b, levelOf);
+            if (prefs.trustedOnly) b = trustedOnly(b);
+            shownCache.set(key, b);
         }
         return b;
     };
-    const levelOf = (id) => presenceLevel(sellPresenceOf(id));
-    // What the Show toggles keep: online buyers, trusted buyers, or both.
-    const buyersOf = (id) => {
-        let b = buyersAll(id);
-        if (prefs.onlineOnly) b = onlineOnly(b, levelOf);
-        if (prefs.trustedOnly) b = trustedOnly(b);
-        return b;
-    };
+    const heldQty = new Map((sell.inventory || []).map((it) => [String(it.id), Number(it.qty) || 0]));
     const heldNames = new Map((sell.inventory || []).map((it) => [String(it.id), it.name]));
+    const summary = sell.summary || new Map();
+    const itemOf = (id) => (sell.index && sell.index.byId ? sell.index.byId.get(String(id)) : null);
     const nameOf = (id) => {
-        const item = sell.index && sell.index.byId ? sell.index.byId.get(String(id)) : null;
-        return (item && item.name) || heldNames.get(String(id)) || 'Item ' + id;
+        const item = itemOf(id);
+        const s = summary.get(String(id));
+        return (item && item.name) || heldNames.get(String(id)) || (s && s.name) || 'Item ' + id;
     };
 
     const stats = traderDbStats(sell.db, now);
@@ -2160,77 +2391,147 @@ function renderSelling() {
         return !one || Boolean(one.failed);
     };
 
-    /*
-     * Every item you hold with every trader, whatever the filters: what the
-     * online checker and "best trader for you" work from.
-     */
-    const myAll = sell.inventory ? itemRows(heldIds(), { buyersOf: buyersAll, nameOf }) : [];
-    // Who to message follows the Show toggles: an offline trader is no one to message.
-    const myShown = prefs.onlineOnly || prefs.trustedOnly ? itemRows(heldIds(), { buyersOf, nameOf }) : myAll;
-    const ranked = bestTradersFor(myShown, Infinity);
-    const best = ranked.slice(0, 5);
-    const traderKey = (b) => (b.id ? String(b.id) : 'name:' + String(b.name).toLowerCase());
-    // The trader you picked stays picked while they still have the best price
-    // on something, in the top five or not. A Show toggle that hides them for
-    // now does not forget the choice: switching it back brings it back.
-    const filterTrader = sell.traderFilter ? ranked.find((e) => traderKey(e.trader) === sell.traderFilter) : null;
-    const onlyItems = filterTrader ? new Set(filterTrader.bestOn) : null;
+    /* The bazaar side: every listing once read, else the summary's cheapest. */
+    const sellersOf = (id) => {
+        const b = sell.bazaars.get(String(id));
+        return b && b.at ? bazaarSellers(b.rows, { selfId: sell.selfId, now }) : null;
+    };
+    const lowestOf = (id) => {
+        const rows = sellersOf(id);
+        if (rows) {
+            const fresh = rows.find((r) => !r.stale) || rows[0];
+            return fresh ? fresh.price : null;
+        }
+        const s = summary.get(String(id));
+        return s ? s.lowestPrice : null;
+    };
+    const planOf = (id) => {
+        const rows = sellersOf(id);
+        const b = buyersOf(id)[0];
+        return rows && b ? flipPlan(rows, b.price, { cash: prefs.cash }) : null;
+    };
 
-    /* My items: everything you hold, those with a trader first. */
-    let my = sell.inventory ? sortItemRows(itemRows(heldIds(), { buyersOf, nameOf, query: sell.queries.my }), sell.sort) : [];
-    if (onlyItems) my = my.filter((r) => onlyItems.has(r.itemId));
-    for (const r of my) {
-        // With Online only, not knowing a trader's status yet is not "nobody online".
-        const statusPending = prefs.onlineOnly && buyersAll(r.itemId).some((b) => b.id && presenceUnknown(b.id));
-        r.pending = !r.best && (pendingFor(r.itemId) || statusPending);
-    }
+    // Which items' bazaars to read for a flip: where a buyer you would sell
+    // to pays more than the summary's cheapest.
+    sell.candidates = sell.summary
+        ? flipCandidates(summary, (id) => {
+            const b = buyersOf(id)[0];
+            return b ? b.price : null;
+        }, { cash: prefs.cash })
+        : [];
+    const flipsChecked = sell.candidates.filter((c) => {
+        const b = sell.bazaars.get(c.itemId);
+        return b && b.at && now - b.at < W3B_CANDIDATE_MS * 2;
+    }).length;
 
-    /* All items: every item any trader buys. */
+    /* Every item: what you hold, and everything any trader buys. */
     const oneIds = [...sell.teOne].filter(([, rec]) => rec.best).map(([id]) => id);
-    const allIds = new Set([...teMap.keys(), ...w3bByItem.keys(), ...oneIds]);
-    const allRows = sortItemRows(itemRows(allIds, { buyersOf, nameOf, query: sell.queries.all }).filter((r) => r.best), sell.sort);
-    const all = allRows.slice(0, sell.allShown);
+    const allIds = new Set([...heldQty.keys(), ...teMap.keys(), ...w3bByItem.keys(), ...oneIds]);
+    const q = String(sell.query || '').trim().toLowerCase();
+    const rows = [];
+    for (const id of allIds) {
+        const name = nameOf(id);
+        if (q && !String(name).toLowerCase().includes(q)) continue;
+        const best = buyersOf(id)[0] || null;
+        const held = heldQty.get(id) || 0;
+        const plan = planOf(id);
+        const lowest = lowestOf(id);
+        let badge = null;
+        let value = 0;
+        if (plan && plan.units > 0) {
+            badge = { kind: 'flip', amount: plan.profit };
+            value = plan.profit;
+        } else if (held && best) {
+            const w = whereToSell({ held, bid: best.price, bazaarLowest: lowest });
+            if (w.best === 'bazaar') {
+                badge = { kind: 'list', amount: w.gain };
+                value = w.gain;
+            } else {
+                badge = { kind: 'sell' };
+            }
+        }
+        rows.push({ itemId: id, name, held, lowest, badge, value, bid: best ? best.price : 0, pending: !best && pendingFor(id), plan, best });
+    }
+    const counts = {
+        all: rows.length,
+        mine: rows.filter((r) => r.held).length,
+        flips: rows.filter((r) => r.badge && r.badge.kind === 'flip').length,
+    };
+    const pass = (r) => (sell.filter === 'mine' ? r.held > 0 : sell.filter === 'flips' ? Boolean(r.badge && r.badge.kind === 'flip') : true);
+    // Money to be made first, then what you hold, then the best price.
+    const listed = rows
+        .filter(pass)
+        .sort((a, b) => b.value - a.value || (b.held > 0) - (a.held > 0) || b.bid - a.bid || String(a.name).localeCompare(String(b.name)));
+    const strip = rows
+        .filter((r) => r.badge && r.badge.kind === 'flip')
+        .sort((a, b) => b.plan.profit - a.plan.profit)
+        .slice(0, 4)
+        .map((r) => ({ itemId: r.itemId, name: r.name, plan: r.plan, buyer: r.best }));
 
-    /*
-     * The item open in the side panel, whatever the search or filter now
-     * shows: it stays open until closed.
-     */
-    const [openKey] = sell.expanded;
-    let detail = null;
-    if (openKey) {
-        const at = openKey.indexOf(':');
-        const section = openKey.slice(0, at);
-        const itemId = openKey.slice(at + 1);
-        const buyers = buyersOf(itemId);
-        const statusPending = prefs.onlineOnly && buyersAll(itemId).some((b) => b.id && presenceUnknown(b.id));
-        detail = { section, itemId, name: nameOf(itemId), buyers, best: buyers[0] || null, pending: !buyers.length && (pendingFor(itemId) || statusPending) };
+    // The item you picked stays picked. Until you pick one, the desk shows
+    // the best flip (or the first item), following it as flips are found.
+    // Only an item you pick asks TornExchange for its full buyer list: its
+    // 10 a minute are not spent on the desk following flips.
+    if (sell.selected && !allIds.has(sell.selected)) {
+        sell.selected = null;
+        sell.pickedByYou = false;
+    }
+    if (!sell.pickedByYou) {
+        sell.selected = sell.filter !== 'mine' && strip.length ? strip[0].itemId : listed.length ? listed[0].itemId : null;
     }
 
-    const watch = tradersToCheck(myAll, all, best, detail ? buyersAll(detail.itemId) : []);
+    let desk = null;
+    const pick = sell.selected;
+    if (pick) {
+        const buyers = buyersOf(pick);
+        const b = sell.bazaars.get(pick);
+        const held = heldQty.get(pick) || 0;
+        const m = sell.market.get(pick);
+        const s = summary.get(pick);
+        const item = itemOf(pick);
+        const load = sell.listState.get(pick) || {};
+        const statusPending = prefs.onlineOnly && buyersAll(pick).some((x) => x.id && presenceUnknown(x.id));
+        desk = {
+            itemId: pick,
+            name: nameOf(pick),
+            held,
+            avg: item ? Number(item.marketValue) || null : null,
+            bazaars: s ? s.totalBazaars : 0,
+            buyers,
+            buyersTotal: buyers.length,
+            buyersLoading: Boolean(load.loading),
+            pending: !buyers.length && (pendingFor(pick) || statusPending),
+            sellers: {
+                state: b && b.at ? 'ok' : b && b.error ? 'error' : 'loading',
+                rows: sellersOf(pick) || [],
+                error: b ? b.error : null,
+            },
+            plan: planOf(pick),
+            planWhy: b && b.at ? null : 'loading',
+            where: held ? whereToSell({ held, bid: buyers[0] ? buyers[0].price : null, bazaarLowest: lowestOf(pick), marketLowest: m ? m.lowest : null }) : null,
+            market: { state: m && m.at ? 'ok' : m && m.error ? 'error' : 'loading', lowest: m ? m.lowest : null },
+        };
+        if (held) loadSellMarket(pick);
+    }
+
+    const watch = sellWatch({ desk, strip, listed, held: [...heldQty.keys()], buyersAll });
     updateSellPresence(watch, now);
     const statusesKnown = watch.ids.filter((id) => !presenceUnknown(id)).length;
 
-    const itemLists = new Map();
-    for (const [id, s] of sell.listState) itemLists.set(id, s);
     const heldCount = sell.inventory ? sell.inventory.length : 0;
     const teOneDone = sell.inventory ? [...heldIds()].filter((i) => sell.teOne.has(i) && !sell.teOne.get(i).failed).length : 0;
-
     const statuses = sellStatusMap(now);
     const traderCount = countTraders(allIds, buyersAll);
 
     sell.page.render({
-        my,
-        all,
-        allTotal: allRows.length,
-        myTotal: myAll.length,
-        best: best.map((e) => ({ trader: e.trader, bestOn: e.bestOn.length, buys: e.buys, key: traderKey(e.trader) })),
-        traderFilter: filterTrader ? { key: sell.traderFilter, name: filterTrader.trader.name, count: filterTrader.bestOn.length } : null,
-        detail,
-        sort: sell.sort,
-        stats: sellStats(myAll, statuses, traderCount),
+        strip,
+        list: listed.slice(0, sell.allShown).map((r) => ({ itemId: r.itemId, name: r.name, held: r.held, lowest: r.lowest, badge: r.badge, pending: r.pending })),
+        listTotal: listed.length,
+        counts,
+        filter: sell.filter,
+        desk,
         statuses,
         prefs,
-        expanded: sell.expanded,
         info: {
             hasKey: Boolean(getSellKey()),
             keyAccess: access && access.name,
@@ -2247,8 +2548,6 @@ function renderSelling() {
             tradersLoading: sell.teLoading || w3bPending || (!teUnusable && !sell.traders) || (teUnusable && teOneDone < heldCount),
             traderCount,
             knownTraders: stats.total + sell.idsByName.size + teMap.size + oneIds.length,
-            w3bAt: stats.newestW3bAt,
-            w3bChecking: stats.unchecked,
             w3bTraders: stats.withW3b,
             // Each source on its own: one failing never hides the others.
             teStatus: !teKey ? 'nokey' : st.badKey ? 'badkey' : sell.traders ? 'ok' : 'loading',
@@ -2256,28 +2555,14 @@ function renderSelling() {
             heldCount,
             w3bKnown: stats.total,
             w3bRead: stats.total - stats.unchecked,
+            bazaarsAt: sell.summaryAt || null,
+            bazaarsError: sell.summaryError,
+            flipsChecked,
+            flipsWanted: sell.candidates.length,
             statusesKnown,
             statusesWanted: watch.ids.length,
-            itemLists,
         },
     });
-}
-
-/** The headline numbers over the lists. */
-function sellStats(myAll, statuses, traderCount) {
-    const online = new Set();
-    for (const r of myAll) {
-        for (const b of r.buyers) {
-            const st = b.id ? statuses.get(String(b.id)) : null;
-            if (st && (st.level === 'online' || st.level === 'busy')) online.add(String(b.id));
-        }
-    }
-    return {
-        held: sell.inventory ? myAll.length : null,
-        withBuyer: sell.inventory ? myAll.filter((r) => r.best).length : null,
-        buyersOnline: online.size,
-        known: traderCount,
-    };
 }
 
 /** Distinct traders buying anything, for the status line. */
@@ -2288,12 +2573,13 @@ function countTraders(itemIds, buyersAll) {
 }
 
 /**
- * Whose online status to keep fresh, most useful first: every trader in an
- * open row, then the top three for each item you hold, then the best buyer
- * of the first items in All items. Built from the rows as shown, so an open
- * row is never starved by the rest.
+ * Whose online status to keep fresh, most useful first: every trader of the
+ * item on the desk (even ones the Show toggles hide: Online only needs to
+ * know about them), the buyers in the best flips, every trader of every item
+ * you hold (best first per item), then the best buyer of the first items in
+ * the list.
  */
-function tradersToCheck(my, all, best = [], openBuyers = []) {
+function sellWatch({ desk, strip, listed, held, buyersAll }) {
     const ids = [];
     const seen = new Set();
     const open = new Set();
@@ -2305,17 +2591,12 @@ function tradersToCheck(my, all, best = [], openBuyers = []) {
         seen.add(id);
         ids.push(id);
     };
-    const rowsAll = (section, rows) => rows.filter((r) => sell.expanded.has(section + ':' + r.itemId));
-    // Every trader of the item open in the side panel first, even ones the
-    // Show toggles hide now: Online only needs to know about them.
-    openBuyers.forEach((b) => push(b, true));
-    for (const r of [...rowsAll('my', my), ...rowsAll('all', all)]) r.buyers.forEach((b) => push(b, true));
-    for (const e of best) push(e.trader);
-    // Every trader of every item you hold, best first per item: Online only
-    // needs to know about all of them.
-    const depth = Math.max(0, ...my.map((r) => r.buyers.length));
-    for (let i = 0; i < depth; i++) for (const r of my) push(r.buyers[i]);
-    for (const r of all) push(r.best);
+    if (desk) buyersAll(desk.itemId).forEach((b) => push(b, true));
+    for (const f of strip) push(f.buyer);
+    const lists = held.map((id) => buyersAll(id));
+    const depth = Math.max(0, ...lists.map((l) => l.length));
+    for (let i = 0; i < depth; i++) for (const l of lists) push(l[i]);
+    for (const r of listed.slice(0, 20)) push(r.best);
     return { ids, open };
 }
 
@@ -2528,7 +2809,7 @@ function loadTeItemList(itemId) {
 /**
  * Traders' public statuses, when due, in the order given (most useful
  * first): visible tab only, at most SELL_PRESENCE_PER_MIN a minute.
- * @param {{ids: string[], open: Set<string>}} watch - from tradersToCheck
+ * @param {{ids: string[], open: Set<string>}} watch - from sellWatch
  */
 function updateSellPresence({ ids, open }, now) {
     for (const id of ids) {
@@ -2596,6 +2877,7 @@ function onSellSaveKey(key) {
     sell.inventory = null;
     sell.inventoryAt = null;
     sell.inventoryRetryAt = 0;
+    forgetSelf();
     sell.page.showView('list');
     loadSellInventory({ force: true }).then(() => refreshSellTraders());
 }
@@ -2609,7 +2891,16 @@ function onSellForgetKey() {
     sell.keyError = null;
     sell.inventory = null;
     sell.inventoryAt = null;
+    forgetSelf();
     renderSelling();
+}
+
+/** A new key may be another player: whose listings are "yours" is asked again. */
+function forgetSelf() {
+    gmDel(STORE_SELL_SELF);
+    sell.selfId = null;
+    sell.selfTried = false;
+    sell.market = new Map();
 }
 
 /**
@@ -2659,39 +2950,41 @@ function onSellRefresh() {
         const prices = t.w3b && t.w3b.found && t.w3b.prices;
         if (prices && Object.keys(prices).some((i) => held.has(i))) markW3bDue(sell.db, id);
     }
+    // Bazaar prices, and every bazaar of the item picked, are read again too.
+    sell.summaryAt = 0;
+    sell.summaryTriedAt = 0;
+    if (sell.selected) {
+        sell.bazaars.delete(sell.selected);
+        sell.market.delete(sell.selected);
+    }
     loadSellInventory({ force: true }).then(() => refreshSellTraders({ force: true }));
+    renderSelling();
 }
 
 /**
- * Open an item's traders in the side panel, one item at a time; the same
- * item again (or ✕ / Esc) closes it.
+ * Put an item on the desk: its full TornExchange buyer list and its bazaars
+ * are asked for straight away (each through its own paced queue).
  */
-function onSellExpand(section, itemId) {
-    const key = section + ':' + String(itemId);
-    const wasOpen = sell.expanded.has(key);
-    sell.expanded.clear();
-    if (!wasOpen) {
-        sell.expanded.add(key);
-        loadTeItemList(itemId);
-    }
+function onSellSelect(itemId) {
+    sell.selected = String(itemId);
+    sell.pickedByYou = true;
+    loadTeItemList(sell.selected);
+    renderSelling();
+    stepW3b();
+}
+
+/** All, Mine or Flips: the desk moves to the first item there. */
+function onSellFilter(key) {
+    sell.filter = key === 'mine' || key === 'flips' ? key : 'all';
+    sell.selected = null;
+    sell.pickedByYou = false;
+    sell.allShown = ALL_ITEMS_PAGE;
     renderSelling();
 }
 
-/** A column header pressed: sort by it, or the other way round. */
-function onSellSort(key) {
-    sell.sort = nextSort(sell.sort, key);
-    renderSelling();
-}
-
-/** Show only the items a trader pays the most for (null shows them all again). */
-function onSellTraderFilter(key) {
-    sell.traderFilter = key && key !== sell.traderFilter ? key : null;
-    renderSelling();
-}
-
-function onSellQuery(section, text) {
-    sell.queries[section === 'all' ? 'all' : 'my'] = String(text || '');
-    if (section === 'all') sell.allShown = ALL_ITEMS_PAGE;
+function onSellQuery(text) {
+    sell.query = String(text || '');
+    sell.allShown = ALL_ITEMS_PAGE;
     renderSelling();
 }
 
@@ -2748,15 +3041,14 @@ function bootSellingPage() {
         onSaveTeKey: onSellSaveTeKey,
         onForgetTeKey: onSellForgetTeKey,
         onRetryTe: onSellRetryTe,
-        onTraderFilter: onSellTraderFilter,
         onRevealTeKey: () => getTeKey(),
         onRefresh: onSellRefresh,
         onPrefsChange: (partial) => {
             gmSet(STORE_SELL_PREFS, { ...sellPrefs(), ...partial });
             renderSelling();
         },
-        onExpand: onSellExpand,
-        onSort: onSellSort,
+        onSelect: onSellSelect,
+        onFilter: onSellFilter,
         onQuery: onSellQuery,
         onMore: () => {
             sell.allShown += ALL_ITEMS_PAGE;
@@ -2793,11 +3085,12 @@ function bootSellingPage() {
             }
         }
         await loadSellInventory();
+        loadSelfId();
         await refreshSellTraders();
         renderSelling();
     })();
 
-    setInterval(stepW3bLists, W3B_LIST_STEP_MS);
+    setInterval(stepW3b, W3B_LIST_STEP_MS);
     setInterval(stepTeOne, TE_ONE_STEP_MS);
 
     setInterval(() => {
@@ -2810,6 +3103,7 @@ function bootSellingPage() {
             refreshMs: INVENTORY_REFRESH_MS,
         });
         if (due && !sell.loading && getSellKey()) loadSellInventory({ force: true });
+        loadSelfId();
         saveTraderDb();
         renderSelling();
     }, 15000);

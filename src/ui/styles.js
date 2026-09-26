@@ -114,6 +114,57 @@ export const PAGE_CSS = `
     pointer-events: none !important;
 }
 
+/*
+ * A trusted trader pays more than this listing asks: "FAFFO pays $73,500 /
+ * +$3,500 each", drawn the same way as the profit label and just as unable
+ * to catch a click. Two lines that wrap inside the card - never cut. On a
+ * card that is also a deal, the trader line goes under the profit.
+ */
+.ttv2-trader {
+    position: relative !important;
+}
+
+.ttv2-trader.ttv2-trader::after {
+    content: attr(data-ttv2-trader) !important;
+
+    display: block !important;
+    position: absolute !important;
+    top: 0 !important;
+    right: 0 !important;
+    left: auto !important;
+    bottom: auto !important;
+
+    width: auto !important;
+    height: auto !important;
+    min-width: 0 !important;
+    max-width: 100% !important;
+    margin: 0 !important;
+    padding: 1px 4px !important;
+    transform: none !important;
+
+    overflow: visible !important;
+    white-space: pre-line !important;
+    text-align: right !important;
+    opacity: 1 !important;
+    visibility: visible !important;
+    z-index: 2147483000 !important;
+
+    background: rgba(10, 40, 16, 0.92) !important;
+    border: 1px solid #35d35a !important;
+    border-radius: 0 0 0 5px !important;
+
+    color: #7ee08f !important;
+    font: 800 11px/14px Arial, Helvetica, sans-serif !important;
+
+    pointer-events: none !important;
+}
+
+.ttv2-hit.ttv2-trader.ttv2-trader::after {
+    content: attr(data-ttv2-profit) "\\A" attr(data-ttv2-trader) !important;
+    white-space: pre-line !important;
+    text-align: right !important;
+}
+
 /* The listing a feed link was opened for. Paint-only, like .ttv2-hit. */
 .ttv2-target {
     box-shadow:

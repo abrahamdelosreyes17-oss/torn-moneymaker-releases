@@ -98,9 +98,23 @@ if (/[?&]tornlayout=\d/.test(location.search)) {
         document.body.prepend(c);
     });
 }
+// ?traders=1: TornExchange's top buyers already stored, as the traders page
+// leaves them: Bob (Trusted, 214 votes) pays $110 for a Hammer, Alice
+// (Known) $115 - so a player's bazaar tags a cheaper Hammer with Bob only.
+if (/[?&]traders=1/.test(location.search)) {
+    _store[NS + 'teCache'] = JSON.stringify({ version: 1, fetchedAt: Date.now(), items: {
+        1: [['Alice', '12', 115, 40], ['Bob', '11', 110, 214]],
+        206: [['Bob', '11', 850000, 214]],
+    } });
+}
 // ?sellprefs=<json> presets the selling page's own preferences.
 const _prefs = new URLSearchParams(location.search).get('sellprefs');
 if (_prefs) _store[NS + 'sellingPage'] = _prefs;
+// ?awake=1: the page reports itself visible even in a background preview,
+// where the traders page would otherwise (rightly) pause every request.
+if (/[?&]awake=1/.test(location.search)) {
+    Object.defineProperty(document, 'visibilityState', { get: () => 'visible' });
+}
 // ?slow=1 answers profile (status) lookups after 2s, like a slow API.
 const SLOW = /[?&]slow=1/.test(location.search);
 
@@ -146,6 +160,9 @@ function respond(url) {
         if (u.pathname === '/torn/' && sel === 'cityshops') {
             return { cityshops: { 1: { name: "Bits 'n' Bobs", inventory: { 1: { price: 90 } } } } };
         }
+        if (u.pathname === '/user/' && sel === 'basic') {
+            return u.searchParams.get('key') === LIMITED ? { player_id: 999, name: 'Me', level: 20 } : { error: { code: 16, error: 'Access level of this key is not high enough' } };
+        }
         if (u.pathname === '/key/') {
             return u.searchParams.get('key') === LIMITED
                 ? { access_level: 3, access_type: 'Limited' }
@@ -189,7 +206,10 @@ function respond(url) {
         }
         const m = u.pathname.match(/^\/v2\/market\/(\d+)\/itemmarket$/);
         if (m) {
-            const listings = m[1] === '180' ? [{ price: 30, amount: 10 }, { price: 58, amount: 4 }] : [{ price: 9999999, amount: 1 }];
+            const listings = m[1] === '180' ? [{ price: 30, amount: 10 }, { price: 58, amount: 4 }]
+                : u.searchParams.get('key') === LIMITED && m[1] === '206' ? [{ price: 845000, amount: 3 }]
+                : u.searchParams.get('key') === LIMITED && m[1] === '1' ? [{ price: 130, amount: 900 }]
+                : [{ price: 9999999, amount: 1 }];
             return { itemmarket: { item: { id: +m[1], average_price: 55 }, listings, cache_timestamp: NOW_S - 10, cache_delay: 30 }, _metadata: { total: listings.length } };
         }
         return { error: { code: 0, error: 'unknown in harness: ' + u.pathname } };
@@ -232,7 +252,8 @@ function respond(url) {
         if (u.pathname === '/api/marketplace') {
             return { items: [
                 { item_id: 1, item_name: 'Hammer', lowest_price: 50, market_price: 120, total_bazaars: 3 },
-                { item_id: 206, item_name: 'Xanax', lowest_price: 840000, market_price: 830000 },
+                { item_id: 206, item_name: 'Xanax', lowest_price: 839000, market_price: 830000, total_bazaars: 2 },
+                { item_id: 180, item_name: 'Bottle of Beer', lowest_price: 60, market_price: 55, total_bazaars: 1 },
                 { item_id: 900, item_name: 'Companion Script : Test', lowest_price: 5, market_price: 10088888 },
                 { item_id: 335, item_name: 'Stick of Dynamite', lowest_price: 17500, market_price: 9172 },
             ] };
@@ -246,7 +267,13 @@ function respond(url) {
             ] };
         }
         if (u.pathname === '/api/marketplace/206') {
-            return { total_listings: 1, listings: [{ player_id: 888, player_name: 'XanSeller', price: 840000, quantity: 2, last_checked: NOW_S - 15 }] };
+            return { total_listings: 2, listings: [
+                { player_id: 999, player_name: 'Me', price: 839000, quantity: 5, last_checked: NOW_S - 15 },
+                { player_id: 888, player_name: 'XanSeller', price: 840000, quantity: 2, last_checked: NOW_S - 15 },
+            ] };
+        }
+        if (u.pathname === '/api/marketplace/180') {
+            return { total_listings: 1, listings: [{ player_id: 321, player_name: 'BeerGuy', price: 60, quantity: 50, last_checked: NOW_S - 40 }] };
         }
         if (u.pathname === '/api/marketplace/335') {
             return { total_listings: 1, listings: [{ player_id: 2, player_name: 'Y', price: 17500, quantity: 53, last_checked: NOW_S }] };
@@ -254,12 +281,13 @@ function respond(url) {
         if (u.pathname === '/api/marketplace/900') {
             return { total_listings: 1, listings: [{ player_id: 1, player_name: 'X', price: 5, quantity: 3, last_checked: NOW_S }] };
         }
-        // Traders' own price lists: Bob pays more here than on TornExchange;
-        // Alice has no TornW3B list; trader 77 is only on TornW3B.
+        // Traders' own price lists: Bob pays more here than on TornExchange,
+        // and buys Dynamite (a flip: 53 sell at $17,500); Alice has no
+        // TornW3B list; trader 77 is only on TornW3B.
         const pl = u.pathname.match(/^\/api\/pricelist\/(\d+)$/);
         if (pl) {
             const lists = {
-                11: [{ itemId: 206, name: 'Xanax', buyPrice: 852000 }, { itemId: 1, name: 'Hammer', buyPrice: 0 }, { itemId: -1, name: 'Flower Set', buyPrice: 300000 }],
+                11: [{ itemId: 206, name: 'Xanax', buyPrice: 852000 }, { itemId: 1, name: 'Hammer', buyPrice: 0 }, { itemId: -1, name: 'Flower Set', buyPrice: 300000 }, { itemId: 335, name: 'Stick of Dynamite', buyPrice: 18000 }],
                 44: [{ itemId: 1, name: 'Hammer', buyPrice: 118 }],
                 77: [{ itemId: 206, name: 'Xanax', buyPrice: 849500 }, { itemId: 180, name: 'Bottle of Beer', buyPrice: 61 }, { itemId: 335, name: 'Stick of Dynamite', buyPrice: 9000 }],
             };
