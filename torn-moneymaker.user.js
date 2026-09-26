@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      3.12.0
+// @version      3.12.1
 // @description  Finds Bazaar and Item Market listings below NPC / market value - on the page you are viewing, and live from the Torn API and TornW3B - ranked by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -40,7 +40,7 @@
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '3.12.0';
+    const TTV2_BUILD_VERSION = '3.12.1';
 
     /* ===== src/platform/gm.js ===== */
     /*
@@ -2536,8 +2536,16 @@
      *   1226 Bazaar sell   {buyer,  items, cost_each, cost_total}
      *   1112 Item Market buy  {seller, anonymous, items, cost_each, cost_total}
      *   1113 Item Market sell {buyer, anonymous, items, cost_each, fee, cost_total} - cost_total is AFTER the fee
+     *   4210 Item shop sell (to an NPC)  {item, quantity, value_each, total_value}
+     *   4200 Item shop buy (a city shop) {item, quantity, cost_total}
+     *   4201 Item abroad buy             {item, quantity, cost_total}
+     *   8156 Attack mug receive          you were mugged: the amount lost (see mugFromLog)
      * Trades come from /user/trades and /user/{id}/trade (typed items and money
      * for each side).
+     *
+     * Buying on the Item Market or in a bazaar under the NPC price and selling to
+     * the NPC is the overlay's whole job: an NPC sale is matched to what its units
+     * cost like any other, so it shows its profit and whom they were bought from.
      */
 
     const LEDGER_VERSION = 1;
@@ -2546,12 +2554,16 @@
     const LOG_BAZAAR_SELL = 1226;
     const LOG_MARKET_BUY = 1112;
     const LOG_MARKET_SELL = 1113;
-    const LEDGER_LOG_TYPES = [LOG_BAZAAR_BUY, LOG_BAZAAR_SELL, LOG_MARKET_BUY, LOG_MARKET_SELL];
+    const LOG_SHOP_SELL = 4210;
+    const LOG_SHOP_BUY = 4200;
+    const LOG_ABROAD_BUY = 4201;
+    const LOG_MUGGED = 8156;
+    const LEDGER_LOG_TYPES = [LOG_BAZAAR_BUY, LOG_BAZAAR_SELL, LOG_MARKET_BUY, LOG_MARKET_SELL, LOG_SHOP_SELL, LOG_SHOP_BUY, LOG_ABROAD_BUY, LOG_MUGGED];
 
-    const VENUE_NAMES = { bazaar: 'Bazaar', market: 'Item Market', trade: 'Trade' };
+    const VENUE_NAMES = { bazaar: 'Bazaar', market: 'Item Market', trade: 'Trade', npc: 'NPC shop', shop: 'City shop', abroad: 'Abroad' };
 
     function emptyLedger() {
-        return { version: LEDGER_VERSION, rows: [], newestAt: 0, oldestAt: 0, backfilled: false, tradesAt: 0, tradeIds: [], logCount: 0, readAt: 0 };
+        return { version: LEDGER_VERSION, rows: [], mugs: [], mugKeys: [], newestAt: 0, oldestAt: 0, backfilled: false, tradesAt: 0, tradeIds: [], logCount: 0, readAt: 0 };
     }
 
     /** A stored ledger, or a fresh one when missing or from another version. */
@@ -2574,6 +2586,26 @@
         const type = Number(entry.details.id);
         const d = entry.data;
         const t = ledgerNum(entry.timestamp) * 1000;
+        // One item each: selling to an NPC shop, buying in a city shop or abroad.
+        if (type === LOG_SHOP_SELL || type === LOG_SHOP_BUY || type === LOG_ABROAD_BUY) {
+            const itemId = ledgerNum(d.item);
+            const qty = ledgerNum(d.quantity) || 1;
+            if (!t || !(itemId > 0) || !(qty > 0)) return [];
+            const total = type === LOG_SHOP_SELL ? ledgerNum(d.total_value) : ledgerNum(d.cost_total);
+            const each = total ? total / qty : ledgerNum(type === LOG_SHOP_SELL ? d.value_each : d.cost_each);
+            return [{
+                id: String(entry.id) + ':0',
+                t,
+                itemId: String(itemId),
+                qty,
+                each,
+                fee: 0,
+                side: type === LOG_SHOP_SELL ? 'sell' : 'buy',
+                venue: type === LOG_SHOP_SELL ? 'npc' : type === LOG_SHOP_BUY ? 'shop' : 'abroad',
+                who: null,
+                whoName: null,
+            }];
+        }
         const items = Array.isArray(d.items) ? d.items : [];
         const venue = type === LOG_BAZAAR_BUY || type === LOG_BAZAAR_SELL ? 'bazaar' : type === LOG_MARKET_BUY || type === LOG_MARKET_SELL ? 'market' : null;
         if (!venue || !t || !items.length) return [];
@@ -2649,6 +2681,71 @@
             gave.forEach((g, i) => rows.push({ ...base, id: 'trade:' + trade.id + ':out:' + i, itemId: g.itemId, qty: g.qty, each: eachs[i], side: received > 0 ? 'sell' : 'give' }));
         }
         return rows;
+    }
+
+    /**
+     * A mugging you suffered (8156), or null. Torn's docs do not type this
+     * entry's fields, so the amount is read from the names Torn uses for mugging
+     * money (money_mugged, money, amount...); one it cannot read is kept with
+     * amount null and counted apart - never guessed. `keys` lists the field names
+     * seen (names only), so an unread shape can be fixed.
+     */
+    function mugFromLog(entry) {
+        if (!entry || !entry.details || Number(entry.details.id) !== LOG_MUGGED) return null;
+        const d = entry.data || {};
+        const t = ledgerNum(entry.timestamp) * 1000;
+        if (!t) return null;
+        let amount = null;
+        for (const k of ['money_mugged', 'money', 'amount', 'mugged', 'money_lost', 'value', 'total']) {
+            const n = Number(d[k]);
+            if (Number.isFinite(n) && n > 0) {
+                amount = n;
+                break;
+            }
+        }
+        const who = d.attacker || d.attacker_id || d.user || d.mugger || null;
+        return {
+            id: String(entry.id),
+            t,
+            amount,
+            who: who && typeof who !== 'object' ? String(who) : who && who.id ? String(who.id) : null,
+            anonymous: Boolean(d.anonymous) || !who,
+            keys: Object.keys(d).sort(),
+        };
+    }
+
+    /** New muggings into the ledger, each once (by id). Returns how many were new. */
+    function addMugs(ledger, mugs) {
+        if (!Array.isArray(ledger.mugs)) ledger.mugs = [];
+        const have = new Set(ledger.mugs.map((m) => m.id));
+        const keys = new Set(ledger.mugKeys || []);
+        let added = 0;
+        for (const m of mugs) {
+            if (!m || have.has(m.id)) continue;
+            have.add(m.id);
+            const { keys: k, ...rest } = m;
+            for (const name of k || []) keys.add(name);
+            ledger.mugs.push(rest);
+            added += 1;
+        }
+        if (added) ledger.mugs.sort((a, b) => a.t - b.t);
+        ledger.mugKeys = [...keys].sort().slice(0, 30);
+        return added;
+    }
+
+    /** What muggings took in a time range: {lost, count, unknown, biggest}. */
+    function mugTotals(mugs, { from = null, to = null } = {}) {
+        const out = { lost: 0, count: 0, unknown: 0, biggest: 0 };
+        for (const m of mugs || []) {
+            if (from && m.t < from) continue;
+            if (to && m.t > to) continue;
+            out.count += 1;
+            if (m.amount > 0) {
+                out.lost += m.amount;
+                if (m.amount > out.biggest) out.biggest = m.amount;
+            } else out.unknown += 1;
+        }
+        return out;
     }
 
     /** New rows into the ledger, each once (by id), oldest first. Returns how many were new. */
@@ -2745,7 +2842,7 @@
      * @returns {{profit, sold, spent, fees, unitsSold, unitsBought, sales, buys, unknownUnits}}
      */
     function ledgerTotals(rows, fifo) {
-        const t = { profit: 0, sold: 0, spent: 0, fees: 0, unitsSold: 0, unitsBought: 0, sales: 0, buys: 0, unknownUnits: 0 };
+        const t = { profit: 0, sold: 0, spent: 0, cost: 0, fees: 0, unitsSold: 0, unitsBought: 0, sales: 0, buys: 0, unknownUnits: 0 };
         for (const r of rows) {
             if (r.side === 'buy') {
                 t.spent += r.each * r.qty;
@@ -2758,12 +2855,14 @@
                 t.unitsSold += r.qty;
                 t.sales += 1;
                 if (m && m.profit !== null) t.profit += m.profit;
+                if (m && m.cost !== null) t.cost += m.cost;
                 if (m) t.unknownUnits += m.unknownQty;
             }
         }
         t.profit = Math.round(t.profit);
         t.sold = Math.round(t.sold);
         t.spent = Math.round(t.spent);
+        t.cost = Math.round(t.cost);
         return t;
     }
 
@@ -9792,6 +9891,8 @@
             this.h = h;
             this.f = { period: '30d', itemId: '', category: '', venue: 'all', who: '' };
             this.group = 'day';
+            /* 'trade' (buys and sells) or 'mugs' (what muggings took) */
+            this.tab = 'trade';
             this.fifoSig = null;
             this.fifo = new Map();
             this.el = lvEl('div', { class: 'lg' });
@@ -9821,7 +9922,8 @@
             this.last = v;
             const L = v.ledger || {};
             const rows = L.rows || [];
-            const sig = JSON.stringify([rows.length, rows.length ? rows[rows.length - 1].id : null, L.hasKey, L.busy, L.error, L.keyError, L.backfilled, Math.floor((Date.now() - (L.readAt || 0)) / 60000), this.f, this.group]);
+            const mugs = L.mugs || [];
+            const sig = JSON.stringify([rows.length, rows.length ? rows[rows.length - 1].id : null, mugs.length, L.hasKey, L.busy, L.error, L.keyError, L.backfilled, Math.floor((Date.now() - (L.readAt || 0)) / 60000), this.f, this.group, this.tab]);
             if (sig === this.sig) return;
             this.sig = sig;
 
@@ -9861,6 +9963,17 @@
                 lvEl('span', { class: 'sp-sp' }),
                 lvEl('button', { type: 'button', class: 'sp-btn', text: L.busy ? 'Reading…' : 'Read now', disabled: L.busy || L.keyError ? '' : null, onclick: () => this.h.onRead && this.h.onRead() }),
             ]));
+
+            /* Trading | Mugged */
+            const tabs = lvEl('div', { class: 'lg-tabs', role: 'tablist' });
+            for (const [k, label] of [['trade', 'Trading'], ['mugs', 'Mugged' + (mugs.length ? ' · ' + lvCount(mugs.length) : '')]]) {
+                tabs.appendChild(lvEl('button', { type: 'button', role: 'tab', class: 'lg-tab', 'aria-selected': String(this.tab === k), text: label, onclick: () => {
+                    this.tab = k;
+                    this.sig = null;
+                    this.render(this.last);
+                } }));
+            }
+            box.appendChild(tabs);
 
             /* filters */
             const items = new Map();
@@ -9902,6 +10015,9 @@
                 lvEl('option', { value: 'bazaar', text: 'Bazaars' }),
                 lvEl('option', { value: 'market', text: 'Item Market' }),
                 lvEl('option', { value: 'trade', text: 'Trades' }),
+                lvEl('option', { value: 'npc', text: 'NPC shops' }),
+                lvEl('option', { value: 'shop', text: 'City shops' }),
+                lvEl('option', { value: 'abroad', text: 'Abroad' }),
             ]);
             venueSel.value = this.f.venue;
             venueSel.addEventListener('change', () => this.set({ venue: venueSel.value }));
@@ -9921,6 +10037,11 @@
             ]));
 
             const { from, to } = this.range();
+            if (this.tab === 'mugs') {
+                this.renderMugs(box, mugs, { from, to }, L);
+                this.restoreFocus(focusKey, caret);
+                return;
+            }
             const shown = filterLedgerRows(rows, { ...this.f, from, to }, typeOf);
             const t = ledgerTotals(shown, this.fifo);
             const periodLabel = (PERIODS.find(([k]) => k === this.f.period) || [0, ''])[1].toLowerCase();
@@ -9934,10 +10055,27 @@
             const tile = (label, value, cls = '', sub = '') => lvEl('div', { class: 'lg-tile ' + cls }, [lvEl('span', { class: 'lg-tl', text: label }), lvEl('b', { text: value }), sub ? lvEl('small', { text: sub }) : null]);
             box.appendChild(lvEl('div', { class: 'lg-tiles' }, [
                 tile('Profit', lvSigned(t.profit), t.profit >= 0 ? 'lg-good' : 'lg-loss', lvCount(t.sales) + ' sale' + (t.sales === 1 ? '' : 's')),
-                tile('Sold, after fees', formatMoney(t.sold), '', lvCount(t.unitsSold) + ' items'),
+                tile('Sold, after fees', formatMoney(t.sold), '', lvCount(t.unitsSold) + ' items' + (t.fees ? ' · ' + formatMoney(t.fees) + ' in fees' : '')),
+                // What the units sold here had cost - wherever they were bought (an NPC sale's bazaar buy).
+                tile('Cost of what sold', formatMoney(t.cost), '', 'first in, first out'),
                 tile('Bought', formatMoney(t.spent), '', lvCount(t.unitsBought) + ' items'),
-                tile('Item Market fees', formatMoney(t.fees)),
             ]));
+            // Muggings in the same period (not per item or place: a mugging takes cash).
+            const mt = mugTotals(mugs, { from, to });
+            if (mt.count && !this.f.itemId && !this.f.category && this.f.venue === 'all' && !this.f.who) {
+                box.appendChild(lvEl('p', { class: 'lg-mugline' }, [
+                    'Lost to ' + lvCount(mt.count) + ' mugging' + (mt.count === 1 ? '' : 's') + ': ',
+                    lvEl('b', { class: 'lg-loss', text: '−' + formatMoney(mt.lost) }),
+                    ' · profit after muggings ',
+                    lvEl('b', { class: t.profit - mt.lost >= 0 ? 'lg-good' : 'lg-loss', text: lvSigned(t.profit - mt.lost) }),
+                    ' ',
+                    lvEl('button', { type: 'button', class: 'sp-link', text: 'See the muggings', onclick: () => {
+                        this.tab = 'mugs';
+                        this.sig = null;
+                        this.render(this.last);
+                    } }),
+                ]));
+            }
             if (t.unknownUnits) {
                 box.appendChild(lvEl('p', { class: 'lg-note', text: lvCount(t.unknownUnits) + ' sold with no buy on record (bought before the Ledger\'s first entry): their cost is not known, so they are not in the profit.' }));
             }
@@ -9979,6 +10117,56 @@
                 this.rowsTable(shown, nameOf),
             ]));
             this.restoreFocus(focusKey, caret);
+        }
+
+        /** What muggings took: totals, per day, and each one. */
+        renderMugs(box, mugs, range, L) {
+            const t = mugTotals(mugs, range);
+            const who = String(this.f.who || '').trim().toLowerCase();
+            const shown = mugs.filter((m) => (!range.from || m.t >= range.from) && (!range.to || m.t <= range.to) && (!who || String(m.who || '') === who));
+            box.appendChild(lvEl('div', { class: 'lg-head' }, [lvEl('h2', { text: 'Lost to muggings' }), lvEl('span', { class: 'lg-muted', text: 'the real danger of carrying cash in Torn' })]));
+            const tile = (label, value, cls = '', sub = '') => lvEl('div', { class: 'lg-tile ' + cls }, [lvEl('span', { class: 'lg-tl', text: label }), lvEl('b', { text: value }), sub ? lvEl('small', { text: sub }) : null]);
+            box.appendChild(lvEl('div', { class: 'lg-tiles' }, [
+                tile('Lost', t.lost ? '−' + formatMoney(t.lost) : '$0', t.lost ? 'lg-lossbox' : ''),
+                tile('Muggings', lvCount(t.count)),
+                tile('Biggest', t.biggest ? '−' + formatMoney(t.biggest) : '–'),
+                tile('Average', t.count - t.unknown > 0 ? '−' + formatMoney(Math.round(t.lost / (t.count - t.unknown))) : '–'),
+            ]));
+            if (t.unknown) {
+                box.appendChild(lvEl('p', { class: 'lg-note', text: lvCount(t.unknown) + ' mugging' + (t.unknown === 1 ? '' : 's') + ' whose amount Torn\'s log did not give in a field the Ledger knows' + (L.mugKeys && L.mugKeys.length ? ' (fields seen: ' + L.mugKeys.join(', ') + ')' : '') + ': not in the total.' }));
+            }
+            if (!shown.length) {
+                box.appendChild(lvEl('p', { class: 'lg-card lg-muted', text: mugs.length ? 'No muggings in this period.' : 'No muggings in your log. Keep it that way: bank your cash.' }));
+                return;
+            }
+            // Per day, as losses.
+            const days = new Map();
+            for (const m of shown) {
+                const k = periodStart(m.t, this.group);
+                days.set(k, (days.get(k) || 0) + (m.amount || 0));
+            }
+            const periods = [...days.entries()].sort((a, b) => a[0] - b[0]).map(([start, lost]) => ({ start, profit: -lost, sold: 0, spent: 0 }));
+            box.appendChild(lvEl('section', { class: 'lg-card' }, [lvEl('div', { class: 'lg-cardh' }, [lvEl('h3', { text: 'Lost per ' + this.group })]), this.periodChart(periods)]));
+            const table = lvEl('table', { class: 'lg-table' });
+            table.appendChild(lvEl('tr', {}, ['When', 'Who', 'Lost'].map((h, i) => lvEl('th', { class: i === 2 ? 'lg-num' : '', text: h }))));
+            for (const m of shown.slice().reverse().slice(0, 200)) {
+                let whoEl;
+                if (m.who) {
+                    const url = 'https://www.torn.com/profiles.php?XID=' + encodeURIComponent(m.who);
+                    whoEl = lvEl('a', { href: url, target: '_blank', rel: 'noopener noreferrer', text: 'Player ' + m.who });
+                    whoEl.addEventListener('click', (e) => {
+                        if (e.button !== 0 || e.ctrlKey || e.metaKey || e.shiftKey) return;
+                        e.preventDefault();
+                        if (this.h.onOpenUrl) this.h.onOpenUrl(url);
+                    });
+                } else whoEl = lvEl('span', { class: 'lg-muted', text: 'anonymous' });
+                table.appendChild(lvEl('tr', {}, [
+                    lvEl('td', { text: dateText(m.t, true) }),
+                    lvEl('td', {}, [whoEl]),
+                    lvEl('td', { class: 'lg-num lg-loss', text: m.amount ? '−' + formatMoney(m.amount) : 'not read' }),
+                ]));
+            }
+            box.appendChild(lvEl('section', { class: 'lg-card' }, [lvEl('h3', { text: 'Every mugging · newest first' }), table]));
         }
 
         restoreFocus(key, caret) {
@@ -10098,7 +10286,9 @@
         rowsTable(shown, nameOf) {
             const table = lvEl('table', { class: 'lg-table lg-rows' });
             table.appendChild(lvEl('tr', {}, ['When', '', 'Item', 'Qty', 'Each', 'Total', 'Where', 'Who', 'Profit'].map((h, i) => lvEl('th', { class: i >= 3 && i <= 5 || i === 8 ? 'lg-num' : '', text: h }))));
-            const who = (id, name) => {
+            const who = (id, name, venue) => {
+                // Shops have no player: the NPC shop, a city shop, abroad.
+                if (!id && !name && (venue === 'npc' || venue === 'shop' || venue === 'abroad')) return lvEl('span', { class: 'lg-muted', text: VENUE_NAMES[venue] });
                 if (!id && !name) return lvEl('span', { class: 'lg-muted', text: 'anonymous' });
                 const label = name || 'Player ' + id;
                 if (!id) return lvEl('span', { text: label });
@@ -10115,7 +10305,9 @@
             for (const r of rows) {
                 const m = r.side === 'sell' ? this.fifo.get(r.id) : null;
                 const total = r.side === 'sell' && m ? m.net : r.each * r.qty;
-                const fromText = m && m.from.length ? 'bought from ' + m.from.map((f) => (f.whoName || (f.who ? 'Player ' + f.who : VENUE_NAMES[f.venue])) + (f.venue ? ' (' + VENUE_NAMES[f.venue] + ')' : '')).join(', ') : '';
+                const fromText = m && m.from.length
+                    ? 'bought ' + m.from.map((f) => lvCount(f.qty) + ' from ' + (f.whoName || (f.who ? 'Player ' + f.who : VENUE_NAMES[f.venue])) + (f.venue ? ' (' + VENUE_NAMES[f.venue] + ')' : '') + ' at ' + formatMoney(Math.round(f.each))).join(', ')
+                    : '';
                 table.appendChild(lvEl('tr', { class: 'lg-' + r.side }, [
                     lvEl('td', { text: dateText(r.t, true) }),
                     lvEl('td', {}, [lvEl('span', { class: 'lg-side', text: r.side === 'buy' ? 'Bought' : r.side === 'sell' ? 'Sold' : 'Gave' })]),
@@ -10124,7 +10316,7 @@
                     lvEl('td', { class: 'lg-num', text: formatMoney(Math.round(r.each)) }),
                     lvEl('td', { class: 'lg-num', text: formatMoney(Math.round(total)) + (r.fee ? '' : '') }),
                     lvEl('td', { text: VENUE_NAMES[r.venue] + (r.fee ? ' · fee ' + formatMoney(r.fee) : '') }),
-                    lvEl('td', {}, [who(r.who, r.whoName)]),
+                    lvEl('td', {}, [who(r.who, r.whoName, r.venue)]),
                     lvEl('td', { class: 'lg-num ' + (m && m.profit !== null ? (m.profit >= 0 ? 'lg-good' : 'lg-loss') : '') }, [m && m.profit !== null ? lvSigned(m.profit) : r.side === 'sell' ? 'cost unknown' : '']),
                 ]));
             }
@@ -10159,6 +10351,12 @@
     .lg-tile.lg-good b, .lg-good { color: var(--price); }
     .lg-tile.lg-loss b, .lg-loss { color: #ff8a80; }
     .lg-note { margin: 0; font-size: 12px; color: var(--warn); }
+    .lg-tabs { display: flex; gap: 6px; }
+    .lg-tab { height: 34px; padding: 0 16px; border-radius: 9px; border: 1px solid var(--cline2); background: none; color: var(--muted); font: bold 13px Arial, Helvetica, sans-serif; cursor: pointer; }
+    .lg-tab[aria-selected="true"] { color: #fff; border-color: var(--profit); background: var(--green-bg); }
+    .lg-mugline { margin: 0; font-size: 13px; color: var(--muted); display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px; }
+    .lg-tile.lg-lossbox { border-color: #6b2b27; background: #2a1917; }
+    .lg-tile.lg-lossbox b { color: #ff8a80; }
     .lg-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; align-items: start; }
     .lg-cardh { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
     .lg-cardh h3 { margin: 0; }
@@ -10896,7 +11094,7 @@
                 ['Data sharing', 'Nobody'],
                 ['Purpose of use', 'Personal: profit tracking'],
                 ['Key storage & sharing', 'Stored locally / Not shared'],
-                ['Key access level', 'Full, used only for your log (bazaar and Item Market buys and sells), your trades, and key info'],
+                ['Key access level', 'Full, used only for your log (bazaar, Item Market and NPC shop buys and sells, and muggings), your trades, and key info'],
                 ['Other services', 'None: never sent to TornExchange or TornW3B'],
             ]) {
                 ledgerTos.appendChild(spEl('tr', {}, [spEl('th', { text: k }), spEl('td', { text: v })]));
@@ -16631,6 +16829,7 @@
                 while (calls < LEDGER_CALLS_PER_RUN) {
                     const rows = await page({ from: data.newestAt, to: gap.to });
                     addLedgerRows(data, rows.flatMap(rowsFromLog));
+                    addMugs(data, rows.map(mugFromLog).filter(Boolean));
                     data.logCount += rows.length;
                     const span = logSpan(rows);
                     if (span.max > gap.newest) gap.newest = span.max;
@@ -16648,6 +16847,7 @@
             while (!data.backfilled && calls < LEDGER_CALLS_PER_RUN) {
                 const rows = await page({ to: data.oldestAt || null });
                 addLedgerRows(data, rows.flatMap(rowsFromLog));
+                addMugs(data, rows.map(mugFromLog).filter(Boolean));
                 data.logCount += rows.length;
                 const span = logSpan(rows);
                 if (span.max > data.newestAt) data.newestAt = span.max;
@@ -16753,6 +16953,8 @@
             backfilled: data ? data.backfilled : false,
             oldestAt: data ? data.oldestAt : 0,
             rows: data ? data.rows : [],
+            mugs: data ? data.mugs || [] : [],
+            mugKeys: data ? data.mugKeys || [] : [],
         };
     }
 

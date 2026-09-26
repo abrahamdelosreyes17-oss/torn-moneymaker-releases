@@ -44,14 +44,14 @@ test('no query rides along: a path with ? is refused, and each path takes only i
     assert.equal(f.calls.length, 0);
 });
 
-test('the log is asked for the four trade types, 100 at a time, with the key only in the query', async () => {
+test('the log is asked for its trade and mugging types, 100 at a time, with the key only in the query', async () => {
     const f = recordingFetch(() => ({ log: [{ id: 'a', timestamp: 1, details: { id: 1225 }, data: {} }] }));
     const rows = await fetchLogPage(client(f), { from: 100, to: 200 });
     assert.equal(rows.length, 1);
     const url = new URL(f.calls[0]);
     assert.equal(url.hostname, 'api.torn.com');
     assert.equal(url.pathname, '/v2/user/log');
-    assert.equal(url.searchParams.get('log'), '1225,1226,1112,1113');
+    assert.equal(url.searchParams.get('log'), '1225,1226,1112,1113,4210,4200,4201,8156');
     assert.equal(url.searchParams.get('limit'), '100');
     assert.equal(url.searchParams.get('from'), '100');
     assert.equal(url.searchParams.get('to'), '200');

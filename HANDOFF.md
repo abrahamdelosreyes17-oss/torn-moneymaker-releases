@@ -5,9 +5,13 @@ rules; this file holds where we are, how the owner works, and what is settled.
 
 ## Where things stand (3.11.0, 2026-09-26)
 
-- **Version 3.12.0** (`7f96632`) on branch `claude/optimistic-ride-1gqguu`.
-  Last install link given to the owner (3.12.0):
-  `https://raw.githubusercontent.com/abrahamdelosreyes17-oss/torn-moneymaker-releases/7f966325bf3f1a342e1188b5a310cb86a56d82e7/torn-moneymaker.user.js`
+- **Version 3.12.1** on branch `claude/optimistic-ride-1gqguu` (its commit and
+  link are in the commit after it). 3.12.1 adds to the Ledger: NPC shop sells
+  (4210), city-shop / abroad buys (4200 / 4201), each sale's buy price and
+  source, *Cost of what sold*, and a **Mugged** tab (8156; its data fields are
+  undocumented - the amount is read from money_mugged / money / amount...,
+  and the field names seen are kept: check them on the owner's first real
+  mugging). 3.12.0 was `7f96632`.
 - **`main` is still at 2.9.3.** The script's `@updateURL` points at `main`, so
   installs are done from **pinned links**:
   `https://raw.githubusercontent.com/abrahamdelosreyes17-oss/torn-moneymaker-releases/<commit>/torn-moneymaker.user.js`

@@ -681,7 +681,7 @@ export class SellingPage {
             ['Data sharing', 'Nobody'],
             ['Purpose of use', 'Personal: profit tracking'],
             ['Key storage & sharing', 'Stored locally / Not shared'],
-            ['Key access level', 'Full, used only for your log (bazaar and Item Market buys and sells), your trades, and key info'],
+            ['Key access level', 'Full, used only for your log (bazaar, Item Market and NPC shop buys and sells, and muggings), your trades, and key info'],
             ['Other services', 'None: never sent to TornExchange or TornW3B'],
         ]) {
             ledgerTos.appendChild(spEl('tr', {}, [spEl('th', { text: k }), spEl('td', { text: v })]));

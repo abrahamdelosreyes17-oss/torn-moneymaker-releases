@@ -292,14 +292,20 @@ you: every link is one you follow yourself, one page per click.
   it.
 
 **Torn Ledger** (the *Ledger* button): what you made, from your own Torn log.
-Every bazaar and Item Market buy and sell (log types 1225, 1226, 1112, 1113)
-and every finished trade (`/v2/user/trades`, each trade's items and money),
+Every bazaar and Item Market buy and sell (log types 1225, 1226, 1112, 1113),
+every sale to an **NPC shop** (4210 - buying under the NPC price and selling to
+the NPC is profit like any other, matched to what the units cost), city-shop
+and abroad buys (4200, 4201), and every finished trade (`/v2/user/trades`, each trade's items and money),
 **first in, first out**, after the Item Market's fee. Filters: period, **item**
 ("how much did I make on this item" - the headline becomes *Profit on X*),
 category, where, and who. Profit, sold, bought and fees; profit per day / week /
 month and per item (graphs and tables); every buy and sell, a sale showing whom
 its units were bought from (a flip: bought from -> sold to). Units sold with no
-buy on record are counted apart, never guessed. It reads a year back a few
+buy on record are counted apart, never guessed. Each sale says what its units
+cost and where from (*bought 20 from X (Item Market) at $40*); *Cost of what
+sold* totals it. The **Mugged** tab: what muggings took (8156), when and by
+whom, per day, and your profit after muggings (a mugging whose amount the log
+does not give in a known field is counted apart, with the field names seen). It reads a year back a few
 pages at a time, then only what is new, every 5 minutes while Torn Bids is in
 front.
 - **Its own Full key**, apart from the Limited key: Torn is asked (key info)

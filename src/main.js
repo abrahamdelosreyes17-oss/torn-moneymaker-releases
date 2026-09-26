@@ -55,7 +55,7 @@ import { rankOpportunities, summarize, hiddenCounts, belowMinRows } from './core
 import { TornApiClient, redactKey, KEY_DEAD_CODES } from './api/client.js';
 import { W3bClient, fetchW3bSummary, fetchW3bListings, fetchW3bPriceList } from './api/w3b.js';
 import { LedgerClient, fetchLedgerKeyInfo, isFullKey, fetchLogPage, fetchTradesPage, fetchTrade } from './api/ledger.js';
-import { readLedger, rowsFromLog, rowsFromTrade, addLedgerRows, logSpan } from './core/ledger.js';
+import { readLedger, rowsFromLog, rowsFromTrade, addLedgerRows, logSpan, mugFromLog, addMugs } from './core/ledger.js';
 import {
     TeClient,
     TeQueue,
@@ -4106,6 +4106,7 @@ async function runLedger({ now = Date.now() } = {}) {
             while (calls < LEDGER_CALLS_PER_RUN) {
                 const rows = await page({ from: data.newestAt, to: gap.to });
                 addLedgerRows(data, rows.flatMap(rowsFromLog));
+                addMugs(data, rows.map(mugFromLog).filter(Boolean));
                 data.logCount += rows.length;
                 const span = logSpan(rows);
                 if (span.max > gap.newest) gap.newest = span.max;
@@ -4123,6 +4124,7 @@ async function runLedger({ now = Date.now() } = {}) {
         while (!data.backfilled && calls < LEDGER_CALLS_PER_RUN) {
             const rows = await page({ to: data.oldestAt || null });
             addLedgerRows(data, rows.flatMap(rowsFromLog));
+            addMugs(data, rows.map(mugFromLog).filter(Boolean));
             data.logCount += rows.length;
             const span = logSpan(rows);
             if (span.max > data.newestAt) data.newestAt = span.max;
@@ -4228,6 +4230,8 @@ function ledgerView() {
         backfilled: data ? data.backfilled : false,
         oldestAt: data ? data.oldestAt : 0,
         rows: data ? data.rows : [],
+        mugs: data ? data.mugs || [] : [],
+        mugKeys: data ? data.mugKeys || [] : [],
     };
 }
 

@@ -241,6 +241,12 @@ function respond(url) {
                 { id: 'l5', timestamp: NOW_S - 2 * D, details: { id: 1226 }, data: { buyer: 55, items: [{ id: 206, qty: 3 }], cost_each: 850000, cost_total: 2550000 } },
                 { id: 'l6', timestamp: NOW_S - 1 * D, details: { id: 1112 }, data: { seller: 66, anonymous: 0, items: [{ id: 180, qty: 30 }], cost_each: 50, cost_total: 1500 } },
                 { id: 'l7', timestamp: NOW_S - 3600, details: { id: 1226 }, data: { buyer: 77, items: [{ id: 180, qty: 30 }], cost_each: 62, cost_total: 1860 } },
+                // Bought under the NPC price on the Item Market, sold to the NPC: +$200.
+                { id: 'l8', timestamp: NOW_S - 12 * 3600, details: { id: 1112 }, data: { seller: 88, anonymous: 0, items: [{ id: 180, qty: 20 }], cost_each: 40, cost_total: 800 } },
+                { id: 'l9', timestamp: NOW_S - 6 * 3600, details: { id: 4210 }, data: { item: 180, quantity: 20, value_each: 50, total_value: 1000 } },
+                // Two muggings: one by player 4242, one anonymous.
+                { id: 'l10', timestamp: NOW_S - 2 * D, details: { id: 8156 }, data: { attacker: 4242, money_mugged: 250000 } },
+                { id: 'l11', timestamp: NOW_S - 3 * 3600, details: { id: 8156 }, data: { anonymous: 1, money: 13584 } },
             ];
             const from = Number(u.searchParams.get('from')) || 0;
             const to = Number(u.searchParams.get('to')) || Infinity;

@@ -18,8 +18,16 @@
  *   1226 Bazaar sell   {buyer,  items, cost_each, cost_total}
  *   1112 Item Market buy  {seller, anonymous, items, cost_each, cost_total}
  *   1113 Item Market sell {buyer, anonymous, items, cost_each, fee, cost_total} - cost_total is AFTER the fee
+ *   4210 Item shop sell (to an NPC)  {item, quantity, value_each, total_value}
+ *   4200 Item shop buy (a city shop) {item, quantity, cost_total}
+ *   4201 Item abroad buy             {item, quantity, cost_total}
+ *   8156 Attack mug receive          you were mugged: the amount lost (see mugFromLog)
  * Trades come from /user/trades and /user/{id}/trade (typed items and money
  * for each side).
+ *
+ * Buying on the Item Market or in a bazaar under the NPC price and selling to
+ * the NPC is the overlay's whole job: an NPC sale is matched to what its units
+ * cost like any other, so it shows its profit and whom they were bought from.
  */
 
 export const LEDGER_VERSION = 1;
@@ -28,12 +36,16 @@ export const LOG_BAZAAR_BUY = 1225;
 export const LOG_BAZAAR_SELL = 1226;
 export const LOG_MARKET_BUY = 1112;
 export const LOG_MARKET_SELL = 1113;
-export const LEDGER_LOG_TYPES = [LOG_BAZAAR_BUY, LOG_BAZAAR_SELL, LOG_MARKET_BUY, LOG_MARKET_SELL];
+export const LOG_SHOP_SELL = 4210;
+export const LOG_SHOP_BUY = 4200;
+export const LOG_ABROAD_BUY = 4201;
+export const LOG_MUGGED = 8156;
+export const LEDGER_LOG_TYPES = [LOG_BAZAAR_BUY, LOG_BAZAAR_SELL, LOG_MARKET_BUY, LOG_MARKET_SELL, LOG_SHOP_SELL, LOG_SHOP_BUY, LOG_ABROAD_BUY, LOG_MUGGED];
 
-export const VENUE_NAMES = { bazaar: 'Bazaar', market: 'Item Market', trade: 'Trade' };
+export const VENUE_NAMES = { bazaar: 'Bazaar', market: 'Item Market', trade: 'Trade', npc: 'NPC shop', shop: 'City shop', abroad: 'Abroad' };
 
 export function emptyLedger() {
-    return { version: LEDGER_VERSION, rows: [], newestAt: 0, oldestAt: 0, backfilled: false, tradesAt: 0, tradeIds: [], logCount: 0, readAt: 0 };
+    return { version: LEDGER_VERSION, rows: [], mugs: [], mugKeys: [], newestAt: 0, oldestAt: 0, backfilled: false, tradesAt: 0, tradeIds: [], logCount: 0, readAt: 0 };
 }
 
 /** A stored ledger, or a fresh one when missing or from another version. */
@@ -56,6 +68,26 @@ export function rowsFromLog(entry) {
     const type = Number(entry.details.id);
     const d = entry.data;
     const t = ledgerNum(entry.timestamp) * 1000;
+    // One item each: selling to an NPC shop, buying in a city shop or abroad.
+    if (type === LOG_SHOP_SELL || type === LOG_SHOP_BUY || type === LOG_ABROAD_BUY) {
+        const itemId = ledgerNum(d.item);
+        const qty = ledgerNum(d.quantity) || 1;
+        if (!t || !(itemId > 0) || !(qty > 0)) return [];
+        const total = type === LOG_SHOP_SELL ? ledgerNum(d.total_value) : ledgerNum(d.cost_total);
+        const each = total ? total / qty : ledgerNum(type === LOG_SHOP_SELL ? d.value_each : d.cost_each);
+        return [{
+            id: String(entry.id) + ':0',
+            t,
+            itemId: String(itemId),
+            qty,
+            each,
+            fee: 0,
+            side: type === LOG_SHOP_SELL ? 'sell' : 'buy',
+            venue: type === LOG_SHOP_SELL ? 'npc' : type === LOG_SHOP_BUY ? 'shop' : 'abroad',
+            who: null,
+            whoName: null,
+        }];
+    }
     const items = Array.isArray(d.items) ? d.items : [];
     const venue = type === LOG_BAZAAR_BUY || type === LOG_BAZAAR_SELL ? 'bazaar' : type === LOG_MARKET_BUY || type === LOG_MARKET_SELL ? 'market' : null;
     if (!venue || !t || !items.length) return [];
@@ -131,6 +163,71 @@ export function rowsFromTrade(trade, selfId, valueOf = () => 1) {
         gave.forEach((g, i) => rows.push({ ...base, id: 'trade:' + trade.id + ':out:' + i, itemId: g.itemId, qty: g.qty, each: eachs[i], side: received > 0 ? 'sell' : 'give' }));
     }
     return rows;
+}
+
+/**
+ * A mugging you suffered (8156), or null. Torn's docs do not type this
+ * entry's fields, so the amount is read from the names Torn uses for mugging
+ * money (money_mugged, money, amount...); one it cannot read is kept with
+ * amount null and counted apart - never guessed. `keys` lists the field names
+ * seen (names only), so an unread shape can be fixed.
+ */
+export function mugFromLog(entry) {
+    if (!entry || !entry.details || Number(entry.details.id) !== LOG_MUGGED) return null;
+    const d = entry.data || {};
+    const t = ledgerNum(entry.timestamp) * 1000;
+    if (!t) return null;
+    let amount = null;
+    for (const k of ['money_mugged', 'money', 'amount', 'mugged', 'money_lost', 'value', 'total']) {
+        const n = Number(d[k]);
+        if (Number.isFinite(n) && n > 0) {
+            amount = n;
+            break;
+        }
+    }
+    const who = d.attacker || d.attacker_id || d.user || d.mugger || null;
+    return {
+        id: String(entry.id),
+        t,
+        amount,
+        who: who && typeof who !== 'object' ? String(who) : who && who.id ? String(who.id) : null,
+        anonymous: Boolean(d.anonymous) || !who,
+        keys: Object.keys(d).sort(),
+    };
+}
+
+/** New muggings into the ledger, each once (by id). Returns how many were new. */
+export function addMugs(ledger, mugs) {
+    if (!Array.isArray(ledger.mugs)) ledger.mugs = [];
+    const have = new Set(ledger.mugs.map((m) => m.id));
+    const keys = new Set(ledger.mugKeys || []);
+    let added = 0;
+    for (const m of mugs) {
+        if (!m || have.has(m.id)) continue;
+        have.add(m.id);
+        const { keys: k, ...rest } = m;
+        for (const name of k || []) keys.add(name);
+        ledger.mugs.push(rest);
+        added += 1;
+    }
+    if (added) ledger.mugs.sort((a, b) => a.t - b.t);
+    ledger.mugKeys = [...keys].sort().slice(0, 30);
+    return added;
+}
+
+/** What muggings took in a time range: {lost, count, unknown, biggest}. */
+export function mugTotals(mugs, { from = null, to = null } = {}) {
+    const out = { lost: 0, count: 0, unknown: 0, biggest: 0 };
+    for (const m of mugs || []) {
+        if (from && m.t < from) continue;
+        if (to && m.t > to) continue;
+        out.count += 1;
+        if (m.amount > 0) {
+            out.lost += m.amount;
+            if (m.amount > out.biggest) out.biggest = m.amount;
+        } else out.unknown += 1;
+    }
+    return out;
 }
 
 /** New rows into the ledger, each once (by id), oldest first. Returns how many were new. */
@@ -227,7 +324,7 @@ export function filterLedgerRows(rows, f = {}, categoryOf = () => null) {
  * @returns {{profit, sold, spent, fees, unitsSold, unitsBought, sales, buys, unknownUnits}}
  */
 export function ledgerTotals(rows, fifo) {
-    const t = { profit: 0, sold: 0, spent: 0, fees: 0, unitsSold: 0, unitsBought: 0, sales: 0, buys: 0, unknownUnits: 0 };
+    const t = { profit: 0, sold: 0, spent: 0, cost: 0, fees: 0, unitsSold: 0, unitsBought: 0, sales: 0, buys: 0, unknownUnits: 0 };
     for (const r of rows) {
         if (r.side === 'buy') {
             t.spent += r.each * r.qty;
@@ -240,12 +337,14 @@ export function ledgerTotals(rows, fifo) {
             t.unitsSold += r.qty;
             t.sales += 1;
             if (m && m.profit !== null) t.profit += m.profit;
+            if (m && m.cost !== null) t.cost += m.cost;
             if (m) t.unknownUnits += m.unknownQty;
         }
     }
     t.profit = Math.round(t.profit);
     t.sold = Math.round(t.sold);
     t.spent = Math.round(t.spent);
+    t.cost = Math.round(t.cost);
     return t;
 }
 

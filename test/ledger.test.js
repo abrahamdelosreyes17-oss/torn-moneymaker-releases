@@ -14,6 +14,9 @@ import {
     readLedger,
     periodStart,
     logSpan,
+    mugFromLog,
+    addMugs,
+    mugTotals,
 } from '../src/core/ledger.js';
 
 // Real payload shapes (a public ledger project's fixtures of Torn API v2 /user/log).
@@ -120,4 +123,44 @@ test('weeks start on Monday, months on the 1st', () => {
     assert.equal(new Date(periodStart(wed, 'week')).getDay(), 1);
     assert.equal(new Date(periodStart(wed, 'month')).getDate(), 1);
     assert.equal(new Date(periodStart(wed, 'day')).getHours(), 0);
+});
+
+test('buy under the NPC price on the Item Market, sell to the NPC: that is profit, bought from whom at what', () => {
+    // A real 4210 sample's shape: {item, quantity, value_each, total_value}.
+    const buy = { id: 'm1', timestamp: T0, details: { id: 1112 }, data: { seller: 777, items: [{ id: 180, qty: 30 }], cost_each: 40, cost_total: 1200 } };
+    const npc = { id: 'n1', timestamp: T0 + 60, details: { id: 4210, title: 'Item shop sell' }, data: { item: 180, quantity: 30, value_each: 50, total_value: 1500, color: 'green' } };
+    const rows = [buy, npc].flatMap(rowsFromLog);
+    const [s] = rows.filter((r) => r.side === 'sell');
+    assert.deepEqual([s.venue, s.qty, s.each, s.fee], ['npc', 30, 50, 0]);
+    const fifo = matchFifo(rows);
+    const m = fifo.get('n1:0');
+    assert.equal(m.profit, 300);
+    assert.deepEqual(m.from.map((f) => [f.who, f.venue, f.each]), [['777', 'market', 40]]);
+    // Filter to NPC sales: what they made, and what their units cost.
+    const t = ledgerTotals(filterLedgerRows(rows, { venue: 'npc' }), fifo);
+    assert.deepEqual([t.profit, t.sold, t.cost, t.spent], [300, 1500, 1200, 0]);
+});
+
+test('city shop and abroad buys are buys', () => {
+    const shop = rowsFromLog({ id: 's1', timestamp: T0, details: { id: 4200 }, data: { item: 97, quantity: 100, cost_total: 500 } })[0];
+    assert.deepEqual([shop.side, shop.venue, shop.qty, shop.each], ['buy', 'shop', 100, 5]);
+    const abroad = rowsFromLog({ id: 'a1', timestamp: T0, details: { id: 4201 }, data: { item: 206, quantity: 2, cost_total: 1500000 } })[0];
+    assert.deepEqual([abroad.side, abroad.venue, abroad.each], ['buy', 'abroad', 750000]);
+});
+
+test('muggings: the amount lost, by whom; one it cannot read is counted apart, never guessed', () => {
+    const a = mugFromLog({ id: 'g1', timestamp: T0, details: { id: 8156 }, data: { attacker: 123, money_mugged: 4446201 } });
+    assert.deepEqual([a.amount, a.who, a.anonymous], [4446201, '123', false]);
+    const b = mugFromLog({ id: 'g2', timestamp: T0 + 10, details: { id: 8156 }, data: { anonymous: 1, money: 13584 } });
+    assert.deepEqual([b.amount, b.anonymous], [13584, true]);
+    const c = mugFromLog({ id: 'g3', timestamp: T0 + 20, details: { id: 8156 }, data: { something: 'x' } });
+    assert.equal(c.amount, null);
+    assert.equal(mugFromLog({ id: 'x', timestamp: T0, details: { id: 1225 }, data: {} }), null);
+    const l = emptyLedger();
+    assert.equal(addMugs(l, [a, b, c, a]), 3);
+    assert.deepEqual(l.mugKeys, ['anonymous', 'attacker', 'money', 'money_mugged', 'something']);
+    assert.deepEqual(mugTotals(l.mugs), { lost: 4446201 + 13584, count: 3, unknown: 1, biggest: 4446201 });
+    assert.equal(mugTotals(l.mugs, { from: (T0 + 5) * 1000 }).lost, 13584);
+    // A mugging is not an item row.
+    assert.deepEqual(rowsFromLog({ id: 'g1', timestamp: T0, details: { id: 8156 }, data: { money_mugged: 5 } }), []);
 });
