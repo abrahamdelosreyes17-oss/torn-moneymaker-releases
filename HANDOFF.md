@@ -5,10 +5,9 @@ rules; this file holds where we are, how the owner works, and what is settled.
 
 ## Where things stand (3.11.0, 2026-09-26)
 
-- **Version 3.11.0** on branch `claude/optimistic-ride-1gqguu`, **not committed
-  yet** (the owner commits when they say so). 3.10.3 is `f48072c`.
-  Last install link given to the owner (3.10.3):
-  `https://raw.githubusercontent.com/abrahamdelosreyes17-oss/torn-moneymaker-releases/f48072c53287869ddc31e18fda945c898f43dc92/torn-moneymaker.user.js`
+- **Version 3.11.0** (`cf38bee`) on branch `claude/optimistic-ride-1gqguu`.
+  Last install link given to the owner (3.11.0):
+  `https://raw.githubusercontent.com/abrahamdelosreyes17-oss/torn-moneymaker-releases/cf38beed78c032c5de05029696f9b765c672077a/torn-moneymaker.user.js`
 - **`main` is still at 2.9.3.** The script's `@updateURL` points at `main`, so
   installs are done from **pinned links**:
   `https://raw.githubusercontent.com/abrahamdelosreyes17-oss/torn-moneymaker-releases/<commit>/torn-moneymaker.user.js`
@@ -21,15 +20,13 @@ rules; this file holds where we are, how the owner works, and what is settled.
 
 ### Start here next session
 
-1. If 3.11.0 is not committed, ask whether to commit and push it and give the
-   pinned link.
-2. Ask the owner to install it, open Torn Bids and a player's bazaar, and
+1. Ask the owner to install it, open Torn Bids and a player's bazaar, and
    look in their Chrome (pages they opened only): Torn Bids at their screen
    width with real traders and bazaars, and the trader tag on real bazaar
    cards. Everything since 3.9.4 is checked in the harness only.
-3. **3.12.0, the Fill button:** make the mockups first (the list is below),
+2. **3.12.0, the Fill button:** make the mockups first (the list is below),
    then build the one the owner picks.
-4. Run `test/ux-check.mjs` once Playwright is available (rewritten for Torn
+3. Run `test/ux-check.mjs` once Playwright is available (rewritten for Torn
    Bids H in 3.11.0; never run - every check in it was run by hand in the
    harness through the browser pane).
 
