@@ -5,10 +5,10 @@ rules; this file holds where we are, how the owner works, and what is settled.
 
 ## Where things stand (3.10.3, 2026-09-26)
 
-- **Version 3.10.3** (not committed yet; 3.10.2 is `9916b94`) on branch `claude/optimistic-ride-1gqguu`,
+- **Version 3.10.3** (`f48072c`) on branch `claude/optimistic-ride-1gqguu`,
   on top of 3.8.1 (`0210c53`) and the cloud session's handoff commits.
-  Last install link given to the owner (3.10.2):
-  `https://raw.githubusercontent.com/abrahamdelosreyes17-oss/torn-moneymaker-releases/9916b946763a847c2bf8e7d00c61c478102525e6/torn-moneymaker.user.js`
+  Last install link given to the owner (3.10.3):
+  `https://raw.githubusercontent.com/abrahamdelosreyes17-oss/torn-moneymaker-releases/f48072c53287869ddc31e18fda945c898f43dc92/torn-moneymaker.user.js`
 - **`main` is still at 2.9.3.** The script's `@updateURL` points at `main`, so
   installs are done from **pinned links**:
   `https://raw.githubusercontent.com/abrahamdelosreyes17-oss/torn-moneymaker-releases/<commit>/torn-moneymaker.user.js`
