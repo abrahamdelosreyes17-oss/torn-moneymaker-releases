@@ -1289,10 +1289,16 @@ function scanOwnBazaarPage(which) {
     let changed = false;
 
     for (const row of rows) {
-        touchItem(hist, row.itemId, now);
-        changed = true;
-        const item = app.index.byId.get(row.itemId);
-        if (item && item.marketValue > 0) recordMarketValue(hist, row.itemId, now, item.marketValue);
+        // Price history is kept for the item you look at (IMA / BP / its row
+        // picked) and the ones you fill - not every row on the page, which
+        // made a big add page rewrite the whole history every 30 seconds.
+        if (row.itemId === app.bzSelected || app.fill.done.has(row.el)) {
+            const isNew = !hist.items[row.itemId];
+            touchItem(hist, row.itemId, now);
+            const item = app.index.byId.get(row.itemId);
+            if (item && item.marketValue > 0) recordMarketValue(hist, row.itemId, now, item.marketValue);
+            if (isNew) changed = true;
+        }
 
         const tag = rowTagFor(row, which);
         app.bzDiagnostics.tags += 1;
@@ -2495,7 +2501,45 @@ function startLiveFeed() {
  * Menu
  * ------------------------------------------------------------------ */
 
+/** When the script started, in ms after the page began to load (performance.now()). */
+const SCRIPT_START_MS = typeof performance !== 'undefined' ? Math.round(performance.now()) : null;
+
+/** Every stored value's size (names and sizes only - never a value, never a key). */
+function storageSizes() {
+    const keys = [
+        STORE_KEY, STORE_ITEMS, STORE_NPC, STORE_MANUAL_NPC, STORE_SETTINGS, STORE_KEY_ACCESS, STORE_API_WINDOW, STORE_KEY_DEAD, STORE_OPENED,
+        STORE_SELL_KEY, STORE_SELL_KEY_DEAD, STORE_SELL_KEY_ACCESS, STORE_TE_KEY, STORE_TE, STORE_TE_STATE, STORE_TE_LISTS, STORE_TE_IDS,
+        STORE_INVENTORY, STORE_SELL_PREFS, STORE_TRADER_DB, STORE_TE_ONE, STORE_SELL_SELF, STORE_SELL_NETWORTH,
+        STORE_LEDGER_KEY, STORE_LEDGER_KEY_DEAD, STORE_LEDGER_SELF, STORE_LEDGER,
+        STORE_FILL, STORE_FILL_OWN_IM, STORE_SELF, STORE_HISTORY, STORE_W3B_SUMMARY, FEED_STORE_KEY,
+    ];
+    const rows = [];
+    let total = 0;
+    for (const k of [...new Set(keys)]) {
+        const v = gmGet(k, undefined);
+        if (v === undefined || v === null) continue;
+        const n = JSON.stringify(v).length;
+        total += n;
+        rows.push([k, n]);
+    }
+    rows.sort((a, b) => b[1] - a[1]);
+    const kb = (n) => (n / 1024).toFixed(n < 10240 ? 1 : 0) + ' KB';
+    return { total, lines: rows.map(([k, n]) => k + ': ' + kb(n)), totalText: kb(total) };
+}
+
 function registerMenu() {
+    gmMenu('Show storage sizes and start time', () => {
+        const s = storageSizes();
+        alert(
+            'Stored by this script: ' + s.totalText + '\n' +
+                'Tampermonkey loads all of it before the script starts, on every page.\n\n' +
+                s.lines.join('\n') +
+                '\n\nThis page: the script started ' + (SCRIPT_START_MS === null ? '?' : SCRIPT_START_MS + ' ms') +
+                ' after the page began to load' +
+                (app.panelShownAt ? '; the panel showed at ' + app.panelShownAt + ' ms' : '') + '.',
+        );
+    });
+
     gmMenu('Open settings', () => {
         app.panel.openSettings({ focusKey: !getStoredKey() });
     });
@@ -3027,7 +3071,27 @@ function buyerLookup({ teMap, lists, teOne, idsByName, db, w3bByItem, dbIdsByNam
 }
 
 /** Everything the page shows, from what is loaded now. */
+/*
+ * Prices arrive one by one (TornW3B lists, TornExchange, statuses, networth),
+ * and each used to recompute the whole page at once. Now they share one
+ * redraw every SELL_RENDER_MS; what you do yourself (pick, filter, search,
+ * category, settings) still draws at once through renderSellingNow().
+ */
+const SELL_RENDER_MS = 120;
+
 function renderSelling() {
+    if (sell.renderTimer) return;
+    sell.renderTimer = setTimeout(() => {
+        sell.renderTimer = null;
+        renderSellingNow();
+    }, SELL_RENDER_MS);
+}
+
+function renderSellingNow() {
+    if (sell.renderTimer) {
+        clearTimeout(sell.renderTimer);
+        sell.renderTimer = null;
+    }
     // A hidden tab draws nothing; it draws on becoming visible again.
     if (!sell.page || document.visibilityState !== 'visible') return;
     const now = Date.now();
@@ -3778,7 +3842,7 @@ function onSellSelect(itemId) {
     sell.selected = String(itemId);
     sell.pickedByYou = true;
     loadTeItemList(sell.selected);
-    renderSelling();
+    renderSellingNow();
     stepW3b();
 }
 
@@ -3788,7 +3852,7 @@ function onSellFilter(key) {
     sell.selected = null;
     sell.pickedByYou = false;
     sell.allShown = ALL_ITEMS_PAGE;
-    renderSelling();
+    renderSellingNow();
 }
 
 /** A category (Torn's item type), or '' for all: the desk moves to the first item there. */
@@ -3797,13 +3861,13 @@ function onSellCategory(category) {
     sell.selected = null;
     sell.pickedByYou = false;
     sell.allShown = ALL_ITEMS_PAGE;
-    renderSelling();
+    renderSellingNow();
 }
 
 function onSellQuery(text) {
     sell.query = String(text || '');
     sell.allShown = ALL_ITEMS_PAGE;
-    renderSelling();
+    renderSellingNow();
 }
 
 function openSellLink(url) {
@@ -3878,7 +3942,7 @@ function bootSellingPage() {
             // one-time Trusted switch) must survive, or Trusted comes back on
             // at every reload after any setting is saved.
             gmSet(STORE_SELL_PREFS, { ...(gmGet(STORE_SELL_PREFS, {}) || {}), ...sellPrefs(), ...partial });
-            renderSelling();
+            renderSellingNow();
         },
         onSelect: onSellSelect,
         onFilter: onSellFilter,
@@ -3961,7 +4025,7 @@ function bootSellingPage() {
     }, 15000);
 
     document.addEventListener('visibilitychange', () => {
-        if (document.visibilityState === 'visible') renderSelling();
+        if (document.visibilityState === 'visible') renderSellingNow();
         else saveTraderDb(true);
     });
     window.addEventListener('pagehide', () => saveTraderDb(true));
@@ -4354,6 +4418,7 @@ export function boot() {
     });
 
     app.panel.mount();
+    app.panelShownAt = Math.round(performance.now());
     app.panel.enableHotkey();
     // Fill settings changed in another tab (or in Torn Bids): show them here too.
     gmOnChange(STORE_FILL, () => {
