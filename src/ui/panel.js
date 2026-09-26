@@ -26,6 +26,7 @@ import { VENUE_LABELS } from '../core/profit.js';
 import { W3B_TERMS_URL, W3B_SITE_URL } from '../api/w3b.js';
 import { panelStyleElement } from './styles.js';
 import { renderPriceGraph } from './graph.js';
+import { buildFillForm } from './fill-form.js';
 
 /** "last update 2m ago" turns the status amber after this. */
 export const PANEL_STALE_MS = 60000;
@@ -388,7 +389,7 @@ export class Panel {
         this.listPage.style.display = this.page === 'list' ? '' : 'none';
         this.bazaarPage.style.display = this.page === 'mybazaar' ? '' : 'none';
         this.settingsBtn.setAttribute('aria-pressed', String(settings));
-        this.titleTextEl.textContent = settings ? 'Settings' : this.page === 'mybazaar' ? 'My bazaar' : 'NPC Arbitrage';
+        this.titleTextEl.textContent = settings ? 'Settings' : this.page === 'mybazaar' ? (this.state.bazaar && this.state.bazaar.title) || 'My bazaar' : 'NPC Arbitrage';
 
         // Opening a page from a collapsed panel should show it.
         if (this.collapsed) this.setCollapsed(false, { save: true });
@@ -694,6 +695,17 @@ export class Panel {
 
         this.settingsPage.appendChild(section('Links', [nt.row]));
 
+        /* ---- the Fill button (your bazaar's and the Item Market's own pages) ---- */
+        this.fillForm = buildFillForm({
+            get: () => (this.handlers.getFill ? this.handlers.getFill() : null),
+            set: (value) => this.handlers.onFillSettings && this.handlers.onFillSettings(value),
+        });
+        this.fillSectionEl = section('Fill', [
+            note('On your bazaar\'s add and manage pages and the Item Market\'s add-listing and your-listings pages: tick Fill in a row to type its price; untick to put it back.'),
+            this.fillForm.el,
+        ]);
+        this.settingsPage.appendChild(this.fillSectionEl);
+
         this.settingsPage.appendChild(
             section('Selling', [
                 note('The selling page has its own keys and settings.'),
@@ -707,6 +719,23 @@ export class Panel {
         );
     }
 
+    /** My bazaar, scrolled to one part: 'graph' (IMA was pressed) or 'lows' (BP). */
+    showBazaarPart(part) {
+        const target = part === 'lows' ? this.bzDetailEl.querySelector('.ttv2-lows') : this.bzDetailEl.querySelector('.ttv2-windows');
+        if (target && target.scrollIntoView) target.scrollIntoView({ block: 'start' });
+    }
+
+    /** Settings, scrolled to the Fill part (Torn's links bar asks for it). */
+    openFillSettings() {
+        this.showPage('settings');
+        if (this.fillSectionEl && this.fillSectionEl.scrollIntoView) this.fillSectionEl.scrollIntoView({ block: 'start' });
+    }
+
+    /** Fill settings changed elsewhere: redraw the form from what is stored. */
+    syncFill() {
+        if (this.fillForm) this.fillForm.sync();
+    }
+
     /**
      * Torn's API Terms of Service require any tool that takes a key to state,
      * in this table form and where the key is entered, how it uses the key.
@@ -715,11 +744,11 @@ export class Panel {
         const rows = [
             ['Data storage', 'Only locally, in this browser'],
             ['Data sharing', 'Nobody'],
-            ['Purpose of use', 'Competitive advantage: finding Bazaar and Item Market listings below NPC or market value'],
+            ['Purpose of use', 'Competitive advantage: finding Bazaar and Item Market listings below NPC or market value, and filling your own listing prices'],
             ['Key storage & sharing', 'Stored locally / Not shared'],
             [
                 'Key access level',
-                'Public (torn: items, cityshops; market: itemmarket; key: info; user: profile, for bazaar owners\' public status)',
+                'Public (torn: items, cityshops; market: itemmarket; key: info; user: profile, for bazaar owners\' public status; user: basic, your own id, so Fill never undercuts you)',
             ],
             [
                 'Other services',
@@ -1435,16 +1464,20 @@ export class Panel {
             return;
         }
         if (this.page === 'list') this.showPage('mybazaar');
+        if (this.page === 'mybazaar' && this.titleTextEl.textContent !== (view.title || 'My bazaar')) this.titleTextEl.textContent = view.title || 'My bazaar';
 
         const updated = view.avgAt ? 'What it sold for, on average · updated ' + formatAge(Date.now() - view.avgAt) + '.' : 'What it sold for, on average.';
 
         // Redrawn only when what it shows changes: the helper repaints every
         // few seconds, and a redraw would drop the graph's hover readout.
         const s = view.series;
+        const f = view.fill;
         const sig = JSON.stringify([
             view.items,
             view.selected,
             view.windowKey,
+            view.mark,
+            f ? [f.lists, f.preview, f.filled, f.canFill] : null,
             s ? [s.points.length, s.points[s.points.length - 1], s.mv.length, s.mv[s.mv.length - 1], Math.floor(s.to / 300000)] : null,
         ]);
         if (sig === this.bzSig && this.bzUpdatedEl) {
@@ -1462,17 +1495,19 @@ export class Panel {
             list.appendChild(el('div', { class: 'ttv2-bzrow ttv2-bzhead' }, [
                 el('span', { class: 'ttv2-label', text: 'Item' }),
                 el('span', { class: 'ttv2-label ttv2-money', text: 'IM average' }),
+                el('span', { class: 'ttv2-label ttv2-money', text: view.lowLabel || 'Lowest' }),
             ]));
             for (const it of view.items) {
                 list.appendChild(el('button', {
                     type: 'button',
                     class: 'ttv2-bzrow',
                     'aria-pressed': String(it.itemId === view.selected),
-                    title: 'Show its graph',
+                    title: 'Show its prices and graph',
                     onclick: () => this.handlers.onSelectBazaarItem && this.handlers.onSelectBazaarItem(it.itemId),
                 }, [
                     el('span', { class: 'ttv2-name', text: it.name }),
                     el('span', { class: 'ttv2-money', text: it.avg ? formatMoney(it.avg) : '…' }),
+                    el('span', { class: 'ttv2-money ttv2-bzlow', text: it.low ? formatMoney(it.low) : '…' }),
                 ]));
             }
         }
@@ -1490,6 +1525,55 @@ export class Panel {
             (this.bzUpdatedEl = el('div', { class: 'ttv2-note', text: updated })),
         ]));
 
+        /* Fill: what it typed, or what it would type */
+        if (f) {
+            const shown = f.filled ? f.filled.price : f.preview ? f.preview.price : null;
+            const verdict = f.preview && f.preview.verdict && !f.filled ? f.preview.verdict : null;
+            const own = f.lists[f.market];
+            const box = el('div', { class: 'ttv2-fillnow' + (f.filled ? ' ttv2-fillnow-done' : '') }, [
+                el('div', { class: 'ttv2-label', text: f.filled ? 'Filled in its row' : 'Fill would type' }),
+                el('div', { class: 'ttv2-fillprice', text: shown ? formatMoney(shown) : own && own.state === 'ok' ? 'Nothing to undercut' : 'Reading prices…' }),
+                verdict && verdict.text
+                    ? el('div', { class: 'ttv2-note ttv2-verdict', 'data-level': verdict.level || '', text: verdict.text + (f.preview.floor === 'npc' ? ' · held at the NPC price' : f.preview.floor === 'avg' ? ' · held at the average' : '') })
+                    : null,
+                f.canFill && !f.filled && shown
+                    ? el('button', { type: 'button', class: 'ttv2-primary ttv2-fillgo', text: 'Fill its row', onclick: () => this.handlers.onFillSelected && this.handlers.onFillSelected() })
+                    : null,
+            ]);
+            detail.appendChild(box);
+
+            /* the lowest listings on both markets; a price you press is undercut */
+            const lists = el('div', { class: 'ttv2-lows' });
+            for (const [m, title] of [['bazaar', 'Bazaars · cheapest 5'], ['market', 'Item Market · cheapest 5']]) {
+                const L = f.lists[m] || { state: 'loading', rows: [] };
+                const col = el('div', { class: 'ttv2-lowcol' }, [el('div', { class: 'ttv2-label', text: title })]);
+                if (L.state === 'loading') col.appendChild(el('div', { class: 'ttv2-note', text: 'Loading…' }));
+                else if (L.state === 'nokey') col.appendChild(el('div', { class: 'ttv2-note', text: 'Needs your key.' }));
+                else if (L.state === 'error') col.appendChild(el('div', { class: 'ttv2-note ttv2-bad', text: L.error || 'Could not load.' }));
+                else if (!L.rows.length) col.appendChild(el('div', { class: 'ttv2-note', text: 'None listed.' }));
+                (L.rows || []).forEach((r, i) => {
+                    const sub = [];
+                    if (r.mine) sub.push('you');
+                    else if (r.name) sub.push(r.name);
+                    sub.push('×' + Number(r.qty || 0).toLocaleString('en-US'));
+                    if (r.net) sub.push(formatMoney(r.net) + ' after fee');
+                    if (r.stale) sub.push('not seen 30m');
+                    if (r.troll) sub.push('far under the average');
+                    const skip = r.mine || r.troll || r.stale;
+                    col.appendChild(el('button', {
+                        type: 'button',
+                        class: 'ttv2-lowrow' + (r.mine ? ' ttv2-lowmine' : '') + (r.stale || r.troll ? ' ttv2-lowstale' : ''),
+                        disabled: skip || !f.canFill ? '' : null,
+                        title: r.mine ? 'Your own listing: never undercut' : r.troll ? 'Far under the average: never undercut' : r.stale ? 'Not seen for 30 minutes: never undercut' : f.canFill ? 'Undercut this one in the item\'s row' : '',
+                        onclick: () => this.handlers.onFillListing && this.handlers.onFillListing(m, i),
+                    }, [el('b', { class: 'ttv2-money', text: formatMoney(r.price) }), el('span', { class: 'ttv2-lowsub', text: sub.join(' · ') })]));
+                });
+                if (L.note) col.appendChild(el('div', { class: 'ttv2-note', text: L.note }));
+                lists.appendChild(col);
+            }
+            detail.appendChild(lists);
+        }
+
         /* the graph, with its window */
         const windows = el('div', { class: 'ttv2-windows', role: 'group', 'aria-label': 'Graph window' });
         for (const key of ['24h', '7d', '30d']) {
@@ -1503,10 +1587,11 @@ export class Panel {
         }
         detail.appendChild(windows);
 
-        if (view.series) detail.appendChild(renderPriceGraph(view.series, { width: 404, height: 160 }));
+        if (view.series) detail.appendChild(renderPriceGraph(view.series, { width: 404, height: 160, mark: view.mark }));
         detail.appendChild(el('div', { class: 'ttv2-graph-keys' }, [
             el('span', { class: 'ttv2-key-mv' }, [el('i'), 'Item Market Average']),
             el('span', { class: 'ttv2-key-im' }, [el('i'), 'Lowest listing we saw']),
+            view.mark ? el('span', { class: 'ttv2-key-mark' }, [el('i'), 'Price to list']) : null,
         ]));
     }
 

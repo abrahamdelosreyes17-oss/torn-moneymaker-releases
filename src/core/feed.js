@@ -224,6 +224,8 @@ export function normalizeW3bListings(raw) {
             qty: Math.floor(qty),
             dataAt: toMs(l.last_checked) || toMs(l.content_updated),
             changedAt: toMs(l.content_updated),
+            // A paid spot on TornW3B: never the listing Fill undercuts.
+            sponsored: Boolean(l.sponsored),
         });
     }
 

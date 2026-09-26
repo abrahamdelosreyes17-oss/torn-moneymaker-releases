@@ -25,6 +25,8 @@ export const UI_PREFIX = 'ttv2';
  * Torn sets its dark value on <body>; the selling page is attached outside
  * it and got Torn's LIGHT default - light-grey text on a light page.
  */
+import { FILL_FORM_CSS } from './fill-form.js';
+
 export const TOKENS_CSS = `
     --bg: #2e2e2e;
     --row: #2b2b2b;
@@ -252,6 +254,135 @@ export const PAGE_CSS = `
     color: #a8dd1c;
     font-weight: bold;
 }
+
+.ttv2-bztag .ttv2-bztag-low {
+    color: #74c0fc;
+}
+
+/*
+ * Your bazaar's add page: IMA and BP chips and the Fill tick, in one line in
+ * Torn's own value column after its price - the row stays one line.
+ */
+.ttv2-bztag.ttv2-bzchips {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    margin-left: 10px;
+    padding: 0;
+    border: 0;
+    background: none;
+    cursor: default;
+    vertical-align: middle;
+    white-space: nowrap;
+}
+
+.ttv2-bzchip {
+    display: inline-block;
+    padding: 0 6px;
+    border: 1px solid #444;
+    border-radius: 4px;
+    background: #2b2b2b;
+    color: #bbb;
+    font: 11px/18px Arial, Helvetica, sans-serif;
+    cursor: pointer;
+}
+
+.ttv2-bzchip b { font-weight: bold; font-variant-numeric: tabular-nums; }
+.ttv2-bzchip-ima b { color: #a8dd1c; }
+.ttv2-bzchip-bp b { color: #74c0fc; }
+.ttv2-bzchip:hover,
+.ttv2-bzchips[data-selected="true"] .ttv2-bzchip { border-color: #99cc00; }
+.ttv2-bzchips .ttv2-fillbox { margin-left: 0; }
+.ttv2-bzchips .ttv2-filltag { display: none; }
+.ttv2-bzchips .ttv2-fillbtn { height: 20px; font-size: 11px; }
+.ttv2-fillbtn[data-level="good"] .ttv2-filllabel { color: #a8dd1c; }
+.ttv2-fillbtn[data-level="warn"] .ttv2-filllabel { color: #f0a020; }
+.ttv2-fillbtn[data-level="bad"] { border-color: #ff8a80; }
+
+/* On the Item Market the tag sits on its own line above the price box. */
+.ttv2-bztag.ttv2-bztag-market {
+    display: block;
+    width: max-content;
+    max-width: 100%;
+    margin: 4px 0;
+    white-space: normal;
+}
+
+/*
+ * The Fill button: ours, beside the tag. It types into Torn's boxes; it never
+ * presses Torn's buttons. Its line says what it typed, or why it could not.
+ */
+.ttv2-fillbox {
+    display: inline-flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    margin-left: 6px;
+    vertical-align: middle;
+    font: 12px/20px Arial, Helvetica, sans-serif;
+}
+
+.ttv2-bztag-market + .ttv2-fillbox {
+    display: flex;
+    margin: 0 0 4px;
+}
+
+.ttv2-fillbtn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    height: 22px;
+    padding: 0 8px 0 6px;
+    border: 1px solid #555;
+    border-radius: 4px;
+    background: #2b2b2b;
+    color: #ddd;
+    font: bold 12px/20px Arial, Helvetica, sans-serif;
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+.ttv2-fillbtn:hover { border-color: #99cc00; }
+.ttv2-fillbtn:disabled { opacity: 0.6; cursor: progress; }
+
+/* The tick box: empty, or ticked in green once the row is filled. */
+.ttv2-fillmark {
+    width: 12px;
+    height: 12px;
+    border: 1px solid #888;
+    border-radius: 2px;
+    background: #1b1b1b;
+    box-sizing: border-box;
+    position: relative;
+}
+
+.ttv2-fillbtn[aria-checked="true"] { border-color: #99cc00; }
+.ttv2-fillbtn[aria-checked="true"] .ttv2-fillmark { background: #99cc00; border-color: #99cc00; }
+.ttv2-fillbtn[aria-checked="true"] .ttv2-fillmark::after {
+    content: '';
+    position: absolute;
+    left: 3px;
+    top: 0;
+    width: 4px;
+    height: 8px;
+    border: solid #1b1b1b;
+    border-width: 0 2px 2px 0;
+    transform: rotate(45deg);
+}
+
+a.ttv2-fillset { cursor: pointer; color: #74c0fc; }
+.ttv2-fillbtn:focus-visible { outline: 2px solid #74c0fc; outline-offset: 1px; }
+
+.ttv2-filltag {
+    color: #ddd;
+    white-space: normal;
+    font-variant-numeric: tabular-nums;
+}
+
+.ttv2-filltag[data-level="good"] { color: #a8dd1c; }
+.ttv2-filltag[data-level="warn"] { color: #f0a020; }
+.ttv2-filltag[data-level="bad"] { color: #ff8a80; }
+.ttv2-filltag[hidden] { display: none; }
 `;
 
 export const PANEL_CSS = `
@@ -998,8 +1129,8 @@ ${TOKENS_CSS}
 
 .ttv2-bzrow {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) 120px;
-    gap: 8px;
+    grid-template-columns: minmax(0, 1fr) auto auto;
+    gap: 8px 16px;
     align-items: center;
     width: 100%;
     height: auto;
@@ -1027,9 +1158,7 @@ ${TOKENS_CSS}
 
 .ttv2-bzrow .ttv2-name {
     min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+    overflow-wrap: anywhere;
     color: var(--text);
 }
 
@@ -1123,6 +1252,58 @@ ${TOKENS_CSS}
 .ttv2-graph-keys i { display: inline-block; width: 16px; height: 0; border-top: 2px solid; }
 .ttv2-graph-keys .ttv2-key-mv i { border-color: #a8dd1c; }
 .ttv2-graph-keys .ttv2-key-im i { border-color: var(--offer); border-top-width: 1px; }
+.ttv2-graph-keys .ttv2-key-mark i { border-color: #f0a020; border-top-style: dashed; }
+
+.ttv2-bzrow .ttv2-bzlow { color: var(--offer); }
+
+.ttv2-fillnow {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 10px 12px;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    background: var(--row);
+}
+.ttv2-fillnow-done { border-color: #99cc00; }
+.ttv2-fillprice {
+    font-size: 20px;
+    font-weight: bold;
+    line-height: 1.2;
+    color: #f0a020;
+    font-variant-numeric: tabular-nums;
+}
+.ttv2-fillnow-done .ttv2-fillprice { color: #a8dd1c; }
+.ttv2-verdict[data-level="good"] { color: #a8dd1c; }
+.ttv2-verdict[data-level="warn"] { color: #f0a020; }
+.ttv2-panel button.ttv2-fillgo { align-self: flex-start; margin-top: 4px; }
+
+.ttv2-lows {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 8px;
+}
+.ttv2-lowcol { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.ttv2-panel button.ttv2-lowrow {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0;
+    height: auto;
+    padding: 4px 8px;
+    text-align: left;
+    font-weight: normal;
+    background: var(--row);
+    border: 1px solid var(--line);
+}
+.ttv2-panel button.ttv2-lowrow:hover:not(:disabled) { border-color: var(--offer); }
+.ttv2-panel button.ttv2-lowrow:disabled { cursor: default; opacity: 1; }
+.ttv2-lowrow .ttv2-money { color: var(--text); font-variant-numeric: tabular-nums; }
+.ttv2-lowsub { font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+.ttv2-lowmine { border-style: dashed !important; }
+.ttv2-lowmine .ttv2-money { color: var(--muted); }
+.ttv2-lowstale .ttv2-money { color: var(--muted); }
+
 
 .ttv2-windows {
     display: flex;
@@ -1256,6 +1437,6 @@ export function injectStyles(doc = document) {
 /** A <style> for the panel's shadow root. */
 export function panelStyleElement(doc = document) {
     const style = doc.createElement('style');
-    style.textContent = PANEL_CSS;
+    style.textContent = PANEL_CSS + FILL_FORM_CSS;
     return style;
 }

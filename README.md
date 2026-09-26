@@ -5,11 +5,15 @@ market value), ranks them by the profit you could actually realize, and links yo
 straight to them - from the page you are viewing, **and live from any Torn page**
 via the Torn API and, if you opt in, TornW3B's bazaar feed.
 
-Two more things: on **your own bazaar's add / manage pages** it shows each item's
-**Item Market Average** with a graph, and **Torn Bids** (the traders page) in its own tab shows
-every item from both sides - who pays most for it (TornExchange and TornW3B
-price lists), who sells it cheapest (TornW3B's bazaar prices), the flips in
-between, and where to sell what you hold.
+More: on **your own bazaar's add / manage pages** and the **Item Market's
+add-listing / your-listings pages** it shows each item's **Item Market Average**
+and the lowest competing price, with a graph, and a **Fill** button per row that
+types the price for you (the lowest bazaar listing −$1 by default; you press
+Torn's button). **Torn Bids** (the traders page) in its own tab shows every item
+from both sides - who pays most for it (TornExchange and TornW3B price lists),
+who sells it cheapest (TornW3B's bazaar prices), the flips in between, and where
+to sell what you hold - and its **Torn Ledger** shows what you made, from your
+own Torn log.
 
 This is a rewrite of an earlier "NPC Arbitrage Scanner" userscript, rebuilt around
 one idea: the item card stays untouched, and every number lives in a side panel
@@ -137,6 +141,43 @@ scrolls to it when it is on the page you are viewing. Nothing is ever bought for
   Tampermonkey menu › *Show my bazaar diagnostics* says which page was detected
   and how many rows were read - the real markup has not been captured here; the
   selectors come from a working 2026 price-filler script for these pages.
+  The tag also names the **lowest bazaar price** (on the Item Market's pages,
+  the lowest Item Market price) - the friend's request. **On #/add** (the
+  owner: "it makes a new row, looks ugly. put it beside the price") it is two
+  chips in Torn's own value column, after its price, so the row stays one line:
+  **IMA** (Item Market Average - press it for the graph) and **BP** (lowest
+  bazaar price - press it for the cheapest listings and who sells them), then
+  the Fill tick, which shows the price it typed.
+- **Fill** (the friend's request, after Greasy Fork's *Customizable Bazaar
+  Filler* 527925 and *Torn Market Filler* 513920): a **tick box** in each row of your
+  bazaar's **#/add** and **#/manage** and the Item Market's **add-listing** and
+  **your-listings** pages. One click types that one row's price - and, on the
+  add pages, the quantity (all you have, or all but one) unless you typed one -
+  into Torn's own boxes. **You press Torn's button**; Fill never does, and never
+  ticks the box of a weapon or armour row (it says to). Unticked, it puts back
+  what was there. **Fill settings** in Torn's links bar (beside Manage items)
+  opens the panel's Settings at Fill.
+  - The price: undercut the **lowest** (or 2nd, 3rd...) listing by an amount
+    in **$ or %** - default the lowest bazaar listing −$1 on your bazaar, the
+    lowest Item Market listing −$1 on the Item Market. Settings › *Fill button*
+    has one row per market (and a floor at the Item Market Average).
+  - Only real competition: never your own listing (your id from the page, or
+    one `user` basic call), and never a $1 (padlocked), sponsored, stale
+    (TornW3B has not seen it for 30 min) or troll (under 25% of the average)
+    listing. The Item Market API does not say whose listing is whose, so your
+    own Item Market prices are read off *Your listings* when you open it (kept
+    30 minutes). **Never below the NPC price.**
+  - Prices are read at the click (TornW3B's listings for the item, or one Item
+    Market call with the panel's key), reused for a minute, through the usual
+    limits. The line after the button says what it typed, against the average
+    (green at or over, amber under), any floor applied, the price after the
+    Item Market's 5% fee, and a warning for weapons and armour (each has its
+    own stats).
+  - The panel's *My bazaar* (or *My Item Market*) view adds, for the item
+    picked: *Fill would type $X*, the **5 cheapest bazaar and Item Market
+    listings** (yours marked, trolls marked, the Item Market's after the fee) -
+    press one to undercut that one in the item's row - and a dashed line on the
+    graph at the price about to be listed.
 - **Highlights on the page:** green for listings that meet your Min (the brighter
   green for the top three), **amber** for listings below your Min that still
   make a profit. The list shows only what meets your Min; Cash still hides what
@@ -207,8 +248,11 @@ you: every link is one you follow yourself, one page per click.
   On the right, **everything about the item picked, at once**:
   - **Traders pay · highest first**: name (their Torn profile), trust badge,
     online status, price, and fixed link slots - **Trade** (starts a trade
-    with them), **TE list**, **W3B list**. One row per trader: on both sites,
-    at the higher of their two prices.
+    with them), **TE list**, **W3B list**, and their **networth**. One row per
+    trader. **On both sites with two different prices, the LOWER one counts**
+    (ranking, flips, where to sell, the bazaar tag) and the row says so in
+    amber: in a trade the trader pays what they choose, and a friend lost money
+    trading on the higher of two lists (one was stale, or bait).
   - **Bazaars sell · cheapest first**: seller (their profile), how many, when
     TornW3B last saw it (older than 30 minutes is greyed and never planned
     on), price, and **Open bazaar** (their bazaar, pointing at the listing).
@@ -232,10 +276,43 @@ you: every link is one you follow yourself, one page per click.
 - **Trust badge**: Trusted (100+), Known (20+), New (0-19) or Caution (below
   0), from the better of their TornExchange vote score and their TornW3B
   rating (ups minus downs); hover for the numbers.
+- **Could they pay** (Settings › Flips › *Trader can pay*, 10% by default):
+  a flip never asks a trader to pay more than that share of their networth
+  (Torn's public personal stats, `v2/user/{id}/personalstats?cat=networth`,
+  with the Limited key; at most 10 a minute, each kept 12 hours). A trader who
+  could not pay for even one is skipped for the next; the plan says when it
+  was capped.
+- **Category** (mockup M): a dropdown beside the search - Torn's own item types
+  with a count each - filters the flips, the list and the All / Mine / Flips
+  counts together; a line under the flips says what is hidden, with *Show
+  all*. To fit, the TornW3B and Online pills hide between 1001 and 1500px.
 - **Layout** (the owner picked mockup H): the full width of the window, one
   scrollbar; the desk stays in view while the list scrolls. On a phone
   (under 1000px) the desk sits above the list, and picking an item scrolls to
   it.
+
+**Torn Ledger** (the *Ledger* button): what you made, from your own Torn log.
+Every bazaar and Item Market buy and sell (log types 1225, 1226, 1112, 1113)
+and every finished trade (`/v2/user/trades`, each trade's items and money),
+**first in, first out**, after the Item Market's fee. Filters: period, **item**
+("how much did I make on this item" - the headline becomes *Profit on X*),
+category, where, and who. Profit, sold, bought and fees; profit per day / week /
+month and per item (graphs and tables); every buy and sell, a sale showing whom
+its units were bought from (a flip: bought from -> sold to). Units sold with no
+buy on record are counted apart, never guessed. It reads a year back a few
+pages at a time, then only what is new, every 5 minutes while Torn Bids is in
+front.
+- **Its own Full key**, apart from the Limited key: Torn is asked (key info)
+  whether it is Full before it is saved - anything else is refused, with why.
+  Masked while typed, never shown again (no Show), redacted from every error,
+  never logged. Its own client (`api/ledger.js`) allows only `/v2/key/info`,
+  `/v2/user/log`, `/v2/user/trades` and `/v2/user/{id}/trade` on
+  api.torn.com - any other path is refused in code before the key is attached.
+  Read only on Torn Bids; the panel on torn.com never reads it; never sent to
+  TornExchange or TornW3B. Error 2/13/16/18 stops it until a new key is saved.
+  *Forget key and delete the ledger* (pressed twice) deletes the key and every
+  stored row. Only derived rows are stored (time, item, quantity, price, where,
+  who, fee), locally.
 
 **Where the prices come from.**
 - **Bazaar prices: TornW3B only** - TornExchange's API has none, and Torn's
@@ -295,6 +372,11 @@ keeps its own:
   panel's Cash.
 - *Open links in a new tab* (on by default); *Trusted buyers only* and
   *Buyers online only* are remembered.
+- The layout is mockup J: a menu down the left (Keys and sources, Torn Bids,
+  Other), each part with its state, and a label on the left, the field on the
+  right. Parts: Torn API key, TornExchange, TornW3B, Flips (Cash, Most per
+  flip, Trader can pay), Torn Ledger (its Full key and its own terms table),
+  Links, Key use.
 
 ---
 
@@ -369,8 +451,10 @@ stylistic preferences, and "it would be more convenient if" is not a reason to c
 them.
 
 1. **Never auto-buy.** The script has no buy path. The panel's only action navigates
-   or scrolls. A user click never triggers a chain of game actions, and nothing is
-   clicked or pre-filled for you.
+   or scrolls. A user click never triggers a chain of game actions. **Fill types
+   one row's price (and quantity) only on your click, into your own listing
+   form, and never presses Torn's buttons** - you confirm. Nothing is filled
+   before you click, and there is no Fill All.
 2. **Never fetch a Torn page the user is not viewing.** There is no `fetch` of
    `torn.com` anywhere — only `api.torn.com` (from `src/api/client.js`),
    `weav3r.dev` (from `src/api/w3b.js`) and `www.tornexchange.com` (from
@@ -380,8 +464,10 @@ them.
    the traders it links to; it sends nothing from there.
 3. **Public API key only for the panel.** Nothing the panel does needs more. The
    traders page keeps a **separate Limited key**, used only there and only for
-   your own inventory, the item database and public profiles - the selections
-   its disclosure table names. Neither key is ever used for the other's job.
+   your own inventory, the item database, public profiles and public networth -
+   the selections its disclosure table names. The **Torn Ledger** keeps a third,
+   **Full** key, used only for your own log, your trades and key info, through a
+   client that refuses every other path. No key is ever used for another's job.
 4. **Rate-limit everything.** All Torn API calls pass through one queue capped at
    70/min, **shared by every open tab**, with dedup and backoff; the live feed
    spends at most 30/min of it; TornW3B gets at most 60/min of its 100/min. Torn's 100/min is per user across all tools. Do not
@@ -415,9 +501,12 @@ them.
 8. **Stop on a dead key.** Torn error 2, 13 or 18 marks the key dead and nothing is
    sent until the user saves another - each key separately. Torn warns that
    repeated invalid-key requests can earn an IP ban.
-10. **Your own bazaar is read, never written.** The add / manage helper reads the
-    rows of the page you are viewing and adds a text tag after the name. It never
-    fills a price or quantity box and never clicks anything of Torn's.
+10. **Your own listings: filled only on your click, one row, never submitted.** The
+    add / manage helper (and the Item Market's add-listing / your-listings pages)
+    reads the rows of the page you are viewing and adds a tag and a Fill button.
+    Fill writes into the one row's price and quantity boxes you pressed it in,
+    and nothing else: it never clicks Torn's buttons or tick boxes. Undo puts
+    back what was there.
 
 ### API key terms of use (Torn API ToS disclosure)
 
@@ -425,7 +514,7 @@ Shown where each key is entered, as Torn requires. The panel's key:
 
 | Data storage | Data sharing | Purpose of use | Key storage & sharing | Key access level |
 |---|---|---|---|---|
-| Only locally | Nobody | Competitive advantage: finding Bazaar and Item Market listings below NPC / market value | Stored locally / Not shared | Public (torn: items, cityshops; market: itemmarket; key: info; user: profile - bazaar owners' public online status, for the bazaar you view and the sellers on the Bazaars list) |
+| Only locally | Nobody | Competitive advantage: finding Bazaar and Item Market listings below NPC / market value, and filling your own listing prices | Stored locally / Not shared | Public (torn: items, cityshops; market: itemmarket; key: info; user: profile - bazaar owners' public online status, for the bazaar you view and the sellers on the Bazaars list; user: basic - your own id, so Fill never undercuts you) |
 
 Plus a line naming the automatic integration: *TornW3B (weav3r.dev), for bazaar
 prices; receives item ids only, never the key* - with a link to its terms beside
@@ -435,9 +524,17 @@ The traders page's key (a separate table beside its own field):
 
 | Data storage | Data sharing | Purpose of use | Key storage & sharing | Key access level |
 |---|---|---|---|---|
-| Only locally | Nobody | Personal gain: who pays most for your items, and flips | Stored locally / Not shared | Limited (user: inventory - your own items; user: basic - your own id; torn: items - item names; market: itemmarket - the Item Market for the item on the desk; user: profile - traders' public online status) |
+| Only locally | Nobody | Personal gain: who pays most for your items, and flips | Stored locally / Not shared | Limited (user: inventory - your own items; user: basic - your own id; torn: items - item names; market: itemmarket - the Item Market for the item on the desk; user: profile - traders' public online status; user: personalstats (networth) - traders' public networth) |
 
 Plus: *TornExchange, only with the key you log in there with.*
+
+The Torn Ledger's key (its own table beside its own field):
+
+| Data storage | Data sharing | Purpose of use | Key storage & sharing | Key access level |
+|---|---|---|---|---|
+| Only locally: time, item, quantity, price, where, who - never the log's own text | Nobody | Personal: profit tracking | Stored locally / Not shared | Full, used only for your log (user: log - bazaar and Item Market buys and sells), your trades (user: trades, trade) and key: info |
+
+Plus: *Other services: none - never sent to TornExchange or TornW3B.*
 
 ### On the bootstrap requests
 

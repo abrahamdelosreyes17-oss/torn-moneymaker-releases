@@ -10,8 +10,12 @@
  *     active traders plus every /pricelist/{id} link seen on a TornW3B page
  *     the user opened (its leaderboards, Search Deals).
  *
- * One row per trader per item: a trader on both sites shows once, with the
- * higher of their two prices and both links. Always highest price first.
+ * One row per trader per item: a trader on both sites shows once, with both
+ * links. When their two lists disagree, the LOWER price is the one counted
+ * (ranking, flips, where to sell), and the row is marked `differ`: in a trade
+ * the trader pays what they choose, and the owner's friend lost money trading
+ * on the higher of two lists (2026-09-26) - one list was stale or bait.
+ * Always highest (counted) price first.
  */
 
 export const TRADER_DB_VERSION = 1;
@@ -310,7 +314,9 @@ export function buyersForItem(itemId, { teBest = [], teFull = null, idsByName = 
 
     const out = [];
     for (const r of rows.values()) {
-        r.price = Math.max(r.te || 0, r.w3b || 0);
+        const both = r.te > 0 && r.w3b > 0;
+        r.price = both ? Math.min(r.te, r.w3b) : Math.max(r.te || 0, r.w3b || 0);
+        r.differ = both && r.te !== r.w3b;
         if (r.price <= 0) continue;
         // What we know of how they trade: TornExchange votes (from any item's
         // top three) and TornW3B's rating.

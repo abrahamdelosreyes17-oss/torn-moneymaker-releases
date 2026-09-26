@@ -100,7 +100,9 @@ function avgAt(mv, t) {
 
 /**
  * @param {object} data - from core/history.js series(): { from, to, points, mv, step }
- * @param {object} [opts] - { width, height, colors: { im, mv } }
+ * @param {object} [opts] - { width, height, colors: { im, mv }, mark }
+ *   mark: a price to show as a dashed line across the graph - the price the
+ *   Fill button is about to list at. Always inside the scale.
  * @returns {HTMLElement} a figure holding the graph, its scale and its hover label
  */
 export function renderPriceGraph(data, opts = {}) {
@@ -134,6 +136,11 @@ export function renderPriceGraph(data, opts = {}) {
     // $9,999,999 Xanax on an empty market) would otherwise flatten every
     // other line; such a point is pinned to the edge and marked instead.
     let { min, max } = scaleRange(points.map((p) => p.im), mv.map((m) => m.mv));
+    const mark = Number(opts.mark) > 0 ? Number(opts.mark) : null;
+    if (mark !== null) {
+        min = Math.min(min, mark);
+        max = Math.max(max, mark);
+    }
     const room = (max - min) * 0.08 || max * 0.02 || 1;
     min = Math.max(0, min - room);
     max += room;
@@ -205,6 +212,15 @@ export function renderPriceGraph(data, opts = {}) {
             d += ' L' + x(end).toFixed(1) + ' ' + y(mv[i].mv).toFixed(1);
         }
         if (d) svg.appendChild(svgEl('path', { d, fill: 'none', stroke: colors.mv, 'stroke-width': 2, 'stroke-linejoin': 'round' }));
+    }
+
+    /* the price about to be listed */
+    if (mark !== null) {
+        const my = y(mark).toFixed(1);
+        svg.appendChild(svgEl('line', { x1: pad.l, x2: pad.l + plotW, y1: my, y2: my, class: 'ttv2-graph-mark', stroke: '#f0a020', 'stroke-width': 1.5, 'stroke-dasharray': '5 3' }));
+        const label = svgEl('text', { x: pad.l + 4, y: Number(my) - 4, class: 'ttv2-graph-marklabel', fill: '#f0a020' });
+        label.textContent = 'Fill ' + formatMoneyShort(mark);
+        svg.appendChild(label);
     }
 
     /* point at the graph to read it */

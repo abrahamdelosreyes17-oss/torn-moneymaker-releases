@@ -24,6 +24,8 @@ import {
     makeItemsCacheEntry,
     isItemsCacheFresh,
     ITEMS_TTL_MS,
+    itemCategory,
+    categoryCounts,
 } from './core/items.js';
 import {
     buildNpcShopIndex,
@@ -52,6 +54,8 @@ import { formatMoneyShort } from './core/parse.js';
 import { rankOpportunities, summarize, hiddenCounts, belowMinRows } from './core/ranker.js';
 import { TornApiClient, redactKey, KEY_DEAD_CODES } from './api/client.js';
 import { W3bClient, fetchW3bSummary, fetchW3bListings, fetchW3bPriceList } from './api/w3b.js';
+import { LedgerClient, fetchLedgerKeyInfo, isFullKey, fetchLogPage, fetchTradesPage, fetchTrade } from './api/ledger.js';
+import { readLedger, rowsFromLog, rowsFromTrade, addLedgerRows, logSpan } from './core/ledger.js';
 import {
     TeClient,
     TeQueue,
@@ -111,6 +115,7 @@ import {
     fetchUserPresence,
     fetchItemMarket,
     fetchInventory,
+    fetchNetworth,
     ACCESS_PUBLIC,
     TORN_ERROR_ACCESS_LEVEL,
 } from './api/torn.js';
@@ -120,6 +125,7 @@ import {
     bazaarOwnerId,
     bazaarTarget,
     ownBazaarPage,
+    marketFillPage,
     tradersPageUrl,
     isTradersPageUrl,
     isOldTradersPageUrl,
@@ -128,6 +134,25 @@ import {
 } from './sources/route.js';
 import { scanDom } from './sources/dom/scan.js';
 import { scanOwnBazaar, ensureRowTag, removeRowTags, OWN_BAZAAR_TAG_CLASS } from './sources/dom/ownbazaar.js';
+import {
+    rowInputs,
+    readInputs,
+    writeInputs,
+    priceText,
+    scanMarketRows,
+    ownIdFromPage,
+    fillAnchor,
+    rowItemIdNow,
+    savedPrice,
+    linksBar,
+    FILL_BUTTON_CLASS,
+    FILL_TAG_CLASS,
+    MARKET_ROW_SELECTOR,
+} from './sources/dom/fill.js';
+import { fillPrice, fillQuantity, fillVerdict, realListings, FILL_REUSE_MS, FILL_SHOW_LISTINGS, FILL_TROLL_SHARE, FILL_FRESH_MS } from './core/fill.js';
+import { readFillSettings } from './ui/fill-form.js';
+import { STAT_ITEM_TYPES, payableUnits, flipBuyers } from './core/flips.js';
+import { VENUE_FEES } from './core/profit.js';
 import {
     readBazaarOpen,
     renderOwnerBadge,
@@ -179,6 +204,32 @@ const STORE_TRADER_DB = 'traderDb';
 const STORE_TE_ONE = 'teOne';
 /* The traders page: your own Torn id, read once with its Limited key. */
 const STORE_SELL_SELF = 'sellSelf';
+/*
+ * The Torn Ledger (Torn Bids only): its own Full key, its dead-key note, the
+ * key owner's id, and the derived rows. The panel on torn.com never reads these.
+ */
+const STORE_LEDGER_KEY = 'ledgerKey';
+const STORE_LEDGER_KEY_DEAD = 'ledgerKeyDead';
+const STORE_LEDGER_SELF = 'ledgerSelf';
+const STORE_LEDGER = 'ledger';
+/* A run makes at most this many calls; new entries every 5 minutes; a year back, a few pages a minute. */
+const LEDGER_CALLS_PER_RUN = 6;
+const LEDGER_EVERY_MS = 5 * 60 * 1000;
+const LEDGER_BACKFILL_GAP_MS = 30 * 1000;
+const LEDGER_BACKFILL_S = 365 * 24 * 60 * 60;
+
+/* Traders' networth (public personal stats), for "could they pay": id -> {value, at}. */
+const STORE_SELL_NETWORTH = 'sellNetworth';
+/* At most this many networth lookups a minute, inside the shared 70; each kept 12 hours. */
+const SELL_NETWORTH_PER_MIN = 10;
+const SELL_NETWORTH_REFRESH_MS = 12 * 60 * 60 * 1000;
+const SELL_NETWORTH_RETRY_MS = 10 * 60 * 1000;
+
+/* The Fill button's settings (shared by the panel and Torn Bids), and your own Item Market prices seen on Your listings. */
+const STORE_FILL = 'fill';
+const STORE_FILL_OWN_IM = 'fillOwnIm';
+/* The panel's own id lookup (your Torn id), for Fill never undercutting you. */
+const STORE_SELF = 'selfId';
 
 /* Price history the script records itself, and TornW3B's latest summary. */
 const STORE_HISTORY = 'priceHistory';
@@ -340,6 +391,12 @@ const app = {
     bzSelected: null,
     bzWindow: '24h',
     bzLastFetchAt: 0,
+    /*
+     * The Fill button. listings: 'bazaar:ID' / 'market:ID' -> {rows, at,
+     * pending, error, note}; done: row element -> what was filled there (to
+     * undo it); busy: rows being filled; selfId: your Torn id.
+     */
+    fill: { listings: new Map(), done: new WeakMap(), last: new Map(), busy: new WeakSet(), selfId: null, selfTried: false },
     /* The recorded price history, loaded once, saved on a timer. */
     history: null,
     historyDirty: false,
@@ -688,10 +745,14 @@ function rescan() {
 
     if (!app.index) return;
 
-    // Your own bazaar's add / manage page: the pricing helper, not the scanner.
-    const own = ownBazaarPage(location.href);
+    // Your own bazaar's add / manage page, or the Item Market's add-listing /
+    // your-listings page: the pricing helper and Fill, not the scanner.
+    const own = ownFillPage(location.href);
     if (own !== app.ownBazaar) {
-        if (app.ownBazaar) removeRowTags(document);
+        if (app.ownBazaar) {
+            removeRowTags(document);
+            removeFillControls(document);
+        }
         app.ownBazaar = own;
         app.bzRows = [];
         app.bzDiagnostics = null;
@@ -1215,9 +1276,13 @@ function statusMap(now) {
 
 /** Read the rows, tag each with its current asking prices, queue what is missing. */
 function scanOwnBazaarPage(which) {
-    const { rows, diagnostics } = scanOwnBazaar(which, document, app.index);
+    const market = which === 'market-add' || which === 'market-view';
+    const { rows, diagnostics } = market ? scanMarketRows(which, document, app.index) : scanOwnBazaar(which, document, app.index);
     app.bzRows = rows;
-    app.bzDiagnostics = { ...diagnostics, tags: 0 };
+    app.bzDiagnostics = { ...diagnostics, tags: 0, fills: 0 };
+    if (which === 'market-view') noteOwnMarketPrices(rows);
+    // Your id marks your own listings in the panel and keeps Fill off them.
+    if (!app.fill.selfId && !app.fill.selfTried) ensureSelfId().then(() => renderMyBazaar());
 
     const now = Date.now();
     const hist = loadHistory();
@@ -1229,12 +1294,14 @@ function scanOwnBazaarPage(which) {
         const item = app.index.byId.get(row.itemId);
         if (item && item.marketValue > 0) recordMarketValue(hist, row.itemId, now, item.marketValue);
 
-        const tag = ensureRowTag(row, document);
+        const tag = rowTagFor(row, which);
         app.bzDiagnostics.tags += 1;
         paintRowTag(tag, row.itemId);
-        if (tag.title !== 'Show its graph') tag.title = 'Show its graph';
+        if (!tag.classList.contains('ttv2-bzchips') && tag.title !== 'Show its graph') tag.title = 'Show its graph';
+        if (ensureFillControls(row, which, tag)) app.bzDiagnostics.fills += 1;
     }
     bindRowTagPress();
+    ensureFillSettingsLink();
     if (changed) markHistoryDirty();
 
     if (!app.bzSelected && rows.length) app.bzSelected = rows[0].itemId;
@@ -1258,22 +1325,35 @@ function bindRowTagPress() {
 
     const tagOf = (event) => {
         const t = event.target;
-        return t && t.closest ? t.closest('.ttv2-bztag') : null;
+        return t && t.closest ? t.closest('.' + FILL_BUTTON_CLASS + ', .ttv2-fillbox, .ttv2-fillset, .ttv2-bzchip, .ttv2-bztag') : null;
     };
 
     const open = (event) => {
         const tag = tagOf(event);
         if (!tag || !app.ownBazaar) return;
+        // Fill: acts on the click only (never on the press), once. The rest of
+        // our box (its result line) is swallowed so Torn's row does not react.
+        if (tag.classList.contains(FILL_BUTTON_CLASS) || tag.classList.contains('ttv2-fillbox') || tag.classList.contains('ttv2-fillset')) {
+            event.preventDefault();
+            event.stopPropagation();
+            if (event.type !== 'click') return;
+            if (tag.classList.contains(FILL_BUTTON_CLASS)) onFillPress(tag);
+            else if (tag.classList.contains('ttv2-fillset')) openFillSettings();
+            return;
+        }
         event.preventDefault();
         event.stopPropagation();
         if (event.type === 'click' && app.bzPressedAt && Date.now() - app.bzPressedAt < 800) return;
         if (event.type !== 'click') app.bzPressedAt = Date.now();
 
         // The row's item NOW: #/manage reuses row elements as you scroll.
-        app.bzSelected = tag.dataset.itemId || app.bzSelected;
+        const holder = tag.classList.contains('ttv2-bzchip') ? tag.closest('.ttv2-bzchips') : tag;
+        app.bzSelected = (holder && holder.dataset.itemId) || app.bzSelected;
         if (app.panel.collapsed) app.panel.setCollapsed(false, { save: true });
         if (app.panel.page !== 'mybazaar') app.panel.showPage('mybazaar');
         repaintOwnBazaar();
+        // IMA: to the graph; BP: to the cheapest bazaar listings.
+        if (tag.dataset.kind) app.panel.showBazaarPart(tag.dataset.kind === 'bp' ? 'lows' : 'graph');
     };
 
     const swallow = (event) => {
@@ -1303,14 +1383,71 @@ function itemAverage(itemId) {
  * inside the observed rows, so every paint would otherwise be a mutation,
  * and every mutation a rescan, and every rescan a paint.
  */
+/**
+ * The price tag of a row. On your bazaar's add page (the owner, 2026-09-26:
+ * "it makes a new row, looks ugly. put it beside the price") two chips go in
+ * Torn's own value column, after its price: IMA (Item Market Average - press
+ * for the graph) and BP (the lowest bazaar price - press for the cheapest
+ * listings and who sells them), then the Fill tick. Elsewhere, the tag after
+ * the name (#/manage) or above the price box (the Item Market).
+ */
+function rowTagFor(row, page) {
+    if (page === 'market-add' || page === 'market-view') return ensureMarketTag(row, page);
+    if (page === 'add') {
+        const cell = row.el.querySelector('.info-wrap');
+        if (cell) {
+            let chips = cell.querySelector('.ttv2-bzchips');
+            if (!chips) {
+                // An old tag after the name (3.11) goes: one line per row.
+                const old = row.el.querySelector('.' + OWN_BAZAAR_TAG_CLASS + ':not(.ttv2-bzchips)');
+                if (old) old.remove();
+                chips = document.createElement('span');
+                chips.className = OWN_BAZAAR_TAG_CLASS + ' ttv2-bzchips';
+                for (const [kind, label, title] of [['ima', 'IMA', 'Item Market Average: press for its graph'], ['bp', 'BP', 'Lowest bazaar price: press for the cheapest listings and who sells them']]) {
+                    const chip = document.createElement('span');
+                    chip.className = 'ttv2-bzchip ttv2-bzchip-' + kind;
+                    chip.dataset.kind = kind;
+                    chip.title = title;
+                    chip.append(label + ' ', Object.assign(document.createElement('b'), { textContent: '…' }));
+                    chips.appendChild(chip);
+                }
+                cell.appendChild(chips);
+            }
+            if (chips.dataset.itemId !== String(row.itemId)) chips.dataset.itemId = String(row.itemId);
+            return chips;
+        }
+    }
+    return ensureRowTag(row, document);
+}
+
 function paintRowTag(tag, itemId) {
+    if (tag.classList.contains('ttv2-bzchips')) {
+        const avg = itemAverage(itemId);
+        const low = lowestBazaarPrice(itemId);
+        const ima = tag.querySelector('.ttv2-bzchip-ima b');
+        const bp = tag.querySelector('.ttv2-bzchip-bp b');
+        const a = avg ? formatMoney(avg) : '…';
+        const b = low ? formatMoney(low) : '…';
+        if (ima && ima.textContent !== a) ima.textContent = a;
+        if (bp && bp.textContent !== b) bp.textContent = b;
+        const selected = String(itemId === app.bzSelected);
+        if (tag.dataset.selected !== selected) tag.dataset.selected = selected;
+        return;
+    }
     const avg = itemAverage(itemId);
-    const words = 'Item Market Average ' + (avg ? formatMoney(avg) : '…');
+    // The friend asked for the lowest competing price beside the average:
+    // the lowest bazaar on your bazaar's pages, the lowest listing on the Item Market's.
+    const onMarket = app.ownBazaar === 'market-add' || app.ownBazaar === 'market-view';
+    const lowest = onMarket ? lowestMarketPrice(itemId) : lowestBazaarPrice(itemId);
+    const lowLabel = onMarket ? 'Lowest Item Market ' : 'Lowest bazaar ';
+    const words = 'Item Market Average ' + (avg ? formatMoney(avg) : '…') + ' · ' + lowLabel + (lowest ? formatMoney(lowest) : '…');
     if (tag.dataset.words !== words) {
         tag.dataset.words = words;
         tag.textContent = '';
         tag.appendChild(document.createTextNode('Item Market Average '));
         tag.appendChild(Object.assign(document.createElement('b'), { textContent: avg ? formatMoney(avg) : '…' }));
+        tag.appendChild(document.createTextNode(' · ' + lowLabel));
+        tag.appendChild(Object.assign(document.createElement('b'), { className: 'ttv2-bztag-low', textContent: lowest ? formatMoney(lowest) : '…' }));
     }
     const selected = String(itemId === app.bzSelected);
     if (tag.dataset.selected !== selected) tag.dataset.selected = selected;
@@ -1409,7 +1546,9 @@ function repaintOwnBazaar() {
     if (!app.ownBazaar) return;
     for (const row of app.bzRows) {
         if (!document.contains(row.el)) continue;
-        paintRowTag(ensureRowTag(row, document), row.itemId);
+        const tag = rowTagFor(row, app.ownBazaar);
+        paintRowTag(tag, row.itemId);
+        ensureFillControls(row, app.ownBazaar, tag);
     }
     renderMyBazaar();
 }
@@ -1418,17 +1557,557 @@ function renderMyBazaar() {
     if (!app.ownBazaar) return;
     const now = Date.now();
     const hist = loadHistory();
-    const items = app.bzRows.map((r) => ({ itemId: r.itemId, name: r.name, avg: itemAverage(r.itemId) }));
+    const onMarket = app.ownBazaar && app.ownBazaar.startsWith('market');
+    const seenIds = new Set();
+    const items = [];
+    for (const r of app.bzRows) {
+        if (seenIds.has(r.itemId)) continue;
+        seenIds.add(r.itemId);
+        items.push({ itemId: r.itemId, name: r.name, avg: itemAverage(r.itemId), low: onMarket ? lowestMarketPrice(r.itemId) : lowestBazaarPrice(r.itemId) });
+    }
     const selected = items.some((i) => i.itemId === app.bzSelected) ? app.bzSelected : items.length ? items[0].itemId : null;
     app.bzSelected = selected;
 
+    const fill = fillPanelView(selected);
     app.panel.renderMyBazaar({
         items,
         selected,
         avgAt: app.itemsDataAt || null,
         series: selected ? series(hist, selected, now, app.bzWindow) : null,
         windowKey: app.bzWindow,
+        title: app.ownBazaar && app.ownBazaar.startsWith('market') ? 'My Item Market' : 'My bazaar',
+        lowLabel: app.ownBazaar && app.ownBazaar.startsWith('market') ? 'Lowest IM' : 'Lowest bazaar',
+        fill,
+        // The graph marks the price about to be listed: what Fill typed, else what it would type.
+        mark: fill ? (fill.filled ? fill.filled.price : fill.preview ? fill.preview.price : null) : null,
     });
+}
+
+/* ------------------------------------------------------------------ *
+ * The Fill button: one click types one row's price (and quantity)
+ * ------------------------------------------------------------------ */
+
+/**
+ * Where Fill works: your bazaar's add / manage pages ('add' / 'manage') and
+ * the Item Market's add-listing / your-listings pages ('market-add' /
+ * 'market-view'). Anything else is null.
+ */
+function ownFillPage(href) {
+    const own = ownBazaarPage(href);
+    if (own) return own;
+    const market = marketFillPage(href);
+    return market ? 'market-' + market : null;
+}
+
+/** 'add' -> 'bazaar-add' and so on: the page names rowInputs() knows. */
+function fillPageKind(page) {
+    return page === 'add' ? 'bazaar-add' : page === 'manage' ? 'bazaar-manage' : page;
+}
+
+function fillSettings() {
+    return readFillSettings(gmGet(STORE_FILL, null));
+}
+
+/** The lowest bazaar price we know for an item: its own listings when read lately, else TornW3B's summary. */
+function lowestBazaarPrice(itemId) {
+    const got = app.fill.listings.get('bazaar:' + itemId);
+    if (got && got.rows && !got.fromMarket && Date.now() - got.at < 10 * 60 * 1000) {
+        const { rows } = realListings(got.rows, { selfId: app.fill.selfId, avg: itemAverage(itemId), checkFresh: true });
+        if (rows.length) return rows[0].price;
+    }
+    const rec = app.bzPrices.get(String(itemId));
+    if (rec && rec.bz && rec.bz.price) return rec.bz.price;
+    const summary = w3bSummaryCached();
+    const low = summary && summary.lowest ? Number(summary.lowest[itemId]) : 0;
+    return low > 0 ? low : null;
+}
+
+/** TornW3B's summary from storage, parsed at most every 10 s (a big page paints hundreds of tags). */
+function w3bSummaryCached() {
+    const now = Date.now();
+    if (!app.fill.summary || now - app.fill.summaryReadAt > 10000) {
+        app.fill.summary = gmGet(STORE_W3B_SUMMARY, null);
+        app.fill.summaryReadAt = now;
+    }
+    return app.fill.summary;
+}
+
+/** The lowest Item Market price we know for an item. */
+function lowestMarketPrice(itemId) {
+    const got = app.fill.listings.get('market:' + itemId);
+    if (got && got.rows && got.rows.length && Date.now() - got.at < 10 * 60 * 1000) {
+        const { rows } = realListings(got.rows, { avg: itemAverage(itemId), checkFresh: false });
+        if (rows.length) return rows[0].price;
+    }
+    const rec = app.bzPrices.get(String(itemId));
+    return rec && rec.im && rec.im.price ? rec.im.price : null;
+}
+
+/** Your Torn id, for never undercutting yourself: from the page, else one Public-key call, kept. */
+function ensureSelfId() {
+    if (app.fill.selfId) return Promise.resolve(app.fill.selfId);
+    const fromPage = ownIdFromPage(document);
+    if (fromPage) {
+        app.fill.selfId = fromPage;
+        gmSet(STORE_SELF, fromPage);
+        return Promise.resolve(fromPage);
+    }
+    const stored = gmGet(STORE_SELF, null);
+    if (stored) {
+        app.fill.selfId = String(stored);
+        return Promise.resolve(app.fill.selfId);
+    }
+    if (app.fill.selfTried || !app.client || !hasUsableKey()) return Promise.resolve(null);
+    app.fill.selfTried = true;
+    return app.client
+        .get('user', { selections: 'basic' })
+        .then((data) => {
+            const id = Number(data && data.player_id);
+            if (id > 0) {
+                app.fill.selfId = String(id);
+                gmSet(STORE_SELF, app.fill.selfId);
+            }
+            return app.fill.selfId;
+        })
+        .catch((error) => {
+            if (isKeyDeadError(error)) markKeyDead(error);
+            return null;
+        });
+}
+
+/**
+ * Your own Item Market prices, read off Your listings (the API does not say
+ * whose listing is whose): kept 30 minutes, so Fill on the add page does not
+ * undercut them either.
+ */
+function noteOwnMarketPrices(rows) {
+    const now = Date.now();
+    const store = gmGet(STORE_FILL_OWN_IM, {}) || {};
+    let changed = false;
+    // Each listing's price as Torn has it on file (the box's value attribute),
+    // never what is typed in the box; each price with its own time, so one no
+    // longer listed is forgotten after 30 minutes.
+    const seen = new Map();
+    for (const row of rows) {
+        const { price } = rowInputs('market-view', row.el);
+        const v = savedPrice(price);
+        if (!(v > 0)) continue;
+        if (!seen.has(row.itemId)) seen.set(row.itemId, []);
+        seen.get(row.itemId).push(v);
+    }
+    for (const [itemId, prices] of seen) {
+        const was = (store[itemId] && store[itemId].prices) || [];
+        const times = new Map(was.filter((p) => p && now - p.at < 30 * 60 * 1000).map((p) => [p.price + ':' + p.n, p.at]));
+        const next = [];
+        const counts = new Map();
+        for (const price of prices) {
+            const n = (counts.get(price) || 0) + 1;
+            counts.set(price, n);
+            next.push({ price, n, at: now });
+            if (!times.has(price + ':' + n)) changed = true;
+        }
+        if (next.length !== was.length) changed = true;
+        store[itemId] = { prices: next };
+    }
+    if (changed || seen.size) gmSet(STORE_FILL_OWN_IM, store);
+}
+
+function ownMarketPrices(itemId) {
+    const store = gmGet(STORE_FILL_OWN_IM, {}) || {};
+    const rec = store[itemId];
+    const now = Date.now();
+    return rec && Array.isArray(rec.prices) ? rec.prices.filter((p) => p && typeof p === 'object' && now - p.at < 30 * 60 * 1000).map((p) => p.price) : [];
+}
+
+/** TornW3B's listings for Fill: every one kept ($1 and sponsored too), so the skip counts are honest. */
+function normalizeW3bListingsForFill(raw) {
+    const out = [];
+    for (const l of raw || []) {
+        const price = Number(l && l.price);
+        const qty = Number(l && l.quantity);
+        if (!(price > 0) || !(qty > 0)) continue;
+        const t = l.last_checked;
+        const checked = typeof t === 'string' && !/^\d+$/.test(t) ? Date.parse(t) : Number(t) > 1e12 ? Number(t) : Number(t) * 1000;
+        out.push({
+            price,
+            qty,
+            sellerId: l.player_id ? String(l.player_id) : null,
+            sellerName: l.player_name ? String(l.player_name) : null,
+            sponsored: Boolean(l.sponsored),
+            dataAt: checked > 0 ? checked : null,
+        });
+    }
+    return out;
+}
+
+/**
+ * The listings Fill goes by, read fresh at the click and reused for
+ * FILL_REUSE_MS. Bazaars: TornW3B's listings (no key; only the item id).
+ * Item Market: Torn's API with the panel's key. Both through their shared
+ * rate limits.
+ *
+ * @returns {Promise<{rows, at, note, fromMarket}>}
+ */
+function fillListings(market, itemId, { force = false } = {}) {
+    const key = market + ':' + itemId;
+    const now = Date.now();
+    const had = app.fill.listings.get(key);
+    if (had && had.promise) return had.promise;
+    if (!force && had && had.rows && now - had.at < FILL_REUSE_MS) return Promise.resolve(had);
+
+    let promise;
+    if (market === 'bazaar' && app.w3b && app.settings.useW3b !== false) {
+        promise = fetchW3bListings(app.w3b, itemId).then(({ listings }) => ({
+            rows: normalizeW3bListingsForFill(listings),
+            at: Date.now(),
+            note: null,
+            fromMarket: false,
+        }));
+    } else if (market === 'bazaar') {
+        // TornW3B is off in Settings: no request to it. The Item Market stands in.
+        promise = fillListings('market', itemId, { force }).then((m) => ({
+            rows: m.rows,
+            at: m.at,
+            note: 'TornW3B is off in Settings, so these are Item Market prices',
+            fromMarket: true,
+        }));
+    } else if (!app.client || !hasUsableKey()) {
+        return Promise.reject(new Error('Add your Public key in Settings first.'));
+    } else {
+        promise = fetchItemMarket(app.client, itemId, { limit: 20 }).then((m) => {
+            const mine = [...ownMarketPrices(String(itemId))];
+            const rows = m.listings.map((l) => {
+                const at = mine.indexOf(l.price);
+                if (at >= 0) mine.splice(at, 1);
+                return { price: l.price, qty: l.amount, mine: at >= 0 };
+            });
+            return { rows, at: Date.now(), note: null, fromMarket: false };
+        });
+    }
+    const wrapped = promise
+        .then((got) => {
+            const entry = { rows: got.rows, at: got.at, note: got.note, fromMarket: got.fromMarket, error: null, promise: null };
+            app.fill.listings.set(key, entry);
+            return entry;
+        })
+        .catch((error) => {
+            if (isKeyDeadError(error)) markKeyDead(error);
+            const msg = redactKey(String((error && error.message) || error), getStoredKey());
+            app.fill.listings.set(key, { ...(had || {}), promise: null, error: msg, errorAt: Date.now() });
+            throw new Error(msg);
+        });
+    app.fill.listings.set(key, { ...(had || {}), promise: wrapped });
+    return wrapped;
+}
+
+/** The row element a Fill button sits in, as the page is NOW. */
+function fillRowOf(btn) {
+    if (!app.ownBazaar) return null;
+    // The row as scanned (its outermost element), never an inner wrapper that
+    // happens to match: on #/manage the box sits inside item___ inside the row.
+    const row = app.bzRows.find((r) => r.el.contains(btn));
+    return row ? row.el : null;
+}
+
+/**
+ * The Fill button and its result line in one row, right after the price
+ * tag. Returns true when the row has a price box to fill.
+ */
+function ensureFillControls(row, page, tag) {
+    const kind = fillPageKind(page);
+    const inputs = rowInputs(kind, row.el);
+    let box = row.el.querySelector('.ttv2-fillbox');
+    if (!inputs.price.length) {
+        if (box) box.remove();
+        return false;
+    }
+    if (!box) {
+        box = document.createElement('span');
+        box.className = 'ttv2-fillbox';
+        // A tick box, as in the script the friend uses: ticked fills the row,
+        // unticked puts back what was there. Ours, not Torn's (a button with
+        // role checkbox, so a click can never reach Torn's form).
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = FILL_BUTTON_CLASS;
+        btn.setAttribute('role', 'checkbox');
+        btn.setAttribute('aria-checked', 'false');
+        btn.appendChild(Object.assign(document.createElement('span'), { className: 'ttv2-fillmark' }));
+        btn.appendChild(Object.assign(document.createElement('span'), { className: 'ttv2-filllabel', textContent: 'Fill' }));
+        const line = document.createElement('span');
+        line.className = FILL_TAG_CLASS;
+        box.append(btn, line);
+        if (tag && tag.classList.contains('ttv2-bzchips')) tag.appendChild(box);
+        else if (tag && tag.parentNode) tag.parentNode.insertBefore(box, tag.nextSibling);
+        else row.el.appendChild(box);
+    }
+    const btn = box.querySelector('.' + FILL_BUTTON_CLASS);
+    if (btn.dataset.itemId !== String(row.itemId)) btn.dataset.itemId = String(row.itemId);
+    paintFill(box, row.el, row.itemId);
+    return true;
+}
+
+/** The Item Market's price tag: before the price box (its rows have no name slot we can follow). */
+function ensureMarketTag(row, page) {
+    let tag = row.el.querySelector('.' + OWN_BAZAAR_TAG_CLASS);
+    if (!tag) {
+        tag = document.createElement('span');
+        tag.className = OWN_BAZAAR_TAG_CLASS + ' ttv2-bztag-market';
+        const at = fillAnchor(page, row);
+        if (at && at.parent) at.parent.insertBefore(tag, at.before);
+        else row.el.appendChild(tag);
+    }
+    if (tag.dataset.itemId !== String(row.itemId)) tag.dataset.itemId = String(row.itemId);
+    return tag;
+}
+
+/** Whether the boxes still hold what Fill typed (you may have typed over it since). */
+function stillFilled(done) {
+    const price = done.inputs.price;
+    // Digits only: Torn may re-format the box (839999 -> 839,999) after Fill types it.
+    const digits = (v) => String(v).replace(/\D/g, '');
+    return price.length > 0 && price.every((i) => document.contains(i)) && readInputs(price).some((v) => digits(v) === digits(done.priceText));
+}
+
+/** The button's words and the line after it, from what this row has had filled. */
+function paintFill(box, rowEl, itemId) {
+    const btn = box.querySelector('.' + FILL_BUTTON_CLASS);
+    const line = box.querySelector('.' + FILL_TAG_CLASS);
+    if (!btn || !line) return;
+    const done = app.fill.done.get(rowEl);
+    const current = done && done.itemId === String(itemId) && stillFilled(done) ? done : null;
+    if (done && !current) app.fill.done.delete(rowEl);
+    const busy = app.fill.busy.has(rowEl);
+    const compact = Boolean(box.parentNode && box.parentNode.classList && box.parentNode.classList.contains('ttv2-bzchips'));
+    const failedNow = !current && app.fill.last.get(String(itemId));
+    const label = busy ? 'Filling…' : current && compact ? formatMoney(current.price) : 'Fill';
+    const labelEl = btn.querySelector('.ttv2-filllabel');
+    if (labelEl && labelEl.textContent !== label) labelEl.textContent = label;
+    const checked = String(Boolean(current));
+    if (btn.getAttribute('aria-checked') !== checked) btn.setAttribute('aria-checked', checked);
+    let title = current ? current.words + '. Untick to put back what was in the boxes.' : 'Tick to type the price (and quantity) into this row. You press Torn\'s button.';
+    if (!current && failedNow && failedNow.error && failedNow.rowEl === rowEl) title = failedNow.error;
+    if (btn.title !== title) btn.title = title;
+    const tone = current ? current.level || '' : failedNow && failedNow.error && failedNow.rowEl === rowEl ? 'bad' : '';
+    if ((btn.dataset.level || '') !== tone) btn.dataset.level = tone;
+    if (btn.disabled !== busy) btn.disabled = busy;
+    const failed = !current && app.fill.last.get(String(itemId));
+    const failedHere = Boolean(failed && failed.error && failed.rowEl === rowEl);
+    const words = current ? current.words : failedHere ? failed.error : '';
+    const level = current ? current.level || '' : failedHere ? 'bad' : '';
+    if (line.textContent !== words) line.textContent = words;
+    if ((line.dataset.level || '') !== level) line.dataset.level = level;
+    if (line.hidden !== !words) line.hidden = !words;
+}
+
+function repaintFills() {
+    if (!app.ownBazaar) return;
+    for (const row of app.bzRows) {
+        const box = row.el.querySelector('.ttv2-fillbox');
+        if (box) paintFill(box, row.el, row.itemId);
+    }
+}
+
+function removeFillControls(root = document) {
+    for (const n of root.querySelectorAll('.ttv2-fillbox, .ttv2-fillset, .ttv2-bzchips')) n.remove();
+}
+
+/**
+ * "Fill settings" in Torn's links bar (beside Manage items, Personalize and
+ * Back on your bazaar), as the reference script puts its settings there. It
+ * opens the panel's Settings at the Fill part; it is ours, not Torn's.
+ */
+function ensureFillSettingsLink() {
+    const bar = linksBar(document);
+    if (!bar || bar.querySelector('.ttv2-fillset')) return;
+    const a = document.createElement('a');
+    a.href = '#';
+    a.className = 'ttv2-fillset';
+    a.setAttribute('role', 'button');
+    a.title = 'Which listing Fill undercuts, and by how much';
+    a.textContent = 'Fill settings';
+    // Torn's own link look, copied from the first link in the bar.
+    const like = bar.querySelector('a[class*="linkContainer___"]');
+    if (like) a.className = like.className.replace(/\biconActive___\S*/g, '') + ' ttv2-fillset';
+    bar.insertBefore(a, bar.firstChild);
+}
+
+function openFillSettings() {
+    if (app.panel.collapsed) app.panel.setCollapsed(false, { save: true });
+    app.panel.openFillSettings();
+}
+
+/** A Fill button was clicked: fill its row, or undo what it filled. */
+function onFillPress(btn) {
+    const rowEl = fillRowOf(btn);
+    const itemId = btn.dataset.itemId;
+    if (!rowEl || !itemId) return;
+    const now = rowItemIdNow(fillPageKind(app.ownBazaar), rowEl);
+    if (now && now !== itemId) {
+        // Torn reused this row for another item since the box was drawn.
+        rescan();
+        return;
+    }
+    const done = app.fill.done.get(rowEl);
+    if (done && done.itemId === itemId && stillFilled(done)) {
+        writeInputs(done.inputs.price, done.prev.price);
+        if (done.qtyWritten) writeInputs(done.inputs.qty, done.prev.qty);
+        app.fill.done.delete(rowEl);
+        repaintFills();
+        renderMyBazaar();
+        return;
+    }
+    fillRow(rowEl, itemId).catch(() => {});
+}
+
+/**
+ * Fill one row: read the prices fresh (or from the last minute), work out
+ * the price with your Fill settings, type it (and the quantity) into this
+ * row's boxes. `base`: undercut this listing instead (a price clicked in
+ * the panel).
+ */
+async function fillRow(rowEl, itemId, { base = null } = {}) {
+    const page = app.ownBazaar;
+    if (!page || app.fill.busy.has(rowEl)) return;
+    const kind = fillPageKind(page);
+    const market = page.startsWith('market') ? 'market' : 'bazaar';
+    const settings = fillSettings()[market];
+    const item = app.index ? app.index.byId.get(String(itemId)) : null;
+    app.fill.last.delete(String(itemId));
+    app.fill.busy.add(rowEl);
+    repaintFills();
+    try {
+        const [got] = await Promise.all([
+            base ? Promise.resolve({ rows: [], note: null, fromMarket: false }) : fillListings(market, itemId),
+            market === 'bazaar' ? ensureSelfId() : Promise.resolve(null),
+        ]);
+        if (app.ownBazaar !== page || !document.contains(rowEl)) throw new Error('The page changed; press Fill again.');
+        const avg = itemAverage(itemId);
+        const ctx = { npc: item && item.sellPrice > 0 ? item.sellPrice : null, avg, selfId: app.fill.selfId, checkFresh: market === 'bazaar' && !got.fromMarket };
+        // A listing picked in the panel is undercut under the same rules as any other.
+        const r = base ? fillPrice([base], { ...settings, index: 1 }, ctx) : fillPrice(got.rows, settings, ctx);
+        if (!(r.price > 0)) throw new Error(base && r.why && /No listing/.test(r.why) ? 'That listing is not one Fill undercuts (yours, $1, stale or far under the average).' : r.why || 'No listing to undercut.');
+
+        // Torn's #/manage reuses row elements: the row must still show this item.
+        const nowId = rowItemIdNow(kind, rowEl);
+        if (nowId && nowId !== String(itemId)) throw new Error('The row changed while prices loaded; tick again.');
+        const inputs = rowInputs(kind, rowEl);
+        if (!inputs.price.length) throw new Error('Torn\'s price box was not found in this row.');
+        // Filled already (a price picked in the panel after a tick): Undo still puts back the first values.
+        const before = app.fill.done.get(rowEl);
+        const again = before && before.itemId === String(itemId) && stillFilled(before) ? before : null;
+        const prev = again ? again.prev : { price: readInputs(inputs.price), qty: readInputs(inputs.qty) };
+        const text = priceText(kind, r.price);
+        writeInputs(inputs.price, text);
+
+        // Quantity: all you have (or all but one), unless you typed one already.
+        let qtyWritten = again ? again.qtyWritten : false;
+        let qtyNote = '';
+        if (inputs.qty.length && !again) {
+            const typed = prev.qty.some((v) => String(v).trim() && String(v).trim() !== '0');
+            const q = fillQuantity(inputs.have, settings.qty);
+            if (!typed && q) {
+                writeInputs(inputs.qty, String(q));
+                qtyWritten = true;
+            } else if (!typed && !q) {
+                qtyNote = inputs.have === 1 && settings.qty === 'allbut1' ? 'you have 1: quantity left empty' : 'type the quantity';
+            }
+        }
+
+        const v = fillVerdict(r.price, avg);
+        const stats = Boolean(item && STAT_ITEM_TYPES.has(item.type));
+        const parts = [(base ? 'Under the one you picked: ' : 'Filled ') + formatMoney(r.price)];
+        if (kind.startsWith('market')) parts.push('you get ' + formatMoney(Math.floor(r.price * (1 - VENUE_FEES.ITEM_MARKET))) + ' after the fee');
+        if (v.text) parts.push(v.text);
+        if (r.floor === 'npc') parts.push('held at the NPC price');
+        if (r.floor === 'avg') parts.push('held at the average');
+        if (!base && r.used < r.index) parts.push(r.count === 1 ? 'only 1 listing, so that one' : 'only ' + r.count + ' listings, so the highest of them');
+        if (stats) parts.push('each one has its own stats: check the price');
+        if (inputs.single) parts.push('tick Torn\'s box for this one');
+        if (qtyNote) parts.push(qtyNote);
+        if (got.note) parts.push(got.note);
+        const level = stats || v.level === 'warn' ? 'warn' : v.level === 'good' ? 'good' : '';
+
+        app.fill.done.set(rowEl, { itemId: String(itemId), price: r.price, priceText: text, prev, inputs, qtyWritten, words: parts.join(' · '), level, at: Date.now() });
+        app.bzSelected = String(itemId);
+    } catch (error) {
+        const msg = redactKey(String((error && error.message) || error), getStoredKey());
+        app.fill.last.set(String(itemId), { error: 'Fill: ' + msg, rowEl, at: Date.now() });
+    } finally {
+        app.fill.busy.delete(rowEl);
+        repaintFills();
+        renderMyBazaar();
+    }
+}
+
+/** A price picked in the panel's lowest listings: undercut that one, in the item's first row. */
+function onFillFromListing(market, index) {
+    const itemId = app.bzSelected;
+    const got = app.fill.listings.get(market + ':' + itemId);
+    const pick = got && got.shown ? got.shown[index] : null;
+    const row = app.bzRows.find((r) => r.itemId === itemId && document.contains(r.el) && r.el.querySelector('.ttv2-fillbox'));
+    if (!pick || !row || pick.mine || pick.stale || pick.troll) return;
+    fillRow(row.el, itemId, { base: pick.row || pick }).catch(() => {});
+}
+
+/** What the panel shows for the item picked: its lowest listings on both markets, and what Fill would type. */
+function fillPanelView(itemId) {
+    if (!itemId || !app.ownBazaar) return null;
+    const now = Date.now();
+    const avg = itemAverage(itemId);
+    const page = app.ownBazaar;
+    const market = page.startsWith('market') ? 'market' : 'bazaar';
+    const settings = fillSettings()[market];
+    const item = app.index ? app.index.byId.get(String(itemId)) : null;
+    const out = { market, lists: {}, preview: null, filled: null, canFill: app.bzRows.some((r) => r.itemId === itemId && r.el.querySelector('.ttv2-fillbox')) };
+
+    for (const m of ['bazaar', 'market']) {
+        const cur0 = app.fill.listings.get(m + ':' + itemId);
+        // Read for the panel too, only while you look at it; reused a minute,
+        // and a failure waits a minute before it is asked again.
+        const due = !cur0 || (!cur0.promise && (cur0.error ? now - (cur0.errorAt || 0) >= FILL_REUSE_MS : now - (cur0.at || 0) >= FILL_REUSE_MS));
+        const can = m === 'bazaar' ? true : Boolean(app.client && hasUsableKey());
+        if (due && can && document.visibilityState === 'visible') {
+            fillListings(m, itemId)
+                .catch(() => {})
+                .finally(() => renderMyBazaar());
+        }
+        const cur = app.fill.listings.get(m + ':' + itemId);
+        if (!cur || !cur.rows) {
+            out.lists[m] = { state: cur && cur.error ? 'error' : can ? 'loading' : 'nokey', error: cur ? cur.error : null, rows: [] };
+            continue;
+        }
+        const self = app.fill.selfId;
+        const shown = cur.rows
+            .filter((r) => r.price > 1 && !r.sponsored)
+            .slice()
+            .sort((a, b) => a.price - b.price)
+            .slice(0, FILL_SHOW_LISTINGS)
+            .map((r) => ({
+                price: r.price,
+                qty: r.qty,
+                name: r.sellerName || null,
+                mine: Boolean(r.mine || (self && r.sellerId && String(r.sellerId) === String(self))),
+                net: m === 'market' ? Math.floor(r.price * (1 - VENUE_FEES.ITEM_MARKET)) : null,
+                stale: m === 'bazaar' && !cur.fromMarket && !(r.dataAt && now - r.dataAt <= FILL_FRESH_MS),
+                // Far under the average: a troll or a mistake, never the one undercut.
+                troll: Boolean(avg > 0 && r.price < avg * FILL_TROLL_SHARE),
+                row: r,
+            }));
+        cur.shown = shown;
+        out.lists[m] = { state: 'ok', rows: shown, at: cur.at, note: cur.note || null, fromMarket: Boolean(cur.fromMarket) };
+    }
+
+    const got = app.fill.listings.get(market + ':' + itemId);
+    if (got && got.rows) {
+        const r = fillPrice(got.rows, settings, { npc: item && item.sellPrice > 0 ? item.sellPrice : null, avg, selfId: app.fill.selfId, checkFresh: market === 'bazaar' && !got.fromMarket });
+        if (r.price) out.preview = { price: r.price, verdict: fillVerdict(r.price, avg), floor: r.floor, base: r.base ? r.base.price : null, used: r.used };
+    }
+    for (const row of app.bzRows) {
+        const done = app.fill.done.get(row.el);
+        if (done && done.itemId === String(itemId) && stillFilled(done)) out.filled = { price: done.price };
+    }
+    return out;
 }
 
 /* ------------------------------------------------------------------ *
@@ -1515,7 +2194,8 @@ async function onScanPage() {
 function scanSummary() {
     if (app.ownBazaar) {
         const d = app.bzDiagnostics || { rows: 0, identified: 0 };
-        return 'Your bazaar: ' + d.identified + ' of ' + d.rows + ' rows priced.';
+        const where = app.ownBazaar.startsWith('market') ? 'Item Market' : 'Your bazaar';
+        return where + ': ' + d.identified + ' of ' + d.rows + ' rows priced.';
     }
     if (app.pageType === PAGE_NONE) {
         return 'Not a Bazaar or Item Market page.';
@@ -1681,11 +2361,11 @@ function onMutations(mutations) {
 
 /** A change to, or inside, one of the helper's own price tags is not the page changing. */
 function isOwnTagMutation(m) {
-    const isTag = (n) =>
-        n && n.nodeType === 1 && n.classList && n.classList.contains(OWN_BAZAAR_TAG_CLASS);
+    const ours = '.' + OWN_BAZAAR_TAG_CLASS + ', .' + FILL_TAG_CLASS + ', .ttv2-fillbox, .ttv2-bzchips, .ttv2-fillset';
+    const isTag = (n) => n && n.nodeType === 1 && n.matches && n.matches(ours);
     const inTag = (n) => {
         const el = n && n.nodeType === 1 ? n : n && n.parentElement;
-        return Boolean(el && el.closest && el.closest('.' + OWN_BAZAAR_TAG_CLASS));
+        return Boolean(el && el.closest && el.closest(ours));
     };
     if (inTag(m.target)) return true;
     const nodes = [...(m.addedNodes || []), ...(m.removedNodes || [])];
@@ -1885,6 +2565,9 @@ function registerMenu() {
  * The traders page (its own tab)
  * ------------------------------------------------------------------ */
 
+/* The Torn Ledger's state on Torn Bids (the key itself stays in storage). */
+const led = { client: null, data: null, busy: false, checking: false, error: null, keyError: null, saveMsg: null, nextAt: 0 };
+
 const sell = {
     client: null,
     te: null,
@@ -1924,11 +2607,15 @@ const sell = {
     /* Your own Torn id: your listings are never "the cheapest", nor a bazaar to buy from. */
     selfId: null,
     selfTried: false,
-    /* The item on the desk (and whether you picked it), the list's filter and search. */
+    /* Traders' networth: id -> {value, at, pending, retryAt}. */
+    networth: new Map(),
+    networthAsked: [],
+    /* The item on the desk (and whether you picked it), the list's filter, search and category. */
     selected: null,
     pickedByYou: false,
     filter: 'all',
     query: '',
+    category: '',
     /* When statuses were asked, for the per-minute limit. */
     presenceAsked: [],
     /* Our trader database (TornW3B lists), and its item index for this render. */
@@ -2407,23 +3094,47 @@ function renderSelling() {
     };
     // A flip sells to a believable buyer only (see flipBuyer), and never
     // buys more than your Most per flip.
+    // ...and never asks a trader to pay more than your share of their networth.
+    const unitsOf = (b) => payableUnits(b.price, b.id ? networthOf(b.id) : null, prefs.networthPct);
     const flipBuyerOf = (id) => {
         const item = itemOf(id);
-        return flipBuyer(buyersOf(id), { avg: item ? Number(item.marketValue) || null : null, type: item ? item.type : null });
+        return flipBuyer(buyersOf(id), { avg: item ? Number(item.marketValue) || null : null, type: item ? item.type : null, unitsOf });
     };
+    const flipBuyersOf = (id) => {
+        const item = itemOf(id);
+        return flipBuyers(buyersOf(id), { avg: item ? Number(item.marketValue) || null : null, type: item ? item.type : null, unitsOf });
+    };
+    // The plan that makes the most among the believable buyers (each capped
+    // by what they can pay); a tie goes to the higher bid.
     const planOf = (id) => {
         const rows = sellersOf(id);
-        const b = flipBuyerOf(id);
-        const plan = rows && b ? flipPlan(rows, b.price, { cash: prefs.cash, maxUnits: prefs.maxPerFlip }) : null;
-        return plan ? { ...plan, buyer: b } : null;
+        if (!rows) return null;
+        let best = null;
+        for (const b of flipBuyersOf(id)) {
+            const most = Math.min(prefs.maxPerFlip || 100, b.maxUnits ? b.maxUnits : Infinity);
+            const plan = flipPlan(rows, b.price, { cash: prefs.cash, maxUnits: most });
+            if (!plan) continue;
+            if (!best || plan.profit > best.profit || (plan.profit === best.profit && plan.units > 0 && !best.units)) best = { ...plan, buyer: b };
+        }
+        return best;
     };
 
     // Which items' bazaars to read for a flip: where a buyer you would sell
     // to pays more than the summary's cheapest.
     sell.candidates = sell.summary
-        ? flipCandidates(summary, (id) => {
-            const b = flipBuyerOf(id);
-            return b ? b.price : null;
+        ? flipCandidates(summary, (id, lowest) => {
+            // The buyer who would make the most at the summary's price, with their cap.
+            let pick = null;
+            let score = -Infinity;
+            for (const b of flipBuyersOf(id)) {
+                const n = Math.min(prefs.maxPerFlip || 100, b.maxUnits || Infinity, prefs.cash > 0 ? Math.floor(prefs.cash / lowest) : Infinity);
+                const s = (b.price - lowest) * n;
+                if (s > score) {
+                    score = s;
+                    pick = b;
+                }
+            }
+            return pick ? { price: pick.price, maxUnits: pick.maxUnits || null } : null;
         }, { cash: prefs.cash, maxUnits: prefs.maxPerFlip })
         : [];
     const flipsChecked = sell.candidates.filter((c) => {
@@ -2435,7 +3146,7 @@ function renderSelling() {
     const oneIds = [...sell.teOne].filter(([, rec]) => rec.best).map(([id]) => id);
     const allIds = new Set([...heldQty.keys(), ...teMap.keys(), ...w3bByItem.keys(), ...oneIds]);
     const q = String(sell.query || '').trim().toLowerCase();
-    const rows = [];
+    let rows = [];
     for (const id of allIds) {
         const name = nameOf(id);
         if (q && !String(name).toLowerCase().includes(q)) continue;
@@ -2457,8 +3168,12 @@ function renderSelling() {
                 badge = { kind: 'sell' };
             }
         }
-        rows.push({ itemId: id, name, held, lowest, badge, value, bid: best ? best.price : 0, pending: !best && pendingFor(id), plan, best });
+        rows.push({ itemId: id, name, held, lowest, badge, value, bid: best ? best.price : 0, pending: !best && pendingFor(id), plan, best, category: itemCategory(itemOf(id)) });
     }
+    // The category filters the flips, the list and its counts together; its
+    // own counts follow the search only.
+    const categories = categoryCounts(rows.map((r) => r.category), sell.category);
+    if (sell.category) rows = rows.filter((r) => r.category === sell.category);
     const counts = {
         all: rows.length,
         mine: rows.filter((r) => r.held).length,
@@ -2523,6 +3238,15 @@ function renderSelling() {
 
     const watch = sellWatch({ desk, strip, listed, held: [...heldQty.keys()], buyersAll });
     updateSellPresence(watch, now);
+    // Networth: the buyers the flips sell to first, then the desk's top traders.
+    const nwIds = [];
+    for (const f of strip) if (f.buyer && f.buyer.id) nwIds.push(String(f.buyer.id));
+    for (const c of sell.candidates) {
+        const b = flipBuyerOf(c.itemId);
+        if (b && b.id) nwIds.push(String(b.id));
+    }
+    if (desk) for (const b of desk.buyers.slice(0, 5)) if (b.id) nwIds.push(String(b.id));
+    updateSellNetworth([...new Set(nwIds)], now);
     const statusesKnown = watch.ids.filter((id) => !presenceUnknown(id)).length;
 
     const heldCount = sell.inventory ? sell.inventory.length : 0;
@@ -2532,10 +3256,19 @@ function renderSelling() {
 
     sell.page.render({
         strip,
+        ledger: ledgerView(),
+        itemNameOf: (id) => nameOf(id),
+        itemTypeOf: (id) => {
+            const item = itemOf(id);
+            return item ? item.type : null;
+        },
+        networth: networthMap(),
         list: listed.slice(0, sell.allShown).map((r) => ({ itemId: r.itemId, name: r.name, held: r.held, lowest: r.lowest, badge: r.badge, pending: r.pending })),
         listTotal: listed.length,
         counts,
         filter: sell.filter,
+        categories,
+        category: sell.category,
         desk,
         statuses,
         prefs,
@@ -2818,6 +3551,75 @@ function loadTeItemList(itemId) {
  * first): visible tab only, at most SELL_PRESENCE_PER_MIN a minute.
  * @param {{ids: string[], open: Set<string>}} watch - from sellWatch
  */
+/** A trader's networth when known (from the store, 12 hours at most), else null. */
+function networthOf(id) {
+    const rec = sell.networth.get(String(id));
+    return rec && rec.value !== null && rec.value !== undefined ? rec.value : null;
+}
+
+function networthMap() {
+    const out = new Map();
+    for (const [id, rec] of sell.networth) if (rec.value !== null && rec.value !== undefined) out.set(id, rec.value);
+    return out;
+}
+
+function loadSellNetworth() {
+    const now = Date.now();
+    const stored = gmGet(STORE_SELL_NETWORTH, {}) || {};
+    for (const [id, rec] of Object.entries(stored)) {
+        if (rec && Number.isFinite(rec.value) && now - rec.at < SELL_NETWORTH_REFRESH_MS * 2) sell.networth.set(id, { value: rec.value, at: rec.at, pending: false, retryAt: 0 });
+    }
+}
+
+function saveSellNetworth() {
+    const out = {};
+    for (const [id, rec] of sell.networth) if (Number.isFinite(rec.value)) out[id] = { value: rec.value, at: rec.at };
+    gmSet(STORE_SELL_NETWORTH, out);
+}
+
+/**
+ * Ask Torn for the networth of the traders a flip would sell to: public
+ * personal stats, one call each, at most SELL_NETWORTH_PER_MIN a minute
+ * inside the shared limit, only while this tab is in front, each kept 12h.
+ */
+function updateSellNetworth(ids, now) {
+    if (!getSellKey() || sell.keyDead || document.visibilityState !== 'visible') return;
+    sell.networthAsked = (sell.networthAsked || []).filter((t) => now - t < 60000);
+    for (const id of ids) {
+        if (sell.networthAsked.length >= SELL_NETWORTH_PER_MIN) break;
+        let rec = sell.networth.get(id);
+        if (!rec) {
+            rec = { value: null, at: 0, pending: false, retryAt: 0 };
+            sell.networth.set(id, rec);
+        }
+        if (rec.pending || now < rec.retryAt || (rec.value !== null && now - rec.at < SELL_NETWORTH_REFRESH_MS)) continue;
+        rec.pending = true;
+        sell.networthAsked.push(now);
+        fetchNetworth(sell.client, id)
+            .then((value) => {
+                if (value === null) {
+                    rec.retryAt = Date.now() + SELL_NETWORTH_RETRY_MS;
+                    return;
+                }
+                rec.value = value;
+                rec.at = Date.now();
+                saveSellNetworth();
+            })
+            .catch((error) => {
+                if (isKeyDeadError(error)) {
+                    sell.keyDead = true;
+                    sell.keyError = sellKeyErrorText(error);
+                    gmSet(STORE_SELL_KEY_DEAD, true);
+                }
+                rec.retryAt = Date.now() + SELL_NETWORTH_RETRY_MS;
+            })
+            .finally(() => {
+                rec.pending = false;
+                renderSelling();
+            });
+    }
+}
+
 function updateSellPresence({ ids, open }, now) {
     for (const id of ids) {
         if (!sell.presence.has(id)) {
@@ -2989,6 +3791,15 @@ function onSellFilter(key) {
     renderSelling();
 }
 
+/** A category (Torn's item type), or '' for all: the desk moves to the first item there. */
+function onSellCategory(category) {
+    sell.category = String(category || '');
+    sell.selected = null;
+    sell.pickedByYou = false;
+    sell.allShown = ALL_ITEMS_PAGE;
+    renderSelling();
+}
+
 function onSellQuery(text) {
     sell.query = String(text || '');
     sell.allShown = ALL_ITEMS_PAGE;
@@ -3006,6 +3817,7 @@ function bootSellingPage() {
         loadWindow: () => gmGet(STORE_API_WINDOW, []),
         saveWindow: (recent) => gmSet(STORE_API_WINDOW, recent),
     });
+    loadSellNetworth();
     /*
      * The pace and any penalty wait live in storage, shared by every tab:
      * a reload or a second traders tab carries on from the same clock.
@@ -3052,16 +3864,26 @@ function bootSellingPage() {
         onRevealKey: () => getSellKey(),
         onSaveTeKey: onSellSaveTeKey,
         onForgetTeKey: onSellForgetTeKey,
+        onLedgerSaveKey,
+        onLedgerForget,
+        onLedgerRead: () => {
+            led.nextAt = 0;
+            runLedger();
+        },
         onRetryTe: onSellRetryTe,
         onRevealTeKey: () => getTeKey(),
         onRefresh: onSellRefresh,
         onPrefsChange: (partial) => {
-            gmSet(STORE_SELL_PREFS, { ...sellPrefs(), ...partial });
+            // Onto what is stored, not just the known keys: trustedOn311 (the
+            // one-time Trusted switch) must survive, or Trusted comes back on
+            // at every reload after any setting is saved.
+            gmSet(STORE_SELL_PREFS, { ...(gmGet(STORE_SELL_PREFS, {}) || {}), ...sellPrefs(), ...partial });
             renderSelling();
         },
         onSelect: onSellSelect,
         onFilter: onSellFilter,
         onQuery: onSellQuery,
+        onCategory: onSellCategory,
         onMore: () => {
             sell.allShown += ALL_ITEMS_PAGE;
             renderSelling();
@@ -3105,6 +3927,24 @@ function bootSellingPage() {
     setInterval(stepW3b, W3B_LIST_STEP_MS);
     setInterval(stepTeOne, TE_ONE_STEP_MS);
 
+    // Another Torn Bids tab saved, forgot or read: take its word for it.
+    gmOnChange(STORE_LEDGER_KEY, () => {
+        led.data = null;
+        led.nextAt = 0;
+        renderSelling();
+    });
+    gmOnChange(STORE_LEDGER, () => {
+        if (!led.busy) led.data = null;
+        renderSelling();
+    });
+    led.client = new LedgerClient({
+        getKey: getLedgerKey,
+        loadWindow: () => gmGet(STORE_API_WINDOW, []),
+        saveWindow: (recent) => gmSet(STORE_API_WINDOW, recent),
+    });
+    runLedger();
+    setInterval(() => runLedger(), 15000);
+
     setInterval(() => {
         if (document.visibilityState !== 'visible') return;
         refreshSellTraders();
@@ -3125,6 +3965,270 @@ function bootSellingPage() {
         else saveTraderDb(true);
     });
     window.addEventListener('pagehide', () => saveTraderDb(true));
+}
+
+/* ------------------------------------------------------------------ *
+ * Torn Ledger: your profit, from your own log, with its own Full key
+ * ------------------------------------------------------------------ */
+
+/**
+ * The Ledger's key: its own storage entry, its own client (only its four
+ * paths - see api/ledger.js), read only here on Torn Bids. Never shown after
+ * Save, never logged, redacted from every error. Forget deletes it and the
+ * ledger.
+ */
+function getLedgerKey() {
+    return gmGet(STORE_LEDGER_KEY, '') || '';
+}
+
+function ledgerData() {
+    if (!led.data) led.data = readLedger(gmGet(STORE_LEDGER, null));
+    return led.data;
+}
+
+function saveLedger() {
+    if (led.data) gmSet(STORE_LEDGER, led.data);
+}
+
+function ledgerErrorText(error) {
+    const code = error && error.code;
+    if (code === 2) return 'Torn says this key is wrong. Paste your Full key again.';
+    if (code === 13) return 'Torn paused this key: its owner has not played for 7 days.';
+    if (code === 18) return 'This key is paused in Torn\'s settings.';
+    if (code === 16) return 'This key cannot read your log. The Ledger needs a Full key.';
+    if (code === 5) return 'Torn asked us to slow down; the Ledger reads again in a few minutes.';
+    return redactKey(String((error && error.message) || error || 'Could not read your log.'), getLedgerKey());
+}
+
+function markLedgerKeyDead(error) {
+    led.keyError = ledgerErrorText(error);
+    gmSet(STORE_LEDGER_KEY_DEAD, led.keyError);
+}
+
+/** Save a key only when Torn says it is a Full key; anything else is refused, with why. */
+async function onLedgerSaveKey(key) {
+    key = String(key || '').trim();
+    led.saveMsg = null;
+    if (!key) {
+        led.saveMsg = { bad: true, text: 'Paste your Full key first.' };
+        renderSelling();
+        return;
+    }
+    if (!/^[A-Za-z0-9]{16}$/.test(key)) {
+        led.saveMsg = { bad: true, text: 'A Torn key is 16 letters and digits.' };
+        renderSelling();
+        return;
+    }
+    led.checking = true;
+    renderSelling();
+    const probe = new LedgerClient({
+        getKey: () => key,
+        loadWindow: () => gmGet(STORE_API_WINDOW, []),
+        saveWindow: (recent) => gmSet(STORE_API_WINDOW, recent),
+        maxRetries: 0,
+    });
+    try {
+        const info = await fetchLedgerKeyInfo(probe);
+        if (!isFullKey(info)) {
+            led.saveMsg = { bad: true, text: 'This is ' + (info.type ? 'a ' + info.type.replace(/\s*access$/i, '') : 'not a Full') + ' key. The Ledger reads your log, which needs a Full key. Not saved.' };
+            return;
+        }
+        if (!info.userId) {
+            led.saveMsg = { bad: true, text: 'Torn did not say whose key this is. Not saved.' };
+            return;
+        }
+        // Another account's key: its own ledger, not this one's rows.
+        const was = gmGet(STORE_LEDGER_SELF, null);
+        if (was && String(was) !== String(info.userId)) {
+            gmDel(STORE_LEDGER);
+            led.data = null;
+        }
+        gmSet(STORE_LEDGER_KEY, key);
+        gmDel(STORE_LEDGER_KEY_DEAD);
+        gmSet(STORE_LEDGER_SELF, info.userId);
+        led.keyError = null;
+        led.saveMsg = { bad: false, text: 'Saved · Full access.' };
+        led.nextAt = 0;
+        runLedger();
+    } catch (error) {
+        led.saveMsg = { bad: true, text: redactKey(ledgerErrorText(error), key) };
+    } finally {
+        led.checking = false;
+        renderSelling();
+    }
+}
+
+/** Forget the key AND everything the Ledger stored. */
+function onLedgerForget() {
+    gmDel(STORE_LEDGER_KEY);
+    gmDel(STORE_LEDGER_KEY_DEAD);
+    gmDel(STORE_LEDGER_SELF);
+    gmDel(STORE_LEDGER);
+    led.data = null;
+    led.keyError = null;
+    led.error = null;
+    led.saveMsg = { bad: false, text: 'Key and ledger deleted.' };
+    renderSelling();
+}
+
+/**
+ * Read what is new in your log (and your finished trades), then go further
+ * back until a year is read. A few calls per run, through the shared request
+ * window; only while Torn Bids is in front; every LEDGER_EVERY_MS.
+ */
+async function runLedger({ now = Date.now() } = {}) {
+    if (led.busy || !getLedgerKey() || gmGet(STORE_LEDGER_KEY_DEAD, null) || document.visibilityState !== 'visible') return;
+    if (now < led.nextAt) return;
+    led.busy = true;
+    led.error = null;
+    renderSelling();
+    // The key this run reads with. If it is forgotten or replaced meanwhile
+    // (here or in another tab), the run stops and keeps nothing.
+    const key = getLedgerKey();
+    const same = () => getLedgerKey() === key;
+    let calls = 0;
+    const data = ledgerData();
+    const page = async (params) => {
+        calls += 1;
+        const rows = await fetchLogPage(led.client, params);
+        if (!same()) throw new LedgerKeyChanged();
+        return rows;
+    };
+    try {
+        const nowS = Math.floor(now / 1000);
+        if (!data.startedAt) data.startedAt = nowS;
+        // 1. What is new since the newest entry read. Newest first, 100 a
+        //    page: the gap is walked back from the top, and where a run stops
+        //    is kept (data.gap), so the next run carries on there - a gap of
+        //    any size is read in the end.
+        if (data.newestAt) {
+            const gap = data.gap || { to: null, newest: data.newestAt };
+            while (calls < LEDGER_CALLS_PER_RUN) {
+                const rows = await page({ from: data.newestAt, to: gap.to });
+                addLedgerRows(data, rows.flatMap(rowsFromLog));
+                data.logCount += rows.length;
+                const span = logSpan(rows);
+                if (span.max > gap.newest) gap.newest = span.max;
+                if (rows.length < 100 || !span.min || (gap.to && span.min >= gap.to)) {
+                    data.newestAt = gap.newest;
+                    data.gap = null;
+                    break;
+                }
+                gap.to = span.min;
+                data.gap = gap;
+            }
+        }
+        // 2. Further back, until a year is read.
+        const floor = nowS - LEDGER_BACKFILL_S;
+        while (!data.backfilled && calls < LEDGER_CALLS_PER_RUN) {
+            const rows = await page({ to: data.oldestAt || null });
+            addLedgerRows(data, rows.flatMap(rowsFromLog));
+            data.logCount += rows.length;
+            const span = logSpan(rows);
+            if (span.max > data.newestAt) data.newestAt = span.max;
+            const done = rows.length < 100 || !span.min || span.min <= floor || (data.oldestAt && span.min >= data.oldestAt);
+            if (span.min) data.oldestAt = span.min;
+            if (done) data.backfilled = true;
+        }
+        // An empty log: from now on, new entries are read.
+        if (data.backfilled && !data.newestAt) data.newestAt = data.startedAt;
+        // 3. Finished trades: each read once. A day of overlap covers any
+        //    difference between the list's order and when a trade finished.
+        let self = gmGet(STORE_LEDGER_SELF, null);
+        // Whose key it is (learned at Save; asked once if it was not).
+        if (!self && calls < LEDGER_CALLS_PER_RUN) {
+            calls += 1;
+            const info = await fetchLedgerKeyInfo(led.client);
+            if (!same()) throw new LedgerKeyChanged();
+            if (info.userId) {
+                self = info.userId;
+                gmSet(STORE_LEDGER_SELF, self);
+            }
+        }
+        if (self && calls < LEDGER_CALLS_PER_RUN) {
+            calls += 1;
+            const trades = await fetchTradesPage(led.client, { from: data.tradesAt ? data.tradesAt - 24 * 60 * 60 : nowS - LEDGER_BACKFILL_S });
+            if (!same()) throw new LedgerKeyChanged();
+            const seen = new Set(data.tradeIds);
+            const fails = data.tradeFails || {};
+            let complete = true;
+            for (const t of trades) {
+                if (!t || seen.has(String(t.id))) continue;
+                if (calls >= LEDGER_CALLS_PER_RUN) {
+                    complete = false;
+                    break;
+                }
+                calls += 1;
+                let full = null;
+                try {
+                    full = await fetchTrade(led.client, t.id);
+                } catch (error) {
+                    if (error && (KEY_DEAD_CODES.has(error.code) || error.code === 16 || error.code === 5)) throw error;
+                    // One trade Torn will not give: tried 3 times, then passed over.
+                    fails[t.id] = (fails[t.id] || 0) + 1;
+                    data.tradeFails = fails;
+                    if (fails[t.id] < 3) {
+                        complete = false;
+                        continue;
+                    }
+                }
+                if (!same()) throw new LedgerKeyChanged();
+                const valueOf = (id) => {
+                    const item = sell.index && sell.index.byId ? sell.index.byId.get(String(id)) : null;
+                    return item ? item.marketValue : 1;
+                };
+                if (full) addLedgerRows(data, rowsFromTrade({ ...t, ...full }, self, valueOf));
+                seen.add(String(t.id));
+                delete fails[t.id];
+            }
+            data.tradeIds = [...seen].slice(-3000);
+            // Moved on only past trades all read (not ones a full run left for later).
+            if (complete) {
+                const latest = trades.reduce((m, t) => Math.max(m, Number(t && (t.completed_at || t.timestamp || t.modified_at)) || 0), data.tradesAt || 0);
+                if (trades.length < 100) data.tradesAt = latest;
+                else data.tradesAt = Math.max(data.tradesAt || 0, latest - 24 * 60 * 60);
+            }
+        }
+        data.readAt = Date.now();
+        if (same()) saveLedger();
+        led.nextAt = Date.now() + (data.backfilled && !data.gap ? LEDGER_EVERY_MS : LEDGER_BACKFILL_GAP_MS);
+    } catch (error) {
+        if (error instanceof LedgerKeyChanged || !same()) {
+            // Forgotten or replaced mid-run: nothing kept, nothing marked; the new key reads at once.
+            led.data = null;
+            led.nextAt = 0;
+        } else {
+            if (error && (KEY_DEAD_CODES.has(error.code) || error.code === 16)) markLedgerKeyDead(error);
+            led.error = ledgerErrorText(error);
+            led.nextAt = Date.now() + LEDGER_EVERY_MS;
+            saveLedger();
+        }
+    } finally {
+        led.busy = false;
+        renderSelling();
+        if (led.nextAt === 0 && getLedgerKey()) setTimeout(() => runLedger(), 0);
+    }
+}
+
+/** A run noticed its key was forgotten or replaced. */
+class LedgerKeyChanged extends Error {}
+
+/** What the page shows about the Ledger: its key's state and the rows (no key, ever). */
+function ledgerView() {
+    const hasKey = Boolean(getLedgerKey());
+    const data = hasKey ? ledgerData() : null;
+    return {
+        hasKey,
+        keyError: gmGet(STORE_LEDGER_KEY_DEAD, null) || null,
+        checking: Boolean(led.checking),
+        saveMsg: led.saveMsg,
+        busy: Boolean(led.busy),
+        error: led.error,
+        readAt: data ? data.readAt : 0,
+        backfilled: data ? data.backfilled : false,
+        oldestAt: data ? data.oldestAt : 0,
+        rows: data ? data.rows : [],
+    };
 }
 
 /* ------------------------------------------------------------------ *
@@ -3232,10 +4336,26 @@ export function boot() {
             app.bzWindow = key;
             renderMyBazaar();
         },
+        onFillListing: (market, index) => onFillFromListing(market, index),
+        onFillSelected: () => {
+            const itemId = app.bzSelected;
+            const row = app.bzRows.find((r) => r.itemId === itemId && document.contains(r.el) && r.el.querySelector('.ttv2-fillbox'));
+            if (row) fillRow(row.el, itemId).catch(() => {});
+        },
+        getFill: () => gmGet(STORE_FILL, null),
+        onFillSettings: (value) => {
+            gmSet(STORE_FILL, value);
+            renderMyBazaar();
+        },
     });
 
     app.panel.mount();
     app.panel.enableHotkey();
+    // Fill settings changed in another tab (or in Torn Bids): show them here too.
+    gmOnChange(STORE_FILL, () => {
+        app.panel.syncFill();
+        renderMyBazaar();
+    });
     app.panel.applySettings(app.settings);
 
     refreshKeyState();

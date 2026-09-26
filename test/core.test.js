@@ -27,6 +27,8 @@ import {
     makeItemsCacheEntry,
     isItemsCacheFresh,
     ITEMS_TTL_MS,
+    itemCategory,
+    categoryCounts,
 } from '../src/core/items.js';
 
 import {
@@ -541,4 +543,27 @@ test('Min applies to a one-item listing: below Min is amber, not listed', () => 
     assert.equal(rankOpportunities([known], opts).length, 0, 'not in the list');
     assert.deepEqual(belowMinRows([known], opts), [known], 'marked amber on the page');
     assert.equal(rankOpportunities([known], { ...opts, minTotalProfit: 500 }).length, 1, 'meets a $500 Min: listed, green');
+});
+
+test('an item\'s category is Torn\'s own item type, else Other', () => {
+    const idx = buildItemIndex({ 206: { name: 'Xanax', type: 'Drug' }, 1: { name: 'Mystery' } });
+    assert.equal(itemCategory(findItemById(idx, 206)), 'Drug');
+    assert.equal(itemCategory(findItemById(idx, 1)), 'Other');
+    assert.equal(itemCategory(null), 'Other');
+});
+
+test('category counts: most first, then by name; a picked category is never dropped', () => {
+    const cats = ['Drug', 'Plushie', 'Plushie', 'Medical', 'Drug', 'Plushie', 'Alcohol'];
+    assert.deepEqual(categoryCounts(cats), [
+        { category: 'Plushie', count: 3 },
+        { category: 'Drug', count: 2 },
+        { category: 'Alcohol', count: 1 },
+        { category: 'Medical', count: 1 },
+    ]);
+    // Picked, but its items are still loading: listed with 0, not lost.
+    assert.deepEqual(categoryCounts(['Drug'], 'Flower'), [
+        { category: 'Drug', count: 1 },
+        { category: 'Flower', count: 0 },
+    ]);
+    assert.deepEqual(categoryCounts([], ''), []);
 });

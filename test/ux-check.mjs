@@ -463,8 +463,9 @@ await p.close();
     return 0.2126 * m[0] + 0.7152 * m[1] + 0.0722 * m[2];
   });
   ok(spLum < 80, 'traders page background is dark: ' + Math.round(spLum));
-  ok((await s('.sp-tos tr').count()) === 6, 'Torn ToS table beside the Limited key field');
-  ok(/Limited/.test(await stxt('.sp-tos')), 'ToS names Limited access');
+  ok((await s('.sp-tos:not(.sp-tos-ledger) tr').count()) === 6, 'Torn ToS table beside the Limited key field');
+  ok((await s('.sp-tos-ledger tr').count()) === 6, 'the Ledger\'s Full key has its own ToS table');
+  ok(/Limited/.test(await stxt('.sp-tos:not(.sp-tos-ledger)')), 'ToS names Limited access');
   ok(/Add your Limited key/.test(await stxt('.sp-banner')), 'banner asks for the Limited key');
   await t.screenshot({ path: sp + '/ux-sell-settings.png' });
   await designCheck(t, '#ttv2-sell-host', 'traders settings');
@@ -514,9 +515,11 @@ await p.close();
 
   // The best flips across the top: trusted buyers only, from the start.
   const strip = await su('.sp-fc').allTextContents();
-  ok(strip.length === 3 && /Stick of Dynamite.*\+\$26,500/.test(strip[0]) && /Xanax.*\+\$24,000/.test(strip[1]) && /Hammer.*\+\$255/.test(strip[2]), 'the best flips, most money first: ' + JSON.stringify(strip));
+  // 3.12.0: Bob lists Xanax at $850,000 on TornExchange and $852,000 on TornW3B - the
+  // lower counts; a Hammer (Melee) has its own stats, so it is never a flip.
+  ok(strip.length === 2 && /Stick of Dynamite.*\+\$26,500/.test(strip[0]) && /Xanax.*\+\$20,000/.test(strip[1]), 'the best flips, most money first: ' + JSON.stringify(strip));
   ok(/Buy 2 from XanSeller/.test(strip[1]), 'your own cheaper Xanax listing is never one to buy');
-  ok(/Buy 5 from CheapSeller, Sponsored/.test(strip[2]), 'Hammer: the fresh listings under the bid, not the one TornW3B has not seen in an hour');
+  ok(!strip.some((f) => /Hammer/.test(f)), 'no flip on a weapon: each has its own stats');
   ok(strip.every((f) => /Sell to Bob/.test(f)), 'every flip sells to Bob, the trusted buyer');
   ok((await prefs()).trustedOnly !== false && (await su('.sp-toggle', { hasText: 'Trusted' }).getAttribute('aria-pressed')) === 'true', 'Trusted buyers only is on by default');
 
@@ -592,6 +595,16 @@ await p.close();
   ok(JSON.stringify(await names()) === '["Xanax"]', 'searching for "xan" shows only Xanax');
   await su('input.sp-search').fill('');
   await u.waitForTimeout(300);
+
+  // Category (mockup M): Torn's item types, filtering the flips and the list together.
+  ok(/Category: All/.test(await utxt('select.sp-cat option')), 'the Category dropdown starts on All');
+  await su('select.sp-cat').selectOption('Drug');
+  await u.waitForTimeout(300);
+  ok(JSON.stringify(await names()) === '["Xanax"]', 'Category Drug shows only Xanax');
+  ok(/Showing Drug only/.test(await utxt('.sp-catline')), 'a line says what the category hides');
+  await su('.sp-catline .sp-link').click();
+  await u.waitForTimeout(300);
+  ok((await names()).length > 1, 'Show all brings every item back');
 
   // Cash for flips: press the pill, type an amount; flips never spend more.
   await su('.sp-pill-btn').click();

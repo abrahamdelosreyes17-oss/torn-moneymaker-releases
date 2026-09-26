@@ -91,7 +91,7 @@ test('a trader\'s TornW3B prices are shown for 6 hours after reading, then dropp
 
 /* ============================================================== one row */
 
-test('one row per trader: on both sites, the higher price and both sources; highest first', () => {
+test('one row per trader: on both sites, the LOWER price counts and the row says they differ; highest first', () => {
     const db = dbWithLists();
     const buyers = buyersForItem('206', {
         teBest: [{ name: 'Bob', id: '11', price: 850000, score: 214 }],
@@ -104,15 +104,30 @@ test('one row per trader: on both sites, the higher price and both sources; high
         db,
         w3bByItem: indexW3bByItem(db, NOW),
     });
+    // Bob lists $850,000 on TornExchange and $852,000 on TornW3B: he may pay
+    // the lower, so $850,000 is what counts (the friend lost money on this).
     assert.deepEqual(
-        buyers.map((b) => [b.name, b.id, b.price, b.te, b.w3b]),
+        buyers.map((b) => [b.name, b.id, b.price, b.te, b.w3b, b.differ]),
         [
-            ['Bob', '11', 852000, 850000, 852000],
-            ['Zed', '77', 849500, null, 849500],
-            ['Carol', '44', 845000, 845000, null],
-            ['Alice', '12', 830000, 830000, null],
+            ['Bob', '11', 850000, 850000, 852000, true],
+            ['Zed', '77', 849500, null, 849500, false],
+            ['Carol', '44', 845000, 845000, null, false],
+            ['Alice', '12', 830000, 830000, null, false],
         ],
     );
+});
+
+test('a trader on both sites at the same price is not marked as differing', () => {
+    const db = dbWithLists();
+    const buyers = buyersForItem('206', {
+        teBest: [{ name: 'Bob', id: '11', price: 852000, score: 214 }],
+        idsByName: new Map([['bob', '11']]),
+        db,
+        w3bByItem: indexW3bByItem(db, NOW),
+    });
+    const bob = buyers.find((b) => b.id === '11');
+    assert.equal(bob.price, 852000);
+    assert.equal(bob.differ, false);
 });
 
 test('a full-list name not among active traders is left out once the active list is known', () => {
@@ -290,7 +305,7 @@ test('a trader known by name on TornExchange and by id on TornW3B is one row', (
     });
     const bobs = buyers.filter((b) => b.name === 'Bob');
     assert.equal(bobs.length, 1);
-    assert.deepEqual([bobs[0].id, bobs[0].te, bobs[0].w3b, bobs[0].price], ['11', 850000, 852000, 852000]);
+    assert.deepEqual([bobs[0].id, bobs[0].te, bobs[0].w3b, bobs[0].price], ['11', 850000, 852000, 850000]);
     // And a name our database knows gives the TornExchange row its id.
     const ids = traderIdsByName(db);
     const alice = buyersForItem('1', { teFull: [{ name: 'alice', price: 115 }], dbIdsByName: ids });

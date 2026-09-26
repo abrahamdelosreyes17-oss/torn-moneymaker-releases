@@ -316,6 +316,38 @@ export async function fetchUserPresence(client, userId) {
     }
 }
 
+/**
+ * A player's total networth, from their public personal stats.
+ *
+ * v2 `/user/{id}/personalstats?cat=networth` answers another player's total
+ * with a Public or Limited key: {personalstats: {networth: {total}}}. The
+ * `stat=networth` form answers an array [{name, value}]: both are read.
+ *
+ * @returns {Promise<number|null>} null when Torn gives no number
+ */
+export async function fetchNetworth(client, userId) {
+    const id = String(userId).replace(/\D/g, '');
+    if (!id) return null;
+    const data = await client.get('v2/user/' + id + '/personalstats', { cat: 'networth' });
+    return parseNetworth(data);
+}
+
+export function parseNetworth(data) {
+    const ps = data && data.personalstats;
+    if (!ps) return null;
+    let v = null;
+    if (Array.isArray(ps)) {
+        const row = ps.find((r) => r && r.name === 'networth');
+        v = row ? row.value : null;
+    } else if (ps.networth && typeof ps.networth === 'object') {
+        v = ps.networth.total;
+    } else {
+        v = ps.networth;
+    }
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+}
+
 /** "Wrong fields" and "Incorrect category": a parameter Torn did not accept. */
 export const TORN_ERROR_WRONG_FIELDS = 4;
 export const TORN_ERROR_INCORRECT_CATEGORY = 21;

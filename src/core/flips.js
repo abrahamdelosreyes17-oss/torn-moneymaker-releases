@@ -36,9 +36,49 @@ export const STAT_ITEM_TYPES = new Set(['Melee', 'Primary', 'Secondary', 'Defens
  * @param {Array} buyers - highest first, after your Show choices
  * @param {{avg: number|null, type: string|null}} item
  */
-export function flipBuyer(buyers, { avg = null, type = null } = {}) {
+export function flipBuyer(buyers, { avg = null, type = null, unitsOf = null } = {}) {
     if (!(avg > 0) || STAT_ITEM_TYPES.has(type)) return null;
-    return (buyers || []).find((b) => b && b.price > 0 && b.price <= avg * BID_SANITY_X) || null;
+    for (const b of buyers || []) {
+        if (!b || !(b.price > 0) || b.price > avg * BID_SANITY_X) continue;
+        // A trader who could not pay for even one is not a buyer.
+        const units = unitsOf ? unitsOf(b) : Infinity;
+        if (!(units >= 1)) continue;
+        return units === Infinity ? b : { ...b, maxUnits: units };
+    }
+    return null;
+}
+
+/**
+ * Every buyer a flip could sell to, best bid first: believable bids only, each
+ * with how many they can pay for (`maxUnits`, when their networth caps it).
+ * The plan picks among them the one that makes the most - a slightly lower
+ * bid from a trader who can take 100 beats a higher one who can take 1.
+ */
+export function flipBuyers(buyers, { avg = null, type = null, unitsOf = null, limit = 5 } = {}) {
+    if (!(avg > 0) || STAT_ITEM_TYPES.has(type)) return [];
+    const out = [];
+    for (const b of buyers || []) {
+        if (out.length >= limit) break;
+        if (!b || !(b.price > 0) || b.price > avg * BID_SANITY_X) continue;
+        const units = unitsOf ? unitsOf(b) : Infinity;
+        if (!(units >= 1)) continue;
+        out.push(units === Infinity ? b : { ...b, maxUnits: units });
+    }
+    return out;
+}
+
+/** The share of their networth a trader is asked to pay, unless you set otherwise. */
+export const NETWORTH_PCT = 10;
+
+/**
+ * How many items a trader can believably pay for: at most `pct` percent of
+ * their networth, spent at their own bid. Infinity while their networth is
+ * not known (or the check is off), so a flip is never hidden for want of a
+ * lookup - the lookup is asked for, and the flip shrinks when it answers.
+ */
+export function payableUnits(bid, networth, pct = NETWORTH_PCT) {
+    if (!(bid > 0) || !(pct > 0) || networth === null || networth === undefined || !Number.isFinite(Number(networth))) return Infinity;
+    return Math.max(0, Math.floor(((Number(networth) * pct) / 100) / bid));
 }
 
 /** How many flip candidates are checked against TornW3B's listings, best first. */
@@ -161,9 +201,12 @@ export function flipCandidates(summary, bidOf, { cash = null, limit = FLIP_CANDI
     for (const [itemId, s] of summary || []) {
         const lowest = s && s.lowestPrice;
         if (!(lowest > 1)) continue;
-        const bid = bidOf(itemId);
+        // A number, or {price, maxUnits} when the buyer's networth caps how many they take.
+        const got = bidOf(itemId, lowest);
+        const bid = got && typeof got === 'object' ? got.price : got;
+        const cap = got && typeof got === 'object' && got.maxUnits > 0 ? got.maxUnits : Infinity;
         if (!(bid > lowest)) continue;
-        const afford = Math.min(cash > 0 ? Math.floor(cash / lowest) : Infinity, maxUnits > 0 ? maxUnits : FLIP_MAX_UNITS);
+        const afford = Math.min(cash > 0 ? Math.floor(cash / lowest) : Infinity, maxUnits > 0 ? maxUnits : FLIP_MAX_UNITS, cap);
         if (afford <= 0) continue;
         const each = bid - lowest;
         out.push({ itemId: String(itemId), lowest, bid, each, score: each * afford });

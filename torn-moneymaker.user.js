@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      3.11.1
+// @version      3.12.0
 // @description  Finds Bazaar and Item Market listings below NPC / market value - on the page you are viewing, and live from the Torn API and TornW3B - ranked by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -40,7 +40,7 @@
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '3.11.1';
+    const TTV2_BUILD_VERSION = '3.12.0';
 
     /* ===== src/platform/gm.js ===== */
     /*
@@ -293,6 +293,29 @@
     function findItemById(index, id) {
         if (!index || !index.byId) return null;
         return index.byId.get(String(id)) || null;
+    }
+
+    /** An item's category in Torn Bids' filter: Torn's own item type. */
+    function itemCategory(item) {
+        return (item && typeof item.type === 'string' && item.type.trim()) || 'Other';
+    }
+
+    /**
+     * How many items each category has, most first (then by name), for the
+     * Category dropdown. A category you picked stays listed, with 0, while the
+     * items that fill it are still loading: the pick is never dropped under you.
+     *
+     * @param {string[]} categories - one per item
+     * @param {string} [picked]
+     * @returns {{category: string, count: number}[]}
+     */
+    function categoryCounts(categories, picked = '') {
+        const n = new Map();
+        for (const c of categories) n.set(c, (n.get(c) || 0) + 1);
+        if (picked && !n.has(picked)) n.set(picked, 0);
+        return [...n]
+            .map(([category, count]) => ({ category, count }))
+            .sort((a, b) => b.count - a.count || a.category.localeCompare(b.category));
     }
 
     /* ===== src/core/npc.js ===== */
@@ -1015,6 +1038,8 @@
                 qty: Math.floor(qty),
                 dataAt: toMs(l.last_checked) || toMs(l.content_updated),
                 changedAt: toMs(l.content_updated),
+                // A paid spot on TornW3B: never the listing Fill undercuts.
+                sponsored: Boolean(l.sponsored),
             });
         }
 
@@ -1458,9 +1483,49 @@
      * @param {Array} buyers - highest first, after your Show choices
      * @param {{avg: number|null, type: string|null}} item
      */
-    function flipBuyer(buyers, { avg = null, type = null } = {}) {
+    function flipBuyer(buyers, { avg = null, type = null, unitsOf = null } = {}) {
         if (!(avg > 0) || STAT_ITEM_TYPES.has(type)) return null;
-        return (buyers || []).find((b) => b && b.price > 0 && b.price <= avg * BID_SANITY_X) || null;
+        for (const b of buyers || []) {
+            if (!b || !(b.price > 0) || b.price > avg * BID_SANITY_X) continue;
+            // A trader who could not pay for even one is not a buyer.
+            const units = unitsOf ? unitsOf(b) : Infinity;
+            if (!(units >= 1)) continue;
+            return units === Infinity ? b : { ...b, maxUnits: units };
+        }
+        return null;
+    }
+
+    /**
+     * Every buyer a flip could sell to, best bid first: believable bids only, each
+     * with how many they can pay for (`maxUnits`, when their networth caps it).
+     * The plan picks among them the one that makes the most - a slightly lower
+     * bid from a trader who can take 100 beats a higher one who can take 1.
+     */
+    function flipBuyers(buyers, { avg = null, type = null, unitsOf = null, limit = 5 } = {}) {
+        if (!(avg > 0) || STAT_ITEM_TYPES.has(type)) return [];
+        const out = [];
+        for (const b of buyers || []) {
+            if (out.length >= limit) break;
+            if (!b || !(b.price > 0) || b.price > avg * BID_SANITY_X) continue;
+            const units = unitsOf ? unitsOf(b) : Infinity;
+            if (!(units >= 1)) continue;
+            out.push(units === Infinity ? b : { ...b, maxUnits: units });
+        }
+        return out;
+    }
+
+    /** The share of their networth a trader is asked to pay, unless you set otherwise. */
+    const NETWORTH_PCT = 10;
+
+    /**
+     * How many items a trader can believably pay for: at most `pct` percent of
+     * their networth, spent at their own bid. Infinity while their networth is
+     * not known (or the check is off), so a flip is never hidden for want of a
+     * lookup - the lookup is asked for, and the flip shrinks when it answers.
+     */
+    function payableUnits(bid, networth, pct = NETWORTH_PCT) {
+        if (!(bid > 0) || !(pct > 0) || networth === null || networth === undefined || !Number.isFinite(Number(networth))) return Infinity;
+        return Math.max(0, Math.floor(((Number(networth) * pct) / 100) / bid));
     }
 
     /** How many flip candidates are checked against TornW3B's listings, best first. */
@@ -1583,9 +1648,12 @@
         for (const [itemId, s] of summary || []) {
             const lowest = s && s.lowestPrice;
             if (!(lowest > 1)) continue;
-            const bid = bidOf(itemId);
+            // A number, or {price, maxUnits} when the buyer's networth caps how many they take.
+            const got = bidOf(itemId, lowest);
+            const bid = got && typeof got === 'object' ? got.price : got;
+            const cap = got && typeof got === 'object' && got.maxUnits > 0 ? got.maxUnits : Infinity;
             if (!(bid > lowest)) continue;
-            const afford = Math.min(cash > 0 ? Math.floor(cash / lowest) : Infinity, maxUnits > 0 ? maxUnits : FLIP_MAX_UNITS);
+            const afford = Math.min(cash > 0 ? Math.floor(cash / lowest) : Infinity, maxUnits > 0 ? maxUnits : FLIP_MAX_UNITS, cap);
             if (afford <= 0) continue;
             const each = bid - lowest;
             out.push({ itemId: String(itemId), lowest, bid, each, score: each * afford });
@@ -2447,6 +2515,424 @@
         return Number.isFinite(n) && n > 0 ? n : null;
     }
 
+    /* ===== src/core/ledger.js ===== */
+    /*
+     * Torn Ledger: what you made, from your own Torn log. Pure - no DOM, no
+     * network, no key. main.js reads the log with the Ledger's own Full key
+     * (see api/ledger.js) and hands the entries here.
+     *
+     * Every buy and sell becomes one row: time, item, quantity, price each,
+     * where (bazaar, Item Market, trade), with whom, and the fee. Only these
+     * derived rows are kept - never the log's own text.
+     *
+     * Profit is first in, first out: a sale uses up the oldest units you
+     * bought of that item, and makes (what you got, after the Item Market's
+     * fee) minus (what those units cost). Units sold with no buy on record
+     * (bought before the Ledger started) have no known cost: they are counted
+     * apart, never guessed.
+     *
+     * Log types (Torn API v2 /user/log):
+     *   1225 Bazaar buy    {seller, items: [{id, qty}], cost_each, cost_total}
+     *   1226 Bazaar sell   {buyer,  items, cost_each, cost_total}
+     *   1112 Item Market buy  {seller, anonymous, items, cost_each, cost_total}
+     *   1113 Item Market sell {buyer, anonymous, items, cost_each, fee, cost_total} - cost_total is AFTER the fee
+     * Trades come from /user/trades and /user/{id}/trade (typed items and money
+     * for each side).
+     */
+
+    const LEDGER_VERSION = 1;
+
+    const LOG_BAZAAR_BUY = 1225;
+    const LOG_BAZAAR_SELL = 1226;
+    const LOG_MARKET_BUY = 1112;
+    const LOG_MARKET_SELL = 1113;
+    const LEDGER_LOG_TYPES = [LOG_BAZAAR_BUY, LOG_BAZAAR_SELL, LOG_MARKET_BUY, LOG_MARKET_SELL];
+
+    const VENUE_NAMES = { bazaar: 'Bazaar', market: 'Item Market', trade: 'Trade' };
+
+    function emptyLedger() {
+        return { version: LEDGER_VERSION, rows: [], newestAt: 0, oldestAt: 0, backfilled: false, tradesAt: 0, tradeIds: [], logCount: 0, readAt: 0 };
+    }
+
+    /** A stored ledger, or a fresh one when missing or from another version. */
+    function readLedger(stored) {
+        if (!stored || typeof stored !== 'object' || stored.version !== LEDGER_VERSION || !Array.isArray(stored.rows)) return emptyLedger();
+        return { ...emptyLedger(), ...stored };
+    }
+
+    const ledgerNum = (v) => {
+        const n = Number(v);
+        return Number.isFinite(n) ? n : 0;
+    };
+
+    /**
+     * The rows one log entry makes (none for a type the Ledger does not count).
+     * @param {{id, timestamp, details: {id}, data}} entry
+     */
+    function rowsFromLog(entry) {
+        if (!entry || !entry.details || !entry.data) return [];
+        const type = Number(entry.details.id);
+        const d = entry.data;
+        const t = ledgerNum(entry.timestamp) * 1000;
+        const items = Array.isArray(d.items) ? d.items : [];
+        const venue = type === LOG_BAZAAR_BUY || type === LOG_BAZAAR_SELL ? 'bazaar' : type === LOG_MARKET_BUY || type === LOG_MARKET_SELL ? 'market' : null;
+        if (!venue || !t || !items.length) return [];
+        const side = type === LOG_BAZAAR_BUY || type === LOG_MARKET_BUY ? 'buy' : 'sell';
+        const who = side === 'buy' ? d.seller : d.buyer;
+        const totalQty = items.reduce((a, it) => a + Math.max(0, ledgerNum(it && it.qty)), 0) || 1;
+        // The fee (Item Market sales) is shared across the entry's units.
+        const feeEach = type === LOG_MARKET_SELL ? ledgerNum(d.fee) / totalQty : 0;
+        let each = ledgerNum(d.cost_each);
+        if (!each && ledgerNum(d.cost_total)) each = (ledgerNum(d.cost_total) + ledgerNum(d.fee)) / totalQty;
+        return items
+            .filter((it) => it && ledgerNum(it.id) > 0 && ledgerNum(it.qty) > 0)
+            .map((it, i) => ({
+                id: String(entry.id) + ':' + i,
+                t,
+                itemId: String(it.id),
+                qty: ledgerNum(it.qty),
+                each,
+                fee: Math.round(feeEach * ledgerNum(it.qty)),
+                side,
+                venue,
+                who: who ? String(who) : null,
+                whoName: null,
+            }));
+    }
+
+    /**
+     * The rows one finished trade makes. Money you gave buys what you got;
+     * money you got pays for what you gave. Several items on one side share the
+     * money by their Item Market Average. Items you got for no money are bought
+     * at $0; items you gave for no money are "given" (they leave your stock,
+     * with no sale counted).
+     *
+     * @param {object} trade - /user/{id}/trade: {id, completed_at|timestamp, trader: {id, name}, user, items: [{user_id, type, details}]}
+     * @param {string} selfId - your Torn id
+     * @param {function} valueOf - (itemId) => the Item Market Average, for sharing money
+     */
+    function rowsFromTrade(trade, selfId, valueOf = () => 1) {
+        if (!trade || !Array.isArray(trade.items) || !selfId) return [];
+        const self = String(selfId);
+        const t = ledgerNum(trade.completed_at || trade.timestamp || trade.modified_at) * 1000;
+        if (!t) return [];
+        const other = [trade.trader, trade.user].find((p) => p && String(p.id) !== self) || null;
+        const mine = trade.items.filter((x) => x && String(x.user_id) === self);
+        const theirs = trade.items.filter((x) => x && String(x.user_id) !== self);
+        const money = (list) => list.filter((x) => x.type === 'Money').reduce((a, x) => a + ledgerNum(x.details && x.details.amount), 0);
+        const goods = (list) => list.filter((x) => x.type === 'Item' && x.details && ledgerNum(x.details.id) > 0 && ledgerNum(x.details.amount) > 0).map((x) => ({ itemId: String(x.details.id), qty: ledgerNum(x.details.amount) }));
+        const gave = goods(mine);
+        const got = goods(theirs);
+        const paid = money(mine);
+        const received = money(theirs);
+        const rows = [];
+        const share = (list, total) => {
+            const weights = list.map((g) => Math.max(1, ledgerNum(valueOf(g.itemId))) * g.qty);
+            const sum = weights.reduce((a, w) => a + w, 0) || 1;
+            return list.map((g, i) => (total * weights[i]) / sum / g.qty);
+        };
+        const base = {
+            venue: 'trade',
+            who: other && other.id ? String(other.id) : null,
+            whoName: other && other.name ? String(other.name) : null,
+            fee: 0,
+            t,
+        };
+        // Items for items with no money either way: a swap, not priced.
+        if (gave.length && got.length && !paid && !received) return [];
+        if (got.length) {
+            const eachs = share(got, gave.length ? 0 : paid);
+            got.forEach((g, i) => rows.push({ ...base, id: 'trade:' + trade.id + ':in:' + i, itemId: g.itemId, qty: g.qty, each: eachs[i], side: 'buy' }));
+        }
+        if (gave.length) {
+            const eachs = share(gave, received);
+            gave.forEach((g, i) => rows.push({ ...base, id: 'trade:' + trade.id + ':out:' + i, itemId: g.itemId, qty: g.qty, each: eachs[i], side: received > 0 ? 'sell' : 'give' }));
+        }
+        return rows;
+    }
+
+    /** New rows into the ledger, each once (by id), oldest first. Returns how many were new. */
+    function addLedgerRows(ledger, rows) {
+        const have = new Set(ledger.rows.map((r) => r.id));
+        let added = 0;
+        for (const r of rows) {
+            if (!r || have.has(r.id)) continue;
+            have.add(r.id);
+            ledger.rows.push(r);
+            added += 1;
+        }
+        if (added) ledger.rows.sort((a, b) => a.t - b.t || String(a.id).localeCompare(String(b.id)));
+        return added;
+    }
+
+    /**
+     * First in, first out, over EVERY row (a filter must not change what a sale
+     * cost). Each sale gets `cost` (null for units with no buy on record),
+     * `profit`, `net` (after the fee) and where its units came from.
+     *
+     * @returns {Map<string, object>} row id -> {net, cost, profit, unknownQty, from: [{who, whoName, venue, qty, each}]}
+     */
+    function matchFifo(rows) {
+        const lots = new Map();
+        const out = new Map();
+        for (const r of rows) {
+            let q = lots.get(r.itemId);
+            if (!q) {
+                q = [];
+                lots.set(r.itemId, q);
+            }
+            if (r.side === 'buy') {
+                q.push({ qty: r.qty, each: r.each, who: r.who, whoName: r.whoName, venue: r.venue });
+                continue;
+            }
+            let left = r.qty;
+            let cost = 0;
+            const from = [];
+            while (left > 0 && q.length) {
+                const lot = q[0];
+                const n = Math.min(left, lot.qty);
+                cost += n * lot.each;
+                from.push({ who: lot.who, whoName: lot.whoName, venue: lot.venue, qty: n, each: lot.each });
+                lot.qty -= n;
+                left -= n;
+                if (lot.qty <= 0) q.shift();
+            }
+            if (r.side === 'give') continue;
+            const matched = r.qty - left;
+            const net = r.each * r.qty - (r.fee || 0);
+            // Profit only on units whose cost is known: their share of the net.
+            const netMatched = r.qty ? (net * matched) / r.qty : 0;
+            out.set(r.id, {
+                net,
+                cost: matched ? cost : null,
+                profit: matched ? netMatched - cost : null,
+                unknownQty: left,
+                from,
+            });
+        }
+        return out;
+    }
+
+    /** Start of the day / week (Monday) / month a time falls in, in local time. */
+    function periodStart(t, period) {
+        const d = new Date(t);
+        d.setHours(0, 0, 0, 0);
+        if (period === 'week') d.setDate(d.getDate() - ((d.getDay() + 6) % 7));
+        if (period === 'month') d.setDate(1);
+        return d.getTime();
+    }
+
+    /**
+     * The rows a filter keeps.
+     * @param {object} f - {from, to (ms, inclusive range), itemId, category, venue, who (id or name text)}
+     * @param {function} categoryOf - (itemId) => Torn's item type
+     */
+    function filterLedgerRows(rows, f = {}, categoryOf = () => null) {
+        const who = f.who ? String(f.who).trim().toLowerCase() : '';
+        return rows.filter((r) => {
+            if (f.from && r.t < f.from) return false;
+            if (f.to && r.t > f.to) return false;
+            if (f.itemId && r.itemId !== String(f.itemId)) return false;
+            if (f.venue && f.venue !== 'all' && r.venue !== f.venue) return false;
+            if (f.category && categoryOf(r.itemId) !== f.category) return false;
+            if (who && !(String(r.who || '') === who || String(r.whoName || '').toLowerCase().includes(who))) return false;
+            return true;
+        });
+    }
+
+    /**
+     * Totals for a set of rows (already filtered), using the FIFO matches.
+     * @returns {{profit, sold, spent, fees, unitsSold, unitsBought, sales, buys, unknownUnits}}
+     */
+    function ledgerTotals(rows, fifo) {
+        const t = { profit: 0, sold: 0, spent: 0, fees: 0, unitsSold: 0, unitsBought: 0, sales: 0, buys: 0, unknownUnits: 0 };
+        for (const r of rows) {
+            if (r.side === 'buy') {
+                t.spent += r.each * r.qty;
+                t.unitsBought += r.qty;
+                t.buys += 1;
+            } else if (r.side === 'sell') {
+                const m = fifo.get(r.id);
+                t.sold += m ? m.net : r.each * r.qty - (r.fee || 0);
+                t.fees += r.fee || 0;
+                t.unitsSold += r.qty;
+                t.sales += 1;
+                if (m && m.profit !== null) t.profit += m.profit;
+                if (m) t.unknownUnits += m.unknownQty;
+            }
+        }
+        t.profit = Math.round(t.profit);
+        t.sold = Math.round(t.sold);
+        t.spent = Math.round(t.spent);
+        return t;
+    }
+
+    /** Profit per day / week / month, oldest first: [{start, profit, sold, spent}]. */
+    function ledgerByPeriod(rows, fifo, period = 'day') {
+        const m = new Map();
+        for (const r of rows) {
+            const k = periodStart(r.t, period);
+            let b = m.get(k);
+            if (!b) {
+                b = { start: k, rows: [] };
+                m.set(k, b);
+            }
+            b.rows.push(r);
+        }
+        return [...m.values()]
+            .sort((a, b) => a.start - b.start)
+            .map((b) => ({ start: b.start, ...ledgerTotals(b.rows, fifo) }));
+    }
+
+    /** Per item, most profit first: [{itemId, profit, sold, spent, unitsSold, unitsBought, avgBuy, avgSell}]. */
+    function ledgerByItem(rows, fifo) {
+        const m = new Map();
+        for (const r of rows) {
+            if (!m.has(r.itemId)) m.set(r.itemId, []);
+            m.get(r.itemId).push(r);
+        }
+        return [...m.entries()]
+            .map(([itemId, list]) => {
+                const t = ledgerTotals(list, fifo);
+                return {
+                    itemId,
+                    ...t,
+                    avgBuy: t.unitsBought ? Math.round(t.spent / t.unitsBought) : null,
+                    avgSell: t.unitsSold ? Math.round((t.sold + t.fees) / t.unitsSold) : null,
+                };
+            })
+            .sort((a, b) => b.profit - a.profit || b.sold - a.sold);
+    }
+
+    /** The oldest and newest log time among entries, for the next incremental read. */
+    function logSpan(entries) {
+        let min = Infinity;
+        let max = 0;
+        for (const e of entries || []) {
+            const t = ledgerNum(e && e.timestamp);
+            if (!t) continue;
+            if (t < min) min = t;
+            if (t > max) max = t;
+        }
+        return { min: min === Infinity ? 0 : min, max };
+    }
+
+    /* ===== src/api/ledger.js ===== */
+    /*
+     * The Torn Ledger's API client: a Full key, used for nothing but your own
+     * log and trades.
+     *
+     * The Full key can read everything on the account, so this client is walled
+     * in by code, not by care: its URL check allows only these api.torn.com
+     * paths, and any other is refused before the key is attached - a bug
+     * elsewhere cannot spend it on anything else.
+     *
+     *   /v2/key/info          - to check the key is Full, and whose it is
+     *   /v2/user/log          - bazaar and Item Market buys and sells
+     *   /v2/user/trades       - your finished trades
+     *   /v2/user/{id}/trade   - one trade's items and money
+     *
+     * It shares the one request window (70 a minute across every tab) with the
+     * other clients. Only Torn Bids makes one; the panel on torn.com never reads
+     * the Ledger's key.
+     */
+
+
+
+
+    /** The only paths the Ledger's key is ever sent to. */
+    const LEDGER_PATHS = [/^\/v2\/key\/info$/, /^\/v2\/user\/log$/, /^\/v2\/user\/trades$/, /^\/v2\/user\/\d+\/trade$/];
+
+    /** The only query parameters each path may carry (the key and comment are added by the client). */
+    const LEDGER_PARAMS = [
+        [/^\/v2\/key\/info$/, []],
+        [/^\/v2\/user\/log$/, ['log', 'from', 'to', 'limit']],
+        [/^\/v2\/user\/trades$/, ['cat', 'from', 'limit', 'sort']],
+        [/^\/v2\/user\/\d+\/trade$/, []],
+    ];
+
+    function ledgerParamsAllowed(path, params = {}) {
+        let pathname;
+        try {
+            pathname = new URL(String(path).replace(/^\/+/, ''), TORN_API_BASE).pathname;
+        } catch {
+            return false;
+        }
+        const rule = LEDGER_PARAMS.find(([re]) => re.test(pathname));
+        if (!rule) return false;
+        return Object.keys(params || {}).every((k) => rule[1].includes(k));
+    }
+
+    function ledgerPathAllowed(path) {
+        // A path carries no query or fragment of its own: parameters go through params, which are checked.
+        if (/[?#]/.test(String(path))) return false;
+        try {
+            const clean = String(path).replace(/^\/+/, '');
+            const url = new URL(clean, TORN_API_BASE);
+            return url.hostname === 'api.torn.com' && LEDGER_PATHS.some((re) => re.test(url.pathname));
+        } catch {
+            return false;
+        }
+    }
+
+    class LedgerClient extends TornApiClient {
+        async requestOnce(path, params, key) {
+            if (!ledgerPathAllowed(path) || !ledgerParamsAllowed(path, params)) {
+                throw new TornApiError('The Ledger key is only for your log and trades; refused ' + String(path).split('?')[0] + '.');
+            }
+            return super.requestOnce(path, params, key);
+        }
+    }
+
+    /**
+     * Whose key it is and what it may read (v2 key/info).
+     * @returns {{level: number|null, type: string|null, userId: string|null}}
+     */
+    async function fetchLedgerKeyInfo(client) {
+        const data = await client.get('v2/key/info');
+        const info = (data && data.info) || {};
+        const access = info.access || {};
+        const level = Number(access.level);
+        return {
+            level: Number.isFinite(level) ? level : null,
+            type: typeof access.type === 'string' ? access.type : null,
+            userId: info.user && info.user.id ? String(info.user.id) : null,
+        };
+    }
+
+    /** A Full key: level 4, or Torn's own words for it. */
+    function isFullKey(info) {
+        return Boolean(info && (info.level === 4 || /^full/i.test(String(info.type || ''))));
+    }
+
+    /**
+     * One page of your log (newest first, at most 100): the four trade types.
+     * `from` / `to` are Torn timestamps (seconds), both inclusive.
+     */
+    async function fetchLogPage(client, { from = null, to = null } = {}) {
+        const params = { log: LEDGER_LOG_TYPES.join(','), limit: 100 };
+        if (from) params.from = from;
+        if (to) params.to = to;
+        const data = await client.get('v2/user/log', params);
+        return Array.isArray(data && data.log) ? data.log : [];
+    }
+
+    /** Your finished trades since `from` (seconds), oldest first, at most 100. */
+    async function fetchTradesPage(client, { from = null } = {}) {
+        const params = { cat: 'finished', limit: 100, sort: 'ASC' };
+        if (from) params.from = from;
+        const data = await client.get('v2/user/trades', params);
+        return Array.isArray(data && data.trades) ? data.trades : [];
+    }
+
+    /** One trade: both sides' items and money. */
+    async function fetchTrade(client, tradeId) {
+        const id = String(tradeId).replace(/\D/g, '');
+        if (!id) return null;
+        const data = await client.get('v2/user/' + id + '/trade');
+        return (data && data.trade) || null;
+    }
+
     /* ===== src/api/te.js ===== */
     /*
      * TornExchange (tornexchange.com) - traders' published buy prices.
@@ -2996,8 +3482,12 @@
      *     active traders plus every /pricelist/{id} link seen on a TornW3B page
      *     the user opened (its leaderboards, Search Deals).
      *
-     * One row per trader per item: a trader on both sites shows once, with the
-     * higher of their two prices and both links. Always highest price first.
+     * One row per trader per item: a trader on both sites shows once, with both
+     * links. When their two lists disagree, the LOWER price is the one counted
+     * (ranking, flips, where to sell), and the row is marked `differ`: in a trade
+     * the trader pays what they choose, and the owner's friend lost money trading
+     * on the higher of two lists (2026-09-26) - one list was stale or bait.
+     * Always highest (counted) price first.
      */
 
     const TRADER_DB_VERSION = 1;
@@ -3296,7 +3786,9 @@
 
         const out = [];
         for (const r of rows.values()) {
-            r.price = Math.max(r.te || 0, r.w3b || 0);
+            const both = r.te > 0 && r.w3b > 0;
+            r.price = both ? Math.min(r.te, r.w3b) : Math.max(r.te || 0, r.w3b || 0);
+            r.differ = both && r.te !== r.w3b;
             if (r.price <= 0) continue;
             // What we know of how they trade: TornExchange votes (from any item's
             // top three) and TornW3B's rating.
@@ -4238,6 +4730,38 @@
         }
     }
 
+    /**
+     * A player's total networth, from their public personal stats.
+     *
+     * v2 `/user/{id}/personalstats?cat=networth` answers another player's total
+     * with a Public or Limited key: {personalstats: {networth: {total}}}. The
+     * `stat=networth` form answers an array [{name, value}]: both are read.
+     *
+     * @returns {Promise<number|null>} null when Torn gives no number
+     */
+    async function fetchNetworth(client, userId) {
+        const id = String(userId).replace(/\D/g, '');
+        if (!id) return null;
+        const data = await client.get('v2/user/' + id + '/personalstats', { cat: 'networth' });
+        return parseNetworth(data);
+    }
+
+    function parseNetworth(data) {
+        const ps = data && data.personalstats;
+        if (!ps) return null;
+        let v = null;
+        if (Array.isArray(ps)) {
+            const row = ps.find((r) => r && r.name === 'networth');
+            v = row ? row.value : null;
+        } else if (ps.networth && typeof ps.networth === 'object') {
+            v = ps.networth.total;
+        } else {
+            v = ps.networth;
+        }
+        const n = Number(v);
+        return Number.isFinite(n) ? n : null;
+    }
+
     /** "Wrong fields" and "Incorrect category": a parameter Torn did not accept. */
     const TORN_ERROR_WRONG_FIELDS = 4;
     const TORN_ERROR_INCORRECT_CATEGORY = 21;
@@ -4430,6 +4954,22 @@
         const hash = (href.split('#')[1] || '').toLowerCase().replace(/^\/+/, '').split(/[?&]/)[0];
         if (hash === 'add' || hash.startsWith('add/')) return 'add';
         if (hash === 'manage' || hash.startsWith('manage/')) return 'manage';
+        return null;
+    }
+
+    /**
+     * The Item Market's own-listing pages, where Fill works: add a listing
+     * (#/addListing) and your listings (#/viewListing, also #/yourItems). The
+     * hash changes without a page load, so callers re-check on hashchange.
+     *
+     * @returns {'add'|'view'|null}
+     */
+    function marketFillPage(href) {
+        if (typeof href !== 'string' || !href) return null;
+        if (detectPage(href) !== PAGE_ITEM_MARKET) return null;
+        const hash = (href.split('#')[1] || '').toLowerCase().replace(/^\/+/, '').split(/[?&]/)[0];
+        if (hash === 'addlisting' || hash.startsWith('addlisting/')) return 'add';
+        if (hash === 'viewlisting' || hash.startsWith('viewlisting/') || hash === 'youritems' || hash.startsWith('youritems/')) return 'view';
         return null;
     }
 
@@ -5154,6 +5694,563 @@
         for (const t of root.querySelectorAll('.' + OWN_BAZAAR_TAG_CLASS)) t.remove();
     }
 
+    /* ===== src/sources/dom/fill.js ===== */
+    /*
+     * The Fill button's side of Torn's pages: in one row, find the price box and
+     * the quantity box, and type into them the way Torn's own forms accept.
+     *
+     * Only on the page you are viewing, only in the row whose Fill you pressed,
+     * only after you pressed it. Nothing of Torn's is ever clicked: not the
+     * confirm / list / update buttons, and not the tick box of a weapon or
+     * armour row (you tick it; Fill types the price).
+     *
+     * The markup comes from two working 2026 scripts for these pages - Greasy
+     * Fork's "Customizable Bazaar Filler" 1.82 (bazaar add / manage) and "Torn
+     * Market Filler" 1.1.2 (Item Market add / your listings):
+     *
+     *   bazaar #/add     li.clearfix; price ".price input"; quantity ".amount input";
+     *                    how many you have ".item-amount.qty"; a weapon or armour
+     *                    row has "div.amount.choice-container input" (a tick box)
+     *   bazaar #/manage  the price in [class*="price___"] as input.input-money
+     *   market add       [class*=itemRow___]; price [class*=priceInputWrapper___]
+     *                    input.input-money (a visible and a hidden one, both set);
+     *                    quantity [class*=amountInputWrapper___] input.input-money;
+     *                    single-copy rows have a [class*=checkboxWrapper___] tick box
+     *   market view      (your listings) the price only
+     */
+
+
+
+
+    /** Our own marks inside Torn's rows. */
+    const FILL_BUTTON_CLASS = 'ttv2-fillbtn';
+    const FILL_TAG_CLASS = 'ttv2-filltag';
+
+    const MARKET_ROW_SELECTOR = '[class*="itemRow___"]:not([class*="grayedOut___"])';
+
+    function text(node) {
+        return ((node && node.textContent) || '').replace(/\s+/g, ' ').trim();
+    }
+
+    function visible(input) {
+        if (!input) return false;
+        if (input.type === 'hidden') return false;
+        return !(input.offsetParent === null && input.getClientRects && input.getClientRects().length === 0);
+    }
+
+    /** The first number in a text: "x12", "12", "1,234 in stock". */
+    function countIn(value) {
+        const m = String(value || '').match(/(\d[\d,]*)/);
+        if (!m) return null;
+        const n = Number(m[1].replace(/,/g, ''));
+        return Number.isFinite(n) && n > 0 ? n : null;
+    }
+
+    /**
+     * The price and quantity boxes of one row, and how many you have of it.
+     *
+     * @param {'bazaar-add'|'bazaar-manage'|'market-add'|'market-view'} page
+     * @param {Element} row
+     * @returns {{price: HTMLInputElement[], qty: HTMLInputElement[], single: boolean, have: number|null}}
+     */
+    function rowInputs(page, row) {
+        const out = { price: [], qty: [], single: false, have: null };
+        if (!row || !row.querySelector) return out;
+
+        if (page === 'bazaar-add') {
+            // Checked on the owner's real page (2026-09-26): a visible text box and a
+            // hidden twin (name="price"), both input.input-money; both are set.
+            out.price.push(...row.querySelectorAll('.price input.input-money, .price input[name="price"]'));
+            if (!out.price.length) {
+                const price = row.querySelector('.price input');
+                if (price) out.price.push(price);
+            }
+            out.single = Boolean(row.querySelector('div.amount.choice-container input, .choice-container input[type="checkbox"]'));
+            if (!out.single) {
+                const qty = row.querySelector('.amount input');
+                if (qty) out.qty.push(qty);
+            }
+            out.have = countIn(text(row.querySelector('.item-amount.qty'))) || countIn((text(row.querySelector('.name-wrap')).match(/x\s*(\d[\d,]*)\s*$/i) || [])[1]);
+            return out;
+        }
+
+        if (page === 'bazaar-manage') {
+            const group = row.querySelector('[class*="price___"]');
+            const inputs = group ? [...group.querySelectorAll('input.input-money')] : [];
+            out.price.push(...(inputs.length ? inputs : [...row.querySelectorAll('[class*="price___"] input')]));
+            return out;
+        }
+
+        if (page === 'market-add' || page === 'market-view') {
+            const priceWrap = row.querySelector('[class*="priceInputWrapper___"]');
+            if (priceWrap) out.price.push(...priceWrap.querySelectorAll('input.input-money'));
+            if (page === 'market-add') {
+                out.single = Boolean(row.querySelector('[class*="checkboxWrapper___"] input[type="checkbox"]'));
+                if (!out.single) {
+                    const qtyWrap = row.querySelector('[class*="amountInputWrapper___"]');
+                    if (qtyWrap) out.qty.push(...qtyWrap.querySelectorAll('input.input-money'));
+                }
+                // "Xanax x12" in the row's name.
+                const m = text(row).match(/\bx\s?(\d[\d,]*)/i);
+                out.have = m ? countIn(m[1]) : null;
+            }
+            return out;
+        }
+        return out;
+    }
+
+    /** An Item Market row's item id: its info button's aria-controls, else its picture. */
+    function marketRowItemId(row) {
+        const info = row.querySelector('[class*="viewInfoButton___"]');
+        const m = info && String(info.getAttribute('aria-controls') || '').match(/-(\d+)-/);
+        if (m) return m[1];
+        const img = row.querySelector(ITEM_IMAGE_SELECTOR) || row.querySelector('img[src*="/items/"]');
+        return img ? itemIdFromImage(img) : null;
+    }
+
+    /**
+     * Every Item Market row on the page you are viewing, with its item.
+     *
+     * @param {'market-add'|'market-view'} page
+     * @returns {{rows: Array<{el, nameEl, itemId, name, item}>, diagnostics: object}}
+     */
+    function scanMarketRows(page, root, index) {
+        const diagnostics = { page, rows: 0, identified: 0, noItem: 0 };
+        const rows = [];
+        if (!root || !index) return { rows, diagnostics };
+        for (const el of root.querySelectorAll(MARKET_ROW_SELECTOR)) {
+            if (el.closest && el.closest('#ttv2-host')) continue;
+            // A row inside a row (Torn nests wrappers): only the outermost counts.
+            if (el.parentElement && el.parentElement.closest && el.parentElement.closest(MARKET_ROW_SELECTOR)) continue;
+            if (!el.querySelector('[class*="priceInputWrapper___"]')) continue;
+            diagnostics.rows += 1;
+            const id = marketRowItemId(el);
+            const nameEl = el.querySelector('[class*="name___"], [class*="title___"]');
+            const name = text(nameEl).replace(/\s*x\s?\d[\d,]*\s*$/i, '');
+            const item = (id && findItemById(index, id)) || findItemByName(index, name) || null;
+            if (!item) {
+                diagnostics.noItem += 1;
+                continue;
+            }
+            diagnostics.identified += 1;
+            rows.push({ el, nameEl: nameEl || null, itemId: item.id, name: item.name, item });
+        }
+        return { rows, diagnostics };
+    }
+
+    /** The item a row shows right now, from its picture: /images/items/{id}/. */
+    function rowItemIdNow(page, row) {
+        if (!row) return null;
+        if (page === 'market-add' || page === 'market-view') return marketRowItemId(row);
+        const img = row.querySelector(ITEM_IMAGE_SELECTOR) || row.querySelector('img[src*="/items/"]');
+        return img ? itemIdFromImage(img) : null;
+    }
+
+    /** The price Torn has on file for a row (its box's value attribute), not what is typed now. */
+    function savedPrice(inputs) {
+        for (const i of inputs || []) {
+            const v = Number(String(i.getAttribute('value') || '').replace(/[^\d]/g, ''));
+            if (v > 0) return v;
+        }
+        return null;
+    }
+
+    /**
+     * Where Fill's settings link goes: Torn's links bar at the top of the page
+     * ("Manage items · Personalize · Back" on your bazaar), as the reference
+     * script does.
+     */
+    function linksBar(doc = document) {
+        return doc.querySelector('[class*="linksContainer___"]');
+    }
+
+    /** What a box holds now, to put back on Undo. */
+    function readInputs(inputs) {
+        return (inputs || []).map((i) => i.value);
+    }
+
+    /**
+     * Type a value into Torn's boxes. Torn's forms listen for input events and
+     * (the bazaar add page) key-ups; React keeps its own copy of a box's value,
+     * so the value goes in through the native setter, which React sees.
+     *
+     * @param {HTMLInputElement[]} inputs
+     * @param {string|string[]} value - one value for all, or one per box (Undo)
+     */
+    function writeInputs(inputs, value) {
+        const list = inputs || [];
+        list.forEach((input, i) => {
+            let v = Array.isArray(value) ? value[i] : value;
+            if (v === undefined || v === null) return;
+            // A hidden twin holds the plain number (value="119999"), the visible box the formatted one.
+            if (input.type === 'hidden' && !Array.isArray(value)) v = String(v).replace(/[^\d]/g, '');
+            const proto = Object.getPrototypeOf(input);
+            const desc = Object.getOwnPropertyDescriptor(proto, 'value') || Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+            if (desc && desc.set) desc.set.call(input, String(v));
+            else input.value = String(v);
+        });
+        // One set of events, from the box you can see (Torn mirrors it into the hidden one).
+        const target = list.find(visible) || list[0];
+        if (!target) return;
+        for (const type of ['input', 'change']) target.dispatchEvent(new Event(type, { bubbles: true }));
+        target.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
+    }
+
+    /** How a price goes into the box: the bazaar pages show 1,234,567; the Item Market takes digits. */
+    function priceText(page, price) {
+        const n = Math.round(Number(price));
+        return page === 'bazaar-add' || page === 'bazaar-manage' ? n.toLocaleString('en-US') : String(n);
+    }
+
+    /** Your own player id, from the page's own data (#torn-user) or the sidebar's profile link. */
+    function ownIdFromPage(doc = document) {
+        try {
+            const raw = doc.getElementById('torn-user');
+            const data = raw && raw.value ? JSON.parse(raw.value) : null;
+            const id = data && Number(data.id);
+            if (id > 0) return String(id);
+        } catch {
+            /* not there */
+        }
+        const a = doc.querySelector('#sidebarroot a[href*="profiles.php?XID="], a[class*="menu-value"][href*="profiles.php?XID="]');
+        const m = a && String(a.getAttribute('href')).match(/XID=(\d+)/);
+        return m ? m[1] : null;
+    }
+
+    /**
+     * Where the Fill button goes in a row: after our price tag on the bazaar
+     * pages (the tag follows the name), before the price box on the Item Market.
+     */
+    function fillAnchor(page, row) {
+        if (page === 'market-add' || page === 'market-view') {
+            const wrap = row.el.querySelector('[class*="priceInputWrapper___"]');
+            return wrap ? { parent: wrap.parentNode, before: wrap } : { parent: row.el, before: null };
+        }
+        return null;
+    }
+
+    /* ===== src/core/fill.js ===== */
+    /*
+     * The Fill button's price: what to type into Torn's price box for one row
+     * on your bazaar's add / manage pages, or the Item Market's. Pure - no DOM,
+     * no network.
+     *
+     * The friend's request, modelled on Greasy Fork's "Customizable Bazaar
+     * Filler" (527925) and "Torn Market Filler" (513920): undercut the lowest
+     * (or 2nd, 3rd...) listing by an amount in dollars or percent. The default
+     * is the lowest bazaar listing minus $1 - his script's own setting (source
+     * Bazaars/weav3r.dev, Listing Index 1, Margin -1, Absolute).
+     *
+     * Only real competition counts: your own listing, $1 (padlocked) ones,
+     * sponsored ones, ones TornW3B has not seen for 30 minutes, and trolls far
+     * under the average are never the one undercut. Never below the NPC price;
+     * optionally never below the Item Market Average.
+     */
+
+    /** A listing TornW3B has not re-checked for this long may have sold. */
+    const FILL_FRESH_MS = 30 * 60 * 1000;
+
+    /** Under this share of the Item Market Average, a listing is a troll or a mistake. */
+    const FILL_TROLL_SHARE = 0.25;
+
+    /** A price read for Fill is reused for this long, then read again. */
+    const FILL_REUSE_MS = 60 * 1000;
+
+    /** How many listings the panel shows per market. */
+    const FILL_SHOW_LISTINGS = 5;
+
+    /** The settings, one row per market. The default is the friend's own. */
+    const FILL_DEFAULTS = {
+        bazaar: { index: 1, amount: 1, unit: '$', qty: 'all', floorAvg: false },
+        market: { index: 1, amount: 1, unit: '$', qty: 'all', floorAvg: false },
+    };
+
+    /** "lowest", "2nd lowest", "3rd lowest", "4th lowest"... */
+    function ordinalLowest(index) {
+        const n = Math.max(1, Math.floor(Number(index) || 1));
+        if (n === 1) return 'lowest';
+        const tens = n % 100;
+        const suffix = tens >= 11 && tens <= 13 ? 'th' : n % 10 === 1 ? 'st' : n % 10 === 2 ? 'nd' : n % 10 === 3 ? 'rd' : 'th';
+        return n + suffix + ' lowest';
+    }
+
+    /** One market's settings, cleaned: anything missing or bad falls back to the default. */
+    function cleanFillSettings(raw, market = 'bazaar') {
+        const d = FILL_DEFAULTS[market] || FILL_DEFAULTS.bazaar;
+        const r = raw && typeof raw === 'object' ? raw : {};
+        const index = Math.floor(Number(r.index));
+        const amount = Number(r.amount);
+        return {
+            index: index >= 1 && index <= 20 ? index : d.index,
+            amount: Number.isFinite(amount) && amount >= 0 && amount < 1e12 ? amount : d.amount,
+            unit: r.unit === '%' ? '%' : '$',
+            qty: r.qty === 'allbut1' ? 'allbut1' : 'all',
+            floorAvg: typeof r.floorAvg === 'boolean' ? r.floorAvg : d.floorAvg,
+        };
+    }
+
+    /**
+     * Which listings may be undercut, cheapest first, and why the rest were not.
+     *
+     * @param {Array<{price, qty?, sellerId?, sponsored?, dataAt?, mine?}>} listings
+     * @param {object} [opts]
+     * @param {string|null} [opts.selfId] - your Torn id; a listing of yours is never undercut
+     * @param {number|null} [opts.avg]    - the Item Market Average, for the troll check
+     * @param {number} [opts.now]
+     * @param {boolean} [opts.checkFresh] - bazaar listings carry TornW3B's check time; the
+     *                                      Item Market's are live and have none
+     */
+    function realListings(listings, { selfId = null, avg = null, now = Date.now(), checkFresh = true } = {}) {
+        const self = selfId ? String(selfId) : null;
+        const skipped = { mine: 0, dollar: 0, sponsored: 0, stale: 0, troll: 0 };
+        const rows = [];
+        for (const l of listings || []) {
+            const price = Number(l && l.price);
+            if (!(price > 0)) continue;
+            if (l.mine || (self && l.sellerId !== undefined && l.sellerId !== null && String(l.sellerId) === self)) skipped.mine += 1;
+            else if (price <= 1) skipped.dollar += 1;
+            else if (l.sponsored) skipped.sponsored += 1;
+            else if (checkFresh && !(l.dataAt && now - l.dataAt <= FILL_FRESH_MS)) skipped.stale += 1;
+            else if (avg > 0 && price < avg * FILL_TROLL_SHARE) skipped.troll += 1;
+            else rows.push(l);
+        }
+        rows.sort((a, b) => a.price - b.price);
+        return { rows, skipped };
+    }
+
+    /**
+     * The price Fill types.
+     *
+     * @param {Array} listings - raw listings for the market (see realListings)
+     * @param {object} settings - cleanFillSettings output
+     * @param {object} [ctx]
+     * @param {number|null} [ctx.npc] - what an NPC shop pays; never gone under
+     * @param {number|null} [ctx.avg] - the Item Market Average
+     * @returns {{price: number|null, base: object|null, index: number, used: number,
+     *   floor: 'npc'|'avg'|null, skipped: object, count: number, why: string|null}}
+     *   `index` asked for (1-based), `used` the one undercut (fewer listings than
+     *   asked: the highest there is). `price` null with `why` when there is nothing
+     *   to go by.
+     */
+    function fillPrice(listings, settings, { npc = null, avg = null, selfId = null, now = Date.now(), checkFresh = true } = {}) {
+        const s = cleanFillSettings(settings);
+        const { rows, skipped } = realListings(listings, { selfId, avg, now, checkFresh });
+        const out = { price: null, base: null, index: s.index, used: 0, floor: null, skipped, count: rows.length, why: null };
+        if (!rows.length) {
+            out.why = 'No listing to undercut.';
+            return out;
+        }
+        out.used = Math.min(s.index, rows.length);
+        out.base = rows[out.used - 1];
+        const base = out.base.price;
+        // Percent in whole-dollar steps without float error (6% of $2,150 is $2,021, not $2,020).
+        let price = s.unit === '%' ? Math.floor((base * (100 - s.amount)) / 100 + 1e-9) : Math.round(base - s.amount);
+        // $1 is Torn's padlocked price, and nothing sells for less: never typed.
+        if (!(price > 1)) {
+            out.why = 'That undercut would go to $1 or less. Lower the amount in Fill settings.';
+            return out;
+        }
+        if (s.floorAvg && avg > 0 && price < avg) {
+            price = Math.ceil(avg);
+            out.floor = 'avg';
+        }
+        if (npc > 0 && price < npc) {
+            price = Math.ceil(npc);
+            out.floor = 'npc';
+        }
+        out.price = price;
+        return out;
+    }
+
+    /**
+     * How many Fill types: everything you have of it, or everything but one.
+     * null leaves Torn's quantity box alone (nothing to list, or not known).
+     */
+    function fillQuantity(have, mode = 'all') {
+        const n = Math.floor(Number(have));
+        if (!(n > 0)) return null;
+        const q = mode === 'allbut1' ? n - 1 : n;
+        return q > 0 ? q : null;
+    }
+
+    /**
+     * The line shown after a fill: the price against the Item Market Average.
+     * Green at or above it, amber below it.
+     *
+     * @returns {{level: 'good'|'warn'|null, text: string}}
+     */
+    function fillVerdict(price, avg) {
+        if (!(price > 0) || !(avg > 0)) return { level: null, text: '' };
+        const diff = (price - avg) / avg;
+        const pct = Math.abs(diff * 100);
+        const shown = pct < 0.1 ? '0' : pct < 10 ? pct.toFixed(1).replace(/\.0$/, '') : String(Math.round(pct));
+        if (diff >= 0) return { level: 'good', text: shown === '0' ? 'at the average' : shown + '% over the average' };
+        return { level: 'warn', text: shown + '% under the average' };
+    }
+
+    /* ===== src/ui/fill-form.js ===== */
+    /*
+     * The Fill button's settings: one block per market (your bazaar, the Item
+     * Market), each "undercut the [lowest / 2nd / 3rd...] listing by [amount]
+     * [$ / %]", the quantity (all, or all but one) and the floor at the Item
+     * Market Average. The same form sits in the panel's Settings on Torn and in
+     * Torn Bids' Settings; both edit one stored value. Built from DOM nodes only.
+     *
+     * The friend's words: "listing index, may choice ako kung yung lowest or
+     * second lowest iundercut ko. kung magkano rin na margin gusto ko, in
+     * dollar or in percentage".
+     */
+
+
+
+
+    const TF_MARKETS = [
+        ['bazaar', 'On your bazaar', 'bazaar'],
+        ['market', 'On the Item Market', 'Item Market'],
+    ];
+
+    /** Every market's settings from what is stored, cleaned. */
+    function readFillSettings(stored) {
+        const s = stored && typeof stored === 'object' ? stored : {};
+        return { bazaar: cleanFillSettings(s.bazaar, 'bazaar'), market: cleanFillSettings(s.market, 'market') };
+    }
+
+    function tfMake(tag, props = {}, children = []) {
+        const node = document.createElement(tag);
+        for (const [key, value] of Object.entries(props)) {
+            if (key === 'class') node.className = value;
+            else if (key === 'text') node.textContent = value;
+            else if (key.startsWith('on') && typeof value === 'function') node.addEventListener(key.slice(2).toLowerCase(), value);
+            else if (value !== null && value !== undefined && value !== false) node.setAttribute(key, String(value));
+        }
+        for (const child of [].concat(children)) {
+            if (child === null || child === undefined || child === false) continue;
+            node.appendChild(typeof child === 'string' ? document.createTextNode(child) : child);
+        }
+        return node;
+    }
+
+    /** The example under each block: what Fill would type for a $1,000,000 listing. */
+    function fillExample(market, s) {
+        const what = market === 'market' ? 'Item Market' : 'bazaar';
+        const rows = [1000000, 1000500, 1001000, 1001500, 1002000, 1002500, 1003000, 1003500, 1004000, 1004500].map((price) => ({ price, mine: false }));
+        const r = fillPrice(rows, { ...s, floorAvg: false }, { checkFresh: false });
+        return 'Example: the ' + ordinalLowest(r.used) + ' ' + what + ' listing is ' + formatMoney(r.base.price) + ' → Fill types ' + formatMoney(r.price) + '.';
+    }
+
+    /**
+     * @param {object} opts
+     * @param {function} opts.get - () => the stored settings {bazaar, market}
+     * @param {function} opts.set - (settings) => save them
+     * @returns {{el: HTMLElement, sync: function}} sync() redraws from get()
+     */
+    function buildFillForm({ get, set }) {
+        const root = tfMake('div', { class: 'tf-form' });
+        const parts = {};
+
+        const save = (market, partial) => {
+            const all = readFillSettings(get());
+            all[market] = cleanFillSettings({ ...all[market], ...partial }, market);
+            set(all);
+            sync();
+        };
+
+        for (const [key, title, what] of TF_MARKETS) {
+            const index = tfMake('select', { class: 'tf-select', 'aria-label': title + ': which listing to undercut' });
+            for (let n = 1; n <= 5; n += 1) index.appendChild(tfMake('option', { value: String(n), text: ordinalLowest(n) }));
+            index.addEventListener('change', () => save(key, { index: Number(index.value) }));
+
+            const amount = tfMake('input', { type: 'text', class: 'tf-num', inputmode: 'decimal', 'aria-label': title + ': by how much', autocomplete: 'off', spellcheck: 'false' });
+            const commit = () => {
+                const v = Number(String(amount.value).replace(/[$,%\s]/g, ''));
+                if (!(v >= 0) || !Number.isFinite(v)) {
+                    amount.classList.add('tf-bad');
+                    return;
+                }
+                amount.classList.remove('tf-bad');
+                save(key, { amount: v });
+            };
+            amount.addEventListener('change', commit);
+            amount.addEventListener('keydown', (event) => {
+                if (event.key !== 'Enter') return;
+                event.preventDefault();
+                commit();
+            });
+
+            const seg = (options, onPick) => {
+                const box = tfMake('span', { class: 'tf-seg', role: 'group' });
+                const btns = options.map(([value, label]) => {
+                    const b = tfMake('button', { type: 'button', 'aria-pressed': 'false', text: label, onclick: () => onPick(value) });
+                    box.appendChild(b);
+                    return [value, b];
+                });
+                return { box, btns };
+            };
+            const unit = seg([['$', '$'], ['%', '%']], (v) => save(key, { unit: v }));
+            const qty = seg([['all', 'All'], ['allbut1', 'All but 1']], (v) => save(key, { qty: v }));
+
+            const floor = tfMake('input', { type: 'checkbox' });
+            floor.addEventListener('change', () => save(key, { floorAvg: floor.checked }));
+
+            const example = tfMake('div', { class: 'tf-example' });
+
+            root.appendChild(tfMake('div', { class: 'tf-block', 'data-market': key }, [
+                tfMake('div', { class: 'tf-title', text: title }),
+                tfMake('div', { class: 'tf-grid' }, [
+                    tfMake('span', { class: 'tf-label', text: 'Undercut' }),
+                    tfMake('div', { class: 'tf-row' }, ['the ', index, ' ' + what + ' listing']),
+                    tfMake('span', { class: 'tf-label', text: 'By' }),
+                    tfMake('div', { class: 'tf-row' }, [amount, unit.box]),
+                    tfMake('span', { class: 'tf-label', text: 'Quantity' }),
+                    tfMake('div', { class: 'tf-row' }, [qty.box]),
+                    tfMake('span', { class: 'tf-label', text: 'Floor' }),
+                    tfMake('label', { class: 'tf-row tf-check' }, [floor, tfMake('span', { text: 'Never below the Item Market Average' })]),
+                ]),
+                example,
+            ]));
+            parts[key] = { index, amount, unit, qty, floor, example };
+        }
+        root.appendChild(tfMake('div', { class: 'tf-note', text: 'Never below the NPC price. Never undercuts your own listing, or a $1, sponsored, stale (over 30 min) or troll (under 25% of the average) one. Fill types into Torn\'s boxes; you press Torn\'s button.' }));
+
+        function sync() {
+            const all = readFillSettings(get());
+            for (const [key] of TF_MARKETS) {
+                const s = all[key];
+                const p = parts[key];
+                p.index.value = String(Math.min(5, s.index));
+                if (root.ownerDocument.activeElement !== p.amount && !(p.amount.getRootNode && p.amount.getRootNode().activeElement === p.amount)) {
+                    p.amount.value = String(s.amount);
+                }
+                for (const [v, b] of p.unit.btns) b.setAttribute('aria-pressed', String(v === s.unit));
+                for (const [v, b] of p.qty.btns) b.setAttribute('aria-pressed', String(v === s.qty));
+                p.floor.checked = s.floorAvg;
+                p.example.textContent = fillExample(key, s);
+            }
+        }
+        sync();
+        return { el: root, sync };
+    }
+
+    /** The form's look, for the panel's and Torn Bids' stylesheets alike (their tokens). */
+    const FILL_FORM_CSS = `
+    .tf-form { display: flex; flex-direction: column; gap: 12px; }
+    .tf-block { display: flex; flex-direction: column; gap: 8px; padding: 12px; border: 1px solid var(--line, #444); border-radius: 8px; background: rgba(0, 0, 0, 0.18); }
+    .tf-title { font-weight: bold; color: #fff; font-size: 13px; }
+    .tf-grid { display: grid; grid-template-columns: 72px minmax(0, 1fr); gap: 8px 10px; align-items: center; }
+    .tf-label { font-size: 12px; color: var(--muted, #999); }
+    .tf-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 13px; color: var(--text, #ddd); }
+    .tf-select, .tf-num { height: 30px; padding: 0 8px; border-radius: 6px; border: 1px solid #555; background: #1b1b1b; color: var(--text, #ddd); font: inherit; font-size: 13px; }
+    .tf-form .tf-row input.tf-num { width: 84px; flex: 0 0 84px; text-align: right; font-variant-numeric: tabular-nums; }
+    .tf-form .tf-row input.tf-num.tf-bad { border-color: var(--bad, #d83500); }
+    .tf-seg { display: inline-flex; border: 1px solid #555; border-radius: 6px; overflow: hidden; }
+    .tf-seg button { height: 28px; padding: 0 10px; border: 0; border-radius: 0; background: none; color: var(--muted, #999); font: inherit; font-size: 13px; font-weight: bold; cursor: pointer; }
+    .tf-seg button[aria-pressed="true"] { background: rgba(153, 204, 0, 0.14); color: #fff; box-shadow: inset 0 0 0 1px var(--profit, #99cc00); }
+    .tf-check { cursor: pointer; }
+    .tf-check input { accent-color: var(--profit, #99cc00); margin: 0; }
+    .tf-example { font-size: 12px; color: var(--muted, #999); font-variant-numeric: tabular-nums; }
+    .tf-note { font-size: 12px; color: var(--muted, #999); }
+    `;
+
     /* ===== src/sources/dom/owner.js ===== */
     /*
      * The bazaar owner banner, captured live 2026-09-24:
@@ -5321,6 +6418,8 @@
      * Torn sets its dark value on <body>; the selling page is attached outside
      * it and got Torn's LIGHT default - light-grey text on a light page.
      */
+
+
     const TOKENS_CSS = `
         --bg: #2e2e2e;
         --row: #2b2b2b;
@@ -5548,6 +6647,135 @@
         color: #a8dd1c;
         font-weight: bold;
     }
+
+    .ttv2-bztag .ttv2-bztag-low {
+        color: #74c0fc;
+    }
+
+    /*
+     * Your bazaar's add page: IMA and BP chips and the Fill tick, in one line in
+     * Torn's own value column after its price - the row stays one line.
+     */
+    .ttv2-bztag.ttv2-bzchips {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        margin-left: 10px;
+        padding: 0;
+        border: 0;
+        background: none;
+        cursor: default;
+        vertical-align: middle;
+        white-space: nowrap;
+    }
+
+    .ttv2-bzchip {
+        display: inline-block;
+        padding: 0 6px;
+        border: 1px solid #444;
+        border-radius: 4px;
+        background: #2b2b2b;
+        color: #bbb;
+        font: 11px/18px Arial, Helvetica, sans-serif;
+        cursor: pointer;
+    }
+
+    .ttv2-bzchip b { font-weight: bold; font-variant-numeric: tabular-nums; }
+    .ttv2-bzchip-ima b { color: #a8dd1c; }
+    .ttv2-bzchip-bp b { color: #74c0fc; }
+    .ttv2-bzchip:hover,
+    .ttv2-bzchips[data-selected="true"] .ttv2-bzchip { border-color: #99cc00; }
+    .ttv2-bzchips .ttv2-fillbox { margin-left: 0; }
+    .ttv2-bzchips .ttv2-filltag { display: none; }
+    .ttv2-bzchips .ttv2-fillbtn { height: 20px; font-size: 11px; }
+    .ttv2-fillbtn[data-level="good"] .ttv2-filllabel { color: #a8dd1c; }
+    .ttv2-fillbtn[data-level="warn"] .ttv2-filllabel { color: #f0a020; }
+    .ttv2-fillbtn[data-level="bad"] { border-color: #ff8a80; }
+
+    /* On the Item Market the tag sits on its own line above the price box. */
+    .ttv2-bztag.ttv2-bztag-market {
+        display: block;
+        width: max-content;
+        max-width: 100%;
+        margin: 4px 0;
+        white-space: normal;
+    }
+
+    /*
+     * The Fill button: ours, beside the tag. It types into Torn's boxes; it never
+     * presses Torn's buttons. Its line says what it typed, or why it could not.
+     */
+    .ttv2-fillbox {
+        display: inline-flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 6px;
+        margin-left: 6px;
+        vertical-align: middle;
+        font: 12px/20px Arial, Helvetica, sans-serif;
+    }
+
+    .ttv2-bztag-market + .ttv2-fillbox {
+        display: flex;
+        margin: 0 0 4px;
+    }
+
+    .ttv2-fillbtn {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        height: 22px;
+        padding: 0 8px 0 6px;
+        border: 1px solid #555;
+        border-radius: 4px;
+        background: #2b2b2b;
+        color: #ddd;
+        font: bold 12px/20px Arial, Helvetica, sans-serif;
+        cursor: pointer;
+        white-space: nowrap;
+    }
+
+    .ttv2-fillbtn:hover { border-color: #99cc00; }
+    .ttv2-fillbtn:disabled { opacity: 0.6; cursor: progress; }
+
+    /* The tick box: empty, or ticked in green once the row is filled. */
+    .ttv2-fillmark {
+        width: 12px;
+        height: 12px;
+        border: 1px solid #888;
+        border-radius: 2px;
+        background: #1b1b1b;
+        box-sizing: border-box;
+        position: relative;
+    }
+
+    .ttv2-fillbtn[aria-checked="true"] { border-color: #99cc00; }
+    .ttv2-fillbtn[aria-checked="true"] .ttv2-fillmark { background: #99cc00; border-color: #99cc00; }
+    .ttv2-fillbtn[aria-checked="true"] .ttv2-fillmark::after {
+        content: '';
+        position: absolute;
+        left: 3px;
+        top: 0;
+        width: 4px;
+        height: 8px;
+        border: solid #1b1b1b;
+        border-width: 0 2px 2px 0;
+        transform: rotate(45deg);
+    }
+
+    a.ttv2-fillset { cursor: pointer; color: #74c0fc; }
+    .ttv2-fillbtn:focus-visible { outline: 2px solid #74c0fc; outline-offset: 1px; }
+
+    .ttv2-filltag {
+        color: #ddd;
+        white-space: normal;
+        font-variant-numeric: tabular-nums;
+    }
+
+    .ttv2-filltag[data-level="good"] { color: #a8dd1c; }
+    .ttv2-filltag[data-level="warn"] { color: #f0a020; }
+    .ttv2-filltag[data-level="bad"] { color: #ff8a80; }
+    .ttv2-filltag[hidden] { display: none; }
     `;
 
     const PANEL_CSS = `
@@ -6294,8 +7522,8 @@
 
     .ttv2-bzrow {
         display: grid;
-        grid-template-columns: minmax(0, 1fr) 120px;
-        gap: 8px;
+        grid-template-columns: minmax(0, 1fr) auto auto;
+        gap: 8px 16px;
         align-items: center;
         width: 100%;
         height: auto;
@@ -6323,9 +7551,7 @@
 
     .ttv2-bzrow .ttv2-name {
         min-width: 0;
-        overflow: hidden;
-        text-overflow: ellipsis;
-        white-space: nowrap;
+        overflow-wrap: anywhere;
         color: var(--text);
     }
 
@@ -6419,6 +7645,58 @@
     .ttv2-graph-keys i { display: inline-block; width: 16px; height: 0; border-top: 2px solid; }
     .ttv2-graph-keys .ttv2-key-mv i { border-color: #a8dd1c; }
     .ttv2-graph-keys .ttv2-key-im i { border-color: var(--offer); border-top-width: 1px; }
+    .ttv2-graph-keys .ttv2-key-mark i { border-color: #f0a020; border-top-style: dashed; }
+
+    .ttv2-bzrow .ttv2-bzlow { color: var(--offer); }
+
+    .ttv2-fillnow {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        padding: 10px 12px;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        background: var(--row);
+    }
+    .ttv2-fillnow-done { border-color: #99cc00; }
+    .ttv2-fillprice {
+        font-size: 20px;
+        font-weight: bold;
+        line-height: 1.2;
+        color: #f0a020;
+        font-variant-numeric: tabular-nums;
+    }
+    .ttv2-fillnow-done .ttv2-fillprice { color: #a8dd1c; }
+    .ttv2-verdict[data-level="good"] { color: #a8dd1c; }
+    .ttv2-verdict[data-level="warn"] { color: #f0a020; }
+    .ttv2-panel button.ttv2-fillgo { align-self: flex-start; margin-top: 4px; }
+
+    .ttv2-lows {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+        gap: 8px;
+    }
+    .ttv2-lowcol { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+    .ttv2-panel button.ttv2-lowrow {
+        display: flex;
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 0;
+        height: auto;
+        padding: 4px 8px;
+        text-align: left;
+        font-weight: normal;
+        background: var(--row);
+        border: 1px solid var(--line);
+    }
+    .ttv2-panel button.ttv2-lowrow:hover:not(:disabled) { border-color: var(--offer); }
+    .ttv2-panel button.ttv2-lowrow:disabled { cursor: default; opacity: 1; }
+    .ttv2-lowrow .ttv2-money { color: var(--text); font-variant-numeric: tabular-nums; }
+    .ttv2-lowsub { font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+    .ttv2-lowmine { border-style: dashed !important; }
+    .ttv2-lowmine .ttv2-money { color: var(--muted); }
+    .ttv2-lowstale .ttv2-money { color: var(--muted); }
+
 
     .ttv2-windows {
         display: flex;
@@ -6552,7 +7830,7 @@
     /** A <style> for the panel's shadow root. */
     function panelStyleElement(doc = document) {
         const style = doc.createElement('style');
-        style.textContent = PANEL_CSS;
+        style.textContent = PANEL_CSS + FILL_FORM_CSS;
         return style;
     }
 
@@ -6659,7 +7937,9 @@
 
     /**
      * @param {object} data - from core/history.js series(): { from, to, points, mv, step }
-     * @param {object} [opts] - { width, height, colors: { im, mv } }
+     * @param {object} [opts] - { width, height, colors: { im, mv }, mark }
+     *   mark: a price to show as a dashed line across the graph - the price the
+     *   Fill button is about to list at. Always inside the scale.
      * @returns {HTMLElement} a figure holding the graph, its scale and its hover label
      */
     function renderPriceGraph(data, opts = {}) {
@@ -6693,6 +7973,11 @@
         // $9,999,999 Xanax on an empty market) would otherwise flatten every
         // other line; such a point is pinned to the edge and marked instead.
         let { min, max } = scaleRange(points.map((p) => p.im), mv.map((m) => m.mv));
+        const mark = Number(opts.mark) > 0 ? Number(opts.mark) : null;
+        if (mark !== null) {
+            min = Math.min(min, mark);
+            max = Math.max(max, mark);
+        }
         const room = (max - min) * 0.08 || max * 0.02 || 1;
         min = Math.max(0, min - room);
         max += room;
@@ -6766,6 +8051,15 @@
             if (d) svg.appendChild(svgEl('path', { d, fill: 'none', stroke: colors.mv, 'stroke-width': 2, 'stroke-linejoin': 'round' }));
         }
 
+        /* the price about to be listed */
+        if (mark !== null) {
+            const my = y(mark).toFixed(1);
+            svg.appendChild(svgEl('line', { x1: pad.l, x2: pad.l + plotW, y1: my, y2: my, class: 'ttv2-graph-mark', stroke: '#f0a020', 'stroke-width': 1.5, 'stroke-dasharray': '5 3' }));
+            const label = svgEl('text', { x: pad.l + 4, y: Number(my) - 4, class: 'ttv2-graph-marklabel', fill: '#f0a020' });
+            label.textContent = 'Fill ' + formatMoneyShort(mark);
+            svg.appendChild(label);
+        }
+
         /* point at the graph to read it */
         const cursor = svgEl('line', { y1: pad.t, y2: pad.t + plotH, class: 'ttv2-graph-cursor', visibility: 'hidden' });
         const dotIm = svgEl('circle', { r: 3, fill: colors.im, visibility: 'hidden' });
@@ -6835,6 +8129,7 @@
      * textContent - names from Torn or TornW3B never touch innerHTML. The panel
      * is in a shadow root (see mount()).
      */
+
 
 
 
@@ -7203,7 +8498,7 @@
             this.listPage.style.display = this.page === 'list' ? '' : 'none';
             this.bazaarPage.style.display = this.page === 'mybazaar' ? '' : 'none';
             this.settingsBtn.setAttribute('aria-pressed', String(settings));
-            this.titleTextEl.textContent = settings ? 'Settings' : this.page === 'mybazaar' ? 'My bazaar' : 'NPC Arbitrage';
+            this.titleTextEl.textContent = settings ? 'Settings' : this.page === 'mybazaar' ? (this.state.bazaar && this.state.bazaar.title) || 'My bazaar' : 'NPC Arbitrage';
 
             // Opening a page from a collapsed panel should show it.
             if (this.collapsed) this.setCollapsed(false, { save: true });
@@ -7509,6 +8804,17 @@
 
             this.settingsPage.appendChild(section('Links', [nt.row]));
 
+            /* ---- the Fill button (your bazaar's and the Item Market's own pages) ---- */
+            this.fillForm = buildFillForm({
+                get: () => (this.handlers.getFill ? this.handlers.getFill() : null),
+                set: (value) => this.handlers.onFillSettings && this.handlers.onFillSettings(value),
+            });
+            this.fillSectionEl = section('Fill', [
+                note('On your bazaar\'s add and manage pages and the Item Market\'s add-listing and your-listings pages: tick Fill in a row to type its price; untick to put it back.'),
+                this.fillForm.el,
+            ]);
+            this.settingsPage.appendChild(this.fillSectionEl);
+
             this.settingsPage.appendChild(
                 section('Selling', [
                     note('The selling page has its own keys and settings.'),
@@ -7522,6 +8828,23 @@
             );
         }
 
+        /** My bazaar, scrolled to one part: 'graph' (IMA was pressed) or 'lows' (BP). */
+        showBazaarPart(part) {
+            const target = part === 'lows' ? this.bzDetailEl.querySelector('.ttv2-lows') : this.bzDetailEl.querySelector('.ttv2-windows');
+            if (target && target.scrollIntoView) target.scrollIntoView({ block: 'start' });
+        }
+
+        /** Settings, scrolled to the Fill part (Torn's links bar asks for it). */
+        openFillSettings() {
+            this.showPage('settings');
+            if (this.fillSectionEl && this.fillSectionEl.scrollIntoView) this.fillSectionEl.scrollIntoView({ block: 'start' });
+        }
+
+        /** Fill settings changed elsewhere: redraw the form from what is stored. */
+        syncFill() {
+            if (this.fillForm) this.fillForm.sync();
+        }
+
         /**
          * Torn's API Terms of Service require any tool that takes a key to state,
          * in this table form and where the key is entered, how it uses the key.
@@ -7530,11 +8853,11 @@
             const rows = [
                 ['Data storage', 'Only locally, in this browser'],
                 ['Data sharing', 'Nobody'],
-                ['Purpose of use', 'Competitive advantage: finding Bazaar and Item Market listings below NPC or market value'],
+                ['Purpose of use', 'Competitive advantage: finding Bazaar and Item Market listings below NPC or market value, and filling your own listing prices'],
                 ['Key storage & sharing', 'Stored locally / Not shared'],
                 [
                     'Key access level',
-                    'Public (torn: items, cityshops; market: itemmarket; key: info; user: profile, for bazaar owners\' public status)',
+                    'Public (torn: items, cityshops; market: itemmarket; key: info; user: profile, for bazaar owners\' public status; user: basic, your own id, so Fill never undercuts you)',
                 ],
                 [
                     'Other services',
@@ -8250,16 +9573,20 @@
                 return;
             }
             if (this.page === 'list') this.showPage('mybazaar');
+            if (this.page === 'mybazaar' && this.titleTextEl.textContent !== (view.title || 'My bazaar')) this.titleTextEl.textContent = view.title || 'My bazaar';
 
             const updated = view.avgAt ? 'What it sold for, on average · updated ' + formatAge(Date.now() - view.avgAt) + '.' : 'What it sold for, on average.';
 
             // Redrawn only when what it shows changes: the helper repaints every
             // few seconds, and a redraw would drop the graph's hover readout.
             const s = view.series;
+            const f = view.fill;
             const sig = JSON.stringify([
                 view.items,
                 view.selected,
                 view.windowKey,
+                view.mark,
+                f ? [f.lists, f.preview, f.filled, f.canFill] : null,
                 s ? [s.points.length, s.points[s.points.length - 1], s.mv.length, s.mv[s.mv.length - 1], Math.floor(s.to / 300000)] : null,
             ]);
             if (sig === this.bzSig && this.bzUpdatedEl) {
@@ -8277,17 +9604,19 @@
                 list.appendChild(el('div', { class: 'ttv2-bzrow ttv2-bzhead' }, [
                     el('span', { class: 'ttv2-label', text: 'Item' }),
                     el('span', { class: 'ttv2-label ttv2-money', text: 'IM average' }),
+                    el('span', { class: 'ttv2-label ttv2-money', text: view.lowLabel || 'Lowest' }),
                 ]));
                 for (const it of view.items) {
                     list.appendChild(el('button', {
                         type: 'button',
                         class: 'ttv2-bzrow',
                         'aria-pressed': String(it.itemId === view.selected),
-                        title: 'Show its graph',
+                        title: 'Show its prices and graph',
                         onclick: () => this.handlers.onSelectBazaarItem && this.handlers.onSelectBazaarItem(it.itemId),
                     }, [
                         el('span', { class: 'ttv2-name', text: it.name }),
                         el('span', { class: 'ttv2-money', text: it.avg ? formatMoney(it.avg) : '…' }),
+                        el('span', { class: 'ttv2-money ttv2-bzlow', text: it.low ? formatMoney(it.low) : '…' }),
                     ]));
                 }
             }
@@ -8305,6 +9634,55 @@
                 (this.bzUpdatedEl = el('div', { class: 'ttv2-note', text: updated })),
             ]));
 
+            /* Fill: what it typed, or what it would type */
+            if (f) {
+                const shown = f.filled ? f.filled.price : f.preview ? f.preview.price : null;
+                const verdict = f.preview && f.preview.verdict && !f.filled ? f.preview.verdict : null;
+                const own = f.lists[f.market];
+                const box = el('div', { class: 'ttv2-fillnow' + (f.filled ? ' ttv2-fillnow-done' : '') }, [
+                    el('div', { class: 'ttv2-label', text: f.filled ? 'Filled in its row' : 'Fill would type' }),
+                    el('div', { class: 'ttv2-fillprice', text: shown ? formatMoney(shown) : own && own.state === 'ok' ? 'Nothing to undercut' : 'Reading prices…' }),
+                    verdict && verdict.text
+                        ? el('div', { class: 'ttv2-note ttv2-verdict', 'data-level': verdict.level || '', text: verdict.text + (f.preview.floor === 'npc' ? ' · held at the NPC price' : f.preview.floor === 'avg' ? ' · held at the average' : '') })
+                        : null,
+                    f.canFill && !f.filled && shown
+                        ? el('button', { type: 'button', class: 'ttv2-primary ttv2-fillgo', text: 'Fill its row', onclick: () => this.handlers.onFillSelected && this.handlers.onFillSelected() })
+                        : null,
+                ]);
+                detail.appendChild(box);
+
+                /* the lowest listings on both markets; a price you press is undercut */
+                const lists = el('div', { class: 'ttv2-lows' });
+                for (const [m, title] of [['bazaar', 'Bazaars · cheapest 5'], ['market', 'Item Market · cheapest 5']]) {
+                    const L = f.lists[m] || { state: 'loading', rows: [] };
+                    const col = el('div', { class: 'ttv2-lowcol' }, [el('div', { class: 'ttv2-label', text: title })]);
+                    if (L.state === 'loading') col.appendChild(el('div', { class: 'ttv2-note', text: 'Loading…' }));
+                    else if (L.state === 'nokey') col.appendChild(el('div', { class: 'ttv2-note', text: 'Needs your key.' }));
+                    else if (L.state === 'error') col.appendChild(el('div', { class: 'ttv2-note ttv2-bad', text: L.error || 'Could not load.' }));
+                    else if (!L.rows.length) col.appendChild(el('div', { class: 'ttv2-note', text: 'None listed.' }));
+                    (L.rows || []).forEach((r, i) => {
+                        const sub = [];
+                        if (r.mine) sub.push('you');
+                        else if (r.name) sub.push(r.name);
+                        sub.push('×' + Number(r.qty || 0).toLocaleString('en-US'));
+                        if (r.net) sub.push(formatMoney(r.net) + ' after fee');
+                        if (r.stale) sub.push('not seen 30m');
+                        if (r.troll) sub.push('far under the average');
+                        const skip = r.mine || r.troll || r.stale;
+                        col.appendChild(el('button', {
+                            type: 'button',
+                            class: 'ttv2-lowrow' + (r.mine ? ' ttv2-lowmine' : '') + (r.stale || r.troll ? ' ttv2-lowstale' : ''),
+                            disabled: skip || !f.canFill ? '' : null,
+                            title: r.mine ? 'Your own listing: never undercut' : r.troll ? 'Far under the average: never undercut' : r.stale ? 'Not seen for 30 minutes: never undercut' : f.canFill ? 'Undercut this one in the item\'s row' : '',
+                            onclick: () => this.handlers.onFillListing && this.handlers.onFillListing(m, i),
+                        }, [el('b', { class: 'ttv2-money', text: formatMoney(r.price) }), el('span', { class: 'ttv2-lowsub', text: sub.join(' · ') })]));
+                    });
+                    if (L.note) col.appendChild(el('div', { class: 'ttv2-note', text: L.note }));
+                    lists.appendChild(col);
+                }
+                detail.appendChild(lists);
+            }
+
             /* the graph, with its window */
             const windows = el('div', { class: 'ttv2-windows', role: 'group', 'aria-label': 'Graph window' });
             for (const key of ['24h', '7d', '30d']) {
@@ -8318,10 +9696,11 @@
             }
             detail.appendChild(windows);
 
-            if (view.series) detail.appendChild(renderPriceGraph(view.series, { width: 404, height: 160 }));
+            if (view.series) detail.appendChild(renderPriceGraph(view.series, { width: 404, height: 160, mark: view.mark }));
             detail.appendChild(el('div', { class: 'ttv2-graph-keys' }, [
                 el('span', { class: 'ttv2-key-mv' }, [el('i'), 'Item Market Average']),
                 el('span', { class: 'ttv2-key-im' }, [el('i'), 'Lowest listing we saw']),
+                view.mark ? el('span', { class: 'ttv2-key-mark' }, [el('i'), 'Price to list']) : null,
             ]));
         }
 
@@ -8339,6 +9718,499 @@
             this.root = null;
         }
     }
+
+    /* ===== src/ui/ledger-view.js ===== */
+    /*
+     * The Torn Ledger's page inside Torn Bids: what you made, and on what.
+     *
+     *   filters  period, item ("how much did I make on this item"), category,
+     *            where (bazaar / Item Market / trade), who
+     *   answer   profit, sold (after fees), bought, fees, units
+     *   graphs   profit per day / week / month, profit per item
+     *   tables   per item, per period, and every buy and sell - a sale shows
+     *            who its units were bought from (a flip: bought from -> sold to)
+     *
+     * Everything is worked out here from the stored rows (core/ledger.js), so a
+     * filter is instant and asks Torn nothing. Names from Torn go in through
+     * textContent only.
+     */
+
+
+
+
+    const DAY = 24 * 60 * 60 * 1000;
+
+    function lvEl(tag, props = {}, children = []) {
+        const node = document.createElement(tag);
+        for (const [key, value] of Object.entries(props)) {
+            if (key === 'class') node.className = value;
+            else if (key === 'text') node.textContent = value;
+            else if (key.startsWith('on') && typeof value === 'function') node.addEventListener(key.slice(2).toLowerCase(), value);
+            else if (value !== null && value !== undefined && value !== false) node.setAttribute(key, String(value));
+        }
+        for (const child of [].concat(children)) {
+            if (child === null || child === undefined || child === false) continue;
+            node.appendChild(typeof child === 'string' ? document.createTextNode(child) : child);
+        }
+        return node;
+    }
+
+    function svgNode(tag, attrs = {}) {
+        const n = document.createElementNS('http://www.w3.org/2000/svg', tag);
+        for (const [k, v] of Object.entries(attrs)) n.setAttribute(k, String(v));
+        return n;
+    }
+
+    function lvSigned(n) {
+        const v = Math.round(n);
+        return (v >= 0 ? '+' : '−') + formatMoney(Math.abs(v));
+    }
+
+    function lvCount(n) {
+        return Number(n || 0).toLocaleString('en-US');
+    }
+
+    function dateText(t, withTime = false) {
+        const d = new Date(t);
+        const s = d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: d.getFullYear() === new Date().getFullYear() ? undefined : 'numeric' });
+        return withTime ? s + ' ' + d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' }) : s;
+    }
+
+    const PERIODS = [
+        ['today', 'Today'],
+        ['7d', '7 days'],
+        ['30d', '30 days'],
+        ['month', 'This month'],
+        ['all', 'All'],
+    ];
+
+    class LedgerView {
+        /**
+         * @param {object} h - onRead(), onOpenSettings(), onOpenUrl(url)
+         */
+        constructor(h = {}) {
+            this.h = h;
+            this.f = { period: '30d', itemId: '', category: '', venue: 'all', who: '' };
+            this.group = 'day';
+            this.fifoSig = null;
+            this.fifo = new Map();
+            this.el = lvEl('div', { class: 'lg' });
+        }
+
+        /** From / to (ms) for the period picked. */
+        range(now = Date.now()) {
+            const p = this.f.period;
+            if (p === 'today') return { from: periodStart(now, 'day'), to: null };
+            if (p === '7d') return { from: now - 7 * DAY, to: null };
+            if (p === '30d') return { from: now - 30 * DAY, to: null };
+            if (p === 'month') return { from: periodStart(now, 'month'), to: null };
+            return { from: null, to: null };
+        }
+
+        set(partial) {
+            Object.assign(this.f, partial);
+            this.sig = null;
+            this.render(this.last);
+        }
+
+        /**
+         * @param {object} v - {ledger, nameOf, typeOf}
+         */
+        render(v) {
+            if (!v) return;
+            this.last = v;
+            const L = v.ledger || {};
+            const rows = L.rows || [];
+            const sig = JSON.stringify([rows.length, rows.length ? rows[rows.length - 1].id : null, L.hasKey, L.busy, L.error, L.keyError, L.backfilled, Math.floor((Date.now() - (L.readAt || 0)) / 60000), this.f, this.group]);
+            if (sig === this.sig) return;
+            this.sig = sig;
+
+            const box = this.el;
+            // Typing in the item or who box: keep the caret where it was.
+            const focus = box.getRootNode && box.getRootNode().activeElement;
+            const focusKey = focus && focus.dataset ? focus.dataset.lgFocus : null;
+            const caret = focus && typeof focus.selectionStart === 'number' ? focus.selectionStart : null;
+            box.textContent = '';
+
+            if (!L.hasKey) {
+                box.appendChild(lvEl('section', { class: 'lg-card lg-empty' }, [
+                    lvEl('h2', { text: 'Torn Ledger' }),
+                    lvEl('p', { text: 'Your profit from your own Torn log: every bazaar, Item Market and trade buy and sell, first in first out, after the Item Market\'s fee. Per day, week and month, per item, and per trader.' }),
+                    lvEl('p', { class: 'lg-muted', text: 'It needs a Full key (your log is Full access only), kept apart from your Limited key and used for nothing else.' }),
+                    lvEl('button', { type: 'button', class: 'sp-btn sp-primary', text: 'Add your Full key in Settings', onclick: () => this.h.onOpenSettings && this.h.onOpenSettings() }),
+                ]));
+                return;
+            }
+
+            if (sig && (!this.fifoSig || this.fifoSig !== rows.length + ':' + (rows.length ? rows[rows.length - 1].id : ''))) {
+                this.fifo = matchFifo(rows);
+                this.fifoSig = rows.length + ':' + (rows.length ? rows[rows.length - 1].id : '');
+            }
+            const nameOf = (id) => (v.nameOf ? v.nameOf(id) : 'Item ' + id);
+            const typeOf = (id) => (v.typeOf ? v.typeOf(id) : null) || 'Other';
+
+            /* status: how much is read, and when */
+            const status = [];
+            status.push(lvCount(rows.length) + ' buys and sells');
+            if (L.readAt) status.push('log read ' + formatAge(Date.now() - L.readAt));
+            if (!L.backfilled) status.push(L.oldestAt ? 'reading back, now at ' + dateText(L.oldestAt * 1000) + '…' : 'reading your log…');
+            else if (L.oldestAt) status.push('since ' + dateText(L.oldestAt * 1000));
+            box.appendChild(lvEl('div', { class: 'lg-status' }, [
+                lvEl('span', { text: status.join(' · ') }),
+                L.keyError ? lvEl('span', { class: 'lg-bad', text: L.keyError }) : L.error ? lvEl('span', { class: 'lg-bad', text: L.error }) : null,
+                lvEl('span', { class: 'sp-sp' }),
+                lvEl('button', { type: 'button', class: 'sp-btn', text: L.busy ? 'Reading…' : 'Read now', disabled: L.busy || L.keyError ? '' : null, onclick: () => this.h.onRead && this.h.onRead() }),
+            ]));
+
+            /* filters */
+            const items = new Map();
+            const cats = new Set();
+            for (const r of rows) {
+                if (!items.has(r.itemId)) items.set(r.itemId, nameOf(r.itemId));
+                cats.add(typeOf(r.itemId));
+            }
+            const periodChips = lvEl('div', { class: 'lg-chips', role: 'group', 'aria-label': 'Period' });
+            for (const [k, label] of PERIODS) {
+                periodChips.appendChild(lvEl('button', { type: 'button', class: 'sp-chip-f', 'aria-pressed': String(this.f.period === k), text: label, onclick: () => this.set({ period: k }) }));
+            }
+            const listId = 'lg-items';
+            // What you type stays as typed; picking an item elsewhere (a bar, a row) writes its name here.
+            const itemInput = lvEl('input', { type: 'search', class: 'lg-in', placeholder: 'Any item', list: listId, 'aria-label': 'Item', 'data-lg-focus': 'item', value: this.itemText !== undefined ? this.itemText : this.f.itemId ? items.get(this.f.itemId) || '' : '' });
+            const datalist = lvEl('datalist', { id: listId });
+            for (const name of [...new Set(items.values())].sort()) datalist.appendChild(lvEl('option', { value: name }));
+            const pickItem = () => {
+                const text = itemInput.value.trim().toLowerCase();
+                this.itemText = itemInput.value;
+                const hit = [...items.entries()].find(([, n]) => String(n).toLowerCase() === text);
+                if (hit) this.set({ itemId: hit[0] });
+                else if (!text && this.f.itemId) this.set({ itemId: '' });
+            };
+            itemInput.addEventListener('change', pickItem);
+            itemInput.addEventListener('input', () => {
+                this.itemText = itemInput.value;
+                const text = itemInput.value.trim().toLowerCase();
+                const hit = [...items.entries()].find(([, n]) => String(n).toLowerCase() === text);
+                // A different name being typed: the old item stops filtering at once.
+                if (hit) this.set({ itemId: hit[0] });
+                else if (this.f.itemId) this.set({ itemId: '' });
+            });
+            const catSel = lvEl('select', { class: 'lg-in', 'aria-label': 'Category' }, [lvEl('option', { value: '', text: 'Any category' }), ...[...cats].sort().map((c) => lvEl('option', { value: c, text: c }))]);
+            catSel.value = this.f.category;
+            catSel.addEventListener('change', () => this.set({ category: catSel.value }));
+            const venueSel = lvEl('select', { class: 'lg-in', 'aria-label': 'Where' }, [
+                lvEl('option', { value: 'all', text: 'Anywhere' }),
+                lvEl('option', { value: 'bazaar', text: 'Bazaars' }),
+                lvEl('option', { value: 'market', text: 'Item Market' }),
+                lvEl('option', { value: 'trade', text: 'Trades' }),
+            ]);
+            venueSel.value = this.f.venue;
+            venueSel.addEventListener('change', () => this.set({ venue: venueSel.value }));
+            const whoInput = lvEl('input', { type: 'search', class: 'lg-in', placeholder: 'Anyone (name or id)', 'aria-label': 'Who', 'data-lg-focus': 'who', value: this.f.who });
+            whoInput.addEventListener('input', () => this.set({ who: whoInput.value }));
+            const any = this.f.itemId || this.f.category || this.f.venue !== 'all' || this.f.who;
+            box.appendChild(lvEl('div', { class: 'lg-filters' }, [
+                periodChips,
+                lvEl('label', { class: 'lg-f' }, [lvEl('span', { text: 'Item' }), itemInput, datalist]),
+                lvEl('label', { class: 'lg-f' }, [lvEl('span', { text: 'Category' }), catSel]),
+                lvEl('label', { class: 'lg-f' }, [lvEl('span', { text: 'Where' }), venueSel]),
+                lvEl('label', { class: 'lg-f' }, [lvEl('span', { text: 'Who' }), whoInput]),
+                any ? lvEl('button', { type: 'button', class: 'sp-link', text: 'Clear filters', onclick: () => {
+                    this.itemText = '';
+                    this.set({ itemId: '', category: '', venue: 'all', who: '' });
+                } }) : null,
+            ]));
+
+            const { from, to } = this.range();
+            const shown = filterLedgerRows(rows, { ...this.f, from, to }, typeOf);
+            const t = ledgerTotals(shown, this.fifo);
+            const periodLabel = (PERIODS.find(([k]) => k === this.f.period) || [0, ''])[1].toLowerCase();
+            const title = this.f.itemId ? 'Profit on ' + nameOf(this.f.itemId) : 'Profit';
+
+            /* the answer */
+            box.appendChild(lvEl('div', { class: 'lg-head' }, [
+                lvEl('h2', { text: title }),
+                lvEl('span', { class: 'lg-muted', text: this.f.period === 'all' ? 'everything read' : periodLabel }),
+            ]));
+            const tile = (label, value, cls = '', sub = '') => lvEl('div', { class: 'lg-tile ' + cls }, [lvEl('span', { class: 'lg-tl', text: label }), lvEl('b', { text: value }), sub ? lvEl('small', { text: sub }) : null]);
+            box.appendChild(lvEl('div', { class: 'lg-tiles' }, [
+                tile('Profit', lvSigned(t.profit), t.profit >= 0 ? 'lg-good' : 'lg-loss', lvCount(t.sales) + ' sale' + (t.sales === 1 ? '' : 's')),
+                tile('Sold, after fees', formatMoney(t.sold), '', lvCount(t.unitsSold) + ' items'),
+                tile('Bought', formatMoney(t.spent), '', lvCount(t.unitsBought) + ' items'),
+                tile('Item Market fees', formatMoney(t.fees)),
+            ]));
+            if (t.unknownUnits) {
+                box.appendChild(lvEl('p', { class: 'lg-note', text: lvCount(t.unknownUnits) + ' sold with no buy on record (bought before the Ledger\'s first entry): their cost is not known, so they are not in the profit.' }));
+            }
+            if (!shown.length) {
+                box.appendChild(lvEl('p', { class: 'lg-card lg-muted', text: rows.length ? 'Nothing matches these filters.' : L.busy ? 'Reading your log…' : 'No buys or sells read yet.' }));
+                this.restoreFocus(focusKey, caret);
+                return;
+            }
+
+            /* graphs */
+            const groupChips = lvEl('div', { class: 'lg-chips lg-chips-s', role: 'group', 'aria-label': 'Group by' });
+            for (const [k, label] of [['day', 'Day'], ['week', 'Week'], ['month', 'Month']]) {
+                groupChips.appendChild(lvEl('button', { type: 'button', class: 'sp-chip-f', 'aria-pressed': String(this.group === k), text: label, onclick: () => {
+                    this.group = k;
+                    this.sig = null;
+                    this.render(this.last);
+                } }));
+            }
+            const periods = ledgerByPeriod(shown, this.fifo, this.group);
+            const perItem = ledgerByItem(shown, this.fifo);
+            box.appendChild(lvEl('div', { class: 'lg-grid' }, [
+                lvEl('section', { class: 'lg-card' }, [
+                    lvEl('div', { class: 'lg-cardh' }, [lvEl('h3', { text: 'Profit per ' + this.group }), groupChips]),
+                    this.periodChart(periods),
+                ]),
+                lvEl('section', { class: 'lg-card' }, [
+                    lvEl('div', { class: 'lg-cardh' }, [lvEl('h3', { text: 'Profit per item' }), lvEl('span', { class: 'lg-muted', text: 'press one to filter' })]),
+                    this.itemChart(perItem.filter((i) => i.sales), nameOf),
+                ]),
+            ]));
+
+            /* tables */
+            box.appendChild(lvEl('div', { class: 'lg-grid' }, [
+                lvEl('section', { class: 'lg-card' }, [lvEl('h3', { text: 'Per item' }), this.itemTable(perItem, nameOf)]),
+                lvEl('section', { class: 'lg-card' }, [lvEl('h3', { text: 'Per ' + this.group }), this.periodTable(periods)]),
+            ]));
+            box.appendChild(lvEl('section', { class: 'lg-card' }, [
+                lvEl('h3', { text: 'Buys and sells · newest first' }),
+                this.rowsTable(shown, nameOf),
+            ]));
+            this.restoreFocus(focusKey, caret);
+        }
+
+        restoreFocus(key, caret) {
+            if (!key) return;
+            const again = this.el.querySelector('[data-lg-focus="' + key + '"]');
+            if (!again) return;
+            again.focus({ preventScroll: true });
+            if (caret !== null && typeof again.setSelectionRange === 'function') {
+                try {
+                    again.setSelectionRange(caret, caret);
+                } catch {
+                    /* search boxes may refuse */
+                }
+            }
+        }
+
+        /** Bars per period: green above the line, red below. */
+        periodChart(periods) {
+            const list = periods.slice(-60);
+            const W = 600;
+            const H = 180;
+            const pad = { l: 8, r: 70, t: 10, b: 22 };
+            const svg = svgNode('svg', { viewBox: '0 0 ' + W + ' ' + H, class: 'lg-chart', role: 'img', 'aria-label': 'Profit per ' + this.group });
+            const max = Math.max(0, ...list.map((p) => p.profit));
+            const min = Math.min(0, ...list.map((p) => p.profit));
+            const span = max - min || 1;
+            const plotW = W - pad.l - pad.r;
+            const plotH = H - pad.t - pad.b;
+            const y = (v) => pad.t + ((max - v) / span) * plotH;
+            const bw = plotW / Math.max(list.length, 1);
+            svg.appendChild(svgNode('line', { x1: pad.l, x2: pad.l + plotW, y1: y(0), y2: y(0), class: 'lg-axis' }));
+            for (const [v, label] of [[max, lvSigned(max)], [min, lvSigned(min)]]) {
+                if (v === 0 && label === lvSigned(0) && (max !== 0 || min !== 0)) continue;
+                const tx = svgNode('text', { x: W - 4, y: y(v) + 4, 'text-anchor': 'end', class: 'lg-lab' });
+                tx.textContent = label;
+                svg.appendChild(tx);
+            }
+            list.forEach((p, i) => {
+                const top = y(Math.max(0, p.profit));
+                const h = Math.max(1, Math.abs(y(p.profit) - y(0)));
+                const r = svgNode('rect', { x: pad.l + i * bw + bw * 0.15, y: top, width: Math.max(1, bw * 0.7), height: h, class: p.profit >= 0 ? 'lg-bar-g' : 'lg-bar-r' });
+                const tt = svgNode('title');
+                tt.textContent = dateText(p.start) + ': ' + lvSigned(p.profit) + ' · sold ' + formatMoney(p.sold) + ' · bought ' + formatMoney(p.spent);
+                r.appendChild(tt);
+                svg.appendChild(r);
+            });
+            if (list.length) {
+                for (const [i, anchor] of [[0, 'start'], [list.length - 1, 'end']]) {
+                    const tx = svgNode('text', { x: anchor === 'start' ? pad.l : pad.l + plotW, y: H - 6, 'text-anchor': anchor, class: 'lg-lab' });
+                    tx.textContent = dateText(list[i].start);
+                    svg.appendChild(tx);
+                }
+            }
+            return svg;
+        }
+
+        /** The items that made (or lost) the most, as bars; press one to filter on it. */
+        itemChart(perItem, nameOf) {
+            const top = perItem.slice().sort((a, b) => Math.abs(b.profit) - Math.abs(a.profit)).slice(0, 10).sort((a, b) => b.profit - a.profit);
+            const box = lvEl('div', { class: 'lg-ibars' });
+            const max = Math.max(1, ...top.map((i) => Math.abs(i.profit)));
+            for (const i of top) {
+                box.appendChild(lvEl('button', { type: 'button', class: 'lg-ibar', title: 'Show only ' + nameOf(i.itemId), onclick: () => {
+                    this.itemText = nameOf(i.itemId);
+                    this.set({ itemId: i.itemId });
+                } }, [
+                    lvEl('span', { class: 'lg-iname', text: nameOf(i.itemId) }),
+                    lvEl('span', { class: 'lg-itrack' }, [lvEl('i', { class: i.profit >= 0 ? 'lg-bar-g' : 'lg-bar-r', style: 'width:' + Math.max(2, (Math.abs(i.profit) / max) * 100).toFixed(1) + '%' })]),
+                    lvEl('b', { class: i.profit >= 0 ? 'lg-good' : 'lg-loss', text: lvSigned(i.profit) }),
+                ]));
+            }
+            if (!top.length) box.appendChild(lvEl('p', { class: 'lg-muted', text: 'No sales in this range.' }));
+            return box;
+        }
+
+        itemTable(perItem, nameOf) {
+            const table = lvEl('table', { class: 'lg-table' });
+            table.appendChild(lvEl('tr', {}, ['Item', 'Bought', 'Avg buy', 'Sold', 'Avg sell', 'Profit'].map((h, i) => lvEl('th', { class: i ? 'lg-num' : '', text: h }))));
+            for (const i of perItem.slice(0, 50)) {
+                const tr = lvEl('tr', { class: 'lg-click', title: 'Show only this item', tabindex: '0' }, [
+                    lvEl('td', { text: nameOf(i.itemId) }),
+                    lvEl('td', { class: 'lg-num', text: lvCount(i.unitsBought) }),
+                    lvEl('td', { class: 'lg-num', text: i.avgBuy === null ? '–' : formatMoney(i.avgBuy) }),
+                    lvEl('td', { class: 'lg-num', text: lvCount(i.unitsSold) }),
+                    lvEl('td', { class: 'lg-num', text: i.avgSell === null ? '–' : formatMoney(i.avgSell) }),
+                    lvEl('td', { class: 'lg-num ' + (i.profit >= 0 ? 'lg-good' : 'lg-loss'), text: i.sales ? lvSigned(i.profit) : '–' }),
+                ]);
+                const pick = () => {
+                    this.itemText = nameOf(i.itemId);
+                    this.set({ itemId: i.itemId });
+                };
+                tr.addEventListener('click', pick);
+                tr.addEventListener('keydown', (e) => {
+                    if (e.key === 'Enter') pick();
+                });
+                table.appendChild(tr);
+            }
+            return table;
+        }
+
+        periodTable(periods) {
+            const table = lvEl('table', { class: 'lg-table' });
+            table.appendChild(lvEl('tr', {}, [this.group === 'day' ? 'Day' : this.group === 'week' ? 'Week of' : 'Month', 'Bought', 'Sold', 'Profit'].map((h, i) => lvEl('th', { class: i ? 'lg-num' : '', text: h }))));
+            for (const p of periods.slice().reverse().slice(0, 60)) {
+                const label = this.group === 'month' ? new Date(p.start).toLocaleDateString('en-GB', { month: 'long', year: 'numeric' }) : dateText(p.start);
+                table.appendChild(lvEl('tr', {}, [
+                    lvEl('td', { text: label }),
+                    lvEl('td', { class: 'lg-num', text: formatMoney(p.spent) }),
+                    lvEl('td', { class: 'lg-num', text: formatMoney(p.sold) }),
+                    lvEl('td', { class: 'lg-num ' + (p.profit >= 0 ? 'lg-good' : 'lg-loss'), text: lvSigned(p.profit) }),
+                ]));
+            }
+            return table;
+        }
+
+        /** Every buy and sell; a sale says whom its units came from. */
+        rowsTable(shown, nameOf) {
+            const table = lvEl('table', { class: 'lg-table lg-rows' });
+            table.appendChild(lvEl('tr', {}, ['When', '', 'Item', 'Qty', 'Each', 'Total', 'Where', 'Who', 'Profit'].map((h, i) => lvEl('th', { class: i >= 3 && i <= 5 || i === 8 ? 'lg-num' : '', text: h }))));
+            const who = (id, name) => {
+                if (!id && !name) return lvEl('span', { class: 'lg-muted', text: 'anonymous' });
+                const label = name || 'Player ' + id;
+                if (!id) return lvEl('span', { text: label });
+                const url = 'https://www.torn.com/profiles.php?XID=' + encodeURIComponent(id);
+                const a = lvEl('a', { href: url, target: '_blank', rel: 'noopener noreferrer', text: label });
+                a.addEventListener('click', (e) => {
+                    if (e.button !== 0 || e.ctrlKey || e.metaKey || e.shiftKey) return;
+                    e.preventDefault();
+                    if (this.h.onOpenUrl) this.h.onOpenUrl(url);
+                });
+                return a;
+            };
+            const rows = shown.slice().reverse().slice(0, 200);
+            for (const r of rows) {
+                const m = r.side === 'sell' ? this.fifo.get(r.id) : null;
+                const total = r.side === 'sell' && m ? m.net : r.each * r.qty;
+                const fromText = m && m.from.length ? 'bought from ' + m.from.map((f) => (f.whoName || (f.who ? 'Player ' + f.who : VENUE_NAMES[f.venue])) + (f.venue ? ' (' + VENUE_NAMES[f.venue] + ')' : '')).join(', ') : '';
+                table.appendChild(lvEl('tr', { class: 'lg-' + r.side }, [
+                    lvEl('td', { text: dateText(r.t, true) }),
+                    lvEl('td', {}, [lvEl('span', { class: 'lg-side', text: r.side === 'buy' ? 'Bought' : r.side === 'sell' ? 'Sold' : 'Gave' })]),
+                    lvEl('td', {}, [lvEl('span', { text: nameOf(r.itemId) }), lvEl('span', { class: 'lg-qtym', text: ' ×' + lvCount(r.qty) }), fromText ? lvEl('small', { class: 'lg-from', text: fromText }) : null]),
+                    lvEl('td', { class: 'lg-num', text: lvCount(r.qty) }),
+                    lvEl('td', { class: 'lg-num', text: formatMoney(Math.round(r.each)) }),
+                    lvEl('td', { class: 'lg-num', text: formatMoney(Math.round(total)) + (r.fee ? '' : '') }),
+                    lvEl('td', { text: VENUE_NAMES[r.venue] + (r.fee ? ' · fee ' + formatMoney(r.fee) : '') }),
+                    lvEl('td', {}, [who(r.who, r.whoName)]),
+                    lvEl('td', { class: 'lg-num ' + (m && m.profit !== null ? (m.profit >= 0 ? 'lg-good' : 'lg-loss') : '') }, [m && m.profit !== null ? lvSigned(m.profit) : r.side === 'sell' ? 'cost unknown' : '']),
+                ]));
+            }
+            if (shown.length > rows.length) table.appendChild(lvEl('tr', {}, [lvEl('td', { colspan: '9', class: 'lg-muted', text: 'The newest ' + rows.length + ' of ' + lvCount(shown.length) + '. Narrow the filters to see others.' })]));
+            return lvEl('div', { class: 'lg-scroll' }, [table]);
+        }
+    }
+
+    const LEDGER_CSS = `
+    .lg { display: flex; flex-direction: column; gap: 16px; padding: 16px 24px 64px; }
+    .lg-card { background: var(--card); border: 1px solid var(--cline); border-radius: 12px; padding: 16px; min-width: 0; }
+    .lg-card h3 { margin: 0 0 10px; font-size: 11px; letter-spacing: 0.6px; text-transform: uppercase; color: var(--muted); }
+    .lg-empty h2 { margin: 0 0 8px; font-size: 20px; color: #fff; }
+    .lg-empty p { margin: 0 0 10px; max-width: 720px; }
+    .lg-muted { color: var(--muted); font-size: 12px; }
+    .lg-bad { color: var(--bad); font-size: 12px; }
+    .lg-status { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; font-size: 12px; color: var(--muted); }
+    .lg-filters { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 12px 16px; padding: 12px 16px; background: var(--rail); border: 1px solid var(--cline); border-radius: 12px; }
+    .lg-chips { display: flex; gap: 6px; flex-wrap: wrap; }
+    .lg-chips .sp-chip-f { flex: 0 0 auto; padding: 0 12px; }
+    .lg-chips-s .sp-chip-f { height: 26px; font-size: 12px; }
+    .lg-f { display: flex; flex-direction: column; gap: 4px; font-size: 11px; letter-spacing: 0.6px; text-transform: uppercase; color: var(--muted); }
+    .lg-in { height: 32px; min-width: 150px; padding: 0 10px; border-radius: 9px; border: 1px solid #444; background: #0f0f0f; color: var(--text); font: 13px Arial, Helvetica, sans-serif; text-transform: none; letter-spacing: 0; }
+    .lg-head { display: flex; align-items: baseline; gap: 12px; }
+    .lg-head h2 { margin: 0; font-size: 20px; color: #fff; }
+    .lg-tiles { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+    .lg-tile { display: flex; flex-direction: column; gap: 2px; padding: 12px 14px; background: var(--card); border: 1px solid var(--cline); border-radius: 12px; }
+    .lg-tile b { font-size: 22px; font-variant-numeric: tabular-nums; color: #fff; }
+    .lg-tile small { color: var(--muted); font-size: 12px; }
+    .lg-tl { font-size: 11px; letter-spacing: 0.6px; text-transform: uppercase; color: var(--muted); }
+    .lg-tile.lg-good { background: var(--hot); border-color: var(--hot-line); }
+    .lg-tile.lg-good b, .lg-good { color: var(--price); }
+    .lg-tile.lg-loss b, .lg-loss { color: #ff8a80; }
+    .lg-note { margin: 0; font-size: 12px; color: var(--warn); }
+    .lg-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; align-items: start; }
+    .lg-cardh { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+    .lg-cardh h3 { margin: 0; }
+    .lg-chart { width: 100%; height: auto; display: block; }
+    .lg-axis { stroke: #555; stroke-width: 1; }
+    .lg-lab { fill: var(--muted); font: 11px Arial, Helvetica, sans-serif; }
+    .lg-bar-g { fill: var(--price); background: var(--price); }
+    .lg-bar-r { fill: #e05a4f; background: #e05a4f; }
+    .lg-ibars { display: flex; flex-direction: column; gap: 4px; }
+    .lg-ibar { display: grid; grid-template-columns: minmax(0, 160px) minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 4px 6px; border: 0; border-radius: 8px; background: none; color: var(--text); text-align: left; cursor: pointer; font: 13px Arial, Helvetica, sans-serif; }
+    .lg-ibar:hover { background: #242424; }
+    .lg-iname { overflow-wrap: anywhere; }
+    .lg-itrack { height: 10px; border-radius: 5px; background: #262626; overflow: hidden; }
+    .lg-itrack i { display: block; height: 100%; border-radius: 5px; }
+    .lg-ibar b { font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .lg-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    .lg-table th { text-align: left; font-size: 11px; letter-spacing: 0.6px; text-transform: uppercase; color: var(--muted); font-weight: normal; padding: 6px 8px; border-bottom: 1px solid var(--cline); }
+    .lg-table td { padding: 7px 8px; border-bottom: 1px solid #262626; vertical-align: top; }
+    .lg-num { text-align: right !important; font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .lg-click { cursor: pointer; }
+    .lg-click:hover { background: #222; }
+    .lg-side { font-size: 11px; font-weight: bold; padding: 2px 6px; border-radius: 8px; background: #262626; color: var(--muted); }
+    .lg-sell .lg-side { color: var(--price); background: var(--green-bg); }
+    .lg-buy .lg-side { color: var(--offer); background: rgba(116, 192, 252, 0.10); }
+    .lg-from { display: block; font-size: 12px; color: var(--muted); }
+    .lg-rows td:nth-child(3) { min-width: 160px; }
+    @media (max-width: 1100px) { .lg-grid { grid-template-columns: minmax(0, 1fr); } }
+    @media (max-width: 1000px) {
+        .lg { padding: 12px 12px 48px; }
+        .lg-tiles { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+        .lg-in { min-width: 0; width: 100%; }
+        .lg-f { flex: 1 1 140px; }
+    }
+    .lg-qtym { display: none; color: var(--muted); }
+    /* A phone: every buy and sell is a small card of three lines, nothing cut. */
+    @media (max-width: 700px) {
+        .lg-rows, .lg-rows tbody, .lg-rows tr, .lg-rows td { display: block; }
+        .lg-rows tr:first-child { display: none; }
+        .lg-rows tr { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 12px; padding: 8px 0; border-bottom: 1px solid #262626; }
+        .lg-rows td { padding: 0; border: 0; min-width: 0 !important; }
+        .lg-rows td:nth-child(3) { grid-column: 1; grid-row: 1; }
+        .lg-rows td:nth-child(9) { grid-column: 2; grid-row: 1; }
+        .lg-rows td:nth-child(1) { grid-column: 1; grid-row: 2; font-size: 12px; color: var(--muted); }
+        .lg-rows td:nth-child(6) { grid-column: 2; grid-row: 2; }
+        .lg-rows td:nth-child(2) { grid-column: 1; grid-row: 3; }
+        .lg-rows td:nth-child(8) { grid-column: 2; grid-row: 3; text-align: right; }
+        .lg-rows td:nth-child(4), .lg-rows td:nth-child(5), .lg-rows td:nth-child(7) { display: none; }
+        .lg-rows td[colspan] { grid-column: 1 / -1; grid-row: auto; }
+        .lg-qtym { display: inline; }
+        .lg-table th, .lg-table td { padding-left: 4px; padding-right: 4px; }
+    }
+    `;
 
     /* ===== src/ui/selling-page.js ===== */
     /*
@@ -8373,6 +10245,7 @@
 
 
 
+
     const SELLING_PAGE_TITLE = 'Torn Bids';
 
     const SELLING_PAGE_DEFAULTS = {
@@ -8386,6 +10259,8 @@
         maxPerFlip: 100,
         /* Every link opens a new tab. */
         linksNewTab: true,
+        /* A flip never asks a trader to pay more than this share of their networth. */
+        networthPct: 10,
     };
 
     /** The item list shows this many at a time. */
@@ -8498,7 +10373,7 @@
          *   onSaveTeKey(key), onForgetTeKey(), onRevealTeKey(), onRetryTe()
          *   onRefresh(), onPrefsChange(partial)
          *   onSelect(itemId)            - pick an item for the desk
-         *   onFilter(key), onQuery(text), onMore()
+         *   onFilter(key), onQuery(text), onCategory(category), onMore()
          *   onOpenUrl(url)
          */
         constructor(handlers = {}) {
@@ -8534,7 +10409,7 @@
          */
         stableOrder(rows) {
             const s = this.state;
-            const asked = JSON.stringify([s.filter, this.query, s.prefs.onlineOnly, s.prefs.trustedOnly, s.prefs.cash]);
+            const asked = JSON.stringify([s.filter, s.category, this.query, s.prefs.onlineOnly, s.prefs.trustedOnly, s.prefs.cash]);
             const changed = asked !== this.orderAsked;
             this.orderAsked = asked;
             if (changed || !this.hover || !this.order.length) {
@@ -8574,7 +10449,7 @@
 
             this.keyHandler = (event) => {
                 if (event.key === 'Escape') {
-                    if (this.view === 'settings') this.showView('list');
+                    if (this.view !== 'list') this.showView('list');
                     return;
                 }
                 // "/" jumps to the search box, as on most sites with one.
@@ -8587,7 +10462,10 @@
             document.addEventListener('keydown', this.keyHandler);
             this.resizeHandler = () => this.fitDesk();
             window.addEventListener('resize', this.resizeHandler);
-            this.ticker = setInterval(() => this.renderPills(), 1000);
+            this.ticker = setInterval(() => {
+                this.renderPills();
+                if (this.view === 'settings') this.renderSettingsNav();
+            }, 1000);
         }
 
         destroy() {
@@ -8629,6 +10507,10 @@
                 this.query = this.searchEl.value;
                 if (this.h.onQuery) this.h.onQuery(this.searchEl.value);
             });
+            // The category (the owner picked mockups/M-category-dropdown.html):
+            // Torn's item types, each with how many items it has.
+            this.catEl = spEl('select', { class: 'sp-cat', 'aria-label': 'Category', title: 'Category: filters the flips and the list' });
+            this.catEl.addEventListener('change', () => this.h.onCategory && this.h.onCategory(this.catEl.value));
             this.pillsEl = spEl('div', { class: 'sp-pills' });
             this.refreshBtn = spEl('button', {
                 type: 'button',
@@ -8637,6 +10519,14 @@
                 'aria-label': 'Refresh now',
                 text: '↻',
                 onclick: () => this.h.onRefresh && this.h.onRefresh(),
+            });
+            this.ledgerBtn = spEl('button', {
+                type: 'button',
+                class: 'sp-hbtn',
+                title: 'Torn Ledger: what you made',
+                'aria-pressed': 'false',
+                text: 'Ledger',
+                onclick: () => this.showView(this.view === 'ledger' ? 'list' : 'ledger'),
             });
             this.settingsBtn = spEl('button', {
                 type: 'button',
@@ -8651,8 +10541,10 @@
                 this.backBtn,
                 spEl('div', { class: 'sp-brand' }, [spEl('span', { class: 'sp-mark', 'aria-hidden': 'true', text: '$' }), this.titleEl, this.taglineEl]),
                 this.searchEl,
+                this.catEl,
                 this.pillsEl,
                 this.refreshBtn,
+                this.ledgerBtn,
                 this.settingsBtn,
             ]);
 
@@ -8672,6 +10564,7 @@
                 onclick: () => set({ trustedOnly: !this.state.prefs.trustedOnly }),
             }, [spEl('span', { class: 'sp-trust', 'data-level': 'trusted', text: 'T' }), 'Trusted buyers only']);
             this.stripEl = spEl('div', { class: 'sp-strip' });
+            this.catLineEl = spEl('div', { class: 'sp-catline', hidden: '' });
 
             /* the desk: every item, and the one picked */
             this.chipBtns = {};
@@ -8714,6 +10607,7 @@
                         this.trustedBtn,
                     ]),
                     this.stripEl,
+                    this.catLineEl,
                     spEl('div', { class: 'sp-desk' }, [
                         spEl('div', { class: 'sp-col-list' }, [
                             spEl('div', { class: 'sp-chips', role: 'group', 'aria-label': 'Show items' }, [chip('all', 'All'), chip('mine', 'Mine'), chip('flips', 'Flips')]),
@@ -8725,20 +10619,90 @@
                 ]),
             ]);
 
+            /* the Torn Ledger */
+            this.ledgerView = new LedgerView({
+                onRead: () => this.h.onLedgerRead && this.h.onLedgerRead(),
+                onOpenSettings: () => {
+                    this.showView('settings');
+                    const sec = this.snavSections && this.snavSections.find((x) => x.id === 'ledger');
+                    if (sec) {
+                        this.snavPick('ledger');
+                        sec.sec.scrollIntoView({ block: 'start' });
+                    }
+                    if (this.ledgerKeyInput) this.ledgerKeyInput.focus({ preventScroll: true });
+                },
+                onOpenUrl: (url) => this.h.onOpenUrl && this.h.onOpenUrl(url),
+            });
+            this.ledgerEl = spEl('main', { class: 'sp-main', hidden: '' }, [this.ledgerView.el]);
+
             /* settings */
             this.settingsEl = spEl('main', { class: 'sp-main', hidden: '' });
             this.buildSettings();
 
-            this.root = spEl('div', { class: 'sp-page' }, [this.headEl, this.bannerEl, this.listEl, this.settingsEl]);
+            this.root = spEl('div', { class: 'sp-page' }, [this.headEl, this.bannerEl, this.listEl, this.ledgerEl, this.settingsEl]);
         }
 
+        /**
+         * Settings (the owner picked mockups/J-settings-sidebar.html): a menu down
+         * the left, each part with its state like the header pills, and the full
+         * width for the parts themselves - a label on the left, the field on the
+         * right. The page scrolls; the menu stays in view and follows it.
+         */
         buildSettings() {
-            const box = spEl('div', { class: 'sp-settings' });
-            const section = (title, children) =>
-                spEl('section', { class: 'sp-card' }, [spEl('h2', { text: title }), ...children]);
+            const body = spEl('div', { class: 'sp-sbody' });
+            this.snavEl = spEl('nav', { class: 'sp-snav', 'aria-label': 'Settings' });
+            const box = spEl('div', { class: 'sp-settings' }, [this.snavEl, body]);
+            this.snav = [];
+            this.snavSections = [];
+
+            const group = (title) => this.snavEl.appendChild(spEl('div', { class: 'sp-snav-g', text: title }));
+            const section = (id, title, lead, children) => {
+                const sec = spEl('section', { class: 'sp-card', 'data-sec': id }, [
+                    spEl('h2', { text: title }),
+                    lead ? spEl('p', { class: 'sp-lead' }, [].concat(lead)) : null,
+                    ...children,
+                ]);
+                const dot = spEl('span', { class: 'sp-dot' });
+                const state = spEl('small');
+                const btn = spEl('button', {
+                    type: 'button',
+                    class: 'sp-snav-a',
+                    onclick: () => {
+                        this.snavPick(id);
+                        sec.scrollIntoView({ block: 'start' });
+                    },
+                }, [dot, spEl('span', { text: title }), state]);
+                this.snav.push({ id, btn, dot, state });
+                this.snavSections.push({ id, sec });
+                this.snavEl.appendChild(btn);
+                body.appendChild(sec);
+            };
+            const field = (label, sub, control) =>
+                spEl('div', { class: 'sp-field' }, [
+                    spEl('div', { class: 'sp-flabel' }, [spEl('b', { text: label }), sub ? spEl('small', {}, [].concat(sub)) : null]),
+                    spEl('div', { class: 'sp-fctl' }, [].concat(control)),
+                ]);
             const note = (children) => spEl('p', { class: 'sp-note' }, children);
+            const newTab = (text, href) => spEl('a', { href, target: '_blank', rel: 'noopener noreferrer', text });
+
+            // The menu follows the page as it scrolls: the part at the top is lit.
+            // At the very bottom the last parts can never reach the top: there,
+            // the one you picked stays lit while it is in view, else the last.
+            this.settingsEl.addEventListener('scroll', () => {
+                const el = this.settingsEl;
+                const box = el.getBoundingClientRect();
+                let on = this.snavSections[0] && this.snavSections[0].id;
+                for (const s of this.snavSections) if (s.sec.getBoundingClientRect().top <= box.top + 24) on = s.id;
+                if (el.scrollTop + el.clientHeight >= el.scrollHeight - 2) {
+                    const picked = this.snavSections.find((s) => s.id === this.snavOn);
+                    const seen = picked && picked.sec.getBoundingClientRect().top < box.bottom && picked.sec.getBoundingClientRect().bottom > box.top;
+                    on = seen ? picked.id : this.snavSections[this.snavSections.length - 1].id;
+                }
+                this.snavPick(on);
+            });
 
             /* Torn key (Limited) */
+            group('Keys and sources');
             const torn = keyField({
                 placeholder: 'Limited API key',
                 primary: true,
@@ -8746,36 +10710,16 @@
                 onReveal: () => this.h.onRevealKey && this.h.onRevealKey(),
             });
             this.keyStateEl = spEl('div', { class: 'sp-keystate', text: 'No key saved.' });
-
-            const tos = spEl('table', { class: 'sp-tos' });
-            for (const [k, v] of [
-                ['Data storage', 'Only locally, in this browser'],
-                ['Data sharing', 'Nobody'],
-                ['Purpose of use', 'Personal gain: who pays most for your items, and flips'],
-                ['Key storage & sharing', 'Stored locally / Not shared'],
-                ['Key access level', 'Limited (your inventory and your own id; item names; Item Market prices; traders\' public status)'],
-                ['Other services', 'TornExchange, only with the key you log in there with'],
-            ]) {
-                tos.appendChild(spEl('tr', {}, [spEl('th', { text: k }), spEl('td', { text: v })]));
-            }
-            this.tosEl = spEl('details', { class: 'sp-tos-box', open: '' }, [
-                spEl('summary', { text: 'Key use (Torn API terms)' }),
-                tos,
-            ]);
-
-            box.appendChild(
-                section('Torn API key', [
+            section('keys', 'Torn API key', 'Used only on this page, sent to api.torn.com only.', [
+                field('Limited key', ['Make one at ', newTab('Torn › Settings › API Key', TORN_API_KEY_URL)], [
                     torn.row,
                     this.keyStateEl,
-                    note([
-                        'Limited access reads your inventory. Make one at ',
-                        spEl('a', { href: TORN_API_KEY_URL, target: '_blank', rel: 'noopener noreferrer', text: 'Torn › Settings › API Key' }),
-                        '.',
+                    note(['Reads your inventory, your own id, item names, the Item Market for the item on the desk, and traders\' online status.']),
+                    spEl('div', { class: 'sp-inline sp-actions' }, [
+                        spEl('button', { type: 'button', class: 'sp-link', text: 'Forget key', onclick: () => this.h.onForgetKey && this.h.onForgetKey() }),
                     ]),
-                    this.tosEl,
-                    spEl('button', { type: 'button', class: 'sp-link', text: 'Forget key', onclick: () => this.h.onForgetKey && this.h.onForgetKey() }),
                 ]),
-            );
+            ]);
 
             /* TornExchange key */
             const te = keyField({
@@ -8791,23 +10735,21 @@
                 onclick: () => this.h.onSaveTeKey && this.h.onSaveTeKey(this.h.onRevealKey ? this.h.onRevealKey() : ''),
             });
 
-            box.appendChild(
-                section('TornExchange', [
+            section('te', 'TornExchange', 'Traders\' buy prices and trust votes.', [
+                field('TornExchange key', ['The Torn key you log into ', newTab('tornexchange.com', TE_SITE_URL), ' with. Often your Limited key.'], [
                     te.row,
                     this.teStateEl,
-                    note([
-                        'The Torn key you log into ',
-                        spEl('a', { href: TE_SITE_URL, target: '_blank', rel: 'noopener noreferrer', text: 'tornexchange.com' }),
-                        ' with. Often your Limited key.',
-                    ]),
                     spEl('div', { class: 'sp-inline sp-actions' }, [
                         this.teSameBtn,
                         spEl('button', { type: 'button', class: 'sp-link', text: 'Forget key', onclick: () => this.h.onForgetTeKey && this.h.onForgetTeKey() }),
                     ]),
                 ]),
-            );
+            ]);
 
-            box.appendChild(section('TornW3B', [note(['Bazaar prices and traders\' price lists are read from weav3r.dev. No key needed.'])]));
+            this.w3bStateEl = spEl('div', { class: 'sp-keystate' });
+            section('w3b', 'TornW3B', ['Bazaar prices and traders\' price lists, from ', newTab('weav3r.dev', 'https://weav3r.dev/'), '. No key needed; it only receives item and trader ids.'], [
+                field('State', null, [this.w3bStateEl]),
+            ]);
 
             /* Cash for flips */
             this.cashInput = spEl('input', {
@@ -8839,14 +10781,6 @@
                 event.preventDefault();
                 saveCash();
             });
-            box.appendChild(
-                section('Cash for flips', [
-                    spEl('div', { class: 'sp-inline' }, [this.cashInput, spEl('button', { type: 'button', class: 'sp-btn sp-primary', text: 'Save', onclick: saveCash })]),
-                    this.cashStateEl,
-                    note(['Flips never plan to spend more than this. Blank: no limit. Reads 5000000, 5,000,000, 5m or 500k.']),
-                ]),
-            );
-
             /* Most items per flip */
             this.maxInput = spEl('input', { type: 'text', class: 'sp-key', placeholder: '100', 'aria-label': 'Most per flip', autocomplete: 'off', spellcheck: 'false' });
             this.maxStateEl = spEl('div', { class: 'sp-keystate' });
@@ -8869,40 +10803,207 @@
                 event.preventDefault();
                 saveMax();
             });
-            box.appendChild(
-                section('Most per flip', [
+            this.nwInput = spEl('input', { type: 'text', class: 'sp-key sp-pctin', placeholder: '10', 'aria-label': 'Networth share a trader can pay', autocomplete: 'off', spellcheck: 'false', inputmode: 'decimal' });
+            this.nwStateEl = spEl('div', { class: 'sp-keystate' });
+            const saveNw = () => {
+                const n = Number(String(this.nwInput.value).replace(/[%,\s]/g, ''));
+                if (!(n > 0 && n <= 100)) {
+                    this.nwStateEl.textContent = 'Type a percent from 1 to 100.';
+                    this.nwStateEl.className = 'sp-keystate sp-bad';
+                    return;
+                }
+                this.nwInput.value = '';
+                this.nwDirty = false;
+                if (this.h.onPrefsChange) this.h.onPrefsChange({ networthPct: n });
+            };
+            this.nwInput.addEventListener('input', () => {
+                this.nwDirty = true;
+            });
+            this.nwInput.addEventListener('keydown', (event) => {
+                if (event.key !== 'Enter') return;
+                event.preventDefault();
+                saveNw();
+            });
+
+            group('Torn Bids');
+            section('flips', 'Flips', 'What Best flips and the flip plan may suggest.', [
+                field('Cash for flips', 'Blank: no limit', [
+                    spEl('div', { class: 'sp-inline' }, [this.cashInput, spEl('button', { type: 'button', class: 'sp-btn sp-primary', text: 'Save', onclick: saveCash })]),
+                    this.cashStateEl,
+                    note(['Flips never plan to spend more than this. Reads 5000000, 5,000,000, 5m or 500k.']),
+                ]),
+                field('Most per flip', null, [
                     spEl('div', { class: 'sp-inline' }, [this.maxInput, spEl('button', { type: 'button', class: 'sp-btn sp-primary', text: 'Save', onclick: saveMax })]),
                     this.maxStateEl,
                     note(['The most items one flip plans to buy. No trader takes thousands at once.']),
                 ]),
-            );
+                field('Trader can pay', null, [
+                    spEl('div', { class: 'sp-inline sp-pct' }, ['At most ', this.nwInput, ' % of their networth ', spEl('button', { type: 'button', class: 'sp-btn sp-primary', text: 'Save', onclick: saveNw })]),
+                    this.nwStateEl,
+                    note(['A flip never asks a trader to pay more than this share of their networth. Networth comes from Torn\'s public stats, read with your Limited key.']),
+                ]),
+            ]);
+
+            /* the Torn Ledger's Full key: masked, never shown again, its own terms */
+            this.ledgerKeyInput = spEl('input', {
+                type: 'password',
+                class: 'sp-masked sp-key',
+                placeholder: 'Full API key',
+                'aria-label': 'Full API key for the Torn Ledger',
+                autocomplete: 'new-password',
+                autocapitalize: 'off',
+                autocorrect: 'off',
+                spellcheck: 'false',
+                'data-lpignore': 'true',
+                'data-1p-ignore': 'true',
+            });
+            const saveLedgerKey = () => {
+                const key = this.ledgerKeyInput.value.trim();
+                this.ledgerKeyInput.value = '';
+                if (this.h.onLedgerSaveKey) this.h.onLedgerSaveKey(key);
+            };
+            this.ledgerKeyInput.addEventListener('keydown', (event) => {
+                if (event.key !== 'Enter') return;
+                event.preventDefault();
+                saveLedgerKey();
+            });
+            this.ledgerStateEl = spEl('div', { class: 'sp-keystate' });
+            this.ledgerForgetBtn = spEl('button', {
+                type: 'button',
+                class: 'sp-link sp-danger',
+                text: 'Forget key and delete the ledger',
+                onclick: () => {
+                    // Twice to delete: a year of log is not read back in a moment.
+                    if (this.ledgerForgetArmed && Date.now() - this.ledgerForgetArmed < 5000) {
+                        this.ledgerForgetArmed = 0;
+                        this.ledgerForgetBtn.textContent = 'Forget key and delete the ledger';
+                        if (this.h.onLedgerForget) this.h.onLedgerForget();
+                        return;
+                    }
+                    this.ledgerForgetArmed = Date.now();
+                    this.ledgerForgetBtn.textContent = 'Press again to delete the key and the ledger';
+                    setTimeout(() => {
+                        if (this.ledgerForgetArmed && Date.now() - this.ledgerForgetArmed >= 5000) {
+                            this.ledgerForgetArmed = 0;
+                            this.ledgerForgetBtn.textContent = 'Forget key and delete the ledger';
+                        }
+                    }, 5100);
+                },
+            });
+            const ledgerTos = spEl('table', { class: 'sp-tos sp-tos-ledger' });
+            for (const [k, v] of [
+                ['Data storage', 'Only locally, in this browser: time, item, quantity, price, where, who. Never the log\'s own text.'],
+                ['Data sharing', 'Nobody'],
+                ['Purpose of use', 'Personal: profit tracking'],
+                ['Key storage & sharing', 'Stored locally / Not shared'],
+                ['Key access level', 'Full, used only for your log (bazaar and Item Market buys and sells), your trades, and key info'],
+                ['Other services', 'None: never sent to TornExchange or TornW3B'],
+            ]) {
+                ledgerTos.appendChild(spEl('tr', {}, [spEl('th', { text: k }), spEl('td', { text: v })]));
+            }
+            section('ledger', 'Torn Ledger', 'Your profit from your own Torn log. It needs a Full key, kept apart from your Limited key and used for nothing else.', [
+                field('Full key', 'Never shown again after Save', [
+                    spEl('div', { class: 'sp-inline' }, [this.ledgerKeyInput, spEl('button', { type: 'button', class: 'sp-btn sp-primary', text: 'Save', onclick: saveLedgerKey })]),
+                    this.ledgerStateEl,
+                    note(['Torn is asked whether it is a Full key before it is saved; anything else is refused. It is sent only to api.torn.com, only for your log, your trades and key info. Paste a new one to change it.']),
+                    spEl('div', { class: 'sp-inline sp-actions' }, [this.ledgerForgetBtn]),
+                ]),
+                field('Key use', 'Torn API terms, Full key', [ledgerTos]),
+            ]);
 
             /* preferences */
+            group('Other');
             this.linksInput = spEl('input', { type: 'checkbox' });
             this.linksInput.addEventListener('change', () => this.h.onPrefsChange && this.h.onPrefsChange({ linksNewTab: this.linksInput.checked }));
-            box.appendChild(
-                section('Links', [
-                    spEl('label', { class: 'sp-check' }, [this.linksInput, spEl('span', { text: 'Open links in a new tab' })]),
-                ]),
-            );
+            section('links', 'Links', null, [
+                field('Where links open', null, [spEl('label', { class: 'sp-check' }, [this.linksInput, spEl('span', { text: 'Open links in a new tab' })])]),
+            ]);
+
+            const tos = spEl('table', { class: 'sp-tos' });
+            for (const [k, v] of [
+                ['Data storage', 'Only locally, in this browser'],
+                ['Data sharing', 'Nobody'],
+                ['Purpose of use', 'Personal gain: who pays most for your items, and flips'],
+                ['Key storage & sharing', 'Stored locally / Not shared'],
+                ['Key access level', 'Limited (your inventory and your own id; item names; Item Market prices; traders\' public status and networth)'],
+                ['Other services', 'TornExchange, only with the key you log in there with'],
+            ]) {
+                tos.appendChild(spEl('tr', {}, [spEl('th', { text: k }), spEl('td', { text: v })]));
+            }
+            section('terms', 'Key use (Torn API terms)', 'For your Limited key.', [tos]);
 
             this.settingsEl.appendChild(box);
+            this.snavPick('keys');
+        }
+
+        /** Light one part in the settings menu. */
+        snavPick(id) {
+            this.snavOn = id;
+            for (const n of this.snav) n.btn.setAttribute('aria-current', n.id === id ? 'true' : 'false');
+        }
+
+        /** Each part's state in the settings menu, in the header pills' words. */
+        renderSettingsNav() {
+            const info = this.state.info || {};
+            const p = this.state.prefs;
+            const now = Date.now();
+            const states = {
+                keys: info.keyError ? ['bad', 'refused'] : !info.hasKey ? ['unknown', 'no key'] : ['online', info.keyAccess ? String(info.keyAccess).replace(/\s*access$/i, '') : 'saved'],
+                te: info.teBadKey ? ['bad', 'key refused'] : !info.hasTeKey ? ['unknown', 'no key'] : info.teAt ? ['online', formatAge(now - info.teAt)] : ['idle', 'loading'],
+                w3b: (info.w3bRead || 0) < (info.w3bKnown || 0) ? ['idle', (info.w3bRead || 0) + '/' + info.w3bKnown] : ['online', count(info.w3bTraders || 0) + ' lists'],
+                flips: p.cash > 0 ? ['online', formatMoney(p.cash) + ' · ' + (p.networthPct || 10) + '%'] : ['idle', 'no cash limit'],
+                links: ['online', p.linksNewTab !== false ? 'new tab' : 'this tab'],
+                ledger: (() => {
+                    const L = this.state.ledger || {};
+                    if (L.keyError) return ['bad', 'key refused'];
+                    if (!L.hasKey) return ['unknown', 'no key'];
+                    return L.backfilled ? ['online', count((L.rows || []).length) + ' rows'] : ['idle', 'reading'];
+                })(),
+                terms: [null, ''],
+            };
+            for (const n of this.snav) {
+                const [level, text] = states[n.id] || [null, ''];
+                if (level) n.dot.setAttribute('data-level', level);
+                else n.dot.removeAttribute('data-level');
+                n.dot.hidden = !level;
+                n.state.textContent = text;
+            }
+
+            const read = info.w3bRead || 0;
+            const known = info.w3bKnown || 0;
+            const parts = [];
+            parts.push(known ? count(read) + ' of ' + count(known) + ' price lists read' : 'No trader known yet');
+            parts.push(info.bazaarsAt ? 'bazaar prices ' + formatAge(now - info.bazaarsAt) : 'bazaar prices loading');
+            if (info.flipsWanted) parts.push('possible flips checked ' + info.flipsChecked + ' of ' + info.flipsWanted);
+            this.w3bStateEl.textContent = parts.join(' · ') + '.';
+            this.w3bStateEl.className = 'sp-keystate' + (info.bazaarsError && !info.bazaarsAt ? ' sp-bad' : info.bazaarsAt ? ' sp-ok' : '');
         }
 
         showView(view) {
-            this.view = view === 'settings' ? 'settings' : 'list';
+            this.view = view === 'settings' || view === 'ledger' ? view : 'list';
             if (!this.root) return;
             const settings = this.view === 'settings';
+            const ledger = this.view === 'ledger';
+            const list = this.view === 'list';
             this.settingsEl.hidden = !settings;
-            this.listEl.hidden = settings;
-            this.backBtn.hidden = !settings;
-            this.refreshBtn.hidden = settings;
-            this.searchEl.hidden = settings;
+            this.ledgerEl.hidden = !ledger;
+            this.listEl.hidden = !list;
+            this.backBtn.hidden = list;
+            this.refreshBtn.hidden = !list;
+            this.searchEl.hidden = !list;
+            this.catEl.hidden = !list;
             this.settingsBtn.setAttribute('aria-pressed', String(settings));
-            this.titleEl.textContent = settings ? 'Settings' : SELLING_PAGE_TITLE;
-            this.taglineEl.hidden = settings;
+            this.ledgerBtn.setAttribute('aria-pressed', String(ledger));
+            this.titleEl.textContent = settings ? 'Settings' : ledger ? 'Torn Ledger' : SELLING_PAGE_TITLE;
+            this.taglineEl.hidden = !list;
             this.renderBanner();
-            if (!settings) this.fitDesk();
+            if (ledger) this.ledgerView.render(this.ledgerArgs());
+            if (list) this.fitDesk();
+        }
+
+        ledgerArgs() {
+            const s = this.state;
+            return { ledger: s.ledger || {}, nameOf: s.itemNameOf, typeOf: s.itemTypeOf };
         }
 
         openSettings() {
@@ -8918,6 +11019,8 @@
          *   listTotal - rows before the page cut
          *   counts    - {all, mine, flips}
          *   filter    - 'all' | 'mine' | 'flips'
+         *   categories - [{category, count}] for the Category dropdown
+         *   category  - the one picked, or ''
          *   desk      - the item picked (see renderDesk), or null
          *   statuses  - Map traderId -> {level, text, title}
          *   prefs     - this page's preferences
@@ -8942,14 +11045,77 @@
                 this.maxStateEl.className = 'sp-keystate';
                 this.maxStateEl.textContent = 'Saved: ' + count(p.maxPerFlip || 100) + ' items.';
             }
+            if (!this.nwDirty) {
+                this.nwInput.placeholder = String(p.networthPct || 10);
+                this.nwStateEl.className = 'sp-keystate';
+                this.nwStateEl.textContent = 'Saved: ' + (p.networthPct || 10) + '%.';
+            }
 
+            this.renderCategory();
+            this.renderLedgerKey();
+            if (this.view === 'ledger') this.ledgerView.render(this.ledgerArgs());
             this.renderKeyStates();
+            this.renderSettingsNav();
             this.renderPills();
             this.renderBanner();
             this.renderStrip();
             this.renderList();
             this.renderDesk();
             this.fitDesk();
+        }
+
+        /** The Ledger key's state in Settings: never the key itself. */
+        renderLedgerKey() {
+            const L = this.state.ledger || {};
+            const el = this.ledgerStateEl;
+            if (!el) return;
+            let text;
+            let cls = 'sp-keystate';
+            if (L.checking) text = 'Asking Torn what this key can read…';
+            else if (L.saveMsg && (L.saveMsg.bad || !L.hasKey)) {
+                text = L.saveMsg.text;
+                if (L.saveMsg.bad) cls += ' sp-bad';
+            } else if (L.keyError) {
+                text = L.keyError;
+                cls += ' sp-bad';
+            } else if (L.hasKey) {
+                text = 'Saved · Full access · ' + count((L.rows || []).length) + ' buys and sells' + (L.readAt ? ' · log read ' + formatAge(Date.now() - L.readAt) : '') + '.';
+                cls += ' sp-ok';
+            } else text = 'No key saved.';
+            if (el.textContent !== text) el.textContent = text;
+            if (el.className !== cls) el.className = cls;
+            this.ledgerForgetBtn.hidden = !L.hasKey;
+        }
+
+        /** The Category dropdown, and the line under the flips saying what it hides. */
+        renderCategory() {
+            const s = this.state;
+            const cats = s.categories || [];
+            const all = cats.reduce((n, c) => n + c.count, 0);
+            // Rebuilt only when the categories themselves change; counts change in
+            // place, so an open dropdown is not closed under you as prices arrive.
+            const setSig = JSON.stringify(cats.map((c) => c.category).sort());
+            if (setSig !== this.catSetSig) {
+                this.catSetSig = setSig;
+                this.catEl.textContent = '';
+                this.catEl.appendChild(spEl('option', { value: '' }));
+                for (const c of cats.slice().sort((a, b) => a.category.localeCompare(b.category))) this.catEl.appendChild(spEl('option', { value: c.category }));
+            }
+            const byName = new Map(cats.map((c) => [c.category, c.count]));
+            for (const o of this.catEl.options) {
+                const text = o.value ? o.value + ' (' + count(byName.get(o.value) || 0) + ')' : 'Category: All (' + count(all) + ')';
+                if (o.textContent !== text) o.textContent = text;
+            }
+            if (this.catEl.value !== (s.category || '')) this.catEl.value = s.category || '';
+            this.catEl.classList.toggle('sp-cat-on', Boolean(s.category));
+            this.catLineEl.hidden = !s.category;
+            if (s.category && this.catLineEl.dataset.cat !== s.category) {
+                this.catLineEl.dataset.cat = s.category;
+                this.catLineEl.textContent = '';
+                this.catLineEl.append('Showing ', spEl('b', { text: s.category }), ' only, in the flips and the list. ');
+                this.catLineEl.appendChild(spEl('button', { type: 'button', class: 'sp-link', text: 'Show all', onclick: () => this.h.onCategory && this.h.onCategory('') }));
+            }
+            if (!s.category) delete this.catLineEl.dataset.cat;
         }
 
         renderKeyStates() {
@@ -8967,7 +11133,6 @@
                 this.keyStateEl.textContent = 'Saved' + (access ? ' · ' + access + ' access' : '') + '.';
                 this.keyStateEl.classList.add('sp-ok');
             }
-            if (this.tosEl) this.tosEl.open = !info.hasKey;
 
             this.teStateEl.className = 'sp-keystate';
             if (info.teBadKey || (info.teError && !info.hasTeKey)) {
@@ -9029,7 +11194,7 @@
             this.pillSig = sig;
             this.pillsEl.textContent = '';
             for (const p of pills) {
-                this.pillsEl.appendChild(spEl('span', { class: 'sp-pill', title: p.title }, [
+                this.pillsEl.appendChild(spEl('span', { class: 'sp-pill', title: p.title, 'data-src': p.label }, [
                     spEl('span', { class: 'sp-dot', 'data-level': p.level }),
                     spEl('b', { text: p.label }),
                     p.text ? ' ' + p.text : '',
@@ -9182,7 +11347,8 @@
             if (!list.length) {
                 let text = 'Loading…';
                 const q = this.query.trim();
-                if (q) text = 'No item matches "' + q + '".';
+                if (q) text = 'No item matches "' + q + '"' + (s.category ? ' in ' + s.category : '') + '.';
+                else if (s.category && !(s.counts && s.counts[s.filter])) text = 'Nothing in ' + s.category + (s.filter === 'mine' ? ' that you hold' : s.filter === 'flips' ? ' to flip right now' : '') + '.';
                 else if (s.filter === 'mine' && !info.hasKey) text = 'Add your Limited key to see your items.';
                 else if (s.filter === 'mine' && info.loading) text = 'Loading your inventory…';
                 else if (s.filter === 'mine' && info.inventoryAt) text = 'Your inventory has nothing to sell.';
@@ -9273,7 +11439,8 @@
             const sig = d
                 ? JSON.stringify([
                     d.itemId, d.name, d.held, d.avg, d.bazaars, d.buyersTotal, d.buyersLoading, d.pending, d.planWhy,
-                    d.buyers.map((b) => [b.id, b.name, b.price, b.te, b.w3b, statusOf(b), b.trust ? b.trust.level + b.trust.score : '']),
+                    d.buyers.map((b) => [b.id, b.name, b.price, b.te, b.w3b, statusOf(b), b.trust ? b.trust.level + b.trust.score : '', this.state.networth && b.id ? this.state.networth.get(String(b.id)) : null]),
+                    p.networthPct,
                     d.sellers.state, d.sellers.error,
                     d.sellers.rows.map((r) => [r.sellerId, r.sellerName, r.price, r.qty, r.stale, Math.floor((now - (r.dataAt || 0)) / 60000)]),
                     d.plan, d.where, d.market,
@@ -9328,6 +11495,11 @@
                     spEl('span', { class: 'sp-tr-l' }, [
                         spEl('span', { class: 'sp-trader-l' }, [this.playerName(b.name, b.id, 'buyer:' + (b.id || b.name)), this.trustBadge(b)]),
                         this.status(b),
+                        this.networthLine(b),
+                        // Their two lists disagree: the lower is counted, and said.
+                        b.differ
+                            ? spEl('small', { class: 'sp-differ', text: 'Lists differ: TE ' + formatMoney(b.te) + ' · W3B ' + formatMoney(b.w3b) + '. Counted at the lower; check before trading.' })
+                            : null,
                     ]),
                     spEl('span', { class: 'sp-tprice', text: formatMoney(b.price) }),
                     this.traderLinks(b),
@@ -9347,6 +11519,13 @@
                 }));
             }
             return card;
+        }
+
+        /** "Networth $1.2b" under a trader, once Torn has said. */
+        networthLine(b) {
+            const nw = b && b.id && this.state.networth ? this.state.networth.get(String(b.id)) : null;
+            if (!(nw >= 0)) return null;
+            return spEl('small', { class: 'sp-networth', text: 'Networth ' + formatMoney(nw) });
         }
 
         /** Trade, TE list and W3B list, in fixed slots so they line up row to row. */
@@ -9438,6 +11617,12 @@
                     spEl('span', {}, ['Sell ', spEl('b', { text: count(f.units) }), ' to ', this.playerName(b.name, b.id, 'step-buyer'), ' at ' + formatMoney(b.price) + ' ', this.trustBadge(b)]),
                     this.stepTraderLinks(b),
                 ]));
+                // Their networth capped the plan: say so, with the numbers.
+                if (b.maxUnits && f.units >= b.maxUnits) {
+                    const nw = b.id && this.state.networth ? this.state.networth.get(String(b.id)) : null;
+                    card.appendChild(spEl('p', { class: 'sp-note', text: b.name + ' can pay for at most ' + count(b.maxUnits) + ': ' + (this.state.prefs.networthPct || 10) + '% of their networth' + (nw >= 0 ? ' (' + formatMoney(nw) + ')' : '') + '.' }));
+                }
+                if (b.differ) card.appendChild(spEl('p', { class: 'sp-note sp-warnnote', text: b.name + '\'s lists differ (TE ' + formatMoney(b.te) + ', W3B ' + formatMoney(b.w3b) + '): planned at the lower. Check their list before trading.' }));
                 return card;
             }
             const card = spEl('div', { class: 'sp-q' + wide }, [spEl('h3', { text: 'Flip plan' })]);
@@ -9567,7 +11752,7 @@
         }
     }
 
-    const SELLING_PAGE_CSS = `
+    const SELLING_PAGE_CSS = LEDGER_CSS + `
     :host { all: initial; }
     * { box-sizing: border-box; }
     .sp-page {
@@ -9600,6 +11785,11 @@
     .sp-tagline { color: var(--muted); font-size: 13px; }
     .sp-search { flex: 1; min-width: 0; max-width: 420px; height: 36px; padding: 0 16px; border-radius: 18px; border: 1px solid var(--cline2); background: #0f0f0f; color: var(--text); }
     .sp-search::placeholder { color: var(--muted); }
+    .sp-cat { flex: 0 0 auto; height: 36px; padding: 0 12px; border-radius: 18px; border: 1px solid var(--cline2); background: #0f0f0f; color: var(--text); font: inherit; font-weight: bold; cursor: pointer; }
+    .sp-cat.sp-cat-on { border-color: var(--profit); background: #1a2210; color: #fff; }
+    .sp-catline { display: flex; align-items: center; gap: 8px; margin: -12px 0 16px; font-size: 12px; color: var(--muted); }
+    .sp-catline b { color: #fff; }
+    .sp-catline .sp-link { font-size: 12px; }
     .sp-pills { margin-left: auto; display: flex; gap: 6px; }
     .sp-pill { display: inline-flex; align-items: center; gap: 7px; height: 28px; padding: 0 11px; border-radius: 14px; background: var(--card); border: 1px solid var(--cline); font-size: 12px; color: var(--muted); white-space: nowrap; cursor: default; }
     .sp-pill b { color: var(--text); }
@@ -9608,6 +11798,10 @@
     .sp-icon { width: 34px; height: 34px; flex: 0 0 auto; border-radius: 9px; border: 1px solid var(--cline2); background: none; cursor: pointer; font-size: 15px; color: var(--text); }
     .sp-icon:hover { background: #242424; }
     .sp-icon[aria-pressed="true"] { color: var(--profit); border-color: var(--profit); }
+    .sp-hbtn { height: 34px; padding: 0 12px; flex: 0 0 auto; border-radius: 9px; border: 1px solid var(--cline2); background: none; cursor: pointer; font-weight: bold; color: var(--text); white-space: nowrap; }
+    .sp-hbtn:hover { background: #242424; }
+    .sp-hbtn[aria-pressed="true"] { color: var(--profit); border-color: var(--profit); }
+    .sp-link.sp-danger { color: #ff8a80; }
 
     .sp-banner {
         display: none; align-items: center; gap: 12px; flex: 0 0 auto;
@@ -9693,6 +11887,8 @@
     .sp-tr.sp-stale { opacity: 0.6; }
     .sp-tr-l { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
     .sp-tr-l small { font-size: 12px; color: var(--muted); }
+    .sp-tr-l small.sp-differ { color: var(--warn); }
+    .sp-note.sp-warnnote { color: var(--warn); }
     .sp-trader-l { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 8px; min-width: 0; }
     .sp-pname { color: #fff; font-weight: bold; }
     .sp-tprice { font-weight: bold; text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
@@ -9751,11 +11947,27 @@
     .sp-trust[data-level="caution"] { color: #f0a020; border-color: #7a5210; }
 
     /* ------------------------------------------------------------ settings */
-    .sp-settings { display: flex; flex-direction: column; gap: 12px; max-width: 760px; margin: 0 auto; padding: 16px 24px 64px; }
-    .sp-card { display: flex; flex-direction: column; gap: 8px; padding: 16px; background: var(--card); border: 1px solid var(--cline); border-radius: 12px; }
-    .sp-card h2 { margin: 0; font-size: 15px; color: #fff; }
+    .sp-settings { display: grid; grid-template-columns: 260px minmax(0, 1fr); gap: 24px; align-items: start; padding: 20px 24px 64px; }
+    .sp-snav { position: sticky; top: 20px; display: flex; flex-direction: column; gap: 4px; }
+    .sp-snav-g { margin: 12px 12px 4px; font-size: 11px; letter-spacing: 0.6px; text-transform: uppercase; color: var(--muted); }
+    .sp-snav-g:first-child { margin-top: 0; }
+    .sp-snav-a { display: flex; align-items: center; gap: 10px; height: 40px; padding: 0 12px; border: 0; border-radius: 9px; background: none; color: var(--muted); font-weight: bold; text-align: left; cursor: pointer; }
+    .sp-snav-a:hover { background: var(--card); color: var(--text); }
+    .sp-snav-a[aria-current="true"] { background: var(--green-bg); color: #fff; box-shadow: inset 0 0 0 1px var(--hot-line); }
+    .sp-snav-a small { margin-left: auto; font-weight: normal; font-size: 12px; white-space: nowrap; }
+    .sp-sbody { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+    .sp-card { display: flex; flex-direction: column; padding: 20px; background: var(--card); border: 1px solid var(--cline); border-radius: 12px; scroll-margin-top: 20px; }
+    .sp-card h2 { margin: 0 0 4px; font-size: 15px; color: #fff; }
+    .sp-lead { margin: 0 0 14px; font-size: 12px; color: var(--muted); }
+    .sp-field { display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 8px 24px; align-items: start; padding: 12px 0; border-top: 1px solid var(--cline); }
+    .sp-flabel { display: flex; flex-direction: column; padding-top: 8px; }
+    .sp-flabel small { font-size: 12px; color: var(--muted); }
+    .sp-fctl { display: flex; flex-direction: column; gap: 6px; min-width: 0; max-width: 640px; }
+    .sp-fctl > .sp-keystate:only-child { padding-top: 8px; }
+    .sp-fctl > .sp-check { padding-top: 8px; }
     .sp-inline { display: flex; gap: 8px; align-items: center; }
     .sp-inline input { flex: 1; min-width: 0; }
+    .sp-inline.sp-pct input.sp-pctin { flex: 0 0 80px; text-align: right; }
     .sp-inline.sp-actions { gap: 16px; }
     input.sp-key { height: 34px; padding: 0 12px; background: #0f0f0f; border: 1px solid #444; border-radius: 9px; color: var(--text); }
     input.sp-key::placeholder { color: var(--muted); }
@@ -9765,13 +11977,17 @@
     .sp-keystate.sp-bad { color: var(--bad); }
     .sp-check { display: flex; gap: 8px; align-items: flex-start; cursor: pointer; }
     input[type="checkbox"] { accent-color: var(--profit); margin: 3px 0 0; }
-    .sp-tos-box { border: 1px solid var(--cline); border-radius: 9px; padding: 8px 12px; background: #161616; }
-    .sp-tos-box summary { cursor: pointer; font-size: 12px; }
-    .sp-tos { width: 100%; margin-top: 8px; border-collapse: collapse; font-size: 12px; }
-    .sp-tos th, .sp-tos td { text-align: left; vertical-align: top; padding: 4px; border-top: 1px solid var(--cline); }
-    .sp-tos th { width: 36%; color: var(--muted); font-weight: normal; }
+    .sp-tos { width: 100%; max-width: 900px; border-collapse: collapse; font-size: 12px; }
+    .sp-tos th, .sp-tos td { text-align: left; vertical-align: top; padding: 8px 4px; border-top: 1px solid var(--cline); }
+    .sp-tos th { width: 220px; color: var(--muted); font-weight: normal; }
 
     /* ---------------------------------------------------------- narrower */
+    /* With the Category dropdown the header needs room: under 1500px the two
+       background-progress pills go (TornW3B's state is in Settings too). On a
+       phone the pills get a row of their own and all come back. */
+    @media (max-width: 1500px) and (min-width: 1001px) {
+        .sp-pill[data-src="TornW3B"], .sp-pill[data-src="Online"] { display: none; }
+    }
     @media (max-width: 1300px) {
         .sp-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     }
@@ -9782,7 +11998,8 @@
     @media (max-width: 1000px) {
         .sp-head { flex-wrap: wrap; height: auto; min-height: var(--head-h); padding: 10px 12px; gap: 8px 10px; }
         .sp-brand { flex: 1; }
-        .sp-search { order: 10; flex: 1 0 100%; max-width: none; }
+        .sp-search { order: 10; flex: 1 1 0; max-width: none; }
+        .sp-cat { order: 10; }
         .sp-pills { order: 11; flex: 1 0 100%; flex-wrap: wrap; margin-left: 0; }
         .sp-wrap { padding: 12px 12px 48px; }
         .sp-sec { flex-wrap: wrap; }
@@ -9792,7 +12009,14 @@
         .sp-strip { grid-template-columns: minmax(0, 1fr); }
         .sp-desk { grid-template-columns: minmax(0, 1fr); }
         .sp-ws { position: static; order: -1; }
-        .sp-settings { padding: 12px 12px 48px; }
+        .sp-settings { grid-template-columns: minmax(0, 1fr); gap: 12px; padding: 12px 12px 48px; }
+        .sp-snav { position: static; flex-direction: row; flex-wrap: wrap; }
+        .sp-snav-g, .sp-snav-a small { display: none; }
+        .sp-snav-a { height: 34px; }
+        .sp-card { padding: 16px; }
+        .sp-field { grid-template-columns: minmax(0, 1fr); }
+        .sp-flabel { padding-top: 0; }
+        .sp-tos th { width: 40%; }
     }
     `;
 
@@ -10471,6 +12695,13 @@
 
 
 
+
+
+
+
+
+
+
     const STORE_KEY = 'apiKey';
     const STORE_ITEMS = 'itemsCache';
     const STORE_NPC = 'npcCache';
@@ -10498,6 +12729,32 @@
     const STORE_TE_ONE = 'teOne';
     /* The traders page: your own Torn id, read once with its Limited key. */
     const STORE_SELL_SELF = 'sellSelf';
+    /*
+     * The Torn Ledger (Torn Bids only): its own Full key, its dead-key note, the
+     * key owner's id, and the derived rows. The panel on torn.com never reads these.
+     */
+    const STORE_LEDGER_KEY = 'ledgerKey';
+    const STORE_LEDGER_KEY_DEAD = 'ledgerKeyDead';
+    const STORE_LEDGER_SELF = 'ledgerSelf';
+    const STORE_LEDGER = 'ledger';
+    /* A run makes at most this many calls; new entries every 5 minutes; a year back, a few pages a minute. */
+    const LEDGER_CALLS_PER_RUN = 6;
+    const LEDGER_EVERY_MS = 5 * 60 * 1000;
+    const LEDGER_BACKFILL_GAP_MS = 30 * 1000;
+    const LEDGER_BACKFILL_S = 365 * 24 * 60 * 60;
+
+    /* Traders' networth (public personal stats), for "could they pay": id -> {value, at}. */
+    const STORE_SELL_NETWORTH = 'sellNetworth';
+    /* At most this many networth lookups a minute, inside the shared 70; each kept 12 hours. */
+    const SELL_NETWORTH_PER_MIN = 10;
+    const SELL_NETWORTH_REFRESH_MS = 12 * 60 * 60 * 1000;
+    const SELL_NETWORTH_RETRY_MS = 10 * 60 * 1000;
+
+    /* The Fill button's settings (shared by the panel and Torn Bids), and your own Item Market prices seen on Your listings. */
+    const STORE_FILL = 'fill';
+    const STORE_FILL_OWN_IM = 'fillOwnIm';
+    /* The panel's own id lookup (your Torn id), for Fill never undercutting you. */
+    const STORE_SELF = 'selfId';
 
     /* Price history the script records itself, and TornW3B's latest summary. */
     const STORE_HISTORY = 'priceHistory';
@@ -10659,6 +12916,12 @@
         bzSelected: null,
         bzWindow: '24h',
         bzLastFetchAt: 0,
+        /*
+         * The Fill button. listings: 'bazaar:ID' / 'market:ID' -> {rows, at,
+         * pending, error, note}; done: row element -> what was filled there (to
+         * undo it); busy: rows being filled; selfId: your Torn id.
+         */
+        fill: { listings: new Map(), done: new WeakMap(), last: new Map(), busy: new WeakSet(), selfId: null, selfTried: false },
         /* The recorded price history, loaded once, saved on a timer. */
         history: null,
         historyDirty: false,
@@ -11007,10 +13270,14 @@
 
         if (!app.index) return;
 
-        // Your own bazaar's add / manage page: the pricing helper, not the scanner.
-        const own = ownBazaarPage(location.href);
+        // Your own bazaar's add / manage page, or the Item Market's add-listing /
+        // your-listings page: the pricing helper and Fill, not the scanner.
+        const own = ownFillPage(location.href);
         if (own !== app.ownBazaar) {
-            if (app.ownBazaar) removeRowTags(document);
+            if (app.ownBazaar) {
+                removeRowTags(document);
+                removeFillControls(document);
+            }
             app.ownBazaar = own;
             app.bzRows = [];
             app.bzDiagnostics = null;
@@ -11534,9 +13801,13 @@
 
     /** Read the rows, tag each with its current asking prices, queue what is missing. */
     function scanOwnBazaarPage(which) {
-        const { rows, diagnostics } = scanOwnBazaar(which, document, app.index);
+        const market = which === 'market-add' || which === 'market-view';
+        const { rows, diagnostics } = market ? scanMarketRows(which, document, app.index) : scanOwnBazaar(which, document, app.index);
         app.bzRows = rows;
-        app.bzDiagnostics = { ...diagnostics, tags: 0 };
+        app.bzDiagnostics = { ...diagnostics, tags: 0, fills: 0 };
+        if (which === 'market-view') noteOwnMarketPrices(rows);
+        // Your id marks your own listings in the panel and keeps Fill off them.
+        if (!app.fill.selfId && !app.fill.selfTried) ensureSelfId().then(() => renderMyBazaar());
 
         const now = Date.now();
         const hist = loadHistory();
@@ -11548,12 +13819,14 @@
             const item = app.index.byId.get(row.itemId);
             if (item && item.marketValue > 0) recordMarketValue(hist, row.itemId, now, item.marketValue);
 
-            const tag = ensureRowTag(row, document);
+            const tag = rowTagFor(row, which);
             app.bzDiagnostics.tags += 1;
             paintRowTag(tag, row.itemId);
-            if (tag.title !== 'Show its graph') tag.title = 'Show its graph';
+            if (!tag.classList.contains('ttv2-bzchips') && tag.title !== 'Show its graph') tag.title = 'Show its graph';
+            if (ensureFillControls(row, which, tag)) app.bzDiagnostics.fills += 1;
         }
         bindRowTagPress();
+        ensureFillSettingsLink();
         if (changed) markHistoryDirty();
 
         if (!app.bzSelected && rows.length) app.bzSelected = rows[0].itemId;
@@ -11577,22 +13850,35 @@
 
         const tagOf = (event) => {
             const t = event.target;
-            return t && t.closest ? t.closest('.ttv2-bztag') : null;
+            return t && t.closest ? t.closest('.' + FILL_BUTTON_CLASS + ', .ttv2-fillbox, .ttv2-fillset, .ttv2-bzchip, .ttv2-bztag') : null;
         };
 
         const open = (event) => {
             const tag = tagOf(event);
             if (!tag || !app.ownBazaar) return;
+            // Fill: acts on the click only (never on the press), once. The rest of
+            // our box (its result line) is swallowed so Torn's row does not react.
+            if (tag.classList.contains(FILL_BUTTON_CLASS) || tag.classList.contains('ttv2-fillbox') || tag.classList.contains('ttv2-fillset')) {
+                event.preventDefault();
+                event.stopPropagation();
+                if (event.type !== 'click') return;
+                if (tag.classList.contains(FILL_BUTTON_CLASS)) onFillPress(tag);
+                else if (tag.classList.contains('ttv2-fillset')) openFillSettings();
+                return;
+            }
             event.preventDefault();
             event.stopPropagation();
             if (event.type === 'click' && app.bzPressedAt && Date.now() - app.bzPressedAt < 800) return;
             if (event.type !== 'click') app.bzPressedAt = Date.now();
 
             // The row's item NOW: #/manage reuses row elements as you scroll.
-            app.bzSelected = tag.dataset.itemId || app.bzSelected;
+            const holder = tag.classList.contains('ttv2-bzchip') ? tag.closest('.ttv2-bzchips') : tag;
+            app.bzSelected = (holder && holder.dataset.itemId) || app.bzSelected;
             if (app.panel.collapsed) app.panel.setCollapsed(false, { save: true });
             if (app.panel.page !== 'mybazaar') app.panel.showPage('mybazaar');
             repaintOwnBazaar();
+            // IMA: to the graph; BP: to the cheapest bazaar listings.
+            if (tag.dataset.kind) app.panel.showBazaarPart(tag.dataset.kind === 'bp' ? 'lows' : 'graph');
         };
 
         const swallow = (event) => {
@@ -11622,14 +13908,71 @@
      * inside the observed rows, so every paint would otherwise be a mutation,
      * and every mutation a rescan, and every rescan a paint.
      */
+    /**
+     * The price tag of a row. On your bazaar's add page (the owner, 2026-09-26:
+     * "it makes a new row, looks ugly. put it beside the price") two chips go in
+     * Torn's own value column, after its price: IMA (Item Market Average - press
+     * for the graph) and BP (the lowest bazaar price - press for the cheapest
+     * listings and who sells them), then the Fill tick. Elsewhere, the tag after
+     * the name (#/manage) or above the price box (the Item Market).
+     */
+    function rowTagFor(row, page) {
+        if (page === 'market-add' || page === 'market-view') return ensureMarketTag(row, page);
+        if (page === 'add') {
+            const cell = row.el.querySelector('.info-wrap');
+            if (cell) {
+                let chips = cell.querySelector('.ttv2-bzchips');
+                if (!chips) {
+                    // An old tag after the name (3.11) goes: one line per row.
+                    const old = row.el.querySelector('.' + OWN_BAZAAR_TAG_CLASS + ':not(.ttv2-bzchips)');
+                    if (old) old.remove();
+                    chips = document.createElement('span');
+                    chips.className = OWN_BAZAAR_TAG_CLASS + ' ttv2-bzchips';
+                    for (const [kind, label, title] of [['ima', 'IMA', 'Item Market Average: press for its graph'], ['bp', 'BP', 'Lowest bazaar price: press for the cheapest listings and who sells them']]) {
+                        const chip = document.createElement('span');
+                        chip.className = 'ttv2-bzchip ttv2-bzchip-' + kind;
+                        chip.dataset.kind = kind;
+                        chip.title = title;
+                        chip.append(label + ' ', Object.assign(document.createElement('b'), { textContent: '…' }));
+                        chips.appendChild(chip);
+                    }
+                    cell.appendChild(chips);
+                }
+                if (chips.dataset.itemId !== String(row.itemId)) chips.dataset.itemId = String(row.itemId);
+                return chips;
+            }
+        }
+        return ensureRowTag(row, document);
+    }
+
     function paintRowTag(tag, itemId) {
+        if (tag.classList.contains('ttv2-bzchips')) {
+            const avg = itemAverage(itemId);
+            const low = lowestBazaarPrice(itemId);
+            const ima = tag.querySelector('.ttv2-bzchip-ima b');
+            const bp = tag.querySelector('.ttv2-bzchip-bp b');
+            const a = avg ? formatMoney(avg) : '…';
+            const b = low ? formatMoney(low) : '…';
+            if (ima && ima.textContent !== a) ima.textContent = a;
+            if (bp && bp.textContent !== b) bp.textContent = b;
+            const selected = String(itemId === app.bzSelected);
+            if (tag.dataset.selected !== selected) tag.dataset.selected = selected;
+            return;
+        }
         const avg = itemAverage(itemId);
-        const words = 'Item Market Average ' + (avg ? formatMoney(avg) : '…');
+        // The friend asked for the lowest competing price beside the average:
+        // the lowest bazaar on your bazaar's pages, the lowest listing on the Item Market's.
+        const onMarket = app.ownBazaar === 'market-add' || app.ownBazaar === 'market-view';
+        const lowest = onMarket ? lowestMarketPrice(itemId) : lowestBazaarPrice(itemId);
+        const lowLabel = onMarket ? 'Lowest Item Market ' : 'Lowest bazaar ';
+        const words = 'Item Market Average ' + (avg ? formatMoney(avg) : '…') + ' · ' + lowLabel + (lowest ? formatMoney(lowest) : '…');
         if (tag.dataset.words !== words) {
             tag.dataset.words = words;
             tag.textContent = '';
             tag.appendChild(document.createTextNode('Item Market Average '));
             tag.appendChild(Object.assign(document.createElement('b'), { textContent: avg ? formatMoney(avg) : '…' }));
+            tag.appendChild(document.createTextNode(' · ' + lowLabel));
+            tag.appendChild(Object.assign(document.createElement('b'), { className: 'ttv2-bztag-low', textContent: lowest ? formatMoney(lowest) : '…' }));
         }
         const selected = String(itemId === app.bzSelected);
         if (tag.dataset.selected !== selected) tag.dataset.selected = selected;
@@ -11728,7 +14071,9 @@
         if (!app.ownBazaar) return;
         for (const row of app.bzRows) {
             if (!document.contains(row.el)) continue;
-            paintRowTag(ensureRowTag(row, document), row.itemId);
+            const tag = rowTagFor(row, app.ownBazaar);
+            paintRowTag(tag, row.itemId);
+            ensureFillControls(row, app.ownBazaar, tag);
         }
         renderMyBazaar();
     }
@@ -11737,17 +14082,557 @@
         if (!app.ownBazaar) return;
         const now = Date.now();
         const hist = loadHistory();
-        const items = app.bzRows.map((r) => ({ itemId: r.itemId, name: r.name, avg: itemAverage(r.itemId) }));
+        const onMarket = app.ownBazaar && app.ownBazaar.startsWith('market');
+        const seenIds = new Set();
+        const items = [];
+        for (const r of app.bzRows) {
+            if (seenIds.has(r.itemId)) continue;
+            seenIds.add(r.itemId);
+            items.push({ itemId: r.itemId, name: r.name, avg: itemAverage(r.itemId), low: onMarket ? lowestMarketPrice(r.itemId) : lowestBazaarPrice(r.itemId) });
+        }
         const selected = items.some((i) => i.itemId === app.bzSelected) ? app.bzSelected : items.length ? items[0].itemId : null;
         app.bzSelected = selected;
 
+        const fill = fillPanelView(selected);
         app.panel.renderMyBazaar({
             items,
             selected,
             avgAt: app.itemsDataAt || null,
             series: selected ? series(hist, selected, now, app.bzWindow) : null,
             windowKey: app.bzWindow,
+            title: app.ownBazaar && app.ownBazaar.startsWith('market') ? 'My Item Market' : 'My bazaar',
+            lowLabel: app.ownBazaar && app.ownBazaar.startsWith('market') ? 'Lowest IM' : 'Lowest bazaar',
+            fill,
+            // The graph marks the price about to be listed: what Fill typed, else what it would type.
+            mark: fill ? (fill.filled ? fill.filled.price : fill.preview ? fill.preview.price : null) : null,
         });
+    }
+
+    /* ------------------------------------------------------------------ *
+     * The Fill button: one click types one row's price (and quantity)
+     * ------------------------------------------------------------------ */
+
+    /**
+     * Where Fill works: your bazaar's add / manage pages ('add' / 'manage') and
+     * the Item Market's add-listing / your-listings pages ('market-add' /
+     * 'market-view'). Anything else is null.
+     */
+    function ownFillPage(href) {
+        const own = ownBazaarPage(href);
+        if (own) return own;
+        const market = marketFillPage(href);
+        return market ? 'market-' + market : null;
+    }
+
+    /** 'add' -> 'bazaar-add' and so on: the page names rowInputs() knows. */
+    function fillPageKind(page) {
+        return page === 'add' ? 'bazaar-add' : page === 'manage' ? 'bazaar-manage' : page;
+    }
+
+    function fillSettings() {
+        return readFillSettings(gmGet(STORE_FILL, null));
+    }
+
+    /** The lowest bazaar price we know for an item: its own listings when read lately, else TornW3B's summary. */
+    function lowestBazaarPrice(itemId) {
+        const got = app.fill.listings.get('bazaar:' + itemId);
+        if (got && got.rows && !got.fromMarket && Date.now() - got.at < 10 * 60 * 1000) {
+            const { rows } = realListings(got.rows, { selfId: app.fill.selfId, avg: itemAverage(itemId), checkFresh: true });
+            if (rows.length) return rows[0].price;
+        }
+        const rec = app.bzPrices.get(String(itemId));
+        if (rec && rec.bz && rec.bz.price) return rec.bz.price;
+        const summary = w3bSummaryCached();
+        const low = summary && summary.lowest ? Number(summary.lowest[itemId]) : 0;
+        return low > 0 ? low : null;
+    }
+
+    /** TornW3B's summary from storage, parsed at most every 10 s (a big page paints hundreds of tags). */
+    function w3bSummaryCached() {
+        const now = Date.now();
+        if (!app.fill.summary || now - app.fill.summaryReadAt > 10000) {
+            app.fill.summary = gmGet(STORE_W3B_SUMMARY, null);
+            app.fill.summaryReadAt = now;
+        }
+        return app.fill.summary;
+    }
+
+    /** The lowest Item Market price we know for an item. */
+    function lowestMarketPrice(itemId) {
+        const got = app.fill.listings.get('market:' + itemId);
+        if (got && got.rows && got.rows.length && Date.now() - got.at < 10 * 60 * 1000) {
+            const { rows } = realListings(got.rows, { avg: itemAverage(itemId), checkFresh: false });
+            if (rows.length) return rows[0].price;
+        }
+        const rec = app.bzPrices.get(String(itemId));
+        return rec && rec.im && rec.im.price ? rec.im.price : null;
+    }
+
+    /** Your Torn id, for never undercutting yourself: from the page, else one Public-key call, kept. */
+    function ensureSelfId() {
+        if (app.fill.selfId) return Promise.resolve(app.fill.selfId);
+        const fromPage = ownIdFromPage(document);
+        if (fromPage) {
+            app.fill.selfId = fromPage;
+            gmSet(STORE_SELF, fromPage);
+            return Promise.resolve(fromPage);
+        }
+        const stored = gmGet(STORE_SELF, null);
+        if (stored) {
+            app.fill.selfId = String(stored);
+            return Promise.resolve(app.fill.selfId);
+        }
+        if (app.fill.selfTried || !app.client || !hasUsableKey()) return Promise.resolve(null);
+        app.fill.selfTried = true;
+        return app.client
+            .get('user', { selections: 'basic' })
+            .then((data) => {
+                const id = Number(data && data.player_id);
+                if (id > 0) {
+                    app.fill.selfId = String(id);
+                    gmSet(STORE_SELF, app.fill.selfId);
+                }
+                return app.fill.selfId;
+            })
+            .catch((error) => {
+                if (isKeyDeadError(error)) markKeyDead(error);
+                return null;
+            });
+    }
+
+    /**
+     * Your own Item Market prices, read off Your listings (the API does not say
+     * whose listing is whose): kept 30 minutes, so Fill on the add page does not
+     * undercut them either.
+     */
+    function noteOwnMarketPrices(rows) {
+        const now = Date.now();
+        const store = gmGet(STORE_FILL_OWN_IM, {}) || {};
+        let changed = false;
+        // Each listing's price as Torn has it on file (the box's value attribute),
+        // never what is typed in the box; each price with its own time, so one no
+        // longer listed is forgotten after 30 minutes.
+        const seen = new Map();
+        for (const row of rows) {
+            const { price } = rowInputs('market-view', row.el);
+            const v = savedPrice(price);
+            if (!(v > 0)) continue;
+            if (!seen.has(row.itemId)) seen.set(row.itemId, []);
+            seen.get(row.itemId).push(v);
+        }
+        for (const [itemId, prices] of seen) {
+            const was = (store[itemId] && store[itemId].prices) || [];
+            const times = new Map(was.filter((p) => p && now - p.at < 30 * 60 * 1000).map((p) => [p.price + ':' + p.n, p.at]));
+            const next = [];
+            const counts = new Map();
+            for (const price of prices) {
+                const n = (counts.get(price) || 0) + 1;
+                counts.set(price, n);
+                next.push({ price, n, at: now });
+                if (!times.has(price + ':' + n)) changed = true;
+            }
+            if (next.length !== was.length) changed = true;
+            store[itemId] = { prices: next };
+        }
+        if (changed || seen.size) gmSet(STORE_FILL_OWN_IM, store);
+    }
+
+    function ownMarketPrices(itemId) {
+        const store = gmGet(STORE_FILL_OWN_IM, {}) || {};
+        const rec = store[itemId];
+        const now = Date.now();
+        return rec && Array.isArray(rec.prices) ? rec.prices.filter((p) => p && typeof p === 'object' && now - p.at < 30 * 60 * 1000).map((p) => p.price) : [];
+    }
+
+    /** TornW3B's listings for Fill: every one kept ($1 and sponsored too), so the skip counts are honest. */
+    function normalizeW3bListingsForFill(raw) {
+        const out = [];
+        for (const l of raw || []) {
+            const price = Number(l && l.price);
+            const qty = Number(l && l.quantity);
+            if (!(price > 0) || !(qty > 0)) continue;
+            const t = l.last_checked;
+            const checked = typeof t === 'string' && !/^\d+$/.test(t) ? Date.parse(t) : Number(t) > 1e12 ? Number(t) : Number(t) * 1000;
+            out.push({
+                price,
+                qty,
+                sellerId: l.player_id ? String(l.player_id) : null,
+                sellerName: l.player_name ? String(l.player_name) : null,
+                sponsored: Boolean(l.sponsored),
+                dataAt: checked > 0 ? checked : null,
+            });
+        }
+        return out;
+    }
+
+    /**
+     * The listings Fill goes by, read fresh at the click and reused for
+     * FILL_REUSE_MS. Bazaars: TornW3B's listings (no key; only the item id).
+     * Item Market: Torn's API with the panel's key. Both through their shared
+     * rate limits.
+     *
+     * @returns {Promise<{rows, at, note, fromMarket}>}
+     */
+    function fillListings(market, itemId, { force = false } = {}) {
+        const key = market + ':' + itemId;
+        const now = Date.now();
+        const had = app.fill.listings.get(key);
+        if (had && had.promise) return had.promise;
+        if (!force && had && had.rows && now - had.at < FILL_REUSE_MS) return Promise.resolve(had);
+
+        let promise;
+        if (market === 'bazaar' && app.w3b && app.settings.useW3b !== false) {
+            promise = fetchW3bListings(app.w3b, itemId).then(({ listings }) => ({
+                rows: normalizeW3bListingsForFill(listings),
+                at: Date.now(),
+                note: null,
+                fromMarket: false,
+            }));
+        } else if (market === 'bazaar') {
+            // TornW3B is off in Settings: no request to it. The Item Market stands in.
+            promise = fillListings('market', itemId, { force }).then((m) => ({
+                rows: m.rows,
+                at: m.at,
+                note: 'TornW3B is off in Settings, so these are Item Market prices',
+                fromMarket: true,
+            }));
+        } else if (!app.client || !hasUsableKey()) {
+            return Promise.reject(new Error('Add your Public key in Settings first.'));
+        } else {
+            promise = fetchItemMarket(app.client, itemId, { limit: 20 }).then((m) => {
+                const mine = [...ownMarketPrices(String(itemId))];
+                const rows = m.listings.map((l) => {
+                    const at = mine.indexOf(l.price);
+                    if (at >= 0) mine.splice(at, 1);
+                    return { price: l.price, qty: l.amount, mine: at >= 0 };
+                });
+                return { rows, at: Date.now(), note: null, fromMarket: false };
+            });
+        }
+        const wrapped = promise
+            .then((got) => {
+                const entry = { rows: got.rows, at: got.at, note: got.note, fromMarket: got.fromMarket, error: null, promise: null };
+                app.fill.listings.set(key, entry);
+                return entry;
+            })
+            .catch((error) => {
+                if (isKeyDeadError(error)) markKeyDead(error);
+                const msg = redactKey(String((error && error.message) || error), getStoredKey());
+                app.fill.listings.set(key, { ...(had || {}), promise: null, error: msg, errorAt: Date.now() });
+                throw new Error(msg);
+            });
+        app.fill.listings.set(key, { ...(had || {}), promise: wrapped });
+        return wrapped;
+    }
+
+    /** The row element a Fill button sits in, as the page is NOW. */
+    function fillRowOf(btn) {
+        if (!app.ownBazaar) return null;
+        // The row as scanned (its outermost element), never an inner wrapper that
+        // happens to match: on #/manage the box sits inside item___ inside the row.
+        const row = app.bzRows.find((r) => r.el.contains(btn));
+        return row ? row.el : null;
+    }
+
+    /**
+     * The Fill button and its result line in one row, right after the price
+     * tag. Returns true when the row has a price box to fill.
+     */
+    function ensureFillControls(row, page, tag) {
+        const kind = fillPageKind(page);
+        const inputs = rowInputs(kind, row.el);
+        let box = row.el.querySelector('.ttv2-fillbox');
+        if (!inputs.price.length) {
+            if (box) box.remove();
+            return false;
+        }
+        if (!box) {
+            box = document.createElement('span');
+            box.className = 'ttv2-fillbox';
+            // A tick box, as in the script the friend uses: ticked fills the row,
+            // unticked puts back what was there. Ours, not Torn's (a button with
+            // role checkbox, so a click can never reach Torn's form).
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = FILL_BUTTON_CLASS;
+            btn.setAttribute('role', 'checkbox');
+            btn.setAttribute('aria-checked', 'false');
+            btn.appendChild(Object.assign(document.createElement('span'), { className: 'ttv2-fillmark' }));
+            btn.appendChild(Object.assign(document.createElement('span'), { className: 'ttv2-filllabel', textContent: 'Fill' }));
+            const line = document.createElement('span');
+            line.className = FILL_TAG_CLASS;
+            box.append(btn, line);
+            if (tag && tag.classList.contains('ttv2-bzchips')) tag.appendChild(box);
+            else if (tag && tag.parentNode) tag.parentNode.insertBefore(box, tag.nextSibling);
+            else row.el.appendChild(box);
+        }
+        const btn = box.querySelector('.' + FILL_BUTTON_CLASS);
+        if (btn.dataset.itemId !== String(row.itemId)) btn.dataset.itemId = String(row.itemId);
+        paintFill(box, row.el, row.itemId);
+        return true;
+    }
+
+    /** The Item Market's price tag: before the price box (its rows have no name slot we can follow). */
+    function ensureMarketTag(row, page) {
+        let tag = row.el.querySelector('.' + OWN_BAZAAR_TAG_CLASS);
+        if (!tag) {
+            tag = document.createElement('span');
+            tag.className = OWN_BAZAAR_TAG_CLASS + ' ttv2-bztag-market';
+            const at = fillAnchor(page, row);
+            if (at && at.parent) at.parent.insertBefore(tag, at.before);
+            else row.el.appendChild(tag);
+        }
+        if (tag.dataset.itemId !== String(row.itemId)) tag.dataset.itemId = String(row.itemId);
+        return tag;
+    }
+
+    /** Whether the boxes still hold what Fill typed (you may have typed over it since). */
+    function stillFilled(done) {
+        const price = done.inputs.price;
+        // Digits only: Torn may re-format the box (839999 -> 839,999) after Fill types it.
+        const digits = (v) => String(v).replace(/\D/g, '');
+        return price.length > 0 && price.every((i) => document.contains(i)) && readInputs(price).some((v) => digits(v) === digits(done.priceText));
+    }
+
+    /** The button's words and the line after it, from what this row has had filled. */
+    function paintFill(box, rowEl, itemId) {
+        const btn = box.querySelector('.' + FILL_BUTTON_CLASS);
+        const line = box.querySelector('.' + FILL_TAG_CLASS);
+        if (!btn || !line) return;
+        const done = app.fill.done.get(rowEl);
+        const current = done && done.itemId === String(itemId) && stillFilled(done) ? done : null;
+        if (done && !current) app.fill.done.delete(rowEl);
+        const busy = app.fill.busy.has(rowEl);
+        const compact = Boolean(box.parentNode && box.parentNode.classList && box.parentNode.classList.contains('ttv2-bzchips'));
+        const failedNow = !current && app.fill.last.get(String(itemId));
+        const label = busy ? 'Filling…' : current && compact ? formatMoney(current.price) : 'Fill';
+        const labelEl = btn.querySelector('.ttv2-filllabel');
+        if (labelEl && labelEl.textContent !== label) labelEl.textContent = label;
+        const checked = String(Boolean(current));
+        if (btn.getAttribute('aria-checked') !== checked) btn.setAttribute('aria-checked', checked);
+        let title = current ? current.words + '. Untick to put back what was in the boxes.' : 'Tick to type the price (and quantity) into this row. You press Torn\'s button.';
+        if (!current && failedNow && failedNow.error && failedNow.rowEl === rowEl) title = failedNow.error;
+        if (btn.title !== title) btn.title = title;
+        const tone = current ? current.level || '' : failedNow && failedNow.error && failedNow.rowEl === rowEl ? 'bad' : '';
+        if ((btn.dataset.level || '') !== tone) btn.dataset.level = tone;
+        if (btn.disabled !== busy) btn.disabled = busy;
+        const failed = !current && app.fill.last.get(String(itemId));
+        const failedHere = Boolean(failed && failed.error && failed.rowEl === rowEl);
+        const words = current ? current.words : failedHere ? failed.error : '';
+        const level = current ? current.level || '' : failedHere ? 'bad' : '';
+        if (line.textContent !== words) line.textContent = words;
+        if ((line.dataset.level || '') !== level) line.dataset.level = level;
+        if (line.hidden !== !words) line.hidden = !words;
+    }
+
+    function repaintFills() {
+        if (!app.ownBazaar) return;
+        for (const row of app.bzRows) {
+            const box = row.el.querySelector('.ttv2-fillbox');
+            if (box) paintFill(box, row.el, row.itemId);
+        }
+    }
+
+    function removeFillControls(root = document) {
+        for (const n of root.querySelectorAll('.ttv2-fillbox, .ttv2-fillset, .ttv2-bzchips')) n.remove();
+    }
+
+    /**
+     * "Fill settings" in Torn's links bar (beside Manage items, Personalize and
+     * Back on your bazaar), as the reference script puts its settings there. It
+     * opens the panel's Settings at the Fill part; it is ours, not Torn's.
+     */
+    function ensureFillSettingsLink() {
+        const bar = linksBar(document);
+        if (!bar || bar.querySelector('.ttv2-fillset')) return;
+        const a = document.createElement('a');
+        a.href = '#';
+        a.className = 'ttv2-fillset';
+        a.setAttribute('role', 'button');
+        a.title = 'Which listing Fill undercuts, and by how much';
+        a.textContent = 'Fill settings';
+        // Torn's own link look, copied from the first link in the bar.
+        const like = bar.querySelector('a[class*="linkContainer___"]');
+        if (like) a.className = like.className.replace(/\biconActive___\S*/g, '') + ' ttv2-fillset';
+        bar.insertBefore(a, bar.firstChild);
+    }
+
+    function openFillSettings() {
+        if (app.panel.collapsed) app.panel.setCollapsed(false, { save: true });
+        app.panel.openFillSettings();
+    }
+
+    /** A Fill button was clicked: fill its row, or undo what it filled. */
+    function onFillPress(btn) {
+        const rowEl = fillRowOf(btn);
+        const itemId = btn.dataset.itemId;
+        if (!rowEl || !itemId) return;
+        const now = rowItemIdNow(fillPageKind(app.ownBazaar), rowEl);
+        if (now && now !== itemId) {
+            // Torn reused this row for another item since the box was drawn.
+            rescan();
+            return;
+        }
+        const done = app.fill.done.get(rowEl);
+        if (done && done.itemId === itemId && stillFilled(done)) {
+            writeInputs(done.inputs.price, done.prev.price);
+            if (done.qtyWritten) writeInputs(done.inputs.qty, done.prev.qty);
+            app.fill.done.delete(rowEl);
+            repaintFills();
+            renderMyBazaar();
+            return;
+        }
+        fillRow(rowEl, itemId).catch(() => {});
+    }
+
+    /**
+     * Fill one row: read the prices fresh (or from the last minute), work out
+     * the price with your Fill settings, type it (and the quantity) into this
+     * row's boxes. `base`: undercut this listing instead (a price clicked in
+     * the panel).
+     */
+    async function fillRow(rowEl, itemId, { base = null } = {}) {
+        const page = app.ownBazaar;
+        if (!page || app.fill.busy.has(rowEl)) return;
+        const kind = fillPageKind(page);
+        const market = page.startsWith('market') ? 'market' : 'bazaar';
+        const settings = fillSettings()[market];
+        const item = app.index ? app.index.byId.get(String(itemId)) : null;
+        app.fill.last.delete(String(itemId));
+        app.fill.busy.add(rowEl);
+        repaintFills();
+        try {
+            const [got] = await Promise.all([
+                base ? Promise.resolve({ rows: [], note: null, fromMarket: false }) : fillListings(market, itemId),
+                market === 'bazaar' ? ensureSelfId() : Promise.resolve(null),
+            ]);
+            if (app.ownBazaar !== page || !document.contains(rowEl)) throw new Error('The page changed; press Fill again.');
+            const avg = itemAverage(itemId);
+            const ctx = { npc: item && item.sellPrice > 0 ? item.sellPrice : null, avg, selfId: app.fill.selfId, checkFresh: market === 'bazaar' && !got.fromMarket };
+            // A listing picked in the panel is undercut under the same rules as any other.
+            const r = base ? fillPrice([base], { ...settings, index: 1 }, ctx) : fillPrice(got.rows, settings, ctx);
+            if (!(r.price > 0)) throw new Error(base && r.why && /No listing/.test(r.why) ? 'That listing is not one Fill undercuts (yours, $1, stale or far under the average).' : r.why || 'No listing to undercut.');
+
+            // Torn's #/manage reuses row elements: the row must still show this item.
+            const nowId = rowItemIdNow(kind, rowEl);
+            if (nowId && nowId !== String(itemId)) throw new Error('The row changed while prices loaded; tick again.');
+            const inputs = rowInputs(kind, rowEl);
+            if (!inputs.price.length) throw new Error('Torn\'s price box was not found in this row.');
+            // Filled already (a price picked in the panel after a tick): Undo still puts back the first values.
+            const before = app.fill.done.get(rowEl);
+            const again = before && before.itemId === String(itemId) && stillFilled(before) ? before : null;
+            const prev = again ? again.prev : { price: readInputs(inputs.price), qty: readInputs(inputs.qty) };
+            const text = priceText(kind, r.price);
+            writeInputs(inputs.price, text);
+
+            // Quantity: all you have (or all but one), unless you typed one already.
+            let qtyWritten = again ? again.qtyWritten : false;
+            let qtyNote = '';
+            if (inputs.qty.length && !again) {
+                const typed = prev.qty.some((v) => String(v).trim() && String(v).trim() !== '0');
+                const q = fillQuantity(inputs.have, settings.qty);
+                if (!typed && q) {
+                    writeInputs(inputs.qty, String(q));
+                    qtyWritten = true;
+                } else if (!typed && !q) {
+                    qtyNote = inputs.have === 1 && settings.qty === 'allbut1' ? 'you have 1: quantity left empty' : 'type the quantity';
+                }
+            }
+
+            const v = fillVerdict(r.price, avg);
+            const stats = Boolean(item && STAT_ITEM_TYPES.has(item.type));
+            const parts = [(base ? 'Under the one you picked: ' : 'Filled ') + formatMoney(r.price)];
+            if (kind.startsWith('market')) parts.push('you get ' + formatMoney(Math.floor(r.price * (1 - VENUE_FEES.ITEM_MARKET))) + ' after the fee');
+            if (v.text) parts.push(v.text);
+            if (r.floor === 'npc') parts.push('held at the NPC price');
+            if (r.floor === 'avg') parts.push('held at the average');
+            if (!base && r.used < r.index) parts.push(r.count === 1 ? 'only 1 listing, so that one' : 'only ' + r.count + ' listings, so the highest of them');
+            if (stats) parts.push('each one has its own stats: check the price');
+            if (inputs.single) parts.push('tick Torn\'s box for this one');
+            if (qtyNote) parts.push(qtyNote);
+            if (got.note) parts.push(got.note);
+            const level = stats || v.level === 'warn' ? 'warn' : v.level === 'good' ? 'good' : '';
+
+            app.fill.done.set(rowEl, { itemId: String(itemId), price: r.price, priceText: text, prev, inputs, qtyWritten, words: parts.join(' · '), level, at: Date.now() });
+            app.bzSelected = String(itemId);
+        } catch (error) {
+            const msg = redactKey(String((error && error.message) || error), getStoredKey());
+            app.fill.last.set(String(itemId), { error: 'Fill: ' + msg, rowEl, at: Date.now() });
+        } finally {
+            app.fill.busy.delete(rowEl);
+            repaintFills();
+            renderMyBazaar();
+        }
+    }
+
+    /** A price picked in the panel's lowest listings: undercut that one, in the item's first row. */
+    function onFillFromListing(market, index) {
+        const itemId = app.bzSelected;
+        const got = app.fill.listings.get(market + ':' + itemId);
+        const pick = got && got.shown ? got.shown[index] : null;
+        const row = app.bzRows.find((r) => r.itemId === itemId && document.contains(r.el) && r.el.querySelector('.ttv2-fillbox'));
+        if (!pick || !row || pick.mine || pick.stale || pick.troll) return;
+        fillRow(row.el, itemId, { base: pick.row || pick }).catch(() => {});
+    }
+
+    /** What the panel shows for the item picked: its lowest listings on both markets, and what Fill would type. */
+    function fillPanelView(itemId) {
+        if (!itemId || !app.ownBazaar) return null;
+        const now = Date.now();
+        const avg = itemAverage(itemId);
+        const page = app.ownBazaar;
+        const market = page.startsWith('market') ? 'market' : 'bazaar';
+        const settings = fillSettings()[market];
+        const item = app.index ? app.index.byId.get(String(itemId)) : null;
+        const out = { market, lists: {}, preview: null, filled: null, canFill: app.bzRows.some((r) => r.itemId === itemId && r.el.querySelector('.ttv2-fillbox')) };
+
+        for (const m of ['bazaar', 'market']) {
+            const cur0 = app.fill.listings.get(m + ':' + itemId);
+            // Read for the panel too, only while you look at it; reused a minute,
+            // and a failure waits a minute before it is asked again.
+            const due = !cur0 || (!cur0.promise && (cur0.error ? now - (cur0.errorAt || 0) >= FILL_REUSE_MS : now - (cur0.at || 0) >= FILL_REUSE_MS));
+            const can = m === 'bazaar' ? true : Boolean(app.client && hasUsableKey());
+            if (due && can && document.visibilityState === 'visible') {
+                fillListings(m, itemId)
+                    .catch(() => {})
+                    .finally(() => renderMyBazaar());
+            }
+            const cur = app.fill.listings.get(m + ':' + itemId);
+            if (!cur || !cur.rows) {
+                out.lists[m] = { state: cur && cur.error ? 'error' : can ? 'loading' : 'nokey', error: cur ? cur.error : null, rows: [] };
+                continue;
+            }
+            const self = app.fill.selfId;
+            const shown = cur.rows
+                .filter((r) => r.price > 1 && !r.sponsored)
+                .slice()
+                .sort((a, b) => a.price - b.price)
+                .slice(0, FILL_SHOW_LISTINGS)
+                .map((r) => ({
+                    price: r.price,
+                    qty: r.qty,
+                    name: r.sellerName || null,
+                    mine: Boolean(r.mine || (self && r.sellerId && String(r.sellerId) === String(self))),
+                    net: m === 'market' ? Math.floor(r.price * (1 - VENUE_FEES.ITEM_MARKET)) : null,
+                    stale: m === 'bazaar' && !cur.fromMarket && !(r.dataAt && now - r.dataAt <= FILL_FRESH_MS),
+                    // Far under the average: a troll or a mistake, never the one undercut.
+                    troll: Boolean(avg > 0 && r.price < avg * FILL_TROLL_SHARE),
+                    row: r,
+                }));
+            cur.shown = shown;
+            out.lists[m] = { state: 'ok', rows: shown, at: cur.at, note: cur.note || null, fromMarket: Boolean(cur.fromMarket) };
+        }
+
+        const got = app.fill.listings.get(market + ':' + itemId);
+        if (got && got.rows) {
+            const r = fillPrice(got.rows, settings, { npc: item && item.sellPrice > 0 ? item.sellPrice : null, avg, selfId: app.fill.selfId, checkFresh: market === 'bazaar' && !got.fromMarket });
+            if (r.price) out.preview = { price: r.price, verdict: fillVerdict(r.price, avg), floor: r.floor, base: r.base ? r.base.price : null, used: r.used };
+        }
+        for (const row of app.bzRows) {
+            const done = app.fill.done.get(row.el);
+            if (done && done.itemId === String(itemId) && stillFilled(done)) out.filled = { price: done.price };
+        }
+        return out;
     }
 
     /* ------------------------------------------------------------------ *
@@ -11834,7 +14719,8 @@
     function scanSummary() {
         if (app.ownBazaar) {
             const d = app.bzDiagnostics || { rows: 0, identified: 0 };
-            return 'Your bazaar: ' + d.identified + ' of ' + d.rows + ' rows priced.';
+            const where = app.ownBazaar.startsWith('market') ? 'Item Market' : 'Your bazaar';
+            return where + ': ' + d.identified + ' of ' + d.rows + ' rows priced.';
         }
         if (app.pageType === PAGE_NONE) {
             return 'Not a Bazaar or Item Market page.';
@@ -12000,11 +14886,11 @@
 
     /** A change to, or inside, one of the helper's own price tags is not the page changing. */
     function isOwnTagMutation(m) {
-        const isTag = (n) =>
-            n && n.nodeType === 1 && n.classList && n.classList.contains(OWN_BAZAAR_TAG_CLASS);
+        const ours = '.' + OWN_BAZAAR_TAG_CLASS + ', .' + FILL_TAG_CLASS + ', .ttv2-fillbox, .ttv2-bzchips, .ttv2-fillset';
+        const isTag = (n) => n && n.nodeType === 1 && n.matches && n.matches(ours);
         const inTag = (n) => {
             const el = n && n.nodeType === 1 ? n : n && n.parentElement;
-            return Boolean(el && el.closest && el.closest('.' + OWN_BAZAAR_TAG_CLASS));
+            return Boolean(el && el.closest && el.closest(ours));
         };
         if (inTag(m.target)) return true;
         const nodes = [...(m.addedNodes || []), ...(m.removedNodes || [])];
@@ -12204,6 +15090,9 @@
      * The traders page (its own tab)
      * ------------------------------------------------------------------ */
 
+    /* The Torn Ledger's state on Torn Bids (the key itself stays in storage). */
+    const led = { client: null, data: null, busy: false, checking: false, error: null, keyError: null, saveMsg: null, nextAt: 0 };
+
     const sell = {
         client: null,
         te: null,
@@ -12243,11 +15132,15 @@
         /* Your own Torn id: your listings are never "the cheapest", nor a bazaar to buy from. */
         selfId: null,
         selfTried: false,
-        /* The item on the desk (and whether you picked it), the list's filter and search. */
+        /* Traders' networth: id -> {value, at, pending, retryAt}. */
+        networth: new Map(),
+        networthAsked: [],
+        /* The item on the desk (and whether you picked it), the list's filter, search and category. */
         selected: null,
         pickedByYou: false,
         filter: 'all',
         query: '',
+        category: '',
         /* When statuses were asked, for the per-minute limit. */
         presenceAsked: [],
         /* Our trader database (TornW3B lists), and its item index for this render. */
@@ -12726,23 +15619,47 @@
         };
         // A flip sells to a believable buyer only (see flipBuyer), and never
         // buys more than your Most per flip.
+        // ...and never asks a trader to pay more than your share of their networth.
+        const unitsOf = (b) => payableUnits(b.price, b.id ? networthOf(b.id) : null, prefs.networthPct);
         const flipBuyerOf = (id) => {
             const item = itemOf(id);
-            return flipBuyer(buyersOf(id), { avg: item ? Number(item.marketValue) || null : null, type: item ? item.type : null });
+            return flipBuyer(buyersOf(id), { avg: item ? Number(item.marketValue) || null : null, type: item ? item.type : null, unitsOf });
         };
+        const flipBuyersOf = (id) => {
+            const item = itemOf(id);
+            return flipBuyers(buyersOf(id), { avg: item ? Number(item.marketValue) || null : null, type: item ? item.type : null, unitsOf });
+        };
+        // The plan that makes the most among the believable buyers (each capped
+        // by what they can pay); a tie goes to the higher bid.
         const planOf = (id) => {
             const rows = sellersOf(id);
-            const b = flipBuyerOf(id);
-            const plan = rows && b ? flipPlan(rows, b.price, { cash: prefs.cash, maxUnits: prefs.maxPerFlip }) : null;
-            return plan ? { ...plan, buyer: b } : null;
+            if (!rows) return null;
+            let best = null;
+            for (const b of flipBuyersOf(id)) {
+                const most = Math.min(prefs.maxPerFlip || 100, b.maxUnits ? b.maxUnits : Infinity);
+                const plan = flipPlan(rows, b.price, { cash: prefs.cash, maxUnits: most });
+                if (!plan) continue;
+                if (!best || plan.profit > best.profit || (plan.profit === best.profit && plan.units > 0 && !best.units)) best = { ...plan, buyer: b };
+            }
+            return best;
         };
 
         // Which items' bazaars to read for a flip: where a buyer you would sell
         // to pays more than the summary's cheapest.
         sell.candidates = sell.summary
-            ? flipCandidates(summary, (id) => {
-                const b = flipBuyerOf(id);
-                return b ? b.price : null;
+            ? flipCandidates(summary, (id, lowest) => {
+                // The buyer who would make the most at the summary's price, with their cap.
+                let pick = null;
+                let score = -Infinity;
+                for (const b of flipBuyersOf(id)) {
+                    const n = Math.min(prefs.maxPerFlip || 100, b.maxUnits || Infinity, prefs.cash > 0 ? Math.floor(prefs.cash / lowest) : Infinity);
+                    const s = (b.price - lowest) * n;
+                    if (s > score) {
+                        score = s;
+                        pick = b;
+                    }
+                }
+                return pick ? { price: pick.price, maxUnits: pick.maxUnits || null } : null;
             }, { cash: prefs.cash, maxUnits: prefs.maxPerFlip })
             : [];
         const flipsChecked = sell.candidates.filter((c) => {
@@ -12754,7 +15671,7 @@
         const oneIds = [...sell.teOne].filter(([, rec]) => rec.best).map(([id]) => id);
         const allIds = new Set([...heldQty.keys(), ...teMap.keys(), ...w3bByItem.keys(), ...oneIds]);
         const q = String(sell.query || '').trim().toLowerCase();
-        const rows = [];
+        let rows = [];
         for (const id of allIds) {
             const name = nameOf(id);
             if (q && !String(name).toLowerCase().includes(q)) continue;
@@ -12776,8 +15693,12 @@
                     badge = { kind: 'sell' };
                 }
             }
-            rows.push({ itemId: id, name, held, lowest, badge, value, bid: best ? best.price : 0, pending: !best && pendingFor(id), plan, best });
+            rows.push({ itemId: id, name, held, lowest, badge, value, bid: best ? best.price : 0, pending: !best && pendingFor(id), plan, best, category: itemCategory(itemOf(id)) });
         }
+        // The category filters the flips, the list and its counts together; its
+        // own counts follow the search only.
+        const categories = categoryCounts(rows.map((r) => r.category), sell.category);
+        if (sell.category) rows = rows.filter((r) => r.category === sell.category);
         const counts = {
             all: rows.length,
             mine: rows.filter((r) => r.held).length,
@@ -12842,6 +15763,15 @@
 
         const watch = sellWatch({ desk, strip, listed, held: [...heldQty.keys()], buyersAll });
         updateSellPresence(watch, now);
+        // Networth: the buyers the flips sell to first, then the desk's top traders.
+        const nwIds = [];
+        for (const f of strip) if (f.buyer && f.buyer.id) nwIds.push(String(f.buyer.id));
+        for (const c of sell.candidates) {
+            const b = flipBuyerOf(c.itemId);
+            if (b && b.id) nwIds.push(String(b.id));
+        }
+        if (desk) for (const b of desk.buyers.slice(0, 5)) if (b.id) nwIds.push(String(b.id));
+        updateSellNetworth([...new Set(nwIds)], now);
         const statusesKnown = watch.ids.filter((id) => !presenceUnknown(id)).length;
 
         const heldCount = sell.inventory ? sell.inventory.length : 0;
@@ -12851,10 +15781,19 @@
 
         sell.page.render({
             strip,
+            ledger: ledgerView(),
+            itemNameOf: (id) => nameOf(id),
+            itemTypeOf: (id) => {
+                const item = itemOf(id);
+                return item ? item.type : null;
+            },
+            networth: networthMap(),
             list: listed.slice(0, sell.allShown).map((r) => ({ itemId: r.itemId, name: r.name, held: r.held, lowest: r.lowest, badge: r.badge, pending: r.pending })),
             listTotal: listed.length,
             counts,
             filter: sell.filter,
+            categories,
+            category: sell.category,
             desk,
             statuses,
             prefs,
@@ -13137,6 +16076,75 @@
      * first): visible tab only, at most SELL_PRESENCE_PER_MIN a minute.
      * @param {{ids: string[], open: Set<string>}} watch - from sellWatch
      */
+    /** A trader's networth when known (from the store, 12 hours at most), else null. */
+    function networthOf(id) {
+        const rec = sell.networth.get(String(id));
+        return rec && rec.value !== null && rec.value !== undefined ? rec.value : null;
+    }
+
+    function networthMap() {
+        const out = new Map();
+        for (const [id, rec] of sell.networth) if (rec.value !== null && rec.value !== undefined) out.set(id, rec.value);
+        return out;
+    }
+
+    function loadSellNetworth() {
+        const now = Date.now();
+        const stored = gmGet(STORE_SELL_NETWORTH, {}) || {};
+        for (const [id, rec] of Object.entries(stored)) {
+            if (rec && Number.isFinite(rec.value) && now - rec.at < SELL_NETWORTH_REFRESH_MS * 2) sell.networth.set(id, { value: rec.value, at: rec.at, pending: false, retryAt: 0 });
+        }
+    }
+
+    function saveSellNetworth() {
+        const out = {};
+        for (const [id, rec] of sell.networth) if (Number.isFinite(rec.value)) out[id] = { value: rec.value, at: rec.at };
+        gmSet(STORE_SELL_NETWORTH, out);
+    }
+
+    /**
+     * Ask Torn for the networth of the traders a flip would sell to: public
+     * personal stats, one call each, at most SELL_NETWORTH_PER_MIN a minute
+     * inside the shared limit, only while this tab is in front, each kept 12h.
+     */
+    function updateSellNetworth(ids, now) {
+        if (!getSellKey() || sell.keyDead || document.visibilityState !== 'visible') return;
+        sell.networthAsked = (sell.networthAsked || []).filter((t) => now - t < 60000);
+        for (const id of ids) {
+            if (sell.networthAsked.length >= SELL_NETWORTH_PER_MIN) break;
+            let rec = sell.networth.get(id);
+            if (!rec) {
+                rec = { value: null, at: 0, pending: false, retryAt: 0 };
+                sell.networth.set(id, rec);
+            }
+            if (rec.pending || now < rec.retryAt || (rec.value !== null && now - rec.at < SELL_NETWORTH_REFRESH_MS)) continue;
+            rec.pending = true;
+            sell.networthAsked.push(now);
+            fetchNetworth(sell.client, id)
+                .then((value) => {
+                    if (value === null) {
+                        rec.retryAt = Date.now() + SELL_NETWORTH_RETRY_MS;
+                        return;
+                    }
+                    rec.value = value;
+                    rec.at = Date.now();
+                    saveSellNetworth();
+                })
+                .catch((error) => {
+                    if (isKeyDeadError(error)) {
+                        sell.keyDead = true;
+                        sell.keyError = sellKeyErrorText(error);
+                        gmSet(STORE_SELL_KEY_DEAD, true);
+                    }
+                    rec.retryAt = Date.now() + SELL_NETWORTH_RETRY_MS;
+                })
+                .finally(() => {
+                    rec.pending = false;
+                    renderSelling();
+                });
+        }
+    }
+
     function updateSellPresence({ ids, open }, now) {
         for (const id of ids) {
             if (!sell.presence.has(id)) {
@@ -13308,6 +16316,15 @@
         renderSelling();
     }
 
+    /** A category (Torn's item type), or '' for all: the desk moves to the first item there. */
+    function onSellCategory(category) {
+        sell.category = String(category || '');
+        sell.selected = null;
+        sell.pickedByYou = false;
+        sell.allShown = ALL_ITEMS_PAGE;
+        renderSelling();
+    }
+
     function onSellQuery(text) {
         sell.query = String(text || '');
         sell.allShown = ALL_ITEMS_PAGE;
@@ -13325,6 +16342,7 @@
             loadWindow: () => gmGet(STORE_API_WINDOW, []),
             saveWindow: (recent) => gmSet(STORE_API_WINDOW, recent),
         });
+        loadSellNetworth();
         /*
          * The pace and any penalty wait live in storage, shared by every tab:
          * a reload or a second traders tab carries on from the same clock.
@@ -13371,16 +16389,26 @@
             onRevealKey: () => getSellKey(),
             onSaveTeKey: onSellSaveTeKey,
             onForgetTeKey: onSellForgetTeKey,
+            onLedgerSaveKey,
+            onLedgerForget,
+            onLedgerRead: () => {
+                led.nextAt = 0;
+                runLedger();
+            },
             onRetryTe: onSellRetryTe,
             onRevealTeKey: () => getTeKey(),
             onRefresh: onSellRefresh,
             onPrefsChange: (partial) => {
-                gmSet(STORE_SELL_PREFS, { ...sellPrefs(), ...partial });
+                // Onto what is stored, not just the known keys: trustedOn311 (the
+                // one-time Trusted switch) must survive, or Trusted comes back on
+                // at every reload after any setting is saved.
+                gmSet(STORE_SELL_PREFS, { ...(gmGet(STORE_SELL_PREFS, {}) || {}), ...sellPrefs(), ...partial });
                 renderSelling();
             },
             onSelect: onSellSelect,
             onFilter: onSellFilter,
             onQuery: onSellQuery,
+            onCategory: onSellCategory,
             onMore: () => {
                 sell.allShown += ALL_ITEMS_PAGE;
                 renderSelling();
@@ -13424,6 +16452,24 @@
         setInterval(stepW3b, W3B_LIST_STEP_MS);
         setInterval(stepTeOne, TE_ONE_STEP_MS);
 
+        // Another Torn Bids tab saved, forgot or read: take its word for it.
+        gmOnChange(STORE_LEDGER_KEY, () => {
+            led.data = null;
+            led.nextAt = 0;
+            renderSelling();
+        });
+        gmOnChange(STORE_LEDGER, () => {
+            if (!led.busy) led.data = null;
+            renderSelling();
+        });
+        led.client = new LedgerClient({
+            getKey: getLedgerKey,
+            loadWindow: () => gmGet(STORE_API_WINDOW, []),
+            saveWindow: (recent) => gmSet(STORE_API_WINDOW, recent),
+        });
+        runLedger();
+        setInterval(() => runLedger(), 15000);
+
         setInterval(() => {
             if (document.visibilityState !== 'visible') return;
             refreshSellTraders();
@@ -13444,6 +16490,270 @@
             else saveTraderDb(true);
         });
         window.addEventListener('pagehide', () => saveTraderDb(true));
+    }
+
+    /* ------------------------------------------------------------------ *
+     * Torn Ledger: your profit, from your own log, with its own Full key
+     * ------------------------------------------------------------------ */
+
+    /**
+     * The Ledger's key: its own storage entry, its own client (only its four
+     * paths - see api/ledger.js), read only here on Torn Bids. Never shown after
+     * Save, never logged, redacted from every error. Forget deletes it and the
+     * ledger.
+     */
+    function getLedgerKey() {
+        return gmGet(STORE_LEDGER_KEY, '') || '';
+    }
+
+    function ledgerData() {
+        if (!led.data) led.data = readLedger(gmGet(STORE_LEDGER, null));
+        return led.data;
+    }
+
+    function saveLedger() {
+        if (led.data) gmSet(STORE_LEDGER, led.data);
+    }
+
+    function ledgerErrorText(error) {
+        const code = error && error.code;
+        if (code === 2) return 'Torn says this key is wrong. Paste your Full key again.';
+        if (code === 13) return 'Torn paused this key: its owner has not played for 7 days.';
+        if (code === 18) return 'This key is paused in Torn\'s settings.';
+        if (code === 16) return 'This key cannot read your log. The Ledger needs a Full key.';
+        if (code === 5) return 'Torn asked us to slow down; the Ledger reads again in a few minutes.';
+        return redactKey(String((error && error.message) || error || 'Could not read your log.'), getLedgerKey());
+    }
+
+    function markLedgerKeyDead(error) {
+        led.keyError = ledgerErrorText(error);
+        gmSet(STORE_LEDGER_KEY_DEAD, led.keyError);
+    }
+
+    /** Save a key only when Torn says it is a Full key; anything else is refused, with why. */
+    async function onLedgerSaveKey(key) {
+        key = String(key || '').trim();
+        led.saveMsg = null;
+        if (!key) {
+            led.saveMsg = { bad: true, text: 'Paste your Full key first.' };
+            renderSelling();
+            return;
+        }
+        if (!/^[A-Za-z0-9]{16}$/.test(key)) {
+            led.saveMsg = { bad: true, text: 'A Torn key is 16 letters and digits.' };
+            renderSelling();
+            return;
+        }
+        led.checking = true;
+        renderSelling();
+        const probe = new LedgerClient({
+            getKey: () => key,
+            loadWindow: () => gmGet(STORE_API_WINDOW, []),
+            saveWindow: (recent) => gmSet(STORE_API_WINDOW, recent),
+            maxRetries: 0,
+        });
+        try {
+            const info = await fetchLedgerKeyInfo(probe);
+            if (!isFullKey(info)) {
+                led.saveMsg = { bad: true, text: 'This is ' + (info.type ? 'a ' + info.type.replace(/\s*access$/i, '') : 'not a Full') + ' key. The Ledger reads your log, which needs a Full key. Not saved.' };
+                return;
+            }
+            if (!info.userId) {
+                led.saveMsg = { bad: true, text: 'Torn did not say whose key this is. Not saved.' };
+                return;
+            }
+            // Another account's key: its own ledger, not this one's rows.
+            const was = gmGet(STORE_LEDGER_SELF, null);
+            if (was && String(was) !== String(info.userId)) {
+                gmDel(STORE_LEDGER);
+                led.data = null;
+            }
+            gmSet(STORE_LEDGER_KEY, key);
+            gmDel(STORE_LEDGER_KEY_DEAD);
+            gmSet(STORE_LEDGER_SELF, info.userId);
+            led.keyError = null;
+            led.saveMsg = { bad: false, text: 'Saved · Full access.' };
+            led.nextAt = 0;
+            runLedger();
+        } catch (error) {
+            led.saveMsg = { bad: true, text: redactKey(ledgerErrorText(error), key) };
+        } finally {
+            led.checking = false;
+            renderSelling();
+        }
+    }
+
+    /** Forget the key AND everything the Ledger stored. */
+    function onLedgerForget() {
+        gmDel(STORE_LEDGER_KEY);
+        gmDel(STORE_LEDGER_KEY_DEAD);
+        gmDel(STORE_LEDGER_SELF);
+        gmDel(STORE_LEDGER);
+        led.data = null;
+        led.keyError = null;
+        led.error = null;
+        led.saveMsg = { bad: false, text: 'Key and ledger deleted.' };
+        renderSelling();
+    }
+
+    /**
+     * Read what is new in your log (and your finished trades), then go further
+     * back until a year is read. A few calls per run, through the shared request
+     * window; only while Torn Bids is in front; every LEDGER_EVERY_MS.
+     */
+    async function runLedger({ now = Date.now() } = {}) {
+        if (led.busy || !getLedgerKey() || gmGet(STORE_LEDGER_KEY_DEAD, null) || document.visibilityState !== 'visible') return;
+        if (now < led.nextAt) return;
+        led.busy = true;
+        led.error = null;
+        renderSelling();
+        // The key this run reads with. If it is forgotten or replaced meanwhile
+        // (here or in another tab), the run stops and keeps nothing.
+        const key = getLedgerKey();
+        const same = () => getLedgerKey() === key;
+        let calls = 0;
+        const data = ledgerData();
+        const page = async (params) => {
+            calls += 1;
+            const rows = await fetchLogPage(led.client, params);
+            if (!same()) throw new LedgerKeyChanged();
+            return rows;
+        };
+        try {
+            const nowS = Math.floor(now / 1000);
+            if (!data.startedAt) data.startedAt = nowS;
+            // 1. What is new since the newest entry read. Newest first, 100 a
+            //    page: the gap is walked back from the top, and where a run stops
+            //    is kept (data.gap), so the next run carries on there - a gap of
+            //    any size is read in the end.
+            if (data.newestAt) {
+                const gap = data.gap || { to: null, newest: data.newestAt };
+                while (calls < LEDGER_CALLS_PER_RUN) {
+                    const rows = await page({ from: data.newestAt, to: gap.to });
+                    addLedgerRows(data, rows.flatMap(rowsFromLog));
+                    data.logCount += rows.length;
+                    const span = logSpan(rows);
+                    if (span.max > gap.newest) gap.newest = span.max;
+                    if (rows.length < 100 || !span.min || (gap.to && span.min >= gap.to)) {
+                        data.newestAt = gap.newest;
+                        data.gap = null;
+                        break;
+                    }
+                    gap.to = span.min;
+                    data.gap = gap;
+                }
+            }
+            // 2. Further back, until a year is read.
+            const floor = nowS - LEDGER_BACKFILL_S;
+            while (!data.backfilled && calls < LEDGER_CALLS_PER_RUN) {
+                const rows = await page({ to: data.oldestAt || null });
+                addLedgerRows(data, rows.flatMap(rowsFromLog));
+                data.logCount += rows.length;
+                const span = logSpan(rows);
+                if (span.max > data.newestAt) data.newestAt = span.max;
+                const done = rows.length < 100 || !span.min || span.min <= floor || (data.oldestAt && span.min >= data.oldestAt);
+                if (span.min) data.oldestAt = span.min;
+                if (done) data.backfilled = true;
+            }
+            // An empty log: from now on, new entries are read.
+            if (data.backfilled && !data.newestAt) data.newestAt = data.startedAt;
+            // 3. Finished trades: each read once. A day of overlap covers any
+            //    difference between the list's order and when a trade finished.
+            let self = gmGet(STORE_LEDGER_SELF, null);
+            // Whose key it is (learned at Save; asked once if it was not).
+            if (!self && calls < LEDGER_CALLS_PER_RUN) {
+                calls += 1;
+                const info = await fetchLedgerKeyInfo(led.client);
+                if (!same()) throw new LedgerKeyChanged();
+                if (info.userId) {
+                    self = info.userId;
+                    gmSet(STORE_LEDGER_SELF, self);
+                }
+            }
+            if (self && calls < LEDGER_CALLS_PER_RUN) {
+                calls += 1;
+                const trades = await fetchTradesPage(led.client, { from: data.tradesAt ? data.tradesAt - 24 * 60 * 60 : nowS - LEDGER_BACKFILL_S });
+                if (!same()) throw new LedgerKeyChanged();
+                const seen = new Set(data.tradeIds);
+                const fails = data.tradeFails || {};
+                let complete = true;
+                for (const t of trades) {
+                    if (!t || seen.has(String(t.id))) continue;
+                    if (calls >= LEDGER_CALLS_PER_RUN) {
+                        complete = false;
+                        break;
+                    }
+                    calls += 1;
+                    let full = null;
+                    try {
+                        full = await fetchTrade(led.client, t.id);
+                    } catch (error) {
+                        if (error && (KEY_DEAD_CODES.has(error.code) || error.code === 16 || error.code === 5)) throw error;
+                        // One trade Torn will not give: tried 3 times, then passed over.
+                        fails[t.id] = (fails[t.id] || 0) + 1;
+                        data.tradeFails = fails;
+                        if (fails[t.id] < 3) {
+                            complete = false;
+                            continue;
+                        }
+                    }
+                    if (!same()) throw new LedgerKeyChanged();
+                    const valueOf = (id) => {
+                        const item = sell.index && sell.index.byId ? sell.index.byId.get(String(id)) : null;
+                        return item ? item.marketValue : 1;
+                    };
+                    if (full) addLedgerRows(data, rowsFromTrade({ ...t, ...full }, self, valueOf));
+                    seen.add(String(t.id));
+                    delete fails[t.id];
+                }
+                data.tradeIds = [...seen].slice(-3000);
+                // Moved on only past trades all read (not ones a full run left for later).
+                if (complete) {
+                    const latest = trades.reduce((m, t) => Math.max(m, Number(t && (t.completed_at || t.timestamp || t.modified_at)) || 0), data.tradesAt || 0);
+                    if (trades.length < 100) data.tradesAt = latest;
+                    else data.tradesAt = Math.max(data.tradesAt || 0, latest - 24 * 60 * 60);
+                }
+            }
+            data.readAt = Date.now();
+            if (same()) saveLedger();
+            led.nextAt = Date.now() + (data.backfilled && !data.gap ? LEDGER_EVERY_MS : LEDGER_BACKFILL_GAP_MS);
+        } catch (error) {
+            if (error instanceof LedgerKeyChanged || !same()) {
+                // Forgotten or replaced mid-run: nothing kept, nothing marked; the new key reads at once.
+                led.data = null;
+                led.nextAt = 0;
+            } else {
+                if (error && (KEY_DEAD_CODES.has(error.code) || error.code === 16)) markLedgerKeyDead(error);
+                led.error = ledgerErrorText(error);
+                led.nextAt = Date.now() + LEDGER_EVERY_MS;
+                saveLedger();
+            }
+        } finally {
+            led.busy = false;
+            renderSelling();
+            if (led.nextAt === 0 && getLedgerKey()) setTimeout(() => runLedger(), 0);
+        }
+    }
+
+    /** A run noticed its key was forgotten or replaced. */
+    class LedgerKeyChanged extends Error {}
+
+    /** What the page shows about the Ledger: its key's state and the rows (no key, ever). */
+    function ledgerView() {
+        const hasKey = Boolean(getLedgerKey());
+        const data = hasKey ? ledgerData() : null;
+        return {
+            hasKey,
+            keyError: gmGet(STORE_LEDGER_KEY_DEAD, null) || null,
+            checking: Boolean(led.checking),
+            saveMsg: led.saveMsg,
+            busy: Boolean(led.busy),
+            error: led.error,
+            readAt: data ? data.readAt : 0,
+            backfilled: data ? data.backfilled : false,
+            oldestAt: data ? data.oldestAt : 0,
+            rows: data ? data.rows : [],
+        };
     }
 
     /* ------------------------------------------------------------------ *
@@ -13551,10 +16861,26 @@
                 app.bzWindow = key;
                 renderMyBazaar();
             },
+            onFillListing: (market, index) => onFillFromListing(market, index),
+            onFillSelected: () => {
+                const itemId = app.bzSelected;
+                const row = app.bzRows.find((r) => r.itemId === itemId && document.contains(r.el) && r.el.querySelector('.ttv2-fillbox'));
+                if (row) fillRow(row.el, itemId).catch(() => {});
+            },
+            getFill: () => gmGet(STORE_FILL, null),
+            onFillSettings: (value) => {
+                gmSet(STORE_FILL, value);
+                renderMyBazaar();
+            },
         });
 
         app.panel.mount();
         app.panel.enableHotkey();
+        // Fill settings changed in another tab (or in Torn Bids): show them here too.
+        gmOnChange(STORE_FILL, () => {
+            app.panel.syncFill();
+            renderMyBazaar();
+        });
         app.panel.applySettings(app.settings);
 
         refreshKeyState();

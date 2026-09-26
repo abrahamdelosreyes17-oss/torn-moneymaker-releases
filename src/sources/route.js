@@ -110,6 +110,22 @@ export function ownBazaarPage(href) {
     return null;
 }
 
+/**
+ * The Item Market's own-listing pages, where Fill works: add a listing
+ * (#/addListing) and your listings (#/viewListing, also #/yourItems). The
+ * hash changes without a page load, so callers re-check on hashchange.
+ *
+ * @returns {'add'|'view'|null}
+ */
+export function marketFillPage(href) {
+    if (typeof href !== 'string' || !href) return null;
+    if (detectPage(href) !== PAGE_ITEM_MARKET) return null;
+    const hash = (href.split('#')[1] || '').toLowerCase().replace(/^\/+/, '').split(/[?&]/)[0];
+    if (hash === 'addlisting' || hash.startsWith('addlisting/')) return 'add';
+    if (hash === 'viewlisting' || hash.startsWith('viewlisting/') || hash === 'youritems' || hash.startsWith('youritems/')) return 'view';
+    return null;
+}
+
 /*
  * The traders page in its own tab, on a page of our own (GitHub Pages), not
  * on Torn: the script draws the page over a blank one there. Nothing on

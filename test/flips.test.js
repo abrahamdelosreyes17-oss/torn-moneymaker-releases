@@ -7,6 +7,8 @@ import {
     whereToSell,
     flipCandidates,
     flipBuyer,
+    payableUnits,
+    flipBuyers,
     traderTagLabel,
     FLIP_FRESH_MS,
     LIST_EDGE,
@@ -135,4 +137,35 @@ test('trader tag: only a Trusted buyer paying more than the listing; two lines, 
     assert.equal(traderTagLabel({ ...faffo, trust: { level: 'Known' } }, 70000), null);
     assert.equal(traderTagLabel({ ...faffo, trust: null }, 70000), null);
     assert.equal(traderTagLabel(null, 70000), null);
+});
+
+test('could they pay: a flip never asks a trader for more than your share of their networth', () => {
+    // $1m networth, 10%: $100,000 at an $18,000 bid is 5 items.
+    assert.equal(payableUnits(18000, 1000000, 10), 5);
+    assert.equal(payableUnits(18000, null, 10), Infinity);
+    assert.equal(payableUnits(18000, 1000000, 0), Infinity);
+    assert.equal(payableUnits(200000, 1000000, 10), 0);
+    const buyers = [{ id: '1', name: 'Poor', price: 200000 }, { id: '2', name: 'Rich', price: 190000 }];
+    const nw = { 1: 1000000, 2: 1e10 };
+    const unitsOf = (b) => payableUnits(b.price, nw[b.id], 10);
+    // The best bidder cannot pay for even one: the next one is the buyer.
+    const b = flipBuyer(buyers, { avg: 150000, type: 'Drug', unitsOf });
+    assert.equal(b.name, 'Rich');
+    assert.equal(b.maxUnits, Math.floor(1e9 / 190000));
+    // Unknown networth: the buyer stands, with no cap yet.
+    assert.equal(flipBuyer(buyers, { avg: 150000, unitsOf: () => Infinity }).maxUnits, undefined);
+});
+
+test('flip buyers: every believable one that can pay for one, best bid first, each with its cap', () => {
+    const buyers = [{ id: '1', price: 1000 }, { id: '2', price: 990 }, { id: '3', price: 99999 }];
+    const nw = { 1: 10000, 2: 1e9 };
+    const list = flipBuyers(buyers, { avg: 1000, type: 'Drug', unitsOf: (b) => payableUnits(b.price, nw[b.id], 10) });
+    // 3 is not believable (over 3x the average); 1 can pay for 1, 2 for many.
+    assert.deepEqual(list.map((b) => [b.id, b.maxUnits]), [['1', 1], ['2', Math.floor(1e8 / 990)]]);
+    // At $900 a unit with 100 on sale: 1 makes $100, 2 makes 100 x $90 - the plan should sell to 2.
+    const sellers = [{ sellerId: '9', price: 900, qty: 100, stale: false }];
+    const plans = list.map((b) => ({ b, p: flipPlan(sellers, b.price, { maxUnits: Math.min(100, b.maxUnits || Infinity) }) }));
+    const best = plans.reduce((a, x) => (x.p.profit > a.p.profit ? x : a));
+    assert.equal(best.b.id, '2');
+    assert.equal(best.p.profit, 9000);
 });

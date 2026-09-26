@@ -32,6 +32,9 @@ if (/[?&]sellkeys=1/.test(location.search)) {
     // &tebad=1: a TornExchange key it rejects ("Invalid API key").
     _store[NS + 'teKey'] = JSON.stringify(/[?&]tebad=1/.test(location.search) ? 'WRONGKEY12345678' : SAME ? LIMITED : TEKEY);
 }
+// ?ledgerkey=1: the Torn Ledger's Full key already saved (its log answers below).
+const FULLKEY = 'FULLKEY123456789';
+if (/[?&]ledgerkey=1/.test(location.search)) _store[NS + 'ledgerKey'] = JSON.stringify(FULLKEY);
 // ?w3btrader=1: our trader database already knows trader 77, found on a
 // TornW3B page and on no TornExchange list.
 if (/[?&]w3btrader=1/.test(location.search)) {
@@ -69,13 +72,45 @@ if (/[?&]ownbazaar=1/.test(location.search)) {
     }
     _store[NS + 'priceHistory'] = JSON.stringify({ version: 1, items });
     document.addEventListener('DOMContentLoaded', () => {
+        const row = (id, name, have, value, weapon) => '<li class="clearfix"><div class="thumbnail-wrap"><div class="item-amount qty">' + (have || 1) + '</div></div>' +
+            '<div class="title-wrap"><div class="image-wrap"><img src="https://www.torn.com/images/items/' + id + '/large.png" alt="' + name + '"></div><div class="name-wrap bold"><span class="t-overflow">' + name + '</span>' + (have ? ' x' + have : '') + '</div></div>' +
+            '<div class="actions-main-wrap clearfix"><div class="amount-main-wrap">' +
+            (weapon ? '<div class="amount choice-container"><input class="checkbox-css" type="checkbox" name="amount"></div>' : '<div class="amount"><input type="text" class="clear-all" placeholder="Qty"></div>') +
+            '<div class="price"><div class="input-money-group"><input type="text" class="clear-all input-money" placeholder="Price"><input type="hidden" name="price" class="clear-all input-money"></div></div></div>' +
+            '<div class="info-main-wrap"><div class="info-wrap t-overflow">$' + value.toLocaleString('en-US') + '</div></div></div></li>';
         const d = document.createElement('div');
         d.id = 'fake-own';
-        d.innerHTML = '<ul class="items-cont">' +
-            '<li class="clearfix"><div class="img-wrap"><img src="https://www.torn.com/images/items/180/large.png" alt="Bottle of Beer" width="60"></div><div class="title-wrap"><div class="name-wrap">Bottle of Beer x12</div></div><div class="amount-wrap"><input type="text" class="amount"></div></li>' +
-            '<li class="clearfix"><div class="img-wrap"><img src="https://www.torn.com/images/items/206/large.png" alt="Xanax" width="60"></div><div class="title-wrap"><div class="name-wrap">Xanax</div></div><div class="amount-wrap"><input type="text" class="amount"></div></li>' +
+        d.innerHTML = '<input type="hidden" id="torn-user" value=\'{"id":999,"playername":"Me"}\'>' +
+            '<div class="topSection___x"><div class="linksContainer____x"><a class="linkContainer___x inRow___x iconActive___x" href="#/manage">Manage items</a><a class="linkContainer___x inRow___x" href="#/personalize">Personalize</a></div></div>' +
+            '<style>#fake-own ul{width:784px;list-style:none;padding:0;background:#2e2e2e;font:12px Arial;color:#ddd}#fake-own li{overflow:hidden;border-bottom:1px solid #444}#fake-own .title-wrap{float:left;width:283px}#fake-own .image-wrap{float:left;width:64px;height:32px}#fake-own .image-wrap img{height:30px}#fake-own .name-wrap{float:left;width:218px;line-height:32px;font-weight:bold}#fake-own .info-main-wrap{float:left;width:325px}#fake-own .info-wrap{line-height:32px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}#fake-own .amount-main-wrap{float:right;width:175px}#fake-own .amount{float:left;width:63px;padding-top:5px}#fake-own .amount input{width:41px}#fake-own .price{float:left;width:111px;padding-top:5px}#fake-own .price input[type=text]{width:89px}</style>' +
+            '<ul class="items-cont">' +
+            row(180, 'Bottle of Beer', 12, 55) +
+            row(206, 'Xanax', 15, 830000) +
+            row(1, 'Hammer', 0, 120, true) +
             '</ul>';
         document.body.prepend(d);
+        // Torn's form keeps what was typed; the harness logs each input event so a check can see Fill's.
+        window.__typed = [];
+        d.addEventListener('input', (e) => window.__typed.push([e.target.closest('li') ? e.target.closest('li').querySelector('.t-overflow').textContent : '?', e.target.className, e.target.value]));
+    });
+}
+// ?ownmarket=add|view: the Item Market's add-listing / your-listings rows.
+const _ownMarket = new URLSearchParams(location.search).get('ownmarket');
+if (_ownMarket) {
+    document.addEventListener('DOMContentLoaded', () => {
+        const d = document.createElement('div');
+        d.id = 'item-market-root';
+        const row = (id, name, have, price) => '<div class="itemRowWrapper___x1"><div class="itemRow___x2"><div class="info___x3">' +
+            '<button type="button" class="viewInfoButton___x4" aria-controls="item-info-' + id + '-0"><img src="https://www.torn.com/images/items/' + id + '/small.png" alt=""></button>' +
+            '<span class="name___x5">' + name + (have ? ' x' + have : '') + '</span></div>' +
+            (_ownMarket === 'add' ? '<div class="amountInputWrapper___x6"><div class="input-money-group"><input class="input-money" type="text"><input class="input-money" type="hidden"></div></div>' : '') +
+            '<div class="priceInputWrapper___x7"><div class="input-money-group"><span class="input-money-symbol">$</span><input class="input-money" type="text" value="' + (price || '') + '"><input class="input-money" type="hidden" value="' + (price || '') + '"></div></div>' +
+            '</div></div>';
+        d.innerHTML = '<input type="hidden" id="torn-user" value=\'{"id":999,"playername":"Me"}\'>' +
+            (_ownMarket === 'add' ? row(206, 'Xanax', 15) + row(180, 'Bottle of Beer', 12) : row(206, 'Xanax', 0, 845000));
+        document.body.prepend(d);
+        window.__typed = [];
+        d.addEventListener('input', (e) => window.__typed.push([e.target.closest('[class*=itemRow___]').querySelector('[class*=name___]').textContent, e.target.className, e.target.value]));
     });
 }
 // ?from381=1: left as 3.8.1 left it when it refused the Limited key as the
@@ -128,13 +163,13 @@ function GM_openInTab(url) { window.__opened.push(url); }
 
 const NOW_S = Math.floor(Date.now() / 1000);
 const ITEMS = {
-    1: { name: 'Hammer', sell_price: 100, market_value: 120 },
-    206: { name: 'Xanax', sell_price: 600, market_value: 830000 },
-    180: { name: 'Bottle of Beer', sell_price: 50, market_value: 55 },
+    1: { name: 'Hammer', type: 'Melee', sell_price: 100, market_value: 120 },
+    206: { name: 'Xanax', type: 'Drug', sell_price: 600, market_value: 830000 },
+    180: { name: 'Bottle of Beer', type: 'Alcohol', sell_price: 50, market_value: 55 },
     // "Sell: N/A" in game. Listed cheap on TornW3B - must NEVER appear.
     900: { name: 'Companion Script : Test', sell_price: null, market_value: 10088888 },
     // "Sell: N/A" too: only a foreign shop, whose "sell" is 75% filler.
-    335: { name: 'Stick of Dynamite', sell_price: null, foreign: true, market_value: 9172 },
+    335: { name: 'Stick of Dynamite', type: 'Temporary', sell_price: null, foreign: true, market_value: 9172 },
 };
 
 window.__requests = [];
@@ -145,7 +180,7 @@ function respond(url) {
         if (u.pathname === '/v2/torn/items') {
             // v2 shape: an array, sell_price null where the game says "Sell: N/A".
             return { items: Object.entries(ITEMS).map(([id, i]) => ({
-                id: +id, name: i.name, type: 'Other',
+                id: +id, name: i.name, type: i.type || 'Other',
                 // Real v2 shape: the NPC price lives in value.shops. The N/A
                 // item keeps a bare sell_price but has no shop - like the
                 // live Companion Script.
@@ -188,6 +223,45 @@ function respond(url) {
                 { id: 180, amount: 2, equipped: false, name: 'Bottle of Beer', faction_owned: false, uid: null },
             ], timestamp: NOW_S }, _metadata: { links: { next: null, prev: null }, total: 6 } };
         }
+        // The Torn Ledger's key: key info says Full for FULLKEY, Limited for the Limited key.
+        if (u.pathname === '/v2/key/info') {
+            const k = u.searchParams.get('key');
+            return k === FULLKEY
+                ? { info: { user: { id: 999 }, access: { level: 4, type: 'Full Access' } } }
+                : { info: { user: { id: 999 }, access: { level: 3, type: 'Limited Access' } } };
+        }
+        if (u.pathname === '/v2/user/log') {
+            if (u.searchParams.get('key') !== FULLKEY) return { error: { code: 16, error: 'Access level of this key is not high enough' } };
+            const D = 86400;
+            const all = [
+                { id: 'l1', timestamp: NOW_S - 9 * D, details: { id: 1225 }, data: { seller: 3630447, items: [{ id: 206, qty: 4 }], cost_each: 820000, cost_total: 3280000 } },
+                { id: 'l2', timestamp: NOW_S - 8 * D, details: { id: 1113 }, data: { buyer: 4114557, items: [{ id: 206, qty: 2 }], cost_each: 845000, fee: 84500, cost_total: 1605500 } },
+                { id: 'l3', timestamp: NOW_S - 6 * D, details: { id: 1225 }, data: { seller: 777, items: [{ id: 384, qty: 20 }], cost_each: 70000, cost_total: 1400000 } },
+                { id: 'l4', timestamp: NOW_S - 5 * D, details: { id: 1226 }, data: { buyer: 4172398, items: [{ id: 384, qty: 15 }], cost_each: 73500, cost_total: 1102500 } },
+                { id: 'l5', timestamp: NOW_S - 2 * D, details: { id: 1226 }, data: { buyer: 55, items: [{ id: 206, qty: 3 }], cost_each: 850000, cost_total: 2550000 } },
+                { id: 'l6', timestamp: NOW_S - 1 * D, details: { id: 1112 }, data: { seller: 66, anonymous: 0, items: [{ id: 180, qty: 30 }], cost_each: 50, cost_total: 1500 } },
+                { id: 'l7', timestamp: NOW_S - 3600, details: { id: 1226 }, data: { buyer: 77, items: [{ id: 180, qty: 30 }], cost_each: 62, cost_total: 1860 } },
+            ];
+            const from = Number(u.searchParams.get('from')) || 0;
+            const to = Number(u.searchParams.get('to')) || Infinity;
+            return { log: all.filter((e) => e.timestamp >= from && e.timestamp <= to).sort((a, b) => b.timestamp - a.timestamp), _metadata: { links: {} } };
+        }
+        if (u.pathname === '/v2/user/trades') {
+            return { trades: [{ id: 501, completed_at: NOW_S - 3 * 86400, user: { id: 999, name: 'Me' }, trader: { id: 11, name: 'Bob' } }], _metadata: { links: {} } };
+        }
+        if (u.pathname === '/v2/user/501/trade') {
+            return { trade: { id: 501, completed_at: NOW_S - 3 * 86400, user: { id: 999, name: 'Me' }, trader: { id: 11, name: 'Bob' }, items: [
+                { user_id: 999, type: 'Item', details: { id: 384, uid: null, amount: 5 } },
+                { user_id: 11, type: 'Money', details: { amount: 367500 } },
+            ] } };
+        }
+        // Traders' public networth: Bob (11) is small, so a flip to him is capped.
+        const nw = u.pathname.match(/^\/v2\/user\/(\d+)\/personalstats$/);
+        if (nw && u.searchParams.get('cat') === 'networth') {
+            // &poorbob=1: Bob has $1,000,000, so at 10% he pays for 5 Dynamite and no Xanax.
+            const poor = /[?&]poorbob=1/.test(location.search) ? { 11: 1000000 } : {};
+            return { personalstats: { networth: { total: poor[nw[1]] || 750000000 } } };
+        }
         const who = u.pathname.match(/^\/v2\/user\/(\d+)\/profile$/);
         // Traders: Bob is online, Alice is not.
         if (who && who[1] === '11') {
@@ -209,6 +283,7 @@ function respond(url) {
             const listings = m[1] === '180' ? [{ price: 30, amount: 10 }, { price: 58, amount: 4 }]
                 : u.searchParams.get('key') === LIMITED && m[1] === '206' ? [{ price: 845000, amount: 3 }]
                 : u.searchParams.get('key') === LIMITED && m[1] === '1' ? [{ price: 130, amount: 900 }]
+                : /[?&]imreal=1/.test(location.search) && m[1] === '206' ? [{ price: 845000, amount: 3 }, { price: 846500, amount: 7 }, { price: 848000, amount: 2 }]
                 : [{ price: 9999999, amount: 1 }];
             return { itemmarket: { item: { id: +m[1], average_price: 55 }, listings, cache_timestamp: NOW_S - 10, cache_delay: 30 }, _metadata: { total: listings.length } };
         }

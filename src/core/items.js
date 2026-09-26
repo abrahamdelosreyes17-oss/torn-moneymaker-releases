@@ -101,3 +101,26 @@ export function findItemById(index, id) {
     if (!index || !index.byId) return null;
     return index.byId.get(String(id)) || null;
 }
+
+/** An item's category in Torn Bids' filter: Torn's own item type. */
+export function itemCategory(item) {
+    return (item && typeof item.type === 'string' && item.type.trim()) || 'Other';
+}
+
+/**
+ * How many items each category has, most first (then by name), for the
+ * Category dropdown. A category you picked stays listed, with 0, while the
+ * items that fill it are still loading: the pick is never dropped under you.
+ *
+ * @param {string[]} categories - one per item
+ * @param {string} [picked]
+ * @returns {{category: string, count: number}[]}
+ */
+export function categoryCounts(categories, picked = '') {
+    const n = new Map();
+    for (const c of categories) n.set(c, (n.get(c) || 0) + 1);
+    if (picked && !n.has(picked)) n.set(picked, 0);
+    return [...n]
+        .map(([category, count]) => ({ category, count }))
+        .sort((a, b) => b.count - a.count || a.category.localeCompare(b.category));
+}
