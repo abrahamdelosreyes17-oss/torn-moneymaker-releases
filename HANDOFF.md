@@ -12,6 +12,8 @@ rules; this file holds where we are, how the owner works, and what is settled.
   undocumented - the amount is read from money_mugged / money / amount...,
   and the field names seen are kept: check them on the owner's first real
   mugging). 3.12.0 was `7f96632`.
+  Last install link given to the owner (3.12.1, `4b3d64c`):
+  `https://raw.githubusercontent.com/abrahamdelosreyes17-oss/torn-moneymaker-releases/4b3d64c6cf44c7b7e78124157965489ce2bfd5de/torn-moneymaker.user.js`
 - **`main` is still at 2.9.3.** The script's `@updateURL` points at `main`, so
   installs are done from **pinned links**:
   `https://raw.githubusercontent.com/abrahamdelosreyes17-oss/torn-moneymaker-releases/<commit>/torn-moneymaker.user.js`
