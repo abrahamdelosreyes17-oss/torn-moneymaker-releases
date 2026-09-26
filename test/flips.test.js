@@ -6,6 +6,7 @@ import {
     flipPlan,
     whereToSell,
     flipCandidates,
+    flipBuyer,
     traderTagLabel,
     FLIP_FRESH_MS,
     LIST_EDGE,
@@ -35,10 +36,33 @@ test('flip plan: cheapest first, only under the bid, the cash caps it, a part-bo
     assert.ok(plan.cost <= 5_000_000);
     assert.equal(plan.each, 3500);
 
-    // No cash set: every listing under the bid, and none at or over it.
-    const all = flipPlan(sellers, 73500, { cash: null });
+    // No cash and a high Most per flip: every listing under the bid, none at or over it.
+    const all = flipPlan(sellers, 73500, { cash: null, maxUnits: 5000 });
     assert.equal(all.units, 26 + 1018);
     assert.equal(all.steps.length, 2);
+});
+
+test('flip plan: never more than Most per flip (100 by default), and says how many were under the bid', () => {
+    // The owner's 2,188-item plan: no trader takes thousands.
+    const sellers = bazaarSellers([row(1, 35019, 5), row(2, 35020, 20), row(3, 35062, 2163)], { now: NOW });
+    const plan = flipPlan(sellers, 40000, { cash: null });
+    assert.equal(plan.units, 100);
+    assert.equal(plan.available, 2188);
+    assert.deepEqual(plan.steps.map((s) => s.qty), [5, 20, 75]);
+    assert.equal(flipPlan(sellers, 40000, { cash: null, maxUnits: 10 }).units, 10);
+});
+
+test('flip buyer: a bid over 3x the Item Market Average is not real; no average or own-stat items: no flip', () => {
+    const buyers = [
+        { name: 'Troll', price: 92_000_000_000 },
+        { name: 'Real', price: 74_000 },
+    ];
+    assert.equal(flipBuyer(buyers, { avg: 71_675, type: 'Plushie' }).name, 'Real');
+    assert.equal(flipBuyer(buyers, { avg: null, type: 'Plushie' }), null);
+    assert.equal(flipBuyer(buyers, { avg: 71_675, type: 'Defensive' }), null);
+    assert.equal(flipBuyer(buyers, { avg: 71_675, type: 'Primary' }), null);
+    assert.equal(flipBuyer([{ name: 'T', price: 300_000 }], { avg: 100_000, type: 'Flower' }).name, 'T');
+    assert.equal(flipBuyer([{ name: 'T', price: 300_001 }], { avg: 100_000, type: 'Flower' }), null);
 });
 
 test('flip plan: nothing under the bid is no plan; one you cannot afford says what it needs', () => {

@@ -39,6 +39,8 @@ export const SELLING_PAGE_DEFAULTS = {
     trustedOnly: true,
     /* Flips never plan to spend more than this; null is no limit. */
     cash: null,
+    /* The most items one flip buys: no trader takes thousands. */
+    maxPerFlip: 100,
     /* Every link opens a new tab. */
     linksNewTab: true,
 };
@@ -363,7 +365,7 @@ export class SellingPage {
         this.listEl = spEl('main', { class: 'sp-main' }, [
             spEl('div', { class: 'sp-wrap' }, [
                 spEl('div', { class: 'sp-sec' }, [
-                    spEl('h2', { text: 'Best flips with your cash' }),
+                    spEl('h2', { text: 'Best flips · each within your cash' }),
                     spEl('span', { class: 'sp-sp' }),
                     this.onlineBtn,
                     this.trustedBtn,
@@ -478,7 +480,7 @@ export class SellingPage {
             const text = this.cashInput.value.trim();
             const cash = text ? parseMoneyInput(text) : null;
             if (text && !(cash > 0)) {
-                this.cashStateEl.textContent = 'Could not read "' + text + '". Try 5000000, 5m or 500k.';
+                this.cashStateEl.textContent = cash === null ? 'Could not read "' + text + '". Try 5000000, 5m or 500k.' : 'Cash must be more than $0. Blank is no limit.';
                 this.cashStateEl.className = 'sp-keystate sp-bad';
                 return;
             }
@@ -499,6 +501,36 @@ export class SellingPage {
                 spEl('div', { class: 'sp-inline' }, [this.cashInput, spEl('button', { type: 'button', class: 'sp-btn sp-primary', text: 'Save', onclick: saveCash })]),
                 this.cashStateEl,
                 note(['Flips never plan to spend more than this. Blank: no limit. Reads 5000000, 5,000,000, 5m or 500k.']),
+            ]),
+        );
+
+        /* Most items per flip */
+        this.maxInput = spEl('input', { type: 'text', class: 'sp-key', placeholder: '100', 'aria-label': 'Most per flip', autocomplete: 'off', spellcheck: 'false' });
+        this.maxStateEl = spEl('div', { class: 'sp-keystate' });
+        const saveMax = () => {
+            const n = Math.floor(Number(String(this.maxInput.value).replace(/[,\s]/g, '')));
+            if (!(n >= 1)) {
+                this.maxStateEl.textContent = 'Type a whole number of items, 1 or more.';
+                this.maxStateEl.className = 'sp-keystate sp-bad';
+                return;
+            }
+            this.maxInput.value = '';
+            this.maxDirty = false;
+            if (this.h.onPrefsChange) this.h.onPrefsChange({ maxPerFlip: n });
+        };
+        this.maxInput.addEventListener('input', () => {
+            this.maxDirty = true;
+        });
+        this.maxInput.addEventListener('keydown', (event) => {
+            if (event.key !== 'Enter') return;
+            event.preventDefault();
+            saveMax();
+        });
+        box.appendChild(
+            section('Most per flip', [
+                spEl('div', { class: 'sp-inline' }, [this.maxInput, spEl('button', { type: 'button', class: 'sp-btn sp-primary', text: 'Save', onclick: saveMax })]),
+                this.maxStateEl,
+                note(['The most items one flip plans to buy. No trader takes thousands at once.']),
             ]),
         );
 
@@ -560,6 +592,12 @@ export class SellingPage {
             this.cashInput.placeholder = p.cash > 0 ? formatMoney(p.cash) : 'No limit';
             this.cashStateEl.className = 'sp-keystate';
             this.cashStateEl.textContent = p.cash > 0 ? 'Saved: ' + formatMoney(p.cash) + '.' : 'No limit set.';
+        }
+
+        if (!this.maxDirty) {
+            this.maxInput.placeholder = String(p.maxPerFlip || 100);
+            this.maxStateEl.className = 'sp-keystate';
+            this.maxStateEl.textContent = 'Saved: ' + count(p.maxPerFlip || 100) + ' items.';
         }
 
         this.renderKeyStates();
@@ -759,7 +797,7 @@ export class SellingPage {
             }, [
                 spEl('span', { class: 'sp-fc-top' }, [spEl('span', { class: 'sp-pic sp-pic-s' }, [this.image('strip', f.itemId)]), spEl('b', { class: 'sp-iname', text: f.name })]),
                 spEl('span', { class: 'sp-fc-p', text: signed(f.plan.profit) }),
-                spEl('small', {}, ['Buy ', spEl('b', { text: count(f.plan.units) }), ' from ' + f.plan.steps.map((st) => st.sellerName || 'a bazaar').join(', ')]),
+                spEl('small', {}, ['Buy ', spEl('b', { text: count(f.plan.units) }), ' from ' + [...new Set(f.plan.steps.map((st) => st.sellerName || 'a bazaar'))].join(', ')]),
                 spEl('small', { class: 'sp-fc-sell' }, ['Sell to ', spEl('b', { text: f.buyer.name }), ' at ' + formatMoney(f.buyer.price), this.trustBadge(f.buyer)]),
             ]));
         }
@@ -984,6 +1022,19 @@ export class SellingPage {
         return links;
     }
 
+    /**
+     * The flip's last step: Trade, and the trader's own price lists, so the
+     * price can be checked on their page before the trade. Only the links
+     * that exist, in the same order as on the traders card.
+     */
+    stepTraderLinks(b) {
+        const links = [];
+        if (b.id) links.push(this.link('Trade', tradeUrl(b.id), { title: 'Start a trade with ' + b.name, focus: 'step-trade' }));
+        if (b.te) links.push(this.link('TE list', tePriceListUrl(b.teName || b.name), { title: b.name + '\'s TornExchange price list: ' + formatMoney(b.te), focus: 'step-te' }));
+        if (b.w3b && b.id) links.push(this.link('W3B list', w3bPriceListUrl(b.id), { title: b.name + '\'s TornW3B price list: ' + formatMoney(b.w3b), focus: 'step-w3b' }));
+        return spEl('span', { class: 'sp-step-links' }, links);
+    }
+
     /** Bazaars sell, cheapest first: seller (their profile), stock, when TornW3B saw it, price; Open bazaar. */
     sellersCard(d) {
         const card = spEl('div', { class: 'sp-q' }, [spEl('h3', { text: 'Bazaars sell · cheapest first' })]);
@@ -1026,11 +1077,11 @@ export class SellingPage {
         const wide = d.held ? '' : ' sp-wide';
         const f = d.plan;
         if (f && f.units > 0) {
-            const b = d.buyers[0];
+            const b = f.buyer || d.buyers[0];
             const card = spEl('div', { class: 'sp-q sp-hot' + wide }, [
                 spEl('h3', { text: 'Flip plan' }),
                 spEl('div', { class: 'sp-big', text: signed(f.profit) }),
-                spEl('p', { class: 'sp-note', text: count(f.units) + ' flipped · cash needed ' + formatMoney(f.cost) }),
+                spEl('p', { class: 'sp-note', text: count(f.units) + ' flipped' + (f.available > f.units ? ' (of ' + count(f.available) + ' under the bid)' : '') + ' · cash needed ' + formatMoney(f.cost) }),
             ]);
             f.steps.forEach((st, i) => {
                 card.appendChild(spEl('div', { class: 'sp-step' }, [
@@ -1042,7 +1093,7 @@ export class SellingPage {
             card.appendChild(spEl('div', { class: 'sp-step' }, [
                 spEl('span', { class: 'sp-n', text: String(f.steps.length + 1) }),
                 spEl('span', {}, ['Sell ', spEl('b', { text: count(f.units) }), ' to ', this.playerName(b.name, b.id, 'step-buyer'), ' at ' + formatMoney(b.price) + ' ', this.trustBadge(b)]),
-                b.id ? this.link('Trade', tradeUrl(b.id), { title: 'Start a trade with ' + b.name, focus: 'step-trade' }) : spEl('span'),
+                this.stepTraderLinks(b),
             ]));
             return card;
         }
@@ -1318,6 +1369,7 @@ button:focus-visible, input:focus-visible, summary:focus-visible, a:focus-visibl
 .sp-q .sp-note + .sp-step { margin-top: 6px; }
 .sp-n { width: 22px; height: 22px; border-radius: 50%; background: var(--profit); color: #131313; font-weight: bold; font-size: 12px; display: grid; place-items: center; }
 .sp-step .sp-trust { margin-left: 2px; }
+.sp-step-links { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
 .sp-opt { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 12px; align-items: center; padding: 8px 10px; margin-bottom: 6px; border-radius: 9px; border: 1px solid var(--cline); color: var(--text); }
 a.sp-opt:hover { text-decoration: none; border-color: #3d4f5c; background: rgba(116, 192, 252, 0.06); }
 .sp-opt-l { display: flex; flex-direction: column; min-width: 0; }

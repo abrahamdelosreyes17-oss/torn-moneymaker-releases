@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      3.11.0
+// @version      3.11.1
 // @description  Finds Bazaar and Item Market listings below NPC / market value - on the page you are viewing, and live from the Torn API and TornW3B - ranked by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -40,7 +40,7 @@
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '3.11.0';
+    const TTV2_BUILD_VERSION = '3.11.1';
 
     /* ===== src/platform/gm.js ===== */
     /*
@@ -1441,6 +1441,28 @@
     /** Waiting for a buyer must pay at least this much more than a trader pays now. */
     const LIST_EDGE = 0.01;
 
+    /** A flip never plans to buy more than this many unless you set otherwise: no trader takes thousands. */
+    const FLIP_MAX_UNITS = 100;
+
+    /** A bid more than this many times the Item Market Average is not a real bid. */
+    const BID_SANITY_X = 3;
+
+    /** Item types whose every copy has its own stats: a bid is for a quality, not the item. */
+    const STAT_ITEM_TYPES = new Set(['Melee', 'Primary', 'Secondary', 'Defensive']);
+
+    /**
+     * The buyer a flip sells to: the best one whose price is believable - at
+     * most BID_SANITY_X times the Item Market Average. No flip at all on items
+     * with no average, or whose copies each have their own stats.
+     *
+     * @param {Array} buyers - highest first, after your Show choices
+     * @param {{avg: number|null, type: string|null}} item
+     */
+    function flipBuyer(buyers, { avg = null, type = null } = {}) {
+        if (!(avg > 0) || STAT_ITEM_TYPES.has(type)) return null;
+        return (buyers || []).find((b) => b && b.price > 0 && b.price <= avg * BID_SANITY_X) || null;
+    }
+
     /** How many flip candidates are checked against TornW3B's listings, best first. */
     const FLIP_CANDIDATES = 30;
 
@@ -1470,23 +1492,26 @@
      * @param {number} bid - what the trader pays per item
      * @param {object} [opts]
      * @param {number|null} [opts.cash] - null or 0: no limit
-     * @returns {null|{units, cost, profit, each, firstPrice, needs, steps: Array<{sellerId, sellerName, qty, price}>}}
+     * @param {number} [opts.maxUnits] - the most items one flip buys
+     * @returns {null|{units, cost, profit, each, firstPrice, needs, available, steps: Array<{sellerId, sellerName, qty, price}>}}
+     *   `available`: every fresh item under the bid, bought or not.
      *   null when no fresh listing is under the bid. `units` 0 with `needs` set:
      *   the cheapest one costs more than your cash.
      */
-    function flipPlan(sellers, bid, { cash = null } = {}) {
+    function flipPlan(sellers, bid, { cash = null, maxUnits = FLIP_MAX_UNITS } = {}) {
         if (!(bid > 0)) return null;
         const under = (sellers || []).filter((s) => !s.stale && s.price < bid);
         if (!under.length) return null;
 
         const limit = cash > 0 ? cash : Infinity;
+        const most = maxUnits > 0 ? Math.floor(maxUnits) : FLIP_MAX_UNITS;
         let left = limit;
         let units = 0;
         let cost = 0;
         let profit = 0;
         const steps = [];
         for (const s of under) {
-            const n = Math.min(s.qty, Math.floor(left / s.price));
+            const n = Math.min(s.qty, Math.floor(left / s.price), most - units);
             if (n <= 0) break;
             steps.push({ sellerId: s.sellerId, sellerName: s.sellerName, qty: n, price: s.price });
             units += n;
@@ -1503,6 +1528,7 @@
             each: bid - under[0].price,
             firstPrice: under[0].price,
             needs: units ? 0 : under[0].price,
+            available: under.reduce((a, s) => a + s.qty, 0),
         };
     }
 
@@ -1552,17 +1578,17 @@
      * @param {number} [opts.limit]
      * @returns {Array<{itemId, lowest, bid, each, score}>} best first
      */
-    function flipCandidates(summary, bidOf, { cash = null, limit = FLIP_CANDIDATES } = {}) {
+    function flipCandidates(summary, bidOf, { cash = null, limit = FLIP_CANDIDATES, maxUnits = FLIP_MAX_UNITS } = {}) {
         const out = [];
         for (const [itemId, s] of summary || []) {
             const lowest = s && s.lowestPrice;
             if (!(lowest > 1)) continue;
             const bid = bidOf(itemId);
             if (!(bid > lowest)) continue;
-            const afford = cash > 0 ? Math.floor(cash / lowest) : 100;
+            const afford = Math.min(cash > 0 ? Math.floor(cash / lowest) : Infinity, maxUnits > 0 ? maxUnits : FLIP_MAX_UNITS);
             if (afford <= 0) continue;
             const each = bid - lowest;
-            out.push({ itemId: String(itemId), lowest, bid, each, score: each * Math.min(afford, 100) });
+            out.push({ itemId: String(itemId), lowest, bid, each, score: each * afford });
         }
         out.sort((a, b) => b.score - a.score || b.each - a.each);
         return out.slice(0, limit);
@@ -8356,6 +8382,8 @@
         trustedOnly: true,
         /* Flips never plan to spend more than this; null is no limit. */
         cash: null,
+        /* The most items one flip buys: no trader takes thousands. */
+        maxPerFlip: 100,
         /* Every link opens a new tab. */
         linksNewTab: true,
     };
@@ -8680,7 +8708,7 @@
             this.listEl = spEl('main', { class: 'sp-main' }, [
                 spEl('div', { class: 'sp-wrap' }, [
                     spEl('div', { class: 'sp-sec' }, [
-                        spEl('h2', { text: 'Best flips with your cash' }),
+                        spEl('h2', { text: 'Best flips · each within your cash' }),
                         spEl('span', { class: 'sp-sp' }),
                         this.onlineBtn,
                         this.trustedBtn,
@@ -8795,7 +8823,7 @@
                 const text = this.cashInput.value.trim();
                 const cash = text ? parseMoneyInput(text) : null;
                 if (text && !(cash > 0)) {
-                    this.cashStateEl.textContent = 'Could not read "' + text + '". Try 5000000, 5m or 500k.';
+                    this.cashStateEl.textContent = cash === null ? 'Could not read "' + text + '". Try 5000000, 5m or 500k.' : 'Cash must be more than $0. Blank is no limit.';
                     this.cashStateEl.className = 'sp-keystate sp-bad';
                     return;
                 }
@@ -8816,6 +8844,36 @@
                     spEl('div', { class: 'sp-inline' }, [this.cashInput, spEl('button', { type: 'button', class: 'sp-btn sp-primary', text: 'Save', onclick: saveCash })]),
                     this.cashStateEl,
                     note(['Flips never plan to spend more than this. Blank: no limit. Reads 5000000, 5,000,000, 5m or 500k.']),
+                ]),
+            );
+
+            /* Most items per flip */
+            this.maxInput = spEl('input', { type: 'text', class: 'sp-key', placeholder: '100', 'aria-label': 'Most per flip', autocomplete: 'off', spellcheck: 'false' });
+            this.maxStateEl = spEl('div', { class: 'sp-keystate' });
+            const saveMax = () => {
+                const n = Math.floor(Number(String(this.maxInput.value).replace(/[,\s]/g, '')));
+                if (!(n >= 1)) {
+                    this.maxStateEl.textContent = 'Type a whole number of items, 1 or more.';
+                    this.maxStateEl.className = 'sp-keystate sp-bad';
+                    return;
+                }
+                this.maxInput.value = '';
+                this.maxDirty = false;
+                if (this.h.onPrefsChange) this.h.onPrefsChange({ maxPerFlip: n });
+            };
+            this.maxInput.addEventListener('input', () => {
+                this.maxDirty = true;
+            });
+            this.maxInput.addEventListener('keydown', (event) => {
+                if (event.key !== 'Enter') return;
+                event.preventDefault();
+                saveMax();
+            });
+            box.appendChild(
+                section('Most per flip', [
+                    spEl('div', { class: 'sp-inline' }, [this.maxInput, spEl('button', { type: 'button', class: 'sp-btn sp-primary', text: 'Save', onclick: saveMax })]),
+                    this.maxStateEl,
+                    note(['The most items one flip plans to buy. No trader takes thousands at once.']),
                 ]),
             );
 
@@ -8877,6 +8935,12 @@
                 this.cashInput.placeholder = p.cash > 0 ? formatMoney(p.cash) : 'No limit';
                 this.cashStateEl.className = 'sp-keystate';
                 this.cashStateEl.textContent = p.cash > 0 ? 'Saved: ' + formatMoney(p.cash) + '.' : 'No limit set.';
+            }
+
+            if (!this.maxDirty) {
+                this.maxInput.placeholder = String(p.maxPerFlip || 100);
+                this.maxStateEl.className = 'sp-keystate';
+                this.maxStateEl.textContent = 'Saved: ' + count(p.maxPerFlip || 100) + ' items.';
             }
 
             this.renderKeyStates();
@@ -9076,7 +9140,7 @@
                 }, [
                     spEl('span', { class: 'sp-fc-top' }, [spEl('span', { class: 'sp-pic sp-pic-s' }, [this.image('strip', f.itemId)]), spEl('b', { class: 'sp-iname', text: f.name })]),
                     spEl('span', { class: 'sp-fc-p', text: signed(f.plan.profit) }),
-                    spEl('small', {}, ['Buy ', spEl('b', { text: count(f.plan.units) }), ' from ' + f.plan.steps.map((st) => st.sellerName || 'a bazaar').join(', ')]),
+                    spEl('small', {}, ['Buy ', spEl('b', { text: count(f.plan.units) }), ' from ' + [...new Set(f.plan.steps.map((st) => st.sellerName || 'a bazaar'))].join(', ')]),
                     spEl('small', { class: 'sp-fc-sell' }, ['Sell to ', spEl('b', { text: f.buyer.name }), ' at ' + formatMoney(f.buyer.price), this.trustBadge(f.buyer)]),
                 ]));
             }
@@ -9301,6 +9365,19 @@
             return links;
         }
 
+        /**
+         * The flip's last step: Trade, and the trader's own price lists, so the
+         * price can be checked on their page before the trade. Only the links
+         * that exist, in the same order as on the traders card.
+         */
+        stepTraderLinks(b) {
+            const links = [];
+            if (b.id) links.push(this.link('Trade', tradeUrl(b.id), { title: 'Start a trade with ' + b.name, focus: 'step-trade' }));
+            if (b.te) links.push(this.link('TE list', tePriceListUrl(b.teName || b.name), { title: b.name + '\'s TornExchange price list: ' + formatMoney(b.te), focus: 'step-te' }));
+            if (b.w3b && b.id) links.push(this.link('W3B list', w3bPriceListUrl(b.id), { title: b.name + '\'s TornW3B price list: ' + formatMoney(b.w3b), focus: 'step-w3b' }));
+            return spEl('span', { class: 'sp-step-links' }, links);
+        }
+
         /** Bazaars sell, cheapest first: seller (their profile), stock, when TornW3B saw it, price; Open bazaar. */
         sellersCard(d) {
             const card = spEl('div', { class: 'sp-q' }, [spEl('h3', { text: 'Bazaars sell · cheapest first' })]);
@@ -9343,11 +9420,11 @@
             const wide = d.held ? '' : ' sp-wide';
             const f = d.plan;
             if (f && f.units > 0) {
-                const b = d.buyers[0];
+                const b = f.buyer || d.buyers[0];
                 const card = spEl('div', { class: 'sp-q sp-hot' + wide }, [
                     spEl('h3', { text: 'Flip plan' }),
                     spEl('div', { class: 'sp-big', text: signed(f.profit) }),
-                    spEl('p', { class: 'sp-note', text: count(f.units) + ' flipped · cash needed ' + formatMoney(f.cost) }),
+                    spEl('p', { class: 'sp-note', text: count(f.units) + ' flipped' + (f.available > f.units ? ' (of ' + count(f.available) + ' under the bid)' : '') + ' · cash needed ' + formatMoney(f.cost) }),
                 ]);
                 f.steps.forEach((st, i) => {
                     card.appendChild(spEl('div', { class: 'sp-step' }, [
@@ -9359,7 +9436,7 @@
                 card.appendChild(spEl('div', { class: 'sp-step' }, [
                     spEl('span', { class: 'sp-n', text: String(f.steps.length + 1) }),
                     spEl('span', {}, ['Sell ', spEl('b', { text: count(f.units) }), ' to ', this.playerName(b.name, b.id, 'step-buyer'), ' at ' + formatMoney(b.price) + ' ', this.trustBadge(b)]),
-                    b.id ? this.link('Trade', tradeUrl(b.id), { title: 'Start a trade with ' + b.name, focus: 'step-trade' }) : spEl('span'),
+                    this.stepTraderLinks(b),
                 ]));
                 return card;
             }
@@ -9635,6 +9712,7 @@
     .sp-q .sp-note + .sp-step { margin-top: 6px; }
     .sp-n { width: 22px; height: 22px; border-radius: 50%; background: var(--profit); color: #131313; font-weight: bold; font-size: 12px; display: grid; place-items: center; }
     .sp-step .sp-trust { margin-left: 2px; }
+    .sp-step-links { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
     .sp-opt { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 12px; align-items: center; padding: 8px 10px; margin-bottom: 6px; border-radius: 9px; border: 1px solid var(--cline); color: var(--text); }
     a.sp-opt:hover { text-decoration: none; border-color: #3d4f5c; background: rgba(116, 192, 252, 0.06); }
     .sp-opt-l { display: flex; flex-direction: column; min-width: 0; }
@@ -12646,19 +12724,26 @@
             const s = summary.get(String(id));
             return s ? s.lowestPrice : null;
         };
+        // A flip sells to a believable buyer only (see flipBuyer), and never
+        // buys more than your Most per flip.
+        const flipBuyerOf = (id) => {
+            const item = itemOf(id);
+            return flipBuyer(buyersOf(id), { avg: item ? Number(item.marketValue) || null : null, type: item ? item.type : null });
+        };
         const planOf = (id) => {
             const rows = sellersOf(id);
-            const b = buyersOf(id)[0];
-            return rows && b ? flipPlan(rows, b.price, { cash: prefs.cash }) : null;
+            const b = flipBuyerOf(id);
+            const plan = rows && b ? flipPlan(rows, b.price, { cash: prefs.cash, maxUnits: prefs.maxPerFlip }) : null;
+            return plan ? { ...plan, buyer: b } : null;
         };
 
         // Which items' bazaars to read for a flip: where a buyer you would sell
         // to pays more than the summary's cheapest.
         sell.candidates = sell.summary
             ? flipCandidates(summary, (id) => {
-                const b = buyersOf(id)[0];
+                const b = flipBuyerOf(id);
                 return b ? b.price : null;
-            }, { cash: prefs.cash })
+            }, { cash: prefs.cash, maxUnits: prefs.maxPerFlip })
             : [];
         const flipsChecked = sell.candidates.filter((c) => {
             const b = sell.bazaars.get(c.itemId);
@@ -12707,7 +12792,7 @@
             .filter((r) => r.badge && r.badge.kind === 'flip')
             .sort((a, b) => b.plan.profit - a.plan.profit)
             .slice(0, 4)
-            .map((r) => ({ itemId: r.itemId, name: r.name, plan: r.plan, buyer: r.best }));
+            .map((r) => ({ itemId: r.itemId, name: r.name, plan: r.plan, buyer: r.plan.buyer }));
 
         // The item you picked stays picked. Until you pick one, the desk shows
         // the best flip (or the first item), following it as flips are found.
@@ -13271,6 +13356,11 @@
             }),
         );
         sell.teOne = loadTeOne();
+        // 3.11.1: Trusted buyers only is turned back on once - a choice stored
+        // before 3.11 (when it was off by default) would otherwise keep troll
+        // bids from new traders in every flip. Your later choice is kept.
+        const storedPrefs = gmGet(STORE_SELL_PREFS, {}) || {};
+        if (!storedPrefs.trustedOn311) gmSet(STORE_SELL_PREFS, { ...storedPrefs, trustedOnly: true, trustedOn311: true });
         // An error message is about the last call, not this visit: a stored one
         // (3.8.1 kept "That is a Torn key" forever) would outlive its cause.
         if (teState().error) setTeState({ error: null });

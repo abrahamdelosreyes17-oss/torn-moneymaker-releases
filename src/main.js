@@ -46,7 +46,7 @@ import {
     SOURCE_BAZAAR,
     SOURCE_ITEM_MARKET,
 } from './core/feed.js';
-import { bazaarSellers, flipPlan, whereToSell, flipCandidates, traderTagLabel } from './core/flips.js';
+import { bazaarSellers, flipPlan, flipBuyer, whereToSell, flipCandidates, traderTagLabel } from './core/flips.js';
 import { makeTabId, LEADER_HEARTBEAT_MS } from './core/leader.js';
 import { formatMoneyShort } from './core/parse.js';
 import { rankOpportunities, summarize, hiddenCounts, belowMinRows } from './core/ranker.js';
@@ -2405,19 +2405,26 @@ function renderSelling() {
         const s = summary.get(String(id));
         return s ? s.lowestPrice : null;
     };
+    // A flip sells to a believable buyer only (see flipBuyer), and never
+    // buys more than your Most per flip.
+    const flipBuyerOf = (id) => {
+        const item = itemOf(id);
+        return flipBuyer(buyersOf(id), { avg: item ? Number(item.marketValue) || null : null, type: item ? item.type : null });
+    };
     const planOf = (id) => {
         const rows = sellersOf(id);
-        const b = buyersOf(id)[0];
-        return rows && b ? flipPlan(rows, b.price, { cash: prefs.cash }) : null;
+        const b = flipBuyerOf(id);
+        const plan = rows && b ? flipPlan(rows, b.price, { cash: prefs.cash, maxUnits: prefs.maxPerFlip }) : null;
+        return plan ? { ...plan, buyer: b } : null;
     };
 
     // Which items' bazaars to read for a flip: where a buyer you would sell
     // to pays more than the summary's cheapest.
     sell.candidates = sell.summary
         ? flipCandidates(summary, (id) => {
-            const b = buyersOf(id)[0];
+            const b = flipBuyerOf(id);
             return b ? b.price : null;
-        }, { cash: prefs.cash })
+        }, { cash: prefs.cash, maxUnits: prefs.maxPerFlip })
         : [];
     const flipsChecked = sell.candidates.filter((c) => {
         const b = sell.bazaars.get(c.itemId);
@@ -2466,7 +2473,7 @@ function renderSelling() {
         .filter((r) => r.badge && r.badge.kind === 'flip')
         .sort((a, b) => b.plan.profit - a.plan.profit)
         .slice(0, 4)
-        .map((r) => ({ itemId: r.itemId, name: r.name, plan: r.plan, buyer: r.best }));
+        .map((r) => ({ itemId: r.itemId, name: r.name, plan: r.plan, buyer: r.plan.buyer }));
 
     // The item you picked stays picked. Until you pick one, the desk shows
     // the best flip (or the first item), following it as flips are found.
@@ -3030,6 +3037,11 @@ function bootSellingPage() {
         }),
     );
     sell.teOne = loadTeOne();
+    // 3.11.1: Trusted buyers only is turned back on once - a choice stored
+    // before 3.11 (when it was off by default) would otherwise keep troll
+    // bids from new traders in every flip. Your later choice is kept.
+    const storedPrefs = gmGet(STORE_SELL_PREFS, {}) || {};
+    if (!storedPrefs.trustedOn311) gmSet(STORE_SELL_PREFS, { ...storedPrefs, trustedOnly: true, trustedOn311: true });
     // An error message is about the last call, not this visit: a stored one
     // (3.8.1 kept "That is a Torn key" forever) would outlive its cause.
     if (teState().error) setTeState({ error: null });

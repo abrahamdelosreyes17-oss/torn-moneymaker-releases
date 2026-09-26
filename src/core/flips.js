@@ -19,6 +19,28 @@ export const FLIP_FRESH_MS = 30 * 60 * 1000;
 /** Waiting for a buyer must pay at least this much more than a trader pays now. */
 export const LIST_EDGE = 0.01;
 
+/** A flip never plans to buy more than this many unless you set otherwise: no trader takes thousands. */
+export const FLIP_MAX_UNITS = 100;
+
+/** A bid more than this many times the Item Market Average is not a real bid. */
+export const BID_SANITY_X = 3;
+
+/** Item types whose every copy has its own stats: a bid is for a quality, not the item. */
+export const STAT_ITEM_TYPES = new Set(['Melee', 'Primary', 'Secondary', 'Defensive']);
+
+/**
+ * The buyer a flip sells to: the best one whose price is believable - at
+ * most BID_SANITY_X times the Item Market Average. No flip at all on items
+ * with no average, or whose copies each have their own stats.
+ *
+ * @param {Array} buyers - highest first, after your Show choices
+ * @param {{avg: number|null, type: string|null}} item
+ */
+export function flipBuyer(buyers, { avg = null, type = null } = {}) {
+    if (!(avg > 0) || STAT_ITEM_TYPES.has(type)) return null;
+    return (buyers || []).find((b) => b && b.price > 0 && b.price <= avg * BID_SANITY_X) || null;
+}
+
 /** How many flip candidates are checked against TornW3B's listings, best first. */
 export const FLIP_CANDIDATES = 30;
 
@@ -48,23 +70,26 @@ export function bazaarSellers(rows, { selfId = null, now = Date.now(), freshMs =
  * @param {number} bid - what the trader pays per item
  * @param {object} [opts]
  * @param {number|null} [opts.cash] - null or 0: no limit
- * @returns {null|{units, cost, profit, each, firstPrice, needs, steps: Array<{sellerId, sellerName, qty, price}>}}
+ * @param {number} [opts.maxUnits] - the most items one flip buys
+ * @returns {null|{units, cost, profit, each, firstPrice, needs, available, steps: Array<{sellerId, sellerName, qty, price}>}}
+ *   `available`: every fresh item under the bid, bought or not.
  *   null when no fresh listing is under the bid. `units` 0 with `needs` set:
  *   the cheapest one costs more than your cash.
  */
-export function flipPlan(sellers, bid, { cash = null } = {}) {
+export function flipPlan(sellers, bid, { cash = null, maxUnits = FLIP_MAX_UNITS } = {}) {
     if (!(bid > 0)) return null;
     const under = (sellers || []).filter((s) => !s.stale && s.price < bid);
     if (!under.length) return null;
 
     const limit = cash > 0 ? cash : Infinity;
+    const most = maxUnits > 0 ? Math.floor(maxUnits) : FLIP_MAX_UNITS;
     let left = limit;
     let units = 0;
     let cost = 0;
     let profit = 0;
     const steps = [];
     for (const s of under) {
-        const n = Math.min(s.qty, Math.floor(left / s.price));
+        const n = Math.min(s.qty, Math.floor(left / s.price), most - units);
         if (n <= 0) break;
         steps.push({ sellerId: s.sellerId, sellerName: s.sellerName, qty: n, price: s.price });
         units += n;
@@ -81,6 +106,7 @@ export function flipPlan(sellers, bid, { cash = null } = {}) {
         each: bid - under[0].price,
         firstPrice: under[0].price,
         needs: units ? 0 : under[0].price,
+        available: under.reduce((a, s) => a + s.qty, 0),
     };
 }
 
@@ -130,17 +156,17 @@ export function whereToSell({ held, bid = null, bazaarLowest = null, marketLowes
  * @param {number} [opts.limit]
  * @returns {Array<{itemId, lowest, bid, each, score}>} best first
  */
-export function flipCandidates(summary, bidOf, { cash = null, limit = FLIP_CANDIDATES } = {}) {
+export function flipCandidates(summary, bidOf, { cash = null, limit = FLIP_CANDIDATES, maxUnits = FLIP_MAX_UNITS } = {}) {
     const out = [];
     for (const [itemId, s] of summary || []) {
         const lowest = s && s.lowestPrice;
         if (!(lowest > 1)) continue;
         const bid = bidOf(itemId);
         if (!(bid > lowest)) continue;
-        const afford = cash > 0 ? Math.floor(cash / lowest) : 100;
+        const afford = Math.min(cash > 0 ? Math.floor(cash / lowest) : Infinity, maxUnits > 0 ? maxUnits : FLIP_MAX_UNITS);
         if (afford <= 0) continue;
         const each = bid - lowest;
-        out.push({ itemId: String(itemId), lowest, bid, each, score: each * Math.min(afford, 100) });
+        out.push({ itemId: String(itemId), lowest, bid, each, score: each * afford });
     }
     out.sort((a, b) => b.score - a.score || b.each - a.each);
     return out.slice(0, limit);

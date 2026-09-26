@@ -80,7 +80,78 @@ rules; this file holds where we are, how the owner works, and what is settled.
   `#/addListing` hash; the tag on real Torn bazaar cards (their `::after`);
   Torn Bids with a real trader database's size.
 
-**Next: 3.12.0 - the Fill button (agreed 2026-09-26, mockups first).** The
+**3.11.1 - built, tested, NOT committed (the owner said: do not commit or push).**
+Done: the flip plan's sell step links Trade / TE list / W3B list; **Most per
+flip** setting (default 100; "N flipped (of M under the bid)"); a flip sells
+only to a believable buyer (`flipBuyer`: bid at most 3× the Item Market
+Average; no flip on items with no average or on Melee / Primary / Secondary /
+Defensive, whose copies have their own stats); Trusted buyers only turned back
+on once (`trustedOn311` flag in the stored prefs); each seller named once on
+a flip card; the strip title says each flip is within your cash on its own;
+Cash "0" says it must be more than $0. 165 tests (each new rule fails its test
+when broken); harness checked. **Not done from 3.11.1:** the networth "could
+they pay" check (item 5 below) - test v1 `personalstats` vs v2
+`personalstats?cat=networth` on one real trader first. Next: ask the owner to
+commit, give the pinned link, check it in their Chrome.
+
+**The plan after 3.11.0 (agreed 2026-09-26).**
+Releases in this order, each with mockups first where the look changes:
+- **Done, not committed:** the flip plan's sell step has Trade, TE list and
+  W3B list (check the trader's page before trading).
+- **3.11.1 - flip fixes** (from the owner's live data: $92b troll bids, a
+  2,188-item plan):
+  1. Trusted buyers only turned back on once (the owner's old stored `false`
+     beats the new default).
+  2. "Most per flip" setting, default 100; the plan says "Buy 100 (of 2,188
+     under the bid)".
+  3. Ignore bids above 3× the Item Market Average; skip items with no Item
+     Market value.
+  4. No flips on weapons/armour with their own stats.
+  5. Networth "could they pay": never a flip where the trader pays more than
+     X% (10% suggested) of their networth (`user/{id}` personalstats
+     `networth`, or v2 `personalstats?cat=networth` - test which before
+     building); networth shown by each trader; key-use table updated.
+  6. Cash wording: each flip card uses all your Cash on its own - say so, or
+     split it; "0" says "Cash must be more than $0". (The cash maths itself was
+     fuzzed against a brute force, 20,000 cases: correct.)
+  7. Each seller named once on a flip card.
+- **3.12.0 - Settings redesign** (mockups `I-settings-grid`, `J-settings-sidebar`
+  ready, K - a side pop-out - not made; the current page is a narrow middle
+  column the owner dislikes) and **the category filter** (Plushies, Flowers,
+  Armour, Weapons, Special… from the item index's `type`; mockups: a
+  full-width row between the flips and the desk vs a "Category" dropdown;
+  it filters the flips and the list together).
+- **3.13.0 - Torn Ledger, inside Torn Bids:** every buy and sell from the
+  owner's Torn logs (bazaar buy 1225 / sell 1226, Item Market buy 1112 /
+  sell 1113, trades category 94, $0 acquires), FIFO profit after the 5% IM
+  fee, totals per day / week / month, graphs (profit over time, by item),
+  filters (dates, item, category, venue, trader/seller), flips done through
+  Torn Bids shown as bought-from → sold-to. TornW3B's Premium does the same
+  (`/v2/user/log`, FIFO); TornExchange only knows its receipts. Mockups first.
+  **Key: a Full key, used only by the Ledger** (the owner chose Full over a
+  Custom key), with its own field in Torn Bids Settings, apart from the
+  Limited key. Security, all of it required:
+  - its own storage entry and its own API client whose URL check allows only
+    `api.torn.com` `/v2/user/log` (and `key/info` to check the key) - any
+    other path is refused in code, so a bug cannot spend it elsewhere;
+  - read only on the Torn Bids tab; the panel on torn.com never reads it;
+    never sent to TornExchange or TornW3B (their clients carry no Torn key);
+  - on Save: `key/info` must say Full; anything else is refused with why;
+  - never shown again after Save (no "Show"; paste a new one to change it),
+    masked while typed, redacted in every error, never logged;
+  - Forget key deletes the key AND the stored ledger; a dead key (2/13/18)
+    stops it until a new one is saved;
+  - only derived rows are stored (time, item, qty, price, venue,
+    counterparty), never raw log text; local only;
+  - its own Torn API-terms table beside the field (storage local, sharing
+    nobody, purpose "personal: profit tracking", access Full - logs only);
+  - paced inside the shared 70/min; the log is read incrementally (only new
+    entries since the last read).
+- **3.14.0 - the Fill button** (list below).
+- Checks in the owner's Chrome after each: Torn Bids with Trusted on, the
+  trader tag on a real bazaar, and for the Fill button the markup listed.
+
+**Later: 3.14.0 - the Fill button (agreed 2026-09-26, mockups first).** The
 friend's request, modelled on Greasy Fork's "Customizable Bazaar Filler"
 (527925) and "Torn Market Filler" (513920) - an add-on to My bazaar, not a
 copy. The owner chose **fill on click** (one click fills one row; the player
@@ -436,7 +507,7 @@ Still ideas, not built:
 
 ```bash
 npm run build      # src/ -> dist/ and torn-moneymaker.user.js (the release file)
-npm test           # unit tests (163)
+npm test           # unit tests (165)
 npm run check      # build + syntax check + unit tests
 PWPATH=$(npm root -g)/playwright node test/ux-check.mjs   # real-browser checks
 ```
