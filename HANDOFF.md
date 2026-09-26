@@ -3,9 +3,9 @@
 Read this first, then `README.md`. The README holds the product and the binding
 rules; this file holds where we are, how the owner works, and what is settled.
 
-## Where things stand (3.10.2, 2026-09-26)
+## Where things stand (3.10.3, 2026-09-26)
 
-- **Version 3.10.2** (`9916b94`) on branch `claude/optimistic-ride-1gqguu`,
+- **Version 3.10.3** (not committed yet; 3.10.2 is `9916b94`) on branch `claude/optimistic-ride-1gqguu`,
   on top of 3.8.1 (`0210c53`) and the cloud session's handoff commits.
   Last install link given to the owner (3.10.2):
   `https://raw.githubusercontent.com/abrahamdelosreyes17-oss/torn-moneymaker-releases/9916b946763a847c2bf8e7d00c61c478102525e6/torn-moneymaker.user.js`
@@ -28,6 +28,30 @@ rules; this file holds where we are, how the owner works, and what is settled.
 2. Run `test/ux-check.mjs` once Playwright is available (updated for Torn
    Bids, never run).
 3. Then the open list at the end of "Not done / open" - ask which first.
+
+**3.10.3 - weapon and armour listings get amber below Min (the owner's report, 2026-09-26).**
+- What the owner saw: Item Market, Fiveseven, Min $1,000. A listing at
+  $6,615 → NPC $7,500 (+$885 each) stayed green and listed; changing Min
+  changed nothing. The panel said "qty unknown".
+- Cause: on the Item Market a quantity is only trusted from a seller row's
+  "N available"; otherwise it is "unknown", and Min is deliberately not
+  applied to unknown quantities (commit 489e70a: a stackable item's tile
+  shows the market-wide total, not how many are at its price). So it could
+  never go amber.
+- But a weapon or armour card is ONE item. Read off the owner's own open
+  page (no clicks, no navigation): all 60 Fiveseven cards carry their own
+  stats (`aria-label="53.47 damage points"`, `"49.31 accuracy points"`)
+  and a Buy label "…, 1 in total."; the Xanax tile has no stats and
+  "13,531 in total". Torn's API schema agrees: non-stackable listings carry
+  `item_details` whose only stats are damage, accuracy and armor.
+- Fix (`sources/dom/scan.js`, `isOneItemListing`): on the Item Market, a
+  card with its own damage / accuracy / armo(u)r points and "1 in total" is
+  one item at that price, so Min applies: below Min but profitable is amber
+  and out of the list; at or above Min is green and listed. Stackable tiles
+  keep the old rule.
+- Not verified: an armour card's exact label (assumed "armor points" /
+  "armour points"), temporary weapons (believed stackable), and bazaars
+  (they already read "in stock"). Tests in `test/core.test.js`.
 
 **3.10.2 - Cash no longer empties the deals (the owner's report, 2026-09-26).**
 - What the owner saw: NPC deals on screen (Travel Visa $120,000 → $122,500
@@ -323,7 +347,7 @@ Still ideas, not built:
 
 ```bash
 npm run build      # src/ -> dist/ and torn-moneymaker.user.js (the release file)
-npm test           # unit tests (153)
+npm test           # unit tests (155)
 npm run check      # build + syntax check + unit tests
 PWPATH=$(npm root -g)/playwright node test/ux-check.mjs   # real-browser checks
 ```

@@ -140,6 +140,27 @@ export function isLockedCard(card) {
     return Boolean(tile && tile !== card && tile.querySelector(LOCKED_SELECTOR));
 }
 
+/*
+ * One specific item. On the Item Market a weapon or armour listing is one
+ * item with its own stats: every Fiveseven card showed "53.47 damage points"
+ * / "49.31 accuracy points" and a Buy label of "1 in total" (read off the
+ * owner's page, 2026-09-26). Torn's API calls these non-stackable listings;
+ * their only stats are damage, accuracy and armor. A stackable item (Xanax)
+ * is one tile for the whole market ("13,531 in total"), with no stats.
+ */
+const OWN_STAT_RE = /^[\d.,]+\s+(?:damage|accuracy|armou?r)\s+points$/i;
+
+/**
+ * Is this listing exactly one item at its price? Yes when the card shows
+ * the item's own stats and its Buy label (when readable) says 1 in total.
+ * @param {Array<string>} statLabels - aria-labels of the card's value cells
+ * @param {{qty: number|null}|null} buy - from parseBuyLabel
+ */
+export function isOneItemListing(statLabels, buy) {
+    if (!(statLabels || []).some((l) => OWN_STAT_RE.test(String(l).trim()))) return false;
+    return !(buy && buy.qty && buy.qty !== 1);
+}
+
 /**
  * Read one card.
  * @returns {object|null}
@@ -243,6 +264,16 @@ export function readCard(card, index, pageType) {
         if (inStock) {
             qty = parseQuantity(inStock[1]);
             qtyAtPrice = Number.isFinite(qty) && qty > 0;
+        }
+    }
+
+    // A weapon or armour card on the Item Market: one item, known - so Min
+    // applies to it (amber below Min, green at or above).
+    if (!qtyAtPrice && pageType === 'itemmarket') {
+        const statLabels = [...card.querySelectorAll('[aria-label]')].map((n) => n.getAttribute('aria-label'));
+        if (isOneItemListing(statLabels, buy)) {
+            qty = 1;
+            qtyAtPrice = true;
         }
     }
 

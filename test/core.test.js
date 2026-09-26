@@ -17,7 +17,7 @@ import {
     bestVenue,
 } from '../src/core/profit.js';
 
-import { rankOpportunities, summarize } from '../src/core/ranker.js';
+import { rankOpportunities, summarize, belowMinRows } from '../src/core/ranker.js';
 
 import {
     buildItemIndex,
@@ -39,7 +39,7 @@ import {
 } from '../src/core/npc.js';
 
 import { detectPage, itemMarketUrl } from '../src/sources/route.js';
-import { parseBuyLabel } from '../src/sources/dom/scan.js';
+import { parseBuyLabel, isOneItemListing } from '../src/sources/dom/scan.js';
 import { itemIdFromImage } from '../src/sources/dom/detect.js';
 
 /* ---------------------------------------------------------------- parse */
@@ -507,4 +507,38 @@ test('compact money drops only zeros that say nothing', () => {
     assert.equal(formatMoneyCompact(12500), '$12.5k');
     assert.equal(formatMoneyCompact(2e9), '$2b');
     assert.equal(formatMoneyCompact(1), '$1');
+});
+
+/*
+ * The owner's report (3.10.2): Min $1,000 on the Item Market, a Fiveseven at
+ * $6,615 -> NPC $7,500 (+$885 each) stayed green and listed, never amber.
+ * The card was read as "qty unknown", and Min is not applied to those. A
+ * weapon card is one item with its own stats ("53.47 damage points"), Buy
+ * label "1 in total" - read off the owner's page.
+ */
+test('a weapon or armour card on the Item Market is one item, known', () => {
+    const buy = parseBuyLabel('Buy item Fiveseven, $6615, 1 in total.');
+    assert.equal(isOneItemListing(['View info for item Fiveseven.', '53.47 damage points', '49.31 accuracy points'], buy), true);
+    assert.equal(isOneItemListing(['42.10 armor points'], null), true);
+    // Xanax: one tile for the whole market, no stats.
+    assert.equal(isOneItemListing(['View info for item Xanax.'], parseBuyLabel('Buy item Xanax, $879000, 13531 in total.')), false);
+    // Stats but more than one in total: not a single item after all.
+    assert.equal(isOneItemListing(['53.47 damage points'], parseBuyLabel('Buy item Fiveseven, $6615, 3 in total.')), false);
+});
+
+test('Min applies to a one-item listing: below Min is amber, not listed', () => {
+    const row = (qtyAtPrice) => ({
+        name: 'Fiveseven',
+        qtyAtPrice,
+        npcVerified: true,
+        profit: bestVenue({ listingPrice: 6615, exits: { NPC: 7500 }, qty: 1 }),
+    });
+    const opts = { minTotalProfit: 1000, includeUnverifiedNpc: true };
+    // Before: quantity unknown - Min skipped, so listed (green), never amber.
+    assert.equal(rankOpportunities([row(false)], opts).length, 1);
+    // Now: one item, known - $885 is under the $1,000 Min.
+    const known = row(true);
+    assert.equal(rankOpportunities([known], opts).length, 0, 'not in the list');
+    assert.deepEqual(belowMinRows([known], opts), [known], 'marked amber on the page');
+    assert.equal(rankOpportunities([known], { ...opts, minTotalProfit: 500 }).length, 1, 'meets a $500 Min: listed, green');
 });
