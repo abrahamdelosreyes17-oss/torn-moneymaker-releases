@@ -20,15 +20,38 @@ rules; this file holds where we are, how the owner works, and what is settled.
 
 ### Start here next session
 
-1. Ask the owner to install it, open Torn Bids and a player's bazaar, and
-   look in their Chrome (pages they opened only): Torn Bids at their screen
-   width with real traders and bazaars, and the trader tag on real bazaar
-   cards. Everything since 3.9.4 is checked in the harness only.
-2. **3.12.0, the Fill button:** make the mockups first (the list is below),
-   then build the one the owner picks.
-3. Run `test/ux-check.mjs` once Playwright is available (rewritten for Torn
-   Bids H in 3.11.0; never run - every check in it was run by hand in the
-   harness through the browser pane).
+**Deliverables status (2026-09-26, end of session):**
+- Done and released in 3.11.0 / 3.11.1: the Torn Bids desk (H), the
+  trusted-trader tag on bazaar cards, and flip fixes 1-4, 7, 8 (price-list
+  links on the flip, Trusted back on, Most per flip, the 3x bid rule, each
+  flip within your cash, sellers named once); fix 5 in part (no flips on
+  Melee/Primary/Secondary/Defensive).
+- **Not done:** the networth "could they pay" check; the Settings redesign;
+  the category filter; the Torn Ledger (Full key, security rules below); the
+  Fill button; the live checks in the owner's Chrome. Details for each are
+  in "The plan after 3.11.0" and "Later: 3.14.0" below.
+
+**Do next, in order:**
+1. Ask the owner which Settings mockup they want: `mockups/I-settings-grid.html`
+   or `mockups/J-settings-sidebar.html` (K, a side pop-out, is not made yet -
+   make it if they want to compare). Then the category-filter mockups (a
+   full-width row between the flips and the desk vs a "Category" dropdown).
+   Build the picks as **3.12.0**. Plan the Ledger's Full-key field into the
+   new Settings.
+2. The networth check: test v1 `user/{id}?selections=personalstats` vs v2
+   `personalstats?cat=networth` on one real trader (read only), then build it
+   (X% of networth, 10% suggested - ask the owner).
+3. **3.13.0 Torn Ledger:** mockups first, then build to the security rules
+   below.
+4. **3.14.0 the Fill button:** mockups first (list below).
+5. Live checks in the owner's Chrome (pages they open; Torn Bids on
+   github.io may be opened by us): Torn Bids with real data - its tab must be
+   in front or it pauses by design - and the trader tag on a real bazaar.
+6. Run `test/ux-check.mjs` once Playwright is available (never run; its
+   checks were run by hand in the harness, `&awake=1`).
+
+The owner says "don't commit / push" until they ask for the link; commit
+handoff notes like this one with the release.
 
 **3.11.0 - Torn Bids is the item desk (mockup H, picked 2026-09-26).**
 - What the owner asked: the bazaar side next to the trader side - the cheapest
