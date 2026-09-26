@@ -14,8 +14,15 @@ rules; this file holds where we are, how the owner works, and what is settled.
   mugging). 3.12.0 was `7f96632`.
   3.12.2 (`f188206`) adds the Ledger's date range (both tabs) and the
   Mugged tab's filters (who, named / anonymous, at least an amount).
-  Last install link given to the owner (3.12.2):
-  `https://raw.githubusercontent.com/abrahamdelosreyes17-oss/torn-moneymaker-releases/f188206168c334236e30717f6ba01de68afb4455/torn-moneymaker.user.js`
+  3.12.3 (`4c85d44`): Torn Bids redraws batched (120 ms; your own clicks
+  draw at once), add-page price history only for the item looked at / filled
+  (it rewrote ~1 MB every 30 s), and a Tampermonkey menu item "Show storage
+  sizes and start time". The owner's "Torn Bids took forever" was a cold
+  start (first run after an update rebuilds caches at the rate-limited pace)
+  plus the pause while its tab is in the background; later opens were
+  instant. The owner decided to stay on Tampermonkey (no Web Store fee).
+  Last install link given to the owner (3.12.3):
+  `https://raw.githubusercontent.com/abrahamdelosreyes17-oss/torn-moneymaker-releases/4c85d44ae8f557e1f098e85ee5c81243ea2ed7f8/torn-moneymaker.user.js`
 - **`main` is still at 2.9.3.** The script's `@updateURL` points at `main`, so
   installs are done from **pinned links**:
   `https://raw.githubusercontent.com/abrahamdelosreyes17-oss/torn-moneymaker-releases/<commit>/torn-moneymaker.user.js`
