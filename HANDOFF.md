@@ -5,9 +5,9 @@ rules; this file holds where we are, how the owner works, and what is settled.
 
 ## Where things stand (3.11.0, 2026-09-26)
 
-- **Version 3.11.0** (`cf38bee`) on branch `claude/optimistic-ride-1gqguu`.
-  Last install link given to the owner (3.11.0):
-  `https://raw.githubusercontent.com/abrahamdelosreyes17-oss/torn-moneymaker-releases/cf38beed78c032c5de05029696f9b765c672077a/torn-moneymaker.user.js`
+- **Version 3.11.1** (`f34a05a`) on branch `claude/optimistic-ride-1gqguu`.
+  Last install link given to the owner (3.11.1):
+  `https://raw.githubusercontent.com/abrahamdelosreyes17-oss/torn-moneymaker-releases/f34a05a36018d329010bff57134ed6989400ba56/torn-moneymaker.user.js`
 - **`main` is still at 2.9.3.** The script's `@updateURL` points at `main`, so
   installs are done from **pinned links**:
   `https://raw.githubusercontent.com/abrahamdelosreyes17-oss/torn-moneymaker-releases/<commit>/torn-moneymaker.user.js`
@@ -80,7 +80,7 @@ rules; this file holds where we are, how the owner works, and what is settled.
   `#/addListing` hash; the tag on real Torn bazaar cards (their `::after`);
   Torn Bids with a real trader database's size.
 
-**3.11.1 - built, tested, NOT committed (the owner said: do not commit or push).**
+**3.11.1 - released (`f34a05a`) when the owner asked for the link.**
 Done: the flip plan's sell step links Trade / TE list / W3B list; **Most per
 flip** setting (default 100; "N flipped (of M under the bid)"); a flip sells
 only to a believable buyer (`flipBuyer`: bid at most 3× the Item Market
@@ -91,8 +91,8 @@ a flip card; the strip title says each flip is within your cash on its own;
 Cash "0" says it must be more than $0. 165 tests (each new rule fails its test
 when broken); harness checked. **Not done from 3.11.1:** the networth "could
 they pay" check (item 5 below) - test v1 `personalstats` vs v2
-`personalstats?cat=networth` on one real trader first. Next: ask the owner to
-commit, give the pinned link, check it in their Chrome.
+`personalstats?cat=networth` on one real trader first. Next: check it in the
+owner's Chrome (Torn Bids with real data).
 
 **The plan after 3.11.0 (agreed 2026-09-26).**
 Releases in this order, each with mockups first where the look changes:
