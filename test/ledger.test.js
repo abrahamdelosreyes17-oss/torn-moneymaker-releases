@@ -164,3 +164,14 @@ test('muggings: the amount lost, by whom; one it cannot read is counted apart, n
     // A mugging is not an item row.
     assert.deepEqual(rowsFromLog({ id: 'g1', timestamp: T0, details: { id: 8156 }, data: { money_mugged: 5 } }), []);
 });
+
+test('mug totals follow exactly the muggings given (the page filters, then totals)', () => {
+    const l = emptyLedger();
+    addMugs(l, [
+        mugFromLog({ id: 'a', timestamp: T0, details: { id: 8156 }, data: { attacker: 1, money_mugged: 100 } }),
+        mugFromLog({ id: 'b', timestamp: T0 + 86400, details: { id: 8156 }, data: { anonymous: 1, money: 50 } }),
+    ]);
+    const named = l.mugs.filter((m) => m.who);
+    assert.deepEqual(mugTotals(named), { lost: 100, count: 1, unknown: 0, biggest: 100 });
+    assert.deepEqual(mugTotals(l.mugs, { from: (T0 + 3600) * 1000 }), { lost: 50, count: 1, unknown: 0, biggest: 50 });
+});

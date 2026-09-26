@@ -305,7 +305,10 @@ buy on record are counted apart, never guessed. Each sale says what its units
 cost and where from (*bought 20 from X (Item Market) at $40*); *Cost of what
 sold* totals it. The **Mugged** tab: what muggings took (8156), when and by
 whom, per day, and your profit after muggings (a mugging whose amount the log
-does not give in a known field is counted apart, with the field names seen). It reads a year back a few
+does not give in a known field is counted apart, with the field names seen).
+Its filters: the period or any **dates** (from - to, both days included; the
+Trading tab has them too), who mugged you, named or anonymous, and at least
+an amount. It reads a year back a few
 pages at a time, then only what is new, every 5 minutes while Torn Bids is in
 front.
 - **Its own Full key**, apart from the Limited key: Torn is asked (key info)

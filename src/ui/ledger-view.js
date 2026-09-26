@@ -60,7 +60,19 @@ const PERIODS = [
     ['30d', '30 days'],
     ['month', 'This month'],
     ['all', 'All'],
+    ['dates', 'Dates'],
 ];
+
+/** "2026-09-26" (a date box's value) -> local midnight, or null. */
+function dayStart(value) {
+    const m = String(value || '').match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    return m ? new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])).getTime() : null;
+}
+
+function dayValue(t) {
+    const d = new Date(t);
+    return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+}
 
 export class LedgerView {
     /**
@@ -68,7 +80,7 @@ export class LedgerView {
      */
     constructor(h = {}) {
         this.h = h;
-        this.f = { period: '30d', itemId: '', category: '', venue: 'all', who: '' };
+        this.f = { period: '30d', itemId: '', category: '', venue: 'all', who: '', fromDay: '', toDay: '', mugger: 'all', mugMin: '' };
         this.group = 'day';
         /* 'trade' (buys and sells) or 'mugs' (what muggings took) */
         this.tab = 'trade';
@@ -84,6 +96,12 @@ export class LedgerView {
         if (p === '7d') return { from: now - 7 * DAY, to: null };
         if (p === '30d') return { from: now - 30 * DAY, to: null };
         if (p === 'month') return { from: periodStart(now, 'month'), to: null };
+        if (p === 'dates') {
+            // Both days included: from its midnight to the end of the last day.
+            const from = dayStart(this.f.fromDay);
+            const end = dayStart(this.f.toDay);
+            return { from, to: end ? end + DAY - 1 : null };
+        }
         return { from: null, to: null };
     }
 
@@ -202,16 +220,45 @@ export class LedgerView {
         venueSel.addEventListener('change', () => this.set({ venue: venueSel.value }));
         const whoInput = lvEl('input', { type: 'search', class: 'lg-in', placeholder: 'Anyone (name or id)', 'aria-label': 'Who', 'data-lg-focus': 'who', value: this.f.who });
         whoInput.addEventListener('input', () => this.set({ who: whoInput.value }));
-        const any = this.f.itemId || this.f.category || this.f.venue !== 'all' || this.f.who;
+        // Dates: from and to, both days included (the "Dates" period).
+        const today = dayValue(Date.now());
+        const fromBox = lvEl('input', { type: 'date', class: 'lg-in lg-date', 'aria-label': 'From', max: today, value: this.f.fromDay || dayValue(Date.now() - 30 * DAY) });
+        const toBox = lvEl('input', { type: 'date', class: 'lg-in lg-date', 'aria-label': 'To', max: today, value: this.f.toDay || today });
+        fromBox.addEventListener('change', () => this.set({ fromDay: fromBox.value }));
+        toBox.addEventListener('change', () => this.set({ toDay: toBox.value }));
+        if (this.f.period === 'dates' && !this.f.fromDay) {
+            this.f.fromDay = fromBox.value;
+            this.f.toDay = toBox.value;
+        }
+        const dates = this.f.period === 'dates'
+            ? [lvEl('label', { class: 'lg-f' }, [lvEl('span', { text: 'From' }), fromBox]), lvEl('label', { class: 'lg-f' }, [lvEl('span', { text: 'To' }), toBox])]
+            : [];
+        // The Mugged tab: who, named or anonymous, and a smallest amount.
+        const muggerSel = lvEl('select', { class: 'lg-in', 'aria-label': 'Mugger' }, [
+            lvEl('option', { value: 'all', text: 'Everyone' }),
+            lvEl('option', { value: 'named', text: 'Named only' }),
+            lvEl('option', { value: 'anon', text: 'Anonymous only' }),
+        ]);
+        muggerSel.value = this.f.mugger;
+        muggerSel.addEventListener('change', () => this.set({ mugger: muggerSel.value }));
+        const minInput = lvEl('input', { type: 'text', class: 'lg-in lg-min', inputmode: 'numeric', placeholder: 'Any amount', 'aria-label': 'At least', 'data-lg-focus': 'mugmin', value: this.f.mugMin });
+        minInput.addEventListener('input', () => this.set({ mugMin: minInput.value }));
+        const mugsTab = this.tab === 'mugs';
+        const any = mugsTab
+            ? this.f.who || this.f.mugger !== 'all' || this.f.mugMin
+            : this.f.itemId || this.f.category || this.f.venue !== 'all' || this.f.who;
         box.appendChild(lvEl('div', { class: 'lg-filters' }, [
             periodChips,
-            lvEl('label', { class: 'lg-f' }, [lvEl('span', { text: 'Item' }), itemInput, datalist]),
-            lvEl('label', { class: 'lg-f' }, [lvEl('span', { text: 'Category' }), catSel]),
-            lvEl('label', { class: 'lg-f' }, [lvEl('span', { text: 'Where' }), venueSel]),
-            lvEl('label', { class: 'lg-f' }, [lvEl('span', { text: 'Who' }), whoInput]),
+            ...dates,
+            mugsTab ? null : lvEl('label', { class: 'lg-f' }, [lvEl('span', { text: 'Item' }), itemInput, datalist]),
+            mugsTab ? null : lvEl('label', { class: 'lg-f' }, [lvEl('span', { text: 'Category' }), catSel]),
+            mugsTab ? null : lvEl('label', { class: 'lg-f' }, [lvEl('span', { text: 'Where' }), venueSel]),
+            lvEl('label', { class: 'lg-f' }, [lvEl('span', { text: mugsTab ? 'Mugged by' : 'Who' }), whoInput]),
+            mugsTab ? lvEl('label', { class: 'lg-f' }, [lvEl('span', { text: 'Mugger' }), muggerSel]) : null,
+            mugsTab ? lvEl('label', { class: 'lg-f' }, [lvEl('span', { text: 'At least' }), minInput]) : null,
             any ? lvEl('button', { type: 'button', class: 'sp-link', text: 'Clear filters', onclick: () => {
                 this.itemText = '';
-                this.set({ itemId: '', category: '', venue: 'all', who: '' });
+                this.set(mugsTab ? { who: '', mugger: 'all', mugMin: '' } : { itemId: '', category: '', venue: 'all', who: '' });
             } }) : null,
         ]));
 
@@ -223,7 +270,9 @@ export class LedgerView {
         }
         const shown = filterLedgerRows(rows, { ...this.f, from, to }, typeOf);
         const t = ledgerTotals(shown, this.fifo);
-        const periodLabel = (PERIODS.find(([k]) => k === this.f.period) || [0, ''])[1].toLowerCase();
+        const periodLabel = this.f.period === 'dates'
+            ? (from ? dateText(from) : 'the start') + ' to ' + (to ? dateText(to) : 'today')
+            : (PERIODS.find(([k]) => k === this.f.period) || [0, ''])[1].toLowerCase();
         const title = this.f.itemId ? 'Profit on ' + nameOf(this.f.itemId) : 'Profit';
 
         /* the answer */
@@ -300,9 +349,15 @@ export class LedgerView {
 
     /** What muggings took: totals, per day, and each one. */
     renderMugs(box, mugs, range, L) {
-        const t = mugTotals(mugs, range);
         const who = String(this.f.who || '').trim().toLowerCase();
-        const shown = mugs.filter((m) => (!range.from || m.t >= range.from) && (!range.to || m.t <= range.to) && (!who || String(m.who || '') === who));
+        const min = Number(String(this.f.mugMin || '').replace(/[$,\s]/g, '').replace(/k$/i, '000').replace(/m$/i, '000000')) || 0;
+        const shown = mugs.filter((m) =>
+            (!range.from || m.t >= range.from) &&
+            (!range.to || m.t <= range.to) &&
+            (!who || String(m.who || '') === who || (m.whoName && String(m.whoName).toLowerCase().includes(who))) &&
+            (this.f.mugger === 'named' ? Boolean(m.who) : this.f.mugger === 'anon' ? !m.who : true) &&
+            (!min || (m.amount || 0) >= min));
+        const t = mugTotals(shown);
         box.appendChild(lvEl('div', { class: 'lg-head' }, [lvEl('h2', { text: 'Lost to muggings' }), lvEl('span', { class: 'lg-muted', text: 'the real danger of carrying cash in Torn' })]));
         const tile = (label, value, cls = '', sub = '') => lvEl('div', { class: 'lg-tile ' + cls }, [lvEl('span', { class: 'lg-tl', text: label }), lvEl('b', { text: value }), sub ? lvEl('small', { text: sub }) : null]);
         box.appendChild(lvEl('div', { class: 'lg-tiles' }, [
@@ -533,6 +588,8 @@ export const LEDGER_CSS = `
 .lg-tabs { display: flex; gap: 6px; }
 .lg-tab { height: 34px; padding: 0 16px; border-radius: 9px; border: 1px solid var(--cline2); background: none; color: var(--muted); font: bold 13px Arial, Helvetica, sans-serif; cursor: pointer; }
 .lg-tab[aria-selected="true"] { color: #fff; border-color: var(--profit); background: var(--green-bg); }
+.lg-in.lg-date { min-width: 140px; color-scheme: dark; }
+.lg-in.lg-min { min-width: 110px; width: 120px; }
 .lg-mugline { margin: 0; font-size: 13px; color: var(--muted); display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px; }
 .lg-tile.lg-lossbox { border-color: #6b2b27; background: #2a1917; }
 .lg-tile.lg-lossbox b { color: #ff8a80; }
