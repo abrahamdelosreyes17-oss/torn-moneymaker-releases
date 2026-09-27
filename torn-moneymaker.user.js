@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      3.12.3
+// @version      3.12.4
 // @description  Finds Bazaar and Item Market listings below NPC / market value - on the page you are viewing, and live from the Torn API and TornW3B - ranked by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -40,7 +40,7 @@
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '3.12.3';
+    const TTV2_BUILD_VERSION = '3.12.4';
 
     /* ===== src/platform/gm.js ===== */
     /*
@@ -8568,7 +8568,10 @@
 
             // Every second: row ages and the refresh countdown are the "is this
             // still live?" signal.
-            this.ticker = setInterval(() => this.refreshAges(), 1000);
+            this.ticker = setInterval(() => {
+                this.refreshAges();
+                if (this.page === 'settings') this.renderApiUse();
+            }, 1000);
 
             return this.root;
         }
@@ -8888,9 +8891,19 @@
             const bz = check('useW3b', 'Watch bazaars via TornW3B', w3bSub);
             this.useW3bInput = bz.input;
 
-            this.settingsPage.appendChild(
-                section('Watching', [im.row, bz.row, note('Nothing is bought, clicked or announced for you.')]),
+            // The friend's switch: every automatic NPC-deal call off at once.
+            const saveSw = check(
+                'saveCalls',
+                'NPC deals: save API calls',
+                el('span', { class: 'ttv2-sub', text: 'Turns off watching and sellers\' online status. Deals come only from the page you are viewing: 0 API calls. Fill and Torn Bids are not affected.' }),
             );
+            this.saveCallsInput = saveSw.input;
+            this.apiUseEl = el('div', { class: 'ttv2-note ttv2-apiuse' });
+
+            this.settingsPage.appendChild(
+                section('Watching', [saveSw.row, im.row, bz.row, this.apiUseEl, note('Nothing is bought, clicked or announced for you.')]),
+            );
+            this.renderApiUse();
 
             /* ---- links ---- */
 
@@ -8925,6 +8938,14 @@
                     }),
                 ]),
             );
+        }
+
+        /** "Torn API calls in the last minute: 12 of 70", every tab together. */
+        renderApiUse() {
+            if (!this.apiUseEl) return;
+            const s = this.handlers.getApiUse ? this.handlers.getApiUse() : null;
+            const text = s ? 'Torn API calls in the last minute: ' + s.usedLastMinute + ' of 70 (all tabs; Torn allows 100).' : '';
+            if (this.apiUseEl.textContent !== text) this.apiUseEl.textContent = text;
         }
 
         /** My bazaar, scrolled to one part: 'graph' (IMA was pressed) or 'lows' (BP). */
@@ -9005,6 +9026,8 @@
 
         emitSettings(partial) {
             this.state.settings = { ...this.state.settings, ...partial };
+            if (this.liveFeedInput) this.liveFeedInput.disabled = Boolean(this.state.settings.saveCalls);
+            if (this.saveCallsInput && partial.saveCalls !== undefined) this.saveCallsInput.checked = Boolean(partial.saveCalls);
             this.syncChips();
             if (this.handlers.onSettingsChange) this.handlers.onSettingsChange(partial);
         }
@@ -9261,6 +9284,11 @@
 
             this.syncChips();
 
+            if (this.saveCallsInput && settings.saveCalls !== undefined) {
+                this.saveCallsInput.checked = Boolean(settings.saveCalls);
+            }
+            // Saving calls overrides watching: its tick box shows it cannot be on.
+            if (this.liveFeedInput) this.liveFeedInput.disabled = Boolean(this.state.settings.saveCalls);
             if (this.liveFeedInput && settings.liveFeed !== undefined) {
                 this.liveFeedInput.checked = Boolean(settings.liveFeed);
             }
@@ -9417,6 +9445,12 @@
             if (!this.hasKey) {
                 return box('Add a Public API key to start.', 'Add key', () =>
                     this.showPage('settings', { focusKey: true }),
+                );
+            }
+
+            if (!d && this.state.settings.saveCalls) {
+                return box('Saving API calls: only this page is scanned.', 'Stop saving', () =>
+                    this.emitSettings({ saveCalls: false }),
                 );
             }
 
@@ -13040,6 +13074,13 @@
          * limit, and never raises alerts - see README.
          */
         liveFeed: true,
+        /*
+         * NPC deals: save API calls (the friend's request). On: no live feed and
+         * no sellers' / bazaar owners' online-status checks - deals come only from
+         * the page you are viewing, which costs no API calls. Fill, your own
+         * pages' prices and Torn Bids are not affected.
+         */
+        saveCalls: false,
 
         /*
          * TornW3B bazaar prices. ON by default: bazaar opportunities are the
@@ -13188,6 +13229,11 @@
      * Stored settings over the defaults, keeping only settings that still exist.
      * Removed settings (the Trader chip, among others) must not linger.
      */
+    /** The settings as the feed must follow them: saving API calls turns watching off. */
+    function effectiveSettings() {
+        return app.settings.saveCalls ? { ...app.settings, liveFeed: false } : app.settings;
+    }
+
     function loadSettings() {
         const stored = gmGet(STORE_SETTINGS, {}) || {};
         const out = { ...DEFAULT_SETTINGS };
@@ -13848,7 +13894,7 @@
             }
             if (app.pageType === PAGE_NONE) {
                 app.panel.setStatus(
-                    app.settings.liveFeed
+                    effectiveSettings().liveFeed
                         ? 'Not a Bazaar or Item Market page. Showing what is watched.'
                         : 'Not a Bazaar or Item Market page.',
                 );
@@ -13926,6 +13972,8 @@
             now - owner.fetchedAt >= OWNER_REFRESH_MS;
         if (!due || !app.client || !hasUsableKey()) return;
         if (document.visibilityState !== 'visible') return;
+        // Saving API calls: the owner's online status is not asked.
+        if (app.settings.saveCalls) return;
 
         owner.pending = true;
         fetchUserPresence(app.client, ownerId)
@@ -14006,6 +14054,8 @@
         if (!app.client || !hasUsableKey()) return;
         if (document.visibilityState !== 'visible') return;
         if (app.panel.collapsed) return;
+        // Saving API calls: sellers' online status is not asked.
+        if (app.settings.saveCalls) return;
 
         let pending = 0;
         for (const s of app.presence.values()) if (s.pending) pending++;
@@ -15227,7 +15277,7 @@
             w3b: app.w3b,
             torn: app.client,
             getIndex: () => app.index,
-            getSettings: () => app.settings,
+            getSettings: () => effectiveSettings(),
             hasUsableKey,
             isVisible: () => document.visibilityState === 'visible',
             load: (key) => gmGet(key, null),
@@ -17184,6 +17234,7 @@
                 app.bzWindow = key;
                 renderMyBazaar();
             },
+            getApiUse: () => (app.client ? app.client.stats() : null),
             onFillListing: (market, index) => onFillFromListing(market, index),
             onFillSelected: () => {
                 const itemId = app.bzSelected;

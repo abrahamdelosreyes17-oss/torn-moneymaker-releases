@@ -91,6 +91,13 @@ scrolls to it when it is on the page you are viewing. Nothing is ever bought for
 
 ### The panel
 
+- **NPC deals: save API calls** (Settings › Watching; the friend's request): one
+  tick turns off everything automatic that the NPC deals spend Torn API calls
+  on - the live feed (up to 30 a minute) and sellers' / bazaar owners' online
+  status. Deals then come only from the page you are viewing: 0 API calls.
+  Fill, your own pages' prices and Torn Bids are not affected. Settings also
+  shows *Torn API calls in the last minute: N of 70* (every tab together).
+
 - **Never over Torn's content.** The panel floats in front of the page, in the
   empty space to the right of Torn's content: it is sized to that space (up to
   430px) and can't be placed or dragged across Torn's content. Torn's page is

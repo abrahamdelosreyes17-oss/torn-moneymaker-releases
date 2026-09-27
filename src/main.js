@@ -260,6 +260,13 @@ const DEFAULT_SETTINGS = {
      * limit, and never raises alerts - see README.
      */
     liveFeed: true,
+    /*
+     * NPC deals: save API calls (the friend's request). On: no live feed and
+     * no sellers' / bazaar owners' online-status checks - deals come only from
+     * the page you are viewing, which costs no API calls. Fill, your own
+     * pages' prices and Torn Bids are not affected.
+     */
+    saveCalls: false,
 
     /*
      * TornW3B bazaar prices. ON by default: bazaar opportunities are the
@@ -408,6 +415,11 @@ const app = {
  * Stored settings over the defaults, keeping only settings that still exist.
  * Removed settings (the Trader chip, among others) must not linger.
  */
+/** The settings as the feed must follow them: saving API calls turns watching off. */
+function effectiveSettings() {
+    return app.settings.saveCalls ? { ...app.settings, liveFeed: false } : app.settings;
+}
+
 function loadSettings() {
     const stored = gmGet(STORE_SETTINGS, {}) || {};
     const out = { ...DEFAULT_SETTINGS };
@@ -1068,7 +1080,7 @@ async function onScan() {
         }
         if (app.pageType === PAGE_NONE) {
             app.panel.setStatus(
-                app.settings.liveFeed
+                effectiveSettings().liveFeed
                     ? 'Not a Bazaar or Item Market page. Showing what is watched.'
                     : 'Not a Bazaar or Item Market page.',
             );
@@ -1146,6 +1158,8 @@ function updateOwner(now) {
         now - owner.fetchedAt >= OWNER_REFRESH_MS;
     if (!due || !app.client || !hasUsableKey()) return;
     if (document.visibilityState !== 'visible') return;
+    // Saving API calls: the owner's online status is not asked.
+    if (app.settings.saveCalls) return;
 
     owner.pending = true;
     fetchUserPresence(app.client, ownerId)
@@ -1226,6 +1240,8 @@ function updatePresence(ids, now) {
     if (!app.client || !hasUsableKey()) return;
     if (document.visibilityState !== 'visible') return;
     if (app.panel.collapsed) return;
+    // Saving API calls: sellers' online status is not asked.
+    if (app.settings.saveCalls) return;
 
     let pending = 0;
     for (const s of app.presence.values()) if (s.pending) pending++;
@@ -2447,7 +2463,7 @@ function startLiveFeed() {
         w3b: app.w3b,
         torn: app.client,
         getIndex: () => app.index,
-        getSettings: () => app.settings,
+        getSettings: () => effectiveSettings(),
         hasUsableKey,
         isVisible: () => document.visibilityState === 'visible',
         load: (key) => gmGet(key, null),
@@ -4404,6 +4420,7 @@ export function boot() {
             app.bzWindow = key;
             renderMyBazaar();
         },
+        getApiUse: () => (app.client ? app.client.stats() : null),
         onFillListing: (market, index) => onFillFromListing(market, index),
         onFillSelected: () => {
             const itemId = app.bzSelected;

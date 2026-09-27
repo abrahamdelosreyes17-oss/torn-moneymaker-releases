@@ -360,7 +360,10 @@ export class Panel {
 
         // Every second: row ages and the refresh countdown are the "is this
         // still live?" signal.
-        this.ticker = setInterval(() => this.refreshAges(), 1000);
+        this.ticker = setInterval(() => {
+            this.refreshAges();
+            if (this.page === 'settings') this.renderApiUse();
+        }, 1000);
 
         return this.root;
     }
@@ -680,9 +683,19 @@ export class Panel {
         const bz = check('useW3b', 'Watch bazaars via TornW3B', w3bSub);
         this.useW3bInput = bz.input;
 
-        this.settingsPage.appendChild(
-            section('Watching', [im.row, bz.row, note('Nothing is bought, clicked or announced for you.')]),
+        // The friend's switch: every automatic NPC-deal call off at once.
+        const saveSw = check(
+            'saveCalls',
+            'NPC deals: save API calls',
+            el('span', { class: 'ttv2-sub', text: 'Turns off watching and sellers\' online status. Deals come only from the page you are viewing: 0 API calls. Fill and Torn Bids are not affected.' }),
         );
+        this.saveCallsInput = saveSw.input;
+        this.apiUseEl = el('div', { class: 'ttv2-note ttv2-apiuse' });
+
+        this.settingsPage.appendChild(
+            section('Watching', [saveSw.row, im.row, bz.row, this.apiUseEl, note('Nothing is bought, clicked or announced for you.')]),
+        );
+        this.renderApiUse();
 
         /* ---- links ---- */
 
@@ -717,6 +730,14 @@ export class Panel {
                 }),
             ]),
         );
+    }
+
+    /** "Torn API calls in the last minute: 12 of 70", every tab together. */
+    renderApiUse() {
+        if (!this.apiUseEl) return;
+        const s = this.handlers.getApiUse ? this.handlers.getApiUse() : null;
+        const text = s ? 'Torn API calls in the last minute: ' + s.usedLastMinute + ' of 70 (all tabs; Torn allows 100).' : '';
+        if (this.apiUseEl.textContent !== text) this.apiUseEl.textContent = text;
     }
 
     /** My bazaar, scrolled to one part: 'graph' (IMA was pressed) or 'lows' (BP). */
@@ -797,6 +818,8 @@ export class Panel {
 
     emitSettings(partial) {
         this.state.settings = { ...this.state.settings, ...partial };
+        if (this.liveFeedInput) this.liveFeedInput.disabled = Boolean(this.state.settings.saveCalls);
+        if (this.saveCallsInput && partial.saveCalls !== undefined) this.saveCallsInput.checked = Boolean(partial.saveCalls);
         this.syncChips();
         if (this.handlers.onSettingsChange) this.handlers.onSettingsChange(partial);
     }
@@ -1053,6 +1076,11 @@ export class Panel {
 
         this.syncChips();
 
+        if (this.saveCallsInput && settings.saveCalls !== undefined) {
+            this.saveCallsInput.checked = Boolean(settings.saveCalls);
+        }
+        // Saving calls overrides watching: its tick box shows it cannot be on.
+        if (this.liveFeedInput) this.liveFeedInput.disabled = Boolean(this.state.settings.saveCalls);
         if (this.liveFeedInput && settings.liveFeed !== undefined) {
             this.liveFeedInput.checked = Boolean(settings.liveFeed);
         }
@@ -1209,6 +1237,12 @@ export class Panel {
         if (!this.hasKey) {
             return box('Add a Public API key to start.', 'Add key', () =>
                 this.showPage('settings', { focusKey: true }),
+            );
+        }
+
+        if (!d && this.state.settings.saveCalls) {
+            return box('Saving API calls: only this page is scanned.', 'Stop saving', () =>
+                this.emitSettings({ saveCalls: false }),
             );
         }
 
