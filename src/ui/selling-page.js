@@ -1341,11 +1341,17 @@ export class SellingPage {
     buyersCard(d) {
         const card = spEl('div', { class: 'sp-q' }, [spEl('h3', { text: 'Traders pay · highest first' })]);
         const all = this.showAll.buyers;
-        const rows = all ? d.buyers : d.buyers.slice(0, DESK_ROWS);
+        // Traders you marked Declined go to the bottom (greyed) until their hour is up.
+        const T = d.trade || null;
+        const declined = (T && T.declined) || {};
+        const ordered = [...d.buyers.filter((b) => !declined[b.tradeKey]), ...d.buyers.filter((b) => declined[b.tradeKey])];
+        const rows = all ? ordered : ordered.slice(0, DESK_ROWS);
         if (d.buyersLoading) card.appendChild(spEl('p', { class: 'sp-note', text: 'Loading more buyers from TornExchange…' }));
         if (!rows.length) card.appendChild(spEl('p', { class: 'sp-note', text: this.noTraderText(d) }));
         rows.forEach((b, i) => {
-            card.appendChild(spEl('div', { class: 'sp-tr' + (i === 0 ? ' sp-top' : '') }, [
+            const planning = Boolean(T && ((T.chosen && T.chosen.key === b.tradeKey) || (T.accepted && T.accepted.key === b.tradeKey)));
+            const until = declined[b.tradeKey];
+            card.appendChild(spEl('div', { class: 'sp-tr' + (i === 0 && !until ? ' sp-top' : '') + (planning ? ' sp-planning' : '') + (until ? ' sp-declined' : '') }, [
                 spEl('span', { class: 'sp-tr-l' }, [
                     spEl('span', { class: 'sp-trader-l' }, [this.playerName(b.name, b.id, 'buyer:' + (b.id || b.name)), this.trustBadge(b)]),
                     this.status(b),
@@ -1354,6 +1360,7 @@ export class SellingPage {
                     b.differ
                         ? spEl('small', { class: 'sp-differ', text: 'Lists differ: ' + this.listPrices(b, ' · ') + '. Counted at the lower; check before trading.' })
                         : null,
+                    T ? this.tradeLine(d, b, planning, until) : null,
                 ]),
                 spEl('span', { class: 'sp-tprice', text: formatMoney(b.price) }),
                 this.traderLinks(b),
@@ -1389,6 +1396,30 @@ export class SellingPage {
         }
         if (b.w3b > 0) parts.push('W3B ' + formatMoney(b.w3b));
         return parts.join(sep);
+    }
+
+    /**
+     * Under a trader on the desk: what the whole trade with them makes, and
+     * the button that puts the flip plan on them (the owner: "trader 1 didn't
+     * want to trade - click trader 2 to see the flip plan there"). Declined:
+     * how long they are passed over, and Undo.
+     */
+    tradeLine(d, b, planning, until) {
+        const t = d.trade.perTrader[b.tradeKey];
+        const words = [];
+        if (t && t.items) words.push('whole trade ' + (t.estimated ? '≈ ' : '') + signed(t.profit) + ' · ' + count(t.items) + (t.items === 1 ? ' item' : ' items'));
+        else if (t) words.push('no trade with your Cash');
+        if (t && !t.hasItem && t.items) words.push('not this item');
+        let btn;
+        if (until) {
+            words.unshift('Declined · passed over for ' + formatAge(until - Date.now()).replace(' ago', ''));
+            btn = spEl('button', { type: 'button', class: 'sp-btn sp-plan', 'data-focus': 'plan:' + b.tradeKey, text: 'Undo', onclick: () => this.h.onTradeUndecline && this.h.onTradeUndecline(b.tradeKey) });
+        } else if (planning) {
+            btn = spEl('span', { class: 'sp-plan sp-plan-on', text: d.trade.accepted ? 'Accepted' : 'Planning' });
+        } else {
+            btn = spEl('button', { type: 'button', class: 'sp-btn sp-plan', 'data-focus': 'plan:' + b.tradeKey, title: 'Put the flip plan on ' + b.name + ': this item and their other items', text: 'Plan trade', onclick: () => this.h.onTradePick && this.h.onTradePick(d.itemId, b.tradeKey) });
+        }
+        return spEl('span', { class: 'sp-tradeline' }, [btn, words.length ? spEl('small', { text: words.join(' · ') }) : null]);
     }
 
     /** "Networth $1.2b" under a trader, once Torn has said. */
@@ -1478,26 +1509,22 @@ export class SellingPage {
         const b = c.buyer;
         const approx = c.estimated ? '≈ ' : '';
         const card = spEl('div', { class: 'sp-q sp-hot sp-wide sp-trade' }, [spEl('h3', { text: 'Flip plan · one trade with ' + b.name })]);
+        // Anything you do here pins the desk to this item and this trader, so
+        // the plan cannot move away while you buy and trade.
+        card.addEventListener('click', (event) => {
+            const t = event.target;
+            if (t && t.closest && t.closest('a, button, input, label') && this.h.onTradePin) this.h.onTradePin(d.itemId, c.key);
+        }, true);
 
-        // Sell to: the whole trade with each trader who buys this item.
-        if (T.options.length > 1) {
-            const box = spEl('div', { class: 'sp-tos', role: 'radiogroup', 'aria-label': 'Sell to' }, [spEl('div', { class: 'sp-tsec', text: 'Sell to · what the whole trade makes' })]);
-            for (const o of T.options) {
-                const on = o.key === c.key;
-                const input = spEl('input', { type: 'radio', name: 'sp-to-' + d.itemId, 'data-focus': 'trade:to:' + o.key });
-                input.checked = on;
-                input.addEventListener('change', () => this.h.onTradePick && this.h.onTradePick(d.itemId, o.key));
-                box.appendChild(spEl('label', { class: 'sp-to' + (on ? ' sp-on' : '') }, [
-                    input,
-                    spEl('span', { class: 'sp-to-l' }, [
-                        spEl('span', {}, [spEl('b', { text: o.buyer.name }), ' ', this.trustBadge(o.buyer)]),
-                        spEl('small', { text: formatMoney(o.bidHere) + ' for this · ' + count(o.items) + (o.items === 1 ? ' item' : ' items') + ' in the trade' + (o.estimated ? ' · ' + o.estimated + ' not read yet' : '') }),
-                    ]),
-                    spEl('span', { class: 'sp-to-p', text: (o.estimated ? '≈ ' : '') + signed(o.profit) }),
-                ]));
-            }
-            card.appendChild(box);
-        }
+        // The trader is chosen on the Traders pay card (Plan trade); here, a way
+        // on when this one says no: Declined passes them over for an hour.
+        card.appendChild(spEl('div', { class: 'sp-tpick' }, [
+            spEl('span', { class: 'sp-note', text: (T.picked ? 'Kept on ' + b.name + ' while you trade. ' : 'The best trade. ') + 'Press Plan trade on another trader above to plan with them.' }),
+            spEl('span', { class: 'sp-tpick-b' }, [
+                spEl('button', { type: 'button', class: 'sp-btn sp-primary', 'data-focus': 'trade:accept', title: b.name + ' said yes: freeze this trade, so nothing in it moves while you buy and send', text: b.name + ' accepted', onclick: () => this.h.onTradeAccept && this.h.onTradeAccept(d.itemId) }),
+                spEl('button', { type: 'button', class: 'sp-btn', 'data-focus': 'trade:decline', title: b.name + ' did not want to trade: plan with the next best (for an hour)', text: b.name + ' declined', onclick: () => this.h.onTradeDecline && this.h.onTradeDecline(c.key) }),
+            ]),
+        ]));
 
         // Who, and the totals.
         card.appendChild(spEl('div', { class: 'sp-th' }, [
@@ -1540,12 +1567,17 @@ export class SellingPage {
         const edit = (id, e) => this.h.onTradeEdit && this.h.onTradeEdit(c.key, id, e);
 
         // Buy, then trade: this item first.
-        if (c.flips.length || c.off.length) card.appendChild(spEl('div', { class: 'sp-tsec', text: 'Buy, then trade to ' + b.name }));
+        if (c.flips.length || c.off.length || c.itemNote) card.appendChild(spEl('div', { class: 'sp-tsec', text: 'Buy, then trade to ' + b.name }));
+        // Planned with a trader who makes no flip on this item: said, with the numbers.
+        if (c.itemNote) {
+            const n = c.itemNote;
+            card.appendChild(spEl('p', { class: 'sp-note sp-itemnote', text: d.name + ' is not in this trade: ' + b.name + ' pays ' + formatMoney(n.bid) + (n.cheapest ? ', the cheapest bazaar is ' + formatMoney(n.cheapest) : '') + ' - not a flip with your settings.' }));
+        }
         for (const r of c.flips) {
             const here = r.itemId === String(d.itemId);
             const steps = r.steps.map((st) => (st.sellerId
                 ? spEl('div', { class: 'sp-buy' }, [
-                    spEl('span', {}, ['Buy ', spEl('b', { text: count(st.qty) }), ' from ', this.playerName(st.sellerName || 'Player ' + st.sellerId, st.sellerId, 'trade:seller:' + r.itemId + ':' + st.sellerId), ' at ' + formatMoney(st.price)]),
+                    spEl('span', {}, ['Buy ', spEl('b', { text: count(st.qty) }), ' from ', this.playerName(st.sellerName || 'Player ' + st.sellerId, st.sellerId, 'trade:seller:' + r.itemId + ':' + st.sellerId), ' at ' + formatMoney(st.price) + (st.seenAt ? ' · seen ' + formatAge(Date.now() - st.seenAt) : '')]),
                     this.link('Open bazaar', bazaarUrl(st.sellerId, r.itemId, st.price), { focus: 'trade:bazaar:' + r.itemId + ':' + st.sellerId }),
                 ])
                 : spEl('div', { class: 'sp-buy' }, [spEl('span', { text: '≈ from ' + formatMoney(st.price) + ': its bazaars are being read' })])));
@@ -1565,6 +1597,16 @@ export class SellingPage {
                 tick(false, 'Include ' + r.name, 'trade:tick:' + r.itemId, (on) => edit(r.itemId, on ? null : { off: true })),
                 spEl('span', { class: 'sp-pic sp-pic-s' }, [this.image('trade-off', r.itemId)]),
                 spEl('span', { class: 'sp-ti-l' }, [spEl('b', { text: r.name }), spEl('small', { text: 'left out of this trade' })]),
+                spEl('span', { class: 'sp-ti-p', text: '–' }),
+            ]));
+        }
+        // Was in this trade, is not now: said, never just gone (the friend lost
+        // track of what to buy when rows vanished mid-trade).
+        for (const r of c.gone || []) {
+            card.appendChild(spEl('div', { class: 'sp-ti sp-off sp-gone' }, [
+                spEl('span', { class: 'sp-gone-mark', text: '!' }),
+                spEl('span', { class: 'sp-pic sp-pic-s' }, [this.image('trade-gone', r.itemId)]),
+                spEl('span', { class: 'sp-ti-l' }, [spEl('b', { text: r.name }), spEl('small', { text: 'no longer in the trade: no bazaar sells it under ' + b.name + '\'s price now (bought, or re-priced), or your Cash went to the others' })]),
                 spEl('span', { class: 'sp-ti-p', text: '–' }),
             ]));
         }
@@ -1601,9 +1643,76 @@ export class SellingPage {
         return card;
     }
 
+    /**
+     * A trade the trader said yes to: frozen, so nothing in it moves. Each
+     * buy step is checked against the bazaar now (still there, re-priced,
+     * fewer left, gone) with a tick for bought; each item a tick for sent -
+     * the same list shows in the panel on Torn's trade page. Then Traded, or
+     * back to the live plan.
+     */
+    acceptedCard(d) {
+        const A = d.trade.accepted;
+        const b = A.buyer;
+        const card = spEl('div', { class: 'sp-q sp-hot sp-wide sp-trade sp-accepted' }, [
+            spEl('h3', { text: 'Trade with ' + b.name + ' · accepted ' + formatAge(Date.now() - A.at) }),
+        ]);
+        const sent = A.items.filter((i) => i.sent).length;
+        card.appendChild(spEl('div', { class: 'sp-th' }, [
+            spEl('span', { class: 'sp-th-l' }, [
+                spEl('span', {}, [this.playerName(b.name, b.id, 'acc:buyer'), ' ', this.trustBadge(b)]),
+                this.status(b),
+            ]),
+            spEl('span', { class: 'sp-th-r' }, [
+                spEl('div', { class: 'sp-big', text: signed(A.profit) }),
+                spEl('small', { text: 'buy for ' + formatMoney(A.cost) + ' · ' + b.name + ' pays ' + formatMoney(A.pays) + ' · sent ' + sent + ' of ' + A.items.length }),
+            ]),
+        ]));
+        card.appendChild(spEl('p', { class: 'sp-note', text: 'Frozen: nothing here changes while you buy and send. The same list is in the panel on Torn\'s trade page.' }));
+
+        const words = {
+            ok: (c) => 'still listed' + (c.seenAt ? ' · seen ' + formatAge(Date.now() - c.seenAt) : ''),
+            price: (c) => 'now ' + formatMoney(c.price) + ' - re-priced',
+            short: (c) => 'only ' + count(c.qty) + ' left',
+            gone: () => 'gone from their bazaar',
+            unknown: () => 'checking…',
+            bought: () => 'bought',
+        };
+        const box = (checked, label, focus, onChange) => {
+            const input = spEl('input', { type: 'checkbox', class: 'sp-tick', 'aria-label': label, 'data-focus': focus });
+            input.checked = checked;
+            input.addEventListener('change', () => onChange(input.checked));
+            return input;
+        };
+        for (const i of A.items) {
+            card.appendChild(spEl('div', { class: 'sp-ti' + (i.sent ? ' sp-off' : '') }, [
+                box(i.sent, 'Sent ' + i.name, 'acc:sent:' + i.line, (yes) => this.h.onTradeTick && this.h.onTradeTick(A.key, i.line, { sent: yes })),
+                spEl('span', { class: 'sp-pic sp-pic-s' }, [this.image('acc-' + i.kind, i.itemId)]),
+                spEl('span', { class: 'sp-ti-l' }, [
+                    spEl('b', { text: i.name }),
+                    spEl('small', { text: 'send ' + count(i.units) + (i.kind === 'yours' ? ' of yours' : '') + ' · ' + b.name + ' pays ' + formatMoney(i.bid) + ' each' + (i.sent ? ' · sent' : '') }),
+                ]),
+                spEl('span', { class: 'sp-ti-p', text: formatMoney(i.units * i.bid) }),
+                i.steps.length ? spEl('div', { class: 'sp-buys' }, i.steps.map((st, k) => spEl('div', { class: 'sp-buy sp-check-' + st.check.state }, [
+                    box(st.bought, 'Bought ' + st.qty + ' from ' + (st.sellerName || st.sellerId), 'acc:bought:' + i.line + ':' + k, (yes) => this.h.onTradeTick && this.h.onTradeTick(A.key, i.line, { step: k, bought: yes })),
+                    spEl('span', {}, ['Buy ', spEl('b', { text: count(st.qty) }), ' from ', this.playerName(st.sellerName || 'Player ' + st.sellerId, st.sellerId, 'acc:seller:' + i.itemId + ':' + k), ' at ' + formatMoney(st.price) + ' · ', spEl('span', { class: 'sp-checkword', text: words[st.check.state](st.check) })]),
+                    st.bought ? null : this.link('Open bazaar', bazaarUrl(st.sellerId, i.itemId, st.price), { focus: 'acc:bazaar:' + i.itemId + ':' + k }),
+                ]))) : null,
+            ]));
+        }
+        card.appendChild(spEl('div', { class: 'sp-tpick' }, [
+            this.stepTraderLinks(b),
+            spEl('span', { class: 'sp-tpick-b' }, [
+                spEl('button', { type: 'button', class: 'sp-btn sp-primary', 'data-focus': 'acc:done', text: 'Traded - done', onclick: () => this.h.onTradeClose && this.h.onTradeClose(A.key) }),
+                spEl('button', { type: 'button', class: 'sp-btn', 'data-focus': 'acc:back', title: 'Unfreeze: back to the live plan', text: 'Back to the live plan', onclick: () => this.h.onTradeClose && this.h.onTradeClose(A.key) }),
+            ]),
+        ]));
+        return card;
+    }
+
     /** The flip plan: buy from these bazaars, sell to this trader, what it makes and costs. */
     planCard(d) {
-        if (d.trade) return this.tradeCard(d);
+        if (d.trade && d.trade.accepted) return this.acceptedCard(d);
+        if (d.trade && d.trade.chosen) return this.tradeCard(d);
         const wide = d.held ? '' : ' sp-wide';
         const f = d.plan;
         if (f && f.units > 0) {
@@ -1640,7 +1749,7 @@ export class SellingPage {
         if (f && f.units === 0) text = 'One costs ' + formatMoney(f.needs) + ', more than your cash (' + formatMoney(this.state.prefs.cash) + ').';
         else if (d.planWhy === 'loading') text = 'Loading bazaars from TornW3B…';
         else if (!top) text = 'No flip: no ' + who + ' for this item.';
-        else if (d.statItem) text = 'No flip: every copy has its own stats, and traders pay one price per item (weapons and armour).';
+        else if (d.statItem) text = 'No flip: every copy is its own (weapons, armour, cars), and traders pay one price for one - nobody buys them by the hundred.';
         else if (d.sellers.rows.some((r) => !r.stale && r.price < top.price && top.price - r.price < Math.max(1, (r.price * (this.state.prefs.minProfitPct ?? 1)) / 100))) {
             // Under the bid, but by less than Settings' least profit per item.
             const r = d.sellers.rows.find((x) => !x.stale);
@@ -1651,6 +1760,8 @@ export class SellingPage {
         else if (d.sellers.rows.length) text = 'No flip: TornW3B has not seen these bazaars in the last 30 minutes.';
         else text = 'No flip: no bazaar is selling it.';
         card.appendChild(spEl('p', { class: 'sp-note', text }));
+        // No flip on this item - but a trader's other items may still make a trade.
+        if (d.trade && !d.trade.chosen && d.buyers.length) card.appendChild(spEl('p', { class: 'sp-note', text: 'Press Plan trade on a trader to plan a trade with their other items.' }));
         return card;
     }
 
@@ -1926,13 +2037,6 @@ button:focus-visible, input:focus-visible, summary:focus-visible, a:focus-visibl
 .sp-chip-none { visibility: hidden; }
 .sp-showall { margin-top: 8px; }
 .sp-tsec { margin: 12px 0 4px; font-size: 11px; letter-spacing: 0.6px; text-transform: uppercase; color: var(--muted); }
-.sp-tos { margin: 2px 0 8px; }
-.sp-to { display: grid; grid-template-columns: 18px minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 8px 10px; margin-top: 6px; border: 1px solid var(--cline2); border-radius: 9px; cursor: pointer; }
-.sp-to.sp-on { border-color: var(--hot-line); background: var(--green-bg); }
-.sp-to input { accent-color: var(--price); margin: 0; }
-.sp-to-l { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
-.sp-to-l small { color: var(--muted); font-size: 12px; }
-.sp-to-p { font-weight: bold; color: var(--price); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .sp-th { display: flex; align-items: flex-start; gap: 16px; flex-wrap: wrap; margin-top: 4px; }
 .sp-th-l { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .sp-th-r { margin-left: auto; text-align: right; }
@@ -1953,6 +2057,23 @@ button:focus-visible, input:focus-visible, summary:focus-visible, a:focus-visibl
 .sp-buy .sp-chip { margin-left: auto; }
 .sp-qty { width: 72px; height: 26px; padding: 0 6px; border-radius: 6px; border: 1px solid var(--cline2); background: #0f0f0f; color: var(--text); text-align: right; font-variant-numeric: tabular-nums; }
 .sp-trade-links { display: flex; justify-content: flex-end; margin-top: 10px; }
+.sp-tradeline { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 4px; }
+.sp-tradeline small { color: var(--muted); font-size: 12px; }
+.sp-plan { height: 26px; padding: 0 10px; font-size: 12px; }
+.sp-plan-on { display: inline-flex; align-items: center; border-radius: 13px; border: 1px solid var(--hot-line); color: var(--price); font-weight: bold; background: var(--green-bg); }
+.sp-tr.sp-planning { box-shadow: inset 3px 0 0 var(--price); }
+.sp-tr.sp-declined { opacity: 0.55; }
+.sp-tpick { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; margin: 2px 0 6px; }
+.sp-itemnote { margin: 6px 0; }
+.sp-tpick-b { display: flex; gap: 6px; flex-wrap: wrap; }
+.sp-buy .sp-tick { flex: 0 0 auto; }
+.sp-check-ok .sp-checkword { color: var(--price); }
+.sp-check-price .sp-checkword, .sp-check-short .sp-checkword { color: var(--warn); font-weight: bold; }
+.sp-check-gone .sp-checkword { color: var(--bad); font-weight: bold; }
+.sp-check-bought { opacity: 0.6; }
+.sp-gone { opacity: 0.8; }
+.sp-gone-mark { width: 16px; height: 16px; border-radius: 50%; background: var(--warn); color: #131313; font-weight: bold; font-size: 11px; display: inline-flex; align-items: center; justify-content: center; }
+.sp-gone small { color: var(--warn); }
 .sp-keeplist { display: flex; flex-direction: column; gap: 6px; }
 .sp-keeprow { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .sp-big { font-size: 22px; font-weight: bold; color: var(--price); font-variant-numeric: tabular-nums; }

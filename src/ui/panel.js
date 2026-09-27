@@ -309,7 +309,14 @@ export class Panel {
         // Whose bazaar this is, and whether they are around. Bazaar pages only.
         this.sellerEl = el('div', { class: 'ttv2-seller' });
 
+        // On Torn's trade page: the trade you accepted in Torn Bids, as a list
+        // of what to send (the friend: "how do I remember the items I will
+        // send him?"). Hidden everywhere else.
+        this.tradeBoxEl = el('div', { class: 'ttv2-tradebox' });
+        this.tradeBoxEl.style.display = 'none';
+
         this.listPage = el('div', { class: 'ttv2-page ttv2-page-list' }, [
+            this.tradeBoxEl,
             this.sellerEl,
             this.chipsEl,
             this.tabsEl,
@@ -760,6 +767,46 @@ export class Panel {
                 }),
             ]),
         );
+    }
+
+    /**
+     * Torn's trade page: each trade you accepted in Torn Bids - what to send,
+     * how many, what they pay - with a tick per item as you add it (the tick
+     * is shared with Torn Bids). Read only: nothing on Torn's page is typed
+     * or pressed.
+     *
+     * @param {Array|null} trades - accepted trades (core/accepted.js), newest first; null hides it
+     */
+    setTrades(trades) {
+        const box = this.tradeBoxEl;
+        if (!box) return;
+        const list = trades || [];
+        const sig = JSON.stringify(list.map((t) => [t.key, t.at, t.items.map((i) => [i.line, i.units, i.sent])]));
+        if (sig === this.tradeSig) return;
+        this.tradeSig = sig;
+        box.textContent = '';
+        box.style.display = list.length ? '' : 'none';
+        for (const t of list) {
+            const sent = t.items.filter((i) => i.sent).length;
+            const block = el('div', { class: 'ttv2-tb' }, [
+                el('div', { class: 'ttv2-tb-head' }, [
+                    el('b', { text: 'Trade with ' + t.trader.name }),
+                    el('span', { class: 'ttv2-money', text: formatMoney(t.pays) }),
+                ]),
+                el('div', { class: 'ttv2-sub', text: 'Send these (' + sent + ' of ' + t.items.length + ' added). ' + t.trader.name + ' should pay ' + formatMoney(t.pays) + ': check their offer before you accept.' }),
+            ]);
+            for (const i of t.items) {
+                const input = el('input', { type: 'checkbox', 'aria-label': 'Added ' + i.name });
+                input.checked = Boolean(i.sent);
+                input.addEventListener('change', () => this.handlers.onTradeSent && this.handlers.onTradeSent(t.key, i.line, input.checked));
+                block.appendChild(el('label', { class: 'ttv2-tb-row' + (i.sent ? ' ttv2-tb-done' : '') }, [
+                    input,
+                    el('span', { class: 'ttv2-tb-name' }, [el('b', { text: i.name }), document.createTextNode(' ×' + i.units.toLocaleString('en-US'))]),
+                    el('span', { class: 'ttv2-money', text: formatMoney(i.units * i.bid) }),
+                ]));
+            }
+            box.appendChild(block);
+        }
     }
 
     /** "Torn API calls in the last minute: 12 of 70", every tab together. */

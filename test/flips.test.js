@@ -228,3 +228,20 @@ test('150,000 Hammers are not all worth the cheapest ask: listing counts only th
     assert.equal(small.options.find((o) => o.venue === 'bazaar').units, 5);
     assert.equal(depthNearCheapest([]), null);
 });
+
+/* ---------------- one-of-a-kind items are never flipped by the hundred */
+
+import { isStatType, flipBuyers as buyersForFlip } from '../src/core/flips.js';
+
+test('weapons, armour and cars are never flipped, whichever way Torn names the type; temporaries are', () => {
+    // The owner: "no one is buying 100 weapons/armor", "same with cars".
+    for (const [type, sub] of [['Melee', null], ['Primary', null], ['Secondary', null], ['Defensive', null], ['Weapon', 'Primary'], ['Weapon', null], ['Armor', null], ['Car', null]]) {
+        assert.equal(isStatType(type, sub), true, type + '/' + sub);
+        assert.deepEqual(buyersForFlip([{ name: 'X', price: 100 }], { avg: 90, type, subType: sub }), [], type + ' has no flip buyers');
+    }
+    // Grenades and the like stack, and traders buy them in bulk.
+    assert.equal(isStatType('Temporary', null), false);
+    assert.equal(isStatType('Weapon', 'Temporary'), false);
+    assert.equal(buyersForFlip([{ name: 'X', price: 100 }], { avg: 90, type: 'Weapon', subType: 'Temporary' }).length, 1);
+    assert.equal(isStatType('Drug', null), false);
+});

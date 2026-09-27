@@ -35,7 +35,7 @@ import {
     BAZAAR_REFRESH_MS,
 } from '../src/core/feed.js';
 import { decideLeader, LEADER_STALE_MS } from '../src/core/leader.js';
-import { bazaarOwnerId, bazaarTarget } from '../src/sources/route.js';
+import { bazaarOwnerId, bazaarTarget, isTradePage } from '../src/sources/route.js';
 import {
     LiveFeed,
     FEED_STORE_KEY,
@@ -908,4 +908,12 @@ test('TornW3B $1 bazaar listings are never offered - Torn locks $1 to a random f
         { player_id: 3, price: 2, quantity: 1 },
     ]);
     assert.deepEqual(rows.map((r) => r.sellerId), ['3']);
+});
+
+test('Torn\'s trade page is recognised at every step (the panel lists what to send there)', () => {
+    assert.equal(isTradePage('https://www.torn.com/trade.php#step=start&userID=11'), true);
+    assert.equal(isTradePage('https://www.torn.com/trade.php#step=view&ID=123'), true);
+    assert.equal(isTradePage('http://localhost:8765/test/harness-live.html?page=trade#step=view'), true);
+    assert.equal(isTradePage('https://www.torn.com/bazaar.php#/'), false);
+    assert.equal(isTradePage('https://www.torn.com/page.php?sid=ItemMarket'), false);
 });

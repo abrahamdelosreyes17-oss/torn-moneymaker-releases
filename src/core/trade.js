@@ -73,7 +73,8 @@ export function planTrade({ first = null, flips = [], held = [], cash = null, ma
         r.units += n;
         r.cost += n * c.s.price;
         r.profit += n * (c.bid - c.s.price);
-        r.steps.push({ sellerId: c.s.sellerId, sellerName: c.s.sellerName, qty: n, price: c.s.price });
+        // When TornW3B last saw it: the card says how fresh each step is.
+        r.steps.push({ sellerId: c.s.sellerId, sellerName: c.s.sellerName, qty: n, price: c.s.price, seenAt: c.s.dataAt || null });
         plan.set(c.id, r);
     };
     for (const c of chunks.filter((x) => x.id === firstId)) take(c);

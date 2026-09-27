@@ -25,8 +25,30 @@ export const FLIP_MAX_UNITS = 100;
 /** A bid more than this many times the Item Market Average is not a real bid. */
 export const BID_SANITY_X = 3;
 
-/** Item types whose every copy has its own stats: a bid is for a quality, not the item. */
-export const STAT_ITEM_TYPES = new Set(['Melee', 'Primary', 'Secondary', 'Defensive']);
+/**
+ * Item types whose every copy is its own thing: weapons and armour (their own
+ * stats, bonuses, rarity) and cars. A trader's flat bid is for one copy, and
+ * nobody buys 100 of them (the owner, 2026-09-27: "no one is buying 100
+ * weapons/armor", "same with cars, that look sus"). Both spellings Torn has
+ * used: the older Melee / Primary / Secondary / Defensive, and v2's Weapon /
+ * Armor (with sub_type).
+ */
+export const STAT_ITEM_TYPES = new Set(['Melee', 'Primary', 'Secondary', 'Defensive', 'Weapon', 'Armor', 'Armour', 'Car']);
+
+/**
+ * Is an item of this type one-of-a-kind (never flipped in bulk)? Temporary
+ * weapons (grenades, smoke...) are the exception: they stack, and traders
+ * do buy them by the hundred.
+ */
+export function isStatType(type = null, subType = null) {
+    if (type === 'Temporary' || subType === 'Temporary') return false;
+    return STAT_ITEM_TYPES.has(type) || STAT_ITEM_TYPES.has(subType);
+}
+
+/** The same, for an item record from buildItemIndex. */
+export function isStatItem(item) {
+    return Boolean(item) && isStatType(item.type, item.subType);
+}
 
 /**
  * The buyer a flip sells to: the best one whose price is believable - at
@@ -36,8 +58,8 @@ export const STAT_ITEM_TYPES = new Set(['Melee', 'Primary', 'Secondary', 'Defens
  * @param {Array} buyers - highest first, after your Show choices
  * @param {{avg: number|null, type: string|null}} item
  */
-export function flipBuyer(buyers, { avg = null, type = null, unitsOf = null } = {}) {
-    if (!(avg > 0) || STAT_ITEM_TYPES.has(type)) return null;
+export function flipBuyer(buyers, { avg = null, type = null, subType = null, unitsOf = null } = {}) {
+    if (!(avg > 0) || isStatType(type, subType)) return null;
     for (const b of buyers || []) {
         if (!b || !(b.price > 0) || b.price > avg * BID_SANITY_X) continue;
         // A trader who could not pay for even one is not a buyer.
@@ -54,8 +76,8 @@ export function flipBuyer(buyers, { avg = null, type = null, unitsOf = null } = 
  * The plan picks among them the one that makes the most - a slightly lower
  * bid from a trader who can take 100 beats a higher one who can take 1.
  */
-export function flipBuyers(buyers, { avg = null, type = null, unitsOf = null, limit = 5 } = {}) {
-    if (!(avg > 0) || STAT_ITEM_TYPES.has(type)) return [];
+export function flipBuyers(buyers, { avg = null, type = null, subType = null, unitsOf = null, limit = 5 } = {}) {
+    if (!(avg > 0) || isStatType(type, subType)) return [];
     const out = [];
     for (const b of buyers || []) {
         if (out.length >= limit) break;

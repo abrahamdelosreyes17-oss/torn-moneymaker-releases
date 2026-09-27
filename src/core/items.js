@@ -43,6 +43,8 @@ export function buildItemIndex(rawItems) {
             id: String(id),
             name: item.name,
             type: item.type || null,
+            // v2's sub_type (Melee / Primary / Secondary / Temporary for weapons).
+            subType: item.sub_type || null,
             buyPrice: Number(item.buy_price) || 0,
             // 0 when no NPC shop buys it ("Sell: N/A" in game).
             sellPrice: Number(item.sell_price) || 0,

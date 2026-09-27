@@ -4,256 +4,271 @@ Read this first, then `README.md`. The README holds the product and the binding
 rules; this file holds where we are, how the owner works, and what is settled.
 Everything below "History" is the record of how we got here.
 
-## Where things stand (3.12.6, 2026-09-27)
+## Start here (state on 2026-09-27, end of session)
 
-**3.12.6 released** (`fe49df0`), pushed. Install link given to the owner:
-`https://raw.githubusercontent.com/abrahamdelosreyes17-oss/torn-moneymaker-releases/fe49df04203c7decb3e03b295f991037036d3083/torn-moneymaker.user.js`
-
-**3.12.6: one trade per trader** (mockup N3 + a "Sell to" picker, the owner's
-picks): the desk's flip plan is the whole trade with one trader (`core/trade.js`
-planTrade, tested; `tradeDesk` in main.js; `SellingPage.tradeCard`). Sell to
-ranks every trader you can flip the item to by the whole trade; ticks and
-numbers per row; the keep list for your own items (prefs.keep, Settings ›
-Flips). Items not read yet are estimated from the summary (≈) and read first
-(`sell.tradeWanted`, up to 30, in `nextW3bJob` right after the picked item).
-Harness: `&manybuyers=1` gives Dynamite three buyers. The owner's trading-
-partners idea is still only an idea (below).
-
-**3.12.5 released** (`aab7e53`), branch `claude/optimistic-ride-1gqguu`,
-pushed. Install link given to the owner:
-`https://raw.githubusercontent.com/abrahamdelosreyes17-oss/torn-moneymaker-releases/aab7e531423cb74617eec487c7e4dbb3ac6f6fdc/torn-moneymaker.user.js`
-It has:
-- TornExchange's top three vs an item's full list disagreeing for one trader:
-  the lower counts, amber "Lists differ: TE top 3 … · TE full list …" (the
-  friend's ID Badge loss: $140k shown, $105k paid). `core/traders.js`.
-- TornW3B limits: the feed's `bazaarDue` compares against the summary price
-  stored with the snapshot (a $1 Dollar Sale made it re-read every 3 s tick:
-  126 calls/min wanted for 6 such items, now 12); every tab shares one TornW3B
-  window of 80/min and one 429 wait (`api/w3b.js`, storage key `w3bWindow`).
-- The two watching switches are independent (`watching()` in
-  `feed/controller.js`); "save API calls" turns off only the Torn API parts,
-  bazaars stay watched (the owner's report).
-- `$1 is for NPC only` (the owner): My bazaar / Market deals and Torn Bids
-  flips need at least 1% of the price per item (`enoughProfit` in
-  `core/profit.js`; overlay setting `resaleMinPct`, Torn Bids `minProfitPct`).
-- Ready for Torn removing `value.sell_price` / `buy_price` / `vendor` on
-  2027-01-01: `npcSaleFromValue` uses Torn shops alone when the field is gone.
-- The overlay's **Sell** button is **Bids**.
-- Tests: 212, each new one shown failing without its fix. Checked in the
-  harness: overlay Settings, save switch (0 Torn calls, TornW3B still read),
-  Torn Bids' new field, the amber TE line (`&tedrop=1`).
-
-**Then every finding of a three-pass review (security / bugs / usability,
-run by a Fable agent, report in the session scratchpad) was fixed, also in
-3.12.5, uncommitted. The owner's brief: "fix everything; latency is
-important, and prices must stay live":**
-- S1/U7/S4 key boxes: `ui/mask.js` - CSS-masked text boxes everywhere (the
-  Ledger's Full key was a password box: browsers offered to save it);
-  password box only where CSS cannot mask; a revealed key leaves the box
-  after a minute or on Save.
-- S2: Torn's v1 item-list fallback gives NO NPC prices (it cannot show a shop
-  in Torn buys it; it priced Companion Scripts at $12m) and is cached 5 min,
-  not 1 h (`items.js` `partial`); v2's relative `next` link no longer throws.
-- S3/B3: `TornApiClient` - a shared pause after Torn error 5/8/9 (30 s /
-  10 min / 2 min, key `tornPause`), code 9 no longer retried at 1-2-4 s; no
-  request leaves a hidden tab (Torn and TornW3B clients), even one queued
-  while visible.
-- B2: the shared request windows are per tab (`platform/tab-window.js`, keys
-  `apiWindow.<tab>` / `w3bWindow.<tab>` + a `.tabs` registry that heals
-  itself) - tabs no longer erase each other's slots. The old single-array
-  keys are deleted at boot.
-- S5/B1: other tabs follow a dead / new key and every overlay setting at once
-  (`gmOnChange`); settings are written as a merge of only what changed.
-  Panel position, collapse and the chosen list stay per tab.
-- B4: an Item Market item is re-asked no sooner than 10 s (a stale Torn
-  timestamp made it due every tick).
-- B5: own-page prices are recorded only for items already tracked.
-- B6: the Ledger's rows live in Torn Bids' IndexedDB (`platform/idb.js`;
-  moved once from GM storage; GM fallback) so Torn pages stop loading them;
-  keyless TE answers, Fill's own-listing cache (no longer rewritten every
-  2.5 s) and traders unnamed for 30 days with no list are pruned.
-- B7: Fill's undo is keyed by item + which of its rows, not the element -
-  survives Torn redrawing the row (checked in the harness).
-- B8 Ledger "At least" reads 1.5k; B9 the card label uses what Cash can
-  make; B10 `userID` in any case; B11 the content-shaped card search starts
-  from "$" text (18,000-element page: 34 ms -> 8.8 ms, same cards);
-  B12 Where to sell counts a listing only for the units listed near its
-  price ("first 900, rest to trader": 150,000 Hammers no longer "+$1.8m").
-- Found while fixing: 3.12.5's own `$1 only for NPC` made `bestVenue` return
-  null for a resale-only miss, and the page path read `profit.totalProfit`
-  unguarded - such rows are now skipped.
-- U1 Fill's notes shown in the panel once filled, "$100 !" on the row when
-  it needs you; U2 BP gets every row's price from one summary call when none
-  is stored (was "…" ~30 s or for ever), and says "off" / "none"; U3 the
-  overlay list updates in place (focus kept, checked 8 s); U4 rejected
-  inputs say why, Esc with unsaved Torn Bids settings warns first; U5 the TE
-  banner says the key goes to tornexchange.com; U6 tabs are real tabs
-  (arrow keys), trust/status read out, Ledger rows take Space.
-- Not verified outside the harness: IndexedDB from inside Tampermonkey's
-  sandbox on the real github.io page (falls back to GM storage if refused).
-- 221 tests.
-
-**Idea from the owner, discussed, not built (mockups first):** trading
-partners - a Ledger "Traders" tab (who, how often, totals, profit), your own
-history on Torn Bids' trader rows ("Traded 7x"; repeat customers first), and
-"did they pay their list?" per trade (the ID Badge loss, per trader).
-
-**Agreed next (the owner said "go build"; mockups first where the look changes):**
-1. **One trade per trader** (the friend: a one-item trade looks odd, many items
-   looks legit): when a flip sells to X, add every other item X buys that a
-   bazaar sells under X's price, plus held items where X is the best trader;
-   ONE Cash for the trade, the picked item first. Mockup
-   `mockups/N-one-trade.html` (N1 card under the flip plan / N2 best-trades
-   strip / N3 flip plan is the trade) - the owner has not picked yet. Add to
-   the mockup: a tick box + quantity per row, and a remembered **keep list**
-   for held items ("Keep 5 Xanax"), editable in Torn Bids Settings.
-2. **Overlay on Torn's trade page** (read only): the plan checklist for the
-   trader you are trading with, a money check ("offers $10.5m, his list says
-   $14m: $3.5m short"), his price beside each item; optional Fill-style
-   quantity tick. Needs the trade page's markup read first (owner opens it).
-3. **Weapons / armour flips** (traders buy them one at a time, flat price per
-   item id): plain copies (uid via TornW3B listings + `torn/{uids}/itemdetails`)
-   to Big Al's or a trader, capped per trader; RW gear under its Bunker Bucks
-   floor (ask if they have the Bunker); RW armour vs flat trader bids; later
-   auction comps. Research notes in memory `trader-sources`.
-4. Worth checking: TornW3B `/api/marketplace/{id}/traders` (every W3B buyer of
-   an item in one call) and TornExchange `prices/{id}` (a TE-only trader's
-   whole list) - both would cut calls and fill gaps.
-
-## Before 3.12.5 (3.12.4, 2026-09-27)
-
-- **Version 3.12.4** (`e1eb9d8`), branch `claude/optimistic-ride-1gqguu`, pushed.
-  Last install link given to the owner (3.12.4):
-  `https://raw.githubusercontent.com/abrahamdelosreyes17-oss/torn-moneymaker-releases/e1eb9d81dcbae98c70b2902a294227f5745d644c/torn-moneymaker.user.js`
-  3.12.4 added the friend's **"NPC deals: save API calls"** switch (overlay
-  Settings › Watching: no live feed, no sellers' / owners' status checks; 0
-  API calls; Fill and Torn Bids unaffected) and a "Torn API calls in the last
-  minute" line. The friend had asked to split features into separate scripts
-  to save calls; we explained that would lose the shared 70/min budget and
-  save nothing, and built the switch instead.
+- **Released: 3.12.7** (commit and link at the very top of this section once
+  pushed), branch `claude/optimistic-ride-1gqguu`. Earlier today: 3.12.5
+  (`aab7e53`), 3.12.6 (`fe49df0`).
 - **`main` is still at 2.9.3.** The script's `@updateURL` points at `main`, so
-  installs are done from **pinned links** (`.../<commit>/torn-moneymaker.user.js`).
-  Merging to `main` would make every install auto-update: only when the owner asks.
-- Who uses it: the owner and a friend who plays Torn. **Desktop only.**
-- It stays a **Tampermonkey userscript**: the owner looked at a Chrome
-  extension and said no (no Web Store fee; "maybe tampermonkey is fine").
-- 221 unit tests (`npm test`); `test/ux-check.mjs` (Playwright) has never run
-  here - Playwright is not installed; its expectations are updated for 3.12.
+  installs go through **pinned links** (`.../<commit>/torn-moneymaker.user.js`).
+  Merging to `main` makes every install auto-update: only if the owner asks.
+- Nothing uncommitted except `mockups/` and `.claude/` (untracked on purpose).
+- 231 unit tests (`npm test`); `test/ux-check.mjs` (Playwright) has never run
+  here - Playwright is not installed.
+- Who uses it: the owner and a friend who plays Torn (the friend's requests
+  come through the owner, often in Tagalog - translate, then restate). **Desktop
+  only.** Stays a **Tampermonkey userscript** (no extension, no Web Store fee).
 
-### The product today - two separate things
+### Open question the owner asked at the very end - answer it first
+
+The owner's idea (2026-09-27): once a trader accepts, **one button that opens
+every bazaar to buy from** (each highlighting the listing - `bazaarUrl` already
+points at it and the overlay marks it), and on Torn's trade page **highlight
+the items to send and fill them all automatically**, like Fill on the bazaar
+add page. They asked: **"is that against TOS? we already have our bazaar
+fill."** Not answered yet. The honest position to bring:
+- Torn's scripting rule as this project has always read it: one click = one
+  action / one request, no chaining, never automate navigation (README "Rules
+  compliance"). **Opening N bazaar tabs from one click** is N Torn page loads
+  from one click - against that reading. Offer instead **"Next bazaar"**: one
+  click opens the next unbought step's bazaar (already highlighted), ticks move
+  on - nearly as fast, compliant.
+- **Fill on the trade page:** our Fill is one row per click (typing into Torn's
+  boxes, never pressing Torn's buttons) - the same on the trade page is fine.
+  **"Fill all" in one click** was left out of Fill on purpose (see "The Fill
+  button" in History: "Left out on purpose: Fill All / Select All"): typing many
+  rows on one click is the chained-action pattern. Offer per-item Fill ticks,
+  with the items to send highlighted.
+- If the owner wants certainty: they can open Torn's scripting-rules thread in
+  the Claude tab group and you read it (read only). Do not decide for them.
+- Either way it needs **the trade page's markup** (add-items step, the money
+  box): the owner opens a trade page, you read it, read only.
+
+### The agenda for the next session (let the owner choose the order)
+
+1. **The owner tries 3.12.7 on real data**, and you read along (read only, in
+   the Claude Chrome tab group - see "How the owner works"). Watch:
+   - **weapons / armour / cars no longer flipped** - the fix covers both type
+     spellings because the real v2 `type` values were never seen: confirm on
+     the real item list (the Category dropdown shows the type names Torn sends);
+   - the trade flow: Plan trade on a trader row, X declined / X accepted, the
+     frozen trade's live checks, the panel's list on Torn's trade page;
+   - how fast "≈" rows fill (up to 30 items, 24 TornW3B calls a minute);
+   - the Ledger in IndexedDB on the real github.io page (not verified inside
+     Tampermonkey's sandbox; "Show storage sizes" has no `ledger` key once moved);
+   - Fill after Torn redraws a row (#/manage), the "!" marker, BP chips;
+   - the Ledger's mugging amount field (8156 undocumented; "not read" shows the
+     field names seen - fix from that).
+2. **Trading partners - asked for three times; NOT built.** Mockup first:
+   - Ledger › a **Traders** tab (from the Ledger's finished trades - no new
+     calls): who, how many trades, totals, last trade, items, FIFO profit;
+   - Torn Bids trader rows: **"Traded 7× · last 3d ago"** beside Plan trade;
+     repeat customers first (ask: badge, tie-break, or trust);
+   - **"Did they pay their list?"** per trade (the ID Badge loss, per trader).
+     The accepted trade (`sellAccepted`) now records what they should pay:
+     comparing it with the finished trade in the Ledger gives this directly.
+   Needs the Ledger's Full key; the log gives ids only (names are open).
+3. **The trade page, part 2** (after reading its markup): per-item Fill of the
+   quantity to send, highlight the rows, a **money check** ("offers $10.5m,
+   the trade says $14m: $3.5m short"). See the open question above.
+4. **Weapons / armour flips done properly** (researched, not built; now they
+   are simply excluded): plain copies to Big Al's or one-per-trader; RW gear
+   under its Bunker Bucks floor (ask if they have the Bunker); notes in memory
+   `trader-sources`.
+5. **Verify, then maybe use:** TornW3B `/api/marketplace/{id}/traders` and
+   TornExchange API `prices/{id}` (a TE-only trader's whole list).
+6. Smaller: the Sell-to-by-trader view could show traders who make no flip on
+   this item but whose other items make a trade (today Plan trade works on any
+   trader row shown); Ledger names / export; run `test/ux-check.mjs`.
+
+## What this session did (2026-09-27)
+
+- **Bug the friend hit (fixed in 3.12.5):** Torn Bids showed SilentStorm77
+  paying $140,000 for ID Badges; his TE list said $105,000 and they traded at a
+  loss. `buyersForItem` kept the HIGHER of TornExchange's top-3 price and the
+  item's full-list price for one trader. Now the lower counts, amber "Lists
+  differ: TE top 3 … · TE full list …". Harness `&tedrop=1`.
+- **3.12.5** (`aab7e53`): TornW3B limits (a $1 Dollar Sale made the feed
+  re-read an item every 3 s: 126 calls/min for 6 items, now 12; one 80/min
+  TornW3B window for all tabs and one 429 wait); "save API calls" stops only
+  Torn API calls, bazaars stay watched, the two watching switches are
+  independent; **$1 is for NPC only** - resale deals and flips need 1% of the
+  price per item (overlay `resaleMinPct`, Torn Bids `minProfitPct`); NPC
+  prices ready for Torn removing `sell_price` on 2027-01-01; overlay button
+  **Sell → Bids**. Then **every finding of a three-pass review** (security /
+  bugs / usability, run by a Fable agent; the owner: "fix everything;
+  latency is important, prices must stay live"): CSS-masked key boxes
+  (`ui/mask.js`; the Ledger's Full key was a password box), v1 item fallback
+  gives no NPC prices, shared pause after Torn 5/8/9, nothing sent from a
+  hidden tab, per-tab request windows (`platform/tab-window.js`), settings and
+  dead keys follow across tabs (`gmOnChange`), Ledger rows in IndexedDB
+  (`platform/idb.js`), stores pruned, Fill undo survives redraws, Fill notes in
+  the panel, BP from one summary call, overlay list updated in place, Where
+  to sell counts only the units listed near a price ("first 900, rest to
+  trader"), a 4× cheaper card search, validation messages, accessibility.
+- **3.12.6** (`fe49df0`): **one trade per trader** - mockups N1/N2/N3 made
+  (`mockups/N-one-trade.html`); the owner picked **N3** plus a **Sell to**
+  picker (pick ONE trader, ranked by what the WHOLE trade makes - chosen over
+  splitting items across several traders). The desk's flip plan is the whole
+  trade: this item first, the trader's other flippable items, your held
+  items where they are the best buyer; one Cash; Most per flip per item;
+  their networth share for the whole trade; a tick and a number per row;
+  the **keep list** for your own items (prefs.keep, Settings › Flips › Keep
+  for yourself). Code: `core/trade.js` (planTrade, keepAfter; tested),
+  `tradeDesk` in `renderSellingNow` (main.js), `SellingPage.tradeCard`;
+  items not read yet are estimated from the summary (≈) and read first
+  (`sell.tradeWanted` in `nextW3bJob`). Harness `&manybuyers=1`.
+
+- **3.12.7**: from the owner's and the friend's first real use of 3.12.6:
+  - **the trader is picked on the Traders pay card** (the owner: "a button on
+    the trader - trader 1 didn't want to trade, click trader 2 to see the flip
+    plan there"): each row shows "whole trade +$X · N items" and **Plan
+    trade**; the plan card's old Sell to list is gone. **X declined** passes a
+    trader over for an hour (greyed at the bottom, Undo; `sellDeclined`).
+  - **"it suddenly disappeared"** (the friend, mid-trade, Tagalog): the desk
+    followed the best flip and the trader followed the best trade. Now any
+    click in the trade pins item and trader (`onTradePin`); the trade's items
+    are re-read every 2 min (`sell.tradeLive`, in `nextW3bJob` after the
+    picked item); an item that drops out stays listed with why (`sell.tradeSeen`);
+    each buy step says "seen N min ago".
+  - **X accepted** (the owner: "the thing that says trader accepted/declined"):
+    freezes the trade (`core/accepted.js`, tested; stored as `sellAccepted`
+    in GM storage, 24 h, keyed per trader); each buy step checked live (still
+    listed / re-priced / fewer left / gone) with a bought tick; each line
+    ('flip:<id>' / 'yours:<id>' - one item can be in a trade twice) a sent
+    tick; Traded - done / back to the live plan.
+  - **Torn's trade page** (the friend: "how do I remember the items I will send
+    him?"): the overlay's panel lists each accepted trade - what to send, how
+    many, what they should pay - with a tick per item, shared with Torn Bids
+    (`showTradeChecklist`, `Panel.setTrades`, `isTradePage` in route.js;
+    harness: `?page=trade`). Reads only our own saved list.
+  - **Weapons, armour and cars are never flipped** (the owner: "no one is
+    buying 100 weapons/armor", "same with cars"): `isStatType` / `isStatItem`
+    in flips.js cover Melee / Primary / Secondary / Defensive AND v2's Weapon /
+    Armor, and Car; Temporary weapons still flip. The v2 `sub_type` is now
+    kept on the item index. The real v2 type names were never seen - check.
+  - No-flip wording gives the real reason (one-of-a-kind items, least profit,
+    buyers who cannot take it).
+
+## The product today - two separate things
 
 **1. The overlay (the "NPC Arbitrage" panel on torn.com).** Keep it separate from
 Torn Bids: the owner was alarmed when Fill settings started to appear in Torn
 Bids ("TORN BIDS IS DIFFERENT FROM ARBITRAGE").
 - The deals list: bazaar and Item Market listings under the NPC price / market
-  value, live feed, Min / Cash, highlights, trader tag on bazaar cards.
+  value, live feed (one leader tab), Min / Cash, highlights, trader tag on
+  bazaar cards. Header: **Bids** (opens Torn Bids) · Scan · ⚙ · –.
+- Settings › Watching: **NPC deals: save API calls** (Item Market watching and
+  sellers' status off: 0 Torn API calls; bazaars still watched via TornW3B),
+  Watch the Item Market, Watch bazaars via TornW3B, **Least profit per item %**
+  (resale deals; NPC counts from $1), Torn API calls in the last minute.
 - **Your bazaar's add page (#/add):** each row stays one line. In Torn's own
-  value column, after its price: **IMA $X** (Item Market Average - press: the
-  graph in the panel) · **BP $Y** (lowest bazaar price - press: the 5 cheapest
-  bazaar and Item Market listings and who sells them) · **☐ Fill**.
-- **Fill** (the friend's request, like Greasy Fork's Customizable Bazaar Filler
-  and Torn Market Filler): tick = type that one row's price (the lowest bazaar
-  listing −$1 by default) and quantity; untick = put back what was there. Never
-  presses Torn's buttons or ticks Torn's boxes; never undercuts your own, $1,
-  sponsored, stale (30 min) or troll (<25% of average) listings; never below
-  the NPC price; never $1 or less. Works on #/add, #/manage, and the Item
-  Market's #/addListing and #/viewListing. **Settings only in the overlay**
-  (panel Settings › Fill; a "Fill settings" link in Torn's links bar): which
-  listing (lowest / 2nd...5th), amount in $ or %, all / all but 1, floor at the
-  average. Code: `core/fill.js`, `sources/dom/fill.js`, the Fill section of
-  `main.js`, `ui/fill-form.js`.
-- Tampermonkey menu: "Show storage sizes and start time" (names and sizes
-  only) - ask the owner for its numbers (see "Next session").
+  value column: **IMA $X** · **BP $Y** · **☐ Fill** (filled: "$100", with "!"
+  when it needs you - e.g. tick Torn's box on weapon rows; the words are in
+  the panel).
+- **Fill** (the friend's request): tick = type that row's price (lowest bazaar
+  −$1 by default) and quantity; untick = put back what was there. Never presses
+  Torn's buttons; never undercuts your own, $1, sponsored, stale or troll
+  listings; never below the NPC price. #/add, #/manage, the Item Market's
+  #/addListing and #/viewListing. **Settings only in the overlay** (Settings ›
+  Fill; a "Fill settings" link in Torn's links bar). Code: `core/fill.js`,
+  `sources/dom/fill.js`, the Fill section of `main.js`, `ui/fill-form.js`.
+- Tampermonkey menu: "Show storage sizes and start time" (names and sizes only).
 
-**2. Torn Bids** (our page on github.io, the panel's **Sell** button opens it).
+**2. Torn Bids** (our page on github.io; the overlay's **Bids** button opens it).
 - The item desk (mockup H): best flips, every item, traders pay / bazaars
-  sell / flip plan / where to sell.
-- Settings in mockup J's layout (menu down the left); a **Category** dropdown
-  (mockup M; the TornW3B and Online pills hide between 1001-1500px to fit).
-- **Could they pay:** a flip never asks a trader for more than 10% (setting)
-  of their networth (`v2/user/{id}/personalstats?cat=networth`); the plan uses
-  the buyer whose capped plan makes the most.
-- **Lower of two prices:** a trader on TornExchange and TornW3B at different
-  prices counts at the LOWER one, marked amber (the friend lost money trading
-  on the higher - one list was stale or bait).
-- **Torn Ledger** (Ledger button): profit from the owner's own log and trades,
-  first in first out, after fees. Counts bazaar / Item Market buys and sells,
-  **NPC shop sells (4210)** - buying under the NPC price and selling to the NPC
-  shows its profit and each sale says "bought 20 from X (Item Market) at $40" -
-  city-shop and abroad buys, and finished trades. Filters: period or any
-  dates, item ("Profit on X"), category, where (incl. NPC shops), who. Tiles,
-  graphs, per-item / per-period / every-row tables. **Mugged tab** (8156):
-  lost, count, biggest, per day, each mugging and by whom; filters by dates,
-  who, named / anonymous, at least an amount; "profit after muggings".
-  **Its own Full key**: checked Full via key/info before saving, masked,
-  never shown again, Forget (twice) deletes key and ledger, and
-  `api/ledger.js` allows only `/v2/key/info`, `/v2/user/log`,
-  `/v2/user/trades`, `/v2/user/{id}/trade` with their own parameters.
+  sell / **flip plan = one trade** (3.12.6) / where to sell.
+- Settings (mockup J layout); **Category** dropdown (mockup M).
+- Flips: Cash, Most per flip, **Trader can pay** (10% of networth), **Least
+  profit per item** (1%), **Keep for yourself**. Weapons, armour and cars are
+  never flipped.
+- **The desk's trade** (3.12.6-3.12.7): Plan trade / X declined on each
+  Traders pay row; the flip plan is the whole trade with that trader; X
+  accepted freezes it; the same list shows on Torn's trade page.
+- **Lower of two prices:** TE vs W3B, and TE top 3 vs TE full list - the lower
+  counts, marked amber (the friend lost money on the higher, twice now).
+- **Where to sell your N:** trader now vs your bazaar vs the Item Market; a
+  listing is counted only for the units listed near its price.
+- **Torn Ledger** (Ledger button): FIFO profit from the owner's own log and
+  trades, after fees; NPC shop sells; Mugged tab; its own **Full key** (walled
+  client: `/v2/key/info`, `/v2/user/log`, `/v2/user/trades`, `/v2/user/{id}/trade`
+  only). Rows in the page's IndexedDB since 3.12.5.
 
 ### Verified, and not
 
-- **Checked live, read only, on the owner's real #/add page (3.11.1 then):**
-  the row markup Fill needs (`li.clearfix`, `.item-amount.qty`,
-  `.amount input`, `.price input.input-money` + a hidden twin
-  `name="price"`, weapon rows `div.amount.choice-container`, `#torn-user`
-  with the id, links bar `[class*=linksContainer___]`, the value column
-  `.info-wrap`). The prices already in Torn's boxes are Torn's own (the last
-  price listed). Torn Bids 3.12.2 opened in 0.78 s with no long tasks.
-- **Everything else was tested in the harness only.** Not yet seen live:
-  - Fill ticking on the real #/add (the owner had not reloaded 3.12.x yet);
-  - #/manage and the Item Market pages' markup;
-  - the networth API on a real trader;
-  - the Ledger on the real log - above all **the mugging amount field**:
-    Torn does not document 8156's data; the Ledger reads money_mugged /
-    money / amount / ... and a mugging it cannot read shows "not read" with
-    the field names seen - fix the name from that;
-  - the IMA / BP chips on the real page (they sit in `.info-wrap`, which has
-    `t-overflow`: check nothing is cut on a long price).
-- **Known, left:** the BP chip (and the #/manage / IM tag) use TornW3B's
-  summary until the item's own listings are read, so it can show your own
-  listing as the lowest; the panel's list is exact. First open after an
-  update is slow (caches rebuilt at the rate-limited pace).
+- **Checked live, read only, on the owner's real #/add page (3.11.1):** the row
+  markup Fill needs (`li.clearfix`, `.item-amount.qty`, `.amount input`,
+  `.price input.input-money` + a hidden `name="price"` twin, weapon rows
+  `div.amount.choice-container`, `#torn-user`, links bar
+  `[class*=linksContainer___]`, value column `.info-wrap`).
+- **Everything since was tested in the harness only** (see agenda item 1).
+- **Known, left:** the BP chip uses TornW3B's summary until an item's own
+  listings are read, so it can show your own listing as the lowest. A Torn tab
+  opened in the background now loads only when you look at it (visible-tab rule).
 
-### Next session: talk with the owner about where to go from here
+## How the owner works
 
-The owner wants to discuss direction first. Bring this, in this order, and let
-them choose - don't start building before they pick:
-
-1. **Finish the live checks** (short, and everything else rests on them): the
-   owner installs 3.12.3 (link above), opens pages in the Claude Chrome tab
-   group, and ticks Fill themselves while you only read: #/add, #/manage, the
-   Item Market's add-listing and your-listings, Torn Bids, and the Ledger with
-   their Full key. Fix what the real pages show.
-2. **The storage numbers** from the Tampermonkey menu item. If a stored value
-   is large (trader lists, TornExchange lists, the ledger, the feed cache),
-   propose trimming it; Tampermonkey hands all of it to the script before it
-   starts, on every Torn page.
-3. **Open ideas the owner may want** (ask, don't assume):
-   - the Ledger: player names for sellers/buyers (the log gives ids only),
-     export, a "bought where" filter;
-   - BP accuracy: read an item's own listings when its row is on screen
-     (costs TornW3B calls - ask);
-   - the older code-review findings in "Not done / open" below (header total
-     with cash, green label ignores Cash, $1 refetch loop, dead-key sharing
-     between tabs, feed backoff on errors 5/8/9, the shared request window
-     losing writes between tabs, requests after a tab hides, a crash after
-     "Re-download item data", userID case);
-   - merging to `main` (auto-updates for everyone) - only if the owner asks.
-4. Keep asking before anything that changes how something looks (mockups
-   first for redesigns), and give the pinned link only when asked.
-
-## How the owner works (added this session)
-
-- **Desktop only** - no phone layouts or phone checks ("we're only doing
-  desktop"); the phone CSS already there stays.
+- **"Don't code" means discuss only.** "Go build" / "fix everything" means
+  build. **Asking for the link means: release** (bump the version, commit,
+  push, give the pinned link). Commit only then.
+- **Mockups first** for anything that changes the look (HTML in `mockups/`,
+  untracked; several variants side by side; send the file, let them pick).
+  Build only what they picked; self-review at desktop widths, measure overflow.
+- **Restate the spec in their words** before a big feature (AskUserQuestion
+  with previews works well for picking between designs).
+- **They ask things mid-task** (sometimes "is X there?" about something not
+  built): answer plainly in a line - say "not built" when it isn't - then
+  continue.
+- **Latency matters, and prices must stay live** (their words when fixing the
+  review): no added waiting on the normal path; update in place, follow other
+  tabs at once.
+- **They lose money on bad data:** prefer the conservative number and say so
+  on the page (lower of two lists; "first N"; "≈" for estimates; "check their
+  list before buying").
+- **$1 is for NPC only:** anything sold to a person needs a real margin.
+- **Desktop only.** No phone layouts.
 - **On torn.com: read only.** "remember read only do not touch this is torn."
-  Only read or screenshot pages the owner opened in the Claude tab group; never
-  click, type or navigate there. Our own github.io page may be opened by us.
-- **The overlay and Torn Bids are separate** (see above).
-- The owner asks things mid-task; answer them in a line and keep going.
-- They lose money on bad data: prefer the conservative number (the lower of
-  two trader prices) and say so on the page.
-- No paid services (no Chrome Web Store fee).
+  Only read or screenshot pages the owner opened in the Claude tab group;
+  never click, type or navigate there. Our own github.io page and the local
+  harness may be used freely.
+- **The overlay and Torn Bids are separate products.**
+- No paid services. They like full deliverables lists with what needs their
+  decision at the end.
+
+## Working notes for the agent (learned the hard way)
+
+- **Release procedure:** bump `package.json` version → `npm run check` (builds
+  `torn-moneymaker.user.js` and `dist/`, runs tests) → `git add HANDOFF.md
+  README.md package.json torn-moneymaker.user.js src test` (never `mockups/`,
+  `.claude/`) → commit → `git push origin claude/optimistic-ride-1gqguu` →
+  check `curl -s https://raw.githubusercontent.com/abrahamdelosreyes17-oss/torn-moneymaker-releases/<sha>/torn-moneymaker.user.js | grep -m1 @version`
+  → a second commit putting the link at the top of this file.
+- **Finding code:** `nexus_locate` first for "where is X" (the owner asked if
+  it was being used); Grep for exact names; LSP for definitions.
+- **Line endings:** the working tree is CRLF (`core.autocrlf=true`). Scripted
+  multi-line replacements must match `\r\n`.
+- **Shell heredocs eat one level of backslashes** (`\\s` arrives as `\s`, then
+  a JS template turns it into `s`): edit anything with a regex or `\'` with
+  the Edit tool, or write the script to a file with the Write tool first.
+- **The browser pane:** it is often hidden, and the script (correctly) sends
+  nothing from a hidden tab - take a screenshot to bring it forward, then
+  check `document.visibilityState`. Screenshots sometimes time out or render
+  half; retry, or read the page with JS. The harness server is `harness` in
+  `.claude/launch.json` (python http.server on 127.0.0.1:8765).
+- **The harness** (`test/harness-live.html`) resets its GM storage on every
+  load; IndexedDB persists across loads. Parameters are listed under "Build
+  and test".
+- **Reloading the harness:** navigating to the same address with only a
+  different `#hash` does NOT reload the page - the old build keeps running
+  and every test "fails" mysteriously. Use `location.reload()` or change the
+  query (`&r=1`). Check with `[...document.scripts].map(s => s.src)` (the
+  `?v=<time>` shows when the script was loaded).
+- **Line endings, again:** files committed from here come back LF, while Git
+  Bash's `grep -c $'\r$'` reports CRLF regardless. In scripts, detect with
+  `s.includes('\r\n')`, never assume.
+- **Prove each new test fails without its fix** (swap the old file in from
+  `git show HEAD:<file>` and run it) - the owner's rule, and it caught two
+  real mistakes this session.
 
 ## History
 
@@ -691,7 +706,8 @@ Still ideas, not built:
   an item's info in game (a page they're viewing, so allowed). That would give
   the add-page graph real sale history. Research the data format first, and
   ask before building.
-- **Findings from the 2026-09-25 code review, not fixed yet** (ask which to do):
+- **Findings from the 2026-09-25 code review - all fixed in 3.12.5** (with the
+  2026-09-27 three-pass review); kept here as the record:
   - the header total stops at the first row the cash can't fully buy
     (`ranker.js summarize`);
   - the green label on the page ignores Cash (`main.js cardLabel`);
@@ -748,7 +764,9 @@ PWPATH=$(npm root -g)/playwright node test/ux-check.mjs   # real-browser checks
   - `&sellkeys=1` saves both keys;
   - `&sellsame=1` makes both keys the same Limited key;
   - `&w3btrader=1` adds a TornW3B-only trader;
-  - `&manybuyers=1` adds Carol and Alice as Dynamite buyers (the Sell to picker);
+  - `&manybuyers=1` adds Carol and Alice as Dynamite buyers (three traders to plan with);
+  - `?page=trade` stands in for Torn's trade page (the panel's send list; save a
+    `tornTrading.v2.sellAccepted` value with GM_setValue, then fire a hashchange);
   - `&tedrop=1` makes Alice's full TornExchange list for the Hammer $100
     while the top three still say $115 (lists that disagree);
   - `&sellprefs=<json>` sets the page's preferences;
@@ -860,6 +878,13 @@ the item on the desk, 21px flip-card money, 22px for the flip plan's total,
   - `styles.js`.
 - **`src/main.js`** wires everything, including `bootSellingPage()` and
   `bootW3bHarvest()` (weav3r.dev).
+- **Added in 3.12.5-3.12.7:** `core/trade.js` (planTrade, keepAfter - one
+  trade with one trader), `core/accepted.js` (a trade the trader accepted:
+  frozen, step checks, ticks), `ui/mask.js` (masked key boxes),
+  `platform/tab-window.js` (per-tab request windows), `platform/idb.js`
+  (IndexedDB for the Ledger's rows); in main.js `tradeDesk` / `tradeWith` in
+  `renderSellingNow`, `showTradeChecklist`; in selling-page.js
+  `tradeCard`, `acceptedCard`, `tradeLine`; in panel.js `setTrades`.
 - **Added in 3.12:** `core/fill.js` (Fill's price), `sources/dom/fill.js`
   (Torn's price / quantity boxes), `ui/fill-form.js` (Fill settings),
   `core/ledger.js` (rows, FIFO, totals, muggings), `api/ledger.js` (the Full

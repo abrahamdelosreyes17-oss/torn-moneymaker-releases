@@ -287,9 +287,22 @@ you: every link is one you follow yourself, one page per click.
     item looks odd, many items looks legit"): the plan is the WHOLE trade with
     one trader - this item first, then every other item that trader buys which
     a bazaar sells for less, then what you hold where they are the best buyer
-    (and listing it would not pay more). **Sell to** lists every trader you
-    can flip this item to, ranked by what the whole trade with them makes;
-    pick another and the plan is worked out for them. One Cash for the whole
+    (and listing it would not pay more). **The trader is picked on the Traders
+    pay card** (3.12.7, the owner: "a button on the trader"): each trader row
+    says what the whole trade with them makes, with **Plan trade**; the plan
+    is with the one you pressed, else the best one who makes a flip on this
+    item. **X declined** passes them over for an hour (greyed at the bottom,
+    Undo); any trader can be planned, even one who makes no flip on this item
+    (it says why). Anything you do in the trade pins the desk to this item and
+    trader, its items are re-read every 2 minutes, and an item that drops out
+    stays listed with why (the friend: mid-trade the plan "suddenly
+    disappeared"). **X accepted** freezes the trade: items, numbers and prices
+    stop moving; each buy step is checked live (still listed / re-priced /
+    fewer left / gone) with a tick for bought, each item a tick for sent;
+    **Traded - done** or back to the live plan. The same list is in the
+    overlay's panel on **Torn's trade page** (what to send, how many, what
+    they should pay; a tick per item as you add it, shared with Torn Bids).
+    One Cash for the whole
     trade (this item first, then the most profit per $), Most per flip per
     item, their networth share for the whole trade. Every row has a tick and a
     number: untick or lower a flip for this trade (not remembered); untick or
@@ -323,6 +336,11 @@ you: every link is one you follow yourself, one page per click.
   with the Limited key; at most 10 a minute, each kept 12 hours). A trader who
   could not pay for even one is skipped for the next; the plan says when it
   was capped.
+- **Weapons, armour and cars are never flipped** (3.12.7, the owner: "no one is
+  buying 100 weapons/armor", "same with cars"): every copy is its own, and a
+  trader pays one price for one. Both type spellings Torn uses (Melee /
+  Primary / Secondary / Defensive and Weapon / Armor), and Car; temporary
+  weapons stack and still flip.
 - **Least profit per item** (Settings › Flips, 1% by default, 3.12.5): a flip
   buys only listings that make at least that share of their price on each
   item - $1 under a trader's bid is not worth a trade. NPC deals in the panel

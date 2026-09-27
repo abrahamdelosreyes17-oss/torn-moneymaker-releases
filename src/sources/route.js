@@ -34,6 +34,16 @@ export function detectPage(href) {
 }
 
 /**
+ * Torn's trade page (trade.php, any step) - where the panel lists what to
+ * send for the trades you accepted in Torn Bids. `page=trade` is the test
+ * harness's stand-in, as `page=bazaar` is for bazaars.
+ */
+export function isTradePage(href) {
+    const url = String(href || '').toLowerCase();
+    return url.includes('/trade.php') || /[?&]page=trade(?:[&#]|$)/.test(url);
+}
+
+/**
  * Deep link to an item's Item Market page.
  *
  * Used by the panel's navigate button. One click, one navigation - the script

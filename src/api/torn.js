@@ -168,6 +168,7 @@ export async function fetchItemsV2(client) {
             out[String(item.id)] = {
                 name: item.name,
                 type: item.type || null,
+                sub_type: item.sub_type || null,
                 // null = "Sell: N/A": no NPC shop buys it.
                 sell_price: npc.price,
                 npc_shop: npc.shop,

@@ -851,6 +851,41 @@ ${TOKENS_CSS}
 .ttv2-dot-other { background: var(--offer); }
 
 /* Seller of the bazaar you are on. */
+.ttv2-tradebox {
+    margin: 0 0 8px;
+    padding: 8px 10px;
+    border: 1px solid var(--profit);
+    border-radius: 6px;
+    background: rgba(153, 204, 0, 0.08);
+}
+
+.ttv2-tb + .ttv2-tb {
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px solid var(--line);
+}
+
+.ttv2-tb-head {
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+    font-size: 13px;
+}
+
+.ttv2-tb-row {
+    display: grid;
+    grid-template-columns: 16px minmax(0, 1fr) auto;
+    gap: 8px;
+    align-items: center;
+    padding: 4px 0;
+    cursor: pointer;
+}
+
+.ttv2-tb-row.ttv2-tb-done .ttv2-tb-name {
+    color: var(--muted);
+    text-decoration: line-through;
+}
+
 .ttv2-seller {
     display: none;
     padding: 8px 12px;
