@@ -6,9 +6,10 @@ Everything below "History" is the record of how we got here.
 
 ## Start here (state on 2026-09-27, end of session)
 
-- **Released: 3.12.7** (commit and link at the very top of this section once
-  pushed), branch `claude/optimistic-ride-1gqguu`. Earlier today: 3.12.5
-  (`aab7e53`), 3.12.6 (`fe49df0`).
+- **Released: 3.12.7** (`d69907c`), branch `claude/optimistic-ride-1gqguu`,
+  pushed. Last install link given to the owner:
+  `https://raw.githubusercontent.com/abrahamdelosreyes17-oss/torn-moneymaker-releases/d69907c1f9af4bb3cda564b10e6df147a0eafa07/torn-moneymaker.user.js`
+  Earlier today: 3.12.5 (`aab7e53`), 3.12.6 (`fe49df0`).
 - **`main` is still at 2.9.3.** The script's `@updateURL` points at `main`, so
   installs go through **pinned links** (`.../<commit>/torn-moneymaker.user.js`).
   Merging to `main` makes every install auto-update: only if the owner asks.
