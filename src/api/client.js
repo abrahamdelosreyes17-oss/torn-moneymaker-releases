@@ -328,7 +328,9 @@ export class TornApiClient {
     /** Start a shared pause after an answer that asking again cannot fix soon. */
     pauseFor(error) {
         const code = error instanceof TornApiError ? error.code : null;
-        const ms = code === TORN_ERROR_RATE_LIMIT ? this.rateLimitBackoffMs : TORN_PAUSE_MS[code];
+        // Torn's code 5, or an HTTP 429 (no code): every tab slows down, not just this one.
+        const rateLimited = code === TORN_ERROR_RATE_LIMIT || (error instanceof TornApiError && error.http === 429);
+        const ms = rateLimited ? this.rateLimitBackoffMs : TORN_PAUSE_MS[code];
         if (!ms || error.paused) return 0;
         const until = Date.now() + ms;
         if (until <= this.pause.until) return until;

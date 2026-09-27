@@ -855,7 +855,23 @@ export class Panel {
         if (v.here) {
             const h = v.here;
             box.appendChild(el('div', { class: 'ttv2-sub', text: 'Here: buy ' + h.qty.toLocaleString('en-US') + ' ' + h.name + ' at ' + formatMoney(h.price) + ' from ' + h.seller + ' (marked on the page).' }));
-            box.appendChild(el('div', { class: h.bought >= h.qty ? 'ttv2-tb-ok' : h.listed ? 'ttv2-sub' : 'ttv2-tb-warn', text: h.bought ? 'You took ' + h.bought.toLocaleString('en-US') + ' of ' + h.qty.toLocaleString('en-US') + (h.bought >= h.qty ? ' ✓' : '') : h.listed ? 'Not bought yet - or skip it: Next counts only what you took.' : 'Not on this page at that price any more.' }));
+            // Re-priced since the plan: still counted; said so, and whether it still pays.
+            if (h.nowPrice) {
+                box.appendChild(el('div', {
+                    class: 'ttv2-tb-warn',
+                    text: 'Now ' + formatMoney(h.nowPrice) + ' each (planned ' + formatMoney(h.price) + ')' + (h.bid && h.nowPrice >= h.bid ? ' - not under what ' + v.trader + ' pays (' + formatMoney(h.bid) + '): skip it.' : '.'),
+                }));
+            }
+            if (!v.ask) box.appendChild(el('div', { class: h.bought >= h.qty ? 'ttv2-tb-ok' : h.listed ? 'ttv2-sub' : 'ttv2-tb-warn', text: h.bought ? 'You took ' + h.bought.toLocaleString('en-US') + ' of ' + h.qty.toLocaleString('en-US') + (h.bought >= h.qty ? ' ✓' : '') : h.listed ? 'Not bought yet - or skip it: Next counts only what you took.' : 'Not on this page any more.' }));
+        }
+        // The listing was never seen here, so nothing could be counted: ask.
+        if (v.ask && v.here) {
+            box.appendChild(el('div', { class: 'ttv2-tb-warn', text: 'The listing was not seen on this page, so nothing was counted. Did you buy ' + v.here.qty.toLocaleString('en-US') + ' ' + v.here.name + '?' }));
+            box.appendChild(el('div', { class: 'ttv2-tb-ask' }, [
+                el('button', { type: 'button', class: 'ttv2-primary', text: 'Bought ' + v.here.qty.toLocaleString('en-US'), onclick: () => this.handlers.onBuyNext && this.handlers.onBuyNext(true) }),
+                el('button', { type: 'button', text: 'Did not buy', onclick: () => this.handlers.onBuyNext && this.handlers.onBuyNext(false) }),
+            ]));
+            return;
         }
         const label = v.here && !v.next ? 'Done - go to the trade' : v.here && v.last ? 'Done - go to the trade' : v.here ? 'Next bazaar' : 'Open the next bazaar' + (v.next ? ': ' + v.next.seller : '');
         box.appendChild(el('button', { type: 'button', class: 'ttv2-primary ttv2-buynext', text: label, onclick: () => this.handlers.onBuyNext && this.handlers.onBuyNext() }));
@@ -1273,6 +1289,7 @@ export class Panel {
                 const html = fresh.outerHTML;
                 const old = this.shownEls && this.shownEls.get(html);
                 const use = old && !kept.has(html) ? old : fresh;
+                use.ttv2Row = row;
                 if (!kept.has(html)) kept.set(html, use);
                 want.push(use);
             }
@@ -1599,10 +1616,13 @@ export class Panel {
                   ? 'Open this bazaar'
                   : 'Open on the Item Market',
             text: row.el ? 'Show' : 'Go',
-            onclick: () => this.handlers.onNavigate && this.handlers.onNavigate(row),
+            // The row as last drawn: a kept element is handed each new row
+            // (Torn may have replaced the card it points at since).
+            onclick: () => this.handlers.onNavigate && this.handlers.onNavigate(rowEl.ttv2Row || row),
         });
 
         const rowEl = el('div', { class: 'ttv2-row' }, [name, profit, details, go]);
+        rowEl.ttv2Row = row;
         rowEl.dataset.ttv2At = String(this.rowTime(row) || '');
         if (row.el) rowEl.classList.add('ttv2-onpage');
 

@@ -210,6 +210,12 @@ export class W3bClient {
 
         const url = this.buildUrl(path);
         await this.waitForSlot();
+        // Another tab may have been blocked while this one waited for a slot.
+        if (this.now() < this.blockedUntil()) {
+            throw new W3bError('TornW3B is rate limiting us; paused briefly.', {
+                blocked: true,
+            });
+        }
 
         let response;
         try {

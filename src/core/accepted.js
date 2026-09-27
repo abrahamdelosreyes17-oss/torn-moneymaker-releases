@@ -97,7 +97,11 @@ export function tickAccepted(trade, line, { step = null, bought = null, sent = n
             if ((i.line || 'flip:' + i.itemId) !== String(line)) return i;
             const next = { ...i };
             if (sent !== null) next.sent = Boolean(sent);
-            if (step !== null && bought !== null) next.steps = i.steps.map((st, k) => (k === step ? { ...st, bought: Boolean(bought) } : st));
+            // A tick is the last word: ticked = bought as planned (not skipped),
+            // unticked = not bought (what Next counted is undone too).
+            if (step !== null && bought !== null) {
+                next.steps = i.steps.map((st, k) => (k !== step ? st : bought ? { ...st, bought: true, skipped: false } : { ...st, bought: false, skipped: false, boughtQty: 0 }));
+            }
             return next;
         }),
     };
@@ -162,16 +166,21 @@ export function recordBuy(trade, line, index, boughtQty) {
 /**
  * The next cheapest listing still under the trader's price, when a step's
  * listing is gone or re-priced (the friend: "sometimes their prices change,
- * or they're not available any more"). Not the same seller; fresh only.
+ * or they're not available any more"). Fresh only. The same seller only when
+ * their listing is still there (re-priced or fewer left): gone is gone.
  *
  * @param {{sellerId, qty}} step
  * @param {Array|null} rows - the item's bazaar listings now
  * @param {number} bid - what the trader pays each
  * @param {function} enough - (profitEach, price) => boolean (the least profit rule)
+ * @param {string} [state] - the step's check: 'gone' | 'price' | 'short'
  */
-export function replacementFor(step, rows, bid, enough) {
+export function replacementFor(step, rows, bid, enough, state = 'gone') {
+    const same = (r) => String(r.sellerId) === String(step.sellerId);
     const ok = (rows || [])
-        .filter((r) => r && !r.stale && r.qty > 0 && String(r.sellerId) !== String(step.sellerId) && enough(bid - r.price, r.price))
+        .filter((r) => r && !r.stale && r.qty > 0 && (state !== 'gone' || !same(r)) && enough(bid - r.price, r.price))
+        // Same price at the same seller changes nothing: not a replacement.
+        .filter((r) => !(same(r) && r.price === step.price && r.qty >= step.qty))
         .sort((a, b) => a.price - b.price);
     if (!ok.length) return null;
     const r = ok[0];
@@ -201,7 +210,7 @@ export function acceptedTotals(trade) {
     for (const i of (trade && trade.items) || []) {
         pays += sendUnits(i) * i.bid;
         for (const st of i.steps || []) {
-            if (st.skipped) continue;
+            if (st.skipped && !st.bought) continue;
             cost += (st.boughtQty > 0 ? st.boughtQty : st.qty) * st.price;
         }
     }

@@ -321,7 +321,11 @@ you: every link is one you follow yourself, one page per click.
     where 3.12.8 put it, so it was never seen), on every category tab's list,
     and the trade page no longer waits for the item list to download. The card
     you are buying from shows only the blue trade label (the green trader tag
-    that covered it is hidden there).
+    that covered it is hidden there). **3.12.10:** a listing re-priced since
+    the plan is still counted (the box shows the new price, and "skip it" when
+    it no longer pays); a reload after buying still counts; when the listing
+    was never seen on the page, Next asks **Bought N** / **Did not buy**
+    instead of guessing; ticking Bought in Torn Bids after a skip counts it.
     One Cash for the whole
     trade (this item first, then the most profit per $), Most per flip per
     item, their networth share for the whole trade. Every row has a tick and a

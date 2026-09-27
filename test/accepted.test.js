@@ -99,3 +99,27 @@ test('a gone or re-priced listing: the next cheapest still under their price, or
     t = dropLine(t, 'flip:206');
     assert.deepEqual(t.items.map((i) => i.line), ['flip:335', 'yours:1']);
 });
+
+test('a tick is the last word: ticked after a skip counts as bought, unticked undoes a count (bug hunt, 3.12.10)', () => {
+    let t = acceptTrade(CHOSEN, '335');
+    t = recordBuy(t, 'flip:335', 0, 0);
+    assert.equal(t.items[0].steps[0].skipped, true);
+    t = tickAccepted(t, 'flip:335', { step: 0, bought: true });
+    assert.equal(t.items[0].steps[0].skipped, false);
+    assert.equal(sendUnits(t.items[0]), 53, 'sends what was planned');
+    const tot = acceptedTotals(t);
+    assert.ok(tot.cost >= 53 * 17500, 'and its cost is counted');
+    t = recordBuy(t, 'flip:335', 0, 20);
+    t = tickAccepted(t, 'flip:335', { step: 0, bought: false });
+    assert.equal(t.items[0].steps[0].boughtQty, 0);
+    assert.equal(nextStep(t).line, 'flip:335', 'the step is to buy again');
+});
+
+test('a re-priced or short seller can be its own replacement; a gone one never (bug hunt, 3.12.10)', () => {
+    const enough = (each) => each > 0;
+    const step = { sellerId: 'S', qty: 5, price: 100 };
+    assert.deepEqual(replacementFor(step, [{ sellerId: 'S', price: 101, qty: 5 }], 200, enough, 'price'), { sellerId: 'S', sellerName: null, price: 101, qty: 5 });
+    assert.equal(replacementFor(step, [{ sellerId: 'S', price: 101, qty: 5 }], 200, enough, 'gone'), null);
+    assert.equal(replacementFor(step, [{ sellerId: 'S', price: 100, qty: 5 }], 200, enough, 'price'), null, 'the same listing is not a replacement');
+    assert.deepEqual(replacementFor(step, [{ sellerId: 'S', price: 101, qty: 5 }, { sellerId: 'T', price: 150, qty: 5 }], 200, enough, 'price').sellerId, 'S', 'the cheapest');
+});

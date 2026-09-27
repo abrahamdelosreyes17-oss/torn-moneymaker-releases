@@ -17,7 +17,7 @@ Everything below "History" is the record of how we got here.
   installs go through **pinned links** (`.../<commit>/torn-moneymaker.user.js`).
   Merging to `main` makes every install auto-update: only if the owner asks.
 - Nothing uncommitted except `mockups/` and `.claude/` (untracked on purpose).
-- 234 unit tests (`npm test`); `test/ux-check.mjs` (Playwright) has never run
+- 237 unit tests (`npm test`); `test/ux-check.mjs` (Playwright) has never run
   here - Playwright is not installed.
 - Who uses it: the owner and a friend who plays Torn (the friend's requests
   come through the owner, often in Tagalog - translate, then restate). **Desktop
@@ -37,7 +37,7 @@ offer to read Torn's scripting-rules page with them (read only).
 
 ### The agenda for the next session (let the owner choose the order)
 
-1. **The owner tries 3.12.9 on real data** while you read along (read only, in
+1. **The owner tries 3.12.10 on real data** while you read along (read only, in
    the Claude Chrome tab group - see "How the owner works"; they open pages,
    you never click or type on torn.com). Above all the trade flow on real pages:
    - Start buying / Next bazaar: does a real bazaar card's stock drop after a
@@ -169,6 +169,31 @@ offer to read Torn's scripting-rules page with them (read only).
   `.ttv2-buyhere`. Found on the way: **the owner had the script switched off**
   in Tampermonkey when they saw no Fill / no Next bazaar - check that first.
   `mockups/O-where-next-and-fill.html` shows where each thing is.
+
+- **3.12.10** (bug hunt of this session's work, two Fable reviewers, each
+  finding checked, then fixed). Buying run: a listing re-priced since the plan
+  is still matched and counted (the box says "Now $X each (planned $Y)", and
+  "skip it" when it is not under their price) - before, it counted 0 and the
+  step became skipped; the starting stock is kept in sessionStorage
+  (`ttv2-buyrun`), so a reload after buying still counts; when the listing was
+  never seen on the page (no item list, or gone before you came) Next asks
+  "Did you buy N?" (**Bought N** / **Did not buy**) instead of recording 0;
+  `trackTradeBuying(null)` = not scanned (never read as "gone"), and an empty
+  scan before the cards are drawn is not "gone" either; Next re-checks the step
+  is still that seller's (Torn Bids may have replaced it). Ticks: ticking
+  Bought clears "skipped", unticking undoes Next's count. `replacementFor`
+  offers the same seller when only re-priced/short. Accepting a second trade
+  with a trader already under way shows that trade instead of overwriting it.
+  Trade page: `[#&]ID=` (not `userID=`), partner kept in sessionStorage per
+  trade, Fill tags updated in place (a rebuilt tag swallowed presses). Other:
+  the Bazaars/Item Market tab switch merges into stored settings; a kept deal
+  row's Show uses the latest row; an HTTP 429 from Torn pauses every tab;
+  TornW3B re-checks its block after waiting for a slot; the Ledger keeps the
+  newer of the GM / IndexedDB copies; traders stored without `seenAt` are
+  dated from now; Fill's memory is cleared when you leave a Fill page.
+  Not changed (low): orphan per-tab window keys (a tab that closes before its
+  registry write), Fill's "n-th row of this item" key shifting when an earlier
+  duplicate listing goes, and a note when the 24 h limit ends a trade.
 
 ## The product today - two separate things
 

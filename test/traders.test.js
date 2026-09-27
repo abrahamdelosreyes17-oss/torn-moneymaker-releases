@@ -535,3 +535,13 @@ test('a trader no source has named for 30 days, with no list in that time, is fo
     // Naming a trader again renews seenAt at most once a day (so it is saved, not rewritten every read).
     assert.equal(addTraders(db, [{ id: '2', name: 'Named', source: 'te' }], later + 1000), false);
 });
+
+test('a trader kept before 3.12.5 (no seenAt) is dated from now, not forgotten at the first save (bug hunt, 3.12.10)', () => {
+    const now = Date.UTC(2026, 8, 27);
+    const db = { version: 1, traders: { 77: { name: 'Old', from: 'w3b', w3b: { checkedAt: now - 60 * 86400000, found: false } } } };
+    pruneDb(db, now);
+    assert.ok(db.traders[77], 'kept');
+    assert.equal(db.traders[77].seenAt, now);
+    pruneDb(db, now + TRADER_FORGET_MS + 1);
+    assert.equal(db.traders[77], undefined, 'forgotten in turn, 30 days later');
+});

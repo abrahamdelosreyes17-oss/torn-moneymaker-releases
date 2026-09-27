@@ -180,6 +180,8 @@ export function markW3bDue(db, traderId) {
  */
 export function pruneTraderDb(db, now = Date.now()) {
     for (const [id, t] of Object.entries(db.traders)) {
+        // Kept before 3.12.5 without a date: counted from now, not forgotten at once.
+        if (!t.seenAt) t.seenAt = now;
         const listAt = (t.w3b && (t.w3b.at || t.w3b.checkedAt)) || 0;
         const lastFound = t.w3b && t.w3b.found ? listAt : 0;
         if (now - (t.seenAt || 0) > TRADER_FORGET_MS && now - lastFound > TRADER_FORGET_MS) {

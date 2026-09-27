@@ -939,6 +939,15 @@ ${TOKENS_CSS}
     width: 100%;
 }
 
+/* "Did you buy it?": two answers, side by side. */
+.ttv2-tb-ask {
+    display: flex;
+    gap: 6px;
+    margin-top: 8px;
+}
+
+.ttv2-tb-ask button { flex: 1; }
+
 .ttv2-tb-ok {
     color: var(--profit);
     font-size: 12px;
