@@ -6,7 +6,9 @@ Everything below "History" is the record of how we got here.
 
 ## Start here (state on 2026-09-27, end of session)
 
-- **Released: 3.12.8** (link below, after this release is pushed); before it **3.12.7** (`d69907c`), branch `claude/optimistic-ride-1gqguu`,
+- **Released: 3.12.8** (`8991095`), pushed. Last install link given to the owner:
+  `https://raw.githubusercontent.com/abrahamdelosreyes17-oss/torn-moneymaker-releases/8991095b6170a17a6318c9b9de87bb51310d8393/torn-moneymaker.user.js`
+- Before it **3.12.7** (`d69907c`), branch `claude/optimistic-ride-1gqguu`,
   pushed. Last install link given to the owner:
   `https://raw.githubusercontent.com/abrahamdelosreyes17-oss/torn-moneymaker-releases/d69907c1f9af4bb3cda564b10e6df147a0eafa07/torn-moneymaker.user.js`
   Earlier today: 3.12.5 (`aab7e53`), 3.12.6 (`fe49df0`).
