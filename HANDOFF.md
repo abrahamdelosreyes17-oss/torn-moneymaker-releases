@@ -4,11 +4,17 @@ Read this first, then `README.md`. The README holds the product and the binding
 rules; this file holds where we are, how the owner works, and what is settled.
 Everything below "History" is the record of how we got here.
 
-## Where things stand (3.12.3, 2026-09-27)
+## Where things stand (3.12.4, 2026-09-27)
 
-- **Version 3.12.3** (`4c85d44`), branch `claude/optimistic-ride-1gqguu`, pushed.
-  Last install link given to the owner (3.12.3):
-  `https://raw.githubusercontent.com/abrahamdelosreyes17-oss/torn-moneymaker-releases/4c85d44ae8f557e1f098e85ee5c81243ea2ed7f8/torn-moneymaker.user.js`
+- **Version 3.12.4** (`e1eb9d8`), branch `claude/optimistic-ride-1gqguu`, pushed.
+  Last install link given to the owner (3.12.4):
+  `https://raw.githubusercontent.com/abrahamdelosreyes17-oss/torn-moneymaker-releases/e1eb9d81dcbae98c70b2902a294227f5745d644c/torn-moneymaker.user.js`
+  3.12.4 added the friend's **"NPC deals: save API calls"** switch (overlay
+  Settings › Watching: no live feed, no sellers' / owners' status checks; 0
+  API calls; Fill and Torn Bids unaffected) and a "Torn API calls in the last
+  minute" line. The friend had asked to split features into separate scripts
+  to save calls; we explained that would lose the shared 70/min budget and
+  save nothing, and built the switch instead.
 - **`main` is still at 2.9.3.** The script's `@updateURL` points at `main`, so
   installs are done from **pinned links** (`.../<commit>/torn-moneymaker.user.js`).
   Merging to `main` would make every install auto-update: only when the owner asks.
