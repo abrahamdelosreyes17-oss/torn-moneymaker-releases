@@ -63,12 +63,20 @@ export function buildItemIndex(rawItems) {
     return { byId, byName, size: byId.size };
 }
 
+/**
+ * An item list without NPC prices (Torn's v1 fallback, see api/torn.js) is
+ * asked for again after this, so real NPC prices return within minutes.
+ */
+export const ITEMS_PARTIAL_TTL_MS = 5 * 60 * 1000;
+
 /** Wrap a raw payload with the metadata the cache policy needs. */
 export function makeItemsCacheEntry(rawItems, now = Date.now()) {
+    const partial = Object.values(rawItems || {}).some((i) => i && i.npc_unknown);
     return {
         version: ITEMS_CACHE_VERSION,
         fetchedAt: now,
         items: rawItems,
+        ...(partial ? { partial: true } : {}),
     };
 }
 
@@ -79,7 +87,7 @@ export function isItemsCacheFresh(entry, now = Date.now(), ttl = ITEMS_TTL_MS) {
     if (!entry.items || typeof entry.items !== 'object') return false;
     if (!Number.isFinite(entry.fetchedAt)) return false;
 
-    return now - entry.fetchedAt < ttl;
+    return now - entry.fetchedAt < (entry.partial ? Math.min(ttl, ITEMS_PARTIAL_TTL_MS) : ttl);
 }
 
 /**

@@ -57,7 +57,19 @@ export async function fetchItems(client) {
         throw new Error('Torn API returned no item database.');
     }
 
-    return data.items;
+    /*
+     * v1 has no shop list, so its `sell_price` cannot be checked against a
+     * shop in Torn - and it is exactly the field that says a Companion
+     * Script sells for $12m. No NPC price from v1 at all: an item with no
+     * NPC price is never shown as an NPC deal, which is the safe way to be
+     * wrong. `npc_unknown` makes the cache short-lived (items.js), so the
+     * real prices return with v2.
+     */
+    const out = {};
+    for (const [id, item] of Object.entries(data.items)) {
+        out[id] = { ...item, sell_price: null, npc_shop: null, npc_unknown: true };
+    }
+    return out;
 }
 
 /**
@@ -89,18 +101,24 @@ export async function fetchItems(client) {
 export function npcSaleFromValue(value) {
     const v = value || {};
     const none = { price: null, shop: null };
+
+    /*
+     * Torn removes `sell_price`, `buy_price` and `vendor` from value on
+     * 2027-01-01, leaving `shops`. Without the field, a shop in Torn that
+     * pays a positive price is the NPC price on its own - which gives the
+     * same answer as both rules together for every item captured above.
+     */
+    if (!Object.prototype.hasOwnProperty.call(v, 'sell_price') && Array.isArray(v.shops)) {
+        const torn = tornShops(v.shops, 'sell_price');
+        return torn.length ? torn.reduce((a, b) => (b.price > a.price ? b : a)) : none;
+    }
+
     const listed = Number(v.sell_price);
 
     if (!Number.isFinite(listed) || listed <= 0) return none;
 
     if (Array.isArray(v.shops)) {
-        const torn = [];
-        for (const s of v.shops) {
-            const price = Number(s && s.sell_price);
-            if (s && s.country === 'Torn' && Number.isFinite(price) && price > 0) {
-                torn.push({ price, shop: s.shop || null });
-            }
-        }
+        const torn = tornShops(v.shops, 'sell_price');
         if (!torn.length) return none;
         return torn.find((t) => t.price === listed) || torn.reduce((a, b) => (b.price > a.price ? b : a));
     }
@@ -110,6 +128,24 @@ export function npcSaleFromValue(value) {
     }
 
     return none;
+}
+
+/** Shops in Torn (not abroad) with a positive `field` price: [{price, shop}]. */
+function tornShops(shops, field) {
+    const out = [];
+    for (const s of shops || []) {
+        const price = Number(s && s[field]);
+        if (s && s.country === 'Torn' && Number.isFinite(price) && price > 0) out.push({ price, shop: s.shop || null });
+    }
+    return out;
+}
+
+/** What a shop in Torn sells an item for, from `buy_price` or (after 2027-01-01) `shops`. */
+export function shopBuyPriceFromValue(value) {
+    const v = value || {};
+    if (Object.prototype.hasOwnProperty.call(v, 'buy_price')) return v.buy_price ?? null;
+    const torn = tornShops(v.shops, 'buy_price');
+    return torn.length ? Math.min(...torn.map((t) => t.price)) : null;
 }
 
 /** v2 item list -> v1-shaped map. Follows `_metadata.links.next` if paged. */
@@ -135,7 +171,7 @@ export async function fetchItemsV2(client) {
                 // null = "Sell: N/A": no NPC shop buys it.
                 sell_price: npc.price,
                 npc_shop: npc.shop,
-                buy_price: value.buy_price ?? null,
+                buy_price: shopBuyPriceFromValue(value),
                 market_value: value.market_price ?? 0,
                 circulation: item.circulation ?? 0,
             };
@@ -144,7 +180,8 @@ export async function fetchItemsV2(client) {
         const next = data._metadata && data._metadata.links && data._metadata.links.next;
         if (!next) break;
 
-        const nextUrl = new URL(next);
+        // Absolute or relative, it is a page of the same list on api.torn.com.
+        const nextUrl = new URL(next, 'https://api.torn.com/v2/torn/items');
         params = Object.fromEntries(nextUrl.searchParams);
         delete params.key;
     }
@@ -228,6 +265,9 @@ export async function fetchKeyAccess(client) {
  *   averagePrice: number|null, cacheTimestamp: number|null, nextAt: number,
  *   total: number}>} cacheTimestamp and nextAt in ms
  */
+/** An item's Item Market listings are asked again no sooner than this (Torn caches 30 s). */
+export const ITEM_MARKET_MIN_RECHECK_MS = 10000;
+
 export async function fetchItemMarket(
     client,
     itemId,
@@ -261,7 +301,10 @@ export async function fetchItemMarket(
             .filter((l) => l.price > 0 && l.amount > 0),
         averagePrice: Number.isFinite(average) && average > 0 ? average : null,
         cacheTimestamp,
-        nextAt: (cacheTimestamp || now) + delayMs,
+        // Torn's snapshot renews delayMs after its timestamp. A timestamp that
+        // is already old made the item due again on every 3 s tick (the whole
+        // feed budget on a few items): never sooner than ITEM_MARKET_MIN_RECHECK_MS.
+        nextAt: Math.max((cacheTimestamp || now) + delayMs, now + ITEM_MARKET_MIN_RECHECK_MS),
         total: Number(data && data._metadata && data._metadata.total) || raw.length,
     };
 }

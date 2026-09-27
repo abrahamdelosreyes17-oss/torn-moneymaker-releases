@@ -4,7 +4,108 @@ Read this first, then `README.md`. The README holds the product and the binding
 rules; this file holds where we are, how the owner works, and what is settled.
 Everything below "History" is the record of how we got here.
 
-## Where things stand (3.12.4, 2026-09-27)
+## Where things stand (3.12.5 built, 2026-09-27)
+
+**3.12.5 is built and tested but not committed** (the owner commits / asks for
+the pinned link). It has:
+- TornExchange's top three vs an item's full list disagreeing for one trader:
+  the lower counts, amber "Lists differ: TE top 3 … · TE full list …" (the
+  friend's ID Badge loss: $140k shown, $105k paid). `core/traders.js`.
+- TornW3B limits: the feed's `bazaarDue` compares against the summary price
+  stored with the snapshot (a $1 Dollar Sale made it re-read every 3 s tick:
+  126 calls/min wanted for 6 such items, now 12); every tab shares one TornW3B
+  window of 80/min and one 429 wait (`api/w3b.js`, storage key `w3bWindow`).
+- The two watching switches are independent (`watching()` in
+  `feed/controller.js`); "save API calls" turns off only the Torn API parts,
+  bazaars stay watched (the owner's report).
+- `$1 is for NPC only` (the owner): My bazaar / Market deals and Torn Bids
+  flips need at least 1% of the price per item (`enoughProfit` in
+  `core/profit.js`; overlay setting `resaleMinPct`, Torn Bids `minProfitPct`).
+- Ready for Torn removing `value.sell_price` / `buy_price` / `vendor` on
+  2027-01-01: `npcSaleFromValue` uses Torn shops alone when the field is gone.
+- The overlay's **Sell** button is **Bids**.
+- Tests: 212, each new one shown failing without its fix. Checked in the
+  harness: overlay Settings, save switch (0 Torn calls, TornW3B still read),
+  Torn Bids' new field, the amber TE line (`&tedrop=1`).
+
+**Then every finding of a three-pass review (security / bugs / usability,
+run by a Fable agent, report in the session scratchpad) was fixed, also in
+3.12.5, uncommitted. The owner's brief: "fix everything; latency is
+important, and prices must stay live":**
+- S1/U7/S4 key boxes: `ui/mask.js` - CSS-masked text boxes everywhere (the
+  Ledger's Full key was a password box: browsers offered to save it);
+  password box only where CSS cannot mask; a revealed key leaves the box
+  after a minute or on Save.
+- S2: Torn's v1 item-list fallback gives NO NPC prices (it cannot show a shop
+  in Torn buys it; it priced Companion Scripts at $12m) and is cached 5 min,
+  not 1 h (`items.js` `partial`); v2's relative `next` link no longer throws.
+- S3/B3: `TornApiClient` - a shared pause after Torn error 5/8/9 (30 s /
+  10 min / 2 min, key `tornPause`), code 9 no longer retried at 1-2-4 s; no
+  request leaves a hidden tab (Torn and TornW3B clients), even one queued
+  while visible.
+- B2: the shared request windows are per tab (`platform/tab-window.js`, keys
+  `apiWindow.<tab>` / `w3bWindow.<tab>` + a `.tabs` registry that heals
+  itself) - tabs no longer erase each other's slots. The old single-array
+  keys are deleted at boot.
+- S5/B1: other tabs follow a dead / new key and every overlay setting at once
+  (`gmOnChange`); settings are written as a merge of only what changed.
+  Panel position, collapse and the chosen list stay per tab.
+- B4: an Item Market item is re-asked no sooner than 10 s (a stale Torn
+  timestamp made it due every tick).
+- B5: own-page prices are recorded only for items already tracked.
+- B6: the Ledger's rows live in Torn Bids' IndexedDB (`platform/idb.js`;
+  moved once from GM storage; GM fallback) so Torn pages stop loading them;
+  keyless TE answers, Fill's own-listing cache (no longer rewritten every
+  2.5 s) and traders unnamed for 30 days with no list are pruned.
+- B7: Fill's undo is keyed by item + which of its rows, not the element -
+  survives Torn redrawing the row (checked in the harness).
+- B8 Ledger "At least" reads 1.5k; B9 the card label uses what Cash can
+  make; B10 `userID` in any case; B11 the content-shaped card search starts
+  from "$" text (18,000-element page: 34 ms -> 8.8 ms, same cards);
+  B12 Where to sell counts a listing only for the units listed near its
+  price ("first 900, rest to trader": 150,000 Hammers no longer "+$1.8m").
+- Found while fixing: 3.12.5's own `$1 only for NPC` made `bestVenue` return
+  null for a resale-only miss, and the page path read `profit.totalProfit`
+  unguarded - such rows are now skipped.
+- U1 Fill's notes shown in the panel once filled, "$100 !" on the row when
+  it needs you; U2 BP gets every row's price from one summary call when none
+  is stored (was "…" ~30 s or for ever), and says "off" / "none"; U3 the
+  overlay list updates in place (focus kept, checked 8 s); U4 rejected
+  inputs say why, Esc with unsaved Torn Bids settings warns first; U5 the TE
+  banner says the key goes to tornexchange.com; U6 tabs are real tabs
+  (arrow keys), trust/status read out, Ledger rows take Space.
+- Not verified outside the harness: IndexedDB from inside Tampermonkey's
+  sandbox on the real github.io page (falls back to GM storage if refused).
+- 221 tests.
+
+**Idea from the owner, discussed, not built (mockups first):** trading
+partners - a Ledger "Traders" tab (who, how often, totals, profit), your own
+history on Torn Bids' trader rows ("Traded 7x"; repeat customers first), and
+"did they pay their list?" per trade (the ID Badge loss, per trader).
+
+**Agreed next (the owner said "go build"; mockups first where the look changes):**
+1. **One trade per trader** (the friend: a one-item trade looks odd, many items
+   looks legit): when a flip sells to X, add every other item X buys that a
+   bazaar sells under X's price, plus held items where X is the best trader;
+   ONE Cash for the trade, the picked item first. Mockup
+   `mockups/N-one-trade.html` (N1 card under the flip plan / N2 best-trades
+   strip / N3 flip plan is the trade) - the owner has not picked yet. Add to
+   the mockup: a tick box + quantity per row, and a remembered **keep list**
+   for held items ("Keep 5 Xanax"), editable in Torn Bids Settings.
+2. **Overlay on Torn's trade page** (read only): the plan checklist for the
+   trader you are trading with, a money check ("offers $10.5m, his list says
+   $14m: $3.5m short"), his price beside each item; optional Fill-style
+   quantity tick. Needs the trade page's markup read first (owner opens it).
+3. **Weapons / armour flips** (traders buy them one at a time, flat price per
+   item id): plain copies (uid via TornW3B listings + `torn/{uids}/itemdetails`)
+   to Big Al's or a trader, capped per trader; RW gear under its Bunker Bucks
+   floor (ask if they have the Bunker); RW armour vs flat trader bids; later
+   auction comps. Research notes in memory `trader-sources`.
+4. Worth checking: TornW3B `/api/marketplace/{id}/traders` (every W3B buyer of
+   an item in one call) and TornExchange `prices/{id}` (a TE-only trader's
+   whole list) - both would cut calls and fill gaps.
+
+## Before 3.12.5 (3.12.4, 2026-09-27)
 
 - **Version 3.12.4** (`e1eb9d8`), branch `claude/optimistic-ride-1gqguu`, pushed.
   Last install link given to the owner (3.12.4):
@@ -21,7 +122,7 @@ Everything below "History" is the record of how we got here.
 - Who uses it: the owner and a friend who plays Torn. **Desktop only.**
 - It stays a **Tampermonkey userscript**: the owner looked at a Chrome
   extension and said no (no Web Store fee; "maybe tampermonkey is fine").
-- 202 unit tests (`npm test`); `test/ux-check.mjs` (Playwright) has never run
+- 221 unit tests (`npm test`); `test/ux-check.mjs` (Playwright) has never run
   here - Playwright is not installed; its expectations are updated for 3.12.
 
 ### The product today - two separate things
@@ -618,7 +719,7 @@ Still ideas, not built:
 
 ```bash
 npm run build      # src/ -> dist/ and torn-moneymaker.user.js (the release file)
-npm test           # unit tests (202)
+npm test           # unit tests (221)
 npm run check      # build + syntax check + unit tests
 PWPATH=$(npm root -g)/playwright node test/ux-check.mjs   # real-browser checks
 ```
@@ -632,6 +733,8 @@ PWPATH=$(npm root -g)/playwright node test/ux-check.mjs   # real-browser checks
   - `&sellkeys=1` saves both keys;
   - `&sellsame=1` makes both keys the same Limited key;
   - `&w3btrader=1` adds a TornW3B-only trader;
+  - `&tedrop=1` makes Alice's full TornExchange list for the Hammer $100
+    while the top three still say $115 (lists that disagree);
   - `&sellprefs=<json>` sets the page's preferences;
   - `&slow=1` answers status lookups slowly;
   - `&nofeed=1` turns the feed off;

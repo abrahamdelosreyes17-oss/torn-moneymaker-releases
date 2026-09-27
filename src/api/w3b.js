@@ -30,6 +30,13 @@ export const W3B_SITE_URL = 'https://weav3r.dev';
 /** TornW3B enforces 100/min per IP; leave 40 for TornTools and friends. */
 export const W3B_MAX_PER_MINUTE = 60;
 
+/**
+ * Every tab together (the feed's Torn tab, Torn Bids, Fill in other tabs):
+ * each client's own ceiling only limits itself, so two of them made 84/min
+ * against TornW3B's 100 per IP before TornTools asked for anything.
+ */
+export const W3B_SHARED_PER_MINUTE = 80;
+
 /** After a 429 or a challenge page, stop asking for this long. */
 export const W3B_COOLDOWN_MS = 60000;
 
@@ -52,18 +59,71 @@ export class W3bClient {
      * @param {function} [options.fetchImpl] - injectable for tests
      * @param {number} [options.maxPerMinute]
      * @param {function} [options.now]
+     * @param {function} [options.loadShared] - () => {recent: number[], cooldownUntil}
+     *   stored for every tab: one window across all of them, and a 429 seen
+     *   by one tab stops them all.
+     * @param {function} [options.saveShared] - (state) => void
+     * @param {function} [options.addShared] - (at) => void: record one slot of
+     *   THIS tab only (platform/tab-window.js), so tabs never overwrite each
+     *   other's; without it the whole window is written back through saveShared
+     * @param {number} [options.sharedPerMinute]
+     * @param {function} [options.sleep] - (ms) => Promise; injectable for tests
+     * @param {function} [options.isVisible] - () => boolean; nothing is sent
+     *   from a hidden tab, even a request queued while it was visible
      */
     constructor({
         fetchImpl = gmFetch,
         maxPerMinute = W3B_MAX_PER_MINUTE,
         now = () => Date.now(),
+        loadShared = null,
+        saveShared = null,
+        sharedPerMinute = W3B_SHARED_PER_MINUTE,
+        sleep = w3bSleep,
+        isVisible = () => true,
+        addShared = null,
     } = {}) {
+        this.addShared = addShared;
+        this.sleep = sleep;
+        this.isVisible = isVisible;
         this.fetchImpl = fetchImpl;
         this.maxPerMinute = maxPerMinute;
         this.now = now;
+        this.loadShared = loadShared;
+        this.saveShared = saveShared;
+        this.sharedPerMinute = sharedPerMinute;
         this.recent = [];
         this.chain = Promise.resolve();
         this.cooldownUntil = 0;
+    }
+
+    /** What every tab has used, and any wait one of them was told to make. */
+    readShared(t) {
+        const out = { recent: [], cooldownUntil: 0 };
+        if (!this.loadShared) return out;
+        let s;
+        try {
+            s = this.loadShared();
+        } catch {
+            return out;
+        }
+        if (!s || typeof s !== 'object') return out;
+        if (Array.isArray(s.recent)) out.recent = s.recent.filter((x) => Number.isFinite(x) && t - x < 60000).sort((a, b) => a - b);
+        if (Number.isFinite(Number(s.cooldownUntil))) out.cooldownUntil = Number(s.cooldownUntil);
+        return out;
+    }
+
+    writeShared(state) {
+        if (!this.saveShared) return;
+        try {
+            this.saveShared(state);
+        } catch {
+            // Sharing is best-effort; this tab still limits itself.
+        }
+    }
+
+    /** The later of this tab's wait and any other tab's. */
+    blockedUntil(t = this.now()) {
+        return Math.max(this.cooldownUntil, this.readShared(t).cooldownUntil);
     }
 
     stats() {
@@ -72,22 +132,50 @@ export class W3bClient {
         return {
             usedLastMinute: used,
             remaining: Math.max(0, this.maxPerMinute - used),
-            coolingDown: t < this.cooldownUntil,
+            coolingDown: t < this.blockedUntil(t),
+            sharedLastMinute: this.loadShared ? this.readShared(t).recent.length : used,
         };
     }
 
     async waitForSlot() {
         for (;;) {
+            // Hidden: take no slot and send nothing until the tab is back.
+            if (!this.isVisible()) {
+                await this.sleep(1000);
+                continue;
+            }
             const t = this.now();
             this.recent = this.recent.filter((x) => t - x < 60000);
+            const shared = this.readShared(t);
+            const sharedFull = this.loadShared && shared.recent.length >= this.sharedPerMinute;
 
-            if (this.recent.length < this.maxPerMinute) {
+            if (this.recent.length < this.maxPerMinute && !sharedFull) {
                 this.recent.push(t);
+                if (this.addShared) {
+                    try {
+                        this.addShared(t);
+                    } catch {
+                        // Best-effort; this tab still limits itself.
+                    }
+                } else if (this.loadShared) {
+                    this.writeShared({ ...shared, recent: [...shared.recent, t] });
+                }
                 return;
             }
 
-            await w3bSleep(Math.max(50, 60000 - (t - this.recent[0]) + 25));
+            // Wait until every full window has a slot again.
+            const frees = [];
+            if (this.recent.length >= this.maxPerMinute) frees.push(this.recent[this.recent.length - this.maxPerMinute]);
+            if (sharedFull) frees.push(shared.recent[shared.recent.length - this.sharedPerMinute]);
+            await this.sleep(Math.max(50, 60000 - (t - Math.max(...frees)) + 25));
         }
+    }
+
+    /** Stop asking - this tab and, through storage, every other. */
+    coolDown() {
+        const t = this.now();
+        this.cooldownUntil = t + W3B_COOLDOWN_MS;
+        if (this.loadShared) this.writeShared({ ...this.readShared(t), cooldownUntil: this.cooldownUntil });
     }
 
     /** Build and check a URL. Exposed for tests. */
@@ -114,7 +202,7 @@ export class W3bClient {
     }
 
     async execute(path) {
-        if (this.now() < this.cooldownUntil) {
+        if (this.now() < this.blockedUntil()) {
             throw new W3bError('TornW3B is rate limiting us; paused briefly.', {
                 blocked: true,
             });
@@ -133,7 +221,7 @@ export class W3bClient {
         }
 
         if (response.status === 429) {
-            this.cooldownUntil = this.now() + W3B_COOLDOWN_MS;
+            this.coolDown();
             throw new W3bError('TornW3B rate limit (429).', {
                 http: 429,
                 blocked: true,
@@ -150,7 +238,7 @@ export class W3bClient {
             return await response.json();
         } catch {
             // Cloudflare answers a challenge page with HTML, not JSON.
-            this.cooldownUntil = this.now() + W3B_COOLDOWN_MS;
+            this.coolDown();
             throw new W3bError('TornW3B returned a non-JSON page (blocked?).', {
                 blocked: true,
             });

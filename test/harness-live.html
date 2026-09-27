@@ -316,7 +316,8 @@ function respond(url) {
             const listings = id === '206'
                 ? [{ trader: 'Bob', price: 850000, item: 'Xanax' }, { trader: 'Carol', price: 845000, item: 'Xanax' }, { trader: 'Alice', price: 830000, item: 'Xanax' }]
                 : id === '1'
-                  ? [{ trader: 'Alice', price: 115, item: 'Hammer' }, { trader: 'Bob', price: 110, item: 'Hammer' }, { trader: 'Dave', price: 105, item: 'Hammer' }]
+                  // &tedrop=1: Alice has since dropped to $100; the top three still say $115.
+                  ? [{ trader: 'Alice', price: /[?&]tedrop=1/.test(location.search) ? 100 : 115, item: 'Hammer' }, { trader: 'Bob', price: 110, item: 'Hammer' }, { trader: 'Dave', price: 105, item: 'Hammer' }]
                   : [];
             return { status: 'success', data: { item: 'x', meta: { total_listings: listings.length, total_pages: 1, current_page: 1 }, listings } };
         }

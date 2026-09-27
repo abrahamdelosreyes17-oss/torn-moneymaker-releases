@@ -40,12 +40,28 @@ export const KEY_DEAD_CODES = new Set([
 /** Torn's rate block lasts "a small period"; 1-2-4s retries only burn it. */
 export const RATE_LIMIT_BACKOFF_MS = 30000;
 
+/**
+ * After these answers EVERY tab stops asking Torn for a while (shared through
+ * storage): asking through an IP block (8) only lengthens it, and a disabled
+ * API (9) or a rate block (5) will not clear in seconds either.
+ */
+export const TORN_PAUSE_MS = {
+    [TORN_ERROR_RATE_LIMIT]: RATE_LIMIT_BACKOFF_MS,
+    [TORN_ERROR_IP_BLOCK]: 10 * 60 * 1000,
+    [TORN_ERROR_UNAVAILABLE]: 2 * 60 * 1000,
+};
+
+/** A hidden tab waiting for a slot checks again this often. */
+const HIDDEN_POLL_MS = 1000;
+
 export class TornApiError extends Error {
-    constructor(message, { code = null, http = null } = {}) {
+    constructor(message, { code = null, http = null, paused = false } = {}) {
         super(message);
         this.name = 'TornApiError';
         this.code = code;
         this.http = http;
+        /** Refused by this client during a shared pause: nothing was sent. */
+        this.paused = paused;
     }
 }
 
@@ -79,6 +95,13 @@ export class TornApiClient {
      *   is per user across all keys; a per-tab window let two tabs make
      *   140/min against a 100/min ceiling.
      * @param {function(number[])} [options.saveWindow]
+     * @param {function(number)} [options.addToWindow] - record one slot of
+     *   THIS tab (platform/tab-window.js); preferred over saveWindow, which
+     *   writes the whole shared array back and can drop another tab's slot
+     * @param {function} [options.loadPause] - () => {until, code} shared by every tab
+     * @param {function} [options.savePause] - ({until, code}) => void
+     * @param {function} [options.isVisible] - () => boolean; a request never
+     *   leaves a hidden tab, even one that was queued while it was visible
      */
     constructor({
         getKey,
@@ -89,7 +112,16 @@ export class TornApiClient {
         loadWindow = null,
         saveWindow = null,
         rateLimitBackoffMs = RATE_LIMIT_BACKOFF_MS,
+        loadPause = null,
+        savePause = null,
+        isVisible = () => true,
+        addToWindow = null,
     } = {}) {
+        this.addToWindow = addToWindow;
+        this.loadPause = loadPause;
+        this.savePause = savePause;
+        this.isVisible = isVisible;
+        this.pause = { until: 0, code: null };
         this.getKey = getKey;
         this.fetchImpl = fetchImpl;
         this.maxPerMinute = maxPerMinute;
@@ -147,9 +179,21 @@ export class TornApiClient {
             this.syncWindow(now);
             this.recent = this.recent.filter((t) => now - t < 60000);
 
+            // Hidden: take no slot and send nothing until the tab is back.
+            if (!this.isVisible()) {
+                await apiSleep(HIDDEN_POLL_MS);
+                continue;
+            }
+
             if (this.recent.length < this.maxPerMinute) {
                 this.recent.push(now);
-                if (this.saveWindow) {
+                if (this.addToWindow) {
+                    try {
+                        this.addToWindow(now);
+                    } catch {
+                        // Best-effort, as below.
+                    }
+                } else if (this.saveWindow) {
                     try {
                         this.saveWindow(this.recent);
                     } catch {
@@ -221,14 +265,21 @@ export class TornApiClient {
 
         let attempt = 0;
         let lastError = null;
+        // A pause this call started itself (a rate block it is waiting out)
+        // does not stop its own retry; a longer one from elsewhere does.
+        let mine = 0;
 
         while (attempt <= this.maxRetries) {
+            this.throwIfPaused(mine);
             await this.waitForSlot();
+            // Another tab may have hit a block while this one waited.
+            this.throwIfPaused(mine);
 
             try {
                 return await this.requestOnce(path, params, key);
             } catch (error) {
                 lastError = error;
+                mine = Math.max(mine, this.pauseFor(error));
 
                 if (!this.isRetryable(error) || attempt === this.maxRetries) {
                     throw error;
@@ -252,7 +303,50 @@ export class TornApiClient {
         throw lastError;
     }
 
+    /** The shared pause, the later of this tab's and storage's. */
+    currentPause(now = Date.now()) {
+        let p = this.pause;
+        if (this.loadPause) {
+            try {
+                const s = this.loadPause();
+                if (s && Number(s.until) > p.until) p = { until: Number(s.until), code: s.code ?? null };
+            } catch {
+                // Sharing is best-effort.
+            }
+        }
+        return now < p.until ? p : null;
+    }
+
+    throwIfPaused(ignoreUntil = 0) {
+        const p = this.currentPause();
+        if (!p || p.until <= ignoreUntil) return;
+        const secs = Math.ceil((p.until - Date.now()) / 1000);
+        const why = p.code === TORN_ERROR_IP_BLOCK ? 'Torn has blocked this IP for a while' : p.code === TORN_ERROR_UNAVAILABLE ? 'the Torn API is down' : 'Torn asked us to slow down';
+        throw new TornApiError('Paused: ' + why + '. Trying again in ' + (secs >= 90 ? Math.ceil(secs / 60) + ' min' : secs + 's') + '.', { code: p.code, paused: true });
+    }
+
+    /** Start a shared pause after an answer that asking again cannot fix soon. */
+    pauseFor(error) {
+        const code = error instanceof TornApiError ? error.code : null;
+        const ms = code === TORN_ERROR_RATE_LIMIT ? this.rateLimitBackoffMs : TORN_PAUSE_MS[code];
+        if (!ms || error.paused) return 0;
+        const until = Date.now() + ms;
+        if (until <= this.pause.until) return until;
+        this.pause = { until, code };
+        if (this.savePause) {
+            try {
+                this.savePause(this.pause);
+            } catch {
+                // This tab still pauses.
+            }
+        }
+        return until;
+    }
+
     isRetryable(error) {
+        // A shared pause is waited out by the caller, not retried here.
+        if (error instanceof TornApiError && error.paused) return false;
+        if (error instanceof TornApiError && error.code === TORN_ERROR_UNAVAILABLE) return false;
         if (!(error instanceof TornApiError)) return true;
 
         if (error.code === TORN_ERROR_RATE_LIMIT) return true;

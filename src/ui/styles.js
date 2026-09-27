@@ -1374,6 +1374,12 @@ ${TOKENS_CSS}
     min-width: 0;
 }
 
+.ttv2-panel .ttv2-pct input[type="text"] {
+    flex: 0 0 auto;
+    width: 44px;
+    text-align: right;
+}
+
 .ttv2-masked {
     -webkit-text-security: disc;
 }
@@ -1385,6 +1391,7 @@ ${TOKENS_CSS}
 
 .ttv2-keystate.ttv2-ok { color: var(--profit); }
 .ttv2-keystate.ttv2-bad { color: var(--bad); }
+.ttv2-sub.ttv2-bad { color: var(--bad); }
 
 .ttv2-tos-box {
     border: 1px solid var(--line);

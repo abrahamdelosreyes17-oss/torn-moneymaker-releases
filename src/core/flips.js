@@ -10,7 +10,7 @@
  *     least LIST_EDGE more.
  */
 
-import { VENUE_FEES } from './profit.js';
+import { VENUE_FEES, enoughProfit, MIN_PROFIT_PCT } from './profit.js';
 import { formatMoney } from './parse.js';
 
 /** A listing TornW3B has not re-checked for this long may have sold: no flip is planned on it. */
@@ -111,14 +111,15 @@ export function bazaarSellers(rows, { selfId = null, now = Date.now(), freshMs =
  * @param {object} [opts]
  * @param {number|null} [opts.cash] - null or 0: no limit
  * @param {number} [opts.maxUnits] - the most items one flip buys
+ * @param {number} [opts.minPct] - each item must make at least this % of its price (a trader is not an NPC shop)
  * @returns {null|{units, cost, profit, each, firstPrice, needs, available, steps: Array<{sellerId, sellerName, qty, price}>}}
  *   `available`: every fresh item under the bid, bought or not.
  *   null when no fresh listing is under the bid. `units` 0 with `needs` set:
  *   the cheapest one costs more than your cash.
  */
-export function flipPlan(sellers, bid, { cash = null, maxUnits = FLIP_MAX_UNITS } = {}) {
+export function flipPlan(sellers, bid, { cash = null, maxUnits = FLIP_MAX_UNITS, minPct = MIN_PROFIT_PCT } = {}) {
     if (!(bid > 0)) return null;
-    const under = (sellers || []).filter((s) => !s.stale && s.price < bid);
+    const under = (sellers || []).filter((s) => !s.stale && enoughProfit(bid - s.price, s.price, 'TRADER', minPct));
     if (!under.length) return null;
 
     const limit = cash > 0 ? cash : Infinity;
@@ -158,17 +159,34 @@ export function flipPlan(sellers, bid, { cash = null, maxUnits = FLIP_MAX_UNITS 
  * @param {number|null} p.bid           - the best trader's price (after your Show choices)
  * @param {number|null} p.bazaarLowest  - the cheapest bazaar listing, not yours
  * @param {number|null} p.marketLowest  - the cheapest Item Market listing
- * @returns {{options: Array<{venue, each}>, best: string|null, gain: number}}
+ * @param {number|null} [p.bazaarDepth] - units other sellers list near the cheapest bazaar price
+ * @param {number|null} [p.marketDepth] - units listed near the cheapest Item Market price
+ * @returns {{options: Array<{venue, each, units, total}>, best: string|null, gain: number}}
  *   options in a fixed order (trader, bazaar, market), `each` null where not
- *   known; `best` the venue to use; `gain` what it makes over the trader for
- *   everything you hold (0 when the trader is best or there is none).
+ *   known; `units` how many that venue is counted for and `total` what you
+ *   get for everything you hold (a listing venue counted for only part sells
+ *   the rest to the trader); `best` the venue to use; `gain` what it makes
+ *   over the trader (0 when the trader is best or there is none).
+ *
+ * The cheapest ask is a price for a few, not for any number: 150,000 Hammers
+ * listed at today's cheapest $129 were "worth" $18.3m and beat the trader by
+ * $1.8m - but the market does not take 150,000 at that price. A listing
+ * venue is counted only for as many as are listed near that price now (its
+ * depth, when known) - the conservative number, said as "the first N".
  */
-export function whereToSell({ held, bid = null, bazaarLowest = null, marketLowest = null, edge = LIST_EDGE }) {
+export function whereToSell({ held, bid = null, bazaarLowest = null, marketLowest = null, bazaarDepth = null, marketDepth = null, edge = LIST_EDGE }) {
+    const n = held > 0 ? held : 0;
+    const trader = bid > 0 ? bid : null;
+    const listing = (venue, each, depth) => {
+        if (each === null) return { venue, each: null, units: 0, total: null };
+        const units = depth > 0 && depth < n ? Math.floor(depth) : n;
+        return { venue, each, units, total: each * units + (trader !== null ? trader * (n - units) : 0) };
+    };
     const options = [
-        { venue: 'trader', each: bid > 0 ? bid : null },
+        { venue: 'trader', each: trader, units: trader !== null ? n : 0, total: trader !== null ? trader * n : null },
         // $1 under the cheapest; never below $1.
-        { venue: 'bazaar', each: bazaarLowest > 1 ? bazaarLowest - 1 : null },
-        { venue: 'market', each: marketLowest > 1 ? Math.floor((marketLowest - 1) * (1 - VENUE_FEES.ITEM_MARKET)) : null },
+        listing('bazaar', bazaarLowest > 1 ? bazaarLowest - 1 : null, bazaarDepth),
+        listing('market', marketLowest > 1 ? Math.floor((marketLowest - 1) * (1 - VENUE_FEES.ITEM_MARKET)) : null, marketDepth),
     ];
     const known = options.filter((o) => o.each !== null);
     if (!known.length) return { options, best: null, gain: 0 };
@@ -177,11 +195,25 @@ export function whereToSell({ held, bid = null, bazaarLowest = null, marketLowes
     for (const o of options.slice(1)) {
         if (o.each === null) continue;
         // Against a trader, waiting has to pay enough to be worth it.
-        const floor = options[0].each !== null ? options[0].each * (1 + edge) : 0;
-        if (o.each >= floor && (!best || o.each > best.each)) best = o;
+        const floor = trader !== null ? trader * (1 + edge) : 0;
+        if (o.each < floor) continue;
+        if (!best || (trader !== null ? o.total > best.total : o.each > best.each)) best = o;
     }
-    const gain = best && options[0].each !== null && best.venue !== 'trader' ? (best.each - options[0].each) * (held || 0) : 0;
+    const gain = best && trader !== null && best.venue !== 'trader' ? best.total - trader * n : 0;
     return { options, best: best ? best.venue : null, gain };
+}
+
+/**
+ * How many units are listed near the cheapest price (within `pct`): what the
+ * market shows it takes at that price right now. Null when nothing is known.
+ *
+ * @param {Array<{price, qty}>} rows - listings, any order (stale ones already left out)
+ */
+export function depthNearCheapest(rows, pct = 0.01) {
+    const list = (rows || []).filter((r) => r && r.price > 0 && r.qty > 0);
+    if (!list.length) return null;
+    const cheapest = Math.min(...list.map((r) => r.price));
+    return list.filter((r) => r.price <= cheapest * (1 + pct)).reduce((a, r) => a + r.qty, 0);
 }
 
 /**
@@ -196,7 +228,7 @@ export function whereToSell({ held, bid = null, bazaarLowest = null, marketLowes
  * @param {number} [opts.limit]
  * @returns {Array<{itemId, lowest, bid, each, score}>} best first
  */
-export function flipCandidates(summary, bidOf, { cash = null, limit = FLIP_CANDIDATES, maxUnits = FLIP_MAX_UNITS } = {}) {
+export function flipCandidates(summary, bidOf, { cash = null, limit = FLIP_CANDIDATES, maxUnits = FLIP_MAX_UNITS, minPct = MIN_PROFIT_PCT } = {}) {
     const out = [];
     for (const [itemId, s] of summary || []) {
         const lowest = s && s.lowestPrice;
@@ -205,7 +237,7 @@ export function flipCandidates(summary, bidOf, { cash = null, limit = FLIP_CANDI
         const got = bidOf(itemId, lowest);
         const bid = got && typeof got === 'object' ? got.price : got;
         const cap = got && typeof got === 'object' && got.maxUnits > 0 ? got.maxUnits : Infinity;
-        if (!(bid > lowest)) continue;
+        if (!enoughProfit(bid - lowest, lowest, 'TRADER', minPct)) continue;
         const afford = Math.min(cash > 0 ? Math.floor(cash / lowest) : Infinity, maxUnits > 0 ? maxUnits : FLIP_MAX_UNITS, cap);
         if (afford <= 0) continue;
         const each = bid - lowest;

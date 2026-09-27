@@ -27,6 +27,7 @@ import { W3B_TERMS_URL, W3B_SITE_URL } from '../api/w3b.js';
 import { panelStyleElement } from './styles.js';
 import { renderPriceGraph } from './graph.js';
 import { buildFillForm } from './fill-form.js';
+import { keyInputAttrs, keyMask } from './mask.js';
 
 /** "last update 2m ago" turns the status amber after this. */
 export const PANEL_STALE_MS = 60000;
@@ -181,13 +182,13 @@ export class Panel {
         this.titleEl.appendChild(this.titleTextEl);
         this.titleEl.appendChild(this.miniEl);
 
-        // The selling page: its own tab, for the items you hold.
+        // Torn Bids: its own tab, for traders' bids and flips.
         this.sellBtn = el('button', {
             type: 'button',
             class: 'ttv2-sell',
-            title: 'Open the selling page in a new tab',
-            text: 'Sell',
-            onclick: guarded(this, 'Sell', () => this.handlers.onOpenSelling && this.handlers.onOpenSelling()),
+            title: 'Open Torn Bids in a new tab',
+            text: 'Bids',
+            onclick: guarded(this, 'Bids', () => this.handlers.onOpenSelling && this.handlers.onOpenSelling()),
         });
 
         // One button for "look again": re-reads this page and refreshes every
@@ -252,7 +253,10 @@ export class Panel {
         this.buildChips();
 
         this.tabBtns = {};
-        this.tabsEl = el('div', { class: 'ttv2-tabs' });
+        // Real tabs for a screen reader (aria-selected means nothing on a
+        // plain button), and the arrow keys move between them.
+        this.tabsEl = el('div', { class: 'ttv2-tabs', role: 'tablist', 'aria-label': 'Deals' });
+        const tabKeys = ['bazaar', 'itemmarket'];
         for (const [key, label] of [
             ['bazaar', 'Bazaars'],
             ['itemmarket', 'Item Market'],
@@ -260,8 +264,16 @@ export class Panel {
             const btn = el('button', {
                 type: 'button',
                 class: 'ttv2-tab',
+                role: 'tab',
                 text: label,
                 onclick: () => this.handlers.onViewChange && this.handlers.onViewChange(key),
+            });
+            btn.addEventListener('keydown', (event) => {
+                if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight') return;
+                event.preventDefault();
+                const next = tabKeys[(tabKeys.indexOf(key) + (event.key === 'ArrowRight' ? 1 : tabKeys.length - 1)) % tabKeys.length];
+                if (this.handlers.onViewChange) this.handlers.onViewChange(next);
+                this.tabBtns[next].focus();
             });
             btn.dataset.label = label;
             this.tabBtns[key] = btn;
@@ -565,40 +577,26 @@ export class Panel {
         /* ---- API key ---- */
 
         /*
-         * NOT type="password": Chrome would treat it as a login form, offer
-         * to save it, and autofill over it. Masking is CSS. And the saved key
-         * is not kept in the field - a value in an <input> is readable by any
-         * script with the panel's shadow root - Show fetches it, Hide removes it.
+         * NOT type="password" where CSS can mask (see ui/mask.js): Chrome
+         * would offer to save it and autofill over it. And the saved key is
+         * not kept in the field - a value in an <input> is readable by any
+         * script with the panel's shadow root - Show fetches it, Hide (or a
+         * minute) removes it.
          */
         this.keyInput = el('input', {
-            type: 'text',
-            class: 'ttv2-masked ttv2-key',
+            ...keyInputAttrs(),
+            class: 'ttv2-key',
             placeholder: 'Public API key',
-            autocomplete: 'off',
-            autocapitalize: 'off',
-            autocorrect: 'off',
-            spellcheck: 'false',
-            'data-lpignore': 'true',
-            'data-1p-ignore': 'true',
         });
 
-        this.keyRevealed = false;
-        const showBtn = el('button', {
-            type: 'button',
-            text: 'Show',
-            onclick: () => {
-                const hidden = this.keyInput.classList.toggle('ttv2-masked');
+        const showBtn = el('button', { type: 'button', text: 'Show' });
+        this.keyMask = keyMask(this.keyInput, 'ttv2-masked', {
+            onReveal: () => (this.handlers.onRevealKey ? this.handlers.onRevealKey() : ''),
+            onChange: (hidden) => {
                 showBtn.textContent = hidden ? 'Show' : 'Hide';
-
-                if (!hidden && !this.keyInput.value && this.handlers.onRevealKey) {
-                    this.keyInput.value = this.handlers.onRevealKey() || '';
-                    this.keyRevealed = true;
-                } else if (hidden && this.keyRevealed) {
-                    this.keyInput.value = '';
-                    this.keyRevealed = false;
-                }
             },
         });
+        showBtn.addEventListener('click', () => this.keyMask.toggle());
 
         const save = guarded(this, 'Save', () => {
             const key = this.keyInput.value.trim();
@@ -687,13 +685,45 @@ export class Panel {
         const saveSw = check(
             'saveCalls',
             'NPC deals: save API calls',
-            el('span', { class: 'ttv2-sub', text: 'Turns off watching and sellers\' online status. Deals come only from the page you are viewing: 0 API calls. Fill and Torn Bids are not affected.' }),
+            el('span', { class: 'ttv2-sub', text: 'Turns off Item Market watching and sellers\' online status: 0 API calls. Bazaars are still watched through TornW3B, which uses none. Fill and Torn Bids are not affected.' }),
         );
         this.saveCallsInput = saveSw.input;
+
+        // Resale deals (the My bazaar / Market chips): a person may pay less
+        // or never buy, so $1 is not a deal there. NPC deals keep $1.
+        this.resaleMinInput = el('input', { type: 'text', inputmode: 'decimal', class: 'ttv2-pct-input', 'aria-label': 'Least profit per item, percent' });
+        const pctSub = el('span', { class: 'ttv2-sub', text: 'For My bazaar and Market deals. NPC deals count from $1.' });
+        const applyPct = () => {
+            const raw = String(this.resaleMinInput.value).replace(/[%\s]/g, '');
+            const n = Number(raw);
+            if (raw && Number.isFinite(n) && n >= 0 && n <= 100) {
+                this.emitSettings({ resaleMinPct: n });
+                pctSub.textContent = 'For My bazaar and Market deals. NPC deals count from $1.';
+                pctSub.classList.remove('ttv2-bad');
+                this.resaleMinInput.removeAttribute('aria-invalid');
+                return;
+            }
+            // Said, not silently put back.
+            pctSub.textContent = 'Not saved: type a percent from 0 to 100. Still ' + (this.state.settings.resaleMinPct ?? 1) + '%.';
+            pctSub.classList.add('ttv2-bad');
+            this.resaleMinInput.setAttribute('aria-invalid', 'true');
+            this.resaleMinInput.value = String(this.state.settings.resaleMinPct ?? 1);
+        };
+        this.resaleMinInput.addEventListener('change', applyPct);
+        this.resaleMinInput.addEventListener('keydown', (event) => {
+            if (event.key === 'Enter') applyPct();
+        });
+        const pctRow = el('label', { class: 'ttv2-check ttv2-pct' }, [
+            this.resaleMinInput,
+            el('span', {}, [
+                el('span', { class: 'ttv2-check-label', text: 'Least profit per item, %' }),
+                pctSub,
+            ]),
+        ]);
         this.apiUseEl = el('div', { class: 'ttv2-note ttv2-apiuse' });
 
         this.settingsPage.appendChild(
-            section('Watching', [saveSw.row, im.row, bz.row, this.apiUseEl, note('Nothing is bought, clicked or announced for you.')]),
+            section('Watching', [saveSw.row, im.row, bz.row, pctRow, this.apiUseEl, note('Nothing is bought, clicked or announced for you.')]),
         );
         this.renderApiUse();
 
@@ -720,13 +750,13 @@ export class Panel {
         this.settingsPage.appendChild(this.fillSectionEl);
 
         this.settingsPage.appendChild(
-            section('Selling', [
-                note('The selling page has its own keys and settings.'),
+            section('Torn Bids', [
+                note('Torn Bids has its own keys and settings.'),
                 el('button', {
                     type: 'button',
                     class: 'ttv2-link',
-                    text: 'Open the selling page',
-                    onclick: guarded(this, 'Sell', () => this.handlers.onOpenSelling && this.handlers.onOpenSelling()),
+                    text: 'Open Torn Bids',
+                    onclick: guarded(this, 'Bids', () => this.handlers.onOpenSelling && this.handlers.onOpenSelling()),
                 }),
             ]),
         );
@@ -1084,6 +1114,9 @@ export class Panel {
         if (this.liveFeedInput && settings.liveFeed !== undefined) {
             this.liveFeedInput.checked = Boolean(settings.liveFeed);
         }
+        if (this.resaleMinInput && settings.resaleMinPct !== undefined && !(this.shadow && this.shadow.activeElement === this.resaleMinInput)) {
+            this.resaleMinInput.value = String(settings.resaleMinPct);
+        }
         if (this.useW3bInput && settings.useW3b !== undefined) {
             this.useW3bInput.checked = Boolean(settings.useW3b);
         }
@@ -1115,18 +1148,43 @@ export class Panel {
         Object.assign(this.state, view);
         if (!this.root) return;
 
-        this.listEl.textContent = '';
-
+        /*
+         * Updated in place, not rebuilt: this runs every 2.5 s and on every
+         * feed change, and emptying the list each time threw away keyboard
+         * focus (on a Go button, say) and relaid out every row. A row is
+         * drawn fresh (cheap, off the page) and kept only if it differs from
+         * the one showing - its HTML as drawn, before refreshAges() fills in
+         * the age, is its identity - so a price that moves is replaced at
+         * once and everything else stays exactly where it is.
+         */
         const rows = this.state.rows || [];
+        const want = [];
+        const kept = new Map();
 
         if (rows.length === 0) {
-            this.listEl.appendChild(this.renderEmpty());
+            const empty = this.renderEmpty();
+            const html = empty.outerHTML;
+            const old = this.shownEls && this.shownEls.get(html);
+            want.push(old || empty);
+            kept.set(html, old || empty);
         } else {
-            this.listEl.appendChild(this.colsEl);
-            rows.forEach((row) => {
-                this.listEl.appendChild(this.renderRow(row));
-            });
+            want.push(this.colsEl);
+            for (const row of rows) {
+                const fresh = this.renderRow(row);
+                const html = fresh.outerHTML;
+                const old = this.shownEls && this.shownEls.get(html);
+                const use = old && !kept.has(html) ? old : fresh;
+                if (!kept.has(html)) kept.set(html, use);
+                want.push(use);
+            }
         }
+
+        want.forEach((node, i) => {
+            const at = this.listEl.childNodes[i];
+            if (at !== node) this.listEl.insertBefore(node, at || null);
+        });
+        while (this.listEl.childNodes.length > want.length) this.listEl.lastChild.remove();
+        this.shownEls = kept;
 
         this.renderTabs();
         this.refreshAges();
@@ -1191,7 +1249,7 @@ export class Panel {
         let title = 'Watching is off. Turn it on under Settings.';
 
         if (live && live.enabled) {
-            if (!live.itemMarket) {
+            if (!live.keyed) {
                 dot = 'warn';
                 text = 'needs key';
                 title = 'Add a Public API key under Settings.';
@@ -1240,21 +1298,28 @@ export class Panel {
             );
         }
 
-        if (!d && this.state.settings.saveCalls) {
-            return box('Saving API calls: only this page is scanned.', 'Stop saving', () =>
+        if (!d && tab === 'bazaar' && live && !live.w3b) {
+            return box('Bazaar watching is off.', 'Turn it on', () =>
+                this.emitSettings({ useW3b: true }),
+            );
+        }
+
+        // Saving API calls stops the Item Market only; bazaars stay watched.
+        if (!d && tab !== 'bazaar' && this.state.settings.saveCalls) {
+            return box('Saving API calls: the Item Market is not watched.', 'Stop saving', () =>
                 this.emitSettings({ saveCalls: false }),
             );
         }
 
-        if (!d && tab === 'bazaar' && live && !live.w3b) {
-            return box('Bazaar watching is off.', 'Turn it on', () =>
-                this.emitSettings({ useW3b: true, liveFeed: true }),
+        if (!d && tab !== 'bazaar' && live && live.keyed && !live.itemMarket) {
+            return box('Item Market watching is off.', 'Turn it on', () =>
+                this.emitSettings({ liveFeed: true }),
             );
         }
 
         if (!d && live && !live.enabled) {
             return box('Watching is off. Only this page is scanned.', 'Turn it on', () =>
-                this.emitSettings({ liveFeed: true }),
+                this.emitSettings({ liveFeed: true, useW3b: true }),
             );
         }
 
@@ -1569,6 +1634,11 @@ export class Panel {
                 el('div', { class: 'ttv2-fillprice', text: shown ? formatMoney(shown) : own && own.state === 'ok' ? 'Nothing to undercut' : 'Reading prices…' }),
                 verdict && verdict.text
                     ? el('div', { class: 'ttv2-note ttv2-verdict', 'data-level': verdict.level || '', text: verdict.text + (f.preview.floor === 'npc' ? ' · held at the NPC price' : f.preview.floor === 'avg' ? ' · held at the average' : '') })
+                    : null,
+                // Filled: what Fill said about it, in full. On #/add the row
+                // has room for the tick only, so this is where it is read.
+                f.filled && f.filled.words
+                    ? el('div', { class: 'ttv2-note ttv2-verdict', 'data-level': f.filled.level === 'warn' ? 'warn' : f.filled.level || '', text: f.filled.words.replace(/^Filled \$[\d,]+( · )?/, '') || 'Filled.' })
                     : null,
                 f.canFill && !f.filled && shown
                     ? el('button', { type: 'button', class: 'ttv2-primary ttv2-fillgo', text: 'Fill its row', onclick: () => this.handlers.onFillSelected && this.handlers.onFillSelected() })

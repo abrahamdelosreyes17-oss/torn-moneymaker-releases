@@ -169,3 +169,62 @@ test('flip buyers: every believable one that can pay for one, best bid first, ea
     assert.equal(best.b.id, '2');
     assert.equal(best.p.profit, 9000);
 });
+
+/* ------------------------------------------------ $1 is for NPC shops only */
+
+import { bestVenue, enoughProfit, MIN_PROFIT_PCT } from '../src/core/profit.js';
+
+test('a flip to a trader needs a real margin: $1 under a $140,000 bid is not a flip', () => {
+    const fresh = (price, qty = 5) => ({ sellerId: 'S' + price, sellerName: 'Seller', price, qty, stale: false });
+    // $1 and $1,000 under: less than 1% of the price, left out.
+    assert.equal(flipPlan([fresh(139999), fresh(139000)], 140000), null);
+    // $2,000 under (1.4%): a flip.
+    const plan = flipPlan([fresh(139999), fresh(138000)], 140000);
+    assert.equal(plan.units, 5);
+    assert.equal(plan.profit, 5 * 2000);
+    // Settings can ask for more, or for nothing at all.
+    assert.equal(flipPlan([fresh(138000)], 140000, { minPct: 2 }), null);
+    assert.equal(flipPlan([fresh(139999)], 140000, { minPct: 0 }).units, 5);
+    // Candidates follow the same rule.
+    const summary = new Map([['1', { lowestPrice: 139999 }], ['2', { lowestPrice: 138000 }]]);
+    assert.deepEqual(flipCandidates(summary, () => 140000).map((c) => c.itemId), ['2']);
+});
+
+test('NPC deals still count from $1; resale deals need the least profit per item', () => {
+    assert.equal(MIN_PROFIT_PCT, 1);
+    assert.equal(enoughProfit(1, 10000, 'NPC'), true);
+    assert.equal(enoughProfit(1, 10000, 'BAZAAR_RESALE'), false);
+    assert.equal(enoughProfit(100, 10000, 'BAZAAR_RESALE'), true);
+    // A $1 NPC margin survives; a $5 resale margin on a $10,000 item does not, so NPC wins.
+    const best = bestVenue({ listingPrice: 10000, exits: { NPC: 10001, BAZAAR_RESALE: 10005 } });
+    assert.equal(best.venue, 'NPC');
+    assert.equal(bestVenue({ listingPrice: 10000, exits: { BAZAAR_RESALE: 10005 } }), null);
+    assert.equal(bestVenue({ listingPrice: 10000, exits: { BAZAAR_RESALE: 10005 }, minPct: 0 }).venue, 'BAZAAR_RESALE');
+    // Cheap items: never less than $1 either way.
+    assert.equal(enoughProfit(0.5, 10, 'TRADER'), false);
+    assert.equal(enoughProfit(1, 10, 'TRADER'), true);
+});
+
+/* ------------------------------------ Where to sell: a big stack is not "all at the cheapest" */
+
+import { whereToSell as sellWhere, depthNearCheapest } from '../src/core/flips.js';
+
+test('150,000 Hammers are not all worth the cheapest ask: listing counts only the first N listed near it', () => {
+    // The review's screenshot: 150,000 Hammers, the trader pays $110, bazaars from $130.
+    const rows = [{ price: 130, qty: 4 }, { price: 131, qty: 9 }, { price: 200, qty: 50 }];
+    const depth = depthNearCheapest(rows);
+    assert.equal(depth, 13, 'within 1% of $130: the 4 and the 9');
+    const w = sellWhere({ held: 150000, bid: 110, bazaarLowest: 130, bazaarDepth: depth });
+    const bz = w.options.find((o) => o.venue === 'bazaar');
+    assert.equal(bz.units, 13);
+    assert.equal(bz.total, 13 * 129 + (150000 - 13) * 110, 'the rest go to the trader');
+    assert.equal(w.best, 'bazaar');
+    assert.equal(w.gain, 13 * (129 - 110), 'the gain is for the 13, not $2.85m');
+    // Before: the gain was (129 - 110) × 150,000.
+    const old = sellWhere({ held: 150000, bid: 110, bazaarLowest: 130 });
+    assert.equal(old.gain, 150000 * 19, 'depth unknown: counted for everything, as before');
+    // A small stack inside the depth is unchanged.
+    const small = sellWhere({ held: 5, bid: 110, bazaarLowest: 130, bazaarDepth: depth });
+    assert.equal(small.options.find((o) => o.venue === 'bazaar').units, 5);
+    assert.equal(depthNearCheapest([]), null);
+});

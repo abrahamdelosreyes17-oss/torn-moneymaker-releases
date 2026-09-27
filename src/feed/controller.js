@@ -70,6 +70,15 @@ export const FEED_RECHECK_KEY = 'feedRecheck';
 /** Set by Scan in any tab: the leader rebuilds everything at once. */
 export const FEED_REFRESH_KEY = 'feedRefreshAt';
 
+/**
+ * Anything to watch? Two separate switches: bazaars through TornW3B (no
+ * Torn API calls) and the Item Market (Torn API calls). Saving API calls
+ * turns the Item Market off and leaves bazaars watched.
+ */
+export function watching(settings) {
+    return Boolean(settings && (settings.liveFeed || settings.useW3b));
+}
+
 export class LiveFeed {
     /**
      * @param {object} deps
@@ -150,9 +159,10 @@ export class LiveFeed {
     status() {
         const s = this.d.getSettings();
         return {
-            enabled: Boolean(s.liveFeed),
-            w3b: Boolean(s.liveFeed && s.useW3b),
+            enabled: watching(s),
+            w3b: Boolean(s.useW3b),
             itemMarket: Boolean(s.liveFeed && this.d.hasUsableKey()),
+            keyed: Boolean(this.d.hasUsableKey()),
             leading: this.leading,
             candidates: this.candidates.length,
             nextRefreshAt: this.lastSummaryAt ? this.lastSummaryAt + SUMMARY_INTERVAL_MS : null,
@@ -174,7 +184,7 @@ export class LiveFeed {
 
         const record = this.d.load(FEED_LEADER_KEY);
 
-        if (!settings.liveFeed) {
+        if (!watching(settings)) {
             if (record && record.id === this.d.tabId) {
                 this.d.save(FEED_LEADER_KEY, { id: null, ts: 0 });
             }
@@ -200,7 +210,7 @@ export class LiveFeed {
 
     /** Stop as soon as the tab is hidden or the user switches the feed off. */
     stillAllowed() {
-        return this.d.isVisible() && Boolean(this.d.getSettings().liveFeed);
+        return this.d.isVisible() && watching(this.d.getSettings());
     }
 
     async cycle() {
@@ -226,7 +236,8 @@ export class LiveFeed {
             this.mutate((feed) => feed.bazaar.clear());
         }
 
-        if (this.d.hasUsableKey()) {
+        // The Item Market costs Torn API calls: only when it is watched.
+        if (settings.liveFeed && this.d.hasUsableKey()) {
             // Rebuilt when what counts as an exit changes (a chip), not just once.
             const sig = [
                 settings.sellToNpc !== false,
@@ -301,7 +312,7 @@ export class LiveFeed {
                 const rows = normalizeW3bListings(listings);
                 const at = this.now();
                 this.mutate((feed) =>
-                    setBazaarSnapshot(feed, candidate.itemId, rows, at),
+                    setBazaarSnapshot(feed, candidate.itemId, rows, at, candidate.lowestPrice),
                 );
             } catch (error) {
                 this.lastError = 'TornW3B: ' + ((error && error.message) || error);
@@ -397,6 +408,7 @@ export class LiveFeed {
         const best = bestVenue({
             listingPrice: price,
             exits: exitsFor(item, this.d.getSettings()),
+            minPct: this.d.getSettings().resaleMinPct,
             qty: 1,
         });
         return Boolean(best && best.profitPerUnit > 0);

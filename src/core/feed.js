@@ -147,6 +147,7 @@ export function selectCandidates(summary, index, settings = {}, max = MAX_CANDID
         const best = bestVenue({
             listingPrice: s.lowestPrice,
             exits: exitsFor(item, settings),
+            minPct: settings.resaleMinPct,
             qty: 1,
         });
 
@@ -250,8 +251,9 @@ export function normalizeItemMarketRows(listings) {
 }
 
 /** Replace everything known about an item's bazaar listings. */
-export function setBazaarSnapshot(feed, itemId, rows, fetchedAt) {
-    feed.bazaar.set(String(itemId), { fetchedAt, rows: rows || [] });
+export function setBazaarSnapshot(feed, itemId, rows, fetchedAt, summaryLowest = null) {
+    // The summary's cheapest price when these rows were read: see bazaarDue.
+    feed.bazaar.set(String(itemId), { fetchedAt, rows: rows || [], summaryLowest });
     return feed;
 }
 
@@ -306,14 +308,22 @@ export function expireFeed(feed, now = Date.now()) {
  * Should this candidate's bazaar listings be (re)fetched now?
  * Yes when never fetched, when the summary's cheapest price moved, or when
  * the snapshot is older than TornW3B's own cache.
+ *
+ * "Moved" is against the summary price the snapshot was read for, not the
+ * snapshot's own cheapest row: the rows leave out $1 Dollar Sales and
+ * listings with no seller, which the summary counts, so the two never
+ * matched and such an item was read again every 3 s tick (20 calls a minute
+ * for one item, the feed's whole TornW3B allowance for a few).
  */
 export function bazaarDue(feed, candidate, now = Date.now()) {
     const snap = feed.bazaar.get(String(candidate.itemId));
     if (!snap) return true;
     if (now - snap.fetchedAt >= BAZAAR_REFRESH_MS) return true;
 
-    const cheapest = snap.rows.length ? snap.rows[0].price : null;
-    return cheapest !== candidate.lowestPrice;
+    const seen = snap.summaryLowest !== null && snap.summaryLowest !== undefined
+        ? snap.summaryLowest
+        : snap.rows.length ? snap.rows[0].price : null;
+    return seen !== candidate.lowestPrice;
 }
 
 /**
@@ -471,6 +481,7 @@ export function feedOpportunities(feed, index, settings = {}, ctx = {}) {
         const profit = bestVenue({
             listingPrice: row.price,
             exits: exitsFor(item, settings),
+            minPct: settings.resaleMinPct,
             qty: row.qty,
             cashOnHand: settings.cashOnHand,
         });

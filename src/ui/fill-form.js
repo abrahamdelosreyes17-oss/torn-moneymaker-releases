@@ -73,10 +73,16 @@ export function buildFillForm({ get, set }) {
         const commit = () => {
             const v = Number(String(amount.value).replace(/[$,%\s]/g, ''));
             if (!(v >= 0) || !Number.isFinite(v)) {
+                // Said in words where the example goes, not only a red border.
                 amount.classList.add('tf-bad');
+                amount.setAttribute('aria-invalid', 'true');
+                parts[key].example.textContent = 'Not saved: type a number, like 1, 50 or 2.5.';
+                parts[key].example.dataset.bad = 'true';
                 return;
             }
             amount.classList.remove('tf-bad');
+            amount.removeAttribute('aria-invalid');
+            delete parts[key].example.dataset.bad;
             save(key, { amount: v });
         };
         amount.addEventListener('change', commit);
@@ -157,6 +163,7 @@ export const FILL_FORM_CSS = `
 .tf-check { cursor: pointer; }
 .tf-check input { accent-color: var(--profit, #99cc00); margin: 0; }
 .tf-example { font-size: 12px; color: var(--muted, #999); font-variant-numeric: tabular-nums; }
+.tf-example[data-bad] { color: var(--bad, #d83500); }
 .tf-note { font-size: 12px; color: var(--muted, #999); }
 `;
 

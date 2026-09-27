@@ -35,6 +35,23 @@ export const VENUE_FEES = {
     TRADER: 0,
 };
 
+/**
+ * The least a deal must make per item when it is NOT sold to an NPC, as a
+ * percent of what you pay. An NPC shop pays its price every time, so $1 is a
+ * real profit there; a trader, your bazaar or the Item Market is a person
+ * who may pay less or never buy, so a $1 margin on a $140,000 item is noise
+ * (the owner, 2026-09-27: "$1 is only for NPC").
+ */
+export const MIN_PROFIT_PCT = 1;
+
+/** Does this profit per item clear the bar for its venue? NPC: any profit; anything else: MIN_PROFIT_PCT. */
+export function enoughProfit(profitPerUnit, listingPrice, venue, pct = MIN_PROFIT_PCT) {
+    if (!(profitPerUnit > 0)) return false;
+    if (venue === 'NPC') return true;
+    const p = Number(pct);
+    return profitPerUnit >= Math.max(1, (listingPrice * (Number.isFinite(p) && p >= 0 ? p : MIN_PROFIT_PCT)) / 100);
+}
+
 /*
  * "Market" is Torn's rolling average, not a price anyone has offered you -
  * the live floor can sit well above or below it. The label says so; the NPC
@@ -119,8 +136,9 @@ export function computeOpportunity({
  * @param {object} input
  * @param {number} input.listingPrice
  * @param {object} input.exits - { VENUE_KEY: exitPrice }
+ * @param {number} [input.minPct] - resale venues must make this % per item (see enoughProfit)
  */
-export function bestVenue({ listingPrice, exits, qty = 1, cashOnHand = null }) {
+export function bestVenue({ listingPrice, exits, qty = 1, cashOnHand = null, minPct = MIN_PROFIT_PCT }) {
     let best = null;
 
     for (const [venue, exitPrice] of Object.entries(exits || {})) {
@@ -133,6 +151,8 @@ export function bestVenue({ listingPrice, exits, qty = 1, cashOnHand = null }) {
         });
 
         if (!candidate) continue;
+        // A resale that makes almost nothing is not a deal (NPC is exempt).
+        if (candidate.venue !== 'NPC' && !enoughProfit(candidate.profitPerUnit, listingPrice, candidate.venue, minPct)) continue;
 
         if (!best || candidate.realizableProfit > best.realizableProfit) {
             best = candidate;

@@ -13,7 +13,7 @@
  * textContent only.
  */
 
-import { formatMoney, formatAge } from '../core/parse.js';
+import { formatMoney, formatAge, parseMoneyInput } from '../core/parse.js';
 import { matchFifo, filterLedgerRows, ledgerTotals, ledgerByItem, ledgerByPeriod, periodStart, mugTotals, VENUE_NAMES } from '../core/ledger.js';
 
 const DAY = 24 * 60 * 60 * 1000;
@@ -350,7 +350,8 @@ export class LedgerView {
     /** What muggings took: totals, per day, and each one. */
     renderMugs(box, mugs, range, L) {
         const who = String(this.f.who || '').trim().toLowerCase();
-        const min = Number(String(this.f.mugMin || '').replace(/[$,\s]/g, '').replace(/k$/i, '000').replace(/m$/i, '000000')) || 0;
+        // Reads 1500, 1,500, 1.5k, $2m the same way as every money box (1.5k was 1.5).
+        const min = Math.max(0, parseMoneyInput(this.f.mugMin) || 0);
         const shown = mugs.filter((m) =>
             (!range.from || m.t >= range.from) &&
             (!range.to || m.t <= range.to) &&
@@ -480,6 +481,7 @@ export class LedgerView {
         const table = lvEl('table', { class: 'lg-table' });
         table.appendChild(lvEl('tr', {}, ['Item', 'Bought', 'Avg buy', 'Sold', 'Avg sell', 'Profit'].map((h, i) => lvEl('th', { class: i ? 'lg-num' : '', text: h }))));
         for (const i of perItem.slice(0, 50)) {
+            // Space works as well as Enter on a row that acts.
             const tr = lvEl('tr', { class: 'lg-click', title: 'Show only this item', tabindex: '0' }, [
                 lvEl('td', { text: nameOf(i.itemId) }),
                 lvEl('td', { class: 'lg-num', text: lvCount(i.unitsBought) }),
@@ -494,7 +496,9 @@ export class LedgerView {
             };
             tr.addEventListener('click', pick);
             tr.addEventListener('keydown', (e) => {
-                if (e.key === 'Enter') pick();
+                if (e.key !== 'Enter' && e.key !== ' ') return;
+                e.preventDefault();
+                pick();
             });
             table.appendChild(tr);
         }

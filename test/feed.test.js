@@ -9,9 +9,9 @@ import {
     fetchW3bListings,
 } from '../src/api/w3b.js';
 import { TornApiClient, KEY_DEAD_CODES } from '../src/api/client.js';
-import { fetchItemMarket, fetchItems, npcSaleFromValue, parseUserPresence } from '../src/api/torn.js';
+import { ITEM_MARKET_MIN_RECHECK_MS, fetchItemMarket, fetchItems, npcSaleFromValue, shopBuyPriceFromValue, parseUserPresence } from '../src/api/torn.js';
 import { agoText, presenceText, presenceShort, presenceWord } from '../src/sources/dom/owner.js';
-import { buildItemIndex } from '../src/core/items.js';
+import { buildItemIndex, makeItemsCacheEntry, isItemsCacheFresh, ITEMS_PARTIAL_TTL_MS } from '../src/core/items.js';
 import {
     emptyFeed,
     exitsFor,
@@ -243,7 +243,7 @@ test('fetchItemMarket reads the v2 shape and when Torn will next refresh it', as
         },
     };
 
-    const m = await fetchItemMarket(client, 206);
+    const m = await fetchItemMarket(client, 206, { now: 1787334782000 + 2000 });
     assert.equal(m.listings.length, 2);
     assert.equal(m.averagePrice, 851096);
     assert.equal(m.cacheTimestamp, 1787334782000);
@@ -251,6 +251,12 @@ test('fetchItemMarket reads the v2 shape and when Torn will next refresh it', as
     assert.equal(m.total, 193);
 
     assert.deepEqual(normalizeItemMarketRows(m.listings), [{ price: 873000, qty: 7 }]);
+
+    // Torn served a snapshot whose timestamp is long past: its renewal time
+    // is already over, and the item used to be due again on every 3 s tick.
+    const later = 1787334782000 + 10 * 60 * 1000;
+    const stale = await fetchItemMarket(client, 206, { now: later });
+    assert.equal(stale.nextAt, later + ITEM_MARKET_MIN_RECHECK_MS);
 });
 
 /* ================================================================ feed core */
@@ -461,6 +467,11 @@ test('bazaar owner and link target come from the URL', () => {
     assert.equal(bazaarOwnerId('https://www.torn.com/bazaar.php#/'), null);
     assert.equal(bazaarTarget('https://www.torn.com/bazaar.php?userId=1#/'), null);
     assert.equal(bazaarOwnerId('https://www.torn.com/page.php?sid=ItemMarket&userId=5'), null);
+    // Any spelling of the parameter: userID made another player's bazaar look like your own.
+    for (const name of ['userId', 'userid', 'userID', 'USERID']) {
+        assert.equal(bazaarOwnerId('https://www.torn.com/bazaar.php?' + name + '=77#/'), '77', name);
+    }
+    assert.equal(bazaarOwnerId('https://www.torn.com/bazaar.php?userID=abc#/'), null, 'digits only');
 });
 
 /* =================================================================== leader */
@@ -677,6 +688,19 @@ test('an NPC price needs sell_price AND a shop in Torn - each field lies alone',
     assert.deepEqual(npcSaleFromValue({ vendor: null, sell_price: 50 }), { price: null, shop: null });
 });
 
+test('after 2027-01-01 (no sell_price / buy_price / vendor), the same NPC prices come from shops alone', () => {
+    for (const [id, item] of Object.entries(LIVE_VALUES)) {
+        const { sell_price: _s, buy_price: _b, vendor: _v, ...after } = item.value;
+        assert.deepEqual(npcSaleFromValue(after), npc(id), item.name);
+    }
+    // What a Torn shop sells it for, with and without buy_price.
+    assert.equal(shopBuyPriceFromValue(LIVE_VALUES[15].value), 2000);
+    const { buy_price: _b, ...beretta } = LIVE_VALUES[15].value;
+    assert.equal(shopBuyPriceFromValue(beretta), 2000);
+    const { buy_price: _c, ...dynamite } = LIVE_VALUES[335].value;
+    assert.equal(shopBuyPriceFromValue(dynamite), null, 'only sold abroad');
+});
+
 test('the item list comes from v2 and never prices a shop-less item for an NPC', async () => {
     const asked = [];
     const client = {
@@ -702,15 +726,44 @@ test('the item list comes from v2 and never prices a shop-less item for an NPC',
     assert.equal(c.length, 0, 'no NPC flip on a Sell: N/A item');
 });
 
-test('if v2 fails for a non-key reason, v1 is used instead', async () => {
+test('if v2 fails for a non-key reason, v1 is used - but gives NO NPC prices, and is asked again in minutes', async () => {
     const client = {
         get: async (path) => {
             if (path === 'v2/torn/items') throw Object.assign(new Error('shape'), { code: 23 });
-            return { items: { 18: { name: 'Beretta M9', sell_price: 3800, market_value: 3542 } } };
+            return { items: {
+                18: { name: 'Beretta M9', sell_price: 3800, market_value: 3542 },
+                // v1 says $12m; no shop buys it (Sell: N/A in game).
+                456: { name: 'Companion Script : Ubay', sell_price: 12000000, market_value: 0 },
+            } };
         },
     };
     const raw = await fetchItems(client);
-    assert.equal(raw['18'].sell_price, 3800);
+    assert.equal(raw['18'].market_value, 3542, 'values still come through');
+    assert.equal(raw['18'].sell_price, null, 'v1 cannot show a shop in Torn buys it');
+    const idx = buildItemIndex(raw);
+    assert.equal(idx.byId.get('456').sellPrice, 0);
+    assert.equal(selectCandidates([{ itemId: '456', lowestPrice: 11000000 }], idx, {}).length, 0, 'no false $12m NPC deal');
+
+    const t = 1_000_000;
+    const entry = makeItemsCacheEntry(raw, t);
+    assert.equal(entry.partial, true);
+    assert.equal(isItemsCacheFresh(entry, t + ITEMS_PARTIAL_TTL_MS - 1), true);
+    assert.equal(isItemsCacheFresh(entry, t + ITEMS_PARTIAL_TTL_MS + 1), false, 'v2 is tried again after 5 minutes, not an hour');
+    assert.equal(makeItemsCacheEntry({ 1: { name: 'x' } }, t).partial, undefined, 'a v2 list is a full one');
+});
+
+test('a relative "next" link on the v2 item list is followed, not a crash into the v1 fallback', async () => {
+    const asked = [];
+    const client = {
+        get: async (path, params) => {
+            asked.push([path, params.offset || null]);
+            if (!params.offset) return { items: [{ id: 1, name: 'A', value: {} }], _metadata: { links: { next: '/v2/torn/items?sort=ASC&offset=1' } } };
+            return { items: [{ id: 2, name: 'B', value: {} }], _metadata: { links: { next: null } } };
+        },
+    };
+    const raw = await fetchItems(client);
+    assert.deepEqual(Object.keys(raw), ['1', '2']);
+    assert.deepEqual(asked, [['v2/torn/items', null], ['v2/torn/items', '1']]);
 });
 
 test('a dead key is not retried against v1', async () => {

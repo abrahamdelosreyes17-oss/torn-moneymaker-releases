@@ -416,9 +416,9 @@ await p.evaluate(() => document.getElementById('fake-own')?.remove());
   await h.close();
 }
 
-// The overlay's Sell button opens the selling page in a new tab.
+// The overlay's Bids button opens Torn Bids in a new tab.
 await q(p, 'button.ttv2-sell').click();
-ok(/github\.io\/torn-moneymaker-releases\/traders\.html$/.test(await p.evaluate(() => window.__opened.at(-1))), 'Sell opens the traders page, off Torn, in its own tab');
+ok(/github\.io\/torn-moneymaker-releases\/traders\.html$/.test(await p.evaluate(() => window.__opened.at(-1))), 'Bids opens Torn Bids, off Torn, in its own tab');
 ok(!(await vis(p, '.ttv2-prompt')), 'no open-mode question');
 
 // Narrow: nothing overflows at 430px.

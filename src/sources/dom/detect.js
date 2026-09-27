@@ -157,32 +157,54 @@ function findByImage(root) {
     return { cards, images: images.length };
 }
 
-/** Strategy 2: shaped like a listing card. */
-function findByContent(root) {
-    const candidates = [];
+/** Is this element card-sized text with a price and a stock count? */
+function looksLikeListing(el) {
+    const text = el.textContent || '';
+    if (!text || text.length > 500) return false;
+    if (!PRICE_RE.test(text) || !STOCK_RE.test(text)) return false;
+    if (!isVisible(el)) return false;
+    const box = boxOf(el);
+    return box.width >= 120 && box.height >= 60;
+}
 
-    let all;
+/**
+ * Strategy 2: shaped like a listing card.
+ *
+ * Starts from the text that holds a "$" and climbs a few parents, instead of
+ * reading the text of EVERY element on the page (each one re-reading all of
+ * its children): that ran on every 2.5 s scan of a page with no item images
+ * (your own storefront, a page still loading) and cost far more than the page
+ * it looked at. A listing's price is always in its own text, so the same
+ * cards are found; the climb stops where the text grows past a card's.
+ */
+function findByContent(root) {
+    const doc = root && (root.nodeType === 9 ? root : root.ownerDocument);
+    const start = root && root.nodeType === 9 ? root.body : root;
+    if (!doc || !start || typeof doc.createTreeWalker !== 'function') return [];
+
+    const candidates = [];
+    const tried = new Set();
+    let walker;
     try {
-        all = root.querySelectorAll('body *');
+        walker = doc.createTreeWalker(start, 4 /* NodeFilter.SHOW_TEXT */);
     } catch {
         return [];
     }
 
-    for (const el of all) {
-        const text = el.textContent || '';
-
-        if (!text || text.length > 500) continue;
-        if (!PRICE_RE.test(text)) continue;
-        if (!STOCK_RE.test(text)) continue;
-        if (!isVisible(el)) continue;
-
-        const box = boxOf(el);
-        if (box.width < 120 || box.height < 60) continue;
-
-        candidates.push(el);
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+        if (!node.nodeValue || node.nodeValue.indexOf('$') < 0) continue;
+        let el = node.parentElement;
+        for (let depth = 0; depth < MAX_CLIMB && el; depth += 1, el = el.parentElement) {
+            if (tried.has(el)) break;
+            tried.add(el);
+            if ((el.textContent || '').length > 500) break;
+            if (looksLikeListing(el)) candidates.push(el);
+        }
     }
 
-    return dedupe(candidates.map(cardFromContent).filter(Boolean));
+    // In page order, as the old walk over every element returned them.
+    const cards = dedupe(candidates.map(cardFromContent).filter(Boolean));
+    return cards.sort((a, b) => (a === b ? 0 : a.compareDocumentPosition(b) & 4 ? -1 : 1));
 }
 
 /**

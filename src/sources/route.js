@@ -67,7 +67,15 @@ function queryOf(href) {
 export function bazaarOwnerId(href) {
     if (detectPage(href) !== PAGE_BAZAAR) return null;
 
-    const id = queryOf(href).get('userId') || queryOf(href).get('userid');
+    // Any spelling (userId, userid, userID, USERID): Torn's own links vary, and
+    // a missed one made another player's bazaar look like your own.
+    let id = null;
+    for (const [name, value] of queryOf(href)) {
+        if (name.toLowerCase() === 'userid') {
+            id = value;
+            break;
+        }
+    }
     return id && /^\d+$/.test(id) ? id : null;
 }
 

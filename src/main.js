@@ -24,6 +24,7 @@ import {
     makeItemsCacheEntry,
     isItemsCacheFresh,
     ITEMS_TTL_MS,
+    ITEMS_PARTIAL_TTL_MS,
     itemCategory,
     categoryCounts,
 } from './core/items.js';
@@ -48,14 +49,16 @@ import {
     SOURCE_BAZAAR,
     SOURCE_ITEM_MARKET,
 } from './core/feed.js';
-import { bazaarSellers, flipPlan, flipBuyer, whereToSell, flipCandidates, traderTagLabel } from './core/flips.js';
+import { bazaarSellers, flipPlan, flipBuyer, whereToSell, depthNearCheapest, flipCandidates, traderTagLabel } from './core/flips.js';
 import { makeTabId, LEADER_HEARTBEAT_MS } from './core/leader.js';
+import { tabWindow } from './platform/tab-window.js';
+import { idbGet, idbSet, idbDel } from './platform/idb.js';
 import { formatMoneyShort } from './core/parse.js';
 import { rankOpportunities, summarize, hiddenCounts, belowMinRows } from './core/ranker.js';
 import { TornApiClient, redactKey, KEY_DEAD_CODES } from './api/client.js';
 import { W3bClient, fetchW3bSummary, fetchW3bListings, fetchW3bPriceList } from './api/w3b.js';
 import { LedgerClient, fetchLedgerKeyInfo, isFullKey, fetchLogPage, fetchTradesPage, fetchTrade } from './api/ledger.js';
-import { readLedger, rowsFromLog, rowsFromTrade, addLedgerRows, logSpan, mugFromLog, addMugs } from './core/ledger.js';
+import { readLedger, emptyLedger, rowsFromLog, rowsFromTrade, addLedgerRows, logSpan, mugFromLog, addMugs } from './core/ledger.js';
 import {
     TeClient,
     TeQueue,
@@ -174,6 +177,7 @@ import {
 import {
     LiveFeed,
     FEED_STORE_KEY,
+    watching,
 } from './feed/controller.js';
 import { formatMoney } from './core/parse.js';
 
@@ -184,6 +188,11 @@ const STORE_MANUAL_NPC = 'npcManual';
 const STORE_SETTINGS = 'settings';
 const STORE_KEY_ACCESS = 'keyAccess';
 const STORE_API_WINDOW = 'apiWindow';
+/* A pause every tab honours after Torn answers 5 / 8 / 9 (api/client.js). */
+const STORE_TORN_PAUSE = 'tornPause';
+/* TornW3B calls of the last minute and any 429 wait, for every tab together. */
+const STORE_W3B_WINDOW = 'w3bWindow';
+const STORE_W3B_COOLDOWN = 'w3bCooldown';
 const STORE_KEY_DEAD = 'keyDead';
 const STORE_OPENED = 'opened';
 
@@ -212,6 +221,8 @@ const STORE_LEDGER_KEY = 'ledgerKey';
 const STORE_LEDGER_KEY_DEAD = 'ledgerKeyDead';
 const STORE_LEDGER_SELF = 'ledgerSelf';
 const STORE_LEDGER = 'ledger';
+/* When the ledger was last saved (its rows are in Torn Bids' IndexedDB): other tabs re-read on a change. */
+const STORE_LEDGER_REV = 'ledgerRev';
 /* A run makes at most this many calls; new entries every 5 minutes; a year back, a few pages a minute. */
 const LEDGER_CALLS_PER_RUN = 6;
 const LEDGER_EVERY_MS = 5 * 60 * 1000;
@@ -253,6 +264,11 @@ const DEFAULT_SETTINGS = {
     sellToNpc: true,
     resaleBazaar: false,
     resaleMarket: false,
+    /*
+     * My bazaar / Market deals must make at least this % of the price per
+     * item; NPC deals count from $1 (the owner: "$1 is only for NPC").
+     */
+    resaleMinPct: 1,
 
     /*
      * Watching: the market from ANY Torn page, not just the one you are on.
@@ -398,12 +414,15 @@ const app = {
     bzSelected: null,
     bzWindow: '24h',
     bzLastFetchAt: 0,
+    /* This tab's own TornW3B summary request, when no fresh one is stored. */
+    bzSummaryPending: false,
+    bzSummaryTriedAt: 0,
     /*
      * The Fill button. listings: 'bazaar:ID' / 'market:ID' -> {rows, at,
      * pending, error, note}; done: row element -> what was filled there (to
      * undo it); busy: rows being filled; selfId: your Torn id.
      */
-    fill: { listings: new Map(), done: new WeakMap(), last: new Map(), busy: new WeakSet(), selfId: null, selfTried: false },
+    fill: { listings: new Map(), done: new Map(), last: new Map(), busy: new WeakSet(), selfId: null, selfTried: false },
     /* The recorded price history, loaded once, saved on a timer. */
     history: null,
     historyDirty: false,
@@ -510,6 +529,9 @@ async function onSaveKey(key) {
     gmDel(STORE_KEY_ACCESS);
     gmDel(STORE_KEY_DEAD);
     app.keyDead = false;
+    // Saved: the box no longer holds it (Show fetches it again).
+    if (app.panel.keyMask) app.panel.keyMask.hide();
+    if (app.panel.keyInput) app.panel.keyInput.value = '';
 
     refreshKeyState();
     await onScan();
@@ -525,6 +547,7 @@ function onForgetKey() {
     gmDel(STORE_KEY_DEAD);
     app.keyDead = false;
 
+    if (app.panel.keyMask) app.panel.keyMask.hide();
     if (app.panel.keyInput) app.panel.keyInput.value = '';
 
     refreshKeyState();
@@ -577,6 +600,7 @@ async function loadReferenceData() {
         app.index = buildItemIndex(cachedItems.items);
         app.itemsFetchedAt = cachedItems.fetchedAt;
         app.itemsDataAt = cachedItems.fetchedAt;
+        app.itemsPartial = Boolean(cachedItems.partial);
     } else {
         app.panel.setStatus('Downloading item database.');
         const raw = await fetchItems(app.client);
@@ -585,6 +609,7 @@ async function loadReferenceData() {
         app.index = buildItemIndex(raw);
         app.itemsFetchedAt = entry.fetchedAt;
         app.itemsDataAt = entry.fetchedAt;
+        app.itemsPartial = Boolean(entry.partial);
     }
 
     const cachedNpc = gmGet(STORE_NPC, null);
@@ -621,7 +646,9 @@ async function loadReferenceData() {
  */
 async function refreshItemsIfStale() {
     if (!app.index || app.loading || app.refreshingItems || !hasUsableKey()) return;
-    if (app.itemsFetchedAt && Date.now() - app.itemsFetchedAt < ITEMS_TTL_MS) return;
+    // A list without NPC prices (Torn's v1 fallback) is asked again sooner.
+    const ttl = app.itemsPartial ? ITEMS_PARTIAL_TTL_MS : ITEMS_TTL_MS;
+    if (app.itemsFetchedAt && Date.now() - app.itemsFetchedAt < ttl) return;
 
     const cached = gmGet(STORE_ITEMS, null);
     if (isItemsCacheFresh(cached)) {
@@ -629,6 +656,7 @@ async function refreshItemsIfStale() {
             app.index = buildItemIndex(cached.items);
             app.itemsFetchedAt = cached.fetchedAt;
             app.itemsDataAt = cached.fetchedAt;
+            app.itemsPartial = Boolean(cached.partial);
         }
         return;
     }
@@ -641,6 +669,7 @@ async function refreshItemsIfStale() {
         app.index = buildItemIndex(raw);
         app.itemsFetchedAt = entry.fetchedAt;
         app.itemsDataAt = entry.fetchedAt;
+        app.itemsPartial = Boolean(entry.partial);
     } catch (error) {
         if (isKeyDeadError(error)) markKeyDead(error);
         // Otherwise keep the old values and try again on a later tick.
@@ -675,9 +704,13 @@ function buildOpportunities(listings) {
         const profit = bestVenue({
             listingPrice: listing.listingPrice,
             exits,
+            minPct: app.settings.resaleMinPct,
             qty: listing.qty,
             cashOnHand: app.settings.cashOnHand,
         });
+        // No exit clears its bar (an NPC profit, or a resale's least profit
+        // per item): not a deal, and nothing downstream has to guard a null.
+        if (!profit) continue;
 
         rows.push({
             ...listing,
@@ -692,8 +725,10 @@ function buildOpportunities(listings) {
             cardLabel:
                 '+' +
                 formatMoneyShort(
+                    // What your Cash can make of it (all of it with no Cash
+                    // set) - the same number the panel's list shows.
                     listing.qtyAtPrice
-                        ? profit.totalProfit
+                        ? profit.realizableProfit
                         : profit.profitPerUnit,
                 ) +
                 (listing.qtyAtPrice ? '' : '/ea'),
@@ -1080,7 +1115,7 @@ async function onScan() {
         }
         if (app.pageType === PAGE_NONE) {
             app.panel.setStatus(
-                effectiveSettings().liveFeed
+                watching(effectiveSettings())
                     ? 'Not a Bazaar or Item Market page. Showing what is watched.'
                     : 'Not a Bazaar or Item Market page.',
             );
@@ -1308,7 +1343,7 @@ function scanOwnBazaarPage(which) {
         // Price history is kept for the item you look at (IMA / BP / its row
         // picked) and the ones you fill - not every row on the page, which
         // made a big add page rewrite the whole history every 30 seconds.
-        if (row.itemId === app.bzSelected || app.fill.done.has(row.el)) {
+        if (row.itemId === app.bzSelected || app.fill.done.has(fillKeyOf(row.el, row.itemId))) {
             const isNew = !hist.items[row.itemId];
             touchItem(hist, row.itemId, now);
             const item = app.index.byId.get(row.itemId);
@@ -1449,9 +1484,13 @@ function paintRowTag(tag, itemId) {
         const ima = tag.querySelector('.ttv2-bzchip-ima b');
         const bp = tag.querySelector('.ttv2-bzchip-bp b');
         const a = avg ? formatMoney(avg) : '…';
-        const b = low ? formatMoney(low) : '…';
+        const miss = low ? null : bpMissing(itemId);
+        const b = low ? formatMoney(low) : miss.text;
         if (ima && ima.textContent !== a) ima.textContent = a;
         if (bp && bp.textContent !== b) bp.textContent = b;
+        const chip = bp && bp.parentNode;
+        const title = low ? 'Lowest bazaar price: press for the cheapest listings and who sells them' : miss.title;
+        if (chip && chip.title !== title) chip.title = title;
         const selected = String(itemId === app.bzSelected);
         if (tag.dataset.selected !== selected) tag.dataset.selected = selected;
         return;
@@ -1486,6 +1525,8 @@ function fetchOwnBazaarPrices() {
     if (document.visibilityState !== 'visible') return;
 
     const now = Date.now();
+    // Every row's BP from one TornW3B call (when none is stored fresh), at once.
+    ensureW3bSummary(now);
     if (now - app.bzLastFetchAt < BZ_FETCH_GAP_MS) return;
 
     const summary = gmGet(STORE_W3B_SUMMARY, null);
@@ -1504,8 +1545,7 @@ function fetchOwnBazaarPrices() {
         if (snap && snap.rows.length && snap.dataAt > (rec.imAt || 0)) {
             rec.im = { price: snap.rows[0].price, at: snap.dataAt };
             rec.imAt = snap.fetchedAt;
-            recordSample(loadHistory(), id, snap.dataAt, { im: snap.rows[0].price });
-            markHistoryDirty();
+            recordIfTracked(id, snap.dataAt, { im: snap.rows[0].price });
         }
 
         if (now - (rec.imAt || 0) >= BZ_IM_TTL_MS) {
@@ -1518,8 +1558,7 @@ function fetchOwnBazaarPrices() {
                     if (market.listings.length) {
                         const lowest = Math.min(...market.listings.map((l) => l.price));
                         rec.im = { price: lowest, at: market.cacheTimestamp || at };
-                        recordSample(loadHistory(), id, at, { im: lowest });
-                        markHistoryDirty();
+                        recordIfTracked(id, at, { im: lowest });
                     } else {
                         rec.im = { price: null, at };
                     }
@@ -1546,8 +1585,7 @@ function fetchOwnBazaarPrices() {
                     if (prices.length) {
                         const lowest = Math.min(...prices);
                         rec.bz = { price: lowest, at };
-                        recordSample(loadHistory(), id, at, { bz: lowest });
-                        markHistoryDirty();
+                        recordIfTracked(id, at, { bz: lowest });
                     } else {
                         rec.bz = { price: null, at };
                     }
@@ -1644,6 +1682,40 @@ function lowestBazaarPrice(itemId) {
     return low > 0 ? low : null;
 }
 
+/** Why BP has no price: TornW3B off, no bazaar lists it, or still loading - never a bare "…". */
+function bpMissing(itemId) {
+    if (app.settings.useW3b === false) return { text: 'off', title: 'Bazaar prices come from TornW3B, which is off in Settings' };
+    const summary = w3bSummaryCached();
+    const fresh = summary && summary.lowest && Date.now() - summary.fetchedAt < BZ_SUMMARY_MAX_AGE_MS;
+    if (fresh && !(Number(summary.lowest[itemId]) > 0)) return { text: 'none', title: 'No bazaar lists it right now' };
+    return { text: '…', title: 'Loading bazaar prices from TornW3B' };
+}
+
+/**
+ * No fresh bazaar summary in storage (the feed's tab writes one every 30 s -
+ * but there may be no feed tab, or it has not run yet): this tab asks for the
+ * one-call summary itself, which prices every row's BP at once, instead of
+ * showing "…" until the feed gets to it.
+ */
+function ensureW3bSummary(now = Date.now()) {
+    if (app.bzSummaryPending || !app.w3b || app.settings.useW3b === false) return;
+    if (now - app.bzSummaryTriedAt < 60000) return;
+    const summary = w3bSummaryCached();
+    if (summary && summary.lowest && now - summary.fetchedAt < BZ_SUMMARY_MAX_AGE_MS) return;
+    app.bzSummaryPending = true;
+    app.bzSummaryTriedAt = now;
+    fetchW3bSummary(app.w3b)
+        .then((rows) => {
+            onW3bSummary(rows, Date.now());
+            app.fill.summary = null;
+        })
+        .catch(() => {})
+        .finally(() => {
+            app.bzSummaryPending = false;
+            repaintOwnBazaar();
+        });
+}
+
 /** TornW3B's summary from storage, parsed at most every 10 s (a big page paints hundreds of tags). */
 function w3bSummaryCached() {
     const now = Date.now();
@@ -1702,6 +1774,10 @@ function ensureSelfId() {
  * whose listing is whose): kept 30 minutes, so Fill on the add page does not
  * undercut them either.
  */
+/** Your own Item Market prices are remembered this long after last seen; "still listed" is renewed this often. */
+const OWN_IM_KEEP_MS = 30 * 60 * 1000;
+const OWN_IM_RENEW_MS = 5 * 60 * 1000;
+
 function noteOwnMarketPrices(rows) {
     const now = Date.now();
     const store = gmGet(STORE_FILL_OWN_IM, {}) || {};
@@ -1719,26 +1795,38 @@ function noteOwnMarketPrices(rows) {
     }
     for (const [itemId, prices] of seen) {
         const was = (store[itemId] && store[itemId].prices) || [];
-        const times = new Map(was.filter((p) => p && now - p.at < 30 * 60 * 1000).map((p) => [p.price + ':' + p.n, p.at]));
+        const times = new Map(was.filter((p) => p && now - p.at < OWN_IM_KEEP_MS).map((p) => [p.price + ':' + p.n, p.at]));
         const next = [];
         const counts = new Map();
         for (const price of prices) {
             const n = (counts.get(price) || 0) + 1;
             counts.set(price, n);
-            next.push({ price, n, at: now });
-            if (!times.has(price + ':' + n)) changed = true;
+            const k = price + ':' + n;
+            // "Still listed" is renewed every few minutes, not on every 2.5 s
+            // scan - it used to rewrite the whole value each time.
+            const at = times.has(k) && now - times.get(k) < OWN_IM_RENEW_MS ? times.get(k) : now;
+            if (at !== times.get(k)) changed = true;
+            next.push({ price, n, at });
         }
         if (next.length !== was.length) changed = true;
         store[itemId] = { prices: next };
     }
-    if (changed || seen.size) gmSet(STORE_FILL_OWN_IM, store);
+    // Items with nothing seen for 30 minutes are forgotten, not kept forever.
+    for (const [itemId, rec] of Object.entries(store)) {
+        const live = rec && Array.isArray(rec.prices) && rec.prices.some((p) => p && now - p.at < OWN_IM_KEEP_MS);
+        if (!live) {
+            delete store[itemId];
+            changed = true;
+        }
+    }
+    if (changed) gmSet(STORE_FILL_OWN_IM, store);
 }
 
 function ownMarketPrices(itemId) {
     const store = gmGet(STORE_FILL_OWN_IM, {}) || {};
     const rec = store[itemId];
     const now = Date.now();
-    return rec && Array.isArray(rec.prices) ? rec.prices.filter((p) => p && typeof p === 'object' && now - p.at < 30 * 60 * 1000).map((p) => p.price) : [];
+    return rec && Array.isArray(rec.prices) ? rec.prices.filter((p) => p && typeof p === 'object' && now - p.at < OWN_IM_KEEP_MS).map((p) => p.price) : [];
 }
 
 /** TornW3B's listings for Fill: every one kept ($1 and sponsored too), so the skip counts are honest. */
@@ -1883,12 +1971,42 @@ function ensureMarketTag(row, page) {
     return tag;
 }
 
+/**
+ * Which row Fill filled, in terms that survive Torn redrawing it: the item,
+ * and which of that item's rows on the page (a page can list one item more
+ * than once). The row ELEMENT used to be the key - and #/manage redraws its
+ * rows, which lost the record: the tick showed unticked, and unticking could
+ * never put Torn's own price back.
+ */
+function fillKeyOf(rowEl, itemId) {
+    const id = String(itemId);
+    let n = 0;
+    for (const r of app.bzRows || []) {
+        if (r.itemId !== id) continue;
+        if (r.el === rowEl) return id + ':' + n;
+        n += 1;
+    }
+    return id + ':0';
+}
+
+/** This row's price boxes now: from the row as Torn draws it now, else the boxes Fill typed into. */
+function fillInputsNow(done, rowEl) {
+    if (rowEl && document.contains(rowEl)) {
+        const now = rowInputs(done.kind, rowEl);
+        if (now.price.length) return now;
+    }
+    return {
+        price: done.inputs.price.filter((i) => document.contains(i)),
+        qty: done.inputs.qty.filter((i) => document.contains(i)),
+    };
+}
+
 /** Whether the boxes still hold what Fill typed (you may have typed over it since). */
-function stillFilled(done) {
-    const price = done.inputs.price;
+function stillFilled(done, rowEl) {
+    const price = fillInputsNow(done, rowEl).price;
     // Digits only: Torn may re-format the box (839999 -> 839,999) after Fill types it.
     const digits = (v) => String(v).replace(/\D/g, '');
-    return price.length > 0 && price.every((i) => document.contains(i)) && readInputs(price).some((v) => digits(v) === digits(done.priceText));
+    return price.length > 0 && readInputs(price).some((v) => digits(v) === digits(done.priceText));
 }
 
 /** The button's words and the line after it, from what this row has had filled. */
@@ -1896,13 +2014,17 @@ function paintFill(box, rowEl, itemId) {
     const btn = box.querySelector('.' + FILL_BUTTON_CLASS);
     const line = box.querySelector('.' + FILL_TAG_CLASS);
     if (!btn || !line) return;
-    const done = app.fill.done.get(rowEl);
-    const current = done && done.itemId === String(itemId) && stillFilled(done) ? done : null;
-    if (done && !current) app.fill.done.delete(rowEl);
+    const key = fillKeyOf(rowEl, itemId);
+    const done = app.fill.done.get(key);
+    const current = done && done.itemId === String(itemId) && stillFilled(done, rowEl) ? done : null;
+    if (done && !current) app.fill.done.delete(key);
     const busy = app.fill.busy.has(rowEl);
     const compact = Boolean(box.parentNode && box.parentNode.classList && box.parentNode.classList.contains('ttv2-bzchips'));
     const failedNow = !current && app.fill.last.get(String(itemId));
-    const label = busy ? 'Filling…' : current && compact ? formatMoney(current.price) : 'Fill';
+    // Something you must do (tick Torn's box, type the quantity) or a warning:
+    // a "!" on the one-line row; the words are in the panel and on hover.
+    const needsYou = Boolean(current && (current.level === 'warn' || /tick Torn's box|type the quantity/.test(current.words)));
+    const label = busy ? 'Filling…' : current && compact ? formatMoney(current.price) + (needsYou ? ' !' : '') : 'Fill';
     const labelEl = btn.querySelector('.ttv2-filllabel');
     if (labelEl && labelEl.textContent !== label) labelEl.textContent = label;
     const checked = String(Boolean(current));
@@ -1910,7 +2032,7 @@ function paintFill(box, rowEl, itemId) {
     let title = current ? current.words + '. Untick to put back what was in the boxes.' : 'Tick to type the price (and quantity) into this row. You press Torn\'s button.';
     if (!current && failedNow && failedNow.error && failedNow.rowEl === rowEl) title = failedNow.error;
     if (btn.title !== title) btn.title = title;
-    const tone = current ? current.level || '' : failedNow && failedNow.error && failedNow.rowEl === rowEl ? 'bad' : '';
+    const tone = current ? (needsYou ? 'warn' : current.level || '') : failedNow && failedNow.error && failedNow.rowEl === rowEl ? 'bad' : '';
     if ((btn.dataset.level || '') !== tone) btn.dataset.level = tone;
     if (btn.disabled !== busy) btn.disabled = busy;
     const failed = !current && app.fill.last.get(String(itemId));
@@ -1970,11 +2092,14 @@ function onFillPress(btn) {
         rescan();
         return;
     }
-    const done = app.fill.done.get(rowEl);
-    if (done && done.itemId === itemId && stillFilled(done)) {
-        writeInputs(done.inputs.price, done.prev.price);
-        if (done.qtyWritten) writeInputs(done.inputs.qty, done.prev.qty);
-        app.fill.done.delete(rowEl);
+    const key = fillKeyOf(rowEl, itemId);
+    const done = app.fill.done.get(key);
+    if (done && done.itemId === itemId && stillFilled(done, rowEl)) {
+        // Into the boxes as Torn draws them now (it may have redrawn the row).
+        const cur = fillInputsNow(done, rowEl);
+        writeInputs(cur.price, done.prev.price);
+        if (done.qtyWritten) writeInputs(cur.qty, done.prev.qty);
+        app.fill.done.delete(key);
         repaintFills();
         renderMyBazaar();
         return;
@@ -2016,8 +2141,9 @@ async function fillRow(rowEl, itemId, { base = null } = {}) {
         const inputs = rowInputs(kind, rowEl);
         if (!inputs.price.length) throw new Error('Torn\'s price box was not found in this row.');
         // Filled already (a price picked in the panel after a tick): Undo still puts back the first values.
-        const before = app.fill.done.get(rowEl);
-        const again = before && before.itemId === String(itemId) && stillFilled(before) ? before : null;
+        const key = fillKeyOf(rowEl, itemId);
+        const before = app.fill.done.get(key);
+        const again = before && before.itemId === String(itemId) && stillFilled(before, rowEl) ? before : null;
         const prev = again ? again.prev : { price: readInputs(inputs.price), qty: readInputs(inputs.qty) };
         const text = priceText(kind, r.price);
         writeInputs(inputs.price, text);
@@ -2050,7 +2176,7 @@ async function fillRow(rowEl, itemId, { base = null } = {}) {
         if (got.note) parts.push(got.note);
         const level = stats || v.level === 'warn' ? 'warn' : v.level === 'good' ? 'good' : '';
 
-        app.fill.done.set(rowEl, { itemId: String(itemId), price: r.price, priceText: text, prev, inputs, qtyWritten, words: parts.join(' · '), level, at: Date.now() });
+        app.fill.done.set(key, { itemId: String(itemId), kind, price: r.price, priceText: text, prev, inputs, qtyWritten, words: parts.join(' · '), level, at: Date.now() });
         app.bzSelected = String(itemId);
     } catch (error) {
         const msg = redactKey(String((error && error.message) || error), getStoredKey());
@@ -2126,8 +2252,9 @@ function fillPanelView(itemId) {
         if (r.price) out.preview = { price: r.price, verdict: fillVerdict(r.price, avg), floor: r.floor, base: r.base ? r.base.price : null, used: r.used };
     }
     for (const row of app.bzRows) {
-        const done = app.fill.done.get(row.el);
-        if (done && done.itemId === String(itemId) && stillFilled(done)) out.filled = { price: done.price };
+        const done = app.fill.done.get(fillKeyOf(row.el, row.itemId));
+        // Everything Fill said about it (held at the NPC price, tick Torn's box...): shown in the panel.
+        if (done && done.itemId === String(itemId) && stillFilled(done, row.el)) out.filled = { price: done.price, words: done.words, level: done.level || '' };
     }
     return out;
 }
@@ -2139,6 +2266,19 @@ function fillPanelView(itemId) {
 function loadHistory() {
     if (!app.history) app.history = readHistory(gmGet(STORE_HISTORY, null));
     return app.history;
+}
+
+/**
+ * A price seen for a row on your own pages goes into the history only when
+ * that item is already tracked (the one you look at, the ones you fill):
+ * recordSample() on its own starts tracking, and pricing every row of a big
+ * add page tracked every one, pushing out the item you watch at 60 items.
+ */
+function recordIfTracked(itemId, at, sample) {
+    const hist = loadHistory();
+    if (!hist.items[String(itemId)]) return;
+    recordSample(hist, itemId, at, sample);
+    markHistoryDirty();
 }
 
 function markHistoryDirty() {
@@ -2335,7 +2475,9 @@ function openDeal(url, newTab = app.settings.openInNewTab !== false) {
 
 function onSettingsChange(partial) {
     app.settings = { ...app.settings, ...partial };
-    gmSet(STORE_SETTINGS, app.settings);
+    // Only what changed, over what is stored NOW: writing this tab's whole
+    // copy undid what another tab had just set (Cash, Min, a switch).
+    gmSet(STORE_SETTINGS, { ...(gmGet(STORE_SETTINGS, {}) || {}), ...partial });
 
     // A change made in one place (a chip, an empty-state button) shows in
     // every control for it.
@@ -2346,6 +2488,38 @@ function onSettingsChange(partial) {
 
     if (app.index) rescan();
     else refreshView();
+}
+
+/** Settings each tab keeps to itself: where its panel sits and which list it shows. */
+const TAB_LOCAL_SETTINGS = new Set(['panelPos', 'collapsed', 'viewTab', 'docked']);
+
+/**
+ * Another tab changed a setting: this one follows at once, and re-prices, so
+ * Cash / Min / the chips / the switches are the same in every tab.
+ */
+function onRemoteSettings() {
+    const stored = gmGet(STORE_SETTINGS, {}) || {};
+    const changed = {};
+    for (const key of Object.keys(DEFAULT_SETTINGS)) {
+        if (TAB_LOCAL_SETTINGS.has(key) || !Object.prototype.hasOwnProperty.call(stored, key)) continue;
+        if (JSON.stringify(stored[key]) !== JSON.stringify(app.settings[key])) changed[key] = stored[key];
+    }
+    if (!Object.keys(changed).length) return;
+    app.settings = { ...app.settings, ...changed };
+    if (app.panel) app.panel.applySettings(changed);
+    if (app.index) rescan();
+    else refreshView();
+}
+
+/** Another tab saved, forgot, or found dead the Public key: follow it without a reload. */
+function onRemoteKey() {
+    const dead = Boolean(gmGet(STORE_KEY_DEAD, false));
+    const was = hasUsableKey();
+    app.keyDead = dead;
+    if (!app.panel) return;
+    refreshKeyState();
+    if (dead) app.panel.setStatus('Torn rejected this key (in another tab). Paste a new Public key.', 'error');
+    else if (!was && hasUsableKey() && app.index) rescan();
 }
 
 /* ------------------------------------------------------------------ *
@@ -2455,8 +2629,44 @@ function handleRouteChange() {
  * Live feed
  * ------------------------------------------------------------------ */
 
+/** One per-tab request window per name, for this tab (platform/tab-window.js). */
+const tabWindows = new Map();
+function sharedTabWindow(name) {
+    if (!tabWindows.has(name)) {
+        tabWindows.set(name, tabWindow(name, app.tabId, { get: gmGet, set: gmSet, del: gmDel }));
+    }
+    return tabWindows.get(name);
+}
+
+/**
+ * What every Torn API client shares with the other tabs: the pause after an
+ * IP block / outage / rate block, and never a request from a hidden tab.
+ */
+function tornSharing() {
+    const win = sharedTabWindow(STORE_API_WINDOW);
+    return {
+        loadWindow: () => win.load(),
+        addToWindow: (at) => win.add(at),
+        loadPause: () => gmGet(STORE_TORN_PAUSE, null),
+        savePause: (p) => gmSet(STORE_TORN_PAUSE, p),
+        isVisible: () => document.visibilityState === 'visible',
+    };
+}
+
+/** A TornW3B client drawing on the one budget every tab shares. */
+function newW3bClient(options = {}) {
+    return new W3bClient({
+        ...options,
+        // Slots per tab (never overwritten by another tab); the 429 wait in one value.
+        loadShared: () => ({ recent: sharedTabWindow(STORE_W3B_WINDOW).load(), cooldownUntil: Number(gmGet(STORE_W3B_COOLDOWN, 0)) || 0 }),
+        saveShared: (state) => gmSet(STORE_W3B_COOLDOWN, state.cooldownUntil),
+        addShared: (at) => sharedTabWindow(STORE_W3B_WINDOW).add(at),
+        isVisible: () => document.visibilityState === 'visible',
+    });
+}
+
 function startLiveFeed() {
-    app.w3b = new W3bClient();
+    app.w3b = newW3bClient();
 
     app.feed = new LiveFeed({
         tabId: app.tabId,
@@ -2523,7 +2733,7 @@ const SCRIPT_START_MS = typeof performance !== 'undefined' ? Math.round(performa
 /** Every stored value's size (names and sizes only - never a value, never a key). */
 function storageSizes() {
     const keys = [
-        STORE_KEY, STORE_ITEMS, STORE_NPC, STORE_MANUAL_NPC, STORE_SETTINGS, STORE_KEY_ACCESS, STORE_API_WINDOW, STORE_KEY_DEAD, STORE_OPENED,
+        STORE_KEY, STORE_ITEMS, STORE_NPC, STORE_MANUAL_NPC, STORE_SETTINGS, STORE_KEY_ACCESS, STORE_API_WINDOW + '.tabs', STORE_W3B_WINDOW + '.tabs', STORE_TORN_PAUSE, STORE_KEY_DEAD, STORE_OPENED,
         STORE_SELL_KEY, STORE_SELL_KEY_DEAD, STORE_SELL_KEY_ACCESS, STORE_TE_KEY, STORE_TE, STORE_TE_STATE, STORE_TE_LISTS, STORE_TE_IDS,
         STORE_INVENTORY, STORE_SELL_PREFS, STORE_TRADER_DB, STORE_TE_ONE, STORE_SELL_SELF, STORE_SELL_NETWORTH,
         STORE_LEDGER_KEY, STORE_LEDGER_KEY_DEAD, STORE_LEDGER_SELF, STORE_LEDGER,
@@ -2765,7 +2975,11 @@ function stepTeOne() {
         .then((best) => {
             const rec = { at: Date.now(), best };
             sell.teOne.set(id, rec);
-            const stored = gmGet(STORE_TE_ONE, null) || {};
+            // Answers past their TTL are dropped as this one is added: never read again, never kept.
+            const stored = {};
+            for (const [k, r] of Object.entries(gmGet(STORE_TE_ONE, null) || {})) {
+                if (r && Date.now() - Number(r.at) < TE_ONE_TTL_MS) stored[k] = r;
+            }
             stored[id] = rec;
             gmSet(STORE_TE_ONE, stored);
             if (best) learnTraders([{ id: best.id, name: best.name, source: 'te' }]);
@@ -3005,7 +3219,9 @@ function loadSellMarket(itemId) {
     fetchItemMarket(sell.client, id, { limit: 5 })
         .then((r) => {
             const lowest = r.listings.length ? Math.min(...r.listings.map((l) => l.price)) : null;
-            sell.market.set(id, { at: Date.now(), triedAt: Date.now(), lowest, loading: false, error: null });
+            // How many are listed near that price: Where to sell counts no more than that.
+            const depth = depthNearCheapest(r.listings.map((l) => ({ price: l.price, qty: l.amount })));
+            sell.market.set(id, { at: Date.now(), triedAt: Date.now(), lowest, depth, loading: false, error: null });
         })
         .catch((error) => {
             if (isKeyDeadError(error)) {
@@ -3163,6 +3379,11 @@ function renderSellingNow() {
         const b = sell.bazaars.get(String(id));
         return b && b.at ? bazaarSellers(b.rows, { selfId: sell.selfId, now }) : null;
     };
+    // Units other sellers list near the cheapest (fresh listings): the most a listing is counted for.
+    const bazaarDepthOf = (id) => {
+        const rows = sellersOf(id);
+        return rows ? depthNearCheapest(rows.filter((r) => !r.stale)) : null;
+    };
     const lowestOf = (id) => {
         const rows = sellersOf(id);
         if (rows) {
@@ -3192,7 +3413,7 @@ function renderSellingNow() {
         let best = null;
         for (const b of flipBuyersOf(id)) {
             const most = Math.min(prefs.maxPerFlip || 100, b.maxUnits ? b.maxUnits : Infinity);
-            const plan = flipPlan(rows, b.price, { cash: prefs.cash, maxUnits: most });
+            const plan = flipPlan(rows, b.price, { cash: prefs.cash, maxUnits: most, minPct: prefs.minProfitPct });
             if (!plan) continue;
             if (!best || plan.profit > best.profit || (plan.profit === best.profit && plan.units > 0 && !best.units)) best = { ...plan, buyer: b };
         }
@@ -3215,7 +3436,7 @@ function renderSellingNow() {
                 }
             }
             return pick ? { price: pick.price, maxUnits: pick.maxUnits || null } : null;
-        }, { cash: prefs.cash, maxUnits: prefs.maxPerFlip })
+        }, { cash: prefs.cash, maxUnits: prefs.maxPerFlip, minPct: prefs.minProfitPct })
         : [];
     const flipsChecked = sell.candidates.filter((c) => {
         const b = sell.bazaars.get(c.itemId);
@@ -3240,7 +3461,7 @@ function renderSellingNow() {
             badge = { kind: 'flip', amount: plan.profit };
             value = plan.profit;
         } else if (held && best) {
-            const w = whereToSell({ held, bid: best.price, bazaarLowest: lowest });
+            const w = whereToSell({ held, bid: best.price, bazaarLowest: lowest, bazaarDepth: bazaarDepthOf(id) });
             if (w.best === 'bazaar') {
                 badge = { kind: 'list', amount: w.gain };
                 value = w.gain;
@@ -3310,7 +3531,7 @@ function renderSellingNow() {
             },
             plan: planOf(pick),
             planWhy: b && b.at ? null : 'loading',
-            where: held ? whereToSell({ held, bid: buyers[0] ? buyers[0].price : null, bazaarLowest: lowestOf(pick), marketLowest: m ? m.lowest : null }) : null,
+            where: held ? whereToSell({ held, bid: buyers[0] ? buyers[0].price : null, bazaarLowest: lowestOf(pick), marketLowest: m ? m.lowest : null, bazaarDepth: bazaarDepthOf(pick), marketDepth: m ? m.depth : null }) : null,
             market: { state: m && m.at ? 'ok' : m && m.error ? 'error' : 'loading', lowest: m ? m.lowest : null },
         };
         if (held) loadSellMarket(pick);
@@ -3894,8 +4115,7 @@ function openSellLink(url) {
 function bootSellingPage() {
     sell.client = new TornApiClient({
         getKey: getSellKey,
-        loadWindow: () => gmGet(STORE_API_WINDOW, []),
-        saveWindow: (recent) => gmSet(STORE_API_WINDOW, recent),
+        ...tornSharing(),
     });
     loadSellNetworth();
     /*
@@ -3913,7 +4133,7 @@ function bootSellingPage() {
         onSettled: onTeSettled,
     });
     // Its own TornW3B budget, well under TornW3B's 100 a minute per IP.
-    sell.w3b = new W3bClient({ maxPerMinute: 24 });
+    sell.w3b = newW3bClient({ maxPerMinute: 24 });
     sell.keyDead = Boolean(gmGet(STORE_SELL_KEY_DEAD, false));
     if (sell.keyDead) sell.keyError = 'Torn rejected this key. Paste a new Limited key.';
 
@@ -3977,6 +4197,19 @@ function bootSellingPage() {
         loadSellTraders();
         renderSelling();
     });
+    // Another Torn Bids tab changed a setting, or found the Limited key
+    // dead / saved a new one: this tab follows at once, no reload.
+    gmOnChange(STORE_SELL_PREFS, () => renderSellingNow());
+    const onSellKeyElsewhere = () => {
+        const dead = Boolean(gmGet(STORE_SELL_KEY_DEAD, false));
+        if (dead === sell.keyDead) return renderSelling();
+        sell.keyDead = dead;
+        if (dead) sell.keyError = 'Torn rejected this key (in another tab). Paste a new Limited key.';
+        else sell.keyError = null;
+        renderSelling();
+    };
+    gmOnChange(STORE_SELL_KEY_DEAD, onSellKeyElsewhere);
+    gmOnChange(STORE_SELL_KEY, onSellKeyElsewhere);
     // Traders found on a TornW3B page you opened, or by another tab.
     gmOnChange(STORE_TRADER_DB, () => {
         if (mergeTraderDbs(sell.db, gmGet(STORE_TRADER_DB, null))) {
@@ -4009,20 +4242,25 @@ function bootSellingPage() {
 
     // Another Torn Bids tab saved, forgot or read: take its word for it.
     gmOnChange(STORE_LEDGER_KEY, () => {
-        led.data = null;
         led.nextAt = 0;
-        renderSelling();
+        reloadLedger();
+    });
+    // Another tab saved the ledger (its rows are in IndexedDB; this is the signal).
+    gmOnChange(STORE_LEDGER_REV, () => {
+        if (!led.busy) reloadLedger();
     });
     gmOnChange(STORE_LEDGER, () => {
-        if (!led.busy) led.data = null;
-        renderSelling();
+        if (!led.busy && !ledgerInIdb) reloadLedger();
     });
     led.client = new LedgerClient({
         getKey: getLedgerKey,
-        loadWindow: () => gmGet(STORE_API_WINDOW, []),
-        saveWindow: (recent) => gmSet(STORE_API_WINDOW, recent),
+        ...tornSharing(),
     });
-    runLedger();
+    // The rows come from IndexedDB (async); the first run waits for them.
+    loadLedgerStore().then(() => {
+        renderSelling();
+        runLedger();
+    });
     setInterval(() => runLedger(), 15000);
 
     setInterval(() => {
@@ -4061,13 +4299,67 @@ function getLedgerKey() {
     return gmGet(STORE_LEDGER_KEY, '') || '';
 }
 
+/*
+ * The Ledger's rows live in Torn Bids' own IndexedDB (platform/idb.js), not
+ * in GM storage: Tampermonkey hands every GM value to the script on every
+ * Torn page, and these grow with every trade. A tiny GM value, the revision,
+ * tells other Torn Bids tabs to re-read. Where IndexedDB is refused, GM
+ * storage is used as before.
+ */
+let ledgerInIdb = true;
+
+async function loadLedgerStore() {
+    try {
+        let stored = await idbGet(STORE_LEDGER);
+        // Before 3.12.5 it was in GM storage: moved once, then deleted there.
+        const old = gmGet(STORE_LEDGER, null);
+        if (old) {
+            if (!stored) {
+                await idbSet(STORE_LEDGER, old);
+                stored = old;
+            }
+            gmDel(STORE_LEDGER);
+        }
+        led.data = readLedger(stored);
+    } catch {
+        ledgerInIdb = false;
+        led.data = readLedger(gmGet(STORE_LEDGER, null));
+    }
+    led.loaded = true;
+}
+
+/** Read the stored ledger again (another tab wrote it, or the key changed). */
+function reloadLedger() {
+    led.loaded = false;
+    led.data = null;
+    return loadLedgerStore().then(() => renderSelling());
+}
+
 function ledgerData() {
-    if (!led.data) led.data = readLedger(gmGet(STORE_LEDGER, null));
+    // Until the store has answered, an empty ledger stands in (and is never saved).
+    if (!led.data) return led.loaded ? (led.data = emptyLedger()) : emptyLedger();
     return led.data;
 }
 
 function saveLedger() {
-    if (led.data) gmSet(STORE_LEDGER, led.data);
+    if (!led.data || !led.loaded) return;
+    if (!ledgerInIdb) {
+        gmSet(STORE_LEDGER, led.data);
+        return;
+    }
+    idbSet(STORE_LEDGER, led.data)
+        .then(() => gmSet(STORE_LEDGER_REV, Date.now()))
+        .catch(() => {
+            ledgerInIdb = false;
+            gmSet(STORE_LEDGER, led.data);
+        });
+}
+
+/** Delete the stored ledger, wherever it is. */
+function clearLedgerStore() {
+    gmDel(STORE_LEDGER);
+    led.data = emptyLedger();
+    if (ledgerInIdb) idbDel(STORE_LEDGER).then(() => gmSet(STORE_LEDGER_REV, Date.now())).catch(() => {});
 }
 
 function ledgerErrorText(error) {
@@ -4103,8 +4395,7 @@ async function onLedgerSaveKey(key) {
     renderSelling();
     const probe = new LedgerClient({
         getKey: () => key,
-        loadWindow: () => gmGet(STORE_API_WINDOW, []),
-        saveWindow: (recent) => gmSet(STORE_API_WINDOW, recent),
+        ...tornSharing(),
         maxRetries: 0,
     });
     try {
@@ -4119,10 +4410,7 @@ async function onLedgerSaveKey(key) {
         }
         // Another account's key: its own ledger, not this one's rows.
         const was = gmGet(STORE_LEDGER_SELF, null);
-        if (was && String(was) !== String(info.userId)) {
-            gmDel(STORE_LEDGER);
-            led.data = null;
-        }
+        if (was && String(was) !== String(info.userId)) clearLedgerStore();
         gmSet(STORE_LEDGER_KEY, key);
         gmDel(STORE_LEDGER_KEY_DEAD);
         gmSet(STORE_LEDGER_SELF, info.userId);
@@ -4143,8 +4431,7 @@ function onLedgerForget() {
     gmDel(STORE_LEDGER_KEY);
     gmDel(STORE_LEDGER_KEY_DEAD);
     gmDel(STORE_LEDGER_SELF);
-    gmDel(STORE_LEDGER);
-    led.data = null;
+    clearLedgerStore();
     led.keyError = null;
     led.error = null;
     led.saveMsg = { bad: false, text: 'Key and ledger deleted.' };
@@ -4157,7 +4444,7 @@ function onLedgerForget() {
  * window; only while Torn Bids is in front; every LEDGER_EVERY_MS.
  */
 async function runLedger({ now = Date.now() } = {}) {
-    if (led.busy || !getLedgerKey() || gmGet(STORE_LEDGER_KEY_DEAD, null) || document.visibilityState !== 'visible') return;
+    if (led.busy || !led.loaded || !getLedgerKey() || gmGet(STORE_LEDGER_KEY_DEAD, null) || document.visibilityState !== 'visible') return;
     if (now < led.nextAt) return;
     led.busy = true;
     led.error = null;
@@ -4277,8 +4564,8 @@ async function runLedger({ now = Date.now() } = {}) {
     } catch (error) {
         if (error instanceof LedgerKeyChanged || !same()) {
             // Forgotten or replaced mid-run: nothing kept, nothing marked; the new key reads at once.
-            led.data = null;
             led.nextAt = 0;
+            reloadLedger();
         } else {
             if (error && (KEY_DEAD_CODES.has(error.code) || error.code === 16)) markLedgerKeyDead(error);
             led.error = ledgerErrorText(error);
@@ -4374,6 +4661,10 @@ export function boot() {
         return;
     }
 
+    // Before 3.12.5 the shared windows were single arrays; now one per tab.
+    if (gmGet(STORE_API_WINDOW, null) !== null) gmDel(STORE_API_WINDOW);
+    if (gmGet(STORE_W3B_WINDOW, null) !== null) gmDel(STORE_W3B_WINDOW);
+
     // A tab opened for the traders page: this whole tab is the page.
     if (isTradersPageUrl(location.href)) {
         bootSellingPage();
@@ -4384,6 +4675,9 @@ export function boot() {
 
     app.settings = loadSettings();
     app.keyDead = Boolean(gmGet(STORE_KEY_DEAD, false));
+    gmOnChange(STORE_SETTINGS, onRemoteSettings);
+    gmOnChange(STORE_KEY_DEAD, onRemoteKey);
+    gmOnChange(STORE_KEY, onRemoteKey);
 
     /*
      * One request budget for every open Torn tab. Torn counts 100/min per
@@ -4392,8 +4686,7 @@ export function boot() {
      */
     app.client = new TornApiClient({
         getKey: getStoredKey,
-        loadWindow: () => gmGet(STORE_API_WINDOW, []),
-        saveWindow: (recent) => gmSet(STORE_API_WINDOW, recent),
+        ...tornSharing(),
     });
 
     app.panel = new Panel({

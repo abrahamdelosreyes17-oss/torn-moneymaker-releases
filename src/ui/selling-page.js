@@ -30,6 +30,7 @@ import { w3bPriceListUrl } from '../api/w3b.js';
 import { bazaarUrl } from '../core/feed.js';
 import { itemMarketUrl } from '../sources/route.js';
 import { LedgerView, LEDGER_CSS } from './ledger-view.js';
+import { keyInputAttrs, keyMask } from './mask.js';
 
 export const SELLING_PAGE_TITLE = 'Torn Bids';
 
@@ -46,6 +47,8 @@ export const SELLING_PAGE_DEFAULTS = {
     linksNewTab: true,
     /* A flip never asks a trader to pay more than this share of their networth. */
     networthPct: 10,
+    /* A flip buys only listings that make at least this % per item: $1 is for NPC shops, not people. */
+    minProfitPct: 1,
 };
 
 /** The item list shows this many at a time. */
@@ -106,40 +109,19 @@ function count(n) {
 
 /** A masked key field with Show / Save. The saved key is never left in the field. */
 function keyField({ placeholder, onSave, onReveal, primary = false }) {
-    const input = spEl('input', {
-        type: 'text',
-        class: 'sp-masked sp-key',
-        placeholder,
-        autocomplete: 'off',
-        autocapitalize: 'off',
-        autocorrect: 'off',
-        spellcheck: 'false',
-        'data-lpignore': 'true',
-        'data-1p-ignore': 'true',
-    });
-    let revealed = false;
-    const show = spEl('button', {
-        type: 'button',
-        class: 'sp-btn',
-        text: 'Show',
-        onclick: () => {
-            const hidden = input.classList.toggle('sp-masked');
+    const input = spEl('input', { ...keyInputAttrs(), class: 'sp-key', placeholder });
+    const show = spEl('button', { type: 'button', class: 'sp-btn', text: 'Show' });
+    const mask = keyMask(input, 'sp-masked', {
+        onReveal: onReveal || null,
+        onChange: (hidden) => {
             show.textContent = hidden ? 'Show' : 'Hide';
-            if (!hidden && !input.value && onReveal) {
-                input.value = onReveal() || '';
-                revealed = true;
-            } else if (hidden && revealed) {
-                input.value = '';
-                revealed = false;
-            }
         },
     });
+    show.addEventListener('click', () => mask.toggle());
     const save = () => {
         const key = input.value.trim();
+        mask.hide();
         input.value = '';
-        revealed = false;
-        input.classList.add('sp-masked');
-        show.textContent = 'Show';
         onSave(key);
     };
     input.addEventListener('keydown', (event) => {
@@ -234,6 +216,12 @@ export class SellingPage {
 
         this.keyHandler = (event) => {
             if (event.key === 'Escape') {
+                // Typed but not saved: the first Esc says so, the second leaves.
+                if (this.view === 'settings' && !this.escWarned && this.warnUnsaved()) {
+                    this.escWarned = true;
+                    return;
+                }
+                this.escWarned = false;
                 if (this.view !== 'list') this.showView('list');
                 return;
             }
@@ -251,6 +239,27 @@ export class SellingPage {
             this.renderPills();
             if (this.view === 'settings') this.renderSettingsNav();
         }, 1000);
+    }
+
+    /**
+     * Settings fields with typed text not saved yet: each one says so under
+     * itself. Returns whether there were any.
+     */
+    warnUnsaved() {
+        const fields = [
+            [this.cashDirty, this.cashInput, this.cashStateEl],
+            [this.maxDirty, this.maxInput, this.maxStateEl],
+            [this.nwDirty, this.nwInput, this.nwStateEl],
+            [this.minDirty, this.minInput, this.minStateEl],
+        ];
+        let any = false;
+        for (const [dirty, input, stateEl] of fields) {
+            if (!dirty || !input || !String(input.value).trim() || !stateEl) continue;
+            stateEl.textContent = 'Not saved yet: press Save, or Esc again to leave without it.';
+            stateEl.className = 'sp-keystate sp-bad';
+            any = true;
+        }
+        return any;
     }
 
     destroy() {
@@ -610,6 +619,29 @@ export class SellingPage {
             saveNw();
         });
 
+        this.minInput = spEl('input', { type: 'text', class: 'sp-key sp-pctin', placeholder: '1', 'aria-label': 'Least profit per item, percent', autocomplete: 'off', spellcheck: 'false', inputmode: 'decimal' });
+        this.minStateEl = spEl('div', { class: 'sp-keystate' });
+        const saveMin = () => {
+            const raw = String(this.minInput.value).replace(/[%,\s]/g, '');
+            const n = Number(raw);
+            if (!raw || !(n >= 0 && n <= 100)) {
+                this.minStateEl.textContent = 'Type a percent from 0 to 100.';
+                this.minStateEl.className = 'sp-keystate sp-bad';
+                return;
+            }
+            this.minInput.value = '';
+            this.minDirty = false;
+            if (this.h.onPrefsChange) this.h.onPrefsChange({ minProfitPct: n });
+        };
+        this.minInput.addEventListener('input', () => {
+            this.minDirty = true;
+        });
+        this.minInput.addEventListener('keydown', (event) => {
+            if (event.key !== 'Enter') return;
+            event.preventDefault();
+            saveMin();
+        });
+
         group('Torn Bids');
         section('flips', 'Flips', 'What Best flips and the flip plan may suggest.', [
             field('Cash for flips', 'Blank: no limit', [
@@ -627,21 +659,23 @@ export class SellingPage {
                 this.nwStateEl,
                 note(['A flip never asks a trader to pay more than this share of their networth. Networth comes from Torn\'s public stats, read with your Limited key.']),
             ]),
+            field('Least profit per item', null, [
+                spEl('div', { class: 'sp-inline sp-pct' }, ['At least ', this.minInput, ' % of the price ', spEl('button', { type: 'button', class: 'sp-btn sp-primary', text: 'Save', onclick: saveMin })]),
+                this.minStateEl,
+                note(['A flip skips listings that make less than this on each item. A trader is a person: $1 under their price is not worth a trade.']),
+            ]),
         ]);
 
         /* the Torn Ledger's Full key: masked, never shown again, its own terms */
+        // A text box masked by CSS, never a password box (ui/mask.js): a
+        // browser would offer to save a Full key into its synced passwords.
         this.ledgerKeyInput = spEl('input', {
-            type: 'password',
-            class: 'sp-masked sp-key',
+            ...keyInputAttrs(),
+            class: 'sp-key',
             placeholder: 'Full API key',
             'aria-label': 'Full API key for the Torn Ledger',
-            autocomplete: 'new-password',
-            autocapitalize: 'off',
-            autocorrect: 'off',
-            spellcheck: 'false',
-            'data-lpignore': 'true',
-            'data-1p-ignore': 'true',
         });
+        keyMask(this.ledgerKeyInput, 'sp-masked');
         const saveLedgerKey = () => {
             const key = this.ledgerKeyInput.value.trim();
             this.ledgerKeyInput.value = '';
@@ -829,6 +863,12 @@ export class SellingPage {
             this.maxInput.placeholder = String(p.maxPerFlip || 100);
             this.maxStateEl.className = 'sp-keystate';
             this.maxStateEl.textContent = 'Saved: ' + count(p.maxPerFlip || 100) + ' items.';
+        }
+        if (!this.minDirty) {
+            const m = p.minProfitPct ?? 1;
+            this.minInput.placeholder = String(m);
+            this.minStateEl.className = 'sp-keystate';
+            this.minStateEl.textContent = 'Saved: ' + m + '%.';
         }
         if (!this.nwDirty) {
             this.nwInput.placeholder = String(p.networthPct || 10);
@@ -1021,7 +1061,8 @@ export class SellingPage {
         } else if (!info.hasKey) {
             say('Add your Limited key to see your items.', null, 'Add key', toSettings);
         } else if (!info.hasTeKey) {
-            say('For every TornExchange trader, add the key you log in there with.', null, 'Use my Limited key', useLimited);
+            // What the button does, before it does it: this key goes to tornexchange.com.
+            say('Most traders post their prices on TornExchange (tornexchange.com). It reads them only with the Torn key you log in there with. If that is your Limited key, this sends it to TornExchange too.', null, 'Use my Limited key', useLimited);
         } else if (info.teBadKey && !info.teSameAsLimited) {
             say(info.teError || 'TornExchange did not accept this key.', 'bad', 'Use my Limited key', useLimited);
         } else if (info.teBadKey) {
@@ -1224,7 +1265,7 @@ export class SellingPage {
         const sig = d
             ? JSON.stringify([
                 d.itemId, d.name, d.held, d.avg, d.bazaars, d.buyersTotal, d.buyersLoading, d.pending, d.planWhy,
-                d.buyers.map((b) => [b.id, b.name, b.price, b.te, b.w3b, statusOf(b), b.trust ? b.trust.level + b.trust.score : '', this.state.networth && b.id ? this.state.networth.get(String(b.id)) : null]),
+                d.buyers.map((b) => [b.id, b.name, b.price, b.te, b.teTop, b.teList, b.w3b, statusOf(b), b.trust ? b.trust.level + b.trust.score : '', this.state.networth && b.id ? this.state.networth.get(String(b.id)) : null]),
                 p.networthPct,
                 d.sellers.state, d.sellers.error,
                 d.sellers.rows.map((r) => [r.sellerId, r.sellerName, r.price, r.qty, r.stale, Math.floor((now - (r.dataAt || 0)) / 60000)]),
@@ -1283,7 +1324,7 @@ export class SellingPage {
                     this.networthLine(b),
                     // Their two lists disagree: the lower is counted, and said.
                     b.differ
-                        ? spEl('small', { class: 'sp-differ', text: 'Lists differ: TE ' + formatMoney(b.te) + ' · W3B ' + formatMoney(b.w3b) + '. Counted at the lower; check before trading.' })
+                        ? spEl('small', { class: 'sp-differ', text: 'Lists differ: ' + this.listPrices(b, ' · ') + '. Counted at the lower; check before trading.' })
                         : null,
                 ]),
                 spEl('span', { class: 'sp-tprice', text: formatMoney(b.price) }),
@@ -1304,6 +1345,22 @@ export class SellingPage {
             }));
         }
         return card;
+    }
+
+    /**
+     * A trader's prices for one item, per list: "TE $850,000 · W3B $852,000",
+     * or "TE top 3 $140,000 · TE full list $105,000" when TornExchange's own
+     * two lists disagree.
+     */
+    listPrices(b, sep) {
+        const parts = [];
+        if (b.teTop > 0 && b.teList > 0 && b.teTop !== b.teList) {
+            parts.push('TE top 3 ' + formatMoney(b.teTop), 'TE full list ' + formatMoney(b.teList));
+        } else if (b.te > 0) {
+            parts.push('TE ' + formatMoney(b.te));
+        }
+        if (b.w3b > 0) parts.push('W3B ' + formatMoney(b.w3b));
+        return parts.join(sep);
     }
 
     /** "Networth $1.2b" under a trader, once Torn has said. */
@@ -1407,7 +1464,7 @@ export class SellingPage {
                 const nw = b.id && this.state.networth ? this.state.networth.get(String(b.id)) : null;
                 card.appendChild(spEl('p', { class: 'sp-note', text: b.name + ' can pay for at most ' + count(b.maxUnits) + ': ' + (this.state.prefs.networthPct || 10) + '% of their networth' + (nw >= 0 ? ' (' + formatMoney(nw) + ')' : '') + '.' }));
             }
-            if (b.differ) card.appendChild(spEl('p', { class: 'sp-note sp-warnnote', text: b.name + '\'s lists differ (TE ' + formatMoney(b.te) + ', W3B ' + formatMoney(b.w3b) + '): planned at the lower. Check their list before trading.' }));
+            if (b.differ) card.appendChild(spEl('p', { class: 'sp-note sp-warnnote', text: b.name + '\'s lists differ (' + this.listPrices(b, ', ') + '): planned at the lower. Check their list before trading.' }));
             return card;
         }
         const card = spEl('div', { class: 'sp-q' + wide }, [spEl('h3', { text: 'Flip plan' })]);
@@ -1417,7 +1474,11 @@ export class SellingPage {
         if (f && f.units === 0) text = 'One costs ' + formatMoney(f.needs) + ', more than your cash (' + formatMoney(this.state.prefs.cash) + ').';
         else if (d.planWhy === 'loading') text = 'Loading bazaars from TornW3B…';
         else if (!top) text = 'No flip: no ' + who + ' for this item.';
-        else if (d.sellers.rows.some((r) => !r.stale)) text = 'No flip: the cheapest bazaar is ' + formatMoney(d.sellers.rows.find((r) => !r.stale).price - top.price) + ' over the best ' + who + '.';
+        else if (d.sellers.rows.some((r) => !r.stale && r.price < top.price)) {
+            // Under the bid, but by less than Settings' least profit per item.
+            const r = d.sellers.rows.find((x) => !x.stale);
+            text = 'No flip: the cheapest bazaar makes only ' + formatMoney(top.price - r.price) + ' each, under your ' + (this.state.prefs.minProfitPct ?? 1) + '% least profit per item.';
+        } else if (d.sellers.rows.some((r) => !r.stale)) text = 'No flip: the cheapest bazaar is ' + formatMoney(d.sellers.rows.find((r) => !r.stale).price - top.price) + ' over the best ' + who + '.';
         else if (d.sellers.rows.length) text = 'No flip: TornW3B has not seen these bazaars in the last 30 minutes.';
         else text = 'No flip: no bazaar is selling it.';
         card.appendChild(spEl('p', { class: 'sp-note', text }));
@@ -1458,9 +1519,13 @@ export class SellingPage {
             const each = o ? o.each : null;
             const win = w.best === r.venue;
             const listAt = r.venue === 'bazaar' && each !== null ? ' at ' + formatMoney(each) : r.venue === 'market' && d.market.lowest > 1 ? ' at ' + formatMoney(d.market.lowest - 1) : '';
+            // A listing counted for only the first N (as many as are listed
+            // near that price now): the rest go to the trader, and it says so.
+            const part = o && each !== null && o.units < n;
+            const eachText = formatMoney(each) + ' each' + (part ? ' · first ' + count(o.units) + (b ? ', rest to trader' : '') : '');
             const inner = [
                 spEl('span', { class: 'sp-opt-l' }, [spEl('b', { text: r.name + listAt }), spEl('small', { text: each === null ? r.missing : r.when })]),
-                spEl('span', { class: 'sp-opt-p' }, each === null ? ['–'] : [formatMoney(each * n), n > 1 ? spEl('small', { text: formatMoney(each) + ' each' }) : null]),
+                spEl('span', { class: 'sp-opt-p' }, each === null ? ['–'] : [formatMoney(o.total !== null ? o.total : each * n), n > 1 ? spEl('small', { text: eachText }) : null]),
             ];
             if (r.url && each !== null) card.appendChild(this.link('', r.url, { cls: 'sp-opt' + (win ? ' sp-win' : ''), title: r.venue === 'trader' ? 'Start a trade' : r.venue === 'bazaar' ? 'Open your bazaar\'s add page' : 'Open the Item Market\'s add page', focus: 'where:' + r.venue, children: inner }));
             else card.appendChild(spEl('div', { class: 'sp-opt sp-opt-none' }, inner));
@@ -1469,12 +1534,13 @@ export class SellingPage {
         const bazaar = w.options.find((x) => x.venue === 'bazaar');
         let verdict = '';
         if (w.best === 'bazaar' || w.best === 'market') {
-            const place = w.best === 'bazaar' ? 'your bazaar' : 'the Item Market';
+            const won = w.options.find((x) => x.venue === w.best);
+            const place = (w.best === 'bazaar' ? 'your bazaar' : 'the Item Market') + (won && won.units < n ? ' for the first ' + count(won.units) + ' (as many as are listed near that price now)' : '');
             verdict = b ? 'Best: ' + place + ', ' + signed(w.gain) + ' more than the trader, but you wait for a buyer.' : 'Best: ' + place + '. ' + rows[0].missing + '.';
         } else if (w.best === 'trader') {
             verdict = 'Best: sell to trader ' + b.name + '.';
             if (bazaar && bazaar.each !== null) {
-                const diff = (bazaar.each - b.price) * n;
+                const diff = bazaar.total - b.price * n;
                 verdict += diff > 0 ? ' Your bazaar would get only ' + signed(diff) + ' more, and you would wait.' : ' Your bazaar would get ' + formatMoney(-diff) + ' less.';
             }
         }
@@ -1525,13 +1591,15 @@ export class SellingPage {
         const parts = [];
         if (t.votes !== null) parts.push('TornExchange votes ' + (t.votes >= 0 ? '+' : '') + t.votes);
         if (t.up !== null) parts.push('TornW3B rating ' + t.up + '↑ ' + t.down + '↓');
-        return spEl('span', { class: 'sp-trust', 'data-level': t.level.toLowerCase(), title: parts.join(' · '), text: t.level });
+        // The numbers are read out too, not only shown on hover.
+        return spEl('span', { class: 'sp-trust', 'data-level': t.level.toLowerCase(), title: parts.join(' · '), 'aria-label': t.level + (parts.length ? ': ' + parts.join(', ') : ''), text: t.level });
     }
 
     /** A dot and a word: Online, Idle 5m, Offline 3h, Online · Hospital. Nothing when not known yet. */
     status(buyer) {
         const st = buyer && buyer.id && this.state.statuses ? this.state.statuses.get(String(buyer.id)) : null;
         const box = spEl('span', { class: 'sp-status', title: st ? buyer.name + ': ' + st.title : '' });
+        if (st) box.setAttribute('aria-label', st.title || st.text);
         if (st) box.append(spEl('span', { class: 'sp-dot', 'data-level': st.level }), st.text);
         return box;
     }

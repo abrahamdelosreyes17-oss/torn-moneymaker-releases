@@ -117,6 +117,31 @@ test('one row per trader: on both sites, the LOWER price counts and the row says
     );
 });
 
+test('TornExchange top three and full list disagree for one trader: the LOWER counts, and the row says so', () => {
+    // The friend traded ID Badges to SilentStorm77 at the top three's
+    // $140,000; the trader's list already said $105,000.
+    const buyers = buyersForItem('1', {
+        teBest: [{ name: 'SilentStorm77', id: '5', price: 140000, score: 3 }],
+        teFull: [{ name: 'SilentStorm77', price: 105000 }],
+    });
+    assert.deepEqual(
+        buyers.map((b) => [b.name, b.price, b.te, b.teTop, b.teList, b.differ]),
+        [['SilentStorm77', 105000, 105000, 140000, 105000, true]],
+    );
+    // Either way round: a newer top three can be the lower one.
+    const other = buyersForItem('1', {
+        teBest: [{ name: 'SilentStorm77', id: '5', price: 100000, score: 3 }],
+        teFull: [{ name: 'SilentStorm77', price: 105000 }],
+    });
+    assert.deepEqual([other[0].price, other[0].differ], [100000, true]);
+    // The same price on both: nothing to say.
+    const same = buyersForItem('1', {
+        teBest: [{ name: 'SilentStorm77', id: '5', price: 105000, score: 3 }],
+        teFull: [{ name: 'SilentStorm77', price: 105000 }],
+    });
+    assert.deepEqual([same[0].price, same[0].differ], [105000, false]);
+});
+
 test('a trader on both sites at the same price is not marked as differing', () => {
     const db = dbWithLists();
     const buyers = buyersForItem('206', {
@@ -491,4 +516,22 @@ test('item rows sort by any column; items nobody buys stay last', () => {
     // Unknown sorts fall back to the best price; the input is not changed.
     assert.deepEqual(names(null), ['Xanax', 'apple', 'Hammer', 'Beer']);
     assert.equal(rows[0].name, 'Xanax');
+});
+
+/* ------------------------------------------------ the database stops growing */
+
+import { pruneTraderDb as pruneDb, TRADER_FORGET_MS } from '../src/core/traders.js';
+
+test('a trader no source has named for 30 days, with no list in that time, is forgotten', () => {
+    const T = 1_800_000_000_000;
+    const db = emptyTraderDb();
+    addTraders(db, [{ id: '1', name: 'Gone', source: 'te' }, { id: '2', name: 'Named', source: 'te' }, { id: '3', name: 'Lister', source: 'w3b' }], T);
+    recordW3bList(db, '3', { prices: { 206: 850000 } }, T + TRADER_FORGET_MS);
+    // A month later, only trader 2 is named again (TornExchange's active list).
+    const later = T + TRADER_FORGET_MS + 1000;
+    addTraders(db, [{ id: '2', name: 'Named', source: 'te' }], later);
+    pruneDb(db, later);
+    assert.deepEqual(Object.keys(db.traders).sort(), ['2', '3'], 'named lately, or a list lately: kept');
+    // Naming a trader again renews seenAt at most once a day (so it is saved, not rewritten every read).
+    assert.equal(addTraders(db, [{ id: '2', name: 'Named', source: 'te' }], later + 1000), false);
 });

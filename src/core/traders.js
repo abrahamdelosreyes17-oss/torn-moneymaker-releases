@@ -35,6 +35,16 @@ export const W3B_MISSING_RECHECK_MS = 24 * 60 * 60 * 1000;
 /** A failed read is not tried again before this. */
 export const W3B_ERROR_RETRY_MS = 5 * 60 * 1000;
 
+/**
+ * A trader no source has named for this long, with no TornW3B list read in
+ * that time, is forgotten: the database used to only grow, and every Torn
+ * page loads it.
+ */
+export const TRADER_FORGET_MS = 30 * 24 * 60 * 60 * 1000;
+
+/** `seenAt` is written back at most this often (it changes on every read of a source). */
+const SEEN_RENEW_MS = 24 * 60 * 60 * 1000;
+
 export function emptyTraderDb() {
     return { version: TRADER_DB_VERSION, traders: {} };
 }
@@ -79,6 +89,7 @@ export function mergeTraderDbs(db, other) {
             mine.name = t.name;
             changed = true;
         }
+        if ((t.seenAt || 0) > (mine.seenAt || 0)) mine.seenAt = t.seenAt;
     }
     return changed;
 }
@@ -104,6 +115,11 @@ export function addTraders(db, found, now = Date.now()) {
             changed = true;
         } else if (name && t.name !== name && ((f.source !== 'w3b' && f.source !== 'seed') || t.name.startsWith('Trader '))) {
             t.name = name;
+            changed = true;
+        }
+        // Still named by a source: not one to forget (see pruneTraderDb).
+        if (!(now - (t.seenAt || 0) < SEEN_RENEW_MS)) {
+            t.seenAt = now;
             changed = true;
         }
         // TornW3B's rating ("523↑ · 7↓"), when the page we read showed it.
@@ -158,10 +174,18 @@ export function markW3bDue(db, traderId) {
 
 /**
  * Drop price lists too old to show, so storage does not grow forever. The
- * trader and when their list was read stay, so it is read again in turn.
+ * trader and when their list was read stay, so it is read again in turn -
+ * unless no source has named them for TRADER_FORGET_MS and they had no list
+ * in that time: then the trader goes too.
  */
 export function pruneTraderDb(db, now = Date.now()) {
-    for (const t of Object.values(db.traders)) {
+    for (const [id, t] of Object.entries(db.traders)) {
+        const listAt = (t.w3b && (t.w3b.at || t.w3b.checkedAt)) || 0;
+        const lastFound = t.w3b && t.w3b.found ? listAt : 0;
+        if (now - (t.seenAt || 0) > TRADER_FORGET_MS && now - lastFound > TRADER_FORGET_MS) {
+            delete db.traders[id];
+            continue;
+        }
         const w = t.w3b;
         if (w && w.found && w.prices && !(now - w.at <= W3B_LIST_MAX_AGE_MS)) {
             t.w3b = { checkedAt: w.checkedAt, at: w.at, found: true, prices: null };
@@ -257,15 +281,19 @@ export function buyersForItem(itemId, { teBest = [], teFull = null, idsByName = 
         const k = id ? 'id:' + id : 'name:' + String(name).toLowerCase();
         let r = rows.get(k);
         if (!r) {
-            r = { id: id || null, name: name || (id ? 'Trader ' + id : '?'), price: 0, te: null, w3b: null, teName: null, votes: null };
+            r = { id: id || null, name: name || (id ? 'Trader ' + id : '?'), price: 0, te: null, teTop: null, teList: null, w3b: null, teName: null, votes: null };
             rows.set(k, r);
         }
         if (name && r.name.startsWith('Trader ') && !String(name).startsWith('Trader ')) r.name = name;
         return r;
     };
-    const setTe = (r, name, price) => {
+    // TornExchange's top three and an item's full list are read at different
+    // times: when they disagree for one trader, the lower counts (as between
+    // the two sites) - the higher may be a price they have since dropped.
+    const setTe = (r, name, price, which) => {
         r.teName = name;
-        if (!(r.te >= price)) r.te = price;
+        if (!(r[which] >= price)) r[which] = price;
+        r.te = r.teTop > 0 && r.teList > 0 ? Math.min(r.teTop, r.teList) : r.teTop || r.teList;
         byName.set(String(name).toLowerCase(), r);
     };
 
@@ -274,7 +302,7 @@ export function buyersForItem(itemId, { teBest = [], teFull = null, idsByName = 
         const lower = String(t.name).toLowerCase();
         const id = cleanId(t.id) || cleanId(idsByName.get(lower)) || cleanId(dbIdsByName && dbIdsByName.get(lower));
         const r = row(id, t.name);
-        setTe(r, t.name, t.price);
+        setTe(r, t.name, t.price, 'teTop');
         // TornExchange's vote score comes with its top buyers.
         if (Number.isFinite(t.score)) r.votes = t.score;
     }
@@ -289,7 +317,7 @@ export function buyersForItem(itemId, { teBest = [], teFull = null, idsByName = 
             const known = byName.get(lower);
             if (!known && activeKnown && !idsByName.has(lower)) continue;
             const id = (known && known.id) || cleanId(idsByName.get(lower)) || cleanId(dbIdsByName && dbIdsByName.get(lower));
-            setTe(known || row(id, t.name), t.name, t.price);
+            setTe(known || row(id, t.name), t.name, t.price, 'teList');
         }
     }
 
@@ -316,7 +344,7 @@ export function buyersForItem(itemId, { teBest = [], teFull = null, idsByName = 
     for (const r of rows.values()) {
         const both = r.te > 0 && r.w3b > 0;
         r.price = both ? Math.min(r.te, r.w3b) : Math.max(r.te || 0, r.w3b || 0);
-        r.differ = both && r.te !== r.w3b;
+        r.differ = (both && r.te !== r.w3b) || (r.teTop > 0 && r.teList > 0 && r.teTop !== r.teList);
         if (r.price <= 0) continue;
         // What we know of how they trade: TornExchange votes (from any item's
         // top three) and TornW3B's rating.

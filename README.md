@@ -93,10 +93,24 @@ scrolls to it when it is on the page you are viewing. Nothing is ever bought for
 
 - **NPC deals: save API calls** (Settings › Watching; the friend's request): one
   tick turns off everything automatic that the NPC deals spend Torn API calls
-  on - the live feed (up to 30 a minute) and sellers' / bazaar owners' online
-  status. Deals then come only from the page you are viewing: 0 API calls.
+  on - Item Market watching (up to 30 a minute) and sellers' / bazaar owners'
+  online status: 0 Torn API calls. **Bazaars are still watched** through
+  TornW3B, which costs no Torn API calls (3.12.5; 3.12.4 stopped them too).
   Fill, your own pages' prices and Torn Bids are not affected. Settings also
   shows *Torn API calls in the last minute: N of 70* (every tab together).
+- **Two watching switches, each on its own** (3.12.5): *Watch the Item Market
+  anywhere* (Torn API calls) and *Watch bazaars via TornW3B* (no Torn API
+  calls). Turning one off no longer stops the other.
+- **TornW3B's 100 a minute per IP is shared by every tab** (3.12.5): one
+  window of 80 a minute for the feed, Torn Bids and Fill together (each keeps
+  its own ceiling too: feed 60, Torn Bids 24), leaving room for TornTools; a
+  429 in one tab pauses every tab for a minute. The feed re-reads an item's
+  bazaars only when TornW3B's summary price for it changes or after a minute -
+  before 3.12.5 an item whose cheapest listing was a $1 Dollar Sale was read
+  on every 3 s tick (126 calls a minute wanted for six such items; now 12).
+- **$1 is for NPC deals only** (3.12.5, the owner): an NPC deal counts from $1
+  profit, but a *My bazaar* / *Market* deal must make at least **1% of the
+  price per item** (Settings › Watching › *Least profit per item, %*).
 
 - **Never over Torn's content.** The panel floats in front of the page, in the
   empty space to the right of Torn's content: it is sized to that space (up to
@@ -109,7 +123,7 @@ scrolls to it when it is on the page you are viewing. Nothing is ever bought for
   ($1.5m, $25m). Only the status line wraps, rather than cut its message. With
   less than 240px of room (a very narrow window) it floats bottom-right as it
   always did.
-- **Header:** **Sell** · **Scan** (re-reads this page and refreshes every price -
+- **Header:** **Bids** · **Scan** (re-reads this page and refreshes every price -
   one button, it used to be Scan and ↻) · ⚙ Settings ·
   – collapse. Drag it anywhere; the position is remembered. Collapsed, it still
   shows *N deals · +$total*; click it to expand.
@@ -189,7 +203,7 @@ scrolls to it when it is on the page you are viewing. Nothing is ever bought for
   green for the top three), **amber** for listings below your Min that still
   make a profit. The list shows only what meets your Min; Cash still hides what
   you cannot afford one of.
-- **Sell** (the blue button; also under Settings): the traders page, always in
+- **Bids** (the blue button; also under Settings): Torn Bids, always in
   its own tab, on a page of our own rather than Torn's
   (`abrahamdelosreyes17-oss.github.io/torn-moneymaker-releases/traders.html`, a
   blank GitHub Pages page the script draws over; the old `torn.com/?ttv2=traders`
@@ -259,7 +273,13 @@ you: every link is one you follow yourself, one page per click.
     trader. **On both sites with two different prices, the LOWER one counts**
     (ranking, flips, where to sell, the bazaar tag) and the row says so in
     amber: in a trade the trader pays what they choose, and a friend lost money
-    trading on the higher of two lists (one was stale, or bait).
+    trading on the higher of two lists (one was stale, or bait). **The same
+    for TornExchange's own two lists** (3.12.5): its top three (read every 10
+    minutes) and an item's full buyer list (read when you pick it) can
+    disagree for one trader - the friend traded ID Badges at the top three's
+    $140,000 when the trader's list already said $105,000. The lower counts,
+    and the row says *Lists differ: TE top 3 $140,000 · TE full list
+    $105,000*.
   - **Bazaars sell · cheapest first**: seller (their profile), how many, when
     TornW3B last saw it (older than 30 minutes is greyed and never planned
     on), price, and **Open bazaar** (their bazaar, pointing at the listing).
@@ -289,6 +309,10 @@ you: every link is one you follow yourself, one page per click.
   with the Limited key; at most 10 a minute, each kept 12 hours). A trader who
   could not pay for even one is skipped for the next; the plan says when it
   was capped.
+- **Least profit per item** (Settings › Flips, 1% by default, 3.12.5): a flip
+  buys only listings that make at least that share of their price on each
+  item - $1 under a trader's bid is not worth a trade. NPC deals in the panel
+  still count from $1.
 - **Category** (mockup M): a dropdown beside the search - Torn's own item types
   with a count each - filters the flips, the list and the All / Mine / Flips
   counts together; a line under the flips says what is hidden, with *Show
@@ -328,7 +352,10 @@ front.
   TornExchange or TornW3B. Error 2/13/16/18 stops it until a new key is saved.
   *Forget key and delete the ledger* (pressed twice) deletes the key and every
   stored row. Only derived rows are stored (time, item, quantity, price, where,
-  who, fee), locally.
+  who, fee), locally - since 3.12.5 in Torn Bids' own IndexedDB, not in
+  Tampermonkey's storage, which is handed to the script on every Torn page
+  (a tiny revision value tells other Torn Bids tabs to re-read). Moved there
+  once from the old storage; where IndexedDB is refused, the old storage is used.
 
 **Where the prices come from.**
 - **Bazaar prices: TornW3B only** - TornExchange's API has none, and Torn's
@@ -574,8 +601,13 @@ the key to a file, never logged it, and sent it only to `api.torn.com` over HTTP
 The real risk is the key's **access level**, which is a user setting rather than a
 code flaw. These measures address both halves.
 
-1. **Public-key-only, stated in the settings panel.** The key field is a password
-   input with an explicit Show toggle, above a note explaining why Public is enough.
+1. **Public-key-only, stated in the settings panel.** Every key field (the
+   Public key, Torn Bids' Limited and TornExchange keys, the Ledger's Full key)
+   is a text box whose letters CSS hides (`ui/mask.js`), with an explicit Show
+   toggle - never a password box, which browsers and password managers offer to
+   save and sync (3.12.5: the Ledger's Full key box was one). Where CSS cannot
+   mask (some Firefox builds) it falls back to a password box with saving
+   turned off. The Public key's note explains why Public is enough.
    After the first successful call the script checks the key's access level via
    `key/info`; if it is above Public, the settings panel shows a standing warning.
    The check is advisory — if it cannot determine the level it says nothing rather
@@ -602,8 +634,16 @@ code flaw. These measures address both halves.
 8. **No key is left in the page.** A value in an `<input>` on torn.com is
    readable by every script on the page, so a saved key is only put into its
    field while the user has pressed *Show* - the panel's Public key and both of
-   the traders page's keys alike. Error text is redacted with `redactKey()` for
-   whichever key a client holds.
+   the traders page's keys alike - and taken out again after a minute, or on
+   Save. Error text is redacted with `redactKey()` for whichever key a client holds.
+9. **Every tab together, and never from a hidden tab** (3.12.5). The Torn API
+   window (70/min) and TornW3B's (80/min) are counted across tabs with each
+   tab writing only its own slots (`platform/tab-window.js`), so tabs no
+   longer erase each other's; after Torn answers 5 (rate), 8 (IP block) or 9
+   (API down) every tab pauses (30 s / 10 min / 2 min) instead of asking into
+   the block; and a request queued while a tab was visible is not sent after
+   it is hidden. The item list's v1 fallback gives no NPC prices at all (it
+   cannot show a shop in Torn buys an item) and is retried after 5 minutes.
 
 ### Out of scope, deliberately
 
