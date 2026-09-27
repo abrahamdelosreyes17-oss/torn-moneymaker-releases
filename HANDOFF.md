@@ -8,15 +8,15 @@ Everything below "History" is the record of how we got here.
 
 - **Released: 3.12.8** (`8991095`), pushed. Last install link given to the owner:
   `https://raw.githubusercontent.com/abrahamdelosreyes17-oss/torn-moneymaker-releases/8991095b6170a17a6318c9b9de87bb51310d8393/torn-moneymaker.user.js`
-- Before it **3.12.7** (`d69907c`), branch `claude/optimistic-ride-1gqguu`,
-  pushed. Last install link given to the owner:
-  `https://raw.githubusercontent.com/abrahamdelosreyes17-oss/torn-moneymaker-releases/d69907c1f9af4bb3cda564b10e6df147a0eafa07/torn-moneymaker.user.js`
-  Earlier today: 3.12.5 (`aab7e53`), 3.12.6 (`fe49df0`).
+- Branch `claude/optimistic-ride-1gqguu`. Released earlier the same day:
+  3.12.5 (`aab7e53`), 3.12.6 (`fe49df0`), 3.12.7 (`d69907c`).
+- **The owner's Chrome still had an old version** (its panel said "Sell", not
+  "Bids") when last seen: ask them to install the 3.12.8 link before testing.
 - **`main` is still at 2.9.3.** The script's `@updateURL` points at `main`, so
   installs go through **pinned links** (`.../<commit>/torn-moneymaker.user.js`).
   Merging to `main` makes every install auto-update: only if the owner asks.
 - Nothing uncommitted except `mockups/` and `.claude/` (untracked on purpose).
-- 231 unit tests (`npm test`); `test/ux-check.mjs` (Playwright) has never run
+- 234 unit tests (`npm test`); `test/ux-check.mjs` (Playwright) has never run
   here - Playwright is not installed.
 - Who uses it: the owner and a friend who plays Torn (the friend's requests
   come through the owner, often in Tagalog - translate, then restate). **Desktop
@@ -36,13 +36,15 @@ offer to read Torn's scripting-rules page with them (read only).
 
 ### The agenda for the next session (let the owner choose the order)
 
-1. **The owner tries 3.12.8 on real data** - above all the trade flow on real pages:
-   Start buying / Next bazaar (does a real bazaar card's stock drop after a buy,
-   so 'You took N' counts it? The harness only simulates it), Fill on the real
-   add step (does Torn's "You are adding N items" counter follow the typed Qty?),
-   the partner and money checks on the real view.
-   Also from 3.12.7 -, and you read along (read only, in
-   the Claude Chrome tab group - see "How the owner works"). Watch:
+1. **The owner tries 3.12.8 on real data** while you read along (read only, in
+   the Claude Chrome tab group - see "How the owner works"; they open pages,
+   you never click or type on torn.com). Above all the trade flow on real pages:
+   - Start buying / Next bazaar: does a real bazaar card's stock drop after a
+     buy, so "You took N" counts it? (The harness only simulates it.)
+   - Fill on the real add step: does Torn's "You are adding N items" counter
+     follow the typed Qty?
+   - the partner and money checks on the real trade view.
+   Also still unseen live:
    - **weapons / armour / cars no longer flipped** - the fix covers both type
      spellings because the real v2 `type` values were never seen: confirm on
      the real item list (the Category dropdown shows the type names Torn sends);
