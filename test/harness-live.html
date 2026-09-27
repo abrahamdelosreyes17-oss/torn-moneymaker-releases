@@ -309,6 +309,11 @@ function respond(url) {
                     { trader: 'Bob', trader_id: 11, price: 110, vote_score: 214 },
                 ] },
                 206: { item: 'Xanax', traders: [{ trader: 'Bob', trader_id: 11, price: 850000, vote_score: 214 }] },
+                // &manybuyers=1: two more traders buy Dynamite (the Sell to picker has three).
+                ...(/[?&]manybuyers=1/.test(location.search) ? { 335: { item: 'Stick of Dynamite', traders: [
+                    { trader: 'Carol', trader_id: 44, price: 18400, vote_score: 150 },
+                    { trader: 'Alice', trader_id: 12, price: 17900, vote_score: 120 },
+                ] } } : {}),
             } };
         }
         if (u.pathname === '/api/listings') {

@@ -35,7 +35,7 @@ import {
     isNpcCacheFresh,
     npcShopFor,
 } from './core/npc.js';
-import { bestVenue } from './core/profit.js';
+import { bestVenue, enoughProfit } from './core/profit.js';
 import {
     exitsFor,
     feedOpportunities,
@@ -50,6 +50,7 @@ import {
     SOURCE_ITEM_MARKET,
 } from './core/feed.js';
 import { bazaarSellers, flipPlan, flipBuyer, whereToSell, depthNearCheapest, flipCandidates, traderTagLabel } from './core/flips.js';
+import { planTrade, keepAfter } from './core/trade.js';
 import { makeTabId, LEADER_HEARTBEAT_MS } from './core/leader.js';
 import { tabWindow } from './platform/tab-window.js';
 import { idbGet, idbSet, idbDel } from './platform/idb.js';
@@ -2869,6 +2870,15 @@ const sell = {
     bazaars: new Map(),
     /* Items worth reading every bazaar of, for a flip: from the summary, best first. */
     candidates: [],
+    /*
+     * One trade (the desk's flip plan, mockup N3): the trader you picked for
+     * an item (itemId -> trader key), what you ticked off or typed in a trade
+     * (trader key -> {itemId: {off} | {qty}}; not remembered), and the items
+     * whose bazaars the trade still needs read, the picked trader's first.
+     */
+    tradePick: new Map(),
+    tradeEdits: new Map(),
+    tradeWanted: [],
     /* Flips and traders' price lists take turns for TornW3B's slots. */
     w3bTurn: 0,
     /* The Item Market's cheapest listing of the item picked, when you hold it. */
@@ -3100,6 +3110,8 @@ function heldIds() {
 const W3B_SUMMARY_MS = 5 * 60 * 1000;
 /* The item picked: its bazaars read again after this. */
 const W3B_SELECTED_MS = 2 * 60 * 1000;
+/* One trade reads at most this many of its items' bazaars (the chosen trader's first). */
+const TRADE_READ_MAX = 30;
 /* A possible flip: its bazaars read again after this. */
 const W3B_CANDIDATE_MS = 10 * 60 * 1000;
 /* A TornW3B request that failed is not asked again before this. */
@@ -3140,6 +3152,9 @@ function nextW3bJob(now) {
     if (now - sell.summaryAt >= W3B_SUMMARY_MS && now - sell.summaryTriedAt >= W3B_FAILED_RETRY_MS) return loadBazaarSummary;
     const picked = sell.selected;
     if (picked && bazaarsDue(picked, W3B_SELECTED_MS, now)) return () => loadBazaars(picked);
+    // The trade on the desk: its other items' bazaars, the chosen trader's first.
+    const forTrade = sell.tradeWanted.find((id) => bazaarsDue(id, W3B_CANDIDATE_MS, now));
+    if (forTrade) return () => loadBazaars(forTrade);
 
     const cand = sell.candidates.find((c) => bazaarsDue(c.itemId, W3B_CANDIDATE_MS, now));
     const list = nextW3bTrader(sell.db, heldIds(), now);
@@ -3176,7 +3191,7 @@ function loadBazaarSummary() {
             sell.summaryAt = Date.now();
             sell.summaryError = null;
             // Listings of items no longer picked or possible flips are let go.
-            const keep = new Set([sell.selected, ...sell.candidates.map((c) => c.itemId)]);
+            const keep = new Set([sell.selected, ...sell.candidates.map((c) => c.itemId), ...sell.tradeWanted]);
             for (const [id, b] of sell.bazaars) {
                 if (!keep.has(id) && Date.now() - (b.at || b.triedAt || 0) > W3B_BAZAARS_FORGET_MS) sell.bazaars.delete(id);
             }
@@ -3503,6 +3518,112 @@ function renderSellingNow() {
         sell.selected = sell.filter !== 'mine' && strip.length ? strip[0].itemId : listed.length ? listed[0].itemId : null;
     }
 
+    /*
+     * One trade with one trader (mockup N3, the owner, 2026-09-27): the
+     * desk's flip plan takes every other item that trader buys which a bazaar
+     * sells for less, and what you hold where they are the best buyer.
+     * "Sell to" lists every trader who makes a flip on the item picked,
+     * ranked by what the WHOLE trade with them makes.
+     */
+    const traderKey = (b) => (b.id ? 'id:' + b.id : 'name:' + String(b.name).toLowerCase());
+    let tradeIndex = null;
+    const tradeItemsOf = (buyer) => {
+        if (!tradeIndex) {
+            tradeIndex = new Map();
+            for (const id of allIds) {
+                for (const fb of flipBuyersOf(id)) {
+                    const k = traderKey(fb);
+                    if (!tradeIndex.has(k)) tradeIndex.set(k, []);
+                    tradeIndex.get(k).push({ id, fb });
+                }
+            }
+        }
+        return tradeIndex.get(traderKey(buyer)) || [];
+    };
+    const tradeWith = (buyer, firstId) => {
+        const key = traderKey(buyer);
+        const flips = [];
+        const estimated = [];
+        for (const { id, fb } of tradeItemsOf(buyer)) {
+            const rows = sellersOf(id);
+            if (rows) {
+                flips.push({ itemId: id, bid: fb.price, sellers: rows });
+                continue;
+            }
+            // Not read yet: TornW3B's summary stands in (one at its cheapest), marked ≈.
+            const low = lowestOf(id);
+            if (low > 1 && enoughProfit(fb.price - low, low, 'TRADER', prefs.minProfitPct)) {
+                estimated.push(id);
+                flips.push({ itemId: id, bid: fb.price, sellers: [{ sellerId: null, sellerName: null, price: low, qty: 1, stale: false }] });
+            }
+        }
+        const held = [];
+        for (const [id, n] of heldQty) {
+            if (!(n > 0)) continue;
+            const top = buyersOf(id)[0];
+            if (!top || traderKey(top) !== key) continue;
+            // Only where they are the place to sell (listing does not pay more).
+            const w = whereToSell({ held: n, bid: top.price, bazaarLowest: lowestOf(id), bazaarDepth: bazaarDepthOf(id) });
+            if (w.best && w.best !== 'trader') continue;
+            held.push({ itemId: id, bid: top.price, held: n });
+        }
+        const nw = buyer.id ? networthOf(buyer.id) : null;
+        const payCap = nw !== null && nw >= 0 && prefs.networthPct > 0 ? (nw * prefs.networthPct) / 100 : Infinity;
+        const t = planTrade({
+            first: firstId,
+            flips,
+            held,
+            cash: prefs.cash,
+            maxPerItem: prefs.maxPerFlip,
+            payCap,
+            minPct: prefs.minProfitPct,
+            edits: sell.tradeEdits.get(key) || {},
+            keep: prefs.keep || {},
+        });
+        return { ...t, key, buyer, estimated };
+    };
+    const tradeDesk = (pickId) => {
+        const rows = sellersOf(pickId);
+        if (!rows) return null;
+        const options = [];
+        for (const b of flipBuyersOf(pickId)) {
+            // Only traders you can flip THIS item to (with your Cash, their cap).
+            const most = Math.min(prefs.maxPerFlip || 100, b.maxUnits ? b.maxUnits : Infinity);
+            const one = flipPlan(rows, b.price, { cash: prefs.cash, maxUnits: most, minPct: prefs.minProfitPct });
+            if (!one || !(one.units > 0)) continue;
+            options.push(tradeWith(b, pickId));
+        }
+        if (!options.length) return null;
+        options.sort((a, b) => b.profit - a.profit || b.buyer.price - a.buyer.price);
+        const chosen = options.find((o) => o.key === sell.tradePick.get(String(pickId))) || options[0];
+        // Read the chosen trader's items first, then the others' (for their totals).
+        const want = [];
+        for (const o of [chosen, ...options.filter((x) => x !== chosen)]) for (const id of o.estimated) if (!want.includes(id)) want.push(id);
+        sell.tradeWanted = want.slice(0, TRADE_READ_MAX);
+        const w3bT = chosen.buyer.id && sell.db.traders[chosen.buyer.id] ? sell.db.traders[chosen.buyer.id].w3b : null;
+        const named = (r) => ({ ...r, name: nameOf(r.itemId), estimated: chosen.estimated.includes(r.itemId) });
+        return {
+            options: options.map((o) => ({ key: o.key, buyer: o.buyer, profit: o.profit, items: o.items, estimated: o.estimated.length, bidHere: o.buyer.price })),
+            chosen: {
+                key: chosen.key,
+                buyer: chosen.buyer,
+                flips: chosen.flips.map(named),
+                off: chosen.off.map(named),
+                held: chosen.held.map(named),
+                items: chosen.items,
+                profit: chosen.profit,
+                cost: chosen.cost,
+                pays: chosen.pays,
+                payCapped: chosen.payCapped,
+                estimated: chosen.estimated.length,
+            },
+            keep: prefs.keep || {},
+            // How old the prices are: check their list before buying.
+            teAt: sell.traders ? sell.traders.fetchedAt : null,
+            w3bAt: w3bT && w3bT.at ? w3bT.at : null,
+        };
+    };
+
     let desk = null;
     const pick = sell.selected;
     if (pick) {
@@ -3531,11 +3652,15 @@ function renderSellingNow() {
             },
             plan: planOf(pick),
             planWhy: b && b.at ? null : 'loading',
+            // Weapons and armour: every copy has its own stats, so no flip (say why).
+            statItem: Boolean(item && STAT_ITEM_TYPES.has(item.type)),
             where: held ? whereToSell({ held, bid: buyers[0] ? buyers[0].price : null, bazaarLowest: lowestOf(pick), marketLowest: m ? m.lowest : null, bazaarDepth: bazaarDepthOf(pick), marketDepth: m ? m.depth : null }) : null,
             market: { state: m && m.at ? 'ok' : m && m.error ? 'error' : 'loading', lowest: m ? m.lowest : null },
         };
+        desk.trade = tradeDesk(pick);
         if (held) loadSellMarket(pick);
     }
+    if (!desk || !desk.trade) sell.tradeWanted = [];
 
     const watch = sellWatch({ desk, strip, listed, held: [...heldQty.keys()], buyersAll });
     updateSellPresence(watch, now);
@@ -4178,6 +4303,30 @@ function bootSellingPage() {
             // one-time Trusted switch) must survive, or Trusted comes back on
             // at every reload after any setting is saved.
             gmSet(STORE_SELL_PREFS, { ...(gmGet(STORE_SELL_PREFS, {}) || {}), ...sellPrefs(), ...partial });
+            renderSellingNow();
+        },
+        // One trade: the trader picked for an item, a row ticked / its number,
+        // and what you keep of your own (remembered in the prefs).
+        onTradePick: (itemId, key) => {
+            sell.tradePick.set(String(itemId), key);
+            renderSellingNow();
+        },
+        onTradeEdit: (key, itemId, edit) => {
+            const e = { ...(sell.tradeEdits.get(key) || {}) };
+            if (edit && (edit.off || edit.qty > 0)) e[String(itemId)] = edit;
+            else delete e[String(itemId)];
+            sell.tradeEdits.set(key, e);
+            renderSellingNow();
+        },
+        onTradeHeld: (itemId, held, give) => {
+            const keep = keepAfter(sellPrefs().keep || {}, itemId, held, give);
+            gmSet(STORE_SELL_PREFS, { ...(gmGet(STORE_SELL_PREFS, {}) || {}), keep });
+            renderSellingNow();
+        },
+        onKeepRemove: (itemId) => {
+            const keep = { ...(sellPrefs().keep || {}) };
+            delete keep[String(itemId)];
+            gmSet(STORE_SELL_PREFS, { ...(gmGet(STORE_SELL_PREFS, {}) || {}), keep });
             renderSellingNow();
         },
         onSelect: onSellSelect,

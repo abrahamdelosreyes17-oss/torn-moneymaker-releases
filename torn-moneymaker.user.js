@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      3.12.5
+// @version      3.12.6
 // @description  Finds Bazaar and Item Market listings below NPC / market value - on the page you are viewing, and live from the Torn API and TornW3B - ranked by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -40,7 +40,7 @@
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '3.12.5';
+    const TTV2_BUILD_VERSION = '3.12.6';
 
     /* ===== src/platform/gm.js ===== */
     /*
@@ -1744,6 +1744,139 @@
         if (!buyer || !buyer.trust || buyer.trust.level !== 'Trusted') return null;
         if (!(buyer.price > listingPrice) || !(listingPrice > 0)) return null;
         return buyer.name + ' pays ' + formatMoney(buyer.price) + '\n+' + formatMoney(buyer.price - listingPrice) + ' each';
+    }
+
+    /* ===== src/core/trade.js ===== */
+    /*
+     * One trade with one trader (Torn Bids, mockup N1, picked 2026-09-27).
+     *
+     * The friend: a trade of one item looks odd to a trader; many items looks
+     * legit. So when a flip sells to a trader, the plan also takes every other
+     * item that trader buys which a bazaar sells for less, and what you hold
+     * where they are the best buyer - one trade. Pure: no DOM, no network.
+     *
+     *   - ONE Cash for the whole trade: the item you picked first, then the most
+     *     profit per $ spent, cheapest listings first within an item;
+     *   - at most Most per flip of each item (or the number you typed);
+     *   - the trader is never asked to pay more than their networth share for
+     *     the whole trade (what you hold counts too);
+     *   - only fresh listings, only at least the least profit per item;
+     *   - your own items: minus what you keep (the keep list: a number, or all).
+     */
+
+
+
+
+    /**
+     * @param {object} p
+     * @param {string} [p.first] - the item picked on the desk: planned first
+     * @param {Array<{itemId, bid, sellers: Array<{sellerId, sellerName, price, qty, stale}>}>} p.flips
+     *   items the trader buys, with their bazaar listings (bazaarSellers output)
+     * @param {Array<{itemId, bid, held}>} p.held - what you hold that they buy best
+     * @param {number|null} [p.cash] - null or 0: no limit
+     * @param {number} [p.maxPerItem] - Most per flip
+     * @param {number} [p.payCap] - the most the trader can pay for everything (Infinity: unknown)
+     * @param {number} [p.minPct] - least profit per item, % of the price
+     * @param {object} [p.edits] - itemId -> {off: true} | {qty: n}: this trade's ticks and numbers
+     * @param {object} [p.keep] - itemId -> n | 'all': what you keep of your own
+     */
+    function planTrade({ first = null, flips = [], held = [], cash = null, maxPerItem = FLIP_MAX_UNITS, payCap = Infinity, minPct = MIN_PROFIT_PCT, edits = {}, keep = {} }) {
+        let cashLeft = cash > 0 ? cash : Infinity;
+        let payLeft = payCap > 0 ? payCap : payCap === 0 ? 0 : Infinity;
+        let payCapped = false;
+        const most = maxPerItem > 0 ? Math.floor(maxPerItem) : FLIP_MAX_UNITS;
+        const firstId = first === null ? null : String(first);
+
+        // Every listing worth buying, per item: fresh, and making enough per item.
+        const chunks = [];
+        const off = [];
+        for (const it of flips || []) {
+            const id = String(it.itemId);
+            const bid = Number(it.bid);
+            if (!(bid > 0)) continue;
+            const under = (it.sellers || []).filter((s) => s && !s.stale && s.qty > 0 && enoughProfit(bid - s.price, s.price, 'TRADER', minPct));
+            if (!under.length) continue;
+            const e = edits[id] || {};
+            if (e.off) {
+                off.push({ itemId: id, bid });
+                continue;
+            }
+            const cap = e.qty > 0 ? Math.min(Math.floor(e.qty), most) : most;
+            for (const s of under) chunks.push({ id, bid, s, cap });
+        }
+        const ratio = (c) => (c.bid - c.s.price) / c.s.price;
+        chunks.sort((a, b) => (a.id === firstId ? 0 : 1) - (b.id === firstId ? 0 : 1) || ratio(b) - ratio(a) || a.s.price - b.s.price);
+
+        // Yours first after the picked item: they cost no cash, only their pay.
+        const heldRows = [];
+        const plan = new Map();
+        const take = (c) => {
+            const r = plan.get(c.id) || { itemId: c.id, bid: c.bid, units: 0, cost: 0, profit: 0, steps: [] };
+            const wanted = Math.min(c.s.qty, Math.floor(cashLeft / c.s.price), c.cap - r.units);
+            const n = Math.min(wanted, Math.floor(payLeft / c.bid));
+            // Their networth share, not your cash, stopped it: said on the card.
+            if (n < wanted) payCapped = true;
+            if (n <= 0) return;
+            cashLeft -= n * c.s.price;
+            payLeft -= n * c.bid;
+            r.units += n;
+            r.cost += n * c.s.price;
+            r.profit += n * (c.bid - c.s.price);
+            r.steps.push({ sellerId: c.s.sellerId, sellerName: c.s.sellerName, qty: n, price: c.s.price });
+            plan.set(c.id, r);
+        };
+        for (const c of chunks.filter((x) => x.id === firstId)) take(c);
+        for (const h of held || []) {
+            const id = String(h.itemId);
+            const bid = Number(h.bid);
+            const have = Math.floor(Number(h.held) || 0);
+            if (!(bid > 0) || !(have > 0)) continue;
+            const k = keep[id];
+            const want = k === 'all' ? 0 : Math.max(0, have - (Number(k) > 0 ? Math.floor(Number(k)) : 0));
+            const payable = Math.floor(payLeft / bid);
+            const units = Math.min(want, payable);
+            if (units < want) payCapped = true;
+            payLeft -= units * bid;
+            heldRows.push({ itemId: id, bid, held: have, units, kept: k === 'all' ? 'all' : Number(k) > 0 ? Math.floor(Number(k)) : 0 });
+        }
+        for (const c of chunks.filter((x) => x.id !== firstId)) take(c);
+
+        const flipRows = [...plan.values()].sort((a, b) => (a.itemId === firstId ? -1 : b.itemId === firstId ? 1 : b.profit - a.profit));
+        const heldOn = heldRows.filter((r) => r.units > 0);
+        return {
+            flips: flipRows,
+            off,
+            held: heldRows,
+            items: new Set([...flipRows.map((r) => r.itemId), ...heldOn.map((r) => r.itemId)]).size,
+            profit: flipRows.reduce((a, r) => a + r.profit, 0),
+            cost: flipRows.reduce((a, r) => a + r.cost, 0),
+            pays: flipRows.reduce((a, r) => a + r.units * r.bid, 0) + heldOn.reduce((a, r) => a + r.units * r.bid, 0),
+            payCapped,
+        };
+    }
+
+    /**
+     * The keep list after you change one of your rows: a number to keep, or
+     * 'all' (unticked), or nothing (you give them everything).
+     *
+     * @param {object} keep - itemId -> n | 'all'
+     * @param {string} itemId
+     * @param {number} held - how many you hold
+     * @param {number|null} give - how many go in the trade (null: untick = keep all)
+     */
+    function keepAfter(keep, itemId, held, give) {
+        const next = { ...(keep || {}) };
+        const id = String(itemId);
+        const have = Math.max(0, Math.floor(Number(held) || 0));
+        if (give === null || give === undefined) {
+            next[id] = 'all';
+            return next;
+        }
+        const n = Math.max(0, Math.min(have, Math.floor(Number(give) || 0)));
+        if (n >= have) delete next[id];
+        else if (n === 0) next[id] = 'all';
+        else next[id] = have - n;
+        return next;
     }
 
     /* ===== src/core/leader.js ===== */
@@ -11236,6 +11369,8 @@
         networthPct: 10,
         /* A flip buys only listings that make at least this % per item: $1 is for NPC shops, not people. */
         minProfitPct: 1,
+        /* What you keep of your own when a trade offers it: itemId -> n | 'all'. */
+        keep: {},
     };
 
     /** The item list shows this many at a time. */
@@ -11426,6 +11561,27 @@
                 this.renderPills();
                 if (this.view === 'settings') this.renderSettingsNav();
             }, 1000);
+        }
+
+        /** Settings › Flips › Keep for yourself: each item kept, with Remove. */
+        renderKeepList(p) {
+            if (!this.keepListEl) return;
+            const keep = Object.entries((p && p.keep) || {});
+            const sig = JSON.stringify(keep);
+            if (sig === this.keepSig) return;
+            this.keepSig = sig;
+            this.keepListEl.textContent = '';
+            if (!keep.length) {
+                this.keepListEl.appendChild(spEl('div', { class: 'sp-keystate', text: 'Nothing kept: a trade offers all of it.' }));
+                return;
+            }
+            const nameOf = this.state.itemNameOf || ((id) => 'Item ' + id);
+            for (const [id, k] of keep) {
+                this.keepListEl.appendChild(spEl('div', { class: 'sp-keeprow' }, [
+                    spEl('span', { text: nameOf(id) + ': keep ' + (k === 'all' ? 'all' : count(k)) }),
+                    spEl('button', { type: 'button', class: 'sp-btn', text: 'Remove', onclick: () => this.h.onKeepRemove && this.h.onKeepRemove(id) }),
+                ]));
+            }
         }
 
         /**
@@ -11846,6 +12002,10 @@
                     this.nwStateEl,
                     note(['A flip never asks a trader to pay more than this share of their networth. Networth comes from Torn\'s public stats, read with your Limited key.']),
                 ]),
+                field('Keep for yourself', null, [
+                    (this.keepListEl = spEl('div', { class: 'sp-keeplist' })),
+                    note(['What a trade leaves out of what you hold. Set it in a trade: untick one of yours, or give fewer than you hold.']),
+                ]),
                 field('Least profit per item', null, [
                     spEl('div', { class: 'sp-inline sp-pct' }, ['At least ', this.minInput, ' % of the price ', spEl('button', { type: 'button', class: 'sp-btn sp-primary', text: 'Save', onclick: saveMin })]),
                     this.minStateEl,
@@ -12051,6 +12211,7 @@
                 this.maxStateEl.className = 'sp-keystate';
                 this.maxStateEl.textContent = 'Saved: ' + count(p.maxPerFlip || 100) + ' items.';
             }
+            this.renderKeepList(p);
             if (!this.minDirty) {
                 const m = p.minProfitPct ?? 1;
                 this.minInput.placeholder = String(m);
@@ -12456,7 +12617,7 @@
                     p.networthPct,
                     d.sellers.state, d.sellers.error,
                     d.sellers.rows.map((r) => [r.sellerId, r.sellerName, r.price, r.qty, r.stale, Math.floor((now - (r.dataAt || 0)) / 60000)]),
-                    d.plan, d.where, d.market,
+                    d.plan, d.where, d.market, d.trade,
                     this.showAll, p.onlineOnly, p.trustedOnly, p.cash, Boolean(info.knownTraders), info.tradersLoading,
                 ])
                 : JSON.stringify([info.hasKey, info.loading, Boolean(info.bazaarsAt), info.tradersLoading, this.state.counts]);
@@ -12623,8 +12784,146 @@
             return card;
         }
 
+        /**
+         * The flip plan as ONE trade with one trader (mockup N3, the owner's pick):
+         * Sell to (every trader you can flip this item to, ranked by what the
+         * whole trade makes), then every item in the trade - this one first,
+         * each with a tick and a number - then what you hold that they pay most
+         * for, minus what you keep. Totals, Trade and their lists, and how old
+         * their prices are.
+         */
+        tradeCard(d) {
+            const T = d.trade;
+            const c = T.chosen;
+            const b = c.buyer;
+            const approx = c.estimated ? '≈ ' : '';
+            const card = spEl('div', { class: 'sp-q sp-hot sp-wide sp-trade' }, [spEl('h3', { text: 'Flip plan · one trade with ' + b.name })]);
+
+            // Sell to: the whole trade with each trader who buys this item.
+            if (T.options.length > 1) {
+                const box = spEl('div', { class: 'sp-tos', role: 'radiogroup', 'aria-label': 'Sell to' }, [spEl('div', { class: 'sp-tsec', text: 'Sell to · what the whole trade makes' })]);
+                for (const o of T.options) {
+                    const on = o.key === c.key;
+                    const input = spEl('input', { type: 'radio', name: 'sp-to-' + d.itemId, 'data-focus': 'trade:to:' + o.key });
+                    input.checked = on;
+                    input.addEventListener('change', () => this.h.onTradePick && this.h.onTradePick(d.itemId, o.key));
+                    box.appendChild(spEl('label', { class: 'sp-to' + (on ? ' sp-on' : '') }, [
+                        input,
+                        spEl('span', { class: 'sp-to-l' }, [
+                            spEl('span', {}, [spEl('b', { text: o.buyer.name }), ' ', this.trustBadge(o.buyer)]),
+                            spEl('small', { text: formatMoney(o.bidHere) + ' for this · ' + count(o.items) + (o.items === 1 ? ' item' : ' items') + ' in the trade' + (o.estimated ? ' · ' + o.estimated + ' not read yet' : '') }),
+                        ]),
+                        spEl('span', { class: 'sp-to-p', text: (o.estimated ? '≈ ' : '') + signed(o.profit) }),
+                    ]));
+                }
+                card.appendChild(box);
+            }
+
+            // Who, and the totals.
+            card.appendChild(spEl('div', { class: 'sp-th' }, [
+                spEl('span', { class: 'sp-th-l' }, [
+                    spEl('span', {}, [this.playerName(b.name, b.id, 'trade:buyer'), ' ', this.trustBadge(b)]),
+                    this.status(b),
+                    this.networthLine(b),
+                ]),
+                spEl('span', { class: 'sp-th-r' }, [
+                    spEl('div', { class: 'sp-big', text: approx + signed(c.profit) }),
+                    spEl('small', { text: count(c.items) + (c.items === 1 ? ' item' : ' items') + ' · cash needed ' + formatMoney(c.cost) + ' · ' + b.name + ' pays ' + approx + formatMoney(c.pays) }),
+                ]),
+            ]));
+            if (c.payCapped) {
+                const nw = b.id && this.state.networth ? this.state.networth.get(String(b.id)) : null;
+                card.appendChild(spEl('p', { class: 'sp-note', text: b.name + ' can pay at most ' + (this.state.prefs.networthPct || 10) + '% of their networth' + (nw >= 0 ? ' (' + formatMoney(nw) + ')' : '') + ' for the whole trade: it stops there.' }));
+            }
+
+            const tick = (checked, label, focus, onChange) => {
+                const input = spEl('input', { type: 'checkbox', class: 'sp-tick', 'aria-label': label, 'data-focus': focus });
+                input.checked = checked;
+                input.addEventListener('change', () => onChange(input.checked));
+                return input;
+            };
+            const qtyBox = (value, label, focus, onSet) => {
+                const input = spEl('input', { type: 'text', class: 'sp-qty', inputmode: 'numeric', value: String(value), 'aria-label': label, 'data-focus': focus, autocomplete: 'off', spellcheck: 'false' });
+                const commit = () => {
+                    const n = Math.floor(Number(String(input.value).replace(/[,s]/g, '')));
+                    if (Number.isFinite(n) && n >= 0) onSet(n);
+                    else input.value = String(value);
+                };
+                input.addEventListener('change', commit);
+                input.addEventListener('keydown', (event) => {
+                    if (event.key !== 'Enter') return;
+                    event.preventDefault();
+                    commit();
+                });
+                return input;
+            };
+            const edit = (id, e) => this.h.onTradeEdit && this.h.onTradeEdit(c.key, id, e);
+
+            // Buy, then trade: this item first.
+            if (c.flips.length || c.off.length) card.appendChild(spEl('div', { class: 'sp-tsec', text: 'Buy, then trade to ' + b.name }));
+            for (const r of c.flips) {
+                const here = r.itemId === String(d.itemId);
+                const steps = r.steps.map((st) => (st.sellerId
+                    ? spEl('div', { class: 'sp-buy' }, [
+                        spEl('span', {}, ['Buy ', spEl('b', { text: count(st.qty) }), ' from ', this.playerName(st.sellerName || 'Player ' + st.sellerId, st.sellerId, 'trade:seller:' + r.itemId + ':' + st.sellerId), ' at ' + formatMoney(st.price)]),
+                        this.link('Open bazaar', bazaarUrl(st.sellerId, r.itemId, st.price), { focus: 'trade:bazaar:' + r.itemId + ':' + st.sellerId }),
+                    ])
+                    : spEl('div', { class: 'sp-buy' }, [spEl('span', { text: '≈ from ' + formatMoney(st.price) + ': its bazaars are being read' })])));
+                card.appendChild(spEl('div', { class: 'sp-ti' }, [
+                    tick(true, 'Include ' + r.name, 'trade:tick:' + r.itemId, (on) => edit(r.itemId, on ? null : { off: true })),
+                    spEl('span', { class: 'sp-pic sp-pic-s' }, [this.image('trade-buy', r.itemId)]),
+                    spEl('span', { class: 'sp-ti-l' }, [
+                        spEl('span', {}, [this.link(r.name, itemMarketUrl(r.itemId, r.name), { cls: 'sp-tiname', title: 'Open it on the Item Market', focus: 'trade:name:' + r.itemId }), here ? spEl('span', { class: 'sp-here', text: 'THIS ITEM' }) : null]),
+                        spEl('small', {}, [qtyBox(r.units, 'How many ' + r.name, 'trade:qty:' + r.itemId, (n) => edit(r.itemId, n > 0 ? { qty: n } : { off: true })), ' at ' + formatMoney(r.bid) + ' each']),
+                    ]),
+                    spEl('span', { class: 'sp-ti-p sp-good' }, [(r.estimated ? '≈ ' : '') + signed(r.profit), spEl('small', { text: 'cost ' + formatMoney(r.cost) })]),
+                    spEl('div', { class: 'sp-buys' }, steps),
+                ]));
+            }
+            for (const r of c.off) {
+                card.appendChild(spEl('div', { class: 'sp-ti sp-off' }, [
+                    tick(false, 'Include ' + r.name, 'trade:tick:' + r.itemId, (on) => edit(r.itemId, on ? null : { off: true })),
+                    spEl('span', { class: 'sp-pic sp-pic-s' }, [this.image('trade-off', r.itemId)]),
+                    spEl('span', { class: 'sp-ti-l' }, [spEl('b', { text: r.name }), spEl('small', { text: 'left out of this trade' })]),
+                    spEl('span', { class: 'sp-ti-p', text: '–' }),
+                ]));
+            }
+
+            // Yours: what they pay most for, minus what you keep.
+            if (c.held.length) card.appendChild(spEl('div', { class: 'sp-tsec', text: 'Yours · ' + b.name + ' pays the most' }));
+            for (const r of c.held) {
+                const give = (n) => this.h.onTradeHeld && this.h.onTradeHeld(r.itemId, r.held, n);
+                const on = r.units > 0;
+                card.appendChild(spEl('div', { class: 'sp-ti' + (on ? '' : ' sp-off') }, [
+                    tick(on, 'Include your ' + r.name, 'trade:htick:' + r.itemId, (yes) => give(yes ? r.held : null)),
+                    spEl('span', { class: 'sp-pic sp-pic-s' }, [this.image('trade-yours', r.itemId)]),
+                    spEl('span', { class: 'sp-ti-l' }, [
+                        spEl('b', { text: r.name }),
+                        on
+                            ? spEl('small', {}, [qtyBox(r.units, 'How many of your ' + r.name, 'trade:hqty:' + r.itemId, give), ' of ' + count(r.held) + ' at ' + formatMoney(r.bid) + ' each' + (r.kept ? ' · keeping ' + (r.kept === 'all' ? 'all' : count(r.kept)) : '')])
+                            : spEl('small', { text: 'kept · you hold ' + count(r.held) }),
+                    ]),
+                    spEl('span', { class: 'sp-ti-p', text: on ? formatMoney(r.units * r.bid) : '–' }),
+                ]));
+            }
+            const kept = Object.entries(T.keep || {});
+            if (kept.length) {
+                const nameOf = this.state.itemNameOf || ((id) => 'Item ' + id);
+                card.appendChild(spEl('p', { class: 'sp-note', text: 'Kept for yourself: ' + kept.map(([id, k]) => nameOf(id) + ' ' + (k === 'all' ? '(all)' : count(k))).join(' · ') + '. Change it in Settings › Flips.' }));
+            }
+
+            card.appendChild(spEl('div', { class: 'sp-trade-links' }, [this.stepTraderLinks(b)]));
+            const ages = [];
+            if (b.te && T.teAt) ages.push('TE ' + formatAge(Date.now() - T.teAt));
+            if (b.w3b && T.w3bAt) ages.push('W3B ' + formatAge(Date.now() - T.w3bAt));
+            card.appendChild(spEl('p', { class: 'sp-note sp-warnnote', text: 'Check ' + b.name + '\'s list before buying' + (ages.length ? ': prices from ' + ages.join(', ') : '') + '.' }));
+            if (b.differ) card.appendChild(spEl('p', { class: 'sp-note sp-warnnote', text: b.name + '\'s lists differ (' + this.listPrices(b, ', ') + '): planned at the lower.' }));
+            return card;
+        }
+
         /** The flip plan: buy from these bazaars, sell to this trader, what it makes and costs. */
         planCard(d) {
+            if (d.trade) return this.tradeCard(d);
             const wide = d.held ? '' : ' sp-wide';
             const f = d.plan;
             if (f && f.units > 0) {
@@ -12661,10 +12960,13 @@
             if (f && f.units === 0) text = 'One costs ' + formatMoney(f.needs) + ', more than your cash (' + formatMoney(this.state.prefs.cash) + ').';
             else if (d.planWhy === 'loading') text = 'Loading bazaars from TornW3B…';
             else if (!top) text = 'No flip: no ' + who + ' for this item.';
-            else if (d.sellers.rows.some((r) => !r.stale && r.price < top.price)) {
+            else if (d.statItem) text = 'No flip: every copy has its own stats, and traders pay one price per item (weapons and armour).';
+            else if (d.sellers.rows.some((r) => !r.stale && r.price < top.price && top.price - r.price < Math.max(1, (r.price * (this.state.prefs.minProfitPct ?? 1)) / 100))) {
                 // Under the bid, but by less than Settings' least profit per item.
                 const r = d.sellers.rows.find((x) => !x.stale);
                 text = 'No flip: the cheapest bazaar makes only ' + formatMoney(top.price - r.price) + ' each, under your ' + (this.state.prefs.minProfitPct ?? 1) + '% least profit per item.';
+            } else if (d.sellers.rows.some((r) => !r.stale && r.price < top.price)) {
+                text = 'No flip: none of these buyers can take it at a profit (their price is over 3× the average, or their networth is too small).';
             } else if (d.sellers.rows.some((r) => !r.stale)) text = 'No flip: the cheapest bazaar is ' + formatMoney(d.sellers.rows.find((r) => !r.stale).price - top.price) + ' over the best ' + who + '.';
             else if (d.sellers.rows.length) text = 'No flip: TornW3B has not seen these bazaars in the last 30 minutes.';
             else text = 'No flip: no bazaar is selling it.';
@@ -12943,6 +13245,36 @@
     .sp-chip:hover { text-decoration: none; background: rgba(116, 192, 252, 0.12); }
     .sp-chip-none { visibility: hidden; }
     .sp-showall { margin-top: 8px; }
+    .sp-tsec { margin: 12px 0 4px; font-size: 11px; letter-spacing: 0.6px; text-transform: uppercase; color: var(--muted); }
+    .sp-tos { margin: 2px 0 8px; }
+    .sp-to { display: grid; grid-template-columns: 18px minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 8px 10px; margin-top: 6px; border: 1px solid var(--cline2); border-radius: 9px; cursor: pointer; }
+    .sp-to.sp-on { border-color: var(--hot-line); background: var(--green-bg); }
+    .sp-to input { accent-color: var(--price); margin: 0; }
+    .sp-to-l { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+    .sp-to-l small { color: var(--muted); font-size: 12px; }
+    .sp-to-p { font-weight: bold; color: var(--price); font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .sp-th { display: flex; align-items: flex-start; gap: 16px; flex-wrap: wrap; margin-top: 4px; }
+    .sp-th-l { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+    .sp-th-r { margin-left: auto; text-align: right; }
+    .sp-th-r small { display: block; color: var(--muted); font-size: 12px; }
+    .sp-ti { display: grid; grid-template-columns: 18px 44px minmax(0, 1fr) auto; gap: 4px 10px; align-items: center; padding: 8px 0; border-top: 1px solid #2f3a1c; }
+    .sp-ti.sp-off { opacity: 0.55; }
+    .sp-tick { width: 16px; height: 16px; margin: 0; accent-color: var(--price); }
+    .sp-ti-l { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+    .sp-ti-l small { color: var(--muted); font-size: 12px; }
+    .sp-tiname { color: #fff; font-weight: bold; text-decoration: none; }
+    .sp-tiname:hover { text-decoration: underline; }
+    .sp-here { margin-left: 6px; font-size: 11px; font-weight: bold; color: var(--price); }
+    .sp-ti-p { text-align: right; font-weight: bold; font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .sp-ti-p.sp-good { color: var(--price); }
+    .sp-ti-p small { display: block; font-weight: normal; color: var(--muted); font-size: 12px; }
+    .sp-buys { grid-column: 3 / 5; display: flex; flex-direction: column; gap: 4px; }
+    .sp-buy { display: flex; align-items: center; gap: 10px; font-size: 12px; color: var(--muted); }
+    .sp-buy .sp-chip { margin-left: auto; }
+    .sp-qty { width: 72px; height: 26px; padding: 0 6px; border-radius: 6px; border: 1px solid var(--cline2); background: #0f0f0f; color: var(--text); text-align: right; font-variant-numeric: tabular-nums; }
+    .sp-trade-links { display: flex; justify-content: flex-end; margin-top: 10px; }
+    .sp-keeplist { display: flex; flex-direction: column; gap: 6px; }
+    .sp-keeprow { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
     .sp-big { font-size: 22px; font-weight: bold; color: var(--price); font-variant-numeric: tabular-nums; }
     .sp-step { display: grid; grid-template-columns: 22px minmax(0, 1fr) auto; gap: 4px 10px; align-items: center; padding: 8px 0; border-top: 1px solid #2f3a1c; }
     .sp-q .sp-note + .sp-step { margin-top: 6px; }
@@ -13717,6 +14049,7 @@
      *   - the selling page tab (index.php?ttv2=traders): its own keys, its own
      *     settings, its own requests. See bootSellingPage().
      */
+
 
 
 
@@ -16444,6 +16777,15 @@
         bazaars: new Map(),
         /* Items worth reading every bazaar of, for a flip: from the summary, best first. */
         candidates: [],
+        /*
+         * One trade (the desk's flip plan, mockup N3): the trader you picked for
+         * an item (itemId -> trader key), what you ticked off or typed in a trade
+         * (trader key -> {itemId: {off} | {qty}}; not remembered), and the items
+         * whose bazaars the trade still needs read, the picked trader's first.
+         */
+        tradePick: new Map(),
+        tradeEdits: new Map(),
+        tradeWanted: [],
         /* Flips and traders' price lists take turns for TornW3B's slots. */
         w3bTurn: 0,
         /* The Item Market's cheapest listing of the item picked, when you hold it. */
@@ -16675,6 +17017,8 @@
     const W3B_SUMMARY_MS = 5 * 60 * 1000;
     /* The item picked: its bazaars read again after this. */
     const W3B_SELECTED_MS = 2 * 60 * 1000;
+    /* One trade reads at most this many of its items' bazaars (the chosen trader's first). */
+    const TRADE_READ_MAX = 30;
     /* A possible flip: its bazaars read again after this. */
     const W3B_CANDIDATE_MS = 10 * 60 * 1000;
     /* A TornW3B request that failed is not asked again before this. */
@@ -16715,6 +17059,9 @@
         if (now - sell.summaryAt >= W3B_SUMMARY_MS && now - sell.summaryTriedAt >= W3B_FAILED_RETRY_MS) return loadBazaarSummary;
         const picked = sell.selected;
         if (picked && bazaarsDue(picked, W3B_SELECTED_MS, now)) return () => loadBazaars(picked);
+        // The trade on the desk: its other items' bazaars, the chosen trader's first.
+        const forTrade = sell.tradeWanted.find((id) => bazaarsDue(id, W3B_CANDIDATE_MS, now));
+        if (forTrade) return () => loadBazaars(forTrade);
 
         const cand = sell.candidates.find((c) => bazaarsDue(c.itemId, W3B_CANDIDATE_MS, now));
         const list = nextW3bTrader(sell.db, heldIds(), now);
@@ -16751,7 +17098,7 @@
                 sell.summaryAt = Date.now();
                 sell.summaryError = null;
                 // Listings of items no longer picked or possible flips are let go.
-                const keep = new Set([sell.selected, ...sell.candidates.map((c) => c.itemId)]);
+                const keep = new Set([sell.selected, ...sell.candidates.map((c) => c.itemId), ...sell.tradeWanted]);
                 for (const [id, b] of sell.bazaars) {
                     if (!keep.has(id) && Date.now() - (b.at || b.triedAt || 0) > W3B_BAZAARS_FORGET_MS) sell.bazaars.delete(id);
                 }
@@ -17078,6 +17425,112 @@
             sell.selected = sell.filter !== 'mine' && strip.length ? strip[0].itemId : listed.length ? listed[0].itemId : null;
         }
 
+        /*
+         * One trade with one trader (mockup N3, the owner, 2026-09-27): the
+         * desk's flip plan takes every other item that trader buys which a bazaar
+         * sells for less, and what you hold where they are the best buyer.
+         * "Sell to" lists every trader who makes a flip on the item picked,
+         * ranked by what the WHOLE trade with them makes.
+         */
+        const traderKey = (b) => (b.id ? 'id:' + b.id : 'name:' + String(b.name).toLowerCase());
+        let tradeIndex = null;
+        const tradeItemsOf = (buyer) => {
+            if (!tradeIndex) {
+                tradeIndex = new Map();
+                for (const id of allIds) {
+                    for (const fb of flipBuyersOf(id)) {
+                        const k = traderKey(fb);
+                        if (!tradeIndex.has(k)) tradeIndex.set(k, []);
+                        tradeIndex.get(k).push({ id, fb });
+                    }
+                }
+            }
+            return tradeIndex.get(traderKey(buyer)) || [];
+        };
+        const tradeWith = (buyer, firstId) => {
+            const key = traderKey(buyer);
+            const flips = [];
+            const estimated = [];
+            for (const { id, fb } of tradeItemsOf(buyer)) {
+                const rows = sellersOf(id);
+                if (rows) {
+                    flips.push({ itemId: id, bid: fb.price, sellers: rows });
+                    continue;
+                }
+                // Not read yet: TornW3B's summary stands in (one at its cheapest), marked ≈.
+                const low = lowestOf(id);
+                if (low > 1 && enoughProfit(fb.price - low, low, 'TRADER', prefs.minProfitPct)) {
+                    estimated.push(id);
+                    flips.push({ itemId: id, bid: fb.price, sellers: [{ sellerId: null, sellerName: null, price: low, qty: 1, stale: false }] });
+                }
+            }
+            const held = [];
+            for (const [id, n] of heldQty) {
+                if (!(n > 0)) continue;
+                const top = buyersOf(id)[0];
+                if (!top || traderKey(top) !== key) continue;
+                // Only where they are the place to sell (listing does not pay more).
+                const w = whereToSell({ held: n, bid: top.price, bazaarLowest: lowestOf(id), bazaarDepth: bazaarDepthOf(id) });
+                if (w.best && w.best !== 'trader') continue;
+                held.push({ itemId: id, bid: top.price, held: n });
+            }
+            const nw = buyer.id ? networthOf(buyer.id) : null;
+            const payCap = nw !== null && nw >= 0 && prefs.networthPct > 0 ? (nw * prefs.networthPct) / 100 : Infinity;
+            const t = planTrade({
+                first: firstId,
+                flips,
+                held,
+                cash: prefs.cash,
+                maxPerItem: prefs.maxPerFlip,
+                payCap,
+                minPct: prefs.minProfitPct,
+                edits: sell.tradeEdits.get(key) || {},
+                keep: prefs.keep || {},
+            });
+            return { ...t, key, buyer, estimated };
+        };
+        const tradeDesk = (pickId) => {
+            const rows = sellersOf(pickId);
+            if (!rows) return null;
+            const options = [];
+            for (const b of flipBuyersOf(pickId)) {
+                // Only traders you can flip THIS item to (with your Cash, their cap).
+                const most = Math.min(prefs.maxPerFlip || 100, b.maxUnits ? b.maxUnits : Infinity);
+                const one = flipPlan(rows, b.price, { cash: prefs.cash, maxUnits: most, minPct: prefs.minProfitPct });
+                if (!one || !(one.units > 0)) continue;
+                options.push(tradeWith(b, pickId));
+            }
+            if (!options.length) return null;
+            options.sort((a, b) => b.profit - a.profit || b.buyer.price - a.buyer.price);
+            const chosen = options.find((o) => o.key === sell.tradePick.get(String(pickId))) || options[0];
+            // Read the chosen trader's items first, then the others' (for their totals).
+            const want = [];
+            for (const o of [chosen, ...options.filter((x) => x !== chosen)]) for (const id of o.estimated) if (!want.includes(id)) want.push(id);
+            sell.tradeWanted = want.slice(0, TRADE_READ_MAX);
+            const w3bT = chosen.buyer.id && sell.db.traders[chosen.buyer.id] ? sell.db.traders[chosen.buyer.id].w3b : null;
+            const named = (r) => ({ ...r, name: nameOf(r.itemId), estimated: chosen.estimated.includes(r.itemId) });
+            return {
+                options: options.map((o) => ({ key: o.key, buyer: o.buyer, profit: o.profit, items: o.items, estimated: o.estimated.length, bidHere: o.buyer.price })),
+                chosen: {
+                    key: chosen.key,
+                    buyer: chosen.buyer,
+                    flips: chosen.flips.map(named),
+                    off: chosen.off.map(named),
+                    held: chosen.held.map(named),
+                    items: chosen.items,
+                    profit: chosen.profit,
+                    cost: chosen.cost,
+                    pays: chosen.pays,
+                    payCapped: chosen.payCapped,
+                    estimated: chosen.estimated.length,
+                },
+                keep: prefs.keep || {},
+                // How old the prices are: check their list before buying.
+                teAt: sell.traders ? sell.traders.fetchedAt : null,
+                w3bAt: w3bT && w3bT.at ? w3bT.at : null,
+            };
+        };
+
         let desk = null;
         const pick = sell.selected;
         if (pick) {
@@ -17106,11 +17559,15 @@
                 },
                 plan: planOf(pick),
                 planWhy: b && b.at ? null : 'loading',
+                // Weapons and armour: every copy has its own stats, so no flip (say why).
+                statItem: Boolean(item && STAT_ITEM_TYPES.has(item.type)),
                 where: held ? whereToSell({ held, bid: buyers[0] ? buyers[0].price : null, bazaarLowest: lowestOf(pick), marketLowest: m ? m.lowest : null, bazaarDepth: bazaarDepthOf(pick), marketDepth: m ? m.depth : null }) : null,
                 market: { state: m && m.at ? 'ok' : m && m.error ? 'error' : 'loading', lowest: m ? m.lowest : null },
             };
+            desk.trade = tradeDesk(pick);
             if (held) loadSellMarket(pick);
         }
+        if (!desk || !desk.trade) sell.tradeWanted = [];
 
         const watch = sellWatch({ desk, strip, listed, held: [...heldQty.keys()], buyersAll });
         updateSellPresence(watch, now);
@@ -17753,6 +18210,30 @@
                 // one-time Trusted switch) must survive, or Trusted comes back on
                 // at every reload after any setting is saved.
                 gmSet(STORE_SELL_PREFS, { ...(gmGet(STORE_SELL_PREFS, {}) || {}), ...sellPrefs(), ...partial });
+                renderSellingNow();
+            },
+            // One trade: the trader picked for an item, a row ticked / its number,
+            // and what you keep of your own (remembered in the prefs).
+            onTradePick: (itemId, key) => {
+                sell.tradePick.set(String(itemId), key);
+                renderSellingNow();
+            },
+            onTradeEdit: (key, itemId, edit) => {
+                const e = { ...(sell.tradeEdits.get(key) || {}) };
+                if (edit && (edit.off || edit.qty > 0)) e[String(itemId)] = edit;
+                else delete e[String(itemId)];
+                sell.tradeEdits.set(key, e);
+                renderSellingNow();
+            },
+            onTradeHeld: (itemId, held, give) => {
+                const keep = keepAfter(sellPrefs().keep || {}, itemId, held, give);
+                gmSet(STORE_SELL_PREFS, { ...(gmGet(STORE_SELL_PREFS, {}) || {}), keep });
+                renderSellingNow();
+            },
+            onKeepRemove: (itemId) => {
+                const keep = { ...(sellPrefs().keep || {}) };
+                delete keep[String(itemId)];
+                gmSet(STORE_SELL_PREFS, { ...(gmGet(STORE_SELL_PREFS, {}) || {}), keep });
                 renderSellingNow();
             },
             onSelect: onSellSelect,

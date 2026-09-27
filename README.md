@@ -283,6 +283,20 @@ you: every link is one you follow yourself, one page per click.
   - **Bazaars sell · cheapest first**: seller (their profile), how many, when
     TornW3B last saw it (older than 30 minutes is greyed and never planned
     on), price, and **Open bazaar** (their bazaar, pointing at the listing).
+  - **Flip plan = one trade** (3.12.6, mockup N3; the friend: "a trade of one
+    item looks odd, many items looks legit"): the plan is the WHOLE trade with
+    one trader - this item first, then every other item that trader buys which
+    a bazaar sells for less, then what you hold where they are the best buyer
+    (and listing it would not pay more). **Sell to** lists every trader you
+    can flip this item to, ranked by what the whole trade with them makes;
+    pick another and the plan is worked out for them. One Cash for the whole
+    trade (this item first, then the most profit per $), Most per flip per
+    item, their networth share for the whole trade. Every row has a tick and a
+    number: untick or lower a flip for this trade (not remembered); untick or
+    lower one of yours and it is remembered as **kept** (Settings › Flips ›
+    Keep for yourself, with Remove). Items whose bazaars are not read yet show
+    TornW3B's summary price, marked ≈, and are read first (the chosen trader's,
+    then the others'). Trade / TE list / W3B list, and how old their prices are.
   - **Flip plan**: what it makes, how many, the cash it needs, and each step
     with its link - *Buy 26 from X at $70,000 [Open bazaar]* ... *Sell 70 to
     FAFFO at $73,500 [Trade]*. Or why there is none: over the best buyer,

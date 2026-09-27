@@ -49,6 +49,8 @@ export const SELLING_PAGE_DEFAULTS = {
     networthPct: 10,
     /* A flip buys only listings that make at least this % per item: $1 is for NPC shops, not people. */
     minProfitPct: 1,
+    /* What you keep of your own when a trade offers it: itemId -> n | 'all'. */
+    keep: {},
 };
 
 /** The item list shows this many at a time. */
@@ -239,6 +241,27 @@ export class SellingPage {
             this.renderPills();
             if (this.view === 'settings') this.renderSettingsNav();
         }, 1000);
+    }
+
+    /** Settings › Flips › Keep for yourself: each item kept, with Remove. */
+    renderKeepList(p) {
+        if (!this.keepListEl) return;
+        const keep = Object.entries((p && p.keep) || {});
+        const sig = JSON.stringify(keep);
+        if (sig === this.keepSig) return;
+        this.keepSig = sig;
+        this.keepListEl.textContent = '';
+        if (!keep.length) {
+            this.keepListEl.appendChild(spEl('div', { class: 'sp-keystate', text: 'Nothing kept: a trade offers all of it.' }));
+            return;
+        }
+        const nameOf = this.state.itemNameOf || ((id) => 'Item ' + id);
+        for (const [id, k] of keep) {
+            this.keepListEl.appendChild(spEl('div', { class: 'sp-keeprow' }, [
+                spEl('span', { text: nameOf(id) + ': keep ' + (k === 'all' ? 'all' : count(k)) }),
+                spEl('button', { type: 'button', class: 'sp-btn', text: 'Remove', onclick: () => this.h.onKeepRemove && this.h.onKeepRemove(id) }),
+            ]));
+        }
     }
 
     /**
@@ -659,6 +682,10 @@ export class SellingPage {
                 this.nwStateEl,
                 note(['A flip never asks a trader to pay more than this share of their networth. Networth comes from Torn\'s public stats, read with your Limited key.']),
             ]),
+            field('Keep for yourself', null, [
+                (this.keepListEl = spEl('div', { class: 'sp-keeplist' })),
+                note(['What a trade leaves out of what you hold. Set it in a trade: untick one of yours, or give fewer than you hold.']),
+            ]),
             field('Least profit per item', null, [
                 spEl('div', { class: 'sp-inline sp-pct' }, ['At least ', this.minInput, ' % of the price ', spEl('button', { type: 'button', class: 'sp-btn sp-primary', text: 'Save', onclick: saveMin })]),
                 this.minStateEl,
@@ -864,6 +891,7 @@ export class SellingPage {
             this.maxStateEl.className = 'sp-keystate';
             this.maxStateEl.textContent = 'Saved: ' + count(p.maxPerFlip || 100) + ' items.';
         }
+        this.renderKeepList(p);
         if (!this.minDirty) {
             const m = p.minProfitPct ?? 1;
             this.minInput.placeholder = String(m);
@@ -1269,7 +1297,7 @@ export class SellingPage {
                 p.networthPct,
                 d.sellers.state, d.sellers.error,
                 d.sellers.rows.map((r) => [r.sellerId, r.sellerName, r.price, r.qty, r.stale, Math.floor((now - (r.dataAt || 0)) / 60000)]),
-                d.plan, d.where, d.market,
+                d.plan, d.where, d.market, d.trade,
                 this.showAll, p.onlineOnly, p.trustedOnly, p.cash, Boolean(info.knownTraders), info.tradersLoading,
             ])
             : JSON.stringify([info.hasKey, info.loading, Boolean(info.bazaarsAt), info.tradersLoading, this.state.counts]);
@@ -1436,8 +1464,146 @@ export class SellingPage {
         return card;
     }
 
+    /**
+     * The flip plan as ONE trade with one trader (mockup N3, the owner's pick):
+     * Sell to (every trader you can flip this item to, ranked by what the
+     * whole trade makes), then every item in the trade - this one first,
+     * each with a tick and a number - then what you hold that they pay most
+     * for, minus what you keep. Totals, Trade and their lists, and how old
+     * their prices are.
+     */
+    tradeCard(d) {
+        const T = d.trade;
+        const c = T.chosen;
+        const b = c.buyer;
+        const approx = c.estimated ? '≈ ' : '';
+        const card = spEl('div', { class: 'sp-q sp-hot sp-wide sp-trade' }, [spEl('h3', { text: 'Flip plan · one trade with ' + b.name })]);
+
+        // Sell to: the whole trade with each trader who buys this item.
+        if (T.options.length > 1) {
+            const box = spEl('div', { class: 'sp-tos', role: 'radiogroup', 'aria-label': 'Sell to' }, [spEl('div', { class: 'sp-tsec', text: 'Sell to · what the whole trade makes' })]);
+            for (const o of T.options) {
+                const on = o.key === c.key;
+                const input = spEl('input', { type: 'radio', name: 'sp-to-' + d.itemId, 'data-focus': 'trade:to:' + o.key });
+                input.checked = on;
+                input.addEventListener('change', () => this.h.onTradePick && this.h.onTradePick(d.itemId, o.key));
+                box.appendChild(spEl('label', { class: 'sp-to' + (on ? ' sp-on' : '') }, [
+                    input,
+                    spEl('span', { class: 'sp-to-l' }, [
+                        spEl('span', {}, [spEl('b', { text: o.buyer.name }), ' ', this.trustBadge(o.buyer)]),
+                        spEl('small', { text: formatMoney(o.bidHere) + ' for this · ' + count(o.items) + (o.items === 1 ? ' item' : ' items') + ' in the trade' + (o.estimated ? ' · ' + o.estimated + ' not read yet' : '') }),
+                    ]),
+                    spEl('span', { class: 'sp-to-p', text: (o.estimated ? '≈ ' : '') + signed(o.profit) }),
+                ]));
+            }
+            card.appendChild(box);
+        }
+
+        // Who, and the totals.
+        card.appendChild(spEl('div', { class: 'sp-th' }, [
+            spEl('span', { class: 'sp-th-l' }, [
+                spEl('span', {}, [this.playerName(b.name, b.id, 'trade:buyer'), ' ', this.trustBadge(b)]),
+                this.status(b),
+                this.networthLine(b),
+            ]),
+            spEl('span', { class: 'sp-th-r' }, [
+                spEl('div', { class: 'sp-big', text: approx + signed(c.profit) }),
+                spEl('small', { text: count(c.items) + (c.items === 1 ? ' item' : ' items') + ' · cash needed ' + formatMoney(c.cost) + ' · ' + b.name + ' pays ' + approx + formatMoney(c.pays) }),
+            ]),
+        ]));
+        if (c.payCapped) {
+            const nw = b.id && this.state.networth ? this.state.networth.get(String(b.id)) : null;
+            card.appendChild(spEl('p', { class: 'sp-note', text: b.name + ' can pay at most ' + (this.state.prefs.networthPct || 10) + '% of their networth' + (nw >= 0 ? ' (' + formatMoney(nw) + ')' : '') + ' for the whole trade: it stops there.' }));
+        }
+
+        const tick = (checked, label, focus, onChange) => {
+            const input = spEl('input', { type: 'checkbox', class: 'sp-tick', 'aria-label': label, 'data-focus': focus });
+            input.checked = checked;
+            input.addEventListener('change', () => onChange(input.checked));
+            return input;
+        };
+        const qtyBox = (value, label, focus, onSet) => {
+            const input = spEl('input', { type: 'text', class: 'sp-qty', inputmode: 'numeric', value: String(value), 'aria-label': label, 'data-focus': focus, autocomplete: 'off', spellcheck: 'false' });
+            const commit = () => {
+                const n = Math.floor(Number(String(input.value).replace(/[,s]/g, '')));
+                if (Number.isFinite(n) && n >= 0) onSet(n);
+                else input.value = String(value);
+            };
+            input.addEventListener('change', commit);
+            input.addEventListener('keydown', (event) => {
+                if (event.key !== 'Enter') return;
+                event.preventDefault();
+                commit();
+            });
+            return input;
+        };
+        const edit = (id, e) => this.h.onTradeEdit && this.h.onTradeEdit(c.key, id, e);
+
+        // Buy, then trade: this item first.
+        if (c.flips.length || c.off.length) card.appendChild(spEl('div', { class: 'sp-tsec', text: 'Buy, then trade to ' + b.name }));
+        for (const r of c.flips) {
+            const here = r.itemId === String(d.itemId);
+            const steps = r.steps.map((st) => (st.sellerId
+                ? spEl('div', { class: 'sp-buy' }, [
+                    spEl('span', {}, ['Buy ', spEl('b', { text: count(st.qty) }), ' from ', this.playerName(st.sellerName || 'Player ' + st.sellerId, st.sellerId, 'trade:seller:' + r.itemId + ':' + st.sellerId), ' at ' + formatMoney(st.price)]),
+                    this.link('Open bazaar', bazaarUrl(st.sellerId, r.itemId, st.price), { focus: 'trade:bazaar:' + r.itemId + ':' + st.sellerId }),
+                ])
+                : spEl('div', { class: 'sp-buy' }, [spEl('span', { text: '≈ from ' + formatMoney(st.price) + ': its bazaars are being read' })])));
+            card.appendChild(spEl('div', { class: 'sp-ti' }, [
+                tick(true, 'Include ' + r.name, 'trade:tick:' + r.itemId, (on) => edit(r.itemId, on ? null : { off: true })),
+                spEl('span', { class: 'sp-pic sp-pic-s' }, [this.image('trade-buy', r.itemId)]),
+                spEl('span', { class: 'sp-ti-l' }, [
+                    spEl('span', {}, [this.link(r.name, itemMarketUrl(r.itemId, r.name), { cls: 'sp-tiname', title: 'Open it on the Item Market', focus: 'trade:name:' + r.itemId }), here ? spEl('span', { class: 'sp-here', text: 'THIS ITEM' }) : null]),
+                    spEl('small', {}, [qtyBox(r.units, 'How many ' + r.name, 'trade:qty:' + r.itemId, (n) => edit(r.itemId, n > 0 ? { qty: n } : { off: true })), ' at ' + formatMoney(r.bid) + ' each']),
+                ]),
+                spEl('span', { class: 'sp-ti-p sp-good' }, [(r.estimated ? '≈ ' : '') + signed(r.profit), spEl('small', { text: 'cost ' + formatMoney(r.cost) })]),
+                spEl('div', { class: 'sp-buys' }, steps),
+            ]));
+        }
+        for (const r of c.off) {
+            card.appendChild(spEl('div', { class: 'sp-ti sp-off' }, [
+                tick(false, 'Include ' + r.name, 'trade:tick:' + r.itemId, (on) => edit(r.itemId, on ? null : { off: true })),
+                spEl('span', { class: 'sp-pic sp-pic-s' }, [this.image('trade-off', r.itemId)]),
+                spEl('span', { class: 'sp-ti-l' }, [spEl('b', { text: r.name }), spEl('small', { text: 'left out of this trade' })]),
+                spEl('span', { class: 'sp-ti-p', text: '–' }),
+            ]));
+        }
+
+        // Yours: what they pay most for, minus what you keep.
+        if (c.held.length) card.appendChild(spEl('div', { class: 'sp-tsec', text: 'Yours · ' + b.name + ' pays the most' }));
+        for (const r of c.held) {
+            const give = (n) => this.h.onTradeHeld && this.h.onTradeHeld(r.itemId, r.held, n);
+            const on = r.units > 0;
+            card.appendChild(spEl('div', { class: 'sp-ti' + (on ? '' : ' sp-off') }, [
+                tick(on, 'Include your ' + r.name, 'trade:htick:' + r.itemId, (yes) => give(yes ? r.held : null)),
+                spEl('span', { class: 'sp-pic sp-pic-s' }, [this.image('trade-yours', r.itemId)]),
+                spEl('span', { class: 'sp-ti-l' }, [
+                    spEl('b', { text: r.name }),
+                    on
+                        ? spEl('small', {}, [qtyBox(r.units, 'How many of your ' + r.name, 'trade:hqty:' + r.itemId, give), ' of ' + count(r.held) + ' at ' + formatMoney(r.bid) + ' each' + (r.kept ? ' · keeping ' + (r.kept === 'all' ? 'all' : count(r.kept)) : '')])
+                        : spEl('small', { text: 'kept · you hold ' + count(r.held) }),
+                ]),
+                spEl('span', { class: 'sp-ti-p', text: on ? formatMoney(r.units * r.bid) : '–' }),
+            ]));
+        }
+        const kept = Object.entries(T.keep || {});
+        if (kept.length) {
+            const nameOf = this.state.itemNameOf || ((id) => 'Item ' + id);
+            card.appendChild(spEl('p', { class: 'sp-note', text: 'Kept for yourself: ' + kept.map(([id, k]) => nameOf(id) + ' ' + (k === 'all' ? '(all)' : count(k))).join(' · ') + '. Change it in Settings › Flips.' }));
+        }
+
+        card.appendChild(spEl('div', { class: 'sp-trade-links' }, [this.stepTraderLinks(b)]));
+        const ages = [];
+        if (b.te && T.teAt) ages.push('TE ' + formatAge(Date.now() - T.teAt));
+        if (b.w3b && T.w3bAt) ages.push('W3B ' + formatAge(Date.now() - T.w3bAt));
+        card.appendChild(spEl('p', { class: 'sp-note sp-warnnote', text: 'Check ' + b.name + '\'s list before buying' + (ages.length ? ': prices from ' + ages.join(', ') : '') + '.' }));
+        if (b.differ) card.appendChild(spEl('p', { class: 'sp-note sp-warnnote', text: b.name + '\'s lists differ (' + this.listPrices(b, ', ') + '): planned at the lower.' }));
+        return card;
+    }
+
     /** The flip plan: buy from these bazaars, sell to this trader, what it makes and costs. */
     planCard(d) {
+        if (d.trade) return this.tradeCard(d);
         const wide = d.held ? '' : ' sp-wide';
         const f = d.plan;
         if (f && f.units > 0) {
@@ -1474,10 +1640,13 @@ export class SellingPage {
         if (f && f.units === 0) text = 'One costs ' + formatMoney(f.needs) + ', more than your cash (' + formatMoney(this.state.prefs.cash) + ').';
         else if (d.planWhy === 'loading') text = 'Loading bazaars from TornW3B…';
         else if (!top) text = 'No flip: no ' + who + ' for this item.';
-        else if (d.sellers.rows.some((r) => !r.stale && r.price < top.price)) {
+        else if (d.statItem) text = 'No flip: every copy has its own stats, and traders pay one price per item (weapons and armour).';
+        else if (d.sellers.rows.some((r) => !r.stale && r.price < top.price && top.price - r.price < Math.max(1, (r.price * (this.state.prefs.minProfitPct ?? 1)) / 100))) {
             // Under the bid, but by less than Settings' least profit per item.
             const r = d.sellers.rows.find((x) => !x.stale);
             text = 'No flip: the cheapest bazaar makes only ' + formatMoney(top.price - r.price) + ' each, under your ' + (this.state.prefs.minProfitPct ?? 1) + '% least profit per item.';
+        } else if (d.sellers.rows.some((r) => !r.stale && r.price < top.price)) {
+            text = 'No flip: none of these buyers can take it at a profit (their price is over 3× the average, or their networth is too small).';
         } else if (d.sellers.rows.some((r) => !r.stale)) text = 'No flip: the cheapest bazaar is ' + formatMoney(d.sellers.rows.find((r) => !r.stale).price - top.price) + ' over the best ' + who + '.';
         else if (d.sellers.rows.length) text = 'No flip: TornW3B has not seen these bazaars in the last 30 minutes.';
         else text = 'No flip: no bazaar is selling it.';
@@ -1756,6 +1925,36 @@ button:focus-visible, input:focus-visible, summary:focus-visible, a:focus-visibl
 .sp-chip:hover { text-decoration: none; background: rgba(116, 192, 252, 0.12); }
 .sp-chip-none { visibility: hidden; }
 .sp-showall { margin-top: 8px; }
+.sp-tsec { margin: 12px 0 4px; font-size: 11px; letter-spacing: 0.6px; text-transform: uppercase; color: var(--muted); }
+.sp-tos { margin: 2px 0 8px; }
+.sp-to { display: grid; grid-template-columns: 18px minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 8px 10px; margin-top: 6px; border: 1px solid var(--cline2); border-radius: 9px; cursor: pointer; }
+.sp-to.sp-on { border-color: var(--hot-line); background: var(--green-bg); }
+.sp-to input { accent-color: var(--price); margin: 0; }
+.sp-to-l { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.sp-to-l small { color: var(--muted); font-size: 12px; }
+.sp-to-p { font-weight: bold; color: var(--price); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.sp-th { display: flex; align-items: flex-start; gap: 16px; flex-wrap: wrap; margin-top: 4px; }
+.sp-th-l { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.sp-th-r { margin-left: auto; text-align: right; }
+.sp-th-r small { display: block; color: var(--muted); font-size: 12px; }
+.sp-ti { display: grid; grid-template-columns: 18px 44px minmax(0, 1fr) auto; gap: 4px 10px; align-items: center; padding: 8px 0; border-top: 1px solid #2f3a1c; }
+.sp-ti.sp-off { opacity: 0.55; }
+.sp-tick { width: 16px; height: 16px; margin: 0; accent-color: var(--price); }
+.sp-ti-l { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.sp-ti-l small { color: var(--muted); font-size: 12px; }
+.sp-tiname { color: #fff; font-weight: bold; text-decoration: none; }
+.sp-tiname:hover { text-decoration: underline; }
+.sp-here { margin-left: 6px; font-size: 11px; font-weight: bold; color: var(--price); }
+.sp-ti-p { text-align: right; font-weight: bold; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.sp-ti-p.sp-good { color: var(--price); }
+.sp-ti-p small { display: block; font-weight: normal; color: var(--muted); font-size: 12px; }
+.sp-buys { grid-column: 3 / 5; display: flex; flex-direction: column; gap: 4px; }
+.sp-buy { display: flex; align-items: center; gap: 10px; font-size: 12px; color: var(--muted); }
+.sp-buy .sp-chip { margin-left: auto; }
+.sp-qty { width: 72px; height: 26px; padding: 0 6px; border-radius: 6px; border: 1px solid var(--cline2); background: #0f0f0f; color: var(--text); text-align: right; font-variant-numeric: tabular-nums; }
+.sp-trade-links { display: flex; justify-content: flex-end; margin-top: 10px; }
+.sp-keeplist { display: flex; flex-direction: column; gap: 6px; }
+.sp-keeprow { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .sp-big { font-size: 22px; font-weight: bold; color: var(--price); font-variant-numeric: tabular-nums; }
 .sp-step { display: grid; grid-template-columns: 22px minmax(0, 1fr) auto; gap: 4px 10px; align-items: center; padding: 8px 0; border-top: 1px solid #2f3a1c; }
 .sp-q .sp-note + .sp-step { margin-top: 6px; }

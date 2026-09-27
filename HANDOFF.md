@@ -4,7 +4,17 @@ Read this first, then `README.md`. The README holds the product and the binding
 rules; this file holds where we are, how the owner works, and what is settled.
 Everything below "History" is the record of how we got here.
 
-## Where things stand (3.12.5, 2026-09-27)
+## Where things stand (3.12.6, 2026-09-27)
+
+**3.12.6: one trade per trader** (mockup N3 + a "Sell to" picker, the owner's
+picks): the desk's flip plan is the whole trade with one trader (`core/trade.js`
+planTrade, tested; `tradeDesk` in main.js; `SellingPage.tradeCard`). Sell to
+ranks every trader you can flip the item to by the whole trade; ticks and
+numbers per row; the keep list for your own items (prefs.keep, Settings ›
+Flips). Items not read yet are estimated from the summary (≈) and read first
+(`sell.tradeWanted`, up to 30, in `nextW3bJob` right after the picked item).
+Harness: `&manybuyers=1` gives Dynamite three buyers. The owner's trading-
+partners idea is still only an idea (below).
 
 **3.12.5 released** (`aab7e53`), branch `claude/optimistic-ride-1gqguu`,
 pushed. Install link given to the owner:
@@ -735,6 +745,7 @@ PWPATH=$(npm root -g)/playwright node test/ux-check.mjs   # real-browser checks
   - `&sellkeys=1` saves both keys;
   - `&sellsame=1` makes both keys the same Limited key;
   - `&w3btrader=1` adds a TornW3B-only trader;
+  - `&manybuyers=1` adds Carol and Alice as Dynamite buyers (the Sell to picker);
   - `&tedrop=1` makes Alice's full TornExchange list for the Hammer $100
     while the top three still say $115 (lists that disagree);
   - `&sellprefs=<json>` sets the page's preferences;
