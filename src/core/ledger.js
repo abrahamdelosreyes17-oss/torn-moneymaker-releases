@@ -397,3 +397,39 @@ export function logSpan(entries) {
     }
     return { min: min === Infinity ? 0 : min, max };
 }
+
+/**
+ * One receipt per finished trade (the owner, 2026-09-28: "in the ledger maybe
+ * create a simple receipt of every trade"): when, with whom, each item you
+ * gave and got with its share of the money, and - for what you sold - what
+ * its units cost you (first in, first out) and what it made.
+ *
+ * @param {Array} rows - ledger rows (only trades are used)
+ * @param {Map} fifo - matchFifo(rows over all time), so costs are known
+ * @returns {Array<{id, t, who, whoName, gave, got, received, paid, cost, profit, unknownQty}>} newest first
+ */
+export function tradeReceipts(rows, fifo) {
+    const by = new Map();
+    for (const r of rows || []) {
+        if (!r || r.venue !== 'trade') continue;
+        const m = String(r.id).match(/^trade:(.+):(in|out):\d+$/);
+        if (!m) continue;
+        const rec = by.get(m[1]) || { id: m[1], t: r.t, who: r.who, whoName: r.whoName, gave: [], got: [], received: 0, paid: 0, cost: 0, profit: 0, unknownQty: 0 };
+        const total = r.each * r.qty;
+        if (r.side === 'buy') {
+            rec.got.push({ itemId: r.itemId, qty: r.qty, each: r.each, total });
+            rec.paid += total;
+        } else {
+            const f = r.side === 'sell' && fifo ? fifo.get(r.id) : null;
+            rec.gave.push({ itemId: r.itemId, qty: r.qty, each: r.each, total: r.side === 'sell' ? total : 0, cost: f ? f.cost : null, profit: f ? f.profit : null, given: r.side === 'give' });
+            if (r.side === 'sell') rec.received += total;
+            if (f) {
+                rec.cost += f.cost || 0;
+                rec.profit += f.profit || 0;
+                rec.unknownQty += f.unknownQty || 0;
+            }
+        }
+        by.set(m[1], rec);
+    }
+    return [...by.values()].sort((a, b) => b.t - a.t);
+}

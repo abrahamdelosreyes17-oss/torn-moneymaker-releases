@@ -326,6 +326,38 @@ you: every link is one you follow yourself, one page per click.
     it no longer pays); a reload after buying still counts; when the listing
     was never seen on the page, Next asks **Bought N** / **Did not buy**
     instead of guessing; ticking Bought in Torn Bids after a skip counts it.
+    **3.13, smart extras** (the owner: "the biggest profit should be the main
+    item... we're only adding items so we don't look sus... if we take too
+    long, prices change or the trader loses interest"): the picked item is
+    planned as before; the other items fill in by TIME - first what the
+    bazaars on the route sell, then at most 2-4 new bazaars (more when the
+    item itself takes several), fast-selling items first, one bazaar per extra
+    item, slow items only where you go anyway. Each item is **fast** (drugs,
+    flowers, plushies, boosters, medical, candy, alcohol, energy drinks,
+    temporaries, or seen selling 20+ an hour), **slow** (weapons/armour, thin -
+    ten take over five bazaars - or two hours with nothing moving) or
+    **normal**; an extra takes at most Most per flip / 10 / 3 of them, and your
+    own items the same (the 150,000 Hammers become 3) unless you type a
+    number. How fast items sell is learned from the bazaar reads the script
+    already makes (no extra calls). Never a listing in the planned trader's
+    own bazaar. The plan says "N bazaars to buy from · about M min", tags
+    extras "sells fast" / "slow seller" and says how many items were left out.
+    **Copy offer** copies the message for the trader (every item, amount and
+    total). With a trade, its card sits beside the traders (not below the
+    fold); Trade opens only after buying. The accepted card has one main
+    button at a time (Start / Continue buying, then Open the trade), **Not
+    taken?** per item (how many the trader refused), and **Traded - done**
+    keeps those as **leftovers**: first in the Best flips strip, with what
+    they cost and the best other trader now, merged into what you hold (so
+    Where to sell and other trades use them) until the inventory shows them
+    gone. On the bazaar, **Fill N** (types the amount into the card's own box;
+    you press Buy) and **Next ›** sit on the marked card; Next stays on the
+    same bazaar when that seller has more for the trade; the panel's buying
+    box sits under its header (also collapsed, also in Settings), shows
+    minutes since the yes (amber after 10), and **N** presses Next. The desk
+    no longer jumps between flips while they load. The Ledger has a
+    **Receipts** tab: one per finished trade, each item with its price, cost
+    (first in, first out) and profit.
     One Cash for the whole
     trade (this item first, then the most profit per $), Most per flip per
     item, their networth share for the whole trade. Every row has a tick and a
@@ -555,7 +587,14 @@ them.
    or scrolls. A user click never triggers a chain of game actions. **Fill types
    one row's price (and quantity) only on your click, into your own listing
    form, and never presses Torn's buttons** - you confirm. Nothing is filled
-   before you click, and there is no Fill All.
+   before you click, and there is no Fill All. The same holds for the trade
+   page's Fill (one row's quantity) and, since 3.13, **Fill on the bazaar card
+   you are buying from for an accepted trade**: one press types that step's
+   quantity into the card's own box - you press Torn's Buy and confirm. Its
+   Next (and the N key, only on that bazaar) is the panel's Next: it counts
+   what you took from the page and opens one page. Those two small buttons
+   are the only elements the script puts inside a Torn card (the marked one
+   only; they act only on it).
 2. **Never fetch a Torn page the user is not viewing.** There is no `fetch` of
    `torn.com` anywhere — only `api.torn.com` (from `src/api/client.js`),
    `weav3r.dev` (from `src/api/w3b.js`) and `www.tornexchange.com` (from

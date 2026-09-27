@@ -144,8 +144,10 @@ if (_tradeView) {
 // window.__buy(id, n) takes n off a listing's stock, as a purchase does.
 if (/[?&]bazaarcards=1/.test(location.search)) {
     document.addEventListener('DOMContentLoaded', () => {
-        const card = (id, name, price, stock) => '<div class="itemDescription___x" data-id="' + id + '" style="width:220px;height:90px;display:inline-block;margin:4px;padding:6px;background:#333;color:#ddd;font:12px Arial">' +
-            '<img src="https://www.torn.com/images/items/' + id + '/large.png" alt="' + name + '" style="height:30px"><div>' + name + '</div><div>$' + price.toLocaleString('en-US') + '</div><div class="stock">(' + stock + ' in stock)</div></div>';
+        const card = (id, name, price, stock) => '<div class="itemDescription___x" data-id="' + id + '" style="width:220px;height:110px;display:inline-block;margin:4px;padding:6px;background:#333;color:#ddd;font:12px Arial">' +
+            '<img src="https://www.torn.com/images/items/' + id + '/large.png" alt="' + name + '" style="height:30px"><div>' + name + '</div><div>$' + price.toLocaleString('en-US') + '</div><div class="stock">(' + stock + ' in stock)</div>' +
+            // A quantity box and Buy, as a card shows once you press to buy (Fill types into the box).
+            '<div style="margin-top:4px"><input class="buyAmountInput" type="text" placeholder="Qty" style="width:60px"> <button type="button">Buy</button></div></div>';
         const d = document.createElement('div');
         d.id = 'fake-bazaar';
         d.innerHTML = card(335, 'Stick of Dynamite', 17500, 60) + card(206, 'Xanax', 840000, 2);

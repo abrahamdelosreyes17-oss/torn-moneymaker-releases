@@ -103,6 +103,9 @@ export function gmFetch(url) {
             method: 'GET',
             url,
             timeout: 30000,
+            // No cookies: every API here authenticates by key or not at all,
+            // so a logged-in tornexchange.com / weav3r.dev session never rides along.
+            anonymous: true,
             onload(response) {
                 resolve({
                     ok: response.status >= 200 && response.status < 300,

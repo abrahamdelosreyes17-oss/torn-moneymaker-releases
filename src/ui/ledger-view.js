@@ -14,7 +14,10 @@
  */
 
 import { formatMoney, formatAge, parseMoneyInput } from '../core/parse.js';
-import { matchFifo, filterLedgerRows, ledgerTotals, ledgerByItem, ledgerByPeriod, periodStart, mugTotals, VENUE_NAMES } from '../core/ledger.js';
+import { matchFifo, filterLedgerRows, ledgerTotals, ledgerByItem, ledgerByPeriod, periodStart, mugTotals, tradeReceipts, VENUE_NAMES } from '../core/ledger.js';
+
+/* At most this many receipts drawn at once (narrow the period or who for older ones). */
+const RECEIPTS_SHOWN = 40;
 
 const DAY = 24 * 60 * 60 * 1000;
 
@@ -24,6 +27,7 @@ function lvEl(tag, props = {}, children = []) {
         if (key === 'class') node.className = value;
         else if (key === 'text') node.textContent = value;
         else if (key.startsWith('on') && typeof value === 'function') node.addEventListener(key.slice(2).toLowerCase(), value);
+        else if (key.startsWith('on')) continue;
         else if (value !== null && value !== undefined && value !== false) node.setAttribute(key, String(value));
     }
     for (const child of [].concat(children)) {
@@ -82,7 +86,7 @@ export class LedgerView {
         this.h = h;
         this.f = { period: '30d', itemId: '', category: '', venue: 'all', who: '', fromDay: '', toDay: '', mugger: 'all', mugMin: '' };
         this.group = 'day';
-        /* 'trade' (buys and sells) or 'mugs' (what muggings took) */
+        /* 'trade' (buys and sells), 'receipts' (one per finished trade) or 'mugs' (what muggings took) */
         this.tab = 'trade';
         this.fifoSig = null;
         this.fifo = new Map();
@@ -163,7 +167,7 @@ export class LedgerView {
 
         /* Trading | Mugged */
         const tabs = lvEl('div', { class: 'lg-tabs', role: 'tablist' });
-        for (const [k, label] of [['trade', 'Trading'], ['mugs', 'Mugged' + (mugs.length ? ' · ' + lvCount(mugs.length) : '')]]) {
+        for (const [k, label] of [['trade', 'Trading'], ['receipts', 'Receipts'], ['mugs', 'Mugged' + (mugs.length ? ' · ' + lvCount(mugs.length) : '')]]) {
             tabs.appendChild(lvEl('button', { type: 'button', role: 'tab', class: 'lg-tab', 'aria-selected': String(this.tab === k), text: label, onclick: () => {
                 this.tab = k;
                 this.sig = null;
@@ -244,6 +248,7 @@ export class LedgerView {
         const minInput = lvEl('input', { type: 'text', class: 'lg-in lg-min', inputmode: 'numeric', placeholder: 'Any amount', 'aria-label': 'At least', 'data-lg-focus': 'mugmin', value: this.f.mugMin });
         minInput.addEventListener('input', () => this.set({ mugMin: minInput.value }));
         const mugsTab = this.tab === 'mugs';
+        const receiptsTab = this.tab === 'receipts';
         const any = mugsTab
             ? this.f.who || this.f.mugger !== 'all' || this.f.mugMin
             : this.f.itemId || this.f.category || this.f.venue !== 'all' || this.f.who;
@@ -252,7 +257,7 @@ export class LedgerView {
             ...dates,
             mugsTab ? null : lvEl('label', { class: 'lg-f' }, [lvEl('span', { text: 'Item' }), itemInput, datalist]),
             mugsTab ? null : lvEl('label', { class: 'lg-f' }, [lvEl('span', { text: 'Category' }), catSel]),
-            mugsTab ? null : lvEl('label', { class: 'lg-f' }, [lvEl('span', { text: 'Where' }), venueSel]),
+            mugsTab || receiptsTab ? null : lvEl('label', { class: 'lg-f' }, [lvEl('span', { text: 'Where' }), venueSel]),
             lvEl('label', { class: 'lg-f' }, [lvEl('span', { text: mugsTab ? 'Mugged by' : 'Who' }), whoInput]),
             mugsTab ? lvEl('label', { class: 'lg-f' }, [lvEl('span', { text: 'Mugger' }), muggerSel]) : null,
             mugsTab ? lvEl('label', { class: 'lg-f' }, [lvEl('span', { text: 'At least' }), minInput]) : null,
@@ -265,6 +270,11 @@ export class LedgerView {
         const { from, to } = this.range();
         if (this.tab === 'mugs') {
             this.renderMugs(box, mugs, { from, to }, L);
+            this.restoreFocus(focusKey, caret);
+            return;
+        }
+        if (receiptsTab) {
+            this.renderReceipts(box, filterLedgerRows(rows, { ...this.f, itemId: '', category: '', venue: 'trade', from, to }, typeOf), nameOf, L, (r) => (!this.f.itemId || [...r.gave, ...r.got].some((g) => String(g.itemId) === String(this.f.itemId))) && (!this.f.category || [...r.gave, ...r.got].some((g) => typeOf(g.itemId) === this.f.category)));
             this.restoreFocus(focusKey, caret);
             return;
         }
@@ -345,6 +355,49 @@ export class LedgerView {
             this.rowsTable(shown, nameOf),
         ]));
         this.restoreFocus(focusKey, caret);
+    }
+
+    /**
+     * One receipt per finished trade, newest first: who, when, each item with
+     * its quantity and price, what they paid or you paid, and - for what you
+     * sold - its cost (first in, first out) and profit.
+     */
+    renderReceipts(box, shown, nameOf, L, keep = () => true) {
+        const list = tradeReceipts(shown, this.fifo).filter(keep);
+        if (!list.length) {
+            box.appendChild(lvEl('p', { class: 'lg-card lg-muted', text: L.busy ? 'Reading your trades…' : 'No finished trades in this period.' }));
+            return;
+        }
+        const wrap = lvEl('div', { class: 'lg-receipts' });
+        for (const r of list.slice(0, RECEIPTS_SHOWN)) {
+            const table = lvEl('table', { class: 'lg-table lg-receipt' });
+            table.appendChild(lvEl('tr', {}, ['Side', 'Item', 'Qty', 'Each', 'Total', 'Cost', 'Profit'].map((h, i) => lvEl('th', { class: i >= 2 ? 'lg-num' : '', scope: 'col', text: h }))));
+            const line = (dir, g, sold) => lvEl('tr', { class: dir === 'out' ? 'lg-sell' : 'lg-buy' }, [
+                lvEl('td', { class: 'lg-muted', text: dir === 'out' ? (g.given ? 'gave' : 'sold') : 'got' }),
+                lvEl('td', { text: nameOf(g.itemId) }),
+                lvEl('td', { class: 'lg-num', text: lvCount(g.qty) }),
+                lvEl('td', { class: 'lg-num', text: g.given ? '–' : formatMoney(Math.round(g.each)) }),
+                lvEl('td', { class: 'lg-num', text: g.given ? '–' : formatMoney(Math.round(g.total)) }),
+                lvEl('td', { class: 'lg-num', text: sold && g.cost !== null ? formatMoney(Math.round(g.cost)) : '–' }),
+                lvEl('td', { class: 'lg-num ' + (sold && g.profit !== null ? (g.profit >= 0 ? 'lg-good' : 'lg-loss') : ''), text: sold && g.profit !== null ? lvSigned(g.profit) : '–' }),
+            ]);
+            for (const g of r.gave) table.appendChild(line('out', g, true));
+            for (const g of r.got) table.appendChild(line('in', g, false));
+            const money = [];
+            if (r.received) money.push((r.whoName || 'They') + ' paid ' + formatMoney(Math.round(r.received)));
+            if (r.paid) money.push('you paid ' + formatMoney(Math.round(r.paid)));
+            if (r.unknownQty) money.push(lvCount(r.unknownQty) + ' with no buy on record (not in the profit)');
+            wrap.appendChild(lvEl('section', { class: 'lg-card lg-rcpt' }, [
+                lvEl('div', { class: 'lg-cardh' }, [
+                    lvEl('h3', { text: dateText(r.t, true) + ' · trade with ' + (r.whoName || (r.who ? 'player ' + r.who : 'someone')) }),
+                    r.received ? lvEl('b', { class: r.profit >= 0 ? 'lg-good' : 'lg-loss', text: lvSigned(r.profit) }) : null,
+                ]),
+                table,
+                money.length ? lvEl('p', { class: 'lg-muted lg-rcpt-foot', text: money.join(' · ') }) : null,
+            ]));
+        }
+        if (list.length > RECEIPTS_SHOWN) wrap.appendChild(lvEl('p', { class: 'lg-muted', text: 'The newest ' + RECEIPTS_SHOWN + ' of ' + lvCount(list.length) + ' trades. Narrow the period or who to see others.' }));
+        box.appendChild(wrap);
     }
 
     /** What muggings took: totals, per day, and each one. */
@@ -590,6 +643,9 @@ export const LEDGER_CSS = `
 .lg-tile.lg-loss b, .lg-loss { color: #ff8a80; }
 .lg-note { margin: 0; font-size: 12px; color: var(--warn); }
 .lg-tabs { display: flex; gap: 6px; }
+.lg-receipts { display: grid; grid-template-columns: repeat(auto-fill, minmax(420px, 1fr)); gap: 12px; }
+.lg-rcpt .lg-cardh b { font-size: 15px; font-variant-numeric: tabular-nums; }
+.lg-rcpt-foot { margin: 8px 0 0; font-size: 12px; }
 .lg-tab { height: 34px; padding: 0 16px; border-radius: 9px; border: 1px solid var(--cline2); background: none; color: var(--muted); font: bold 13px Arial, Helvetica, sans-serif; cursor: pointer; }
 .lg-tab[aria-selected="true"] { color: #fff; border-color: var(--profit); background: var(--green-bg); }
 .lg-in.lg-date { min-width: 140px; color-scheme: dark; }

@@ -203,6 +203,62 @@ export const PAGE_CSS = `
     display: none !important;
 }
 
+/*
+ * On the listing you are buying (3.13): one strip across the card's top with
+ * the words, Fill and Next, so the pointer does not cross the page to the
+ * panel after every buy. It takes the place of the card's own label.
+ */
+.ttv2-buyhere.ttv2-hasbar::before {
+    display: none !important;
+}
+
+.ttv2-buybar {
+    position: absolute !important;
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 3;
+    display: flex !important;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px;
+    padding: 3px 4px;
+    background: rgba(16, 32, 44, 0.92);
+    border-bottom: 1px solid #4dabf7;
+}
+
+.ttv2-buybar-l {
+    margin-right: auto;
+    padding: 0 6px;
+    border-radius: 3px;
+    background: #4dabf7;
+    color: #10202c;
+    font: bold 12px/20px Arial, sans-serif;
+    white-space: nowrap;
+}
+
+.ttv2-buybar button {
+    height: 24px;
+    padding: 0 9px;
+    border: 1px solid #4dabf7;
+    border-radius: 3px;
+    background: #10202c;
+    color: #9ad0fa;
+    font: bold 12px/22px Arial, sans-serif;
+    white-space: nowrap;
+    cursor: pointer;
+}
+
+.ttv2-buybar button:focus-visible {
+    outline: 2px solid #fff;
+    outline-offset: 1px;
+}
+
+.ttv2-buybar button[data-act="next"] {
+    background: #4dabf7;
+    color: #10202c;
+}
+
 .ttv2-sendrow {
     box-shadow: inset 3px 0 0 #4dabf7, inset 0 0 0 9999px rgba(77, 171, 247, 0.10) !important;
 }
@@ -938,6 +994,29 @@ ${TOKENS_CSS}
     margin-top: 8px;
     width: 100%;
 }
+
+/* Under the header (3.13): its own margin, since it is outside the pages. */
+.ttv2-panel > .ttv2-buybox {
+    margin: 8px 10px;
+}
+
+.ttv2-kbd {
+    display: inline-block;
+    margin-left: 8px;
+    padding: 0 5px;
+    border: 1px solid currentColor;
+    border-radius: 3px;
+    font-size: 10px;
+    line-height: 14px;
+    opacity: 0.7;
+}
+
+.ttv2-buybox .ttv2-sub.ttv2-tb-late,
+.ttv2-tb-late {
+    color: var(--warn);
+    font-weight: bold;
+}
+
 
 /* "Did you buy it?": two answers, side by side. */
 .ttv2-tb-ask {

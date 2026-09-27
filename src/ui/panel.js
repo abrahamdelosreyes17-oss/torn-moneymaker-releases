@@ -45,7 +45,8 @@ function el(tag, props = {}, children = []) {
         else if (key === 'text') node.textContent = value;
         else if (key.startsWith('on') && typeof value === 'function') {
             node.addEventListener(key.slice(2).toLowerCase(), value);
-        } else if (value !== null && value !== undefined) {
+        } else if (!key.startsWith('on') && value !== null && value !== undefined) {
+            // A string "on..." is never set: no inline handler, ever.
             node.setAttribute(key, String(value));
         }
     }
@@ -319,7 +320,6 @@ export class Panel {
         this.buyBoxEl.style.display = 'none';
 
         this.listPage = el('div', { class: 'ttv2-page ttv2-page-list' }, [
-            this.buyBoxEl,
             this.tradeBoxEl,
             this.sellerEl,
             this.chipsEl,
@@ -346,7 +346,9 @@ export class Panel {
             this.settingsPage,
         ]);
 
-        this.root = el('div', { class: 'ttv2-panel' }, [this.headEl, this.bodyEl]);
+        // The buying run's box sits under the header, outside the pages: Next
+        // is there on every page, in Settings, and with the panel collapsed.
+        this.root = el('div', { class: 'ttv2-panel' }, [this.headEl, this.buyBoxEl, this.bodyEl]);
 
         // Esc closes an open chip editor, then Settings.
         this.root.addEventListener('keydown', (event) => {
@@ -788,7 +790,7 @@ export class Panel {
         if (!box) return;
         const list = trades || [];
         const show = list.length > 0 || ctx.match === 'other';
-        const sig = JSON.stringify([list.map((t) => [t.key, t.at, t.items.map((i) => [i.line, i.units, i.sent, (i.steps || []).map((s) => s.boughtQty)])]), ctx]);
+        const sig = JSON.stringify([list.map((t) => [t.key, t.at, t.items.map((i) => [i.line, i.units, i.sent, i.left || 0, (i.steps || []).map((s) => s.boughtQty)])]), ctx]);
         if (sig === this.tradeSig) return;
         this.tradeSig = sig;
         box.textContent = '';
@@ -847,14 +849,16 @@ export class Panel {
         this.buySig = sig;
         box.textContent = '';
         box.style.display = v ? '' : 'none';
+        this.buyHereActive = Boolean(v && v.here && !v.ask);
         if (!v) return;
+        // How long since they said yes: the longer, the likelier prices moved.
         box.appendChild(el('div', { class: 'ttv2-tb-head' }, [
             el('b', { text: 'Buying for ' + v.trader }),
-            el('span', { class: 'ttv2-sub', text: v.done + ' of ' + v.total + ' done' }),
+            el('span', { class: 'ttv2-sub' + (v.age >= 10 * 60000 ? ' ttv2-tb-late' : ''), title: 'Since ' + v.trader + ' said yes: the longer, the likelier prices moved', text: v.done + ' of ' + v.total + ' done' + (v.age >= 60000 ? ' · yes ' + Math.floor(v.age / 60000) + ' min ago' : '') }),
         ]));
         if (v.here) {
             const h = v.here;
-            box.appendChild(el('div', { class: 'ttv2-sub', text: 'Here: buy ' + h.qty.toLocaleString('en-US') + ' ' + h.name + ' at ' + formatMoney(h.price) + ' from ' + h.seller + ' (marked on the page).' }));
+            box.appendChild(el('div', { class: 'ttv2-sub', text: 'Here: buy ' + h.qty.toLocaleString('en-US') + ' ' + h.name + ' at ' + formatMoney(h.price) + ' from ' + h.seller + (h.listed ? ' (marked on the page).' : '.') }));
             // Re-priced since the plan: still counted; said so, and whether it still pays.
             if (h.nowPrice) {
                 box.appendChild(el('div', {
@@ -871,10 +875,13 @@ export class Panel {
                 el('button', { type: 'button', class: 'ttv2-primary', text: 'Bought ' + v.here.qty.toLocaleString('en-US'), onclick: () => this.handlers.onBuyNext && this.handlers.onBuyNext(true) }),
                 el('button', { type: 'button', text: 'Did not buy', onclick: () => this.handlers.onBuyNext && this.handlers.onBuyNext(false) }),
             ]));
+            const first = box.querySelector('.ttv2-tb-ask button');
+            if (first && this.root && this.root.getRootNode().activeElement === null) first.focus({ preventScroll: true });
             return;
         }
-        const label = v.here && !v.next ? 'Done - go to the trade' : v.here && v.last ? 'Done - go to the trade' : v.here ? 'Next bazaar' : 'Open the next bazaar' + (v.next ? ': ' + v.next.seller : '');
-        box.appendChild(el('button', { type: 'button', class: 'ttv2-primary ttv2-buynext', text: label, onclick: () => this.handlers.onBuyNext && this.handlers.onBuyNext() }));
+        const label = v.here && (!v.next || v.last) ? 'Done - go to the trade' : v.here && !v.here.listed ? 'Not here - next' : v.here && v.same ? 'Next item here' : v.here ? 'Next bazaar' : 'Open the next bazaar' + (v.next ? ': ' + v.next.seller : '');
+        this.buyNextBtn = el('button', { type: 'button', class: 'ttv2-primary ttv2-buynext', title: this.buyHereActive ? 'Key: N' : null, onclick: () => this.handlers.onBuyNext && this.handlers.onBuyNext() }, [label, this.buyHereActive ? el('span', { class: 'ttv2-kbd', text: 'N' }) : null]);
+        box.appendChild(this.buyNextBtn);
     }
 
     /** "Torn API calls in the last minute: 12 of 70", every tab together. */
@@ -1162,10 +1169,17 @@ export class Panel {
     enableHotkey(target = document) {
         if (this.hotkeyHandler) return;
         this.hotkeyHandler = (event) => {
-            if (event.key !== '`' || event.repeat) return;
-            if (event.ctrlKey || event.altKey || event.metaKey) return;
+            if (event.repeat || event.ctrlKey || event.altKey || event.metaKey) return;
             if (isTypingTarget(event)) return;
             if (!this.root) return;
+            // N: the buying run's Next (one key, one page) - only on a bazaar
+            // you are buying from for the trade, never a stray key elsewhere.
+            if ((event.key === 'n' || event.key === 'N') && this.buyHereActive && this.buyNextBtn && this.buyNextBtn.isConnected && this.buyBoxEl.style.display !== 'none') {
+                event.preventDefault();
+                this.buyNextBtn.click();
+                return;
+            }
+            if (event.key !== '`') return;
             event.preventDefault();
             this.setCollapsed(!this.collapsed, { save: true });
         };

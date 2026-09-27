@@ -69,7 +69,9 @@ const HEADER = `// ==UserScript==
  * Rules this script keeps, deliberately (see README.md):
  *   - Data comes from the Torn API or from the page you are currently
  *     viewing. It never requests a Torn page you are not on.
- *   - It never buys anything. The only action button navigates.
+ *   - It never buys anything, and never presses Torn's buttons. Its buttons
+ *     navigate (one page per press) or type one number into a Torn box on
+ *     your press (Fill); you press Buy / Add / Accept yourself.
  *   - Public API key only; the key goes to api.torn.com and nowhere else,
  *     and is never logged.
  *   - The optional TornW3B bazaar feed (weav3r.dev) is opt-in, has its own

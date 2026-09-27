@@ -6,9 +6,10 @@
  * (main/api.py, require_api_key). So this client carries a key - but NEVER
  * the main one:
  *
- *   1. It is given its own key (Settings -> TornExchange), which main.js
- *      refuses to accept if it equals the main Torn key. The Torn client and
- *      this one share nothing.
+ *   1. It is given its own key (Settings -> TornExchange). It may equal the
+ *      Limited key (TornExchange already has the key you log in there with),
+ *      but main.js refuses the Ledger's Full key, and a key Torn says has
+ *      Full access. The Torn client and this one share nothing.
  *   2. www.tornexchange.com is the only destination - asserted on the
  *      resolved URL, as client.js does for api.torn.com.
  *   3. Its rate limit is harsh: 10 requests a minute PER IP across the whole

@@ -4,12 +4,21 @@ Read this first, then `README.md`. The README holds the product and the binding
 rules; this file holds where we are, how the owner works, and what is settled.
 Everything below "History" is the record of how we got here.
 
-## Start here (state on 2026-09-27, end of session)
+## Start here (state on 2026-09-28, end of session)
 
-- **Released: 3.12.10** (`711f893`), pushed. Last install link given to the owner:
-  `https://raw.githubusercontent.com/abrahamdelosreyes17-oss/torn-moneymaker-releases/711f893c14995ab4927fa11971b4f5fc89ac4379/torn-moneymaker.user.js`
-- Branch `claude/optimistic-ride-1gqguu`. Released earlier the same day:
+- **Released: 3.13.0** (smart trade plans, leftovers, receipts, the faster
+  buying run; see "What the 2026-09-28 session did"). Its commit and pinned
+  install link are in the commit right after it ("Handoff: 3.13.0's commit
+  and install link").
+- Branch `claude/optimistic-ride-1gqguu`. Earlier: 3.12.10 (`711f893`),
   3.12.5 (`aab7e53`), 3.12.6 (`fe49df0`), 3.12.7 (`d69907c`), 3.12.8 (`8991095`), 3.12.9 (`c45a227`).
+- **Remind the owner (they asked, 2026-09-28: "dont build, but remind the
+  next session"):** Favourites on the Ledger's traders page (3+ trades = auto,
+  editable, click one = "what can I sell them now"); the faction rule (skip a
+  trader in the same faction as the bazaar you bought from); trader capacity
+  (price vs how much they take - networth, reselling bazaar, W3B bulk prices,
+  own history - and a "Sell fast" line in Where to sell: the Vladbull case,
+  never a ranking bias). Details in memory `remind-next-session`.
 - **The owner had the script switched off** in Tampermonkey while testing the
   trade page (2026-09-27): when something "isn't there", ask them to check the
   Tampermonkey icon (script on, version) before anything else.
@@ -17,8 +26,13 @@ Everything below "History" is the record of how we got here.
   installs go through **pinned links** (`.../<commit>/torn-moneymaker.user.js`).
   Merging to `main` makes every install auto-update: only if the owner asks.
 - Nothing uncommitted except `mockups/` and `.claude/` (untracked on purpose).
-- 237 unit tests (`npm test`); `test/ux-check.mjs` (Playwright) has never run
-  here - Playwright is not installed.
+- 250 unit tests (`npm test`); `test/ux-check.mjs` has never run here. For
+  screenshots, 2026-09-28 used `playwright-core` installed in the session's
+  scratchpad with the system Chrome (`executablePath`), never the repo. **Block
+  torn.com in every Playwright context** (`ctx.route(/torn\.com\//, r =>
+  r.abort())`): the harness's Next / Go to trade / Trade links go to real
+  Torn pages, and one unblocked press loaded trade.php once (no login, no
+  action) on 2026-09-28.
 - Who uses it: the owner and a friend who plays Torn (the friend's requests
   come through the owner, often in Tagalog - translate, then restate). **Desktop
   only.** Stays a **Tampermonkey userscript** (no extension, no Web Store fee).
@@ -34,6 +48,23 @@ types one row's quantity; you press ADD TO TRADE / Accept). "Fill all in one
 click" was NOT built, deliberately: it is the chained-action pattern this
 project has always left out (see Fill in History). If the owner asks again,
 offer to read Torn's scripting-rules page with them (read only).
+
+### Open after 3.13.0 (check live first, read only)
+
+- **The bazaar card strip** (Buy N · Fill N · Next ›, across the top of the
+  marked card) and **Fill's quantity box** were only seen on the harness card:
+  the real bazaar card's markup (is the Qty box on the card, or only after
+  pressing its buy button? does the strip cover anything needed?) was never
+  read. `buyQtyInput` guesses (number / "quant" / "qty" / "amount" boxes,
+  else the first text box). Ask the owner to open a bazaar during a buying
+  run and read it.
+- Movement (fast / slow from bazaar reads) needs hours of the Torn Bids tab
+  open to say anything; until then the type decides. Check `sellMoves` after
+  a day (Tampermonkey storage).
+- Deferred from the 3.13 review (Low): Torn v2 calls could send the key as an
+  `Authorization: ApiKey` header instead of `?key=`; the Ledger lives on the
+  github.io user-site origin (any other Pages project of that account shares
+  it - note in the ToS table); a removed leftover has no Undo.
 
 ### The agenda for the next session (let the owner choose the order)
 
@@ -78,6 +109,55 @@ offer to read Torn's scripting-rules page with them (read only).
 6. Smaller: the Sell-to-by-trader view could show traders who make no flip on
    this item but whose other items make a trade (today Plan trade works on any
    trader row shown); Ledger names / export; run `test/ux-check.mjs`.
+
+## What the 2026-09-28 session did (3.13.0)
+
+The owner (after the 3.12.10 run): the plan asked for 100 Hand Drills for a
+little profit; "the biggest profit should be the main item... we're only adding
+items so we don't look sus... if we take too long buying, prices change or the
+trader loses interest"; "some items even in their list they'd only buy 5, not
+100"; "the software has to be smart - the default is the baseline, we never
+touch settings". Research first (no code): TornW3B listings of 176 items read
+twice 28 minutes apart - flowers, plushies, drugs, medical fill 25 units from
+1-2 bazaars and move hundreds an hour; Hand Drills need 21 bazaars for 25 and
+none moved; 75 of 176 items moved nothing; stock is not demand. Plus a UX
+study (NN/g, Baymard, Fitts/Hick, OSRS flipping tools). Then built, with
+the owner's "no mockups, I trust your judgement":
+
+- **Smart extras** (`core/liquidity.js`, `planTrade` with `kindOf`): the
+  picked item as before; extras by time - bazaars on the route first, then
+  `extraStopBudget` (2-4) new bazaars, fast first, one bazaar per extra item,
+  slow only where you go anyway; `EXTRA_CAP` fast = Most / normal 10 / slow 3,
+  your own items too (typed numbers win: `edits['held:<id>']`); never the
+  planned trader's own bazaar (owner's rule, memory `no-resell-to-own-trader`;
+  buying from any bazaar to sell to someone else is fine). Kind = type
+  (`FAST_TYPES`, any spelling), thin listings, or measured movement
+  (`noteMovement` on every bazaar read, `sellMoves` store, merged across tabs;
+  an empty read is not a sale; one read counts at most a quarter). The plan
+  says bazaars and minutes, tags extras, counts what was left out.
+- **Copy offer** (the message to the trader, one line per item).
+- **Desk:** a trade's card sits beside the traders; Trade only after buying;
+  no jumping between flips while loading; declining the only trader says so.
+- **Accepted card:** one main button (Start / Continue buying, then Open the
+  trade), SENT column, **They took fewer…** once bought (`markLeft`,
+  `takenUnits`), totals on what they took; **Traded - done** keeps the rest as
+  **leftovers** (`sellLeftovers`: strip cards with cost and the best OTHER
+  trader, merged into held, not offered back to who refused, pruned once the
+  inventory - read an hour later - shows them gone). The trade page fills only
+  what they take.
+- **Buying run:** the strip on the marked card (Fill types the step's amount
+  into the card's box; Next); two steps at one bazaar are both counted from
+  the stock on arrival (per-step `ttv2-buyrun` map) and Next stays on the page;
+  the panel's box is under the header (also collapsed / Settings), "yes N min
+  ago" (amber after 10), labels say where Next goes, **N** only on the bazaar
+  being bought from.
+- **Ledger Receipts** tab (`tradeReceipts`).
+- **Fable review, three passes** (security / bugs / usability): all fixed but
+  the three Lows above. Security: the Full key can never go to TornExchange;
+  requests carry no cookies (`anonymous`); card buttons act only on the marked
+  card; no string `on*` attributes. Bugs: empty-read movement, second step at a
+  bazaar, ≈ lines frozen into an accepted trade, tick after a partial count,
+  receipts under an item filter. Usability: 16 wording / keyboard / layout fixes.
 
 ## What this session did (2026-09-27)
 

@@ -1,9 +1,11 @@
 /*
  * Row marking.
  *
- * The entire contract: add one class, remove one class. No element is ever
- * appended into Torn's DOM, no inline style is ever set on a Torn element,
- * and `position` is never touched. The numbers live in the panel.
+ * The entire contract here: add one class, remove one class. This module
+ * never appends into Torn's DOM, never sets an inline style on a Torn element,
+ * and never touches `position`. The numbers live in the panel. (Elsewhere,
+ * main.js adds Fill tags on your own listing rows and the trade page, and
+ * since 3.13 Fill / Next on the one bazaar card marked for a trade.)
  *
  * The dataset flag exists so a re-mark after a Torn re-render is cheap. V1
  * had the same idea but its Clear only removed the class, never the flag, so

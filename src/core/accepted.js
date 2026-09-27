@@ -25,16 +25,19 @@ export const ACCEPTED_MAX = 10;
 export function acceptTrade(chosen, itemId, now = Date.now()) {
     const items = [];
     for (const r of chosen.flips || []) {
-        if (!(r.units > 0)) continue;
+        // Only listings actually read (an ≈ estimate has no seller to buy from).
+        const steps = (r.steps || []).filter((st) => st.sellerId && st.qty > 0).map((st) => ({ sellerId: String(st.sellerId), sellerName: st.sellerName || null, qty: st.qty, price: st.price, bought: false }));
+        const units = steps.reduce((a, st) => a + st.qty, 0);
+        if (!(units > 0)) continue;
         items.push({
             line: 'flip:' + r.itemId,
             itemId: String(r.itemId),
             name: r.name,
-            units: r.units,
+            units,
             bid: r.bid,
             kind: 'flip',
             sent: false,
-            steps: (r.steps || []).filter((st) => st.sellerId).map((st) => ({ sellerId: String(st.sellerId), sellerName: st.sellerName || null, qty: st.qty, price: st.price, bought: false })),
+            steps,
         });
     }
     for (const r of chosen.held || []) {
@@ -49,7 +52,7 @@ export function acceptTrade(chosen, itemId, now = Date.now()) {
         items,
         cost: items.reduce((a, i) => a + i.steps.reduce((b, st) => b + st.qty * st.price, 0), 0),
         pays: items.reduce((a, i) => a + i.units * i.bid, 0),
-        profit: (chosen.flips || []).reduce((a, r) => a + (r.units > 0 ? r.profit : 0), 0),
+        profit: items.reduce((a, i) => a + (i.kind === 'flip' ? i.steps.reduce((b, st) => b + st.qty * (i.bid - st.price), 0) : 0), 0),
     };
 }
 
@@ -100,7 +103,7 @@ export function tickAccepted(trade, line, { step = null, bought = null, sent = n
             // A tick is the last word: ticked = bought as planned (not skipped),
             // unticked = not bought (what Next counted is undone too).
             if (step !== null && bought !== null) {
-                next.steps = i.steps.map((st, k) => (k !== step ? st : bought ? { ...st, bought: true, skipped: false } : { ...st, bought: false, skipped: false, boughtQty: 0 }));
+                next.steps = i.steps.map((st, k) => (k !== step ? st : bought ? { ...st, bought: true, skipped: false, boughtQty: 0 } : { ...st, bought: false, skipped: false, boughtQty: 0 }));
             }
             return next;
         }),
@@ -203,16 +206,96 @@ export function dropLine(trade, line) {
     return { ...trade, items: trade.items.filter((i) => (i.line || 'flip:' + i.itemId) !== String(line)) };
 }
 
-/** What the trade comes to now: what you send, what they pay, what you spent, what it makes. */
+/* --------------------------------------- what the trader did not take (3.13) */
+
+/*
+ * The owner, 2026-09-28: "sometimes the trader doesn't want to buy everything
+ * we wanna sell, so if a trade pushes through (but we've bought it) we need to
+ * still try to flip that item". Each line can say how many they did not take;
+ * the trade's totals leave those out, and Traded - done keeps them as
+ * leftovers to sell elsewhere, at what they cost you.
+ */
+
+/** A copy of the trade with how many of one line the trader did not take (0: they took all). */
+export function markLeft(trade, line, n) {
+    return {
+        ...trade,
+        items: trade.items.map((i) => {
+            if ((i.line || 'flip:' + i.itemId) !== String(line)) return i;
+            const most = sendUnits(i);
+            return { ...i, left: Math.max(0, Math.min(most, Math.floor(Number(n) || 0))) };
+        }),
+    };
+}
+
+/** Units of a line that went to the trader: what you send, minus what they did not take. */
+export function takenUnits(line) {
+    return Math.max(0, sendUnits(line) - Math.max(0, Math.floor(Number(line && line.left) || 0)));
+}
+
+/** What one line's bought units cost you, each (0 for your own items). */
+export function costEach(line) {
+    let units = 0;
+    let cost = 0;
+    for (const st of (line && line.steps) || []) {
+        if (st.skipped && !st.bought) continue;
+        const n = st.boughtQty > 0 ? st.boughtQty : st.bought ? st.qty : 0;
+        units += n;
+        cost += n * st.price;
+    }
+    return units ? cost / units : 0;
+}
+
+/** The leftovers a finished trade leaves: bought items the trader did not take. */
+export function leftoversOf(trade, now = Date.now()) {
+    const out = [];
+    for (const i of (trade && trade.items) || []) {
+        const n = Math.min(sendUnits(i), Math.max(0, Math.floor(Number(i.left) || 0)));
+        if (i.kind !== 'flip' || !(n > 0)) continue;
+        out.push({ itemId: String(i.itemId), name: i.name, qty: n, each: Math.round(costEach(i)), from: trade.trader ? trade.trader.name : null, at: now });
+    }
+    return out;
+}
+
+/** Leftovers added to a stored list: one row per item, the cost averaged over both. */
+export function addLeftovers(list, add) {
+    const out = (Array.isArray(list) ? list : []).map((l) => ({ ...l }));
+    for (const a of add || []) {
+        const same = out.find((l) => String(l.itemId) === String(a.itemId));
+        if (same) {
+            const qty = same.qty + a.qty;
+            same.each = Math.round((same.each * same.qty + a.each * a.qty) / qty);
+            same.qty = qty;
+            same.at = Math.max(Number(same.at) || 0, Number(a.at) || 0);
+            same.from = a.from || same.from;
+        } else {
+            out.push({ ...a });
+        }
+    }
+    return out;
+}
+
+/**
+ * What the trade comes to now: what they pay (for what they took), what you
+ * spent, and the profit on what they took (a leftover's cost is not a loss:
+ * it is still yours to sell).
+ */
 export function acceptedTotals(trade) {
     let pays = 0;
     let cost = 0;
+    let profit = 0;
     for (const i of (trade && trade.items) || []) {
-        pays += sendUnits(i) * i.bid;
+        const taken = takenUnits(i);
+        pays += taken * i.bid;
         for (const st of i.steps || []) {
             if (st.skipped && !st.bought) continue;
             cost += (st.boughtQty > 0 ? st.boughtQty : st.qty) * st.price;
         }
+        if (i.kind !== 'flip') continue;
+        // Not bought yet: planned prices; bought: what it cost.
+        const started = (i.steps || []).some(stepDone);
+        const each = started ? costEach(i) : (i.steps || []).reduce((a, st) => a + st.qty * st.price, 0) / Math.max(1, (i.steps || []).reduce((a, st) => a + st.qty, 0));
+        profit += taken * (i.bid - each);
     }
-    return { pays, cost, profit: (trade && trade.items || []).reduce((a, i) => a + (i.kind === 'flip' ? sendUnits(i) * i.bid : 0), 0) - cost };
+    return { pays, cost, profit };
 }

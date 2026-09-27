@@ -30,6 +30,7 @@ function tfMake(tag, props = {}, children = []) {
         if (key === 'class') node.className = value;
         else if (key === 'text') node.textContent = value;
         else if (key.startsWith('on') && typeof value === 'function') node.addEventListener(key.slice(2).toLowerCase(), value);
+        else if (key.startsWith('on')) continue;
         else if (value !== null && value !== undefined && value !== false) node.setAttribute(key, String(value));
     }
     for (const child of [].concat(children)) {
