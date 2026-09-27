@@ -6,10 +6,10 @@ Everything below "History" is the record of how we got here.
 
 ## Start here (state on 2026-09-27, end of session)
 
-- **Released: 3.12.9** (`c45a227`), pushed. Last install link given to the owner:
-  `https://raw.githubusercontent.com/abrahamdelosreyes17-oss/torn-moneymaker-releases/c45a227ada718e223939c58cff739d25a4b5eb42/torn-moneymaker.user.js`
+- **Released: 3.12.10** (`711f893`), pushed. Last install link given to the owner:
+  `https://raw.githubusercontent.com/abrahamdelosreyes17-oss/torn-moneymaker-releases/711f893c14995ab4927fa11971b4f5fc89ac4379/torn-moneymaker.user.js`
 - Branch `claude/optimistic-ride-1gqguu`. Released earlier the same day:
-  3.12.5 (`aab7e53`), 3.12.6 (`fe49df0`), 3.12.7 (`d69907c`), 3.12.8 (`8991095`).
+  3.12.5 (`aab7e53`), 3.12.6 (`fe49df0`), 3.12.7 (`d69907c`), 3.12.8 (`8991095`), 3.12.9 (`c45a227`).
 - **The owner had the script switched off** in Tampermonkey while testing the
   trade page (2026-09-27): when something "isn't there", ask them to check the
   Tampermonkey icon (script on, version) before anything else.
