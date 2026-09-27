@@ -299,9 +299,24 @@ you: every link is one you follow yourself, one page per click.
     disappeared"). **X accepted** freezes the trade: items, numbers and prices
     stop moving; each buy step is checked live (still listed / re-priced /
     fewer left / gone) with a tick for bought, each item a tick for sent;
-    **Traded - done** or back to the live plan. The same list is in the
+    **Traded - done** or back to the live plan. **3.12.8, the buying run:**
+    **Start buying** opens the first bazaar with the listing marked (blue, "Buy
+    53 for Bob", apart from the NPC deals' green); the panel on Torn's pages
+    shows **Buying for Bob** with **Next bazaar** (one press, one page). What
+    you took is counted from the listing's stock on the page (it drops, or the
+    listing goes); a skipped step counts nothing, and you then send what you
+    bought. A gone or re-priced step offers the next cheapest listing still
+    under their price (**Use it**); an item with none left is marked "not
+    profitable any more" with **Drop it**. The same list is in the
     overlay's panel on **Torn's trade page** (what to send, how many, what
-    they should pay; a tick per item as you add it, shared with Torn Bids).
+    they should pay). **3.12.8 on the trade page:** it checks the trade is
+    with that trader ("Trading with Bob ✓", or "This trade is with X"), reads
+    their money against what the trade says (".95m short"), shows how many
+    of each are in already, and on the add step marks each row to send with
+    **Fill N for Bob** - one press types that row's quantity into Torn's Qty
+    box (a second puts back what was there); you press ADD TO TRADE and
+    Accept. One-of-a-kind rows (weapons) say "tick Torn's box". Read off the
+    owner's real trade page (2026-09-27, read only).
     One Cash for the whole
     trade (this item first, then the most profit per $), Most per flip per
     item, their networth share for the whole trade. Every row has a tick and a
@@ -336,6 +351,8 @@ you: every link is one you follow yourself, one page per click.
   with the Limited key; at most 10 a minute, each kept 12 hours). A trader who
   could not pay for even one is skipped for the next; the plan says when it
   was capped.
+- **Never flip** (Settings › Flips, 3.12.8; the friend: "don't include
+  clothes"): categories flips and trades never buy - Clothing by default.
 - **Weapons, armour and cars are never flipped** (3.12.7, the owner: "no one is
   buying 100 weapons/armor", "same with cars"): every copy is its own, and a
   trader pays one price for one. Both type spellings Torn uses (Melee /

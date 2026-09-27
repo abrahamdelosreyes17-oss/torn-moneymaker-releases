@@ -917,3 +917,15 @@ test('Torn\'s trade page is recognised at every step (the panel lists what to se
     assert.equal(isTradePage('https://www.torn.com/bazaar.php#/'), false);
     assert.equal(isTradePage('https://www.torn.com/page.php?sid=ItemMarket'), false);
 });
+
+import { parseTradeItemLine, parseTradeMoney } from '../src/sources/dom/trade.js';
+
+test('Torn\'s trade view: item lines and money, as the real page writes them', () => {
+    assert.deepEqual(parseTradeItemLine('Bag of Candy Kisses x1'), { name: 'Bag of Candy Kisses', qty: 1 });
+    assert.deepEqual(parseTradeItemLine('Xanax x1,234'), { name: 'Xanax', qty: 1234 });
+    assert.deepEqual(parseTradeItemLine('Beretta M9'), { name: 'Beretta M9', qty: 1 });
+    assert.equal(parseTradeItemLine('  '), null);
+    assert.equal(parseTradeMoney('No money in trade'), 0);
+    assert.equal(parseTradeMoney('$14,000,000'), 14000000);
+    assert.equal(parseTradeMoney(''), 0);
+});

@@ -6,7 +6,7 @@ Everything below "History" is the record of how we got here.
 
 ## Start here (state on 2026-09-27, end of session)
 
-- **Released: 3.12.7** (`d69907c`), branch `claude/optimistic-ride-1gqguu`,
+- **Released: 3.12.8** (link below, after this release is pushed); before it **3.12.7** (`d69907c`), branch `claude/optimistic-ride-1gqguu`,
   pushed. Last install link given to the owner:
   `https://raw.githubusercontent.com/abrahamdelosreyes17-oss/torn-moneymaker-releases/d69907c1f9af4bb3cda564b10e6df147a0eafa07/torn-moneymaker.user.js`
   Earlier today: 3.12.5 (`aab7e53`), 3.12.6 (`fe49df0`).
@@ -20,34 +20,26 @@ Everything below "History" is the record of how we got here.
   come through the owner, often in Tagalog - translate, then restate). **Desktop
   only.** Stays a **Tampermonkey userscript** (no extension, no Web Store fee).
 
-### Open question the owner asked at the very end - answer it first
+### Decided at the end of the session (3.12.8)
 
-The owner's idea (2026-09-27): once a trader accepts, **one button that opens
-every bazaar to buy from** (each highlighting the listing - `bazaarUrl` already
-points at it and the overlay marks it), and on Torn's trade page **highlight
-the items to send and fill them all automatically**, like Fill on the bazaar
-add page. They asked: **"is that against TOS? we already have our bazaar
-fill."** Not answered yet. The honest position to bring:
-- Torn's scripting rule as this project has always read it: one click = one
-  action / one request, no chaining, never automate navigation (README "Rules
-  compliance"). **Opening N bazaar tabs from one click** is N Torn page loads
-  from one click - against that reading. Offer instead **"Next bazaar"**: one
-  click opens the next unbought step's bazaar (already highlighted), ticks move
-  on - nearly as fast, compliant.
-- **Fill on the trade page:** our Fill is one row per click (typing into Torn's
-  boxes, never pressing Torn's buttons) - the same on the trade page is fine.
-  **"Fill all" in one click** was left out of Fill on purpose (see "The Fill
-  button" in History: "Left out on purpose: Fill All / Select All"): typing many
-  rows on one click is the chained-action pattern. Offer per-item Fill ticks,
-  with the items to send highlighted.
-- If the owner wants certainty: they can open Torn's scripting-rules thread in
-  the Claude tab group and you read it (read only). Do not decide for them.
-- Either way it needs **the trade page's markup** (add-items step, the money
-  box): the owner opens a trade page, you read it, read only.
+The owner's flow, built as agreed ("yes on above"): once a trader accepts,
+**Start buying** / **Next bazaar** - one press opens ONE bazaar (never several
+at once: that would be many Torn pages from one click), the listing marked;
+what you took is counted from the listing's stock on the page; then on the
+trade page the partner check, the money check, and **Fill per row** (one press
+types one row's quantity; you press ADD TO TRADE / Accept). "Fill all in one
+click" was NOT built, deliberately: it is the chained-action pattern this
+project has always left out (see Fill in History). If the owner asks again,
+offer to read Torn's scripting-rules page with them (read only).
 
 ### The agenda for the next session (let the owner choose the order)
 
-1. **The owner tries 3.12.7 on real data**, and you read along (read only, in
+1. **The owner tries 3.12.8 on real data** - above all the trade flow on real pages:
+   Start buying / Next bazaar (does a real bazaar card's stock drop after a buy,
+   so 'You took N' counts it? The harness only simulates it), Fill on the real
+   add step (does Torn's "You are adding N items" counter follow the typed Qty?),
+   the partner and money checks on the real view.
+   Also from 3.12.7 -, and you read along (read only, in
    the Claude Chrome tab group - see "How the owner works"). Watch:
    - **weapons / armour / cars no longer flipped** - the fix covers both type
      spellings because the real v2 `type` values were never seen: confirm on
@@ -69,9 +61,9 @@ fill."** Not answered yet. The honest position to bring:
      The accepted trade (`sellAccepted`) now records what they should pay:
      comparing it with the finished trade in the Ledger gives this directly.
    Needs the Ledger's Full key; the log gives ids only (names are open).
-3. **The trade page, part 2** (after reading its markup): per-item Fill of the
-   quantity to send, highlight the rows, a **money check** ("offers $10.5m,
-   the trade says $14m: $3.5m short"). See the open question above.
+3. **Trade page: built in 3.12.8** (partner check, money check, what is in,
+   Fill per row). Open: auto-ticking 'sent' in Torn Bids from the view, and
+   money in the other direction (you paying them) is not handled.
 4. **Weapons / armour flips done properly** (researched, not built; now they
    are simply excluded): plain copies to Big Al's or one-per-trader; RW gear
    under its Bunker Bucks floor (ask if they have the Bunker); notes in memory
@@ -150,6 +142,16 @@ fill."** Not answered yet. The honest position to bring:
     kept on the item index. The real v2 type names were never seen - check.
   - No-flip wording gives the real reason (one-of-a-kind items, least profit,
     buyers who cannot take it).
+
+- **3.12.8** (the friend: "I buy a lot and then can't remember", "prices change or
+  they're gone, so not profitable any more; and no clothes"; the owner's
+  Next-bazaar flow): the buying run (`trackTradeBuying`, `onBuyNext`, panel
+  `setBuying`; counted by `boughtFromStock` from the listing's stock), the
+  replacement offer / Drop it in the accepted card (`replacementFor`,
+  `replaceStep`, `dropLine`), what to send = what you bought (`sendUnits`),
+  **Never flip** categories (prefs.neverFlip, Clothing by default), and on
+  Torn's trade page the partner check, money check, "N in", and Fill per row
+  (`scanTradePage`, `sources/dom/trade.js`, read off the owner's real page).
 
 ## The product today - two separate things
 
@@ -766,6 +768,10 @@ PWPATH=$(npm root -g)/playwright node test/ux-check.mjs   # real-browser checks
   - `&sellsame=1` makes both keys the same Limited key;
   - `&w3btrader=1` adds a TornW3B-only trader;
   - `&manybuyers=1` adds Carol and Alice as Dynamite buyers (three traders to plan with);
+  - `&tradeview=<name>` (+ `&offer=<n>`, `&inside=<Name:qty,...>`) draws Torn's
+    trade view; with `?ownbazaar=1&page=trade#step=add&ID=5` the add rows too;
+  - `&bazaarcards=1` (with `page=bazaar&userId=<seller>`) draws a player's
+    bazaar with two listings; `window.__buy(id, n)` takes n off one (a purchase);
   - `?page=trade` stands in for Torn's trade page (the panel's send list; save a
     `tornTrading.v2.sellAccepted` value with GM_setValue, then fire a hashchange);
   - `&tedrop=1` makes Alice's full TornExchange list for the Hammer $100
@@ -879,6 +885,8 @@ the item on the desk, 21px flip-card money, 22px for the flip plan's total,
   - `styles.js`.
 - **`src/main.js`** wires everything, including `bootSellingPage()` and
   `bootW3bHarvest()` (weav3r.dev).
+- **Added in 3.12.8:** `sources/dom/trade.js` (Torn's trade view and add rows);
+  in main.js the "A trade on Torn's pages" section (buying run, trade page).
 - **Added in 3.12.5-3.12.7:** `core/trade.js` (planTrade, keepAfter - one
   trade with one trader), `core/accepted.js` (a trade the trader accepted:
   frozen, step checks, ticks), `ui/mask.js` (masked key boxes),

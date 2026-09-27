@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      3.12.7
+// @version      3.12.8
 // @description  Finds Bazaar and Item Market listings below NPC / market value - on the page you are viewing, and live from the Torn API and TornW3B - ranked by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -40,7 +40,7 @@
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '3.12.7';
+    const TTV2_BUILD_VERSION = '3.12.8';
 
     /* ===== src/platform/gm.js ===== */
     /*
@@ -2008,6 +2008,672 @@
                 return next;
             }),
         };
+    }
+
+    /* ------------------------------------------------ the buying run (3.12.8) */
+
+    /*
+     * After a yes, the buying run (the owner, 2026-09-27): Next bazaar opens the
+     * next seller's bazaar with the listing marked; you buy it or not, press Next
+     * again, and the script counts what you bought from the listing's stock on
+     * the page (it drops by what you took, or the listing goes). What you send is
+     * what you bought - a skipped step sends nothing.
+     */
+
+    /** A step you have been through: bought (all or some), or skipped. */
+    function stepDone(step) {
+        return Boolean(step && (step.bought || step.skipped || step.boughtQty > 0));
+    }
+
+    /** How many of a line to send: yours as planned; a flip what you actually bought, once you started buying it. */
+    function sendUnits(line) {
+        if (!line) return 0;
+        if (line.kind === 'yours') return line.units;
+        const started = (line.steps || []).some(stepDone);
+        if (!started) return line.units;
+        return line.steps.reduce((a, st) => a + (st.bought ? (st.boughtQty > 0 ? st.boughtQty : st.qty) : st.boughtQty || 0), 0);
+    }
+
+    /** The next step to buy: {line, index, step, itemId, name}, or null when every step is done. */
+    function nextStep(trade) {
+        for (const i of (trade && trade.items) || []) {
+            const k = (i.steps || []).findIndex((st) => !stepDone(st));
+            if (k >= 0) return { line: i.line || 'flip:' + i.itemId, index: k, step: i.steps[k], itemId: i.itemId, name: i.name };
+        }
+        return null;
+    }
+
+    /**
+     * What you bought on a bazaar page, from the listing's stock: seen first
+     * (when you arrived) and now. Gone from the page = all of it (what you
+     * needed, at most what was there). Never more than you needed.
+     */
+    function boughtFromStock(firstSeen, nowSeen, need) {
+        if (!(firstSeen > 0)) return 0;
+        if (nowSeen === null || nowSeen === undefined) return Math.min(need, firstSeen);
+        return Math.max(0, Math.min(need, firstSeen - nowSeen));
+    }
+
+    /** A copy of the trade with one step's outcome: how many you bought (0 = skipped). */
+    function recordBuy(trade, line, index, boughtQty) {
+        const n = Math.max(0, Math.floor(Number(boughtQty) || 0));
+        return {
+            ...trade,
+            items: trade.items.map((i) => {
+                if ((i.line || 'flip:' + i.itemId) !== String(line)) return i;
+                return { ...i, steps: i.steps.map((st, k) => (k === index ? { ...st, boughtQty: n, bought: n >= st.qty, skipped: n === 0 } : st)) };
+            }),
+        };
+    }
+
+    /**
+     * The next cheapest listing still under the trader's price, when a step's
+     * listing is gone or re-priced (the friend: "sometimes their prices change,
+     * or they're not available any more"). Not the same seller; fresh only.
+     *
+     * @param {{sellerId, qty}} step
+     * @param {Array|null} rows - the item's bazaar listings now
+     * @param {number} bid - what the trader pays each
+     * @param {function} enough - (profitEach, price) => boolean (the least profit rule)
+     */
+    function replacementFor(step, rows, bid, enough) {
+        const ok = (rows || [])
+            .filter((r) => r && !r.stale && r.qty > 0 && String(r.sellerId) !== String(step.sellerId) && enough(bid - r.price, r.price))
+            .sort((a, b) => a.price - b.price);
+        if (!ok.length) return null;
+        const r = ok[0];
+        return { sellerId: String(r.sellerId), sellerName: r.sellerName || null, price: r.price, qty: Math.min(step.qty, r.qty) };
+    }
+
+    /** A copy of the trade with one step replaced by another listing. */
+    function replaceStep(trade, line, index, repl) {
+        return {
+            ...trade,
+            items: trade.items.map((i) => {
+                if ((i.line || 'flip:' + i.itemId) !== String(line)) return i;
+                return { ...i, steps: i.steps.map((st, k) => (k === index ? { sellerId: repl.sellerId, sellerName: repl.sellerName, qty: repl.qty, price: repl.price, bought: false } : st)) };
+            }),
+        };
+    }
+
+    /** A copy of the trade without one line (not profitable any more, or you changed your mind). */
+    function dropLine(trade, line) {
+        return { ...trade, items: trade.items.filter((i) => (i.line || 'flip:' + i.itemId) !== String(line)) };
+    }
+
+    /** What the trade comes to now: what you send, what they pay, what you spent, what it makes. */
+    function acceptedTotals(trade) {
+        let pays = 0;
+        let cost = 0;
+        for (const i of (trade && trade.items) || []) {
+            pays += sendUnits(i) * i.bid;
+            for (const st of i.steps || []) {
+                if (st.skipped) continue;
+                cost += (st.boughtQty > 0 ? st.boughtQty : st.qty) * st.price;
+            }
+        }
+        return { pays, cost, profit: (trade && trade.items || []).reduce((a, i) => a + (i.kind === 'flip' ? sendUnits(i) * i.bid : 0), 0) - cost };
+    }
+
+    /* ===== src/sources/dom/detect.js ===== */
+    /*
+     * Finding the listing cards on the page.
+     *
+     * This is the part that has to work, so it uses two strategies and prefers
+     * whichever actually finds cards:
+     *
+     *   1. Image-anchored. Every listing carries an item image whose path holds
+     *      the item id (/images/items/206/large.png). Starting there and climbing
+     *      to the card is cheap and precise.
+     *
+     *   2. Content-shaped. Walk the document for elements whose text contains a
+     *      price AND "in stock", that are visible and card-sized, then climb to
+     *      the smallest ancestor that looks like a whole card (price + stock +
+     *      image + plausible dimensions).
+     *
+     * Strategy 2 is deliberately the same approach as the script that is known to
+     * work on live Torn pages. It is slower, so it runs only when strategy 1
+     * finds nothing - which keeps the fast path fast without betting the whole
+     * feature on it.
+     */
+
+    const ITEM_IMAGE_SELECTOR =
+        'img[src*="/images/items/"], img[srcset*="/images/items/"]';
+
+    const ITEM_IMAGE_ID_RE = /\/images\/items\/(\d+)\//;
+
+    /** Known card containers, tightest first. */
+    const CARD_SELECTOR = [
+        '[class*="itemTile"]',
+        '[data-testid="item-description"]',
+        '[class*="itemDescription"]',
+        '[class*="sellerRow"]',
+        '[class*="listItem"]',
+    ].join(', ');
+
+    const PRICE_RE = /\$\s*[\d,]+/;
+    const STOCK_RE = /in\s+stock|in\s+total/i;
+
+    const MAX_CLIMB = 8;
+
+    /** The item id from an image path, or null if it is not an item image. */
+    function itemIdFromImage(img) {
+        if (!img || typeof img.getAttribute !== 'function') return null;
+
+        const src = img.getAttribute('src') || img.getAttribute('srcset') || '';
+        const match = src.match(ITEM_IMAGE_ID_RE);
+
+        return match ? match[1] : null;
+    }
+
+    function isVisible(el) {
+        if (!el || typeof window === 'undefined') return true;
+
+        const style = window.getComputedStyle(el);
+        if (style.display === 'none' || style.visibility === 'hidden') return false;
+
+        const rect = el.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+    }
+
+    function boxOf(el) {
+        if (!el || typeof el.getBoundingClientRect !== 'function') {
+            return { width: 0, height: 0 };
+        }
+        return el.getBoundingClientRect();
+    }
+
+    function countItemImages(el) {
+        try {
+            return el.querySelectorAll(ITEM_IMAGE_SELECTOR).length;
+        } catch {
+            return 0;
+        }
+    }
+
+    /**
+     * Climb from an item image to the element representing ONE listing.
+     *
+     * The guard that matters: the moment an ancestor contains more than one item
+     * image we have climbed into a container holding several listings and must
+     * stop. Without it, one card's name gets paired with another card's price -
+     * which is the oldest bug in this project.
+     */
+    function cardFromImage(img) {
+        const preferred = img.closest ? img.closest(CARD_SELECTOR) : null;
+        if (preferred && countItemImages(preferred) === 1) return preferred;
+
+        let node = img.parentElement;
+        let best = null;
+
+        for (let depth = 0; depth < MAX_CLIMB && node; depth += 1) {
+            if (countItemImages(node) > 1) break;
+
+            best = node;
+
+            const text = node.textContent || '';
+            if (node.querySelector('[aria-label^="Buy"]') || PRICE_RE.test(text)) {
+                return node;
+            }
+
+            node = node.parentElement;
+        }
+
+        return best;
+    }
+
+    /** Climb from a price-bearing element to something card-shaped. */
+    function cardFromContent(el) {
+        let node = el;
+
+        for (let depth = 0; depth < MAX_CLIMB && node; depth += 1) {
+            const text = node.textContent || '';
+            const box = boxOf(node);
+
+            if (
+                PRICE_RE.test(text) &&
+                STOCK_RE.test(text) &&
+                node.querySelector('img') &&
+                box.width >= 150 &&
+                box.width <= 600 &&
+                box.height >= 60 &&
+                box.height <= 400
+            ) {
+                return node;
+            }
+
+            node = node.parentElement;
+        }
+
+        return null;
+    }
+
+    function dedupe(cards) {
+        const seen = new Set();
+        const out = [];
+
+        for (const card of cards) {
+            if (!card || seen.has(card)) continue;
+            seen.add(card);
+            out.push(card);
+        }
+
+        return out;
+    }
+
+    /** Strategy 1: anchored on item images. */
+    function findByImage(root) {
+        let images;
+        try {
+            images = Array.from(root.querySelectorAll(ITEM_IMAGE_SELECTOR));
+        } catch {
+            return { cards: [], images: 0 };
+        }
+
+        const cards = dedupe(images.map(cardFromImage).filter(Boolean));
+
+        return { cards, images: images.length };
+    }
+
+    /** Is this element card-sized text with a price and a stock count? */
+    function looksLikeListing(el) {
+        const text = el.textContent || '';
+        if (!text || text.length > 500) return false;
+        if (!PRICE_RE.test(text) || !STOCK_RE.test(text)) return false;
+        if (!isVisible(el)) return false;
+        const box = boxOf(el);
+        return box.width >= 120 && box.height >= 60;
+    }
+
+    /**
+     * Strategy 2: shaped like a listing card.
+     *
+     * Starts from the text that holds a "$" and climbs a few parents, instead of
+     * reading the text of EVERY element on the page (each one re-reading all of
+     * its children): that ran on every 2.5 s scan of a page with no item images
+     * (your own storefront, a page still loading) and cost far more than the page
+     * it looked at. A listing's price is always in its own text, so the same
+     * cards are found; the climb stops where the text grows past a card's.
+     */
+    function findByContent(root) {
+        const doc = root && (root.nodeType === 9 ? root : root.ownerDocument);
+        const start = root && root.nodeType === 9 ? root.body : root;
+        if (!doc || !start || typeof doc.createTreeWalker !== 'function') return [];
+
+        const candidates = [];
+        const tried = new Set();
+        let walker;
+        try {
+            walker = doc.createTreeWalker(start, 4 /* NodeFilter.SHOW_TEXT */);
+        } catch {
+            return [];
+        }
+
+        for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+            if (!node.nodeValue || node.nodeValue.indexOf('$') < 0) continue;
+            let el = node.parentElement;
+            for (let depth = 0; depth < MAX_CLIMB && el; depth += 1, el = el.parentElement) {
+                if (tried.has(el)) break;
+                tried.add(el);
+                if ((el.textContent || '').length > 500) break;
+                if (looksLikeListing(el)) candidates.push(el);
+            }
+        }
+
+        // In page order, as the old walk over every element returned them.
+        const cards = dedupe(candidates.map(cardFromContent).filter(Boolean));
+        return cards.sort((a, b) => (a === b ? 0 : a.compareDocumentPosition(b) & 4 ? -1 : 1));
+    }
+
+    /**
+     * Find every listing card on the page.
+     *
+     * @returns {{cards: Element[], strategy: string, images: number}}
+     */
+    function findCards(root) {
+        if (!root) return { cards: [], strategy: 'none', images: 0 };
+
+        const byImage = findByImage(root);
+        if (byImage.cards.length > 0) {
+            return {
+                cards: byImage.cards,
+                strategy: 'image',
+                images: byImage.images,
+            };
+        }
+
+        const byContent = findByContent(root);
+
+        return {
+            cards: byContent,
+            strategy: byContent.length > 0 ? 'content' : 'none',
+            images: byImage.images,
+        };
+    }
+
+    /* ===== src/sources/dom/fill.js ===== */
+    /*
+     * The Fill button's side of Torn's pages: in one row, find the price box and
+     * the quantity box, and type into them the way Torn's own forms accept.
+     *
+     * Only on the page you are viewing, only in the row whose Fill you pressed,
+     * only after you pressed it. Nothing of Torn's is ever clicked: not the
+     * confirm / list / update buttons, and not the tick box of a weapon or
+     * armour row (you tick it; Fill types the price).
+     *
+     * The markup comes from two working 2026 scripts for these pages - Greasy
+     * Fork's "Customizable Bazaar Filler" 1.82 (bazaar add / manage) and "Torn
+     * Market Filler" 1.1.2 (Item Market add / your listings):
+     *
+     *   bazaar #/add     li.clearfix; price ".price input"; quantity ".amount input";
+     *                    how many you have ".item-amount.qty"; a weapon or armour
+     *                    row has "div.amount.choice-container input" (a tick box)
+     *   bazaar #/manage  the price in [class*="price___"] as input.input-money
+     *   market add       [class*=itemRow___]; price [class*=priceInputWrapper___]
+     *                    input.input-money (a visible and a hidden one, both set);
+     *                    quantity [class*=amountInputWrapper___] input.input-money;
+     *                    single-copy rows have a [class*=checkboxWrapper___] tick box
+     *   market view      (your listings) the price only
+     */
+
+
+
+
+    /** Our own marks inside Torn's rows. */
+    const FILL_BUTTON_CLASS = 'ttv2-fillbtn';
+    const FILL_TAG_CLASS = 'ttv2-filltag';
+
+    const MARKET_ROW_SELECTOR = '[class*="itemRow___"]:not([class*="grayedOut___"])';
+
+    function text(node) {
+        return ((node && node.textContent) || '').replace(/\s+/g, ' ').trim();
+    }
+
+    function visible(input) {
+        if (!input) return false;
+        if (input.type === 'hidden') return false;
+        return !(input.offsetParent === null && input.getClientRects && input.getClientRects().length === 0);
+    }
+
+    /** The first number in a text: "x12", "12", "1,234 in stock". */
+    function countIn(value) {
+        const m = String(value || '').match(/(\d[\d,]*)/);
+        if (!m) return null;
+        const n = Number(m[1].replace(/,/g, ''));
+        return Number.isFinite(n) && n > 0 ? n : null;
+    }
+
+    /**
+     * The price and quantity boxes of one row, and how many you have of it.
+     *
+     * @param {'bazaar-add'|'bazaar-manage'|'market-add'|'market-view'} page
+     * @param {Element} row
+     * @returns {{price: HTMLInputElement[], qty: HTMLInputElement[], single: boolean, have: number|null}}
+     */
+    function rowInputs(page, row) {
+        const out = { price: [], qty: [], single: false, have: null };
+        if (!row || !row.querySelector) return out;
+
+        if (page === 'bazaar-add') {
+            // Checked on the owner's real page (2026-09-26): a visible text box and a
+            // hidden twin (name="price"), both input.input-money; both are set.
+            out.price.push(...row.querySelectorAll('.price input.input-money, .price input[name="price"]'));
+            if (!out.price.length) {
+                const price = row.querySelector('.price input');
+                if (price) out.price.push(price);
+            }
+            out.single = Boolean(row.querySelector('div.amount.choice-container input, .choice-container input[type="checkbox"]'));
+            if (!out.single) {
+                const qty = row.querySelector('.amount input');
+                if (qty) out.qty.push(qty);
+            }
+            out.have = countIn(text(row.querySelector('.item-amount.qty'))) || countIn((text(row.querySelector('.name-wrap')).match(/x\s*(\d[\d,]*)\s*$/i) || [])[1]);
+            return out;
+        }
+
+        if (page === 'bazaar-manage') {
+            const group = row.querySelector('[class*="price___"]');
+            const inputs = group ? [...group.querySelectorAll('input.input-money')] : [];
+            out.price.push(...(inputs.length ? inputs : [...row.querySelectorAll('[class*="price___"] input')]));
+            return out;
+        }
+
+        if (page === 'market-add' || page === 'market-view') {
+            const priceWrap = row.querySelector('[class*="priceInputWrapper___"]');
+            if (priceWrap) out.price.push(...priceWrap.querySelectorAll('input.input-money'));
+            if (page === 'market-add') {
+                out.single = Boolean(row.querySelector('[class*="checkboxWrapper___"] input[type="checkbox"]'));
+                if (!out.single) {
+                    const qtyWrap = row.querySelector('[class*="amountInputWrapper___"]');
+                    if (qtyWrap) out.qty.push(...qtyWrap.querySelectorAll('input.input-money'));
+                }
+                // "Xanax x12" in the row's name.
+                const m = text(row).match(/\bx\s?(\d[\d,]*)/i);
+                out.have = m ? countIn(m[1]) : null;
+            }
+            return out;
+        }
+        return out;
+    }
+
+    /** An Item Market row's item id: its info button's aria-controls, else its picture. */
+    function marketRowItemId(row) {
+        const info = row.querySelector('[class*="viewInfoButton___"]');
+        const m = info && String(info.getAttribute('aria-controls') || '').match(/-(\d+)-/);
+        if (m) return m[1];
+        const img = row.querySelector(ITEM_IMAGE_SELECTOR) || row.querySelector('img[src*="/items/"]');
+        return img ? itemIdFromImage(img) : null;
+    }
+
+    /**
+     * Every Item Market row on the page you are viewing, with its item.
+     *
+     * @param {'market-add'|'market-view'} page
+     * @returns {{rows: Array<{el, nameEl, itemId, name, item}>, diagnostics: object}}
+     */
+    function scanMarketRows(page, root, index) {
+        const diagnostics = { page, rows: 0, identified: 0, noItem: 0 };
+        const rows = [];
+        if (!root || !index) return { rows, diagnostics };
+        for (const el of root.querySelectorAll(MARKET_ROW_SELECTOR)) {
+            if (el.closest && el.closest('#ttv2-host')) continue;
+            // A row inside a row (Torn nests wrappers): only the outermost counts.
+            if (el.parentElement && el.parentElement.closest && el.parentElement.closest(MARKET_ROW_SELECTOR)) continue;
+            if (!el.querySelector('[class*="priceInputWrapper___"]')) continue;
+            diagnostics.rows += 1;
+            const id = marketRowItemId(el);
+            const nameEl = el.querySelector('[class*="name___"], [class*="title___"]');
+            const name = text(nameEl).replace(/\s*x\s?\d[\d,]*\s*$/i, '');
+            const item = (id && findItemById(index, id)) || findItemByName(index, name) || null;
+            if (!item) {
+                diagnostics.noItem += 1;
+                continue;
+            }
+            diagnostics.identified += 1;
+            rows.push({ el, nameEl: nameEl || null, itemId: item.id, name: item.name, item });
+        }
+        return { rows, diagnostics };
+    }
+
+    /** The item a row shows right now, from its picture: /images/items/{id}/. */
+    function rowItemIdNow(page, row) {
+        if (!row) return null;
+        if (page === 'market-add' || page === 'market-view') return marketRowItemId(row);
+        const img = row.querySelector(ITEM_IMAGE_SELECTOR) || row.querySelector('img[src*="/items/"]');
+        return img ? itemIdFromImage(img) : null;
+    }
+
+    /** The price Torn has on file for a row (its box's value attribute), not what is typed now. */
+    function savedPrice(inputs) {
+        for (const i of inputs || []) {
+            const v = Number(String(i.getAttribute('value') || '').replace(/[^\d]/g, ''));
+            if (v > 0) return v;
+        }
+        return null;
+    }
+
+    /**
+     * Where Fill's settings link goes: Torn's links bar at the top of the page
+     * ("Manage items · Personalize · Back" on your bazaar), as the reference
+     * script does.
+     */
+    function linksBar(doc = document) {
+        return doc.querySelector('[class*="linksContainer___"]');
+    }
+
+    /** What a box holds now, to put back on Undo. */
+    function readInputs(inputs) {
+        return (inputs || []).map((i) => i.value);
+    }
+
+    /**
+     * Type a value into Torn's boxes. Torn's forms listen for input events and
+     * (the bazaar add page) key-ups; React keeps its own copy of a box's value,
+     * so the value goes in through the native setter, which React sees.
+     *
+     * @param {HTMLInputElement[]} inputs
+     * @param {string|string[]} value - one value for all, or one per box (Undo)
+     */
+    function writeInputs(inputs, value) {
+        const list = inputs || [];
+        list.forEach((input, i) => {
+            let v = Array.isArray(value) ? value[i] : value;
+            if (v === undefined || v === null) return;
+            // A hidden twin holds the plain number (value="119999"), the visible box the formatted one.
+            if (input.type === 'hidden' && !Array.isArray(value)) v = String(v).replace(/[^\d]/g, '');
+            const proto = Object.getPrototypeOf(input);
+            const desc = Object.getOwnPropertyDescriptor(proto, 'value') || Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+            if (desc && desc.set) desc.set.call(input, String(v));
+            else input.value = String(v);
+        });
+        // One set of events, from the box you can see (Torn mirrors it into the hidden one).
+        const target = list.find(visible) || list[0];
+        if (!target) return;
+        for (const type of ['input', 'change']) target.dispatchEvent(new Event(type, { bubbles: true }));
+        target.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
+    }
+
+    /** How a price goes into the box: the bazaar pages show 1,234,567; the Item Market takes digits. */
+    function priceText(page, price) {
+        const n = Math.round(Number(price));
+        return page === 'bazaar-add' || page === 'bazaar-manage' ? n.toLocaleString('en-US') : String(n);
+    }
+
+    /** Your own player id, from the page's own data (#torn-user) or the sidebar's profile link. */
+    function ownIdFromPage(doc = document) {
+        try {
+            const raw = doc.getElementById('torn-user');
+            const data = raw && raw.value ? JSON.parse(raw.value) : null;
+            const id = data && Number(data.id);
+            if (id > 0) return String(id);
+        } catch {
+            /* not there */
+        }
+        const a = doc.querySelector('#sidebarroot a[href*="profiles.php?XID="], a[class*="menu-value"][href*="profiles.php?XID="]');
+        const m = a && String(a.getAttribute('href')).match(/XID=(\d+)/);
+        return m ? m[1] : null;
+    }
+
+    /**
+     * Where the Fill button goes in a row: after our price tag on the bazaar
+     * pages (the tag follows the name), before the price box on the Item Market.
+     */
+    function fillAnchor(page, row) {
+        if (page === 'market-add' || page === 'market-view') {
+            const wrap = row.el.querySelector('[class*="priceInputWrapper___"]');
+            return wrap ? { parent: wrap.parentNode, before: wrap } : { parent: row.el, before: null };
+        }
+        return null;
+    }
+
+    /* ===== src/sources/dom/trade.js ===== */
+    /*
+     * Torn's trade page (trade.php), read only. Markup read on the owner's real
+     * page on 2026-09-27 (a trade with HandsomeVincent, nothing touched):
+     *
+     *   View step (#/step=view): .trade-cont
+     *     .t-title                         "Trade between A and B"
+     *     .user.left  / .user.right        you / them
+     *       .title-black                   the name ("HandsomeVincent")
+     *       ul.cont > li.color1            money: .name "No money in trade" or "$1,234"
+     *                 li.color2            items: ul.desc > li > .name "Bag of Candy Kisses x1"
+     *                 li.color3            properties
+     *
+     *   Add step (#step=add): the same item list as your bazaar's add page -
+     *     ul.items-cont > li.clearfix, the item id in the picture's path
+     *     (/images/items/1321/large.png), .item-amount.qty how many you have,
+     *     .amount input[name=amount] (Qty), a tick box instead for one-of-a-kind
+     *     items (weapons), rows "disabled" when they cannot be traded, and one
+     *     ADD TO TRADE button for the page.
+     *
+     * Nothing here clicks, types or presses anything; Fill (in main.js) types
+     * into one row's Qty box when you press it, like Fill on your bazaar.
+     */
+
+
+
+
+    /** "Bag of Candy Kisses x12" -> {name, qty}; a line with no "xN" is one. */
+    function parseTradeItemLine(text) {
+        const s = String(text || '').replace(/\s+/g, ' ').trim();
+        if (!s) return null;
+        const m = s.match(/^(.*?)\s+x\s?(\d[\d,]*)$/i);
+        if (m) return { name: m[1].trim(), qty: Number(m[2].replace(/,/g, '')) };
+        return { name: s, qty: 1 };
+    }
+
+    /** "$1,234,567" -> 1234567; "No money in trade" (or nothing) -> 0. */
+    function parseTradeMoney(text) {
+        const m = String(text || '').replace(/\s+/g, '').match(/\$([\d,]+)/);
+        return m ? Number(m[1].replace(/,/g, '')) : 0;
+    }
+
+    function tradeText(el) {
+        return el ? String(el.textContent || '').replace(/\s+/g, ' ').trim() : '';
+    }
+
+    /**
+     * The trade view, if it is on the page: who it is with, what each side has
+     * put in. Null on other steps.
+     *
+     * @returns {null|{partner: string, you: {money: number, items: Array<{name, qty}>}, them: {money: number, items: Array<{name, qty}>}}}
+     */
+    function readTradeView(doc = document) {
+        const box = doc.querySelector('.trade-cont');
+        if (!box) return null;
+        const side = (el) => {
+            if (!el) return { money: 0, items: [] };
+            const money = el.querySelector('ul.cont > li.color1 .name');
+            const items = [...el.querySelectorAll('ul.cont > li.color2 ul.desc > li .name')]
+                .map((n) => parseTradeItemLine(tradeText(n)))
+                .filter((x) => x && !/^no items in trade$/i.test(x.name));
+            return { money: parseTradeMoney(tradeText(money)), items };
+        };
+        const right = box.querySelector('.user.right');
+        const partner = right ? tradeText(right.querySelector('.title-black')) : '';
+        return { partner, you: side(box.querySelector('.user.left')), them: side(right) };
+    }
+
+    /**
+     * The add step's rows you can add: item id, name, how many you have, and
+     * the Qty box (or null for a tick-box row - one-of-a-kind items).
+     *
+     * @returns {Array<{el: Element, itemId: string, name: string, have: number|null, qty: HTMLInputElement|null, single: boolean}>}
+     */
+    function readTradeAddRows(doc = document) {
+        const list = doc.querySelector('ul.items-cont');
+        if (!list) return [];
+        const out = [];
+        for (const li of list.querySelectorAll('li.clearfix')) {
+            if (li.classList.contains('disabled')) continue;
+            const img = li.querySelector(ITEM_IMAGE_SELECTOR) || li.querySelector('img[src*="/items/"]');
+            const itemId = img ? itemIdFromImage(img) : null;
+            if (!itemId) continue;
+            const inputs = rowInputs('bazaar-add', li);
+            const name = tradeText(li.querySelector('.name-wrap .t-overflow')) || (img && img.getAttribute('alt')) || '';
+            out.push({ el: li, itemId: String(itemId), name, have: inputs.have, qty: inputs.qty[0] || null, single: inputs.single });
+        }
+        return out;
     }
 
     /* ===== src/core/leader.js ===== */
@@ -5855,242 +6521,6 @@
         return queryOf(href).get(TRADERS_PAGE_PARAM) === TRADERS_PAGE_VALUE && isTornHost(href);
     }
 
-    /* ===== src/sources/dom/detect.js ===== */
-    /*
-     * Finding the listing cards on the page.
-     *
-     * This is the part that has to work, so it uses two strategies and prefers
-     * whichever actually finds cards:
-     *
-     *   1. Image-anchored. Every listing carries an item image whose path holds
-     *      the item id (/images/items/206/large.png). Starting there and climbing
-     *      to the card is cheap and precise.
-     *
-     *   2. Content-shaped. Walk the document for elements whose text contains a
-     *      price AND "in stock", that are visible and card-sized, then climb to
-     *      the smallest ancestor that looks like a whole card (price + stock +
-     *      image + plausible dimensions).
-     *
-     * Strategy 2 is deliberately the same approach as the script that is known to
-     * work on live Torn pages. It is slower, so it runs only when strategy 1
-     * finds nothing - which keeps the fast path fast without betting the whole
-     * feature on it.
-     */
-
-    const ITEM_IMAGE_SELECTOR =
-        'img[src*="/images/items/"], img[srcset*="/images/items/"]';
-
-    const ITEM_IMAGE_ID_RE = /\/images\/items\/(\d+)\//;
-
-    /** Known card containers, tightest first. */
-    const CARD_SELECTOR = [
-        '[class*="itemTile"]',
-        '[data-testid="item-description"]',
-        '[class*="itemDescription"]',
-        '[class*="sellerRow"]',
-        '[class*="listItem"]',
-    ].join(', ');
-
-    const PRICE_RE = /\$\s*[\d,]+/;
-    const STOCK_RE = /in\s+stock|in\s+total/i;
-
-    const MAX_CLIMB = 8;
-
-    /** The item id from an image path, or null if it is not an item image. */
-    function itemIdFromImage(img) {
-        if (!img || typeof img.getAttribute !== 'function') return null;
-
-        const src = img.getAttribute('src') || img.getAttribute('srcset') || '';
-        const match = src.match(ITEM_IMAGE_ID_RE);
-
-        return match ? match[1] : null;
-    }
-
-    function isVisible(el) {
-        if (!el || typeof window === 'undefined') return true;
-
-        const style = window.getComputedStyle(el);
-        if (style.display === 'none' || style.visibility === 'hidden') return false;
-
-        const rect = el.getBoundingClientRect();
-        return rect.width > 0 && rect.height > 0;
-    }
-
-    function boxOf(el) {
-        if (!el || typeof el.getBoundingClientRect !== 'function') {
-            return { width: 0, height: 0 };
-        }
-        return el.getBoundingClientRect();
-    }
-
-    function countItemImages(el) {
-        try {
-            return el.querySelectorAll(ITEM_IMAGE_SELECTOR).length;
-        } catch {
-            return 0;
-        }
-    }
-
-    /**
-     * Climb from an item image to the element representing ONE listing.
-     *
-     * The guard that matters: the moment an ancestor contains more than one item
-     * image we have climbed into a container holding several listings and must
-     * stop. Without it, one card's name gets paired with another card's price -
-     * which is the oldest bug in this project.
-     */
-    function cardFromImage(img) {
-        const preferred = img.closest ? img.closest(CARD_SELECTOR) : null;
-        if (preferred && countItemImages(preferred) === 1) return preferred;
-
-        let node = img.parentElement;
-        let best = null;
-
-        for (let depth = 0; depth < MAX_CLIMB && node; depth += 1) {
-            if (countItemImages(node) > 1) break;
-
-            best = node;
-
-            const text = node.textContent || '';
-            if (node.querySelector('[aria-label^="Buy"]') || PRICE_RE.test(text)) {
-                return node;
-            }
-
-            node = node.parentElement;
-        }
-
-        return best;
-    }
-
-    /** Climb from a price-bearing element to something card-shaped. */
-    function cardFromContent(el) {
-        let node = el;
-
-        for (let depth = 0; depth < MAX_CLIMB && node; depth += 1) {
-            const text = node.textContent || '';
-            const box = boxOf(node);
-
-            if (
-                PRICE_RE.test(text) &&
-                STOCK_RE.test(text) &&
-                node.querySelector('img') &&
-                box.width >= 150 &&
-                box.width <= 600 &&
-                box.height >= 60 &&
-                box.height <= 400
-            ) {
-                return node;
-            }
-
-            node = node.parentElement;
-        }
-
-        return null;
-    }
-
-    function dedupe(cards) {
-        const seen = new Set();
-        const out = [];
-
-        for (const card of cards) {
-            if (!card || seen.has(card)) continue;
-            seen.add(card);
-            out.push(card);
-        }
-
-        return out;
-    }
-
-    /** Strategy 1: anchored on item images. */
-    function findByImage(root) {
-        let images;
-        try {
-            images = Array.from(root.querySelectorAll(ITEM_IMAGE_SELECTOR));
-        } catch {
-            return { cards: [], images: 0 };
-        }
-
-        const cards = dedupe(images.map(cardFromImage).filter(Boolean));
-
-        return { cards, images: images.length };
-    }
-
-    /** Is this element card-sized text with a price and a stock count? */
-    function looksLikeListing(el) {
-        const text = el.textContent || '';
-        if (!text || text.length > 500) return false;
-        if (!PRICE_RE.test(text) || !STOCK_RE.test(text)) return false;
-        if (!isVisible(el)) return false;
-        const box = boxOf(el);
-        return box.width >= 120 && box.height >= 60;
-    }
-
-    /**
-     * Strategy 2: shaped like a listing card.
-     *
-     * Starts from the text that holds a "$" and climbs a few parents, instead of
-     * reading the text of EVERY element on the page (each one re-reading all of
-     * its children): that ran on every 2.5 s scan of a page with no item images
-     * (your own storefront, a page still loading) and cost far more than the page
-     * it looked at. A listing's price is always in its own text, so the same
-     * cards are found; the climb stops where the text grows past a card's.
-     */
-    function findByContent(root) {
-        const doc = root && (root.nodeType === 9 ? root : root.ownerDocument);
-        const start = root && root.nodeType === 9 ? root.body : root;
-        if (!doc || !start || typeof doc.createTreeWalker !== 'function') return [];
-
-        const candidates = [];
-        const tried = new Set();
-        let walker;
-        try {
-            walker = doc.createTreeWalker(start, 4 /* NodeFilter.SHOW_TEXT */);
-        } catch {
-            return [];
-        }
-
-        for (let node = walker.nextNode(); node; node = walker.nextNode()) {
-            if (!node.nodeValue || node.nodeValue.indexOf('$') < 0) continue;
-            let el = node.parentElement;
-            for (let depth = 0; depth < MAX_CLIMB && el; depth += 1, el = el.parentElement) {
-                if (tried.has(el)) break;
-                tried.add(el);
-                if ((el.textContent || '').length > 500) break;
-                if (looksLikeListing(el)) candidates.push(el);
-            }
-        }
-
-        // In page order, as the old walk over every element returned them.
-        const cards = dedupe(candidates.map(cardFromContent).filter(Boolean));
-        return cards.sort((a, b) => (a === b ? 0 : a.compareDocumentPosition(b) & 4 ? -1 : 1));
-    }
-
-    /**
-     * Find every listing card on the page.
-     *
-     * @returns {{cards: Element[], strategy: string, images: number}}
-     */
-    function findCards(root) {
-        if (!root) return { cards: [], strategy: 'none', images: 0 };
-
-        const byImage = findByImage(root);
-        if (byImage.cards.length > 0) {
-            return {
-                cards: byImage.cards,
-                strategy: 'image',
-                images: byImage.images,
-            };
-        }
-
-        const byContent = findByContent(root);
-
-        return {
-            cards: byContent,
-            strategy: byContent.length > 0 ? 'content' : 'none',
-            images: byImage.images,
-        };
-    }
-
     /* ===== src/sources/dom/scan.js ===== */
     /*
      * Reading one listing card into numbers.
@@ -6562,241 +6992,6 @@
 
     function removeRowTags(root = document) {
         for (const t of root.querySelectorAll('.' + OWN_BAZAAR_TAG_CLASS)) t.remove();
-    }
-
-    /* ===== src/sources/dom/fill.js ===== */
-    /*
-     * The Fill button's side of Torn's pages: in one row, find the price box and
-     * the quantity box, and type into them the way Torn's own forms accept.
-     *
-     * Only on the page you are viewing, only in the row whose Fill you pressed,
-     * only after you pressed it. Nothing of Torn's is ever clicked: not the
-     * confirm / list / update buttons, and not the tick box of a weapon or
-     * armour row (you tick it; Fill types the price).
-     *
-     * The markup comes from two working 2026 scripts for these pages - Greasy
-     * Fork's "Customizable Bazaar Filler" 1.82 (bazaar add / manage) and "Torn
-     * Market Filler" 1.1.2 (Item Market add / your listings):
-     *
-     *   bazaar #/add     li.clearfix; price ".price input"; quantity ".amount input";
-     *                    how many you have ".item-amount.qty"; a weapon or armour
-     *                    row has "div.amount.choice-container input" (a tick box)
-     *   bazaar #/manage  the price in [class*="price___"] as input.input-money
-     *   market add       [class*=itemRow___]; price [class*=priceInputWrapper___]
-     *                    input.input-money (a visible and a hidden one, both set);
-     *                    quantity [class*=amountInputWrapper___] input.input-money;
-     *                    single-copy rows have a [class*=checkboxWrapper___] tick box
-     *   market view      (your listings) the price only
-     */
-
-
-
-
-    /** Our own marks inside Torn's rows. */
-    const FILL_BUTTON_CLASS = 'ttv2-fillbtn';
-    const FILL_TAG_CLASS = 'ttv2-filltag';
-
-    const MARKET_ROW_SELECTOR = '[class*="itemRow___"]:not([class*="grayedOut___"])';
-
-    function text(node) {
-        return ((node && node.textContent) || '').replace(/\s+/g, ' ').trim();
-    }
-
-    function visible(input) {
-        if (!input) return false;
-        if (input.type === 'hidden') return false;
-        return !(input.offsetParent === null && input.getClientRects && input.getClientRects().length === 0);
-    }
-
-    /** The first number in a text: "x12", "12", "1,234 in stock". */
-    function countIn(value) {
-        const m = String(value || '').match(/(\d[\d,]*)/);
-        if (!m) return null;
-        const n = Number(m[1].replace(/,/g, ''));
-        return Number.isFinite(n) && n > 0 ? n : null;
-    }
-
-    /**
-     * The price and quantity boxes of one row, and how many you have of it.
-     *
-     * @param {'bazaar-add'|'bazaar-manage'|'market-add'|'market-view'} page
-     * @param {Element} row
-     * @returns {{price: HTMLInputElement[], qty: HTMLInputElement[], single: boolean, have: number|null}}
-     */
-    function rowInputs(page, row) {
-        const out = { price: [], qty: [], single: false, have: null };
-        if (!row || !row.querySelector) return out;
-
-        if (page === 'bazaar-add') {
-            // Checked on the owner's real page (2026-09-26): a visible text box and a
-            // hidden twin (name="price"), both input.input-money; both are set.
-            out.price.push(...row.querySelectorAll('.price input.input-money, .price input[name="price"]'));
-            if (!out.price.length) {
-                const price = row.querySelector('.price input');
-                if (price) out.price.push(price);
-            }
-            out.single = Boolean(row.querySelector('div.amount.choice-container input, .choice-container input[type="checkbox"]'));
-            if (!out.single) {
-                const qty = row.querySelector('.amount input');
-                if (qty) out.qty.push(qty);
-            }
-            out.have = countIn(text(row.querySelector('.item-amount.qty'))) || countIn((text(row.querySelector('.name-wrap')).match(/x\s*(\d[\d,]*)\s*$/i) || [])[1]);
-            return out;
-        }
-
-        if (page === 'bazaar-manage') {
-            const group = row.querySelector('[class*="price___"]');
-            const inputs = group ? [...group.querySelectorAll('input.input-money')] : [];
-            out.price.push(...(inputs.length ? inputs : [...row.querySelectorAll('[class*="price___"] input')]));
-            return out;
-        }
-
-        if (page === 'market-add' || page === 'market-view') {
-            const priceWrap = row.querySelector('[class*="priceInputWrapper___"]');
-            if (priceWrap) out.price.push(...priceWrap.querySelectorAll('input.input-money'));
-            if (page === 'market-add') {
-                out.single = Boolean(row.querySelector('[class*="checkboxWrapper___"] input[type="checkbox"]'));
-                if (!out.single) {
-                    const qtyWrap = row.querySelector('[class*="amountInputWrapper___"]');
-                    if (qtyWrap) out.qty.push(...qtyWrap.querySelectorAll('input.input-money'));
-                }
-                // "Xanax x12" in the row's name.
-                const m = text(row).match(/\bx\s?(\d[\d,]*)/i);
-                out.have = m ? countIn(m[1]) : null;
-            }
-            return out;
-        }
-        return out;
-    }
-
-    /** An Item Market row's item id: its info button's aria-controls, else its picture. */
-    function marketRowItemId(row) {
-        const info = row.querySelector('[class*="viewInfoButton___"]');
-        const m = info && String(info.getAttribute('aria-controls') || '').match(/-(\d+)-/);
-        if (m) return m[1];
-        const img = row.querySelector(ITEM_IMAGE_SELECTOR) || row.querySelector('img[src*="/items/"]');
-        return img ? itemIdFromImage(img) : null;
-    }
-
-    /**
-     * Every Item Market row on the page you are viewing, with its item.
-     *
-     * @param {'market-add'|'market-view'} page
-     * @returns {{rows: Array<{el, nameEl, itemId, name, item}>, diagnostics: object}}
-     */
-    function scanMarketRows(page, root, index) {
-        const diagnostics = { page, rows: 0, identified: 0, noItem: 0 };
-        const rows = [];
-        if (!root || !index) return { rows, diagnostics };
-        for (const el of root.querySelectorAll(MARKET_ROW_SELECTOR)) {
-            if (el.closest && el.closest('#ttv2-host')) continue;
-            // A row inside a row (Torn nests wrappers): only the outermost counts.
-            if (el.parentElement && el.parentElement.closest && el.parentElement.closest(MARKET_ROW_SELECTOR)) continue;
-            if (!el.querySelector('[class*="priceInputWrapper___"]')) continue;
-            diagnostics.rows += 1;
-            const id = marketRowItemId(el);
-            const nameEl = el.querySelector('[class*="name___"], [class*="title___"]');
-            const name = text(nameEl).replace(/\s*x\s?\d[\d,]*\s*$/i, '');
-            const item = (id && findItemById(index, id)) || findItemByName(index, name) || null;
-            if (!item) {
-                diagnostics.noItem += 1;
-                continue;
-            }
-            diagnostics.identified += 1;
-            rows.push({ el, nameEl: nameEl || null, itemId: item.id, name: item.name, item });
-        }
-        return { rows, diagnostics };
-    }
-
-    /** The item a row shows right now, from its picture: /images/items/{id}/. */
-    function rowItemIdNow(page, row) {
-        if (!row) return null;
-        if (page === 'market-add' || page === 'market-view') return marketRowItemId(row);
-        const img = row.querySelector(ITEM_IMAGE_SELECTOR) || row.querySelector('img[src*="/items/"]');
-        return img ? itemIdFromImage(img) : null;
-    }
-
-    /** The price Torn has on file for a row (its box's value attribute), not what is typed now. */
-    function savedPrice(inputs) {
-        for (const i of inputs || []) {
-            const v = Number(String(i.getAttribute('value') || '').replace(/[^\d]/g, ''));
-            if (v > 0) return v;
-        }
-        return null;
-    }
-
-    /**
-     * Where Fill's settings link goes: Torn's links bar at the top of the page
-     * ("Manage items · Personalize · Back" on your bazaar), as the reference
-     * script does.
-     */
-    function linksBar(doc = document) {
-        return doc.querySelector('[class*="linksContainer___"]');
-    }
-
-    /** What a box holds now, to put back on Undo. */
-    function readInputs(inputs) {
-        return (inputs || []).map((i) => i.value);
-    }
-
-    /**
-     * Type a value into Torn's boxes. Torn's forms listen for input events and
-     * (the bazaar add page) key-ups; React keeps its own copy of a box's value,
-     * so the value goes in through the native setter, which React sees.
-     *
-     * @param {HTMLInputElement[]} inputs
-     * @param {string|string[]} value - one value for all, or one per box (Undo)
-     */
-    function writeInputs(inputs, value) {
-        const list = inputs || [];
-        list.forEach((input, i) => {
-            let v = Array.isArray(value) ? value[i] : value;
-            if (v === undefined || v === null) return;
-            // A hidden twin holds the plain number (value="119999"), the visible box the formatted one.
-            if (input.type === 'hidden' && !Array.isArray(value)) v = String(v).replace(/[^\d]/g, '');
-            const proto = Object.getPrototypeOf(input);
-            const desc = Object.getOwnPropertyDescriptor(proto, 'value') || Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
-            if (desc && desc.set) desc.set.call(input, String(v));
-            else input.value = String(v);
-        });
-        // One set of events, from the box you can see (Torn mirrors it into the hidden one).
-        const target = list.find(visible) || list[0];
-        if (!target) return;
-        for (const type of ['input', 'change']) target.dispatchEvent(new Event(type, { bubbles: true }));
-        target.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
-    }
-
-    /** How a price goes into the box: the bazaar pages show 1,234,567; the Item Market takes digits. */
-    function priceText(page, price) {
-        const n = Math.round(Number(price));
-        return page === 'bazaar-add' || page === 'bazaar-manage' ? n.toLocaleString('en-US') : String(n);
-    }
-
-    /** Your own player id, from the page's own data (#torn-user) or the sidebar's profile link. */
-    function ownIdFromPage(doc = document) {
-        try {
-            const raw = doc.getElementById('torn-user');
-            const data = raw && raw.value ? JSON.parse(raw.value) : null;
-            const id = data && Number(data.id);
-            if (id > 0) return String(id);
-        } catch {
-            /* not there */
-        }
-        const a = doc.querySelector('#sidebarroot a[href*="profiles.php?XID="], a[class*="menu-value"][href*="profiles.php?XID="]');
-        const m = a && String(a.getAttribute('href')).match(/XID=(\d+)/);
-        return m ? m[1] : null;
-    }
-
-    /**
-     * Where the Fill button goes in a row: after our price tag on the bazaar
-     * pages (the tag follows the name), before the price box on the Item Market.
-     */
-    function fillAnchor(page, row) {
-        if (page === 'market-add' || page === 'market-view') {
-            const wrap = row.el.querySelector('[class*="priceInputWrapper___"]');
-            return wrap ? { parent: wrap.parentNode, before: wrap } : { parent: row.el, before: null };
-        }
-        return null;
     }
 
     /* ===== src/core/fill.js ===== */
@@ -7436,6 +7631,52 @@
         white-space: pre-line !important;
         text-align: right !important;
     }
+
+    /*
+     * A trade you accepted (3.12.8): the listing to buy on a bazaar, in blue with
+     * its own words, apart from the NPC deals' green; on Torn's trade page the
+     * rows to send, and Fill.
+     */
+    .ttv2-buyhere,
+    .ttv2-target.ttv2-buyhere {
+        position: relative !important;
+        box-shadow:
+            inset 0 0 0 3px #4dabf7,
+            inset 0 0 0 9999px rgba(77, 171, 247, 0.16) !important;
+    }
+
+    .ttv2-buyhere::before {
+        content: attr(data-ttv2-buy);
+        position: absolute;
+        top: 4px;
+        left: 4px;
+        z-index: 2;
+        padding: 1px 6px;
+        border-radius: 3px;
+        background: #4dabf7;
+        color: #10202c;
+        font: bold 11px/16px Arial, sans-serif;
+        pointer-events: none;
+    }
+
+    .ttv2-sendrow {
+        box-shadow: inset 3px 0 0 #4dabf7, inset 0 0 0 9999px rgba(77, 171, 247, 0.10) !important;
+    }
+
+    .ttv2-sendfill {
+        display: inline-block;
+        margin-left: 8px;
+        padding: 1px 8px;
+        border: 1px solid #4dabf7;
+        border-radius: 10px;
+        color: #9ad0fa;
+        font: bold 12px/18px Arial, sans-serif;
+        white-space: nowrap;
+        cursor: default;
+    }
+
+    .ttv2-sendfill[data-fill] { cursor: pointer; }
+    .ttv2-sendfill[aria-pressed="true"] { background: #4dabf7; color: #10202c; }
 
     /* The listing a feed link was opened for. Paint-only, like .ttv2-hit. */
     .ttv2-target {
@@ -8127,6 +8368,41 @@
         border: 1px solid var(--profit);
         border-radius: 6px;
         background: rgba(153, 204, 0, 0.08);
+    }
+
+    .ttv2-buybox {
+        border-color: #4dabf7;
+        background: rgba(77, 171, 247, 0.08);
+    }
+
+    .ttv2-buybox .ttv2-sub, .ttv2-buybox .ttv2-tb-ok, .ttv2-buybox .ttv2-tb-warn {
+        margin-top: 4px;
+    }
+
+    .ttv2-buynext {
+        margin-top: 8px;
+        width: 100%;
+    }
+
+    .ttv2-tb-ok {
+        color: var(--profit);
+        font-size: 12px;
+    }
+
+    .ttv2-tb-warn {
+        color: var(--warn);
+        font-size: 12px;
+        font-weight: bold;
+    }
+
+    .ttv2-tb-mark {
+        color: var(--profit);
+        font-weight: bold;
+    }
+
+    .ttv2-tb-in {
+        color: var(--muted);
+        font-size: 12px;
     }
 
     .ttv2-tb + .ttv2-tb {
@@ -9441,8 +9717,12 @@
             // send him?"). Hidden everywhere else.
             this.tradeBoxEl = el('div', { class: 'ttv2-tradebox' });
             this.tradeBoxEl.style.display = 'none';
+            // The buying run after a trader said yes: Next bazaar (3.12.8).
+            this.buyBoxEl = el('div', { class: 'ttv2-tradebox ttv2-buybox' });
+            this.buyBoxEl.style.display = 'none';
 
             this.listPage = el('div', { class: 'ttv2-page ttv2-page-list' }, [
+                this.buyBoxEl,
                 this.tradeBoxEl,
                 this.sellerEl,
                 this.chipsEl,
@@ -9897,43 +10177,91 @@
         }
 
         /**
-         * Torn's trade page: each trade you accepted in Torn Bids - what to send,
-         * how many, what they pay - with a tick per item as you add it (the tick
-         * is shared with Torn Bids). Read only: nothing on Torn's page is typed
-         * or pressed.
+         * Torn's trade page: the trade you accepted in Torn Bids - is this the
+         * right person, did they put in the money, what to send and what is in
+         * already. Read only: Fill on the add step is the only thing that types,
+         * one row per press.
          *
-         * @param {Array|null} trades - accepted trades (core/accepted.js), newest first; null hides it
+         * @param {Array|null} trades - accepted trades (core/accepted.js); null hides the box
+         * @param {object} [ctx] - {partner, match: 'ok'|'other'|null, wanted: string[],
+         *   need: [{name, qty, inside}], money: {offer, expected}|null}
          */
-        setTrades(trades) {
+        setTrades(trades, ctx = {}) {
             const box = this.tradeBoxEl;
             if (!box) return;
             const list = trades || [];
-            const sig = JSON.stringify(list.map((t) => [t.key, t.at, t.items.map((i) => [i.line, i.units, i.sent])]));
+            const show = list.length > 0 || ctx.match === 'other';
+            const sig = JSON.stringify([list.map((t) => [t.key, t.at, t.items.map((i) => [i.line, i.units, i.sent, (i.steps || []).map((s) => s.boughtQty)])]), ctx]);
             if (sig === this.tradeSig) return;
             this.tradeSig = sig;
             box.textContent = '';
-            box.style.display = list.length ? '' : 'none';
+            box.style.display = show ? '' : 'none';
+            if (!show) return;
+            if (ctx.match === 'other') {
+                box.appendChild(el('div', { class: 'ttv2-tb-warn', text: 'This trade is with ' + ctx.partner + '. The trade you accepted is with ' + (ctx.wanted || []).join(', ') + '.' }));
+                return;
+            }
             for (const t of list) {
-                const sent = t.items.filter((i) => i.sent).length;
+                const need = ctx.need && list.length === 1 ? ctx.need : t.items.map((i) => ({ name: i.name, qty: i.units, inside: 0 }));
+                const expected = ctx.money ? ctx.money.expected : t.pays;
                 const block = el('div', { class: 'ttv2-tb' }, [
                     el('div', { class: 'ttv2-tb-head' }, [
                         el('b', { text: 'Trade with ' + t.trader.name }),
-                        el('span', { class: 'ttv2-money', text: formatMoney(t.pays) }),
+                        el('span', { class: 'ttv2-money', text: formatMoney(expected) }),
                     ]),
-                    el('div', { class: 'ttv2-sub', text: 'Send these (' + sent + ' of ' + t.items.length + ' added). ' + t.trader.name + ' should pay ' + formatMoney(t.pays) + ': check their offer before you accept.' }),
                 ]);
-                for (const i of t.items) {
-                    const input = el('input', { type: 'checkbox', 'aria-label': 'Added ' + i.name });
-                    input.checked = Boolean(i.sent);
-                    input.addEventListener('change', () => this.handlers.onTradeSent && this.handlers.onTradeSent(t.key, i.line, input.checked));
-                    block.appendChild(el('label', { class: 'ttv2-tb-row' + (i.sent ? ' ttv2-tb-done' : '') }, [
-                        input,
-                        el('span', { class: 'ttv2-tb-name' }, [el('b', { text: i.name }), document.createTextNode(' ×' + i.units.toLocaleString('en-US'))]),
-                        el('span', { class: 'ttv2-money', text: formatMoney(i.units * i.bid) }),
+                // Is this them? (Read off the trade view; the add step remembers it.)
+                if (ctx.match === 'ok') block.appendChild(el('div', { class: 'ttv2-tb-ok', text: 'Trading with ' + ctx.partner + ' ✓' }));
+                else block.appendChild(el('div', { class: 'ttv2-sub', text: 'Open the trade with ' + t.trader.name + ' to check it is them.' }));
+                // Their money against what the trade says.
+                if (ctx.money) {
+                    const m = ctx.money;
+                    const text = m.offer >= m.expected
+                        ? t.trader.name + ' put in ' + formatMoney(m.offer) + ' ✓'
+                        : m.offer > 0
+                            ? t.trader.name + ' put in ' + formatMoney(m.offer) + ' of ' + formatMoney(m.expected) + ': ' + formatMoney(m.expected - m.offer) + ' short'
+                            : t.trader.name + ' has not put money in yet (' + formatMoney(m.expected) + ' expected)';
+                    block.appendChild(el('div', { class: m.offer >= m.expected ? 'ttv2-tb-ok' : 'ttv2-tb-warn', text }));
+                }
+                for (const n of need) {
+                    const inTrade = n.inside >= n.qty;
+                    block.appendChild(el('div', { class: 'ttv2-tb-row' + (inTrade ? ' ttv2-tb-done' : '') }, [
+                        el('span', { class: 'ttv2-tb-mark', text: inTrade ? '✓' : '·' }),
+                        el('span', { class: 'ttv2-tb-name' }, [el('b', { text: n.name }), document.createTextNode(' ×' + n.qty.toLocaleString('en-US'))]),
+                        el('span', { class: 'ttv2-tb-in', text: n.inside ? n.inside.toLocaleString('en-US') + ' in' : '' }),
                     ]));
                 }
                 box.appendChild(block);
             }
+        }
+
+        /**
+         * The buying run, on any Torn page while a trade you accepted still has
+         * something to buy: where you are, what you took here, and Next bazaar
+         * (one press opens one bazaar).
+         *
+         * @param {object|null} v - {trader, done, total, here: {name, qty, price, seller, listed, bought}|null, next: {name, seller}|null, last}
+         */
+        setBuying(v) {
+            const box = this.buyBoxEl;
+            if (!box) return;
+            const sig = JSON.stringify(v);
+            if (sig === this.buySig) return;
+            this.buySig = sig;
+            box.textContent = '';
+            box.style.display = v ? '' : 'none';
+            if (!v) return;
+            box.appendChild(el('div', { class: 'ttv2-tb-head' }, [
+                el('b', { text: 'Buying for ' + v.trader }),
+                el('span', { class: 'ttv2-sub', text: v.done + ' of ' + v.total + ' done' }),
+            ]));
+            if (v.here) {
+                const h = v.here;
+                box.appendChild(el('div', { class: 'ttv2-sub', text: 'Here: buy ' + h.qty.toLocaleString('en-US') + ' ' + h.name + ' at ' + formatMoney(h.price) + ' from ' + h.seller + ' (marked on the page).' }));
+                box.appendChild(el('div', { class: h.bought >= h.qty ? 'ttv2-tb-ok' : h.listed ? 'ttv2-sub' : 'ttv2-tb-warn', text: h.bought ? 'You took ' + h.bought.toLocaleString('en-US') + ' of ' + h.qty.toLocaleString('en-US') + (h.bought >= h.qty ? ' ✓' : '') : h.listed ? 'Not bought yet - or skip it: Next counts only what you took.' : 'Not on this page at that price any more.' }));
+            }
+            const label = v.here && !v.next ? 'Done - go to the trade' : v.here && v.last ? 'Done - go to the trade' : v.here ? 'Next bazaar' : 'Open the next bazaar' + (v.next ? ': ' + v.next.seller : '');
+            box.appendChild(el('button', { type: 'button', class: 'ttv2-primary ttv2-buynext', text: label, onclick: () => this.handlers.onBuyNext && this.handlers.onBuyNext() }));
         }
 
         /** "Torn API calls in the last minute: 12 of 70", every tab together. */
@@ -11595,6 +11923,12 @@
         minProfitPct: 1,
         /* What you keep of your own when a trade offers it: itemId -> n | 'all'. */
         keep: {},
+        /*
+         * Categories a flip (and so a trade) never buys: the friend, 2026-09-27,
+         * "don't include clothes". Weapons, armour and cars are never flipped
+         * whatever this says (every copy is its own).
+         */
+        neverFlip: ['Clothing'],
     };
 
     /** The item list shows this many at a time. */
@@ -11788,6 +12122,29 @@
         }
 
         /** Settings › Flips › Keep for yourself: each item kept, with Remove. */
+        /** Settings › Flips › Never flip: a tick per category (Torn's item types). */
+        renderNeverFlip(p) {
+            if (!this.neverListEl) return;
+            const never = new Set((p && p.neverFlip) || []);
+            const seen = (this.state.categories || []).map((c) => c.category);
+            const cats = [...new Set([...seen, ...never])].filter((c) => !/^(Melee|Primary|Secondary|Defensive|Weapon|Armor|Armour|Car)$/.test(c)).sort((a, b) => a.localeCompare(b));
+            const sig = JSON.stringify([cats, [...never]]);
+            if (sig === this.neverSig) return;
+            this.neverSig = sig;
+            this.neverListEl.textContent = '';
+            for (const c of cats) {
+                const input = spEl('input', { type: 'checkbox', 'data-focus': 'never:' + c });
+                input.checked = never.has(c);
+                input.addEventListener('change', () => {
+                    const next = new Set((this.state.prefs && this.state.prefs.neverFlip) || []);
+                    if (input.checked) next.add(c);
+                    else next.delete(c);
+                    if (this.h.onPrefsChange) this.h.onPrefsChange({ neverFlip: [...next] });
+                });
+                this.neverListEl.appendChild(spEl('label', { class: 'sp-check sp-never' }, [input, spEl('span', { text: c })]));
+            }
+        }
+
         renderKeepList(p) {
             if (!this.keepListEl) return;
             const keep = Object.entries((p && p.keep) || {});
@@ -12226,6 +12583,10 @@
                     this.nwStateEl,
                     note(['A flip never asks a trader to pay more than this share of their networth. Networth comes from Torn\'s public stats, read with your Limited key.']),
                 ]),
+                field('Never flip', null, [
+                    (this.neverListEl = spEl('div', { class: 'sp-neverlist' })),
+                    note(['Flips and trades never buy these. Weapons, armour and cars never, whatever is ticked: every copy is its own.']),
+                ]),
                 field('Keep for yourself', null, [
                     (this.keepListEl = spEl('div', { class: 'sp-keeplist' })),
                     note(['What a trade leaves out of what you hold. Set it in a trade: untick one of yours, or give fewer than you hold.']),
@@ -12436,6 +12797,7 @@
                 this.maxStateEl.textContent = 'Saved: ' + count(p.maxPerFlip || 100) + ' items.';
             }
             this.renderKeepList(p);
+            this.renderNeverFlip(p);
             if (!this.minDirty) {
                 const m = p.minProfitPct ?? 1;
                 this.minInput.placeholder = String(m);
@@ -13201,17 +13563,26 @@
                 spEl('h3', { text: 'Trade with ' + b.name + ' · accepted ' + formatAge(Date.now() - A.at) }),
             ]);
             const sent = A.items.filter((i) => i.sent).length;
+            const tot = A.totals || { pays: A.pays, cost: A.cost, profit: A.profit };
+            const pending = A.items.some((i) => (i.steps || []).some((st) => !(st.bought || st.skipped || st.boughtQty > 0)));
             card.appendChild(spEl('div', { class: 'sp-th' }, [
                 spEl('span', { class: 'sp-th-l' }, [
                     spEl('span', {}, [this.playerName(b.name, b.id, 'acc:buyer'), ' ', this.trustBadge(b)]),
                     this.status(b),
                 ]),
                 spEl('span', { class: 'sp-th-r' }, [
-                    spEl('div', { class: 'sp-big', text: signed(A.profit) }),
-                    spEl('small', { text: 'buy for ' + formatMoney(A.cost) + ' · ' + b.name + ' pays ' + formatMoney(A.pays) + ' · sent ' + sent + ' of ' + A.items.length }),
+                    spEl('div', { class: 'sp-big', text: signed(tot.profit) }),
+                    spEl('small', { text: 'buy for ' + formatMoney(tot.cost) + ' · ' + b.name + ' pays ' + formatMoney(tot.pays) + ' · sent ' + sent + ' of ' + A.items.length }),
                 ]),
             ]));
             card.appendChild(spEl('p', { class: 'sp-note', text: 'Frozen: nothing here changes while you buy and send. The same list is in the panel on Torn\'s trade page.' }));
+            // The buying run: one bazaar at a time, Next in the panel on Torn's pages.
+            if (pending) {
+                card.appendChild(spEl('div', { class: 'sp-tpick' }, [
+                    spEl('span', { class: 'sp-note', text: 'Start buying: the first bazaar opens with the listing marked. Buy it (or not), then press Next bazaar in the panel - it counts what you took.' }),
+                    spEl('button', { type: 'button', class: 'sp-btn sp-primary', 'data-focus': 'acc:start', text: 'Start buying', onclick: () => this.h.onTradeStartBuying && this.h.onTradeStartBuying(A.key) }),
+                ]));
+            }
 
             const words = {
                 ok: (c) => 'still listed' + (c.seenAt ? ' · seen ' + formatAge(Date.now() - c.seenAt) : ''),
@@ -13233,12 +13604,24 @@
                     spEl('span', { class: 'sp-pic sp-pic-s' }, [this.image('acc-' + i.kind, i.itemId)]),
                     spEl('span', { class: 'sp-ti-l' }, [
                         spEl('b', { text: i.name }),
-                        spEl('small', { text: 'send ' + count(i.units) + (i.kind === 'yours' ? ' of yours' : '') + ' · ' + b.name + ' pays ' + formatMoney(i.bid) + ' each' + (i.sent ? ' · sent' : '') }),
+                        spEl('small', { text: 'send ' + count(i.send !== undefined ? i.send : i.units) + (i.kind === 'yours' ? ' of yours' : '') + (i.send !== undefined && i.send !== i.units && i.kind !== 'yours' ? ' (planned ' + count(i.units) + ')' : '') + ' · ' + b.name + ' pays ' + formatMoney(i.bid) + ' each' + (i.sent ? ' · sent' : '') }),
                     ]),
-                    spEl('span', { class: 'sp-ti-p', text: formatMoney(i.units * i.bid) }),
+                    spEl('span', { class: 'sp-ti-p' }, [
+                        formatMoney((i.send !== undefined ? i.send : i.units) * i.bid),
+                        // Not profitable any more (no listing under their price): drop it.
+                        i.kind !== 'yours' && (i.steps || []).some((st) => ['gone', 'price'].includes(st.check.state) && !st.repl && !st.bought)
+                            ? spEl('button', { type: 'button', class: 'sp-btn sp-drop', 'data-focus': 'acc:drop:' + i.line, title: 'No bazaar sells it under ' + b.name + '\'s price now', text: 'Drop it', onclick: () => this.h.onTradeDrop && this.h.onTradeDrop(A.key, i.line) })
+                            : null,
+                    ]),
                     i.steps.length ? spEl('div', { class: 'sp-buys' }, i.steps.map((st, k) => spEl('div', { class: 'sp-buy sp-check-' + st.check.state }, [
                         box(st.bought, 'Bought ' + st.qty + ' from ' + (st.sellerName || st.sellerId), 'acc:bought:' + i.line + ':' + k, (yes) => this.h.onTradeTick && this.h.onTradeTick(A.key, i.line, { step: k, bought: yes })),
-                        spEl('span', {}, ['Buy ', spEl('b', { text: count(st.qty) }), ' from ', this.playerName(st.sellerName || 'Player ' + st.sellerId, st.sellerId, 'acc:seller:' + i.itemId + ':' + k), ' at ' + formatMoney(st.price) + ' · ', spEl('span', { class: 'sp-checkword', text: words[st.check.state](st.check) })]),
+                        spEl('span', {}, [
+                            'Buy ', spEl('b', { text: count(st.qty) }), ' from ', this.playerName(st.sellerName || 'Player ' + st.sellerId, st.sellerId, 'acc:seller:' + i.itemId + ':' + k), ' at ' + formatMoney(st.price) + ' · ',
+                            spEl('span', { class: 'sp-checkword', text: st.skipped ? 'skipped' : st.boughtQty > 0 && !st.bought ? 'bought ' + count(st.boughtQty) + ' of ' + count(st.qty) : words[st.check.state](st.check) }),
+                            // Gone or re-priced: the next cheapest still under their price.
+                            st.repl ? spEl('span', { class: 'sp-repl' }, [' · next cheapest: ' + count(st.repl.qty) + ' from ' + (st.repl.sellerName || 'Player ' + st.repl.sellerId) + ' at ' + formatMoney(st.repl.price) + ' ', spEl('button', { type: 'button', class: 'sp-link', 'data-focus': 'acc:repl:' + i.line + ':' + k, text: 'Use it', onclick: () => this.h.onTradeReplace && this.h.onTradeReplace(A.key, i.line, k, st.repl) })]) : null,
+                            ['gone', 'price'].includes(st.check.state) && !st.repl && !st.bought ? spEl('span', { class: 'sp-bad', text: ' · not profitable any more' }) : null,
+                        ]),
                         st.bought ? null : this.link('Open bazaar', bazaarUrl(st.sellerId, i.itemId, st.price), { focus: 'acc:bazaar:' + i.itemId + ':' + k }),
                     ]))) : null,
                 ]));
@@ -13618,6 +14001,12 @@
     .sp-gone { opacity: 0.8; }
     .sp-gone-mark { width: 16px; height: 16px; border-radius: 50%; background: var(--warn); color: #131313; font-weight: bold; font-size: 11px; display: inline-flex; align-items: center; justify-content: center; }
     .sp-gone small { color: var(--warn); }
+    .sp-buy .sp-bad { color: var(--bad); font-weight: bold; }
+    .sp-repl { color: var(--text); }
+    .sp-repl .sp-link { font-size: 12px; }
+    .sp-drop { display: block; margin: 4px 0 0 auto; height: 24px; padding: 0 8px; font-size: 12px; }
+    .sp-neverlist { display: flex; flex-wrap: wrap; gap: 6px 14px; }
+    .sp-never { font-size: 12px; }
     .sp-keeplist { display: flex; flex-direction: column; gap: 6px; }
     .sp-keeprow { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
     .sp-big { font-size: 22px; font-weight: bold; color: var(--price); font-variant-numeric: tabular-nums; }
@@ -14435,6 +14824,7 @@
 
 
 
+
     const STORE_KEY = 'apiKey';
     const STORE_ITEMS = 'itemsCache';
     const STORE_NPC = 'npcCache';
@@ -14475,6 +14865,10 @@
     const STORE_LEDGER_KEY_DEAD = 'ledgerKeyDead';
     const STORE_LEDGER_SELF = 'ledgerSelf';
     const STORE_LEDGER = 'ledger';
+    /* Our marks on Torn's pages for a trade: the listing to buy, the rows to send, Fill. */
+    const TRADE_BUY_CLASS = 'ttv2-buyhere';
+    const TRADE_SEND_CLASS = 'ttv2-sendrow';
+    const TRADE_FILL_CLASS = 'ttv2-sendfill';
     /* Traders you marked Declined in Torn Bids: trader key -> until (an hour). */
     const STORE_SELL_DECLINED = 'sellDeclined';
     /* Trades a trader said yes to, frozen (core/accepted.js): trader key -> trade. Torn Bids and the overlay's trade page share it. */
@@ -14625,6 +15019,11 @@
 
     const app = {
         tabId: makeTabId(),
+        /* Torn's trade page: who each trade (by its ID) is with, and what you have put in. */
+        tradePartners: new Map(),
+        tradeInside: new Map(),
+        buyHere: null,
+        tradeFillBound: false,
         index: null,
         /* Who buys what, from what the traders page stored: for the bazaar tags. */
         traderLookup: null,
@@ -15142,6 +15541,7 @@
         // A trusted trader pays more than a listing here asks: named on its card.
         markTraderTags(app.pageType === PAGE_BAZAAR && sellerId && !closedHere ? traderTags(listings) : []);
         showBazaarTarget(listings);
+        trackTradeBuying(app.pageType === PAGE_BAZAAR ? listings : []);
 
         app.lastScanAt = now;
         app.pageRows = live;
@@ -16748,24 +17148,242 @@
         else refreshView();
     }
 
-    /**
-     * Torn's trade page (trade.php): the trades you accepted in Torn Bids, as a
-     * list of what to send (the friend: "how do I remember the items I will send
-     * him? like add listing in the bazaar"). A trade opened with someone
-     * (#step=start&userID=...) shows theirs first. Only our own saved list is
-     * read; nothing on Torn's page is touched.
+    /* ------------------------------------------------------------------ *
+     * A trade on Torn's pages (3.12.8): the buying run, and the trade page
+     * ------------------------------------------------------------------ */
+
+    /*
+     * The buying run (the owner, 2026-09-27): after the trader said yes, Next
+     * bazaar opens the next seller's bazaar with the listing to buy marked; you
+     * buy it or not and press Next again; what you took is counted from the
+     * listing's stock on the page (the page you are viewing - read only). One
+     * click, one page: never several at once.
      */
-    function showTradeChecklist(fresh = null) {
+    const buyRun = { stepKey: null, firstSeen: null, nowSeen: null, seenGone: false };
+
+    /** The accepted trade and step this bazaar page is for, if any. */
+    function buyStepHere(listings) {
+        const seller = bazaarOwnerId(location.href);
+        if (!seller) return null;
+        for (const t of Object.values(sellAccepted())) {
+            for (const i of t.items) {
+                const k = (i.steps || []).findIndex((st) => !stepDone(st) && String(st.sellerId) === String(seller));
+                if (k < 0) continue;
+                const st = i.steps[k];
+                // The listing: this item, at (or under) the price planned.
+                const here = listings.filter((l) => String(l.itemId) === String(i.itemId));
+                const listing = here.find((l) => l.listingPrice <= st.price) || null;
+                return { trade: t, line: i.line || 'flip:' + i.itemId, index: k, step: st, item: i, listing, anyHere: here.length > 0 };
+            }
+        }
+        return null;
+    }
+
+    /** On a bazaar page: mark the listing to buy, count what you took, show the box with Next. */
+    function trackTradeBuying(listings) {
         if (!app.panel) return;
-        if (!isTradePage(location.href)) {
-            app.panel.setTrades(null);
+        const pending = Object.values(sellAccepted()).filter((t) => nextStep(t));
+        if (!pending.length) {
+            app.buyHere = null;
+            app.panel.setBuying(null);
+            clearBuyMarks();
             return;
         }
-        // Just written by this tab: drawn from that, not re-read.
-        const list = Object.values(fresh || sellAccepted());
-        const m = String(location.hash).match(/userID=(\d+)/i);
-        if (m) list.sort((a, b) => (b.trader.id === m[1]) - (a.trader.id === m[1]));
-        app.panel.setTrades(list);
+        const here = app.pageType === PAGE_BAZAAR ? buyStepHere(listings) : null;
+        app.buyHere = here;
+        if (here) {
+            const key = here.trade.key + '|' + here.line + '|' + here.index;
+            if (buyRun.stepKey !== key) Object.assign(buyRun, { stepKey: key, firstSeen: null, nowSeen: null, seenGone: false });
+            const stock = here.listing ? Number(here.listing.qty) || null : null;
+            if (here.listing && buyRun.firstSeen === null) buyRun.firstSeen = stock;
+            if (buyRun.firstSeen !== null) {
+                buyRun.nowSeen = here.listing ? stock : null;
+                buyRun.seenGone = !here.listing;
+            }
+            markTradeTarget(here.listing ? here.listing.el : null, 'Buy ' + here.step.qty.toLocaleString('en-US') + ' for ' + here.trade.trader.name);
+        } else {
+            clearBuyMarks();
+        }
+        const t = here ? here.trade : pending[0];
+        const steps = t.items.flatMap((i) => i.steps || []);
+        const done = steps.filter(stepDone).length;
+        const bought = here && buyRun.firstSeen !== null ? boughtFromStock(buyRun.firstSeen, buyRun.nowSeen, here.step.qty) : 0;
+        const next = nextStep(t);
+        app.panel.setBuying({
+            trader: t.trader.name,
+            done,
+            total: steps.length,
+            here: here
+                ? {
+                    name: here.item.name,
+                    qty: here.step.qty,
+                    price: here.step.price,
+                    seller: here.step.sellerName || 'this bazaar',
+                    listed: Boolean(here.listing),
+                    bought,
+                }
+                : null,
+            next: next ? { name: next.name, seller: next.step.sellerName || 'the next bazaar' } : null,
+            last: Boolean(here && next && steps.filter((st) => !stepDone(st)).length === 1),
+        });
+    }
+
+    /** Next bazaar: record what you took here, then open the next step (one page). */
+    function onBuyNext() {
+        const here = app.buyHere;
+        let all = sellAccepted();
+        let t = here ? all[here.trade.key] : Object.values(all).find((x) => nextStep(x));
+        if (!t) return;
+        if (here) {
+            const took = buyRun.firstSeen !== null ? boughtFromStock(buyRun.firstSeen, buyRun.nowSeen, here.step.qty) : 0;
+            t = recordBuy(t, here.line, here.index, took);
+            all = { ...all, [t.key]: t };
+            saveSellAccepted(all);
+            buyRun.stepKey = null;
+        }
+        const next = nextStep(t);
+        if (next) {
+            location.assign(bazaarUrl(next.step.sellerId, next.itemId, next.step.price));
+            return;
+        }
+        // Everything bought (or skipped): on to the trade.
+        if (t.trader.id) location.assign(tradeUrl(t.trader.id));
+        else trackTradeBuying([]);
+    }
+
+    /** Fill on the trade page: what you typed there, to put back on the second press. */
+    const tradeFill = new Map();
+
+    /**
+     * Torn's trade page: who the trade is with, whether they put in what the
+     * trade you accepted says, and on the add step each item to send marked,
+     * with Fill (one row per press: types that row's quantity; you press ADD TO
+     * TRADE and Accept yourself).
+     */
+    function scanTradePage() {
+        if (!app.panel) return;
+        if (!isTradePage(location.href)) {
+            clearSendMarks();
+            return;
+        }
+        const accepted = Object.values(sellAccepted());
+        const view = readTradeView(document);
+        const tradeId = (String(location.hash).match(/ID=(\d+)/) || [])[1] || null;
+        if (view && view.partner && tradeId) app.tradePartners.set(tradeId, view.partner);
+        if (view && tradeId) app.tradeInside.set(tradeId, view.you.items);
+        const partner = (view && view.partner) || (tradeId ? app.tradePartners.get(tradeId) : null) || null;
+        const lower = (s) => String(s || '').toLowerCase();
+        const trade = partner ? accepted.find((t) => lower(t.trader.name) === lower(partner)) : accepted.length === 1 ? accepted[0] : null;
+
+        // What goes in, per item (one item can be in a trade twice: flipped and yours).
+        const need = new Map();
+        for (const i of (trade && trade.items) || []) {
+            const n = sendUnits(i);
+            if (n > 0) need.set(i.itemId, { name: i.name, qty: (need.get(i.itemId) || { qty: 0 }).qty + n });
+        }
+        const inside = new Map();
+        for (const it of (tradeId && app.tradeInside.get(tradeId)) || []) inside.set(lower(it.name), (inside.get(lower(it.name)) || 0) + it.qty);
+        const expected = trade ? acceptedTotals(trade).pays : 0;
+
+        app.panel.setTrades(trade ? [trade] : partner ? [] : accepted, {
+            partner,
+            match: trade ? 'ok' : partner && accepted.length ? 'other' : null,
+            wanted: accepted.map((t) => t.trader.name),
+            need: [...need.values()].map((n) => ({ ...n, inside: inside.get(lower(n.name)) || 0 })),
+            money: view && trade ? { offer: view.them.money, expected } : null,
+        });
+
+        // The add step: mark each row to send, with Fill.
+        clearSendMarks();
+        if (!trade) return;
+        for (const row of readTradeAddRows(document)) {
+            const n = need.get(row.itemId);
+            if (!n) continue;
+            const left = Math.max(0, n.qty - (inside.get(lower(n.name)) || 0));
+            row.el.classList.add(TRADE_SEND_CLASS);
+            const cell = row.el.querySelector('.info-wrap') || row.el.querySelector('.name-wrap');
+            if (!cell) continue;
+            const chip = document.createElement('span');
+            chip.className = TRADE_FILL_CLASS;
+            chip.dataset.itemId = row.itemId;
+            if (row.single) {
+                chip.textContent = left ? 'Send 1 · tick Torn\'s box' : 'In the trade';
+            } else if (!left) {
+                chip.textContent = 'All ' + n.qty.toLocaleString('en-US') + ' in the trade';
+            } else {
+                const filled = tradeFill.has(row.itemId) && row.qty && row.qty.value === String(left);
+                chip.setAttribute('role', 'button');
+                chip.setAttribute('aria-pressed', String(filled));
+                chip.dataset.fill = String(left);
+                chip.title = filled ? 'Untick to put back what was there' : 'Type ' + left + ' into this row\'s Qty. You press ADD TO TRADE.';
+                chip.textContent = (filled ? '☑ ' : '☐ ') + 'Fill ' + left.toLocaleString('en-US') + ' for ' + trade.trader.name;
+            }
+            cell.appendChild(chip);
+        }
+        bindTradeFillPress();
+    }
+
+    /** The trade page's marks (rows to send, Fill), gone before they are drawn again. */
+    function clearSendMarks() {
+        for (const n of document.querySelectorAll('.' + TRADE_FILL_CLASS)) n.remove();
+        for (const n of document.querySelectorAll('.' + TRADE_SEND_CLASS)) n.classList.remove(TRADE_SEND_CLASS);
+    }
+
+    /** The buying run's mark on a bazaar listing. Apart from the trade page's: each clears its own. */
+    function clearBuyMarks() {
+        for (const n of document.querySelectorAll('.' + TRADE_BUY_CLASS)) {
+            n.classList.remove(TRADE_BUY_CLASS);
+            delete n.dataset.ttv2Buy;
+        }
+    }
+
+    /** The listing to buy for a trade: its own colour and words, apart from the NPC deals' marks. */
+    function markTradeTarget(el, words) {
+        for (const n of document.querySelectorAll('.' + TRADE_BUY_CLASS)) {
+            if (n !== el) {
+                n.classList.remove(TRADE_BUY_CLASS);
+                delete n.dataset.ttv2Buy;
+            }
+        }
+        if (!el) return;
+        if (!el.classList.contains(TRADE_BUY_CLASS)) {
+            el.classList.add(TRADE_BUY_CLASS);
+            if (el.scrollIntoView) el.scrollIntoView({ block: 'center' });
+        }
+        if (el.dataset.ttv2Buy !== words) el.dataset.ttv2Buy = words;
+    }
+
+    /**
+     * Fill on the trade page, caught once in the capture phase (as on your
+     * bazaar's add page: Torn's rows react to a press before a click lands).
+     * One press types one row's quantity; a second press puts back what was there.
+     */
+    function bindTradeFillPress() {
+        if (app.tradeFillBound) return;
+        app.tradeFillBound = true;
+        const chipOf = (event) => (event.target && event.target.closest ? event.target.closest('.' + TRADE_FILL_CLASS + '[data-fill]') : null);
+        for (const type of ['mousedown', 'pointerdown', 'touchstart']) {
+            window.addEventListener(type, (event) => {
+                if (chipOf(event)) event.stopPropagation();
+            }, true);
+        }
+        window.addEventListener('click', (event) => {
+            const chip = chipOf(event);
+            if (!chip) return;
+            event.preventDefault();
+            event.stopPropagation();
+            const row = readTradeAddRows(document).find((r) => r.itemId === chip.dataset.itemId);
+            if (!row || !row.qty) return;
+            const want = chip.dataset.fill;
+            if (tradeFill.has(row.itemId) && row.qty.value === want) {
+                writeInputs([row.qty], tradeFill.get(row.itemId));
+                tradeFill.delete(row.itemId);
+            } else {
+                tradeFill.set(row.itemId, row.qty.value);
+                writeInputs([row.qty], want);
+            }
+            scanTradePage();
+        }, true);
     }
 
     /** Settings each tab keeps to itself: where its panel sits and which list it shows. */
@@ -16897,8 +17515,8 @@
     }
 
     function handleRouteChange() {
-        // Torn's trade page: the accepted trades' lists (it changes by hash, too).
-        showTradeChecklist();
+        // Torn's trade page: the accepted trade's checks (it changes by hash, too).
+        scanTradePage();
         const next = detectPage(location.href);
         if (next === app.pageType && location.href === app.pageHref) return;
 
@@ -17741,10 +18359,16 @@
             return flipBuyer(buyersOf(id), { avg: item ? Number(item.marketValue) || null : null, type: item ? item.type : null, subType: item ? item.subType : null, unitsOf });
         };
         const flipBuyersCache = new Map();
+        // Settings › Flips › Never flip (Clothing by default: the friend's "don't include clothes").
+        const neverFlip = new Set(prefs.neverFlip || []);
         const flipBuyersOf = (id) => {
             const key = String(id);
             if (!flipBuyersCache.has(key)) {
                 const item = itemOf(id);
+                if (neverFlip.has(itemCategory(item))) {
+                    flipBuyersCache.set(key, []);
+                    return [];
+                }
                 flipBuyersCache.set(key, flipBuyers(buyersOf(id), { avg: item ? Number(item.marketValue) || null : null, type: item ? item.type : null, subType: item ? item.subType : null, unitsOf }));
             }
             return flipBuyersCache.get(key);
@@ -17937,7 +18561,20 @@
                     accepted: {
                         ...acc,
                         buyer,
-                        items: acc.items.map((i) => ({ ...i, steps: i.steps.map((st) => ({ ...st, check: stepState(st, sellersOf(i.itemId)) })) })),
+                        items: acc.items.map((i) => ({
+                            ...i,
+                            send: sendUnits(i),
+                            steps: i.steps.map((st) => {
+                                const check = stepState(st, sellersOf(i.itemId));
+                                // Gone, re-priced or short: the next cheapest still under their price
+                                // (the friend: "their prices change, or not available any more").
+                                const repl = ['gone', 'price', 'short'].includes(check.state) && !stepDone(st)
+                                    ? replacementFor(st, sellersOf(i.itemId), i.bid, (each, price) => enoughProfit(each, price, 'TRADER', prefs.minProfitPct))
+                                    : null;
+                                return { ...st, check, repl };
+                            }),
+                        })),
+                        totals: acceptedTotals(acc),
                     },
                 };
             }
@@ -18724,6 +19361,26 @@
                 sell.tradePick.set(String(itemId), acc.key);
                 renderSellingNow();
             },
+            onTradeReplace: (key, line, index, repl) => {
+                const all = sellAccepted();
+                if (!all[key]) return;
+                all[key] = replaceStep(all[key], line, index, repl);
+                saveSellAccepted(all);
+                renderSellingNow();
+            },
+            onTradeDrop: (key, line) => {
+                const all = sellAccepted();
+                if (!all[key]) return;
+                all[key] = dropLine(all[key], line);
+                saveSellAccepted(all);
+                renderSellingNow();
+            },
+            // Start the buying run: the first bazaar to buy from (one page).
+            onTradeStartBuying: (key) => {
+                const t = sellAccepted()[key];
+                const next = t && nextStep(t);
+                if (next) openSellLink(bazaarUrl(next.step.sellerId, next.itemId, next.step.price));
+            },
             onTradeTick: (key, line, tick) => {
                 tickSellAccepted(key, line, tick);
                 renderSellingNow();
@@ -19259,7 +19916,12 @@
         app.settings = loadSettings();
         app.keyDead = Boolean(gmGet(STORE_KEY_DEAD, false));
         gmOnChange(STORE_SETTINGS, onRemoteSettings);
-        gmOnChange(STORE_SELL_ACCEPTED, () => showTradeChecklist());
+        // A trade accepted, bought or changed in another tab: the marks and boxes follow.
+        gmOnChange(STORE_SELL_ACCEPTED, () => {
+            scanTradePage();
+            if (app.pageType === PAGE_BAZAAR) rescan();
+            else trackTradeBuying([]);
+        });
         gmOnChange(STORE_KEY_DEAD, onRemoteKey);
         gmOnChange(STORE_KEY, onRemoteKey);
 
@@ -19298,9 +19960,11 @@
                 renderMyBazaar();
             },
             getApiUse: () => (app.client ? app.client.stats() : null),
+            onBuyNext,
             // A tick on Torn's trade page: shared with Torn Bids.
             onTradeSent: (key, line, sent) => {
-                showTradeChecklist(tickSellAccepted(key, line, { sent }));
+                tickSellAccepted(key, line, { sent });
+                scanTradePage();
             },
             onFillListing: (market, index) => onFillFromListing(market, index),
             onFillSelected: () => {
@@ -19357,6 +20021,9 @@
 
             if (detectPage(location.href) === PAGE_NONE) {
                 if (app.pageType !== PAGE_NONE) rescan();
+                // Torn's trade page, and the buying box on other pages.
+                if (isTradePage(location.href)) scanTradePage();
+                trackTradeBuying([]);
                 return;
             }
 
@@ -19365,7 +20032,8 @@
 
         startPageWatch();
         startLiveFeed();
-        showTradeChecklist();
+        scanTradePage();
+        trackTradeBuying([]);
     }
 
     boot();

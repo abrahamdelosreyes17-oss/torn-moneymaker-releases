@@ -51,6 +51,12 @@ export const SELLING_PAGE_DEFAULTS = {
     minProfitPct: 1,
     /* What you keep of your own when a trade offers it: itemId -> n | 'all'. */
     keep: {},
+    /*
+     * Categories a flip (and so a trade) never buys: the friend, 2026-09-27,
+     * "don't include clothes". Weapons, armour and cars are never flipped
+     * whatever this says (every copy is its own).
+     */
+    neverFlip: ['Clothing'],
 };
 
 /** The item list shows this many at a time. */
@@ -244,6 +250,29 @@ export class SellingPage {
     }
 
     /** Settings › Flips › Keep for yourself: each item kept, with Remove. */
+    /** Settings › Flips › Never flip: a tick per category (Torn's item types). */
+    renderNeverFlip(p) {
+        if (!this.neverListEl) return;
+        const never = new Set((p && p.neverFlip) || []);
+        const seen = (this.state.categories || []).map((c) => c.category);
+        const cats = [...new Set([...seen, ...never])].filter((c) => !/^(Melee|Primary|Secondary|Defensive|Weapon|Armor|Armour|Car)$/.test(c)).sort((a, b) => a.localeCompare(b));
+        const sig = JSON.stringify([cats, [...never]]);
+        if (sig === this.neverSig) return;
+        this.neverSig = sig;
+        this.neverListEl.textContent = '';
+        for (const c of cats) {
+            const input = spEl('input', { type: 'checkbox', 'data-focus': 'never:' + c });
+            input.checked = never.has(c);
+            input.addEventListener('change', () => {
+                const next = new Set((this.state.prefs && this.state.prefs.neverFlip) || []);
+                if (input.checked) next.add(c);
+                else next.delete(c);
+                if (this.h.onPrefsChange) this.h.onPrefsChange({ neverFlip: [...next] });
+            });
+            this.neverListEl.appendChild(spEl('label', { class: 'sp-check sp-never' }, [input, spEl('span', { text: c })]));
+        }
+    }
+
     renderKeepList(p) {
         if (!this.keepListEl) return;
         const keep = Object.entries((p && p.keep) || {});
@@ -682,6 +711,10 @@ export class SellingPage {
                 this.nwStateEl,
                 note(['A flip never asks a trader to pay more than this share of their networth. Networth comes from Torn\'s public stats, read with your Limited key.']),
             ]),
+            field('Never flip', null, [
+                (this.neverListEl = spEl('div', { class: 'sp-neverlist' })),
+                note(['Flips and trades never buy these. Weapons, armour and cars never, whatever is ticked: every copy is its own.']),
+            ]),
             field('Keep for yourself', null, [
                 (this.keepListEl = spEl('div', { class: 'sp-keeplist' })),
                 note(['What a trade leaves out of what you hold. Set it in a trade: untick one of yours, or give fewer than you hold.']),
@@ -892,6 +925,7 @@ export class SellingPage {
             this.maxStateEl.textContent = 'Saved: ' + count(p.maxPerFlip || 100) + ' items.';
         }
         this.renderKeepList(p);
+        this.renderNeverFlip(p);
         if (!this.minDirty) {
             const m = p.minProfitPct ?? 1;
             this.minInput.placeholder = String(m);
@@ -1657,17 +1691,26 @@ export class SellingPage {
             spEl('h3', { text: 'Trade with ' + b.name + ' · accepted ' + formatAge(Date.now() - A.at) }),
         ]);
         const sent = A.items.filter((i) => i.sent).length;
+        const tot = A.totals || { pays: A.pays, cost: A.cost, profit: A.profit };
+        const pending = A.items.some((i) => (i.steps || []).some((st) => !(st.bought || st.skipped || st.boughtQty > 0)));
         card.appendChild(spEl('div', { class: 'sp-th' }, [
             spEl('span', { class: 'sp-th-l' }, [
                 spEl('span', {}, [this.playerName(b.name, b.id, 'acc:buyer'), ' ', this.trustBadge(b)]),
                 this.status(b),
             ]),
             spEl('span', { class: 'sp-th-r' }, [
-                spEl('div', { class: 'sp-big', text: signed(A.profit) }),
-                spEl('small', { text: 'buy for ' + formatMoney(A.cost) + ' · ' + b.name + ' pays ' + formatMoney(A.pays) + ' · sent ' + sent + ' of ' + A.items.length }),
+                spEl('div', { class: 'sp-big', text: signed(tot.profit) }),
+                spEl('small', { text: 'buy for ' + formatMoney(tot.cost) + ' · ' + b.name + ' pays ' + formatMoney(tot.pays) + ' · sent ' + sent + ' of ' + A.items.length }),
             ]),
         ]));
         card.appendChild(spEl('p', { class: 'sp-note', text: 'Frozen: nothing here changes while you buy and send. The same list is in the panel on Torn\'s trade page.' }));
+        // The buying run: one bazaar at a time, Next in the panel on Torn's pages.
+        if (pending) {
+            card.appendChild(spEl('div', { class: 'sp-tpick' }, [
+                spEl('span', { class: 'sp-note', text: 'Start buying: the first bazaar opens with the listing marked. Buy it (or not), then press Next bazaar in the panel - it counts what you took.' }),
+                spEl('button', { type: 'button', class: 'sp-btn sp-primary', 'data-focus': 'acc:start', text: 'Start buying', onclick: () => this.h.onTradeStartBuying && this.h.onTradeStartBuying(A.key) }),
+            ]));
+        }
 
         const words = {
             ok: (c) => 'still listed' + (c.seenAt ? ' · seen ' + formatAge(Date.now() - c.seenAt) : ''),
@@ -1689,12 +1732,24 @@ export class SellingPage {
                 spEl('span', { class: 'sp-pic sp-pic-s' }, [this.image('acc-' + i.kind, i.itemId)]),
                 spEl('span', { class: 'sp-ti-l' }, [
                     spEl('b', { text: i.name }),
-                    spEl('small', { text: 'send ' + count(i.units) + (i.kind === 'yours' ? ' of yours' : '') + ' · ' + b.name + ' pays ' + formatMoney(i.bid) + ' each' + (i.sent ? ' · sent' : '') }),
+                    spEl('small', { text: 'send ' + count(i.send !== undefined ? i.send : i.units) + (i.kind === 'yours' ? ' of yours' : '') + (i.send !== undefined && i.send !== i.units && i.kind !== 'yours' ? ' (planned ' + count(i.units) + ')' : '') + ' · ' + b.name + ' pays ' + formatMoney(i.bid) + ' each' + (i.sent ? ' · sent' : '') }),
                 ]),
-                spEl('span', { class: 'sp-ti-p', text: formatMoney(i.units * i.bid) }),
+                spEl('span', { class: 'sp-ti-p' }, [
+                    formatMoney((i.send !== undefined ? i.send : i.units) * i.bid),
+                    // Not profitable any more (no listing under their price): drop it.
+                    i.kind !== 'yours' && (i.steps || []).some((st) => ['gone', 'price'].includes(st.check.state) && !st.repl && !st.bought)
+                        ? spEl('button', { type: 'button', class: 'sp-btn sp-drop', 'data-focus': 'acc:drop:' + i.line, title: 'No bazaar sells it under ' + b.name + '\'s price now', text: 'Drop it', onclick: () => this.h.onTradeDrop && this.h.onTradeDrop(A.key, i.line) })
+                        : null,
+                ]),
                 i.steps.length ? spEl('div', { class: 'sp-buys' }, i.steps.map((st, k) => spEl('div', { class: 'sp-buy sp-check-' + st.check.state }, [
                     box(st.bought, 'Bought ' + st.qty + ' from ' + (st.sellerName || st.sellerId), 'acc:bought:' + i.line + ':' + k, (yes) => this.h.onTradeTick && this.h.onTradeTick(A.key, i.line, { step: k, bought: yes })),
-                    spEl('span', {}, ['Buy ', spEl('b', { text: count(st.qty) }), ' from ', this.playerName(st.sellerName || 'Player ' + st.sellerId, st.sellerId, 'acc:seller:' + i.itemId + ':' + k), ' at ' + formatMoney(st.price) + ' · ', spEl('span', { class: 'sp-checkword', text: words[st.check.state](st.check) })]),
+                    spEl('span', {}, [
+                        'Buy ', spEl('b', { text: count(st.qty) }), ' from ', this.playerName(st.sellerName || 'Player ' + st.sellerId, st.sellerId, 'acc:seller:' + i.itemId + ':' + k), ' at ' + formatMoney(st.price) + ' · ',
+                        spEl('span', { class: 'sp-checkword', text: st.skipped ? 'skipped' : st.boughtQty > 0 && !st.bought ? 'bought ' + count(st.boughtQty) + ' of ' + count(st.qty) : words[st.check.state](st.check) }),
+                        // Gone or re-priced: the next cheapest still under their price.
+                        st.repl ? spEl('span', { class: 'sp-repl' }, [' · next cheapest: ' + count(st.repl.qty) + ' from ' + (st.repl.sellerName || 'Player ' + st.repl.sellerId) + ' at ' + formatMoney(st.repl.price) + ' ', spEl('button', { type: 'button', class: 'sp-link', 'data-focus': 'acc:repl:' + i.line + ':' + k, text: 'Use it', onclick: () => this.h.onTradeReplace && this.h.onTradeReplace(A.key, i.line, k, st.repl) })]) : null,
+                        ['gone', 'price'].includes(st.check.state) && !st.repl && !st.bought ? spEl('span', { class: 'sp-bad', text: ' · not profitable any more' }) : null,
+                    ]),
                     st.bought ? null : this.link('Open bazaar', bazaarUrl(st.sellerId, i.itemId, st.price), { focus: 'acc:bazaar:' + i.itemId + ':' + k }),
                 ]))) : null,
             ]));
@@ -2074,6 +2129,12 @@ button:focus-visible, input:focus-visible, summary:focus-visible, a:focus-visibl
 .sp-gone { opacity: 0.8; }
 .sp-gone-mark { width: 16px; height: 16px; border-radius: 50%; background: var(--warn); color: #131313; font-weight: bold; font-size: 11px; display: inline-flex; align-items: center; justify-content: center; }
 .sp-gone small { color: var(--warn); }
+.sp-buy .sp-bad { color: var(--bad); font-weight: bold; }
+.sp-repl { color: var(--text); }
+.sp-repl .sp-link { font-size: 12px; }
+.sp-drop { display: block; margin: 4px 0 0 auto; height: 24px; padding: 0 8px; font-size: 12px; }
+.sp-neverlist { display: flex; flex-wrap: wrap; gap: 6px 14px; }
+.sp-never { font-size: 12px; }
 .sp-keeplist { display: flex; flex-direction: column; gap: 6px; }
 .sp-keeprow { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .sp-big { font-size: 22px; font-weight: bold; color: var(--price); font-variant-numeric: tabular-nums; }

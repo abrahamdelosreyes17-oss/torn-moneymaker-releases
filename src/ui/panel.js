@@ -314,8 +314,12 @@ export class Panel {
         // send him?"). Hidden everywhere else.
         this.tradeBoxEl = el('div', { class: 'ttv2-tradebox' });
         this.tradeBoxEl.style.display = 'none';
+        // The buying run after a trader said yes: Next bazaar (3.12.8).
+        this.buyBoxEl = el('div', { class: 'ttv2-tradebox ttv2-buybox' });
+        this.buyBoxEl.style.display = 'none';
 
         this.listPage = el('div', { class: 'ttv2-page ttv2-page-list' }, [
+            this.buyBoxEl,
             this.tradeBoxEl,
             this.sellerEl,
             this.chipsEl,
@@ -770,43 +774,91 @@ export class Panel {
     }
 
     /**
-     * Torn's trade page: each trade you accepted in Torn Bids - what to send,
-     * how many, what they pay - with a tick per item as you add it (the tick
-     * is shared with Torn Bids). Read only: nothing on Torn's page is typed
-     * or pressed.
+     * Torn's trade page: the trade you accepted in Torn Bids - is this the
+     * right person, did they put in the money, what to send and what is in
+     * already. Read only: Fill on the add step is the only thing that types,
+     * one row per press.
      *
-     * @param {Array|null} trades - accepted trades (core/accepted.js), newest first; null hides it
+     * @param {Array|null} trades - accepted trades (core/accepted.js); null hides the box
+     * @param {object} [ctx] - {partner, match: 'ok'|'other'|null, wanted: string[],
+     *   need: [{name, qty, inside}], money: {offer, expected}|null}
      */
-    setTrades(trades) {
+    setTrades(trades, ctx = {}) {
         const box = this.tradeBoxEl;
         if (!box) return;
         const list = trades || [];
-        const sig = JSON.stringify(list.map((t) => [t.key, t.at, t.items.map((i) => [i.line, i.units, i.sent])]));
+        const show = list.length > 0 || ctx.match === 'other';
+        const sig = JSON.stringify([list.map((t) => [t.key, t.at, t.items.map((i) => [i.line, i.units, i.sent, (i.steps || []).map((s) => s.boughtQty)])]), ctx]);
         if (sig === this.tradeSig) return;
         this.tradeSig = sig;
         box.textContent = '';
-        box.style.display = list.length ? '' : 'none';
+        box.style.display = show ? '' : 'none';
+        if (!show) return;
+        if (ctx.match === 'other') {
+            box.appendChild(el('div', { class: 'ttv2-tb-warn', text: 'This trade is with ' + ctx.partner + '. The trade you accepted is with ' + (ctx.wanted || []).join(', ') + '.' }));
+            return;
+        }
         for (const t of list) {
-            const sent = t.items.filter((i) => i.sent).length;
+            const need = ctx.need && list.length === 1 ? ctx.need : t.items.map((i) => ({ name: i.name, qty: i.units, inside: 0 }));
+            const expected = ctx.money ? ctx.money.expected : t.pays;
             const block = el('div', { class: 'ttv2-tb' }, [
                 el('div', { class: 'ttv2-tb-head' }, [
                     el('b', { text: 'Trade with ' + t.trader.name }),
-                    el('span', { class: 'ttv2-money', text: formatMoney(t.pays) }),
+                    el('span', { class: 'ttv2-money', text: formatMoney(expected) }),
                 ]),
-                el('div', { class: 'ttv2-sub', text: 'Send these (' + sent + ' of ' + t.items.length + ' added). ' + t.trader.name + ' should pay ' + formatMoney(t.pays) + ': check their offer before you accept.' }),
             ]);
-            for (const i of t.items) {
-                const input = el('input', { type: 'checkbox', 'aria-label': 'Added ' + i.name });
-                input.checked = Boolean(i.sent);
-                input.addEventListener('change', () => this.handlers.onTradeSent && this.handlers.onTradeSent(t.key, i.line, input.checked));
-                block.appendChild(el('label', { class: 'ttv2-tb-row' + (i.sent ? ' ttv2-tb-done' : '') }, [
-                    input,
-                    el('span', { class: 'ttv2-tb-name' }, [el('b', { text: i.name }), document.createTextNode(' ×' + i.units.toLocaleString('en-US'))]),
-                    el('span', { class: 'ttv2-money', text: formatMoney(i.units * i.bid) }),
+            // Is this them? (Read off the trade view; the add step remembers it.)
+            if (ctx.match === 'ok') block.appendChild(el('div', { class: 'ttv2-tb-ok', text: 'Trading with ' + ctx.partner + ' ✓' }));
+            else block.appendChild(el('div', { class: 'ttv2-sub', text: 'Open the trade with ' + t.trader.name + ' to check it is them.' }));
+            // Their money against what the trade says.
+            if (ctx.money) {
+                const m = ctx.money;
+                const text = m.offer >= m.expected
+                    ? t.trader.name + ' put in ' + formatMoney(m.offer) + ' ✓'
+                    : m.offer > 0
+                        ? t.trader.name + ' put in ' + formatMoney(m.offer) + ' of ' + formatMoney(m.expected) + ': ' + formatMoney(m.expected - m.offer) + ' short'
+                        : t.trader.name + ' has not put money in yet (' + formatMoney(m.expected) + ' expected)';
+                block.appendChild(el('div', { class: m.offer >= m.expected ? 'ttv2-tb-ok' : 'ttv2-tb-warn', text }));
+            }
+            for (const n of need) {
+                const inTrade = n.inside >= n.qty;
+                block.appendChild(el('div', { class: 'ttv2-tb-row' + (inTrade ? ' ttv2-tb-done' : '') }, [
+                    el('span', { class: 'ttv2-tb-mark', text: inTrade ? '✓' : '·' }),
+                    el('span', { class: 'ttv2-tb-name' }, [el('b', { text: n.name }), document.createTextNode(' ×' + n.qty.toLocaleString('en-US'))]),
+                    el('span', { class: 'ttv2-tb-in', text: n.inside ? n.inside.toLocaleString('en-US') + ' in' : '' }),
                 ]));
             }
             box.appendChild(block);
         }
+    }
+
+    /**
+     * The buying run, on any Torn page while a trade you accepted still has
+     * something to buy: where you are, what you took here, and Next bazaar
+     * (one press opens one bazaar).
+     *
+     * @param {object|null} v - {trader, done, total, here: {name, qty, price, seller, listed, bought}|null, next: {name, seller}|null, last}
+     */
+    setBuying(v) {
+        const box = this.buyBoxEl;
+        if (!box) return;
+        const sig = JSON.stringify(v);
+        if (sig === this.buySig) return;
+        this.buySig = sig;
+        box.textContent = '';
+        box.style.display = v ? '' : 'none';
+        if (!v) return;
+        box.appendChild(el('div', { class: 'ttv2-tb-head' }, [
+            el('b', { text: 'Buying for ' + v.trader }),
+            el('span', { class: 'ttv2-sub', text: v.done + ' of ' + v.total + ' done' }),
+        ]));
+        if (v.here) {
+            const h = v.here;
+            box.appendChild(el('div', { class: 'ttv2-sub', text: 'Here: buy ' + h.qty.toLocaleString('en-US') + ' ' + h.name + ' at ' + formatMoney(h.price) + ' from ' + h.seller + ' (marked on the page).' }));
+            box.appendChild(el('div', { class: h.bought >= h.qty ? 'ttv2-tb-ok' : h.listed ? 'ttv2-sub' : 'ttv2-tb-warn', text: h.bought ? 'You took ' + h.bought.toLocaleString('en-US') + ' of ' + h.qty.toLocaleString('en-US') + (h.bought >= h.qty ? ' ✓' : '') : h.listed ? 'Not bought yet - or skip it: Next counts only what you took.' : 'Not on this page at that price any more.' }));
+        }
+        const label = v.here && !v.next ? 'Done - go to the trade' : v.here && v.last ? 'Done - go to the trade' : v.here ? 'Next bazaar' : 'Open the next bazaar' + (v.next ? ': ' + v.next.seller : '');
+        box.appendChild(el('button', { type: 'button', class: 'ttv2-primary ttv2-buynext', text: label, onclick: () => this.handlers.onBuyNext && this.handlers.onBuyNext() }));
     }
 
     /** "Torn API calls in the last minute: 12 of 70", every tab together. */

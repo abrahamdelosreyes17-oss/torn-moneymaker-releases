@@ -102,3 +102,108 @@ export function tickAccepted(trade, line, { step = null, bought = null, sent = n
         }),
     };
 }
+
+/* ------------------------------------------------ the buying run (3.12.8) */
+
+/*
+ * After a yes, the buying run (the owner, 2026-09-27): Next bazaar opens the
+ * next seller's bazaar with the listing marked; you buy it or not, press Next
+ * again, and the script counts what you bought from the listing's stock on
+ * the page (it drops by what you took, or the listing goes). What you send is
+ * what you bought - a skipped step sends nothing.
+ */
+
+/** A step you have been through: bought (all or some), or skipped. */
+export function stepDone(step) {
+    return Boolean(step && (step.bought || step.skipped || step.boughtQty > 0));
+}
+
+/** How many of a line to send: yours as planned; a flip what you actually bought, once you started buying it. */
+export function sendUnits(line) {
+    if (!line) return 0;
+    if (line.kind === 'yours') return line.units;
+    const started = (line.steps || []).some(stepDone);
+    if (!started) return line.units;
+    return line.steps.reduce((a, st) => a + (st.bought ? (st.boughtQty > 0 ? st.boughtQty : st.qty) : st.boughtQty || 0), 0);
+}
+
+/** The next step to buy: {line, index, step, itemId, name}, or null when every step is done. */
+export function nextStep(trade) {
+    for (const i of (trade && trade.items) || []) {
+        const k = (i.steps || []).findIndex((st) => !stepDone(st));
+        if (k >= 0) return { line: i.line || 'flip:' + i.itemId, index: k, step: i.steps[k], itemId: i.itemId, name: i.name };
+    }
+    return null;
+}
+
+/**
+ * What you bought on a bazaar page, from the listing's stock: seen first
+ * (when you arrived) and now. Gone from the page = all of it (what you
+ * needed, at most what was there). Never more than you needed.
+ */
+export function boughtFromStock(firstSeen, nowSeen, need) {
+    if (!(firstSeen > 0)) return 0;
+    if (nowSeen === null || nowSeen === undefined) return Math.min(need, firstSeen);
+    return Math.max(0, Math.min(need, firstSeen - nowSeen));
+}
+
+/** A copy of the trade with one step's outcome: how many you bought (0 = skipped). */
+export function recordBuy(trade, line, index, boughtQty) {
+    const n = Math.max(0, Math.floor(Number(boughtQty) || 0));
+    return {
+        ...trade,
+        items: trade.items.map((i) => {
+            if ((i.line || 'flip:' + i.itemId) !== String(line)) return i;
+            return { ...i, steps: i.steps.map((st, k) => (k === index ? { ...st, boughtQty: n, bought: n >= st.qty, skipped: n === 0 } : st)) };
+        }),
+    };
+}
+
+/**
+ * The next cheapest listing still under the trader's price, when a step's
+ * listing is gone or re-priced (the friend: "sometimes their prices change,
+ * or they're not available any more"). Not the same seller; fresh only.
+ *
+ * @param {{sellerId, qty}} step
+ * @param {Array|null} rows - the item's bazaar listings now
+ * @param {number} bid - what the trader pays each
+ * @param {function} enough - (profitEach, price) => boolean (the least profit rule)
+ */
+export function replacementFor(step, rows, bid, enough) {
+    const ok = (rows || [])
+        .filter((r) => r && !r.stale && r.qty > 0 && String(r.sellerId) !== String(step.sellerId) && enough(bid - r.price, r.price))
+        .sort((a, b) => a.price - b.price);
+    if (!ok.length) return null;
+    const r = ok[0];
+    return { sellerId: String(r.sellerId), sellerName: r.sellerName || null, price: r.price, qty: Math.min(step.qty, r.qty) };
+}
+
+/** A copy of the trade with one step replaced by another listing. */
+export function replaceStep(trade, line, index, repl) {
+    return {
+        ...trade,
+        items: trade.items.map((i) => {
+            if ((i.line || 'flip:' + i.itemId) !== String(line)) return i;
+            return { ...i, steps: i.steps.map((st, k) => (k === index ? { sellerId: repl.sellerId, sellerName: repl.sellerName, qty: repl.qty, price: repl.price, bought: false } : st)) };
+        }),
+    };
+}
+
+/** A copy of the trade without one line (not profitable any more, or you changed your mind). */
+export function dropLine(trade, line) {
+    return { ...trade, items: trade.items.filter((i) => (i.line || 'flip:' + i.itemId) !== String(line)) };
+}
+
+/** What the trade comes to now: what you send, what they pay, what you spent, what it makes. */
+export function acceptedTotals(trade) {
+    let pays = 0;
+    let cost = 0;
+    for (const i of (trade && trade.items) || []) {
+        pays += sendUnits(i) * i.bid;
+        for (const st of i.steps || []) {
+            if (st.skipped) continue;
+            cost += (st.boughtQty > 0 ? st.boughtQty : st.qty) * st.price;
+        }
+    }
+    return { pays, cost, profit: (trade && trade.items || []).reduce((a, i) => a + (i.kind === 'flip' ? sendUnits(i) * i.bid : 0), 0) - cost };
+}

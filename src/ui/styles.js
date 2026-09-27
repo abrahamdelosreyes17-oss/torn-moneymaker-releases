@@ -167,6 +167,52 @@ export const PAGE_CSS = `
     text-align: right !important;
 }
 
+/*
+ * A trade you accepted (3.12.8): the listing to buy on a bazaar, in blue with
+ * its own words, apart from the NPC deals' green; on Torn's trade page the
+ * rows to send, and Fill.
+ */
+.ttv2-buyhere,
+.ttv2-target.ttv2-buyhere {
+    position: relative !important;
+    box-shadow:
+        inset 0 0 0 3px #4dabf7,
+        inset 0 0 0 9999px rgba(77, 171, 247, 0.16) !important;
+}
+
+.ttv2-buyhere::before {
+    content: attr(data-ttv2-buy);
+    position: absolute;
+    top: 4px;
+    left: 4px;
+    z-index: 2;
+    padding: 1px 6px;
+    border-radius: 3px;
+    background: #4dabf7;
+    color: #10202c;
+    font: bold 11px/16px Arial, sans-serif;
+    pointer-events: none;
+}
+
+.ttv2-sendrow {
+    box-shadow: inset 3px 0 0 #4dabf7, inset 0 0 0 9999px rgba(77, 171, 247, 0.10) !important;
+}
+
+.ttv2-sendfill {
+    display: inline-block;
+    margin-left: 8px;
+    padding: 1px 8px;
+    border: 1px solid #4dabf7;
+    border-radius: 10px;
+    color: #9ad0fa;
+    font: bold 12px/18px Arial, sans-serif;
+    white-space: nowrap;
+    cursor: default;
+}
+
+.ttv2-sendfill[data-fill] { cursor: pointer; }
+.ttv2-sendfill[aria-pressed="true"] { background: #4dabf7; color: #10202c; }
+
 /* The listing a feed link was opened for. Paint-only, like .ttv2-hit. */
 .ttv2-target {
     box-shadow:
@@ -857,6 +903,41 @@ ${TOKENS_CSS}
     border: 1px solid var(--profit);
     border-radius: 6px;
     background: rgba(153, 204, 0, 0.08);
+}
+
+.ttv2-buybox {
+    border-color: #4dabf7;
+    background: rgba(77, 171, 247, 0.08);
+}
+
+.ttv2-buybox .ttv2-sub, .ttv2-buybox .ttv2-tb-ok, .ttv2-buybox .ttv2-tb-warn {
+    margin-top: 4px;
+}
+
+.ttv2-buynext {
+    margin-top: 8px;
+    width: 100%;
+}
+
+.ttv2-tb-ok {
+    color: var(--profit);
+    font-size: 12px;
+}
+
+.ttv2-tb-warn {
+    color: var(--warn);
+    font-size: 12px;
+    font-weight: bold;
+}
+
+.ttv2-tb-mark {
+    color: var(--profit);
+    font-weight: bold;
+}
+
+.ttv2-tb-in {
+    color: var(--muted);
+    font-size: 12px;
 }
 
 .ttv2-tb + .ttv2-tb {

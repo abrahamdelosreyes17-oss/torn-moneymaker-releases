@@ -55,3 +55,47 @@ test('ticks: a step bought, an item sent; old trades are let go', () => {
     const kept = liveAccepted({ a: { ...t, key: 'a', at: 1000 }, b: { ...t, key: 'b', at: 1000 - ACCEPTED_MAX_AGE_MS } }, 2000);
     assert.deepEqual(Object.keys(kept), ['a']);
 });
+
+/* ------------------------------------------------ the buying run */
+
+import { nextStep, boughtFromStock, recordBuy, sendUnits, replacementFor, replaceStep, dropLine, acceptedTotals } from '../src/core/accepted.js';
+
+test('the buying run: next step, what you bought from the stock drop, what you then send', () => {
+    let t = acceptTrade(CHOSEN, '335', 1000);
+    assert.deepEqual([nextStep(t).itemId, nextStep(t).index], ['335', 0]);
+    // 60 in stock when you arrived, 7 now: you took 53 (what you needed).
+    assert.equal(boughtFromStock(60, 7, 53), 53);
+    assert.equal(boughtFromStock(60, 40, 53), 20, 'part of it');
+    assert.equal(boughtFromStock(60, 60, 53), 0, 'nothing: skipped');
+    assert.equal(boughtFromStock(30, null, 53), 30, 'the listing went: all there was');
+    assert.equal(boughtFromStock(null, 5, 53), 0, 'never seen: nothing counted');
+    t = recordBuy(t, 'flip:335', 0, 20);
+    assert.equal(sendUnits(t.items[0]), 20, 'send what you bought, not what was planned');
+    assert.deepEqual([nextStep(t).itemId, nextStep(t).index], ['206', 0], 'on to the next item');
+    t = recordBuy(t, 'flip:206', 0, 0);
+    assert.equal(sendUnits(t.items[1]), 0, 'skipped: nothing to send');
+    assert.equal(nextStep(t), null, 'every step done');
+    assert.equal(sendUnits(t.items[2]), 10, 'yours as planned');
+    const tot = acceptedTotals(t);
+    assert.equal(tot.pays, 20 * 18000 + 10 * 110);
+    assert.equal(tot.cost, 20 * 17500);
+    assert.equal(tot.profit, 20 * 18000 - 20 * 17500);
+});
+
+test('a gone or re-priced listing: the next cheapest still under their price, or drop the item', () => {
+    const step = { sellerId: '2', qty: 53, price: 17500 };
+    const enough = (each, price) => each >= Math.max(1, price / 100);
+    const rows = [
+        { sellerId: '2', price: 19000, qty: 60 },
+        { sellerId: '5', sellerName: 'Z', price: 17600, qty: 40 },
+        { sellerId: '6', price: 17900, qty: 90 },
+        { sellerId: '7', price: 17000, qty: 9, stale: true },
+    ];
+    assert.deepEqual(replacementFor(step, rows, 18000, enough), { sellerId: '5', sellerName: 'Z', price: 17600, qty: 40 });
+    assert.equal(replacementFor(step, [{ sellerId: '5', price: 17990, qty: 9 }], 18000, enough), null, 'not profitable any more');
+    let t = acceptTrade(CHOSEN, '335', 1000);
+    t = replaceStep(t, 'flip:335', 0, { sellerId: '5', sellerName: 'Z', price: 17600, qty: 40 });
+    assert.deepEqual(t.items[0].steps[0], { sellerId: '5', sellerName: 'Z', qty: 40, price: 17600, bought: false });
+    t = dropLine(t, 'flip:206');
+    assert.deepEqual(t.items.map((i) => i.line), ['flip:335', 'yours:1']);
+});

@@ -51,7 +51,8 @@ import {
 } from './core/feed.js';
 import { bazaarSellers, flipPlan, flipBuyer, whereToSell, depthNearCheapest, flipCandidates, traderTagLabel } from './core/flips.js';
 import { planTrade, keepAfter } from './core/trade.js';
-import { acceptTrade, liveAccepted, stepState, tickAccepted } from './core/accepted.js';
+import { acceptTrade, liveAccepted, stepState, tickAccepted, stepDone, nextStep, boughtFromStock, recordBuy, sendUnits, acceptedTotals, replacementFor, replaceStep, dropLine } from './core/accepted.js';
+import { readTradeView, readTradeAddRows } from './sources/dom/trade.js';
 import { makeTabId, LEADER_HEARTBEAT_MS } from './core/leader.js';
 import { tabWindow } from './platform/tab-window.js';
 import { idbGet, idbSet, idbDel } from './platform/idb.js';
@@ -168,7 +169,7 @@ import {
 } from './sources/dom/owner.js';
 import { injectStyles } from './ui/styles.js';
 import { Panel, TORN_API_KEY_URL } from './ui/panel.js';
-import { SellingPage, SELLING_PAGE_DEFAULTS, ALL_ITEMS_PAGE } from './ui/selling-page.js';
+import { SellingPage, SELLING_PAGE_DEFAULTS, ALL_ITEMS_PAGE, tradeUrl } from './ui/selling-page.js';
 import { SEED_TRADERS, SEED_RATINGS } from './core/seed-traders.js';
 import {
     markRows,
@@ -224,6 +225,10 @@ const STORE_LEDGER_KEY = 'ledgerKey';
 const STORE_LEDGER_KEY_DEAD = 'ledgerKeyDead';
 const STORE_LEDGER_SELF = 'ledgerSelf';
 const STORE_LEDGER = 'ledger';
+/* Our marks on Torn's pages for a trade: the listing to buy, the rows to send, Fill. */
+const TRADE_BUY_CLASS = 'ttv2-buyhere';
+const TRADE_SEND_CLASS = 'ttv2-sendrow';
+const TRADE_FILL_CLASS = 'ttv2-sendfill';
 /* Traders you marked Declined in Torn Bids: trader key -> until (an hour). */
 const STORE_SELL_DECLINED = 'sellDeclined';
 /* Trades a trader said yes to, frozen (core/accepted.js): trader key -> trade. Torn Bids and the overlay's trade page share it. */
@@ -374,6 +379,11 @@ const HISTORY_SAVE_MS = 30000;
 
 const app = {
     tabId: makeTabId(),
+    /* Torn's trade page: who each trade (by its ID) is with, and what you have put in. */
+    tradePartners: new Map(),
+    tradeInside: new Map(),
+    buyHere: null,
+    tradeFillBound: false,
     index: null,
     /* Who buys what, from what the traders page stored: for the bazaar tags. */
     traderLookup: null,
@@ -891,6 +901,7 @@ function rescan() {
     // A trusted trader pays more than a listing here asks: named on its card.
     markTraderTags(app.pageType === PAGE_BAZAAR && sellerId && !closedHere ? traderTags(listings) : []);
     showBazaarTarget(listings);
+    trackTradeBuying(app.pageType === PAGE_BAZAAR ? listings : []);
 
     app.lastScanAt = now;
     app.pageRows = live;
@@ -2497,24 +2508,242 @@ function onSettingsChange(partial) {
     else refreshView();
 }
 
-/**
- * Torn's trade page (trade.php): the trades you accepted in Torn Bids, as a
- * list of what to send (the friend: "how do I remember the items I will send
- * him? like add listing in the bazaar"). A trade opened with someone
- * (#step=start&userID=...) shows theirs first. Only our own saved list is
- * read; nothing on Torn's page is touched.
+/* ------------------------------------------------------------------ *
+ * A trade on Torn's pages (3.12.8): the buying run, and the trade page
+ * ------------------------------------------------------------------ */
+
+/*
+ * The buying run (the owner, 2026-09-27): after the trader said yes, Next
+ * bazaar opens the next seller's bazaar with the listing to buy marked; you
+ * buy it or not and press Next again; what you took is counted from the
+ * listing's stock on the page (the page you are viewing - read only). One
+ * click, one page: never several at once.
  */
-function showTradeChecklist(fresh = null) {
+const buyRun = { stepKey: null, firstSeen: null, nowSeen: null, seenGone: false };
+
+/** The accepted trade and step this bazaar page is for, if any. */
+function buyStepHere(listings) {
+    const seller = bazaarOwnerId(location.href);
+    if (!seller) return null;
+    for (const t of Object.values(sellAccepted())) {
+        for (const i of t.items) {
+            const k = (i.steps || []).findIndex((st) => !stepDone(st) && String(st.sellerId) === String(seller));
+            if (k < 0) continue;
+            const st = i.steps[k];
+            // The listing: this item, at (or under) the price planned.
+            const here = listings.filter((l) => String(l.itemId) === String(i.itemId));
+            const listing = here.find((l) => l.listingPrice <= st.price) || null;
+            return { trade: t, line: i.line || 'flip:' + i.itemId, index: k, step: st, item: i, listing, anyHere: here.length > 0 };
+        }
+    }
+    return null;
+}
+
+/** On a bazaar page: mark the listing to buy, count what you took, show the box with Next. */
+function trackTradeBuying(listings) {
     if (!app.panel) return;
-    if (!isTradePage(location.href)) {
-        app.panel.setTrades(null);
+    const pending = Object.values(sellAccepted()).filter((t) => nextStep(t));
+    if (!pending.length) {
+        app.buyHere = null;
+        app.panel.setBuying(null);
+        clearBuyMarks();
         return;
     }
-    // Just written by this tab: drawn from that, not re-read.
-    const list = Object.values(fresh || sellAccepted());
-    const m = String(location.hash).match(/userID=(\d+)/i);
-    if (m) list.sort((a, b) => (b.trader.id === m[1]) - (a.trader.id === m[1]));
-    app.panel.setTrades(list);
+    const here = app.pageType === PAGE_BAZAAR ? buyStepHere(listings) : null;
+    app.buyHere = here;
+    if (here) {
+        const key = here.trade.key + '|' + here.line + '|' + here.index;
+        if (buyRun.stepKey !== key) Object.assign(buyRun, { stepKey: key, firstSeen: null, nowSeen: null, seenGone: false });
+        const stock = here.listing ? Number(here.listing.qty) || null : null;
+        if (here.listing && buyRun.firstSeen === null) buyRun.firstSeen = stock;
+        if (buyRun.firstSeen !== null) {
+            buyRun.nowSeen = here.listing ? stock : null;
+            buyRun.seenGone = !here.listing;
+        }
+        markTradeTarget(here.listing ? here.listing.el : null, 'Buy ' + here.step.qty.toLocaleString('en-US') + ' for ' + here.trade.trader.name);
+    } else {
+        clearBuyMarks();
+    }
+    const t = here ? here.trade : pending[0];
+    const steps = t.items.flatMap((i) => i.steps || []);
+    const done = steps.filter(stepDone).length;
+    const bought = here && buyRun.firstSeen !== null ? boughtFromStock(buyRun.firstSeen, buyRun.nowSeen, here.step.qty) : 0;
+    const next = nextStep(t);
+    app.panel.setBuying({
+        trader: t.trader.name,
+        done,
+        total: steps.length,
+        here: here
+            ? {
+                name: here.item.name,
+                qty: here.step.qty,
+                price: here.step.price,
+                seller: here.step.sellerName || 'this bazaar',
+                listed: Boolean(here.listing),
+                bought,
+            }
+            : null,
+        next: next ? { name: next.name, seller: next.step.sellerName || 'the next bazaar' } : null,
+        last: Boolean(here && next && steps.filter((st) => !stepDone(st)).length === 1),
+    });
+}
+
+/** Next bazaar: record what you took here, then open the next step (one page). */
+function onBuyNext() {
+    const here = app.buyHere;
+    let all = sellAccepted();
+    let t = here ? all[here.trade.key] : Object.values(all).find((x) => nextStep(x));
+    if (!t) return;
+    if (here) {
+        const took = buyRun.firstSeen !== null ? boughtFromStock(buyRun.firstSeen, buyRun.nowSeen, here.step.qty) : 0;
+        t = recordBuy(t, here.line, here.index, took);
+        all = { ...all, [t.key]: t };
+        saveSellAccepted(all);
+        buyRun.stepKey = null;
+    }
+    const next = nextStep(t);
+    if (next) {
+        location.assign(bazaarUrl(next.step.sellerId, next.itemId, next.step.price));
+        return;
+    }
+    // Everything bought (or skipped): on to the trade.
+    if (t.trader.id) location.assign(tradeUrl(t.trader.id));
+    else trackTradeBuying([]);
+}
+
+/** Fill on the trade page: what you typed there, to put back on the second press. */
+const tradeFill = new Map();
+
+/**
+ * Torn's trade page: who the trade is with, whether they put in what the
+ * trade you accepted says, and on the add step each item to send marked,
+ * with Fill (one row per press: types that row's quantity; you press ADD TO
+ * TRADE and Accept yourself).
+ */
+function scanTradePage() {
+    if (!app.panel) return;
+    if (!isTradePage(location.href)) {
+        clearSendMarks();
+        return;
+    }
+    const accepted = Object.values(sellAccepted());
+    const view = readTradeView(document);
+    const tradeId = (String(location.hash).match(/ID=(\d+)/) || [])[1] || null;
+    if (view && view.partner && tradeId) app.tradePartners.set(tradeId, view.partner);
+    if (view && tradeId) app.tradeInside.set(tradeId, view.you.items);
+    const partner = (view && view.partner) || (tradeId ? app.tradePartners.get(tradeId) : null) || null;
+    const lower = (s) => String(s || '').toLowerCase();
+    const trade = partner ? accepted.find((t) => lower(t.trader.name) === lower(partner)) : accepted.length === 1 ? accepted[0] : null;
+
+    // What goes in, per item (one item can be in a trade twice: flipped and yours).
+    const need = new Map();
+    for (const i of (trade && trade.items) || []) {
+        const n = sendUnits(i);
+        if (n > 0) need.set(i.itemId, { name: i.name, qty: (need.get(i.itemId) || { qty: 0 }).qty + n });
+    }
+    const inside = new Map();
+    for (const it of (tradeId && app.tradeInside.get(tradeId)) || []) inside.set(lower(it.name), (inside.get(lower(it.name)) || 0) + it.qty);
+    const expected = trade ? acceptedTotals(trade).pays : 0;
+
+    app.panel.setTrades(trade ? [trade] : partner ? [] : accepted, {
+        partner,
+        match: trade ? 'ok' : partner && accepted.length ? 'other' : null,
+        wanted: accepted.map((t) => t.trader.name),
+        need: [...need.values()].map((n) => ({ ...n, inside: inside.get(lower(n.name)) || 0 })),
+        money: view && trade ? { offer: view.them.money, expected } : null,
+    });
+
+    // The add step: mark each row to send, with Fill.
+    clearSendMarks();
+    if (!trade) return;
+    for (const row of readTradeAddRows(document)) {
+        const n = need.get(row.itemId);
+        if (!n) continue;
+        const left = Math.max(0, n.qty - (inside.get(lower(n.name)) || 0));
+        row.el.classList.add(TRADE_SEND_CLASS);
+        const cell = row.el.querySelector('.info-wrap') || row.el.querySelector('.name-wrap');
+        if (!cell) continue;
+        const chip = document.createElement('span');
+        chip.className = TRADE_FILL_CLASS;
+        chip.dataset.itemId = row.itemId;
+        if (row.single) {
+            chip.textContent = left ? 'Send 1 · tick Torn\'s box' : 'In the trade';
+        } else if (!left) {
+            chip.textContent = 'All ' + n.qty.toLocaleString('en-US') + ' in the trade';
+        } else {
+            const filled = tradeFill.has(row.itemId) && row.qty && row.qty.value === String(left);
+            chip.setAttribute('role', 'button');
+            chip.setAttribute('aria-pressed', String(filled));
+            chip.dataset.fill = String(left);
+            chip.title = filled ? 'Untick to put back what was there' : 'Type ' + left + ' into this row\'s Qty. You press ADD TO TRADE.';
+            chip.textContent = (filled ? '☑ ' : '☐ ') + 'Fill ' + left.toLocaleString('en-US') + ' for ' + trade.trader.name;
+        }
+        cell.appendChild(chip);
+    }
+    bindTradeFillPress();
+}
+
+/** The trade page's marks (rows to send, Fill), gone before they are drawn again. */
+function clearSendMarks() {
+    for (const n of document.querySelectorAll('.' + TRADE_FILL_CLASS)) n.remove();
+    for (const n of document.querySelectorAll('.' + TRADE_SEND_CLASS)) n.classList.remove(TRADE_SEND_CLASS);
+}
+
+/** The buying run's mark on a bazaar listing. Apart from the trade page's: each clears its own. */
+function clearBuyMarks() {
+    for (const n of document.querySelectorAll('.' + TRADE_BUY_CLASS)) {
+        n.classList.remove(TRADE_BUY_CLASS);
+        delete n.dataset.ttv2Buy;
+    }
+}
+
+/** The listing to buy for a trade: its own colour and words, apart from the NPC deals' marks. */
+function markTradeTarget(el, words) {
+    for (const n of document.querySelectorAll('.' + TRADE_BUY_CLASS)) {
+        if (n !== el) {
+            n.classList.remove(TRADE_BUY_CLASS);
+            delete n.dataset.ttv2Buy;
+        }
+    }
+    if (!el) return;
+    if (!el.classList.contains(TRADE_BUY_CLASS)) {
+        el.classList.add(TRADE_BUY_CLASS);
+        if (el.scrollIntoView) el.scrollIntoView({ block: 'center' });
+    }
+    if (el.dataset.ttv2Buy !== words) el.dataset.ttv2Buy = words;
+}
+
+/**
+ * Fill on the trade page, caught once in the capture phase (as on your
+ * bazaar's add page: Torn's rows react to a press before a click lands).
+ * One press types one row's quantity; a second press puts back what was there.
+ */
+function bindTradeFillPress() {
+    if (app.tradeFillBound) return;
+    app.tradeFillBound = true;
+    const chipOf = (event) => (event.target && event.target.closest ? event.target.closest('.' + TRADE_FILL_CLASS + '[data-fill]') : null);
+    for (const type of ['mousedown', 'pointerdown', 'touchstart']) {
+        window.addEventListener(type, (event) => {
+            if (chipOf(event)) event.stopPropagation();
+        }, true);
+    }
+    window.addEventListener('click', (event) => {
+        const chip = chipOf(event);
+        if (!chip) return;
+        event.preventDefault();
+        event.stopPropagation();
+        const row = readTradeAddRows(document).find((r) => r.itemId === chip.dataset.itemId);
+        if (!row || !row.qty) return;
+        const want = chip.dataset.fill;
+        if (tradeFill.has(row.itemId) && row.qty.value === want) {
+            writeInputs([row.qty], tradeFill.get(row.itemId));
+            tradeFill.delete(row.itemId);
+        } else {
+            tradeFill.set(row.itemId, row.qty.value);
+            writeInputs([row.qty], want);
+        }
+        scanTradePage();
+    }, true);
 }
 
 /** Settings each tab keeps to itself: where its panel sits and which list it shows. */
@@ -2646,8 +2875,8 @@ function applyPageType(next, { initial = false } = {}) {
 }
 
 function handleRouteChange() {
-    // Torn's trade page: the accepted trades' lists (it changes by hash, too).
-    showTradeChecklist();
+    // Torn's trade page: the accepted trade's checks (it changes by hash, too).
+    scanTradePage();
     const next = detectPage(location.href);
     if (next === app.pageType && location.href === app.pageHref) return;
 
@@ -3490,10 +3719,16 @@ function renderSellingNow() {
         return flipBuyer(buyersOf(id), { avg: item ? Number(item.marketValue) || null : null, type: item ? item.type : null, subType: item ? item.subType : null, unitsOf });
     };
     const flipBuyersCache = new Map();
+    // Settings › Flips › Never flip (Clothing by default: the friend's "don't include clothes").
+    const neverFlip = new Set(prefs.neverFlip || []);
     const flipBuyersOf = (id) => {
         const key = String(id);
         if (!flipBuyersCache.has(key)) {
             const item = itemOf(id);
+            if (neverFlip.has(itemCategory(item))) {
+                flipBuyersCache.set(key, []);
+                return [];
+            }
             flipBuyersCache.set(key, flipBuyers(buyersOf(id), { avg: item ? Number(item.marketValue) || null : null, type: item ? item.type : null, subType: item ? item.subType : null, unitsOf }));
         }
         return flipBuyersCache.get(key);
@@ -3686,7 +3921,20 @@ function renderSellingNow() {
                 accepted: {
                     ...acc,
                     buyer,
-                    items: acc.items.map((i) => ({ ...i, steps: i.steps.map((st) => ({ ...st, check: stepState(st, sellersOf(i.itemId)) })) })),
+                    items: acc.items.map((i) => ({
+                        ...i,
+                        send: sendUnits(i),
+                        steps: i.steps.map((st) => {
+                            const check = stepState(st, sellersOf(i.itemId));
+                            // Gone, re-priced or short: the next cheapest still under their price
+                            // (the friend: "their prices change, or not available any more").
+                            const repl = ['gone', 'price', 'short'].includes(check.state) && !stepDone(st)
+                                ? replacementFor(st, sellersOf(i.itemId), i.bid, (each, price) => enoughProfit(each, price, 'TRADER', prefs.minProfitPct))
+                                : null;
+                            return { ...st, check, repl };
+                        }),
+                    })),
+                    totals: acceptedTotals(acc),
                 },
             };
         }
@@ -4473,6 +4721,26 @@ function bootSellingPage() {
             sell.tradePick.set(String(itemId), acc.key);
             renderSellingNow();
         },
+        onTradeReplace: (key, line, index, repl) => {
+            const all = sellAccepted();
+            if (!all[key]) return;
+            all[key] = replaceStep(all[key], line, index, repl);
+            saveSellAccepted(all);
+            renderSellingNow();
+        },
+        onTradeDrop: (key, line) => {
+            const all = sellAccepted();
+            if (!all[key]) return;
+            all[key] = dropLine(all[key], line);
+            saveSellAccepted(all);
+            renderSellingNow();
+        },
+        // Start the buying run: the first bazaar to buy from (one page).
+        onTradeStartBuying: (key) => {
+            const t = sellAccepted()[key];
+            const next = t && nextStep(t);
+            if (next) openSellLink(bazaarUrl(next.step.sellerId, next.itemId, next.step.price));
+        },
         onTradeTick: (key, line, tick) => {
             tickSellAccepted(key, line, tick);
             renderSellingNow();
@@ -5008,7 +5276,12 @@ export function boot() {
     app.settings = loadSettings();
     app.keyDead = Boolean(gmGet(STORE_KEY_DEAD, false));
     gmOnChange(STORE_SETTINGS, onRemoteSettings);
-    gmOnChange(STORE_SELL_ACCEPTED, () => showTradeChecklist());
+    // A trade accepted, bought or changed in another tab: the marks and boxes follow.
+    gmOnChange(STORE_SELL_ACCEPTED, () => {
+        scanTradePage();
+        if (app.pageType === PAGE_BAZAAR) rescan();
+        else trackTradeBuying([]);
+    });
     gmOnChange(STORE_KEY_DEAD, onRemoteKey);
     gmOnChange(STORE_KEY, onRemoteKey);
 
@@ -5047,9 +5320,11 @@ export function boot() {
             renderMyBazaar();
         },
         getApiUse: () => (app.client ? app.client.stats() : null),
+        onBuyNext,
         // A tick on Torn's trade page: shared with Torn Bids.
         onTradeSent: (key, line, sent) => {
-            showTradeChecklist(tickSellAccepted(key, line, { sent }));
+            tickSellAccepted(key, line, { sent });
+            scanTradePage();
         },
         onFillListing: (market, index) => onFillFromListing(market, index),
         onFillSelected: () => {
@@ -5106,6 +5381,9 @@ export function boot() {
 
         if (detectPage(location.href) === PAGE_NONE) {
             if (app.pageType !== PAGE_NONE) rescan();
+            // Torn's trade page, and the buying box on other pages.
+            if (isTradePage(location.href)) scanTradePage();
+            trackTradeBuying([]);
             return;
         }
 
@@ -5114,5 +5392,6 @@ export function boot() {
 
     startPageWatch();
     startLiveFeed();
-    showTradeChecklist();
+    scanTradePage();
+    trackTradeBuying([]);
 }

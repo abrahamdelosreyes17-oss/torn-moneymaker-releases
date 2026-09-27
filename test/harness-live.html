@@ -113,6 +113,45 @@ if (_ownMarket) {
         d.addEventListener('input', (e) => window.__typed.push([e.target.closest('[class*=itemRow___]').querySelector('[class*=name___]').textContent, e.target.className, e.target.value]));
     });
 }
+// &tradeview=<name>: Torn's trade view (as read on the real page, 2026-09-27)
+// with that partner; &offer=<n> their money; &inside=<Name:qty,Name:qty> yours.
+const _tradeView = new URLSearchParams(location.search).get('tradeview');
+if (_tradeView) {
+    document.addEventListener('DOMContentLoaded', () => {
+        const q = new URLSearchParams(location.search);
+        const offer = Number(q.get('offer') || 0);
+        const inside = (q.get('inside') || '').split(',').filter(Boolean).map((p) => p.split(':'));
+        const d = document.createElement('div');
+        d.innerHTML = '<div class="trade-cont"><div class="t-title">Trade between Me and ' + _tradeView + '</div>' +
+            '<div class="user left"><div class="title-black"><div class="title-divider">Me</div></div><ul class="cont">' +
+            '<li class="color1"><ul class="desc"><li class="last"><div class="name left inactive">No money in trade</div></li></ul></li>' +
+            '<li class="color2"><ul class="desc">' + (inside.length ? inside.map(([n, x]) => '<li><div class="name left">' + n + ' x' + x + '</div></li>').join('') : '<li class="last"><div class="name left inactive">No items in trade</div></li>') + '</ul></li>' +
+            '<li class="color3 last"><ul class="desc"><li class="last"><div class="name left inactive">No properties in trade</div></li></ul></li></ul></div>' +
+            '<div class="user right"><div class="title-black">' + _tradeView + '</div><ul class="cont">' +
+            '<li class="color1"><ul class="desc"><li class="last"><div class="name left">' + (offer ? '$' + offer.toLocaleString('en-US') : 'No money in trade') + '</div></li></ul></li></ul></div></div>';
+        document.body.prepend(d);
+    });
+}
+// &bazaarcards=1 (with page=bazaar&userId=<seller>): a player's bazaar with
+// Stick of Dynamite ($17,500, 60 in stock) and Xanax ($840,000, 2 in stock).
+// window.__buy(id, n) takes n off a listing's stock, as a purchase does.
+if (/[?&]bazaarcards=1/.test(location.search)) {
+    document.addEventListener('DOMContentLoaded', () => {
+        const card = (id, name, price, stock) => '<div class="itemDescription___x" data-id="' + id + '" style="width:220px;height:90px;display:inline-block;margin:4px;padding:6px;background:#333;color:#ddd;font:12px Arial">' +
+            '<img src="https://www.torn.com/images/items/' + id + '/large.png" alt="' + name + '" style="height:30px"><div>' + name + '</div><div>$' + price.toLocaleString('en-US') + '</div><div class="stock">(' + stock + ' in stock)</div></div>';
+        const d = document.createElement('div');
+        d.id = 'fake-bazaar';
+        d.innerHTML = card(335, 'Stick of Dynamite', 17500, 60) + card(206, 'Xanax', 840000, 2);
+        document.body.prepend(d);
+        window.__buy = (id, n) => {
+            const c = d.querySelector('[data-id="' + id + '"]');
+            const s = c.querySelector('.stock');
+            const left = Number(s.textContent.replace(/\D/g, '')) - n;
+            if (left > 0) s.textContent = '(' + left + ' in stock)';
+            else c.remove();
+        };
+    });
+}
 // ?from381=1: left as 3.8.1 left it when it refused the Limited key as the
 // TornExchange key - the Limited key saved, no TornExchange key, and its
 // refusal message still stored.
