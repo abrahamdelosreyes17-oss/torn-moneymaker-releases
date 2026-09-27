@@ -15,7 +15,10 @@
  *     (/images/items/1321/large.png), .item-amount.qty how many you have,
  *     .amount input[name=amount] (Qty), a tick box instead for one-of-a-kind
  *     items (weapons), rows "disabled" when they cannot be traded, and one
- *     ADD TO TRADE button for the page.
+ *     ADD TO TRADE button for the page. One ul.items-cont per category tab
+ *     (.all-items first); only the tab you are on is shown. The price and
+ *     .info-wrap cells are in each row but hidden (display: none) - read
+ *     again on 2026-09-27: marks go in .name-wrap, the visible cell.
  *
  * Nothing here clicks, types or presses anything; Fill (in main.js) types
  * into one row's Qty box when you press it, like Fill on your bazaar.
@@ -72,10 +75,9 @@ export function readTradeView(doc = document) {
  * @returns {Array<{el: Element, itemId: string, name: string, have: number|null, qty: HTMLInputElement|null, single: boolean}>}
  */
 export function readTradeAddRows(doc = document) {
-    const list = doc.querySelector('ul.items-cont');
-    if (!list) return [];
     const out = [];
-    for (const li of list.querySelectorAll('li.clearfix')) {
+    // Every category tab's list: the one you switch to is marked too.
+    for (const li of doc.querySelectorAll('ul.items-cont li.clearfix')) {
         if (li.classList.contains('disabled')) continue;
         const img = li.querySelector(ITEM_IMAGE_SELECTOR) || li.querySelector('img[src*="/items/"]');
         const itemId = img ? itemIdFromImage(img) : null;

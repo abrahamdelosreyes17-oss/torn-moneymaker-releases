@@ -89,6 +89,13 @@ if (/[?&]ownbazaar=1/.test(location.search)) {
             row(1, 'Hammer', 0, 120, true) +
             '</ul>';
         document.body.prepend(d);
+        // On the trade page (page=trade), as read on the real one: the info
+        // cell is hidden, and each category tab has its own list after All
+        // (only the tab you are on shows).
+        if (/[?&]page=trade/.test(location.search)) {
+            d.querySelector('ul.items-cont').classList.add('all-items');
+            d.insertAdjacentHTML('beforeend', '<style>#fake-own .info-wrap{display:none}</style><ul class="items-cont drugs-items" style="display:none">' + row(206, 'Xanax', 15, 830000) + '</ul>');
+        }
         // Torn's form keeps what was typed; the harness logs each input event so a check can see Fill's.
         window.__typed = [];
         d.addEventListener('input', (e) => window.__typed.push([e.target.closest('li') ? e.target.closest('li').querySelector('.t-overflow').textContent : '?', e.target.className, e.target.value]));

@@ -6,12 +6,12 @@ Everything below "History" is the record of how we got here.
 
 ## Start here (state on 2026-09-27, end of session)
 
-- **Released: 3.12.8** (`8991095`), pushed. Last install link given to the owner:
-  `https://raw.githubusercontent.com/abrahamdelosreyes17-oss/torn-moneymaker-releases/8991095b6170a17a6318c9b9de87bb51310d8393/torn-moneymaker.user.js`
+- **Released: 3.12.9**, pushed (link below, once given).
 - Branch `claude/optimistic-ride-1gqguu`. Released earlier the same day:
-  3.12.5 (`aab7e53`), 3.12.6 (`fe49df0`), 3.12.7 (`d69907c`).
-- **The owner's Chrome still had an old version** (its panel said "Sell", not
-  "Bids") when last seen: ask them to install the 3.12.8 link before testing.
+  3.12.5 (`aab7e53`), 3.12.6 (`fe49df0`), 3.12.7 (`d69907c`), 3.12.8 (`8991095`).
+- **The owner had the script switched off** in Tampermonkey while testing the
+  trade page (2026-09-27): when something "isn't there", ask them to check the
+  Tampermonkey icon (script on, version) before anything else.
 - **`main` is still at 2.9.3.** The script's `@updateURL` points at `main`, so
   installs go through **pinned links** (`.../<commit>/torn-moneymaker.user.js`).
   Merging to `main` makes every install auto-update: only if the owner asks.
@@ -36,7 +36,7 @@ offer to read Torn's scripting-rules page with them (read only).
 
 ### The agenda for the next session (let the owner choose the order)
 
-1. **The owner tries 3.12.8 on real data** while you read along (read only, in
+1. **The owner tries 3.12.9 on real data** while you read along (read only, in
    the Claude Chrome tab group - see "How the owner works"; they open pages,
    you never click or type on torn.com). Above all the trade flow on real pages:
    - Start buying / Next bazaar: does a real bazaar card's stock drop after a
@@ -156,6 +156,18 @@ offer to read Torn's scripting-rules page with them (read only).
   **Never flip** categories (prefs.neverFlip, Clothing by default), and on
   Torn's trade page the partner check, money check, "N in", and Fill per row
   (`scanTradePage`, `sources/dom/trade.js`, read off the owner's real page).
+
+- **3.12.9** (live test, the owner: "where's my fill?", "where's the next bazaar
+  button?", "take that green info away"). Read the real add step again (read
+  only): Torn keeps each row's `.info-wrap` in the page but `display: none`,
+  and 3.12.8 put Fill there - never visible. Fill now goes in `.name-wrap`
+  (nowrap, overflow visible, so it never drops under the picture); every
+  category tab's `ul.items-cont` is read (All first); a press fills its own
+  row (`closest('li')`, `tradeFill` keyed by row). The poll runs the trade
+  checks before the item list has loaded. The green `::after` tag is hidden on
+  `.ttv2-buyhere`. Found on the way: **the owner had the script switched off**
+  in Tampermonkey when they saw no Fill / no Next bazaar - check that first.
+  `mockups/O-where-next-and-fill.html` shows where each thing is.
 
 ## The product today - two separate things
 

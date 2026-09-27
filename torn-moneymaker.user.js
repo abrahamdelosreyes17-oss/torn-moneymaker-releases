@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      3.12.8
+// @version      3.12.9
 // @description  Finds Bazaar and Item Market listings below NPC / market value - on the page you are viewing, and live from the Torn API and TornW3B - ranked by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -40,7 +40,7 @@
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '3.12.8';
+    const TTV2_BUILD_VERSION = '3.12.9';
 
     /* ===== src/platform/gm.js ===== */
     /*
@@ -2604,7 +2604,10 @@
      *     (/images/items/1321/large.png), .item-amount.qty how many you have,
      *     .amount input[name=amount] (Qty), a tick box instead for one-of-a-kind
      *     items (weapons), rows "disabled" when they cannot be traded, and one
-     *     ADD TO TRADE button for the page.
+     *     ADD TO TRADE button for the page. One ul.items-cont per category tab
+     *     (.all-items first); only the tab you are on is shown. The price and
+     *     .info-wrap cells are in each row but hidden (display: none) - read
+     *     again on 2026-09-27: marks go in .name-wrap, the visible cell.
      *
      * Nothing here clicks, types or presses anything; Fill (in main.js) types
      * into one row's Qty box when you press it, like Fill on your bazaar.
@@ -2661,10 +2664,9 @@
      * @returns {Array<{el: Element, itemId: string, name: string, have: number|null, qty: HTMLInputElement|null, single: boolean}>}
      */
     function readTradeAddRows(doc = document) {
-        const list = doc.querySelector('ul.items-cont');
-        if (!list) return [];
         const out = [];
-        for (const li of list.querySelectorAll('li.clearfix')) {
+        // Every category tab's list: the one you switch to is marked too.
+        for (const li of doc.querySelectorAll('ul.items-cont li.clearfix')) {
             if (li.classList.contains('disabled')) continue;
             const img = li.querySelector(ITEM_IMAGE_SELECTOR) || li.querySelector('img[src*="/items/"]');
             const itemId = img ? itemIdFromImage(img) : null;
@@ -7659,6 +7661,15 @@
         pointer-events: none;
     }
 
+    /*
+     * The card you are buying for a trade says so in blue; the trader tag and
+     * deal label (green) on it are hidden - they covered the blue words, and the
+     * trade already says who pays what (the owner, 2026-09-27: "no longer needed").
+     */
+    .ttv2-buyhere.ttv2-buyhere.ttv2-buyhere.ttv2-buyhere::after {
+        display: none !important;
+    }
+
     .ttv2-sendrow {
         box-shadow: inset 3px 0 0 #4dabf7, inset 0 0 0 9999px rgba(77, 171, 247, 0.10) !important;
     }
@@ -7674,6 +7685,17 @@
         white-space: nowrap;
         cursor: default;
     }
+
+    /*
+     * Torn's name cell is a fixed 406px: a long name and Fill stay on one line,
+     * running on past it (its width kept, so the cell never drops under the picture).
+     */
+    .ttv2-sendrow .name-wrap {
+        white-space: nowrap;
+        overflow: visible !important;
+    }
+
+    .ttv2-sendrow .name-wrap .ttv2-sendfill { vertical-align: middle; }
 
     .ttv2-sendfill[data-fill] { cursor: pointer; }
     .ttv2-sendfill[aria-pressed="true"] { background: #4dabf7; color: #10202c; }
@@ -17251,8 +17273,8 @@
         else trackTradeBuying([]);
     }
 
-    /** Fill on the trade page: what you typed there, to put back on the second press. */
-    const tradeFill = new Map();
+    /** Fill on the trade page: what you typed there, per row, to put back on the second press. */
+    const tradeFill = new WeakMap();
 
     /**
      * Torn's trade page: who the trade is with, whether they put in what the
@@ -17301,7 +17323,8 @@
             if (!n) continue;
             const left = Math.max(0, n.qty - (inside.get(lower(n.name)) || 0));
             row.el.classList.add(TRADE_SEND_CLASS);
-            const cell = row.el.querySelector('.info-wrap') || row.el.querySelector('.name-wrap');
+            // After the name: Torn hides this page's .info-wrap, so a mark there is never seen.
+            const cell = row.el.querySelector('.name-wrap') || row.el.querySelector('.title-wrap');
             if (!cell) continue;
             const chip = document.createElement('span');
             chip.className = TRADE_FILL_CLASS;
@@ -17311,7 +17334,7 @@
             } else if (!left) {
                 chip.textContent = 'All ' + n.qty.toLocaleString('en-US') + ' in the trade';
             } else {
-                const filled = tradeFill.has(row.itemId) && row.qty && row.qty.value === String(left);
+                const filled = tradeFill.has(row.el) && row.qty && row.qty.value === String(left);
                 chip.setAttribute('role', 'button');
                 chip.setAttribute('aria-pressed', String(filled));
                 chip.dataset.fill = String(left);
@@ -17372,14 +17395,16 @@
             if (!chip) return;
             event.preventDefault();
             event.stopPropagation();
-            const row = readTradeAddRows(document).find((r) => r.itemId === chip.dataset.itemId);
+            // This chip's own row (the item is in the All list and its category's list).
+            const li = chip.closest('li');
+            const row = readTradeAddRows(document).find((r) => r.el === li);
             if (!row || !row.qty) return;
             const want = chip.dataset.fill;
-            if (tradeFill.has(row.itemId) && row.qty.value === want) {
-                writeInputs([row.qty], tradeFill.get(row.itemId));
-                tradeFill.delete(row.itemId);
+            if (tradeFill.has(row.el) && row.qty.value === want) {
+                writeInputs([row.qty], tradeFill.get(row.el));
+                tradeFill.delete(row.el);
             } else {
-                tradeFill.set(row.itemId, row.qty.value);
+                tradeFill.set(row.el, row.qty.value);
                 writeInputs([row.qty], want);
             }
             scanTradePage();
@@ -20010,6 +20035,9 @@
             // Never loaded yet (no key at boot, or a failed first load). A key
             // Torn has rejected is never retried - see markKeyDead.
             if (!app.index) {
+                // The trade page and the buying box need no item list: never wait for it.
+                if (isTradePage(location.href)) scanTradePage();
+                if (detectPage(location.href) !== PAGE_BAZAAR) trackTradeBuying([]);
                 if (hasUsableKey() && !app.loading && Date.now() >= app.retryLoadAt) {
                     onScan();
                 }

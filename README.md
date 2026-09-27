@@ -316,7 +316,12 @@ you: every link is one you follow yourself, one page per click.
     **Fill N for Bob** - one press types that row's quantity into Torn's Qty
     box (a second puts back what was there); you press ADD TO TRADE and
     Accept. One-of-a-kind rows (weapons) say "tick Torn's box". Read off the
-    owner's real trade page (2026-09-27, read only).
+    owner's real trade page (2026-09-27, read only). **3.12.9:** Fill sits
+    after the item's name (Torn hides the row's price/info cell on this page,
+    where 3.12.8 put it, so it was never seen), on every category tab's list,
+    and the trade page no longer waits for the item list to download. The card
+    you are buying from shows only the blue trade label (the green trader tag
+    that covered it is hidden there).
     One Cash for the whole
     trade (this item first, then the most profit per $), Most per flip per
     item, their networth share for the whole trade. Every row has a tick and a

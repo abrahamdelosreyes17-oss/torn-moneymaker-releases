@@ -194,6 +194,15 @@ export const PAGE_CSS = `
     pointer-events: none;
 }
 
+/*
+ * The card you are buying for a trade says so in blue; the trader tag and
+ * deal label (green) on it are hidden - they covered the blue words, and the
+ * trade already says who pays what (the owner, 2026-09-27: "no longer needed").
+ */
+.ttv2-buyhere.ttv2-buyhere.ttv2-buyhere.ttv2-buyhere::after {
+    display: none !important;
+}
+
 .ttv2-sendrow {
     box-shadow: inset 3px 0 0 #4dabf7, inset 0 0 0 9999px rgba(77, 171, 247, 0.10) !important;
 }
@@ -209,6 +218,17 @@ export const PAGE_CSS = `
     white-space: nowrap;
     cursor: default;
 }
+
+/*
+ * Torn's name cell is a fixed 406px: a long name and Fill stay on one line,
+ * running on past it (its width kept, so the cell never drops under the picture).
+ */
+.ttv2-sendrow .name-wrap {
+    white-space: nowrap;
+    overflow: visible !important;
+}
+
+.ttv2-sendrow .name-wrap .ttv2-sendfill { vertical-align: middle; }
 
 .ttv2-sendfill[data-fill] { cursor: pointer; }
 .ttv2-sendfill[aria-pressed="true"] { background: #4dabf7; color: #10202c; }

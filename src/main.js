@@ -2611,8 +2611,8 @@ function onBuyNext() {
     else trackTradeBuying([]);
 }
 
-/** Fill on the trade page: what you typed there, to put back on the second press. */
-const tradeFill = new Map();
+/** Fill on the trade page: what you typed there, per row, to put back on the second press. */
+const tradeFill = new WeakMap();
 
 /**
  * Torn's trade page: who the trade is with, whether they put in what the
@@ -2661,7 +2661,8 @@ function scanTradePage() {
         if (!n) continue;
         const left = Math.max(0, n.qty - (inside.get(lower(n.name)) || 0));
         row.el.classList.add(TRADE_SEND_CLASS);
-        const cell = row.el.querySelector('.info-wrap') || row.el.querySelector('.name-wrap');
+        // After the name: Torn hides this page's .info-wrap, so a mark there is never seen.
+        const cell = row.el.querySelector('.name-wrap') || row.el.querySelector('.title-wrap');
         if (!cell) continue;
         const chip = document.createElement('span');
         chip.className = TRADE_FILL_CLASS;
@@ -2671,7 +2672,7 @@ function scanTradePage() {
         } else if (!left) {
             chip.textContent = 'All ' + n.qty.toLocaleString('en-US') + ' in the trade';
         } else {
-            const filled = tradeFill.has(row.itemId) && row.qty && row.qty.value === String(left);
+            const filled = tradeFill.has(row.el) && row.qty && row.qty.value === String(left);
             chip.setAttribute('role', 'button');
             chip.setAttribute('aria-pressed', String(filled));
             chip.dataset.fill = String(left);
@@ -2732,14 +2733,16 @@ function bindTradeFillPress() {
         if (!chip) return;
         event.preventDefault();
         event.stopPropagation();
-        const row = readTradeAddRows(document).find((r) => r.itemId === chip.dataset.itemId);
+        // This chip's own row (the item is in the All list and its category's list).
+        const li = chip.closest('li');
+        const row = readTradeAddRows(document).find((r) => r.el === li);
         if (!row || !row.qty) return;
         const want = chip.dataset.fill;
-        if (tradeFill.has(row.itemId) && row.qty.value === want) {
-            writeInputs([row.qty], tradeFill.get(row.itemId));
-            tradeFill.delete(row.itemId);
+        if (tradeFill.has(row.el) && row.qty.value === want) {
+            writeInputs([row.qty], tradeFill.get(row.el));
+            tradeFill.delete(row.el);
         } else {
-            tradeFill.set(row.itemId, row.qty.value);
+            tradeFill.set(row.el, row.qty.value);
             writeInputs([row.qty], want);
         }
         scanTradePage();
@@ -5370,6 +5373,9 @@ export function boot() {
         // Never loaded yet (no key at boot, or a failed first load). A key
         // Torn has rejected is never retried - see markKeyDead.
         if (!app.index) {
+            // The trade page and the buying box need no item list: never wait for it.
+            if (isTradePage(location.href)) scanTradePage();
+            if (detectPage(location.href) !== PAGE_BAZAAR) trackTradeBuying([]);
             if (hasUsableKey() && !app.loading && Date.now() >= app.retryLoadAt) {
                 onScan();
             }
