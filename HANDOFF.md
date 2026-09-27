@@ -6,6 +6,9 @@ Everything below "History" is the record of how we got here.
 
 ## Where things stand (3.12.6, 2026-09-27)
 
+**3.12.6 released** (`fe49df0`), pushed. Install link given to the owner:
+`https://raw.githubusercontent.com/abrahamdelosreyes17-oss/torn-moneymaker-releases/fe49df04203c7decb3e03b295f991037036d3083/torn-moneymaker.user.js`
+
 **3.12.6: one trade per trader** (mockup N3 + a "Sell to" picker, the owner's
 picks): the desk's flip plan is the whole trade with one trader (`core/trade.js`
 planTrade, tested; `tradeDesk` in main.js; `SellingPage.tradeCard`). Sell to
