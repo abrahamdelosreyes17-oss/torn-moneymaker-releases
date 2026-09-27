@@ -4,10 +4,12 @@ Read this first, then `README.md`. The README holds the product and the binding
 rules; this file holds where we are, how the owner works, and what is settled.
 Everything below "History" is the record of how we got here.
 
-## Where things stand (3.12.5 built, 2026-09-27)
+## Where things stand (3.12.5, 2026-09-27)
 
-**3.12.5 is built and tested but not committed** (the owner commits / asks for
-the pinned link). It has:
+**3.12.5 released** (`aab7e53`), branch `claude/optimistic-ride-1gqguu`,
+pushed. Install link given to the owner:
+`https://raw.githubusercontent.com/abrahamdelosreyes17-oss/torn-moneymaker-releases/aab7e531423cb74617eec487c7e4dbb3ac6f6fdc/torn-moneymaker.user.js`
+It has:
 - TornExchange's top three vs an item's full list disagreeing for one trader:
   the lower counts, amber "Lists differ: TE top 3 … · TE full list …" (the
   friend's ID Badge loss: $140k shown, $105k paid). `core/traders.js`.
