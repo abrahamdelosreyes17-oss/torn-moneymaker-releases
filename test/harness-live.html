@@ -120,6 +120,20 @@ if (_ownMarket) {
         d.addEventListener('input', (e) => window.__typed.push([e.target.closest('[class*=itemRow___]').querySelector('[class*=name___]').textContent, e.target.className, e.target.value]));
     });
 }
+// ?page=profile&XID=<id>: a player's profile with its Actions buttons (as read
+// on the real page, 2026-09-28: Start chat is a button with no link);
+// &chatwanted=1: Chat was pressed for that player in Torn Bids.
+if (/[?&]page=profile/.test(location.search)) {
+    const _xid = new URLSearchParams(location.search).get('XID') || '5001';
+    if (/[?&]chatwanted=1/.test(location.search)) _store[NS + 'chatWanted'] = JSON.stringify({ id: _xid, name: 'KayMalta', at: Date.now() });
+    document.addEventListener('DOMContentLoaded', () => {
+        const d = document.createElement('div');
+        d.innerHTML = '<div class="profile-buttons" style="display:flex;gap:6px;padding:40px">' +
+            '<a id="button1-profile-' + _xid + '" class="profile-button profile-button-sendMessage active" aria-label="Private message" href="#mail">mail</a>' +
+            '<button id="button2-profile-' + _xid + '" class="profile-button profile-button-initiateChat active withoutLink" aria-label="Start chat">chat</button></div>';
+        document.body.prepend(d);
+    });
+}
 // &tradeview=<name>: Torn's trade view (as read on the real page, 2026-09-27)
 // with that partner; &offer=<n> their money; &inside=<Name:qty,Name:qty> yours.
 const _tradeView = new URLSearchParams(location.search).get('tradeview');

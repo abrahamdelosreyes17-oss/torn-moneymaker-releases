@@ -89,6 +89,21 @@ export function itemImageUrl(itemId) {
 }
 
 /** The pin (3.14): an outline pin, drawn in the current colour. */
+/** A speech bubble, drawn in the current colour (Chat). */
+function chatIcon() {
+    const NS = 'http://www.w3.org/2000/svg';
+    const svg = document.createElementNS(NS, 'svg');
+    svg.setAttribute('viewBox', '0 0 16 16');
+    svg.setAttribute('width', '13');
+    svg.setAttribute('height', '13');
+    svg.setAttribute('aria-hidden', 'true');
+    const path = document.createElementNS(NS, 'path');
+    path.setAttribute('d', 'M2 3.5A1.5 1.5 0 0 1 3.5 2h9A1.5 1.5 0 0 1 14 3.5v6a1.5 1.5 0 0 1-1.5 1.5H7l-3.5 3v-3h0A1.5 1.5 0 0 1 2 9.5z');
+    path.setAttribute('fill', 'currentColor');
+    svg.appendChild(path);
+    return svg;
+}
+
 function pinIcon() {
     const NS = 'http://www.w3.org/2000/svg';
     const svg = document.createElementNS(NS, 'svg');
@@ -1694,7 +1709,14 @@ export class SellingPage {
      * name only, their TornExchange page.
      */
     chatLink(b) {
-        if (b.id) return this.link('Chat', spProfileUrl(b.id), { cls: 'sp-btn sp-chat', title: 'Open ' + b.name + '\'s profile to chat with them', focus: 'trade:chat' });
+        if (b.id) {
+            const a = this.link('Chat', spProfileUrl(b.id), { cls: 'sp-btn sp-chat', title: 'Open ' + b.name + '\'s profile: their chat button is marked', focus: 'trade:chat', children: [chatIcon(), 'Chat'] });
+            // Remembered for the overlay, which marks Torn's chat button there.
+            const want = () => this.h.onChatWanted && this.h.onChatWanted(b.id, b.name);
+            a.addEventListener('click', want);
+            a.addEventListener('auxclick', want);
+            return a;
+        }
         if (b.te) return this.link('Chat', tePriceListUrl(b.teName || b.name), { cls: 'sp-btn sp-chat', title: b.name + ' is known by name only: their TornExchange page', focus: 'trade:chat' });
         return null;
     }
@@ -2382,7 +2404,7 @@ a.sp-btn { display: inline-flex; align-items: center; text-decoration: none; }
 .sp-mainnote { margin: 4px 0 6px; color: var(--text); }
 .sp-add { padding: 2px 10px; }
 .sp-fc .sp-lo-x { margin-left: auto; padding: 4px 8px; color: var(--offer); font-weight: bold; }
-.sp-chat { min-width: 64px; justify-content: center; }
+.sp-chat { min-width: 64px; justify-content: center; gap: 6px; }
 .sp-q > .sp-note + .sp-note { margin-top: 6px; }
 .sp-tr { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 10px; align-items: center; padding: 8px 6px; border-top: 1px solid var(--cline); }
 .sp-q h3 + .sp-tr, .sp-q .sp-note + .sp-tr { border-top: 0; }

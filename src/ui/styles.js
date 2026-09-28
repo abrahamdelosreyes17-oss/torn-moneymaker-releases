@@ -180,6 +180,19 @@ export const PAGE_CSS = `
         inset 0 0 0 9999px rgba(77, 171, 247, 0.16) !important;
 }
 
+/* Chat from Torn Bids (3.14): Torn's own Start chat button on that profile, in blue. You press it. */
+.ttv2-chatmark {
+    outline: 3px solid #4dabf7 !important;
+    outline-offset: 2px;
+    border-radius: 6px;
+    box-shadow: 0 0 0 7px rgba(77, 171, 247, 0.28) !important;
+    animation: ttv2-chatpulse 1.2s ease-in-out 4;
+}
+
+@keyframes ttv2-chatpulse {
+    50% { box-shadow: 0 0 0 11px rgba(77, 171, 247, 0.12); }
+}
+
 .ttv2-buyhere::before {
     content: attr(data-ttv2-buy);
     position: absolute;

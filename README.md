@@ -495,7 +495,13 @@ front.
   2 minutes) and for up to 30 possible flips (where a buyer you would sell to
   pays more than the cheapest price; every 10 minutes). The summary, those
   listings and traders' price lists share one budget: one TornW3B call every
-  2.5 s, 24 a minute at most, visible tab only.
+  2.5 s, 24 a minute at most while the page is in view. **In the background
+  (3.14)** Torn Bids keeps reading TornExchange (every 10 minutes, as in view)
+  and TornW3B (6 a minute), and works out the flips every 30 s, so it is
+  current when you come back - before, a page left behind your Torn tabs
+  showed hour-old TornExchange prices and "0 of 30" flips checked, and took
+  a minute to catch up. Coming back refreshes TornExchange at once. Torn API
+  calls (statuses, networth, inventory, the Item Market) stay in-view only.
 - **Trader prices: TornExchange and TornW3B together**, as below.
 - **The Item Market**: one call with the Limited key for the item on the desk,
   when you hold it (every 2 minutes while it stays there).
@@ -538,6 +544,10 @@ keeps its own:
   apart (6 a minute against its 10 per IP), never retried on their own, shared
   by every tab, and a 429 waits out `retry_after`; saving or forgetting the key
   never resets that wait.
+- **Chat** (3.14): Torn has no link that opens a chat (its profile's Start
+  chat button has none), so Chat opens the trader's profile and the overlay
+  marks that button in blue; you press it. The mark goes when you do, or
+  after 10 minutes.
 - **Cash for flips** - flips never plan to spend more (reads `5000000`,
   `5,000,000`, `5m`, `500k`; blank is no limit). The **Cash** pill in the
   header shows it; press it to change it. Its own setting, apart from the
@@ -778,7 +788,9 @@ code flaw. These measures address both halves.
    longer erase each other's; after Torn answers 5 (rate), 8 (IP block) or 9
    (API down) every tab pauses (30 s / 10 min / 2 min) instead of asking into
    the block; and a request queued while a tab was visible is not sent after
-   it is hidden. The item list's v1 fallback gives no NPC prices at all (it
+   it is hidden. (3.14: Torn Bids' own TornExchange and TornW3B clients do
+   keep going in the background, slowly - they are not Torn; the Torn API
+   never does.) The item list's v1 fallback gives no NPC prices at all (it
    cannot show a shop in Torn buys an item) and is retried after 5 minutes.
 
 ### Out of scope, deliberately

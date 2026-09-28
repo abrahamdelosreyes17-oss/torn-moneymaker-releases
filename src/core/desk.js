@@ -3,6 +3,20 @@
  * Pure: no DOM, no network.
  */
 
+/*
+ * In the background (3.14, the owner: "can we do it automatically?"): Torn
+ * Bids keeps reading TornExchange and TornW3B while its tab is hidden - a
+ * quarter of TornW3B's in-view pace - and works out the flips now and then,
+ * so the page is current when you look at it. Torn API calls stay in-view only.
+ */
+export const W3B_HIDDEN_PER_MIN = 6;
+export const HIDDEN_RENDER_MS = 30 * 1000;
+
+/** May a hidden tab make another TornW3B read now? `recent`: its reads' times. */
+export function backgroundSlot(recent, now, perMinute = W3B_HIDDEN_PER_MIN) {
+    return (recent || []).filter((t) => now - t < 60000).length < perMinute;
+}
+
 /**
  * The item on the desk. One you picked stays picked (pressing a Best flips
  * card, a list row, or anything in the trade). Until you pick one, the desk

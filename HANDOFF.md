@@ -6,9 +6,9 @@ Everything below "History" is the record of how we got here.
 
 ## Start here (state on 2026-09-28, end of the second session)
 
-- **Released: 3.14.0** (`b9b99e9`; see "What the 2026-09-28 second session did"), pushed.
-  Install link given to the owner:
-  `https://raw.githubusercontent.com/abrahamdelosreyes17-oss/torn-moneymaker-releases/b9b99e9fd35ef8b056d35ca4b0b4e73674b9f30d/torn-moneymaker.user.js`
+- **Released: 3.14.1** (3.14.0 `b9b99e9` + Torn Bids keeping fresh in the
+  background and Chat marking Torn's chat button; see "What the 2026-09-28
+  second session did"), pushed. Install link: RELEASE_LINK_PLACEHOLDER
 - Before it: 3.13.1 (`e3b4fc5`). Branch `claude/optimistic-ride-1gqguu`. Earlier: 3.12.10 (`711f893`),
   3.12.5 (`aab7e53`), 3.12.6 (`fe49df0`), 3.12.7 (`d69907c`), 3.12.8 (`8991095`), 3.12.9 (`c45a227`).
 - **Remind the owner (they asked, 2026-09-28: "dont build, but remind the
@@ -25,7 +25,7 @@ Everything below "History" is the record of how we got here.
   installs go through **pinned links** (`.../<commit>/torn-moneymaker.user.js`).
   Merging to `main` makes every install auto-update: only if the owner asks.
 - Nothing uncommitted except `mockups/` and `.claude/` (untracked on purpose).
-- 272 unit tests (`npm test`); `test/ux-check.mjs` has never run here. For
+- 274 unit tests (`npm test`); `test/ux-check.mjs` has never run here. For
   screenshots, 2026-09-28 used `playwright-core` installed in the session's
   scratchpad with the system Chrome (`executablePath`), never the repo. **Block
   torn.com in every Playwright context** (`ctx.route(/torn\.com\//, r =>
@@ -178,9 +178,16 @@ main flip... 1 bazaar best"; "about 5 extras, soft cap"; no money thresholds
   its trader even when a toggle hides them; the hovered strip keeps its
   places but updates; the pin icon shows only what was saved. Worst case
   (12 traders x 30 items x 100 listings) plans in ~31 ms.
-- **Open:** Torn's direct chat link (the owner should open a trader's profile
-  in the Claude tab group; read what the chat button points to); a pin from a
-  list row (only Best flips cards have the pin); Settings › Keep for yourself
+- **Found live (read only, the owner's page):** Torn Bids showed "TornExchange
+  1h" and "0 of 30" flips checked - its tab was hidden, and the page sent
+  nothing while hidden. Fixed in 3.14.1: TornExchange and TornW3B keep going in
+  the background (6 TornW3B reads a minute), TornExchange refreshes on coming
+  back; Torn API calls stay in-view only. Torn's profile "Start chat" is a
+  button with no link (`button2-profile-<id>`, class `withoutLink`); 3.14.1's
+  Chat stores `chatWanted` and the overlay marks that button in blue
+  (`markChatButton`). Harness: `?page=profile&XID=5001&chatwanted=1`.
+- **Open:** the TornExchange pill's yellow state was never seen live (ask for
+  its hover text if it comes back); a pin from a list row (only Best flips cards have the pin); Settings › Keep for yourself
   is now unused by trades (kept, harmless).
 
 ## What the 2026-09-28 session did (3.13.0)
@@ -982,8 +989,10 @@ PWPATH=$(npm root -g)/playwright node test/ux-check.mjs   # real-browser checks
     TornExchange key, and its refusal message stored);
   - `?ownbazaar=1&page=bazaar#/add` opens your own add page with a week of
     recorded prices.
-- **The traders page pauses every request while its tab is hidden** (Torn's
-  rules). In a background preview it looks stuck until brought forward.
+- **The traders page pauses its Torn API requests while its tab is hidden**;
+  since 3.14 its TornExchange and TornW3B reads go on slowly in the
+  background (`backgroundSlot`, 6 TornW3B reads a minute, flips worked out
+  every 30 s). A background preview shows little until brought forward.
 
 ## Settled facts (don't reopen these)
 

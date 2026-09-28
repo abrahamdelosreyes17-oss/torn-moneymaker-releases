@@ -44,6 +44,17 @@ export function isTradePage(href) {
 }
 
 /**
+ * The player whose Torn profile this is (profiles.php?XID=), or null. The
+ * harness stands in with `page=profile&XID=`.
+ */
+export function profileIdOf(href) {
+    const url = String(href || '');
+    if (!/\/profiles\.php/i.test(url) && !/[?&]page=profile(?:[&#]|$)/i.test(url)) return null;
+    const m = url.match(/[?&#]XID=(\d+)/i);
+    return m ? m[1] : null;
+}
+
+/**
  * Deep link to an item's Item Market page.
  *
  * Used by the panel's navigate button. One click, one navigation - the script

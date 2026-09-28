@@ -52,7 +52,7 @@ import {
 import { bazaarSellers, flipPlan, flipBuyer, whereToSell, depthNearCheapest, flipCandidates, traderTagLabel, pickBazaars, MAIN_STOPS, EXTRA_STOPS } from './core/flips.js';
 import { planTrade, keepAfter } from './core/trade.js';
 import { holdTrade, holdKey, resolveEstimated, priceHeld, livePins, editHeld, HOLD_MS } from './core/held.js';
-import { deskItem, nextW3bRead } from './core/desk.js';
+import { deskItem, nextW3bRead, backgroundSlot, W3B_HIDDEN_PER_MIN, HIDDEN_RENDER_MS } from './core/desk.js';
 import { liquidityKind, unitsMoved, addMovement, stopsMinutes, EXTRA_CAP } from './core/liquidity.js';
 import { acceptTrade, liveAccepted, stepState, tickAccepted, stepDone, nextStep, boughtFromStock, recordBuy, sendUnits, acceptedTotals, replacementFor, replaceStep, dropLine, markLeft, leftoversOf, addLeftovers, takenUnits } from './core/accepted.js';
 import { readTradeView, readTradeAddRows } from './sources/dom/trade.js';
@@ -139,6 +139,7 @@ import {
     isTradersPageUrl,
     isOldTradersPageUrl,
     isTradePage,
+    profileIdOf,
     PAGE_NONE,
     PAGE_BAZAAR,
 } from './sources/route.js';
@@ -239,6 +240,10 @@ const STORE_SELL_DECLINED = 'sellDeclined';
 const STORE_SELL_ACCEPTED = 'sellAccepted';
 /* Trades you pinned (core/held.js): 'item|trader key' -> held trade. Only prices move in them. */
 const STORE_SELL_PINNED = 'sellPinned';
+/* Chat pressed in Torn Bids (3.14): {id, name, at}; the overlay marks Torn's chat button on that profile. */
+const STORE_CHAT_WANTED = 'chatWanted';
+const CHAT_WANTED_MS = 10 * 60 * 1000;
+const CHAT_MARK_CLASS = 'ttv2-chatmark';
 /* How fast each item leaves the bazaars (core/liquidity.js): itemId -> {units, ms, at}. */
 const STORE_SELL_MOVES = 'sellMoves';
 const SELL_MOVES_MAX = 1500;
@@ -2746,6 +2751,29 @@ const tradeFill = new WeakMap();
  * with Fill (one row per press: types that row's quantity; you press ADD TO
  * TRADE and Accept yourself).
  */
+/**
+ * Chat from Torn Bids (the owner, 2026-09-28: "when you press chat trader it
+ * leads them to their profile with the chat highlighted"). Torn has no link
+ * that opens a chat - its Start chat button has none - so Chat opens the
+ * profile and the overlay marks that button in blue. You press it; the mark
+ * goes when you do, or after ten minutes. Nothing is pressed for you.
+ */
+function markChatButton() {
+    const id = profileIdOf(location.href);
+    const want = gmGet(STORE_CHAT_WANTED, null);
+    const on = Boolean(id && want && String(want.id) === id && Date.now() - Number(want.at) < CHAT_WANTED_MS);
+    const btn = on ? document.getElementById('button2-profile-' + id) || document.querySelector('.profile-button-initiateChat') : null;
+    for (const b of document.querySelectorAll('.' + CHAT_MARK_CLASS)) {
+        if (b !== btn) b.classList.remove(CHAT_MARK_CLASS);
+    }
+    if (!btn || btn.classList.contains(CHAT_MARK_CLASS)) return;
+    btn.classList.add(CHAT_MARK_CLASS);
+    btn.addEventListener('click', () => {
+        gmSet(STORE_CHAT_WANTED, null);
+        btn.classList.remove(CHAT_MARK_CLASS);
+    }, { once: true });
+}
+
 function scanTradePage() {
     if (!app.panel) return;
     if (!isTradePage(location.href)) {
@@ -3201,15 +3229,19 @@ function tornSharing() {
     };
 }
 
-/** A TornW3B client drawing on the one budget every tab shares. */
-function newW3bClient(options = {}) {
+/**
+ * A TornW3B client drawing on the one budget every tab shares. Only while
+ * its tab is in view, unless `background` (Torn Bids, 3.14: TornW3B is not
+ * Torn, and a page that sleeps while you play shows hour-old prices).
+ */
+function newW3bClient({ background = false, ...options } = {}) {
     return new W3bClient({
         ...options,
         // Slots per tab (never overwritten by another tab); the 429 wait in one value.
         loadShared: () => ({ recent: sharedTabWindow(STORE_W3B_WINDOW).load(), cooldownUntil: Number(gmGet(STORE_W3B_COOLDOWN, 0)) || 0 }),
         saveShared: (state) => gmSet(STORE_W3B_COOLDOWN, state.cooldownUntil),
         addShared: (at) => sharedTabWindow(STORE_W3B_WINDOW).add(at),
-        isVisible: () => document.visibilityState === 'visible',
+        isVisible: () => background || document.visibilityState === 'visible',
     });
 }
 
@@ -3792,16 +3824,23 @@ const W3B_BAZAARS_FORGET_MS = 30 * 60 * 1000;
 const SELL_MARKET_REFRESH_MS = 2 * 60 * 1000;
 
 function stepW3b() {
-    if (sell.w3bBusy || document.visibilityState !== 'visible') return;
+    if (sell.w3bBusy) return;
     const now = Date.now();
     if (now < sell.w3bPauseUntil) return;
+    // In the background: a few reads a minute (backgroundSlot), each started
+    // as the last one ends - a hidden tab's timers fire once a minute at best.
+    const hidden = document.visibilityState !== 'visible';
+    sell.w3bHidden = (sell.w3bHidden || []).filter((t) => now - t < 60000);
+    if (hidden && !backgroundSlot(sell.w3bHidden, now)) return;
     const job = nextW3bJob(now);
     if (!job) return;
 
     sell.w3bBusy = true;
+    if (hidden) sell.w3bHidden.push(now);
     job().finally(() => {
         sell.w3bBusy = false;
         renderSelling();
+        if (document.visibilityState !== 'visible') stepW3b();
     });
 }
 
@@ -4021,9 +4060,14 @@ function renderSellingNow() {
         clearTimeout(sell.renderTimer);
         sell.renderTimer = null;
     }
-    // A hidden tab draws nothing; it draws on becoming visible again.
-    if (!sell.page || document.visibilityState !== 'visible') return;
+    // A hidden tab works out the flips now and then (which bazaars to read
+    // next depends on it), and draws in full on becoming visible again.
+    if (!sell.page) return;
     const now = Date.now();
+    if (document.visibilityState !== 'visible') {
+        if (now - (sell.hiddenRenderAt || 0) < HIDDEN_RENDER_MS) return;
+        sell.hiddenRenderAt = now;
+    }
     const prefs = sellPrefs();
     const st = teState();
     const access = gmGet(STORE_SELL_KEY_ACCESS, null);
@@ -4802,7 +4846,6 @@ function loadSellTraders(now = Date.now()) {
  */
 async function refreshSellTraders({ force = false } = {}) {
     if (!getTeKey() || sell.teLoading) return;
-    if (document.visibilityState !== 'visible') return;
 
     const now = Date.now();
     loadSellTraders(now);
@@ -5215,13 +5258,17 @@ function bootSellingPage() {
         loadState: () => teState(),
         saveState: (state) => setTeState(state),
     });
+    // TornExchange and TornW3B keep going in the background (3.14, the
+    // owner: "can we do it automatically?"): they are not Torn, and a page
+    // that sleeps while you play shows hour-old prices and no flips when
+    // you come back. Torn API calls stay in-view only.
     sell.queue = new TeQueue({
         client: sell.te,
-        isVisible: () => document.visibilityState === 'visible',
+        isVisible: () => true,
         onSettled: onTeSettled,
     });
     // Its own TornW3B budget, well under TornW3B's 100 a minute per IP.
-    sell.w3b = newW3bClient({ maxPerMinute: 24 });
+    sell.w3b = newW3bClient({ maxPerMinute: 24, background: true });
     sell.keyDead = Boolean(gmGet(STORE_SELL_KEY_DEAD, false));
     if (sell.keyDead) sell.keyError = 'Torn rejected this key. Paste a new Limited key.';
 
@@ -5393,6 +5440,10 @@ function bootSellingPage() {
             saveSellAccepted(all);
             renderSellingNow();
         },
+        // Chat pressed: the overlay marks Torn's chat button on their profile.
+        onChatWanted: (id, name) => {
+            if (id) gmSet(STORE_CHAT_WANTED, { id: String(id), name: String(name || ''), at: Date.now() });
+        },
         onLeftoverRemove: (itemId) => {
             saveSellLeftovers(sellLeftovers().filter((l) => String(l.itemId) !== String(itemId)));
             renderSellingNow();
@@ -5529,8 +5580,14 @@ function bootSellingPage() {
     setInterval(() => runLedger(), 15000);
 
     setInterval(() => {
-        if (document.visibilityState !== 'visible') return;
+        // TornExchange and TornW3B keep going in the background; the Torn
+        // API (inventory, your id) only while this tab is in view.
         refreshSellTraders();
+        stepW3b();
+        if (document.visibilityState !== 'visible') {
+            saveTraderDb();
+            return;
+        }
         const due = inventoryRefreshDue({
             inventoryAt: sell.inventoryAt,
             retryAt: sell.inventoryRetryAt,
@@ -5544,8 +5601,14 @@ function bootSellingPage() {
     }, 15000);
 
     document.addEventListener('visibilitychange', () => {
-        if (document.visibilityState === 'visible') renderSellingNow();
-        else saveTraderDb(true);
+        if (document.visibilityState === 'visible') {
+            // Back: TornExchange at once if its list is due, the next read now.
+            refreshSellTraders();
+            stepW3b();
+            renderSellingNow();
+        } else {
+            saveTraderDb(true);
+        }
     });
     window.addEventListener('pagehide', () => saveTraderDb(true));
 }
@@ -6040,6 +6103,7 @@ export function boot() {
         if (!app.index) {
             // The trade page and the buying box need no item list: never wait for it.
             if (isTradePage(location.href)) scanTradePage();
+            markChatButton();
             trackTradeBuying(null);
             if (hasUsableKey() && !app.loading && Date.now() >= app.retryLoadAt) {
                 onScan();
@@ -6054,6 +6118,7 @@ export function boot() {
             if (app.pageType !== PAGE_NONE) rescan();
             // Torn's trade page, and the buying box on other pages.
             if (isTradePage(location.href)) scanTradePage();
+            markChatButton();
             trackTradeBuying([]);
             return;
         }
