@@ -80,6 +80,42 @@ offer to read Torn's scripting-rules page with them (read only).
   github.io user-site origin (any other Pages project of that account shares
   it - note in the ToS table); a removed leftover has no Undo.
 
+### The agenda for the fourth session (start here)
+
+1. **Check 3.14.4 live first** (read only; pages the owner opens in the Claude
+   tab group; ask first whether the script is on and shows 3.14.4). Nothing
+   of 3.14.3 / 3.14.4 has been seen on real pages:
+   - Torn Bids: flips checked while hidden (the Bazaars pill "N of 30" on
+     coming back); Your traders; ☆ / ⊘ and "Traded 7×"; Settings with no
+     Save buttons (Enter / Tab / click away, Esc, red reason, Cash No limit /
+     Up to); a Public key refused; Ledger › Traders and Receipts' trader
+     picker (needs the Full key).
+   - A real buying run: the Bought window (above NPC Arbitrage, drag, fold),
+     planned buys counted from the card's stock, an unplanned buy (orange /
+     red), and the trade page checklist ("✓ in" / "Not in the trade yet").
+     The real bazaar card's markup (Buy button, Qty box, stock text) was
+     never read: if counting misses, read that page with the owner.
+   - Still from before: A4 one row per pinned item, A5 Declined moves on,
+     A6 "Other" never flipped, A7 the light-red opened-listing mark, and
+     the friend's A1 screenshot.
+2. **Unplan (the owner, end of the third session, asked for next time):**
+   "there's declined, but then there's also - I press plan, they didn't
+   decline but I just want to unplan". Restated: after **Plan trade** on a
+   trader, a way to take that pick back - the desk goes back to what it
+   showed before you picked (the best trade), and the trader is NOT marked
+   declined (their trades keep showing as usual). Code today: Plan trade is
+   `onTradePick(itemId, key)` (main.js, sets `sell.tradePick`, `selected`,
+   `pickedByYou`); the first press on a trade also takes a hold
+   (`sell.tradeHold`, core/held.js); pins and accepted trades are separate
+   (Unpin, Traded - done / Back). Likely: an "Unplan" beside "X accepted /
+   X declined" on the flip plan (and on the "Planning" chip of the Traders
+   pay row) that clears the pick and releases the hold - never a pin or an
+   accepted trade. **Before building:** restate it, and mockups for the
+   label and where it sits (the owner decides; labels 6 words or fewer).
+3. **Held, remind only:** the faction rule (skip a trader in the same
+   faction as the bazaar you bought from); trader capacity and "Sell fast"
+   (the Vladbull case, never a ranking bias).
+
 ### The plan (third session, 2026-09-28 - its live check so far)
 
 Written down so it is not lost. Nothing on the agenda (C) is built yet; A
