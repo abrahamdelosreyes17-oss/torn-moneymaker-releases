@@ -77,6 +77,73 @@ offer to read Torn's scripting-rules page with them (read only).
   github.io user-site origin (any other Pages project of that account shares
   it - note in the ToS table); a removed leftover has no Undo.
 
+### The plan (third session, 2026-09-28 - its live check so far)
+
+Written down so it is not lost. Nothing on the agenda (C) is built yet; A
+checks what 3.14.0-3.14.2 built; B are bugs the live check found.
+
+**A. Live check of 3.14.2 (read only)**
+
+| # | Check | Status |
+|---|---|---|
+| A1 | The friend's add step: what the line after "ADD TO TRADE · Clear all" says | not seen - his screen; needs his screenshot |
+| A2 | Chat -> profile with Start chat outlined blue | the owner: fine - dropped |
+| A3 | Torn Bids in the background: TornExchange pill in minutes; flips already checked on coming back | **pill passed; flips failed** (3 of 30 in ~5 min) -> B2 |
+| A4 | Pins on Best flips cards and list rows, one row per pinned item | to do |
+| A5 | Declined per trade; the desk goes on to the next flip | to do |
+| A6 | "Other" in Never flip | to do |
+| A7 | The overlay's light-red mark on the listing you opened | to do |
+
+**B. Fixes from the live check**
+
+| # | Fix | Done when |
+|---|---|---|
+| B1 | The buying box: its button label is not cut off, the status does not wrap mid-line, the time reads "yes 1h 40m ago" (the box is 3.13's) | a test fails on the old code and passes on the new; screenshots at 430 / 288 / 240px of free space |
+| B2 | Possible flips checked while Torn Bids is hidden | measured first, then fixed: all 30 checked by the time you come back |
+| B3 | TornExchange "did not answer": why | read its hover text and colour the next time it shows; fix only if it is ours |
+
+B2, what 3.14.1 does (the previous session's note - it only ever checked
+that background reads happen, 6 in 45 s on the harness, never that all 30
+possible flips get covered, so "flips already checked when you come back"
+was an overclaim):
+- `backgroundSlot` (core/desk.js) caps TornW3B at `W3B_HIDDEN_PER_MIN` = 6
+  reads a minute while hidden;
+- `nextW3bRead` alternates possible flips and traders' price lists (`turn`),
+  so about half of those go to price lists (the owner's page: 282/293 lists
+  still being read);
+- the candidates are recomputed only every `HIDDEN_RENDER_MS` (30 s) while
+  hidden (`renderSellingNow`);
+- Chrome throttles a hidden tab's timers to once a minute after ~5 minutes;
+  `stepW3b` chains the next read from the last one's end only while
+  `backgroundSlot` allows, then waits for the (throttled) 15 s / 2.5 s timers.
+Likely direction (measure first): while hidden, the flips before the price
+lists (lists can wait), and a higher background pace for the flips alone
+(TornW3B allows 100 a minute per IP; in view Torn Bids uses 24).
+
+**C. The agenda (the owner's order)**
+
+| # | Deliverable | Before building | The owner decides |
+|---|---|---|---|
+| 1 | **"Bought since you accepted":** a separate overlay, shown only while a trade is accepted, listing every item bought since; Fill and the trade page's highlight come from that list | research the source (Torn's bazaar purchase message vs Torn Bids reading the log - the Full key never in the overlay); mockups | a mockup |
+| 2 | **Extras per trade** in Settings › Flips: a number or unlimited, default 5 | none (a setting) | does "unlimited" also lift the 3-bazaars-per-extra rule? |
+| 3 | **Our trusted traders:** Ledger › Traders tab (who, trades, totals, last trade, did they pay their list) + "Traded 7× · last 3d ago" on trader rows | mockup | automatic (N trades, all paid) or picked? |
+| 4 | **Favourite / blacklisted traders:** favourite = 3+ trades, automatic and editable; blacklist = never planned, never a buyer, with Undo | mockup | 3 trades total or on different days? blacklisted hidden or greyed at the bottom? last-paid prices for a favourite with no list? |
+| 5 | **Receipts by trader** (a picker + totals), and each line's profit split by the trader's accepted prices | mockup | picker + totals, or is the Who box enough? |
+| 6 | **Scan trusted / favourite traders:** the best whole trade with each now, one press to the desk | research TornExchange's per-trader list endpoint | none until the research is back |
+
+**D. Still held (remind, do not build):** the faction rule; trader capacity
+and "Sell fast".
+
+**Also noticed live, not on the list:** troll bids (a Parcel at $99b) lead
+Torn Bids' item list - flips ignore a bid over 3x the Item Market Average
+(`BID_SANITY_X`), but the list sorts partly by the best bid. Ask before adding.
+
+**Rules for every build:** a unit test that fails on the old code and passes
+on the new; `npm run check` green (277 tests); nothing removed (the buying
+run, Fill, leftovers, receipts, pins, held trades keep working); harness
+screenshots with torn.com blocked; no money thresholds; asking for the link
+means release (bump, commit, push, pinned link).
+
 ### The agenda for the next session (let the owner choose the order)
 
 The owner, end of 2026-09-28: "write me handoff for next session. with the
