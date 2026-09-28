@@ -55,7 +55,7 @@ import { planTrade, keepAfter } from './core/trade.js';
 import { holdTrade, holdKey, resolveEstimated, priceHeld, livePins, editHeld, HOLD_MS } from './core/held.js';
 import { deskItem, nextW3bRead, backgroundSlot, backgroundListSlot, flipsStale, W3B_HIDDEN_PER_MIN, HIDDEN_RENDER_MS, declineKey, declinedOn } from './core/desk.js';
 import { liquidityKind, unitsMoved, addMovement, stopsMinutes, EXTRA_CAP } from './core/liquidity.js';
-import { boughtSince, acceptTrade, liveAccepted, stepState, tickAccepted, stepDone, nextStep, boughtFromStock, recordBuy, sendUnits, acceptedTotals, replacementFor, replaceStep, dropLine, markLeft, leftoversOf, addLeftovers, takenUnits, fillNote } from './core/accepted.js';
+import { boughtSince, stockBuys, addExtraBuy, acceptTrade, liveAccepted, stepState, tickAccepted, stepDone, nextStep, boughtFromStock, recordBuy, sendUnits, acceptedTotals, replacementFor, replaceStep, dropLine, markLeft, leftoversOf, addLeftovers, takenUnits, fillNote } from './core/accepted.js';
 import { readTradeView, readTradeAddRows } from './sources/dom/trade.js';
 import { BoughtWindow } from './ui/bought-window.js';
 import { makeTabId, LEADER_HEARTBEAT_MS } from './core/leader.js';
@@ -2629,11 +2629,6 @@ function buyStepHere(listings) {
 }
 
 /**
- * On a bazaar page: mark the listing to buy, count what you took, show the box
- * with Next. `listings`: what this page's scan found; null = not scanned (no
- * item list yet) - nothing is counted or unmarked from that, never "gone".
- */
-/**
  * Bought since you accepted (3.14.3, ui/bought-window.js): its own window on
  * Torn's pages while a trade is accepted - the trade you are on (the trade
  * page's partner), else the newest one. On the trade page it is a checklist.
@@ -2659,8 +2654,90 @@ function updateBoughtWindow() {
     app.bought.render({ ...boughtSince(trade, { inside: onTradePage ? check.inside : null }), onTradePage });
 }
 
+/* Unplanned buys: each card's stock on the bazaar you are on, kept for this tab. */
+const EXTRA_SEEN_SESSION = 'ttv2-extra-seen';
+
+/** What the trader of `trade` pays for one of an item, from the lists this browser has (0: they do not buy it). */
+function traderBidOf(trade, itemId) {
+    trustedBuyerOf(itemId);
+    const lookup = app.traderLookup;
+    if (!lookup) return 0;
+    const lower = (x) => String(x || '').toLowerCase();
+    const b = lookup.buyersAll(String(itemId)).find((x) => (trade.trader.id && String(x.id) === String(trade.trader.id)) || lower(x.name) === lower(trade.trader.name));
+    return b ? b.price : 0;
+}
+
+/** Which card you pressed a button on (Torn's Buy): a card that then vanishes was bought by you. Read only. */
+function bindExtraPress() {
+    if (app.extraPressBound) return;
+    app.extraPressBound = true;
+    document.addEventListener('click', (event) => {
+        const target = event.target;
+        if (!target || !target.closest || !target.closest('button, a, input[type="submit"], input[type="button"], [role="button"]')) return;
+        for (const c of app.extraCards || []) {
+            if (c.el && c.el.contains(target)) (app.extraPressed = app.extraPressed || []).push(String(c.itemId) + '|' + Number(c.listingPrice));
+        }
+    }, true);
+}
+
+/**
+ * Unplanned buys (3.14.3, core/accepted.js stockBuys): on a bazaar page while
+ * a trade is accepted, what left each card's stock that is not in the plan
+ * here - counted for that trade when its trader buys it (else left off).
+ */
+function trackExtraBuys(listings) {
+    const seller = bazaarOwnerId(location.href);
+    if (!seller || !Array.isArray(listings) || !listings.length) return;
+    const all = Object.values(sellAccepted()).sort((a, b) => b.at - a.at);
+    if (!all.length) {
+        app.extraCards = null;
+        return;
+    }
+    const here = (t) => t.items.filter((i) => (i.steps || []).some((st) => String(st.sellerId) === String(seller)));
+    const trade = all.find((t) => here(t).length) || all[0];
+    // Planned here: counted by the buying run, never twice.
+    const planned = new Set(here(trade).map((i) => String(i.itemId)));
+    const cards = listings.filter((l) => !planned.has(String(l.itemId)));
+    app.extraCards = cards;
+    bindExtraPress();
+    let store = {};
+    try {
+        store = JSON.parse(sessionStorage.getItem(EXTRA_SEEN_SESSION) || '{}') || {};
+    } catch {
+        store = {};
+    }
+    const mine = store[seller] && store[seller].trade === trade.key ? store[seller] : { trade: trade.key, seen: {} };
+    const { bought, seen } = stockBuys(mine.seen, cards, new Set(app.extraPressed || []));
+    app.extraPressed = [];
+    let t = trade;
+    const sellerName = (() => {
+        for (const x of all) for (const i of x.items) for (const st of i.steps || []) if (String(st.sellerId) === String(seller) && st.sellerName) return st.sellerName;
+        return null;
+    })();
+    for (const b of bought) {
+        const bid = traderBidOf(trade, b.itemId);
+        if (!(bid > 0)) continue;
+        t = addExtraBuy(t, { ...b, bid, sellerId: seller, seller: sellerName });
+    }
+    store[seller] = { trade: trade.key, seen };
+    const keys = Object.keys(store);
+    for (const k of keys.slice(0, Math.max(0, keys.length - 10))) delete store[k];
+    try {
+        sessionStorage.setItem(EXTRA_SEEN_SESSION, JSON.stringify(store));
+    } catch {
+        /* this read only */
+    }
+    if (t !== trade) saveSellAccepted({ ...sellAccepted(), [t.key]: t });
+}
+
+/**
+ * On a bazaar page: mark the listing to buy, count what you took, show the box
+ * with Next. `listings`: what this page's scan found; null = not scanned (no
+ * item list yet) - nothing is counted or unmarked from that, never "gone".
+ */
 function trackTradeBuying(listings) {
     if (!app.panel) return;
+    if (detectPage(location.href) === PAGE_BAZAAR) trackExtraBuys(listings);
     updateBoughtWindow();
     const scanned = Array.isArray(listings);
     const pending = Object.values(sellAccepted()).filter((t) => nextStep(t));

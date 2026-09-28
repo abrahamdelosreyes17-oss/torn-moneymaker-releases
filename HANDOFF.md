@@ -336,16 +336,20 @@ blocked); nothing of it seen live yet.
   trade (steps now carry `boughtAt`), cost / they pay / profit, still to buy;
   on the trade page a checklist ("✓ in" / "add 20") and "Not in the trade
   yet: X ×20" or "Everything you bought is in the trade ✓"; gone at Traded -
-  done. **Unplanned buys** (orange while profitable, red at a loss; ones the
-  trader does not buy left off) are in the model (`trade.extra`) but nothing
-  fills it yet: that needs the bazaar page's own purchase message read live
-  (the owner buys something with the Claude tab open) - today only the
-  planned steps are counted, from the listing's stock, as before.
+  done. **Unplanned buys (3.14.4)** (orange while profitable, red at a loss;
+  ones the trader does not buy left off): the owner asked "do you really need
+  [the live read]? ... the way the script is written?" - no: `stockBuys`
+  counts them as the planned buys are counted, from each card's stock on the
+  bazaar page you are on (every card not planned at that seller; a card that
+  vanishes counts only if you pressed a button on it - `bindExtraPress`, read
+  only; a card with no stock shown never counts). The trader's price comes
+  from the overlay's own lists (`traderBidOf`). Stored as `trade.extra`.
+  Torn's own purchase message would be exact; still never read live.
 - **Overlay (review + inputs A/D):** the Min and Cash chips save on Enter / Tab
   / click away, errors under the chips, Cash has "Any" (0 is refused);
   Settings › Fill's amount the same; the Seller line wraps (no "…"); the add
   page header and rows fit at 240px; the buying box's grey is readable.
-- **Still open:** C1's unplanned-buy reader (above); the friend's A1
+- **Still open:** everything above is unseen live; the friend's A1
   screenshot; A4 (one row per pinned item), A5, A6, A7 live. Held (remind):
   the faction rule; trader capacity and "Sell fast".
 

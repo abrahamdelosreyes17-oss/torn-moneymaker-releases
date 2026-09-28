@@ -194,6 +194,46 @@ export function recordBuy(trade, line, index, boughtQty, now = Date.now()) {
  */
 
 /**
+ * Unplanned buys on a bazaar page (3.14.3; the owner: "don't we have enough
+ * ... the way the script is written?"): the same way the planned buys are
+ * counted - a card's stock on the page you are viewing - for every card.
+ * Stock that drops while you are on the page: bought. A card that vanishes:
+ * bought only if you pressed a button on it (else someone else bought it out,
+ * and it is not counted). A card whose stock the page does not say is never
+ * counted. `seen` carries each card's last stock between reads.
+ *
+ * @param {object} seen - key ('itemId|price') -> {qty, itemId, price, name}
+ * @param {Array<{itemId, name, listingPrice, qty, qtyAssumed}>} cards - this read
+ * @param {Set<string>} [pressed] - keys of the cards you pressed a button on
+ * @returns {{bought: Array<{itemId, name, price, qty}>, seen: object}}
+ */
+export function stockBuys(seen, cards, pressed = new Set()) {
+    const now = {};
+    for (const c of cards || []) {
+        if (!c || c.qtyAssumed || !(Number(c.qty) > 0) || !(Number(c.listingPrice) > 0)) continue;
+        const key = String(c.itemId) + '|' + Number(c.listingPrice);
+        const prev = now[key];
+        now[key] = { qty: (prev ? prev.qty : 0) + Number(c.qty), itemId: String(c.itemId), price: Number(c.listingPrice), name: c.name || null };
+    }
+    const bought = [];
+    for (const [key, was] of Object.entries(seen || {})) {
+        const is = now[key];
+        if (is && is.qty < was.qty) bought.push({ itemId: was.itemId, name: was.name, price: was.price, qty: was.qty - is.qty });
+        else if (!is && pressed.has(key)) bought.push({ itemId: was.itemId, name: was.name, price: was.price, qty: was.qty });
+    }
+    return { bought, seen: now };
+}
+
+/** The trade with one more unplanned buy (merged with the same item, price and seller). */
+export function addExtraBuy(trade, buy, now = Date.now()) {
+    const extra = [...((trade && trade.extra) || [])];
+    const same = extra.findIndex((x) => x.itemId === String(buy.itemId) && x.price === buy.price && String(x.sellerId || '') === String(buy.sellerId || ''));
+    if (same >= 0) extra[same] = { ...extra[same], qty: extra[same].qty + buy.qty, at: now };
+    else extra.push({ itemId: String(buy.itemId), name: buy.name, qty: buy.qty, price: buy.price, bid: buy.bid, sellerId: buy.sellerId || null, seller: buy.seller || null, at: now });
+    return { ...trade, extra };
+}
+
+/**
  * @param {object} trade - an accepted trade (acceptTrade + recordBuy)
  * @param {object} [o]
  * @param {Map<string, number>|null} [o.inside] - lowercase item name -> how many are in Torn's trade now (the trade page), or null elsewhere
@@ -237,7 +277,7 @@ export function boughtSince(trade, { inside = null } = {}) {
         const inTrade = inside ? Math.min(x.qty, has(x.name)) : null;
         cost += x.qty * x.price;
         pays += x.qty * x.bid;
-        extra.push({ ...x, planned: false, tone: x.bid > x.price ? 'extra' : 'loss', send: x.qty, inTrade, profit: x.qty * (x.bid - x.price) });
+        extra.push({ ...x, each: x.price, sellers: x.seller ? [x.seller] : [], planned: false, tone: x.bid > x.price ? 'extra' : 'loss', send: x.qty, inTrade, profit: x.qty * (x.bid - x.price) });
     }
     const all = [...rows, ...extra].sort((a, b) => (a.at || 0) - (b.at || 0));
     const missing = inside ? all.filter((r) => r.inTrade < r.send).map((r) => ({ name: r.name, qty: r.send - r.inTrade })) : [];

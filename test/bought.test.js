@@ -49,6 +49,7 @@ test('unplanned buys: only what the trader buys; orange while profitable, red at
     ] };
     const b = boughtSince(t);
     assert.deepEqual(b.rows.map((r) => [r.name, r.tone]), [['Hammer', 'extra'], ['Dahlia', 'loss']], 'Parcel: they do not buy it, left off');
+    assert.deepEqual(b.rows.map((r) => r.each), [50, 900], 'each at what you paid');
 });
 
 import { clampWindowPos } from '../src/ui/bought-window.js';
@@ -58,4 +59,28 @@ test('the Bought window goes anywhere on the page, but its title bar never leave
     assert.deepEqual(clampWindowPos(260, 388, v), { x: 260, y: 388 }, 'over Torn\'s page: allowed (the owner moves it)');
     assert.deepEqual(clampWindowPos(-50, -20, v), { x: 0, y: 0 });
     assert.deepEqual(clampWindowPos(1300, 895, v), { x: 1100, y: 868 }, 'always a title bar to grab');
+});
+
+import { stockBuys, addExtraBuy } from '../src/core/accepted.js';
+
+test('unplanned buys are counted from the page the way planned ones are: a card\'s stock dropping', () => {
+    const card = (itemId, name, price, qty, extra = {}) => ({ itemId, name, listingPrice: price, qty, ...extra });
+    let r = stockBuys({}, [card('1', 'Hammer', 50, 10), card('2', 'Dahlia', 900, 3)]);
+    assert.deepEqual(r.bought, [], 'the first read only notes the stock');
+    r = stockBuys(r.seen, [card('1', 'Hammer', 50, 7), card('2', 'Dahlia', 900, 3)]);
+    assert.deepEqual(r.bought, [{ itemId: '1', name: 'Hammer', price: 50, qty: 3 }], 'Hammer 10 -> 7: you took 3');
+    // Gone: only counted when you pressed a button on that card.
+    const gone = stockBuys(r.seen, [card('1', 'Hammer', 50, 7)]);
+    assert.deepEqual(gone.bought, [], 'Dahlia gone, nothing pressed: someone else - not counted');
+    const pressed = stockBuys(r.seen, [card('1', 'Hammer', 50, 7)], new Set(['2|900']));
+    assert.deepEqual(pressed.bought, [{ itemId: '2', name: 'Dahlia', price: 900, qty: 3 }]);
+    // A card whose stock the page does not say is never counted.
+    const unknown = stockBuys({ '3|10': { qty: 1, itemId: '3', price: 10, name: 'X' } }, [card('3', 'X', 10, 1, { qtyAssumed: true })]);
+    assert.deepEqual(unknown.bought, []);
+});
+
+test('an unplanned buy joins the trade, merged with the same item and seller', () => {
+    let t = addExtraBuy({ key: 'k', extra: [] }, { itemId: '1', name: 'Hammer', price: 50, qty: 3, bid: 70, sellerId: '9' }, 10);
+    t = addExtraBuy(t, { itemId: '1', name: 'Hammer', price: 50, qty: 2, bid: 70, sellerId: '9' }, 20);
+    assert.deepEqual(t.extra.map((x) => [x.name, x.qty, x.at]), [['Hammer', 5, 20]]);
 });

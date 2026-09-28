@@ -563,7 +563,10 @@ list 6 of 7"), and Receipts has a Trader picker with that trader's totals.
 **Bought since you accepted** (3.14.3, on Torn's pages): while a trade is
 accepted, its own small window - above NPC Arbitrage, dragged by its title
 anywhere, folds to one line - lists what you bought for it (cost, what they
-pay, profit, what is still to buy). On Torn's trade page it is a checklist:
+pay, profit, what is still to buy), planned or not: an unplanned buy is
+counted from the bazaar card's stock on the page you are on (a card that
+vanishes only when you pressed its button), shown orange - red at a loss -
+and left off when the trader does not buy that item. On Torn's trade page it is a checklist:
 each item "✓ in" once it is in the trade, and anything bought but not added
 is named. It never presses anything of Torn's, and goes at Traded - done.
 
