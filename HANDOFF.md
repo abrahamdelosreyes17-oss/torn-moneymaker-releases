@@ -6,10 +6,9 @@ Everything below "History" is the record of how we got here.
 
 ## Start here (state on 2026-09-28, end of session)
 
-- **Released: 3.13.0** (`75ecf65`; smart trade plans, leftovers, receipts,
-  the faster buying run; see "What the 2026-09-28 session did"), pushed.
-  Install link given to the owner:
-  `https://raw.githubusercontent.com/abrahamdelosreyes17-oss/torn-moneymaker-releases/75ecf654dd6d346a5c31555774b4e577a7098e56/torn-moneymaker.user.js`
+- **Released: 3.13.1** (`e3b4fc5`; 3.13.0 `75ecf65` + the desk layout fix;
+  see "What the 2026-09-28 session did"), pushed. Install link given to the owner:
+  `https://raw.githubusercontent.com/abrahamdelosreyes17-oss/torn-moneymaker-releases/e3b4fc571d807d36060c77c316756856a46a7629/torn-moneymaker.user.js`
 - Branch `claude/optimistic-ride-1gqguu`. Earlier: 3.12.10 (`711f893`),
   3.12.5 (`aab7e53`), 3.12.6 (`fe49df0`), 3.12.7 (`d69907c`), 3.12.8 (`8991095`), 3.12.9 (`c45a227`).
 - **Remind the owner (they asked, 2026-09-28: "dont build, but remind the
