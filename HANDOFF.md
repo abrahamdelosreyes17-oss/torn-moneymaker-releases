@@ -82,7 +82,7 @@ offer to read Torn's scripting-rules page with them (read only).
 The owner, end of 2026-09-28: "write me handoff for next session. with the
 trusted traders, receipt filterable by trader, and something for favourite
 trader blacklisted trader, and scanning if we can flip something on our
-trusted trader". Items 2-5 are theirs, NOT built: restate each in their words,
+trusted trader". Items 2-7 are theirs, NOT built: restate each in their words,
 mockup first where it changes the look (see "How the owner works"), then build.
 
 1. **Check 3.14.2 live first** (read only, pages the owner opens in the Claude
@@ -140,11 +140,40 @@ mockup first where it changes the look (see "How the owner works"), then build.
    (agenda item 5 of before; memory `trader-sources`). Reads: the summary's ≈
    first, then their items' bazaars at the background pace (3.14.1) - never
    more than the shared TornW3B budget.
-6. **Still held, remind (not built):** the **faction rule** (skip a trader in
+6. **"Bought since you accepted" - a list in the overlay, and Fill from it**
+   (the owner, 2026-09-28: "have another overlay window popup, or within NPC
+   Arbitrage: recent items bought ever since I clicked accepted trade. And our
+   Fill items from the trading as well, cus our current Fill items and
+   highlight from bought items is kinda buggy, so a list, and the highlight").
+   - Today Fill / the highlight count only the PLANNED steps, from a listing's
+     stock dropping on the bazaar page (never verified live) - an extra you
+     buy in the same bazaar is not counted, and a missed count means no Fill
+     (the friend's page, item 1).
+   - Wanted: from the moment of "X accepted", every item you actually bought
+     (planned or not) in one list - in the NPC Arbitrage panel (its own
+     section) or a separate popup; mockups first, the owner picks. On Torn's
+     trade page: that list is what Fill fills and what gets highlighted.
+   - Research first (no code): where "bought" comes from. (a) Torn's log -
+     exact (1225 bazaar buys: item, qty, price, seller), but it needs the
+     Ledger's **Full key**, which the overlay on torn.com must never read
+     (README security rule): Torn Bids could read it (it already does every
+     5 min for the Ledger) and share only derived rows (item, qty, price,
+     seller, time) through GM storage - Torn Bids has to be open. (b) the
+     bazaar page itself, read only: Torn's own "you bought N x item" message
+     after a buy - instant, no key; its markup must be read live first. (c)
+     the Limited key's inventory - Torn caches it ~1 hour: too slow. Likely
+     (b) for instant + (a) to correct. Items given back by "They took fewer"
+     stay leftovers as now.
+7. **Receipts: each item's own profit.** A trade pays one lump sum; the Ledger
+   splits it across items by Item Market Average (`rowsFromTrade` `share`),
+   so a receipt's total profit is right but per-item profit can shift between
+   items. When the trade was accepted in Torn Bids, `sellAccepted` has the
+   trader's price per item: split by those instead (and say so on the receipt).
+8. **Still held, remind (not built):** the **faction rule** (skip a trader in
    the same faction as the bazaar you bought from); **trader capacity** (price
    vs how much they take - networth, reselling bazaar, W3B bulk prices, own
    history) and a **"Sell fast"** line in Where to sell (the Vladbull case).
-7. Older, smaller: weapons / armour flips done properly (Big Al's, RW gear
+9. Older, smaller: weapons / armour flips done properly (Big Al's, RW gear
    under its Bunker Bucks floor); a yellow TornExchange pill was never seen
    live (ask for its hover text); the trade page does not handle you paying
    them; Settings › Keep for yourself is unused since own items left trades;
