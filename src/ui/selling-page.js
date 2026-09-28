@@ -1414,15 +1414,19 @@ export class SellingPage {
         const quad = spEl('div', { class: 'sp-quad' });
         // A trade being planned or bought: its card beside the traders, at the
         // top, where Plan trade was pressed - not below the fold.
+        // Two columns, each as tall as its own cards: a long plan never
+        // stretches the traders' side (it did as a spanning grid row).
         if (d.trade && (d.trade.chosen || d.trade.accepted)) {
             const plan = this.planCard(d);
             plan.classList.remove('sp-wide');
-            plan.classList.add('sp-side');
-            quad.append(this.buyersCard(d), plan, this.sellersCard(d));
+            quad.append(
+                spEl('div', { class: 'sp-col' }, [this.buyersCard(d), this.sellersCard(d), d.held ? this.whereCard(d) : null]),
+                spEl('div', { class: 'sp-col' }, [plan]),
+            );
         } else {
             quad.append(this.buyersCard(d), this.sellersCard(d), this.planCard(d));
+            if (d.held) quad.appendChild(this.whereCard(d));
         }
-        if (d.held) quad.appendChild(this.whereCard(d));
         box.appendChild(quad);
 
         if (keep) {
@@ -2243,7 +2247,7 @@ a.sp-btn { display: inline-flex; align-items: center; text-decoration: none; }
 .sp-q h3 { margin: 0 0 8px; font-size: 11px; letter-spacing: 0.6px; text-transform: uppercase; color: var(--muted); }
 .sp-q.sp-hot { background: var(--hot); border-color: var(--hot-line); }
 .sp-q.sp-wide { grid-column: 1 / -1; }
-.sp-q.sp-side { grid-column: 2; grid-row: 1 / span 3; }
+.sp-col { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
 .sp-kind { margin-left: 6px; font-size: 11px; font-weight: bold; }
 .sp-kind-fast { color: var(--price); }
 .sp-kind-slow { color: var(--warn); }
@@ -2414,7 +2418,6 @@ input[type="checkbox"] { accent-color: var(--profit); margin: 3px 0 0; }
 @media (max-width: 1200px) {
     .sp-tagline { display: none; }
     .sp-quad { grid-template-columns: minmax(0, 1fr); }
-    .sp-q.sp-side { grid-column: auto; grid-row: auto; }
 }
 @media (max-width: 1000px) {
     .sp-head { flex-wrap: wrap; height: auto; min-height: var(--head-h); padding: 10px 12px; gap: 8px 10px; }

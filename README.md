@@ -355,7 +355,8 @@ you: every link is one you follow yourself, one page per click.
     same bazaar when that seller has more for the trade; the panel's buying
     box sits under its header (also collapsed, also in Settings), shows
     minutes since the yes (amber after 10), and **N** presses Next. The desk
-    no longer jumps between flips while they load. The Ledger has a
+    no longer jumps between flips while they load (3.13.1: the traders'
+    column and the plan's column are each as tall as their own cards). The Ledger has a
     **Receipts** tab: one per finished trade, each item with its price, cost
     (first in, first out) and profit.
     One Cash for the whole

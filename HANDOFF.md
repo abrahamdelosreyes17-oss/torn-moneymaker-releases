@@ -61,7 +61,15 @@ offer to read Torn's scripting-rules page with them (read only).
 - Movement (fast / slow from bazaar reads) needs hours of the Torn Bids tab
   open to say anything; until then the type decides. Check `sellMoves` after
   a day (Tampermonkey storage).
-- Deferred from the 3.13 review (Low): Torn v2 calls could send the key as an
+- **3.13.1** (same day): the desk's two columns are stacked separately (a
+  long plan beside the traders had stretched the grid rows, leaving a big gap
+  above Bazaars sell / Where to sell), and `anonymous: true` on requests was
+  taken out again - untested live, and the owner saw small flips right after
+  (3.12.10 and 3.13 give identical flips on the harness with $100m Cash, so
+  the flip logic is not it; likely the market or trader lists at that moment -
+  check the TornW3B / TornExchange pills if it persists).
+- Deferred from the 3.13 review (Low): requests without cookies (verify live
+  first), Torn v2 calls could send the key as an
   `Authorization: ApiKey` header instead of `?key=`; the Ledger lives on the
   github.io user-site origin (any other Pages project of that account shares
   it - note in the ToS table); a removed leftover has no Undo.

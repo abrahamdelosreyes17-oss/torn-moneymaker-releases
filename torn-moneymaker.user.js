@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      3.13.0
+// @version      3.13.1
 // @description  Finds Bazaar and Item Market listings below NPC / market value - on the page you are viewing, and live from the Torn API and TornW3B - ranked by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -42,7 +42,7 @@
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '3.13.0';
+    const TTV2_BUILD_VERSION = '3.13.1';
 
     /* ===== src/platform/gm.js ===== */
     /*
@@ -150,9 +150,6 @@
                 method: 'GET',
                 url,
                 timeout: 30000,
-                // No cookies: every API here authenticates by key or not at all,
-                // so a logged-in tornexchange.com / weav3r.dev session never rides along.
-                anonymous: true,
                 onload(response) {
                     resolve({
                         ok: response.status >= 200 && response.status < 300,
@@ -13885,15 +13882,19 @@
             const quad = spEl('div', { class: 'sp-quad' });
             // A trade being planned or bought: its card beside the traders, at the
             // top, where Plan trade was pressed - not below the fold.
+            // Two columns, each as tall as its own cards: a long plan never
+            // stretches the traders' side (it did as a spanning grid row).
             if (d.trade && (d.trade.chosen || d.trade.accepted)) {
                 const plan = this.planCard(d);
                 plan.classList.remove('sp-wide');
-                plan.classList.add('sp-side');
-                quad.append(this.buyersCard(d), plan, this.sellersCard(d));
+                quad.append(
+                    spEl('div', { class: 'sp-col' }, [this.buyersCard(d), this.sellersCard(d), d.held ? this.whereCard(d) : null]),
+                    spEl('div', { class: 'sp-col' }, [plan]),
+                );
             } else {
                 quad.append(this.buyersCard(d), this.sellersCard(d), this.planCard(d));
+                if (d.held) quad.appendChild(this.whereCard(d));
             }
-            if (d.held) quad.appendChild(this.whereCard(d));
             box.appendChild(quad);
 
             if (keep) {
@@ -14714,7 +14715,7 @@
     .sp-q h3 { margin: 0 0 8px; font-size: 11px; letter-spacing: 0.6px; text-transform: uppercase; color: var(--muted); }
     .sp-q.sp-hot { background: var(--hot); border-color: var(--hot-line); }
     .sp-q.sp-wide { grid-column: 1 / -1; }
-    .sp-q.sp-side { grid-column: 2; grid-row: 1 / span 3; }
+    .sp-col { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
     .sp-kind { margin-left: 6px; font-size: 11px; font-weight: bold; }
     .sp-kind-fast { color: var(--price); }
     .sp-kind-slow { color: var(--warn); }
@@ -14885,7 +14886,6 @@
     @media (max-width: 1200px) {
         .sp-tagline { display: none; }
         .sp-quad { grid-template-columns: minmax(0, 1fr); }
-        .sp-q.sp-side { grid-column: auto; grid-row: auto; }
     }
     @media (max-width: 1000px) {
         .sp-head { flex-wrap: wrap; height: auto; min-height: var(--head-h); padding: 10px 12px; gap: 8px 10px; }
