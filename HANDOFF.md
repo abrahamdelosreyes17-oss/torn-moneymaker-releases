@@ -7,7 +7,8 @@ Everything below "History" is the record of how we got here.
 ## Start here (state on 2026-09-28, end of the second session)
 
 - **Released: 3.14.2** (see "What the 2026-09-28 second session did"),
-  pushed. Install link: RELEASE_LINK_PLACEHOLDER
+  pushed (`ac4c3cb`). Install link given to the owner:
+  `https://raw.githubusercontent.com/abrahamdelosreyes17-oss/torn-moneymaker-releases/ac4c3cb63f751a8ebf7b116c06b403edc049e737/torn-moneymaker.user.js`
 - Before it: 3.14.1 (`9ceda80`, background refresh, Chat mark), 3.14.0 (`b9b99e9`).
 - Before it: 3.13.1 (`e3b4fc5`). Branch `claude/optimistic-ride-1gqguu`. Earlier: 3.12.10 (`711f893`),
   3.12.5 (`aab7e53`), 3.12.6 (`fe49df0`), 3.12.7 (`d69907c`), 3.12.8 (`8991095`), 3.12.9 (`c45a227`).
@@ -17,7 +18,10 @@ Everything below "History" is the record of how we got here.
   trader in the same faction as the bazaar you bought from); trader capacity
   (price vs how much they take - networth, reselling bazaar, W3B bulk prices,
   own history - and a "Sell fast" line in Where to sell: the Vladbull case,
-  never a ranking bias). Details in memory `remind-next-session`.
+  never a ranking bias). Details in memory `remind-next-session`. The owner
+  added at the end: our trusted traders, receipts by trader, favourite /
+  blacklisted traders, and scanning for flips with trusted traders - all in
+  the agenda below, not built.
 - **The owner had the script switched off** in Tampermonkey while testing the
   trade page (2026-09-27): when something "isn't there", ask them to check the
   Tampermonkey icon (script on, version) before anything else.
@@ -75,47 +79,76 @@ offer to read Torn's scripting-rules page with them (read only).
 
 ### The agenda for the next session (let the owner choose the order)
 
-1. **The owner tries 3.12.10 on real data** while you read along (read only, in
-   the Claude Chrome tab group - see "How the owner works"; they open pages,
-   you never click or type on torn.com). Above all the trade flow on real pages:
-   - Start buying / Next bazaar: does a real bazaar card's stock drop after a
-     buy, so "You took N" counts it? (The harness only simulates it.)
-   - Fill on the real add step: does Torn's "You are adding N items" counter
-     follow the typed Qty?
-   - the partner and money checks on the real trade view.
-   Also still unseen live:
-   - **weapons / armour / cars no longer flipped** - the fix covers both type
-     spellings because the real v2 `type` values were never seen: confirm on
-     the real item list (the Category dropdown shows the type names Torn sends);
-   - the trade flow: Plan trade on a trader row, X declined / X accepted, the
-     frozen trade's live checks, the panel's list on Torn's trade page;
-   - how fast "≈" rows fill (up to 30 items, 24 TornW3B calls a minute);
-   - the Ledger in IndexedDB on the real github.io page (not verified inside
-     Tampermonkey's sandbox; "Show storage sizes" has no `ledger` key once moved);
-   - Fill after Torn redraws a row (#/manage), the "!" marker, BP chips;
-   - the Ledger's mugging amount field (8156 undocumented; "not read" shows the
-     field names seen - fix from that).
-2. **Trading partners - asked for three times; NOT built.** Mockup first:
-   - Ledger › a **Traders** tab (from the Ledger's finished trades - no new
-     calls): who, how many trades, totals, last trade, items, FIFO profit;
-   - Torn Bids trader rows: **"Traded 7× · last 3d ago"** beside Plan trade;
-     repeat customers first (ask: badge, tie-break, or trust);
-   - **"Did they pay their list?"** per trade (the ID Badge loss, per trader).
-     The accepted trade (`sellAccepted`) now records what they should pay:
-     comparing it with the finished trade in the Ledger gives this directly.
-   Needs the Ledger's Full key; the log gives ids only (names are open).
-3. **Trade page: built in 3.12.8** (partner check, money check, what is in,
-   Fill per row). Open: auto-ticking 'sent' in Torn Bids from the view, and
-   money in the other direction (you paying them) is not handled.
-4. **Weapons / armour flips done properly** (researched, not built; now they
-   are simply excluded): plain copies to Big Al's or one-per-trader; RW gear
-   under its Bunker Bucks floor (ask if they have the Bunker); notes in memory
-   `trader-sources`.
-5. **Verify, then maybe use:** TornW3B `/api/marketplace/{id}/traders` and
-   TornExchange API `prices/{id}` (a TE-only trader's whole list).
-6. Smaller: the Sell-to-by-trader view could show traders who make no flip on
-   this item but whose other items make a trade (today Plan trade works on any
-   trader row shown); Ledger names / export; run `test/ux-check.mjs`.
+The owner, end of 2026-09-28: "write me handoff for next session. with the
+trusted traders, receipt filterable by trader, and something for favourite
+trader blacklisted trader, and scanning if we can flip something on our
+trusted trader". Items 2-5 are theirs, NOT built: restate each in their words,
+mockup first where it changes the look (see "How the owner works"), then build.
+
+1. **Check 3.14.2 live first** (read only, pages the owner opens in the Claude
+   tab group; ask if the script is on and shows 3.14.2):
+   - the friend's trade add step: what the new line after *ADD TO TRADE ·
+     Clear all* says - it names why Fill marked nothing (he had pressed
+     accepted; likely a trade with someone else, or 0 recorded as bought);
+   - Chat → the trader's profile with Torn's Start chat button outlined blue;
+   - Torn Bids left in the background for a while: the TornExchange pill in
+     minutes (not "1h") and flips already checked on coming back;
+   - pins (Best flips cards and list rows; one row per pinned item), per-trade
+     Declined (the desk goes on to the next flip), "Other" never flipped,
+     the overlay's opened-listing mark in light red;
+   - still never seen live: a real bazaar card's stock dropping after a buy
+     (the buying run counts from it), Fill typing into the real add step's Qty,
+     the real v2 type names for weapons/armour/cars.
+2. **Our trusted traders.** The trust badge today is the public score
+   (TornExchange votes / TornW3B rating). The owner wants their OWN trusted
+   traders: the people they have traded with. Source: the Ledger's finished
+   trades (Full key; `/v2/user/trades`, names open) - no new calls. Shape it
+   with the old "Trading partners" ask (asked three times): a **Ledger ›
+   Traders** tab - who, how many trades, total paid, profit (FIFO), last
+   trade, items; **"Did they pay their list?"** per trade (the accepted trade
+   in `sellAccepted` records what they should pay; the finished trade what
+   they did - the ID Badge loss); on Torn Bids' trader rows **"Traded 7× ·
+   last 3d ago"**. Ask: is "trusted" automatic (N trades, all paid) or picked?
+3. **Favourite and blacklisted traders** (Favourites was designed 2026-09-28,
+   memory `remind-next-session`):
+   - **Favourite**: 3+ finished trades = automatically a favourite, editable
+     (add / remove, and a removal sticks). Open questions from then: 3 trades
+     in total or on different days? For a partner with no public list, use
+     their last-paid prices, marked as such?
+   - **Blacklisted**: never planned, never a flip's buyer, never in the
+     strip, the desk's trades or Where to sell; listed with Undo. Different
+     from Declined (3.14.2: one trade, one hour). Ask: hidden, or greyed at
+     the bottom like Declined? Forever until removed?
+   - Where: the Ledger's Traders tab (item 2) and a small control on each
+     Traders pay row. Never a ranking bias toward any named trader (the
+     owner's earlier rule) - favourites may be marked and sorted first on a
+     tie, not given a better price.
+4. **Receipts filterable by trader.** The Receipts tab already has a free-text
+   **Who** box (`this.f.who`, matched in `filterLedgerRows`) - check live
+   whether typing a trader's name works on receipts (receipts carry
+   `who`/`whoName`). The ask is likely a proper trader picker (the traders on
+   your receipts, most trades first) plus a totals line for that trader
+   (trades, paid to you, cost, profit). Ask which.
+5. **Scan: what can I flip with my trusted / favourite traders now.** For
+   each favourite, the best whole trade with them right now (`planTrade`:
+   main flip ≤5 bazaars + ~5 extras), listed like the pinned rows ("Trade
+   +$X · N items"), one press = that trade on the desk. Needs each trader's
+   WHOLE buy list: TornW3B `/api/pricelist/{id}` (have it for W3B traders);
+   TornExchange has only the top 3 per item (`all_best_listings`) and per-item
+   full lists (`listings?item_id`, 10 a minute - too slow per trader). Research
+   first (no code): TornExchange `prices/{id}` or a per-trader list endpoint
+   (agenda item 5 of before; memory `trader-sources`). Reads: the summary's ≈
+   first, then their items' bazaars at the background pace (3.14.1) - never
+   more than the shared TornW3B budget.
+6. **Still held, remind (not built):** the **faction rule** (skip a trader in
+   the same faction as the bazaar you bought from); **trader capacity** (price
+   vs how much they take - networth, reselling bazaar, W3B bulk prices, own
+   history) and a **"Sell fast"** line in Where to sell (the Vladbull case).
+7. Older, smaller: weapons / armour flips done properly (Big Al's, RW gear
+   under its Bunker Bucks floor); a yellow TornExchange pill was never seen
+   live (ask for its hover text); the trade page does not handle you paying
+   them; Settings › Keep for yourself is unused since own items left trades;
+   run `test/ux-check.mjs`.
 
 ## What the 2026-09-28 second session did (3.14.0)
 
