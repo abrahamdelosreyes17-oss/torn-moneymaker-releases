@@ -56,7 +56,7 @@ export const SELLING_PAGE_DEFAULTS = {
      * "don't include clothes". Weapons, armour and cars are never flipped
      * whatever this says (every copy is its own).
      */
-    neverFlip: ['Clothing'],
+    neverFlip: ['Clothing', 'Other'],
 };
 
 /** The item list shows this many at a time. */
@@ -89,6 +89,15 @@ export function itemImageUrl(itemId) {
 }
 
 /** The pin (3.14): an outline pin, drawn in the current colour. */
+/** $809,351 or $809,351–$820,000: what a plan's steps cost each. */
+function priceRange(steps) {
+    const prices = (steps || []).map((st) => st.price).filter((p) => p > 0);
+    if (!prices.length) return '–';
+    const lo = Math.min(...prices);
+    const hi = Math.max(...prices);
+    return lo === hi ? formatMoney(lo) : formatMoney(lo) + '–' + formatMoney(hi);
+}
+
 /** A speech bubble, drawn in the current colour (Chat). */
 function chatIcon() {
     const NS = 'http://www.w3.org/2000/svg';
@@ -1293,7 +1302,8 @@ export class SellingPage {
             }, [
                 spEl('span', { class: 'sp-fc-top' }, [spEl('span', { class: 'sp-pic sp-pic-s' }, [this.image('strip', f.itemId)]), spEl('b', { class: 'sp-iname', text: f.name }), pin]),
                 spEl('span', { class: 'sp-fc-p', text: signed(f.plan.profit) }),
-                spEl('small', {}, ['Buy ', spEl('b', { text: count(f.plan.units) }), ' from ' + [...new Set(f.plan.steps.map((st) => st.sellerName || 'a bazaar'))].join(', ')]),
+                // What the bazaars sell it for (cheapest to dearest bought), and to whom.
+                spEl('small', {}, ['Buy ', spEl('b', { text: count(f.plan.units) }), ' at ', spEl('b', { text: priceRange(f.plan.steps) }), ' from ' + [...new Set(f.plan.steps.map((st) => st.sellerName || 'a bazaar'))].join(', ')]),
                 spEl('small', { class: 'sp-fc-sell' }, ['Sell to ', spEl('b', { text: f.buyer.name }), ' at ' + formatMoney(f.buyer.price), this.trustBadge(f.buyer)]),
             ]);
             card.addEventListener('click', () => this.select(f.itemId));
@@ -1311,7 +1321,10 @@ export class SellingPage {
     renderList() {
         const s = this.state;
         const info = s.info || {};
-        const list = this.stableOrder(s.list);
+        // A pinned item is listed once: its row moves to the top, pinned (the
+        // owner: "it created something doubled, instead of just pinning it").
+        const pinnedItems = new Set((s.pinned || []).map((p) => p.itemId));
+        const list = this.stableOrder(s.list).filter((r) => !pinnedItems.has(r.itemId));
         const sig = JSON.stringify([
             s.filter,
             s.counts,
@@ -1323,7 +1336,7 @@ export class SellingPage {
             info.tradersLoading,
             Boolean(info.bazaarsAt),
             this.query,
-            list.map((r) => [r.itemId, r.name, r.held, r.lowest, r.badge && [r.badge.kind, r.badge.amount], r.pending]),
+            list.map((r) => [r.itemId, r.name, r.held, r.lowest, r.badge && [r.badge.kind, r.badge.amount], r.pending, r.buy, r.sell]),
             s.pinned || [],
         ]);
         if (sig === this.listSig) return;
@@ -1368,10 +1381,11 @@ export class SellingPage {
                     open();
                 },
             }, [
-                spEl('span', { class: 'sp-pic sp-pic-s' }, [this.image('pin', pt.mainId)]),
-                spEl('b', { class: 'sp-iname', text: pt.name + ' → ' + pt.trader }),
-                spEl('span', { class: 'sp-pinrow-r' }, [spEl('span', { class: 'sp-badge ' + (pt.profit < 0 ? 'sp-badge-bad' : 'sp-badge-flip'), text: signed(pt.profit) }), unpin]),
-                spEl('small', { text: count(pt.items) + (pt.items === 1 ? ' item' : ' items') + ' · ' + count(pt.stops) + (pt.stops === 1 ? ' bazaar' : ' bazaars') }),
+                spEl('span', { class: 'sp-pic sp-pic-s' }, [this.image('pin', pt.itemId)]),
+                spEl('b', { class: 'sp-iname', text: pt.name }),
+                // The whole trade with that trader (the flip and its cover), live.
+                spEl('span', { class: 'sp-pinrow-r' }, [spEl('span', { class: 'sp-badge ' + (pt.profit < 0 ? 'sp-badge-bad' : 'sp-badge-flip'), text: 'Trade ' + signed(pt.profit) }), unpin]),
+                spEl('small', { text: pt.trader + (pt.mainId !== pt.itemId ? ' · main ' + pt.mainName : '') + ' · ' + count(pt.items) + (pt.items === 1 ? ' item' : ' items') + ' · ' + count(pt.stops) + (pt.stops === 1 ? ' bazaar' : ' bazaars') }),
             ]));
         }
         if ((s.pinned || []).length) this.listBox.appendChild(spEl('div', { class: 'sp-pinsep', 'aria-hidden': 'true' }));
@@ -1387,20 +1401,40 @@ export class SellingPage {
             else if (!info.tradersLoading && !info.traderCount && !info.hasKey) text = 'No traders loaded yet.';
             this.listBox.appendChild(spEl('div', { class: 'sp-empty', text }));
         }
+        const pinnedIds = new Set((s.pinned || []).map((p) => p.itemId));
         for (const r of list) {
             const on = Boolean(s.desk && s.desk.itemId === r.itemId);
             const sub = [];
             if (r.held) sub.push('You hold ' + count(r.held));
-            if (r.lowest) sub.push('from ' + formatMoney(r.lowest));
+            // A flip: what the bazaar sells it for, and what the trader pays.
+            if (r.buy && r.sell) sub.push('Buy ' + formatMoney(r.buy) + ' · Sell ' + formatMoney(r.sell));
+            else if (r.lowest) sub.push('from ' + formatMoney(r.lowest));
+            // A flip row has the pin too (the owner: "put it here as well"), in
+            // its bottom corner, out of the flow: pinning moves nothing.
+            const flip = Boolean(r.badge && r.badge.kind === 'flip');
+            const pinned = pinnedIds.has(r.itemId);
+            const pin = flip
+                ? spEl('button', {
+                    type: 'button',
+                    class: 'sp-pin sp-pin-row' + (pinned ? ' sp-pin-on' : ''),
+                    'aria-pressed': String(pinned),
+                    'aria-label': (pinned ? 'Unpin ' : 'Pin ') + r.name + '\'s trade',
+                    title: pinned ? 'Pinned on top of the list: press to unpin' : 'Pin this trade: it stays on top of the list, only prices move',
+                    onclick: (event) => {
+                        event.stopPropagation();
+                        if (this.h.onPin) this.h.onPin(r.itemId);
+                    },
+                }, [pinIcon()])
+                : null;
             this.listBox.appendChild(spEl('div', {
-                class: 'sp-it' + (on ? ' sp-sel' : ''),
+                class: 'sp-it' + (on ? ' sp-sel' : '') + (flip ? ' sp-it-pin' : ''),
                 role: 'button',
                 tabindex: '0',
                 'aria-pressed': String(on),
                 'data-focus': 'item:' + r.itemId,
                 onclick: () => this.select(r.itemId),
                 onkeydown: (event) => {
-                    if (event.key !== 'Enter' && event.key !== ' ') return;
+                    if (event.target !== event.currentTarget || (event.key !== 'Enter' && event.key !== ' ')) return;
                     event.preventDefault();
                     this.select(r.itemId);
                 },
@@ -1409,6 +1443,7 @@ export class SellingPage {
                 spEl('b', { class: 'sp-iname', text: r.name }),
                 this.badge(r),
                 spEl('small', { text: sub.join(' · ') || (r.pending ? 'Checking…' : '') }),
+                pin,
             ]));
         }
         this.moreBtn.hidden = !(s.listTotal > list.length);
@@ -1745,7 +1780,7 @@ export class SellingPage {
             spEl('span', { class: 'sp-tpick-b' }, [
                 this.chatLink(b),
                 spEl('button', { type: 'button', class: 'sp-btn sp-primary', 'data-focus': 'trade:accept', title: b.name + ' said yes: freeze this trade, so nothing in it moves while you buy and send', text: b.name + ' accepted', onclick: () => this.h.onTradeAccept && this.h.onTradeAccept(d.itemId) }),
-                spEl('button', { type: 'button', class: 'sp-btn', 'data-focus': 'trade:decline', title: b.name + ' did not want to trade: plan with the next best (for an hour)', text: b.name + ' declined', onclick: () => this.h.onTradeDecline && this.h.onTradeDecline(c.key) }),
+                spEl('button', { type: 'button', class: 'sp-btn', 'data-focus': 'trade:decline', title: b.name + ' said no to this trade: on to the next flip (this trade is passed over for an hour; their other trades stay)', text: b.name + ' declined', onclick: () => this.h.onTradeDecline && this.h.onTradeDecline(c.key) }),
             ]),
         ]));
 
@@ -2395,6 +2430,9 @@ a.sp-btn { display: inline-flex; align-items: center; text-decoration: none; }
 .sp-pin:hover { color: #fff; border-color: #555; }
 .sp-pin:focus-visible { outline: 2px solid var(--offer); outline-offset: 1px; }
 .sp-pin.sp-pin-on { color: var(--offer); border-color: #2f4466; background: #1b2230; }
+.sp-it.sp-it-pin { position: relative; }
+.sp-it.sp-it-pin small { padding-right: 30px; }
+.sp-it .sp-pin-row { position: absolute; right: 10px; bottom: 6px; width: 22px; height: 22px; }
 .sp-it.sp-pinrow { background: #1b2230; border-color: #2f4466; }
 .sp-it.sp-pinrow.sp-sel { border-color: var(--offer); }
 .sp-pinrow-r { display: inline-flex; align-items: center; gap: 6px; }

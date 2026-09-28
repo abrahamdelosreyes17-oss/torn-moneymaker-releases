@@ -93,6 +93,8 @@ if (/[?&]ownbazaar=1/.test(location.search)) {
         // cell is hidden, and each category tab has its own list after All
         // (only the tab you are on shows).
         if (/[?&]page=trade/.test(location.search)) {
+            // Torn's bar above the lists (as on the friend's page, 2026-09-28).
+            d.querySelector('ul.items-cont').insertAdjacentHTML('beforebegin', '<div class="add-bar" style="padding:8px"><button type="button" class="torn-btn">ADD TO TRADE</button> <span>You are adding 0 items across 0 categories</span> <a href="#clear">Clear all</a></div>');
             d.querySelector('ul.items-cont').classList.add('all-items');
             d.insertAdjacentHTML('beforeend', '<style>#fake-own .info-wrap{display:none}</style><ul class="items-cont drugs-items" style="display:none">' + row(206, 'Xanax', 15, 830000) + '</ul>');
         }
@@ -253,6 +255,8 @@ const BIG_ITEMS = {
     1007: { name: 'Teddy Bear Plushie', type: 'Plushie', sell_price: 10, market_value: 700 },
 };
 for (let i = 0; i < 9; i++) BIG_ITEMS[1010 + i] = { name: 'Lollipop ' + (i + 1), type: 'Candy', sell_price: 10, market_value: 380 };
+// An item of Torn's "Other" type, sold on the virus route: never flipped (3.14.2).
+BIG_ITEMS[1030] = { name: 'Blank Card', type: 'Other', sell_price: 10, market_value: 5000 };
 if (BIG) Object.assign(ITEMS, BIG_ITEMS);
 const bigRow = (id, name, price, qty) => ({ player_id: id, player_name: name, price, quantity: qty, last_checked: NOW_S - 20 });
 const BIG_BAZAARS = {
@@ -265,10 +269,12 @@ const BIG_BAZAARS = {
     1007: [bigRow(6002, 'VirusB', 600, 20)],
 };
 for (let i = 0; i < 9; i++) BIG_BAZAARS[1010 + i] = [bigRow(6100 + i, 'Candy' + i, 300 + i, 30)];
+BIG_BAZAARS[1030] = [bigRow(6001, 'VirusA', 3000, 40)];
 // What KayMalta buys (TornExchange's top buyers): the virus, and the cover.
 const BIG_TE = { 870: { item: 'Stealth Virus', traders: [{ trader: 'KayMalta', trader_id: 5001, price: 1157499, vote_score: 180 }] } };
 BIG_TE[1006] = { item: 'Dahlia', traders: [{ trader: 'KayMalta', trader_id: 5001, price: 1500, vote_score: 180 }] };
 BIG_TE[1007] = { item: 'Teddy Bear Plushie', traders: [{ trader: 'KayMalta', trader_id: 5001, price: 900, vote_score: 180 }] };
+BIG_TE[1030] = { item: 'Blank Card', traders: [{ trader: 'KayMalta', trader_id: 5001, price: 6000, vote_score: 180 }] };
 for (let i = 0; i < 9; i++) BIG_TE[1010 + i] = { item: 'Lollipop ' + (i + 1), traders: [{ trader: 'KayMalta', trader_id: 5001, price: 400, vote_score: 180 }] };
 if (BIG) {
     const t = Date.now();

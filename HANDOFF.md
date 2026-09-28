@@ -6,10 +6,9 @@ Everything below "History" is the record of how we got here.
 
 ## Start here (state on 2026-09-28, end of the second session)
 
-- **Released: 3.14.1** (3.14.0 `b9b99e9` + Torn Bids keeping fresh in the
-  background and Chat marking Torn's chat button; see "What the 2026-09-28
-  second session did"), pushed. `9ceda80`. Install link given to the owner:
-  `https://raw.githubusercontent.com/abrahamdelosreyes17-oss/torn-moneymaker-releases/9ceda8076117a4296d0eb32a57839b2ff59cca44/torn-moneymaker.user.js`
+- **Released: 3.14.2** (see "What the 2026-09-28 second session did"),
+  pushed. Install link: RELEASE_LINK_PLACEHOLDER
+- Before it: 3.14.1 (`9ceda80`, background refresh, Chat mark), 3.14.0 (`b9b99e9`).
 - Before it: 3.13.1 (`e3b4fc5`). Branch `claude/optimistic-ride-1gqguu`. Earlier: 3.12.10 (`711f893`),
   3.12.5 (`aab7e53`), 3.12.6 (`fe49df0`), 3.12.7 (`d69907c`), 3.12.8 (`8991095`), 3.12.9 (`c45a227`).
 - **Remind the owner (they asked, 2026-09-28: "dont build, but remind the
@@ -26,7 +25,7 @@ Everything below "History" is the record of how we got here.
   installs go through **pinned links** (`.../<commit>/torn-moneymaker.user.js`).
   Merging to `main` makes every install auto-update: only if the owner asks.
 - Nothing uncommitted except `mockups/` and `.claude/` (untracked on purpose).
-- 274 unit tests (`npm test`); `test/ux-check.mjs` has never run here. For
+- 277 unit tests (`npm test`); `test/ux-check.mjs` has never run here. For
   screenshots, 2026-09-28 used `playwright-core` installed in the session's
   scratchpad with the system Chrome (`executablePath`), never the repo. **Block
   torn.com in every Playwright context** (`ctx.route(/torn\.com\//, r =>
@@ -187,6 +186,24 @@ main flip... 1 bazaar best"; "about 5 extras, soft cap"; no money thresholds
   button with no link (`button2-profile-<id>`, class `withoutLink`); 3.14.1's
   Chat stores `chatWanted` and the overlay marks that button in blue
   (`markChatButton`). Harness: `?page=profile&XID=5001&chatwanted=1`.
+- **3.14.2 (the owner, live):** "put it here as well" - the pin on every flip
+  row in the list; "it created something doubled" - a pinned item is listed
+  once (its row moves to the top: *Trade +$X*, trader, main flip); "it doesn't
+  say how much the bazaar sells it for and how much the trader buys it for" -
+  list rows *Buy $X · Sell $Y*, cards *Buy N at $lo–$hi from ...*. The owner's
+  live list showed Stealth Virus +$29.2m, Armored Virus +$12.9m on 3.14.1.
+  The friend's add step (screenshot, TornTools prices on the rows) had no
+  Fill after he pressed accepted: why is unknown (a trade with someone else,
+  or 0 recorded as bought, are the likely ones) - so 3.14.2 puts the reason
+  on the page (`fillNote`, `showFillNote` after ADD TO TRADE) and matches
+  the partner by Torn id too (`ttv2-tradeuser` from `#step=start&userID=`).
+  Ask the friend what the new line says.
+  Also in 3.14.2 (the owner): Declined is per trade (`declineKey`
+  'item|trader', `declinedOn`; older per-trader entries ignored) and the desk
+  goes on to the next flip; "Other" joins Never flip once
+  (`neverFlipOtherOnce`, flag `otherOn3142`); items pushed out by the 5-extras
+  cap go to Show them, not "no longer in the trade"; the overlay's opened-
+  listing mark (`.ttv2-target`) is light red #ff8a80 instead of yellow.
 - **Open:** the TornExchange pill's yellow state was never seen live (ask for
   its hover text if it comes back); a pin from a list row (only Best flips cards have the pin); Settings › Keep for yourself
   is now unused by trades (kept, harmless).

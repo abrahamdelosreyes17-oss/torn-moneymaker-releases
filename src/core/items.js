@@ -134,3 +134,20 @@ export function categoryCounts(categories, picked = '') {
         .map(([category, count]) => ({ category, count }))
         .sort((a, b) => b.count - a.count || a.category.localeCompare(b.category));
 }
+
+/*
+ * Never flip "Other" (3.14.2, the friend: "nakakahiya itrade" - embarrassing
+ * to trade): Torn's Other category joins Clothing on the Never flip list,
+ * once - a list saved before keeps its choices and gains "Other"; taking it
+ * off again afterwards is yours to keep.
+ */
+export const NEVER_FLIP_ONCE = 'otherOn3142';
+
+/** Stored Torn Bids preferences with "Other" added to Never flip once, or null when already done. */
+export function neverFlipOtherOnce(stored) {
+    const p = stored && typeof stored === 'object' ? stored : {};
+    if (p[NEVER_FLIP_ONCE]) return null;
+    const never = new Set(Array.isArray(p.neverFlip) ? p.neverFlip : ['Clothing']);
+    never.add('Other');
+    return { ...p, neverFlip: [...never], [NEVER_FLIP_ONCE]: true };
+}

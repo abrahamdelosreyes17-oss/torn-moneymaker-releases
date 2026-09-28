@@ -299,3 +299,31 @@ export function acceptedTotals(trade) {
     }
     return { pays, cost, profit };
 }
+
+/* ------------------------------------------ Fill on Torn's trade page (3.14.2) */
+
+/*
+ * The owner, 2026-09-28 (the friend's add step, no Fill anywhere, after he
+ * had pressed accepted): "where's our fill?". When Fill marks nothing, the
+ * page says why in one line beside ADD TO TRADE - never silent.
+ */
+
+/**
+ * The line beside ADD TO TRADE.
+ *
+ * @param {object} p
+ * @param {string[]} p.accepted - the traders of the trades accepted on this browser
+ * @param {string|null} p.trader - the accepted trade this Torn trade is (null: none matched)
+ * @param {string|null} p.partner - who this Torn trade is with, when known
+ * @param {number} p.toSend - items of that trade with something to send
+ * @param {number} p.marked - rows marked with Fill on this page
+ * @returns {{ok: boolean, text: string}}
+ */
+export function fillNote({ accepted = [], trader = null, partner = null, toSend = 0, marked = 0 }) {
+    if (!accepted.length) return { ok: false, text: 'Fill: no trade accepted in Torn Bids on this browser' };
+    if (!trader && partner) return { ok: false, text: 'Fill: this trade is with ' + partner + '; you accepted ' + accepted.join(', ') };
+    if (!trader) return { ok: false, text: 'Fill: which trade? You accepted ' + accepted.join(', ') + ' - open it from its first page' };
+    if (!toSend) return { ok: false, text: 'Fill: nothing recorded as bought for ' + trader + ' - tick Bought in Torn Bids' };
+    if (!marked) return { ok: false, text: 'Fill: none of ' + trader + '\'s items are in this list' };
+    return { ok: true, text: 'Fill for ' + trader + ': ' + marked + (marked === 1 ? ' row' : ' rows') + ' marked' };
+}

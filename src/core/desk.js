@@ -17,6 +17,24 @@ export function backgroundSlot(recent, now, perMinute = W3B_HIDDEN_PER_MIN) {
     return (recent || []).filter((t) => now - t < 60000).length < perMinute;
 }
 
+/*
+ * Declined is one trade, not the person (3.14.2, the owner: "if we decline
+ * one trade, doesn't mean we would decline the other trades with the same
+ * person"): stored per item and trader, 'itemId|traderKey' -> until. Older
+ * per-trader entries (no item) count for nothing and expire within the hour.
+ */
+export function declineKey(itemId, traderKey) {
+    return String(itemId) + '|' + String(traderKey);
+}
+
+/** The traders passed over on this item: trader key -> until. */
+export function declinedOn(declined, itemId) {
+    const out = new Map();
+    const p = String(itemId) + '|';
+    for (const [k, until] of declined || []) if (String(k).startsWith(p)) out.set(String(k).slice(p.length), until);
+    return out;
+}
+
 /**
  * The item on the desk. One you picked stays picked (pressing a Best flips
  * card, a list row, or anything in the trade). Until you pick one, the desk

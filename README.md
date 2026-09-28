@@ -271,6 +271,24 @@ you: every link is one you follow yourself, one page per click.
   and profit move; press it again (or the pin on the list row) to unpin. It
   stays until you unpin it or trade it (Traded - done), across reloads, a
   week at most. The strip never re-orders while your pointer is on it.
+  **3.14.2:** every flip row in the list has the pin too (its bottom corner);
+  a pinned item is listed once - its own row moves to the top, saying *Trade
+  +$X* (the whole trade, live), the trader, and the main flip when that is
+  another item. Each flip says both prices: the list *Buy $809,351 · Sell
+  $1,157,499*, the card *Buy 48 at $809,351–$820,000 from ...*.
+  **Fill on Torn's trade page never fails silently (3.14.2):** one line after
+  Torn's *ADD TO TRADE · Clear all* says *Fill for KayMalta: 3 rows marked*,
+  or why nothing is marked - no trade accepted in Torn Bids on this browser;
+  this trade is with someone else; nothing recorded as bought; none of their
+  items in the list. The trade is matched to the trader by name, or by their
+  Torn id from the Trade link Torn Bids opened (`userID=`), for a trader whose
+  TornExchange name is not their Torn name.
+  **Declined is one trade (3.14.2):** *X declined* passes over that item's
+  trade with X for an hour - X's other trades stay - and the desk goes on to
+  the next flip. **Never flip** now has Torn's *Other* category too (the
+  friend: "nakakahiya itrade" - embarrassing to trade), added once to a saved
+  list; take it off in Settings › Flips and it stays off. In the overlay, the
+  listing a panel link was opened for is marked light red (it was yellow).
 - **The desk.** On the left, every item: **All** (what you hold and everything
   any trader buys), **Mine**, **Flips** - money to be made first, each with a
   badge (*Flip +$26,500*, *List +$749,998*, *Sell to trader*), what you hold

@@ -27,6 +27,7 @@ import {
     ITEMS_PARTIAL_TTL_MS,
     itemCategory,
     categoryCounts,
+    neverFlipOtherOnce,
 } from './core/items.js';
 import {
     buildNpcShopIndex,
@@ -52,9 +53,9 @@ import {
 import { bazaarSellers, flipPlan, flipBuyer, whereToSell, depthNearCheapest, flipCandidates, traderTagLabel, pickBazaars, MAIN_STOPS, EXTRA_STOPS } from './core/flips.js';
 import { planTrade, keepAfter } from './core/trade.js';
 import { holdTrade, holdKey, resolveEstimated, priceHeld, livePins, editHeld, HOLD_MS } from './core/held.js';
-import { deskItem, nextW3bRead, backgroundSlot, W3B_HIDDEN_PER_MIN, HIDDEN_RENDER_MS } from './core/desk.js';
+import { deskItem, nextW3bRead, backgroundSlot, W3B_HIDDEN_PER_MIN, HIDDEN_RENDER_MS, declineKey, declinedOn } from './core/desk.js';
 import { liquidityKind, unitsMoved, addMovement, stopsMinutes, EXTRA_CAP } from './core/liquidity.js';
-import { acceptTrade, liveAccepted, stepState, tickAccepted, stepDone, nextStep, boughtFromStock, recordBuy, sendUnits, acceptedTotals, replacementFor, replaceStep, dropLine, markLeft, leftoversOf, addLeftovers, takenUnits } from './core/accepted.js';
+import { acceptTrade, liveAccepted, stepState, tickAccepted, stepDone, nextStep, boughtFromStock, recordBuy, sendUnits, acceptedTotals, replacementFor, replaceStep, dropLine, markLeft, leftoversOf, addLeftovers, takenUnits, fillNote } from './core/accepted.js';
 import { readTradeView, readTradeAddRows } from './sources/dom/trade.js';
 import { makeTabId, LEADER_HEARTBEAT_MS } from './core/leader.js';
 import { tabWindow } from './platform/tab-window.js';
@@ -234,6 +235,8 @@ const TRADE_BUY_CLASS = 'ttv2-buyhere';
 const TRADE_SEND_CLASS = 'ttv2-sendrow';
 const TRADE_FILL_CLASS = 'ttv2-sendfill';
 const TRADE_BUYBAR_CLASS = 'ttv2-buybar';
+/* Fill's line beside Torn's ADD TO TRADE (3.14.2): what it marked, or why nothing. */
+const TRADE_NOTE_CLASS = 'ttv2-fillnote';
 /* Traders you marked Declined in Torn Bids: trader key -> until (an hour). */
 const STORE_SELL_DECLINED = 'sellDeclined';
 /* Trades a trader said yes to, frozen (core/accepted.js): trader key -> trade. Torn Bids and the overlay's trade page share it. */
@@ -2794,6 +2797,23 @@ function scanTradePage() {
         }
     }
     if (view && tradeId) app.tradeInside.set(tradeId, view.you.items);
+    // Who the trade is with by Torn id: "#step=start&userID=N" (the Trade link
+    // Torn Bids opens) is kept for this tab and tied to the trade that follows.
+    let userId = null;
+    try {
+        const startId = (String(location.hash).match(/[#&]userID=(\d+)/i) || [])[1] || null;
+        if (startId) sessionStorage.setItem('ttv2-tradeuser', startId);
+        if (tradeId) {
+            userId = sessionStorage.getItem('ttv2-tradeuser-' + tradeId);
+            const last = sessionStorage.getItem('ttv2-tradeuser');
+            if (!userId && last) {
+                sessionStorage.setItem('ttv2-tradeuser-' + tradeId, last);
+                userId = last;
+            }
+        }
+    } catch {
+        userId = null;
+    }
     let kept = null;
     try {
         kept = tradeId ? sessionStorage.getItem('ttv2-tradepartner-' + tradeId) : null;
@@ -2802,7 +2822,9 @@ function scanTradePage() {
     }
     const partner = (view && view.partner) || (tradeId ? app.tradePartners.get(tradeId) || kept : null) || null;
     const lower = (s) => String(s || '').toLowerCase();
-    const trade = partner ? accepted.find((t) => lower(t.trader.name) === lower(partner)) : accepted.length === 1 ? accepted[0] : null;
+    // By name (Torn's page), else by Torn id (a TornExchange name can differ from the Torn one).
+    const byId = userId ? accepted.find((t) => t.trader.id && String(t.trader.id) === String(userId)) : null;
+    const trade = (partner ? accepted.find((t) => lower(t.trader.name) === lower(partner)) : null) || byId || (!partner && accepted.length === 1 ? accepted[0] : null);
 
     // What goes in, per item (one item can be in a trade twice: flipped and yours).
     const need = new Map();
@@ -2825,8 +2847,10 @@ function scanTradePage() {
 
     // The add step: mark each row to send, with Fill. Updated in place, not
     // redrawn: a chip replaced under a press would swallow it.
+    const note = (marked) => showFillNote(fillNote({ accepted: accepted.map((t) => t.trader.name), trader: trade ? trade.trader.name : null, partner, toSend: need.size, marked }));
     if (!trade) {
         clearSendMarks();
+        note(0);
         return;
     }
     const marked = new Set();
@@ -2882,12 +2906,37 @@ function scanTradePage() {
         if (li) li.classList.remove(TRADE_SEND_CLASS);
         c.remove();
     }
+    note(marked.size);
     bindTradeFillPress();
+}
+
+/**
+ * Fill's one line on the add step, after Torn's ADD TO TRADE bar ("You are
+ * adding 0 items ... Clear all"): what it marked, or why nothing - the reason
+ * used to live only in the panel, which is often collapsed. Updated in place.
+ */
+function showFillNote(n) {
+    const bar = [...document.querySelectorAll('button, input[type=submit], input[type=button], a, span, div')]
+        .find((e) => e.children.length === 0 && /^\s*add to trade\s*$/i.test(e.value || e.textContent || ''));
+    let tag = document.querySelector('.' + TRADE_NOTE_CLASS);
+    if (!bar || !bar.parentElement) {
+        if (tag) tag.remove();
+        return;
+    }
+    if (!tag) {
+        tag = document.createElement('span');
+        tag.className = TRADE_NOTE_CLASS;
+        bar.parentElement.appendChild(tag);
+    }
+    if (tag.textContent !== n.text) tag.textContent = n.text;
+    const cls = TRADE_NOTE_CLASS + (n.ok ? ' ttv2-fillnote-ok' : '');
+    if (tag.className !== cls) tag.className = cls;
 }
 
 /** The trade page's marks (rows to send, Fill), gone before they are drawn again. */
 function clearSendMarks() {
     for (const n of document.querySelectorAll('.' + TRADE_FILL_CLASS)) n.remove();
+    if (!isTradePage(location.href)) for (const n of document.querySelectorAll('.' + TRADE_NOTE_CLASS)) n.remove();
     for (const n of document.querySelectorAll('.' + TRADE_SEND_CLASS)) n.classList.remove(TRADE_SEND_CLASS);
 }
 
@@ -3711,7 +3760,7 @@ const TRADE_TRADERS_MAX = 12;
 /* A trader you marked Declined is passed over for this long. */
 const TRADE_DECLINE_MS = 60 * 60 * 1000;
 
-/** Traders you marked Declined, still passed over: trader key -> until. */
+/** Trades you marked Declined, still passed over: 'itemId|trader key' -> until (declineKey). */
 function sellDeclined(now = Date.now()) {
     const out = new Map();
     for (const [k, until] of Object.entries(gmGet(STORE_SELL_DECLINED, {}) || {})) {
@@ -4189,11 +4238,14 @@ function renderSellingNow() {
     };
     // The plan that makes the most among the believable buyers (each capped
     // by what they can pay); a tie goes to the higher bid.
+    const declinedAll = sellDeclined(now);
     const planOf = (id) => {
         const rows = sellersOf(id);
         if (!rows) return null;
         let best = null;
         for (const b of flipBuyersOf(id)) {
+            // A trade you declined is not a flip (the same trader's other items still are).
+            if (declinedAll.size && declinedAll.has(declineKey(id, b.id ? 'id:' + b.id : 'name:' + String(b.name).toLowerCase()))) continue;
             const most = Math.min(prefs.maxPerFlip || 100, b.maxUnits ? b.maxUnits : Infinity);
             const plan = flipPlan(rows, b.price, { cash: prefs.cash, maxUnits: most, minPct: prefs.minProfitPct });
             if (!plan) continue;
@@ -4368,7 +4420,7 @@ function renderSellingNow() {
      * (a pin must come back as it was pinned).
      */
     const chooseTrade = (pickId, buyers) => {
-        const declined = sellDeclined(now);
+        const declined = declinedOn(declinedAll, pickId);
         const plans = new Map();
         for (const b of buyers.slice(0, TRADE_TRADERS_MAX)) plans.set(traderKey(b), tradeWith(b, pickId));
         // A pinned trade on this item comes back with its trader (after a reload too).
@@ -4392,7 +4444,7 @@ function renderSellingNow() {
     const tradeDesk = (pickId, buyers) => {
         const rows = sellersOf(pickId);
         if (!rows || !buyers.length) return null;
-        const declined = sellDeclined(now);
+        const declined = declinedOn(declinedAll, pickId);
         // They said yes: the trade is frozen; only each step's check is live.
         const acc = Object.values(sellAccepted(now)).find((t) => t.itemId === String(pickId));
         if (acc) {
@@ -4524,7 +4576,9 @@ function renderSellingNow() {
         const seenKey = String(pickId) + '|' + chosen.key;
         const seen = sell.tradeSeen.get(seenKey) || new Set();
         const inNow = new Set([...chosen.flips.map((r) => r.itemId), ...chosen.off.map((r) => r.itemId)]);
-        const gone = [...seen].filter((id) => !inNow.has(id));
+        // Left out to keep the trade quick (the extras' cap) is listed under Show them, not "gone".
+        const leftIds = new Set((chosen.left || []).map((r) => r.itemId));
+        const gone = [...seen].filter((id) => !inNow.has(id) && !leftIds.has(id));
         sell.tradeSeen.set(seenKey, new Set([...seen, ...inNow]));
 
         const fresh = rows.find((r) => !r.stale);
@@ -4642,7 +4696,7 @@ function renderSellingNow() {
         const p = priceHeld(t, { rowsOf: sellersOf, bidOf, lowestOf });
         const main = t.lines.find((l) => l.itemId === t.main) || t.lines[0] || null;
         const mainId = main ? main.itemId : t.itemId;
-        return { key: k, itemId: t.itemId, mainId, name: nameOf(mainId), trader: t.trader.name, items: p.items, stops: p.stops, profit: p.profit, on: Boolean(desk && desk.itemId === t.itemId && deskKey === t.key) };
+        return { key: k, itemId: t.itemId, mainId, name: nameOf(t.itemId), mainName: nameOf(mainId), trader: t.trader.name, items: p.items, stops: p.stops, profit: p.profit, on: Boolean(desk && desk.itemId === t.itemId && deskKey === t.key) };
     });
 
     const watch = sellWatch({ desk, strip, listed, held: [...heldQty.keys()], buyersAll });
@@ -4680,7 +4734,8 @@ function renderSellingNow() {
             return item ? item.type : null;
         },
         networth: networthMap(),
-        list: listed.slice(0, sell.allShown).map((r) => ({ itemId: r.itemId, name: r.name, held: r.held, lowest: r.lowest, badge: r.badge, pending: r.pending })),
+        // A flip row says what you buy at and what the trader pays (the owner: "it doesn't say how much the bazaar sells it for and how much the trader buys it for").
+        list: listed.slice(0, sell.allShown).map((r) => ({ itemId: r.itemId, name: r.name, held: r.held, lowest: r.lowest, badge: r.badge, pending: r.pending, buy: r.badge && r.badge.kind === 'flip' && r.plan ? r.plan.firstPrice : null, sell: r.badge && r.badge.kind === 'flip' && r.plan && r.plan.buyer ? r.plan.buyer.price : null })),
         listTotal: listed.length,
         counts,
         filter: sell.filter,
@@ -5289,6 +5344,9 @@ function bootSellingPage() {
     // bids from new traders in every flip. Your later choice is kept.
     const storedPrefs = gmGet(STORE_SELL_PREFS, {}) || {};
     if (!storedPrefs.trustedOn311) gmSet(STORE_SELL_PREFS, { ...storedPrefs, trustedOnly: true, trustedOn311: true });
+    // 3.14.2: "Other" joins Never flip once (the friend: "nakakahiya itrade").
+    const withOther = neverFlipOtherOnce(gmGet(STORE_SELL_PREFS, {}) || {});
+    if (withOther) gmSet(STORE_SELL_PREFS, withOther);
     // An error message is about the last call, not this visit: a stored one
     // (3.8.1 kept "That is a Torn key" forever) would outlive its cause.
     if (teState().error) setTeState({ error: null });
@@ -5322,7 +5380,7 @@ function bootSellingPage() {
             sell.selected = String(itemId);
             sell.pickedByYou = true;
             // Planning a trader you declined means you are trying them again.
-            if (sellDeclined().has(key)) setSellDeclined(key, null);
+            if (sellDeclined().has(declineKey(itemId, key))) setSellDeclined(declineKey(itemId, key), null);
             renderSellingNow();
         },
         onTradePin: (itemId, key) => {
@@ -5358,7 +5416,7 @@ function bootSellingPage() {
             const t = sellPinned()[pinKey];
             if (!t) return;
             sell.tradePick.set(String(t.itemId), t.key);
-            if (sellDeclined().has(t.key)) setSellDeclined(t.key, null);
+            if (sellDeclined().has(declineKey(t.itemId, t.key))) setSellDeclined(declineKey(t.itemId, t.key), null);
             // As picking the item: its full TornExchange list, its bazaars read now.
             onSellSelect(t.itemId);
         },
@@ -5448,14 +5506,21 @@ function bootSellingPage() {
             saveSellLeftovers(sellLeftovers().filter((l) => String(l.itemId) !== String(itemId)));
             renderSellingNow();
         },
+        // They said no to this trade: it is passed over for an hour - that
+        // trade only, the same trader's other trades stay - and the desk goes
+        // on to the next flip (the owner, 2026-09-28).
         onTradeDecline: (key) => {
-            setSellDeclined(key, Date.now() + TRADE_DECLINE_MS);
+            const item = sell.selected;
+            if (!item) return;
+            setSellDeclined(declineKey(item, key), Date.now() + TRADE_DECLINE_MS);
             // The held plan with them goes (a pin stays until you unpin it).
-            if (sell.selected) sell.tradeHold.delete(holdKey(sell.selected, key));
+            sell.tradeHold.delete(holdKey(item, key));
+            sell.tradePick.delete(String(item));
+            sell.pickedByYou = false;
             renderSellingNow();
         },
         onTradeUndecline: (key) => {
-            setSellDeclined(key, null);
+            if (sell.selected) setSellDeclined(declineKey(sell.selected, key), null);
             renderSellingNow();
         },
         onTradeEdit: (key, itemId, edit) => {

@@ -180,6 +180,19 @@ export const PAGE_CSS = `
         inset 0 0 0 9999px rgba(77, 171, 247, 0.16) !important;
 }
 
+/* Fill's line beside Torn's ADD TO TRADE (3.14.2): amber when it marks nothing, blue when it does. */
+.ttv2-fillnote {
+    display: inline-block;
+    margin-left: 12px;
+    font: bold 12px/18px Arial, sans-serif;
+    color: #f0a020;
+    vertical-align: middle;
+}
+
+.ttv2-fillnote.ttv2-fillnote-ok {
+    color: #4dabf7;
+}
+
 /* Chat from Torn Bids (3.14): Torn's own Start chat button on that profile, in blue. You press it. */
 .ttv2-chatmark {
     outline: 3px solid #4dabf7 !important;
@@ -302,11 +315,11 @@ export const PAGE_CSS = `
 .ttv2-sendfill[data-fill] { cursor: pointer; }
 .ttv2-sendfill[aria-pressed="true"] { background: #4dabf7; color: #10202c; }
 
-/* The listing a feed link was opened for. Paint-only, like .ttv2-hit. */
+/* The listing a feed link was opened for: light red (3.14.2, the owner; it was yellow). Paint-only, like .ttv2-hit. */
 .ttv2-target {
     box-shadow:
-        inset 0 0 0 3px #ffd24a,
-        inset 0 0 0 9999px rgba(255, 210, 74, 0.14) !important;
+        inset 0 0 0 3px #ff8a80,
+        inset 0 0 0 9999px rgba(255, 138, 128, 0.14) !important;
 }
 
 .ttv2-hit-top {
@@ -317,8 +330,8 @@ export const PAGE_CSS = `
 
 /*
  * Profitable, but below your Min: amber, thinner and fainter than green, so
- * the deals that meet your Min still stand out first. (Yellow is taken: it
- * marks the listing a panel link was opened for.)
+ * the deals that meet your Min still stand out first. (Light red marks the
+ * listing a panel link was opened for.)
  */
 .ttv2-hit.ttv2-hit-low {
     box-shadow:
