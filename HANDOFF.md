@@ -126,7 +126,24 @@ offer to read Torn's scripting-rules page with them (read only).
    (desk, accepted card, Settings, the overlay's chips and Fill amount).
    Reproduce in the harness with a real mouse first (click in the empty left
    part, with and without the box focused), then a test that fails before.
-4. **Held, remind only:** the faction rule (skip a trader in the same
+4. **Favourites: no list, and no "plan flip" for them** (the owner, end of
+   the third session, live on 3.14.4 - they had starred traders: "i can
+   favorite traders, but then theres no list of favorite traders, and theres
+   no 'plan flip' for them, again for next session"). Today: ☆ on the desk's
+   Traders pay rows and in Ledger › Traders (which lists only traders with
+   finished trades - a favourite starred by hand with no trade yet is in no
+   list at all); favourites feed "Your traders" under Best flips (with
+   Trusted-badge traders mixed in), whose "Put on desk" works only when a
+   trade with them exists now ("No trade now" otherwise), and the section can
+   be folded. First, on the owner's page (read only): is "Your traders"
+   there, folded or open, and what do the favourites' cards say? Then restate
+   and mockup: a favourites list (probably its own place - e.g. a
+   "Favourites" filter in Your traders, or a Settings/Ledger list with
+   Remove), each with "Plan flip" = the best whole trade with them on the
+   desk (`onTradePick(mainId, 'id:'+id)` as Put on desk does), and when
+   there is none, say why ("nothing in bazaars under their prices" / "their
+   list not read yet").
+5. **Held, remind only:** the faction rule (skip a trader in the same
    faction as the bazaar you bought from); trader capacity and "Sell fast"
    (the Vladbull case, never a ranking bias).
 
