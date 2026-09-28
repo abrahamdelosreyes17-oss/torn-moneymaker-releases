@@ -112,7 +112,21 @@ offer to read Torn's scripting-rules page with them (read only).
    pay row) that clears the pick and releases the hold - never a pin or an
    accepted trade. **Before building:** restate it, and mockups for the
    label and where it sits (the owner decides; labels 6 words or fewer).
-3. **Held, remind only:** the faction rule (skip a trader in the same
+3. **Number boxes: the cursor starts at the left** (the owner, end of the
+   third session, with a screenshot of the trade card's quantity box - Gift
+   Card, "1" selected, right-aligned, green focus ring - "when you click this
+   as well cursor starts at left not from right, again for next session").
+   The trade card's `.sp-qty` (and Settings' `.sp-pctin`) are right-aligned:
+   the digits sit at the right, so a click in the empty part of the box - left
+   of the digits - puts the caret before the number (the browser's own
+   behaviour), and typing goes in front of it. `selectOnFocus`
+   (selling-page.js) only selects on the click that focuses the box. Likely
+   fix: a click that leaves the caret collapsed left of the text puts it at
+   the end instead (`setSelectionRange(len, len)`), on every number box
+   (desk, accepted card, Settings, the overlay's chips and Fill amount).
+   Reproduce in the harness with a real mouse first (click in the empty left
+   part, with and without the box focused), then a test that fails before.
+4. **Held, remind only:** the faction rule (skip a trader in the same
    faction as the bazaar you bought from); trader capacity and "Sell fast"
    (the Vladbull case, never a ranking bias).
 
