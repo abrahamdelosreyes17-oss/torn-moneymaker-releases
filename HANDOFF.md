@@ -8,7 +8,8 @@ Everything below "History" is the record of how we got here.
 
 - **Released: 3.14.1** (3.14.0 `b9b99e9` + Torn Bids keeping fresh in the
   background and Chat marking Torn's chat button; see "What the 2026-09-28
-  second session did"), pushed. Install link: RELEASE_LINK_PLACEHOLDER
+  second session did"), pushed. `9ceda80`. Install link given to the owner:
+  `https://raw.githubusercontent.com/abrahamdelosreyes17-oss/torn-moneymaker-releases/9ceda8076117a4296d0eb32a57839b2ff59cca44/torn-moneymaker.user.js`
 - Before it: 3.13.1 (`e3b4fc5`). Branch `claude/optimistic-ride-1gqguu`. Earlier: 3.12.10 (`711f893`),
   3.12.5 (`aab7e53`), 3.12.6 (`fe49df0`), 3.12.7 (`d69907c`), 3.12.8 (`8991095`), 3.12.9 (`c45a227`).
 - **Remind the owner (they asked, 2026-09-28: "dont build, but remind the
