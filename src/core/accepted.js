@@ -144,6 +144,18 @@ export function nextStep(trade) {
 }
 
 /**
+ * The buying box's status, in parts that never break inside (3.14.3, the
+ * owner: it read "yes 100 / min ago"): "0 of 2 done", then - after a minute -
+ * "yes 1h 40m ago". `age` in ms since they said yes.
+ */
+export function buyingStatus(done, total, age) {
+    const out = [done + ' of ' + total + ' done'];
+    const m = Math.floor((Number(age) || 0) / 60000);
+    if (m >= 1) out.push('yes ' + (m < 60 ? m + 'm' : Math.floor(m / 60) + 'h' + (m % 60 ? ' ' + (m % 60) + 'm' : '')) + ' ago');
+    return out;
+}
+
+/**
  * What you bought on a bazaar page, from the listing's stock: seen first
  * (when you arrived) and now. Gone from the page = all of it (what you
  * needed, at most what was there). Never more than you needed.
@@ -155,14 +167,88 @@ export function boughtFromStock(firstSeen, nowSeen, need) {
 }
 
 /** A copy of the trade with one step's outcome: how many you bought (0 = skipped). */
-export function recordBuy(trade, line, index, boughtQty) {
+export function recordBuy(trade, line, index, boughtQty, now = Date.now()) {
     const n = Math.max(0, Math.floor(Number(boughtQty) || 0));
     return {
         ...trade,
         items: trade.items.map((i) => {
             if ((i.line || 'flip:' + i.itemId) !== String(line)) return i;
-            return { ...i, steps: i.steps.map((st, k) => (k === index ? { ...st, boughtQty: n, bought: n >= st.qty, skipped: n === 0 } : st)) };
+            // When: the Bought window lists buys in the order you made them (3.14.3).
+            return { ...i, steps: i.steps.map((st, k) => (k === index ? { ...st, boughtQty: n, bought: n >= st.qty, skipped: n === 0, boughtAt: n > 0 ? now : null } : st)) };
         }),
+    };
+}
+
+/* ------------------------------------ Bought since you accepted (3.14.3) */
+
+/*
+ * The owner, 2026-09-28: a separate window, only while a trade is accepted,
+ * listing everything bought for it since "X accepted" - and on Torn's trade
+ * page, a checklist: each item ticks itself once it is in the trade, and a
+ * warning names what was bought but not added. Picked from mockups/Q: its own
+ * window, moved anywhere. Items bought that the trader does not buy are left
+ * off; ones they buy that were not planned are orange (red when at a loss).
+ * `trade.extra` holds those unplanned buys ({itemId, name, qty, price, seller,
+ * at, bid}); nothing fills it until the bazaar page's own purchase message has
+ * been read live (the planned steps are counted as before).
+ */
+
+/**
+ * @param {object} trade - an accepted trade (acceptTrade + recordBuy)
+ * @param {object} [o]
+ * @param {Map<string, number>|null} [o.inside] - lowercase item name -> how many are in Torn's trade now (the trade page), or null elsewhere
+ * @returns {{trader, at, rows: Array, extra: Array, toBuy: number, totals: {cost, pays, profit}, missing: Array<{name, qty}>, done: boolean}}
+ */
+export function boughtSince(trade, { inside = null } = {}) {
+    const rows = [];
+    let cost = 0;
+    let pays = 0;
+    let toBuy = 0;
+    const has = (name) => (inside ? inside.get(String(name).toLowerCase()) || 0 : null);
+    for (const i of (trade && trade.items) || []) {
+        if (i.kind !== 'flip') continue;
+        let qty = 0;
+        let spent = 0;
+        let at = 0;
+        const sellers = [];
+        for (const st of i.steps || []) {
+            if (!stepDone(st)) {
+                toBuy += 1;
+                continue;
+            }
+            const n = st.boughtQty > 0 ? st.boughtQty : st.bought ? st.qty : 0;
+            if (!n) continue;
+            qty += n;
+            spent += n * st.price;
+            at = Math.max(at, Number(st.boughtAt) || 0);
+            if (st.sellerName && !sellers.includes(st.sellerName)) sellers.push(st.sellerName);
+        }
+        if (!qty) continue;
+        const send = takenUnits(i);
+        const inTrade = inside ? Math.min(send, has(i.name)) : null;
+        cost += spent;
+        pays += send * i.bid;
+        rows.push({ itemId: i.itemId, name: i.name, qty, each: spent / qty, bid: i.bid, sellers, at, planned: true, tone: 'planned', send, inTrade, profit: send * i.bid - (spent / qty) * send });
+    }
+    // Bought but not planned: only what this trader buys (the owner: "if the trader doesn't buy it, leave it off").
+    const extra = [];
+    for (const x of (trade && trade.extra) || []) {
+        if (!x || !(x.bid > 0) || !(x.qty > 0)) continue;
+        const inTrade = inside ? Math.min(x.qty, has(x.name)) : null;
+        cost += x.qty * x.price;
+        pays += x.qty * x.bid;
+        extra.push({ ...x, planned: false, tone: x.bid > x.price ? 'extra' : 'loss', send: x.qty, inTrade, profit: x.qty * (x.bid - x.price) });
+    }
+    const all = [...rows, ...extra].sort((a, b) => (a.at || 0) - (b.at || 0));
+    const missing = inside ? all.filter((r) => r.inTrade < r.send).map((r) => ({ name: r.name, qty: r.send - r.inTrade })) : [];
+    return {
+        trader: trade && trade.trader ? trade.trader.name : null,
+        at: trade ? Number(trade.at) || 0 : 0,
+        rows: all,
+        toBuy,
+        totals: { cost, pays, profit: pays - cost },
+        missing,
+        done: Boolean(inside) && all.length > 0 && !missing.length,
     };
 }
 
@@ -319,11 +405,13 @@ export function acceptedTotals(trade) {
  * @param {number} p.marked - rows marked with Fill on this page
  * @returns {{ok: boolean, text: string}}
  */
-export function fillNote({ accepted = [], trader = null, partner = null, toSend = 0, marked = 0 }) {
+export function fillNote({ accepted = [], trader = null, partner = null, toSend = 0, marked = 0, missing = [] }) {
     if (!accepted.length) return { ok: false, text: 'Fill: no trade accepted in Torn Bids on this browser' };
     if (!trader && partner) return { ok: false, text: 'Fill: this trade is with ' + partner + '; you accepted ' + accepted.join(', ') };
     if (!trader) return { ok: false, text: 'Fill: which trade? You accepted ' + accepted.join(', ') + ' - open it from its first page' };
     if (!toSend) return { ok: false, text: 'Fill: nothing recorded as bought for ' + trader + ' - tick Bought in Torn Bids' };
     if (!marked) return { ok: false, text: 'Fill: none of ' + trader + '\'s items are in this list' };
-    return { ok: true, text: 'Fill for ' + trader + ': ' + marked + (marked === 1 ? ' row' : ' rows') + ' marked' };
+    // Items to send with no row here (not in your items, or on another tab): named, so none is missed.
+    const gone = missing.length ? ' · not in this list: ' + missing.join(', ') : '';
+    return { ok: !missing.length, text: 'Fill for ' + trader + ': ' + marked + (marked === 1 ? ' item' : ' items') + ' marked' + gone };
 }

@@ -88,8 +88,8 @@ checks what 3.14.0-3.14.2 built; B are bugs the live check found.
 |---|---|---|
 | A1 | The friend's add step: what the line after "ADD TO TRADE · Clear all" says | not seen - his screen; needs his screenshot |
 | A2 | Chat -> profile with Start chat outlined blue | the owner: fine - dropped |
-| A3 | Torn Bids in the background: TornExchange pill in minutes; flips already checked on coming back | **pill passed; flips failed** (3 of 30 in ~5 min) -> B2 |
-| A4 | Pins on Best flips cards and list rows, one row per pinned item | to do |
+| A3 | Torn Bids in the background: TornExchange pill in minutes; flips already checked on coming back | **pill passed; flips failed** (3 of 30 in ~5 min; third session on 3.14.2: 5 of 30 after ~2.5 min, 0 of 30 after 1.5 min on 3.14.1) -> B2 |
+| A4 | Pins on Best flips cards and list rows, one row per pinned item | **half seen (3.14.2, third session):** pins on all 4 cards and every flip row, rows say *Buy $X · Sell $Y*. One row per pinned item not seen yet (the owner had 3.14.1 until then; the agent pressed Stealth Virus's card pin once, then stopped - live clicks are the owner's) |
 | A5 | Declined per trade; the desk goes on to the next flip | to do |
 | A6 | "Other" in Never flip | to do |
 | A7 | The overlay's light-red mark on the listing you opened | to do |
@@ -98,9 +98,9 @@ checks what 3.14.0-3.14.2 built; B are bugs the live check found.
 
 | # | Fix | Done when |
 |---|---|---|
-| B1 | The buying box: its button label is not cut off, the status does not wrap mid-line, the time reads "yes 1h 40m ago" (the box is 3.13's) | a test fails on the old code and passes on the new; screenshots at 430 / 288 / 240px of free space |
-| B2 | Possible flips checked while Torn Bids is hidden | measured first, then fixed: all 30 checked by the time you come back |
-| B3 | TornExchange "did not answer": why | read its hover text and colour the next time it shows; fix only if it is ours |
+| B1 | The buying box: its button label is not cut off, the status does not wrap mid-line, the time reads "yes 1h 40m ago" (the box is 3.13's) | **done, unreleased:** `buyingStatus` (core/accepted.js), `.ttv2-buynext` wraps, `.ttv2-nobr` parts; harness at 430/288/240 (old: label 291px in a 217px button) |
+| B2 | Possible flips checked while Torn Bids is hidden | **done, unreleased:** hidden = flips before lists (`nextW3bRead` `hidden`), 20 reads/min (`W3B_HIDDEN_PER_MIN`), lists at most 6 of them (`backgroundListSlot`), flips worked out at once on new data (`flipsStale`). Harness, 6 s in view then ~2 min hidden: 18/18 checked (3.14.2: 7/18) |
+| B3 | TornExchange "did not answer": why | hover seen live (3.14.1): "TornExchange did not answer. Trying again soon." - the same text for timeouts, no connection, HTTP errors and TE error replies. **Unreleased:** the hover now says which (`teFailText`); read it next time to tell theirs from ours |
 
 B2, what 3.14.1 does (the previous session's note - it only ever checked
 that background reads happen, 6 in 45 s on the harness, never that all 30
@@ -130,6 +130,21 @@ lists (lists can wait), and a higher background pace for the flips alone
 | 4 | **Favourite / blacklisted traders:** favourite = 3+ trades, automatic and editable; blacklist = never planned, never a buyer, with Undo | mockup | 3 trades total or on different days? blacklisted hidden or greyed at the bottom? last-paid prices for a favourite with no list? |
 | 5 | **Receipts by trader** (a picker + totals), and each line's profit split by the trader's accepted prices | mockup | picker + totals, or is the Who box enough? |
 | 6 | **Scan trusted / favourite traders:** the best whole trade with each now, one press to the desk | research TornExchange's per-trader list endpoint | none until the research is back |
+
+**The owner's decisions (third session, 2026-09-28):**
+- C2: Extras per trade = a number, **default 5, 1-10** ("unlimited" meant every item we can flip to that trader, capped at 10); the 3-bazaars-per-extra rule stays. **Built, unreleased** (`extrasPerTrade`, `EXTRA_ITEMS_MAX`, prefs `extraItems`).
+- C3: "trusted" = TornExchange / TornW3B's own rating (the badge), not ours. The Ledger › Traders tab (who, trades, money, profit, last trade, did they pay their list) and "Traded 7× · last 3d ago" on trader rows: yes.
+- C4: favourite = **5+ finished trades** (automatic, editable). Blacklisted = never a buyer (flips, trades, Where to sell), **their bazaars still used** to buy from. A favourite with no public list: their last-paid prices, marked "last paid".
+- C5: a trader **dropdown** (most trades first) **plus a totals line** (trades, paid to you, cost, profit); and the per-item profit split by accepted prices.
+- Troll bids: the item list ignores bids over 3× the Item Market Average when sorting (as flips do); the bid still shows on the item, marked as not believable.
+
+**Picked from the mockups (`mockups/Q-*.html`, third session):**
+- C1: variant B's own window, but **freely movable anywhere on the page** (the owner's choice, overriding "never cover Torn" for this window only; it starts in the free space). A **checklist** on the trade page: each bought item ticks itself once it is in the trade (read from Torn's trade view), and a warning names anything bought but not added; Fill and the highlight come from this list (Fill and the highlight were still never seen live). Items the trader does not buy: **left off**. Unplanned items the trader buys: **orange** while profitable, **red** when not.
+- C3: as drawn. C4: **A** (star + ⊘ buttons on every row). Favourite = 5+ trades **and a trade within the last month** (added by hand: kept until removed). Blacklisted: **not shown in Torn Bids at all**; un-blacklist from the Ledger › Traders tab.
+- C5: the agent's pick (the owner: "whatever fits our look"): **B**, four boxes like the Trading tab.
+- C6: **collapsible** section; scans favourites and every trader with a Trusted badge.
+
+**Research done (third session):** C6 - TornExchange `GET /api/prices/{torn id or name}` (key) = one trader's WHOLE buy list `{items:[{item_id,name,price}], meta:{trader, vote_score, last_updated, time_since_last_trade}}` (swagger), one call per trader at our 10 s pace. C1 - the Ledger already reads log 1225 (bazaar buys) every 5 min from Torn Bids; the bazaar page's own purchase message is still unread (needs the owner to buy with the Claude tab open).
 
 **D. Still held (remind, do not build):** the faction rule; trader capacity
 and "Sell fast".
@@ -262,6 +277,75 @@ mockup first where it changes the look (see "How the owner works"), then build.
    live (ask for its hover text); the trade page does not handle you paying
    them; Settings › Keep for yourself is unused since own items left trades;
    run `test/ux-check.mjs`.
+
+## What the 2026-09-28 third session did (3.14.3, unreleased until the owner asks for the link)
+
+Built after the owner's decisions (see "The plan (third session...)"), each with
+unit tests that fail on the old code, and checked in the harness (torn.com
+blocked); nothing of it seen live yet.
+
+- **B1** buying box (`buyingStatus`, `.ttv2-buynext` wraps, `.ttv2-nobr`). **B2**
+  hidden tab: flips before price lists, 20 reads/min, lists at most 6
+  (`nextW3bRead` `hidden`, `backgroundListSlot`, `flipsStale`). **B3**
+  TornExchange failures say why (`teFailText`).
+- **C2** Extras per trade (1-10, default 5). **C3/C4** `core/partners.js`:
+  partnerStats (trades, money, FIFO profit, last trade, paid their list -
+  kept on the ledger rows as `agreed`, so it outlives the price records),
+  favourites (5+ trades and one within 30 days; added by hand; a removal
+  sticks), blacklist (`blacklistKeys`: id and name; applied on every buyer
+  path incl. pins, the desk fallback, bids and the overlay's tags). Ledger ›
+  Traders tab, ☆/⊘ on Traders pay rows, "Traded 7× · last 3d ago",
+  Settings › Flips › Blacklisted traders with Undo (for anyone without a
+  Full key). **C5** receipts: Trader dropdown + four boxes, "split by their
+  prices" (price records `sellPriceRecords` saved at "X accepted";
+  `rowsFromTrade(priceOf)`), "$N short". **C6** Your traders (collapsible,
+  under Best flips): favourites + Trusted-badge traders, the best whole trade
+  each, Put on desk; favourites' whole TornExchange lists via `prices/{id}`
+  (`fetchTeTraderPrices`, paced in the shared queue, visible tab only,
+  `sellTeOwnLists` pruned to favourites, failures back off); no public list =
+  last-paid prices, kept apart (`lastPaidOnly`) and marked. Worked out at most
+  every 10 s (`SCAN_EVERY_MS`) or at once on a settings change.
+- **Troll bids**: the list sorts and Where to sell use the best believable bid
+  (`listBid`, `believableBid`); troll rows are struck through, after the real
+  ones, "Over 3× Item Market Average: not counted".
+- **Inputs (owner: 2/10; mockup R-inputs, picked A + D)**: no Save buttons
+  anywhere in Settings - the box shows the saved value, click/Tab selects it,
+  Enter/Tab/click away saves ("Saved ✓" 2 s), Esc restores, a bad value is red
+  with the reason under it and the old value stays, an emptied box restores.
+  Cash for flips: "No limit" / "Up to [amount]" (`cashLast` keeps the amount).
+  Keys save on Enter or leaving the box (and are checked first: format, Torn
+  accepts it, not Public/Minimal - `keyTooLowForInventory`). Desk quantity
+  boxes: never redrawn while you are in one (unless the window lost focus),
+  Enter leaves and saves, Esc restores, bad input said beside the box, more
+  than listed is cut and said ("11 listed - 999 is more than bazaars have").
+  The Ledger keeps focus and selection; dates apply when finished.
+- **Review of the session (3 passes, all findings fixed)**: see the list of
+  fixes in the commit; the top ones: a Public key replaced the Limited key;
+  blacklisted traders came back through pins/fallbacks/overlay tags; the star
+  did not redraw; no Undo without a Full key; last-paid prices counted as live
+  bids; decline focus landed on the next trader's decline; the scan planned
+  every trader on every redraw; the Fill note counted hidden duplicate rows
+  and now names items missing from the list; faded rows by colour (contrast);
+  at 1000px the list comes before the desk.
+- **C1 Bought since you accepted** (`core/accepted.js` `boughtSince`,
+  `ui/bought-window.js`): its own window on Torn's pages while a trade is
+  accepted, ending just above NPC Arbitrage; dragged by its title anywhere
+  (kept in `boughtWindow`), folds to one line; every buy recorded for the
+  trade (steps now carry `boughtAt`), cost / they pay / profit, still to buy;
+  on the trade page a checklist ("✓ in" / "add 20") and "Not in the trade
+  yet: X ×20" or "Everything you bought is in the trade ✓"; gone at Traded -
+  done. **Unplanned buys** (orange while profitable, red at a loss; ones the
+  trader does not buy left off) are in the model (`trade.extra`) but nothing
+  fills it yet: that needs the bazaar page's own purchase message read live
+  (the owner buys something with the Claude tab open) - today only the
+  planned steps are counted, from the listing's stock, as before.
+- **Overlay (review + inputs A/D):** the Min and Cash chips save on Enter / Tab
+  / click away, errors under the chips, Cash has "Any" (0 is refused);
+  Settings › Fill's amount the same; the Seller line wraps (no "…"); the add
+  page header and rows fit at 240px; the buying box's grey is readable.
+- **Still open:** C1's unplanned-buy reader (above); the friend's A1
+  screenshot; A4 (one row per pinned item), A5, A6, A7 live. Held (remind):
+  the faction rule; trader capacity and "Sell fast".
 
 ## What the 2026-09-28 second session did (3.14.0)
 
@@ -1140,6 +1224,7 @@ PWPATH=$(npm root -g)/playwright node test/ux-check.mjs   # real-browser checks
     bazaar with two listings; `window.__buy(id, n)` takes n off one (a purchase);
   - `?page=trade` stands in for Torn's trade page (the panel's send list; save a
     `tornTrading.v2.sellAccepted` value with GM_setValue, then fire a hashchange);
+  - `&manytrades=1` (with `&ledgerkey=1`, then Ledger › Read now a few times): Bob 5 trades (a favourite), KayMalta 2 with accepted prices (one $300 short); TornExchange `prices/11` answers Bob's whole list;
   - `&tedrop=1` makes Alice's full TornExchange list for the Hammer $100
     while the top three still say $115 (lists that disagree);
   - `&sellprefs=<json>` sets the page's preferences;

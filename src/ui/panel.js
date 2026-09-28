@@ -23,6 +23,7 @@ import {
     parseMoneyInput,
 } from '../core/parse.js';
 import { VENUE_LABELS } from '../core/profit.js';
+import { buyingStatus } from '../core/accepted.js';
 import { W3B_TERMS_URL, W3B_SITE_URL } from '../api/w3b.js';
 import { panelStyleElement } from './styles.js';
 import { renderPriceGraph } from './graph.js';
@@ -36,6 +37,57 @@ export const TORN_API_KEY_URL = 'https://www.torn.com/preferences.php#tab=api';
 
 /** Info messages ("Ready.") clear themselves; warnings and errors stay. */
 const INFO_STATUS_MS = 6000;
+
+/** The green "Saved ✓" under the Min / Cash chips goes after this. */
+export const CHIP_SAVED_MS = 2000;
+/** "Empty - put back $1m." stays a little longer, to be read. */
+const CHIP_NOTE_MS = 4000;
+
+/** The saved Min / Cash value in words: "$1m", or "Any" for no cash limit. */
+function chipValueWords(key, value) {
+    if (key === 'cashOnHand' && !value) return 'Any';
+    return formatMoneyCompact(Number(value) || 0);
+}
+
+/**
+ * What a Min or Cash chip's box holds when it opens: the saved value exactly,
+ * short where that is exact ("1m", "2.5k"), else in full ("1,234,567"); "any"
+ * for no cash limit. Never an empty box.
+ */
+export function chipEditText(key, value) {
+    if (key === 'cashOnHand' && !value) return 'any';
+    const n = Math.round(Number(value) || 0);
+    for (const [unit, mult] of [['b', 1e9], ['m', 1e6], ['k', 1e3]]) {
+        if (Math.abs(n) < mult) continue;
+        const short = String(Number((n / mult).toFixed(2)));
+        if (Math.round(Number(short) * mult) === n) return short + unit;
+    }
+    return n.toLocaleString('en-US');
+}
+
+/**
+ * Read what was typed in a Min or Cash chip's box (key 'minTotalProfit' or
+ * 'cashOnHand'), against the saved value.
+ *
+ *   {value}    save it
+ *   {any}      Cash only: no cash limit (stored as null, as an empty box was)
+ *   {restore}  the box was emptied: the saved value comes back, with a note
+ *   {error}    not taken, and why; the saved value still counts
+ */
+export function readChipValue(key, raw, current) {
+    const text = String(raw == null ? '' : raw).trim();
+    const cash = key === 'cashOnHand';
+    const words = chipValueWords(key, current);
+    if (!text) return { restore: true, note: 'Empty - put back ' + words + '.' };
+    if (cash && /^(any|no ?limit|none)$/i.test(text)) return { any: true };
+    const value = parseMoneyInput(text);
+    const still = ' Still ' + words + '.';
+    if (value === null) return { error: 'Could not read "' + text + '" - try 2m or 800k.' + still };
+    if (value < 0) return { error: (cash ? 'Cash' : 'Min') + ' can not be below $0.' + still };
+    // No limit is its own button, never 0 or an empty box.
+    if (cash && value === 0) return { error: 'Cash must be more than $0 - or press Any.' + still };
+    return { value };
+}
 
 function el(tag, props = {}, children = []) {
     const node = document.createElement(tag);
@@ -251,6 +303,8 @@ export class Panel {
         /* ---- list page ---- */
 
         this.chipsEl = el('div', { class: 'ttv2-chips' });
+        // Right under the chips: Saved ✓, or why Min / Cash did not take a value.
+        this.chipNoteEl = el('div', { class: 'ttv2-chip-note', role: 'status', 'aria-live': 'polite' });
         this.buildChips();
 
         this.tabBtns = {};
@@ -323,6 +377,7 @@ export class Panel {
             this.tradeBoxEl,
             this.sellerEl,
             this.chipsEl,
+            this.chipNoteEl,
             this.tabsEl,
             this.listEl,
         ]);
@@ -483,10 +538,13 @@ export class Panel {
     }
 
     /**
-     * A chip showing a number; click it to edit in place (Enter / Esc).
-     * Anything the editor cannot read keeps the old value and says so:
-     * a cash figure that silently became "no cap" showed every deal as
-     * affordable.
+     * A chip showing a number; click it to edit in place. The box opens with
+     * the saved value, all selected: typing replaces it. Enter, Tab or
+     * clicking away saves ("Saved ✓" under the chips for 2 seconds); Esc or
+     * an emptied box puts the saved value back. Anything the box cannot read
+     * stays in it, red, with the reason under the chips, and the old value
+     * still counts: a cash figure that silently became "no cap" showed every
+     * deal as affordable. No cash limit is Cash's own Any button.
      */
     valueChip(key, label, title) {
         const chip = el('button', {
@@ -498,64 +556,122 @@ export class Panel {
         chip.labelFor = label;
         chip.textContent = label(null);
 
-        chip.addEventListener('click', () => {
-            this.closeChipEditor();
-
-            const input = el('input', {
-                type: 'text',
-                inputmode: 'numeric',
-                class: 'ttv2-chip-input',
-                placeholder: key === 'cashOnHand' ? 'any' : '0',
-                'aria-label': title,
-            });
-            const current = this.state.settings[key];
-            input.value = current === null || current === undefined ? '' : String(current);
-
-            const commit = () => {
-                const raw = input.value.trim();
-                this.closeChipEditor();
-
-                if (!raw) {
-                    if (/must be a number/.test(this.state.status.text)) this.setStatus('');
-                    this.emitSettings({ [key]: key === 'cashOnHand' ? null : 0 });
-                    return;
-                }
-                const value = parseMoneyInput(raw);
-                if (value === null || value < 0) {
-                    this.setStatus(
-                        (key === 'cashOnHand' ? 'Cash' : 'Min') + ' must be a number like 1234567 or 1.5m.',
-                        'error',
-                    );
-                    return;
-                }
-                // A good value clears the complaint about a bad one.
-                if (/must be a number/.test(this.state.status.text)) this.setStatus('');
-                this.emitSettings({ [key]: key === 'cashOnHand' && value === 0 ? null : value });
-            };
-
-            input.addEventListener('keydown', (event) => {
-                if (event.key === 'Enter') commit();
-                if (event.key === 'Escape') {
-                    event.stopPropagation();
-                    this.closeChipEditor();
-                }
-            });
-            input.addEventListener('blur', () => {
-                if (this.chipEditor && this.chipEditor.input === input) commit();
-            });
-
-            chip.style.display = 'none';
-            // In the chip's place, right end included.
-            if (chip.classList.contains('ttv2-chips-end')) input.style.marginLeft = 'auto';
-            chip.parentNode.insertBefore(input, chip.nextSibling);
-            this.chipEditor = { chip, input };
-            // The editor is wider than "Min $0": the row must still fit.
-            this.clampIntoView();
-            input.focus();
-            input.select();
-        });
+        chip.addEventListener('click', () => this.openChipEditor(chip, key, title));
 
         return chip;
+    }
+
+    openChipEditor(chip, key, title) {
+        this.closeChipEditor();
+        this.setChipNote('');
+
+        const cash = key === 'cashOnHand';
+        const saved = () => this.state.settings[key];
+        const input = el('input', {
+            type: 'text',
+            class: 'ttv2-chip-input',
+            autocomplete: 'off',
+            spellcheck: 'false',
+            'aria-label': title,
+        });
+        input.value = chipEditText(key, saved());
+        input.classList.toggle('ttv2-chip-input-dim', cash && !saved());
+
+        const anyBtn = cash
+            ? el('button', {
+                type: 'button',
+                class: 'ttv2-chip ttv2-chip-any',
+                title: 'No cash limit: show every deal',
+                'aria-pressed': String(!saved()),
+                text: 'Any',
+            })
+            : null;
+        const box = el('span', { class: 'ttv2-chip-edit' + (anyBtn ? ' ttv2-chip-edit-any' : '') }, [input, anyBtn]);
+        const editor = { chip, input, box };
+        let dirty = false;
+
+        // Leaving the box saves what was typed. false: not taken (it stays, red).
+        const leave = () => {
+            if (this.chipEditor !== editor) return true;
+            if (!dirty) {
+                this.closeChipEditor();
+                return true;
+            }
+            const r = readChipValue(key, input.value, saved());
+            if (r.error) {
+                input.classList.add('ttv2-bad');
+                input.setAttribute('aria-invalid', 'true');
+                this.setChipNote(r.error, 'bad');
+                return false;
+            }
+            this.closeChipEditor();
+            if (r.restore) {
+                this.setChipNote(r.note, 'grey');
+                return true;
+            }
+            this.emitSettings({ [key]: r.any ? null : r.value });
+            this.setChipNote('Saved ✓', 'ok');
+            return true;
+        };
+
+        input.addEventListener('input', () => {
+            dirty = true;
+            input.classList.remove('ttv2-chip-input-dim');
+        });
+        input.addEventListener('keydown', (event) => {
+            if (event.key === 'Enter') {
+                event.preventDefault();
+                leave();
+            } else if (event.key === 'Escape') {
+                // The saved value back, as if nothing was typed.
+                event.preventDefault();
+                event.stopPropagation();
+                this.closeChipEditor();
+            }
+        });
+        // Click or Tab in: all of it selected, so typing replaces it. The
+        // second click of a double-click on the chip lands in the box: it
+        // must not drop the selection.
+        const openedAt = Date.now();
+        let clickFocus = false;
+        input.addEventListener('mousedown', (event) => {
+            if (!dirty && Date.now() - openedAt < 600) {
+                event.preventDefault();
+                return;
+            }
+            clickFocus = input.getRootNode().activeElement !== input;
+        });
+        input.addEventListener('mouseup', (event) => {
+            if (!clickFocus) return;
+            clickFocus = false;
+            event.preventDefault();
+        });
+        input.addEventListener('focus', () => input.select());
+
+        if (anyBtn) {
+            // Pressing Any keeps the focus in the box: leaving would save first.
+            anyBtn.addEventListener('mousedown', (event) => event.preventDefault());
+            anyBtn.addEventListener('click', () => {
+                this.closeChipEditor();
+                this.emitSettings({ cashOnHand: null });
+                this.setChipNote('Saved ✓', 'ok');
+            });
+        }
+        // Tab from the box to Any stays in the editor; anywhere else leaves it.
+        box.addEventListener('focusout', (event) => {
+            if (event.relatedTarget && box.contains(event.relatedTarget)) return;
+            leave();
+        });
+
+        chip.style.display = 'none';
+        // In the chip's place, right end included.
+        if (chip.classList.contains('ttv2-chips-end')) box.style.marginLeft = 'auto';
+        chip.parentNode.insertBefore(box, chip.nextSibling);
+        this.chipEditor = editor;
+        // The editor is wider than "Min $0": the row must still fit.
+        this.clampIntoView();
+        input.focus();
+        input.select();
     }
 
     /** @returns {boolean} true if an editor was open */
@@ -563,11 +679,34 @@ export class Panel {
         const editor = this.chipEditor;
         if (!editor) return false;
 
+        const root = editor.box.getRootNode();
+        const hadFocus = Boolean(root && root.activeElement && editor.box.contains(root.activeElement));
         this.chipEditor = null;
         editor.chip.style.display = '';
-        if (editor.input.parentNode) editor.input.parentNode.removeChild(editor.input);
+        if (editor.box.parentNode) editor.box.parentNode.removeChild(editor.box);
+        // The saved value is shown again: a complaint about a bad one goes.
+        if (this.chipNoteEl && this.chipNoteEl.dataset.level === 'bad') this.setChipNote('');
+        // Enter, Esc or Any: the keyboard carries on from the chip.
+        if (hadFocus) editor.chip.focus();
         this.clampIntoView();
         return true;
+    }
+
+    /**
+     * The line under the chips: "Saved ✓" (green, 2 seconds), why a value
+     * was not taken (red, until fixed or Esc), or a grey note. '' hides it.
+     */
+    setChipNote(text, level = '') {
+        const note = this.chipNoteEl;
+        if (!note) return;
+        clearTimeout(this.chipNoteTimer);
+        note.textContent = text || '';
+        note.dataset.level = text ? level : '';
+        note.classList.toggle('ttv2-shown', Boolean(text));
+        this.chipsEl.classList.toggle('ttv2-chips-noted', Boolean(text));
+        if (text && level !== 'bad') {
+            this.chipNoteTimer = setTimeout(() => this.setChipNote(''), level === 'ok' ? CHIP_SAVED_MS : CHIP_NOTE_MS);
+        }
     }
 
     /* --------------------------------------------------------- settings */
@@ -810,7 +949,7 @@ export class Panel {
                 ]),
             ]);
             // Is this them? (Read off the trade view; the add step remembers it.)
-            if (ctx.match === 'ok') block.appendChild(el('div', { class: 'ttv2-tb-ok', text: 'Trading with ' + ctx.partner + ' ✓' }));
+            if (ctx.match === 'ok') block.appendChild(el('div', { class: 'ttv2-tb-ok', text: 'Trading with ' + (ctx.partner || t.trader.name) + ' ✓' }));
             else block.appendChild(el('div', { class: 'ttv2-sub', text: 'Open the trade with ' + t.trader.name + ' to check it is them.' }));
             // Their money against what the trade says.
             if (ctx.money) {
@@ -854,7 +993,9 @@ export class Panel {
         // How long since they said yes: the longer, the likelier prices moved.
         box.appendChild(el('div', { class: 'ttv2-tb-head' }, [
             el('b', { text: 'Buying for ' + v.trader }),
-            el('span', { class: 'ttv2-sub' + (v.age >= 10 * 60000 ? ' ttv2-tb-late' : ''), title: 'Since ' + v.trader + ' said yes: the longer, the likelier prices moved', text: v.done + ' of ' + v.total + ' done' + (v.age >= 60000 ? ' · yes ' + Math.floor(v.age / 60000) + ' min ago' : '') }),
+            // Its parts never break inside ("yes 100 / min ago"): a part that does not fit goes to the next line whole.
+            el('span', { class: 'ttv2-sub ttv2-tb-status' + (v.age >= 10 * 60000 ? ' ttv2-tb-late' : ''), title: 'Since ' + v.trader + ' said yes: the longer, the likelier prices moved' },
+                buyingStatus(v.done, v.total, v.age).flatMap((part, i) => [i ? ' · ' : null, el('span', { class: 'ttv2-nobr', text: part })]).filter(Boolean)),
         ]));
         if (v.here) {
             const h = v.here;

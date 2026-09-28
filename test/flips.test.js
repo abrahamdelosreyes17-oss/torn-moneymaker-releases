@@ -247,3 +247,21 @@ test('weapons, armour and cars are never flipped, whichever way Torn names the t
     assert.equal(buyersForFlip([{ name: 'X', price: 100 }], { avg: 90, type: 'Weapon', subType: 'Temporary' }).length, 1);
     assert.equal(isStatType('Drug', null), false);
 });
+
+import { listBid, believableBid } from '../src/core/flips.js';
+
+test('troll bids never lead the item list: it sorts by the best believable bid', () => {
+    // A Parcel-style troll: $99b against an item worth $300.
+    const buyers = [{ name: 'Norker', price: 99_000_000_000 }, { name: 'Real', price: 320 }];
+    assert.equal(listBid(buyers, 300), 320, 'the real bid counts');
+    assert.equal(listBid(buyers.slice(0, 1), 300), 0, 'only a troll: nothing to sort by');
+    assert.equal(listBid(buyers, null), 0, 'no market price: a bid cannot be told real, so it does not lead');
+    assert.equal(believableBid(900, 300), true, 'exactly 3x: still real');
+    assert.equal(believableBid(901, 300), false);
+    // Sorted as the list sorts: the real item first.
+    const rows = [
+        { name: 'Parcel', bid: listBid([{ price: 99_000_000_000 }], null) },
+        { name: 'Xanax', bid: listBid([{ price: 850_000 }], 830_000) },
+    ].sort((a, b) => b.bid - a.bid);
+    assert.equal(rows[0].name, 'Xanax');
+});

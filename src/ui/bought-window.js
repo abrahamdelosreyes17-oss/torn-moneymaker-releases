@@ -1,0 +1,273 @@
+/*
+ * Bought since you accepted (3.14.3; the owner, 2026-09-28: "have another
+ * overlay window popup... recent items bought ever since I clicked accepted
+ * trade"; "can we make that overlay something we can freely move around the
+ * page"; "a checklist if we already input it in the trade, that naturally
+ * checks if we have it in and warns if we missed something out").
+ *
+ * Its own window, apart from NPC Arbitrage, shown only while a trade is
+ * accepted. It starts at the top of the free space right of Torn's content;
+ * dragged by its title it goes anywhere on the page (the owner's choice), and
+ * it folds to one line. On Torn's trade page each row says whether it is in
+ * the trade, and anything bought but not added is named. Read only: it never
+ * presses anything of Torn's. Names go in through textContent only.
+ */
+
+const BW_HOST_ID = 'ttv2-bought-host';
+
+function bwEl(tag, props = {}, children = []) {
+    const node = document.createElement(tag);
+    for (const [key, value] of Object.entries(props)) {
+        if (key === 'class') node.className = value;
+        else if (key === 'text') node.textContent = value;
+        else if (key.startsWith('on') && typeof value === 'function') node.addEventListener(key.slice(2).toLowerCase(), value);
+        else if (value !== null && value !== undefined && value !== false) node.setAttribute(key, String(value));
+    }
+    for (const child of [].concat(children)) {
+        if (child === null || child === undefined || child === false) continue;
+        node.appendChild(typeof child === 'string' ? document.createTextNode(child) : child);
+    }
+    return node;
+}
+
+function bwMoney(n) {
+    const v = Math.round(Number(n) || 0);
+    return (v < 0 ? '−$' : '$') + Math.abs(v).toLocaleString('en-US');
+}
+
+function bwSigned(n) {
+    const v = Math.round(Number(n) || 0);
+    return (v >= 0 ? '+$' : '−$') + Math.abs(v).toLocaleString('en-US');
+}
+
+function bwTime(t) {
+    if (!t) return '';
+    const d = new Date(t);
+    return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+}
+
+/**
+ * Where the window may sit: inside the page's view, its title bar always
+ * reachable. Pure - tested.
+ * @returns {{x: number, y: number}}
+ */
+export function clampWindowPos(x, y, { width, height, viewW, viewH }) {
+    const w = Math.max(0, Number(width) || 0);
+    const minX = 0;
+    const maxX = Math.max(0, viewW - Math.min(w, viewW));
+    const maxY = Math.max(0, viewH - 32);
+    return {
+        x: Math.round(Math.min(maxX, Math.max(minX, Number(x) || 0))),
+        y: Math.round(Math.min(maxY, Math.max(0, Number(y) || 0))),
+    };
+}
+
+export class BoughtWindow {
+    /**
+     * @param {object} h - onMove({x, y}), onFold(folded), panelRect() - NPC Arbitrage's box, to sit above it
+     * @param {object} [o] - {pos: {x, y}|null, folded: boolean}
+     */
+    constructor(h = {}, { pos = null, folded = false } = {}) {
+        this.h = h;
+        this.pos = pos;
+        this.folded = folded;
+        this.sig = null;
+        this.host = null;
+    }
+
+    mount() {
+        if (this.host && this.host.isConnected) return;
+        const old = document.getElementById(BW_HOST_ID);
+        if (old) old.remove();
+        this.host = bwEl('div', { id: BW_HOST_ID });
+        const root = this.host.attachShadow({ mode: 'open' });
+        root.appendChild(bwEl('style', { text: BOUGHT_CSS }));
+        this.box = bwEl('section', { class: 'bw', role: 'region', 'aria-label': 'Bought since you accepted' });
+        root.appendChild(this.box);
+        document.body.appendChild(this.host);
+        this.place();
+        this.resizer = () => this.place();
+        window.addEventListener('resize', this.resizer);
+    }
+
+    unmount() {
+        if (this.resizer) window.removeEventListener('resize', this.resizer);
+        this.resizer = null;
+        if (this.host) this.host.remove();
+        this.host = null;
+        this.sig = null;
+    }
+
+    /** Its place: where you left it, else the top of the free space right of Torn's content. */
+    place() {
+        if (!this.box) return;
+        const viewW = document.documentElement.clientWidth || window.innerWidth;
+        const viewH = window.innerHeight;
+        const width = this.box.offsetWidth || 300;
+        let p = this.pos;
+        if (!p) {
+            // Right-aligned with NPC Arbitrage, ending just above it (mockup B): the
+            // free space right of Torn's content, never on Torn's own page by itself.
+            const panel = this.h.panelRect ? this.h.panelRect() : null;
+            const height = this.box.offsetHeight || 200;
+            const right = panel && panel.width ? panel.right : viewW - 16;
+            const top = panel && panel.height ? panel.top - 8 - height : 64;
+            p = { x: right - width, y: Math.max(8, top) };
+        }
+        const c = clampWindowPos(p.x, p.y, { width, height: this.box.offsetHeight, viewW, viewH });
+        this.box.style.left = c.x + 'px';
+        this.box.style.top = c.y + 'px';
+    }
+
+    /** Dragged by its title bar: anywhere on the page, kept for next time. */
+    dragFrom(event) {
+        if (event.button !== 0 || (event.target && event.target.closest && event.target.closest('button'))) return;
+        event.preventDefault();
+        const r = this.box.getBoundingClientRect();
+        const dx = event.clientX - r.left;
+        const dy = event.clientY - r.top;
+        const move = (e) => {
+            const c = clampWindowPos(e.clientX - dx, e.clientY - dy, { width: r.width, height: r.height, viewW: document.documentElement.clientWidth || window.innerWidth, viewH: window.innerHeight });
+            this.box.style.left = c.x + 'px';
+            this.box.style.top = c.y + 'px';
+            this.pos = c;
+        };
+        const up = () => {
+            window.removeEventListener('pointermove', move);
+            window.removeEventListener('pointerup', up);
+            this.box.classList.remove('bw-drag');
+            if (this.pos && this.h.onMove) this.h.onMove(this.pos);
+        };
+        this.box.classList.add('bw-drag');
+        window.addEventListener('pointermove', move);
+        window.addEventListener('pointerup', up);
+    }
+
+    /**
+     * @param {object|null} m - boughtSince(trade, {inside}) plus {onTradePage}; null hides it
+     */
+    render(m) {
+        if (!m) {
+            this.unmount();
+            return;
+        }
+        this.mount();
+        const sig = JSON.stringify([m, this.folded]);
+        if (sig === this.sig) return;
+        this.sig = sig;
+        const box = this.box;
+        box.textContent = '';
+        box.classList.toggle('bw-folded', this.folded);
+
+        const buys = m.rows.length;
+        const fold = bwEl('button', {
+            type: 'button',
+            class: 'bw-ic',
+            'aria-expanded': String(!this.folded),
+            'aria-label': this.folded ? 'Show the list' : 'Fold to one line',
+            title: this.folded ? 'Show the list' : 'Fold to one line',
+            text: this.folded ? '▸' : '▾',
+            onclick: () => {
+                this.folded = !this.folded;
+                if (this.h.onFold) this.h.onFold(this.folded);
+                this.sig = null;
+                this.render(m);
+            },
+        });
+        const head = bwEl('div', { class: 'bw-hd', title: 'Drag to move it anywhere' }, [
+            bwEl('span', { class: 'bw-ti' }, [
+                'Bought for ' + (m.trader || 'the trade'),
+                this.folded ? bwEl('span', { class: 'bw-mini', text: ' · ' + buys + (buys === 1 ? ' buy' : ' buys') + ' · ' + bwSigned(m.totals.profit) + (m.toBuy ? ' · ' + m.toBuy + ' to buy' : '') }) : null,
+            ]),
+            fold,
+        ]);
+        head.addEventListener('pointerdown', (e) => this.dragFrom(e));
+        box.appendChild(head);
+        if (this.folded) {
+            this.place();
+            return;
+        }
+
+        const body = bwEl('div', { class: 'bw-body' });
+        body.appendChild(bwEl('div', { class: 'bw-since', text: 'Since "' + (m.trader || 'they') + ' accepted"' + (m.at ? ' at ' + bwTime(m.at) : '') }));
+        if (!buys) body.appendChild(bwEl('p', { class: 'bw-empty', text: 'Nothing bought yet. What you buy for this trade shows here.' }));
+        for (const r of m.rows) {
+            const check = m.onTradePage
+                ? r.inTrade >= r.send
+                    ? bwEl('span', { class: 'bw-ck bw-in', title: 'In the trade', text: '✓ in' })
+                    : bwEl('span', { class: 'bw-ck bw-miss', title: 'Not in the trade yet', text: 'add ' + (r.send - r.inTrade).toLocaleString('en-US') })
+                : null;
+            body.appendChild(bwEl('div', { class: 'bw-it bw-' + r.tone }, [
+                bwEl('span', { class: 'bw-n' }, [
+                    bwEl('b', { text: r.name }),
+                    ' ×' + r.qty.toLocaleString('en-US'),
+                    r.planned ? null : bwEl('span', { class: 'bw-tag', text: r.tone === 'loss' ? 'not planned · loses' : 'not planned' }),
+                ]),
+                bwEl('span', { class: 'bw-p' + (r.profit < 0 ? ' bw-neg' : '') }, [bwSigned(r.profit), check]),
+                bwEl('span', { class: 'bw-d', text: 'at ' + bwMoney(r.each) + (r.sellers && r.sellers.length ? ' · ' + r.sellers.join(', ') : r.seller ? ' · ' + r.seller : '') + (r.at ? ' · ' + bwTime(r.at) : '') + ' · ' + (m.trader || 'they') + ' pays ' + bwMoney(r.bid) }),
+            ]));
+        }
+        if (buys) {
+            body.appendChild(bwEl('div', { class: 'bw-tot' }, [
+                bwEl('span', { text: 'Cost' }), bwEl('b', { text: bwMoney(m.totals.cost) }),
+                bwEl('span', { text: (m.trader || 'They') + ' pays' }), bwEl('b', { text: bwMoney(m.totals.pays) }),
+                bwEl('span', { text: 'Profit' }), bwEl('b', { class: m.totals.profit >= 0 ? 'bw-g' : 'bw-neg', text: bwSigned(m.totals.profit) }),
+            ]));
+        }
+        if (m.toBuy) body.appendChild(bwEl('p', { class: 'bw-todo', text: 'Still to buy: ' + m.toBuy + (m.toBuy === 1 ? ' bazaar' : ' bazaars') }));
+        // The checklist's verdict on the trade page: all in, or what is missing.
+        if (m.onTradePage && buys) {
+            body.appendChild(m.missing.length
+                ? bwEl('p', { class: 'bw-warn', role: 'status', text: 'Not in the trade yet: ' + m.missing.map((x) => x.name + ' ×' + x.qty.toLocaleString('en-US')).join(', ') })
+                : bwEl('p', { class: 'bw-ok', role: 'status', text: 'Everything you bought is in the trade ✓' }));
+        }
+        box.appendChild(body);
+        this.place();
+    }
+}
+
+export const BOUGHT_CSS = `
+:host { all: initial; }
+* { box-sizing: border-box; }
+.bw {
+    --bg: #2e2e2e; --row: #2b2b2b; --line: #444; --text: #ddd; --muted: #b3b3b3; --profit: #99cc00;
+    --buy: #4dabf7; --orange: #ff9f43; --red: #ff8a80; --warn: #f0a020;
+    position: fixed; z-index: 2147483001; width: 300px; max-width: calc(100vw - 16px);
+    display: flex; flex-direction: column; background: var(--bg); color: var(--text);
+    border: 1px solid var(--buy); border-radius: 4px; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+    font: 13px/1.4 Arial, Helvetica, sans-serif;
+}
+.bw.bw-drag { opacity: 0.92; }
+.bw-hd { display: flex; align-items: center; gap: 4px; min-height: 30px; padding: 4px 4px 4px 12px; cursor: move; user-select: none;
+    background: repeating-linear-gradient(90deg, #242424 0 2px, #2e2e2e 0 4px); border-bottom: 1px solid var(--line); touch-action: none; }
+.bw-folded .bw-hd { border-bottom: 0; }
+.bw-ti { flex: 1; min-width: 0; font-weight: bold; color: #fff; overflow-wrap: anywhere; }
+.bw-mini { font-weight: normal; color: var(--profit); }
+.bw-ic { width: 24px; height: 24px; padding: 0; border: 1px solid transparent; border-radius: 4px; background: transparent; color: var(--text); font: 15px/22px Arial, Helvetica, sans-serif; cursor: pointer; }
+.bw-ic:hover { border-color: var(--line); }
+.bw-ic:focus-visible { outline: 2px solid var(--profit); outline-offset: 1px; }
+.bw-body { padding: 8px 12px 10px; }
+.bw-since { font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+.bw-empty { margin: 0; font-size: 12px; color: var(--muted); }
+.bw-it { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 8px; padding: 6px 8px; margin-bottom: 6px;
+    background: var(--row); border: 1px solid var(--line); border-left: 3px solid var(--buy); border-radius: 4px; }
+.bw-it.bw-extra { border-left-color: var(--orange); }
+.bw-it.bw-loss { border-left-color: var(--red); }
+.bw-n { min-width: 0; overflow-wrap: anywhere; }
+.bw-n b { color: #fff; }
+.bw-tag { margin-left: 6px; font-size: 11px; font-weight: bold; color: var(--orange); white-space: nowrap; }
+.bw-loss .bw-tag { color: var(--red); }
+.bw-p { text-align: right; font-weight: bold; color: var(--profit); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.bw-p.bw-neg, .bw-neg { color: var(--red); }
+.bw-d { grid-column: 1 / -1; font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+.bw-ck { display: block; font-size: 11px; }
+.bw-in { color: var(--profit); }
+.bw-miss { color: var(--warn); }
+.bw-tot { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 8px; margin-top: 8px; padding-top: 6px; border-top: 1px solid var(--line); font-size: 12px; }
+.bw-tot span { color: var(--muted); }
+.bw-tot b { text-align: right; font-variant-numeric: tabular-nums; }
+.bw-tot b.bw-g { color: var(--profit); font-size: 15px; }
+.bw-todo { margin: 8px 0 0; font-size: 12px; color: var(--buy); }
+.bw-warn { margin: 8px 0 0; font-size: 12px; font-weight: bold; color: var(--warn); }
+.bw-ok { margin: 8px 0 0; font-size: 12px; font-weight: bold; color: var(--profit); }
+`;

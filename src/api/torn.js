@@ -28,6 +28,17 @@ export const ACCESS_LEVEL_NAMES = {
 };
 
 /**
+ * A key too weak for Torn Bids (3.14.3 review): a Public or Minimal key cannot
+ * read your inventory. The reason in words, or null. Limited, Full and custom
+ * keys (whose level Torn gives as 0) pass - custom keys may include it.
+ */
+export function keyTooLowForInventory(info) {
+    const level = Number(info && info.access_level);
+    if (level === 1 || level === 2) return 'That is a ' + ACCESS_LEVEL_NAMES[level] + ' key: Torn Bids needs a Limited key to read your inventory.';
+    return null;
+}
+
+/**
  * The full item database. Public key.
  *
  * Read from v2 (`/v2/torn/items`), where an item no NPC will buy has

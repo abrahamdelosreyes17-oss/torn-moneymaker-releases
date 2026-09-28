@@ -550,3 +550,40 @@ test('a trader kept before 3.12.5 (no seenAt) is dated from now, not forgotten a
     pruneDb(db, now + TRADER_FORGET_MS + 1);
     assert.equal(db.traders[77], undefined, 'forgotten in turn, 30 days later');
 });
+
+import { parseTeTraderPrices } from '../src/api/te.js';
+import { buyersForItem as buyersForItem3143 } from '../src/core/traders.js';
+
+test("a trader's whole TornExchange list: every item they buy, and it counts as their price", () => {
+    const body = { status: 'success', data: { items: [{ item_id: 870, name: 'Stealth Virus', price: 1157499 }, { item_id: 'x', price: 5 }, { item_id: 206, price: 0 }] }, meta: { trader: 'KayMalta' } };
+    assert.deepEqual(parseTeTraderPrices(body), { name: 'KayMalta', prices: [{ itemId: '870', price: 1157499 }] });
+    assert.deepEqual(parseTeTraderPrices({}), { name: null, prices: [] });
+    // KayMalta is not in Stealth Virus's top three, but their own list says they buy it.
+    const rows = buyersForItem3143('870', { teBest: [{ name: 'Bob', id: '11', price: 1000000 }], teOwn: [{ id: '5001', name: 'KayMalta', price: 1157499 }] });
+    assert.deepEqual(rows.map((r) => [r.name, r.price]), [['KayMalta', 1157499], ['Bob', 1000000]]);
+    // No public list: last-paid prices, marked.
+    const last = buyersForItem3143('870', { teOwn: [{ id: '44', name: 'Havean', price: 900, lastPaid: true }] });
+    assert.equal(last[0].lastPaidOnly, true, 'marked: only what they paid last time');
+    assert.equal(last[0].price, 900);
+    assert.equal(last[0].te, null, 'not a TornExchange list: no TE list link');
+    // A live price wins over a last-paid one.
+    const both = buyersForItem3143('870', { teBest: [{ name: 'Havean', id: '44', price: 800 }], teOwn: [{ id: '44', name: 'Havean', price: 900, lastPaid: true }] });
+    assert.deepEqual([both[0].price, both[0].lastPaidOnly], [800, false]);
+});
+
+import { fetchTeTraderPrices, TeClient as TeClient3143 } from '../src/api/te.js';
+
+test("a trader TornExchange does not know is an empty list, never a failure asked again forever", async () => {
+    const client = (reply) => new TeClient3143({ getKey: () => 'AbCdEfGh12345678', now: () => 1_000_000, fetchImpl: async () => reply });
+    const json = (status, body) => ({ ok: status < 300, status, json: async () => body });
+    assert.deepEqual(await fetchTeTraderPrices(client(json(404, { status: 'error', message: 'Trader not found' })), '5001'), { name: null, prices: [] });
+    assert.deepEqual(await fetchTeTraderPrices(client(json(200, { status: 'error', message: 'Trader not found' })), '5001'), { name: null, prices: [] }, 'said in a normal answer');
+    await assert.rejects(fetchTeTraderPrices(client(json(502, null)), '5001'), 'a real failure still fails');
+    await assert.rejects(fetchTeTraderPrices(client(json(200, {})), 'bad id!'), 'never a made-up path');
+});
+
+test('a 401 from TornExchange never puts a key on the page', async () => {
+    const KEY = 'AbCdEfGh12345678';
+    const c = new TeClient3143({ getKey: () => KEY, now: () => 1_000_000, fetchImpl: async () => ({ ok: false, status: 401, json: async () => ({ message: 'Invalid key ' + KEY }) }) });
+    await assert.rejects(c.get('all_best_listings'), (e) => !e.message.includes(KEY));
+});

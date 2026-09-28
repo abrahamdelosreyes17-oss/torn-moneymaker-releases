@@ -123,3 +123,20 @@ test('a re-priced or short seller can be its own replacement; a gone one never (
     assert.equal(replacementFor(step, [{ sellerId: 'S', price: 100, qty: 5 }], 200, enough, 'price'), null, 'the same listing is not a replacement');
     assert.deepEqual(replacementFor(step, [{ sellerId: 'S', price: 101, qty: 5 }, { sellerId: 'T', price: 150, qty: 5 }], 200, enough, 'price').sellerId, 'S', 'the cheapest');
 });
+
+import { buyingStatus } from '../src/core/accepted.js';
+import { PANEL_CSS } from '../src/ui/styles.js';
+
+test('the buying box: its status never breaks inside, the time in hours and minutes, the label never cut', () => {
+    // The owner's page (3.13): "0 of 2 done · yes 100 / min ago".
+    assert.deepEqual(buyingStatus(0, 2, 100 * 60000), ['0 of 2 done', 'yes 1h 40m ago']);
+    assert.deepEqual(buyingStatus(1, 2, 12 * 60000 + 5000), ['1 of 2 done', 'yes 12m ago']);
+    assert.deepEqual(buyingStatus(2, 3, 120 * 60000), ['2 of 3 done', 'yes 2h ago']);
+    assert.deepEqual(buyingStatus(0, 1, 30000), ['0 of 1 done'], 'under a minute: no time');
+    // Next's label ("Open the next bazaar: <a long name>") wraps instead of being cut.
+    const rule = PANEL_CSS.match(/\.ttv2-panel button\.ttv2-buynext \{([^}]*)\}/);
+    assert.ok(rule, 'the button has its own rule');
+    assert.match(rule[1], /white-space: normal/);
+    assert.match(rule[1], /height: auto/);
+    assert.match(PANEL_CSS, /\.ttv2-nobr \{ white-space: nowrap; \}/);
+});

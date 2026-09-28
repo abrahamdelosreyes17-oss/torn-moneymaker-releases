@@ -1016,9 +1016,24 @@ ${TOKENS_CSS}
     margin-top: 4px;
 }
 
+/* Grey on the blue-tinted box: lighter than --muted, to read (5.7:1, not 4.2:1). */
+.ttv2-buybox .ttv2-sub {
+    color: #b3b3b3;
+}
+
 .ttv2-buynext {
     margin-top: 8px;
     width: 100%;
+}
+
+/* Its label is never cut (3.14.3): a long seller's name goes to a second line. */
+.ttv2-panel button.ttv2-buynext {
+    height: auto;
+    min-height: 28px;
+    padding: 6px 12px;
+    line-height: 16px;
+    white-space: normal;
+    overflow-wrap: anywhere;
 }
 
 /* Under the header (3.13): its own margin, since it is outside the pages. */
@@ -1082,10 +1097,17 @@ ${TOKENS_CSS}
 
 .ttv2-tb-head {
     display: flex;
+    flex-wrap: wrap;
     justify-content: space-between;
-    gap: 8px;
+    align-items: baseline;
+    gap: 0 8px;
     font-size: 13px;
+    overflow-wrap: anywhere;
 }
+
+/* The status: on the right, or whole on its own line when it does not fit. */
+.ttv2-buybox .ttv2-tb-head .ttv2-tb-status { margin: 0 0 0 auto; text-align: right; }
+.ttv2-nobr { white-space: nowrap; }
 
 .ttv2-tb-row {
     display: grid;
@@ -1101,15 +1123,16 @@ ${TOKENS_CSS}
     text-decoration: line-through;
 }
 
+/* Never cut with "…": a long name or status goes on to a second line. */
 .ttv2-seller {
     display: none;
     padding: 8px 12px;
     font-size: 12px;
     color: var(--muted);
     border-bottom: 1px solid var(--line);
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    white-space: normal;
+    overflow: visible;
+    overflow-wrap: anywhere;
     flex: 0 0 auto;
 }
 
@@ -1194,6 +1217,78 @@ ${TOKENS_CSS}
     padding: 0 8px;
     border-radius: 12px;
     font-size: 12px;
+}
+
+/* A Min or Cash box being edited, in the chip's place; Cash's Any beside it. */
+.ttv2-chip-edit {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    flex: 0 0 auto;
+}
+
+.ttv2-panel.ttv2-tighter .ttv2-chip-edit {
+    gap: 2px;
+}
+
+/* In the least room Cash's box gives Any its width (what is typed scrolls inside). */
+.ttv2-panel.ttv2-tighter .ttv2-chip-edit-any input.ttv2-chip-input {
+    width: 48px;
+}
+
+.ttv2-panel input.ttv2-chip-input-dim {
+    color: var(--muted);
+}
+
+/* A value the box could not read: red, and the reason under the chips.
+   #ff8a80, not --bad: a red that reads on the panel (5.9:1), as Torn Bids' .sp-inerr. */
+.ttv2-panel input.ttv2-chip-input.ttv2-bad {
+    border-color: #ff8a80;
+    box-shadow: 0 0 0 1px #ff8a80;
+}
+
+.ttv2-panel input.ttv2-chip-input.ttv2-bad:focus-visible {
+    outline: 0;
+}
+
+.ttv2-panel button.ttv2-chip-any {
+    font-weight: bold;
+    color: var(--text);
+    background: var(--line);
+}
+
+/* Right under the chips: "Saved ✓" for 2 seconds, or why a value was not taken. */
+.ttv2-chip-note {
+    display: none;
+    margin-top: -4px;
+    padding: 0 12px 8px;
+    font-size: 12px;
+    line-height: 16px;
+    text-align: right;
+    color: var(--muted);
+    border-bottom: 1px solid var(--line);
+    overflow-wrap: anywhere;
+    flex: 0 0 auto;
+}
+
+.ttv2-chip-note.ttv2-shown {
+    display: block;
+}
+
+.ttv2-chip-note[data-level="ok"] {
+    color: var(--profit);
+}
+
+.ttv2-chip-note[data-level="bad"] {
+    color: #ff8a80;
+}
+
+.ttv2-chips.ttv2-chips-noted {
+    border-bottom-color: transparent;
+}
+
+.ttv2-panel.ttv2-narrow .ttv2-chip-note {
+    padding: 0 8px 6px;
 }
 
 /* ------------------------------------------------------------------- tabs */
@@ -1417,6 +1512,16 @@ ${TOKENS_CSS}
     font-variant-numeric: tabular-nums;
 }
 
+/* The header in little room: "Item" keeps its width and the money labels
+   wrap ("IM / average") - never one on top of the other. */
+.ttv2-bzhead {
+    grid-template-columns: minmax(max-content, 1fr) auto auto;
+}
+
+.ttv2-bzhead .ttv2-money {
+    white-space: normal;
+}
+
 .ttv2-panel button.ttv2-bzrow[aria-pressed="true"] .ttv2-money {
     color: #a8dd1c;
     font-weight: bold;
@@ -1550,6 +1655,9 @@ ${TOKENS_CSS}
 .ttv2-panel button.ttv2-lowrow:disabled { cursor: default; opacity: 1; }
 .ttv2-lowrow .ttv2-money { color: var(--text); font-variant-numeric: tabular-nums; }
 .ttv2-lowsub { font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+/* "×10 · $28 after fee" wraps inside the row's padding in little room (buttons are nowrap). */
+.ttv2-panel button.ttv2-lowrow { white-space: normal; min-width: 0; max-width: 100%; }
+.ttv2-lowrow .ttv2-lowsub { white-space: normal; max-width: 100%; }
 .ttv2-lowmine { border-style: dashed !important; }
 .ttv2-lowmine .ttv2-money { color: var(--muted); }
 .ttv2-lowstale .ttv2-money { color: var(--muted); }

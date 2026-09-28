@@ -218,3 +218,14 @@ test('an absolute path cannot redirect the key to another host', async () => {
 
     assert.equal(fetchImpl.calls.length, 0);
 });
+
+import { keyTooLowForInventory } from '../src/api/torn.js';
+
+test('a Public or Minimal key never replaces the Limited key: refused with the reason', () => {
+    assert.match(keyTooLowForInventory({ access_level: 1 }), /Public key/);
+    assert.match(keyTooLowForInventory({ access_level: 2 }), /Minimal key/);
+    assert.equal(keyTooLowForInventory({ access_level: 3 }), null);
+    assert.equal(keyTooLowForInventory({ access_level: 4 }), null);
+    assert.equal(keyTooLowForInventory({ access_level: 0 }), null, 'custom keys pass');
+    assert.equal(keyTooLowForInventory(null), null, 'no answer: not refused on a guess');
+});

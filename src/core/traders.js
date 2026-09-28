@@ -272,9 +272,11 @@ export function traderDbStats(db, now = Date.now()) {
  * @param {Map}    [src.idsByName]  - lowercase TornExchange name -> torn id
  * @param {object} [src.db]         - the trader database (TornW3B lists)
  * @param {Map}    [src.w3bByItem]  - itemId -> [{id, price}], from indexW3bByItem
+ * @param {Array}  [src.teOwn]      - your traders' own whole TornExchange lists (3.14.3):
+ *   {id, name, price, lastPaid} - lastPaid: no public list, what they paid you last
  * @returns {Array<{id, name, price, te: number|null, w3b: number|null, teName: string|null}>}
  */
-export function buyersForItem(itemId, { teBest = [], teFull = null, idsByName = new Map(), db = null, w3bByItem = null, dbIdsByName = null, votesById = null } = {}) {
+export function buyersForItem(itemId, { teBest = [], teFull = null, idsByName = new Map(), db = null, w3bByItem = null, dbIdsByName = null, votesById = null, teOwn = null } = {}) {
     const key = String(itemId);
     const rows = new Map();
     const byName = new Map();
@@ -323,6 +325,24 @@ export function buyersForItem(itemId, { teBest = [], teFull = null, idsByName = 
         }
     }
 
+    // A trader's own whole list counts as their full list. Last-paid prices
+    // (no public list) are kept apart and count only when nothing else does.
+    for (const t of teOwn || []) {
+        if (!t || !(t.price > 0) || !(t.id || t.name)) continue;
+        const known = t.name ? byName.get(String(t.name).toLowerCase()) : null;
+        const r = rows.get('id:' + cleanId(t.id)) || known || row(cleanId(t.id), t.name);
+        if (t.lastPaid) {
+            if (!(r.lastPaid >= t.price)) r.lastPaid = t.price;
+            continue;
+        }
+        // Only a real name makes a TornExchange list link.
+        if (t.name) setTe(r, t.name, t.price, 'teList');
+        else if (!(r.teList >= t.price)) {
+            r.teList = t.price;
+            r.te = r.teTop > 0 ? Math.min(r.teTop, r.teList) : r.teList;
+        }
+    }
+
     const w3b = w3bByItem ? w3bByItem.get(key) || [] : [];
     for (const { id, price } of w3b) {
         const t = db && db.traders[id];
@@ -346,6 +366,9 @@ export function buyersForItem(itemId, { teBest = [], teFull = null, idsByName = 
     for (const r of rows.values()) {
         const both = r.te > 0 && r.w3b > 0;
         r.price = both ? Math.min(r.te, r.w3b) : Math.max(r.te || 0, r.w3b || 0);
+        // Only what they paid you last: marked, and never above a live price.
+        r.lastPaidOnly = !(r.price > 0) && r.lastPaid > 0;
+        if (r.lastPaidOnly) r.price = r.lastPaid;
         r.differ = (both && r.te !== r.w3b) || (r.teTop > 0 && r.teList > 0 && r.teTop !== r.teList);
         if (r.price <= 0) continue;
         // What we know of how they trade: TornExchange votes (from any item's

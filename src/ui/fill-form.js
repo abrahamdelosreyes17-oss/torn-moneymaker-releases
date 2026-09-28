@@ -48,6 +48,34 @@ export function fillExample(market, s) {
     return 'Example: the ' + ordinalLowest(r.used) + ' ' + what + ' listing is ' + formatMoney(r.base.price) + ' → Fill types ' + formatMoney(r.price) + '.';
 }
 
+/** The saved amount in words: "$50" or "2.5%". */
+function fillAmountWords(amount, unit) {
+    const n = Number(amount) || 0;
+    return unit === '%' ? n + '%' : '$' + n.toLocaleString('en-US', { maximumFractionDigits: 2 });
+}
+
+/**
+ * Read the "By how much" box (unit '$' or '%') against the saved amount.
+ *
+ *   {value}    save it
+ *   {restore}  the box was emptied: the saved amount comes back, with a note
+ *   {error}    not saved, and why; the saved amount still counts
+ */
+export function readFillAmount(raw, unit, saved) {
+    const text = String(raw == null ? '' : raw).trim();
+    const words = fillAmountWords(saved, unit);
+    if (!text) return { restore: true, note: 'Empty - put back ' + words + '.' };
+    const cleaned = text.replace(/[$,%\s]/g, '');
+    const v = cleaned ? Number(cleaned) : NaN;
+    const still = ' Still ' + words + '.';
+    if (!Number.isFinite(v) || v < 0) return { error: 'Not saved: type a number, like 1, 50 or 2.5.' + still };
+    if (unit === '%' && v >= 100) return { error: 'Not saved: a percent under 100, like 1 or 2.5.' + still };
+    return { value: v };
+}
+
+/** "Saved ✓" under the box goes after this. */
+export const FILL_SAVED_MS = 2000;
+
 /**
  * @param {object} opts
  * @param {function} opts.get - () => the stored settings {bazaar, market}
@@ -70,28 +98,69 @@ export function buildFillForm({ get, set }) {
         for (let n = 1; n <= 5; n += 1) index.appendChild(tfMake('option', { value: String(n), text: ordinalLowest(n) }));
         index.addEventListener('change', () => save(key, { index: Number(index.value) }));
 
+        /*
+         * The box always shows the saved amount. Click or Tab in: all of it
+         * selected, so typing replaces it. Enter or leaving saves ("Saved ✓"
+         * under it for 2 seconds); Esc or an emptied box puts the saved
+         * amount back. A bad amount stays in the box, red, with the reason
+         * right under it; the saved amount still counts.
+         */
         const amount = tfMake('input', { type: 'text', class: 'tf-num', inputmode: 'decimal', 'aria-label': title + ': by how much', autocomplete: 'off', spellcheck: 'false' });
-        const commit = () => {
-            const v = Number(String(amount.value).replace(/[$,%\s]/g, ''));
-            if (!(v >= 0) || !Number.isFinite(v)) {
-                // Said in words where the example goes, not only a red border.
-                amount.classList.add('tf-bad');
-                amount.setAttribute('aria-invalid', 'true');
-                parts[key].example.textContent = 'Not saved: type a number, like 1, 50 or 2.5.';
-                parts[key].example.dataset.bad = 'true';
-                return;
-            }
+        const state = tfMake('div', { class: 'tf-state', role: 'status', 'aria-live': 'polite' });
+        let dirty = false;
+        const showSaved = () => {
+            amount.value = String(readFillSettings(get())[key].amount);
+            dirty = false;
             amount.classList.remove('tf-bad');
             amount.removeAttribute('aria-invalid');
-            delete parts[key].example.dataset.bad;
-            save(key, { amount: v });
         };
-        amount.addEventListener('change', commit);
+        const commit = () => {
+            if (!dirty) return true;
+            const s = readFillSettings(get())[key];
+            const r = readFillAmount(amount.value, s.unit, s.amount);
+            if (r.error) {
+                amount.classList.add('tf-bad');
+                amount.setAttribute('aria-invalid', 'true');
+                setState(key, r.error, 'bad');
+                return false;
+            }
+            if (r.restore) {
+                showSaved();
+                setState(key, r.note, 'grey');
+                return true;
+            }
+            dirty = false;
+            save(key, { amount: r.value });
+            showSaved();
+            setState(key, 'Saved ✓', 'ok');
+            return true;
+        };
+        amount.addEventListener('input', () => { dirty = true; });
+        amount.addEventListener('blur', commit);
         amount.addEventListener('keydown', (event) => {
-            if (event.key !== 'Enter') return;
-            event.preventDefault();
-            commit();
+            if (event.key === 'Enter') {
+                event.preventDefault();
+                if (commit()) amount.blur();
+            } else if (event.key === 'Escape') {
+                // The saved amount back, and the red gone. This Esc is the
+                // box's own: it does not also close Settings.
+                event.preventDefault();
+                event.stopPropagation();
+                showSaved();
+                setState(key, '');
+                amount.blur();
+            }
         });
+        let clickFocus = false;
+        amount.addEventListener('mousedown', () => {
+            clickFocus = amount.getRootNode().activeElement !== amount;
+        });
+        amount.addEventListener('mouseup', (event) => {
+            if (!clickFocus) return;
+            clickFocus = false;
+            event.preventDefault();
+        });
+        amount.addEventListener('focus', () => amount.select());
 
         const seg = (options, onPick) => {
             const box = tfMake('span', { class: 'tf-seg', role: 'group' });
@@ -102,7 +171,15 @@ export function buildFillForm({ get, set }) {
             });
             return { box, btns };
         };
-        const unit = seg([['$', '$'], ['%', '%']], (v) => save(key, { unit: v }));
+        const unit = seg([['$', '$'], ['%', '%']], (v) => {
+            // A percent is under 100: $150 does not become 150%.
+            const s = readFillSettings(get())[key];
+            if (v === '%' && s.unit !== '%' && s.amount >= 100) {
+                setState(key, 'Not changed: ' + s.amount + '% is not under 100. Type a smaller amount first.', 'bad');
+                return;
+            }
+            save(key, { unit: v });
+        });
         const qty = seg([['all', 'All'], ['allbut1', 'All but 1']], (v) => save(key, { qty: v }));
 
         const floor = tfMake('input', { type: 'checkbox' });
@@ -117,6 +194,7 @@ export function buildFillForm({ get, set }) {
                 tfMake('div', { class: 'tf-row' }, ['the ', index, ' ' + what + ' listing']),
                 tfMake('span', { class: 'tf-label', text: 'By' }),
                 tfMake('div', { class: 'tf-row' }, [amount, unit.box]),
+                state,
                 tfMake('span', { class: 'tf-label', text: 'Quantity' }),
                 tfMake('div', { class: 'tf-row' }, [qty.box]),
                 tfMake('span', { class: 'tf-label', text: 'Floor' }),
@@ -124,9 +202,18 @@ export function buildFillForm({ get, set }) {
             ]),
             example,
         ]));
-        parts[key] = { index, amount, unit, qty, floor, example };
+        parts[key] = { index, amount, unit, qty, floor, example, state, timer: null };
     }
     root.appendChild(tfMake('div', { class: 'tf-note', text: 'Never below the NPC price. Never undercuts your own listing, or a $1, sponsored, stale (over 30 min) or troll (under 25% of the average) one. Fill types into Torn\'s boxes; you press Torn\'s button.' }));
+
+    /** The line under the By box: "Saved ✓" (2 seconds), why not (red), a grey note; '' hides it. */
+    function setState(key, text, level = '') {
+        const p = parts[key];
+        clearTimeout(p.timer);
+        p.state.textContent = text || '';
+        p.state.dataset.level = text ? level : '';
+        if (text && level !== 'bad') p.timer = setTimeout(() => setState(key, ''), level === 'ok' ? FILL_SAVED_MS : 4000);
+    }
 
     function sync() {
         const all = readFillSettings(get());
@@ -136,6 +223,11 @@ export function buildFillForm({ get, set }) {
             p.index.value = String(Math.min(5, s.index));
             if (root.ownerDocument.activeElement !== p.amount && !(p.amount.getRootNode && p.amount.getRootNode().activeElement === p.amount)) {
                 p.amount.value = String(s.amount);
+                // The box shows what is saved again: no longer red (3.14.3: it
+                // stayed red), and the reason under it goes too.
+                p.amount.classList.remove('tf-bad');
+                p.amount.removeAttribute('aria-invalid');
+                if (p.state.dataset.level === 'bad') setState(key, '');
             }
             for (const [v, b] of p.unit.btns) b.setAttribute('aria-pressed', String(v === s.unit));
             for (const [v, b] of p.qty.btns) b.setAttribute('aria-pressed', String(v === s.qty));
@@ -157,14 +249,19 @@ export const FILL_FORM_CSS = `
 .tf-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 13px; color: var(--text, #ddd); }
 .tf-select, .tf-num { height: 30px; padding: 0 8px; border-radius: 6px; border: 1px solid #555; background: #1b1b1b; color: var(--text, #ddd); font: inherit; font-size: 13px; }
 .tf-form .tf-row input.tf-num { width: 84px; flex: 0 0 84px; text-align: right; font-variant-numeric: tabular-nums; }
-.tf-form .tf-row input.tf-num.tf-bad { border-color: var(--bad, #d83500); }
+.tf-form .tf-row input.tf-num.tf-bad { border-color: #ff8a80; box-shadow: 0 0 0 1px #ff8a80; }
+.tf-form .tf-row input.tf-num.tf-bad:focus-visible { outline: 0; }
 .tf-seg { display: inline-flex; border: 1px solid #555; border-radius: 6px; overflow: hidden; }
 .tf-seg button { height: 28px; padding: 0 10px; border: 0; border-radius: 0; background: none; color: var(--muted, #999); font: inherit; font-size: 13px; font-weight: bold; cursor: pointer; }
 .tf-seg button[aria-pressed="true"] { background: rgba(153, 204, 0, 0.14); color: #fff; box-shadow: inset 0 0 0 1px var(--profit, #99cc00); }
 .tf-check { cursor: pointer; }
 .tf-check input { accent-color: var(--profit, #99cc00); margin: 0; }
 .tf-example { font-size: 12px; color: var(--muted, #999); font-variant-numeric: tabular-nums; }
-.tf-example[data-bad] { color: var(--bad, #d83500); }
+/* Under the By box, in the grid's second column: Saved ✓ / why not (#ff8a80: red that reads) / a note. */
+.tf-state { grid-column: 2; margin-top: -4px; font-size: 12px; color: var(--muted, #999); overflow-wrap: anywhere; }
+.tf-state:empty { display: none; }
+.tf-state[data-level="ok"] { color: var(--profit, #99cc00); }
+.tf-state[data-level="bad"] { color: #ff8a80; }
 .tf-note { font-size: 12px; color: var(--muted, #999); }
 `;
 

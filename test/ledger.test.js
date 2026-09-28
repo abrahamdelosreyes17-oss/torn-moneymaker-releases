@@ -175,3 +175,32 @@ test('mug totals follow exactly the muggings given (the page filters, then total
     assert.deepEqual(mugTotals(named), { lost: 100, count: 1, unknown: 0, biggest: 100 });
     assert.deepEqual(mugTotals(l.mugs, { from: (T0 + 3600) * 1000 }), { lost: 50, count: 1, unknown: 0, biggest: 50 });
 });
+
+import { priceRecordOf, addPriceRecord, acceptedPricesFor } from '../src/core/ledger.js';
+
+test("a trade's money is split by the trader's accepted prices, not Item Market Average", () => {
+    const me = '999';
+    const T = 1_800_000_000;
+    // KayMalta accepted: Stealth Virus at $1,157,499, Dahlia at $1,500 (Dahlia's market value is far higher).
+    const acc = { trader: { id: '5001', name: 'KayMalta' }, at: T * 1000 - 3600e3, items: [{ itemId: '870', bid: 1157499 }, { itemId: '1006', bid: 1500 }] };
+    const records = addPriceRecord([], priceRecordOf(acc), T * 1000);
+    const agreed = acceptedPricesFor(records, '5001', T * 1000);
+    assert.deepEqual(agreed, { 870: 1157499, 1006: 1500 });
+    const trade = { id: 90, completed_at: T, trader: { id: 5001, name: 'KayMalta' }, user: { id: 999 }, items: [
+        { user_id: 999, type: 'Item', details: { id: 870, amount: 10 } },
+        { user_id: 999, type: 'Item', details: { id: 1006, amount: 20 } },
+        { user_id: 5001, type: 'Money', details: { amount: 10 * 1157499 + 20 * 1500 } },
+    ] };
+    const valueOf = (id) => ({ 870: 900000, 1006: 50000 })[id];
+    const byPrice = rowsFromTrade(trade, me, valueOf, (id) => agreed[id] || 0);
+    assert.deepEqual(byPrice.map((r) => [r.itemId, Math.round(r.each), r.split]), [['870', 1157499, 'price'], ['1006', 1500, 'price']]);
+    // Without their prices: by market value, and said so.
+    const byValue = rowsFromTrade(trade, me, valueOf);
+    assert.equal(byValue[0].split, 'value');
+    assert.notEqual(Math.round(byValue[1].each), 1500);
+    // An item they gave no price for: the whole trade falls back to market value.
+    assert.equal(rowsFromTrade(trade, me, valueOf, (id) => (id === '870' ? 1157499 : 0))[0].split, 'value');
+    // Another trader, or a record from over a day before: not used.
+    assert.equal(acceptedPricesFor(records, '11', T * 1000), null);
+    assert.equal(acceptedPricesFor(records, '5001', T * 1000 + 2 * 86400e3), null);
+});

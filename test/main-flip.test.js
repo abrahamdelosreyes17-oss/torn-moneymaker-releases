@@ -141,3 +141,33 @@ test('the item on the desk stays in its trade, even as slow cover', () => {
     assert.ok(t.flips.some((r) => r.itemId === 'kit'), 'the desk item is in');
     assert.equal(t.flips.find((r) => r.itemId === 'kit').units, 3, 'a slow one: 3');
 });
+
+import { extrasPerTrade, EXTRA_ITEMS_MAX } from '../src/core/trade.js';
+import { EXTRA_STOPS } from '../src/core/flips.js';
+import { SELLING_PAGE_DEFAULTS } from '../src/ui/selling-page.js';
+
+test('Extras per trade (Settings): 5 by default, up to 10, and each extra still from at most 3 bazaars', () => {
+    assert.equal(SELLING_PAGE_DEFAULTS.extraItems, 5, 'the default stays 5');
+    assert.equal(extrasPerTrade(undefined), 5);
+    assert.equal(extrasPerTrade(''), 5);
+    assert.equal(extrasPerTrade(99), EXTRA_ITEMS_MAX, 'never more than 10');
+    assert.equal(extrasPerTrade(0), 1);
+    assert.equal(extrasPerTrade('7'), 7);
+
+    // The route sells twelve other things the trader buys.
+    const flips = [{ itemId: 'M', bid: 10000, sellers: [s(5000, 10, 'Hub')] }];
+    for (let i = 0; i < 12; i += 1) flips.push({ itemId: 'x' + i, bid: 100 + i, sellers: [s(50, 10, 'Hub')] });
+    assert.equal(planTrade({ first: 'M', flips, kindOf: fast }).flips.length, 1 + 5, 'unset: five');
+    const ten = planTrade({ first: 'M', flips, kindOf: fast, extraItems: 10 });
+    assert.equal(ten.flips.length, 1 + 10, 'the main flip and ten extras');
+    assert.equal(ten.left.length, 2, 'the rest under Show them');
+    assert.equal(planTrade({ first: 'M', flips, kindOf: fast, extraItems: 2 }).flips.length, 1 + 2);
+
+    // Ten extras that each need many bazaars: still at most 3 each.
+    const spread = [{ itemId: 'M', bid: 10000, sellers: [s(5000, 10, 'Hub')] }];
+    for (let i = 0; i < 10; i += 1) spread.push({ itemId: 'y' + i, bid: 500, sellers: Array.from({ length: 8 }, (_, k) => s(100 + k, 1, 'y' + i + '-' + k)) });
+    const t = planTrade({ first: 'M', flips: spread, kindOf: fast, extraItems: 10 });
+    for (const r of t.flips.filter((r) => r.role !== 'main')) {
+        assert.ok(new Set(r.steps.map((st) => st.sellerId)).size <= EXTRA_STOPS, r.itemId + ': ' + r.steps.length + ' bazaars');
+    }
+});

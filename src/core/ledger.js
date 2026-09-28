@@ -125,7 +125,48 @@ export function rowsFromLog(entry) {
  * @param {string} selfId - your Torn id
  * @param {function} valueOf - (itemId) => the Item Market Average, for sharing money
  */
-export function rowsFromTrade(trade, selfId, valueOf = () => 1) {
+/*
+ * What a trader agreed to pay, per item, kept after the trade (3.14.3, the
+ * owner: each receipt line's profit split by the trader's accepted prices, not
+ * Item Market Average). One record per "X accepted" in Torn Bids.
+ */
+export const PRICE_RECORD_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+export const PRICE_RECORD_MAX = 300;
+/* A trade finished this long after "accepted" still uses its prices. */
+export const PRICE_RECORD_MATCH_MS = 24 * 60 * 60 * 1000;
+
+/** The record an accepted trade leaves: {traderId, name, at, prices: {itemId: each}}. */
+export function priceRecordOf(accepted) {
+    if (!accepted || !accepted.trader || !accepted.trader.id) return null;
+    const prices = {};
+    for (const i of accepted.items || []) if (i && Number(i.bid) > 0) prices[String(i.itemId)] = Number(i.bid);
+    if (!Object.keys(prices).length) return null;
+    return { traderId: String(accepted.trader.id), name: accepted.trader.name || null, at: Number(accepted.at) || 0, prices };
+}
+
+/** The stored records plus one, old ones dropped, newest first. */
+export function addPriceRecord(list, rec, now = Date.now()) {
+    const kept = (Array.isArray(list) ? list : []).filter((r) => r && r.traderId && now - Number(r.at) < PRICE_RECORD_MAX_AGE_MS && !(rec && r.traderId === rec.traderId && r.at === rec.at));
+    return (rec ? [rec, ...kept] : kept).sort((a, b) => b.at - a.at).slice(0, PRICE_RECORD_MAX);
+}
+
+/** The prices a finished trade with this trader at time t was accepted at: the latest record before it, within a day; else null. */
+export function acceptedPricesFor(list, traderId, t) {
+    if (!traderId || !(t > 0)) return null;
+    let best = null;
+    for (const r of Array.isArray(list) ? list : []) {
+        if (!r || String(r.traderId) !== String(traderId) || !(r.at <= t) || t - r.at > PRICE_RECORD_MATCH_MS) continue;
+        if (!best || r.at > best.at) best = r;
+    }
+    return best ? best.prices : null;
+}
+
+/**
+ * @param {function} [priceOf] - (itemId) => what the trader agreed to pay for one (their accepted
+ *   prices), or 0. When every item you gave has one, the money they paid is split by those, and
+ *   the rows say `split: 'price'`; otherwise by Item Market Average (`split: 'value'`).
+ */
+export function rowsFromTrade(trade, selfId, valueOf = () => 1, priceOf = null) {
     if (!trade || !Array.isArray(trade.items) || !selfId) return [];
     const self = String(selfId);
     const t = ledgerNum(trade.completed_at || trade.timestamp || trade.modified_at) * 1000;
@@ -159,8 +200,16 @@ export function rowsFromTrade(trade, selfId, valueOf = () => 1) {
         got.forEach((g, i) => rows.push({ ...base, id: 'trade:' + trade.id + ':in:' + i, itemId: g.itemId, qty: g.qty, each: eachs[i], side: 'buy' }));
     }
     if (gave.length) {
-        const eachs = share(gave, received);
-        gave.forEach((g, i) => rows.push({ ...base, id: 'trade:' + trade.id + ':out:' + i, itemId: g.itemId, qty: g.qty, each: eachs[i], side: received > 0 ? 'sell' : 'give' }));
+        // What they agreed to pay for each, when known for every item: the split follows it.
+        const agreed = priceOf && received > 0 ? gave.map((g) => ledgerNum(priceOf(g.itemId))) : null;
+        const byPrice = Boolean(agreed && agreed.every((p) => p > 0));
+        const eachs = byPrice ? (() => {
+            const sum = gave.reduce((a, g, i) => a + agreed[i] * g.qty, 0);
+            return gave.map((g, i) => (received * agreed[i]) / sum);
+        })() : share(gave, received);
+        // What they agreed to pay for each is kept with the row: "did they pay their
+        // list" survives the accepted prices being forgotten (review L9).
+        gave.forEach((g, i) => rows.push({ ...base, id: 'trade:' + trade.id + ':out:' + i, itemId: g.itemId, qty: g.qty, each: eachs[i], side: received > 0 ? 'sell' : 'give', ...(received > 0 ? { split: byPrice ? 'price' : 'value' } : {}), ...(byPrice ? { agreed: agreed[i] } : {}) }));
     }
     return rows;
 }
@@ -423,6 +472,14 @@ export function tradeReceipts(rows, fifo) {
             const f = r.side === 'sell' && fifo ? fifo.get(r.id) : null;
             rec.gave.push({ itemId: r.itemId, qty: r.qty, each: r.each, total: r.side === 'sell' ? total : 0, cost: f ? f.cost : null, profit: f ? f.profit : null, given: r.side === 'give' });
             if (r.side === 'sell') rec.received += total;
+            // How the money was split across the items: 'price' (their accepted prices) or 'value' (market value).
+            if (r.split) rec.split = r.split;
+            // What they agreed to pay for all of it, when every sold row says.
+            if (r.side === 'sell') {
+                rec.agreedRows = (rec.agreedRows || 0) + 1;
+                if (r.agreed > 0) rec.expectedSum = (rec.expectedSum || 0) + r.qty * r.agreed;
+                else rec.expectedMissing = true;
+            }
             if (f) {
                 rec.cost += f.cost || 0;
                 rec.profit += f.profit || 0;
@@ -430,6 +487,12 @@ export function tradeReceipts(rows, fifo) {
             }
         }
         by.set(m[1], rec);
+    }
+    for (const rec of by.values()) {
+        if (rec.agreedRows && !rec.expectedMissing) rec.expected = rec.expectedSum;
+        delete rec.agreedRows;
+        delete rec.expectedSum;
+        delete rec.expectedMissing;
     }
     return [...by.values()].sort((a, b) => b.t - a.t);
 }

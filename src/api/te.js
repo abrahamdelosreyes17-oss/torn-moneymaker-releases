@@ -43,8 +43,12 @@ export function tePriceListUrl(traderId) {
 export const TE_MIN_GAP_MS = 10000;
 
 export class TeError extends Error {
-    constructor(message, { http = null, retryAfterMs = 0, badKey = false, tooSoon = false } = {}) {
+    constructor(message, { http = null, retryAfterMs = 0, badKey = false, tooSoon = false, reason = null, said = null } = {}) {
         super(message);
+        /** Why a call failed, for the pill's hover: 'no connection', 'no answer in 30 s'. */
+        this.reason = reason;
+        /** What TornExchange itself said, when it answered with an error. */
+        this.said = said;
         this.name = 'TeError';
         this.http = http;
         this.retryAfterMs = retryAfterMs;
@@ -52,6 +56,22 @@ export class TeError extends Error {
         /** Refused by this client for pacing, never sent: ask again later. */
         this.tooSoon = tooSoon;
     }
+}
+
+/**
+ * The TornExchange pill's hover after a failed call (3.14.3): what went wrong,
+ * so a failure can be told apart - theirs (down, slow, an HTTP error) or a
+ * call of ours they refused. 3.14.2 said "did not answer" for all of them.
+ * Never the key: a Torn key's 16 letters are blanked out of anything they said.
+ */
+export function teFailText(error) {
+    const e = error || {};
+    if (e.said) {
+        const said = String(e.said).replace(/[A-Za-z0-9]{16}/g, '****').slice(0, 80);
+        return 'TornExchange answered with an error: "' + said + '". Trying again soon.';
+    }
+    const why = e.reason || (e.http ? 'HTTP ' + e.http : null);
+    return 'TornExchange did not answer' + (why ? ' (' + why + ')' : '') + '. Trying again soon.';
 }
 
 export class TeClient {
@@ -159,7 +179,8 @@ export class TeClient {
             response = await this.fetchImpl(url.toString());
         } catch (error) {
             // The message never carries the URL, so never the key.
-            throw new TeError('TornExchange network error.');
+            const timedOut = /timed out/i.test(String((error && error.message) || ''));
+            throw new TeError(timedOut ? 'TornExchange timed out.' : 'TornExchange network error.', { reason: timedOut ? 'no answer in 30 s' : 'no connection' });
         }
 
         let body = null;
@@ -183,7 +204,8 @@ export class TeClient {
         if (response.status === 401) {
             // TornExchange says which: "Missing API key" or "Invalid API key"
             // (a key other than the one you last logged in there with).
-            const said = body && typeof body.message === 'string' ? body.message.slice(0, 60) : 'Invalid API key';
+            // Never a key on the page, even one TornExchange repeats back (review L12).
+            const said = body && typeof body.message === 'string' ? body.message.replace(/[A-Za-z0-9]{16}/g, '****').slice(0, 60) : 'Invalid API key';
             throw new TeError(
                 'TornExchange says "' + said + '". It only knows the key you last logged in there with: ' +
                     'log out of tornexchange.com, log in with this key, then Try again.',
@@ -198,7 +220,7 @@ export class TeClient {
         }
 
         if (body.status && body.status !== 'success') {
-            throw new TeError('TornExchange: ' + String(body.message || 'error') + '.');
+            throw new TeError('TornExchange: ' + String(body.message || 'error') + '.', { said: String(body.message || 'error') });
         }
 
         return body;
@@ -276,6 +298,43 @@ export function parseTeBestListing(body) {
     const out = { name: typeof d.trader === 'string' && d.trader ? d.trader : 'Trader ' + id, id, price };
     if (Number.isFinite(Number(d.vote)) && d.vote !== null) out.score = Number(d.vote);
     return out;
+}
+
+/**
+ * One trader's WHOLE buy list: /api/prices/{torn id or name} (3.14.3, for
+ * scanning your own traders - the top three per item miss most of it). The
+ * key is the one you log into TornExchange with, as for every keyed call.
+ * No list there (404 / 400): an empty list, not an error.
+ *
+ * @returns {Promise<{name: string|null, prices: Array<{itemId: string, price: number}>}>}
+ */
+export async function fetchTeTraderPrices(client, trader) {
+    const who = String(trader || '').trim();
+    if (!who || !/^[A-Za-z0-9_-]+$/.test(who)) throw new TeError('No trader to ask TornExchange about.');
+    let body;
+    try {
+        body = await client.get('prices/' + encodeURIComponent(who));
+    } catch (error) {
+        // "Not found" in any form (a 404, a 400, or a normal answer saying so): no list, not a failure.
+        if (error && (error.http === 404 || error.http === 400 || /not found|no (listings|prices|price list)|does not exist|unknown trader/i.test(String(error.said || '')))) return { name: null, prices: [] };
+        throw error;
+    }
+    return parseTeTraderPrices(body);
+}
+
+/** Exposed for tests. Rows without an item id or a price are dropped, never guessed. */
+export function parseTeTraderPrices(body) {
+    const data = body && body.data;
+    const items = data && Array.isArray(data.items) ? data.items : [];
+    const prices = [];
+    for (const it of items) {
+        const itemId = String((it && it.item_id) || '').replace(/\D/g, '');
+        const price = Number(it && it.price);
+        if (!itemId || !Number.isFinite(price) || price <= 0) continue;
+        prices.push({ itemId, price });
+    }
+    const meta = (body && body.meta) || (data && data.meta) || {};
+    return { name: typeof meta.trader === 'string' && meta.trader ? meta.trader : null, prices };
 }
 
 /**

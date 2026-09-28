@@ -411,3 +411,24 @@ test('traders page URL: our own page, not Torn; the old Torn address forwards to
     // The test harness keeps booting it with the marker on its own page.
     assert.equal(isTradersPageUrl('http://localhost:8765/test/harness-live.html?ttv2=traders'), true);
 });
+
+import { TeClient as TeClientB3, teFailText } from '../src/api/te.js';
+
+test('TornExchange failing: the pill says why - down, slow, an HTTP error, or what it said - never the key', async () => {
+    const KEY = 'AbCdEfGh12345678';
+    const clientWith = (fetchImpl) => new TeClientB3({ getKey: () => KEY, fetchImpl, now: () => 1_000_000 });
+    const failOf = async (fetchImpl) => {
+        try {
+            await clientWith(fetchImpl).get('all_best_listings');
+        } catch (e) {
+            return teFailText(e);
+        }
+        return 'no error';
+    };
+    assert.equal(await failOf(async () => { throw new Error('Torn API request timed out.'); }), 'TornExchange did not answer (no answer in 30 s). Trying again soon.');
+    assert.equal(await failOf(async () => { throw new Error('Network request failed.'); }), 'TornExchange did not answer (no connection). Trying again soon.');
+    assert.equal(await failOf(async () => ({ ok: false, status: 502, json: async () => { throw new Error('html'); } })), 'TornExchange did not answer (HTTP 502). Trying again soon.');
+    const said = await failOf(async () => ({ ok: true, status: 200, json: async () => ({ status: 'error', message: 'Item not found for ' + KEY }) }));
+    assert.equal(said, 'TornExchange answered with an error: "Item not found for ****". Trying again soon.');
+    assert.ok(!said.includes(KEY));
+});

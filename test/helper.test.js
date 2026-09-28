@@ -219,3 +219,12 @@ test('graph: recorded runs are solid, gaps are bridged by a dotted line, a lone 
         globalThis.document = prev;
     }
 });
+
+import { readWholeNumber } from '../src/core/parse.js';
+
+test('a quantity box reads whole numbers only, and never drops a stray letter', () => {
+    assert.equal(readWholeNumber('25'), 25);
+    assert.equal(readWholeNumber(' 1,000 '), 1000);
+    assert.equal(readWholeNumber('1 000'), 1000, 'a space is a thousands gap (the old /[,s]/ typo dropped "s" instead)');
+    for (const bad of ['abc', '-3', '5m', '2.5', '', null, '25s']) assert.equal(readWholeNumber(bad), null, String(bad));
+});

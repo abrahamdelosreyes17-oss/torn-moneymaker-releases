@@ -42,6 +42,20 @@ const KIND_RANK = { fast: 0, normal: 1, slow: 2 };
 
 /** About this many extra items: a soft cap (the rest are listed, and can be added). */
 export const EXTRA_ITEMS = 5;
+/*
+ * Settings › Flips › Extras per trade (3.14.3; the friend, through the owner:
+ * more extras - "unlimited" meaning every item we can flip to that trader, up
+ * to 10). The default stays EXTRA_ITEMS; each extra still comes from at most
+ * EXTRA_STOPS bazaars.
+ */
+export const EXTRA_ITEMS_MAX = 10;
+
+/** The extras a trade plans: the setting, a whole number from 1 to EXTRA_ITEMS_MAX; unset or unreadable = EXTRA_ITEMS. */
+export function extrasPerTrade(setting) {
+    const n = Math.floor(Number(setting));
+    if (setting === null || setting === undefined || setting === '' || !Number.isFinite(n)) return EXTRA_ITEMS;
+    return Math.min(EXTRA_ITEMS_MAX, Math.max(1, n));
+}
 
 /**
  * @param {object} p
@@ -59,6 +73,7 @@ export const EXTRA_ITEMS = 5;
  * @param {string|null} [p.traderId] - the trader: their own bazaar is never bought from
  * @param {function|null} [p.kindOf] - itemId -> 'fast' | 'normal' | 'slow': the main flip and its
  *   extras (see above); null plans every item up to Most, the item on the desk first
+ * @param {number} [p.extraItems] - Extras per trade (Settings); unset = EXTRA_ITEMS
  */
 export function planTrade(p) {
     if (typeof p.kindOf === 'function') return planMainAndExtras(p);
@@ -110,7 +125,8 @@ function heldRowsOf(held, keep, edits, capOf, payLeftRef, kindName) {
 }
 
 /** The main flip and a few extras (the app's plan). */
-function planMainAndExtras({ first = null, flips = [], held = [], cash = null, maxPerItem = FLIP_MAX_UNITS, payCap = Infinity, minPct = MIN_PROFIT_PCT, edits = {}, keep = {}, traderId = null, kindOf }) {
+function planMainAndExtras({ first = null, flips = [], held = [], cash = null, maxPerItem = FLIP_MAX_UNITS, payCap = Infinity, minPct = MIN_PROFIT_PCT, edits = {}, keep = {}, traderId = null, kindOf, extraItems = EXTRA_ITEMS }) {
+    const extrasWanted = extrasPerTrade(extraItems);
     let cashLeft = cash > 0 ? cash : Infinity;
     const pay = { left: payCap > 0 ? payCap : payCap === 0 ? 0 : Infinity };
     let payCapped = false;
@@ -223,7 +239,7 @@ function planMainAndExtras({ first = null, flips = [], held = [], cash = null, m
         return { k: onRoute.length ? 0 : 1, rank: KIND_RANK[kind(it.id)], profit: best };
     };
     const tried = new Set();
-    while (extras < EXTRA_ITEMS) {
+    while (extras < extrasWanted) {
         const next = items
             .filter((it) => !plan.has(it.id) && !tried.has(it.id))
             .map((it) => ({ it, g: guess(it) }))

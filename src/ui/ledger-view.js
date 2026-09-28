@@ -15,6 +15,7 @@
 
 import { formatMoney, formatAge, parseMoneyInput } from '../core/parse.js';
 import { matchFifo, filterLedgerRows, ledgerTotals, ledgerByItem, ledgerByPeriod, periodStart, mugTotals, tradeReceipts, VENUE_NAMES } from '../core/ledger.js';
+import { isFavourite, FAVOURITE_TRADES } from '../core/partners.js';
 
 /* At most this many receipts drawn at once (narrow the period or who for older ones). */
 const RECEIPTS_SHOWN = 40;
@@ -80,13 +81,13 @@ function dayValue(t) {
 
 export class LedgerView {
     /**
-     * @param {object} h - onRead(), onOpenSettings(), onOpenUrl(url)
+     * @param {object} h - onRead(), onOpenSettings(), onOpenUrl(url), onFavourite(b, on), onBlacklist(b, on)
      */
     constructor(h = {}) {
         this.h = h;
-        this.f = { period: '30d', itemId: '', category: '', venue: 'all', who: '', fromDay: '', toDay: '', mugger: 'all', mugMin: '' };
+        this.f = { period: '30d', itemId: '', category: '', venue: 'all', who: '', fromDay: '', toDay: '', mugger: 'all', mugMin: '', trader: '' };
         this.group = 'day';
-        /* 'trade' (buys and sells), 'receipts' (one per finished trade) or 'mugs' (what muggings took) */
+        /* 'trade' (buys and sells), 'receipts' (one per finished trade), 'traders' (who you traded with) or 'mugs' (what muggings took) */
         this.tab = 'trade';
         this.fifoSig = null;
         this.fifo = new Map();
@@ -112,6 +113,7 @@ export class LedgerView {
     set(partial) {
         Object.assign(this.f, partial);
         this.sig = null;
+        this.force = true;
         this.render(this.last);
     }
 
@@ -124,15 +126,27 @@ export class LedgerView {
         const L = v.ledger || {};
         const rows = L.rows || [];
         const mugs = L.mugs || [];
-        const sig = JSON.stringify([rows.length, rows.length ? rows[rows.length - 1].id : null, mugs.length, L.hasKey, L.busy, L.error, L.keyError, L.backfilled, Math.floor((Date.now() - (L.readAt || 0)) / 60000), this.f, this.group, this.tab]);
+        const sig = JSON.stringify([rows.length, rows.length ? rows[rows.length - 1].id : null, mugs.length, L.hasKey, L.busy, L.error, L.keyError, L.backfilled, Math.floor((Date.now() - (L.readAt || 0)) / 60000), this.f, this.group, this.tab, L.favourites || null, (L.blacklist || []).map((x) => x.key), (L.partners || []).length]);
         if (sig === this.sig) return;
+        const box = this.el;
+        // A date being typed part by part is never redrawn under you (3.14.3:
+        // a read landing mid-date sent the rest of it to the wrong part); a
+        // change you made (set) is drawn at once.
+        const act = box.getRootNode && box.getRootNode().activeElement;
+        if (!this.force && act && box.contains(act) && act.type === 'date') return;
+        this.force = false;
         this.sig = sig;
 
-        const box = this.el;
         // Typing in the item or who box: keep the caret where it was.
         const focus = box.getRootNode && box.getRootNode().activeElement;
         const focusKey = focus && focus.dataset ? focus.dataset.lgFocus : null;
-        const caret = focus && typeof focus.selectionStart === 'number' ? focus.selectionStart : null;
+        // What was selected in it, kept as it was (3.14.3: only the caret was kept).
+        let caret = null;
+        try {
+            caret = focus && typeof focus.selectionStart === 'number' ? [focus.selectionStart, focus.selectionEnd, focus.selectionDirection] : null;
+        } catch {
+            caret = null;
+        }
         box.textContent = '';
 
         if (!L.hasKey) {
@@ -166,15 +180,21 @@ export class LedgerView {
         ]));
 
         /* Trading | Mugged */
-        const tabs = lvEl('div', { class: 'lg-tabs', role: 'tablist' });
-        for (const [k, label] of [['trade', 'Trading'], ['receipts', 'Receipts'], ['mugs', 'Mugged' + (mugs.length ? ' · ' + lvCount(mugs.length) : '')]]) {
-            tabs.appendChild(lvEl('button', { type: 'button', role: 'tab', class: 'lg-tab', 'aria-selected': String(this.tab === k), text: label, onclick: () => {
+        const tabs = lvEl('div', { class: 'lg-tabs', role: 'group', 'aria-label': 'Ledger' });
+        for (const [k, label] of [['trade', 'Trading'], ['receipts', 'Receipts'], ['traders', 'Traders'], ['mugs', 'Mugged' + (mugs.length ? ' · ' + lvCount(mugs.length) : '')]]) {
+            tabs.appendChild(lvEl('button', { type: 'button', class: 'lg-tab', 'aria-pressed': String(this.tab === k), 'data-lg-focus': 'tab:' + k, text: label, onclick: () => {
                 this.tab = k;
                 this.sig = null;
                 this.render(this.last);
             } }));
         }
         box.appendChild(tabs);
+
+        if (this.tab === 'traders') {
+            this.renderTraders(box, L);
+            this.restoreFocus(focusKey, caret);
+            return;
+        }
 
         /* filters */
         const items = new Map();
@@ -185,7 +205,7 @@ export class LedgerView {
         }
         const periodChips = lvEl('div', { class: 'lg-chips', role: 'group', 'aria-label': 'Period' });
         for (const [k, label] of PERIODS) {
-            periodChips.appendChild(lvEl('button', { type: 'button', class: 'sp-chip-f', 'aria-pressed': String(this.f.period === k), text: label, onclick: () => this.set({ period: k }) }));
+            periodChips.appendChild(lvEl('button', { type: 'button', class: 'sp-chip-f', 'aria-pressed': String(this.f.period === k), 'data-lg-focus': 'period:' + k, text: label, onclick: () => this.set({ period: k }) }));
         }
         const listId = 'lg-items';
         // What you type stays as typed; picking an item elsewhere (a bar, a row) writes its name here.
@@ -208,10 +228,10 @@ export class LedgerView {
             if (hit) this.set({ itemId: hit[0] });
             else if (this.f.itemId) this.set({ itemId: '' });
         });
-        const catSel = lvEl('select', { class: 'lg-in', 'aria-label': 'Category' }, [lvEl('option', { value: '', text: 'Any category' }), ...[...cats].sort().map((c) => lvEl('option', { value: c, text: c }))]);
+        const catSel = lvEl('select', { class: 'lg-in', 'aria-label': 'Category', 'data-lg-focus': 'cat' }, [lvEl('option', { value: '', text: 'Any category' }), ...[...cats].sort().map((c) => lvEl('option', { value: c, text: c }))]);
         catSel.value = this.f.category;
         catSel.addEventListener('change', () => this.set({ category: catSel.value }));
-        const venueSel = lvEl('select', { class: 'lg-in', 'aria-label': 'Where' }, [
+        const venueSel = lvEl('select', { class: 'lg-in', 'aria-label': 'Where', 'data-lg-focus': 'venue' }, [
             lvEl('option', { value: 'all', text: 'Anywhere' }),
             lvEl('option', { value: 'bazaar', text: 'Bazaars' }),
             lvEl('option', { value: 'market', text: 'Item Market' }),
@@ -226,10 +246,27 @@ export class LedgerView {
         whoInput.addEventListener('input', () => this.set({ who: whoInput.value }));
         // Dates: from and to, both days included (the "Dates" period).
         const today = dayValue(Date.now());
-        const fromBox = lvEl('input', { type: 'date', class: 'lg-in lg-date', 'aria-label': 'From', max: today, value: this.f.fromDay || dayValue(Date.now() - 30 * DAY) });
-        const toBox = lvEl('input', { type: 'date', class: 'lg-in lg-date', 'aria-label': 'To', max: today, value: this.f.toDay || today });
-        fromBox.addEventListener('change', () => this.set({ fromDay: fromBox.value }));
-        toBox.addEventListener('change', () => this.set({ toDay: toBox.value }));
+        const fromBox = lvEl('input', { type: 'date', class: 'lg-in lg-date', 'aria-label': 'From', 'data-lg-focus': 'from', max: today, value: this.f.fromDay || dayValue(Date.now() - 30 * DAY) });
+        const toBox = lvEl('input', { type: 'date', class: 'lg-in lg-date', 'aria-label': 'To', 'data-lg-focus': 'to', max: today, value: this.f.toDay || today });
+        // A date typed part by part (day, month, year) is used once you finish it -
+        // Enter or leaving the box; one picked from the calendar at once (3.14.3:
+        // every typed part redrew the bar, and the rest of the date went nowhere).
+        const dateBox = (input, key) => {
+            let typedAt = 0;
+            const apply = () => {
+                if (input.value && input.value !== this.f[key]) this.set({ [key]: input.value });
+            };
+            input.addEventListener('keydown', (event) => {
+                typedAt = Date.now();
+                if (event.key === 'Enter') apply();
+            });
+            input.addEventListener('change', () => {
+                if (Date.now() - typedAt > 400) apply();
+            });
+            input.addEventListener('blur', () => setTimeout(apply, 0));
+        };
+        dateBox(fromBox, 'fromDay');
+        dateBox(toBox, 'toDay');
         if (this.f.period === 'dates' && !this.f.fromDay) {
             this.f.fromDay = fromBox.value;
             this.f.toDay = toBox.value;
@@ -238,7 +275,7 @@ export class LedgerView {
             ? [lvEl('label', { class: 'lg-f' }, [lvEl('span', { text: 'From' }), fromBox]), lvEl('label', { class: 'lg-f' }, [lvEl('span', { text: 'To' }), toBox])]
             : [];
         // The Mugged tab: who, named or anonymous, and a smallest amount.
-        const muggerSel = lvEl('select', { class: 'lg-in', 'aria-label': 'Mugger' }, [
+        const muggerSel = lvEl('select', { class: 'lg-in', 'aria-label': 'Mugger', 'data-lg-focus': 'mugger' }, [
             lvEl('option', { value: 'all', text: 'Everyone' }),
             lvEl('option', { value: 'named', text: 'Named only' }),
             lvEl('option', { value: 'anon', text: 'Anonymous only' }),
@@ -249,21 +286,31 @@ export class LedgerView {
         minInput.addEventListener('input', () => this.set({ mugMin: minInput.value }));
         const mugsTab = this.tab === 'mugs';
         const receiptsTab = this.tab === 'receipts';
+        // Receipts: pick a trader (the ones on your receipts, most trades first; a star for favourites).
+        const partners = L.partners || [];
+        const traderSel = lvEl('select', { class: 'lg-in', 'aria-label': 'Trader', 'data-lg-focus': 'trader' }, [
+            lvEl('option', { value: '', text: 'All traders' }),
+            ...partners.map((p) => lvEl('option', { value: p.who, text: (isFavourite(p, L.favourites || {}) ? '★ ' : '') + (p.whoName || 'Player ' + p.who) + ' · ' + lvCount(p.trades) + (p.trades === 1 ? ' trade' : ' trades') })),
+        ]);
+        traderSel.value = partners.some((p) => p.who === this.f.trader) ? this.f.trader : '';
+        traderSel.addEventListener('change', () => this.set({ trader: traderSel.value }));
         const any = mugsTab
             ? this.f.who || this.f.mugger !== 'all' || this.f.mugMin
-            : this.f.itemId || this.f.category || this.f.venue !== 'all' || this.f.who;
+            : receiptsTab
+                ? this.f.itemId || this.f.category || this.f.trader
+                : this.f.itemId || this.f.category || this.f.venue !== 'all' || this.f.who;
         box.appendChild(lvEl('div', { class: 'lg-filters' }, [
             periodChips,
             ...dates,
             mugsTab ? null : lvEl('label', { class: 'lg-f' }, [lvEl('span', { text: 'Item' }), itemInput, datalist]),
             mugsTab ? null : lvEl('label', { class: 'lg-f' }, [lvEl('span', { text: 'Category' }), catSel]),
             mugsTab || receiptsTab ? null : lvEl('label', { class: 'lg-f' }, [lvEl('span', { text: 'Where' }), venueSel]),
-            lvEl('label', { class: 'lg-f' }, [lvEl('span', { text: mugsTab ? 'Mugged by' : 'Who' }), whoInput]),
+            receiptsTab ? lvEl('label', { class: 'lg-f' }, [lvEl('span', { text: 'Trader' }), traderSel]) : lvEl('label', { class: 'lg-f' }, [lvEl('span', { text: mugsTab ? 'Mugged by' : 'Who' }), whoInput]),
             mugsTab ? lvEl('label', { class: 'lg-f' }, [lvEl('span', { text: 'Mugger' }), muggerSel]) : null,
             mugsTab ? lvEl('label', { class: 'lg-f' }, [lvEl('span', { text: 'At least' }), minInput]) : null,
             any ? lvEl('button', { type: 'button', class: 'sp-link', text: 'Clear filters', onclick: () => {
                 this.itemText = '';
-                this.set(mugsTab ? { who: '', mugger: 'all', mugMin: '' } : { itemId: '', category: '', venue: 'all', who: '' });
+                this.set(mugsTab ? { who: '', mugger: 'all', mugMin: '' } : receiptsTab ? { itemId: '', category: '', trader: '' } : { itemId: '', category: '', venue: 'all', who: '' });
             } }) : null,
         ]));
 
@@ -274,7 +321,7 @@ export class LedgerView {
             return;
         }
         if (receiptsTab) {
-            this.renderReceipts(box, filterLedgerRows(rows, { ...this.f, itemId: '', category: '', venue: 'trade', from, to }, typeOf), nameOf, L, (r) => (!this.f.itemId || [...r.gave, ...r.got].some((g) => String(g.itemId) === String(this.f.itemId))) && (!this.f.category || [...r.gave, ...r.got].some((g) => typeOf(g.itemId) === this.f.category)));
+            this.renderReceipts(box, filterLedgerRows(rows, { ...this.f, itemId: '', category: '', venue: 'trade', who: '', from, to }, typeOf), nameOf, L, (r) => (!this.f.trader || String(r.who) === String(this.f.trader)) && (!this.f.itemId || [...r.gave, ...r.got].some((g) => String(g.itemId) === String(this.f.itemId))) && (!this.f.category || [...r.gave, ...r.got].some((g) => typeOf(g.itemId) === this.f.category)));
             this.restoreFocus(focusKey, caret);
             return;
         }
@@ -364,10 +411,25 @@ export class LedgerView {
      */
     renderReceipts(box, shown, nameOf, L, keep = () => true) {
         const list = tradeReceipts(shown, this.fifo).filter(keep);
+        // One trader picked: their totals in this period, as the Trading tab's boxes.
+        const picked = this.f.trader ? (L.partners || []).find((p) => p.who === this.f.trader) : null;
+        if (picked) {
+            const sum = list.reduce((a, r) => ({ n: a.n + 1, received: a.received + (r.received || 0), cost: a.cost + (r.cost || 0), profit: a.profit + (r.profit || 0), unknown: a.unknown + (r.unknownQty || 0) }), { n: 0, received: 0, cost: 0, profit: 0, unknown: 0 });
+            const tile = (label, value, cls = '', sub = '') => lvEl('div', { class: 'lg-tile ' + cls }, [lvEl('span', { class: 'lg-tl', text: label }), lvEl('b', { text: value }), sub ? lvEl('small', { text: sub }) : null]);
+            box.appendChild(lvEl('div', { class: 'lg-tiles' }, [
+                tile('Trades', lvCount(sum.n), '', 'with ' + (picked.whoName || 'Player ' + picked.who)),
+                tile('Paid to you', formatMoney(Math.round(sum.received))),
+                tile('Cost of what sold', formatMoney(Math.round(sum.cost)), '', 'first in, first out'),
+                tile('Profit', lvSigned(sum.profit), sum.profit >= 0 ? 'lg-good' : 'lg-loss', sum.unknown ? lvCount(sum.unknown) + ' sold with no buy on record: not in it' : ''),
+            ]));
+        }
         if (!list.length) {
             box.appendChild(lvEl('p', { class: 'lg-card lg-muted', text: L.busy ? 'Reading your trades…' : 'No finished trades in this period.' }));
             return;
         }
+        // Trades paid short of what they accepted (core/partners.js), by trader and time.
+        const shortAt = new Map();
+        for (const p of L.partners || []) for (const x of p.list ? p.list.short : []) shortAt.set(p.who + '|' + x.t, x);
         const wrap = lvEl('div', { class: 'lg-receipts' });
         for (const r of list.slice(0, RECEIPTS_SHOWN)) {
             const table = lvEl('table', { class: 'lg-table lg-receipt' });
@@ -384,7 +446,10 @@ export class LedgerView {
             for (const g of r.gave) table.appendChild(line('out', g, true));
             for (const g of r.got) table.appendChild(line('in', g, false));
             const money = [];
-            if (r.received) money.push((r.whoName || 'They') + ' paid ' + formatMoney(Math.round(r.received)));
+            const short = shortAt.get(String(r.who) + '|' + r.t);
+            if (r.received) money.push((r.whoName || 'They') + ' paid ' + formatMoney(Math.round(r.received)) + (short ? ' of ' + formatMoney(Math.round(short.expected)) : ''));
+            // Two or more items sold: how the one sum was split between them.
+            if (r.received && r.gave.filter((g) => !g.given).length > 1 && r.split) money.push(r.split === 'price' ? 'split by their prices' : 'split by market value');
             if (r.paid) money.push('you paid ' + formatMoney(Math.round(r.paid)));
             if (r.unknownQty) money.push(lvCount(r.unknownQty) + ' with no buy on record (not in the profit)');
             wrap.appendChild(lvEl('section', { class: 'lg-card lg-rcpt' }, [
@@ -393,11 +458,103 @@ export class LedgerView {
                     r.received ? lvEl('b', { class: r.profit >= 0 ? 'lg-good' : 'lg-loss', text: lvSigned(r.profit) }) : null,
                 ]),
                 table,
-                money.length ? lvEl('p', { class: 'lg-muted lg-rcpt-foot', text: money.join(' · ') }) : null,
+                money.length ? lvEl('p', { class: 'lg-muted lg-rcpt-foot' }, [money.join(' · '), short ? lvEl('b', { class: 'lg-short', text: ' · ' + formatMoney(Math.round(short.expected - short.got)) + ' short' }) : null]) : null,
             ]));
         }
         if (list.length > RECEIPTS_SHOWN) wrap.appendChild(lvEl('p', { class: 'lg-muted', text: 'The newest ' + RECEIPTS_SHOWN + ' of ' + lvCount(list.length) + ' trades. Narrow the period or who to see others.' }));
         box.appendChild(wrap);
+    }
+
+    /**
+     * Ledger › Traders (3.14.3): everyone you finished a trade with - trades,
+     * money, profit, the last trade, and whether they paid what they accepted -
+     * with a star (favourite) and a blacklist button. Blacklisted traders,
+     * traded with or not, are listed greyed at the bottom with Undo.
+     */
+    renderTraders(box, L) {
+        const partners = L.partners || [];
+        const edits = L.favourites || {};
+        const black = L.blacklist || [];
+        const blackKeys = new Set(black.map((x) => x.key));
+        const keyOf = (p) => 'id:' + p.who;
+        const shown = partners.filter((p) => !blackKeys.has(keyOf(p)) && !(p.whoName && blackKeys.has('name:' + String(p.whoName).toLowerCase())));
+        const totals = shown.reduce((a, p) => ({ trades: a.trades + p.trades, received: a.received + p.received, profit: a.profit + p.profit }), { trades: 0, received: 0, profit: 0 });
+        const card = lvEl('section', { class: 'lg-card' });
+        card.appendChild(lvEl('div', { class: 'lg-cardh' }, [
+            lvEl('h3', { text: 'Traders · most trades first' }),
+            partners.length ? lvEl('span', { class: 'lg-muted' }, [lvCount(shown.length) + ' traders · ', lvEl('b', { text: lvCount(totals.trades) }), ' trades · paid to you ', lvEl('b', { text: formatMoney(Math.round(totals.received)) }), ' · profit ', lvEl('b', { class: totals.profit >= 0 ? 'lg-good' : 'lg-loss', text: lvSigned(totals.profit) })]) : null,
+        ]));
+        if (!partners.length && !black.length) {
+            card.appendChild(lvEl('p', { class: 'lg-muted', text: L.busy ? 'Reading your trades…' : 'No finished trades read yet.' }));
+            box.appendChild(card);
+            return;
+        }
+        const table = lvEl('table', { class: 'lg-table lg-traders' });
+        table.appendChild(lvEl('tr', {}, ['Trader', 'Trades', 'Paid to you', 'Profit', 'Last trade', 'Paid their list?', ''].map((h, i) => lvEl('th', { class: i >= 1 && i <= 4 ? 'lg-num' : '', scope: 'col', text: h }))));
+        const trust = (id) => {
+            const t = L.trustOf ? L.trustOf(id) : null;
+            if (!t) return null;
+            return lvEl('span', { class: 'sp-trust', 'data-level': t.level.toLowerCase(), title: 'TornExchange / TornW3B rating', text: t.level + (Number.isFinite(t.score) ? ' ' + lvCount(t.score) : '') });
+        };
+        const name = (id, whoName) => {
+            const label = whoName || 'Player ' + id;
+            const url = 'https://www.torn.com/profiles.php?XID=' + encodeURIComponent(id);
+            const a = lvEl('a', { href: url, target: '_blank', rel: 'noopener noreferrer', class: 'lg-tname', text: label });
+            a.addEventListener('click', (e) => {
+                if (e.button !== 0 || e.ctrlKey || e.metaKey || e.shiftKey) return;
+                e.preventDefault();
+                if (this.h.onOpenUrl) this.h.onOpenUrl(url);
+            });
+            return a;
+        };
+        for (const p of shown) {
+            const fav = isFavourite(p, edits);
+            const removed = (edits.removed || []).map(String).includes(p.who);
+            const added = (edits.added || []).map(String).includes(p.who);
+            const favNote = fav ? (added ? 'Favourite · added by you' : 'Favourite · ' + FAVOURITE_TRADES + '+ trades') : removed ? 'Not a favourite · removed by you' : '';
+            const pl = p.list || { checked: 0, paid: 0, short: [] };
+            const lastShort = pl.short.length ? pl.short[0] : null;
+            const b = { id: p.who, name: p.whoName || 'Player ' + p.who };
+            table.appendChild(lvEl('tr', {}, [
+                lvEl('td', {}, [lvEl('div', { class: 'lg-who' }, [
+                    lvEl('span', { class: 'lg-who1' }, [fav ? lvEl('span', { class: 'lg-star', text: '★' }) : null, name(p.who, p.whoName), trust(p.who)]),
+                    favNote ? lvEl('small', { text: favNote }) : null,
+                ])]),
+                lvEl('td', { class: 'lg-num', text: lvCount(p.trades) }),
+                lvEl('td', { class: 'lg-num', text: formatMoney(Math.round(p.received)) }),
+                lvEl('td', { class: 'lg-num ' + (p.profit >= 0 ? 'lg-good' : 'lg-loss'), text: lvSigned(p.profit) }),
+                lvEl('td', { class: 'lg-num', text: p.last ? formatAge(Date.now() - p.last) : '–' }),
+                lvEl('td', {}, [pl.checked
+                    ? lvEl('div', { class: 'lg-paid' }, [
+                        lvEl('span', { class: pl.paid < pl.checked ? 'lg-short' : 'lg-good', text: 'Paid list ' + pl.paid + ' of ' + pl.checked + (pl.paid < pl.checked ? '' : ' ✓') }),
+                        lastShort ? lvEl('small', { class: 'lg-short', text: dateText(lastShort.t) + ': ' + formatMoney(Math.round(lastShort.expected - lastShort.got)) + ' short' }) : null,
+                        pl.checked < p.trades ? lvEl('small', { class: 'lg-muted', text: lvCount(p.trades - pl.checked) + ' not accepted in Torn Bids' }) : null,
+                    ])
+                    : lvEl('span', { class: 'lg-muted', text: 'not accepted in Torn Bids' })]),
+                lvEl('td', { class: 'lg-ctl' }, [
+                    lvEl('button', { type: 'button', class: 'sp-fav' + (fav ? ' sp-fav-on' : ''), 'aria-pressed': String(fav), 'aria-label': fav ? 'Remove ' + b.name + ' from favourites' : 'Make ' + b.name + ' a favourite', 'data-lg-focus': 'fav:' + p.who, title: fav ? 'Favourite - press to remove' : 'Make ' + b.name + ' a favourite', text: fav ? '★' : '☆', onclick: () => this.h.onFavourite && this.h.onFavourite(b, !fav) }),
+                    lvEl('button', { type: 'button', class: 'sp-blk', title: 'Blacklist ' + b.name + ': never a buyer (their bazaars are still used)', 'aria-label': 'Blacklist ' + b.name, 'data-lg-focus': 'blk:' + p.who, text: '⊘', onclick: () => this.h.onBlacklist && this.h.onBlacklist(b, true) }),
+                ]),
+            ]));
+        }
+        // Blacklisted: greyed at the bottom, each with Undo (traded with or not).
+        for (const x of black) {
+            const p = partners.find((q) => keyOf(q) === x.key || (q.whoName && 'name:' + String(q.whoName).toLowerCase() === x.key)) || null;
+            table.appendChild(lvEl('tr', { class: 'lg-bl' }, [
+                lvEl('td', {}, [lvEl('div', { class: 'lg-who' }, [
+                    lvEl('span', { class: 'lg-who1' }, [x.id ? name(x.id, x.name) : lvEl('b', { text: x.name || 'Someone' }), lvEl('span', { class: 'lg-bltag', text: 'Blacklisted' })]),
+                    lvEl('small', { text: 'Never a buyer · bazaars still used' }),
+                ])]),
+                lvEl('td', { class: 'lg-num', text: p ? lvCount(p.trades) : '–' }),
+                lvEl('td', { class: 'lg-num', text: p ? formatMoney(Math.round(p.received)) : '–' }),
+                lvEl('td', { class: 'lg-num', text: p ? lvSigned(p.profit) : '–' }),
+                lvEl('td', { class: 'lg-num', text: p && p.last ? formatAge(Date.now() - p.last) : '–' }),
+                lvEl('td', {}, []),
+                lvEl('td', { class: 'lg-ctl' }, [lvEl('button', { type: 'button', class: 'sp-link lg-undo', text: 'Undo', 'aria-label': 'Take ' + (x.name || 'them') + ' off the blacklist', 'data-lg-focus': 'unblk:' + x.key, title: 'Take ' + (x.name || 'them') + ' off the blacklist', onclick: () => this.h.onBlacklist && this.h.onBlacklist({ id: x.id, name: x.name }, false) })]),
+            ]));
+        }
+        card.appendChild(lvEl('div', { class: 'lg-scroll' }, [table]));
+        box.appendChild(card);
     }
 
     /** What muggings took: totals, per day, and each one. */
@@ -462,11 +619,11 @@ export class LedgerView {
         const again = this.el.querySelector('[data-lg-focus="' + key + '"]');
         if (!again) return;
         again.focus({ preventScroll: true });
-        if (caret !== null && typeof again.setSelectionRange === 'function') {
+        if (caret && typeof again.setSelectionRange === 'function') {
             try {
-                again.setSelectionRange(caret, caret);
+                again.setSelectionRange(caret[0], caret[1], caret[2] || 'none');
             } catch {
-                /* search boxes may refuse */
+                /* date and number boxes refuse */
             }
         }
     }
@@ -647,7 +804,7 @@ export const LEDGER_CSS = `
 .lg-rcpt .lg-cardh b { font-size: 15px; font-variant-numeric: tabular-nums; }
 .lg-rcpt-foot { margin: 8px 0 0; font-size: 12px; }
 .lg-tab { height: 34px; padding: 0 16px; border-radius: 9px; border: 1px solid var(--cline2); background: none; color: var(--muted); font: bold 13px Arial, Helvetica, sans-serif; cursor: pointer; }
-.lg-tab[aria-selected="true"] { color: #fff; border-color: var(--profit); background: var(--green-bg); }
+.lg-tab[aria-pressed="true"] { color: #fff; border-color: var(--profit); background: var(--green-bg); }
 .lg-in.lg-date { min-width: 140px; color-scheme: dark; }
 .lg-in.lg-min { min-width: 110px; width: 120px; }
 .lg-mugline { margin: 0; font-size: 13px; color: var(--muted); display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px; }
@@ -656,7 +813,7 @@ export const LEDGER_CSS = `
 .lg-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; align-items: start; }
 .lg-cardh { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
 .lg-cardh h3 { margin: 0; }
-.lg-chart { width: 100%; height: auto; display: block; }
+.lg-chart { width: 100%; height: auto; max-height: 260px; display: block; }
 .lg-axis { stroke: #555; stroke-width: 1; }
 .lg-lab { fill: var(--muted); font: 11px Arial, Helvetica, sans-serif; }
 .lg-bar-g { fill: var(--price); background: var(--price); }
@@ -687,6 +844,21 @@ export const LEDGER_CSS = `
     .lg-f { flex: 1 1 140px; }
 }
 .lg-qtym { display: none; color: var(--muted); }
+.lg-short { color: var(--warn); font-weight: bold; }
+.lg-who { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.lg-who1 { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 8px; }
+.lg-who small { color: var(--muted); font-size: 12px; }
+.lg-tname { color: #fff; font-weight: bold; text-decoration: none; }
+.lg-tname:hover { text-decoration: underline; }
+.lg-star { color: #f2c94c; }
+.lg-paid { display: flex; flex-direction: column; gap: 2px; }
+.lg-paid span { white-space: nowrap; font-weight: bold; }
+.lg-paid small { font-size: 12px; }
+.lg-ctl { text-align: right; white-space: nowrap; }
+.lg-ctl .sp-fav + .sp-blk { margin-left: 6px; }
+.lg-bl td { opacity: 0.55; }
+.lg-bl td.lg-ctl { opacity: 1; }
+.lg-bltag { font-size: 10px; font-weight: bold; letter-spacing: 0.4px; text-transform: uppercase; color: #ff8a80; border: 1px solid #6b2b27; border-radius: 9px; padding: 1px 6px; white-space: nowrap; }
 /* A phone: every buy and sell is a small card of three lines, nothing cut. */
 @media (max-width: 700px) {
     .lg-rows, .lg-rows tbody, .lg-rows tr, .lg-rows td { display: block; }

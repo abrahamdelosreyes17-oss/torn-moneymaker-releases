@@ -70,6 +70,21 @@ export function flipBuyer(buyers, { avg = null, type = null, subType = null, uni
     return null;
 }
 
+/** Is this bid believable: at most BID_SANITY_X times the Item Market Average? No average: it cannot be told. */
+export function believableBid(price, avg) {
+    return avg > 0 && price > 0 && price <= avg * BID_SANITY_X;
+}
+
+/**
+ * The bid the item list sorts by (3.14.3, the owner: troll bids - a Parcel at
+ * $99b - led the list): the best believable one, as flips use. 0 when there is
+ * none, or no average to tell a real bid from a troll one by.
+ */
+export function listBid(buyers, avg) {
+    for (const b of buyers || []) if (b && believableBid(b.price, avg)) return b.price;
+    return 0;
+}
+
 /**
  * Every buyer a flip could sell to, best bid first: believable bids only, each
  * with how many they can pay for (`maxUnits`, when their networth caps it).

@@ -50,13 +50,14 @@ import {
     SOURCE_BAZAAR,
     SOURCE_ITEM_MARKET,
 } from './core/feed.js';
-import { bazaarSellers, flipPlan, flipBuyer, whereToSell, depthNearCheapest, flipCandidates, traderTagLabel, pickBazaars, MAIN_STOPS, EXTRA_STOPS } from './core/flips.js';
+import { bazaarSellers, flipPlan, flipBuyer, listBid, believableBid, whereToSell, depthNearCheapest, flipCandidates, traderTagLabel, pickBazaars, MAIN_STOPS, EXTRA_STOPS } from './core/flips.js';
 import { planTrade, keepAfter } from './core/trade.js';
 import { holdTrade, holdKey, resolveEstimated, priceHeld, livePins, editHeld, HOLD_MS } from './core/held.js';
-import { deskItem, nextW3bRead, backgroundSlot, W3B_HIDDEN_PER_MIN, HIDDEN_RENDER_MS, declineKey, declinedOn } from './core/desk.js';
+import { deskItem, nextW3bRead, backgroundSlot, backgroundListSlot, flipsStale, W3B_HIDDEN_PER_MIN, HIDDEN_RENDER_MS, declineKey, declinedOn } from './core/desk.js';
 import { liquidityKind, unitsMoved, addMovement, stopsMinutes, EXTRA_CAP } from './core/liquidity.js';
-import { acceptTrade, liveAccepted, stepState, tickAccepted, stepDone, nextStep, boughtFromStock, recordBuy, sendUnits, acceptedTotals, replacementFor, replaceStep, dropLine, markLeft, leftoversOf, addLeftovers, takenUnits, fillNote } from './core/accepted.js';
+import { boughtSince, acceptTrade, liveAccepted, stepState, tickAccepted, stepDone, nextStep, boughtFromStock, recordBuy, sendUnits, acceptedTotals, replacementFor, replaceStep, dropLine, markLeft, leftoversOf, addLeftovers, takenUnits, fillNote } from './core/accepted.js';
 import { readTradeView, readTradeAddRows } from './sources/dom/trade.js';
+import { BoughtWindow } from './ui/bought-window.js';
 import { makeTabId, LEADER_HEARTBEAT_MS } from './core/leader.js';
 import { tabWindow } from './platform/tab-window.js';
 import { idbGet, idbSet, idbDel } from './platform/idb.js';
@@ -65,7 +66,8 @@ import { rankOpportunities, summarize, hiddenCounts, belowMinRows } from './core
 import { TornApiClient, redactKey, KEY_DEAD_CODES } from './api/client.js';
 import { W3bClient, fetchW3bSummary, fetchW3bListings, fetchW3bPriceList } from './api/w3b.js';
 import { LedgerClient, fetchLedgerKeyInfo, isFullKey, fetchLogPage, fetchTradesPage, fetchTrade } from './api/ledger.js';
-import { readLedger, emptyLedger, rowsFromLog, rowsFromTrade, addLedgerRows, logSpan, mugFromLog, addMugs } from './core/ledger.js';
+import { readLedger, emptyLedger, rowsFromLog, rowsFromTrade, addLedgerRows, logSpan, mugFromLog, addMugs, priceRecordOf, addPriceRecord, acceptedPricesFor, matchFifo, tradeReceipts } from './core/ledger.js';
+import { partnerStats, isFavourite, editFavourite, editBlacklist, withoutBlacklisted, favouritesFirstOnTie, tradedLine, partnerKey, scanOrder, blacklistKeys } from './core/partners.js';
 import {
     TeClient,
     TeQueue,
@@ -73,6 +75,8 @@ import {
     fetchTeListings,
     fetchTeActiveTraderList,
     fetchTeBestListing,
+    teFailText,
+    fetchTeTraderPrices,
 } from './api/te.js';
 import {
     makeTeCacheEntry,
@@ -101,6 +105,7 @@ import {
     votesByTrader,
     ratingsInText,
     trustedOnly,
+    liveW3bPrices,
 } from './core/traders.js';
 import {
     mergeInventory,
@@ -128,6 +133,7 @@ import {
     fetchNetworth,
     ACCESS_PUBLIC,
     TORN_ERROR_ACCESS_LEVEL,
+    keyTooLowForInventory,
 } from './api/torn.js';
 import {
     detectPage,
@@ -243,6 +249,16 @@ const STORE_SELL_DECLINED = 'sellDeclined';
 const STORE_SELL_ACCEPTED = 'sellAccepted';
 /* Trades you pinned (core/held.js): 'item|trader key' -> held trade. Only prices move in them. */
 const STORE_SELL_PINNED = 'sellPinned';
+/* The Bought window (3.14.3): {pos: {x, y}|null, folded}. Where you dragged it, kept. */
+const STORE_BOUGHT_WINDOW = 'boughtWindow';
+/* What traders agreed to pay, per accepted trade (core/ledger.js): the Ledger splits a trade's money by it. */
+const STORE_SELL_PRICE_RECORDS = 'sellPriceRecords';
+/* Traders never offered anything (3.14.3): [{key, id, name, at}]; their bazaars are still used. */
+const STORE_SELL_BLACKLIST = 'sellBlacklist';
+/* Favourites you added or removed by hand: {added: [ids], removed: [ids]}. */
+const STORE_SELL_FAVOURITES = 'sellFavourites';
+/* Your favourites' whole TornExchange lists (3.14.3): {id: {at, name, prices: [{itemId, price}]}}. */
+const STORE_SELL_TE_OWN = 'sellTeOwnLists';
 /* Chat pressed in Torn Bids (3.14): {id, name, at}; the overlay marks Torn's chat button on that profile. */
 const STORE_CHAT_WANTED = 'chatWanted';
 const CHAT_WANTED_MS = 10 * 60 * 1000;
@@ -261,6 +277,8 @@ const STORE_LEDGER_REV = 'ledgerRev';
 /* A run makes at most this many calls; new entries every 5 minutes; a year back, a few pages a minute. */
 const LEDGER_CALLS_PER_RUN = 6;
 const LEDGER_EVERY_MS = 5 * 60 * 1000;
+/* A refused Full key's message stays this long. */
+const LEDGER_MSG_MS = 30 * 1000;
 const LEDGER_BACKFILL_GAP_MS = 30 * 1000;
 const LEDGER_BACKFILL_S = 365 * 24 * 60 * 60;
 
@@ -968,7 +986,8 @@ function trustedBuyerOf(itemId) {
     }
     const id = String(itemId);
     const lookup = app.traderLookup;
-    if (!lookup.best.has(id)) lookup.best.set(id, trustedOnly(lookup.buyersAll(id))[0] || null);
+    // A blacklisted trader is never named as the one who pays more (3.14.3).
+    if (!lookup.best.has(id)) lookup.best.set(id, trustedOnly(withoutBlacklisted(lookup.buyersAll(id), blacklistKeys(sellBlacklist())))[0] || null);
     return lookup.best.get(id);
 }
 
@@ -2614,8 +2633,35 @@ function buyStepHere(listings) {
  * with Next. `listings`: what this page's scan found; null = not scanned (no
  * item list yet) - nothing is counted or unmarked from that, never "gone".
  */
+/**
+ * Bought since you accepted (3.14.3, ui/bought-window.js): its own window on
+ * Torn's pages while a trade is accepted - the trade you are on (the trade
+ * page's partner), else the newest one. On the trade page it is a checklist.
+ */
+function updateBoughtWindow() {
+    if (!app.panel) return;
+    const all = Object.values(sellAccepted()).sort((a, b) => b.at - a.at);
+    if (!all.length) {
+        if (app.bought) app.bought.render(null);
+        return;
+    }
+    const check = app.tradeCheck && isTradePage(location.href) ? app.tradeCheck : null;
+    const trade = (check && all.find((t) => t.key === check.key)) || all[0];
+    if (!app.bought) {
+        const saved = gmGet(STORE_BOUGHT_WINDOW, null) || {};
+        app.bought = new BoughtWindow({
+            onMove: (pos) => gmSet(STORE_BOUGHT_WINDOW, { ...(gmGet(STORE_BOUGHT_WINDOW, null) || {}), pos }),
+            onFold: (folded) => gmSet(STORE_BOUGHT_WINDOW, { ...(gmGet(STORE_BOUGHT_WINDOW, null) || {}), folded }),
+            panelRect: () => (app.panel && app.panel.root ? app.panel.root.getBoundingClientRect() : null),
+        }, { pos: saved.pos || null, folded: Boolean(saved.folded) });
+    }
+    const onTradePage = Boolean(check && check.key === trade.key);
+    app.bought.render({ ...boughtSince(trade, { inside: onTradePage ? check.inside : null }), onTradePage });
+}
+
 function trackTradeBuying(listings) {
     if (!app.panel) return;
+    updateBoughtWindow();
     const scanned = Array.isArray(listings);
     const pending = Object.values(sellAccepted()).filter((t) => nextStep(t));
     if (!pending.length) {
@@ -2781,6 +2827,7 @@ function scanTradePage() {
     if (!app.panel) return;
     if (!isTradePage(location.href)) {
         clearSendMarks();
+        app.tradeCheck = null;
         return;
     }
     const accepted = Object.values(sellAccepted());
@@ -2836,6 +2883,9 @@ function scanTradePage() {
     const inside = new Map();
     for (const it of (tradeId && app.tradeInside.get(tradeId)) || []) inside.set(lower(it.name), (inside.get(lower(it.name)) || 0) + it.qty);
     const expected = trade ? acceptedTotals(trade).pays : 0;
+    // The Bought window's checklist: this trade, and what is in it now.
+    app.tradeCheck = trade ? { key: trade.key, inside, at: Date.now() } : null;
+    updateBoughtWindow();
 
     app.panel.setTrades(trade ? [trade] : partner ? [] : accepted, {
         partner,
@@ -2847,7 +2897,7 @@ function scanTradePage() {
 
     // The add step: mark each row to send, with Fill. Updated in place, not
     // redrawn: a chip replaced under a press would swallow it.
-    const note = (marked) => showFillNote(fillNote({ accepted: accepted.map((t) => t.trader.name), trader: trade ? trade.trader.name : null, partner, toSend: need.size, marked }));
+    const note = (marked, missing = []) => showFillNote(fillNote({ accepted: accepted.map((t) => t.trader.name), trader: trade ? trade.trader.name : null, partner, toSend: need.size, marked, missing }));
     if (!trade) {
         clearSendMarks();
         note(0);
@@ -2906,7 +2956,10 @@ function scanTradePage() {
         if (li) li.classList.remove(TRADE_SEND_CLASS);
         c.remove();
     }
-    note(marked.size);
+    // Items, not rows: Torn lists one item on several tabs (review: "3 rows marked" with 2 seen).
+    const markedIds = new Set([...marked].map((c) => c.dataset.itemId));
+    const missing = [...need.entries()].filter(([id, n]) => !markedIds.has(id) && Math.max(0, n.qty - (inside.get(lower(n.name)) || 0)) > 0).map(([, n]) => n.name);
+    note(markedIds.size, missing);
     bindTradeFillPress();
 }
 
@@ -3468,6 +3521,8 @@ function registerMenu() {
 const led = { client: null, data: null, busy: false, checking: false, error: null, keyError: null, saveMsg: null, nextAt: 0 };
 
 const sell = {
+    /* Traders' TornExchange / TornW3B badges seen so far (the Ledger's Traders tab shows them). */
+    trustById: new Map(),
     client: null,
     te: null,
     w3b: null,
@@ -3647,6 +3702,101 @@ function stepTeOne() {
         });
 }
 
+/* Your traders' trades are worked out again at most this often (sooner when a setting changes). */
+const SCAN_EVERY_MS = 10 * 1000;
+/* A favourite's whole list is read again after this; a failed read is tried again after TE_RETRY_MS, then later each time. */
+const TE_OWN_TTL_MS = 30 * 60 * 1000;
+
+function sellTeOwn() {
+    const all = gmGet(STORE_SELL_TE_OWN, null);
+    return all && typeof all === 'object' ? all : {};
+}
+
+/** The favourites Torn Bids scans (core/partners.js): [{id, name}]. Blacklisted ones never. */
+function favouriteTraders(now = Date.now()) {
+    const edits = sellFavourites();
+    const black = new Set(sellBlacklist().map((x) => x.key));
+    const out = [];
+    for (const st of partnersNow()) {
+        if (black.has('id:' + st.who) || !isFavourite(st, edits, now)) continue;
+        out.push({ id: st.who, name: st.whoName || null });
+    }
+    // Added by hand before any trade: favourites too.
+    for (const id of edits.added || []) if (!out.some((f) => f.id === String(id)) && !black.has('id:' + id)) out.push({ id: String(id), name: null });
+    return out;
+}
+
+/**
+ * Your favourites' whole TornExchange lists (3.14.3): one at a time in the
+ * shared TornExchange pace, each again after TE_OWN_TTL_MS, only with the
+ * key you log in there with, and only while this tab is in view.
+ */
+function stepTeOwn() {
+    if (sell.teOwnBusy || !sell.queue || document.visibilityState !== 'visible') return;
+    if (!getTeKey() || teState().badKey || sell.queue.length > 0) return;
+    const now = Date.now();
+    if (now < (Number(teState().blockedUntil) || 0)) return;
+    const lists = sellTeOwn();
+    const due = favouriteTraders(now).find((f) => {
+        const rec = lists[f.id];
+        if (!rec) return true;
+        return now - rec.at >= (rec.failed ? TE_RETRY_MS * 2 ** Math.min(Number(rec.failed) || 1, 4) : TE_OWN_TTL_MS);
+    });
+    if (!due) return;
+    sell.teOwnBusy = true;
+    sell.queue
+        .enqueue(() => fetchTeTraderPrices(sell.te, due.id))
+        .then(({ name, prices }) => {
+            gmSet(STORE_SELL_TE_OWN, keepFavouriteLists({ ...sellTeOwn(), [due.id]: { at: Date.now(), name: name || due.name, prices } }));
+            if (name) learnTraders([{ id: due.id, name, source: 'te' }]);
+        })
+        .catch(() => {
+            // Asked again later, each time later still (never every few minutes forever).
+            const prev = sellTeOwn()[due.id] || { prices: [] };
+            gmSet(STORE_SELL_TE_OWN, keepFavouriteLists({ ...sellTeOwn(), [due.id]: { ...prev, at: Date.now(), failed: (Number(prev.failed) || 0) + 1 } }));
+        })
+        .finally(() => {
+            sell.teOwnBusy = false;
+            renderSelling();
+        });
+}
+
+/** Only current favourites' lists are kept (review M6: they piled up forever). */
+function keepFavouriteLists(all) {
+    const keep = new Set(favouriteTraders().map((f) => f.id));
+    return Object.fromEntries(Object.entries(all || {}).filter(([id]) => keep.has(id)));
+}
+
+/**
+ * What your favourites buy, per item, from their own lists (buyersForItem's
+ * teOwn): a favourite with no public list (TornExchange empty, no TornW3B
+ * list) is taken at what they last accepted in Torn Bids, marked "last paid".
+ */
+function teOwnByItem(now = Date.now(), { favs = null, lists = null } = {}) {
+    const out = new Map();
+    lists = lists || sellTeOwn();
+    const records = gmGet(STORE_SELL_PRICE_RECORDS, []) || [];
+    const add = (itemId, row) => {
+        const k = String(itemId);
+        if (!out.has(k)) out.set(k, []);
+        out.get(k).push(row);
+    };
+    for (const f of favs || favouriteTraders(now)) {
+        const rec = lists[f.id];
+        const name = (rec && rec.name) || f.name;
+        if (rec && rec.prices && rec.prices.length) {
+            for (const p of rec.prices) add(p.itemId, { id: f.id, name, price: p.price });
+            continue;
+        }
+        const w3b = sell.db && sell.db.traders[f.id] ? liveW3bPrices(sell.db.traders[f.id], now) : null;
+        if (rec && !rec.failed && !(w3b && Object.keys(w3b).length)) {
+            const last = (Array.isArray(records) ? records : []).filter((r) => r && String(r.traderId) === f.id).sort((a, b) => b.at - a.at)[0];
+            if (last) for (const [itemId, price] of Object.entries(last.prices || {})) add(itemId, { id: f.id, name, price, lastPaid: true, paidAt: last.at });
+        }
+    }
+    return out;
+}
+
 function getSellKey() {
     return gmGet(STORE_SELL_KEY, '') || '';
 }
@@ -3787,6 +3937,30 @@ function saveSellPinned(all) {
     gmSet(STORE_SELL_PINNED, all);
 }
 
+function sellBlacklist() {
+    const l = gmGet(STORE_SELL_BLACKLIST, []);
+    return Array.isArray(l) ? l : [];
+}
+
+function sellFavourites() {
+    const f = gmGet(STORE_SELL_FAVOURITES, null);
+    return f && typeof f === 'object' ? f : {};
+}
+
+/*
+ * The traders you have traded with (core/partners.js), from the Ledger's
+ * rows: worked out again only when the rows or the accepted prices change.
+ */
+let partnersCache = { key: '', stats: [] };
+function partnersNow() {
+    const data = getLedgerKey() ? ledgerData() : null;
+    const rows = data ? data.rows : [];
+    const recs = gmGet(STORE_SELL_PRICE_RECORDS, []) || [];
+    const key = rows.length + '|' + (data ? data.readAt : 0) + '|' + recs.length + '|' + (recs[0] ? recs[0].at : 0);
+    if (partnersCache.key !== key) partnersCache = { key, stats: partnerStats(tradeReceipts(rows, matchFifo(rows)), recs) };
+    return partnersCache.stats;
+}
+
 /** The held trade for an item and trader: pinned, else one you started on (still fresh). */
 function heldTradeFor(itemId, traderKey, now = Date.now()) {
     const k = holdKey(itemId, traderKey);
@@ -3880,12 +4054,20 @@ function stepW3b() {
     // as the last one ends - a hidden tab's timers fire once a minute at best.
     const hidden = document.visibilityState !== 'visible';
     sell.w3bHidden = (sell.w3bHidden || []).filter((t) => now - t < 60000);
+    sell.w3bHiddenLists = (sell.w3bHiddenLists || []).filter((t) => now - t < 60000);
     if (hidden && !backgroundSlot(sell.w3bHidden, now)) return;
-    const job = nextW3bJob(now);
+    // A new summary or TornExchange list: which items are possible flips is worked out first.
+    const flipDataAt = sell.summaryAt && Math.max(sell.summaryAt, (sell.traders && sell.traders.fetchedAt) || 0);
+    if (hidden && flipsStale(flipDataAt, sell.hiddenRenderAt)) {
+        sell.hiddenRenderAt = 0;
+        renderSellingNow();
+    }
+    const job = nextW3bJob(now, hidden);
     if (!job) return;
 
     sell.w3bBusy = true;
     if (hidden) sell.w3bHidden.push(now);
+    if (hidden && job.list) sell.w3bHiddenLists.push(now);
     job().finally(() => {
         sell.w3bBusy = false;
         renderSelling();
@@ -3906,7 +4088,7 @@ function bazaarsDue(itemId, every, now) {
  * The next TornW3B request: the summary when old, then the item picked, then
  * possible flips and price lists taking turns, so neither waits on the other.
  */
-function nextW3bJob(now) {
+function nextW3bJob(now, hidden = false) {
     sell.w3bTurn ^= 1;
     // The trade on the desk comes before the possible flips only while you
     // work on it (core/desk.js): until then the flips are checked first.
@@ -3919,13 +4101,15 @@ function nextW3bJob(now) {
         wanted: sell.tradeWanted,
         candidates: sell.candidates.map((c) => c.itemId),
         pinned: pinnedIds,
-        list: nextW3bTrader(sell.db, heldIds(), now),
+        // Hidden, the lists have a few reads a minute of their own at most.
+        list: hidden && !backgroundListSlot(sell.w3bHiddenLists, now) ? null : nextW3bTrader(sell.db, heldIds(), now),
         turn: sell.w3bTurn,
+        hidden,
         due: (id, how) => bazaarsDue(id, how === 'desk' ? W3B_SELECTED_MS : W3B_CANDIDATE_MS, now),
     });
     if (!read) return null;
     if (read.kind === 'summary') return loadBazaarSummary;
-    if (read.kind === 'list') return () => loadW3bList(read.id);
+    if (read.kind === 'list') return Object.assign(() => loadW3bList(read.id), { list: true });
     return () => loadBazaars(read.id);
 }
 
@@ -4057,7 +4241,7 @@ function loadSelfId() {
  * trader database's TornW3B lists. Answers are kept per item for one pass.
  * The traders page and the panel's bazaar tags both use it.
  */
-function buyerLookup({ teMap, lists, teOne, idsByName, db, w3bByItem, dbIdsByName }) {
+function buyerLookup({ teMap, lists, teOne, idsByName, db, w3bByItem, dbIdsByName, teOwn = new Map() }) {
     // TornExchange's votes for the trust badge, from every answer we have.
     const votesById = votesByTrader([
         ...teMap.values(),
@@ -4080,6 +4264,7 @@ function buyerLookup({ teMap, lists, teOne, idsByName, db, w3bByItem, dbIdsByNam
                 w3bByItem,
                 dbIdsByName,
                 votesById,
+                teOwn: teOwn.get(id) || null,
             });
             cache.set(id, b);
         }
@@ -4123,17 +4308,46 @@ function renderSellingNow() {
 
     const w3bByItem = w3bIndex(now);
     const teMap = sell.traders ? sell.traders.map : new Map();
-    const buyersAll = buyerLookup({ teMap, lists: sell.lists, teOne: sell.teOne, idsByName: sell.idsByName, db: sell.db, w3bByItem, dbIdsByName: sell.dbIdsByName });
+    // Your favourites and their own lists: read once per redraw (review M6).
+    const favsNow = favouriteTraders(now);
+    const ownLists = sellTeOwn();
+    const ownByItem = teOwnByItem(now, { favs: favsNow, lists: ownLists });
+    const buyersAll = buyerLookup({ teMap, lists: sell.lists, teOne: sell.teOne, idsByName: sell.idsByName, db: sell.db, w3bByItem, dbIdsByName: sell.dbIdsByName, teOwn: ownByItem });
     const levelOf = (id) => presenceLevel(sellPresenceOf(id));
     // Trusted means Known (20+ votes) or Trusted; while TornExchange's votes
     // are not loaded, a trader without any is kept ("no votes yet").
     const votesMissing = !(teMap.size > 0);
     const shownCache = new Map();
+    // Your traders: history by id (and name, for name-only buyers), favourites, the blacklist.
+    const partnerOf = new Map();
+    for (const st of partnersNow()) {
+        partnerOf.set('id:' + st.who, st);
+        if (st.whoName) partnerOf.set('name:' + String(st.whoName).toLowerCase(), st);
+    }
+    const favEdits = sellFavourites();
+    const statOf = (b) => partnerOf.get(partnerKey(b)) || (b && b.name ? partnerOf.get('name:' + String(b.name).toLowerCase()) : null) || null;
+    const favOf = (b) => {
+        const st = statOf(b);
+        return st ? isFavourite(st, favEdits, now) : Boolean(b && b.id && (favEdits.added || []).map(String).includes(String(b.id)));
+    };
+    const blacklist = blacklistKeys(sellBlacklist());
+    // Every buyer lookup that is not the shown list (a pinned or picked trade, its bids) skips them too.
+    const buyersAllowed = (id) => withoutBlacklisted(buyersAll(id), blacklist);
+    // Every trader with a Trusted badge seen on any item (Your traders scans them).
+    const trustedSeen = new Map();
     const buyersOf = (id) => {
         const key = String(id);
         let b = shownCache.get(key);
         if (!b) {
-            b = buyersAll(key);
+            // Blacklisted traders are never buyers (their bazaars still are sellers); favourites first on a tie.
+            const all = buyersAll(key);
+            // Each trader's TornExchange / TornW3B badge, for the Ledger's Traders tab.
+            for (const x of all) {
+                if (!x || !x.id || !x.trust) continue;
+                sell.trustById.set(String(x.id), x.trust);
+                if (x.trust.level === 'Trusted' && !trustedSeen.has(String(x.id))) trustedSeen.set(String(x.id), x);
+            }
+            b = favouritesFirstOnTie(withoutBlacklisted(all, blacklist), favOf);
             if (prefs.onlineOnly) b = onlineOnly(b, levelOf);
             if (prefs.trustedOnly) b = trustedOnly(b, { min: 'Known', keepUnrated: votesMissing });
             shownCache.set(key, b);
@@ -4289,13 +4503,17 @@ function renderSellingNow() {
         const held = heldQty.get(id) || 0;
         const plan = planOf(id);
         const lowest = lowestOf(id);
+        // The best believable bid (a troll one - $99b for a Parcel - never counts):
+        // it sorts the list and says where to sell. No average: the top bid, as before.
+        const avg = itemOf(id) ? Number(itemOf(id).marketValue) || null : null;
+        const realBid = avg > 0 ? listBid(buyersOf(id), avg) : best ? best.price : 0;
         let badge = null;
         let value = 0;
         if (plan && plan.units > 0) {
             badge = { kind: 'flip', amount: plan.profit };
             value = plan.profit;
-        } else if (held && best) {
-            const w = whereToSell({ held, bid: best.price, bazaarLowest: lowest, bazaarDepth: bazaarDepthOf(id) });
+        } else if (held && realBid > 0) {
+            const w = whereToSell({ held, bid: realBid, bazaarLowest: lowest, bazaarDepth: bazaarDepthOf(id) });
             if (w.best === 'bazaar') {
                 badge = { kind: 'list', amount: w.gain };
                 value = w.gain;
@@ -4303,7 +4521,7 @@ function renderSellingNow() {
                 badge = { kind: 'sell' };
             }
         }
-        rows.push({ itemId: id, name, held, lowest, badge, value, bid: best ? best.price : 0, pending: !best && pendingFor(id), plan, best, category: itemCategory(itemOf(id)) });
+        rows.push({ itemId: id, name, held, lowest, badge, value, bid: avg > 0 ? realBid : 0, pending: !best && pendingFor(id), plan, best, category: itemCategory(itemOf(id)) });
     }
     // The category filters the flips, the list and its counts together; its
     // own counts follow the search only.
@@ -4392,6 +4610,7 @@ function renderSellingNow() {
             // Never their own bazaar; the extras by how fast they sell.
             traderId: buyer.id || null,
             kindOf,
+            extraItems: prefs.extraItems,
         });
         return { ...t, key, buyer, estimated };
     };
@@ -4424,10 +4643,10 @@ function renderSellingNow() {
         const plans = new Map();
         for (const b of buyers.slice(0, TRADE_TRADERS_MAX)) plans.set(traderKey(b), tradeWith(b, pickId));
         // A pinned trade on this item comes back with its trader (after a reload too).
-        const pinFor = Object.values(sellPinned(now)).find((t) => t.itemId === String(pickId) && !declined.has(t.key));
+        const pinFor = Object.values(sellPinned(now)).find((t) => t.itemId === String(pickId) && !declined.has(t.key) && !blacklist.has(t.key));
         const pickedKey = sell.tradePick.get(String(pickId)) || (pinFor ? pinFor.key : null);
         if (pickedKey && !plans.has(pickedKey)) {
-            const b = buyers.find((x) => traderKey(x) === pickedKey) || buyersAll(pickId).find((x) => traderKey(x) === pickedKey);
+            const b = buyers.find((x) => traderKey(x) === pickedKey) || buyersAllowed(pickId).find((x) => traderKey(x) === pickedKey);
             if (b) plans.set(pickedKey, tradeWith({ ...b, tradeKey: pickedKey }, pickId));
         }
         const hasItem = (t) => t.flips.some((r) => r.itemId === String(pickId));
@@ -4498,7 +4717,7 @@ function renderSellingNow() {
         // What this trader pays now (whatever the Show toggles hide), and how a
         // line you change is re-picked alone (at most 5 bazaars) - the others stay.
         const bidNow = (id) => {
-            const b = buyersAll(id).find((x) => traderKey(x) === chosen.key);
+            const b = buyersAllowed(id).find((x) => traderKey(x) === chosen.key);
             return b ? b.price : null;
         };
         sell.heldEdit = {
@@ -4641,11 +4860,78 @@ function renderSellingNow() {
         }
     }
 
+    /*
+     * Your traders (3.14.3, the owner: "scanning if we can flip something on
+     * our trusted trader"; "make it a collapsible thing"; trusted badge too):
+     * for each favourite and each trader with a Trusted badge, the best whole
+     * trade with them now - the same plan the desk makes (main flip + extras).
+     * Worked out only while the section is open.
+     */
+    let scan = { open: prefs.scanOpen !== false, list: [], favourites: 0, trusted: 0 };
+    {
+        // Every item's buyers, whatever the search box shows (review L3): who is
+        // Trusted does not depend on what you typed.
+        for (const id of allIds) buyersOf(id);
+        const favs = favsNow;
+        const lastPaidIds = new Set();
+        for (const rows of ownByItem.values()) for (const r of rows) if (r.lastPaid) lastPaidIds.add(String(r.id));
+        const teBad = Boolean(teState().badKey);
+        const who = new Map();
+        for (const f of favs) who.set(f.id, { id: f.id, name: f.name || (statOf({ id: f.id }) || {}).whoName || 'Player ' + f.id, favourite: true });
+        for (const [id, x] of trustedSeen) {
+            if (blacklist.has('id:' + id)) continue;
+            if (who.has(id)) who.get(id).name = x.name;
+            else who.set(id, { id, name: x.name, favourite: false });
+        }
+        scan.favourites = favs.length;
+        scan.trusted = [...who.values()].filter((w) => !w.favourite).length;
+        // Worked out again at most every SCAN_EVERY_MS, or at once when what
+        // shapes a trade changes (review M4: every trader's plan, every redraw).
+        const scanSig = JSON.stringify([prefs.cash, prefs.maxPerFlip, prefs.extraItems, prefs.minProfitPct, prefs.networthPct, prefs.onlineOnly, prefs.trustedOnly, favEdits, [...blacklist], [...who.keys()], sell.summaryAt]);
+        const fresh = sell.scanSig === scanSig && now - (sell.scanAt || 0) < SCAN_EVERY_MS;
+        if (scan.open && fresh) scan.list = sell.scanList || [];
+        else if (scan.open) {
+            sell.scanSig = scanSig;
+            sell.scanAt = now;
+            for (const w of who.values()) {
+                const trust = sell.trustById.get(w.id) || null;
+                // Not "reading" when TornExchange refused the key: it never will (review L8).
+                const reading = w.favourite && getTeKey() && !teBad && !ownLists[w.id];
+                const t = tradeWith({ id: w.id, name: w.name, trust }, null);
+                const main = t && t.main ? t.flips.find((r) => r.itemId === String(t.main)) : null;
+                scan.list.push({
+                    key: 'id:' + w.id,
+                    id: w.id,
+                    name: w.name,
+                    trust,
+                    favourite: w.favourite,
+                    traded: tradedLine(statOf({ id: w.id }), now),
+                    reading: Boolean(reading) && !(t && t.items),
+                    lastPaid: lastPaidIds.has(w.id),
+                    profit: t && t.items ? t.profit : 0,
+                    items: t ? t.items || 0 : 0,
+                    stops: t ? t.stops || 0 : 0,
+                    estimated: t ? t.estimated.length : 0,
+                    mainId: main ? main.itemId : null,
+                    mainName: main ? nameOf(main.itemId) : null,
+                    mainUnits: main ? main.units : 0,
+                    itemIds: t ? t.flips.map((r) => r.itemId) : [],
+                });
+            }
+            // Biggest trade first; still reading, then nothing now, after.
+            scan.list = scanOrder(scan.list);
+            sell.scanList = scan.list;
+        }
+    }
+
     let desk = null;
     const pick = sell.selected;
     if (pick) {
         // Each trader row carries its key: Plan trade and Declined act on it.
-        const buyers = buyersOf(pick).map((x) => ({ ...x, tradeKey: traderKey(x) }));
+        const pickAvg = itemOf(pick) ? Number(itemOf(pick).marketValue) || null : null;
+        // A bid over 3x the Item Market Average is shown, marked, and never counted (troll bids).
+        const buyers = buyersOf(pick).map((x) => ({ ...x, tradeKey: traderKey(x), troll: pickAvg > 0 && !believableBid(x.price, pickAvg), traded: tradedLine(statOf(x), now), favourite: favOf(x) }));
+        const realBid = pickAvg > 0 ? listBid(buyers, pickAvg) || null : buyers[0] ? buyers[0].price : null;
         const b = sell.bazaars.get(pick);
         const held = heldQty.get(pick) || 0;
         const m = sell.market.get(pick);
@@ -4672,7 +4958,7 @@ function renderSellingNow() {
             planWhy: b && b.at ? null : 'loading',
             // Weapons and armour: every copy has its own stats, so no flip (say why).
             statItem: isStatItem(item),
-            where: held ? whereToSell({ held, bid: buyers[0] ? buyers[0].price : null, bazaarLowest: lowestOf(pick), marketLowest: m ? m.lowest : null, bazaarDepth: bazaarDepthOf(pick), marketDepth: m ? m.depth : null }) : null,
+            where: held ? whereToSell({ held, bid: realBid, bazaarLowest: lowestOf(pick), marketLowest: m ? m.lowest : null, bazaarDepth: bazaarDepthOf(pick), marketDepth: m ? m.depth : null }) : null,
             market: { state: m && m.at ? 'ok' : m && m.error ? 'error' : 'loading', lowest: m ? m.lowest : null },
         };
         desk.trade = tradeDesk(pick, buyers);
@@ -4688,9 +4974,10 @@ function renderSellingNow() {
 
     // Pinned trades, on top of the list: the main flip, the trader, and the profit now.
     const deskKey = desk && desk.trade && desk.trade.chosen ? desk.trade.chosen.key : null;
-    const pinned = Object.entries(sellPinned(now)).map(([k, t]) => {
+    // A trader blacklisted after the pin: the pin is not shown (it stays stored, for Undo).
+    const pinned = Object.entries(sellPinned(now)).filter(([, t]) => !blacklist.has(t.key)).map(([k, t]) => {
         const bidOf = (id) => {
-            const b = buyersAll(id).find((x) => traderKey(x) === t.key);
+            const b = buyersAllowed(id).find((x) => traderKey(x) === t.key);
             return b ? b.price : null;
         };
         const p = priceHeld(t, { rowsOf: sellersOf, bidOf, lowestOf });
@@ -4728,6 +5015,8 @@ function renderSellingNow() {
         pinned,
         leftovers: leftShown,
         ledger: ledgerView(),
+        scan,
+        blacklist: sellBlacklist(),
         itemNameOf: (id) => nameOf(id),
         itemTypeOf: (id) => {
             const item = itemOf(id);
@@ -4751,6 +5040,7 @@ function renderSellingNow() {
             hasTeKey: Boolean(teKey),
             teSameAsLimited: Boolean(teKey) && teKey === getSellKey(),
             teError: st.error || null,
+            teKeyMsg: sell.teKeyMsg || null,
             teBadKey: Boolean(st.badKey),
             teWaitUntil: st.blockedUntil > now ? st.blockedUntil : null,
             teAt: sell.traders ? sell.traders.fetchedAt : null,
@@ -4979,7 +5269,7 @@ function onTeSettled(error) {
     } else if (error.badKey) {
         setTeState({ badKey: true, badAt: Date.now(), error: error.message });
     } else {
-        setTeState({ error: 'TornExchange did not answer. Trying again soon.' });
+        setTeState({ error: teFailText(error) });
     }
     renderSelling();
 }
@@ -5156,6 +5446,44 @@ function onSellSaveKey(key) {
         renderSelling();
         return;
     }
+    // Checked before it replaces the key you have (3.14.3: a typo replaced a
+    // working key, as the Ledger's and the overlay's keys never could).
+    if (!looksLikeTornKey(key)) {
+        sell.keyError = 'A Torn key is 16 letters and digits. Your saved key is unchanged.';
+        renderSelling();
+        return;
+    }
+    const probe = new TornApiClient({ getKey: () => key, ...tornSharing(), maxRetries: 0 });
+    // Two saves close together: only the last one counts (review L11).
+    const seq = (sell.keyProbeSeq = (sell.keyProbeSeq || 0) + 1);
+    probe.get('key', { selections: 'info' }).then(
+        (info) => {
+            if (seq !== sell.keyProbeSeq) return;
+            // Too little access to read your inventory (a Public or Minimal key):
+            // refused, and the key you had stays (review H3: it replaced it).
+            const why = keyTooLowForInventory(info);
+            if (why) {
+                sell.keyError = why + ' Your saved key is unchanged.';
+                renderSelling();
+                return;
+            }
+            useSellKey(key);
+        },
+        (error) => {
+            if (seq !== sell.keyProbeSeq) return;
+            // Torn said no: the key you had stays. Anything else (no answer): saved, as before.
+            if (isKeyDeadError(error)) {
+                sell.keyError = 'Torn does not accept that key. Your saved key is unchanged.';
+                renderSelling();
+                return;
+            }
+            useSellKey(key);
+        },
+    );
+}
+
+/** A Limited key Torn accepted: saved, and everything read again with it. */
+function useSellKey(key) {
     gmSet(STORE_SELL_KEY, key);
     gmDel(STORE_SELL_KEY_DEAD);
     gmDel(STORE_SELL_KEY_ACCESS);
@@ -5199,18 +5527,26 @@ function forgetSelf() {
 function onSellSaveTeKey(key) {
     key = String(key || '').trim();
     if (!key) {
-        setTeState({ error: 'Paste a key first.' });
+        sell.teKeyMsg = 'Paste a key first.';
         renderSelling();
         return;
     }
     // A Full-access key never goes to a third party: not the Ledger's, and
     // not a "Limited" key that turned out to be Full.
     const access = gmGet(STORE_SELL_KEY_ACCESS, null);
+    // A refused key is said in its own field - never as a TornExchange outage on the pill (review M5).
     if (key === getLedgerKey() || (key === getSellKey() && isFullKey(access))) {
-        setTeState({ error: 'That key has Full access. TornExchange never gets it: paste the Limited key you log into tornexchange.com with.' });
+        sell.teKeyMsg = 'That key has Full access. TornExchange never gets it: paste the Limited key you log into tornexchange.com with. Your saved key is unchanged.';
         renderSelling();
         return;
     }
+    // Its key is a Torn key: a typo never replaces the one you have (3.14.3).
+    if (!looksLikeTornKey(key)) {
+        sell.teKeyMsg = 'A Torn key is 16 letters and digits. Your saved key is unchanged.';
+        renderSelling();
+        return;
+    }
+    sell.teKeyMsg = null;
     gmSet(STORE_TE_KEY, key);
     // A new key clears the old key's verdict, never the shared pace or wait.
     setTeState({ badKey: false, error: null, lastAttemptAt: 0 });
@@ -5420,6 +5756,17 @@ function bootSellingPage() {
             // As picking the item: its full TornExchange list, its bazaars read now.
             onSellSelect(t.itemId);
         },
+        // Favourite (the star) and Blacklist (⊘) on a trader row; the Ledger's Traders tab too.
+        onFavourite: (b, on) => {
+            if (!b || !b.id) return;
+            gmSet(STORE_SELL_FAVOURITES, editFavourite(sellFavourites(), b.id, on));
+            renderSellingNow();
+        },
+        onBlacklist: (b, on) => {
+            if (!b || (!b.id && !b.name)) return;
+            gmSet(STORE_SELL_BLACKLIST, editBlacklist(sellBlacklist(), b, on));
+            renderSellingNow();
+        },
         onTradeAccept: (itemId) => {
             const t = sell.lastTrade && sell.lastTrade.chosen;
             if (!t) return;
@@ -5437,6 +5784,9 @@ function bootSellingPage() {
             }
             all[acc.key] = acc;
             saveSellAccepted(all);
+            // Kept after the trade: the Ledger splits what they paid by these prices.
+            const rec = priceRecordOf(acc);
+            if (rec) gmSet(STORE_SELL_PRICE_RECORDS, addPriceRecord(gmGet(STORE_SELL_PRICE_RECORDS, []), rec));
             // Accepted takes over from the held plan.
             sell.tradeHold.delete(holdKey(itemId, acc.key));
             sell.selected = String(itemId);
@@ -5620,6 +5970,7 @@ function bootSellingPage() {
 
     setInterval(stepW3b, W3B_LIST_STEP_MS);
     setInterval(stepTeOne, TE_ONE_STEP_MS);
+    setInterval(stepTeOwn, TE_ONE_STEP_MS);
 
     // Another Torn Bids tab saved, forgot or read: take its word for it.
     gmOnChange(STORE_LEDGER_KEY, () => {
@@ -5778,12 +6129,12 @@ async function onLedgerSaveKey(key) {
     key = String(key || '').trim();
     led.saveMsg = null;
     if (!key) {
-        led.saveMsg = { bad: true, text: 'Paste your Full key first.' };
+        led.saveMsg = { bad: true, at: Date.now(), text: 'Paste your Full key first.' };
         renderSelling();
         return;
     }
     if (!/^[A-Za-z0-9]{16}$/.test(key)) {
-        led.saveMsg = { bad: true, text: 'A Torn key is 16 letters and digits.' };
+        led.saveMsg = { bad: true, at: Date.now(), text: 'A Torn key is 16 letters and digits.' + (getLedgerKey() ? ' Your saved key is unchanged.' : '') };
         renderSelling();
         return;
     }
@@ -5797,11 +6148,11 @@ async function onLedgerSaveKey(key) {
     try {
         const info = await fetchLedgerKeyInfo(probe);
         if (!isFullKey(info)) {
-            led.saveMsg = { bad: true, text: 'This is ' + (info.type ? 'a ' + info.type.replace(/\s*access$/i, '') : 'not a Full') + ' key. The Ledger reads your log, which needs a Full key. Not saved.' };
+            led.saveMsg = { bad: true, text: 'This is ' + (info.type ? 'a ' + info.type.replace(/\s*access$/i, '') : 'not a Full') + ' key. The Ledger reads your log, which needs a Full key. Not saved' + (getLedgerKey() ? ': your saved key is unchanged.' : '.'), at: Date.now() };
             return;
         }
         if (!info.userId) {
-            led.saveMsg = { bad: true, text: 'Torn did not say whose key this is. Not saved.' };
+            led.saveMsg = { bad: true, at: Date.now(), text: 'Torn did not say whose key this is. Not saved.' };
             return;
         }
         // Another account's key: its own ledger, not this one's rows.
@@ -5815,7 +6166,7 @@ async function onLedgerSaveKey(key) {
         led.nextAt = 0;
         runLedger();
     } catch (error) {
-        led.saveMsg = { bad: true, text: redactKey(ledgerErrorText(error), key) };
+        led.saveMsg = { bad: true, at: Date.now(), text: redactKey(ledgerErrorText(error), key) };
     } finally {
         led.checking = false;
         renderSelling();
@@ -5942,7 +6293,12 @@ async function runLedger({ now = Date.now() } = {}) {
                     const item = sell.index && sell.index.byId ? sell.index.byId.get(String(id)) : null;
                     return item ? item.marketValue : 1;
                 };
-                if (full) addLedgerRows(data, rowsFromTrade({ ...t, ...full }, self, valueOf));
+                if (full) {
+                    const whole = { ...t, ...full };
+                    const partner = [whole.trader, whole.user].find((p) => p && String(p.id) !== String(self));
+                    const agreed = partner ? acceptedPricesFor(gmGet(STORE_SELL_PRICE_RECORDS, []), partner.id, Number(whole.completed_at || whole.timestamp || whole.modified_at) * 1000) : null;
+                    addLedgerRows(data, rowsFromTrade(whole, self, valueOf, agreed ? (id) => agreed[String(id)] || 0 : null));
+                }
                 seen.add(String(t.id));
                 delete fails[t.id];
             }
@@ -5986,7 +6342,8 @@ function ledgerView() {
         hasKey,
         keyError: gmGet(STORE_LEDGER_KEY_DEAD, null) || null,
         checking: Boolean(led.checking),
-        saveMsg: led.saveMsg,
+        // A refusal is said for a while, then the key's own state shows again (review: it stuck).
+        saveMsg: led.saveMsg && led.saveMsg.bad && Date.now() - (led.saveMsg.at || 0) > LEDGER_MSG_MS ? null : led.saveMsg,
         busy: Boolean(led.busy),
         error: led.error,
         readAt: data ? data.readAt : 0,
@@ -5995,6 +6352,11 @@ function ledgerView() {
         rows: data ? data.rows : [],
         mugs: data ? data.mugs || [] : [],
         mugKeys: data ? data.mugKeys || [] : [],
+        // Ledger › Traders and the Receipts trader picker (core/partners.js).
+        partners: data ? partnersNow() : [],
+        favourites: sellFavourites(),
+        blacklist: sellBlacklist(),
+        trustOf: (id) => sell.trustById.get(String(id)) || null,
     };
 }
 

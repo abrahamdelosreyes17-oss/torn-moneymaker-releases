@@ -162,3 +162,15 @@ export function formatAge(ms) {
 
     return Math.floor(hours / 24) + 'd ago';
 }
+
+/**
+ * A whole number typed in a quantity box (3.14.3): "25", "1,000" and "1 000"
+ * read as numbers; anything else ("abc", "-3", "5m", "2.5", empty) is null -
+ * never a guess. A stray "s" is not dropped any more (the old /[,s]/ typo).
+ */
+export function readWholeNumber(text) {
+    const t = String(text === null || text === undefined ? '' : text).trim().replace(/[,\s]/g, '');
+    if (!/^\d+$/.test(t)) return null;
+    const n = Number(t);
+    return Number.isSafeInteger(n) ? n : null;
+}

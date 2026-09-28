@@ -5,16 +5,41 @@
 
 /*
  * In the background (3.14, the owner: "can we do it automatically?"): Torn
- * Bids keeps reading TornExchange and TornW3B while its tab is hidden - a
- * quarter of TornW3B's in-view pace - and works out the flips now and then,
- * so the page is current when you look at it. Torn API calls stay in-view only.
+ * Bids keeps reading TornExchange and TornW3B while its tab is hidden, and
+ * works out the flips now and then, so the page is current when you look at
+ * it. Torn API calls stay in-view only.
+ *
+ * 3.14.3: 3.14.1 allowed 6 reads a minute and gave every other one to a
+ * trader's price list (2,482 of them), so a hidden page had checked 3 of 30
+ * possible flips after five minutes (the owner's page). Hidden, the flips now
+ * come before the price lists (nextW3bRead's `hidden`), at 20 reads a minute -
+ * still below the in-view 24 - so all 30 are checked within two minutes.
  */
-export const W3B_HIDDEN_PER_MIN = 6;
+export const W3B_HIDDEN_PER_MIN = 20;
+/* Of those, price lists at most this many (3.14.1's pace): a page that loads
+ * hidden has no possible flips yet, and the lists took the whole minute's reads
+ * in five seconds - the flips, found a moment later, waited a minute. */
+export const W3B_HIDDEN_LISTS_PER_MIN = 6;
 export const HIDDEN_RENDER_MS = 30 * 1000;
 
 /** May a hidden tab make another TornW3B read now? `recent`: its reads' times. */
 export function backgroundSlot(recent, now, perMinute = W3B_HIDDEN_PER_MIN) {
     return (recent || []).filter((t) => now - t < 60000).length < perMinute;
+}
+
+/** Hidden, may the next read be a price list? `lists`: the lists' read times. */
+export function backgroundListSlot(lists, now) {
+    return backgroundSlot(lists, now, W3B_HIDDEN_LISTS_PER_MIN);
+}
+
+/**
+ * Hidden, work the flips out again now? Yes once newer data has come in (the
+ * bazaar summary, TornExchange's buyers): until then the possible flips are
+ * the old ones (or none, on a page that loaded hidden) and the reads would go
+ * to price lists instead.
+ */
+export function flipsStale(dataAt, workedOutAt) {
+    return !!dataAt && dataAt > (workedOutAt || 0);
 }
 
 /*
@@ -77,11 +102,12 @@ export function deskItem({ pickedByYou = false, selected = null, filter = 'all',
  * @param {string[]} p.candidates - possible flips, best first
  * @param {string[]} p.pinned - pinned trades' items
  * @param {string|null} p.list - the next trader price list due, or null
- * @param {number} p.turn - 0 or 1: flips and lists take turns
+ * @param {number} p.turn - 0 or 1: flips and lists take turns (in view)
+ * @param {boolean} p.hidden - the tab is hidden: flips before lists
  * @param {function} p.due - (itemId, 'desk' | 'slow') => boolean
  * @returns {null|{kind: 'summary'}|{kind: 'bazaars', id: string}|{kind: 'list', id: string}}
  */
-export function nextW3bRead({ summaryDue = false, picked = null, active = false, live = [], wanted = [], candidates = [], pinned = [], list = null, turn = 0, due }) {
+export function nextW3bRead({ summaryDue = false, picked = null, active = false, live = [], wanted = [], candidates = [], pinned = [], list = null, turn = 0, hidden = false, due }) {
     if (summaryDue) return { kind: 'summary' };
     if (picked && due(picked, 'desk')) return { kind: 'bazaars', id: picked };
     if (active) {
@@ -91,7 +117,8 @@ export function nextW3bRead({ summaryDue = false, picked = null, active = false,
         if (w) return { kind: 'bazaars', id: w };
     }
     const cand = candidates.find((id) => due(id, 'slow'));
-    if (cand && (turn || !list)) return { kind: 'bazaars', id: cand };
+    // Hidden, the flips first: the price lists can wait until you look.
+    if (cand && (turn || !list || hidden)) return { kind: 'bazaars', id: cand };
     if (list) return { kind: 'list', id: list };
     if (cand) return { kind: 'bazaars', id: cand };
     if (!active) {

@@ -538,7 +538,9 @@ prices in two places, and TornW3B has no list of its traders, so the script
 keeps its own:
 - every active **TornExchange** trader (`/api/active_traders`, with ids), and
   the top three buyers of every item (`/api/all_best_listings`, every 10 min);
-  an item's **full** buyer list (`/api/listings`) only when you pick it;
+  an item's **full** buyer list (`/api/listings`) only when you pick it; and
+  (3.14.3) each of your **favourite** traders' whole list (`/api/prices/{id}`,
+  every 30 min, in the same shared 10-second pace, visible tab only);
 - every trader a **TornW3B** page you open links to (`/pricelist/{id}` links:
   its Highest Rated and Most Trades lists, Search Deals). On weav3r.dev the
   script only reads the page you are on, sends nothing and changes nothing;
@@ -548,7 +550,30 @@ keeps its own:
   a trader with no list is checked again daily. A list older than 6 hours is
   not shown.
 
-**Settings** (⚙, and where the page opens until the Limited key is saved):
+**Your traders** (3.14.3, under Best flips, folds away): for each favourite
+(5+ finished trades, the last within a month, or added with ☆) and each
+trader with a Trusted badge, the best whole trade with them now - Put on desk.
+A favourite with no public list is taken at what they last accepted, marked
+"Last paid". **Blacklisted** traders (⊘) are never a buyer anywhere (flips,
+trades, Where to sell, the overlay's tags); their bazaars are still bought
+from; Undo in Settings › Flips and Ledger › Traders. The Ledger's **Traders**
+tab lists everyone you traded with (trades, money, profit, last trade, "Paid
+list 6 of 7"), and Receipts has a Trader picker with that trader's totals.
+
+**Bought since you accepted** (3.14.3, on Torn's pages): while a trade is
+accepted, its own small window - above NPC Arbitrage, dragged by its title
+anywhere, folds to one line - lists what you bought for it (cost, what they
+pay, profit, what is still to buy). On Torn's trade page it is a checklist:
+each item "✓ in" once it is in the trade, and anything bought but not added
+is named. It never presses anything of Torn's, and goes at Traded - done.
+
+**Settings** (⚙, and where the page opens until the Limited key is saved).
+There are no Save buttons (3.14.3): each box shows what is saved; Enter, Tab
+or clicking away saves it ("Saved ✓"), Esc puts it back, a bad value is said
+in red under the box and the saved one stays. Cash for flips is "No limit" or
+"Up to" an amount. A key is saved on Enter or on leaving its box, and only
+once it checks out (16 letters and digits; Torn accepts it; for the Limited
+key, not a Public or Minimal one) - otherwise the saved key is unchanged.
 - **Torn API key - a Limited key.** Used only here: your inventory
   (`/v2/user/inventory`), your own id (`user` basic), the item database when
   the shared cache is stale, the Item Market for the item on the desk, and
@@ -798,8 +823,8 @@ code flaw. These measures address both halves.
 8. **No key is left in the page.** A value in an `<input>` on torn.com is
    readable by every script on the page, so a saved key is only put into its
    field while the user has pressed *Show* - the panel's Public key and both of
-   the traders page's keys alike - and taken out again after a minute, or on
-   Save. Error text is redacted with `redactKey()` for whichever key a client holds.
+   the traders page's keys alike - and taken out again after a minute, or when
+   it is saved (Enter or leaving the box). Error text is redacted with `redactKey()` for whichever key a client holds.
 9. **Every tab together, and never from a hidden tab** (3.12.5). The Torn API
    window (70/min) and TornW3B's (80/min) are counted across tabs with each
    tab writing only its own slots (`platform/tab-window.js`), so tabs no

@@ -22,12 +22,13 @@
  * TornExchange or TornW3B only ever go in via textContent.
  */
 
-import { formatMoney, formatAge, parseMoneyInput } from '../core/parse.js';
+import { formatMoney, formatAge, parseMoneyInput, readWholeNumber } from '../core/parse.js';
 import { TOKENS_CSS } from './styles.js';
 import { TORN_API_KEY_URL } from './panel.js';
 import { TE_SITE_URL, tePriceListUrl } from '../api/te.js';
 import { w3bPriceListUrl } from '../api/w3b.js';
 import { bazaarUrl } from '../core/feed.js';
+import { extrasPerTrade, EXTRA_ITEMS_MAX } from '../core/trade.js';
 import { itemMarketUrl } from '../sources/route.js';
 import { LedgerView, LEDGER_CSS } from './ledger-view.js';
 import { keyInputAttrs, keyMask } from './mask.js';
@@ -41,8 +42,14 @@ export const SELLING_PAGE_DEFAULTS = {
     trustedOnly: true,
     /* Flips never plan to spend more than this; null is no limit. */
     cash: null,
+    /* The last Cash amount, kept while No limit is picked (Up to brings it back). */
+    cashLast: null,
     /* The most items one flip buys: no trader takes thousands. */
     maxPerFlip: 100,
+    /* Extra items a trade adds beside the main flip, 1 to 10 (3.14.3; each from at most 3 bazaars). */
+    extraItems: 5,
+    /* Your traders (favourites and Trusted): the section is open. */
+    scanOpen: true,
     /* Every link opens a new tab. */
     linksNewTab: true,
     /* A flip never asks a trader to pay more than this share of their networth. */
@@ -58,6 +65,9 @@ export const SELLING_PAGE_DEFAULTS = {
      */
     neverFlip: ['Clothing', 'Other'],
 };
+
+/* Your traders: this many cards before "Show all". */
+const SCAN_SHOWN = 5;
 
 /** The item list shows this many at a time. */
 export const ALL_ITEMS_PAGE = 50;
@@ -127,6 +137,51 @@ function pinIcon() {
     return svg;
 }
 
+/*
+ * Number boxes behave like any form (3.14.3, the owner: "I click on 20, I have
+ * to click right of the 0 and backspace... I can't just double-click and type
+ * normally"): clicking into one, or tabbing in, selects what is there, so what
+ * you type replaces it. A second click places the caret as usual.
+ */
+function selectOnFocus(input) {
+    let fresh = false;
+    let pressed = false;
+    input.addEventListener('pointerdown', () => {
+        pressed = document.activeElement !== input && (!input.getRootNode || input.getRootNode().activeElement !== input);
+    });
+    input.addEventListener('focus', () => {
+        // Tabbed in: selected, and a later click places the caret as usual.
+        fresh = pressed;
+        pressed = false;
+        input.select();
+    });
+    // The click that focused it would put the caret back: keep the selection.
+    input.addEventListener('mouseup', (event) => {
+        // A drag chose its own part: kept. A plain click: the whole number again.
+        if (fresh && input.selectionStart === input.selectionEnd) {
+            event.preventDefault();
+            input.select();
+        }
+        fresh = false;
+    });
+    input.addEventListener('keydown', () => {
+        fresh = false;
+    });
+}
+
+/** A box that refused what was typed: red for a moment, and why - written beside it, and read out. */
+function flashBad(input, why) {
+    input.classList.add('sp-in-bad');
+    input.setAttribute('aria-invalid', 'true');
+    const said = spEl('span', { class: 'sp-inerr', role: 'alert', text: ' ' + why });
+    input.after(said);
+    setTimeout(() => {
+        input.classList.remove('sp-in-bad');
+        input.removeAttribute('aria-invalid');
+        said.remove();
+    }, 3000);
+}
+
 function spEl(tag, props = {}, children = []) {
     const node = document.createElement(tag);
     for (const [key, value] of Object.entries(props)) {
@@ -166,19 +221,34 @@ function keyField({ placeholder, onSave, onReveal, primary = false }) {
         },
     });
     show.addEventListener('click', () => mask.toggle());
+    // No Save button (3.14.3, the owner: "just instant save upon clicking away
+    // or enter"): what you pasted is saved on Enter or on leaving the box. The
+    // box is emptied at once - a saved key is never left in the page.
     const save = () => {
         const key = input.value.trim();
+        if (!key) return;
         mask.hide();
         input.value = '';
         onSave(key);
     };
     input.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape') {
+            event.stopPropagation();
+            input.value = '';
+            input.blur();
+            return;
+        }
         if (event.key !== 'Enter') return;
         event.preventDefault();
         save();
     });
-    const saveBtn = spEl('button', { type: 'button', class: 'sp-btn' + (primary ? ' sp-primary' : ''), text: 'Save', onclick: save });
-    return { input, row: spEl('div', { class: 'sp-inline' }, [input, show, saveBtn]) };
+    // Leaving the box saves - but not a click on its own Show button.
+    input.addEventListener('blur', (event) => {
+        if (event.relatedTarget === show) return;
+        save();
+    });
+    void primary;
+    return { input, row: spEl('div', { class: 'sp-inline' }, [input, show]) };
 }
 
 export class SellingPage {
@@ -264,12 +334,7 @@ export class SellingPage {
 
         this.keyHandler = (event) => {
             if (event.key === 'Escape') {
-                // Typed but not saved: the first Esc says so, the second leaves.
-                if (this.view === 'settings' && !this.escWarned && this.warnUnsaved()) {
-                    this.escWarned = true;
-                    return;
-                }
-                this.escWarned = false;
+                // Nothing is left unsaved (leaving a box saves it): Esc goes back.
                 if (this.view !== 'list') this.showView('list');
                 return;
             }
@@ -333,25 +398,24 @@ export class SellingPage {
         }
     }
 
-    /**
-     * Settings fields with typed text not saved yet: each one says so under
-     * itself. Returns whether there were any.
-     */
-    warnUnsaved() {
-        const fields = [
-            [this.cashDirty, this.cashInput, this.cashStateEl],
-            [this.maxDirty, this.maxInput, this.maxStateEl],
-            [this.nwDirty, this.nwInput, this.nwStateEl],
-            [this.minDirty, this.minInput, this.minStateEl],
-        ];
-        let any = false;
-        for (const [dirty, input, stateEl] of fields) {
-            if (!dirty || !input || !String(input.value).trim() || !stateEl) continue;
-            stateEl.textContent = 'Not saved yet: press Save, or Esc again to leave without it.';
-            stateEl.className = 'sp-keystate sp-bad';
-            any = true;
+    /** Settings › Flips › Blacklisted traders: each with Undo (3.14.3; also in Ledger › Traders). */
+    renderBlackList() {
+        if (!this.blackListEl) return;
+        const list = this.state.blacklist || [];
+        const sig = JSON.stringify(list.map((x) => [x.key, x.name]));
+        if (sig === this.blackSig) return;
+        this.blackSig = sig;
+        this.blackListEl.textContent = '';
+        if (!list.length) {
+            this.blackListEl.appendChild(spEl('div', { class: 'sp-keystate', text: 'Nobody blacklisted.' }));
+            return;
         }
-        return any;
+        for (const x of list) {
+            this.blackListEl.appendChild(spEl('div', { class: 'sp-keeprow' }, [
+                spEl('span', { text: x.name || (x.id ? 'Player ' + x.id : 'Someone') }),
+                spEl('button', { type: 'button', class: 'sp-btn', 'data-focus': 'set:unblk:' + x.key, 'aria-label': 'Take ' + (x.name || 'them') + ' off the blacklist', text: 'Undo', onclick: () => this.h.onBlacklist && this.h.onBlacklist({ id: x.id, name: x.name }, false) }),
+            ]));
+        }
     }
 
     destroy() {
@@ -448,7 +512,7 @@ export class SellingPage {
             class: 'sp-toggle',
             'aria-pressed': 'false',
             onclick: () => set({ trustedOnly: !this.state.prefs.trustedOnly }),
-        }, [spEl('span', { class: 'sp-trust', 'data-level': 'trusted', text: 'T' }), 'Trusted buyers only']);
+        }, [spEl('span', { class: 'sp-trust', 'data-level': 'trusted', 'aria-hidden': 'true', text: 'T' }), 'Trusted buyers only']);
         this.stripEl = spEl('div', { class: 'sp-strip' });
         // Numbers update under your pointer, the order does not: a card never
         // moves while you are about to press it (3.14).
@@ -460,6 +524,9 @@ export class SellingPage {
             this.renderStrip();
         });
         this.catLineEl = spEl('div', { class: 'sp-catline', hidden: '' });
+        /* Your traders: the best whole trade with each favourite and Trusted trader now (3.14.3) */
+        this.scanEl = spEl('section', { class: 'sp-scan', 'aria-label': 'Your traders' });
+        this.scanAll = false;
 
         /* the desk: every item, and the one picked */
         this.chipBtns = {};
@@ -502,6 +569,7 @@ export class SellingPage {
                     this.trustedBtn,
                 ]),
                 this.stripEl,
+                this.scanEl,
                 this.catLineEl,
                 spEl('div', { class: 'sp-desk' }, [
                     spEl('div', { class: 'sp-col-list' }, [
@@ -527,6 +595,8 @@ export class SellingPage {
                 if (this.ledgerKeyInput) this.ledgerKeyInput.focus({ preventScroll: true });
             },
             onOpenUrl: (url) => this.h.onOpenUrl && this.h.onOpenUrl(url),
+            onFavourite: (b, on) => this.h.onFavourite && this.h.onFavourite(b, on),
+            onBlacklist: (b, on) => this.h.onBlacklist && this.h.onBlacklist(b, on),
         });
         this.ledgerEl = spEl('main', { class: 'sp-main', hidden: '' }, [this.ledgerView.el]);
 
@@ -646,117 +716,188 @@ export class SellingPage {
             field('State', null, [this.w3bStateEl]),
         ]);
 
-        /* Cash for flips */
-        this.cashInput = spEl('input', {
-            type: 'text',
-            class: 'sp-key',
-            placeholder: 'No limit',
-            'aria-label': 'Cash for flips',
-            autocomplete: 'off',
-            spellcheck: 'false',
-        });
-        this.cashStateEl = spEl('div', { class: 'sp-keystate' });
-        const saveCash = () => {
-            const text = this.cashInput.value.trim();
-            const cash = text ? parseMoneyInput(text) : null;
-            if (text && !(cash > 0)) {
-                this.cashStateEl.textContent = cash === null ? 'Could not read "' + text + '". Try 5000000, 5m or 500k.' : 'Cash must be more than $0. Blank is no limit.';
-                this.cashStateEl.className = 'sp-keystate sp-bad';
-                return;
-            }
-            this.cashInput.value = '';
-            this.cashDirty = false;
-            if (this.h.onPrefsChange) this.h.onPrefsChange({ cash: cash || null });
+        /*
+         * Settings boxes (3.14.3, mockup R-inputs A, picked by the owner): the
+         * box always shows what is saved; a click or Tab selects it, so typing
+         * replaces it; Enter, Tab or clicking away saves, and a green Saved ✓
+         * shows for 2 seconds; Esc puts the saved value back; a bad value turns
+         * the box red with the reason under it, and the saved one stays in
+         * force; an emptied box puts the saved value back. No Save buttons.
+         */
+        this.boxes = [];
+        const settingBox = (input, stateEl, { read, show }) => {
+            selectOnFocus(input);
+            const saved = () => show(this.state.prefs || SELLING_PAGE_DEFAULTS);
+            let bad = false;
+            let savedTimer = null;
+            const clearBad = () => {
+                bad = false;
+                input.classList.remove('sp-in-bad');
+                input.removeAttribute('aria-invalid');
+            };
+            const say = (text, cls = '') => {
+                stateEl.textContent = text;
+                stateEl.className = 'sp-keystate' + (cls ? ' ' + cls : '');
+            };
+            // Returns false when refused.
+            const commit = () => {
+                const text = input.value.trim();
+                if (!text || text === saved()) {
+                    input.value = saved();
+                    clearBad();
+                    if (!savedTimer) say('');
+                    return true;
+                }
+                const r = read(text);
+                if (r.error) {
+                    bad = true;
+                    input.classList.add('sp-in-bad');
+                    input.setAttribute('aria-invalid', 'true');
+                    say(r.error + (saved() ? ' Still ' + saved() + '.' : ''), 'sp-bad');
+                    return false;
+                }
+                clearBad();
+                if (this.h.onPrefsChange) this.h.onPrefsChange(r.patch);
+                input.value = saved();
+                say('Saved ✓', 'sp-ok');
+                clearTimeout(savedTimer);
+                savedTimer = setTimeout(() => {
+                    savedTimer = null;
+                    if (!bad) say('');
+                }, 2000);
+                return true;
+            };
+            input.addEventListener('blur', commit);
+            input.addEventListener('keydown', (event) => {
+                if (event.key === 'Escape') {
+                    // Esc: the saved value, unchanged - and the page stays open.
+                    event.preventDefault();
+                    event.stopPropagation();
+                    input.value = saved();
+                    clearBad();
+                    say('');
+                    input.blur();
+                    return;
+                }
+                if (event.key !== 'Enter') return;
+                event.preventDefault();
+                // Saved: out of the box. Refused: stays, all selected, to type again.
+                if (commit()) input.blur();
+                else input.select();
+            });
+            const box = {
+                commit,
+                // The saved value, unless you are in the box or it is showing a refusal.
+                sync: () => {
+                    const active = input.getRootNode && input.getRootNode().activeElement;
+                    if (active !== input && !bad) input.value = saved();
+                },
+            };
+            this.boxes.push(box);
+            return box;
         };
-        this.cashInput.addEventListener('input', () => {
-            this.cashDirty = true;
+
+        /* Cash for flips: No limit, or Up to an amount (mockup R-inputs D) */
+        this.cashInput = spEl('input', { type: 'text', class: 'sp-key', 'aria-label': 'Cash for flips: up to', autocomplete: 'off', spellcheck: 'false', 'data-focus': 'set:cash' });
+        this.cashStateEl = spEl('div', { class: 'sp-keystate', role: 'status' });
+        const cashAmount = (p) => (p.cash > 0 ? p.cash : p.cashLast > 0 ? p.cashLast : null);
+        this.cashBox = settingBox(this.cashInput, this.cashStateEl, {
+            show: (p) => (cashAmount(p) ? formatMoney(cashAmount(p)) : ''),
+            read: (text) => {
+                const cash = parseMoneyInput(text);
+                if (cash === null) return { error: 'Could not read "' + text + '". Try 5000000, 5m or 500k.' };
+                if (!(cash > 0)) return { error: 'Cash must be more than $0 (or pick No limit).' };
+                return { patch: { cash, cashLast: cash } };
+            },
         });
-        this.cashInput.addEventListener('keydown', (event) => {
-            if (event.key !== 'Enter') return;
-            event.preventDefault();
-            saveCash();
-        });
-        /* Most items per flip */
-        this.maxInput = spEl('input', { type: 'text', class: 'sp-key', placeholder: '100', 'aria-label': 'Most per flip', autocomplete: 'off', spellcheck: 'false' });
-        this.maxStateEl = spEl('div', { class: 'sp-keystate' });
-        const saveMax = () => {
-            const n = Math.floor(Number(String(this.maxInput.value).replace(/[,\s]/g, '')));
-            if (!(n >= 1)) {
-                this.maxStateEl.textContent = 'Type a whole number of items, 1 or more.';
-                this.maxStateEl.className = 'sp-keystate sp-bad';
-                return;
-            }
-            this.maxInput.value = '';
-            this.maxDirty = false;
-            if (this.h.onPrefsChange) this.h.onPrefsChange({ maxPerFlip: n });
+        const cashRadio = (value, label) => {
+            const input = spEl('input', { type: 'radio', name: 'sp-cash-mode', value, 'data-focus': 'set:cashmode:' + value });
+            input.addEventListener('change', () => {
+                if (!input.checked) return;
+                const p = this.state.prefs || SELLING_PAGE_DEFAULTS;
+                if (value === 'none') {
+                    // The amount waits, greyed, for when you pick Up to again.
+                    if (this.h.onPrefsChange) this.h.onPrefsChange({ cash: null, cashLast: p.cash > 0 ? p.cash : p.cashLast || null });
+                } else if (cashAmount(p)) {
+                    if (this.h.onPrefsChange) this.h.onPrefsChange({ cash: cashAmount(p) });
+                } else {
+                    this.cashInput.focus();
+                }
+            });
+            return input;
         };
-        this.maxInput.addEventListener('input', () => {
-            this.maxDirty = true;
-        });
-        this.maxInput.addEventListener('keydown', (event) => {
-            if (event.key !== 'Enter') return;
-            event.preventDefault();
-            saveMax();
-        });
-        this.nwInput = spEl('input', { type: 'text', class: 'sp-key sp-pctin', placeholder: '10', 'aria-label': 'Networth share a trader can pay', autocomplete: 'off', spellcheck: 'false', inputmode: 'decimal' });
-        this.nwStateEl = spEl('div', { class: 'sp-keystate' });
-        const saveNw = () => {
-            const n = Number(String(this.nwInput.value).replace(/[%,\s]/g, ''));
-            if (!(n > 0 && n <= 100)) {
-                this.nwStateEl.textContent = 'Type a percent from 1 to 100.';
-                this.nwStateEl.className = 'sp-keystate sp-bad';
-                return;
-            }
-            this.nwInput.value = '';
-            this.nwDirty = false;
-            if (this.h.onPrefsChange) this.h.onPrefsChange({ networthPct: n });
-        };
-        this.nwInput.addEventListener('input', () => {
-            this.nwDirty = true;
-        });
-        this.nwInput.addEventListener('keydown', (event) => {
-            if (event.key !== 'Enter') return;
-            event.preventDefault();
-            saveNw();
+        this.cashNone = cashRadio('none', 'No limit');
+        this.cashUpTo = cashRadio('upto', 'Up to');
+        // Clicking the box picks Up to.
+        this.cashInput.addEventListener('focus', () => {
+            this.cashUpTo.checked = true;
         });
 
-        this.minInput = spEl('input', { type: 'text', class: 'sp-key sp-pctin', placeholder: '1', 'aria-label': 'Least profit per item, percent', autocomplete: 'off', spellcheck: 'false', inputmode: 'decimal' });
-        this.minStateEl = spEl('div', { class: 'sp-keystate' });
-        const saveMin = () => {
-            const raw = String(this.minInput.value).replace(/[%,\s]/g, '');
-            const n = Number(raw);
-            if (!raw || !(n >= 0 && n <= 100)) {
-                this.minStateEl.textContent = 'Type a percent from 0 to 100.';
-                this.minStateEl.className = 'sp-keystate sp-bad';
-                return;
-            }
-            this.minInput.value = '';
-            this.minDirty = false;
-            if (this.h.onPrefsChange) this.h.onPrefsChange({ minProfitPct: n });
-        };
-        this.minInput.addEventListener('input', () => {
-            this.minDirty = true;
+        /* Most items per flip */
+        this.maxInput = spEl('input', { type: 'text', class: 'sp-key sp-pctin', 'aria-label': 'Most per flip', autocomplete: 'off', spellcheck: 'false', inputmode: 'numeric', 'data-focus': 'set:max' });
+        this.maxStateEl = spEl('div', { class: 'sp-keystate', role: 'status' });
+        this.maxBox = settingBox(this.maxInput, this.maxStateEl, {
+            show: (p) => String(p.maxPerFlip || 100),
+            read: (text) => {
+                // A whole number, or refused (3.14.3: 1.7 was saved as 1).
+                const n = readWholeNumber(text);
+                return n >= 1 ? { patch: { maxPerFlip: n } } : { error: 'Type a whole number of items, 1 or more.' };
+            },
         });
-        this.minInput.addEventListener('keydown', (event) => {
-            if (event.key !== 'Enter') return;
-            event.preventDefault();
-            saveMin();
+        /* Extras per trade: 1 to 10 */
+        this.extraInput = spEl('input', { type: 'text', class: 'sp-key sp-pctin', 'aria-label': 'Extras per trade', autocomplete: 'off', spellcheck: 'false', inputmode: 'numeric', 'data-focus': 'set:extra' });
+        this.extraStateEl = spEl('div', { class: 'sp-keystate', role: 'status' });
+        this.extraBox = settingBox(this.extraInput, this.extraStateEl, {
+            show: (p) => String(extrasPerTrade(p.extraItems)),
+            read: (text) => {
+                const n = readWholeNumber(text);
+                return n >= 1 && n <= EXTRA_ITEMS_MAX ? { patch: { extraItems: n } } : { error: 'Type a whole number from 1 to ' + EXTRA_ITEMS_MAX + '.' };
+            },
+        });
+        /* Trader can pay: a percent of their networth */
+        this.nwInput = spEl('input', { type: 'text', class: 'sp-key sp-pctin', 'aria-label': 'Networth share a trader can pay', autocomplete: 'off', spellcheck: 'false', inputmode: 'decimal', 'data-focus': 'set:nw' });
+        this.nwStateEl = spEl('div', { class: 'sp-keystate', role: 'status' });
+        this.nwBox = settingBox(this.nwInput, this.nwStateEl, {
+            show: (p) => String(p.networthPct || 10),
+            read: (text) => {
+                const n = Number(String(text).replace(/[%,\s]/g, ''));
+                return n >= 1 && n <= 100 ? { patch: { networthPct: n } } : { error: 'Type a percent from 1 to 100.' };
+            },
+        });
+        /* Least profit per item */
+        this.minInput = spEl('input', { type: 'text', class: 'sp-key sp-pctin', 'aria-label': 'Least profit per item, percent', autocomplete: 'off', spellcheck: 'false', inputmode: 'decimal', 'data-focus': 'set:min' });
+        this.minStateEl = spEl('div', { class: 'sp-keystate', role: 'status' });
+        this.minBox = settingBox(this.minInput, this.minStateEl, {
+            show: (p) => String(p.minProfitPct ?? 1),
+            read: (text) => {
+                const raw = String(text).replace(/[%,\s]/g, '');
+                const n = Number(raw);
+                return raw && n >= 0 && n <= 100 ? { patch: { minProfitPct: n } } : { error: 'Type a percent from 0 to 100.' };
+            },
         });
 
         group('Torn Bids');
         section('flips', 'Flips', 'What Best flips and the flip plan may suggest.', [
-            field('Cash for flips', 'Blank: no limit', [
-                spEl('div', { class: 'sp-inline' }, [this.cashInput, spEl('button', { type: 'button', class: 'sp-btn sp-primary', text: 'Save', onclick: saveCash })]),
+            field('Cash for flips', null, [
+                spEl('div', { class: 'sp-radio', role: 'radiogroup', 'aria-label': 'Cash for flips' }, [
+                    spEl('label', { class: 'sp-radio-o' }, [this.cashNone, spEl('span', { text: 'No limit' })]),
+                    spEl('label', { class: 'sp-radio-o' }, [this.cashUpTo, spEl('span', { text: 'Up to' }), this.cashInput]),
+                ]),
                 this.cashStateEl,
                 note(['Flips never plan to spend more than this. Reads 5000000, 5,000,000, 5m or 500k.']),
             ]),
             field('Most per flip', null, [
-                spEl('div', { class: 'sp-inline' }, [this.maxInput, spEl('button', { type: 'button', class: 'sp-btn sp-primary', text: 'Save', onclick: saveMax })]),
+                spEl('div', { class: 'sp-inline sp-pct' }, [this.maxInput, ' items']),
                 this.maxStateEl,
                 note(['The most items one flip plans to buy. No trader takes thousands at once.']),
             ]),
+            field('Extras per trade', null, [
+                spEl('div', { class: 'sp-inline sp-pct' }, ['Up to ', this.extraInput, ' items besides the main flip']),
+                this.extraStateEl,
+                note(['Items the same trader also buys, as cover for the main flip. Each from at most 3 bazaars; the rest are under Show them. 1 to ' + EXTRA_ITEMS_MAX + '.']),
+            ]),
             field('Trader can pay', null, [
-                spEl('div', { class: 'sp-inline sp-pct' }, ['At most ', this.nwInput, ' % of their networth ', spEl('button', { type: 'button', class: 'sp-btn sp-primary', text: 'Save', onclick: saveNw })]),
+                spEl('div', { class: 'sp-inline sp-pct' }, ['At most ', this.nwInput, ' % of their networth']),
                 this.nwStateEl,
                 note(['A flip never asks a trader to pay more than this share of their networth. Networth comes from Torn\'s public stats, read with your Limited key.']),
             ]),
@@ -769,9 +910,14 @@ export class SellingPage {
                 note(['What a trade leaves out of what you hold. Set it in a trade: untick one of yours, or give fewer than you hold.']),
             ]),
             field('Least profit per item', null, [
-                spEl('div', { class: 'sp-inline sp-pct' }, ['At least ', this.minInput, ' % of the price ', spEl('button', { type: 'button', class: 'sp-btn sp-primary', text: 'Save', onclick: saveMin })]),
+                spEl('div', { class: 'sp-inline sp-pct' }, ['At least ', this.minInput, ' % of the price']),
                 this.minStateEl,
                 note(['A flip skips listings that make less than this on each item. A trader is a person: $1 under their price is not worth a trade.']),
+            ]),
+            // Blacklisted traders, with Undo - here too, for anyone without a Ledger key (3.14.3).
+            field('Blacklisted traders', null, [
+                (this.blackListEl = spEl('div', { class: 'sp-keeplist' })),
+                note(['Never a buyer in flips, trades or Where to sell. Their bazaars are still bought from.']),
             ]),
         ]);
 
@@ -785,16 +931,25 @@ export class SellingPage {
             'aria-label': 'Full API key for the Torn Ledger',
         });
         keyMask(this.ledgerKeyInput, 'sp-masked');
+        // Enter or leaving the box saves what you pasted (no Save button, 3.14.3).
         const saveLedgerKey = () => {
             const key = this.ledgerKeyInput.value.trim();
+            if (!key) return;
             this.ledgerKeyInput.value = '';
             if (this.h.onLedgerSaveKey) this.h.onLedgerSaveKey(key);
         };
         this.ledgerKeyInput.addEventListener('keydown', (event) => {
+            if (event.key === 'Escape') {
+                event.stopPropagation();
+                this.ledgerKeyInput.value = '';
+                this.ledgerKeyInput.blur();
+                return;
+            }
             if (event.key !== 'Enter') return;
             event.preventDefault();
             saveLedgerKey();
         });
+        this.ledgerKeyInput.addEventListener('blur', saveLedgerKey);
         this.ledgerStateEl = spEl('div', { class: 'sp-keystate' });
         this.ledgerForgetBtn = spEl('button', {
             type: 'button',
@@ -830,8 +985,8 @@ export class SellingPage {
             ledgerTos.appendChild(spEl('tr', {}, [spEl('th', { text: k }), spEl('td', { text: v })]));
         }
         section('ledger', 'Torn Ledger', 'Your profit from your own Torn log. It needs a Full key, kept apart from your Limited key and used for nothing else.', [
-            field('Full key', 'Never shown again after Save', [
-                spEl('div', { class: 'sp-inline' }, [this.ledgerKeyInput, spEl('button', { type: 'button', class: 'sp-btn sp-primary', text: 'Save', onclick: saveLedgerKey })]),
+            field('Full key', 'Never shown again once saved', [
+                spEl('div', { class: 'sp-inline' }, [this.ledgerKeyInput]),
                 this.ledgerStateEl,
                 note(['Torn is asked whether it is a Full key before it is saved; anything else is refused. It is sent only to api.torn.com, only for your log, your trades and key info. Paste a new one to change it.']),
                 spEl('div', { class: 'sp-inline sp-actions' }, [this.ledgerForgetBtn]),
@@ -962,30 +1117,15 @@ export class SellingPage {
         this.onlineBtn.setAttribute('aria-pressed', String(Boolean(p.onlineOnly)));
         this.trustedBtn.setAttribute('aria-pressed', String(Boolean(p.trustedOnly)));
         this.linksInput.checked = p.linksNewTab !== false;
-        if (!this.cashDirty) {
-            this.cashInput.placeholder = p.cash > 0 ? formatMoney(p.cash) : 'No limit';
-            this.cashStateEl.className = 'sp-keystate';
-            this.cashStateEl.textContent = p.cash > 0 ? 'Saved: ' + formatMoney(p.cash) + '.' : 'No limit set.';
-        }
-
-        if (!this.maxDirty) {
-            this.maxInput.placeholder = String(p.maxPerFlip || 100);
-            this.maxStateEl.className = 'sp-keystate';
-            this.maxStateEl.textContent = 'Saved: ' + count(p.maxPerFlip || 100) + ' items.';
-        }
+        // Every settings box shows what is saved (not while you are in it).
+        for (const box of this.boxes || []) box.sync();
+        const hasCash = p.cash > 0;
+        this.cashNone.checked = !hasCash;
+        if (!(this.cashInput.getRootNode && this.cashInput.getRootNode().activeElement === this.cashInput)) this.cashUpTo.checked = hasCash;
+        this.cashInput.classList.toggle('sp-dim', !hasCash);
         this.renderKeepList(p);
         this.renderNeverFlip(p);
-        if (!this.minDirty) {
-            const m = p.minProfitPct ?? 1;
-            this.minInput.placeholder = String(m);
-            this.minStateEl.className = 'sp-keystate';
-            this.minStateEl.textContent = 'Saved: ' + m + '%.';
-        }
-        if (!this.nwDirty) {
-            this.nwInput.placeholder = String(p.networthPct || 10);
-            this.nwStateEl.className = 'sp-keystate';
-            this.nwStateEl.textContent = 'Saved: ' + (p.networthPct || 10) + '%.';
-        }
+        this.renderBlackList();
 
         this.renderCategory();
         this.renderLedgerKey();
@@ -995,6 +1135,7 @@ export class SellingPage {
         this.renderPills();
         this.renderBanner();
         this.renderStrip();
+        this.renderScan();
         this.renderList();
         this.renderDesk();
         this.fitDesk();
@@ -1071,7 +1212,10 @@ export class SellingPage {
         }
 
         this.teStateEl.className = 'sp-keystate';
-        if (info.teBadKey || (info.teError && !info.hasTeKey)) {
+        if (info.teKeyMsg) {
+            this.teStateEl.textContent = info.teKeyMsg;
+            this.teStateEl.classList.add('sp-bad');
+        } else if (info.teBadKey || (info.teError && !info.hasTeKey)) {
             this.teStateEl.textContent = info.teError || 'TornExchange did not accept this key.';
             this.teStateEl.classList.add('sp-bad');
         } else if (!info.hasTeKey) {
@@ -1154,12 +1298,13 @@ export class SellingPage {
         b.textContent = '';
         b.className = 'sp-banner';
 
-        const say = (text, level, label, fn) => {
+        const say = (text, level, label, fn, label2 = null, fn2 = null) => {
             b.classList.add('sp-banner-on');
             if (level) b.classList.add('sp-banner-' + level);
             b.appendChild(spEl('span', { text }));
             if (label && this.view !== 'settings') {
                 b.appendChild(spEl('button', { type: 'button', class: 'sp-btn sp-primary', text: label, onclick: fn }));
+                if (label2) b.appendChild(spEl('button', { type: 'button', class: 'sp-btn', text: label2, onclick: fn2 }));
             }
         };
         const toSettings = () => this.showView('settings');
@@ -1175,7 +1320,8 @@ export class SellingPage {
             // What the button does, before it does it: this key goes to tornexchange.com.
             say('Most traders post their prices on TornExchange (tornexchange.com). It reads them only with the Torn key you log in there with. If that is your Limited key, this sends it to TornExchange too.', null, 'Use my Limited key', useLimited);
         } else if (info.teBadKey && !info.teSameAsLimited) {
-            say(info.teError || 'TornExchange did not accept this key.', 'bad', 'Use my Limited key', useLimited);
+            // Its message says "then Try again": the button is there (review M13).
+            say(info.teError || 'TornExchange did not accept this key.', 'bad', 'Try again', () => this.h.onRetryTe && this.h.onRetryTe(), 'Use my Limited key', useLimited);
         } else if (info.teBadKey) {
             say(info.teError || 'TornExchange did not accept this key.', 'bad', 'Try again', () => this.h.onRetryTe && this.h.onRetryTe());
         } else if (info.teWaitUntil && info.teWaitUntil > Date.now()) {
@@ -1207,6 +1353,100 @@ export class SellingPage {
     }
 
     /* ------------------------------------------------------------ strip */
+
+    /** The focus key of what has the focus inside `box`, or null. */
+    focusKeyIn(box) {
+        const shadow = this.root && this.root.getRootNode();
+        const active = shadow && shadow.activeElement;
+        return active && box.contains(active) && active.dataset ? active.dataset.focus || null : null;
+    }
+
+    /** After `box` was drawn again: the focus back on the same thing's new copy. */
+    focusBack(box, key) {
+        if (!key) return;
+        const node = [...box.querySelectorAll('[data-focus]')].find((n) => n.dataset.focus === key);
+        if (node) node.focus({ preventScroll: true });
+    }
+
+    /**
+     * Your traders (3.14.3; mockup Q4 A, collapsible): one card per favourite
+     * and Trusted trader - the best whole trade with them now, and Put on desk.
+     * Folded, it says how many; open, the biggest trades first.
+     */
+    renderScan() {
+        const s = this.state;
+        const sc = s && s.scan;
+        const box = this.scanEl;
+        if (!sc) return;
+        const refocus = this.focusKeyIn(box);
+        queueMicrotask(() => this.focusBack(box, refocus));
+        const sig = JSON.stringify([sc.open, sc.favourites, sc.trusted, this.scanAll, s.desk && s.desk.itemId, s.desk && s.desk.trade && s.desk.trade.chosen && s.desk.trade.chosen.key,
+            sc.list.map((x) => [x.id, x.name, x.profit, x.items, x.stops, x.reading, x.lastPaid, x.mainId, x.mainUnits, x.favourite, x.traded, x.trust && x.trust.level + x.trust.score])]);
+        if (sig === this.scanSig) return;
+        this.scanSig = sig;
+        box.textContent = '';
+        const total = sc.favourites + sc.trusted;
+        const toggle = () => this.h.onPrefsChange && this.h.onPrefsChange({ scanOpen: !sc.open });
+        box.appendChild(spEl('div', { class: 'sp-sec sp-scanh' }, [
+            spEl('button', { type: 'button', class: 'sp-fold', 'aria-expanded': String(sc.open), 'data-focus': 'scan:fold', title: sc.open ? 'Fold away' : 'Show the best trade with each', onclick: toggle }, [
+                spEl('span', { class: 'sp-chev', text: sc.open ? '▾' : '▸' }),
+                spEl('h2', { text: 'Your traders · best trade now' }),
+            ]),
+            spEl('span', { class: 'sp-sp' }),
+            spEl('small', { class: 'sp-muted', text: total ? count(sc.favourites) + (sc.favourites === 1 ? ' favourite' : ' favourites') + ' · ' + count(sc.trusted) + ' trusted' : 'No favourites or trusted traders yet' }),
+        ]));
+        if (!sc.open || !total) return;
+        const onDesk = s.desk && s.desk.trade && s.desk.trade.chosen ? s.desk.trade.chosen.key : null;
+        const shown = this.scanAll ? sc.list : sc.list.slice(0, SCAN_SHOWN);
+        const grid = spEl('div', { class: 'sp-scangrid' });
+        for (const x of shown) {
+            const ready = x.items > 0 && x.profit > 0;
+            const sel = ready && onDesk === x.key && s.desk && s.desk.itemId === x.mainId;
+            const head = spEl('span', { class: 'sp-fc-top' }, [
+                x.favourite ? spEl('span', { class: 'sp-star', title: 'Favourite', text: '★' }) : null,
+                spEl('b', { class: 'sp-iname', text: x.name }),
+                this.trustBadge(x),
+                x.lastPaid ? spEl('span', { class: 'sp-lastpaid', title: 'No public list: the prices they accepted from you last time. Check before buying.', text: 'Last paid' }) : null,
+            ]);
+            const card = spEl('div', { class: 'sp-fc sp-tc' + (ready ? ' sp-tc-ready' : ' sp-tc-none') + (sel ? ' sp-sel' : '') }, [head]);
+            if (ready) {
+                card.append(
+                    spEl('span', { class: 'sp-fc-p' + (x.lastPaid || x.estimated ? ' sp-est' : ''), title: x.lastPaid ? 'About: from what they paid you last time' : x.estimated ? 'About: some bazaars are still being read' : null, text: (x.lastPaid || x.estimated ? '≈ ' : '') + 'Trade ' + signed(x.profit) }),
+                    spEl('small', {}, [spEl('b', { text: count(x.items) + (x.items === 1 ? ' item' : ' items') }), ' · ' + count(x.stops) + (x.stops === 1 ? ' bazaar' : ' bazaars') + (x.mainName ? ' · ' + x.mainName + ' ×' + count(x.mainUnits) + (x.items > 1 ? ' + ' + count(x.items - 1) + (x.items === 2 ? ' extra' : ' extras') : '') : '')]),
+                );
+            } else {
+                card.appendChild(spEl('small', { text: x.reading ? 'Reading their list…' : 'No trade now: nothing in bazaars under their prices' }));
+            }
+            if (x.traded) card.appendChild(spEl('small', { class: 'sp-traded', text: x.traded }));
+            card.appendChild(spEl('button', {
+                type: 'button',
+                class: 'sp-btn sp-go' + (sel ? ' sp-go-on' : ''),
+                'data-focus': 'scan:' + x.id,
+                disabled: ready ? null : '',
+                title: ready ? 'Put this trade on the desk: ' + x.mainName + ' with ' + x.name : '',
+                text: sel ? 'On the desk ✓' : 'Put on desk',
+                onclick: () => {
+                    if (!ready || !this.h.onTradePick) return;
+                    this.h.onTradePick(x.mainId, x.key);
+                    this.deskEl.scrollIntoView({ block: 'start', behavior: 'smooth' });
+                },
+            }));
+            grid.appendChild(card);
+        }
+        box.appendChild(grid);
+        if (sc.list.length > SCAN_SHOWN) {
+            box.appendChild(spEl('button', {
+                type: 'button',
+                class: 'sp-link sp-showall',
+                'data-focus': 'scan:all',
+                text: this.scanAll ? 'Show the top ' + SCAN_SHOWN : 'Show all ' + count(sc.list.length) + ' traders',
+                onclick: () => {
+                    this.scanAll = !this.scanAll;
+                    this.renderScan();
+                },
+            }));
+        }
+    }
 
     renderStrip() {
         const s = this.state;
@@ -1240,7 +1480,10 @@ export class SellingPage {
         this.stripShown = strip;
 
         const box = this.stripEl;
+        const refocus = this.focusKeyIn(box);
         box.textContent = '';
+        // Leftovers and flips below: focus goes back once they are drawn.
+        queueMicrotask(() => this.focusBack(box, refocus));
         // What a trader did not take: first, until it is sold (or you drop it).
         for (const l of s.leftovers || []) {
             const on = Boolean(s.desk && s.desk.itemId === String(l.itemId));
@@ -1248,6 +1491,7 @@ export class SellingPage {
                 class: 'sp-fc sp-lo' + (on ? ' sp-sel' : ''),
                 role: 'button',
                 tabindex: '0',
+                'data-focus': 'left:' + l.itemId,
                 'aria-pressed': String(on),
                 title: 'Left over from the trade with ' + (l.from || 'a trader') + ': show where to sell it',
             }, [
@@ -1286,6 +1530,7 @@ export class SellingPage {
                 type: 'button',
                 class: 'sp-pin' + (pinned ? ' sp-pin-on' : ''),
                 'aria-pressed': String(pinned),
+                'data-focus': 'strippin:' + f.itemId,
                 'aria-label': (pinned ? 'Unpin ' : 'Pin ') + f.name + '\'s trade',
                 title: pinned ? 'Pinned on top of the list: press to unpin' : 'Pin this trade: it stays on top of the list, only prices move',
                 onclick: (event) => {
@@ -1297,6 +1542,7 @@ export class SellingPage {
                 class: 'sp-fc' + (on ? ' sp-sel' : ''),
                 role: 'button',
                 tabindex: '0',
+                'data-focus': 'strip:' + f.itemId,
                 'aria-pressed': String(on),
                 title: 'Show its flip plan',
             }, [
@@ -1359,6 +1605,7 @@ export class SellingPage {
                 type: 'button',
                 class: 'sp-pin sp-pin-on',
                 'aria-pressed': 'true',
+                'data-focus': 'unpin:' + pt.key,
                 'aria-label': 'Unpin the trade with ' + pt.trader,
                 title: 'Pinned: press to unpin',
                 onclick: (event) => {
@@ -1418,6 +1665,7 @@ export class SellingPage {
                     type: 'button',
                     class: 'sp-pin sp-pin-row' + (pinned ? ' sp-pin-on' : ''),
                     'aria-pressed': String(pinned),
+                    'data-focus': 'rowpin:' + r.itemId,
                     'aria-label': (pinned ? 'Unpin ' : 'Pin ') + r.name + '\'s trade',
                     title: pinned ? 'Pinned on top of the list: press to unpin' : 'Pin this trade: it stays on top of the list, only prices move',
                     onclick: (event) => {
@@ -1458,6 +1706,8 @@ export class SellingPage {
     noFlipsText() {
         const info = this.state.info || {};
         if (!info.bazaarsAt) return 'Loading bazaar prices…';
+        // Never "looking" forever when TornExchange has refused the key (review M13).
+        if (info.teBadKey && !info.knownTraders) return 'No traders: TornExchange refused the key.';
         if (info.flipsChecked < info.flipsWanted) return 'No flips found yet. Checking ' + info.flipsChecked + ' of ' + info.flipsWanted + '.';
         if (info.tradersLoading) return 'Looking for traders…';
         return 'No flips with these settings right now.';
@@ -1505,7 +1755,8 @@ export class SellingPage {
         const sig = d
             ? JSON.stringify([
                 d.itemId, d.name, d.held, d.avg, d.bazaars, d.buyersTotal, d.buyersLoading, d.pending, d.planWhy,
-                d.buyers.map((b) => [b.id, b.name, b.price, b.te, b.teTop, b.teList, b.w3b, statusOf(b), b.trust ? b.trust.level + b.trust.score : '', this.state.networth && b.id ? this.state.networth.get(String(b.id)) : null]),
+                d.buyers.map((b) => [b.id, b.name, b.price, b.te, b.teTop, b.teList, b.w3b, statusOf(b), b.trust ? b.trust.level + b.trust.score : '', this.state.networth && b.id ? this.state.networth.get(String(b.id)) : null, Boolean(b.favourite), b.traded || '', Boolean(b.troll), Boolean(b.lastPaidOnly)]),
+                this.justBlacklisted ? this.justBlacklisted.at : 0,
                 p.networthPct,
                 d.sellers.state, d.sellers.error,
                 d.sellers.rows.map((r) => [r.sellerId, r.sellerName, r.price, r.qty, r.stale, Math.floor((now - (r.dataAt || 0)) / 60000)]),
@@ -1517,9 +1768,10 @@ export class SellingPage {
 
         const shadow = this.root.getRootNode();
         const active = shadow && shadow.activeElement;
-        // A number half typed is never replaced: the desk is drawn again
-        // once you press Enter or leave the box.
-        if (active && box.contains(active) && active.dataset && active.dataset.dirty) return;
+        // A box you are in is never replaced (3.14.3: it only waited once you
+        // had typed, so a selection made by a double-click was wiped within
+        // seconds by the next read): the desk is drawn again once you leave it.
+        if (active && box.contains(active) && active.tagName === 'INPUT' && active.type !== 'checkbox' && (active.dataset.dirty || document.hasFocus())) return;
         this.deskSig = sig;
         const keep = active && box.contains(active) && active.dataset ? active.dataset.focus : null;
 
@@ -1560,7 +1812,10 @@ export class SellingPage {
         box.appendChild(quad);
 
         if (keep) {
-            const node = [...box.querySelectorAll('[data-focus]')].find((n) => n.dataset.focus === keep);
+            // A trader just blacklisted is gone from the rows: their Undo takes the focus.
+            // Declined: that trader's Undo (never the next trader's "declined", review M3).
+            const want = keep.startsWith('blk:') && this.justBlacklisted ? 'desk:bl-undo' : keep.startsWith('trade:decline:') ? 'plan:' + keep.slice('trade:decline:'.length) : keep;
+            const node = [...box.querySelectorAll('[data-focus]')].find((n) => n.dataset.focus === want);
             if (node) node.focus({ preventScroll: true });
         }
     }
@@ -1572,26 +1827,44 @@ export class SellingPage {
         // Traders you marked Declined go to the bottom (greyed) until their hour is up.
         const T = d.trade || null;
         const declined = (T && T.declined) || {};
-        const ordered = [...d.buyers.filter((b) => !declined[b.tradeKey]), ...d.buyers.filter((b) => declined[b.tradeKey])];
+        const ordered = [...d.buyers.filter((b) => !declined[b.tradeKey] && !b.troll), ...d.buyers.filter((b) => !declined[b.tradeKey] && b.troll), ...d.buyers.filter((b) => declined[b.tradeKey])];
         const rows = all ? ordered : ordered.slice(0, DESK_ROWS);
         if (d.buyersLoading) card.appendChild(spEl('p', { class: 'sp-note', text: 'Loading more buyers from TornExchange…' }));
+        // Just blacklisted: a moment to take it back (then only the Ledger's Traders tab has Undo).
+        const justOff = this.justBlacklisted && Date.now() - this.justBlacklisted.at < 15000 ? this.justBlacklisted.b : null;
+        if (justOff) {
+            card.appendChild(spEl('p', { class: 'sp-note sp-blnote' }, [
+                'Blacklisted ' + justOff.name + ': never a buyer. ',
+                spEl('button', { type: 'button', class: 'sp-link', 'data-focus': 'desk:bl-undo', text: 'Undo', onclick: () => {
+                    this.justBlacklisted = null;
+                    if (this.h.onBlacklist) this.h.onBlacklist(justOff, false);
+                } }),
+            ]));
+        }
         if (!rows.length) card.appendChild(spEl('p', { class: 'sp-note', text: this.noTraderText(d) }));
-        rows.forEach((b, i) => {
+        // The top row is the best real bid: a troll one (over 3x the market price) is never it.
+        const topRow = rows.find((b) => !b.troll && !declined[b.tradeKey]);
+        rows.forEach((b) => {
             const planning = Boolean(T && ((T.chosen && T.chosen.key === b.tradeKey) || (T.accepted && T.accepted.key === b.tradeKey)));
             const until = declined[b.tradeKey];
-            card.appendChild(spEl('div', { class: 'sp-tr' + (i === 0 && !until ? ' sp-top' : '') + (planning ? ' sp-planning' : '') + (until ? ' sp-declined' : '') }, [
+            card.appendChild(spEl('div', { class: 'sp-tr' + (b === topRow ? ' sp-top' : '') + (b.troll ? ' sp-troll' : '') + (planning ? ' sp-planning' : '') + (until ? ' sp-declined' : '') }, [
                 spEl('span', { class: 'sp-tr-l' }, [
-                    spEl('span', { class: 'sp-trader-l' }, [this.playerName(b.name, b.id, 'buyer:' + (b.id || b.name)), this.trustBadge(b)]),
+                    spEl('span', { class: 'sp-trader-l' }, [this.favButton(b), this.playerName(b.name, b.id, 'buyer:' + (b.id || b.name)), this.trustBadge(b)]),
                     this.status(b),
                     this.networthLine(b),
+                    // Your own history with them (the Ledger): "Traded 7× · last 3d ago".
+                    b.traded ? spEl('small', { class: 'sp-traded', text: b.traded }) : null,
                     // Their two lists disagree: the lower is counted, and said.
                     b.differ
                         ? spEl('small', { class: 'sp-differ', text: 'Lists differ: ' + this.listPrices(b, ' · ') + '. Counted at the lower; check before trading.' })
                         : null,
+                    b.troll ? spEl('small', { class: 'sp-differ', text: 'Over 3× Item Market Average: not counted' }) : null,
+                    // No public list: what they paid you last (review M2).
+                    b.lastPaidOnly ? spEl('small', { class: 'sp-differ', text: 'Last paid: no public list, check with them' }) : null,
                     T ? this.tradeLine(d, b, planning, until) : null,
                 ]),
                 spEl('span', { class: 'sp-tprice', text: formatMoney(b.price) }),
-                this.traderLinks(b),
+                this.traderLinks(b, { blacklist: true }),
             ]));
         });
         if (d.buyers.length > DESK_ROWS) {
@@ -1636,7 +1909,7 @@ export class SellingPage {
         const t = d.trade.perTrader[b.tradeKey];
         const words = [];
         if (t && t.items) words.push('whole trade ' + (t.estimated ? '≈ ' : '') + signed(t.profit) + ' · ' + count(t.items) + (t.items === 1 ? ' item' : ' items') + (t.stops ? ' · ' + count(t.stops) + (t.stops === 1 ? ' bazaar' : ' bazaars') : ''));
-        else if (t) words.push('no trade with your Cash');
+        else if (t) words.push(b.troll ? 'their bid is not believable' : 'no trade with your Cash');
         if (t && !t.hasItem && t.items) words.push('not this item');
         let btn;
         if (until) {
@@ -1657,8 +1930,24 @@ export class SellingPage {
         return spEl('small', { class: 'sp-networth', text: 'Networth ' + formatMoney(nw) });
     }
 
-    /** Trade, TE list and W3B list, in fixed slots so they line up row to row. */
-    traderLinks(b) {
+    /** The star before a trader's name: a favourite (5+ trades this month, or added by you); press to change. */
+    favButton(b) {
+        if (!b || !b.id) return null;
+        const on = Boolean(b.favourite);
+        return spEl('button', {
+            type: 'button',
+            class: 'sp-fav' + (on ? ' sp-fav-on' : ''),
+            'data-focus': 'fav:' + b.id,
+            title: on ? 'Favourite - press to remove' : 'Make ' + b.name + ' a favourite',
+            'aria-pressed': String(on),
+            'aria-label': on ? 'Remove ' + b.name + ' from favourites' : 'Make ' + b.name + ' a favourite',
+            text: on ? '★' : '☆',
+            onclick: () => this.h.onFavourite && this.h.onFavourite(b, !on),
+        });
+    }
+
+    /** Trade, TE list and W3B list, in fixed slots so they line up row to row; ⊘ (blacklist) at the end on the desk. */
+    traderLinks(b, { blacklist = false } = {}) {
         const links = spEl('span', { class: 'sp-links' });
         const slot = (text, url, title) => {
             if (!url) {
@@ -1669,6 +1958,25 @@ export class SellingPage {
         };
         slot('TE list', b.te ? tePriceListUrl(b.teName || b.name) : null, 'TornExchange price list: ' + formatMoney(b.te || 0));
         slot('W3B list', b.w3b && b.id ? w3bPriceListUrl(b.id) : null, 'TornW3B price list: ' + formatMoney(b.w3b || 0));
+        if (blacklist) {
+            links.appendChild(spEl('button', {
+                type: 'button',
+                class: 'sp-blk',
+                'data-focus': 'blk:' + (b.id || b.name),
+                title: 'Blacklist ' + b.name + ': never a buyer (their bazaars are still used)',
+                'aria-label': 'Blacklist ' + b.name,
+                text: '⊘',
+                onclick: () => {
+                    this.justBlacklisted = { b: { id: b.id || null, name: b.name }, at: Date.now() };
+                    clearTimeout(this.blNoteTimer);
+                    this.blNoteTimer = setTimeout(() => {
+                        this.justBlacklisted = null;
+                        this.renderDesk();
+                    }, 15000);
+                    if (this.h.onBlacklist) this.h.onBlacklist(b, true);
+                },
+            }));
+        }
         return links;
     }
 
@@ -1779,8 +2087,8 @@ export class SellingPage {
             spEl('span', { class: 'sp-note', text: c.stops ? count(c.stops) + (c.stops === 1 ? ' bazaar' : ' bazaars') + ' to buy from · about ' + c.minutes + ' min' : 'Nothing to buy: all yours' }),
             spEl('span', { class: 'sp-tpick-b' }, [
                 this.chatLink(b),
-                spEl('button', { type: 'button', class: 'sp-btn sp-primary', 'data-focus': 'trade:accept', title: b.name + ' said yes: freeze this trade, so nothing in it moves while you buy and send', text: b.name + ' accepted', onclick: () => this.h.onTradeAccept && this.h.onTradeAccept(d.itemId) }),
-                spEl('button', { type: 'button', class: 'sp-btn', 'data-focus': 'trade:decline', title: b.name + ' said no to this trade: on to the next flip (this trade is passed over for an hour; their other trades stay)', text: b.name + ' declined', onclick: () => this.h.onTradeDecline && this.h.onTradeDecline(c.key) }),
+                spEl('button', { type: 'button', class: 'sp-btn sp-primary', 'data-focus': 'trade:accept:' + c.key, title: b.name + ' said yes: freeze this trade, so nothing in it moves while you buy and send', text: b.name + ' accepted', onclick: () => this.h.onTradeAccept && this.h.onTradeAccept(d.itemId) }),
+                spEl('button', { type: 'button', class: 'sp-btn', 'data-focus': 'trade:decline:' + c.key, title: b.name + ' said no to this trade: on to the next flip (this trade is passed over for an hour; their other trades stay)', text: b.name + ' declined', onclick: () => this.h.onTradeDecline && this.h.onTradeDecline(c.key) }),
             ]),
         ]));
 
@@ -1809,28 +2117,57 @@ export class SellingPage {
         };
         const qtyBox = (value, label, focus, onSet) => {
             const input = spEl('input', { type: 'text', class: 'sp-qty', inputmode: 'numeric', value: String(value), 'aria-label': label, 'data-focus': focus, autocomplete: 'off', spellcheck: 'false' });
+            selectOnFocus(input);
+            // Just refused, and the desk drawn again since: still said.
+            if (this.qtyRefused && this.qtyRefused.focus === focus && Date.now() - this.qtyRefused.at < 2500) queueMicrotask(() => flashBad(input, 'Type a whole number, like 25'));
             const commit = () => {
+                if (!input.dataset.dirty) return;
                 delete input.dataset.dirty;
-                const n = Math.floor(Number(String(input.value).replace(/[,s]/g, '')));
-                if (Number.isFinite(n) && n >= 0) onSet(n);
-                else input.value = String(value);
+                const n = readWholeNumber(input.value);
+                if (n !== null) {
+                    onSet(n);
+                    return;
+                }
+                // Not a number: put back what was there, and say so (3.14.3: it was silent).
+                input.value = String(value);
+                flashBad(input, 'Type a whole number, like 25');
+                this.qtyRefused = { focus, at: Date.now() };
             };
             input.addEventListener('input', () => {
                 input.dataset.dirty = '1';
             });
-            input.addEventListener('blur', () => {
-                if (!input.dataset.dirty) return;
-                commit();
-            });
-            input.addEventListener('change', commit);
+            // Saved once focus has moved on (Tab to the next box keeps you there),
+            // and the desk catches up with what it held back while you were in the box.
+            input.addEventListener('blur', () => setTimeout(() => {
+                if (input.dataset.dirty) commit();
+                else this.renderDesk();
+            }, 0));
             input.addEventListener('keydown', (event) => {
+                if (event.key === 'Escape') {
+                    // Esc: what was there, unchanged.
+                    event.preventDefault();
+                    event.stopPropagation();
+                    delete input.dataset.dirty;
+                    input.value = String(value);
+                    input.blur();
+                    return;
+                }
                 if (event.key !== 'Enter') return;
+                // Enter: done - saved, and out of the box.
                 event.preventDefault();
-                commit();
+                input.blur();
             });
             return input;
         };
         const edit = (id, e) => this.h.onTradeEdit && this.h.onTradeEdit(c.key, id, e);
+        // You typed more than bazaars list (mockup R-inputs): the plan takes what there is, and says so.
+        const cutNote = (r) => {
+            const t = this.typedQty;
+            if (!t || t.itemId !== r.itemId || Date.now() - t.at > 8000) return null;
+            const got = r.plannedUnits || r.units;
+            if (!(t.n > got)) return null;
+            return spEl('small', { class: 'sp-warnnote', role: 'status', text: count(got) + ' listed - ' + count(t.n) + ' is more than bazaars have' });
+        };
 
         // Buy, then trade: the main flip first.
         if (c.flips.length || c.off.length || c.itemNote) card.appendChild(spEl('div', { class: 'sp-tsec', text: 'Buy, then trade to ' + b.name }));
@@ -1873,7 +2210,12 @@ export class SellingPage {
                 spEl('span', { class: 'sp-pic sp-pic-s' }, [this.image('trade-buy', r.itemId)]),
                 spEl('span', { class: 'sp-ti-l' }, [
                     spEl('span', {}, [this.link(r.name, itemMarketUrl(r.itemId, r.name), { cls: 'sp-tiname', title: 'Open it on the Item Market', focus: 'trade:name:' + r.itemId }), isMain ? spEl('span', { class: 'sp-here', text: 'MAIN' }) : here ? spEl('span', { class: 'sp-here', text: 'THIS ITEM' }) : this.kindTag(r.kind)]),
-                    spEl('small', {}, [qtyBox(r.plannedUnits || r.units, 'How many ' + r.name, 'trade:qty:' + r.itemId, (n) => edit(r.itemId, n > 0 ? { qty: n } : { off: true })), ' at ' + formatMoney(r.bid) + ' each', r.noBid ? spEl('span', { class: 'sp-warnnote', text: ' · not on their list now' }) : null]),
+                    spEl('small', {}, [qtyBox(r.plannedUnits || r.units, 'How many ' + r.name, 'trade:qty:' + r.itemId, (n) => {
+                        // Remembered for a moment: more than bazaars have is cut down, and said.
+                        this.typedQty = { itemId: r.itemId, n, at: Date.now() };
+                        edit(r.itemId, n > 0 ? { qty: n } : { off: true });
+                    }), ' at ' + formatMoney(r.bid) + ' each', r.noBid ? spEl('span', { class: 'sp-warnnote', text: ' · not on their list now' }) : null]),
+                    cutNote(r),
                 ]),
                 spEl('span', { class: 'sp-ti-p ' + (r.profit < 0 ? 'sp-bad' : 'sp-good') }, [(r.estimated ? '≈ ' : '') + signed(r.profit), spEl('small', { text: 'cost ' + formatMoney(r.cost) })]),
                 spEl('div', { class: 'sp-buys' }, steps),
@@ -1967,10 +2309,13 @@ export class SellingPage {
         const card = spEl('div', { class: 'sp-q sp-hot sp-wide sp-trade sp-accepted' }, [
             spEl('h3', { text: 'Trade with ' + b.name + ' · accepted ' + formatAge(Date.now() - A.at) }),
         ]);
-        const sent = A.items.filter((i) => i.sent).length;
+        const done = (st) => st.bought || st.skipped || st.boughtQty > 0;
+        // Only items with something to send count (review: "sent 0 of 2" counted a skipped one).
+        const skippedAll = (i) => i.kind !== 'yours' && (i.steps || []).length > 0 && i.steps.every((st) => st.skipped && !st.bought && !(st.boughtQty > 0));
+        const toSend = A.items.filter((i) => !skippedAll(i));
+        const sent = toSend.filter((i) => i.sent).length;
         const tot = A.totals || { pays: A.pays, cost: A.cost, profit: A.profit };
         const steps = A.items.flatMap((i) => i.steps || []);
-        const done = (st) => st.bought || st.skipped || st.boughtQty > 0;
         const left = steps.filter((st) => !done(st)).length;
         card.appendChild(spEl('div', { class: 'sp-th' }, [
             spEl('span', { class: 'sp-th-l' }, [
@@ -1979,7 +2324,7 @@ export class SellingPage {
             ]),
             spEl('span', { class: 'sp-th-r' }, [
                 spEl('div', { class: 'sp-big', text: signed(tot.profit) }),
-                spEl('small', { text: 'buy for ' + formatMoney(tot.cost) + ' · ' + b.name + ' pays ' + formatMoney(tot.pays) + ' · sent ' + sent + ' of ' + A.items.length }),
+                spEl('small', { text: 'buy for ' + formatMoney(tot.cost) + ' · ' + b.name + ' pays ' + formatMoney(tot.pays) + ' · sent ' + sent + ' of ' + toSend.length }),
             ]),
         ]));
         // One thing to press next, always in the same place: buy, then trade.
@@ -2024,24 +2369,34 @@ export class SellingPage {
             if (notTaken > 0 || this.leftOpen.has(openKey)) {
                 // Same focus key as the button that opened it: the box takes the focus.
                 const input = spEl('input', { type: 'text', class: 'sp-qty', inputmode: 'numeric', value: notTaken > 0 ? String(notTaken) : '', placeholder: '0-' + send, 'aria-label': 'How many ' + i.name + ' ' + b.name + ' did not take (0 to ' + send + ')', 'data-focus': 'acc:left:' + i.line, autocomplete: 'off', spellcheck: 'false' });
+                selectOnFocus(input);
+                const was = input.value;
                 const commit = () => {
-                    const n = Math.floor(Number(String(input.value).replace(/[,\s]/g, '')));
-                    if (!Number.isFinite(n) || n < 0 || n > send) {
-                        input.setCustomValidity('A number from 0 to ' + send);
-                        input.reportValidity();
+                    if (input.value === was) return;
+                    const n = readWholeNumber(input.value);
+                    if (n === null || n > send) {
+                        // Refused in place (3.14.3: the browser's own bubble), and what was there put back.
+                        input.value = was;
+                        flashBad(input, 'A number from 0 to ' + send);
                         return;
                     }
-                    input.setCustomValidity('');
                     this.leftOpen.delete(openKey);
                     input.value = String(n);
                     if (this.h.onTradeLeft) this.h.onTradeLeft(A.key, i.line, n);
                 };
-                input.addEventListener('change', commit);
-                input.addEventListener('input', () => input.setCustomValidity(''));
+                // Saved once you leave the box (Enter leaves it); Esc puts back what was there.
+                input.addEventListener('blur', () => setTimeout(commit, 0));
                 input.addEventListener('keydown', (event) => {
+                    if (event.key === 'Escape') {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        input.value = was;
+                        input.blur();
+                        return;
+                    }
                     if (event.key !== 'Enter') return;
                     event.preventDefault();
-                    commit();
+                    input.blur();
                 });
                 leftCtl = spEl('small', { class: 'sp-left' }, [
                     input,
@@ -2253,6 +2608,7 @@ export class SellingPage {
     noTraderText(d) {
         const info = this.state.info || {};
         const p = this.state.prefs;
+        if (info.teBadKey && (!info.knownTraders || (d && d.pending))) return 'No traders: TornExchange refused the key';
         if (!info.knownTraders) return 'No traders yet';
         if (d && d.pending) return 'Checking…';
         if (p.onlineOnly && p.trustedOnly) return 'No trusted buyer online';
@@ -2448,7 +2804,7 @@ a.sp-btn { display: inline-flex; align-items: center; text-decoration: none; }
 .sp-q h3 + .sp-tr, .sp-q .sp-note + .sp-tr { border-top: 0; }
 .sp-tr.sp-top { background: var(--green-bg); border-radius: 9px; border-top-color: transparent; }
 .sp-tr.sp-top + .sp-tr { border-top-color: transparent; }
-.sp-tr.sp-stale { opacity: 0.6; }
+.sp-tr.sp-stale .sp-tprice, .sp-tr.sp-stale b, .sp-tr.sp-stale small { color: #8c8c8c; }
 .sp-tr-l { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .sp-tr-l small { font-size: 12px; color: var(--muted); }
 .sp-tr-l small.sp-differ { color: var(--warn); }
@@ -2458,7 +2814,14 @@ a.sp-btn { display: inline-flex; align-items: center; text-decoration: none; }
 .sp-tprice { font-weight: bold; text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .sp-top .sp-tprice { color: var(--price); }
 .sp-links { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 6px; }
-.sp-tr .sp-links { display: grid; grid-template-columns: 64px 64px 76px; }
+.sp-tr .sp-links { display: grid; grid-template-columns: 64px 64px 76px minmax(0, 1fr); align-items: center; }
+.sp-tr .sp-links .sp-blk { grid-column: -2 / -1; justify-self: end; }
+.sp-fav, .sp-blk { width: 24px; height: 24px; padding: 0; border-radius: 7px; border: 1px solid var(--cline2); background: #161616; color: #8a8a8a; font: 13px/22px Arial, Helvetica, sans-serif; cursor: pointer; }
+.sp-fav:hover, .sp-blk:hover { color: var(--text); border-color: #555; }
+.sp-fav.sp-fav-on { color: #f2c94c; border-color: #6b5a22; background: #262110; }
+.sp-blk:hover { color: #ff6b6b; }
+.sp-tr-l small.sp-traded { color: var(--muted); }
+.sp-blnote { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .sp-tr .sp-links.sp-links-one { display: flex; }
 .sp-chip {
     display: inline-flex; align-items: center; justify-content: center; height: 30px; padding: 0 10px; font-size: 12px; white-space: nowrap;
@@ -2473,7 +2836,7 @@ a.sp-btn { display: inline-flex; align-items: center; text-decoration: none; }
 .sp-th-r { margin-left: auto; text-align: right; }
 .sp-th-r small { display: block; color: var(--muted); font-size: 12px; }
 .sp-ti { display: grid; grid-template-columns: 18px 44px minmax(0, 1fr) auto; gap: 4px 10px; align-items: center; padding: 8px 0; border-top: 1px solid #2f3a1c; }
-.sp-ti.sp-off { opacity: 0.55; }
+.sp-ti.sp-off b, .sp-ti.sp-off small, .sp-ti.sp-off .sp-ti-p { color: #8c8c8c; }
 .sp-tick { width: 16px; height: 16px; margin: 0; accent-color: var(--price); }
 .sp-ti-l { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
 .sp-ti-l small { color: var(--muted); font-size: 12px; }
@@ -2487,13 +2850,33 @@ a.sp-btn { display: inline-flex; align-items: center; text-decoration: none; }
 .sp-buy { display: flex; align-items: center; gap: 10px; font-size: 12px; color: var(--muted); }
 .sp-buy .sp-chip { margin-left: auto; }
 .sp-qty { width: 72px; height: 26px; padding: 0 6px; border-radius: 6px; border: 1px solid var(--cline2); background: #0f0f0f; color: var(--text); text-align: right; font-variant-numeric: tabular-nums; }
+.sp-in-bad, .sp-key.sp-in-bad { border-color: #e05a4f !important; box-shadow: 0 0 0 1px #e05a4f; }
 .sp-trade-links { display: flex; justify-content: flex-end; margin-top: 10px; }
 .sp-tradeline { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 4px; }
 .sp-tradeline small { color: var(--muted); font-size: 12px; }
 .sp-plan { height: 26px; padding: 0 10px; font-size: 12px; }
 .sp-plan-on { display: inline-flex; align-items: center; border-radius: 13px; border: 1px solid var(--hot-line); color: var(--price); font-weight: bold; background: var(--green-bg); }
 .sp-tr.sp-planning { box-shadow: inset 3px 0 0 var(--price); }
-.sp-tr.sp-declined { opacity: 0.55; }
+/* Dimmed by colour, not see-through: its words stay readable (review M10). */
+.sp-tr.sp-declined .sp-tprice, .sp-tr.sp-declined .sp-trader-l, .sp-tr.sp-declined small { color: #8c8c8c; }
+.sp-tr.sp-troll .sp-tprice { color: var(--muted); text-decoration: line-through; }
+.sp-scan { display: flex; flex-direction: column; gap: 8px; margin: 0 0 16px; }
+.sp-scanh { margin: 0; }
+.sp-fold { display: inline-flex; align-items: center; gap: 8px; padding: 0; border: 0; background: none; color: inherit; cursor: pointer; font: inherit; }
+.sp-fold h2 { margin: 0; }
+.sp-fold:hover h2 { color: #fff; }
+.sp-chev { width: 12px; color: var(--muted); font-size: 12px; }
+.sp-scangrid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; }
+@media (max-width: 1400px) { .sp-scangrid { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+.sp-tc { cursor: default; }
+.sp-tc.sp-tc-none { background: var(--card); border-color: var(--cline2); }
+.sp-inerr { color: #ff8a80; font-size: 12px; font-weight: bold; }
+.sp-tc .sp-go { margin-top: auto; }
+.sp-tc .sp-go.sp-go-on { border-color: var(--offer); color: var(--offer); }
+.sp-star { color: #f2c94c; }
+.sp-lastpaid { display: inline-flex; align-items: center; height: 18px; padding: 0 6px; font-size: 10px; font-weight: bold; text-transform: uppercase; letter-spacing: 0.4px; border-radius: 9px; border: 1px solid #7a5210; color: var(--warn); white-space: nowrap; }
+.sp-fc-p.sp-est { color: #c3ea6f; }
+.sp-tc small.sp-traded { color: var(--muted); }
 .sp-tpick { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; margin: 2px 0 6px; }
 .sp-itemnote { margin: 6px 0; }
 .sp-tpick-b { display: flex; gap: 6px; flex-wrap: wrap; }
@@ -2584,6 +2967,11 @@ input.sp-key::placeholder { color: var(--muted); }
 .sp-masked { -webkit-text-security: disc; }
 .sp-keystate { font-size: 12px; color: var(--muted); }
 .sp-keystate.sp-ok { color: var(--profit); }
+.sp-radio { display: flex; flex-direction: column; gap: 8px; }
+.sp-radio-o { display: flex; align-items: center; gap: 8px; cursor: pointer; font-size: 13px; }
+.sp-radio-o input[type="radio"] { width: 16px; height: 16px; margin: 0; accent-color: var(--profit); cursor: pointer; }
+.sp-radio-o .sp-key { flex: 0 1 220px; }
+.sp-key.sp-dim { color: var(--muted); }
 .sp-keystate.sp-bad { color: var(--bad); }
 .sp-check { display: flex; gap: 8px; align-items: flex-start; cursor: pointer; }
 input[type="checkbox"] { accent-color: var(--profit); margin: 3px 0 0; }
@@ -2613,12 +3001,13 @@ input[type="checkbox"] { accent-color: var(--profit); margin: 3px 0 0; }
     .sp-pills { order: 11; flex: 1 0 100%; flex-wrap: wrap; margin-left: 0; }
     .sp-wrap { padding: 12px 12px 48px; }
     .sp-sec { flex-wrap: wrap; }
-    .sp-sec h2 { flex: 1 0 100%; }
+    .sp-sec > h2, .sp-scanh .sp-fold { flex: 1 0 100%; }
     .sp-sp { display: none; }
     .sp-toggle { flex: 1; justify-content: center; }
-    .sp-strip { grid-template-columns: minmax(0, 1fr); }
+    /* A desktop window at half a screen (3.14.3 review): two cards a row, and the list before the desk. */
+    .sp-strip, .sp-scangrid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .sp-desk { grid-template-columns: minmax(0, 1fr); }
-    .sp-ws { position: static; order: -1; }
+    .sp-ws { position: static; }
     .sp-settings { grid-template-columns: minmax(0, 1fr); gap: 12px; padding: 12px 12px 48px; }
     .sp-snav { position: static; flex-direction: row; flex-wrap: wrap; }
     .sp-snav-g, .sp-snav-a small { display: none; }
