@@ -150,9 +150,12 @@ mockup first where it changes the look (see "How the owner works"), then build.
      buy in the same bazaar is not counted, and a missed count means no Fill
      (the friend's page, item 1).
    - Wanted: from the moment of "X accepted", every item you actually bought
-     (planned or not) in one list - in the NPC Arbitrage panel (its own
-     section) or a separate popup; mockups first, the owner picks. On Torn's
-     trade page: that list is what Fill fills and what gets highlighted.
+     (planned or not) in one list. **Decided (the owner): a separate overlay
+     of its own, apart from NPC Arbitrage, that shows up only while a trade is
+     accepted** (and goes when it is Traded - done / back to the live plan).
+     Mockups of how it looks first; it must never cover Torn's content (the
+     panel's rule). On Torn's trade page: that list is what Fill fills and
+     what gets highlighted.
    - Research first (no code): where "bought" comes from. (a) Torn's log -
      exact (1225 bazaar buys: item, qty, price, seller), but it needs the
      Ledger's **Full key**, which the overlay on torn.com must never read
