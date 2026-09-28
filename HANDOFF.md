@@ -82,7 +82,7 @@ offer to read Torn's scripting-rules page with them (read only).
 The owner, end of 2026-09-28: "write me handoff for next session. with the
 trusted traders, receipt filterable by trader, and something for favourite
 trader blacklisted trader, and scanning if we can flip something on our
-trusted trader". Items 2-7 are theirs, NOT built: restate each in their words,
+trusted trader". Items 2-8 are theirs, NOT built: restate each in their words,
 mockup first where it changes the look (see "How the owner works"), then build.
 
 1. **Check 3.14.2 live first** (read only, pages the owner opens in the Claude
@@ -172,11 +172,25 @@ mockup first where it changes the look (see "How the owner works"), then build.
    so a receipt's total profit is right but per-item profit can shift between
    items. When the trade was accepted in Torn Bids, `sellAccepted` has the
    trader's price per item: split by those instead (and say so on the receipt).
-8. **Still held, remind (not built):** the **faction rule** (skip a trader in
+8. **How many extras: a setting** (the friend, through the owner,
+   2026-09-28: he wants more extra items - "add unlimited, or just set the
+   limit ourselves there"). Today `EXTRA_ITEMS` = 5 is fixed in code (a soft
+   cap: the rest are under *Show them* with Add). Wanted: Settings › Flips ›
+   **Extras per trade** - a number, or unlimited; **the default stays 5**
+   (smart defaults: the owner never touches settings, the friend will). The
+   other extras rules stay (route first, then one new bazaar each, at most 3
+   bazaars each, fast first, slow only on the route). Ask: does "unlimited"
+   also lift the 3-bazaars-per-extra rule, or only the count?
+9. **How profit is counted - explained to the owner, keep in mind:** the
+   Ledger is per item, first in first out (a sale matched to that item's
+   oldest buys, after fees), not networth; items never bought (crimes, gifts)
+   are counted apart, never as profit; a trade's money is split by Item
+   Market Average (item 7).
+10. **Still held, remind (not built):** the **faction rule** (skip a trader in
    the same faction as the bazaar you bought from); **trader capacity** (price
    vs how much they take - networth, reselling bazaar, W3B bulk prices, own
    history) and a **"Sell fast"** line in Where to sell (the Vladbull case).
-9. Older, smaller: weapons / armour flips done properly (Big Al's, RW gear
+11. Older, smaller: weapons / armour flips done properly (Big Al's, RW gear
    under its Bunker Bucks floor); a yellow TornExchange pill was never seen
    live (ask for its hover text); the trade page does not handle you paying
    them; Settings › Keep for yourself is unused since own items left trades;
