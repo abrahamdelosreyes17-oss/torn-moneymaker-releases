@@ -2,12 +2,11 @@
  * One trade with one trader (Torn Bids, mockup N1, picked 2026-09-27).
  *
  * The friend: a trade of one item looks odd to a trader; many items looks
- * legit. So when a flip sells to a trader, the plan also takes every other
- * item that trader buys which a bazaar sells for less, and what you hold
- * where they are the best buyer - one trade. Pure: no DOM, no network.
+ * legit. So when a flip sells to a trader, the plan also takes other items
+ * that trader buys which a bazaar sells for less - one trade. Pure: no DOM,
+ * no network.
  *
- *   - ONE Cash for the whole trade: the item you picked first, then the most
- *     profit per $ spent, cheapest listings first within an item;
+ *   - ONE Cash for the whole trade: the main flip first;
  *   - at most Most per flip of each item (or the number you typed);
  *   - the trader is never asked to pay more than their networth share for
  *     the whole trade (what you hold counts too);
@@ -16,29 +15,37 @@
  */
 
 import { enoughProfit, MIN_PROFIT_PCT } from './profit.js';
-import { FLIP_MAX_UNITS } from './flips.js';
-import { EXTRA_CAP, extraStopBudget, stopsMinutes } from './liquidity.js';
+import { FLIP_MAX_UNITS, MAIN_STOPS, EXTRA_STOPS, pickBazaars } from './flips.js';
+import { EXTRA_CAP, stopsMinutes } from './liquidity.js';
 
 /*
- * Smart extras (the owner, 2026-09-28: "the biggest profit should be the main
- * item... we're only adding items so we don't look sus... if we take too long
- * buying, prices change, or the trader loses interest"). With `kindOf`:
+ * The main flip and its extras (the owner, 2026-09-28: "the MAIN flip is the
+ * big earner... extra items are only cover, so the trader doesn't see a
+ * one-item scam"; "I'll flip lets say 5 extra items, not max, but soft cap,
+ * cus my main money is in the MAIN flip"; "1 item 1 bazaar best, 1 item 3
+ * bazaars sure, 5 bazaars max for the main flip"). With `kindOf`:
  *
- *   - the picked item is planned as before (Most per flip);
- *   - the other items fill in by TIME, not by profit alone: first whatever the
- *     bazaars you already visit sell (no extra stop), then at most a few new
- *     bazaars (extraStopBudget), each extra item from one bazaar, fast-selling
- *     items first; slow items only where you are going anyway;
- *   - each extra item at most EXTRA_CAP[kind] (a trader takes 100 plushies,
- *     not 100 hand drills), yours too - unless you typed a number;
+ *   - the MAIN flip is the item that makes the most with this trader - not
+ *     necessarily the one on the desk - from at most MAIN_STOPS bazaars, the
+ *     ones that pay the most, up to Most per flip;
+ *   - about EXTRA_ITEMS extras, each from at most EXTRA_STOPS bazaars: first
+ *     what the bazaars on the route sell (no new bazaar), then items one new
+ *     bazaar away; fast sellers before normal ones, then the most profit.
+ *     Slow items only where you go anyway. Low profit is fine: they are cover;
+ *   - each extra at most EXTRA_CAP[kind] (a trader takes 100 plushies, not
+ *     100 hand drills), unless you typed a number;
+ *   - an item you typed a number for is in, as its own choice;
  *   - never a listing in the trader's own bazaar (the owner: "if they see we
  *     buy from their bazaar and resell they're no longer going to deal with us").
  */
 const KIND_RANK = { fast: 0, normal: 1, slow: 2 };
 
+/** About this many extra items: a soft cap (the rest are listed, and can be added). */
+export const EXTRA_ITEMS = 5;
+
 /**
  * @param {object} p
- * @param {string} [p.first] - the item picked on the desk: planned first
+ * @param {string} [p.first] - the item on the desk (tagged; the main flip only when it makes the most)
  * @param {Array<{itemId, bid, sellers: Array<{sellerId, sellerName, price, qty, stale}>}>} p.flips
  *   items the trader buys, with their bazaar listings (bazaarSellers output)
  * @param {Array<{itemId, bid, held}>} p.held - what you hold that they buy best
@@ -50,29 +57,18 @@ const KIND_RANK = { fast: 0, normal: 1, slow: 2 };
  *   'held:<itemId>' -> {qty: n}: how many of yours you typed
  * @param {object} [p.keep] - itemId -> n | 'all': what you keep of your own
  * @param {string|null} [p.traderId] - the trader: their own bazaar is never bought from
- * @param {function|null} [p.kindOf] - itemId -> 'fast' | 'normal' | 'slow': smart extras (see above); null plans every item up to Most
+ * @param {function|null} [p.kindOf] - itemId -> 'fast' | 'normal' | 'slow': the main flip and its
+ *   extras (see above); null plans every item up to Most, the item on the desk first
  */
-export function planTrade({ first = null, flips = [], held = [], cash = null, maxPerItem = FLIP_MAX_UNITS, payCap = Infinity, minPct = MIN_PROFIT_PCT, edits = {}, keep = {}, traderId = null, kindOf = null }) {
-    let cashLeft = cash > 0 ? cash : Infinity;
-    let payLeft = payCap > 0 ? payCap : payCap === 0 ? 0 : Infinity;
-    let payCapped = false;
-    const most = maxPerItem > 0 ? Math.floor(maxPerItem) : FLIP_MAX_UNITS;
-    const firstId = first === null ? null : String(first);
-    const trader = traderId ? String(traderId) : null;
-    const smart = typeof kindOf === 'function';
-    const kinds = new Map();
-    const kind = (id) => {
-        if (!smart) return 'fast';
-        if (!kinds.has(id)) kinds.set(id, KIND_RANK[kindOf(id)] !== undefined ? kindOf(id) : 'normal');
-        return kinds.get(id);
-    };
-    const kindCap = (id) => Math.min(most, EXTRA_CAP[kind(id)]);
+export function planTrade(p) {
+    if (typeof p.kindOf === 'function') return planMainAndExtras(p);
+    return planEverything(p);
+}
 
-    // Every listing worth buying, per item: fresh, making enough per item, and
-    // not in the trader's own bazaar.
-    const chunks = [];
+/** The items worth buying: fresh, making enough per item, and not in the trader's own bazaar. */
+function usable(flips, trader, minPct, edits) {
+    const items = [];
     const off = [];
-    const typed = new Set();
     for (const it of flips || []) {
         const id = String(it.itemId);
         const bid = Number(it.bid);
@@ -84,45 +80,15 @@ export function planTrade({ first = null, flips = [], held = [], cash = null, ma
             off.push({ itemId: id, bid });
             continue;
         }
-        if (e.qty > 0) typed.add(id);
-        const cap = e.qty > 0 ? Math.min(Math.floor(e.qty), most) : !smart || id === firstId ? most : kindCap(id);
-        for (const s of under) chunks.push({ id, bid, s, cap });
+        items.push({ id, bid, under, typed: e.qty > 0 ? Math.floor(e.qty) : 0 });
     }
-    const ratio = (c) => (c.bid - c.s.price) / c.s.price;
-    chunks.sort((a, b) => (a.id === firstId ? 0 : 1) - (b.id === firstId ? 0 : 1) || ratio(b) - ratio(a) || a.s.price - b.s.price);
+    return { items, off };
+}
 
-    // Yours first after the picked item: they cost no cash, only their pay.
-    const heldRows = [];
-    const plan = new Map();
-    // The bazaars on the route; a listing TornW3B has not been read for yet
-    // (no seller) is one bazaar of its own.
-    const route = new Set();
-    let unknownStops = 0;
-    const stopOf = (c) => (c.s.sellerId ? String(c.s.sellerId) : null);
-    const take = (c) => {
-        const r = plan.get(c.id) || { itemId: c.id, bid: c.bid, units: 0, cost: 0, profit: 0, steps: [], kind: kind(c.id) };
-        const wanted = Math.min(c.s.qty, Math.floor(cashLeft / c.s.price), c.cap - r.units);
-        const n = Math.min(wanted, Math.floor(payLeft / c.bid));
-        // Their networth share, not your cash, stopped it: said on the card.
-        if (n < wanted) payCapped = true;
-        if (n <= 0) return 0;
-        cashLeft -= n * c.s.price;
-        payLeft -= n * c.bid;
-        r.units += n;
-        r.cost += n * c.s.price;
-        r.profit += n * (c.bid - c.s.price);
-        const stop = stopOf(c);
-        // A bazaar you visit anyway for something else: no extra time.
-        const along = Boolean(stop && route.has(stop) && c.id !== firstId);
-        if (stop) route.add(stop);
-        else unknownStops += 1;
-        // When TornW3B last saw it: the card says how fresh each step is.
-        r.steps.push({ sellerId: c.s.sellerId, sellerName: c.s.sellerName, qty: n, price: c.s.price, seenAt: c.s.dataAt || null, along });
-        plan.set(c.id, r);
-        return n;
-    };
-    for (const c of chunks.filter((x) => x.id === firstId)) take(c);
-    const mainStops = route.size + unknownStops;
+/** Your own items: what you can give, minus what you keep and what they refused. */
+function heldRowsOf(held, keep, edits, capOf, payLeftRef, kindName) {
+    const rows = [];
+    let capped = false;
     for (const h of held || []) {
         const id = String(h.itemId);
         const bid = Number(h.bid);
@@ -133,68 +99,163 @@ export function planTrade({ first = null, flips = [], held = [], cash = null, ma
         // Leftovers this trader refused are not offered to them again.
         const refused = Math.max(0, Math.floor(Number(h.refused) || 0));
         const spare = kept === 'all' ? 0 : Math.max(0, have - kept - refused);
-        // Smart: no more of yours than the trader would take of that kind -
-        // unless you typed how many.
         const e = edits['held:' + id] || {};
-        const want = e.qty > 0 ? Math.min(spare, Math.floor(e.qty)) : smart ? Math.min(spare, kindCap(id)) : spare;
-        const payable = Math.floor(payLeft / bid);
-        const units = Math.min(want, payable);
-        if (units < want) payCapped = true;
-        payLeft -= units * bid;
-        heldRows.push({ itemId: id, bid, held: have, units, kept, spare, kind: kind(id) });
+        const want = e.qty > 0 ? Math.min(spare, Math.floor(e.qty)) : Math.min(spare, capOf(id));
+        const units = Math.max(0, Math.min(want, Math.floor(payLeftRef.left / bid)));
+        if (units < want) capped = true;
+        payLeftRef.left -= units * bid;
+        rows.push({ itemId: id, bid, held: have, units, kept, spare, kind: kindName(id) });
     }
+    return { rows, capped };
+}
 
-    const rest = chunks.filter((x) => x.id !== firstId);
-    let more = 0;
-    let budget = null;
-    if (!smart) {
-        for (const c of rest) take(c);
-    } else {
-        // 1. What the bazaars on the route sell: no extra bazaar.
-        for (const c of rest) if (stopOf(c) && route.has(stopOf(c))) take(c);
-        // 2. Items you typed a number for: as many bazaars as it takes.
-        for (const c of rest) if (typed.has(c.id) && !(stopOf(c) && route.has(stopOf(c)))) take(c);
-        // 3. A few new bazaars, the most worth it first: fast items before
-        // normal ones, then the most profit there. One bazaar per item.
-        budget = extraStopBudget(mainStops);
-        let added = 0;
-        const has = (id) => plan.has(id) && plan.get(id).units > 0;
-        while (added < budget) {
-            const bySeller = new Map();
-            for (const c of rest) {
-                if (has(c.id) || kind(c.id) === 'slow') continue;
-                const key = stopOf(c) || 'unread:' + c.id;
-                if (stopOf(c) && route.has(stopOf(c))) continue;
-                const n = Math.min(c.s.qty, c.cap, Math.floor(cashLeft / c.s.price), Math.floor(payLeft / c.bid));
-                if (!(n > 0)) continue;
-                const g = bySeller.get(key) || { key, rank: 9, profit: 0, list: [], ids: new Set() };
-                // One listing per item at a bazaar (its cheapest, sorted first).
-                if (g.ids.has(c.id)) continue;
-                g.ids.add(c.id);
-                g.list.push(c);
-                g.rank = Math.min(g.rank, KIND_RANK[kind(c.id)]);
-                g.profit += n * (c.bid - c.s.price);
-                bySeller.set(key, g);
-            }
-            const best = [...bySeller.values()].sort((a, b) => a.rank - b.rank || b.profit - a.profit)[0];
-            if (!best) break;
-            let got = 0;
-            for (const c of best.list) got += take(c);
-            if (!got) break;
-            added += 1;
+/** The main flip and a few extras (the app's plan). */
+function planMainAndExtras({ first = null, flips = [], held = [], cash = null, maxPerItem = FLIP_MAX_UNITS, payCap = Infinity, minPct = MIN_PROFIT_PCT, edits = {}, keep = {}, traderId = null, kindOf }) {
+    let cashLeft = cash > 0 ? cash : Infinity;
+    const pay = { left: payCap > 0 ? payCap : payCap === 0 ? 0 : Infinity };
+    let payCapped = false;
+    const most = maxPerItem > 0 ? Math.floor(maxPerItem) : FLIP_MAX_UNITS;
+    const firstId = first === null ? null : String(first);
+    const trader = traderId ? String(traderId) : null;
+    const kinds = new Map();
+    const kind = (id) => {
+        if (!kinds.has(id)) kinds.set(id, KIND_RANK[kindOf(id)] !== undefined ? kindOf(id) : 'normal');
+        return kinds.get(id);
+    };
+    const kindCap = (id) => Math.min(most, EXTRA_CAP[kind(id)]);
+
+    const { items, off } = usable(flips, trader, minPct, edits);
+    const plan = new Map();
+    // The bazaars on the route (seller ids); a listing TornW3B has not been
+    // read for yet (no seller) is one bazaar of its own.
+    const route = new Set();
+    let unknownStops = 0;
+    const take = (it, p, role) => {
+        if (!p || !(p.units > 0)) return false;
+        cashLeft -= p.cost;
+        pay.left -= p.units * it.bid;
+        const steps = p.steps.map((st) => {
+            const stop = st.sellerId ? String(st.sellerId) : null;
+            // A bazaar you visit anyway for something else: no extra time.
+            const along = Boolean(stop && route.has(stop));
+            return { sellerId: st.sellerId, sellerName: st.sellerName, qty: st.qty, price: st.price, seenAt: st.dataAt || null, along };
+        });
+        for (const st of p.steps) {
+            if (st.sellerId) route.add(String(st.sellerId));
+            else unknownStops += 1;
         }
-        // What this trader also buys, left out to keep the trade quick.
-        const left = new Set(rest.filter((c) => !has(c.id)).map((c) => c.id));
-        more = left.size;
+        plan.set(it.id, { itemId: it.id, bid: it.bid, units: p.units, cost: p.cost, profit: p.profit, steps, kind: kind(it.id), role });
+        return true;
+    };
+    // At most what the trader can still pay for, and what your cash still buys.
+    const pick = (it, cap, opts) => {
+        const payUnits = Math.floor(pay.left / it.bid);
+        const p = pickBazaars(it.under, it.bid, { cash: cashLeft, maxUnits: Math.min(cap, payUnits), minPct: 0, free: route, ...opts });
+        if (p && payUnits < cap && p.units === payUnits && payUnits < it.under.reduce((a, s) => a + s.qty, 0)) payCapped = true;
+        return p;
+    };
+
+    // 1. The main flip: the item that makes the most, from at most 5 bazaars.
+    // Items are weighed best-first by what they could make at most, and the
+    // weighing stops once no item left could beat the best found.
+    const capOfMain = (it) => (it.typed ? Math.min(it.typed, most) : most);
+    // The most an item could make: its five best sellers' profit, and no more
+    // than Most per flip (or the cash, or their pay) at its cheapest margin.
+    const bounds = new Map();
+    const bound = (it) => {
+        if (!bounds.has(it.id)) {
+            const bySeller = new Map();
+            it.under.forEach((s, i) => {
+                const k = s.sellerId ? String(s.sellerId) : '#' + i;
+                bySeller.set(k, (bySeller.get(k) || 0) + s.qty * (it.bid - s.price));
+            });
+            const five = [...bySeller.values()].sort((a, b) => b - a).slice(0, MAIN_STOPS).reduce((a, v) => a + v, 0);
+            const flat = Math.min(capOfMain(it), cashLeft / it.under[0].price, pay.left / it.bid) * (it.bid - it.under[0].price);
+            bounds.set(it.id, Math.min(five, flat));
+        }
+        return bounds.get(it.id);
+    };
+    let main = null;
+    let mainPlan = null;
+    for (const it of [...items].sort((a, b) => bound(b) - bound(a) || (a.id === firstId ? -1 : b.id === firstId ? 1 : 0))) {
+        if (mainPlan && bound(it) < mainPlan.profit) break;
+        const p = pickBazaars(it.under, it.bid, { cash: cashLeft, maxUnits: Math.min(capOfMain(it), Math.floor(pay.left / it.bid)), minPct: 0, maxStops: MAIN_STOPS });
+        if (!p || !(p.units > 0)) continue;
+        // A tie goes to the item on the desk.
+        if (!mainPlan || p.profit > mainPlan.profit || (p.profit === mainPlan.profit && it.id === firstId)) {
+            main = it;
+            mainPlan = p;
+        }
+    }
+    if (main) {
+        const payUnits = Math.floor(pay.left / main.bid);
+        if (payUnits < capOfMain(main) && mainPlan.units === payUnits) payCapped = true;
+        take(main, mainPlan, 'main');
+    } else if (items.length && Math.floor(pay.left / items[0].bid) < 1) {
+        payCapped = true;
+    }
+    const mainStops = route.size + unknownStops;
+
+    // Yours: they cost no cash, only their pay (not offered by the app since 3.14; kept for the API).
+    const yours = heldRowsOf(held, keep, edits, kindCap, pay, kind);
+    if (yours.capped) payCapped = true;
+
+    // 2. The item on the desk is always in (you are looking at it): as the
+    // main flip, or as cover - even a slow one, from at most 3 bazaars.
+    let extras = 0;
+    const deskIt = firstId ? items.find((it) => it.id === firstId) : null;
+    if (deskIt && !plan.has(deskIt.id)) {
+        const cap = deskIt.typed ? Math.min(deskIt.typed, most) : kindCap(deskIt.id);
+        if (take(deskIt, pick(deskIt, cap, { maxStops: deskIt.typed ? MAIN_STOPS : EXTRA_STOPS }), 'extra')) extras += 1;
+    }
+    // Items you typed a number for: in, as your own choice.
+    for (const it of items) {
+        if (plan.has(it.id) || !it.typed) continue;
+        if (take(it, pick(it, Math.min(it.typed, most), { maxStops: MAIN_STOPS }), 'typed')) extras += 1;
     }
 
-    const flipRows = [...plan.values()].sort((a, b) => (a.itemId === firstId ? -1 : b.itemId === firstId ? 1 : b.profit - a.profit));
-    const heldOn = heldRows.filter((r) => r.units > 0);
+    // 3. The extras: the quickest first - on the route, then one new bazaar;
+    // fast sellers first; then the most profit. Slow ones only on the route.
+    const guess = (it) => {
+        const onRoute = it.under.filter((s) => s.sellerId && route.has(String(s.sellerId)));
+        const rows = onRoute.length ? onRoute : it.under;
+        const best = rows.reduce((a, s) => Math.max(a, Math.min(s.qty, kindCap(it.id)) * (it.bid - s.price)), 0);
+        return { k: onRoute.length ? 0 : 1, rank: KIND_RANK[kind(it.id)], profit: best };
+    };
+    const tried = new Set();
+    while (extras < EXTRA_ITEMS) {
+        const next = items
+            .filter((it) => !plan.has(it.id) && !tried.has(it.id))
+            .map((it) => ({ it, g: guess(it) }))
+            .filter(({ it, g }) => !(kind(it.id) === 'slow' && g.k > 0))
+            .sort((a, b) => a.g.k - b.g.k || a.g.rank - b.g.rank || b.g.profit - a.g.profit)[0];
+        if (!next) break;
+        tried.add(next.it.id);
+        const p = next.g.k === 0
+            ? pick(next.it, kindCap(next.it.id), { maxStops: EXTRA_STOPS, maxNew: 0 })
+            : pick(next.it, kindCap(next.it.id), { maxStops: EXTRA_STOPS, maxNew: 1 }) || null;
+        if (take(next.it, p, 'extra')) extras += 1;
+    }
+
+    // What this trader also buys, left out to keep the trade quick: listed,
+    // and one press puts it in (a typed number).
+    const left = items
+        .filter((it) => !plan.has(it.id))
+        .map((it) => {
+            const g = guess(it);
+            return { itemId: it.id, bid: it.bid, kind: kind(it.id), units: kindCap(it.id), profit: g.profit, price: it.under[0].price };
+        })
+        .sort((a, b) => b.profit - a.profit);
+
+    const mainId = main ? main.id : null;
+    const flipRows = [...plan.values()].sort((a, b) => (a.itemId === mainId ? -1 : b.itemId === mainId ? 1 : b.profit - a.profit));
+    const heldOn = yours.rows.filter((r) => r.units > 0);
     const stops = route.size + unknownStops;
     return {
         flips: flipRows,
         off,
-        held: heldRows,
+        held: yours.rows,
+        main: mainId,
         items: new Set([...flipRows.map((r) => r.itemId), ...heldOn.map((r) => r.itemId)]).size,
         profit: flipRows.reduce((a, r) => a + r.profit, 0),
         cost: flipRows.reduce((a, r) => a + r.cost, 0),
@@ -204,8 +265,79 @@ export function planTrade({ first = null, flips = [], held = [], cash = null, ma
         stops,
         minutes: stops ? stopsMinutes(stops) : 0,
         mainStops,
-        budget,
-        more,
+        budget: null,
+        more: left.length,
+        left,
+    };
+}
+
+/** Every item up to Most, the item on the desk first, then the most profit per $ (no kinds given). */
+function planEverything({ first = null, flips = [], held = [], cash = null, maxPerItem = FLIP_MAX_UNITS, payCap = Infinity, minPct = MIN_PROFIT_PCT, edits = {}, keep = {}, traderId = null }) {
+    let cashLeft = cash > 0 ? cash : Infinity;
+    const pay = { left: payCap > 0 ? payCap : payCap === 0 ? 0 : Infinity };
+    let payCapped = false;
+    const most = maxPerItem > 0 ? Math.floor(maxPerItem) : FLIP_MAX_UNITS;
+    const firstId = first === null ? null : String(first);
+    const trader = traderId ? String(traderId) : null;
+
+    const { items, off } = usable(flips, trader, minPct, edits);
+    const chunks = [];
+    for (const it of items) {
+        const cap = it.typed ? Math.min(it.typed, most) : most;
+        for (const s of it.under) chunks.push({ id: it.id, bid: it.bid, s, cap });
+    }
+    const ratio = (c) => (c.bid - c.s.price) / c.s.price;
+    chunks.sort((a, b) => (a.id === firstId ? 0 : 1) - (b.id === firstId ? 0 : 1) || ratio(b) - ratio(a) || a.s.price - b.s.price);
+
+    const plan = new Map();
+    const route = new Set();
+    let unknownStops = 0;
+    const take = (c) => {
+        const r = plan.get(c.id) || { itemId: c.id, bid: c.bid, units: 0, cost: 0, profit: 0, steps: [], kind: 'fast' };
+        const wanted = Math.min(c.s.qty, Math.floor(cashLeft / c.s.price), c.cap - r.units);
+        const n = Math.min(wanted, Math.floor(pay.left / c.bid));
+        // Their networth share, not your cash, stopped it: said on the card.
+        if (n < wanted) payCapped = true;
+        if (n <= 0) return 0;
+        cashLeft -= n * c.s.price;
+        pay.left -= n * c.bid;
+        r.units += n;
+        r.cost += n * c.s.price;
+        r.profit += n * (c.bid - c.s.price);
+        const stop = c.s.sellerId ? String(c.s.sellerId) : null;
+        const along = Boolean(stop && route.has(stop) && c.id !== firstId);
+        if (stop) route.add(stop);
+        else unknownStops += 1;
+        r.steps.push({ sellerId: c.s.sellerId, sellerName: c.s.sellerName, qty: n, price: c.s.price, seenAt: c.s.dataAt || null, along });
+        plan.set(c.id, r);
+        return n;
+    };
+    for (const c of chunks.filter((x) => x.id === firstId)) take(c);
+    const mainStops = route.size + unknownStops;
+    // Yours first after the picked item: they cost no cash, only their pay.
+    const yours = heldRowsOf(held, keep, edits, () => Infinity, pay, () => 'fast');
+    if (yours.capped) payCapped = true;
+    for (const c of chunks.filter((x) => x.id !== firstId)) take(c);
+
+    const flipRows = [...plan.values()].sort((a, b) => (a.itemId === firstId ? -1 : b.itemId === firstId ? 1 : b.profit - a.profit));
+    const heldOn = yours.rows.filter((r) => r.units > 0);
+    const stops = route.size + unknownStops;
+    return {
+        flips: flipRows,
+        off,
+        held: yours.rows,
+        main: flipRows.length ? flipRows[0].itemId : null,
+        items: new Set([...flipRows.map((r) => r.itemId), ...heldOn.map((r) => r.itemId)]).size,
+        profit: flipRows.reduce((a, r) => a + r.profit, 0),
+        cost: flipRows.reduce((a, r) => a + r.cost, 0),
+        pays: flipRows.reduce((a, r) => a + r.units * r.bid, 0) + heldOn.reduce((a, r) => a + r.units * r.bid, 0),
+        payCapped,
+        stops,
+        minutes: stops ? stopsMinutes(stops) : 0,
+        mainStops,
+        budget: null,
+        more: 0,
+        left: [],
     };
 }
 

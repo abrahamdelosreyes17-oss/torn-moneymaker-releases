@@ -63,26 +63,28 @@ const TRADE = [
     { itemId: 'G', bid: 40000, sellers: [s(37000, 20, 'Twinkie')] }, // also at a bazaar on the route
 ];
 
-test('smart extras: the route first, then a few new bazaars, fast items first; never 100 hand drills', () => {
+test('smart extras: the route first, then one new bazaar each, fast items first; never 100 hand drills', () => {
     const t = planTrade({ first: 'V', flips: TRADE, maxPerItem: 100, kindOf });
     const by = new Map(t.flips.map((r) => [r.itemId, r]));
-    assert.equal(by.get('V').units, 51, 'the picked item as before');
-    assert.equal(by.get('F').steps.length, 1, 'one bazaar per extra item');
+    assert.equal(by.get('V').units, 51, 'the main flip as before');
+    assert.equal(t.main, 'V');
+    assert.equal(by.get('F').steps.length, 1, 'one bazaar for this extra');
     assert.equal(by.get('F').steps[0].sellerId, 'Woog', 'from a bazaar you visit anyway');
     assert.equal(by.get('F').steps[0].along, true);
     assert.ok(by.get('G').units > 0, 'also on the route');
     assert.equal(by.has('H'), false, 'slow items only where you go anyway');
-    // Two bazaars for the virus: two new ones for the extras (P first: most profit).
+    // Two bazaars for the virus; five extras (the soft cap): two on the route, three one bazaar each.
     assert.equal(t.mainStops, 2);
-    assert.equal(t.stops, 4);
-    assert.ok(by.has('P'));
-    assert.equal(t.more > 0, true, 'the rest said, not planned');
-    assert.equal(t.minutes, 2);
+    assert.equal(t.flips.length, 6);
+    assert.equal(t.stops, 5);
+    assert.deepEqual(t.left.map((r) => r.itemId), ['H'], 'the rest said, not planned');
+    assert.equal(t.more, 1);
+    assert.equal(t.minutes, 3);
 });
 
 test('smart extras: normal items at most 10, slow at most 3, yours too - unless you typed a number', () => {
     const flips = [
-        { itemId: 'V', bid: 100, sellers: [s(50, 5, 'A')] },
+        { itemId: 'V', bid: 2000, sellers: [s(50, 5, 'A')] }, // the main flip: it makes the most
         { itemId: 'N', bid: 100, sellers: [s(50, 500, 'A')] },
         { itemId: 'H', bid: 100, sellers: [s(50, 500, 'A')] },
     ];

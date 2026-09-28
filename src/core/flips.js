@@ -123,10 +123,196 @@ export function bazaarSellers(rows, { selfId = null, now = Date.now(), freshMs =
         .sort((a, b) => a.price - b.price);
 }
 
+/*
+ * How many bazaars a flip may take (the owner, 2026-09-28: "the app will
+ * suggest 100 bazaars if it can. 1 item 1 bazaar best, 1 item 3 bazaars
+ * sure, 5 bazaars max for the main flip"). 100 of an item is fine from one
+ * bazaar; the trouble is 100 spread over 38. The extras of a trade take at
+ * most EXTRA_STOPS each ("3 bazaars for 10k is fine, 10 bazaars is not").
+ * These count effort, not money: a bazaar is the same half minute on any day.
+ */
+export const MAIN_STOPS = 5;
+export const EXTRA_STOPS = 3;
+
+/** The bazaar a listing is in: its seller (a listing with no seller is a bazaar of its own). */
+function stopKey(s, i) {
+    return s.sellerId ? 'id:' + String(s.sellerId) : 'row:' + i;
+}
+
+/** Once the flip is full, a bazaar that only swaps for cheaper units must add this share of the profit. */
+export const SWAP_GAIN = 0.1;
+
+/** Only this many bazaars are weighed: the ones that could make the most (TornW3B returns at most 100 listings). */
+const PICK_GROUPS = 60;
+
+/** Two cheapest-first listing lists as one, still cheapest first. */
+function mergeRows(a, b) {
+    const out = [];
+    let i = 0;
+    let j = 0;
+    while (i < a.length || j < b.length) {
+        if (j >= b.length || (i < a.length && a[i].price <= b[j].price)) out.push(a[i++]);
+        else out.push(b[j++]);
+    }
+    return out;
+}
+
+/** What buyFrom would make, without building the steps: {profit, full} (full: the most units, or all the cash). */
+function profitFrom(listings, bid, left, most) {
+    let units = 0;
+    let profit = 0;
+    let full = false;
+    for (const s of listings) {
+        const n = Math.min(s.qty, Math.floor(left / s.price), most - units);
+        if (n <= 0) {
+            full = true;
+            break;
+        }
+        units += n;
+        profit += n * (bid - s.price);
+        left -= n * s.price;
+        if (n < s.qty) {
+            full = true;
+            break;
+        }
+    }
+    return { profit, full: full || units >= most };
+}
+
 /**
- * Buy from the cheapest fresh listings first, while they cost less than the
- * trader pays and the cash lasts. A listing only partly affordable is bought
- * in part, and nothing after it.
+ * Buy the listings of the bazaars chosen, cheapest first, while the cash and
+ * the most units last. A listing only partly affordable is bought in part,
+ * and nothing after it.
+ */
+function buyFrom(listings, bid, left, most) {
+    let units = 0;
+    let cost = 0;
+    let profit = 0;
+    const steps = [];
+    for (const s of listings) {
+        const n = Math.min(s.qty, Math.floor(left / s.price), most - units);
+        if (n <= 0) break;
+        steps.push({ sellerId: s.sellerId, sellerName: s.sellerName, qty: n, price: s.price, dataAt: s.dataAt || null });
+        units += n;
+        cost += n * s.price;
+        profit += n * (bid - s.price);
+        left -= n * s.price;
+        if (n < s.qty) break;
+    }
+    return { units, cost, profit, steps };
+}
+
+/**
+ * The most profit from a few bazaars: bazaars are added one at a time, each
+ * time the one that adds the most (one seller with 30 beats five with 2
+ * each), until `maxStops` or nothing more is gained. A bazaar that adds
+ * nothing is never visited, so fewer is always preferred.
+ *
+ * @param {Array} sellers - bazaarSellers output (cheapest first)
+ * @param {number} bid - what the trader pays per item
+ * @param {object} [opts]
+ * @param {number|null} [opts.cash] - null: no limit; 0 or less: nothing (the cash is spent)
+ * @param {number} [opts.maxUnits] - the most items bought (0 or less: nothing)
+ * @param {number} [opts.minPct] - least profit per item, % of its price
+ * @param {number} [opts.maxStops] - the most bazaars
+ * @param {number} [opts.maxNew] - the most bazaars not in `free`
+ * @param {Set<string>} [opts.free] - seller ids you visit anyway (no extra stop)
+ * @param {string|null} [opts.exclude] - a seller never bought from (the trader's own bazaar)
+ * @returns {null|{units, cost, profit, steps, stops, newStops, under}} null when no fresh listing makes the least profit
+ */
+export function pickBazaars(sellers, bid, { cash = null, maxUnits = FLIP_MAX_UNITS, minPct = MIN_PROFIT_PCT, maxStops = MAIN_STOPS, maxNew = Infinity, free = null, exclude = null } = {}) {
+    if (!(bid > 0)) return null;
+    const no = exclude ? String(exclude) : null;
+    const under = (sellers || []).filter((s) => s && !s.stale && s.qty > 0 && s.price > 0 && !(no && s.sellerId && String(s.sellerId) === no) && enoughProfit(bid - s.price, s.price, 'TRADER', minPct));
+    if (!under.length) return null;
+    // Nothing left to spend, or no unit left to take: nothing bought (never "no limit").
+    const left = cash === null || cash === undefined ? Infinity : Number(cash) > 0 ? Number(cash) : 0;
+    const most = Number(maxUnits) > 0 ? Math.floor(Number(maxUnits)) : 0;
+
+    let groups = new Map();
+    under.forEach((s, i) => {
+        const k = stopKey(s, i);
+        if (!groups.has(k)) groups.set(k, { key: k, free: Boolean(free && s.sellerId && free.has(String(s.sellerId))), rows: [] });
+        groups.get(k).rows.push(s);
+    });
+    // Too many to weigh: the bazaars that could make the most on their own
+    // (a big seller behind sixty single units is not missed), and every one
+    // you visit anyway.
+    if (groups.size > PICK_GROUPS) {
+        for (const g of groups.values()) g.alone = profitFrom(g.rows, bid, left, most).profit;
+        const keep = [...groups.values()].sort((x, y) => y.alone - x.alone).slice(0, PICK_GROUPS);
+        for (const g of groups.values()) if (g.free && !keep.includes(g)) keep.push(g);
+        groups = new Map(keep.map((g) => [g.key, g]));
+    }
+    const rowsOf = (keys) => {
+        let rows = [];
+        for (const k of keys) rows = mergeRows(rows, groups.get(k).rows);
+        return rows;
+    };
+    const newCount = (keys) => [...keys].filter((k) => !groups.get(k).free).length;
+    // Only bazaars actually bought from hold a place (a bazaar the cheaper
+    // ones since pushed out is let go).
+    const usedOnly = (keys) => {
+        const bought = new Set(buyFrom(rowsOf(keys), bid, left, most).steps.map((st) => st.sellerId + '|' + st.price));
+        const used = new Set();
+        for (const k of keys) if (groups.get(k).rows.some((r) => bought.has(r.sellerId + '|' + r.price))) used.add(k);
+        return used;
+    };
+    let chosen = new Set();
+    let best = { profit: 0, full: false };
+    // A bazaar is worth its stop when it adds something - once the flip is
+    // full (Most per flip, or the cash), when it adds a real share (one
+    // bazaar is best: not five for a few dollars more). One you visit anyway
+    // only has to add something.
+    const worth = (g, r) => r.profit > best.profit && (!best.full || g.free || r.profit >= best.profit * (1 + SWAP_GAIN));
+    while (chosen.size < maxStops) {
+        let pick = null;
+        const base = rowsOf(chosen);
+        const newNow = newCount(chosen);
+        for (const g of groups.values()) {
+            if (chosen.has(g.key) || (!g.free && newNow >= maxNew)) continue;
+            const r = profitFrom(mergeRows(base, g.rows), bid, left, most);
+            if (!worth(g, r)) continue;
+            if (!pick || r.profit > pick.r.profit || (r.profit === pick.r.profit && g.free && !pick.g.free)) pick = { g, r };
+        }
+        if (!pick) break;
+        chosen = usedOnly(new Set(chosen).add(pick.g.key));
+        best = profitFrom(rowsOf(chosen), bid, left, most);
+    }
+    // One pass of swaps: a bazaar in the plan for one not in it, when that
+    // makes more (adding one at a time can take a big seller first that
+    // five smaller ones would beat).
+    // (The main flip only: an extra is a bazaar or two of cover.)
+    for (let round = 0; round < MAIN_STOPS && chosen.size > 1 && maxStops >= MAIN_STOPS; round++) {
+        let better = null;
+        for (const out of chosen) {
+            const rest = new Set(chosen);
+            rest.delete(out);
+            const base = rowsOf(rest);
+            const newRest = newCount(rest);
+            for (const g of groups.values()) {
+                if (chosen.has(g.key) || (!g.free && newRest + 1 > maxNew)) continue;
+                const r = profitFrom(mergeRows(base, g.rows), bid, left, most);
+                if (r.profit > (better ? better.r.profit : best.profit)) better = { next: new Set(rest).add(g.key), r };
+            }
+        }
+        if (!better) break;
+        chosen = usedOnly(better.next);
+        best = profitFrom(rowsOf(chosen), bid, left, most);
+    }
+    const plan = buyFrom(rowsOf(chosen), bid, left, most);
+    // Only bazaars actually bought from count (cash or the most units can stop short).
+    const used = new Set(plan.steps.map((st) => (st.sellerId ? 'id:' + String(st.sellerId) : null)).filter(Boolean));
+    const unknown = plan.steps.filter((st) => !st.sellerId).length;
+    let usedNew = unknown;
+    for (const k of used) if (!(free && free.has(k.slice(3)))) usedNew += 1;
+    return { ...plan, stops: used.size + unknown, newStops: usedNew, under };
+}
+
+/**
+ * A flip: the most profit from at most MAIN_STOPS bazaars (see pickBazaars),
+ * only listings that cost less than the trader pays (by the least profit),
+ * only fresh ones, and only with the cash you set.
  *
  * @param {Array} sellers - bazaarSellers output
  * @param {number} bid - what the trader pays per item
@@ -134,41 +320,26 @@ export function bazaarSellers(rows, { selfId = null, now = Date.now(), freshMs =
  * @param {number|null} [opts.cash] - null or 0: no limit
  * @param {number} [opts.maxUnits] - the most items one flip buys
  * @param {number} [opts.minPct] - each item must make at least this % of its price (a trader is not an NPC shop)
- * @returns {null|{units, cost, profit, each, firstPrice, needs, available, steps: Array<{sellerId, sellerName, qty, price}>}}
+ * @param {number} [opts.maxStops] - the most bazaars (MAIN_STOPS)
+ * @returns {null|{units, cost, profit, each, firstPrice, needs, available, stops, steps: Array<{sellerId, sellerName, qty, price}>}}
  *   `available`: every fresh item under the bid, bought or not.
  *   null when no fresh listing is under the bid. `units` 0 with `needs` set:
  *   the cheapest one costs more than your cash.
  */
-export function flipPlan(sellers, bid, { cash = null, maxUnits = FLIP_MAX_UNITS, minPct = MIN_PROFIT_PCT } = {}) {
-    if (!(bid > 0)) return null;
-    const under = (sellers || []).filter((s) => !s.stale && enoughProfit(bid - s.price, s.price, 'TRADER', minPct));
-    if (!under.length) return null;
-
-    const limit = cash > 0 ? cash : Infinity;
-    const most = maxUnits > 0 ? Math.floor(maxUnits) : FLIP_MAX_UNITS;
-    let left = limit;
-    let units = 0;
-    let cost = 0;
-    let profit = 0;
-    const steps = [];
-    for (const s of under) {
-        const n = Math.min(s.qty, Math.floor(left / s.price), most - units);
-        if (n <= 0) break;
-        steps.push({ sellerId: s.sellerId, sellerName: s.sellerName, qty: n, price: s.price });
-        units += n;
-        cost += n * s.price;
-        profit += n * (bid - s.price);
-        left -= n * s.price;
-        if (n < s.qty) break;
-    }
+export function flipPlan(sellers, bid, { cash = null, maxUnits = FLIP_MAX_UNITS, minPct = MIN_PROFIT_PCT, maxStops = MAIN_STOPS } = {}) {
+    // Here Cash 0 or blank is no limit, and no Most per flip is the default.
+    const p = pickBazaars(sellers, bid, { cash: cash > 0 ? cash : null, maxUnits: maxUnits > 0 ? maxUnits : FLIP_MAX_UNITS, minPct, maxStops });
+    if (!p) return null;
+    const under = p.under;
     return {
-        units,
-        cost,
-        profit,
-        steps,
+        units: p.units,
+        cost: p.cost,
+        profit: p.profit,
+        steps: p.steps.map(({ sellerId, sellerName, qty, price }) => ({ sellerId, sellerName, qty, price })),
+        stops: p.stops,
         each: bid - under[0].price,
         firstPrice: under[0].price,
-        needs: units ? 0 : under[0].price,
+        needs: p.units ? 0 : under[0].price,
         available: under.reduce((a, s) => a + s.qty, 0),
     };
 }

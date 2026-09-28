@@ -257,11 +257,20 @@ panel except the cached item database. Nothing is traded, listed or clicked for
 you: every link is one you follow yourself, one page per click.
 
 - **Best flips with your cash** (across the top): the four flips that make the
-  most. A flip buys from bazaars **cheapest first**, only listings that cost
-  **less than a trader pays**, only listings **TornW3B saw in the last 30
-  minutes**, and never more than your **Cash** (Settings; blank is no limit).
-  Your own listings are never a bazaar to buy from. Each card says how many,
-  from whom, and to whom; press it to put that item on the desk.
+  most. A flip buys from **at most 5 bazaars** (3.14, the owner: "the app will
+  suggest 100 bazaars if it can... 1 item 1 bazaar best, 3 sure, 5 max"): the
+  bazaars that add the most, so one seller with 30 beats five sellers with 2
+  each, and once Most per flip (or your cash) is full another bazaar only
+  counts when it adds a tenth more. Only listings that cost **less than a
+  trader pays**, only listings **TornW3B saw in the last 30 minutes**, and
+  never more than your **Cash** (Settings; blank is no limit). Your own
+  listings are never a bazaar to buy from. Each card says how many, from whom,
+  and to whom; press it to put that item on the desk. **The pin** (3.14) in
+  each card's corner pins that flip's trade - with the trader the card sells
+  to - on top of the list (All, Mine and Flips); from then on only its prices
+  and profit move; press it again (or the pin on the list row) to unpin. It
+  stays until you unpin it or trade it (Traded - done), across reloads, a
+  week at most. The strip never re-orders while your pointer is on it.
 - **The desk.** On the left, every item: **All** (what you hold and everything
   any trader buys), **Mine**, **Flips** - money to be made first, each with a
   badge (*Flip +$26,500*, *List +$749,998*, *Sell to trader*), what you hold
@@ -379,7 +388,36 @@ you: every link is one you follow yourself, one page per click.
     Each row is its link: Trade, your bazaar's add page, the Item Market's
     add-listing page.
   - The item's name opens it on the Item Market.
-  Until you pick an item, the desk shows the best flip.
+  Until you pick an item, the desk shows the best flip - the #1 flip, following
+  it as better ones are found (3.14; 3.13 had kept it on the first flip that
+  loaded while that flip stayed in the top four).
+  **3.14, the main flip and its cover** (the owner: "the MAIN flip is the big
+  earner... extra items are only cover, so the trader doesn't see a one-item
+  scam"): with the trader you plan with, the item that makes the most is the
+  **main flip** (first, tagged MAIN, at most 5 bazaars) - when that is not the
+  item on the desk, one line says so (*Main: Gentleman Cache +$55,349 · Small
+  First Aid Kit is cover*). Then **about 5 extras**: what the bazaars on the
+  route sell first, then items one new bazaar away, fast sellers first; low
+  profit is fine; each at most 3 bazaars. The rest are listed under *Show
+  them*, each with **Add**. **Your own items are no longer put in a trade**
+  (the owner: "omit it"); Where to sell and the Mine tab stay. **Copy offer is
+  gone; Chat** opens the trader's profile (Torn's chat button is there), or
+  their TornExchange page for a trader known by name only. **The trade holds
+  still** once you start on it (any press in its card) or pin it: the trader,
+  the items, how many and from which bazaars stay; what the bazaars ask and
+  what the trader pays are live, so the profit is today's; a step shows *now
+  $X (was $Y)*, *only N left*, or *gone*, and a line that stops paying stays,
+  in red. Only you change it: untick, tick back, or a number re-picks that one
+  line. A number box is never redrawn while you type in it. **Reads:** a trade
+  on the desk that nobody is working on no longer reads its items before the
+  possible flips (it read up to 30 items for twelve traders' totals first, so
+  the flips waited and the big ones stayed unconfirmed).
+- **3.14:** *Buyers online only* now hides only traders known to be offline -
+  idle ones, ones whose status is not read yet and ones known by name only
+  stay (it used to hide most big TornExchange buyers). *Trusted buyers only*
+  keeps Trusted and Known (20+ votes); while TornExchange's votes are not
+  loaded, a trader without any is kept. The badge shows the score (*TRUSTED
+  180*). The overlay's bazaar-card tag still needs the Trusted badge.
 - **Trusted buyers only** (on from the start: money changes hands on trust)
   and **Buyers online only** apply to the whole page - flips, the desk, the
   badges. A trader's status comes from Torn's public profile, at most 30 a

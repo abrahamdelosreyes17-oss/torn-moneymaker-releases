@@ -88,22 +88,19 @@ export function itemImageUrl(itemId) {
     return 'https://www.torn.com/images/items/' + encodeURIComponent(String(itemId)) + '/small.png';
 }
 
-/** Copy text where the Clipboard API is missing or refused: a hidden box, selected and copied. */
-function copyByHand(text) {
-    const box = document.createElement('textarea');
-    box.value = text;
-    box.setAttribute('readonly', '');
-    box.style.cssText = 'position:fixed;left:-9999px;top:0;opacity:0';
-    document.body.appendChild(box);
-    box.select();
-    let ok = false;
-    try {
-        ok = document.execCommand('copy');
-    } catch {
-        ok = false;
-    }
-    box.remove();
-    return ok;
+/** The pin (3.14): an outline pin, drawn in the current colour. */
+function pinIcon() {
+    const NS = 'http://www.w3.org/2000/svg';
+    const svg = document.createElementNS(NS, 'svg');
+    svg.setAttribute('viewBox', '0 0 16 16');
+    svg.setAttribute('width', '14');
+    svg.setAttribute('height', '14');
+    svg.setAttribute('aria-hidden', 'true');
+    const path = document.createElementNS(NS, 'path');
+    path.setAttribute('d', 'M10.5 1.5l4 4-2 1-2.5 2.5.5 3-1.5 1.5-3-3-3.5 3.5-.5-.5 3.5-3.5-3-3L4.5 5l3 .5L10 3z');
+    path.setAttribute('fill', 'currentColor');
+    svg.appendChild(path);
+    return svg;
 }
 
 function spEl(tag, props = {}, children = []) {
@@ -429,6 +426,15 @@ export class SellingPage {
             onclick: () => set({ trustedOnly: !this.state.prefs.trustedOnly }),
         }, [spEl('span', { class: 'sp-trust', 'data-level': 'trusted', text: 'T' }), 'Trusted buyers only']);
         this.stripEl = spEl('div', { class: 'sp-strip' });
+        // Numbers update under your pointer, the order does not: a card never
+        // moves while you are about to press it (3.14).
+        this.stripEl.addEventListener('mouseenter', () => {
+            this.stripHover = true;
+        });
+        this.stripEl.addEventListener('mouseleave', () => {
+            this.stripHover = false;
+            this.renderStrip();
+        });
         this.catLineEl = spEl('div', { class: 'sp-catline', hidden: '' });
 
         /* the desk: every item, and the one picked */
@@ -1180,9 +1186,22 @@ export class SellingPage {
 
     renderStrip() {
         const s = this.state;
+        if (!s) return;
         const info = s.info || {};
+        // Under your pointer the cards keep their places: the numbers update,
+        // a card never jumps to another slot (the new order comes on leaving).
+        const order = s.strip.map((f) => f.itemId).join(',');
+        let strip = s.strip;
+        if (this.stripHover && this.stripShown && order !== this.stripOrder) {
+            const byId = new Map(s.strip.map((f) => [f.itemId, f]));
+            strip = this.stripShown.map((f) => byId.get(f.itemId) || f);
+        } else {
+            this.stripOrder = order;
+        }
+        const pinnedIds = new Set((s.pinned || []).map((p) => p.itemId));
         const sig = JSON.stringify([
-            s.strip.map((f) => [f.itemId, f.name, f.plan.profit, f.plan.units, f.plan.steps.map((st) => st.sellerName), f.buyer.name, f.buyer.price, f.buyer.trust && f.buyer.trust.level]),
+            [...pinnedIds],
+            strip.map((f) => [f.itemId, f.name, f.plan.profit, f.plan.units, f.plan.steps.map((st) => st.sellerName), f.buyer.name, f.buyer.price, f.buyer.trust && f.buyer.trust.level]),
             s.desk && s.desk.itemId,
             info.flipsChecked,
             info.flipsWanted,
@@ -1194,6 +1213,7 @@ export class SellingPage {
         ]);
         if (sig === this.stripSig) return;
         this.stripSig = sig;
+        this.stripShown = strip;
 
         const box = this.stripEl;
         box.textContent = '';
@@ -1227,26 +1247,47 @@ export class SellingPage {
             });
             box.appendChild(card);
         }
-        if (!s.strip.length && (s.leftovers || []).length) return;
-        if (!s.strip.length) {
+        if (!strip.length && (s.leftovers || []).length) return;
+        if (!strip.length) {
             const text = this.noFlipsText();
             box.appendChild(spEl('div', { class: 'sp-empty sp-strip-empty', text }));
             return;
         }
-        for (const f of s.strip) {
+        for (const f of strip) {
             const on = Boolean(s.desk && s.desk.itemId === f.itemId);
-            box.appendChild(spEl('button', {
+            const pinned = pinnedIds.has(f.itemId);
+            // The pin: always shown, in the card's top corner; pressing it
+            // changes only its colour - the card stays where it is.
+            const pin = spEl('button', {
                 type: 'button',
+                class: 'sp-pin' + (pinned ? ' sp-pin-on' : ''),
+                'aria-pressed': String(pinned),
+                'aria-label': (pinned ? 'Unpin ' : 'Pin ') + f.name + '\'s trade',
+                title: pinned ? 'Pinned on top of the list: press to unpin' : 'Pin this trade: it stays on top of the list, only prices move',
+                onclick: (event) => {
+                    event.stopPropagation();
+                    if (this.h.onPin) this.h.onPin(f.itemId);
+                },
+            }, [pinIcon()]);
+            const card = spEl('div', {
                 class: 'sp-fc' + (on ? ' sp-sel' : ''),
+                role: 'button',
+                tabindex: '0',
                 'aria-pressed': String(on),
                 title: 'Show its flip plan',
-                onclick: () => this.select(f.itemId),
             }, [
-                spEl('span', { class: 'sp-fc-top' }, [spEl('span', { class: 'sp-pic sp-pic-s' }, [this.image('strip', f.itemId)]), spEl('b', { class: 'sp-iname', text: f.name })]),
+                spEl('span', { class: 'sp-fc-top' }, [spEl('span', { class: 'sp-pic sp-pic-s' }, [this.image('strip', f.itemId)]), spEl('b', { class: 'sp-iname', text: f.name }), pin]),
                 spEl('span', { class: 'sp-fc-p', text: signed(f.plan.profit) }),
                 spEl('small', {}, ['Buy ', spEl('b', { text: count(f.plan.units) }), ' from ' + [...new Set(f.plan.steps.map((st) => st.sellerName || 'a bazaar'))].join(', ')]),
                 spEl('small', { class: 'sp-fc-sell' }, ['Sell to ', spEl('b', { text: f.buyer.name }), ' at ' + formatMoney(f.buyer.price), this.trustBadge(f.buyer)]),
-            ]));
+            ]);
+            card.addEventListener('click', () => this.select(f.itemId));
+            card.addEventListener('keydown', (event) => {
+                if (event.target !== card || (event.key !== 'Enter' && event.key !== ' ')) return;
+                event.preventDefault();
+                this.select(f.itemId);
+            });
+            box.appendChild(card);
         }
     }
 
@@ -1268,6 +1309,7 @@ export class SellingPage {
             Boolean(info.bazaarsAt),
             this.query,
             list.map((r) => [r.itemId, r.name, r.held, r.lowest, r.badge && [r.badge.kind, r.badge.amount], r.pending]),
+            s.pinned || [],
         ]);
         if (sig === this.listSig) return;
         this.listSig = sig;
@@ -1283,6 +1325,41 @@ export class SellingPage {
         }
 
         this.listBox.textContent = '';
+        // Pinned trades first, whatever the filter: the main flip, the trader, the profit now.
+        for (const pt of s.pinned || []) {
+            const unpin = spEl('button', {
+                type: 'button',
+                class: 'sp-pin sp-pin-on',
+                'aria-pressed': 'true',
+                'aria-label': 'Unpin the trade with ' + pt.trader,
+                title: 'Pinned: press to unpin',
+                onclick: (event) => {
+                    event.stopPropagation();
+                    if (this.h.onUnpin) this.h.onUnpin(pt.key);
+                },
+            }, [pinIcon()]);
+            const open = () => this.h.onPinnedOpen && this.h.onPinnedOpen(pt.key);
+            this.listBox.appendChild(spEl('div', {
+                class: 'sp-it sp-pinrow' + (pt.on ? ' sp-sel' : ''),
+                role: 'button',
+                tabindex: '0',
+                'aria-pressed': String(pt.on),
+                'data-focus': 'pin:' + pt.key,
+                title: 'Your pinned trade: only prices and profit move',
+                onclick: open,
+                onkeydown: (event) => {
+                    if (event.target !== event.currentTarget || (event.key !== 'Enter' && event.key !== ' ')) return;
+                    event.preventDefault();
+                    open();
+                },
+            }, [
+                spEl('span', { class: 'sp-pic sp-pic-s' }, [this.image('pin', pt.mainId)]),
+                spEl('b', { class: 'sp-iname', text: pt.name + ' → ' + pt.trader }),
+                spEl('span', { class: 'sp-pinrow-r' }, [spEl('span', { class: 'sp-badge ' + (pt.profit < 0 ? 'sp-badge-bad' : 'sp-badge-flip'), text: signed(pt.profit) }), unpin]),
+                spEl('small', { text: count(pt.items) + (pt.items === 1 ? ' item' : ' items') + ' · ' + count(pt.stops) + (pt.stops === 1 ? ' bazaar' : ' bazaars') }),
+            ]));
+        }
+        if ((s.pinned || []).length) this.listBox.appendChild(spEl('div', { class: 'sp-pinsep', 'aria-hidden': 'true' }));
         if (!list.length) {
             let text = 'Loading…';
             const q = this.query.trim();
@@ -1387,10 +1464,13 @@ export class SellingPage {
             ])
             : JSON.stringify([info.hasKey, info.loading, Boolean(info.bazaarsAt), info.tradersLoading, this.state.counts]);
         if (sig === this.deskSig) return;
-        this.deskSig = sig;
 
         const shadow = this.root.getRootNode();
         const active = shadow && shadow.activeElement;
+        // A number half typed is never replaced: the desk is drawn again
+        // once you press Enter or leave the box.
+        if (active && box.contains(active) && active.dataset && active.dataset.dirty) return;
+        this.deskSig = sig;
         const keep = active && box.contains(active) && active.dataset ? active.dataset.focus : null;
 
         box.textContent = '';
@@ -1608,36 +1688,15 @@ export class SellingPage {
     }
 
     /**
-     * The message you send the trader first (the owner: "we message the trader
-     * first if they're buying"): each item and amount, and what their list
-     * comes to. Copied only - you paste and send it yourself.
+     * Chat with the trader (the owner, 2026-09-28: "we don't need copy offer,
+     * what we need is a button that goes straight to chatting that trader"):
+     * their Torn profile, where Torn's own chat button is; a trader known by
+     * name only, their TornExchange page.
      */
-    offerText(name, c) {
-        // One line per item: bought to flip and your own of the same item are one amount.
-        const units = new Map();
-        for (const r of [...c.flips, ...c.held]) if (r.units > 0) units.set(r.name, (units.get(r.name) || 0) + r.units);
-        const parts = [...units].map(([name, n]) => count(n) + 'x ' + name);
-        return 'Hi ' + name + '! I have ' + parts.join(', ') + ' for you - ' + (c.estimated ? 'about ' : '') + formatMoney(c.pays) + ' at your list prices. Want them?';
-    }
-
-    copyOfferButton(name, c) {
-        const btn = spEl('button', { type: 'button', class: 'sp-btn sp-offer', 'data-focus': 'trade:offer', title: 'Copy a message for ' + name + ' with every item and the total', text: 'Copy offer' });
-        btn.addEventListener('click', () => {
-            const text = this.offerText(name, c);
-            const done = (ok) => {
-                btn.textContent = ok ? 'Copied ✓' : 'Copy failed';
-                setTimeout(() => {
-                    btn.textContent = 'Copy offer';
-                }, 2000);
-            };
-            try {
-                if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(() => done(true), () => done(copyByHand(text)));
-                else done(copyByHand(text));
-            } catch {
-                done(copyByHand(text));
-            }
-        });
-        return btn;
+    chatLink(b) {
+        if (b.id) return this.link('Chat', spProfileUrl(b.id), { cls: 'sp-btn sp-chat', title: 'Open ' + b.name + '\'s profile to chat with them', focus: 'trade:chat' });
+        if (b.te) return this.link('Chat', tePriceListUrl(b.teName || b.name), { cls: 'sp-btn sp-chat', title: b.name + ' is known by name only: their TornExchange page', focus: 'trade:chat' });
+        return null;
     }
 
     tradeCard(d) {
@@ -1645,7 +1704,11 @@ export class SellingPage {
         const c = T.chosen;
         const b = c.buyer;
         const approx = c.estimated ? '≈ ' : '';
-        const card = spEl('div', { class: 'sp-q sp-hot sp-wide sp-trade' }, [spEl('h3', { text: 'Flip plan · one trade with ' + b.name })]);
+        const card = spEl('div', { class: 'sp-q sp-hot sp-wide sp-trade' }, [spEl('h3', {}, [
+            'Flip plan · one trade with ' + b.name,
+            // Held (you started on it) or pinned: the items stay, prices and profit are live.
+            c.hold ? spEl('span', { class: 'sp-heldtag', title: 'The items stay as they are; prices and profit are live', text: c.hold.pinned ? 'Pinned' : 'Held' }) : null,
+        ])]);
         // Anything you do here pins the desk to this item and this trader, so
         // the plan cannot move away while you buy and trade.
         card.addEventListener('click', (event) => {
@@ -1658,7 +1721,7 @@ export class SellingPage {
         card.appendChild(spEl('div', { class: 'sp-tpick' }, [
             spEl('span', { class: 'sp-note', text: c.stops ? count(c.stops) + (c.stops === 1 ? ' bazaar' : ' bazaars') + ' to buy from · about ' + c.minutes + ' min' : 'Nothing to buy: all yours' }),
             spEl('span', { class: 'sp-tpick-b' }, [
-                this.copyOfferButton(b.name, c),
+                this.chatLink(b),
                 spEl('button', { type: 'button', class: 'sp-btn sp-primary', 'data-focus': 'trade:accept', title: b.name + ' said yes: freeze this trade, so nothing in it moves while you buy and send', text: b.name + ' accepted', onclick: () => this.h.onTradeAccept && this.h.onTradeAccept(d.itemId) }),
                 spEl('button', { type: 'button', class: 'sp-btn', 'data-focus': 'trade:decline', title: b.name + ' did not want to trade: plan with the next best (for an hour)', text: b.name + ' declined', onclick: () => this.h.onTradeDecline && this.h.onTradeDecline(c.key) }),
             ]),
@@ -1690,10 +1753,18 @@ export class SellingPage {
         const qtyBox = (value, label, focus, onSet) => {
             const input = spEl('input', { type: 'text', class: 'sp-qty', inputmode: 'numeric', value: String(value), 'aria-label': label, 'data-focus': focus, autocomplete: 'off', spellcheck: 'false' });
             const commit = () => {
+                delete input.dataset.dirty;
                 const n = Math.floor(Number(String(input.value).replace(/[,s]/g, '')));
                 if (Number.isFinite(n) && n >= 0) onSet(n);
                 else input.value = String(value);
             };
+            input.addEventListener('input', () => {
+                input.dataset.dirty = '1';
+            });
+            input.addEventListener('blur', () => {
+                if (!input.dataset.dirty) return;
+                commit();
+            });
             input.addEventListener('change', commit);
             input.addEventListener('keydown', (event) => {
                 if (event.key !== 'Enter') return;
@@ -1704,8 +1775,13 @@ export class SellingPage {
         };
         const edit = (id, e) => this.h.onTradeEdit && this.h.onTradeEdit(c.key, id, e);
 
-        // Buy, then trade: this item first.
+        // Buy, then trade: the main flip first.
         if (c.flips.length || c.off.length || c.itemNote) card.appendChild(spEl('div', { class: 'sp-tsec', text: 'Buy, then trade to ' + b.name }));
+        // Another item makes the most with this trader: it is the main flip, this one is cover.
+        const mainRow = c.main ? c.flips.find((r) => r.itemId === String(c.main)) : null;
+        if (mainRow && mainRow.itemId !== String(d.itemId) && c.flips.some((r) => r.itemId === String(d.itemId))) {
+            card.appendChild(spEl('p', { class: 'sp-note sp-mainnote', text: 'Main: ' + mainRow.name + ' ' + signed(mainRow.profit) + ' · ' + d.name + ' is cover' }));
+        }
         // Planned with a trader who makes no flip on this item: said, with the numbers.
         if (c.itemNote) {
             const n = c.itemNote;
@@ -1718,11 +1794,20 @@ export class SellingPage {
             }[n.why] || 'not a flip with your settings';
             card.appendChild(spEl('p', { class: 'sp-note sp-itemnote', text: d.name + ' is not in this trade: ' + b.name + ' pays ' + formatMoney(n.bid) + (n.cheapest ? ', the cheapest bazaar is ' + formatMoney(n.cheapest) : '') + ' - ' + why + '.' }));
         }
+        // A held trade's step against the bazaar now: re-priced, fewer left, gone.
+        const mark = (st) => {
+            const k = st.check && st.check.state;
+            if (k === 'price') return spEl('span', { class: 'sp-warnnote', text: ' · now ' + formatMoney(st.price) + ' (was ' + formatMoney(st.planned) + ')' });
+            if (k === 'short') return spEl('span', { class: 'sp-warnnote', text: ' · only ' + count(st.qty) + ' left of ' + count(st.plannedQty) });
+            if (k === 'gone') return spEl('span', { class: 'sp-bad', text: ' · gone' });
+            return null;
+        };
         for (const r of c.flips) {
             const here = r.itemId === String(d.itemId);
+            const isMain = c.main && r.itemId === String(c.main);
             const steps = r.steps.map((st) => (st.sellerId
                 ? spEl('div', { class: 'sp-buy' }, [
-                    spEl('span', {}, ['Buy ', spEl('b', { text: count(st.qty) }), ' from ', this.playerName(st.sellerName || 'Player ' + st.sellerId, st.sellerId, 'trade:seller:' + r.itemId + ':' + st.sellerId), ' at ' + formatMoney(st.price) + (st.along ? ' · same bazaar' : '') + (st.seenAt ? ' · seen ' + formatAge(Date.now() - st.seenAt) : '')]),
+                    spEl('span', {}, ['Buy ', spEl('b', { text: count(st.check && st.check.state === 'gone' ? st.plannedQty : st.qty) }), ' from ', this.playerName(st.sellerName || 'Player ' + st.sellerId, st.sellerId, 'trade:seller:' + r.itemId + ':' + st.sellerId), ' at ' + formatMoney(st.check && st.check.state === 'price' ? st.planned : st.price) + (st.along ? ' · same bazaar' : '') + (st.seenAt ? ' · seen ' + formatAge(Date.now() - st.seenAt) : ''), mark(st)]),
                     this.link('Open bazaar', bazaarUrl(st.sellerId, r.itemId, st.price), { focus: 'trade:bazaar:' + r.itemId + ':' + st.sellerId }),
                 ])
                 : spEl('div', { class: 'sp-buy' }, [spEl('span', { text: '≈ from ' + formatMoney(st.price) + ': its bazaars are being read' })])));
@@ -1730,10 +1815,10 @@ export class SellingPage {
                 tick(true, 'Include ' + r.name, 'trade:tick:' + r.itemId, (on) => edit(r.itemId, on ? null : { off: true })),
                 spEl('span', { class: 'sp-pic sp-pic-s' }, [this.image('trade-buy', r.itemId)]),
                 spEl('span', { class: 'sp-ti-l' }, [
-                    spEl('span', {}, [this.link(r.name, itemMarketUrl(r.itemId, r.name), { cls: 'sp-tiname', title: 'Open it on the Item Market', focus: 'trade:name:' + r.itemId }), here ? spEl('span', { class: 'sp-here', text: 'THIS ITEM' }) : this.kindTag(r.kind)]),
-                    spEl('small', {}, [qtyBox(r.units, 'How many ' + r.name, 'trade:qty:' + r.itemId, (n) => edit(r.itemId, n > 0 ? { qty: n } : { off: true })), ' at ' + formatMoney(r.bid) + ' each']),
+                    spEl('span', {}, [this.link(r.name, itemMarketUrl(r.itemId, r.name), { cls: 'sp-tiname', title: 'Open it on the Item Market', focus: 'trade:name:' + r.itemId }), isMain ? spEl('span', { class: 'sp-here', text: 'MAIN' }) : here ? spEl('span', { class: 'sp-here', text: 'THIS ITEM' }) : this.kindTag(r.kind)]),
+                    spEl('small', {}, [qtyBox(r.plannedUnits || r.units, 'How many ' + r.name, 'trade:qty:' + r.itemId, (n) => edit(r.itemId, n > 0 ? { qty: n } : { off: true })), ' at ' + formatMoney(r.bid) + ' each', r.noBid ? spEl('span', { class: 'sp-warnnote', text: ' · not on their list now' }) : null]),
                 ]),
-                spEl('span', { class: 'sp-ti-p sp-good' }, [(r.estimated ? '≈ ' : '') + signed(r.profit), spEl('small', { text: 'cost ' + formatMoney(r.cost) })]),
+                spEl('span', { class: 'sp-ti-p ' + (r.profit < 0 ? 'sp-bad' : 'sp-good') }, [(r.estimated ? '≈ ' : '') + signed(r.profit), spEl('small', { text: 'cost ' + formatMoney(r.cost) })]),
                 spEl('div', { class: 'sp-buys' }, steps),
             ]));
         }
@@ -1745,8 +1830,29 @@ export class SellingPage {
                 spEl('span', { class: 'sp-ti-p', text: '–' }),
             ]));
         }
-        // What else they buy, left out so the buying stays quick.
-        if (c.more > 0) card.appendChild(spEl('p', { class: 'sp-note', text: count(c.more) + (c.more === 1 ? ' more item ' : ' more items ') + b.name + ' buys left out, to keep the buying quick.' }));
+        // What else they buy, left out so the buying stays quick: listed on a
+        // press, each with Add (the owner: "5 extra items, not max, but soft cap").
+        if (c.more > 0) {
+            const open = this.showLeft === c.key;
+            card.appendChild(spEl('p', { class: 'sp-note sp-leftline' }, [
+                b.name + ' buys ' + count(c.more) + (c.more === 1 ? ' more item' : ' more items') + ', left out to keep it quick. ',
+                spEl('button', { type: 'button', class: 'sp-link', 'aria-expanded': String(open), 'data-focus': 'trade:left', text: open ? 'Hide them' : 'Show them', onclick: () => {
+                    this.showLeft = open ? null : c.key;
+                    this.deskSig = null;
+                    this.renderDesk();
+                } }),
+            ]));
+            if (open) {
+                for (const r of c.left || []) {
+                    card.appendChild(spEl('div', { class: 'sp-ti sp-off sp-leftrow' }, [
+                        spEl('button', { type: 'button', class: 'sp-btn sp-add', 'data-focus': 'trade:add:' + r.itemId, 'aria-label': 'Add ' + r.name + ' to the trade', text: 'Add', onclick: () => edit(r.itemId, { qty: r.units }) }),
+                        spEl('span', { class: 'sp-pic sp-pic-s' }, [this.image('trade-left', r.itemId)]),
+                        spEl('span', { class: 'sp-ti-l' }, [spEl('span', {}, [spEl('b', { text: r.name }), this.kindTag(r.kind)]), spEl('small', { text: 'from ' + formatMoney(r.price) + ' · ' + b.name + ' pays ' + formatMoney(r.bid) })]),
+                        spEl('span', { class: 'sp-ti-p', text: '≈ ' + signed(r.profit) }),
+                    ]));
+                }
+            }
+        }
         // Was in this trade, is not now: said, never just gone (the friend lost
         // track of what to buy when rows vanished mid-trade).
         for (const r of c.gone || []) {
@@ -2106,7 +2212,10 @@ export class SellingPage {
         if (t.votes !== null) parts.push('TornExchange votes ' + (t.votes >= 0 ? '+' : '') + t.votes);
         if (t.up !== null) parts.push('TornW3B rating ' + t.up + '↑ ' + t.down + '↓');
         // The numbers are read out too, not only shown on hover.
-        return spEl('span', { class: 'sp-trust', 'data-level': t.level.toLowerCase(), title: parts.join(' · '), 'aria-label': t.level + (parts.length ? ': ' + parts.join(', ') : ''), text: t.level });
+        // The more trades behind them, the bigger the number (3.14, the owner:
+        // "the more trusted the trader, show it").
+        const score = Number.isFinite(t.score) ? ' ' + count(t.score) : '';
+        return spEl('span', { class: 'sp-trust', 'data-level': t.level.toLowerCase(), title: parts.join(' · '), 'aria-label': t.level + (parts.length ? ': ' + parts.join(', ') : ''), text: t.level + score });
     }
 
     /** A dot and a word: Online, Idle 5m, Offline 3h, Online · Hospital. Nothing when not known yet. */
@@ -2255,8 +2364,25 @@ a.sp-btn { display: inline-flex; align-items: center; text-decoration: none; }
 .sp-left .sp-qty { width: 56px; }
 .sp-acc-foot { margin-top: 10px; }
 .sp-fc.sp-lo { border-style: dashed; }
+/* The pin sits in the card's corner, out of the flow: the card's contents
+   are where they always were, pinned or not (the owner: "you moved the contents"). */
+.sp-fc { position: relative; }
+.sp-fc .sp-fc-top { padding-right: 28px; }
+.sp-pin { display: grid; place-items: center; width: 24px; height: 24px; padding: 0; border-radius: 7px; border: 1px solid var(--cline2); background: #161616; color: var(--muted); cursor: pointer; }
+.sp-fc .sp-pin { position: absolute; top: 8px; right: 8px; }
+.sp-pin:hover { color: #fff; border-color: #555; }
+.sp-pin:focus-visible { outline: 2px solid var(--offer); outline-offset: 1px; }
+.sp-pin.sp-pin-on { color: var(--offer); border-color: #2f4466; background: #1b2230; }
+.sp-it.sp-pinrow { background: #1b2230; border-color: #2f4466; }
+.sp-it.sp-pinrow.sp-sel { border-color: var(--offer); }
+.sp-pinrow-r { display: inline-flex; align-items: center; gap: 6px; }
+.sp-pinsep { border-top: 1px dashed var(--cline2); margin: 4px 0 8px; }
+.sp-badge-bad { color: var(--bad); }
+.sp-heldtag { margin-left: 8px; font-size: 11px; font-weight: bold; text-transform: uppercase; letter-spacing: 0.4px; color: var(--offer); }
+.sp-mainnote { margin: 4px 0 6px; color: var(--text); }
+.sp-add { padding: 2px 10px; }
 .sp-fc .sp-lo-x { margin-left: auto; padding: 4px 8px; color: var(--offer); font-weight: bold; }
-.sp-offer { min-width: 104px; justify-content: center; }
+.sp-chat { min-width: 64px; justify-content: center; }
 .sp-q > .sp-note + .sp-note { margin-top: 6px; }
 .sp-tr { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 10px; align-items: center; padding: 8px 6px; border-top: 1px solid var(--cline); }
 .sp-q h3 + .sp-tr, .sp-q .sp-note + .sp-tr { border-top: 0; }

@@ -4,12 +4,11 @@ Read this first, then `README.md`. The README holds the product and the binding
 rules; this file holds where we are, how the owner works, and what is settled.
 Everything below "History" is the record of how we got here.
 
-## Start here (state on 2026-09-28, end of session)
+## Start here (state on 2026-09-28, end of the second session)
 
-- **Released: 3.13.1** (`e3b4fc5`; 3.13.0 `75ecf65` + the desk layout fix;
-  see "What the 2026-09-28 session did"), pushed. Install link given to the owner:
-  `https://raw.githubusercontent.com/abrahamdelosreyes17-oss/torn-moneymaker-releases/e3b4fc571d807d36060c77c316756856a46a7629/torn-moneymaker.user.js`
-- Branch `claude/optimistic-ride-1gqguu`. Earlier: 3.12.10 (`711f893`),
+- **Released: 3.14.0** (see "What the 2026-09-28 second session did"), pushed.
+  Install link: RELEASE_LINK_PLACEHOLDER
+- Before it: 3.13.1 (`e3b4fc5`). Branch `claude/optimistic-ride-1gqguu`. Earlier: 3.12.10 (`711f893`),
   3.12.5 (`aab7e53`), 3.12.6 (`fe49df0`), 3.12.7 (`d69907c`), 3.12.8 (`8991095`), 3.12.9 (`c45a227`).
 - **Remind the owner (they asked, 2026-09-28: "dont build, but remind the
   next session"):** Favourites on the Ledger's traders page (3+ trades = auto,
@@ -25,7 +24,7 @@ Everything below "History" is the record of how we got here.
   installs go through **pinned links** (`.../<commit>/torn-moneymaker.user.js`).
   Merging to `main` makes every install auto-update: only if the owner asks.
 - Nothing uncommitted except `mockups/` and `.claude/` (untracked on purpose).
-- 250 unit tests (`npm test`); `test/ux-check.mjs` has never run here. For
+- 272 unit tests (`npm test`); `test/ux-check.mjs` has never run here. For
   screenshots, 2026-09-28 used `playwright-core` installed in the session's
   scratchpad with the system Chrome (`executablePath`), never the repo. **Block
   torn.com in every Playwright context** (`ctx.route(/torn\.com\//, r =>
@@ -116,6 +115,72 @@ offer to read Torn's scripting-rules page with them (read only).
 6. Smaller: the Sell-to-by-trader view could show traders who make no flip on
    this item but whose other items make a trade (today Plan trade works on any
    trader row shown); Ledger names / export; run `test/ux-check.mjs`.
+
+## What the 2026-09-28 second session did (3.14.0)
+
+The owner: "before 3.12.6 the flip tool worked... since 3.13 it feels
+underwhelming: candy flips of a few thousand, and it doesn't lead with the
+best flip". Their plan, restated and agreed (explainer `mockups/P-trade-rules-explained.html`):
+the MAIN flip is the big earner; extras are only cover; "5 bazaars max for the
+main flip... 1 bazaar best"; "about 5 extras, soft cap"; no money thresholds
+("why are we hardcoding money? make it smart"); own items not in trades; a pin;
+"the only thing that updates is price/profit"; Chat instead of Copy offer.
+
+- **Desk regression (3.13) fixed:** `deskItem` (core/desk.js) - the #1 flip
+  until you pick. Proven on the harness (`&bigflip=1`) with 3.12.5, 3.12.10,
+  3.13.1 and 3.14 side by side (Playwright, torn.com blocked): 3.13.1 kept the
+  desk on Xanax +$20,000 for 35 s while Stealth Virus +$16.6m led the strip.
+- **Main flip at most 5 bazaars** (`pickBazaars` / `flipPlan`, core/flips.js):
+  bazaars added by what they add; once full (Most per flip / cash) a bazaar that
+  only swaps for cheaper units must add 10% (`SWAP_GAIN`, a ratio, not money).
+  Junk sinks by itself: Bon Bons +$9,633 from 38 bazaars → +$1,725 from 5. No
+  "worth the stops" money rule (the owner rejected $5,000/bazaar).
+- **planTrade with kindOf** (core/trade.js `planMainAndExtras`): main = the item
+  that makes the most with that trader (≤5 bazaars); "Main: X · Y is cover"
+  on the card; `EXTRA_ITEMS` 5 extras: route first, then one new bazaar, fast
+  first, ≤3 bazaars each (`EXTRA_STOPS`), slow only on the route; `left` =
+  the rest, *Show them* + Add. Without kindOf: the old plan (`planEverything`).
+- **Held and pinned trades** (core/held.js): a press in the trade card holds
+  it (session, 2 h); the pin on a Best flips card pins it (GM `sellPinned`,
+  'item|traderKey', a week, 8 max; Traded - done removes it). Items / amounts /
+  steps stay; `priceHeld` prices them live (check per step, their bid now);
+  lines never vanish (red when losing); `editHeld` changes only the line you
+  edit; ≈ lines resolve when read. Pinned rows on top of the list; the pin is
+  absolutely positioned (the owner: "you moved the contents" - measured equal).
+- **UI calm:** no desk redraw while a number box is dirty; the strip never
+  re-orders under the pointer. The full keyed in-place update was NOT built
+  (the hold makes redraws structure-identical).
+- **Reads (the yellow Bazaars pill):** `nextW3bRead` - the desk's trade read
+  its items (up to 30, for twelve traders' totals) before the possible flips,
+  always; now only while a trade is under way (picked / held / pinned), and
+  only the chosen trader's ≈ items. The harness found Stealth Virus at 12.5 s
+  vs 15-20 s.
+- **Toggles:** Online only drops only known-offline traders; Trusted only =
+  Known+ (and unrated while TE votes are missing); badge shows the score. The
+  overlay's bazaar tag still needs Trusted.
+- **Own items out of trades** (the owner: "omit it"); Copy offer → **Chat**
+  (profile; TE page for name-only traders).
+- **TornExchange pill (not fixed, not found):** the pacing (10 s, shared,
+  429 honoured) and the keyless per-item lookups (only without a working key)
+  are fine. Yellow = no top-3 list yet ("loading") or the last call's error on
+  the pill. Needs the owner's pill hover text (Claude in Chrome was not
+  connected). TornW3B 6/114 is the seed traders' lists being read one per two
+  slots - slow, but by design.
+- **Bug hunt (two reviewers, every finding reproduced, then fixed and
+  re-checked in the harness):** a zero pay cap / spent cash read as "no
+  limit" in `pickBazaars`; a big seller behind 60 single units never weighed;
+  greedy bazaar picks now get a swap pass (main flips); `priceHeld` shares a
+  seller's stock across steps; ticking a held line back restores it as it was;
+  the desk item always stays in its trade; the hold is taken AT the first press
+  (the first untick used to re-plan and drop the line); no stray "Held" after
+  Accept; a pin uses the trade the item's desk would show (`chooseTrade`),
+  its trader even when a toggle hides them; the hovered strip keeps its
+  places but updates; the pin icon shows only what was saved. Worst case
+  (12 traders x 30 items x 100 listings) plans in ~31 ms.
+- **Open:** Torn's direct chat link (the owner should open a trader's profile
+  in the Claude tab group; read what the chat button points to); a pin from a
+  list row (only Best flips cards have the pin); Settings › Keep for yourself
+  is now unused by trades (kept, harmless).
 
 ## What the 2026-09-28 session did (3.13.0)
 

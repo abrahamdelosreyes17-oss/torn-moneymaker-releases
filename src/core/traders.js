@@ -462,14 +462,29 @@ export function indexW3bByItem(db, now = Date.now()) {
     return out;
 }
 
-/** "Online only": keep traders known to be online, order unchanged. */
+/**
+ * "Buyers online only": drop traders known to be offline, order unchanged.
+ * Idle ones (logged in, away a few minutes), ones whose status is not read
+ * yet, and ones known by name only stay - it used to drop all of those, and
+ * with them most of the big TornExchange buyers (3.14).
+ */
 export function onlineOnly(buyers, levelOf) {
-    return buyers.filter((b) => b.id && levelOf(b.id) === 'online');
+    return buyers.filter((b) => !(b.id && levelOf(b.id) === 'offline'));
 }
 
-/** "Trusted buyers only": keep traders whose trust badge says Trusted, order unchanged. */
-export function trustedOnly(buyers) {
-    return buyers.filter((b) => b.trust && b.trust.level === 'Trusted');
+/**
+ * "Trusted buyers only", order unchanged. By default the Trusted badge only
+ * (the bazaar-card tag in the overlay). Torn Bids (3.14, the owner: "we've
+ * made the trusted too strict") passes `min: 'Known'` - 20 votes and up - and
+ * `keepUnrated` while TornExchange's votes are not loaded: a trader is not
+ * untrusted because a list did not load.
+ *
+ * @param {Array} buyers
+ * @param {{min?: 'Trusted'|'Known', keepUnrated?: boolean}} [opts]
+ */
+export function trustedOnly(buyers, { min = 'Trusted', keepUnrated = false } = {}) {
+    const ok = min === 'Known' ? new Set(['Trusted', 'Known']) : new Set(['Trusted']);
+    return buyers.filter((b) => (b.trust ? ok.has(b.trust.level) : keepUnrated));
 }
 
 /** What each column sorts by first: prices and counts high to low, names A to Z. */

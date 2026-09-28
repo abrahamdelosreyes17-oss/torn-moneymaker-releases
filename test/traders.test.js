@@ -167,11 +167,12 @@ test('a full-list name not among active traders is left out once the active list
     assert.deepEqual(unknown.map((b) => [b.name, b.id]), [['Ghost', null]]);
 });
 
-test('an item nobody buys has no rows; Online only keeps order and drops the rest', () => {
+test('an item nobody buys has no rows; Online only keeps order and drops only who is offline', () => {
     assert.deepEqual(buyersForItem('999', { db: dbWithLists(), w3bByItem: new Map() }), []);
-    const buyers = [{ id: '1', price: 3 }, { id: '2', price: 2 }, { id: null, price: 1 }, { id: '4', price: 0.5 }];
-    const level = { 1: 'offline', 2: 'online', 4: 'online' };
-    assert.deepEqual(onlineOnly(buyers, (id) => level[id]).map((b) => b.id), ['2', '4']);
+    const buyers = [{ id: '1', price: 3 }, { id: '2', price: 2 }, { id: null, price: 1 }, { id: '4', price: 0.5 }, { id: '5', price: 0.4 }, { id: '6', price: 0.3 }];
+    const level = { 1: 'offline', 2: 'online', 4: 'online', 5: 'idle', 6: 'unknown' };
+    // 3.14: idle, not read yet and name-only traders stay (it hid most big buyers).
+    assert.deepEqual(onlineOnly(buyers, (id) => level[id]).map((b) => b.id), ['2', null, '4', '5', '6']);
 });
 
 /* =============================================================== sections */
@@ -484,6 +485,10 @@ test('Trusted buyers only keeps the Trusted badge, order unchanged', () => {
         { id: '4', name: 'D', trust: t('Trusted') },
     ];
     assert.deepEqual(trustedOnly(buyers).map((b) => b.name), ['B', 'D']);
+    // Torn Bids (3.14): Known counts too; no votes yet counts while TornExchange's list is missing.
+    const caution = [...buyers, { id: '5', name: 'E', trust: t('New') }, { id: '6', name: 'F', trust: t('Caution') }];
+    assert.deepEqual(trustedOnly(caution, { min: 'Known' }).map((b) => b.name), ['A', 'B', 'D']);
+    assert.deepEqual(trustedOnly(caution, { min: 'Known', keepUnrated: true }).map((b) => b.name), ['A', 'B', 'C', 'D']);
 });
 
 test('a column header sorts its natural way first, then turns round', () => {

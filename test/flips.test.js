@@ -50,7 +50,9 @@ test('flip plan: never more than Most per flip (100 by default), and says how ma
     const plan = flipPlan(sellers, 40000, { cash: null });
     assert.equal(plan.units, 100);
     assert.equal(plan.available, 2188);
-    assert.deepEqual(plan.steps.map((s) => s.qty), [5, 20, 75]);
+    // 3.14: all 100 from the one bazaar that has them - three bazaars would
+    // make $1,055 more (0.2%), not worth two more stops ("1 bazaar best").
+    assert.deepEqual(plan.steps.map((s) => [s.sellerId, s.qty]), [['3', 100]]);
     assert.equal(flipPlan(sellers, 40000, { cash: null, maxUnits: 10 }).units, 10);
 });
 

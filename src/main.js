@@ -49,9 +49,11 @@ import {
     SOURCE_BAZAAR,
     SOURCE_ITEM_MARKET,
 } from './core/feed.js';
-import { bazaarSellers, flipPlan, flipBuyer, whereToSell, depthNearCheapest, flipCandidates, traderTagLabel } from './core/flips.js';
+import { bazaarSellers, flipPlan, flipBuyer, whereToSell, depthNearCheapest, flipCandidates, traderTagLabel, pickBazaars, MAIN_STOPS, EXTRA_STOPS } from './core/flips.js';
 import { planTrade, keepAfter } from './core/trade.js';
-import { liquidityKind, unitsMoved, addMovement } from './core/liquidity.js';
+import { holdTrade, holdKey, resolveEstimated, priceHeld, livePins, editHeld, HOLD_MS } from './core/held.js';
+import { deskItem, nextW3bRead } from './core/desk.js';
+import { liquidityKind, unitsMoved, addMovement, stopsMinutes, EXTRA_CAP } from './core/liquidity.js';
 import { acceptTrade, liveAccepted, stepState, tickAccepted, stepDone, nextStep, boughtFromStock, recordBuy, sendUnits, acceptedTotals, replacementFor, replaceStep, dropLine, markLeft, leftoversOf, addLeftovers, takenUnits } from './core/accepted.js';
 import { readTradeView, readTradeAddRows } from './sources/dom/trade.js';
 import { makeTabId, LEADER_HEARTBEAT_MS } from './core/leader.js';
@@ -235,6 +237,8 @@ const TRADE_BUYBAR_CLASS = 'ttv2-buybar';
 const STORE_SELL_DECLINED = 'sellDeclined';
 /* Trades a trader said yes to, frozen (core/accepted.js): trader key -> trade. Torn Bids and the overlay's trade page share it. */
 const STORE_SELL_ACCEPTED = 'sellAccepted';
+/* Trades you pinned (core/held.js): 'item|trader key' -> held trade. Only prices move in them. */
+const STORE_SELL_PINNED = 'sellPinned';
 /* How fast each item leaves the bazaars (core/liquidity.js): itemId -> {units, ms, at}. */
 const STORE_SELL_MOVES = 'sellMoves';
 const SELL_MOVES_MAX = 1500;
@@ -3279,7 +3283,7 @@ function storageSizes() {
     const keys = [
         STORE_KEY, STORE_ITEMS, STORE_NPC, STORE_MANUAL_NPC, STORE_SETTINGS, STORE_KEY_ACCESS, STORE_API_WINDOW + '.tabs', STORE_W3B_WINDOW + '.tabs', STORE_TORN_PAUSE, STORE_KEY_DEAD, STORE_OPENED,
         STORE_SELL_KEY, STORE_SELL_KEY_DEAD, STORE_SELL_KEY_ACCESS, STORE_TE_KEY, STORE_TE, STORE_TE_STATE, STORE_TE_LISTS, STORE_TE_IDS,
-        STORE_INVENTORY, STORE_SELL_PREFS, STORE_TRADER_DB, STORE_TE_ONE, STORE_SELL_SELF, STORE_SELL_NETWORTH,
+        STORE_INVENTORY, STORE_SELL_PREFS, STORE_TRADER_DB, STORE_TE_ONE, STORE_SELL_SELF, STORE_SELL_NETWORTH, STORE_SELL_ACCEPTED, STORE_SELL_PINNED,
         STORE_LEDGER_KEY, STORE_LEDGER_KEY_DEAD, STORE_LEDGER_SELF, STORE_LEDGER,
         STORE_FILL, STORE_FILL_OWN_IM, STORE_SELF, STORE_HISTORY, STORE_W3B_SUMMARY, FEED_STORE_KEY,
     ];
@@ -3426,6 +3430,17 @@ const sell = {
     tradeLive: [],
     /* Items each trade has shown ('item|trader' -> Set): one that drops out stays listed, with why. */
     tradeSeen: new Map(),
+    /*
+     * Trades that hold still (3.14): 'item|trader' -> {trade, touched}. A trade
+     * you start on keeps its items; only prices and profit move. `pinWanted`:
+     * a Best flips card whose trade to pin. `heldEdit`: how the desk's trade
+     * re-picks one line you change.
+     */
+    tradeHold: new Map(),
+    pinWanted: null,
+    heldEdit: null,
+    /* A trade under way on the desk (picked, held or pinned): its reads come before the flips'. */
+    tradeActive: false,
     /* Flips and traders' price lists take turns for TornW3B's slots. */
     w3bTurn: 0,
     /* The Item Market's cheapest listing of the item picked, when you hold it. */
@@ -3682,6 +3697,37 @@ function saveSellAccepted(all) {
     gmSet(STORE_SELL_ACCEPTED, all);
 }
 
+/** Pinned trades still kept: {'item|trader': held trade}, newest first. */
+function sellPinned(now = Date.now()) {
+    return livePins(gmGet(STORE_SELL_PINNED, null), now);
+}
+
+function saveSellPinned(all) {
+    gmSet(STORE_SELL_PINNED, all);
+}
+
+/** The held trade for an item and trader: pinned, else one you started on (still fresh). */
+function heldTradeFor(itemId, traderKey, now = Date.now()) {
+    const k = holdKey(itemId, traderKey);
+    const pin = sellPinned(now)[k];
+    if (pin) return { held: pin, pinned: true };
+    const h = sell.tradeHold.get(k);
+    if (h && now - h.touched < HOLD_MS) return { held: h.trade, pinned: false };
+    return null;
+}
+
+/** A held trade changed (an ≈ line read, or a line you changed): kept where it lives. */
+function saveHeldTrade(itemId, traderKey, trade, pinned, now = Date.now()) {
+    const k = holdKey(itemId, traderKey);
+    if (pinned) {
+        const all = sellPinned(now);
+        all[k] = trade;
+        saveSellPinned(all);
+    } else {
+        sell.tradeHold.set(k, { trade, touched: now });
+    }
+}
+
 /** One tick on an accepted trade (a step bought, an item sent), from either page. */
 function tickSellAccepted(key, line, tick) {
     const all = sellAccepted();
@@ -3773,23 +3819,26 @@ function bazaarsDue(itemId, every, now) {
  * possible flips and price lists taking turns, so neither waits on the other.
  */
 function nextW3bJob(now) {
-    if (now - sell.summaryAt >= W3B_SUMMARY_MS && now - sell.summaryTriedAt >= W3B_FAILED_RETRY_MS) return loadBazaarSummary;
-    const picked = sell.selected;
-    if (picked && bazaarsDue(picked, W3B_SELECTED_MS, now)) return () => loadBazaars(picked);
-    // The trade on the desk: its items kept live (you may be buying them now),
-    // then the ones not read yet, the chosen trader's first.
-    const live = sell.tradeLive.find((id) => bazaarsDue(id, W3B_SELECTED_MS, now));
-    if (live) return () => loadBazaars(live);
-    const forTrade = sell.tradeWanted.find((id) => bazaarsDue(id, W3B_CANDIDATE_MS, now));
-    if (forTrade) return () => loadBazaars(forTrade);
-
-    const cand = sell.candidates.find((c) => bazaarsDue(c.itemId, W3B_CANDIDATE_MS, now));
-    const list = nextW3bTrader(sell.db, heldIds(), now);
     sell.w3bTurn ^= 1;
-    if (cand && (sell.w3bTurn || !list)) return () => loadBazaars(cand.itemId);
-    if (list) return () => loadW3bList(list);
-    if (cand) return () => loadBazaars(cand.itemId);
-    return null;
+    // The trade on the desk comes before the possible flips only while you
+    // work on it (core/desk.js): until then the flips are checked first.
+    const pinnedIds = [...new Set(Object.values(sellPinned(now)).flatMap((t) => t.lines.map((l) => l.itemId)))];
+    const read = nextW3bRead({
+        summaryDue: now - sell.summaryAt >= W3B_SUMMARY_MS && now - sell.summaryTriedAt >= W3B_FAILED_RETRY_MS,
+        picked: sell.selected,
+        active: sell.tradeActive,
+        live: sell.tradeLive,
+        wanted: sell.tradeWanted,
+        candidates: sell.candidates.map((c) => c.itemId),
+        pinned: pinnedIds,
+        list: nextW3bTrader(sell.db, heldIds(), now),
+        turn: sell.w3bTurn,
+        due: (id, how) => bazaarsDue(id, how === 'desk' ? W3B_SELECTED_MS : W3B_CANDIDATE_MS, now),
+    });
+    if (!read) return null;
+    if (read.kind === 'summary') return loadBazaarSummary;
+    if (read.kind === 'list') return () => loadW3bList(read.id);
+    return () => loadBazaars(read.id);
 }
 
 /** One trader's TornW3B price list. */
@@ -3818,7 +3867,8 @@ function loadBazaarSummary() {
             sell.summaryAt = Date.now();
             sell.summaryError = null;
             // Listings of items no longer picked or possible flips are let go.
-            const keep = new Set([sell.selected, ...sell.candidates.map((c) => c.itemId), ...sell.tradeWanted, ...sell.tradeLive]);
+            const pinned = Object.values(sellPinned()).flatMap((t) => t.lines.map((l) => l.itemId));
+            const keep = new Set([sell.selected, ...sell.candidates.map((c) => c.itemId), ...sell.tradeWanted, ...sell.tradeLive, ...pinned]);
             for (const [id, b] of sell.bazaars) {
                 if (!keep.has(id) && Date.now() - (b.at || b.triedAt || 0) > W3B_BAZAARS_FORGET_MS) sell.bazaars.delete(id);
             }
@@ -3982,7 +4032,9 @@ function renderSellingNow() {
     const teMap = sell.traders ? sell.traders.map : new Map();
     const buyersAll = buyerLookup({ teMap, lists: sell.lists, teOne: sell.teOne, idsByName: sell.idsByName, db: sell.db, w3bByItem, dbIdsByName: sell.dbIdsByName });
     const levelOf = (id) => presenceLevel(sellPresenceOf(id));
-    // What the Show toggles keep: online buyers, trusted buyers, or both.
+    // Trusted means Known (20+ votes) or Trusted; while TornExchange's votes
+    // are not loaded, a trader without any is kept ("no votes yet").
+    const votesMissing = !(teMap.size > 0);
     const shownCache = new Map();
     const buyersOf = (id) => {
         const key = String(id);
@@ -3990,7 +4042,7 @@ function renderSellingNow() {
         if (!b) {
             b = buyersAll(key);
             if (prefs.onlineOnly) b = onlineOnly(b, levelOf);
-            if (prefs.trustedOnly) b = trustedOnly(b);
+            if (prefs.trustedOnly) b = trustedOnly(b, { min: 'Known', keepUnrated: votesMissing });
             shownCache.set(key, b);
         }
         return b;
@@ -4185,12 +4237,7 @@ function renderSellingNow() {
         sell.selected = null;
         sell.pickedByYou = false;
     }
-    // While the flips load, the desk stays on one that is still a flip: it
-    // does not jump from one to the next under your pointer.
-    if (!sell.pickedByYou) {
-        const stays = sell.filter !== 'mine' && sell.selected && strip.some((f) => f.itemId === sell.selected);
-        if (!stays) sell.selected = sell.filter !== 'mine' && strip.length ? strip[0].itemId : listed.length ? listed[0].itemId : null;
-    }
+    sell.selected = deskItem({ pickedByYou: sell.pickedByYou, selected: sell.selected, filter: sell.filter, strip, listed });
 
     /*
      * One trade with one trader (mockup N3, the owner, 2026-09-27): the
@@ -4231,21 +4278,9 @@ function renderSellingNow() {
                 flips.push({ itemId: id, bid: fb.price, sellers: [{ sellerId: null, sellerName: null, price: low, qty: 1, stale: false }] });
             }
         }
+        // Your own items are not offered in a trade (the owner, 2026-09-28:
+        // "my own items as cover, omit it"): the trade is what you buy to flip.
         const held = [];
-        const refused = new Map();
-        for (const l of leftovers) if (l.from && String(l.from).toLowerCase() === String(buyer.name).toLowerCase()) refused.set(String(l.itemId), (refused.get(String(l.itemId)) || 0) + l.qty);
-        for (const [id, n] of heldQty) {
-            if (!(n > 0)) continue;
-            // Not offered again to the trader who just refused it.
-            const no = refused.get(id) || 0;
-            if (n - no <= 0) continue;
-            const top = buyersOf(id)[0];
-            if (!top || traderKey(top) !== key) continue;
-            // Only where they are the place to sell (listing does not pay more).
-            const w = whereToSell({ held: n, bid: top.price, bazaarLowest: lowestOf(id), bazaarDepth: bazaarDepthOf(id) });
-            if (w.best && w.best !== 'trader') continue;
-            held.push({ itemId: id, bid: top.price, held: n, refused: no });
-        }
         const nw = buyer.id ? networthOf(buyer.id) : null;
         const payCap = nw !== null && nw >= 0 && prefs.networthPct > 0 ? (nw * prefs.networthPct) / 100 : Infinity;
         const t = planTrade({
@@ -4282,6 +4317,34 @@ function renderSellingNow() {
         if (!enoughProfit(bid - fresh.price, fresh.price, 'TRADER', prefs.minProfitPct)) return 'profit';
         return 'cash';
     };
+    /*
+     * The trade an item's desk shows: with the trader you picked (or pinned),
+     * else the best whole trade among its traders who make a flip on it. A
+     * trader you picked or pinned is used even when a Show toggle hides them
+     * (a pin must come back as it was pinned).
+     */
+    const chooseTrade = (pickId, buyers) => {
+        const declined = sellDeclined(now);
+        const plans = new Map();
+        for (const b of buyers.slice(0, TRADE_TRADERS_MAX)) plans.set(traderKey(b), tradeWith(b, pickId));
+        // A pinned trade on this item comes back with its trader (after a reload too).
+        const pinFor = Object.values(sellPinned(now)).find((t) => t.itemId === String(pickId) && !declined.has(t.key));
+        const pickedKey = sell.tradePick.get(String(pickId)) || (pinFor ? pinFor.key : null);
+        if (pickedKey && !plans.has(pickedKey)) {
+            const b = buyers.find((x) => traderKey(x) === pickedKey) || buyersAll(pickId).find((x) => traderKey(x) === pickedKey);
+            if (b) plans.set(pickedKey, tradeWith({ ...b, tradeKey: pickedKey }, pickId));
+        }
+        const hasItem = (t) => t.flips.some((r) => r.itemId === String(pickId));
+        let chosen = pickedKey && !declined.has(pickedKey) ? plans.get(pickedKey) || null : null;
+        if (!chosen) {
+            chosen = [...plans.values()]
+                .filter((t) => !declined.has(t.key) && hasItem(t))
+                .sort((a, b) => b.profit - a.profit || b.buyer.price - a.buyer.price)[0] || null;
+        }
+        return { plans, pickedKey, chosen, declined, hasItem };
+    };
+    // A plan's lines with their names and ≈ marks, as a held trade keeps them.
+    const namedTrade = (t) => ({ ...t, flips: t.flips.map((r) => ({ ...r, name: nameOf(r.itemId), estimated: t.estimated.includes(r.itemId) })), off: t.off.map((r) => ({ ...r, name: nameOf(r.itemId) })) });
     const tradeDesk = (pickId, buyers) => {
         const rows = sellersOf(pickId);
         if (!rows || !buyers.length) return null;
@@ -4291,6 +4354,8 @@ function renderSellingNow() {
         if (acc) {
             sell.tradeLive = acc.items.filter((i) => i.steps.some((st) => !stepDone(st))).map((i) => i.itemId);
             sell.tradeWanted = [];
+            sell.tradeActive = true;
+            sell.heldEdit = null;
             const buyer = buyers.find((x) => traderKey(x) === acc.key) || { id: acc.trader.id, name: acc.trader.name, tradeKey: acc.key };
             return {
                 perTrader: {},
@@ -4316,33 +4381,98 @@ function renderSellingNow() {
                 },
             };
         }
-        const plans = new Map();
-        for (const b of buyers.slice(0, TRADE_TRADERS_MAX)) plans.set(traderKey(b), tradeWith(b, pickId));
-        const pickedKey = sell.tradePick.get(String(pickId));
-        if (pickedKey && !plans.has(pickedKey)) {
-            const b = buyers.find((x) => traderKey(x) === pickedKey);
-            if (b) plans.set(pickedKey, tradeWith(b, pickId));
-        }
-        const hasItem = (t) => t.flips.some((r) => r.itemId === String(pickId));
-        let chosen = pickedKey && !declined.has(pickedKey) ? plans.get(pickedKey) || null : null;
-        if (!chosen) {
-            chosen = [...plans.values()]
-                .filter((t) => !declined.has(t.key) && hasItem(t))
-                .sort((a, b) => b.profit - a.profit || b.buyer.price - a.buyer.price)[0] || null;
-        }
+        const { plans, pickedKey, chosen, hasItem } = chooseTrade(pickId, buyers);
         const perTrader = {};
         for (const [k, t] of plans) perTrader[k] = { profit: t.profit, items: t.items, estimated: t.estimated.length, hasItem: hasItem(t), stops: t.stops, minutes: t.minutes };
         const declinedOut = Object.fromEntries(declined);
 
-        // Read the chosen trader's items first, then the others' (for their totals).
-        const want = [];
-        const order = chosen ? [chosen, ...[...plans.values()].filter((x) => x !== chosen)] : [...plans.values()];
-        for (const o of order) for (const id of o.estimated) if (!want.includes(id)) want.push(id);
-        sell.tradeWanted = want.slice(0, TRADE_READ_MAX);
+        // The trade holds still once you start on it (a press in its card,
+        // held at that press) or pin it: its items stay, only prices and profit move.
+        const named = (r) => ({ ...r, name: nameOf(r.itemId), estimated: chosen.estimated.includes(r.itemId) });
+        const hold = chosen ? heldTradeFor(pickId, chosen.key, now) : null;
+        // Its reads come before the possible flips' only while you work on it.
+        sell.tradeActive = Boolean(sell.pickedByYou || hold);
+        // The chosen trader's items not read yet (their ≈ lines) - not twelve traders' worth.
+        sell.tradeWanted = chosen ? chosen.estimated.slice(0, TRADE_READ_MAX) : [];
         if (!chosen) {
             sell.tradeLive = [];
+            sell.heldEdit = null;
             return { perTrader, declined: declinedOut, chosen: null, picked: false };
         }
+        // What this trader pays now (whatever the Show toggles hide), and how a
+        // line you change is re-picked alone (at most 5 bazaars) - the others stay.
+        const bidNow = (id) => {
+            const b = buyersAll(id).find((x) => traderKey(x) === chosen.key);
+            return b ? b.price : null;
+        };
+        sell.heldEdit = {
+            pickId: String(pickId),
+            key: chosen.key,
+            repick: (id, n) => {
+                const bid = bidNow(id);
+                const list = sellersOf(id);
+                if (!(bid > 0) || !list) return null;
+                const p = pickBazaars(list, bid, { maxUnits: n, minPct: prefs.minProfitPct, maxStops: MAIN_STOPS, exclude: chosen.buyer.id || null });
+                return p && p.units > 0 ? p.steps : null;
+            },
+            info: (id) => ({ name: nameOf(id), bid: bidNow(id), kind: kindOf(id), units: Math.min(prefs.maxPerFlip || 100, EXTRA_CAP[kindOf(id)] || 10) }),
+        };
+        const w3bT = chosen.buyer.id && sell.db.traders[chosen.buyer.id] ? sell.db.traders[chosen.buyer.id].w3b : null;
+        const common = {
+            perTrader,
+            declined: declinedOut,
+            picked: chosen.key === pickedKey,
+            keep: prefs.keep || {},
+            // How old the prices are: check their list before buying.
+            teAt: sell.traders ? sell.traders.fetchedAt : null,
+            w3bAt: w3bT && w3bT.at ? w3bT.at : null,
+        };
+
+        if (hold) {
+            const key = chosen.key;
+            const bidOf = bidNow;
+            // An ≈ line once its bazaars are read: the live plan's steps, or its
+            // own (as an extra: at most 3 bazaars, its kind's amount).
+            const pickOwn = (id) => {
+                const list = sellersOf(id);
+                const bid = bidOf(id);
+                if (!list || !(bid > 0)) return null;
+                const p = pickBazaars(list, bid, { maxUnits: Math.min(prefs.maxPerFlip || 100, EXTRA_CAP[kindOf(id)] || 10), minPct: prefs.minProfitPct, maxStops: EXTRA_STOPS, exclude: chosen.buyer.id || null });
+                return p && p.units > 0 ? p.steps : null;
+            };
+            const held = resolveEstimated(hold.held, chosen.flips.map(named), pickOwn);
+            if (held !== hold.held) saveHeldTrade(pickId, key, held, hold.pinned);
+            const priced = priceHeld(held, { rowsOf: sellersOf, bidOf, lowestOf });
+            sell.tradeLive = priced.lines.map((l) => l.itemId).filter((id) => id !== String(pickId));
+            perTrader[key] = { ...(perTrader[key] || {}), profit: priced.profit, items: priced.items, stops: priced.stops, minutes: stopsMinutes(priced.stops), hasItem: true };
+            const inHeld = new Set([...priced.lines.map((l) => l.itemId), ...(held.off || []).map((o) => o.itemId)]);
+            const left = (chosen.left || []).filter((r) => !inHeld.has(r.itemId)).map((r) => ({ ...r, name: nameOf(r.itemId) }));
+            return {
+                ...common,
+                chosen: {
+                    key,
+                    buyer: chosen.buyer,
+                    main: held.main,
+                    flips: priced.lines.map((l) => ({ ...l, name: l.name || nameOf(l.itemId) })),
+                    off: (held.off || []).map((o) => ({ itemId: o.itemId, bid: o.bid, name: o.name || nameOf(o.itemId) })),
+                    held: [],
+                    items: priced.items,
+                    profit: priced.profit,
+                    cost: priced.cost,
+                    pays: priced.pays,
+                    payCapped: false,
+                    estimated: priced.lines.filter((l) => l.estimated).length,
+                    stops: priced.stops,
+                    minutes: priced.stops ? stopsMinutes(priced.stops) : 0,
+                    more: left.length,
+                    left,
+                    gone: [],
+                    itemNote: null,
+                    hold: { pinned: hold.pinned, at: held.at },
+                },
+            };
+        }
+
         // Kept live while you trade: every item in the plan, like the item picked.
         sell.tradeLive = chosen.flips.map((r) => r.itemId).filter((id) => id !== String(pickId));
         // An item that was in this trade and is not now (bought, re-priced, a
@@ -4353,16 +4483,13 @@ function renderSellingNow() {
         const gone = [...seen].filter((id) => !inNow.has(id));
         sell.tradeSeen.set(seenKey, new Set([...seen, ...inNow]));
 
-        const w3bT = chosen.buyer.id && sell.db.traders[chosen.buyer.id] ? sell.db.traders[chosen.buyer.id].w3b : null;
-        const named = (r) => ({ ...r, name: nameOf(r.itemId), estimated: chosen.estimated.includes(r.itemId) });
         const fresh = rows.find((r) => !r.stale);
         return {
-            perTrader,
-            declined: declinedOut,
-            picked: chosen.key === pickedKey,
+            ...common,
             chosen: {
                 key: chosen.key,
                 buyer: chosen.buyer,
+                main: chosen.main,
                 flips: chosen.flips.map(named),
                 off: chosen.off.map(named),
                 held: chosen.held.map(named),
@@ -4376,16 +4503,45 @@ function renderSellingNow() {
                 stops: chosen.stops,
                 minutes: chosen.minutes,
                 more: chosen.more,
+                left: (chosen.left || []).map((r) => ({ ...r, name: nameOf(r.itemId) })),
                 gone: gone.map((id) => ({ itemId: id, name: nameOf(id) })),
                 // Planned with a trader who makes no flip on this item: say why.
                 itemNote: hasItem(chosen) ? null : { bid: chosen.buyer.price, cheapest: fresh ? fresh.price : null, why: noFlipWhy(pickId, chosen.buyer.price, fresh) },
+                hold: null,
             },
-            keep: prefs.keep || {},
-            // How old the prices are: check their list before buying.
-            teAt: sell.traders ? sell.traders.fetchedAt : null,
-            w3bAt: w3bT && w3bT.at ? w3bT.at : null,
         };
     };
+
+    /*
+     * Pins (the owner, 2026-09-28: "a good trade that we want but we're doing
+     * another trade still, to pin that flip card"). The pin on a Best flips
+     * card pins that flip's trade - with the trader the card sells to - as it
+     * is now; nothing on the page moves. Pressed again, it unpins.
+     */
+    if (sell.pinWanted) {
+        const id = sell.pinWanted;
+        sell.pinWanted = null;
+        const pins = sellPinned(now);
+        const mine = Object.keys(pins).filter((k) => pins[k].itemId === id);
+        if (mine.length) {
+            for (const k of mine) delete pins[k];
+            saveSellPinned(pins);
+        } else {
+            // The trade this item's desk shows (the trader you picked, else the
+            // best whole trade) - held already, pinned as you see it.
+            const c = chooseTrade(id, buyersOf(id).map((x) => ({ ...x, tradeKey: traderKey(x) })));
+            if (c.chosen) {
+                const key = c.chosen.key;
+                const h = heldTradeFor(id, key, now);
+                const snap = h ? h.held : c.chosen.flips.length ? holdTrade(namedTrade(c.chosen), id, now) : null;
+                if (snap) {
+                    pins[holdKey(id, key)] = { ...snap, at: now };
+                    saveSellPinned(pins);
+                    sell.tradeHold.delete(holdKey(id, key));
+                }
+            }
+        }
+    }
 
     let desk = null;
     const pick = sell.selected;
@@ -4428,7 +4584,22 @@ function renderSellingNow() {
     if (!desk || !desk.trade) {
         sell.tradeWanted = [];
         sell.tradeLive = [];
+        sell.tradeActive = false;
+        sell.heldEdit = null;
     }
+
+    // Pinned trades, on top of the list: the main flip, the trader, and the profit now.
+    const deskKey = desk && desk.trade && desk.trade.chosen ? desk.trade.chosen.key : null;
+    const pinned = Object.entries(sellPinned(now)).map(([k, t]) => {
+        const bidOf = (id) => {
+            const b = buyersAll(id).find((x) => traderKey(x) === t.key);
+            return b ? b.price : null;
+        };
+        const p = priceHeld(t, { rowsOf: sellersOf, bidOf, lowestOf });
+        const main = t.lines.find((l) => l.itemId === t.main) || t.lines[0] || null;
+        const mainId = main ? main.itemId : t.itemId;
+        return { key: k, itemId: t.itemId, mainId, name: nameOf(mainId), trader: t.trader.name, items: p.items, stops: p.stops, profit: p.profit, on: Boolean(desk && desk.itemId === t.itemId && deskKey === t.key) };
+    });
 
     const watch = sellWatch({ desk, strip, listed, held: [...heldQty.keys()], buyersAll });
     updateSellPresence(watch, now);
@@ -4456,6 +4627,7 @@ function renderSellingNow() {
     });
     sell.page.render({
         strip,
+        pinned,
         leftovers: leftShown,
         ledger: ledgerView(),
         itemNameOf: (id) => nameOf(id),
@@ -5109,10 +5281,39 @@ function bootSellingPage() {
         onTradePin: (itemId, key) => {
             // The friend (2026-09-27): mid-trade, the plan "suddenly disappeared".
             // The desk followed the best flip, and the trader followed the best
-            // trade; once you act on a trade, neither moves.
+            // trade; once you act on a trade, neither moves - and (3.14) its
+            // items hold still: only prices and profit move from here.
             sell.selected = String(itemId);
             sell.pickedByYou = true;
-            if (key) sell.tradePick.set(String(itemId), key);
+            if (key) {
+                sell.tradePick.set(String(itemId), key);
+                const k = holdKey(itemId, key);
+                const h = sell.tradeHold.get(k);
+                const shown = sell.lastTrade && sell.lastTrade.chosen;
+                if (h) h.touched = Date.now();
+                // Held at this press, as drawn - before any tick or number of yours lands.
+                else if (shown && shown.key === key && !shown.hold && !sellPinned()[k]) sell.tradeHold.set(k, { trade: holdTrade(shown, itemId), touched: Date.now() });
+            }
+        },
+        // The pin on a Best flips card: pin that flip's trade, or unpin it.
+        onPin: (itemId) => {
+            sell.pinWanted = String(itemId);
+            renderSellingNow();
+        },
+        onUnpin: (pinKey) => {
+            const all = sellPinned();
+            delete all[pinKey];
+            saveSellPinned(all);
+            renderSellingNow();
+        },
+        // A pinned trade on the list: on the desk, as it was pinned.
+        onPinnedOpen: (pinKey) => {
+            const t = sellPinned()[pinKey];
+            if (!t) return;
+            sell.tradePick.set(String(t.itemId), t.key);
+            if (sellDeclined().has(t.key)) setSellDeclined(t.key, null);
+            // As picking the item: its full TornExchange list, its bazaars read now.
+            onSellSelect(t.itemId);
         },
         onTradeAccept: (itemId) => {
             const t = sell.lastTrade && sell.lastTrade.chosen;
@@ -5131,6 +5332,8 @@ function bootSellingPage() {
             }
             all[acc.key] = acc;
             saveSellAccepted(all);
+            // Accepted takes over from the held plan.
+            sell.tradeHold.delete(holdKey(itemId, acc.key));
             sell.selected = String(itemId);
             sell.pickedByYou = true;
             sell.tradePick.set(String(itemId), acc.key);
@@ -5168,8 +5371,18 @@ function bootSellingPage() {
                 const left = leftoversOf(all[key]);
                 if (left.length) saveSellLeftovers(addLeftovers(sellLeftovers(), left));
             }
+            const itemId = all[key] ? String(all[key].itemId) : null;
             delete all[key];
             saveSellAccepted(all);
+            // Traded: its pin goes too (back to the live plan keeps it).
+            if (done && itemId) {
+                const pins = sellPinned();
+                if (pins[holdKey(itemId, key)]) {
+                    delete pins[holdKey(itemId, key)];
+                    saveSellPinned(pins);
+                }
+                sell.tradeHold.delete(holdKey(itemId, key));
+            }
             renderSellingNow();
         },
         // How many of a line the trader did not take (0: they took all).
@@ -5186,6 +5399,8 @@ function bootSellingPage() {
         },
         onTradeDecline: (key) => {
             setSellDeclined(key, Date.now() + TRADE_DECLINE_MS);
+            // The held plan with them goes (a pin stays until you unpin it).
+            if (sell.selected) sell.tradeHold.delete(holdKey(sell.selected, key));
             renderSellingNow();
         },
         onTradeUndecline: (key) => {
@@ -5197,6 +5412,15 @@ function bootSellingPage() {
             if (edit && (edit.off || edit.qty > 0)) e[String(itemId)] = edit;
             else delete e[String(itemId)];
             sell.tradeEdits.set(key, e);
+            // A held trade: only the line you changed changes.
+            const he = sell.heldEdit;
+            if (he && he.key === key) {
+                const h = heldTradeFor(he.pickId, key);
+                if (h) {
+                    const next = editHeld(h.held, itemId, edit, he.repick, he.info(String(itemId)));
+                    if (next !== h.held) saveHeldTrade(he.pickId, key, next, h.pinned);
+                }
+            }
             renderSellingNow();
         },
         onTradeHeld: (itemId, held, give, key) => {
@@ -5240,6 +5464,7 @@ function bootSellingPage() {
     gmOnChange(STORE_SELL_PREFS, () => renderSellingNow());
     // Ticks made on Torn's trade page (the overlay) show here at once.
     gmOnChange(STORE_SELL_ACCEPTED, () => renderSellingNow());
+    gmOnChange(STORE_SELL_PINNED, () => renderSellingNow());
     const onSellKeyElsewhere = () => {
         const dead = Boolean(gmGet(STORE_SELL_KEY_DEAD, false));
         if (dead === sell.keyDead) return renderSelling();
