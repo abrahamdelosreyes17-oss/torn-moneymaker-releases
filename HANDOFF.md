@@ -4,12 +4,14 @@ Read this first, then `README.md`. The README holds the product and the binding
 rules; this file holds where we are, how the owner works, and what is settled.
 Everything below "History" is the record of how we got here.
 
-## Start here (state on 2026-09-28, end of the second session)
+## Start here (state on 2026-09-28, end of the third session)
 
-- **Released: 3.14.2** (see "What the 2026-09-28 second session did"),
-  pushed (`ac4c3cb`). Install link given to the owner:
-  `https://raw.githubusercontent.com/abrahamdelosreyes17-oss/torn-moneymaker-releases/ac4c3cb63f751a8ebf7b116c06b403edc049e737/torn-moneymaker.user.js`
-- Before it: 3.14.1 (`9ceda80`, background refresh, Chat mark), 3.14.0 (`b9b99e9`).
+- **Released: 3.14.3** (see "What the 2026-09-28 third session did"),
+  pushed (`fd73fcf`). Install link given to the owner:
+  `https://raw.githubusercontent.com/abrahamdelosreyes17-oss/torn-moneymaker-releases/fd73fcf737d1384fe96e58cc61f59aee63bbcee4/torn-moneymaker.user.js`
+  Nothing of 3.14.3 has been seen live yet: check it first (ask whether the
+  script is on and shows 3.14.3).
+- Before it: 3.14.2 (`ac4c3cb`), 3.14.1 (`9ceda80`, background refresh, Chat mark), 3.14.0 (`b9b99e9`).
 - Before it: 3.13.1 (`e3b4fc5`). Branch `claude/optimistic-ride-1gqguu`. Earlier: 3.12.10 (`711f893`),
   3.12.5 (`aab7e53`), 3.12.6 (`fe49df0`), 3.12.7 (`d69907c`), 3.12.8 (`8991095`), 3.12.9 (`c45a227`).
 - **Remind the owner (they asked, 2026-09-28: "dont build, but remind the
