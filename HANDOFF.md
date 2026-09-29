@@ -4,6 +4,48 @@ Read this first, then `README.md`. The README holds the product and the binding
 rules; this file holds where we are, how the owner works, and what is settled.
 Everything below "History" is the record of how we got here.
 
+## The agenda for the fifth session (start here)
+
+State: **3.15.0 released** (`5350ec7`), `main` = 3.15.0 (installs
+auto-update; release = bump, commit, push the branch, fast-forward `main`,
+push `main`, check the raw `main` URL shows the new @version). 335 tests.
+Nothing of 3.14.x / 3.15.0 has been seen on real Torn pages - harness only.
+
+1. **Bugs first: the owner will relay them** ("next bugs I'll tell the next
+   session"). Ask for the friend's **Report a problem** zip (Torn Bids ›
+   Settings › Help): read `problem-log.txt` first (failed requests and why,
+   script errors, his last steps), then `report.txt` and the screenshots.
+   Reproduce in the harness before fixing; a failing test first.
+2. **Ask for the friend's Export API usage zip** (Settings › API use) after a
+   day or more on 3.15.0: is Torn still near 70 (by-minute.csv, `t.*` rows)?
+   What does TornW3B spend (`w.*`)? `state.json` has his switches and
+   coverage (flips checked, every-item sweep, TE lists scanned).
+3. **Learned read scheduling ("mini AI"), the owner said yes (2026-09-29) -
+   after the zips show real numbers:** per item, remember how often a
+   bazaar read found a flip and how big; spend TornW3B's reads on items that
+   tend to pay (a bandit - e.g. Thompson sampling / UCB) instead of fixed
+   timers (`W3B_CANDIDATE_MS`, `W3B_SWEEP_MS`, the 150 `SELL_FLIP_CANDIDATES`).
+   Then: per-trader list refresh by how often their list changes; listing
+   speed (`sellMoves`) to re-check fast-selling cheap listings sooner. All
+   local, no server. NOT trader-acceptance learning without asking (the
+   owner's "never a ranking bias toward a named trader"). Restate + measure
+   (flips found per 100 reads, harness `&bigflip=1`) before and after.
+4. **The overlay shopping cart** (the friend): once "X accepted", the whole
+   still-to-buy list in the overlay (today the buying box shows one bazaar
+   at a time). Mockups first.
+5. From before, still open: live check (the owner's pages, read only; ask
+   first whether the script is on and shows 3.15.0); **Unplan** (take back
+   a Plan trade without Declined); **number boxes' cursor at the left**;
+   **favourites list + Plan flip**. Held, remind only: the faction rule;
+   trader capacity / "Sell fast".
+
+Known, not fixed: on a first-ever load (no stored votes) an unrated trader
+shows until TornExchange's votes arrive, then is hidden with the "Trusted
+buyers only hides N" line. The browser pane shows the harness zoomed in
+(screenshots crop the right side; read the DOM instead). The harness server
+(`preview_start` name `harness`) stops between turns sometimes: start it
+again.
+
 ## Start here (state on 2026-09-29, fourth session)
 
 - **Released: 3.15.0** (API efficiency; README "API use and efficiency
