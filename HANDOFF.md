@@ -11,6 +11,77 @@ auto-update; release = bump, commit, push the branch, fast-forward `main`,
 push `main`, check the raw `main` URL shows the new @version). 335 tests.
 Nothing of 3.14.x / 3.15.0 has been seen on real Torn pages - harness only.
 
+### THE FOCUS of the fifth session: will this trader actually trade this item?
+
+The owner (2026-09-29): "we're not building it here. It's next session...
+we start building that, still keep in mind other agendas, but for next
+session specifically it's this." Look at it yourself first (live data and
+the code), then restate, then build.
+
+**The problem, in the owner's words:** "we think we wanna sell cus oh it will
+make profit, but it won't sell. Will this trader trade? What does this
+trader trade? Our software does not know, and suggests everything out of the
+blue. We chatted someone cus something is in his pricelist, but then he said
+oh sorry I actually don't trade that anymore, so we have to cancel trade and
+our software still picks it up." They also want "a separate low latency fast
+script (no need for UI, just CLI maybe)... see the market moves, makes the
+suggestions better, which items are to sell, while not interfering with
+settings".
+
+**What the research found (live, 2026-09-29, fourth session - re-verify):**
+
+| Signal | TornW3B | TornExchange | Used by our code? |
+|---|---|---|---|
+| When the trader last updated their list | `pricelist_updated` on `/api/marketplace/{id}/traders` | `meta.last_updated` on `/api/prices/{id}` | **No** - `traders.js` `listAt` is when WE read it |
+| When the trader last traded (anyone) | `last_trade` (same endpoint) | `meta.time_since_last_trade`; `active_traders` `verbose[].last_trade` | **No** - 3.15 fetches W3B's (`fetchW3bItemTraders` `lastTrade`, `listAt`) but nothing uses it; TE's `meta` is not parsed (`parseTeTraderPrices`) |
+| Last active | `last_action` | `/api/profile` `last_active`, `activity_status` | Status dot only (`sell.activity`) |
+| Votes / rating / reviews | rating up/down | `votes`, `reviews` (text) on `/api/profile` | votes only (trust badge) |
+| Which items a trader actually bought | `/api/trades/{id}` exists but needs THAT trader's own TornW3B key (`?apiKey=`) - not usable | `/api/receipt/{receipt_id}`: line items (item, price, qty), no key, but only by a receipt link a trader sends | No |
+| Your own trades with each trader, per item | - | - | The Ledger (Full key) - used only for "Traded 7×" |
+
+- No public source says "this trader bought item X last week". Price lists
+  are claims, often never cleaned. The data CAN show stale lists and traders
+  who are not trading.
+- **Why the software "still picks it up":** after Cancel trade nothing
+  remembers "he doesn't trade this item"; Declined is one trade for one hour
+  (`TRADE_DECLINE_MS`), then the same trade is suggested again.
+- TornExchange's full spec: `tornexchange.com/api/swagger.yaml` (public, 15
+  endpoints). TornW3B's (`weav3r.dev/openapi-spec.json`) is behind Cloudflare
+  for scripts. **Warning:** probing unusual TornW3B paths (`/api/trades`,
+  `?trader=`, `/api/trader/...`) got a Cloudflare block page on this IP
+  (the owner's IP - the userscript uses it too). The normal endpoints kept
+  working. Use only documented endpoints, at a polite pace.
+
+**What was proposed to the owner (they chose to build it next session):**
+1. **"Doesn't trade this" per trader and item:** a button on the trade row,
+   and a choice at Cancel trade ("He doesn't buy X anymore"); kept until
+   removed; the trader stays for everything else (not Declined, not
+   Blacklist).
+2. **Use the freshness signals:** a list untouched for months or a trader
+   with no trade in weeks is marked ("list 8 months old · last trade 23d
+   ago") and ranked below fresh ones; items a trader paid you for before
+   (the Ledger) get "✓ bought from you before". Mind the owner's rule: never
+   a ranking bias toward a NAMED trader - these are signals any trader can
+   earn; show them, and ask before they change ranking.
+3. **A separate fast market watcher (CLI, no UI, e.g. Node on the owner's
+   PC):** polls TornW3B / TornExchange on a schedule and keeps a history:
+   each trader's list over time (a price changed or an item dropped = an
+   actively managed list), how often each trader's last-trade time moves
+   (how often they really trade), how fast cheap bazaar listings disappear
+   (what really sells); from that a per-trader, per-item "likely to buy"
+   score the userscript reads. It shares the IP and TornW3B's ~100/min with
+   the userscript: split the budget. Open: how the userscript reads it (a
+   file it imports, or a localhost URL with `@connect localhost`) - ask.
+4. **Receipts:** a pasted TornExchange receipt link = exact items and prices
+   that trader paid.
+
+Open questions the owner has not answered yet: which of 1-4 first (proposed:
+1 and 2 in the script first, then 3); is Node on their PC fine for the
+watcher; where the watcher's output goes. Mockups before anything changes
+the look.
+
+### Keep in mind (the owner: "still keep in mind other agendas")
+
 1. **Bugs first: the owner will relay them** ("next bugs I'll tell the next
    session"). Ask for the friend's **Report a problem** zip (Torn Bids ›
    Settings › Help): read `problem-log.txt` first (failed requests and why,
