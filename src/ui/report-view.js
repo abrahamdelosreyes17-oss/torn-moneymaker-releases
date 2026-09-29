@@ -153,6 +153,11 @@ export class ReportView {
         if (!this.logEl.hidden) this.logEl.textContent = logAsText(log.slice(-40)) || 'Nothing logged yet.';
     }
 
+    /**
+     * One file, then a clean form (3.16, the friend had to clear the log by
+     * hand): the words, the screenshots and the log go, so the next report
+     * starts empty. The zip is kept in memory for "Download it again".
+     */
     download() {
         const r = this.h.getReport ? this.h.getReport() : {};
         const now = Date.now();
@@ -165,13 +170,25 @@ export class ReportView {
             env: { userAgent: navigator.userAgent, screen: window.screen ? window.screen.width + 'x' + window.screen.height : '' },
             now,
         });
-        const zip = makeZip(files, new Date(now));
+        this.lastZip = { data: makeZip(files, new Date(now)), name: 'torn-trading-report-' + rvStamp(now) + '.zip' };
+        this.saveZip(this.lastZip);
+        this.happened.value = '';
+        this.expected.value = '';
+        for (const s of this.shots) URL.revokeObjectURL(s.url);
+        this.shots = [];
+        if (this.h.onClearLog) this.h.onClearLog();
+        this.statusEl.textContent = 'Saved ' + this.lastZip.name + ' to your downloads. Send that file - nothing was sent by this page. The form and the log are cleared for your next report. ';
+        this.statusEl.appendChild(rvEl('button', { type: 'button', class: 'rv-link', text: 'Download it again', onclick: () => this.saveZip(this.lastZip) }));
+        this.render();
+    }
+
+    saveZip(z) {
+        if (!z) return;
         const a = document.createElement('a');
-        a.href = URL.createObjectURL(new Blob([zip], { type: 'application/zip' }));
-        a.download = 'torn-trading-report-' + rvStamp(now) + '.zip';
+        a.href = URL.createObjectURL(new Blob([z.data], { type: 'application/zip' }));
+        a.download = z.name;
         a.click();
         setTimeout(() => URL.revokeObjectURL(a.href), 10000);
-        this.statusEl.textContent = 'Saved ' + a.download + ' to your downloads. Send that file - nothing was sent by this page.';
     }
 }
 

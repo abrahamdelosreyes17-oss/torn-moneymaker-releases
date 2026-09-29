@@ -35,6 +35,9 @@ export const PANEL_STALE_MS = 60000;
 
 export const TORN_API_KEY_URL = 'https://www.torn.com/preferences.php#tab=api';
 
+/** "Did you buy?" takes no press this long after it appears (3.16: a quick second press on Next answered it). */
+export const BUY_ASK_GUARD_MS = 1000;
+
 /** Info messages ("Ready.") clear themselves; warnings and errors stay. */
 const INFO_STATUS_MS = 6000;
 
@@ -985,7 +988,23 @@ export class Panel {
         if (!box) return;
         // Cancel trade asks first (a buying run is not thrown away by a slip).
         if (!v || this.cancelAsk !== v.key) this.cancelAsk = null;
-        const sig = JSON.stringify([v, this.cancelAsk]);
+        // "Did you buy?" takes no press for a moment after it appears (3.16):
+        // its answers come up where Next was, and in the friend's run a quick
+        // second press on Next answered "Did not buy" every time.
+        const askId = v && v.ask && v.here ? v.key + '|' + v.here.name + '|' + v.here.seller : null;
+        if (askId !== this.askId) {
+            this.askId = askId;
+            this.askSince = Date.now();
+        }
+        const askWait = askId ? Math.max(0, BUY_ASK_GUARD_MS - (Date.now() - this.askSince)) : 0;
+        if (askWait > 0 && !this.askTimer) {
+            this.askTimer = setTimeout(() => {
+                this.askTimer = null;
+                if (this.lastBuying) this.setBuying(this.lastBuying);
+            }, askWait + 20);
+        }
+        this.lastBuying = v;
+        const sig = JSON.stringify([v, this.cancelAsk, askWait > 0]);
         if (sig === this.buySig) return;
         this.buySig = sig;
         box.textContent = '';
@@ -1014,12 +1033,19 @@ export class Panel {
         // The listing was never seen here, so nothing could be counted: ask.
         if (v.ask && v.here) {
             box.appendChild(el('div', { class: 'ttv2-tb-warn', text: 'The listing was not seen on this page, so nothing was counted. Did you buy ' + v.here.qty.toLocaleString('en-US') + ' ' + v.here.name + '?' }));
+            // null, not false: el() sets any value it gets, and disabled="false" is still disabled.
+            const waiting = askWait > 0 ? true : null;
+            // Pressed while still waiting: nothing happens (a disabled button takes no click).
+            const answer = (yes) => () => {
+                if (Date.now() - this.askSince < BUY_ASK_GUARD_MS) return;
+                if (this.handlers.onBuyNext) this.handlers.onBuyNext(yes);
+            };
             box.appendChild(el('div', { class: 'ttv2-tb-ask' }, [
-                el('button', { type: 'button', class: 'ttv2-primary', text: 'Bought ' + v.here.qty.toLocaleString('en-US'), onclick: () => this.handlers.onBuyNext && this.handlers.onBuyNext(true) }),
-                el('button', { type: 'button', text: 'Did not buy', onclick: () => this.handlers.onBuyNext && this.handlers.onBuyNext(false) }),
+                el('button', { type: 'button', class: 'ttv2-primary', disabled: waiting, text: 'Bought ' + v.here.qty.toLocaleString('en-US'), onclick: answer(true) }),
+                el('button', { type: 'button', disabled: waiting, text: 'Did not buy', onclick: answer(false) }),
             ]));
             const first = box.querySelector('.ttv2-tb-ask button');
-            if (first && this.root && this.root.getRootNode().activeElement === null) first.focus({ preventScroll: true });
+            if (!waiting && first && this.root && this.root.getRootNode().activeElement === null) first.focus({ preventScroll: true });
             return;
         }
         const label = v.here && (!v.next || v.last) ? 'Done - go to the trade' : v.here && !v.here.listed ? 'Not here - next' : v.here && v.same ? 'Next item here' : v.here ? 'Next bazaar' : 'Open the next bazaar' + (v.next ? ': ' + v.next.seller : '');
@@ -1046,7 +1072,7 @@ export class Panel {
             ]);
         }
         return el('div', { class: 'ttv2-tb-cancel ttv2-tb-ask' }, [
-            el('div', { class: 'ttv2-tb-warn', text: 'Cancel the trade with ' + v.trader + '? What you already bought stays yours to sell.' }),
+            el('div', { class: 'ttv2-tb-warn', text: 'Cancel the trade with ' + v.trader + '? What you bought goes to Torn Bids as leftovers, to sell elsewhere.' }),
             el('button', { type: 'button', text: 'Yes, cancel it', onclick: () => {
                 this.cancelAsk = null;
                 if (this.handlers.onTradeCancel) this.handlers.onTradeCancel(v.key);

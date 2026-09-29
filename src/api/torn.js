@@ -421,7 +421,7 @@ export const TORN_INVENTORY_CATEGORIES = [
 ];
 
 /** Torn refused the request for want of a (valid) `cat`. */
-function isCategoryError(error) {
+export function isCategoryError(error) {
     const code = Number(error && error.code);
     if (code === TORN_ERROR_INCORRECT_CATEGORY || code === TORN_ERROR_WRONG_FIELDS) return true;
     return /categor/i.test(String((error && error.message) || ''));

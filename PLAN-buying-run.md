@@ -1,5 +1,33 @@
 # Plan: the buying run on real pages (for a session after the mini-AI one)
 
+## Status: built in 3.16.0 (2026-09-29), except where marked
+
+The owner said "go through the plan" without answering the four questions
+below; these were taken, and are theirs to reverse:
+
+- **Order:** as proposed.
+- **Ledger in the background (2a): yes**, tightly: only while a trade you
+  accepted is under 3 hours old, only log 1225, once a minute, results shown
+  only on pages you look at. README Security 9 names it as the one Torn API
+  call that leaves a hidden tab.
+- **Unplanned buys the trader does not take (8): kept off Checkout** (the
+  owner's 3.14.3 rule), but no longer lost: Cancel trade lists them, and
+  both Cancel and Traded - done keep them as leftovers in Torn Bids.
+- **Scrolling Checkout (4): yes**, only when it is taller than the screen;
+  finished lines fold into one.
+
+Done: 1 (report reset, category fallback not logged), 2 (log-confirmed buys),
+3 (answers wait a second; the ask also logs what the page showed), 4, 5
+(To buy rows say ✓ in / add N; one count never ticks two rows), 7 in part:
+Cancel trade lists everything bought with its best other buyer, all of it
+kept as leftovers. **Not done:** 6 (reading a real bazaar and trade page with
+the owner - no browser this session; the trade page's view markup was in fact
+read live on 2026-09-27, see src/sources/dom/trade.js); 7's "items you hold
+back in trade plans" - not re-enabled, because the owner removed own items
+from trades in 3.14.0 ("omit it"); ask before bringing them back.
+Nothing of 3.16.0 has been seen on real Torn pages: unit tests, a headless
+DOM walk-through and a headless boot of the built script only.
+
 Written 2026-09-29 at the owner's request ("consolidate all, and create a
 plan for next session"), after the friend's first live report on 3.15.1.
 Nothing here is built. Restate it to the owner and get their order before

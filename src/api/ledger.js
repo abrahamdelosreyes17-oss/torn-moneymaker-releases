@@ -94,11 +94,11 @@ export function isFullKey(info) {
  * One page of your log (newest first, at most 100): the four trade types.
  * `from` / `to` are Torn timestamps (seconds), both inclusive.
  */
-export async function fetchLogPage(client, { from = null, to = null } = {}) {
-    const params = { log: LEDGER_LOG_TYPES.join(','), limit: 100 };
+export async function fetchLogPage(client, { from = null, to = null, types = LEDGER_LOG_TYPES, use = undefined } = {}) {
+    const params = { log: types.join(','), limit: 100 };
     if (from) params.from = from;
     if (to) params.to = to;
-    const data = await client.get('v2/user/log', params);
+    const data = await client.get('v2/user/log', params, use);
     return Array.isArray(data && data.log) ? data.log : [];
 }
 

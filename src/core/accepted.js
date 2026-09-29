@@ -227,7 +227,8 @@ export function stockBuys(seen, cards, pressed = new Set()) {
 /** The trade with one more unplanned buy (merged with the same item, price and seller). */
 export function addExtraBuy(trade, buy, now = Date.now()) {
     const extra = [...((trade && trade.extra) || [])];
-    const same = extra.findIndex((x) => x.itemId === String(buy.itemId) && x.price === buy.price && String(x.sellerId || '') === String(buy.sellerId || ''));
+    // Never into a row from your log (3.16): the next read rebuilds those, and this buy would go with it.
+    const same = extra.findIndex((x) => !x.fromLog && x.itemId === String(buy.itemId) && x.price === buy.price && String(x.sellerId || '') === String(buy.sellerId || ''));
     if (same >= 0) extra[same] = { ...extra[same], qty: extra[same].qty + buy.qty, at: now };
     else extra.push({ itemId: String(buy.itemId), name: buy.name, qty: buy.qty, price: buy.price, bid: buy.bid, sellerId: buy.sellerId || null, seller: buy.seller || null, at: now });
     return { ...trade, extra };
@@ -244,7 +245,6 @@ export function boughtSince(trade, { inside = null } = {}) {
     let cost = 0;
     let pays = 0;
     let toBuy = 0;
-    const has = (name) => (inside ? inside.get(String(name).toLowerCase()) || 0 : null);
     for (const i of (trade && trade.items) || []) {
         if (i.kind !== 'flip') continue;
         let qty = 0;
@@ -265,21 +265,29 @@ export function boughtSince(trade, { inside = null } = {}) {
         }
         if (!qty) continue;
         const send = takenUnits(i);
-        const inTrade = inside ? Math.min(send, has(i.name)) : null;
         cost += spent;
         pays += send * i.bid;
-        rows.push({ itemId: i.itemId, name: i.name, qty, each: spent / qty, bid: i.bid, sellers, at, planned: true, tone: 'planned', send, inTrade, profit: send * i.bid - (spent / qty) * send });
+        rows.push({ itemId: i.itemId, name: i.name, qty, each: spent / qty, bid: i.bid, sellers, at, planned: true, tone: 'planned', send, inTrade: null, profit: send * i.bid - (spent / qty) * send });
     }
     // Bought but not planned: only what this trader buys (the owner: "if the trader doesn't buy it, leave it off").
     const extra = [];
     for (const x of (trade && trade.extra) || []) {
         if (!x || !(x.bid > 0) || !(x.qty > 0)) continue;
-        const inTrade = inside ? Math.min(x.qty, has(x.name)) : null;
         cost += x.qty * x.price;
         pays += x.qty * x.bid;
-        extra.push({ ...x, each: x.price, sellers: x.seller ? [x.seller] : [], planned: false, tone: x.bid > x.price ? 'extra' : 'loss', send: x.qty, inTrade, profit: x.qty * (x.bid - x.price) });
+        extra.push({ ...x, each: x.price, sellers: x.seller ? [x.seller] : [], planned: false, tone: x.bid > x.price ? 'extra' : 'loss', send: x.qty, inTrade: null, profit: x.qty * (x.bid - x.price) });
     }
     const all = [...rows, ...extra].sort((a, b) => (a.at || 0) - (b.at || 0));
+    // What is in the trade, shared out in the order you bought: one item bought
+    // twice (planned, and again unplanned) is not ticked twice from one count.
+    if (inside) {
+        const left = new Map([...inside].map(([k, n]) => [String(k).toLowerCase(), n]));
+        for (const r of all) {
+            const k = String(r.name).toLowerCase();
+            r.inTrade = Math.min(r.send, left.get(k) || 0);
+            left.set(k, (left.get(k) || 0) - r.inTrade);
+        }
+    }
     const missing = inside ? all.filter((r) => r.inTrade < r.send).map((r) => ({ name: r.name, qty: r.send - r.inTrade })) : [];
     return {
         trader: trade && trade.trader ? trade.trader.name : null,
@@ -309,7 +317,7 @@ export function boughtSince(trade, { inside = null } = {}) {
  * @returns {{lines: Array<{line, index, itemId, name, qty, price, bid, sellerId, seller, state, bought}>, bazaars: number, bazaarsLeft: number, units: number, unitsBought: number, cost: number, done: boolean}}
  *   state: 'todo' | 'here' | 'part' (bought fewer than planned) | 'done' | 'skipped'
  */
-export function checkoutList(trade, { here = null } = {}) {
+export function checkoutList(trade, { here = null, inside = null } = {}) {
     const lines = [];
     for (const i of (trade && trade.items) || []) {
         if (i.kind !== 'flip') continue;
@@ -328,6 +336,17 @@ export function checkoutList(trade, { here = null } = {}) {
             lines.push({ line, index: k, itemId: String(i.itemId), name: i.name, qty: st.qty, price: st.price, bid: i.bid, sellerId: st.sellerId ? String(st.sellerId) : null, seller: st.sellerName || null, state, bought });
         });
     }
+    // On the trade page (3.16): each line bought says whether it is in the
+    // trade - what is in shared out in plan order, as the send is.
+    if (inside) {
+        const left = new Map([...inside].map(([k, n]) => [String(k).toLowerCase(), n]));
+        for (const l of lines) {
+            if (!(l.bought > 0) || l.state === 'here') continue;
+            const k = String(l.name).toLowerCase();
+            l.inTrade = Math.min(l.bought, left.get(k) || 0);
+            left.set(k, (left.get(k) || 0) - l.inTrade);
+        }
+    }
     // Bazaars: one visit buys every line at that seller (Next stays there for the next one).
     const sellers = new Set(lines.map((l) => l.sellerId || l.seller || '?'));
     const open = new Set(lines.filter((l) => l.state === 'todo' || l.state === 'here').map((l) => l.sellerId || l.seller || '?'));
@@ -339,6 +358,8 @@ export function checkoutList(trade, { here = null } = {}) {
         unitsBought: lines.reduce((a, l) => a + l.bought, 0),
         cost: lines.reduce((a, l) => a + l.bought * l.price, 0),
         done: lines.length > 0 && open.size === 0,
+        // Finished lines, for the folded "✓ 5 bought" line (3.16).
+        finished: lines.filter((l) => l.state === 'done' || l.state === 'skipped').length,
     };
 }
 
@@ -429,6 +450,10 @@ export function leftoversOf(trade, now = Date.now()) {
         const n = Math.min(sendUnits(i), Math.max(0, Math.floor(Number(i.left) || 0)));
         if (i.kind !== 'flip' || !(n > 0)) continue;
         out.push({ itemId: String(i.itemId), name: i.name, qty: n, each: Math.round(costEach(i)), from: trade.trader ? trade.trader.name : null, at: now });
+    }
+    // Bought on the way that this trader does not buy (3.16): never in the trade, still yours to sell.
+    for (const x of (trade && trade.extra) || []) {
+        if (x && !(Number(x.bid) > 0) && Number(x.qty) > 0) out.push({ itemId: String(x.itemId), name: x.name, qty: Number(x.qty), each: Math.round(Number(x.price) || 0), from: trade.trader ? trade.trader.name : null, at: now });
     }
     return out;
 }
@@ -524,4 +549,168 @@ export function fillNote({ accepted = [], trader = null, partner = null, toSend 
     // Items to send with no row here (not in your items, or on another tab): named, so none is missed.
     const gone = missing.length ? ' · not in this list: ' + missing.join(', ') : '';
     return { ok: !missing.length, text: 'Fill for ' + trader + ': ' + marked + (marked === 1 ? ' item' : ' items') + ' marked' + gone };
+}
+
+/* ------------------------------------ Buys confirmed from your log (3.16) */
+
+/*
+ * The friend's first live run (3.15.1, 2026-09-29): he bought 534 Red Fox
+ * Plushies and 362 Peony for an accepted trade, and none of it was recorded -
+ * the bazaar page's cards were not recognised, so each Next asked "Did you
+ * buy?" and a quick second press answered "Did not buy". Checkout, Bought,
+ * the trade page's checklist and Cancel trade's leftovers all stayed empty.
+ *
+ * Torn's own log says every bazaar buy (log 1225: seller, item, how many, at
+ * what price), whatever the page looked like and whatever was pressed. Torn
+ * Bids reads it with the Ledger's key while a trade is accepted, and every
+ * page applies it here: a buy from a planned seller ticks that step off;
+ * anything else is an unplanned buy. Pure and idempotent - applied again to
+ * its own output, nothing changes.
+ */
+
+/** A log buy this long before "accepted" still counts for the trade (Torn's clock and yours differ a little). */
+export const LOG_BUY_SLACK_MS = 60 * 1000;
+
+/**
+ * Your bazaar buys, from Ledger rows (core/ledger.js rowsFromLog of log 1225).
+ * @returns {Array<{id, t, itemId, qty, each, sellerId}>}
+ */
+export function bazaarBuyRows(rows) {
+    return (rows || [])
+        .filter((r) => r && r.side === 'buy' && r.venue === 'bazaar' && Number(r.qty) > 0 && r.itemId && r.who)
+        .map((r) => ({ id: String(r.id), t: Number(r.t), itemId: String(r.itemId), qty: Number(r.qty), each: Number(r.each) || 0, sellerId: String(r.who) }));
+}
+
+/** Stored log buys plus new ones: one per log line, only since `since` (ms), oldest first. */
+export function addLogBuys(stored, add, since = 0) {
+    const byId = new Map();
+    for (const b of [...(Array.isArray(stored) ? stored : []), ...(add || [])]) if (b && b.id && Number(b.t) >= since) byId.set(String(b.id), b);
+    return [...byId.values()].sort((a, b) => a.t - b.t || String(a.id).localeCompare(String(b.id)));
+}
+
+/**
+ * The trade with your log's bazaar buys applied.
+ *
+ * - A buy of a planned item from that step's seller ticks the step: how many
+ *   the log says (at most what was planned), at what you really paid. The
+ *   log wins over the page's count and over "Did not buy".
+ * - Anything else bought since "accepted" - more than planned from that
+ *   seller, the item from another seller, another item - is an unplanned buy
+ *   (`extra`, `fromLog`), with what this trader pays for it (0: they don't).
+ * - Unplanned buys the page counted before the log's read time go: the log
+ *   has them (or they were not yours).
+ * - A step the page counted that the log does not show is left as it is
+ *   (never un-bought from a log that may lag).
+ *
+ * @param {object} trade - an accepted trade
+ * @param {Array} buys - bazaarBuyRows
+ * @param {object} [o]
+ * @param {number} [o.readTo] - the log is complete up to here (ms, your clock)
+ * @param {function} [o.bidOf] - itemId -> what this trader pays each (0: not bought)
+ * @param {function} [o.nameOf] - itemId -> name
+ */
+export function applyLogBuys(trade, buys, { readFrom = 0, readTo = 0, bidOf = () => 0, nameOf = () => null } = {}) {
+    if (!trade || !Array.isArray(trade.items)) return trade;
+    const since = Number(trade.at) - LOG_BUY_SLACK_MS;
+    // The stored log does not reach back to this trade's yes (an older trade no
+    // longer read): it is left as it was last saved, never emptied.
+    if (Number(readFrom) > since) return trade;
+    const mine = (buys || []).filter((b) => b && Number(b.t) >= since && Number(b.qty) > 0 && b.itemId && b.sellerId);
+    if (!mine.length && !(readTo > 0)) return trade;
+    // Every buy, by item and seller: what is left of it after the steps take theirs.
+    const pool = new Map();
+    for (const b of mine) {
+        const k = String(b.itemId) + '|' + String(b.sellerId);
+        const p = pool.get(k) || { itemId: String(b.itemId), sellerId: String(b.sellerId), qty: 0, cost: 0, at: 0 };
+        p.qty += Number(b.qty);
+        p.cost += Number(b.qty) * (Number(b.each) || 0);
+        p.at = Math.max(p.at, Number(b.t));
+        pool.set(k, p);
+    }
+    for (const p of pool.values()) p.left = p.qty;
+    const names = new Map();
+    const items = trade.items.map((i) => {
+        if (i.kind !== 'flip' || !(i.steps || []).length) return i;
+        names.set(String(i.itemId), i.name);
+        let changed = false;
+        const steps = i.steps.map((st) => {
+            const p = pool.get(String(i.itemId) + '|' + String(st.sellerId));
+            if (!st.sellerId || !p || !(p.left > 0)) {
+                // Counted as bought on the page (or "Bought N"), and the log -
+                // complete past that moment - has no such buy: not bought.
+                const counted = !st.logged && (st.bought || st.boughtQty > 0) && Number(st.boughtAt) >= since;
+                if (counted && readTo > 0 && Number(st.boughtAt) <= readTo) {
+                    changed = true;
+                    return { ...st, bought: false, boughtQty: 0, skipped: true, notInLog: true };
+                }
+                return st;
+            }
+            const take = Math.min(st.qty, p.left);
+            p.left -= take;
+            changed = true;
+            const paid = p.qty ? p.cost / p.qty : 0;
+            return { ...st, price: paid > 0 ? paid : st.price, planned: st.planned || st.price, boughtQty: take, bought: take >= st.qty, skipped: false, boughtAt: p.at, logged: true };
+        });
+        return changed ? { ...i, steps } : i;
+    });
+    // Seller names the plan knows, for the unplanned rows.
+    const sellerName = new Map();
+    for (const i of trade.items) for (const st of i.steps || []) if (st.sellerId && st.sellerName) sellerName.set(String(st.sellerId), st.sellerName);
+    const fromLog = [];
+    for (const p of pool.values()) {
+        if (!(p.left > 0)) continue;
+        const line = trade.items.find((i) => i.kind === 'flip' && String(i.itemId) === p.itemId);
+        fromLog.push({
+            itemId: p.itemId,
+            name: names.get(p.itemId) || nameOf(p.itemId) || 'Item ' + p.itemId,
+            qty: p.left,
+            price: p.qty ? p.cost / p.qty : 0,
+            bid: line ? line.bid : Math.max(0, Number(bidOf(p.itemId)) || 0),
+            sellerId: p.sellerId,
+            seller: sellerName.get(p.sellerId) || null,
+            at: p.at,
+            fromLog: true,
+        });
+    }
+    const pageExtra = ((trade && trade.extra) || []).filter((x) => x && !x.fromLog && !(readTo > 0 && Number(x.at) <= readTo));
+    return { ...trade, items, extra: [...pageExtra, ...fromLog], logTo: Math.max(Number(trade.logTo) || 0, Number(readTo) || 0) };
+}
+
+/**
+ * Sell what you're holding (3.16, the friend: "a trader went offline and now
+ * I'm stuck with these items with no flip plan for them"): everything bought
+ * for the trade, each with who pays most for it now - never the trader this
+ * trade was with. Cancel trade keeps them as leftovers in Torn Bids.
+ *
+ * @param {object} trade
+ * @param {function} buyersOf - itemId -> buyers, best first ({id, name, price})
+ * @returns {Array<{itemId, name, qty, each, best: {name, price}|null, gain: number|null}>}
+ */
+export function sellElsewhere(trade, buyersOf) {
+    const id = trade && trade.trader && trade.trader.id ? String(trade.trader.id) : null;
+    const name = trade && trade.trader ? String(trade.trader.name || '').toLowerCase() : '';
+    return cancelledLeftovers(trade).map((l) => {
+        const top = ((buyersOf && buyersOf(l.itemId)) || []).find((b) => b && !(id && b.id && String(b.id) === id) && String(b.name || '').toLowerCase() !== name) || null;
+        return { ...l, best: top ? { name: top.name, price: top.price } : null, gain: top ? (top.price - l.each) * l.qty : null };
+    });
+}
+
+/**
+ * Which accepted trade each log buy belongs to, so no buy counts twice: a
+ * buy from a seller a trade planned for that item goes to that trade (the
+ * newest such); anything else to the newest trade accepted before it.
+ *
+ * @returns {Map<string, Array>} trade key -> its buys
+ */
+export function splitLogBuys(trades, buys) {
+    const list = [...(trades || [])].filter((t) => t && t.key).sort((a, b) => b.at - a.at);
+    const out = new Map(list.map((t) => [t.key, []]));
+    for (const b of buys || []) {
+        if (!b) continue;
+        const open = list.filter((t) => Number(b.t) >= Number(t.at) - LOG_BUY_SLACK_MS);
+        if (!open.length) continue;
+        const planned = open.find((t) => (t.items || []).some((i) => i.kind === 'flip' && String(i.itemId) === String(b.itemId) && (i.steps || []).some((st) => String(st.sellerId) === String(b.sellerId))));
+        out.get((planned || open[0]).key).push(b);
+    }
+    return out;
 }

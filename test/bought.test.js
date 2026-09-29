@@ -130,3 +130,17 @@ test('the checkout window starts clear of NPC Arbitrage: above it if it fits, el
     assert.deepEqual(windowStart({ ...panel, top: 500 }, { width: 300, height: 300, viewW: 1616 }), { x: 1300, y: 192 });
     assert.deepEqual(windowStart(null, { width: 300, height: 300, viewW: 1616 }), { x: 1300, y: 64 });
 });
+
+import { fitWindow } from '../src/ui/bought-window.js';
+
+test('Checkout fits the screen (3.16): moved up to fit when it can, else its list scrolls inside', () => {
+    // The friend's screen: 1536x960 (about 830 px of view). Short: stays where it is.
+    assert.deepEqual(fitWindow(64, { height: 300, viewH: 830 }), { y: 64, maxHeight: 758 });
+    // Long, low on the screen: moved up just enough.
+    assert.deepEqual(fitWindow(500, { height: 600, viewH: 830 }), { y: 222, maxHeight: 600 });
+    // Taller than the screen (10 extras): at the top, capped - the list scrolls inside.
+    assert.deepEqual(fitWindow(300, { height: 814, viewH: 830 }), { y: 8, maxHeight: 814 });
+    // Dropped at the very bottom by its title bar: still all on screen.
+    const low = fitWindow(798, { height: 400, viewH: 830 });
+    assert.equal(low.y + 400 <= 830 - 8, true);
+});

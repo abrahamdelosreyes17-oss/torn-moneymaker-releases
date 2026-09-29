@@ -597,6 +597,42 @@ and whatever you already bought for it - counted up to the bazaar you are on -
 goes to your leftovers, to sell elsewhere. *← Back to the live plan* is
 unchanged (unfreezes the plan, nothing kept).
 
+**Buys checked with your Torn log** (3.16, after the friend's first live run:
+he bought 534 Red Fox Plushies and 362 Peony for an accepted trade and none
+of it was recorded - the real bazaar page's listing was not recognised, so
+every Next asked "Did you buy?", and a quick second press answered "Did not
+buy"). While a trade you accepted is under 3 hours old, Torn Bids reads your
+bazaar buys from your Torn log (log 1225 only: seller, item, how many, each)
+with the Ledger's Full key, once a minute - also while its tab is in the
+background, because during a buying run you are on Torn's pages. Every page
+applies them (`core/accepted.js` `applyLogBuys`): a buy of a planned item from
+that step's seller ticks the step (how many the log says, at what you paid -
+the log wins over the page's count and over "Did not buy"; a step counted as
+bought on the page that the log, read past that moment, does not show goes
+back to not bought, so a wrong "Bought N" is never sent twice); anything else
+bought since "accepted" (more than planned, the item from another seller,
+another item) is an unplanned buy, with what this trader pays for it. A buy
+counts for one trade only (`splitLogBuys`), and a trade that goes takes its
+buys with it. Checkout says whether it was checked ("Checked with your Torn
+log at 23:14", or keep Torn Bids open, or save a Ledger key); without a Ledger
+key it counts from the page as before.
+
+- **"Did you buy?"** takes no press for a second after it appears (its
+  answers come up where Next was). When it has to ask, the problem log notes
+  what the page showed (cards found, read, unknown items, the item ids read),
+  so the next report shows why the listing was not seen.
+- **Checkout fits the screen:** moved up just enough when it can; taller than
+  the screen, its list scrolls inside (a window pinned to the screen has no
+  other way), and stays where you scrolled when it is drawn again. Finished
+  lines fold into one ("✓ 8 bought · 4 skipped", *Show ▸*).
+- **On the trade page** each bought line of To buy says *✓ in* or *add N*
+  too; what is in the trade is shared out across rows, so one item bought
+  twice (planned and unplanned) is never ticked twice from one count.
+- **Sell what you're holding:** Cancel trade lists everything bought for the
+  trade, each with who pays most for it now (never that trader, never a
+  blacklisted one); it all goes to Torn Bids' leftovers. At Traded - done,
+  unplanned buys the trader does not take become leftovers too.
+
 **Add all** (3.14.5): beside *"X buys N more items, left out to keep it
 quick · Show them"*, one press puts every one of them in the trade, past
 Extras per trade. On a held trade an item whose bazaars are not read yet goes
@@ -691,7 +727,10 @@ services that do sat mostly idle.
   code), the script's own errors, and your steps (picked an item, Plan
   trade, accepted, Cancel trade, Next bazaar, Fill...). "No list" answers
   (TornW3B 404, TornExchange not found) are not errors. Keys are masked
-  before anything is stored; nothing is sent anywhere by the page.
+  before anything is stored; nothing is sent anywhere by the page. After the
+  download (3.16) the words, screenshots and log are cleared for the next
+  report, with *Download it again*; the inventory's "Incorrect category"
+  answer (Torn then gets asked per category) is no longer logged as an error.
 
 ---
 
@@ -854,7 +893,7 @@ The Torn Ledger's key (its own table beside its own field):
 
 | Data storage | Data sharing | Purpose of use | Key storage & sharing | Key access level |
 |---|---|---|---|---|
-| Only locally: time, item, quantity, price, where, who - never the log's own text | Nobody | Personal: profit tracking | Stored locally / Not shared | Full, used only for your log (user: log - bazaar and Item Market buys and sells), your trades (user: trades, trade) and key: info |
+| Only locally: time, item, quantity, price, where, who - never the log's own text | Nobody | Personal: profit tracking, and checking what you bought for a trade you accepted | Stored locally / Not shared | Full, used only for your log (user: log - bazaar and Item Market buys and sells), your trades (user: trades, trade) and key: info |
 
 Plus: *Other services: none - never sent to TornExchange or TornW3B.*
 
@@ -923,7 +962,11 @@ code flaw. These measures address both halves.
    the block; and a request queued while a tab was visible is not sent after
    it is hidden. (3.14: Torn Bids' own TornExchange and TornW3B clients do
    keep going in the background, slowly - they are not Torn; the Torn API
-   never does.) The item list's v1 fallback gives no NPC prices at all (it
+   never does - with one exception since 3.16: while a trade you accepted is
+   under 3 hours old, Torn Bids reads your own bazaar buys (log 1225) once
+   a minute with the Ledger's key from a hidden tab too, in the shared window,
+   shown only on pages you look at - no alert of any kind. Torn's rule is
+   about unfocused pages drawing attention; this draws none.) The item list's v1 fallback gives no NPC prices at all (it
    cannot show a shop in Torn buys an item) and is retried after 5 minutes.
 
 ### Out of scope, deliberately

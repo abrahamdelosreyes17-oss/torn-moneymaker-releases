@@ -79,6 +79,25 @@ export function windowStart(panel, { width, height, viewW }) {
     return { x: panel.right - width, y: 8 };
 }
 
+/**
+ * The window fits the screen (3.16; the owner: the Checkout list could not
+ * be scrolled - it is pinned to the screen, so what went past the bottom was
+ * out of reach). Moved up just enough to fit when it can; when it is taller
+ * than the screen, its list scrolls inside it (a pinned window has no other
+ * way). Pure - tested.
+ *
+ * @param {number} y - where its top is now
+ * @param {{height: number, viewH: number}} o - its natural height, the view's
+ * @returns {{y: number, maxHeight: number}}
+ */
+export function fitWindow(y, { height, viewH }) {
+    const gap = 8;
+    const h = Math.max(0, Number(height) || 0);
+    let top = Math.max(0, Number(y) || 0);
+    if (top + h > viewH - gap) top = Math.max(Math.min(top, gap), viewH - gap - h);
+    return { y: Math.round(top), maxHeight: Math.max(120, Math.round(viewH - gap - top)) };
+}
+
 export class BoughtWindow {
     /**
      * @param {object} h - onMove({x, y}), onFold(folded), panelRect() - NPC Arbitrage's box, to sit above it
@@ -129,8 +148,12 @@ export class BoughtWindow {
             p = windowStart(panel, { width, height: this.box.offsetHeight || 200, viewW });
         }
         const c = clampWindowPos(p.x, p.y, { width, height: this.box.offsetHeight, viewW, viewH });
+        // Its whole height on screen when it fits; else the list scrolls inside (3.16).
+        this.box.style.maxHeight = '';
+        const fit = fitWindow(c.y, { height: this.box.offsetHeight, viewH });
         this.box.style.left = c.x + 'px';
-        this.box.style.top = c.y + 'px';
+        this.box.style.top = fit.y + 'px';
+        this.box.style.maxHeight = fit.maxHeight + 'px';
     }
 
     /** Dragged by its title bar: anywhere on the page, kept for next time. */
@@ -151,6 +174,8 @@ export class BoughtWindow {
             window.removeEventListener('pointerup', up);
             this.box.classList.remove('bw-drag');
             if (this.pos && this.h.onMove) this.h.onMove(this.pos);
+            // Dropped low: fitted to the screen again.
+            this.place();
         };
         this.box.classList.add('bw-drag');
         window.addEventListener('pointermove', move);
@@ -174,8 +199,18 @@ export class BoughtWindow {
                 } }),
             ]);
         }
+        // Sell what you're holding (3.16, the friend: stuck with items after the
+        // trader went offline): what you bought, and who pays most for it now.
+        const holding = m.holding || [];
         return bwEl('div', { class: 'bw-cancel bw-ask' }, [
-            bwEl('p', { class: 'bw-warn', text: 'Cancel the trade with ' + (m.trader || 'them') + '? What you already bought stays yours to sell.' }),
+            bwEl('p', { class: 'bw-warn', text: 'Cancel the trade with ' + (m.trader || 'them') + '? ' + (holding.length ? 'What you bought goes to Torn Bids as leftovers, to sell elsewhere:' : 'Nothing is recorded as bought for it.') }),
+            holding.length ? bwEl('ul', { class: 'bw-hold' }, holding.map((l) => bwEl('li', {}, [
+                bwEl('b', { text: l.name }),
+                ' ×' + l.qty.toLocaleString('en-US') + ' · ',
+                l.best
+                    ? bwEl('span', {}, ['sell to ', bwEl('b', { text: l.best.name }), ' at ' + bwMoney(l.best.price) + ' (', bwEl('span', { class: l.gain >= 0 ? 'bw-g' : 'bw-neg', text: bwSigned(l.gain) }), ')'])
+                    : bwEl('span', { class: 'bw-mute', text: 'no other trader buys it now' }),
+            ]))) : null,
             bwEl('button', { type: 'button', class: 'bw-btn', text: 'Yes, cancel it', onclick: () => {
                 this.cancelAsk = null;
                 if (this.h.onCancel) this.h.onCancel(m.key);
@@ -206,7 +241,13 @@ export class BoughtWindow {
                 ' ' + count,
                 l.state === 'skipped' ? bwEl('span', { class: 'bw-tag bw-tag-mute', text: 'skipped' }) : l.state === 'here' ? bwEl('span', { class: 'bw-tag bw-tag-here', text: 'here' }) : null,
             ]),
-            open ? bwEl('a', { class: 'bw-open', href: l.url, title: 'Open ' + (l.seller || 'this') + '\'s bazaar', text: 'Open' }) : bwEl('span'),
+            open ? bwEl('a', { class: 'bw-open', href: l.url, title: 'Open ' + (l.seller || 'this') + '\'s bazaar', text: 'Open' })
+                // On the trade page (3.16): each line bought, in the trade or not yet.
+                : m.onTradePage && l.inTrade !== undefined
+                    ? l.inTrade >= l.bought
+                        ? bwEl('span', { class: 'bw-ck bw-in', title: 'In the trade', text: '✓ in' })
+                        : bwEl('span', { class: 'bw-ck bw-miss', title: 'Not in the trade yet', text: 'add ' + (l.bought - l.inTrade).toLocaleString('en-US') })
+                    : bwEl('span'),
             bwEl('span', { class: 'bw-d', text: 'from ' + (l.seller || 'Player ' + l.sellerId) + ' at ' + bwMoney(l.price) + ' · ' + (m.trader || 'they') + ' pays ' + bwMoney(l.bid) }),
         ]);
     }
@@ -221,10 +262,12 @@ export class BoughtWindow {
         }
         this.mount();
         if (this.cancelAsk !== m.key) this.cancelAsk = null;
-        const sig = JSON.stringify([m, this.folded, this.cancelAsk]);
+        const sig = JSON.stringify([m, this.folded, this.cancelAsk, this.showFinished]);
         if (sig === this.sig) return;
         this.sig = sig;
         const box = this.box;
+        // Drawn again (a buy counted, the log read): the list stays where you scrolled it.
+        const scrolled = this.body && this.body.isConnected ? this.body.scrollTop : 0;
         box.textContent = '';
         box.classList.toggle('bw-folded', this.folded);
 
@@ -266,15 +309,43 @@ export class BoughtWindow {
 
         const body = bwEl('div', { class: 'bw-body' });
         body.appendChild(bwEl('div', { class: 'bw-since', text: 'Since "' + (m.trader || 'they') + ' accepted"' + (m.at ? ' at ' + bwTime(m.at) : '') }));
+        // Whether your buys were checked with your Torn log (3.16).
+        if (m.logNote) body.appendChild(bwEl('div', { class: 'bw-log' + (m.logNote.ok ? ' bw-log-ok' : ''), role: 'status', text: m.logNote.text }));
         if (cartLines.length) {
             body.appendChild(bwEl('div', { class: 'bw-sec' }, [
                 bwEl('span', { text: 'To buy' }),
                 bwEl('span', { class: cart.done ? 'bw-g' : '', text: cart.done ? 'all done ✓' : left + ' of ' + cart.bazaars + (cart.bazaars === 1 ? ' bazaar' : ' bazaars') + ' left' }),
             ]));
-            for (const l of cartLines) body.appendChild(this.cartRow(l, m));
+            // Finished lines fold into one (3.16): the list stays short as you buy.
+            const finished = cartLines.filter((l) => l.state === 'done' || l.state === 'skipped');
+            if (finished.length && !this.showFinished) {
+                const bought = finished.filter((l) => l.state === 'done').length;
+                const skipped = finished.length - bought;
+                const inAll = !m.onTradePage || finished.every((l) => l.inTrade === undefined || l.inTrade >= l.bought);
+                body.appendChild(bwEl('button', { type: 'button', class: 'bw-cart bw-fold', 'aria-expanded': 'false', title: 'Show them', onclick: () => {
+                    this.showFinished = true;
+                    this.sig = null;
+                    this.render(m);
+                } }, [
+                    bwEl('span', { class: 'bw-mark bw-m-done', text: '✓' }),
+                    bwEl('span', { class: 'bw-n', text: [bought ? bought + ' bought' : '', skipped ? skipped + ' skipped' : ''].filter(Boolean).join(' · ') + (inAll ? '' : ' · not all in the trade') }),
+                    bwEl('span', { class: 'bw-open', text: 'Show ▸' }),
+                ]));
+            }
+            for (const l of cartLines) {
+                if (!this.showFinished && (l.state === 'done' || l.state === 'skipped')) continue;
+                body.appendChild(this.cartRow(l, m));
+            }
+            if (finished.length && this.showFinished) {
+                body.appendChild(bwEl('button', { type: 'button', class: 'bw-link bw-fold-back', 'aria-expanded': 'true', text: 'Fold the finished ones', onclick: () => {
+                    this.showFinished = false;
+                    this.sig = null;
+                    this.render(m);
+                } }));
+            }
             body.appendChild(bwEl('div', { class: 'bw-sec' }, [bwEl('span', { text: 'Bought' }), bwEl('span', { text: buys ? bwSigned(m.totals.profit) : '' })]));
         }
-        if (!buys) body.appendChild(bwEl('p', { class: 'bw-empty', text: cartLines.length ? 'Nothing recorded yet: what you take at a bazaar is added here when you press Next.' : 'Nothing bought yet. What you buy for this trade shows here.' }));
+        if (!buys) body.appendChild(bwEl('p', { class: 'bw-empty', text: cartLines.length ? 'Nothing recorded yet: what you take at a bazaar is added here when you press Next, and from your Torn log.' : 'Nothing bought yet. What you buy for this trade shows here.' }));
         for (const r of m.rows) {
             const check = m.onTradePage
                 ? r.inTrade >= r.send
@@ -308,7 +379,9 @@ export class BoughtWindow {
         }
         body.appendChild(this.cancelPart(m));
         box.appendChild(body);
+        this.body = body;
         this.place();
+        if (scrolled) body.scrollTop = scrolled;
     }
 }
 
@@ -318,7 +391,7 @@ export const BOUGHT_CSS = `
 .bw {
     --bg: #2e2e2e; --row: #2b2b2b; --line: #444; --text: #ddd; --muted: #b3b3b3; --profit: #99cc00;
     --buy: #4dabf7; --orange: #ff9f43; --red: #ff8a80; --warn: #f0a020;
-    position: fixed; z-index: 2147483001; width: 300px; max-width: calc(100vw - 16px);
+    position: fixed; z-index: 2147483001; width: 300px; max-width: calc(100vw - 16px); max-height: calc(100vh - 16px);
     display: flex; flex-direction: column; background: var(--bg); color: var(--text);
     border: 1px solid var(--buy); border-radius: 4px; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
     font: 13px/1.4 Arial, Helvetica, sans-serif;
@@ -332,7 +405,20 @@ export const BOUGHT_CSS = `
 .bw-ic { width: 24px; height: 24px; padding: 0; border: 1px solid transparent; border-radius: 4px; background: transparent; color: var(--text); font: 15px/22px Arial, Helvetica, sans-serif; cursor: pointer; }
 .bw-ic:hover { border-color: var(--line); }
 .bw-ic:focus-visible { outline: 2px solid var(--profit); outline-offset: 1px; }
-.bw-body { padding: 8px 12px 10px; }
+.bw-body { padding: 8px 12px 10px; flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
+.bw-hd { flex: 0 0 auto; }
+.bw-log { font-size: 12px; color: var(--warn); margin: -2px 0 6px; }
+.bw-log.bw-log-ok { color: var(--muted); }
+.bw-fold { width: 100%; text-align: left; color: var(--text); font: 13px/1.4 Arial, Helvetica, sans-serif; cursor: pointer; }
+.bw-fold:hover { border-color: var(--buy); }
+.bw-fold:focus-visible { outline: 2px solid var(--profit); outline-offset: 1px; }
+.bw-fold .bw-n { color: var(--muted); }
+.bw-fold-back { display: block; margin: 0 0 6px auto; }
+.bw-hold { flex: 1 1 100%; margin: 0; padding-left: 16px; font-size: 12px; }
+.bw-hold li { margin: 2px 0; overflow-wrap: anywhere; }
+.bw-hold b { color: #fff; }
+.bw-g { color: var(--profit); }
+.bw-mute { color: var(--muted); }
 .bw-since { font-size: 12px; color: var(--muted); margin-bottom: 6px; }
 .bw-empty { margin: 0; font-size: 12px; color: var(--muted); }
 .bw-it { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 8px; padding: 6px 8px; margin-bottom: 6px;

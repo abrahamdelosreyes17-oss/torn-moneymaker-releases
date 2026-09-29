@@ -57,7 +57,7 @@ import { deskItem, nextW3bRead, backgroundSlot, backgroundListSlot, flipsStale, 
 import { liquidityKind, unitsMoved, addMovement, stopsMinutes, EXTRA_CAP } from './core/liquidity.js';
 import { usageAdd, usageMerge, usageSeries, USAGE_SERVICES, USAGE_RANGES, USAGE_LABELS } from './core/usage.js';
 import { addLogEntries, logText } from './core/errlog.js';
-import { checkoutList, boughtSince, stockBuys, addExtraBuy, acceptTrade, liveAccepted, stepState, tickAccepted, stepDone, nextStep, boughtFromStock, recordBuy, sendUnits, acceptedTotals, replacementFor, replaceStep, dropLine, markLeft, leftoversOf, cancelledLeftovers, addLeftovers, takenUnits, fillNote } from './core/accepted.js';
+import { checkoutList, boughtSince, stockBuys, addExtraBuy, applyLogBuys, bazaarBuyRows, addLogBuys, splitLogBuys, sellElsewhere, LOG_BUY_SLACK_MS, acceptTrade, liveAccepted, stepState, tickAccepted, stepDone, nextStep, boughtFromStock, recordBuy, sendUnits, acceptedTotals, replacementFor, replaceStep, dropLine, markLeft, leftoversOf, cancelledLeftovers, addLeftovers, takenUnits, fillNote } from './core/accepted.js';
 import { readTradeView, readTradeAddRows } from './sources/dom/trade.js';
 import { BoughtWindow } from './ui/bought-window.js';
 import { makeTabId, LEADER_HEARTBEAT_MS } from './core/leader.js';
@@ -68,7 +68,7 @@ import { rankOpportunities, summarize, hiddenCounts, belowMinRows } from './core
 import { TornApiClient, redactKey, KEY_DEAD_CODES } from './api/client.js';
 import { W3bClient, fetchW3bSummary, fetchW3bListings, fetchW3bPriceList, fetchW3bItemTraders } from './api/w3b.js';
 import { LedgerClient, fetchLedgerKeyInfo, isFullKey, fetchLogPage, fetchTradesPage, fetchTrade } from './api/ledger.js';
-import { readLedger, emptyLedger, rowsFromLog, rowsFromTrade, addLedgerRows, logSpan, mugFromLog, addMugs, priceRecordOf, addPriceRecord, acceptedPricesFor, matchFifo, tradeReceipts } from './core/ledger.js';
+import { LOG_BAZAAR_BUY, readLedger, emptyLedger, rowsFromLog, rowsFromTrade, addLedgerRows, logSpan, mugFromLog, addMugs, priceRecordOf, addPriceRecord, acceptedPricesFor, matchFifo, tradeReceipts } from './core/ledger.js';
 import { partnerStats, isFavourite, editFavourite, editBlacklist, withoutBlacklisted, favouritesFirstOnTie, tradedLine, partnerKey, scanOrder, blacklistKeys } from './core/partners.js';
 import {
     TeClient,
@@ -141,6 +141,7 @@ import {
     ACCESS_PUBLIC,
     TORN_ERROR_ACCESS_LEVEL,
     keyTooLowForInventory,
+    isCategoryError,
 } from './api/torn.js';
 import {
     detectPage,
@@ -290,6 +291,13 @@ const SELL_MOVES_KEEP_MS = 3 * 24 * 60 * 60 * 1000;
 const SELL_MOVES_GAP_MS = 60 * 60 * 1000;
 /* What a trader did not take after you bought it (the owner: "we need to still try to flip that item"): [{itemId, name, qty, each, from, at}]. */
 const STORE_SELL_LEFTOVERS = 'sellLeftovers';
+/*
+ * Your bazaar buys from your Torn log while a trade is accepted (3.16): Torn
+ * Bids reads them with the Ledger's key and keeps them here; every page
+ * applies them to the accepted trades (core/accepted.js applyLogBuys).
+ * {buys: [{id, t, itemId, qty, each, sellerId}], readTo, at, state: 'on' | 'nokey' | 'error'}
+ */
+const STORE_SELL_LOG_BUYS = 'sellLogBuys';
 const SELL_LEFTOVERS_KEEP_MS = 7 * 24 * 60 * 60 * 1000;
 /* When the ledger was last saved (its rows are in Torn Bids' IndexedDB): other tabs re-read on a change. */
 const STORE_LEDGER_REV = 'ledgerRev';
@@ -2678,9 +2686,27 @@ function updateBoughtWindow() {
     const here = app.buyHere && app.buyHere.trade.key === trade.key && buyRun.firstSeen !== null
         ? { line: app.buyHere.line, index: app.buyHere.index, took: boughtFromStock(buyRun.firstSeen, buyRun.nowSeen, app.buyHere.step.qty) }
         : app.buyHere && app.buyHere.trade.key === trade.key ? { line: app.buyHere.line, index: app.buyHere.index, took: 0 } : null;
-    const cart = checkoutList(trade, { here });
+    const inside = onTradePage ? check.inside : null;
+    const cart = checkoutList(trade, { here, inside });
     for (const l of cart.lines) l.url = l.sellerId ? bazaarUrl(l.sellerId, l.itemId, l.price) : null;
-    app.bought.render({ ...boughtSince(trade, { inside: onTradePage ? check.inside : null }), onTradePage, key: trade.key, cart });
+    app.bought.render({ ...boughtSince(trade, { inside }), onTradePage, key: trade.key, cart, logNote: logBuysNote(), holding: sellElsewhere(trade, buyersForHolding) });
+}
+
+/** Whether Torn Bids checked your buys with your Torn log (3.16), in one line for Checkout. */
+function logBuysNote(now = Date.now()) {
+    const log = gmGet(STORE_SELL_LOG_BUYS, null);
+    const fresh = log && now - Number(log.at) < 3 * 60 * 1000;
+    if (log && log.state === 'nokey') return { ok: false, text: 'Counted from the page only: save a Ledger (Full) key in Torn Bids and it checks your buys with your Torn log.' };
+    if (fresh && log.state === 'on') return { ok: true, text: 'Checked with your Torn log at ' + new Date(Number(log.at)).toTimeString().slice(0, 5) + '.' };
+    if (fresh && log.state === 'error') return { ok: false, text: 'Torn Bids could not read your Torn log just now; it tries again in a minute.' };
+    return { ok: false, text: 'Keep Torn Bids open in a tab: it checks your buys with your Torn log.' };
+}
+
+/** Who buys an item you hold, best first: the overlay's trusted buyers, never a blacklisted one. */
+function buyersForHolding(itemId) {
+    trustedBuyerOf(itemId);
+    const lookup = app.traderLookup;
+    return lookup ? trustedOnly(withoutBlacklisted(lookup.buyersAll(String(itemId)), blacklistKeys(sellBlacklist()))) : [];
 }
 
 /* Unplanned buys: each card's stock on the bazaar you are on, kept for this tab. */
@@ -2778,6 +2804,8 @@ function trackTradeBuying(listings) {
     }
     const here = detectPage(location.href) === PAGE_BAZAAR ? buyStepHere(listings) : null;
     app.buyHere = here;
+    // The items this bazaar page was read as having, for the problem log (3.16).
+    if (scanned) app.bazaarIds = [...new Set(listings.map((l) => String(l.itemId)))];
     if (here) {
         const key = here.trade.key + '|' + here.line + '|' + here.index + '|' + here.step.sellerId;
         if (buyRun.stepKey !== key) {
@@ -2906,6 +2934,10 @@ function onBuyNext(answer) {
         const counted = buyRun.firstSeen !== null;
         if (!counted && answer === undefined) {
             app.buyAsk = buyRun.stepKey;
+            // What the page showed, for the next problem report (3.16: in the
+            // friend's run the listing was never recognised on the real page).
+            const d = app.pageDiagnostics || {};
+            logProblem('note', 'Bazaar: the listing to buy was not seen (' + (here.item.name || 'item ' + here.item.itemId) + ')', 'wanted item ' + here.item.itemId + ' at $' + here.step.price + ' · the page: ' + (d.cards || 0) + ' cards found (' + (d.strategy || '?') + '), ' + (d.listings || 0) + ' read, ' + (d.noItem || 0) + ' item not known, ' + (d.noPrice || 0) + ' no price, ' + (d.locked || 0) + ' locked · items read: ' + ((app.bazaarIds || []).slice(0, 25).join(',') || 'none'));
             trackTradeBuying(null);
             return;
         }
@@ -3512,6 +3544,8 @@ function logFailed(service, x) {
     const path = String((x && x.path) || '');
     if (service === 'w' && e && e.http === 404) return;
     if (service === 'e' && /prices\//.test(path) && e && (e.http === 404 || e.http === 400)) return;
+    // Your inventory without a category, refused as one: expected - fetchInventory then asks per category (the friend's report showed it as an error).
+    if (service === 't' && /user\/inventory/.test(path) && isCategoryError(e)) return;
     const name = (USAGE_SERVICES[service] || { name: service }).name;
     const tag = usageTagFor(service, null, x && x.path, x && x.tag);
     const why = (e && (e.message || e.said)) || String(e || 'failed');
@@ -3852,7 +3886,7 @@ function registerMenu() {
  * ------------------------------------------------------------------ */
 
 /* The Torn Ledger's state on Torn Bids (the key itself stays in storage). */
-const led = { client: null, data: null, busy: false, checking: false, error: null, keyError: null, saveMsg: null, nextAt: 0 };
+const led = { client: null, data: null, busy: false, checking: false, error: null, keyError: null, saveMsg: null, nextAt: 0, buysClient: null, buysBusy: false, buysNextAt: 0 };
 
 const sell = {
     /* Traders' TornExchange / TornW3B badges seen so far (the Ledger's Traders tab shows them). */
@@ -4388,9 +4422,45 @@ function sellDeclined(now = Date.now()) {
     return out;
 }
 
-/** Accepted trades still kept: {key: trade}, newest first. */
+/**
+ * Accepted trades still kept: {key: trade}, newest first - with the bazaar
+ * buys your Torn log shows applied (3.16): what the log says you bought
+ * ticks the plan off, whatever the page showed or was pressed.
+ */
 function sellAccepted(now = Date.now()) {
-    return liveAccepted(gmGet(STORE_SELL_ACCEPTED, null), now);
+    const all = liveAccepted(gmGet(STORE_SELL_ACCEPTED, null), now);
+    const log = gmGet(STORE_SELL_LOG_BUYS, null);
+    if (!log || !Array.isArray(log.buys) || !Object.keys(all).length) return all;
+    // Only trades the stored log reaches back to share its buys (an older one keeps what it saved).
+    const readFrom = Number(log.readFrom) || 0;
+    const split = splitLogBuys(Object.values(all).filter((t) => Number(t.at) - LOG_BUY_SLACK_MS >= readFrom), log.buys);
+    for (const key of Object.keys(all)) {
+        const t = all[key];
+        all[key] = applyLogBuys(t, split.get(key) || [], { readFrom, readTo: Number(log.readTo) || 0, bidOf: (id) => traderBidOf(t, id), nameOf: itemNameAnywhere });
+    }
+    return all;
+}
+
+/**
+ * A trade goes (traded, cancelled, back to the live plan): the log buys that
+ * were its own are set aside for good, so another trade still accepted
+ * never takes them as its unplanned buys.
+ */
+function forgetLogBuysOf(key, all) {
+    const log = gmGet(STORE_SELL_LOG_BUYS, null);
+    if (!log || !Array.isArray(log.buys) || !all[key]) return;
+    const readFrom = Number(log.readFrom) || 0;
+    const mine = splitLogBuys(Object.values(all).filter((t) => Number(t.at) - LOG_BUY_SLACK_MS >= readFrom), log.buys).get(key) || [];
+    if (!mine.length) return;
+    const gone = new Set([...(Array.isArray(log.gone) ? log.gone : []), ...mine.map((b) => String(b.id))]);
+    gmSet(STORE_SELL_LOG_BUYS, { ...log, buys: log.buys.filter((b) => !gone.has(String(b.id))), gone: [...gone].slice(-1000) });
+}
+
+/** An item's name from whichever item list this page has (the overlay's or Torn Bids'). */
+function itemNameAnywhere(id) {
+    const index = app.index || sell.index;
+    const item = index && index.byId ? index.byId.get(String(id)) : null;
+    return item ? item.name : null;
 }
 
 function saveSellAccepted(all) {
@@ -4517,6 +4587,7 @@ function cancelSellAccepted(key, now = Date.now()) {
     const id = t.trader && t.trader.id ? String(t.trader.id) : null;
     const kept = recs.filter((r) => !(r && id && String(r.traderId) === id && Number(r.at) === Number(t.at)));
     if (kept.length !== recs.length) gmSet(STORE_SELL_PRICE_RECORDS, kept);
+    forgetLogBuysOf(key, all);
     delete all[key];
     saveSellAccepted(all);
     const cancelled = gmGet(STORE_SELL_CANCELLED, {}) || {};
@@ -6492,6 +6563,7 @@ function bootSellingPage() {
                 if (left.length) saveSellLeftovers(addLeftovers(sellLeftovers(), left));
             }
             const itemId = all[key] ? String(all[key].itemId) : null;
+            forgetLogBuysOf(key, all);
             delete all[key];
             saveSellAccepted(all);
             // Traded: its pin goes too (back to the live plan keeps it).
@@ -6673,6 +6745,15 @@ function bootSellingPage() {
         runLedger();
     });
     setInterval(() => runLedger(), 15000);
+    // Your buys for an accepted trade, from your log - in the background too (3.16).
+    led.buysClient = new LedgerClient({
+        getKey: getLedgerKey,
+        ...tornSharing('led'),
+        isVisible: () => true,
+    });
+    watchAcceptedBuys();
+    setInterval(() => watchAcceptedBuys(), 15000);
+    gmOnChange(STORE_SELL_LOG_BUYS, () => renderSellingNow());
 
     setInterval(() => {
         // TornExchange and TornW3B keep going in the background; the Torn
@@ -7013,6 +7094,95 @@ async function runLedger({ now = Date.now() } = {}) {
 /** A run noticed its key was forgotten or replaced. */
 class LedgerKeyChanged extends Error {}
 
+/*
+ * Buys for an accepted trade, from your Torn log (3.16; the friend's first
+ * live run recorded none of the 896 items he bought). While a trade you
+ * accepted is under BUYS_WATCH_MS old, Torn Bids reads your bazaar buys (log
+ * 1225 only) once a minute with the Ledger's key - also while its tab is in
+ * the background, because during a buying run you are on Torn's pages. The
+ * only Torn API call that leaves a hidden tab: one a minute, only then, only
+ * your own log, results shown only on the pages you look at (no alerts).
+ */
+const BUYS_EVERY_MS = 60 * 1000;
+const BUYS_WATCH_MS = 3 * 60 * 60 * 1000;
+/*
+ * Your log is taken as complete up to this long before the read was sent: a
+ * buy is in Torn's log as it happens; the margin only covers a slow write.
+ * (Both ends are your clock: a page count at T and a read sent after T.)
+ */
+const BUYS_READ_MARGIN_MS = 5 * 1000;
+/* Pages of 100 per read; a longer stretch is finished on the next reads before it counts as read. */
+const BUYS_PAGES_PER_READ = 10;
+
+async function watchAcceptedBuys(now = Date.now()) {
+    if (led.buysBusy || !led.buysClient || now < (led.buysNextAt || 0)) return;
+    const stored = gmGet(STORE_SELL_LOG_BUYS, null) || {};
+    const trades = Object.values(sellAccepted(now)).filter((t) => now - Number(t.at) < BUYS_WATCH_MS);
+    const since = trades.length ? Math.min(...trades.map((t) => Number(t.at))) - LOG_BUY_SLACK_MS : Infinity;
+    // A trade leaves the watch (3 hours): what the log said about it is saved
+    // into the trade itself first, so nothing it confirmed goes with the store.
+    if (Array.isArray(stored.buys) && since > (Number(stored.readFrom) || 0)) saveSellAccepted(sellAccepted(now));
+    if (!trades.length) {
+        if (stored.buys || stored.state) gmSet(STORE_SELL_LOG_BUYS, null);
+        return;
+    }
+    if (!getLedgerKey() || gmGet(STORE_LEDGER_KEY_DEAD, null)) {
+        if (stored.state !== 'nokey') gmSet(STORE_SELL_LOG_BUYS, { ...stored, state: 'nokey', at: now });
+        return;
+    }
+    // Two Torn Bids tabs: one read a minute between them.
+    if (stored.state === 'on' && now - Number(stored.at) < BUYS_EVERY_MS - 5000) return;
+    led.buysBusy = true;
+    led.buysNextAt = now + BUYS_EVERY_MS;
+    const sentAt = Date.now();
+    // Buys of a trade already gone (forgetLogBuysOf): never read back in.
+    const gone = new Set(Array.isArray(stored.gone) ? stored.gone.map(String) : []);
+    try {
+        let buys = addLogBuys(stored.buys, [], since).filter((b) => !gone.has(String(b.id)));
+        // Newest first, 100 a page. From the newest line already read
+        // (inclusive: kept once by its id), else the oldest trade's yes - or,
+        // when the last read left a stretch unread, on down through it.
+        const gap = stored.gap && Number(stored.gap.from) > 0 ? stored.gap : null;
+        const from = gap ? Number(gap.from) : Math.floor(Math.max(since, buys.length ? buys[buys.length - 1].t : 0) / 1000);
+        let to = gap ? Number(gap.to) || null : null;
+        // The log counts as read up to when the top of this stretch was read.
+        const topAt = gap ? Number(gap.topAt) || sentAt : sentAt;
+        let complete = false;
+        for (let page = 0; page < BUYS_PAGES_PER_READ; page += 1) {
+            const rows = await fetchLogPage(led.buysClient, { from, to, types: [LOG_BAZAAR_BUY], use: { tag: 't.buys', priority: 'normal' } });
+            buys = addLogBuys(buys, bazaarBuyRows(rows.flatMap(rowsFromLog)).filter((b) => !gone.has(String(b.id))), since);
+            const span = logSpan(rows);
+            if (rows.length < 100 || !span.min || (to && span.min >= to)) {
+                complete = true;
+                break;
+            }
+            to = span.min;
+        }
+        // What another tab set aside meanwhile stays aside.
+        const now2 = gmGet(STORE_SELL_LOG_BUYS, null) || {};
+        const goneNow = new Set([...gone, ...(Array.isArray(now2.gone) ? now2.gone.map(String) : [])]);
+        gmSet(STORE_SELL_LOG_BUYS, {
+            buys: buys.filter((b) => !goneNow.has(String(b.id))),
+            gone: [...goneNow].slice(-1000),
+            readFrom: since,
+            // Not all read yet: the page's counts before it are not judged by the log.
+            readTo: complete ? topAt - BUYS_READ_MARGIN_MS : Number(stored.readTo) || 0,
+            gap: complete ? null : { from, to, topAt },
+            at: Date.now(),
+            state: 'on',
+        });
+        // This tab is not told of its own write: its accepted cards show the buys now.
+        if (document.visibilityState === 'visible') renderSelling();
+    } catch (error) {
+        if (error && (KEY_DEAD_CODES.has(error.code) || error.code === 16)) markLedgerKeyDead(error);
+        // Torn asked to slow down, or a pause is on: a longer wait; the next read catches up.
+        if (error && (error.code === 5 || error.paused)) led.buysNextAt = Date.now() + 3 * BUYS_EVERY_MS;
+        gmSet(STORE_SELL_LOG_BUYS, { ...(gmGet(STORE_SELL_LOG_BUYS, null) || stored), state: 'error', at: Date.now() });
+    } finally {
+        led.buysBusy = false;
+    }
+}
+
 /** What the page shows about the Ledger: its key's state and the rows (no key, ever). */
 function ledgerView() {
     const hasKey = Boolean(getLedgerKey());
@@ -7114,11 +7284,14 @@ export function boot() {
     app.keyDead = Boolean(gmGet(STORE_KEY_DEAD, false));
     gmOnChange(STORE_SETTINGS, onRemoteSettings);
     // A trade accepted, bought or changed in another tab: the marks and boxes follow.
-    gmOnChange(STORE_SELL_ACCEPTED, () => {
+    const onAcceptedElsewhere = () => {
         scanTradePage();
         if (app.pageType === PAGE_BAZAAR) rescan();
         else trackTradeBuying([]);
-    });
+    };
+    gmOnChange(STORE_SELL_ACCEPTED, onAcceptedElsewhere);
+    // Torn Bids read your log: what it says you bought ticks the plan (3.16).
+    gmOnChange(STORE_SELL_LOG_BUYS, onAcceptedElsewhere);
     gmOnChange(STORE_KEY_DEAD, onRemoteKey);
     gmOnChange(STORE_KEY, onRemoteKey);
 
