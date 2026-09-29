@@ -43,6 +43,17 @@ Nothing of 3.14.x / 3.15.0 has been seen on real Torn pages - harness only.
    too little data, a market that shifts hourly, and no way to see why for
    a network now). Show what it learned in Settings › API use ("reads Xanax
    often: 40% found a flip").
+   **"Can we train it without live data?"** (the owner, same day). Told: not
+   by self-play like the poker bot - poker's rules are known, Torn's market
+   is other players, and a simulator only teaches what we put in it. But
+   without NEW requests, yes: (1) pre-train from the Ledger (a year of the
+   owner's bazaar buys, trades and pay - real outcomes: which items / price
+   gaps / traders made money) so it starts informed, not blind; also the
+   overlay's price history (`STORE_HISTORY`, a week), the trader db,
+   `sellMoves`; (2) record once, replay many times - capture a day of what
+   every read returned, then tune reading strategies offline against the
+   recording, zero API calls; (3) the harness stays for testing the
+   plumbing, not for learning the market. Start the learning work from (1).
 4. **The overlay shopping cart** (the friend): once "X accepted", the whole
    still-to-buy list in the overlay (today the buying box shows one bazaar
    at a time). Mockups first.
