@@ -15,11 +15,11 @@
  * come before the price lists (nextW3bRead's `hidden`), at 20 reads a minute -
  * still below the in-view 24 - so all 30 are checked within two minutes.
  */
-export const W3B_HIDDEN_PER_MIN = 20;
+export const W3B_HIDDEN_PER_MIN = 40;
 /* Of those, price lists at most this many (3.14.1's pace): a page that loads
  * hidden has no possible flips yet, and the lists took the whole minute's reads
  * in five seconds - the flips, found a moment later, waited a minute. */
-export const W3B_HIDDEN_LISTS_PER_MIN = 6;
+export const W3B_HIDDEN_LISTS_PER_MIN = 12;
 export const HIDDEN_RENDER_MS = 30 * 1000;
 
 /** May a hidden tab make another TornW3B read now? `recent`: its reads' times. */
@@ -105,11 +105,16 @@ export function deskItem({ pickedByYou = false, selected = null, filter = 'all',
  * @param {number} p.turn - 0 or 1: flips and lists take turns (in view)
  * @param {boolean} p.hidden - the tab is hidden: flips before lists
  * @param {function} p.due - (itemId, 'desk' | 'slow') => boolean
- * @returns {null|{kind: 'summary'}|{kind: 'bazaars', id: string}|{kind: 'list', id: string}}
+ * @param {string[]} [p.buyers] - items whose every-buyer list (TornW3B /traders) may be read: the desk's, then the possible flips' (3.15)
+ * @param {function} [p.buyersDue] - (itemId) => boolean
+ * @param {string[]} [p.near] - near-misses: a bazaar a little over the best bid (the summary lags), 3.15
+ * @param {string[]} [p.sweep] - every other item anyone buys, oldest read first: what is left of the budget (3.15)
+ * @returns {null|{kind: 'summary'}|{kind: 'bazaars', id: string}|{kind: 'buyers', id: string}|{kind: 'list', id: string}}
  */
-export function nextW3bRead({ summaryDue = false, picked = null, active = false, live = [], wanted = [], candidates = [], pinned = [], list = null, turn = 0, hidden = false, due }) {
+export function nextW3bRead({ summaryDue = false, picked = null, active = false, live = [], wanted = [], candidates = [], pinned = [], list = null, turn = 0, hidden = false, due, buyers = [], buyersDue = () => false, near = [], sweep = [] }) {
     if (summaryDue) return { kind: 'summary' };
     if (picked && due(picked, 'desk')) return { kind: 'bazaars', id: picked };
+    if (picked && buyers.includes(picked) && buyersDue(picked)) return { kind: 'buyers', id: picked };
     if (active) {
         const l = live.find((id) => due(id, 'desk'));
         if (l) return { kind: 'bazaars', id: l };
@@ -117,15 +122,22 @@ export function nextW3bRead({ summaryDue = false, picked = null, active = false,
         if (w) return { kind: 'bazaars', id: w };
     }
     const cand = candidates.find((id) => due(id, 'slow'));
+    const buy = buyers.find((id) => buyersDue(id));
     // Hidden, the flips first: the price lists can wait until you look.
     if (cand && (turn || !list || hidden)) return { kind: 'bazaars', id: cand };
+    if (buy && (turn || !list || hidden)) return { kind: 'buyers', id: buy };
     if (list) return { kind: 'list', id: list };
     if (cand) return { kind: 'bazaars', id: cand };
+    if (buy) return { kind: 'buyers', id: buy };
+    const n = near.find((id) => due(id, 'slow'));
+    if (n) return { kind: 'bazaars', id: n };
     if (!active) {
         const w = wanted.find((id) => due(id, 'slow'));
         if (w) return { kind: 'bazaars', id: w };
     }
     const p = pinned.find((id) => due(id, 'slow'));
     if (p) return { kind: 'bazaars', id: p };
+    const sw = sweep.find((id) => due(id, 'sweep'));
+    if (sw) return { kind: 'bazaars', id: sw };
     return null;
 }

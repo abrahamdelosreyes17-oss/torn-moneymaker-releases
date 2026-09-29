@@ -54,6 +54,21 @@ export const TORN_PAUSE_MS = {
 /** A hidden tab waiting for a slot checks again this often. */
 const HIDDEN_POLL_MS = 1000;
 
+/*
+ * Priority lanes (3.15, the friend: "it struggles with the API, it maxes
+ * out"). Every tab shares the one window, so each lane leaves room for the
+ * lanes above it: a low call (a trader's status, networth, the Ledger
+ * catching up) only goes while LOW_RESERVE slots are free, a normal one
+ * (the Item Market feed, inventory) while NORMAL_RESERVE are. What you are
+ * doing right now (Fill, pricing your bazaar, the item on screen) is never
+ * kept waiting behind them, in this tab or another.
+ */
+export const API_PRIORITY = { low: 0, normal: 1, high: 2 };
+export const NORMAL_RESERVE = 5;
+export const LOW_RESERVE = 20;
+/* Returned by a wait that gave way to a more urgent call. */
+const YIELDED = Symbol('yielded');
+
 export class TornApiError extends Error {
     constructor(message, { code = null, http = null, paused = false } = {}) {
         super(message);
@@ -116,7 +131,13 @@ export class TornApiClient {
         savePause = null,
         isVisible = () => true,
         addToWindow = null,
+        onSent = null,
+        onFailed = null,
     } = {}) {
+        /** ({path, tag, error}) => void, a call that failed for good (not each retry): the problem log (3.15). */
+        this.onFailed = onFailed;
+        /** ({path, params, tag, priority}) => void, each request that leaves (retries too): the usage record. */
+        this.onSent = onSent;
         this.addToWindow = addToWindow;
         this.loadPause = loadPause;
         this.savePause = savePause;
@@ -133,8 +154,10 @@ export class TornApiClient {
 
         /** Timestamps of recent requests, for the sliding window. */
         this.recent = [];
-        /** Serialises the queue so the window check cannot race. */
-        this.chain = Promise.resolve();
+        /** Waiting calls, most urgent first; one runs at a time, so the window check cannot race. */
+        this.queue = [];
+        this.pumping = false;
+        this.seq = 0;
         /** In-flight and recently-completed requests, keyed without the key. */
         this.inflight = new Map();
         this.cache = new Map();
@@ -172,9 +195,20 @@ export class TornApiClient {
             .sort((a, b) => a - b);
     }
 
-    /** Block until the sliding window has room for one more request. */
-    async waitForSlot() {
+    /** How many of the window's slots this lane may fill. */
+    laneLimit(priority = API_PRIORITY.normal) {
+        const reserve = priority >= API_PRIORITY.high ? 0 : priority >= API_PRIORITY.normal ? NORMAL_RESERVE : LOW_RESERVE;
+        return Math.max(1, this.maxPerMinute - reserve);
+    }
+
+    /**
+     * Block until the sliding window has room for one more request of this
+     * lane. `shouldYield` (the first attempt only): a more urgent call has
+     * arrived - give way to it (returns YIELDED, no slot taken).
+     */
+    async waitForSlot(priority = API_PRIORITY.high, shouldYield = null) {
         for (;;) {
+            if (shouldYield && shouldYield()) return YIELDED;
             const now = Date.now();
             this.syncWindow(now);
             this.recent = this.recent.filter((t) => now - t < 60000);
@@ -185,7 +219,8 @@ export class TornApiClient {
                 continue;
             }
 
-            if (this.recent.length < this.maxPerMinute) {
+            const limit = this.laneLimit(priority);
+            if (this.recent.length < limit) {
                 this.recent.push(now);
                 if (this.addToWindow) {
                     try {
@@ -204,8 +239,11 @@ export class TornApiClient {
                 return;
             }
 
-            const oldest = this.recent[0];
-            await apiSleep(Math.max(50, 60000 - (now - oldest) + 25));
+            // The slot this lane waits for: the one that brings the window under its limit.
+            const frees = this.recent[this.recent.length - limit] || this.recent[0];
+            const wait = Math.max(50, 60000 - (now - frees) + 25);
+            // Waiting with a lane below: look again each second for a more urgent call.
+            await apiSleep(shouldYield ? Math.min(wait, 1000) : wait);
         }
     }
 
@@ -215,8 +253,9 @@ export class TornApiClient {
      * @param {string} path - e.g. "torn" or "user" or "market/123"
      * @param {object} params - query params; `key` is added here and only here
      */
-    async get(path, params = {}) {
+    async get(path, params = {}, { tag = null, priority = 'high' } = {}) {
         const cacheKey = path + '?' + new URLSearchParams(params).toString();
+        const prio = API_PRIORITY[priority] ?? API_PRIORITY.high;
 
         const cached = this.cache.get(cacheKey);
         if (cached && Date.now() - cached.at < this.dedupTtlMs) {
@@ -224,14 +263,18 @@ export class TornApiClient {
         }
 
         const existing = this.inflight.get(cacheKey);
-        if (existing) return existing;
+        if (existing) {
+            // Asked again, more urgently: the waiting call moves up.
+            const job = this.queue.find((j) => j.cacheKey === cacheKey);
+            if (job && prio > job.prio) job.prio = prio;
+            return existing;
+        }
 
-        // Queue behind whatever is already scheduled, then take a slot.
-        const promise = this.chain
-            .catch(() => {})
-            .then(() => this.execute(path, params, cacheKey));
-
-        this.chain = promise.catch(() => {});
+        // Queued by lane (most urgent first, then in order), then a slot.
+        const promise = new Promise((resolve, reject) => {
+            this.queue.push({ seq: this.seq++, path, params, cacheKey, tag, prio, resolve, reject });
+        });
+        this.pump();
         this.inflight.set(cacheKey, promise);
 
         try {
@@ -251,7 +294,40 @@ export class TornApiClient {
         }
     }
 
-    async execute(path, params, cacheKey) {
+    /** Run the waiting calls one at a time, the most urgent first. */
+    async pump() {
+        if (this.pumping) return;
+        this.pumping = true;
+        try {
+            while (this.queue.length) {
+                this.queue.sort((a, b) => b.prio - a.prio || a.seq - b.seq);
+                const job = this.queue[0];
+                const shouldYield = () => this.queue.some((j) => j !== job && j.prio > job.prio);
+                let out;
+                try {
+                    out = { value: await this.execute(job.path, job.params, job.cacheKey, job, shouldYield) };
+                } catch (error) {
+                    out = { error };
+                    if (this.onFailed) {
+                        try {
+                            this.onFailed({ path: job.path, tag: job.tag, error });
+                        } catch {
+                            // The log is best-effort.
+                        }
+                    }
+                }
+                if (out.value === YIELDED) continue;
+                this.queue.splice(this.queue.indexOf(job), 1);
+                if ('error' in out) job.reject(out.error);
+                else job.resolve(out.value);
+            }
+        } finally {
+            this.pumping = false;
+        }
+    }
+
+    async execute(path, params, cacheKey, job = null, shouldYield = null) {
+        const prio = job ? job.prio : API_PRIORITY.high;
         if (!this.fetchImpl) {
             throw new TornApiError('No fetch implementation available.');
         }
@@ -271,9 +347,17 @@ export class TornApiClient {
 
         while (attempt <= this.maxRetries) {
             this.throwIfPaused(mine);
-            await this.waitForSlot();
+            // Only the first wait gives way to a more urgent call (a retry keeps its turn).
+            if ((await this.waitForSlot(prio, attempt === 0 ? shouldYield : null)) === YIELDED) return YIELDED;
             // Another tab may have hit a block while this one waited.
             this.throwIfPaused(mine);
+            if (this.onSent) {
+                try {
+                    this.onSent({ path, params, tag: job ? job.tag : null, priority: prio });
+                } catch {
+                    // The usage record is best-effort.
+                }
+            }
 
             try {
                 return await this.requestOnce(path, params, key);

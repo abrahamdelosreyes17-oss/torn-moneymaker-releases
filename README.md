@@ -627,6 +627,60 @@ key, not a Public or Minimal one) - otherwise the saved key is unchanged.
   flip, Trader can pay), Torn Ledger (its Full key and its own terms table),
   Links, Key use.
 
+### API use and efficiency (3.15)
+
+The friend: "it struggles with the API, it maxes out"; the owner: "it doesn't
+see all trades available". The one limited budget (Torn's, 70 a minute for
+every tab together) went to things that find no trades, while the two free
+services that do sat mostly idle.
+
+- **Torn API in lanes.** Every call carries a lane: *first* (Fill, pricing
+  your bazaar, the item on the desk, setup), *normal* (the Item Market feed,
+  inventory, the bazaar owner's status) and *waits for room* (trader
+  statuses, networth, the Ledger). A normal call goes only while 5 of the 70
+  are free, a low one while 20 are, in any tab - so what you are doing is
+  never stuck behind a status check.
+- **Less Torn:** the overlay's Item Market feed runs only while a tab shows
+  the panel open on its Item Market tab (bazaar deals, from TornW3B, go on);
+  trader statuses only for the desk's first rows, the trader you plan or
+  trade with, the Best flips buyers and the best buyer of what you hold (every
+  buyer of every held item was up to 30 a minute), kept 10 min across reloads
+  and tabs; everyone else shows TornW3B's last-active time ("Idle 12m",
+  free); networth 5 a minute, never re-asked of a trader who hides it;
+  inventory hourly (Torn caches it an hour), the key's details once; the
+  Ledger catching up a run a minute; the overlay's owner / seller statuses
+  every 1 / 2 min.
+- **More TornW3B:** 60 reads a minute in view, 40 hidden (all tabs under 80;
+  TornW3B allows about 100). Possible flips checked: 150, not 30, ranked by
+  the cheapest bazaar as last read (an item whose cheap listing sold no longer
+  holds a place); near-misses up to 5% over the best bid; then every other
+  item someone buys, in turn. Each checked item's every TornW3B buyer
+  (`/marketplace/{id}/traders`, up to 100, with rating and last-active) - new
+  traders join the database. The summary every 2 min, or the overlay's 30 s
+  copy when newer.
+- **More TornExchange:** every active trader's whole list in turn (3 a
+  minute, only when nothing else waits, each every 90 min), so buyers ranked
+  4th and lower count; the item you open goes ahead of background reads,
+  stops when you leave it, keeps the pages it read if a later one fails, and
+  says so when the list did not come.
+- **Settings › API use:** a meter per service (used in the last minute of
+  our limit), the service and range (last hour / 24 hours / 7 days), a bar
+  chart stacked by what each request was for (our limit marked), hover for
+  a bar's breakdown, and a table of every use with its lane and share. Every
+  tab adds its counts to the record every 10 s; a day of minutes, then hours
+  for a week. **Export API usage** downloads one .zip to send (the record,
+  by-minute / by-hour CSVs, the page's switches, limits and coverage; no key,
+  no player id or name).
+- **Settings › Report a problem:** what happened, what you expected,
+  screenshots, and a list of what goes in - then **Download report (.zip)**:
+  your words, the screenshots, the problem log, the API use and the page's
+  state. The problem log (every tab, a week, `STORE_PROBLEM_LOG`) keeps each
+  request that failed for good (service, what for, why: HTTP status / Torn
+  code), the script's own errors, and your steps (picked an item, Plan
+  trade, accepted, Cancel trade, Next bazaar, Fill...). "No list" answers
+  (TornW3B 404, TornExchange not found) are not errors. Keys are masked
+  before anything is stored; nothing is sent anywhere by the page.
+
 ---
 
 ## Architecture

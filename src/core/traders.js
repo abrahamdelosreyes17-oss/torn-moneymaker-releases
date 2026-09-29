@@ -192,8 +192,44 @@ export function pruneTraderDb(db, now = Date.now()) {
         if (w && w.found && w.prices && !(now - w.at <= W3B_LIST_MAX_AGE_MS)) {
             t.w3b = { checkedAt: w.checkedAt, at: w.at, found: true, prices: null };
         }
+        if (t.te && t.te.prices && !(now - t.te.at < TE_SCAN_MAX_AGE_MS)) t.te = { ...t.te, prices: null };
     }
     return db;
+}
+
+/*
+ * TornExchange, every active trader's whole list in turn (3.15): the top
+ * three per item missed everyone ranked 4th and lower. Kept with the trader,
+ * like their TornW3B list; used for TE_SCAN_MAX_AGE_MS.
+ */
+export const TE_SCAN_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+
+/** One trader's TornExchange list read (`prices` [{itemId, price}]), or `{error: true}`. */
+export function recordTeScan(db, traderId, { prices = null, error = false } = {}, now = Date.now()) {
+    const id = cleanId(traderId);
+    if (!id) return;
+    const t = db.traders[id] || (db.traders[id] = { name: 'Trader ' + id, from: 'te', seenAt: now, w3b: null });
+    if (error) {
+        t.te = { ...(t.te || {}), triedAt: now, failed: ((t.te && t.te.failed) || 0) + 1 };
+        return;
+    }
+    const map = {};
+    for (const p of prices || []) if (p && p.price > 0) map[String(p.itemId)] = p.price;
+    t.te = { at: now, triedAt: now, prices: map, failed: 0 };
+}
+
+/** itemId -> [{id, name, price}] from every TornExchange list read within TE_SCAN_MAX_AGE_MS. */
+export function indexTeScanByItem(db, now = Date.now()) {
+    const out = new Map();
+    for (const [id, t] of Object.entries((db && db.traders) || {})) {
+        const te = t && t.te;
+        if (!te || !te.prices || !(now - te.at < TE_SCAN_MAX_AGE_MS)) continue;
+        for (const [itemId, price] of Object.entries(te.prices)) {
+            if (!out.has(itemId)) out.set(itemId, []);
+            out.get(itemId).push({ id, name: t.name && !String(t.name).startsWith('Trader ') ? t.name : null, price });
+        }
+    }
+    return out;
 }
 
 /** A trader's TornW3B prices, if read recently enough to show. */
@@ -276,7 +312,7 @@ export function traderDbStats(db, now = Date.now()) {
  *   {id, name, price, lastPaid} - lastPaid: no public list, what they paid you last
  * @returns {Array<{id, name, price, te: number|null, w3b: number|null, teName: string|null}>}
  */
-export function buyersForItem(itemId, { teBest = [], teFull = null, idsByName = new Map(), db = null, w3bByItem = null, dbIdsByName = null, votesById = null, teOwn = null } = {}) {
+export function buyersForItem(itemId, { teBest = [], teFull = null, idsByName = new Map(), db = null, w3bByItem = null, dbIdsByName = null, votesById = null, teOwn = null, w3bItem = null } = {}) {
     const key = String(itemId);
     const rows = new Map();
     const byName = new Map();
@@ -362,6 +398,26 @@ export function buyersForItem(itemId, { teBest = [], teFull = null, idsByName = 
         if (!(r.w3b >= price)) r.w3b = price;
     }
 
+    // Every TornW3B buyer of this item, read minutes ago (3.15, /traders): its
+    // price is the newest, and it names traders we had no list of yet.
+    for (const t of w3bItem || []) {
+        const id = cleanId(t && t.id);
+        if (!id || !(t.price > 0)) continue;
+        let r = rows.get('id:' + id);
+        if (!r && t.name) {
+            const named = byName.get(String(t.name).toLowerCase());
+            if (named && !named.id) {
+                rows.delete('name:' + String(named.name).toLowerCase());
+                named.id = id;
+                rows.set('id:' + id, named);
+                r = named;
+            }
+        }
+        if (!r) r = row(id, t.name || null);
+        r.w3b = t.price;
+        if (Number.isFinite(t.up) && Number.isFinite(t.down)) r.itemRating = { up: t.up, down: t.down };
+    }
+
     const out = [];
     for (const r of rows.values()) {
         const both = r.te > 0 && r.w3b > 0;
@@ -375,7 +431,7 @@ export function buyersForItem(itemId, { teBest = [], teFull = null, idsByName = 
         // top three) and TornW3B's rating.
         if (r.votes === null && r.id && votesById && votesById.has(r.id)) r.votes = votesById.get(r.id);
         const t = r.id && db ? db.traders[r.id] : null;
-        r.rating = (t && t.rating) || null;
+        r.rating = (t && t.rating) || r.itemRating || null;
         r.trust = trustOf(r.votes, r.rating);
         out.push(r);
     }

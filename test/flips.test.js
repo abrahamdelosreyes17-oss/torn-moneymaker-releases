@@ -265,3 +265,13 @@ test('troll bids never lead the item list: it sorts by the best believable bid',
     ].sort((a, b) => b.bid - a.bid);
     assert.equal(rows[0].name, 'Xanax');
 });
+
+import { nearMisses } from '../src/core/flips.js';
+
+test('near-misses: a bazaar a little over the best bid is read too (the summary lags), closest first (3.15)', () => {
+    const summary = new Map([['1', { lowestPrice: 71800 }], ['2', { lowestPrice: 200 }], ['3', { lowestPrice: 101 }], ['4', { lowestPrice: 90 }]]);
+    const bids = { 1: 70000, 2: 100, 3: 100, 4: 100 };
+    // 1: 2.6% over; 2: 100% over (no); 3: 1% over; 4: already a flip (not a near-miss).
+    assert.deepEqual(nearMisses(summary, (id) => bids[id]), ['3', '1']);
+    assert.deepEqual(nearMisses(summary, (id) => bids[id], { exclude: new Set(['3']) }), ['1']);
+});

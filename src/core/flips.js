@@ -456,6 +456,28 @@ export function flipCandidates(summary, bidOf, { cash = null, limit = FLIP_CANDI
 }
 
 /**
+ * Near-misses (3.15): items whose summary price is a little over the best
+ * bid - TornW3B's summary lags its own listings (Camel Plushie: summary
+ * $71,800 with 26 listed at $70,000), so these are read too, after the
+ * possible flips. `pct`: how far over (a ratio, not money).
+ *
+ * @returns {string[]} item ids, the closest first
+ */
+export function nearMisses(summary, bidOf, { pct = 5, limit = 40, exclude = new Set() } = {}) {
+    const out = [];
+    for (const [itemId, s] of summary || []) {
+        const id = String(itemId);
+        const lowest = s && s.lowestPrice;
+        if (exclude.has(id) || !(lowest > 1)) continue;
+        const got = bidOf(id, lowest);
+        const bid = got && typeof got === 'object' ? got.price : got;
+        if (!(bid > 0) || bid > lowest || lowest > bid * (1 + pct / 100)) continue;
+        out.push({ id, gap: (lowest - bid) / bid });
+    }
+    return out.sort((a, b) => a.gap - b.gap).slice(0, limit).map((x) => x.id);
+}
+
+/**
  * The words on a bazaar card a trusted trader pays more for, or null.
  * Two lines, never cut: the card is narrow, so the line breaks instead.
  *

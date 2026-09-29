@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      3.14.5
+// @version      3.15.0
 // @description  Finds Bazaar and Item Market listings below NPC / market value - on the page you are viewing, and live from the Torn API and TornW3B - ranked by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -42,7 +42,7 @@
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '3.14.5';
+    const TTV2_BUILD_VERSION = '3.15.0';
 
     /* ===== src/platform/gm.js ===== */
     /*
@@ -1975,6 +1975,28 @@
     }
 
     /**
+     * Near-misses (3.15): items whose summary price is a little over the best
+     * bid - TornW3B's summary lags its own listings (Camel Plushie: summary
+     * $71,800 with 26 listed at $70,000), so these are read too, after the
+     * possible flips. `pct`: how far over (a ratio, not money).
+     *
+     * @returns {string[]} item ids, the closest first
+     */
+    function nearMisses(summary, bidOf, { pct = 5, limit = 40, exclude = new Set() } = {}) {
+        const out = [];
+        for (const [itemId, s] of summary || []) {
+            const id = String(itemId);
+            const lowest = s && s.lowestPrice;
+            if (exclude.has(id) || !(lowest > 1)) continue;
+            const got = bidOf(id, lowest);
+            const bid = got && typeof got === 'object' ? got.price : got;
+            if (!(bid > 0) || bid > lowest || lowest > bid * (1 + pct / 100)) continue;
+            out.push({ id, gap: (lowest - bid) / bid });
+        }
+        return out.sort((a, b) => a.gap - b.gap).slice(0, limit).map((x) => x.id);
+    }
+
+    /**
      * The words on a bazaar card a trusted trader pays more for, or null.
      * Two lines, never cut: the card is narrow, so the line breaks instead.
      *
@@ -2771,11 +2793,11 @@
      * come before the price lists (nextW3bRead's `hidden`), at 20 reads a minute -
      * still below the in-view 24 - so all 30 are checked within two minutes.
      */
-    const W3B_HIDDEN_PER_MIN = 20;
+    const W3B_HIDDEN_PER_MIN = 40;
     /* Of those, price lists at most this many (3.14.1's pace): a page that loads
      * hidden has no possible flips yet, and the lists took the whole minute's reads
      * in five seconds - the flips, found a moment later, waited a minute. */
-    const W3B_HIDDEN_LISTS_PER_MIN = 6;
+    const W3B_HIDDEN_LISTS_PER_MIN = 12;
     const HIDDEN_RENDER_MS = 30 * 1000;
 
     /** May a hidden tab make another TornW3B read now? `recent`: its reads' times. */
@@ -2861,11 +2883,16 @@
      * @param {number} p.turn - 0 or 1: flips and lists take turns (in view)
      * @param {boolean} p.hidden - the tab is hidden: flips before lists
      * @param {function} p.due - (itemId, 'desk' | 'slow') => boolean
-     * @returns {null|{kind: 'summary'}|{kind: 'bazaars', id: string}|{kind: 'list', id: string}}
+     * @param {string[]} [p.buyers] - items whose every-buyer list (TornW3B /traders) may be read: the desk's, then the possible flips' (3.15)
+     * @param {function} [p.buyersDue] - (itemId) => boolean
+     * @param {string[]} [p.near] - near-misses: a bazaar a little over the best bid (the summary lags), 3.15
+     * @param {string[]} [p.sweep] - every other item anyone buys, oldest read first: what is left of the budget (3.15)
+     * @returns {null|{kind: 'summary'}|{kind: 'bazaars', id: string}|{kind: 'buyers', id: string}|{kind: 'list', id: string}}
      */
-    function nextW3bRead({ summaryDue = false, picked = null, active = false, live = [], wanted = [], candidates = [], pinned = [], list = null, turn = 0, hidden = false, due }) {
+    function nextW3bRead({ summaryDue = false, picked = null, active = false, live = [], wanted = [], candidates = [], pinned = [], list = null, turn = 0, hidden = false, due, buyers = [], buyersDue = () => false, near = [], sweep = [] }) {
         if (summaryDue) return { kind: 'summary' };
         if (picked && due(picked, 'desk')) return { kind: 'bazaars', id: picked };
+        if (picked && buyers.includes(picked) && buyersDue(picked)) return { kind: 'buyers', id: picked };
         if (active) {
             const l = live.find((id) => due(id, 'desk'));
             if (l) return { kind: 'bazaars', id: l };
@@ -2873,17 +2900,264 @@
             if (w) return { kind: 'bazaars', id: w };
         }
         const cand = candidates.find((id) => due(id, 'slow'));
+        const buy = buyers.find((id) => buyersDue(id));
         // Hidden, the flips first: the price lists can wait until you look.
         if (cand && (turn || !list || hidden)) return { kind: 'bazaars', id: cand };
+        if (buy && (turn || !list || hidden)) return { kind: 'buyers', id: buy };
         if (list) return { kind: 'list', id: list };
         if (cand) return { kind: 'bazaars', id: cand };
+        if (buy) return { kind: 'buyers', id: buy };
+        const n = near.find((id) => due(id, 'slow'));
+        if (n) return { kind: 'bazaars', id: n };
         if (!active) {
             const w = wanted.find((id) => due(id, 'slow'));
             if (w) return { kind: 'bazaars', id: w };
         }
         const p = pinned.find((id) => due(id, 'slow'));
         if (p) return { kind: 'bazaars', id: p };
+        const sw = sweep.find((id) => due(id, 'sweep'));
+        if (sw) return { kind: 'bazaars', id: sw };
         return null;
+    }
+
+    /* ===== src/core/usage.js ===== */
+    /*
+     * API use (3.15, the owner: "I need to see the usage with a graph, so we're
+     * able to analyse what needs more priority and what needs less").
+     *
+     * Every request that leaves - Torn, TornW3B, TornExchange, any tab - is
+     * counted under what it was for (its tag), per minute. Each tab keeps its
+     * counts in memory and adds them to the stored record every few seconds; a
+     * day of minutes is kept, then folded into hours, kept a week. Two tabs
+     * writing in the same instant can lose a few counts: this is a record to
+     * read trends from, not the limiter (the limiters count exactly).
+     */
+
+    /* Minutes kept one by one; older ones are folded into their hour. */
+    const USAGE_MINUTES_KEPT = 24 * 60;
+    /* Hours kept. */
+    const USAGE_HOURS_KEPT = 7 * 24;
+
+    /** Each service: its name and how many a minute we allow ourselves (the meter's 100%). */
+    const USAGE_SERVICES = {
+        t: { name: 'Torn API', perMin: 70, note: 'every tab together; Torn allows 100' },
+        w: { name: 'TornW3B', perMin: 80, note: 'every tab together; TornW3B allows about 100' },
+        e: { name: 'TornExchange', perMin: 6, note: 'one every 10 s; TornExchange allows 10' },
+    };
+
+    /** What each tag means, and its lane (Torn only: high goes first, low waits for room). */
+    const USAGE_LABELS = {
+        't.fill': { name: 'Fill', lane: 'high' },
+        't.bazaar': { name: 'Pricing your bazaar', lane: 'high' },
+        't.market': { name: 'Held item: Item Market', lane: 'high' },
+        't.setup': { name: 'Items list, key, you', lane: 'high' },
+        't.feed': { name: 'Item Market feed (overlay)', lane: 'normal' },
+        't.inventory': { name: 'Your inventory', lane: 'normal' },
+        't.owner': { name: 'Bazaar owner status', lane: 'normal' },
+        't.sellers': { name: 'Seller statuses (overlay)', lane: 'low' },
+        't.status': { name: 'Trader statuses', lane: 'low' },
+        't.networth': { name: 'Trader networth', lane: 'low' },
+        't.ledger': { name: 'Ledger', lane: 'low' },
+        't.other': { name: 'Other', lane: 'high' },
+        'w.summary': { name: 'Bazaar summary' },
+        'w.feed': { name: 'Overlay bazaar deals' },
+        'w.own': { name: 'Your bazaar / Fill' },
+        'w.desk': { name: 'Item on the desk' },
+        'w.flips': { name: 'Possible flips' },
+        'w.sweep': { name: 'Every item, in turn' },
+        'w.trade': { name: 'Trade and pins' },
+        'w.buyers': { name: 'Buyers per item' },
+        'w.lists': { name: 'Trader price lists' },
+        'w.other': { name: 'Other' },
+        'e.top': { name: 'Top 3 buyers, every item' },
+        'e.active': { name: 'Active traders' },
+        'e.list': { name: "An item's full list" },
+        'e.trader': { name: "A trader's whole list" },
+        'e.one': { name: 'Best buyer (no key)' },
+        'e.other': { name: 'Other' },
+    };
+
+    /** A tag that is not in the list is counted as its service's Other. */
+    function usageLabel(tag) {
+        const t = String(tag || '');
+        if (USAGE_LABELS[t]) return t;
+        const svc = t.charAt(0);
+        return USAGE_SERVICES[svc] ? svc + '.other' : 't.other';
+    }
+
+    /** One request, counted in this tab's pending counts. */
+    function usageAdd(pending, tag, at = Date.now()) {
+        const m = Math.floor(at / 60000);
+        const label = usageLabel(tag);
+        const row = pending[m] || (pending[m] = {});
+        row[label] = (row[label] || 0) + 1;
+        return pending;
+    }
+
+    function cleanStore(stored) {
+        const s = stored && typeof stored === 'object' ? stored : {};
+        return {
+            m: s.m && typeof s.m === 'object' ? { ...s.m } : {},
+            h: s.h && typeof s.h === 'object' ? { ...s.h } : {},
+        };
+    }
+
+    function addInto(target, key, counts) {
+        const row = { ...(target[key] || {}) };
+        for (const [label, n] of Object.entries(counts || {})) {
+            if (Number(n) > 0) row[label] = (row[label] || 0) + Number(n);
+        }
+        target[key] = row;
+    }
+
+    /**
+     * The stored record with this tab's pending counts added: minutes over a day
+     * old folded into their hour, hours over a week dropped.
+     */
+    function usageMerge(stored, pending, now = Date.now()) {
+        const out = cleanStore(stored);
+        for (const [minute, counts] of Object.entries(pending || {})) addInto(out.m, minute, counts);
+        const nowMin = Math.floor(now / 60000);
+        for (const minute of Object.keys(out.m)) {
+            if (nowMin - Number(minute) >= USAGE_MINUTES_KEPT) {
+                addInto(out.h, String(Math.floor(Number(minute) / 60)), out.m[minute]);
+                delete out.m[minute];
+            }
+        }
+        const nowHour = Math.floor(now / 3600000);
+        for (const hour of Object.keys(out.h)) if (nowHour - Number(hour) >= USAGE_HOURS_KEPT) delete out.h[hour];
+        return out;
+    }
+
+    /** The ranges the chart offers: how far back, and how wide each bar is. */
+    const USAGE_RANGES = {
+        '1h': { name: 'Last hour', bars: 60, barMs: 60000, barName: 'minute' },
+        '24h': { name: 'Last 24 hours', bars: 24, barMs: 3600000, barName: 'hour' },
+        '7d': { name: 'Last 7 days', bars: 7, barMs: 86400000, barName: 'day' },
+    };
+
+    /**
+     * One service's use over a range: a bar each minute / hour / day, split by
+     * tag, and each tag's total (biggest first).
+     *
+     * @param {object} stored - usageMerge output (already holding pending counts)
+     * @param {{service: 't'|'w'|'e', range: '1h'|'24h'|'7d', now?: number}} opts
+     * @returns {{bars: Array<{start: number, counts: object, total: number}>, labels: Array<{id, name, total, share}>, total: number, peak: number, perMinute: number}}
+     */
+    function usageSeries(stored, { service = 't', range = '1h', now = Date.now() } = {}) {
+        const r = USAGE_RANGES[range] || USAGE_RANGES['1h'];
+        const s = cleanStore(stored);
+        // The day bars start at local midnight, the others on the minute / hour.
+        const end = range === '7d'
+            ? (() => { const d = new Date(now); d.setHours(24, 0, 0, 0); return d.getTime(); })()
+            : (Math.floor(now / r.barMs) + 1) * r.barMs;
+        const start = end - r.bars * r.barMs;
+        const bars = Array.from({ length: r.bars }, (_, i) => ({ start: start + i * r.barMs, counts: {}, total: 0 }));
+        const put = (at, counts) => {
+            if (at < start || at >= end) return;
+            const bar = bars[Math.floor((at - start) / r.barMs)];
+            for (const [label, n] of Object.entries(counts)) {
+                if (label.charAt(0) !== service || !(Number(n) > 0)) continue;
+                bar.counts[label] = (bar.counts[label] || 0) + Number(n);
+                bar.total += Number(n);
+            }
+        };
+        for (const [minute, counts] of Object.entries(s.m)) put(Number(minute) * 60000, counts);
+        // Hours only where minutes are gone (older than a day): never both.
+        if (r.barMs >= 3600000) for (const [hour, counts] of Object.entries(s.h)) put(Number(hour) * 3600000, counts);
+        const totals = {};
+        for (const b of bars) for (const [label, n] of Object.entries(b.counts)) totals[label] = (totals[label] || 0) + n;
+        const total = Object.values(totals).reduce((a, n) => a + n, 0);
+        const labels = Object.entries(totals)
+            .map(([id, n]) => ({ id, name: (USAGE_LABELS[id] || { name: id }).name, lane: (USAGE_LABELS[id] || {}).lane || null, total: n, share: total ? n / total : 0 }))
+            .sort((a, b) => b.total - a.total);
+        // Per minute over the time the range has really covered (up to now, not the empty end of the last bar).
+        const covered = Math.max(60000, Math.min(now, end) - start);
+        return { bars, labels, total, peak: Math.max(0, ...bars.map((b) => b.total)), perMinute: total / (covered / 60000) };
+    }
+
+    /**
+     * The record as CSV rows, one per minute (or hour) per use - for a
+     * spreadsheet (3.15, the export's by-minute.csv / by-hour.csv). Local time.
+     */
+    function usageCsv(stored, { by = 'minute' } = {}) {
+        const s = cleanStore(stored);
+        const rows = [['time', 'service', 'what for', 'tag', 'requests']];
+        const pad = (n) => String(n).padStart(2, '0');
+        const local = (ms) => {
+            const d = new Date(ms);
+            return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+        };
+        const bucket = new Map();
+        const put = (at, counts) => {
+            const key = by === 'hour' ? Math.floor(at / 3600000) * 3600000 : at;
+            const row = bucket.get(key) || {};
+            for (const [label, n] of Object.entries(counts || {})) row[label] = (row[label] || 0) + Number(n || 0);
+            bucket.set(key, row);
+        };
+        for (const [minute, counts] of Object.entries(s.m)) put(Number(minute) * 60000, counts);
+        if (by === 'hour') for (const [hour, counts] of Object.entries(s.h)) put(Number(hour) * 3600000, counts);
+        for (const at of [...bucket.keys()].sort((a, b) => a - b)) {
+            for (const [label, n] of Object.entries(bucket.get(at)).sort()) {
+                if (!(n > 0)) continue;
+                const svc = USAGE_SERVICES[label.charAt(0)];
+                rows.push([local(at), svc ? svc.name : '?', (USAGE_LABELS[label] || { name: label }).name, label, n]);
+            }
+        }
+        return rows.map((r) => r.map((c) => (/[",\n]/.test(String(c)) ? '"' + String(c).replace(/"/g, '""') + '"' : String(c))).join(',')).join('\n') + '\n';
+    }
+
+    /* ===== src/core/errlog.js ===== */
+    /*
+     * The problem log (3.15, the owner: "an error log he can export in settings,
+     * so if he encounters a bug he can write the report there, send the
+     * screenshot, and zip that along with the error log - so it helps you
+     * instead of grepping the code from scratch").
+     *
+     * Every tab adds what went wrong (a request that failed and why, a script
+     * error) and what you did just before (picked an item, planned, accepted,
+     * pressed Next...). Kept 7 days, at most LOG_MAX entries. No key (redacted
+     * before it is stored), no player id or name.
+     */
+
+    const LOG_MAX = 400;
+    const LOG_KEEP_MS = 7 * 24 * 60 * 60 * 1000;
+
+    /** The stored log plus new entries: oldest first, a week at most, LOG_MAX at most. */
+    function addLogEntries(stored, entries, now = Date.now()) {
+        const all = [...(Array.isArray(stored) ? stored : []), ...(entries || [])]
+            .filter((e) => e && Number.isFinite(Number(e.at)) && now - Number(e.at) < LOG_KEEP_MS)
+            .sort((a, b) => a.at - b.at);
+        // The same line twice in a row within a minute is counted, not repeated.
+        const out = [];
+        for (const e of all) {
+            const last = out[out.length - 1];
+            if (last && last.kind === e.kind && last.where === e.where && last.what === e.what && e.at - last.at < 60000) {
+                last.times = (last.times || 1) + (e.times || 1);
+                last.lastAt = e.at;
+            } else {
+                out.push({ ...e });
+            }
+        }
+        return out.slice(-LOG_MAX);
+    }
+
+    /** A line of text, never a key: anything key-like is masked (16 letters and digits). */
+    function logText(text, max = 300) {
+        return String(text === null || text === undefined ? '' : text)
+            .replace(/key=[^&\s"']+/gi, 'key=****')
+            .replace(/\b[A-Za-z0-9]{16}\b/g, '****')
+            .slice(0, max);
+    }
+
+    /** The log as plain text, one line each, for the report. */
+    function logAsText(list) {
+        const pad = (n) => String(n).padStart(2, '0');
+        const t = (ms) => {
+            const d = new Date(ms);
+            return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
+        };
+        return (list || []).map((e) => t(e.at) + '  ' + (e.kind === 'error' ? 'ERROR ' : e.kind === 'action' ? 'did   ' : 'note  ') + '[' + (e.where || '?') + '] ' + e.what + (e.detail ? ' - ' + e.detail : '') + (e.times > 1 ? ' (x' + e.times + ', last ' + t(e.lastAt) + ')' : '')).join('\n') + '\n';
     }
 
     /* ===== src/core/accepted.js ===== */
@@ -4693,6 +4967,21 @@
     /** A hidden tab waiting for a slot checks again this often. */
     const HIDDEN_POLL_MS = 1000;
 
+    /*
+     * Priority lanes (3.15, the friend: "it struggles with the API, it maxes
+     * out"). Every tab shares the one window, so each lane leaves room for the
+     * lanes above it: a low call (a trader's status, networth, the Ledger
+     * catching up) only goes while LOW_RESERVE slots are free, a normal one
+     * (the Item Market feed, inventory) while NORMAL_RESERVE are. What you are
+     * doing right now (Fill, pricing your bazaar, the item on screen) is never
+     * kept waiting behind them, in this tab or another.
+     */
+    const API_PRIORITY = { low: 0, normal: 1, high: 2 };
+    const NORMAL_RESERVE = 5;
+    const LOW_RESERVE = 20;
+    /* Returned by a wait that gave way to a more urgent call. */
+    const YIELDED = Symbol('yielded');
+
     class TornApiError extends Error {
         constructor(message, { code = null, http = null, paused = false } = {}) {
             super(message);
@@ -4755,7 +5044,13 @@
             savePause = null,
             isVisible = () => true,
             addToWindow = null,
+            onSent = null,
+            onFailed = null,
         } = {}) {
+            /** ({path, tag, error}) => void, a call that failed for good (not each retry): the problem log (3.15). */
+            this.onFailed = onFailed;
+            /** ({path, params, tag, priority}) => void, each request that leaves (retries too): the usage record. */
+            this.onSent = onSent;
             this.addToWindow = addToWindow;
             this.loadPause = loadPause;
             this.savePause = savePause;
@@ -4772,8 +5067,10 @@
 
             /** Timestamps of recent requests, for the sliding window. */
             this.recent = [];
-            /** Serialises the queue so the window check cannot race. */
-            this.chain = Promise.resolve();
+            /** Waiting calls, most urgent first; one runs at a time, so the window check cannot race. */
+            this.queue = [];
+            this.pumping = false;
+            this.seq = 0;
             /** In-flight and recently-completed requests, keyed without the key. */
             this.inflight = new Map();
             this.cache = new Map();
@@ -4811,9 +5108,20 @@
                 .sort((a, b) => a - b);
         }
 
-        /** Block until the sliding window has room for one more request. */
-        async waitForSlot() {
+        /** How many of the window's slots this lane may fill. */
+        laneLimit(priority = API_PRIORITY.normal) {
+            const reserve = priority >= API_PRIORITY.high ? 0 : priority >= API_PRIORITY.normal ? NORMAL_RESERVE : LOW_RESERVE;
+            return Math.max(1, this.maxPerMinute - reserve);
+        }
+
+        /**
+         * Block until the sliding window has room for one more request of this
+         * lane. `shouldYield` (the first attempt only): a more urgent call has
+         * arrived - give way to it (returns YIELDED, no slot taken).
+         */
+        async waitForSlot(priority = API_PRIORITY.high, shouldYield = null) {
             for (;;) {
+                if (shouldYield && shouldYield()) return YIELDED;
                 const now = Date.now();
                 this.syncWindow(now);
                 this.recent = this.recent.filter((t) => now - t < 60000);
@@ -4824,7 +5132,8 @@
                     continue;
                 }
 
-                if (this.recent.length < this.maxPerMinute) {
+                const limit = this.laneLimit(priority);
+                if (this.recent.length < limit) {
                     this.recent.push(now);
                     if (this.addToWindow) {
                         try {
@@ -4843,8 +5152,11 @@
                     return;
                 }
 
-                const oldest = this.recent[0];
-                await apiSleep(Math.max(50, 60000 - (now - oldest) + 25));
+                // The slot this lane waits for: the one that brings the window under its limit.
+                const frees = this.recent[this.recent.length - limit] || this.recent[0];
+                const wait = Math.max(50, 60000 - (now - frees) + 25);
+                // Waiting with a lane below: look again each second for a more urgent call.
+                await apiSleep(shouldYield ? Math.min(wait, 1000) : wait);
             }
         }
 
@@ -4854,8 +5166,9 @@
          * @param {string} path - e.g. "torn" or "user" or "market/123"
          * @param {object} params - query params; `key` is added here and only here
          */
-        async get(path, params = {}) {
+        async get(path, params = {}, { tag = null, priority = 'high' } = {}) {
             const cacheKey = path + '?' + new URLSearchParams(params).toString();
+            const prio = API_PRIORITY[priority] ?? API_PRIORITY.high;
 
             const cached = this.cache.get(cacheKey);
             if (cached && Date.now() - cached.at < this.dedupTtlMs) {
@@ -4863,14 +5176,18 @@
             }
 
             const existing = this.inflight.get(cacheKey);
-            if (existing) return existing;
+            if (existing) {
+                // Asked again, more urgently: the waiting call moves up.
+                const job = this.queue.find((j) => j.cacheKey === cacheKey);
+                if (job && prio > job.prio) job.prio = prio;
+                return existing;
+            }
 
-            // Queue behind whatever is already scheduled, then take a slot.
-            const promise = this.chain
-                .catch(() => {})
-                .then(() => this.execute(path, params, cacheKey));
-
-            this.chain = promise.catch(() => {});
+            // Queued by lane (most urgent first, then in order), then a slot.
+            const promise = new Promise((resolve, reject) => {
+                this.queue.push({ seq: this.seq++, path, params, cacheKey, tag, prio, resolve, reject });
+            });
+            this.pump();
             this.inflight.set(cacheKey, promise);
 
             try {
@@ -4890,7 +5207,40 @@
             }
         }
 
-        async execute(path, params, cacheKey) {
+        /** Run the waiting calls one at a time, the most urgent first. */
+        async pump() {
+            if (this.pumping) return;
+            this.pumping = true;
+            try {
+                while (this.queue.length) {
+                    this.queue.sort((a, b) => b.prio - a.prio || a.seq - b.seq);
+                    const job = this.queue[0];
+                    const shouldYield = () => this.queue.some((j) => j !== job && j.prio > job.prio);
+                    let out;
+                    try {
+                        out = { value: await this.execute(job.path, job.params, job.cacheKey, job, shouldYield) };
+                    } catch (error) {
+                        out = { error };
+                        if (this.onFailed) {
+                            try {
+                                this.onFailed({ path: job.path, tag: job.tag, error });
+                            } catch {
+                                // The log is best-effort.
+                            }
+                        }
+                    }
+                    if (out.value === YIELDED) continue;
+                    this.queue.splice(this.queue.indexOf(job), 1);
+                    if ('error' in out) job.reject(out.error);
+                    else job.resolve(out.value);
+                }
+            } finally {
+                this.pumping = false;
+            }
+        }
+
+        async execute(path, params, cacheKey, job = null, shouldYield = null) {
+            const prio = job ? job.prio : API_PRIORITY.high;
             if (!this.fetchImpl) {
                 throw new TornApiError('No fetch implementation available.');
             }
@@ -4910,9 +5260,17 @@
 
             while (attempt <= this.maxRetries) {
                 this.throwIfPaused(mine);
-                await this.waitForSlot();
+                // Only the first wait gives way to a more urgent call (a retry keeps its turn).
+                if ((await this.waitForSlot(prio, attempt === 0 ? shouldYield : null)) === YIELDED) return YIELDED;
                 // Another tab may have hit a block while this one waited.
                 this.throwIfPaused(mine);
+                if (this.onSent) {
+                    try {
+                        this.onSent({ path, params, tag: job ? job.tag : null, priority: prio });
+                    } catch {
+                        // The usage record is best-effort.
+                    }
+                }
 
                 try {
                     return await this.requestOnce(path, params, key);
@@ -5162,7 +5520,13 @@
             sleep = w3bSleep,
             isVisible = () => true,
             addShared = null,
+            onSent = null,
+            onFailed = null,
         } = {}) {
+            /** ({path, tag}) => void, each request that leaves: the usage record (3.15). */
+            this.onSent = onSent;
+            /** ({path, tag, error}) => void, a request that failed: the problem log (3.15). */
+            this.onFailed = onFailed;
             this.addShared = addShared;
             this.sleep = sleep;
             this.isVisible = isVisible;
@@ -5274,15 +5638,24 @@
             return url;
         }
 
-        /** GET one TornW3B path. Serialised, rate-limited, never keyed. */
-        get(path) {
-            const run = () => this.execute(path);
+        /** GET one TornW3B path. Serialised, rate-limited, never keyed. `tag`: what it is for (the usage record). */
+        get(path, { tag = null } = {}) {
+            const run = () => this.execute(path, tag).catch((error) => {
+                if (this.onFailed) {
+                    try {
+                        this.onFailed({ path, tag, error });
+                    } catch {
+                        // The log is best-effort.
+                    }
+                }
+                throw error;
+            });
             const promise = this.chain.catch(() => {}).then(run);
             this.chain = promise.catch(() => {});
             return promise;
         }
 
-        async execute(path) {
+        async execute(path, tag = null) {
             if (this.now() < this.blockedUntil()) {
                 throw new W3bError('TornW3B is rate limiting us; paused briefly.', {
                     blocked: true,
@@ -5296,6 +5669,14 @@
                 throw new W3bError('TornW3B is rate limiting us; paused briefly.', {
                     blocked: true,
                 });
+            }
+
+            if (this.onSent) {
+                try {
+                    this.onSent({ path, tag });
+                } catch {
+                    // The usage record is best-effort.
+                }
             }
 
             let response;
@@ -5339,8 +5720,8 @@
      * @returns {Promise<Array<{itemId: string, name: string, lowestPrice: number|null,
      *   marketPrice: number|null, bazaarAverage: number|null, totalBazaars: number}>>}
      */
-    async function fetchW3bSummary(client) {
-        const data = await client.get('marketplace');
+    async function fetchW3bSummary(client, { tag = 'w.summary' } = {}) {
+        const data = await client.get('marketplace', { tag });
         const items = data && Array.isArray(data.items) ? data.items : null;
 
         if (!items) throw new W3bError('TornW3B returned no item summary.');
@@ -5367,10 +5748,10 @@
      *
      * @returns {Promise<{listings: Array, total: number}>} raw listing objects
      */
-    async function fetchW3bListings(client, itemId) {
+    async function fetchW3bListings(client, itemId, { tag = null } = {}) {
         const path = 'marketplace/' + encodeURIComponent(String(itemId));
 
-        let data = await client.get(path);
+        let data = await client.get(path, { tag });
 
         const empty = (d) =>
             d &&
@@ -5378,11 +5759,41 @@
             Array.isArray(d.listings) &&
             d.listings.length === 0;
 
-        if (empty(data)) data = await client.get(path);
+        if (empty(data)) data = await client.get(path, { tag });
 
         return {
             listings: data && Array.isArray(data.listings) ? data.listings : [],
             total: Number(data && data.total_listings) || 0,
+        };
+    }
+
+    /**
+     * Every TornW3B buyer of one item (3.15): GET /api/marketplace/{id}/traders,
+     * highest price first, at most 100 (`total_count` says how many there are:
+     * 412 for Xanax on 2026-09-29, against ~290 lists we had read). Each comes
+     * with their rating and when they were last active - free, where a Torn
+     * profile call per trader cost the shared 70/min.
+     *
+     * @returns {Promise<{total: number, traders: Array<{id, name, price, up, down, lastAction, lastTrade, listAt}>}>}
+     */
+    async function fetchW3bItemTraders(client, itemId, { tag = 'w.buyers' } = {}) {
+        const data = await client.get('marketplace/' + encodeURIComponent(String(itemId)) + '/traders', { tag });
+        const rows = data && Array.isArray(data.traders) ? data.traders : [];
+        const sec = (x) => (Number(x) > 0 ? Number(x) * 1000 : null);
+        return {
+            total: Number(data && data.total_count) || rows.length,
+            traders: rows
+                .filter((t) => t && Number(t.player_id) > 0 && Number(t.price) > 0)
+                .map((t) => ({
+                    id: String(t.player_id),
+                    name: t.player_name ? String(t.player_name) : null,
+                    price: Number(t.price),
+                    up: t.rating && Number.isFinite(Number(t.rating.upvotes)) ? Number(t.rating.upvotes) : null,
+                    down: t.rating && Number.isFinite(Number(t.rating.downvotes)) ? Number(t.rating.downvotes) : null,
+                    lastAction: sec(t.last_action),
+                    lastTrade: sec(t.last_trade),
+                    listAt: sec(t.pricelist_updated),
+                })),
         };
     }
 
@@ -5974,6 +6385,11 @@
     }
 
     class LedgerClient extends TornApiClient {
+        /** The Ledger is never urgent (3.15): the low lane, unless a call says otherwise (checking a key you just saved). */
+        get(path, params = {}, use = {}) {
+            return super.get(path, params, { tag: 't.ledger', priority: 'low', ...use });
+        }
+
         async requestOnce(path, params, key) {
             if (!ledgerPathAllowed(path) || !ledgerParamsAllowed(path, params)) {
                 throw new TornApiError('The Ledger key is only for your log and trades; refused ' + String(path).split('?')[0] + '.');
@@ -5987,7 +6403,7 @@
      * @returns {{level: number|null, type: string|null, userId: string|null}}
      */
     async function fetchLedgerKeyInfo(client) {
-        const data = await client.get('v2/key/info');
+        const data = await client.get('v2/key/info', {}, { priority: 'high' });
         const info = (data && data.info) || {};
         const access = info.access || {};
         const level = Number(access.level);
@@ -6263,7 +6679,11 @@
          *   same pace and the same penalty wait as this one.
          * @param {function} [options.saveState] - (state) => void
          */
-        constructor({ getKey, fetchImpl = gmFetch, now = () => Date.now(), loadState = null, saveState = null } = {}) {
+        constructor({ getKey, fetchImpl = gmFetch, now = () => Date.now(), loadState = null, saveState = null, onSent = null, onFailed = null } = {}) {
+            /** ({path, tag, error}) => void, a request that failed (not "too soon"): the problem log (3.15). */
+            this.onFailed = onFailed;
+            /** ({path, tag}) => void, each request that leaves: the usage record (3.15). */
+            this.onSent = onSent;
             this.getKey = getKey || (() => '');
             this.fetchImpl = fetchImpl;
             this.now = now;
@@ -6324,7 +6744,22 @@
          * @param {boolean} [options.keyless] - an endpoint that needs no key
          *   (best_listing): sent without one, on the same shared pace.
          */
-        async get(path, params = {}, { keyless = false } = {}) {
+        async get(path, params = {}, options = {}) {
+            try {
+                return await this.request(path, params, options);
+            } catch (error) {
+                if (this.onFailed && !(error && error.tooSoon)) {
+                    try {
+                        this.onFailed({ path, tag: options.tag || null, error });
+                    } catch {
+                        // The log is best-effort.
+                    }
+                }
+                throw error;
+            }
+        }
+
+        async request(path, params = {}, { keyless = false, tag = null } = {}) {
             const key = keyless ? '' : String(this.getKey() || '').trim();
             if (!key && !keyless) throw new TeError('No TornExchange key.', { badKey: true });
 
@@ -6351,6 +6786,13 @@
             }
             this.lastRequestAt = t;
             this.persistState();
+            if (this.onSent) {
+                try {
+                    this.onSent({ path, tag });
+                } catch {
+                    // The usage record is best-effort.
+                }
+            }
 
             let response;
             try {
@@ -6524,28 +6966,39 @@
      *
      * @returns {Promise<{traders: Array<{name: string, price: number}>, total: number, complete: boolean}>}
      */
-    async function fetchTeListings(client, itemId, { maxPages = 3, schedule = (fn) => fn() } = {}) {
+    async function fetchTeListings(client, itemId, { maxPages = 3, schedule = (fn) => fn(), keepGoing = () => true } = {}) {
         const traders = [];
         let total = 0;
         let pages = 1;
+        let read = 0;
 
         for (let page = 1; page <= maxPages && page <= pages; page += 1) {
-            const body = await schedule(() =>
-                client.get('listings', {
-                    item_id: String(itemId),
-                    sort_by: 'price',
-                    order: 'desc',
-                    page,
-                }),
-            );
+            // 3.15: a later page is not asked for an item you have left, and one
+            // that fails keeps the pages already read (they were thrown away).
+            if (page > 1 && !keepGoing()) break;
+            let body;
+            try {
+                body = await schedule(() =>
+                    client.get('listings', {
+                        item_id: String(itemId),
+                        sort_by: 'price',
+                        order: 'desc',
+                        page,
+                    }),
+                );
+            } catch (error) {
+                if (page === 1) throw error;
+                break;
+            }
             const parsed = parseTeListings(body);
             traders.push(...parsed.traders);
             total = parsed.total;
             pages = parsed.pages;
+            read = page;
         }
 
         traders.sort((a, b) => b.price - a.price);
-        return { traders, total, complete: pages <= maxPages };
+        return { traders, total, complete: read >= pages };
     }
 
     /**
@@ -6578,10 +7031,27 @@
             return this.jobs.length;
         }
 
-        /** @returns {Promise} what `fn` returns, once its slot has come. */
-        enqueue(fn) {
+        /** Nothing waiting and nothing on its way: room for a background read (3.15). */
+        get idle() {
+            return !this.jobs.length && !this.running;
+        }
+
+        /**
+         * @param {function} fn
+         * @param {{urgent?: boolean}} [opts] - urgent (the item you opened, 3.15): ahead of
+         *   everything not urgent, instead of behind background reads
+         * @returns {Promise} what `fn` returns, once its slot has come.
+         */
+        enqueue(fn, { urgent = false } = {}) {
             return new Promise((resolve, reject) => {
-                this.jobs.push({ fn, resolve, reject });
+                const job = { fn, resolve, reject, urgent };
+                if (urgent) {
+                    const at = this.jobs.findIndex((j) => !j.urgent);
+                    if (at < 0) this.jobs.push(job);
+                    else this.jobs.splice(at, 0, job);
+                } else {
+                    this.jobs.push(job);
+                }
                 this.run();
             });
         }
@@ -6610,6 +7080,7 @@
             }
             const job = this.jobs.shift();
             if (!job) return;
+            this.running = true;
             try {
                 const result = await job.fn();
                 job.resolve(result);
@@ -6621,6 +7092,8 @@
                     job.reject(error);
                     this.onSettled(error);
                 }
+            } finally {
+                this.running = false;
             }
             this.run();
         }
@@ -6966,8 +7439,44 @@
             if (w && w.found && w.prices && !(now - w.at <= W3B_LIST_MAX_AGE_MS)) {
                 t.w3b = { checkedAt: w.checkedAt, at: w.at, found: true, prices: null };
             }
+            if (t.te && t.te.prices && !(now - t.te.at < TE_SCAN_MAX_AGE_MS)) t.te = { ...t.te, prices: null };
         }
         return db;
+    }
+
+    /*
+     * TornExchange, every active trader's whole list in turn (3.15): the top
+     * three per item missed everyone ranked 4th and lower. Kept with the trader,
+     * like their TornW3B list; used for TE_SCAN_MAX_AGE_MS.
+     */
+    const TE_SCAN_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+
+    /** One trader's TornExchange list read (`prices` [{itemId, price}]), or `{error: true}`. */
+    function recordTeScan(db, traderId, { prices = null, error = false } = {}, now = Date.now()) {
+        const id = cleanId(traderId);
+        if (!id) return;
+        const t = db.traders[id] || (db.traders[id] = { name: 'Trader ' + id, from: 'te', seenAt: now, w3b: null });
+        if (error) {
+            t.te = { ...(t.te || {}), triedAt: now, failed: ((t.te && t.te.failed) || 0) + 1 };
+            return;
+        }
+        const map = {};
+        for (const p of prices || []) if (p && p.price > 0) map[String(p.itemId)] = p.price;
+        t.te = { at: now, triedAt: now, prices: map, failed: 0 };
+    }
+
+    /** itemId -> [{id, name, price}] from every TornExchange list read within TE_SCAN_MAX_AGE_MS. */
+    function indexTeScanByItem(db, now = Date.now()) {
+        const out = new Map();
+        for (const [id, t] of Object.entries((db && db.traders) || {})) {
+            const te = t && t.te;
+            if (!te || !te.prices || !(now - te.at < TE_SCAN_MAX_AGE_MS)) continue;
+            for (const [itemId, price] of Object.entries(te.prices)) {
+                if (!out.has(itemId)) out.set(itemId, []);
+                out.get(itemId).push({ id, name: t.name && !String(t.name).startsWith('Trader ') ? t.name : null, price });
+            }
+        }
+        return out;
     }
 
     /** A trader's TornW3B prices, if read recently enough to show. */
@@ -7050,7 +7559,7 @@
      *   {id, name, price, lastPaid} - lastPaid: no public list, what they paid you last
      * @returns {Array<{id, name, price, te: number|null, w3b: number|null, teName: string|null}>}
      */
-    function buyersForItem(itemId, { teBest = [], teFull = null, idsByName = new Map(), db = null, w3bByItem = null, dbIdsByName = null, votesById = null, teOwn = null } = {}) {
+    function buyersForItem(itemId, { teBest = [], teFull = null, idsByName = new Map(), db = null, w3bByItem = null, dbIdsByName = null, votesById = null, teOwn = null, w3bItem = null } = {}) {
         const key = String(itemId);
         const rows = new Map();
         const byName = new Map();
@@ -7136,6 +7645,26 @@
             if (!(r.w3b >= price)) r.w3b = price;
         }
 
+        // Every TornW3B buyer of this item, read minutes ago (3.15, /traders): its
+        // price is the newest, and it names traders we had no list of yet.
+        for (const t of w3bItem || []) {
+            const id = cleanId(t && t.id);
+            if (!id || !(t.price > 0)) continue;
+            let r = rows.get('id:' + id);
+            if (!r && t.name) {
+                const named = byName.get(String(t.name).toLowerCase());
+                if (named && !named.id) {
+                    rows.delete('name:' + String(named.name).toLowerCase());
+                    named.id = id;
+                    rows.set('id:' + id, named);
+                    r = named;
+                }
+            }
+            if (!r) r = row(id, t.name || null);
+            r.w3b = t.price;
+            if (Number.isFinite(t.up) && Number.isFinite(t.down)) r.itemRating = { up: t.up, down: t.down };
+        }
+
         const out = [];
         for (const r of rows.values()) {
             const both = r.te > 0 && r.w3b > 0;
@@ -7149,7 +7678,7 @@
             // top three) and TornW3B's rating.
             if (r.votes === null && r.id && votesById && votesById.has(r.id)) r.votes = votesById.get(r.id);
             const t = r.id && db ? db.traders[r.id] : null;
-            r.rating = (t && t.rating) || null;
+            r.rating = (t && t.rating) || r.itemRating || null;
             r.trust = trustOf(r.votes, r.rating);
             out.push(r);
         }
@@ -8123,11 +8652,12 @@
     async function fetchItemMarket(
         client,
         itemId,
-        { limit = 20, offset = 0, now = Date.now() } = {},
+        { limit = 20, offset = 0, now = Date.now(), tag = null, priority = 'high' } = {},
     ) {
         const data = await client.get(
             'v2/market/' + encodeURIComponent(String(itemId)) + '/itemmarket',
             { limit, offset },
+            { tag, priority },
         );
 
         const market = (data && data.itemmarket) || {};
@@ -8192,12 +8722,13 @@
      * Public data (what their profile shows anyone); a Public key can read it.
      * Tries v2 first, then v1; a dead key or rate limit is not retried.
      */
-    async function fetchUserPresence(client, userId) {
+    async function fetchUserPresence(client, userId, { tag = null, priority = 'low' } = {}) {
         const id = String(userId).replace(/\D/g, '');
         if (!id) return null;
+        const use = { tag, priority };
 
         try {
-            return parseUserPresence(await client.get('v2/user/' + id + '/profile'));
+            return parseUserPresence(await client.get('v2/user/' + id + '/profile', {}, use));
         } catch (error) {
             const code = error && error.code;
             if (
@@ -8207,7 +8738,7 @@
             ) {
                 throw error;
             }
-            return parseUserPresence(await client.get('user/' + id, { selections: 'profile' }));
+            return parseUserPresence(await client.get('user/' + id, { selections: 'profile' }, use));
         }
     }
 
@@ -8220,10 +8751,10 @@
      *
      * @returns {Promise<number|null>} null when Torn gives no number
      */
-    async function fetchNetworth(client, userId) {
+    async function fetchNetworth(client, userId, { priority = 'low' } = {}) {
         const id = String(userId).replace(/\D/g, '');
         if (!id) return null;
-        const data = await client.get('v2/user/' + id + '/personalstats', { cat: 'networth' });
+        const data = await client.get('v2/user/' + id + '/personalstats', { cat: 'networth' }, { tag: 't.networth', priority });
         return parseNetworth(data);
     }
 
@@ -8273,7 +8804,7 @@
         for (let page = 0; page < 40; page += 1) {
             let data;
             try {
-                data = await client.get('v2/user/inventory', { ...params, limit, offset });
+                data = await client.get('v2/user/inventory', { ...params, limit, offset }, { tag: 't.inventory', priority: 'normal' });
             } catch (error) {
                 if (error && Number(error.code) === TORN_ERROR_ACCESS_LEVEL) {
                     throw new TornApiError('This key cannot read your inventory: it needs Limited access.', {
@@ -13782,6 +14313,672 @@
         }
     }
 
+    /* ===== src/core/zip.js ===== */
+    /*
+     * A .zip of a few text files, made in the browser (3.15: Settings › API use ›
+     * Export, "downloads as a zip file so he can send it to us"). Stored, not
+     * compressed - a few hundred KB of numbers at most - so nothing but a CRC-32
+     * and the zip headers: no library.
+     */
+
+    const CRC_TABLE = (() => {
+        const t = new Uint32Array(256);
+        for (let n = 0; n < 256; n++) {
+            let c = n;
+            for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+            t[n] = c >>> 0;
+        }
+        return t;
+    })();
+
+    function crc32(bytes) {
+        let c = 0xffffffff;
+        for (let i = 0; i < bytes.length; i++) c = CRC_TABLE[(c ^ bytes[i]) & 0xff] ^ (c >>> 8);
+        return (c ^ 0xffffffff) >>> 0;
+    }
+
+    /** MS-DOS time and date, as zip headers keep them. */
+    function dosTime(d) {
+        return {
+            time: (d.getHours() << 11) | (d.getMinutes() << 5) | Math.floor(d.getSeconds() / 2),
+            date: ((d.getFullYear() - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate(),
+        };
+    }
+
+    /**
+     * @param {Array<{name: string, text?: string, data?: Uint8Array}>} files
+     * @param {Date} [when]
+     * @returns {Uint8Array} the .zip
+     */
+    function makeZip(files, when = new Date()) {
+        const enc = new TextEncoder();
+        const { time, date } = dosTime(when);
+        const parts = [];
+        const central = [];
+        let offset = 0;
+        for (const f of files) {
+            const name = enc.encode(f.name);
+            // Text, or bytes as they are (a screenshot).
+            const data = f.data instanceof Uint8Array ? f.data : enc.encode(f.text || '');
+            const crc = crc32(data);
+            const local = new DataView(new ArrayBuffer(30));
+            local.setUint32(0, 0x04034b50, true);
+            local.setUint16(4, 20, true); // version needed
+            local.setUint16(6, 0x0800, true); // UTF-8 names
+            local.setUint16(8, 0, true); // stored
+            local.setUint16(10, time, true);
+            local.setUint16(12, date, true);
+            local.setUint32(14, crc, true);
+            local.setUint32(18, data.length, true);
+            local.setUint32(22, data.length, true);
+            local.setUint16(26, name.length, true);
+            local.setUint16(28, 0, true);
+            parts.push(new Uint8Array(local.buffer), name, data);
+
+            const cen = new DataView(new ArrayBuffer(46));
+            cen.setUint32(0, 0x02014b50, true);
+            cen.setUint16(4, 20, true);
+            cen.setUint16(6, 20, true);
+            cen.setUint16(8, 0x0800, true);
+            cen.setUint16(10, 0, true);
+            cen.setUint16(12, time, true);
+            cen.setUint16(14, date, true);
+            cen.setUint32(16, crc, true);
+            cen.setUint32(20, data.length, true);
+            cen.setUint32(24, data.length, true);
+            cen.setUint16(28, name.length, true);
+            cen.setUint32(42, offset, true);
+            central.push(new Uint8Array(cen.buffer), name);
+            offset += 30 + name.length + data.length;
+        }
+        const centralSize = central.reduce((a, p) => a + p.length, 0);
+        const end = new DataView(new ArrayBuffer(22));
+        end.setUint32(0, 0x06054b50, true);
+        end.setUint16(8, files.length, true);
+        end.setUint16(10, files.length, true);
+        end.setUint32(12, centralSize, true);
+        end.setUint32(16, offset, true);
+        const all = [...parts, ...central, new Uint8Array(end.buffer)];
+        const out = new Uint8Array(all.reduce((a, p) => a + p.length, 0));
+        let at = 0;
+        for (const p of all) {
+            out.set(p, at);
+            at += p.length;
+        }
+        return out;
+    }
+
+    /* ===== src/ui/usage-view.js ===== */
+    /*
+     * Settings › API use (3.15, the owner: "a separate tab inside settings... I
+     * need to see the usage with a graph, so we're able to analyse what needs
+     * more priority and what needs less"). Modelled on Anthropic's own usage
+     * pages: a meter per limit ("12 of 70 this minute", like claude.ai's "% used"),
+     * then the Console's chart - bars over time, stacked by what used them -
+     * and a table of every use with its share.
+     */
+
+
+
+    const UV_SVG_NS = 'http://www.w3.org/2000/svg';
+
+    function uvEl(tag, attrs = {}, children = []) {
+        const node = document.createElement(tag);
+        for (const [k, v] of Object.entries(attrs)) {
+            if (v === null || v === undefined || v === false) continue;
+            if (k === 'text') node.textContent = v;
+            else if (k === 'onclick') node.addEventListener('click', v);
+            else node.setAttribute(k, v === true ? '' : String(v));
+        }
+        for (const c of [].concat(children)) if (c !== null && c !== undefined && c !== false) node.appendChild(typeof c === 'string' ? document.createTextNode(c) : c);
+        return node;
+    }
+
+    function uvSvg(tag, attrs = {}) {
+        const node = document.createElementNS(UV_SVG_NS, tag);
+        for (const [k, v] of Object.entries(attrs)) if (v !== null && v !== undefined) node.setAttribute(k, String(v));
+        return node;
+    }
+
+    const uvNum = (n) => Math.round(Number(n) || 0).toLocaleString('en-US');
+
+    /*
+     * Each use keeps its colour whatever its rank (a colour follows the use, never
+     * its place): seven hues per service, validated for the dark card (the
+     * data-viz reference palette's dark steps, all checks passing on #1f1f1f); the
+     * rest share one grey "Everything else" in the chart and are listed one by one
+     * in the table below it.
+     */
+    const UV_HUES = ['#3987e5', '#d95926', '#199e70', '#c98500', '#d55181', '#008300', '#9085e9'];
+    const UV_OTHER_HUE = '#6b6b6b';
+    const USAGE_COLOURS = {
+        t: ['t.feed', 't.status', 't.networth', 't.ledger', 't.inventory', 't.sellers', 't.owner'],
+        w: ['w.flips', 'w.buyers', 'w.lists', 'w.sweep', 'w.summary', 'w.desk', 'w.feed'],
+        e: ['e.top', 'e.trader', 'e.list', 'e.active', 'e.one'],
+    };
+
+    /** The chart's colour for a use, and the series it is drawn in ('other' when folded). */
+    function usageColour(service, label) {
+        const i = (USAGE_COLOURS[service] || []).indexOf(label);
+        return i >= 0 ? { series: label, colour: UV_HUES[i] } : { series: 'other', colour: UV_OTHER_HUE };
+    }
+
+    const UV_LANE_WORDS = { high: 'goes first', normal: 'normal', low: 'waits for room' };
+
+    /* Export (3.15, the owner: "an export API usage button that downloads as a zip file, so he can send it to us to analyse"). */
+    const USAGE_EXPORT_KIND = 'torn-trading-api-usage';
+
+    /**
+     * The files in the zip: counts, settings and coverage only - no key, no
+     * player id, no name. `state`: what the page adds (version, switches,
+     * coverage) - see usageNow in main.js.
+     *
+     * @returns {Array<{name: string, text: string}>}
+     */
+    function usageExportFiles(record, { state = {}, now = Date.now() } = {}) {
+        const rec = { m: (record && record.m) || {}, h: (record && record.h) || {} };
+        const stamp = new Date(now).toISOString();
+        const tz = -new Date(now).getTimezoneOffset();
+        return [
+            { name: 'README.txt', text: [
+                'Torn Trading - API use export',
+                'Exported ' + stamp + ' (UTC; the player\'s clock is UTC' + (tz >= 0 ? '+' : '') + tz / 60 + 'h).',
+                '',
+                'api-usage.json  every request by what it was for: per minute for the last day ("m": minute number since 1970), per hour for the week before ("h").',
+                'by-minute.csv   the same, one row per minute, service and use (local time) - opens in Excel.',
+                'by-hour.csv     the same per hour.',
+                'state.json      the script version, the page\'s switches and limits, and how much it had covered when exported.',
+                '',
+                'No API key, player id or name is in these files.',
+            ].join('\n') + '\n' },
+            { name: 'api-usage.json', text: JSON.stringify({ kind: USAGE_EXPORT_KIND, v: 1, exportedAt: stamp, tzOffsetMin: tz, limits: Object.fromEntries(Object.entries(USAGE_SERVICES).map(([id, sv]) => [id, sv.perMin])), record: rec }) },
+            { name: 'by-minute.csv', text: usageCsv(rec, { by: 'minute' }) },
+            { name: 'by-hour.csv', text: usageCsv(rec, { by: 'hour' }) },
+            { name: 'state.json', text: JSON.stringify({ exportedAt: stamp, ...state }, null, 2) },
+        ];
+    }
+
+    function uvTime(at, range) {
+        const d = new Date(at);
+        if (range === '7d') return d.toLocaleDateString([], { weekday: 'short' });
+        return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    }
+
+    class UsageView {
+        constructor() {
+            this.service = 't';
+            this.range = '1h';
+            this.data = null;
+            this.el = uvEl('div', { class: 'uv' });
+            this.metersEl = uvEl('div', { class: 'uv-meters' });
+            this.controlsEl = uvEl('div', { class: 'uv-controls' });
+            this.summaryEl = uvEl('p', { class: 'uv-summary' });
+            this.chartEl = uvEl('div', { class: 'uv-chart' });
+            this.tipEl = uvEl('div', { class: 'uv-tip', role: 'status', hidden: true });
+            this.tableEl = uvEl('table', { class: 'uv-table' });
+            this.exportNote = uvEl('p', { class: 'uv-summary', role: 'status' });
+            this.el.append(this.metersEl, this.controlsEl, this.summaryEl, uvEl('div', { class: 'uv-plot' }, [this.chartEl, this.tipEl]), this.tableEl, this.exportNote);
+        }
+
+        /** Export API usage: one .zip to send (every tab's record, this page's settings; no key). */
+        exportZip() {
+            if (!this.data) return;
+            const now = Date.now();
+            const zip = makeZip(usageExportFiles(this.data.record, { state: this.data.state || {}, now }), new Date(now));
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(new Blob([zip], { type: 'application/zip' }));
+            const d = new Date(now);
+            const pad = (n) => String(n).padStart(2, '0');
+            a.download = 'torn-api-usage-' + d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + '-' + pad(d.getHours()) + pad(d.getMinutes()) + '.zip';
+            a.click();
+            setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+            this.exportNote.textContent = 'Saved ' + a.download + ' to your downloads: send that file (no key or name is in it).';
+        }
+
+        /**
+         * @param {{now: number, record: object, live: {t, w, e}: {used: number, cap: number}}} data
+         */
+        render(data) {
+            this.data = data;
+            this.renderMeters();
+            this.renderControls();
+            this.renderChart();
+        }
+
+        renderMeters() {
+            const { live = {} } = this.data;
+            this.metersEl.textContent = '';
+            for (const [id, svc] of Object.entries(USAGE_SERVICES)) {
+                const l = live[id] || { used: 0, cap: svc.perMin };
+                const pct = l.cap ? Math.min(1, l.used / l.cap) : 0;
+                // State in words and colour both: never colour alone.
+                const state = pct >= 0.95 ? ['bad', 'at the limit'] : pct >= 0.8 ? ['warn', 'busy'] : ['ok', 'room to spare'];
+                this.metersEl.appendChild(uvEl('button', {
+                    type: 'button',
+                    class: 'uv-meter' + (id === this.service ? ' uv-on' : ''),
+                    'aria-pressed': String(id === this.service),
+                    title: 'Show ' + svc.name + ' below',
+                    onclick: () => {
+                        this.service = id;
+                        this.hover = null;
+                        this.render(this.data);
+                    },
+                }, [
+                    uvEl('span', { class: 'uv-mname' }, [uvEl('b', { text: svc.name }), uvEl('span', { class: 'uv-state uv-' + state[0], text: state[1] })]),
+                    uvEl('span', { class: 'uv-mnum' }, [uvEl('b', { text: uvNum(l.used) }), ' of ' + uvNum(l.cap) + ' in the last minute']),
+                    uvEl('span', { class: 'uv-bar', role: 'meter', 'aria-valuemin': 0, 'aria-valuemax': l.cap, 'aria-valuenow': l.used, 'aria-label': svc.name + ' use' }, [
+                        uvEl('span', { class: 'uv-fill uv-' + state[0], style: 'width:' + Math.round(pct * 100) + '%' }),
+                    ]),
+                    uvEl('small', { text: Math.round(pct * 100) + '% used · ' + svc.note }),
+                ]));
+            }
+        }
+
+        renderControls() {
+            this.controlsEl.textContent = '';
+            const seg = (items, current, pick, label) => uvEl('div', { class: 'uv-seg', role: 'group', 'aria-label': label }, items.map(([id, name]) => uvEl('button', {
+                type: 'button',
+                class: id === current ? 'uv-on' : null,
+                'aria-pressed': String(id === current),
+                text: name,
+                onclick: () => pick(id),
+            })));
+            this.controlsEl.append(
+                seg(Object.entries(USAGE_SERVICES).map(([id, s]) => [id, s.name]), this.service, (id) => {
+                    this.service = id;
+                    this.hover = null;
+                    this.render(this.data);
+                }, 'Service'),
+                uvEl('div', { class: 'uv-right' }, [
+                    seg(Object.entries(USAGE_RANGES).map(([id, r]) => [id, r.name]), this.range, (id) => {
+                        this.range = id;
+                        this.hover = null;
+                        this.render(this.data);
+                    }, 'Time'),
+                    uvEl('button', { type: 'button', class: 'uv-btn', title: 'Download a .zip of the last week\'s API use and this page\'s settings, to send for a look (no key, no names)', text: 'Export API usage', onclick: () => this.exportZip() }),
+                ]),
+            );
+        }
+
+        renderChart() {
+            const { now, record } = this.data;
+            const svc = USAGE_SERVICES[this.service];
+            const range = USAGE_RANGES[this.range];
+            const s = usageSeries(record, { service: this.service, range: this.range, now });
+            this.summaryEl.textContent = s.total
+                ? uvNum(s.total) + ' requests to ' + svc.name + ' in the ' + range.name.toLowerCase() + ' · about ' + (s.perMinute >= 10 ? uvNum(s.perMinute) : s.perMinute.toFixed(1)) + ' a minute · busiest ' + range.barName + ' ' + uvNum(s.peak)
+                : 'No requests to ' + svc.name + ' in the ' + range.name.toLowerCase() + ' yet (every tab adds its own every few seconds).';
+
+            // Stacked bars: each bar's uses, biggest share of the range at the bottom.
+            const order = s.labels.map((l) => usageColour(this.service, l.id).series).filter((x, i, a) => a.indexOf(x) === i);
+            const W = 720;
+            const H = 220;
+            const pad = { l: 44, r: 8, t: 10, b: 24 };
+            const plotW = W - pad.l - pad.r;
+            const plotH = H - pad.t - pad.b;
+            // The limit line (last hour only: a bar is one minute there).
+            const cap = this.range === '1h' ? svc.perMin : null;
+            const top = Math.max(1, s.peak, cap || 0);
+            const step = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000, 50000].find((x) => top / x <= 4) || Math.ceil(top / 4);
+            const yMax = Math.ceil(top / step) * step;
+            const y = (v) => pad.t + plotH - (v / yMax) * plotH;
+            const slot = plotW / s.bars.length;
+            const barW = Math.max(2, slot - 2);
+
+            const root = uvSvg('svg', { viewBox: '0 0 ' + W + ' ' + H, class: 'uv-svg', role: 'img', 'aria-label': svc.name + ' requests per ' + range.barName + ', ' + range.name.toLowerCase() });
+            for (let v = 0; v <= yMax; v += step) {
+                root.appendChild(uvSvg('line', { x1: pad.l, x2: W - pad.r, y1: y(v), y2: y(v), class: 'uv-grid' }));
+                const t = uvSvg('text', { x: pad.l - 6, y: y(v) + 4, class: 'uv-axis', 'text-anchor': 'end' });
+                t.textContent = uvNum(v);
+                root.appendChild(t);
+            }
+            if (cap) {
+                root.appendChild(uvSvg('line', { x1: pad.l, x2: W - pad.r, y1: y(cap), y2: y(cap), class: 'uv-cap' }));
+                const t = uvSvg('text', { x: W - pad.r, y: y(cap) - 4, class: 'uv-axis', 'text-anchor': 'end' });
+                t.textContent = 'our limit ' + cap + ' a minute';
+                root.appendChild(t);
+            }
+            const labelEvery = this.range === '1h' ? 10 : this.range === '24h' ? 4 : 1;
+            s.bars.forEach((b, i) => {
+                const x = pad.l + i * slot + 1;
+                if (i % labelEvery === 0 || (this.range === '7d')) {
+                    const t = uvSvg('text', { x: x + barW / 2, y: H - 6, class: 'uv-axis', 'text-anchor': 'middle' });
+                    t.textContent = uvTime(b.start, this.range);
+                    root.appendChild(t);
+                }
+                // Folded into series, drawn bottom up with a 2px gap between segments.
+                const bySeries = {};
+                for (const [label, n] of Object.entries(b.counts)) {
+                    const k = usageColour(this.service, label).series;
+                    bySeries[k] = (bySeries[k] || 0) + n;
+                }
+                let acc = 0;
+                const segs = order.filter((k) => bySeries[k] > 0);
+                segs.forEach((k, j) => {
+                    const v = bySeries[k];
+                    const y0 = y(acc);
+                    const y1 = y(acc + v);
+                    acc += v;
+                    const h = Math.max(1, y0 - y1 - (j < segs.length - 1 ? 2 : 0));
+                    const colour = k === 'other' ? UV_OTHER_HUE : usageColour(this.service, k).colour;
+                    const last = j === segs.length - 1;
+                    root.appendChild(uvSvg('rect', { x, y: y0 - h, width: barW, height: h, fill: colour, rx: last ? Math.min(3, barW / 2) : 0 }));
+                });
+                // The hover target: the whole column, bigger than the bar.
+                const hit = uvSvg('rect', { x: pad.l + i * slot, y: pad.t, width: slot, height: plotH, class: 'uv-hit', tabindex: b.total ? 0 : -1 });
+                const show = () => {
+                    this.hover = i;
+                    this.showTip(b, i / s.bars.length);
+                };
+                const hide = () => {
+                    this.hover = null;
+                    this.tipEl.hidden = true;
+                };
+                hit.addEventListener('mouseenter', show);
+                hit.addEventListener('focus', show);
+                hit.addEventListener('mouseleave', hide);
+                hit.addEventListener('blur', hide);
+                root.appendChild(hit);
+            });
+            this.chartEl.textContent = '';
+            this.chartEl.appendChild(root);
+            // Drawn again every few seconds: the bar under the pointer keeps its (fresh) tooltip.
+            if (this.hover !== null && this.hover !== undefined && s.bars[this.hover]) this.showTip(s.bars[this.hover], this.hover / s.bars.length);
+            else this.tipEl.hidden = true;
+
+            // The table: every use, its share - also the chart's legend.
+            this.tableEl.textContent = '';
+            this.tableEl.appendChild(uvEl('thead', {}, [uvEl('tr', {}, [
+                uvEl('th', { text: 'What for' }),
+                this.service === 't' ? uvEl('th', { text: 'Lane' }) : null,
+                uvEl('th', { class: 'uv-r', text: 'Requests' }),
+                uvEl('th', { class: 'uv-r', text: 'Share' }),
+                uvEl('th', { class: 'uv-r', text: 'A minute' }),
+            ])]));
+            const body = uvEl('tbody');
+            const minutes = Math.max(1, s.total && s.perMinute ? s.total / s.perMinute : 1);
+            for (const l of s.labels) {
+                const c = usageColour(this.service, l.id);
+                body.appendChild(uvEl('tr', {}, [
+                    uvEl('td', {}, [uvEl('span', { class: 'uv-sw', style: 'background:' + c.colour }), l.name + (c.series === 'other' ? ' (grey in the chart)' : '')]),
+                    this.service === 't' ? uvEl('td', { class: 'uv-lane uv-lane-' + (l.lane || 'high'), text: UV_LANE_WORDS[l.lane || 'high'] }) : null,
+                    uvEl('td', { class: 'uv-r', text: uvNum(l.total) }),
+                    uvEl('td', { class: 'uv-r', text: Math.round(l.share * 100) + '%' }),
+                    uvEl('td', { class: 'uv-r', text: (l.total / minutes).toFixed(1) }),
+                ]));
+            }
+            if (!s.labels.length) body.appendChild(uvEl('tr', {}, [uvEl('td', { colspan: 5, class: 'uv-empty', text: 'Nothing yet.' })]));
+            this.tableEl.appendChild(body);
+        }
+
+        showTip(bar, at) {
+            if (!bar.total) {
+                this.tipEl.hidden = true;
+                return;
+            }
+            const range = USAGE_RANGES[this.range];
+            this.tipEl.textContent = '';
+            this.tipEl.appendChild(uvEl('b', { text: uvTime(bar.start, this.range) + (this.range === '7d' ? '' : ' – ' + uvTime(bar.start + range.barMs, this.range)) + ' · ' + uvNum(bar.total) }));
+            for (const [label, n] of Object.entries(bar.counts).sort((a, b) => b[1] - a[1])) {
+                this.tipEl.appendChild(uvEl('div', { class: 'uv-trow' }, [
+                    uvEl('span', { class: 'uv-sw', style: 'background:' + usageColour(this.service, label).colour }),
+                    uvEl('span', { text: (USAGE_LABELS[label] || { name: label }).name }),
+                    uvEl('b', { text: uvNum(n) }),
+                ]));
+            }
+            this.tipEl.style.left = Math.round(Math.min(0.72, Math.max(0.02, at)) * 100) + '%';
+            this.tipEl.hidden = false;
+        }
+    }
+
+    const USAGE_CSS = `
+    .uv { display: flex; flex-direction: column; gap: 14px; }
+    .uv-meters { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+    .uv-meter { display: flex; flex-direction: column; gap: 6px; padding: 12px; text-align: left; background: var(--card2); border: 1px solid var(--cline2); border-radius: 10px; color: var(--text); cursor: pointer; }
+    .uv-meter:hover { border-color: var(--muted); }
+    .uv-meter.uv-on { border-color: var(--hot-line); box-shadow: inset 0 0 0 1px var(--hot-line); }
+    .uv-mname { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
+    .uv-mnum { color: var(--muted); }
+    .uv-mnum b { color: var(--text); font-size: 20px; font-variant-numeric: tabular-nums; }
+    .uv-meter small { color: var(--muted); font-size: 12px; }
+    .uv-bar { display: block; height: 8px; border-radius: 4px; background: #333; overflow: hidden; }
+    .uv-fill { display: block; height: 100%; border-radius: 4px; background: #3987e5; }
+    .uv-fill.uv-warn { background: #c98500; }
+    .uv-fill.uv-bad { background: #e66767; }
+    .uv-state { font-size: 12px; font-weight: bold; }
+    .uv-state.uv-ok { color: var(--muted); }
+    .uv-state.uv-warn { color: #e0a530; }
+    .uv-state.uv-bad { color: #ff8a80; }
+    .uv-controls { display: flex; flex-wrap: wrap; gap: 10px; justify-content: space-between; }
+    .uv-seg { display: inline-flex; border: 1px solid var(--cline2); border-radius: 8px; overflow: hidden; }
+    .uv-seg button { padding: 6px 12px; border: 0; background: none; color: var(--muted); cursor: pointer; }
+    .uv-seg button + button { border-left: 1px solid var(--cline2); }
+    .uv-seg button.uv-on { background: var(--green-bg); color: var(--text); font-weight: bold; }
+    .uv-summary { margin: 0; color: var(--muted); }
+    .uv-right { display: inline-flex; flex-wrap: wrap; gap: 8px; }
+    .uv-btn { padding: 6px 12px; border: 1px solid var(--cline2); border-radius: 8px; background: var(--card2); color: var(--text); cursor: pointer; }
+    .uv-btn:hover { border-color: var(--muted); }
+
+    .uv-plot { position: relative; }
+    .uv-svg { display: block; width: 100%; height: auto; }
+    .uv-grid { stroke: #2f2f2f; stroke-width: 1; }
+    .uv-cap { stroke: #ff8a80; stroke-width: 1; stroke-dasharray: 4 4; }
+    .uv-axis { fill: var(--muted); font-size: 11px; font-family: Arial, Helvetica, sans-serif; }
+    .uv-hit { fill: transparent; cursor: default; }
+    .uv-hit:hover, .uv-hit:focus { fill: rgba(255, 255, 255, 0.05); outline: none; }
+    .uv-tip { position: absolute; top: 0; min-width: 200px; max-width: 280px; padding: 8px 10px; background: #111; border: 1px solid var(--cline2); border-radius: 8px; box-shadow: 0 6px 18px rgba(0, 0, 0, 0.5); pointer-events: none; font-size: 12px; }
+    .uv-tip > b { display: block; margin-bottom: 4px; }
+    .uv-trow { display: grid; grid-template-columns: 10px 1fr auto; gap: 6px; align-items: center; }
+    .uv-sw { display: inline-block; width: 10px; height: 10px; margin-right: 6px; border-radius: 2px; vertical-align: -1px; }
+    .uv-trow .uv-sw { margin: 0; }
+    .uv-table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+    .uv-table th { text-align: left; font-size: 11px; letter-spacing: 0.4px; text-transform: uppercase; color: var(--muted); padding: 6px 8px; border-bottom: 1px solid var(--cline2); }
+    .uv-table td { padding: 6px 8px; border-bottom: 1px solid var(--cline); }
+    .uv-r { text-align: right; }
+    .uv-lane { color: var(--muted); font-size: 12px; }
+    .uv-lane-high { color: var(--price); }
+    .uv-empty { color: var(--muted); }
+    `;
+
+    /* ===== src/ui/report-view.js ===== */
+    /*
+     * Settings › Report a problem (3.15, the owner: "an error log he can export
+     * in settings... write the report there, send the screenshot, and zip that
+     * along with the error log - make it similar to how Anthropic does it").
+     * Like Anthropic's own "report a problem": what happened, what you expected,
+     * what is attached - shown before anything is made - then one file. Nothing
+     * is sent anywhere: the zip is downloaded, and you send it.
+     */
+
+
+
+
+    function rvEl(tag, attrs = {}, children = []) {
+        const node = document.createElement(tag);
+        for (const [k, v] of Object.entries(attrs)) {
+            if (v === null || v === undefined || v === false) continue;
+            if (k === 'text') node.textContent = v;
+            else if (k === 'onclick') node.addEventListener('click', v);
+            else node.setAttribute(k, v === true ? '' : String(v));
+        }
+        for (const c of [].concat(children)) if (c !== null && c !== undefined && c !== false) node.appendChild(typeof c === 'string' ? document.createTextNode(c) : c);
+        return node;
+    }
+
+    const rvStamp = (ms) => {
+        const d = new Date(ms);
+        const p = (n) => String(n).padStart(2, '0');
+        return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + '-' + p(d.getHours()) + p(d.getMinutes());
+    };
+
+    /**
+     * What goes in the report zip (pure, tested): the words, the screenshots,
+     * the problem log, the API use and the page's state. No key, no player id.
+     *
+     * @param {object} r
+     * @param {string} r.happened
+     * @param {string} r.expected
+     * @param {Array<{name: string, data: Uint8Array}>} r.shots
+     * @param {Array} r.log - the problem log (core/errlog.js)
+     * @param {object} r.usage - getUsage(): {record, state}
+     * @param {object} [r.env] - {userAgent, screen}
+     * @returns {Array<{name: string, text?: string, data?: Uint8Array}>}
+     */
+    function reportFiles({ happened = '', expected = '', shots = [], log = [], usage = {}, env = {}, now = Date.now() }) {
+        const state = usage.state || {};
+        const errors = log.filter((e) => e.kind === 'error');
+        const safe = (n) => String(n || 'screenshot').replace(/[^\w.-]+/g, '_').slice(0, 60);
+        const files = [
+            { name: 'report.txt', text: [
+                'Torn Trading - problem report',
+                'Made ' + new Date(now).toString(),
+                'Script ' + (state.script || '?') + ' · ' + (env.userAgent || '') + (env.screen ? ' · screen ' + env.screen : ''),
+                '',
+                'WHAT HAPPENED',
+                happened.trim() || '(not filled in)',
+                '',
+                'WHAT I EXPECTED',
+                expected.trim() || '(not filled in)',
+                '',
+                'ATTACHED',
+                shots.length ? shots.map((s, i) => '  screenshots/' + (i + 1) + '-' + safe(s.name)).join('\n') : '  no screenshots',
+                '  problem-log.txt - ' + errors.length + ' errors and ' + (log.length - errors.length) + ' other lines, the last 7 days',
+                '  api-usage/ - every request by what it was for (see its README)',
+                '  state.json - the page\'s switches, limits and coverage',
+                '',
+                'No API key, player id or name is in these files.',
+            ].join('\n') + '\n' },
+            { name: 'problem-log.txt', text: logAsText(log) },
+            { name: 'problem-log.json', text: JSON.stringify(log) },
+            { name: 'state.json', text: JSON.stringify(state, null, 2) },
+        ];
+        shots.forEach((s, i) => files.push({ name: 'screenshots/' + (i + 1) + '-' + safe(s.name), data: s.data }));
+        for (const f of usageExportFiles(usage.record, { state, now })) files.push({ ...f, name: 'api-usage/' + f.name });
+        return files;
+    }
+
+    class ReportView {
+        /** @param {{getReport: function, onClearLog: function}} h */
+        constructor(h) {
+            this.h = h;
+            this.shots = [];
+            this.el = rvEl('div', { class: 'rv' });
+            this.happened = rvEl('textarea', { class: 'rv-text', rows: 4, placeholder: 'For example: I picked Xanax, the buyers list went empty and it said "Loading more buyers".' });
+            this.expected = rvEl('textarea', { class: 'rv-text', rows: 2, placeholder: 'For example: the traders buying Xanax.' });
+            this.fileInput = rvEl('input', { type: 'file', accept: 'image/*', multiple: true, hidden: true });
+            this.fileInput.addEventListener('change', () => this.addShots());
+            this.shotsEl = rvEl('div', { class: 'rv-shots' });
+            this.includesEl = rvEl('ul', { class: 'rv-includes' });
+            this.logEl = rvEl('pre', { class: 'rv-log', hidden: true });
+            this.statusEl = rvEl('p', { class: 'rv-status', role: 'status' });
+            this.logBtn = rvEl('button', { type: 'button', class: 'rv-link', text: 'Show the log', onclick: () => this.toggleLog() });
+            this.el.append(
+                rvEl('label', { class: 'rv-label' }, [rvEl('b', { text: 'What happened?' }), this.happened]),
+                rvEl('label', { class: 'rv-label' }, [rvEl('b', { text: 'What did you expect?' }), this.expected]),
+                rvEl('div', { class: 'rv-label' }, [
+                    rvEl('b', { text: 'Screenshots' }),
+                    rvEl('div', { class: 'rv-row' }, [rvEl('button', { type: 'button', class: 'rv-btn', text: 'Add screenshots', onclick: () => this.fileInput.click() }), rvEl('small', { text: 'Take them with Win + Shift + S, save, then add them here.' })]),
+                    this.shotsEl,
+                ]),
+                rvEl('div', { class: 'rv-label' }, [rvEl('b', { text: 'What goes in the zip' }), this.includesEl, this.logBtn, this.logEl]),
+                rvEl('div', { class: 'rv-row' }, [
+                    rvEl('button', { type: 'button', class: 'rv-btn rv-primary', text: 'Download report (.zip)', onclick: () => this.download() }),
+                    rvEl('button', { type: 'button', class: 'rv-link', text: 'Clear the log', title: 'Start the log again (after sending a report)', onclick: () => {
+                        if (this.h.onClearLog) this.h.onClearLog();
+                        this.statusEl.textContent = 'Log cleared.';
+                        this.render();
+                    } }),
+                ]),
+                this.statusEl,
+                this.fileInput,
+            );
+        }
+
+        addShots() {
+            const files = [...(this.fileInput.files || [])];
+            this.fileInput.value = '';
+            Promise.all(files.map((f) => f.arrayBuffer().then((b) => ({ name: f.name, data: new Uint8Array(b), url: URL.createObjectURL(f) })))).then((got) => {
+                this.shots.push(...got);
+                this.render();
+            });
+        }
+
+        toggleLog() {
+            this.logEl.hidden = !this.logEl.hidden;
+            this.logBtn.textContent = this.logEl.hidden ? 'Show the log' : 'Hide the log';
+            this.render();
+        }
+
+        /** What will be attached, drawn before anything is made (as Anthropic's report does). */
+        render() {
+            const r = this.h.getReport ? this.h.getReport() : { log: [] };
+            const log = r.log || [];
+            const errors = log.filter((e) => e.kind === 'error').length;
+            this.shotsEl.textContent = '';
+            this.shots.forEach((s, i) => {
+                this.shotsEl.appendChild(rvEl('span', { class: 'rv-shot' }, [
+                    rvEl('img', { src: s.url, alt: s.name }),
+                    rvEl('button', { type: 'button', class: 'rv-x', 'aria-label': 'Remove ' + s.name, text: '×', onclick: () => {
+                        URL.revokeObjectURL(s.url);
+                        this.shots.splice(i, 1);
+                        this.render();
+                    } }),
+                ]));
+            });
+            this.includesEl.textContent = '';
+            for (const line of [
+                'What you wrote above',
+                this.shots.length ? this.shots.length + (this.shots.length === 1 ? ' screenshot' : ' screenshots') : 'No screenshots yet',
+                'The problem log: ' + errors + (errors === 1 ? ' error' : ' errors') + ' and ' + (log.length - errors) + ' of your steps, the last 7 days (every tab: Torn Bids and Torn\'s pages)',
+                'API use: every request by what it was for, the last week',
+                'This page\'s version, switches and limits - no API key, no player id or name',
+            ]) this.includesEl.appendChild(rvEl('li', { text: line }));
+            if (!this.logEl.hidden) this.logEl.textContent = logAsText(log.slice(-40)) || 'Nothing logged yet.';
+        }
+
+        download() {
+            const r = this.h.getReport ? this.h.getReport() : {};
+            const now = Date.now();
+            const files = reportFiles({
+                happened: this.happened.value,
+                expected: this.expected.value,
+                shots: this.shots,
+                log: r.log || [],
+                usage: r.usage || {},
+                env: { userAgent: navigator.userAgent, screen: window.screen ? window.screen.width + 'x' + window.screen.height : '' },
+                now,
+            });
+            const zip = makeZip(files, new Date(now));
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(new Blob([zip], { type: 'application/zip' }));
+            a.download = 'torn-trading-report-' + rvStamp(now) + '.zip';
+            a.click();
+            setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+            this.statusEl.textContent = 'Saved ' + a.download + ' to your downloads. Send that file - nothing was sent by this page.';
+        }
+    }
+
+    const REPORT_CSS = `
+    .rv { display: flex; flex-direction: column; gap: 14px; }
+    .rv-label { display: flex; flex-direction: column; gap: 6px; }
+    .rv-text { width: 100%; padding: 8px 10px; border: 1px solid var(--cline2); border-radius: 8px; background: var(--card2); color: var(--text); font: inherit; resize: vertical; }
+    .rv-text:focus { outline: 2px solid var(--hot-line); outline-offset: 0; }
+    .rv-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+    .rv-row small { color: var(--muted); }
+    .rv-btn { padding: 7px 14px; border: 1px solid var(--cline2); border-radius: 8px; background: var(--card2); color: var(--text); cursor: pointer; }
+    .rv-btn:hover { border-color: var(--muted); }
+    .rv-btn.rv-primary { background: var(--price); border-color: var(--price); color: #111; font-weight: bold; }
+    .rv-link { padding: 0; border: 0; background: none; color: var(--offer); text-decoration: underline; cursor: pointer; align-self: flex-start; }
+    .rv-shots { display: flex; flex-wrap: wrap; gap: 8px; }
+    .rv-shot { position: relative; }
+    .rv-shot img { display: block; height: 72px; border-radius: 6px; border: 1px solid var(--cline2); }
+    .rv-x { position: absolute; top: 2px; right: 2px; width: 20px; height: 20px; padding: 0; border: 0; border-radius: 10px; background: rgba(0, 0, 0, 0.7); color: #fff; cursor: pointer; }
+    .rv-includes { margin: 0; padding-left: 18px; color: var(--muted); }
+    .rv-includes li::marker { content: '✓  '; color: var(--price); }
+    .rv-log { margin: 0; padding: 8px 10px; border: 1px solid var(--cline2); border-radius: 8px; background: #111; font: 11px/1.5 Consolas, monospace; white-space: pre-wrap; }
+    .rv-status { margin: 0; color: var(--muted); }
+    `;
+
     /* ===== src/ui/ledger-view.js ===== */
     /*
      * The Torn Ledger's page inside Torn Bids: what you made, and on what.
@@ -14699,6 +15896,8 @@
 
 
 
+
+
     const SELLING_PAGE_TITLE = 'Torn Bids';
 
     const SELLING_PAGE_DEFAULTS = {
@@ -15542,6 +16741,19 @@
                 },
             });
 
+            /* API use (3.15): what every request to Torn, TornW3B and TornExchange was for, over time */
+            group('API use');
+            this.usageView = new UsageView();
+            section('api', 'API use', [
+                'Every request this script sends, from every tab - Torn Bids and Torn\'s pages - by what it was for. ',
+                'Torn\'s limit is shared by everything you run with your keys, so its calls wait in lanes: what you are doing now goes first, statuses and the Ledger wait for room.',
+            ], [this.usageView.el]);
+
+            /* Report a problem (3.15): your words, screenshots, the problem log - one zip to send */
+            group('Help');
+            this.reportView = new ReportView({ getReport: () => (this.h.getReport ? this.h.getReport() : { log: [] }), onClearLog: () => this.h.onClearLog && this.h.onClearLog() });
+            section('report', 'Report a problem', 'Found a bug? Say what happened, add screenshots, and download one .zip to send. It also holds the problem log - what failed and what you did just before, in every tab - so the cause can be found without guessing. Nothing is sent anywhere by this page.', [this.reportView.el]);
+
             group('Torn Bids');
             section('flips', 'Flips', 'What Best flips and the flip plan may suggest.', [
                 field('Cash for flips', null, [
@@ -15702,6 +16914,16 @@
                 w3b: (info.w3bRead || 0) < (info.w3bKnown || 0) ? ['idle', (info.w3bRead || 0) + '/' + info.w3bKnown] : ['online', count(info.w3bTraders || 0) + ' lists'],
                 flips: p.cash > 0 ? ['online', formatMoney(p.cash) + ' · ' + (p.networthPct || 10) + '%'] : ['idle', 'no cash limit'],
                 links: ['online', p.linksNewTab !== false ? 'new tab' : 'this tab'],
+                report: (() => {
+                    const log = this.problemLog || [];
+                    const day = log.filter((e) => e.kind === 'error' && now - e.at < 86400000).length;
+                    return day ? ['idle', day + (day === 1 ? ' error' : ' errors') + ' today'] : ['online', 'no errors'];
+                })(),
+                api: (() => {
+                    const u = this.usage && this.usage.live && this.usage.live.t;
+                    if (!u) return ['idle', ''];
+                    return [u.used >= u.cap * 0.95 ? 'bad' : u.used >= u.cap * 0.8 ? 'idle' : 'online', 'Torn ' + u.used + '/' + u.cap];
+                })(),
                 ledger: (() => {
                     const L = this.state.ledger || {};
                     if (L.keyError) return ['bad', 'key refused'];
@@ -15728,10 +16950,28 @@
             this.w3bStateEl.className = 'sp-keystate' + (info.bazaarsError && !info.bazaarsAt ? ' sp-bad' : info.bazaarsAt ? ' sp-ok' : '');
         }
 
+        /** API use, drawn again every few seconds while Settings is open. */
+        renderUsage() {
+            if (!this.usageView || !this.h.getUsage) return;
+            this.usage = this.h.getUsage();
+            this.usageView.render(this.usage);
+            if (this.reportView) {
+                this.problemLog = this.h.getReport ? this.h.getReport().log || [] : [];
+                this.reportView.render();
+            }
+        }
+
         showView(view) {
             this.view = view === 'settings' || view === 'ledger' ? view : 'list';
             if (!this.root) return;
             const settings = this.view === 'settings';
+            if (settings && !this.usageTimer) {
+                this.renderUsage();
+                this.usageTimer = setInterval(() => this.renderUsage(), 5000);
+            } else if (!settings && this.usageTimer) {
+                clearInterval(this.usageTimer);
+                this.usageTimer = null;
+            }
             const ledger = this.view === 'ledger';
             const list = this.view === 'list';
             this.settingsEl.hidden = !settings;
@@ -16420,7 +17660,7 @@
             const info = this.state.info || {};
             const sig = d
                 ? JSON.stringify([
-                    d.itemId, d.name, d.held, d.avg, d.bazaars, d.buyersTotal, d.buyersLoading, d.pending, d.planWhy,
+                    d.itemId, d.name, d.held, d.avg, d.bazaars, d.buyersTotal, d.buyersLoading, d.buyersListNote, d.pending, d.planWhy,
                     d.buyers.map((b) => [b.id, b.name, b.price, b.te, b.teTop, b.teList, b.w3b, statusOf(b), b.trust ? b.trust.level + b.trust.score : '', this.state.networth && b.id ? this.state.networth.get(String(b.id)) : null, Boolean(b.favourite), b.traded || '', Boolean(b.troll), Boolean(b.lastPaidOnly)]),
                     this.justBlacklisted ? this.justBlacklisted.at : 0,
                     (d.hidden || []).map((b) => [b.tradeKey, b.price, b.hiddenBy, statusOf(b), b.trust ? b.trust.level + b.trust.score : '']),
@@ -16497,6 +17737,7 @@
             const ordered = [...d.buyers.filter((b) => !declined[b.tradeKey] && !b.troll), ...d.buyers.filter((b) => !declined[b.tradeKey] && b.troll), ...d.buyers.filter((b) => declined[b.tradeKey])];
             const rows = all ? ordered : ordered.slice(0, DESK_ROWS);
             if (d.buyersLoading) card.appendChild(spEl('p', { class: 'sp-note', text: 'Loading more buyers from TornExchange…' }));
+            else if (d.buyersListNote) card.appendChild(spEl('p', { class: 'sp-note', text: d.buyersListNote }));
             // Just blacklisted: a moment to take it back (then only the Ledger's Traders tab has Undo).
             const justOff = this.justBlacklisted && Date.now() - this.justBlacklisted.at < 15000 ? this.justBlacklisted.b : null;
             if (justOff) {
@@ -17379,7 +18620,7 @@
         }
     }
 
-    const SELLING_PAGE_CSS = LEDGER_CSS + `
+    const SELLING_PAGE_CSS = LEDGER_CSS + USAGE_CSS + REPORT_CSS + `
     :host { all: initial; }
     * { box-sizing: border-box; }
     .sp-page {
@@ -18183,7 +19424,9 @@
             }
 
             // The Item Market costs Torn API calls: only when it is watched.
-            if (settings.liveFeed && this.d.hasUsableKey()) {
+            // The Item Market side costs the shared Torn budget: only while someone
+            // is looking at it (3.15, the owner: "we rarely use the market").
+            if (settings.liveFeed && this.d.hasUsableKey() && (!this.d.wantsItemMarket || this.d.wantsItemMarket())) {
                 // Rebuilt when what counts as an exit changes (a chip), not just once.
                 const sig = [
                     settings.sellToNpc !== false,
@@ -18382,6 +19625,8 @@
                 try {
                     const market = await fetchItemMarket(this.d.torn, id, {
                         now: this.now(),
+                        tag: 't.feed',
+                        priority: 'normal',
                     });
                     const rows = normalizeItemMarketRows(market.listings);
                     const at = this.now();
@@ -18466,6 +19711,8 @@
 
 
 
+
+
     const STORE_KEY = 'apiKey';
     const STORE_ITEMS = 'itemsCache';
     const STORE_NPC = 'npcCache';
@@ -18492,6 +19739,14 @@
     const STORE_TE_IDS = 'teIds';
     /* TornExchange votes last seen per trader (a week): {id: [score, at]}. */
     const STORE_TE_VOTES = 'teVotes';
+    /* API use (3.15, core/usage.js): requests per minute by what they were for, every tab. */
+    const STORE_API_USAGE = 'apiUsage';
+    /* The problem log (3.15, core/errlog.js): what failed and what you did, every tab, a week. */
+    const STORE_PROBLEM_LOG = 'problemLog';
+    /* When a tab last showed the panel's Item Market tab (the feed's Torn calls run only then). */
+    const STORE_IM_WATCH = 'itemMarketWatch';
+    /* Each tab adds its counts to the stored record this often. */
+    const USAGE_FLUSH_MS = 10000;
     const STORE_INVENTORY = 'inventory';
     const STORE_SELL_PREFS = 'sellingPage';
     /* Our own trader database: every trader we know of, and their TornW3B list. */
@@ -18553,13 +19808,14 @@
     const LEDGER_EVERY_MS = 5 * 60 * 1000;
     /* A refused Full key's message stays this long. */
     const LEDGER_MSG_MS = 30 * 1000;
-    const LEDGER_BACKFILL_GAP_MS = 30 * 1000;
+    /* Reading back through the year: a run a minute (6 calls at most, in the low lane: 3.15). */
+    const LEDGER_BACKFILL_GAP_MS = 60 * 1000;
     const LEDGER_BACKFILL_S = 365 * 24 * 60 * 60;
 
     /* Traders' networth (public personal stats), for "could they pay": id -> {value, at}. */
     const STORE_SELL_NETWORTH = 'sellNetworth';
     /* At most this many networth lookups a minute, inside the shared 70; each kept 12 hours. */
-    const SELL_NETWORTH_PER_MIN = 10;
+    const SELL_NETWORTH_PER_MIN = 5;
     const SELL_NETWORTH_REFRESH_MS = 12 * 60 * 60 * 1000;
     const SELL_NETWORTH_RETRY_MS = 10 * 60 * 1000;
 
@@ -18643,7 +19899,7 @@
      * The viewed bazaar's owner: one public-profile call when you open it, then
      * at most once per OWNER_REFRESH_MS while you stay. A failure waits a minute.
      */
-    const OWNER_REFRESH_MS = 30000;
+    const OWNER_REFRESH_MS = 60000;
     const OWNER_RETRY_MS = 60000;
 
     /*
@@ -18653,7 +19909,7 @@
      * shared 70/min budget next to the feed's 30. Visible tab only.
      */
     const SELLER_STATUS_MAX = 10;
-    const PRESENCE_REFRESH_MS = 60000;
+    const PRESENCE_REFRESH_MS = 120000;
     const PRESENCE_RETRY_MS = 120000;
     const PRESENCE_MAX_PENDING = 3;
     /* Players not on a list this long are forgotten. */
@@ -19539,7 +20795,7 @@
         if (app.settings.saveCalls) return;
 
         owner.pending = true;
-        fetchUserPresence(app.client, ownerId)
+        fetchUserPresence(app.client, ownerId, { tag: 't.owner', priority: 'normal' })
             .then((presence) => {
                 owner.fetchedAt = Date.now();
                 if (presence) owner.presence = presence;
@@ -19633,7 +20889,7 @@
 
             pending++;
             s.pending = true;
-            fetchUserPresence(app.client, id)
+            fetchUserPresence(app.client, id, { tag: 't.sellers', priority: 'low' })
                 .then((presence) => {
                     s.fetchedAt = Date.now();
                     if (presence) s.presence = presence;
@@ -19893,7 +21149,7 @@
             if (now - (rec.imAt || 0) >= BZ_IM_TTL_MS) {
                 rec.pending = true;
                 app.bzLastFetchAt = now;
-                fetchItemMarket(app.client, id, { now })
+                fetchItemMarket(app.client, id, { now, tag: 't.bazaar', priority: 'high' })
                     .then((market) => {
                         const at = Date.now();
                         rec.imAt = at;
@@ -20226,7 +21482,7 @@
         } else if (!app.client || !hasUsableKey()) {
             return Promise.reject(new Error('Add your Public key in Settings first.'));
         } else {
-            promise = fetchItemMarket(app.client, itemId, { limit: 20 }).then((m) => {
+            promise = fetchItemMarket(app.client, itemId, { limit: 20, tag: 't.fill', priority: 'high' }).then((m) => {
                 const mine = [...ownMarketPrices(String(itemId))];
                 const rows = m.listings.map((l) => {
                     const at = mine.indexOf(l.price);
@@ -20427,6 +21683,7 @@
     function onFillPress(btn) {
         const rowEl = fillRowOf(btn);
         const itemId = btn.dataset.itemId;
+        logAction('Fill pressed (item ' + (itemId || '?') + ')' + (rowEl ? '' : ' - no row found'));
         if (!rowEl || !itemId) return;
         const now = rowItemIdNow(fillPageKind(app.ownBazaar), rowEl);
         if (now && now !== itemId) {
@@ -21119,6 +22376,7 @@
 
     /** Cancel trade on Torn's pages (the buying box, the Bought window): as in Torn Bids. */
     function onOverlayTradeCancel(key) {
+        logAction('Cancel trade (overlay)');
         // What you took at this bazaar is counted first (Next would have): it is yours to sell.
         const here = app.buyHere;
         if (here && here.trade.key === key && buyRun.firstSeen !== null) {
@@ -21141,6 +22399,7 @@
      * asks "did you buy it?"; answer (true / false) records that instead.
      */
     function onBuyNext(answer) {
+        logAction('Next bazaar' + (answer === true ? ' (said: bought)' : answer === false ? ' (said: did not buy)' : ''));
         const here = app.buyHere;
         let all = sellAccepted();
         let t = here ? all[here.trade.key] : Object.values(all).find((x) => nextStep(x));
@@ -21705,13 +22964,178 @@
         return tabWindows.get(name);
     }
 
+    /*
+     * API use (3.15): every request any client sends is counted here under what
+     * it was for, and added to the stored record (STORE_API_USAGE) every few
+     * seconds and when the page goes. Torn Bids › Settings › API use draws it.
+     */
+    let usagePending = {};
+    let usageTimer = null;
+
+    /*
+     * The problem log (3.15): each tab keeps its new lines and adds them to the
+     * stored log every few seconds and when the page goes. Settings › Report a
+     * problem puts it in the zip.
+     */
+    let logPending = [];
+    let logTimer = null;
+
+    /** Where this tab is: Torn Bids, or the Torn page (its path, never its query). */
+    function logWhere() {
+        if (typeof location === 'undefined') return '?';
+        if (isTradersPageUrl(location.href)) return 'Torn Bids';
+        return 'torn ' + location.pathname.replace(/^\//, '') + (location.hash && /^#\/?[a-z]+/i.test(location.hash) ? location.hash.match(/^#\/?[a-z]+/i)[0] : '');
+    }
+
+    /** kind: 'error' (something failed), 'action' (what you did), 'note'. */
+    function logProblem(kind, what, detail = null) {
+        logPending.push({ at: Date.now(), kind, where: logWhere(), what: logText(what), detail: detail ? logText(detail) : undefined });
+        if (!logTimer) logTimer = setTimeout(flushProblemLog, 5000);
+    }
+
+    function logAction(what) {
+        logProblem('action', what);
+    }
+
+    function flushProblemLog() {
+        if (logTimer) clearTimeout(logTimer);
+        logTimer = null;
+        if (!logPending.length) return;
+        const add = logPending;
+        logPending = [];
+        gmSet(STORE_PROBLEM_LOG, addLogEntries(gmGet(STORE_PROBLEM_LOG, null), add));
+    }
+
+    /** A request that failed for good: which service, what for, and why. */
+    function logFailed(service, x) {
+        const e = x && x.error;
+        if (e && (e.paused || e.tooSoon)) return;
+        // "No list" is an answer, not a failure: a trader without a TornW3B list (404), or unknown to TornExchange.
+        const path = String((x && x.path) || '');
+        if (service === 'w' && e && e.http === 404) return;
+        if (service === 'e' && /prices\//.test(path) && e && (e.http === 404 || e.http === 400)) return;
+        const name = (USAGE_SERVICES[service] || { name: service }).name;
+        const tag = usageTagFor(service, null, x && x.path, x && x.tag);
+        const why = (e && (e.message || e.said)) || String(e || 'failed');
+        logProblem('error', name + ' failed: ' + (USAGE_LABELS[tag] || { name: tag }).name + ' (' + String((x && x.path) || '').replace(/\d{5,}/g, 'N') + ')', why + (e && e.http ? ' [HTTP ' + e.http + ']' : '') + (e && e.code ? ' [code ' + e.code + ']' : ''));
+    }
+
+    if (typeof window !== 'undefined') {
+        window.addEventListener('pagehide', flushProblemLog);
+        // Script errors - ours only, never Torn's page's own.
+        const ours = (file, stack) => /userscript|tampermonkey|torn-?moneymaker|torn-trading|harness/i.test(String(file || '') + ' ' + String(stack || ''));
+        window.addEventListener('error', (ev) => {
+            if (!ours(ev.filename, ev.error && ev.error.stack)) return;
+            logProblem('error', 'Script error: ' + (ev.message || 'unknown'), ((ev.error && ev.error.stack) || '').split('\n').slice(0, 4).join(' | '));
+        });
+        window.addEventListener('unhandledrejection', (ev) => {
+            const r = ev.reason;
+            if (!ours('', r && r.stack)) return;
+            logProblem('error', 'Script error (promise): ' + ((r && r.message) || String(r)), ((r && r.stack) || '').split('\n').slice(0, 4).join(' | '));
+        });
+    }
+
+    /** What a request was for: its tag, else worked out from which client sent it and the path. */
+    function usageTagFor(service, who, path, tag) {
+        if (tag) return tag;
+        const p = String(path || '');
+        if (service === 'e') {
+            if (/all_best_listings/.test(p)) return 'e.top';
+            if (/active_traders/.test(p)) return 'e.active';
+            if (/best_listing/.test(p)) return 'e.one';
+            if (/listings/.test(p)) return 'e.list';
+            if (/prices\//.test(p)) return 'e.trader';
+            return 'e.other';
+        }
+        if (service === 'w') {
+            if (/^\/?marketplace\/?$/.test(p)) return 'w.summary';
+            if (/\/traders$/.test(p)) return 'w.buyers';
+            if (/pricelist/.test(p)) return 'w.lists';
+            return who === 'sell' ? 'w.desk' : 'w.feed';
+        }
+        if (who === 'led') return 't.ledger';
+        if (/personalstats/.test(p)) return 't.networth';
+        if (/inventory/.test(p)) return 't.inventory';
+        if (/itemmarket/.test(p)) return who === 'sell' ? 't.market' : 't.feed';
+        if (/^(v2\/)?user\/\d+/.test(p)) return who === 'sell' ? 't.status' : 't.sellers';
+        return 't.setup';
+    }
+
+    /** Settings › API use: the stored record with this tab's pending counts, and each limit's last minute. */
+    function usageNow(now = Date.now()) {
+        const record = usageMerge(gmGet(STORE_API_USAGE, null), usagePending, now);
+        // TornExchange has no shared window: its last minute from the record (the minute before, by the part of it still inside).
+        const m = Math.floor(now / 60000);
+        const into = (now % 60000) / 60000;
+        const sumE = (row) => Object.entries(row || {}).reduce((a, [k, n]) => a + (k.charAt(0) === 'e' ? n : 0), 0);
+        const e = Math.round(sumE(record.m[m]) + sumE(record.m[m - 1]) * (1 - into));
+        return {
+            now,
+            record,
+            version: typeof TTV2_BUILD_VERSION !== 'undefined' ? TTV2_BUILD_VERSION : null,
+            state: usageState(),
+            live: {
+                t: { used: sharedTabWindow(STORE_API_WINDOW).load().length, cap: USAGE_SERVICES.t.perMin },
+                w: { used: sharedTabWindow(STORE_W3B_WINDOW).load().length, cap: USAGE_SERVICES.w.perMin },
+                e: { used: e, cap: USAGE_SERVICES.e.perMin },
+            },
+        };
+    }
+
+    /*
+     * What the API use export says of this page (3.15, state.json): the version,
+     * the switches that change what is asked, and how much was covered. Keys only
+     * as yes / no; no player id, no name.
+     */
+    function usageState() {
+        const p = sellPrefs();
+        const info = (sell.page && sell.page.state && sell.page.state.info) || {};
+        const overlay = gmGet(STORE_SETTINGS, {}) || {};
+        return {
+            script: typeof TTV2_BUILD_VERSION !== 'undefined' ? TTV2_BUILD_VERSION : null,
+            keys: { torn: Boolean(getSellKey()), tornExchange: Boolean(getTeKey()), ledger: Boolean(getLedgerKey()), overlay: Boolean(gmGet(STORE_KEY, '')) },
+            tornBids: {
+                cash: p.cash || null, mostPerFlip: p.maxPerFlip || null, extrasPerTrade: p.extraItems || null, minProfitPct: p.minProfitPct ?? null,
+                traderCanPayPct: p.networthPct ?? null, onlineOnly: Boolean(p.onlineOnly), trustedOnly: Boolean(p.trustedOnly),
+                favourites: favouriteTraders().length, blacklisted: sellBlacklist().length,
+            },
+            overlay: { liveFeed: overlay.liveFeed !== false, saveCalls: Boolean(overlay.saveCalls), useW3b: overlay.useW3b !== false },
+            coverage: {
+                tradersKnown: info.w3bKnown ?? null, tradersRead: info.w3bRead ?? null,
+                flipsChecked: info.flipsChecked ?? null, flipsWanted: info.flipsWanted ?? null,
+                everyItemChecked: info.sweepChecked ?? null, everyItem: info.sweepTotal ?? null,
+                statusesKnown: info.statusesKnown ?? null, statusesWanted: info.statusesWanted ?? null,
+                teScanned: Object.values((sell.db && sell.db.traders) || {}).filter((t) => t && t.te && t.te.prices).length,
+            },
+        };
+    }
+
+    function recordUse(service, who, path, tag) {
+        usageAdd(usagePending, usageTagFor(service, who, path, tag));
+        if (!usageTimer) usageTimer = setTimeout(flushUsage, USAGE_FLUSH_MS);
+    }
+
+    /** This tab's counts, added to the stored record. */
+    function flushUsage() {
+        if (usageTimer) clearTimeout(usageTimer);
+        usageTimer = null;
+        if (!Object.keys(usagePending).length) return;
+        const pending = usagePending;
+        usagePending = {};
+        gmSet(STORE_API_USAGE, usageMerge(gmGet(STORE_API_USAGE, null), pending));
+    }
+    if (typeof window !== 'undefined') window.addEventListener('pagehide', flushUsage);
+
     /**
      * What every Torn API client shares with the other tabs: the pause after an
      * IP block / outage / rate block, and never a request from a hidden tab.
+     * `who`: which client (overlay / sell / led), for the API use record.
      */
-    function tornSharing() {
+    function tornSharing(who = 'app') {
         const win = sharedTabWindow(STORE_API_WINDOW);
         return {
+            onSent: (x) => recordUse('t', who, x.path, x.tag),
+            onFailed: (x) => logFailed('t', { ...x, tag: x.tag || usageTagFor('t', who, x.path, null) }),
             loadWindow: () => win.load(),
             addToWindow: (at) => win.add(at),
             loadPause: () => gmGet(STORE_TORN_PAUSE, null),
@@ -21725,15 +23149,37 @@
      * its tab is in view, unless `background` (Torn Bids, 3.14: TornW3B is not
      * Torn, and a page that sleeps while you play shows hour-old prices).
      */
-    function newW3bClient({ background = false, ...options } = {}) {
+    function newW3bClient({ background = false, who = 'app', ...options } = {}) {
         return new W3bClient({
             ...options,
+            onSent: (x) => recordUse('w', who, x.path, x.tag),
+            onFailed: (x) => logFailed('w', { ...x, tag: x.tag || usageTagFor('w', who, x.path, null) }),
             // Slots per tab (never overwritten by another tab); the 429 wait in one value.
             loadShared: () => ({ recent: sharedTabWindow(STORE_W3B_WINDOW).load(), cooldownUntil: Number(gmGet(STORE_W3B_COOLDOWN, 0)) || 0 }),
             saveShared: (state) => gmSet(STORE_W3B_COOLDOWN, state.cooldownUntil),
             addShared: (at) => sharedTabWindow(STORE_W3B_WINDOW).add(at),
             isVisible: () => background || document.visibilityState === 'visible',
         });
+    }
+
+    /*
+     * The Item Market feed spends the shared Torn budget (30 a minute), so it
+     * runs only while someone is looking at it (3.15): a visible tab with the
+     * panel open on its Item Market tab marks that in storage, and the feed's
+     * leader - whichever tab - reads the mark. Bazaar deals (TornW3B, free)
+     * keep going as before.
+     */
+    const IM_WATCH_MS = 15000;
+
+    function itemMarketWatched() {
+        const now = Date.now();
+        const here = document.visibilityState === 'visible' && app.panel && !app.panel.collapsed && activeTab() === 'itemmarket';
+        if (here) {
+            const was = Number(gmGet(STORE_IM_WATCH, 0)) || 0;
+            if (now - was > IM_WATCH_MS / 3) gmSet(STORE_IM_WATCH, now);
+            return true;
+        }
+        return now - (Number(gmGet(STORE_IM_WATCH, 0)) || 0) < IM_WATCH_MS;
     }
 
     function startLiveFeed() {
@@ -21753,6 +23199,7 @@
             isKeyDead: isKeyDeadError,
             onKeyDead: markKeyDead,
             onSummary: onW3bSummary,
+            wantsItemMarket: itemMarketWatched,
         });
 
         // Follower tabs re-render the moment the leader stores something new.
@@ -21805,7 +23252,7 @@
     function storageSizes() {
         const keys = [
             STORE_KEY, STORE_ITEMS, STORE_NPC, STORE_MANUAL_NPC, STORE_SETTINGS, STORE_KEY_ACCESS, STORE_API_WINDOW + '.tabs', STORE_W3B_WINDOW + '.tabs', STORE_TORN_PAUSE, STORE_KEY_DEAD, STORE_OPENED,
-            STORE_SELL_KEY, STORE_SELL_KEY_DEAD, STORE_SELL_KEY_ACCESS, STORE_TE_KEY, STORE_TE, STORE_TE_STATE, STORE_TE_LISTS, STORE_TE_IDS, STORE_TE_VOTES,
+            STORE_SELL_KEY, STORE_SELL_KEY_DEAD, STORE_SELL_KEY_ACCESS, STORE_TE_KEY, STORE_TE, STORE_TE_STATE, STORE_TE_LISTS, STORE_TE_IDS, STORE_TE_VOTES, STORE_API_USAGE, STORE_PROBLEM_LOG,
             STORE_INVENTORY, STORE_SELL_PREFS, STORE_TRADER_DB, STORE_TE_ONE, STORE_SELL_SELF, STORE_SELL_NETWORTH, STORE_SELL_ACCEPTED, STORE_SELL_PINNED,
             STORE_LEDGER_KEY, STORE_LEDGER_KEY_DEAD, STORE_LEDGER_SELF, STORE_LEDGER,
             STORE_FILL, STORE_FILL_OWN_IM, STORE_SELF, STORE_HISTORY, STORE_W3B_SUMMARY, FEED_STORE_KEY,
@@ -21912,6 +23359,13 @@
     const sell = {
         /* Traders' TornExchange / TornW3B badges seen so far (the Ledger's Traders tab shows them). */
         trustById: new Map(),
+        /* Every TornW3B buyer of an item (3.15, /traders): itemId -> {at, triedAt, total, traders, loading, error}. */
+        itemTraders: new Map(),
+        /* When each trader was last active, from TornW3B (free): id -> {at, name}. The status of traders Torn is not asked about. */
+        activity: new Map(),
+        /* Near-misses and every other item anyone buys (3.15): read after the possible flips. */
+        nearIds: [],
+        sweepIds: [],
         client: null,
         te: null,
         w3b: null,
@@ -22016,12 +23470,19 @@
     const SELL_PRESENCE_OPEN_REFRESH_MS = 90000;
     const SELL_PRESENCE_MAX_PENDING = 3;
     const SELL_PRESENCE_PER_MIN = 30;
+    /* The desk's rows whose status is asked of Torn (the rest: TornW3B's activity). */
+    const SELL_STATUS_DESK_ROWS = 6;
+    /* Statuses kept between reloads and tabs (3.15): {id: [presence, at]}. */
+    const STORE_SELL_PRESENCE = 'sellPresence';
+    const SELL_PRESENCE_KEEP = 400;
     /* A failed TornExchange call is not retried sooner than this. */
     const TE_RETRY_MS = 5 * 60 * 1000;
     /* Inventory is asked again after this, or on Refresh. */
-    const INVENTORY_REFRESH_MS = 15 * 60 * 1000;
+    /* Torn caches your inventory for about an hour: asking more often got the same answer (3.15). */
+    const INVENTORY_REFRESH_MS = 60 * 60 * 1000;
     /* One TornW3B price list every this often: 24 a minute at most. */
-    const W3B_LIST_STEP_MS = 2500;
+    /* The next TornW3B read is looked for this often, and at once when one ends (the client keeps the pace). */
+    const W3B_LIST_STEP_MS = 1000;
     /* The trader database is written back no more often than this (and on leaving). */
     const TRADER_DB_SAVE_MS = 60000;
     /* TornExchange's active traders (names -> ids) are used for this long. */
@@ -22055,7 +23516,7 @@
      */
     function stepTeOne() {
         if (sell.teOneBusy || !sell.queue || document.visibilityState !== 'visible') return;
-        if (!teKeyUnusable() || sell.queue.length > 0) return;
+        if (!teKeyUnusable() || !sell.queue.idle) return;
         const now = Date.now();
         const blockedUntil = Number(teState().blockedUntil) || 0;
         if (now < blockedUntil) return;
@@ -22122,7 +23583,7 @@
      */
     function stepTeOwn() {
         if (sell.teOwnBusy || !sell.queue || document.visibilityState !== 'visible') return;
-        if (!getTeKey() || teState().badKey || sell.queue.length > 0) return;
+        if (!getTeKey() || teState().badKey || !sell.queue.idle) return;
         const now = Date.now();
         if (now < (Number(teState().blockedUntil) || 0)) return;
         const lists = sellTeOwn();
@@ -22148,6 +23609,63 @@
                 sell.teOwnBusy = false;
                 renderSelling();
             });
+    }
+
+    /*
+     * Every active TornExchange trader's whole list, in turn (3.15): the top
+     * three per item hid everyone ranked 4th and lower. Only when TornExchange's
+     * line is empty (what you open goes first), at most TE_SCAN_PER_MIN a
+     * minute, each list again after TE_SCAN_MS; never read, first.
+     */
+    const TE_SCAN_PER_MIN = 3;
+    const TE_SCAN_MS = 90 * 60 * 1000;
+
+    function stepTeScan() {
+        if (sell.teScanBusy || !sell.queue || !sell.queue.idle || !getTeKey() || teState().badKey) return;
+        const now = Date.now();
+        if (now < (Number(teState().blockedUntil) || 0)) return;
+        sell.teScanAsked = (sell.teScanAsked || []).filter((t) => now - t < 60000);
+        if (sell.teScanAsked.length >= TE_SCAN_PER_MIN) return;
+        const favs = new Set(favouriteTraders(now).map((f) => f.id));
+        const black = blacklistKeys(sellBlacklist());
+        let due = null;
+        let dueAt = Infinity;
+        for (const id of new Set([...sell.idsByName.values()].map(String))) {
+            if (!/^\d+$/.test(id) || favs.has(id) || black.has('id:' + id)) continue;
+            const te = sell.db.traders[id] && sell.db.traders[id].te;
+            const at = te ? te.triedAt || te.at || 0 : 0;
+            const every = te && te.failed ? TE_SCAN_MS * 2 : TE_SCAN_MS;
+            if (te && now - at < every) continue;
+            if (at < dueAt) {
+                due = id;
+                dueAt = at;
+            }
+        }
+        if (!due) return;
+        sell.teScanBusy = true;
+        sell.teScanAsked.push(now);
+        sell.queue
+            .enqueue(() => fetchTeTraderPrices(sell.te, due))
+            .then(({ name, prices }) => {
+                recordTeScan(sell.db, due, { prices }, Date.now());
+                if (name) learnTraders([{ id: due, name, source: 'te' }]);
+            })
+            .catch(() => recordTeScan(sell.db, due, { error: true }, Date.now()))
+            .finally(() => {
+                sell.teScanBusy = false;
+                sell.dbDirty = true;
+                sell.teScanIndex = null;
+                renderSelling();
+            });
+    }
+
+    /** itemId -> [{id, name, price}] from the TornExchange lists read in turn; rebuilt when one is read (or a minute on). */
+    function teScanIndex(now) {
+        if (!sell.teScanIndex || now - (sell.teScanIndexAt || 0) > 60000) {
+            sell.teScanIndex = indexTeScanByItem(sell.db, now);
+            sell.teScanIndexAt = now;
+        }
+        return sell.teScanIndex;
     }
 
     /** Only current favourites' lists are kept (review M6: they piled up forever). */
@@ -22213,11 +23731,29 @@
 
     function sellPresenceOf(id) {
         const entry = sell.presence.get(String(id));
-        return (entry && entry.presence) || null;
+        return (entry && entry.presence) || w3bPresenceOf(id);
+    }
+
+    /*
+     * A trader Torn was not asked about (3.15): when TornW3B last saw them
+     * active, free with every item's buyer list. Online within 5 minutes, idle
+     * within 30, else offline - "Idle 12m", marked as TornW3B's in the hover.
+     */
+    function w3bPresenceOf(id, now = Date.now()) {
+        const a = sell.activity.get(String(id));
+        if (!a || !a.at) return null;
+        const age = now - a.at;
+        return { name: a.name || null, online: age < 5 * 60000 ? 'Online' : age < 30 * 60000 ? 'Idle' : 'Offline', lastActionAt: a.at, state: null, description: null, source: 'w3b' };
     }
 
     function sellStatusMap(now) {
         const out = new Map();
+        // TornW3B's last-active first; Torn's own answer, where asked, replaces it.
+        for (const id of sell.activity.keys()) {
+            if (sell.presence.get(id) && sell.presence.get(id).presence) continue;
+            const p = w3bPresenceOf(id, now);
+            if (p) out.set(id, { name: p.name, ...presenceWord(p, now), title: 'Last active ' + formatAge(now - p.lastActionAt) + ' (TornW3B)' });
+        }
         for (const [id, s] of sell.presence) {
             if (!s.presence) continue;
             const word = presenceWord(s.presence, now);
@@ -22231,6 +23767,31 @@
             }
         }
         return out;
+    }
+
+    /** Statuses read by any tab in the last SELL_PRESENCE_REFRESH_MS: not asked again on a reload (3.15). */
+    function loadSellPresence(now = Date.now()) {
+        const stored = gmGet(STORE_SELL_PRESENCE, null);
+        if (!stored || typeof stored !== 'object') return;
+        for (const [id, v] of Object.entries(stored)) {
+            if (!Array.isArray(v) || !v[0] || !(now - Number(v[1]) < SELL_PRESENCE_REFRESH_MS)) continue;
+            const s = sell.presence.get(id);
+            if (s && s.fetchedAt >= Number(v[1])) continue;
+            sell.presence.set(id, { presence: v[0], fetchedAt: Number(v[1]), pending: Boolean(s && s.pending), retryAt: 0 });
+        }
+    }
+
+    let sellPresenceTimer = null;
+    function saveSellPresenceSoon() {
+        if (sellPresenceTimer) return;
+        sellPresenceTimer = setTimeout(() => {
+            sellPresenceTimer = null;
+            const now = Date.now();
+            const merged = { ...(gmGet(STORE_SELL_PRESENCE, null) || {}) };
+            for (const [id, s] of sell.presence) if (s.presence && s.fetchedAt && !(Number((merged[id] || [])[1]) >= s.fetchedAt)) merged[id] = [s.presence, s.fetchedAt];
+            const kept = Object.entries(merged).filter(([, v]) => Array.isArray(v) && now - Number(v[1]) < SELL_PRESENCE_REFRESH_MS).sort((a, b) => b[1][1] - a[1][1]).slice(0, SELL_PRESENCE_KEEP);
+            gmSet(STORE_SELL_PRESENCE, Object.fromEntries(kept));
+        }, 5000);
     }
 
     /** Is a trader's status unknown (never answered yet)? */
@@ -22289,7 +23850,28 @@
      * summary, every bazaar of the item picked, the possible flips, and
      * traders' price lists all share those slots. Visible tab only.
      */
-    const W3B_SUMMARY_MS = 5 * 60 * 1000;
+    /* 3.15: every 2 min (was 5), and the overlay's 30 s copy is used when newer. */
+    const W3B_SUMMARY_MS = 2 * 60 * 1000;
+    /*
+     * TornW3B, used much more (3.15, the owner: "why aren't we using more of
+     * TornW3B? use more"): 60 reads a minute in view (was 24; TornW3B allows
+     * about 100 per IP, every tab together stays under 80), and the possible
+     * flips checked went from 30 to 150, plus near-misses and, with what is
+     * left, every other item anyone buys in turn.
+     */
+    const SELL_W3B_PER_MIN = 60;
+    const SELL_FLIP_CANDIDATES = 150;
+    /* An item's every-buyer list (/traders) read again after this. */
+    const W3B_BUYERS_MS = 20 * 60 * 1000;
+    /* ...and used for this long (then the price lists alone). */
+    const W3B_BUYERS_TTL_MS = 60 * 60 * 1000;
+    /* Every other item anyone buys: its bazaars read again after this (in turn, with what is left). */
+    const W3B_SWEEP_MS = 45 * 60 * 1000;
+    /* Near-misses: a bazaar at most this % over the best bid (a ratio, not money). */
+    const W3B_NEAR_PCT = 5;
+    const W3B_NEAR_MAX = 40;
+    /* A sweep read keeps this many of the cheapest listings (the rest are never the flip). */
+    const W3B_SWEEP_ROWS = 10;
     /* The item picked: its bazaars read again after this. */
     const W3B_SELECTED_MS = 2 * 60 * 1000;
     /* One trade reads at most this many of its items' bazaars (the chosen trader's first). */
@@ -22467,7 +24049,7 @@
     /* A TornW3B request that failed is not asked again before this. */
     const W3B_FAILED_RETRY_MS = 60 * 1000;
     /* Bazaar listings nobody is looking at any more are dropped after this. */
-    const W3B_BAZAARS_FORGET_MS = 30 * 60 * 1000;
+    const W3B_BAZAARS_FORGET_MS = 60 * 60 * 1000;
     /* The Item Market's cheapest listing of the item picked, read again after this. */
     const SELL_MARKET_REFRESH_MS = 2 * 60 * 1000;
 
@@ -22496,6 +24078,9 @@
         job().finally(() => {
             sell.w3bBusy = false;
             renderSelling();
+            // Hidden, the next read at once (timers are slowed there). In view, one a
+            // second (W3B_LIST_STEP_MS): back to back, 60 went in the first 20 s -
+            // all to price lists - and the flips waited out the minute (3.15 harness).
             if (document.visibilityState !== 'visible') stepW3b();
         });
     }
@@ -22518,24 +24103,76 @@
         // The trade on the desk comes before the possible flips only while you
         // work on it (core/desk.js): until then the flips are checked first.
         const pinnedIds = [...new Set(Object.values(sellPinned(now)).flatMap((t) => t.lines.map((l) => l.itemId)))];
+        const candIds = sell.candidates.map((c) => c.itemId);
         const read = nextW3bRead({
             summaryDue: now - sell.summaryAt >= W3B_SUMMARY_MS && now - sell.summaryTriedAt >= W3B_FAILED_RETRY_MS,
             picked: sell.selected,
             active: sell.tradeActive,
             live: sell.tradeLive,
             wanted: sell.tradeWanted,
-            candidates: sell.candidates.map((c) => c.itemId),
+            candidates: candIds,
             pinned: pinnedIds,
+            // Every buyer: the desk's item, what you hold, then the possible flips.
+            buyers: [...new Set([sell.selected, ...[...heldIds()].slice(0, 20), ...candIds].filter(Boolean).map(String))],
+            buyersDue: (id) => itemTradersDue(id, now),
+            near: sell.nearIds,
+            sweep: sell.sweepIds,
             // Hidden, the lists have a few reads a minute of their own at most.
             list: hidden && !backgroundListSlot(sell.w3bHiddenLists, now) ? null : nextW3bTrader(sell.db, heldIds(), now),
             turn: sell.w3bTurn,
             hidden,
-            due: (id, how) => bazaarsDue(id, how === 'desk' ? W3B_SELECTED_MS : W3B_CANDIDATE_MS, now),
+            due: (id, how) => bazaarsDue(id, how === 'desk' ? W3B_SELECTED_MS : how === 'sweep' ? W3B_SWEEP_MS : W3B_CANDIDATE_MS, now),
         });
         if (!read) return null;
         if (read.kind === 'summary') return loadBazaarSummary;
         if (read.kind === 'list') return Object.assign(() => loadW3bList(read.id), { list: true });
-        return () => loadBazaars(read.id);
+        if (read.kind === 'buyers') return () => loadItemTraders(read.id);
+        // What the read was for (the API use record), and a sweep keeps only the cheapest rows.
+        const id = String(read.id);
+        const tag = id === String(sell.selected) ? 'w.desk'
+            : sell.tradeLive.includes(id) || sell.tradeWanted.includes(id) || pinnedIds.includes(id) ? 'w.trade'
+            : candIds.includes(id) || sell.nearIds.includes(id) ? 'w.flips'
+            : 'w.sweep';
+        return () => loadBazaars(read.id, tag);
+    }
+
+    /** Is an item's every-buyer list (TornW3B /traders) due? */
+    function itemTradersDue(itemId, now) {
+        const t = sell.itemTraders.get(String(itemId));
+        if (!t) return true;
+        if (t.loading) return false;
+        if (t.error) return now - t.triedAt >= W3B_FAILED_RETRY_MS * 5;
+        return now - t.at >= W3B_BUYERS_MS;
+    }
+
+    /**
+     * Every TornW3B buyer of one item (3.15): the traders we had no list of join
+     * the database (their lists are read next), and when each was last active
+     * becomes their status, free.
+     */
+    function loadItemTraders(itemId) {
+        const id = String(itemId);
+        const prev = sell.itemTraders.get(id) || null;
+        sell.itemTraders.set(id, { ...(prev || { at: 0, traders: [], total: 0 }), loading: true, triedAt: Date.now() });
+        return fetchW3bItemTraders(sell.w3b, id)
+            .then(({ total, traders }) => {
+                const at = Date.now();
+                sell.itemTraders.set(id, { at, triedAt: at, total, traders, loading: false, error: null });
+                const found = [];
+                for (const t of traders) {
+                    if (t.lastAction) {
+                        const was = sell.activity.get(t.id);
+                        if (!was || was.at < t.lastAction) sell.activity.set(t.id, { at: t.lastAction, name: t.name });
+                    }
+                    found.push({ id: t.id, name: t.name, source: 'w3b', rating: Number.isFinite(t.up) && Number.isFinite(t.down) ? { up: t.up, down: t.down } : null });
+                }
+                learnTraders(found);
+                sell.w3bIndex = null;
+            })
+            .catch((error) => {
+                sell.itemTraders.set(id, { ...(prev || { at: 0, traders: [], total: 0 }), loading: false, triedAt: Date.now(), error: true });
+                if (error && error.blocked) sell.w3bPauseUntil = Date.now() + 60000;
+            });
     }
 
     /** One trader's TornW3B price list. */
@@ -22565,7 +24202,12 @@
                 sell.summaryError = null;
                 // Listings of items no longer picked or possible flips are let go.
                 const pinned = Object.values(sellPinned()).flatMap((t) => t.lines.map((l) => l.itemId));
-                const keep = new Set([sell.selected, ...sell.candidates.map((c) => c.itemId), ...sell.tradeWanted, ...sell.tradeLive, ...pinned]);
+                const keep = new Set([sell.selected, ...sell.candidates.map((c) => c.itemId), ...sell.nearIds, ...sell.tradeWanted, ...sell.tradeLive, ...pinned]);
+                // The overlay reads it too (its own copy every 30 s while a Torn tab is open).
+                const lowest = {};
+                for (const r of rows) if (r.lowestPrice > 0) lowest[r.itemId] = r.lowestPrice;
+                const shared = gmGet(STORE_W3B_SUMMARY, null);
+                if (!shared || !(Number(shared.fetchedAt) >= sell.summaryAt)) gmSet(STORE_W3B_SUMMARY, { fetchedAt: sell.summaryAt, lowest });
                 for (const [id, b] of sell.bazaars) {
                     if (!keep.has(id) && Date.now() - (b.at || b.triedAt || 0) > W3B_BAZAARS_FORGET_MS) sell.bazaars.delete(id);
                 }
@@ -22577,18 +24219,21 @@
     }
 
     /** Every bazaar listing of one item. */
-    function loadBazaars(itemId) {
+    function loadBazaars(itemId, tag = 'w.desk') {
         const id = String(itemId);
         const prev = sell.bazaars.get(id) || { at: 0, rows: [], error: null };
         sell.bazaars.set(id, { ...prev, loading: true, triedAt: Date.now() });
-        return fetchW3bListings(sell.w3b, id)
+        return fetchW3bListings(sell.w3b, id, { tag })
             .then(({ listings }) => {
-                const rows = normalizeW3bListings(listings);
+                let rows = normalizeW3bListings(listings);
                 const at = Date.now();
+                // A sweep read (every item in turn, 3.15): only the cheapest few are kept - the rest are never the flip.
+                const sweep = tag === 'w.sweep';
+                if (sweep) rows = [...rows].sort((a, b) => a.price - b.price).slice(0, W3B_SWEEP_ROWS);
                 // How fast it sells: what left the bazaars since the last read.
                 const suspect = rows.length === 0 && (prev.rows || []).length > 0;
-                if (prev.at && at - prev.at <= SELL_MOVES_GAP_MS && !suspect) noteMovement(id, unitsMoved(prev.rows, rows, (listings || []).length >= 100), at - prev.at, at);
-                sell.bazaars.set(id, { at, triedAt: at, rows, error: null, loading: false });
+                if (!sweep && !prev.sweep && prev.at && at - prev.at <= SELL_MOVES_GAP_MS && !suspect) noteMovement(id, unitsMoved(prev.rows, rows, (listings || []).length >= 100), at - prev.at, at);
+                sell.bazaars.set(id, { at, triedAt: at, rows, error: null, loading: false, sweep });
             })
             .catch((error) => {
                 sell.bazaars.set(id, { ...prev, triedAt: Date.now(), error: 'TornW3B did not answer. Trying again soon.', loading: false });
@@ -22610,7 +24255,7 @@
 
         sell.marketBusy = true;
         sell.market.set(id, { ...(m || { at: 0, lowest: null }), loading: true, triedAt: now });
-        fetchItemMarket(sell.client, id, { limit: 5 })
+        fetchItemMarket(sell.client, id, { limit: 5, tag: 't.market', priority: 'high' })
             .then((r) => {
                 const lowest = r.listings.length ? Math.min(...r.listings.map((l) => l.price)) : null;
                 // How many are listed near that price: Where to sell counts no more than that.
@@ -22666,7 +24311,7 @@
      * trader database's TornW3B lists. Answers are kept per item for one pass.
      * The traders page and the panel's bazaar tags both use it.
      */
-    function buyerLookup({ teMap, lists, teOne, idsByName, db, w3bByItem, dbIdsByName, teOwn = new Map(), votes = new Map() }) {
+    function buyerLookup({ teMap, lists, teOne, idsByName, db, w3bByItem, dbIdsByName, teOwn = new Map(), votes = new Map(), itemTraders = null, now = Date.now() }) {
         // TornExchange's votes for the trust badge, from every answer we have,
         // then the ones remembered from earlier answers.
         const votesById = votesByTrader([
@@ -22692,6 +24337,11 @@
                     dbIdsByName,
                     votesById,
                     teOwn: teOwn.get(id) || null,
+                    // Every TornW3B buyer of it, when read within the hour (3.15).
+                    w3bItem: (() => {
+                        const it = itemTraders && itemTraders.get(id);
+                        return it && it.at && now - it.at < W3B_BUYERS_TTL_MS ? it.traders : null;
+                    })(),
                 });
                 cache.set(id, b);
             }
@@ -22739,7 +24389,14 @@
         const favsNow = favouriteTraders(now);
         const ownLists = sellTeOwn();
         const ownByItem = teOwnByItem(now, { favs: favsNow, lists: ownLists });
-        const buyersAll = buyerLookup({ teMap, lists: sell.lists, teOne: sell.teOne, idsByName: sell.idsByName, db: sell.db, w3bByItem, dbIdsByName: sell.dbIdsByName, teOwn: ownByItem, votes: sell.votes || new Map() });
+        // Every active TornExchange trader's list read in turn (3.15), beside your favourites' own.
+        for (const [itemId, list] of teScanIndex(now)) {
+            const have = ownByItem.get(itemId) || [];
+            const seen = new Set(have.map((r) => String(r.id)));
+            const add = list.filter((r) => !seen.has(String(r.id)));
+            if (add.length) ownByItem.set(itemId, [...have, ...add]);
+        }
+        const buyersAll = buyerLookup({ teMap, lists: sell.lists, teOne: sell.teOne, idsByName: sell.idsByName, db: sell.db, w3bByItem, dbIdsByName: sell.dbIdsByName, teOwn: ownByItem, votes: sell.votes || new Map(), itemTraders: sell.itemTraders, now });
         const levelOf = (id) => presenceLevel(sellPresenceOf(id));
         // Trusted means Known (20+ votes) or Trusted; while TornExchange's votes
         // are not loaded, a trader without any is kept ("no votes yet").
@@ -22800,6 +24457,17 @@
             heldQty.set(id, Math.max(heldQty.get(id) || 0, n));
             const l = leftovers.find((x) => String(x.itemId) === id);
             if (!heldNames.has(id) && l && l.name) heldNames.set(id, l.name);
+        }
+        // The overlay's summary copy (every 30 s while a Torn tab is open), when newer (3.15).
+        const sharedSummary = gmGet(STORE_W3B_SUMMARY, null);
+        if (sell.summary && sharedSummary && Number(sharedSummary.fetchedAt) > sell.summaryAt && sharedSummary.lowest) {
+            const next = new Map();
+            for (const [id, row] of sell.summary) {
+                const low = Number(sharedSummary.lowest[id]);
+                next.set(id, low > 0 && low !== row.lowestPrice ? { ...row, lowestPrice: low } : row);
+            }
+            sell.summary = next;
+            sell.summaryAt = Number(sharedSummary.fetchedAt);
         }
         const summary = sell.summary || new Map();
         const itemOf = (id) => (sell.index && sell.index.byId ? sell.index.byId.get(String(id)) : null);
@@ -22896,9 +24564,20 @@
         };
 
         // Which items' bazaars to read for a flip: where a buyer you would sell
-        // to pays more than the summary's cheapest.
+        // to pays more than the cheapest bazaar. 3.15: the cheapest as last read
+        // (the summary lags: an item whose cheap listing already sold kept its
+        // place and pushed real flips out), unless the summary is newer and
+        // cheaper (a new listing); 150 of them, not 30.
+        const effective = new Map();
+        for (const [id, row] of summary) {
+            const b = sell.bazaars.get(String(id));
+            const read = b && b.at && now - b.at < W3B_CANDIDATE_MS * 2 ? lowestOf(id) : null;
+            const lowest = read > 0 && !(sell.summaryAt > b.at && row.lowestPrice > 0 && row.lowestPrice < read) ? read : b && b.at && !(read > 0) && !(sell.summaryAt > b.at) ? null : row.lowestPrice;
+            effective.set(id, lowest === row.lowestPrice ? row : { ...row, lowestPrice: lowest });
+        }
+        const withBid = [];
         sell.candidates = sell.summary
-            ? flipCandidates(summary, (id, lowest) => {
+            ? flipCandidates(effective, (id, lowest) => {
                 // The buyer who would make the most at the summary's price, with their cap.
                 let pick = null;
                 let score = -Infinity;
@@ -22910,9 +24589,24 @@
                         pick = b;
                     }
                 }
+                if (pick) withBid.push(String(id));
                 return pick ? { price: pick.price, maxUnits: pick.maxUnits || null } : null;
-            }, { cash: prefs.cash, maxUnits: prefs.maxPerFlip, minPct: prefs.minProfitPct })
+            }, { cash: prefs.cash, maxUnits: prefs.maxPerFlip, minPct: prefs.minProfitPct, limit: SELL_FLIP_CANDIDATES })
             : [];
+        // Near-misses, then every other item someone buys, oldest read first (3.15).
+        const candSet = new Set(sell.candidates.map((c) => c.itemId));
+        const bestBidOf = (id) => {
+            const b = flipBuyersOf(id)[0];
+            return b ? b.price : null;
+        };
+        sell.nearIds = sell.summary ? nearMisses(summary, bestBidOf, { pct: W3B_NEAR_PCT, limit: W3B_NEAR_MAX, exclude: candSet }) : [];
+        const nearSet = new Set(sell.nearIds);
+        const readAt = (id) => {
+            const b = sell.bazaars.get(id);
+            return b ? b.at || 0 : 0;
+        };
+        sell.sweepIds = withBid.filter((id) => !candSet.has(id) && !nearSet.has(id)).sort((a, b) => readAt(a) - readAt(b));
+        const sweepChecked = withBid.filter((id) => now - readAt(id) < W3B_SWEEP_MS).length;
         const flipsChecked = sell.candidates.filter((c) => {
             const b = sell.bazaars.get(c.itemId);
             return b && b.at && now - b.at < W3B_CANDIDATE_MS * 2;
@@ -23369,7 +25063,7 @@
             const s = summary.get(pick);
             const item = itemOf(pick);
             const load = sell.listState.get(pick) || {};
-            const statusPending = prefs.onlineOnly && buyersAll(pick).some((x) => x.id && presenceUnknown(x.id));
+            const statusPending = prefs.onlineOnly && buyersAll(pick).slice(0, SELL_STATUS_DESK_ROWS).some((x) => x.id && presenceUnknown(x.id));
             desk = {
                 itemId: pick,
                 name: nameOf(pick),
@@ -23379,6 +25073,7 @@
                 buyers,
                 buyersTotal: buyers.length,
                 buyersLoading: Boolean(load.loading),
+                buyersListNote: !load.loading && load.error && now < (load.retryAt || 0) ? load.error : null,
                 hidden,
                 pending: !buyers.length && !hidden.length && (pendingFor(pick) || statusPending),
                 sellers: {
@@ -23493,6 +25188,8 @@
                 bazaarsError: sell.summaryError,
                 flipsChecked,
                 flipsWanted: sell.candidates.length,
+                sweepChecked,
+                sweepTotal: withBid.length,
                 statusesKnown,
                 statusesWanted: watch.ids.length,
             },
@@ -23525,12 +25222,22 @@
             seen.add(id);
             ids.push(id);
         };
-        if (desk) buyersAll(desk.itemId).forEach((b) => push(b, true));
+        /*
+         * Only the traders you can see or are about to deal with (3.15, the
+         * friend: "it maxes out"): every buyer of every item you hold made up to
+         * 30 profile calls a minute. The rest show what TornW3B says of them
+         * ("Idle 12m", free) - see sellStatusMap.
+         */
+        if (desk) {
+            const T = desk.trade;
+            const planned = T && (T.accepted || T.chosen) ? String((T.accepted || T.chosen).key || '') : '';
+            buyersAll(desk.itemId).forEach((b, i) => {
+                if (i < SELL_STATUS_DESK_ROWS || (b.id && planned === 'id:' + b.id)) push(b, true);
+            });
+        }
         for (const f of strip) push(f.buyer);
-        const lists = held.map((id) => buyersAll(id));
-        const depth = Math.max(0, ...lists.map((l) => l.length));
-        for (let i = 0; i < depth; i++) for (const l of lists) push(l[i]);
-        for (const r of listed.slice(0, 20)) push(r.best);
+        for (const id of held) push(buyersAll(id)[0]);
+        for (const r of listed.slice(0, 10)) push(r.best);
         return { ids, open };
     }
 
@@ -23583,8 +25290,12 @@
             sell.inventoryAt = Date.now();
             sell.keyError = null;
 
-            const access = await fetchKeyAccess(sell.client);
-            if (access && access.level !== null) gmSet(STORE_SELL_KEY_ACCESS, access);
+            // What the key may do: read once (it was checked when saved), not with every inventory.
+            let access = gmGet(STORE_SELL_KEY_ACCESS, null);
+            if (!access || access.level === null || access.level === undefined) {
+                access = await fetchKeyAccess(sell.client);
+                if (access && access.level !== null) gmSet(STORE_SELL_KEY_ACCESS, access);
+            }
             if (isFullKey(access)) sell.keyError = 'This key has Full access. A Limited key is enough here - and only a Limited key can be used for TornExchange.';
         } catch (error) {
             sell.keyError = sellKeyErrorText(error);
@@ -23737,7 +25448,8 @@
         }
 
         sell.listState.set(id, { loading: true, error: null, at: now, retryAt: 0 });
-        fetchTeListings(sell.te, id, { schedule: (fn) => sell.queue.enqueue(fn) })
+        // The item you opened goes ahead of background reads, and stops if you leave it (3.15).
+        fetchTeListings(sell.te, id, { schedule: (fn) => sell.queue.enqueue(fn, { urgent: true }), keepGoing: () => String(sell.selected) === id })
             .then(({ traders }) => {
                 gmSet(STORE_TE_LISTS, writeTeItemList(gmGet(STORE_TE_LISTS, null), id, traders));
                 sell.lists.set(id, { at: Date.now(), traders });
@@ -23746,7 +25458,8 @@
             .catch((error) => {
                 const at = Date.now();
                 const retryAt = error && error.http === 429 ? at + (error.retryAfterMs || TE_RETRY_MS) : at + TE_RETRY_MS;
-                sell.listState.set(id, { loading: false, error: null, at, retryAt });
+                // Said on the desk, not just gone (the friend: "loading more buyers" then nothing).
+                sell.listState.set(id, { loading: false, error: 'TornExchange did not send its full list; trying again after ' + new Date(retryAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) + '.', at, retryAt });
             })
             .finally(() => renderSelling());
     }
@@ -23803,7 +25516,8 @@
             fetchNetworth(sell.client, id)
                 .then((value) => {
                     if (value === null) {
-                        rec.retryAt = Date.now() + SELL_NETWORTH_RETRY_MS;
+                        // They do not show it: asking every 10 min changes nothing (3.15).
+                        rec.retryAt = Date.now() + SELL_NETWORTH_REFRESH_MS;
                         return;
                     }
                     rec.value = value;
@@ -23847,11 +25561,12 @@
             pending++;
             sell.presenceAsked.push(now);
             s.pending = true;
-            fetchUserPresence(sell.client, id)
+            fetchUserPresence(sell.client, id, { tag: 't.status', priority: 'low' })
                 .then((presence) => {
                     s.fetchedAt = Date.now();
                     if (presence) {
                         s.presence = presence;
+                        saveSellPresenceSoon();
                         // TornW3B lists carry no name; Torn's profile does.
                         if (presence.name) learnTraders([{ id, name: presence.name }]);
                     } else {
@@ -24018,6 +25733,7 @@
     }
 
     function onSellRefresh() {
+        logAction('Refresh (Torn Bids)');
         for (const s of sell.presence.values()) s.fetchedAt = 0;
         // Lists of traders buying what you hold are read again first.
         const held = heldIds();
@@ -24041,6 +25757,7 @@
      * are asked for straight away (each through its own paced queue).
      */
     function onSellSelect(itemId) {
+        logAction('Picked item ' + itemId + ' (' + (sell.index && sell.index.byId && sell.index.byId.get(String(itemId)) ? sell.index.byId.get(String(itemId)).name : '?') + ')');
         sell.selected = String(itemId);
         sell.pickedByYou = true;
         loadTeItemList(sell.selected);
@@ -24080,9 +25797,11 @@
     function bootSellingPage() {
         sell.client = new TornApiClient({
             getKey: getSellKey,
-            ...tornSharing(),
+            ...tornSharing('sell'),
         });
         loadSellNetworth();
+        loadSellPresence();
+        gmOnChange(STORE_SELL_PRESENCE, () => loadSellPresence());
         /*
          * The pace and any penalty wait live in storage, shared by every tab:
          * a reload or a second traders tab carries on from the same clock.
@@ -24091,6 +25810,8 @@
             getKey: getTeKey,
             loadState: () => teState(),
             saveState: (state) => setTeState(state),
+            onSent: (x) => recordUse('e', 'sell', x.path, x.tag),
+            onFailed: (x) => logFailed('e', x),
         });
         // TornExchange and TornW3B keep going in the background (3.14, the
         // owner: "can we do it automatically?"): they are not Torn, and a page
@@ -24102,7 +25823,7 @@
             onSettled: onTeSettled,
         });
         // Its own TornW3B budget, well under TornW3B's 100 a minute per IP.
-        sell.w3b = newW3bClient({ maxPerMinute: 24, background: true });
+        sell.w3b = newW3bClient({ maxPerMinute: SELL_W3B_PER_MIN, background: true, who: 'sell' });
         sell.keyDead = Boolean(gmGet(STORE_SELL_KEY_DEAD, false));
         if (sell.keyDead) sell.keyError = 'Torn rejected this key. Paste a new Limited key.';
 
@@ -24155,6 +25876,7 @@
             // One trade: the trader picked for an item, a row ticked / its number,
             // and what you keep of your own (remembered in the prefs).
             onTradePick: (itemId, key) => {
+                logAction('Plan trade on item ' + itemId);
                 sell.tradePick.set(String(itemId), key);
                 sell.selected = String(itemId);
                 sell.pickedByYou = true;
@@ -24211,6 +25933,7 @@
                 renderSellingNow();
             },
             onTradeAccept: (itemId) => {
+                logAction('Pressed accepted (item ' + itemId + ')');
                 const t = sell.lastTrade && sell.lastTrade.chosen;
                 if (!t) return;
                 const all = sellAccepted();
@@ -24264,6 +25987,7 @@
             // Traded (done), or back to the live plan: the frozen trade goes. Done
             // keeps what they did not take, to sell elsewhere.
             onTradeClose: (key, done) => {
+                logAction(done ? 'Traded - done' : 'Back to the live plan');
                 const all = sellAccepted();
                 if (done && all[key]) {
                     const left = leftoversOf(all[key]);
@@ -24285,6 +26009,7 @@
             },
             // Cancel trade: they accepted, then it was called off - the plan is gone.
             onTradeCancel: (key) => {
+                logAction('Cancel trade (Torn Bids)');
                 cancelSellAccepted(key);
                 takeSellCancelled();
                 renderSellingNow();
@@ -24309,6 +26034,7 @@
             // trade only, the same trader's other trades stay - and the desk goes
             // on to the next flip (the owner, 2026-09-28).
             onTradeDecline: (key) => {
+                logAction('Declined (item ' + sell.selected + ')');
                 const item = sell.selected;
                 if (!item) return;
                 setSellDeclined(declineKey(item, key), Date.now() + TRADE_DECLINE_MS);
@@ -24359,6 +26085,12 @@
                 renderSelling();
             },
             onOpenUrl: openSellLink,
+            getUsage: usageNow,
+            getReport: () => ({ log: addLogEntries(gmGet(STORE_PROBLEM_LOG, null), logPending), usage: usageNow() }),
+            onClearLog: () => {
+                logPending = [];
+                gmSet(STORE_PROBLEM_LOG, []);
+            },
         });
         sell.page.mount();
 
@@ -24419,6 +26151,7 @@
         setInterval(stepW3b, W3B_LIST_STEP_MS);
         setInterval(stepTeOne, TE_ONE_STEP_MS);
         setInterval(stepTeOwn, TE_ONE_STEP_MS);
+        setInterval(stepTeScan, TE_ONE_STEP_MS);
 
         // Another Torn Bids tab saved, forgot or read: take its word for it.
         gmOnChange(STORE_LEDGER_KEY, () => {
@@ -24434,7 +26167,7 @@
         });
         led.client = new LedgerClient({
             getKey: getLedgerKey,
-            ...tornSharing(),
+            ...tornSharing('led'),
         });
         // The rows come from IndexedDB (async); the first run waits for them.
         loadLedgerStore().then(() => {

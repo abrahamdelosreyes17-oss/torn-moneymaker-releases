@@ -81,7 +81,13 @@ export class W3bClient {
         sleep = w3bSleep,
         isVisible = () => true,
         addShared = null,
+        onSent = null,
+        onFailed = null,
     } = {}) {
+        /** ({path, tag}) => void, each request that leaves: the usage record (3.15). */
+        this.onSent = onSent;
+        /** ({path, tag, error}) => void, a request that failed: the problem log (3.15). */
+        this.onFailed = onFailed;
         this.addShared = addShared;
         this.sleep = sleep;
         this.isVisible = isVisible;
@@ -193,15 +199,24 @@ export class W3bClient {
         return url;
     }
 
-    /** GET one TornW3B path. Serialised, rate-limited, never keyed. */
-    get(path) {
-        const run = () => this.execute(path);
+    /** GET one TornW3B path. Serialised, rate-limited, never keyed. `tag`: what it is for (the usage record). */
+    get(path, { tag = null } = {}) {
+        const run = () => this.execute(path, tag).catch((error) => {
+            if (this.onFailed) {
+                try {
+                    this.onFailed({ path, tag, error });
+                } catch {
+                    // The log is best-effort.
+                }
+            }
+            throw error;
+        });
         const promise = this.chain.catch(() => {}).then(run);
         this.chain = promise.catch(() => {});
         return promise;
     }
 
-    async execute(path) {
+    async execute(path, tag = null) {
         if (this.now() < this.blockedUntil()) {
             throw new W3bError('TornW3B is rate limiting us; paused briefly.', {
                 blocked: true,
@@ -215,6 +230,14 @@ export class W3bClient {
             throw new W3bError('TornW3B is rate limiting us; paused briefly.', {
                 blocked: true,
             });
+        }
+
+        if (this.onSent) {
+            try {
+                this.onSent({ path, tag });
+            } catch {
+                // The usage record is best-effort.
+            }
         }
 
         let response;
@@ -258,8 +281,8 @@ export class W3bClient {
  * @returns {Promise<Array<{itemId: string, name: string, lowestPrice: number|null,
  *   marketPrice: number|null, bazaarAverage: number|null, totalBazaars: number}>>}
  */
-export async function fetchW3bSummary(client) {
-    const data = await client.get('marketplace');
+export async function fetchW3bSummary(client, { tag = 'w.summary' } = {}) {
+    const data = await client.get('marketplace', { tag });
     const items = data && Array.isArray(data.items) ? data.items : null;
 
     if (!items) throw new W3bError('TornW3B returned no item summary.');
@@ -286,10 +309,10 @@ export async function fetchW3bSummary(client) {
  *
  * @returns {Promise<{listings: Array, total: number}>} raw listing objects
  */
-export async function fetchW3bListings(client, itemId) {
+export async function fetchW3bListings(client, itemId, { tag = null } = {}) {
     const path = 'marketplace/' + encodeURIComponent(String(itemId));
 
-    let data = await client.get(path);
+    let data = await client.get(path, { tag });
 
     const empty = (d) =>
         d &&
@@ -297,11 +320,41 @@ export async function fetchW3bListings(client, itemId) {
         Array.isArray(d.listings) &&
         d.listings.length === 0;
 
-    if (empty(data)) data = await client.get(path);
+    if (empty(data)) data = await client.get(path, { tag });
 
     return {
         listings: data && Array.isArray(data.listings) ? data.listings : [],
         total: Number(data && data.total_listings) || 0,
+    };
+}
+
+/**
+ * Every TornW3B buyer of one item (3.15): GET /api/marketplace/{id}/traders,
+ * highest price first, at most 100 (`total_count` says how many there are:
+ * 412 for Xanax on 2026-09-29, against ~290 lists we had read). Each comes
+ * with their rating and when they were last active - free, where a Torn
+ * profile call per trader cost the shared 70/min.
+ *
+ * @returns {Promise<{total: number, traders: Array<{id, name, price, up, down, lastAction, lastTrade, listAt}>}>}
+ */
+export async function fetchW3bItemTraders(client, itemId, { tag = 'w.buyers' } = {}) {
+    const data = await client.get('marketplace/' + encodeURIComponent(String(itemId)) + '/traders', { tag });
+    const rows = data && Array.isArray(data.traders) ? data.traders : [];
+    const sec = (x) => (Number(x) > 0 ? Number(x) * 1000 : null);
+    return {
+        total: Number(data && data.total_count) || rows.length,
+        traders: rows
+            .filter((t) => t && Number(t.player_id) > 0 && Number(t.price) > 0)
+            .map((t) => ({
+                id: String(t.player_id),
+                name: t.player_name ? String(t.player_name) : null,
+                price: Number(t.price),
+                up: t.rating && Number.isFinite(Number(t.rating.upvotes)) ? Number(t.rating.upvotes) : null,
+                down: t.rating && Number.isFinite(Number(t.rating.downvotes)) ? Number(t.rating.downvotes) : null,
+                lastAction: sec(t.last_action),
+                lastTrade: sec(t.last_trade),
+                listAt: sec(t.pricelist_updated),
+            })),
     };
 }
 

@@ -229,3 +229,22 @@ test('a Public or Minimal key never replaces the Limited key: refused with the r
     assert.equal(keyTooLowForInventory({ access_level: 0 }), null, 'custom keys pass');
     assert.equal(keyTooLowForInventory(null), null, 'no answer: not refused on a guess');
 });
+
+test('priority lanes: with the shared window nearly full, a low call waits and an urgent one goes first (3.15)', async () => {
+    const fetchImpl = recordingFetch(async () => jsonResponse({ ok: 1 }));
+    // Every tab together has used 60 of 70 this minute.
+    let others = Array.from({ length: 60 }, () => Date.now());
+    const sent = [];
+    const client = makeClient(fetchImpl, { loadWindow: () => [...others], addToWindow: () => {}, onSent: (x) => sent.push(x.tag) });
+    const low = client.get('user/5/profile', {}, { tag: 'status', priority: 'low' });
+    const high = client.get('market/1/itemmarket', {}, { tag: 'fill', priority: 'high' });
+    await high;
+    assert.deepEqual(sent, ['fill'], 'the status check (low lane: needs 20 free) has not gone yet');
+    // The window empties: the low call goes too.
+    others = [];
+    await low;
+    assert.deepEqual(sent, ['fill', 'status']);
+    assert.equal(client.laneLimit(0), 50);
+    assert.equal(client.laneLimit(1), 65);
+    assert.equal(client.laneLimit(2), 70);
+});

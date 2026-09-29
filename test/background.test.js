@@ -11,12 +11,12 @@ import { profileIdOf } from '../src/sources/route.js';
 
 test('in the background, a few TornW3B reads a minute - never the in-view pace', () => {
     const now = 1_000_000;
-    const recent = Array.from({ length: W3B_HIDDEN_PER_MIN }, (_, i) => now - i * 2000);
+    const recent = Array.from({ length: W3B_HIDDEN_PER_MIN }, (_, i) => now - i * 1000);
     assert.equal(backgroundSlot(recent, now), false, 'the minute is full');
     assert.equal(backgroundSlot(recent.slice(1), now), true);
     assert.equal(backgroundSlot(recent, now + 60000), true, 'a minute later: room again');
     assert.equal(backgroundSlot(null, now), true);
-    assert.ok(W3B_HIDDEN_PER_MIN < 24, 'below the in-view 24 a minute');
+    assert.ok(W3B_HIDDEN_PER_MIN < 60, 'below the in-view 60 a minute (3.15: 24 before)');
 });
 
 import { nextW3bRead } from '../src/core/desk.js';

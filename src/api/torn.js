@@ -283,11 +283,12 @@ export const ITEM_MARKET_MIN_RECHECK_MS = 10000;
 export async function fetchItemMarket(
     client,
     itemId,
-    { limit = 20, offset = 0, now = Date.now() } = {},
+    { limit = 20, offset = 0, now = Date.now(), tag = null, priority = 'high' } = {},
 ) {
     const data = await client.get(
         'v2/market/' + encodeURIComponent(String(itemId)) + '/itemmarket',
         { limit, offset },
+        { tag, priority },
     );
 
     const market = (data && data.itemmarket) || {};
@@ -352,12 +353,13 @@ export function parseUserPresence(data) {
  * Public data (what their profile shows anyone); a Public key can read it.
  * Tries v2 first, then v1; a dead key or rate limit is not retried.
  */
-export async function fetchUserPresence(client, userId) {
+export async function fetchUserPresence(client, userId, { tag = null, priority = 'low' } = {}) {
     const id = String(userId).replace(/\D/g, '');
     if (!id) return null;
+    const use = { tag, priority };
 
     try {
-        return parseUserPresence(await client.get('v2/user/' + id + '/profile'));
+        return parseUserPresence(await client.get('v2/user/' + id + '/profile', {}, use));
     } catch (error) {
         const code = error && error.code;
         if (
@@ -367,7 +369,7 @@ export async function fetchUserPresence(client, userId) {
         ) {
             throw error;
         }
-        return parseUserPresence(await client.get('user/' + id, { selections: 'profile' }));
+        return parseUserPresence(await client.get('user/' + id, { selections: 'profile' }, use));
     }
 }
 
@@ -380,10 +382,10 @@ export async function fetchUserPresence(client, userId) {
  *
  * @returns {Promise<number|null>} null when Torn gives no number
  */
-export async function fetchNetworth(client, userId) {
+export async function fetchNetworth(client, userId, { priority = 'low' } = {}) {
     const id = String(userId).replace(/\D/g, '');
     if (!id) return null;
-    const data = await client.get('v2/user/' + id + '/personalstats', { cat: 'networth' });
+    const data = await client.get('v2/user/' + id + '/personalstats', { cat: 'networth' }, { tag: 't.networth', priority });
     return parseNetworth(data);
 }
 
@@ -433,7 +435,7 @@ async function fetchInventoryPages(client, params, limit) {
     for (let page = 0; page < 40; page += 1) {
         let data;
         try {
-            data = await client.get('v2/user/inventory', { ...params, limit, offset });
+            data = await client.get('v2/user/inventory', { ...params, limit, offset }, { tag: 't.inventory', priority: 'normal' });
         } catch (error) {
             if (error && Number(error.code) === TORN_ERROR_ACCESS_LEVEL) {
                 throw new TornApiError('This key cannot read your inventory: it needs Limited access.', {

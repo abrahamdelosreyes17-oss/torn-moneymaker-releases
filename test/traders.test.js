@@ -622,3 +622,30 @@ test('hiddenBuyers: what Buyers online only / Trusted buyers only leave out, and
     assert.deepEqual(hiddenBuyers(b, { prefs: { trustedOnly: true }, levelOf, votesMissing: true }).map((x) => x.name), ['B']);
     assert.deepEqual(hiddenBuyers(b, { prefs: {}, levelOf }), []);
 });
+
+test('TornW3B /traders: a buyer we had no list of counts, with their rating; its price is the newest (3.15)', () => {
+    const db = { traders: { 11: { name: 'Bob', w3b: { found: true, at: 1, prices: { 206: 840000 } } } } };
+    const out = buyersForItem('206', {
+        db,
+        w3bByItem: new Map([['206', [{ id: '11', price: 840000 }]]]),
+        w3bItem: [{ id: '11', name: 'Bob', price: 845000, up: 300, down: 2 }, { id: '99', name: 'NewGuy', price: 847300, up: 69, down: 5 }],
+    });
+    assert.deepEqual(out.map((b) => [b.name, b.price]), [['NewGuy', 847300], ['Bob', 845000]]);
+    assert.equal(out[0].trust.level, 'Known', 'rated from TornW3B: 64 up');
+});
+
+import { recordTeScan, indexTeScanByItem, TE_SCAN_MAX_AGE_MS } from '../src/core/traders.js';
+
+test('TornExchange lists read in turn (3.15): a trader 4th on TornExchange is a buyer too, for 6 hours', () => {
+    const db = { traders: { 44: { name: 'Carol' } } };
+    recordTeScan(db, '44', { prices: [{ itemId: '206', price: 846000 }, { itemId: '1', price: 0 }] }, 1000);
+    recordTeScan(db, '45', { error: true }, 1000);
+    const idx = indexTeScanByItem(db, 2000);
+    assert.deepEqual(idx.get('206'), [{ id: '44', name: 'Carol', price: 846000 }]);
+    assert.equal(idx.has('1'), false);
+    assert.equal(db.traders['45'].te.failed, 1);
+    assert.equal(indexTeScanByItem(db, 1000 + TE_SCAN_MAX_AGE_MS).size, 0);
+    // As a buyer: the same way a favourite's own list counts (teOwn).
+    const out = buyersForItem('206', { teOwn: idx.get('206') });
+    assert.deepEqual(out.map((b) => [b.name, b.price]), [['Carol', 846000]]);
+});

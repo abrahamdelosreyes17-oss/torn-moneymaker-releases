@@ -511,7 +511,7 @@ function memoryStore() {
     };
 }
 
-function makeFeed({ store, tabId = 'A', visible = true, settings = {}, w3bFetch, tornGet, now }) {
+function makeFeed({ store, tabId = 'A', visible = true, settings = {}, w3bFetch, tornGet, now, wantsItemMarket = undefined }) {
     const w3b = new W3bClient({ fetchImpl: w3bFetch, now });
     return new LiveFeed({
         tabId,
@@ -524,6 +524,7 @@ function makeFeed({ store, tabId = 'A', visible = true, settings = {}, w3bFetch,
         load: store.load,
         save: store.save,
         now,
+        wantsItemMarket,
     });
 }
 
@@ -928,4 +929,23 @@ test('Torn\'s trade view: item lines and money, as the real page writes them', (
     assert.equal(parseTradeMoney('No money in trade'), 0);
     assert.equal(parseTradeMoney('$14,000,000'), 14000000);
     assert.equal(parseTradeMoney(''), 0);
+});
+
+test('the Item Market side (the shared Torn budget) waits until someone looks at it; bazaars (TornW3B) do not (3.15)', async () => {
+    const store = memoryStore();
+    let t = 1_000_000;
+    const now = () => t;
+    const fetch = w3bServer();
+    const tornCalls = [];
+    let looking = false;
+    const a = makeFeed({ store, w3bFetch: fetch, now, wantsItemMarket: () => looking, tornGet: async (p) => (tornCalls.push(p), { itemmarket: { listings: [] } }) });
+    await a.tick();
+    t += 5000;
+    await a.tick();
+    assert.ok(fetch.calls.length >= 2, 'bazaar deals still found');
+    assert.equal(tornCalls.length, 0, 'no Item Market calls while nobody has it open');
+    looking = true;
+    t += 5000;
+    await a.tick();
+    assert.ok(tornCalls.length >= 1);
 });

@@ -6,6 +6,26 @@ Everything below "History" is the record of how we got here.
 
 ## Start here (state on 2026-09-29, fourth session)
 
+- **Released: 3.15.0** (API efficiency; README "API use and efficiency
+  (3.15)"). The friend: "parang hirap siya sa API nag mamax"; the owner: it
+  "doesn't see all trades", "use more TornW3B", "we rarely use the market",
+  statuses fine "but there must be a way it doesn't hit our limits", and an
+  API use tab with a graph in Anthropic's style, plus Export to read the
+  friend's use. Built: Torn API lanes (`API_PRIORITY`, `LOW_RESERVE` 20,
+  `NORMAL_RESERVE` 5 in api/client.js), tags on every request
+  (core/usage.js, `STORE_API_USAGE`), the Item Market feed gated on
+  `STORE_IM_WATCH`, narrowed statuses (`sellWatch`) + `STORE_SELL_PRESENCE`,
+  TornW3B 60/min + 150 candidates + near-misses + sweep + `/traders`
+  (`fetchW3bItemTraders`, `sell.itemTraders`, `sell.activity`), TornExchange
+  urgent queue + partial pages + active-trader scan (`stepTeScan`,
+  `recordTeScan` in the trader db), ui/usage-view.js (Export API usage =
+  a .zip, core/zip.js), Settings › Report a problem (ui/report-view.js,
+  core/errlog.js, `STORE_PROBLEM_LOG`, `logProblem` / `logAction`, the
+  clients' `onFailed`). When the friend reports a bug, ask for the report
+  zip: problem-log.txt first. Harness numbers: see the commit. **Not seen
+  live:** ask the friend for an Export API usage zip after a day.
+  Ideas not built (the owner asked "can't we train this like a mini AI?"):
+  see memory `api-efficiency-plan`.
 - **Released: 3.14.5** (2026-09-29, fourth session), and **`main` now follows
   every release** (the owner: "yes please move to main on each new release"):
   every install auto-updates from `main` (Tampermonkey checks about daily, or

@@ -56,6 +56,11 @@ export function ledgerPathAllowed(path) {
 }
 
 export class LedgerClient extends TornApiClient {
+    /** The Ledger is never urgent (3.15): the low lane, unless a call says otherwise (checking a key you just saved). */
+    get(path, params = {}, use = {}) {
+        return super.get(path, params, { tag: 't.ledger', priority: 'low', ...use });
+    }
+
     async requestOnce(path, params, key) {
         if (!ledgerPathAllowed(path) || !ledgerParamsAllowed(path, params)) {
             throw new TornApiError('The Ledger key is only for your log and trades; refused ' + String(path).split('?')[0] + '.');
@@ -69,7 +74,7 @@ export class LedgerClient extends TornApiClient {
  * @returns {{level: number|null, type: string|null, userId: string|null}}
  */
 export async function fetchLedgerKeyInfo(client) {
-    const data = await client.get('v2/key/info');
+    const data = await client.get('v2/key/info', {}, { priority: 'high' });
     const info = (data && data.info) || {};
     const access = info.access || {};
     const level = Number(access.level);

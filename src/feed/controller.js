@@ -237,7 +237,9 @@ export class LiveFeed {
         }
 
         // The Item Market costs Torn API calls: only when it is watched.
-        if (settings.liveFeed && this.d.hasUsableKey()) {
+        // The Item Market side costs the shared Torn budget: only while someone
+        // is looking at it (3.15, the owner: "we rarely use the market").
+        if (settings.liveFeed && this.d.hasUsableKey() && (!this.d.wantsItemMarket || this.d.wantsItemMarket())) {
             // Rebuilt when what counts as an exit changes (a chip), not just once.
             const sig = [
                 settings.sellToNpc !== false,
@@ -436,6 +438,8 @@ export class LiveFeed {
             try {
                 const market = await fetchItemMarket(this.d.torn, id, {
                     now: this.now(),
+                    tag: 't.feed',
+                    priority: 'normal',
                 });
                 const rows = normalizeItemMarketRows(market.listings);
                 const at = this.now();

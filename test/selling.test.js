@@ -432,3 +432,40 @@ test('TornExchange failing: the pill says why - down, slow, an HTTP error, or wh
     assert.equal(said, 'TornExchange answered with an error: "Item not found for ****". Trying again soon.');
     assert.ok(!said.includes(KEY));
 });
+
+test('TornExchange (3.15): the item you open jumps the line; a later page that fails keeps what was read; leaving the item stops its pages', async () => {
+    const clock = { t: 9_000_000 };
+    const order = [];
+    let failPage = 0;
+    const te = new TeClient({
+        getKey: () => 'k',
+        now: () => clock.t,
+        fetchImpl: async (url) => {
+            const u = new URL(url);
+            const page = Number(u.searchParams.get('page'));
+            order.push(u.pathname.replace('/api/', '') + (page ? ':' + page : ''));
+            if (page && page === failPage) return response(500, {});
+            return response(200, u.pathname.includes('listings')
+                ? { status: 'success', data: { meta: { total_listings: 6, total_pages: 3, current_page: page }, listings: [{ trader: 'P' + page, price: 1000 - page }] } }
+                : { status: 'success', data: { items: [] }, meta: {} });
+        },
+    });
+    const queue = fakeQueue(te, clock);
+    const scan = queue.enqueue(() => te.get('prices/5'));
+    const scan2 = queue.enqueue(() => te.get('prices/6'));
+    failPage = 3;
+    const list = fetchTeListings(te, 206, { schedule: (fn) => queue.enqueue(fn, { urgent: true }) });
+    const got = await list;
+    await Promise.all([scan, scan2]);
+    assert.deepEqual(order, ['listings:1', 'listings:2', 'listings:3', 'prices/5', 'prices/6'], 'the opened item pages before the background reads waiting');
+    assert.equal(got.traders.length, 2, 'pages 1 and 2 kept although page 3 failed');
+    assert.equal(got.complete, false);
+    // Left the item after page 1: page 2 is never asked.
+    order.length = 0;
+    failPage = 0;
+    let here = true;
+    const left = fetchTeListings(te, 1, { schedule: (fn) => queue.enqueue(fn, { urgent: true }).then((r) => ((here = false), r)) , keepGoing: () => here });
+    assert.equal((await left).traders.length, 1);
+    assert.deepEqual(order, ['listings:1']);
+    assert.equal(queue.idle, true);
+});

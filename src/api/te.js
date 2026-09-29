@@ -85,7 +85,11 @@ export class TeClient {
      *   same pace and the same penalty wait as this one.
      * @param {function} [options.saveState] - (state) => void
      */
-    constructor({ getKey, fetchImpl = gmFetch, now = () => Date.now(), loadState = null, saveState = null } = {}) {
+    constructor({ getKey, fetchImpl = gmFetch, now = () => Date.now(), loadState = null, saveState = null, onSent = null, onFailed = null } = {}) {
+        /** ({path, tag, error}) => void, a request that failed (not "too soon"): the problem log (3.15). */
+        this.onFailed = onFailed;
+        /** ({path, tag}) => void, each request that leaves: the usage record (3.15). */
+        this.onSent = onSent;
         this.getKey = getKey || (() => '');
         this.fetchImpl = fetchImpl;
         this.now = now;
@@ -146,7 +150,22 @@ export class TeClient {
      * @param {boolean} [options.keyless] - an endpoint that needs no key
      *   (best_listing): sent without one, on the same shared pace.
      */
-    async get(path, params = {}, { keyless = false } = {}) {
+    async get(path, params = {}, options = {}) {
+        try {
+            return await this.request(path, params, options);
+        } catch (error) {
+            if (this.onFailed && !(error && error.tooSoon)) {
+                try {
+                    this.onFailed({ path, tag: options.tag || null, error });
+                } catch {
+                    // The log is best-effort.
+                }
+            }
+            throw error;
+        }
+    }
+
+    async request(path, params = {}, { keyless = false, tag = null } = {}) {
         const key = keyless ? '' : String(this.getKey() || '').trim();
         if (!key && !keyless) throw new TeError('No TornExchange key.', { badKey: true });
 
@@ -173,6 +192,13 @@ export class TeClient {
         }
         this.lastRequestAt = t;
         this.persistState();
+        if (this.onSent) {
+            try {
+                this.onSent({ path, tag });
+            } catch {
+                // The usage record is best-effort.
+            }
+        }
 
         let response;
         try {
@@ -346,28 +372,39 @@ export function parseTeTraderPrices(body) {
  *
  * @returns {Promise<{traders: Array<{name: string, price: number}>, total: number, complete: boolean}>}
  */
-export async function fetchTeListings(client, itemId, { maxPages = 3, schedule = (fn) => fn() } = {}) {
+export async function fetchTeListings(client, itemId, { maxPages = 3, schedule = (fn) => fn(), keepGoing = () => true } = {}) {
     const traders = [];
     let total = 0;
     let pages = 1;
+    let read = 0;
 
     for (let page = 1; page <= maxPages && page <= pages; page += 1) {
-        const body = await schedule(() =>
-            client.get('listings', {
-                item_id: String(itemId),
-                sort_by: 'price',
-                order: 'desc',
-                page,
-            }),
-        );
+        // 3.15: a later page is not asked for an item you have left, and one
+        // that fails keeps the pages already read (they were thrown away).
+        if (page > 1 && !keepGoing()) break;
+        let body;
+        try {
+            body = await schedule(() =>
+                client.get('listings', {
+                    item_id: String(itemId),
+                    sort_by: 'price',
+                    order: 'desc',
+                    page,
+                }),
+            );
+        } catch (error) {
+            if (page === 1) throw error;
+            break;
+        }
         const parsed = parseTeListings(body);
         traders.push(...parsed.traders);
         total = parsed.total;
         pages = parsed.pages;
+        read = page;
     }
 
     traders.sort((a, b) => b.price - a.price);
-    return { traders, total, complete: pages <= maxPages };
+    return { traders, total, complete: read >= pages };
 }
 
 /**
@@ -400,10 +437,27 @@ export class TeQueue {
         return this.jobs.length;
     }
 
-    /** @returns {Promise} what `fn` returns, once its slot has come. */
-    enqueue(fn) {
+    /** Nothing waiting and nothing on its way: room for a background read (3.15). */
+    get idle() {
+        return !this.jobs.length && !this.running;
+    }
+
+    /**
+     * @param {function} fn
+     * @param {{urgent?: boolean}} [opts] - urgent (the item you opened, 3.15): ahead of
+     *   everything not urgent, instead of behind background reads
+     * @returns {Promise} what `fn` returns, once its slot has come.
+     */
+    enqueue(fn, { urgent = false } = {}) {
         return new Promise((resolve, reject) => {
-            this.jobs.push({ fn, resolve, reject });
+            const job = { fn, resolve, reject, urgent };
+            if (urgent) {
+                const at = this.jobs.findIndex((j) => !j.urgent);
+                if (at < 0) this.jobs.push(job);
+                else this.jobs.splice(at, 0, job);
+            } else {
+                this.jobs.push(job);
+            }
             this.run();
         });
     }
@@ -432,6 +486,7 @@ export class TeQueue {
         }
         const job = this.jobs.shift();
         if (!job) return;
+        this.running = true;
         try {
             const result = await job.fn();
             job.resolve(result);
@@ -443,6 +498,8 @@ export class TeQueue {
                 job.reject(error);
                 this.onSettled(error);
             }
+        } finally {
+            this.running = false;
         }
         this.run();
     }

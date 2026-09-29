@@ -23,6 +23,8 @@
  */
 
 import { formatMoney, formatAge, parseMoneyInput, readWholeNumber } from '../core/parse.js';
+import { UsageView, USAGE_CSS } from './usage-view.js';
+import { ReportView, REPORT_CSS } from './report-view.js';
 import { TOKENS_CSS } from './styles.js';
 import { TORN_API_KEY_URL } from './panel.js';
 import { TE_SITE_URL, tePriceListUrl } from '../api/te.js';
@@ -876,6 +878,19 @@ export class SellingPage {
             },
         });
 
+        /* API use (3.15): what every request to Torn, TornW3B and TornExchange was for, over time */
+        group('API use');
+        this.usageView = new UsageView();
+        section('api', 'API use', [
+            'Every request this script sends, from every tab - Torn Bids and Torn\'s pages - by what it was for. ',
+            'Torn\'s limit is shared by everything you run with your keys, so its calls wait in lanes: what you are doing now goes first, statuses and the Ledger wait for room.',
+        ], [this.usageView.el]);
+
+        /* Report a problem (3.15): your words, screenshots, the problem log - one zip to send */
+        group('Help');
+        this.reportView = new ReportView({ getReport: () => (this.h.getReport ? this.h.getReport() : { log: [] }), onClearLog: () => this.h.onClearLog && this.h.onClearLog() });
+        section('report', 'Report a problem', 'Found a bug? Say what happened, add screenshots, and download one .zip to send. It also holds the problem log - what failed and what you did just before, in every tab - so the cause can be found without guessing. Nothing is sent anywhere by this page.', [this.reportView.el]);
+
         group('Torn Bids');
         section('flips', 'Flips', 'What Best flips and the flip plan may suggest.', [
             field('Cash for flips', null, [
@@ -1036,6 +1051,16 @@ export class SellingPage {
             w3b: (info.w3bRead || 0) < (info.w3bKnown || 0) ? ['idle', (info.w3bRead || 0) + '/' + info.w3bKnown] : ['online', count(info.w3bTraders || 0) + ' lists'],
             flips: p.cash > 0 ? ['online', formatMoney(p.cash) + ' · ' + (p.networthPct || 10) + '%'] : ['idle', 'no cash limit'],
             links: ['online', p.linksNewTab !== false ? 'new tab' : 'this tab'],
+            report: (() => {
+                const log = this.problemLog || [];
+                const day = log.filter((e) => e.kind === 'error' && now - e.at < 86400000).length;
+                return day ? ['idle', day + (day === 1 ? ' error' : ' errors') + ' today'] : ['online', 'no errors'];
+            })(),
+            api: (() => {
+                const u = this.usage && this.usage.live && this.usage.live.t;
+                if (!u) return ['idle', ''];
+                return [u.used >= u.cap * 0.95 ? 'bad' : u.used >= u.cap * 0.8 ? 'idle' : 'online', 'Torn ' + u.used + '/' + u.cap];
+            })(),
             ledger: (() => {
                 const L = this.state.ledger || {};
                 if (L.keyError) return ['bad', 'key refused'];
@@ -1062,10 +1087,28 @@ export class SellingPage {
         this.w3bStateEl.className = 'sp-keystate' + (info.bazaarsError && !info.bazaarsAt ? ' sp-bad' : info.bazaarsAt ? ' sp-ok' : '');
     }
 
+    /** API use, drawn again every few seconds while Settings is open. */
+    renderUsage() {
+        if (!this.usageView || !this.h.getUsage) return;
+        this.usage = this.h.getUsage();
+        this.usageView.render(this.usage);
+        if (this.reportView) {
+            this.problemLog = this.h.getReport ? this.h.getReport().log || [] : [];
+            this.reportView.render();
+        }
+    }
+
     showView(view) {
         this.view = view === 'settings' || view === 'ledger' ? view : 'list';
         if (!this.root) return;
         const settings = this.view === 'settings';
+        if (settings && !this.usageTimer) {
+            this.renderUsage();
+            this.usageTimer = setInterval(() => this.renderUsage(), 5000);
+        } else if (!settings && this.usageTimer) {
+            clearInterval(this.usageTimer);
+            this.usageTimer = null;
+        }
         const ledger = this.view === 'ledger';
         const list = this.view === 'list';
         this.settingsEl.hidden = !settings;
@@ -1754,7 +1797,7 @@ export class SellingPage {
         const info = this.state.info || {};
         const sig = d
             ? JSON.stringify([
-                d.itemId, d.name, d.held, d.avg, d.bazaars, d.buyersTotal, d.buyersLoading, d.pending, d.planWhy,
+                d.itemId, d.name, d.held, d.avg, d.bazaars, d.buyersTotal, d.buyersLoading, d.buyersListNote, d.pending, d.planWhy,
                 d.buyers.map((b) => [b.id, b.name, b.price, b.te, b.teTop, b.teList, b.w3b, statusOf(b), b.trust ? b.trust.level + b.trust.score : '', this.state.networth && b.id ? this.state.networth.get(String(b.id)) : null, Boolean(b.favourite), b.traded || '', Boolean(b.troll), Boolean(b.lastPaidOnly)]),
                 this.justBlacklisted ? this.justBlacklisted.at : 0,
                 (d.hidden || []).map((b) => [b.tradeKey, b.price, b.hiddenBy, statusOf(b), b.trust ? b.trust.level + b.trust.score : '']),
@@ -1831,6 +1874,7 @@ export class SellingPage {
         const ordered = [...d.buyers.filter((b) => !declined[b.tradeKey] && !b.troll), ...d.buyers.filter((b) => !declined[b.tradeKey] && b.troll), ...d.buyers.filter((b) => declined[b.tradeKey])];
         const rows = all ? ordered : ordered.slice(0, DESK_ROWS);
         if (d.buyersLoading) card.appendChild(spEl('p', { class: 'sp-note', text: 'Loading more buyers from TornExchange…' }));
+        else if (d.buyersListNote) card.appendChild(spEl('p', { class: 'sp-note', text: d.buyersListNote }));
         // Just blacklisted: a moment to take it back (then only the Ledger's Traders tab has Undo).
         const justOff = this.justBlacklisted && Date.now() - this.justBlacklisted.at < 15000 ? this.justBlacklisted.b : null;
         if (justOff) {
@@ -2713,7 +2757,7 @@ export class SellingPage {
     }
 }
 
-export const SELLING_PAGE_CSS = LEDGER_CSS + `
+export const SELLING_PAGE_CSS = LEDGER_CSS + USAGE_CSS + REPORT_CSS + `
 :host { all: initial; }
 * { box-sizing: border-box; }
 .sp-page {
