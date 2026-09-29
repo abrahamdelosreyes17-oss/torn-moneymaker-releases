@@ -62,6 +62,23 @@ export function clampWindowPos(x, y, { width, height, viewW, viewH }) {
     };
 }
 
+/**
+ * Where the window starts, before you drag it (3.15.1): just above NPC
+ * Arbitrage when it fits there; else beside it, to its left - it used to be
+ * pushed down over the panel and its Next bazaar button once the checkout
+ * list made it taller. Pure - tested.
+ *
+ * @param {{left, top, right, width, height}|null} panel
+ * @returns {{x: number, y: number}}
+ */
+export function windowStart(panel, { width, height, viewW }) {
+    if (!panel || !panel.width) return { x: viewW - 16 - width, y: 64 };
+    const above = panel.top - 8 - height;
+    if (above >= 8) return { x: panel.right - width, y: above };
+    if (panel.left - 8 - width >= 0) return { x: panel.left - 8 - width, y: Math.max(8, panel.top) };
+    return { x: panel.right - width, y: 8 };
+}
+
 export class BoughtWindow {
     /**
      * @param {object} h - onMove({x, y}), onFold(folded), panelRect() - NPC Arbitrage's box, to sit above it
@@ -109,10 +126,7 @@ export class BoughtWindow {
             // Right-aligned with NPC Arbitrage, ending just above it (mockup B): the
             // free space right of Torn's content, never on Torn's own page by itself.
             const panel = this.h.panelRect ? this.h.panelRect() : null;
-            const height = this.box.offsetHeight || 200;
-            const right = panel && panel.width ? panel.right : viewW - 16;
-            const top = panel && panel.height ? panel.top - 8 - height : 64;
-            p = { x: right - width, y: Math.max(8, top) };
+            p = windowStart(panel, { width, height: this.box.offsetHeight || 200, viewW });
         }
         const c = clampWindowPos(p.x, p.y, { width, height: this.box.offsetHeight, viewW, viewH });
         this.box.style.left = c.x + 'px';
@@ -174,7 +188,31 @@ export class BoughtWindow {
     }
 
     /**
-     * @param {object|null} m - boughtSince(trade, {inside}) plus {onTradePage, key}; null hides it
+     * One line of the cart: a tick that follows the buying run (to buy, you
+     * are here, bought, fewer than planned, skipped), what and from whom, and
+     * the bazaar - a plain link, opened by you.
+     */
+    cartRow(l, m) {
+        const mark = { todo: ['bw-m-todo', '☐', 'To buy'], here: ['bw-m-here', '▶', 'You are on this bazaar'], done: ['bw-m-done', '✓', 'Bought'], part: ['bw-m-part', '✓', 'Bought fewer than planned'], skipped: ['bw-m-skip', '–', 'Skipped'] }[l.state] || ['bw-m-todo', '☐', ''];
+        const count = l.state === 'here' ? l.bought.toLocaleString('en-US') + ' of ' + l.qty.toLocaleString('en-US')
+            : l.state === 'part' ? l.bought.toLocaleString('en-US') + ' of ' + l.qty.toLocaleString('en-US')
+            : '×' + l.qty.toLocaleString('en-US');
+        // Open: only a bazaar still to go to (not the one you are on).
+        const open = l.state === 'todo' && l.url;
+        return bwEl('div', { class: 'bw-cart bw-cart-' + l.state }, [
+            bwEl('span', { class: 'bw-mark ' + mark[0], title: mark[2], 'aria-label': mark[2], text: mark[1] }),
+            bwEl('span', { class: 'bw-n' }, [
+                bwEl('b', { text: l.name }),
+                ' ' + count,
+                l.state === 'skipped' ? bwEl('span', { class: 'bw-tag bw-tag-mute', text: 'skipped' }) : l.state === 'here' ? bwEl('span', { class: 'bw-tag bw-tag-here', text: 'here' }) : null,
+            ]),
+            open ? bwEl('a', { class: 'bw-open', href: l.url, title: 'Open ' + (l.seller || 'this') + '\'s bazaar', text: 'Open' }) : bwEl('span'),
+            bwEl('span', { class: 'bw-d', text: 'from ' + (l.seller || 'Player ' + l.sellerId) + ' at ' + bwMoney(l.price) + ' · ' + (m.trader || 'they') + ' pays ' + bwMoney(l.bid) }),
+        ]);
+    }
+
+    /**
+     * @param {object|null} m - boughtSince(trade, {inside}) plus {onTradePage, key, cart: checkoutList(...) with each line's url}; null hides it
      */
     render(m) {
         if (!m) {
@@ -205,10 +243,17 @@ export class BoughtWindow {
                 this.render(m);
             },
         });
+        // The checkout cart (3.15.1): the plan's lines, each ticking itself off.
+        const cart = m.cart || null;
+        const cartLines = cart ? cart.lines : [];
+        const left = cart ? cart.bazaarsLeft : 0;
+        const mini = cart && cartLines.length
+            ? ' · ' + (cart.done ? 'all bought' : left + (left === 1 ? ' bazaar' : ' bazaars') + ' to go') + ' · ' + cart.unitsBought.toLocaleString('en-US') + ' of ' + cart.units.toLocaleString('en-US') + ' items' + (buys ? ' · ' + bwSigned(m.totals.profit) : '')
+            : ' · ' + buys + (buys === 1 ? ' buy' : ' buys') + ' · ' + bwSigned(m.totals.profit) + (m.toBuy ? ' · ' + m.toBuy + ' to buy' : '');
         const head = bwEl('div', { class: 'bw-hd', title: 'Drag to move it anywhere' }, [
             bwEl('span', { class: 'bw-ti' }, [
-                'Bought for ' + (m.trader || 'the trade'),
-                this.folded ? bwEl('span', { class: 'bw-mini', text: ' · ' + buys + (buys === 1 ? ' buy' : ' buys') + ' · ' + bwSigned(m.totals.profit) + (m.toBuy ? ' · ' + m.toBuy + ' to buy' : '') }) : null,
+                'Checkout · ' + (m.trader || 'the trade'),
+                this.folded ? bwEl('span', { class: 'bw-mini', text: mini }) : null,
             ]),
             fold,
         ]);
@@ -221,7 +266,15 @@ export class BoughtWindow {
 
         const body = bwEl('div', { class: 'bw-body' });
         body.appendChild(bwEl('div', { class: 'bw-since', text: 'Since "' + (m.trader || 'they') + ' accepted"' + (m.at ? ' at ' + bwTime(m.at) : '') }));
-        if (!buys) body.appendChild(bwEl('p', { class: 'bw-empty', text: 'Nothing bought yet. What you buy for this trade shows here.' }));
+        if (cartLines.length) {
+            body.appendChild(bwEl('div', { class: 'bw-sec' }, [
+                bwEl('span', { text: 'To buy' }),
+                bwEl('span', { class: cart.done ? 'bw-g' : '', text: cart.done ? 'all done ✓' : left + ' of ' + cart.bazaars + (cart.bazaars === 1 ? ' bazaar' : ' bazaars') + ' left' }),
+            ]));
+            for (const l of cartLines) body.appendChild(this.cartRow(l, m));
+            body.appendChild(bwEl('div', { class: 'bw-sec' }, [bwEl('span', { text: 'Bought' }), bwEl('span', { text: buys ? bwSigned(m.totals.profit) : '' })]));
+        }
+        if (!buys) body.appendChild(bwEl('p', { class: 'bw-empty', text: cartLines.length ? 'Nothing recorded yet: what you take at a bazaar is added here when you press Next.' : 'Nothing bought yet. What you buy for this trade shows here.' }));
         for (const r of m.rows) {
             const check = m.onTradePage
                 ? r.inTrade >= r.send
@@ -245,7 +298,8 @@ export class BoughtWindow {
                 bwEl('span', { text: 'Profit' }), bwEl('b', { class: m.totals.profit >= 0 ? 'bw-g' : 'bw-neg', text: bwSigned(m.totals.profit) }),
             ]));
         }
-        if (m.toBuy) body.appendChild(bwEl('p', { class: 'bw-todo', text: 'Still to buy: ' + m.toBuy + (m.toBuy === 1 ? ' bazaar' : ' bazaars') }));
+        // Without the cart (no plan lines): the count, as before.
+        if (m.toBuy && !cartLines.length) body.appendChild(bwEl('p', { class: 'bw-todo', text: 'Still to buy: ' + m.toBuy + (m.toBuy === 1 ? ' bazaar' : ' bazaars') }));
         // The checklist's verdict on the trade page: all in, or what is missing.
         if (m.onTradePage && buys) {
             body.appendChild(m.missing.length
@@ -303,6 +357,24 @@ export const BOUGHT_CSS = `
 .bw-warn { margin: 8px 0 0; font-size: 12px; font-weight: bold; color: var(--warn); }
 .bw-ok { margin: 8px 0 0; font-size: 12px; font-weight: bold; color: var(--profit); }
 .bw-cancel { margin-top: 8px; text-align: right; }
+.bw-sec { display: flex; justify-content: space-between; margin: 8px 0 6px; font-size: 11px; font-weight: bold; letter-spacing: 0.5px; text-transform: uppercase; color: var(--muted); }
+.bw-sec:first-of-type { margin-top: 2px; }
+.bw-sec .bw-g { color: var(--profit); }
+.bw-cart { display: grid; grid-template-columns: 18px minmax(0, 1fr) auto; gap: 2px 8px; align-items: baseline; padding: 6px 8px; margin-bottom: 4px; background: var(--row); border: 1px solid var(--line); border-radius: 4px; }
+.bw-cart .bw-d { grid-column: 2 / -1; }
+.bw-cart-here { border-color: var(--buy); box-shadow: inset 3px 0 0 var(--buy); }
+.bw-cart-done .bw-n, .bw-cart-skipped .bw-n { color: var(--muted); }
+.bw-cart-done .bw-n b, .bw-cart-skipped .bw-n b { color: var(--muted); text-decoration: line-through; }
+.bw-mark { font-weight: bold; text-align: center; }
+.bw-m-todo { color: var(--muted); }
+.bw-m-here { color: var(--buy); }
+.bw-m-done { color: var(--profit); }
+.bw-m-part { color: var(--warn); }
+.bw-m-skip { color: var(--muted); }
+.bw-tag-here { color: var(--buy); }
+.bw-tag-mute { color: var(--muted); }
+.bw-open { color: var(--buy); font-size: 12px; text-decoration: none; white-space: nowrap; }
+.bw-open:hover { text-decoration: underline; }
 .bw-cancel.bw-ask { display: flex; flex-wrap: wrap; gap: 6px; text-align: left; }
 .bw-cancel.bw-ask .bw-warn { flex: 1 1 100%; margin: 0; }
 .bw-link { padding: 0; border: 0; background: none; color: var(--muted); font: 12px Arial, Helvetica, sans-serif; text-decoration: underline; cursor: pointer; }

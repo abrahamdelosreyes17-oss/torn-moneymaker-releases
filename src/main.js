@@ -57,7 +57,7 @@ import { deskItem, nextW3bRead, backgroundSlot, backgroundListSlot, flipsStale, 
 import { liquidityKind, unitsMoved, addMovement, stopsMinutes, EXTRA_CAP } from './core/liquidity.js';
 import { usageAdd, usageMerge, usageSeries, USAGE_SERVICES, USAGE_RANGES, USAGE_LABELS } from './core/usage.js';
 import { addLogEntries, logText } from './core/errlog.js';
-import { boughtSince, stockBuys, addExtraBuy, acceptTrade, liveAccepted, stepState, tickAccepted, stepDone, nextStep, boughtFromStock, recordBuy, sendUnits, acceptedTotals, replacementFor, replaceStep, dropLine, markLeft, leftoversOf, cancelledLeftovers, addLeftovers, takenUnits, fillNote } from './core/accepted.js';
+import { checkoutList, boughtSince, stockBuys, addExtraBuy, acceptTrade, liveAccepted, stepState, tickAccepted, stepDone, nextStep, boughtFromStock, recordBuy, sendUnits, acceptedTotals, replacementFor, replaceStep, dropLine, markLeft, leftoversOf, cancelledLeftovers, addLeftovers, takenUnits, fillNote } from './core/accepted.js';
 import { readTradeView, readTradeAddRows } from './sources/dom/trade.js';
 import { BoughtWindow } from './ui/bought-window.js';
 import { makeTabId, LEADER_HEARTBEAT_MS } from './core/leader.js';
@@ -2674,7 +2674,13 @@ function updateBoughtWindow() {
         }, { pos: saved.pos || null, folded: Boolean(saved.folded) });
     }
     const onTradePage = Boolean(check && check.key === trade.key);
-    app.bought.render({ ...boughtSince(trade, { inside: onTradePage ? check.inside : null }), onTradePage, key: trade.key });
+    // The checkout cart (3.15.1): the step you are on counts what the page saw you take, before Next records it.
+    const here = app.buyHere && app.buyHere.trade.key === trade.key && buyRun.firstSeen !== null
+        ? { line: app.buyHere.line, index: app.buyHere.index, took: boughtFromStock(buyRun.firstSeen, buyRun.nowSeen, app.buyHere.step.qty) }
+        : app.buyHere && app.buyHere.trade.key === trade.key ? { line: app.buyHere.line, index: app.buyHere.index, took: 0 } : null;
+    const cart = checkoutList(trade, { here });
+    for (const l of cart.lines) l.url = l.sellerId ? bazaarUrl(l.sellerId, l.itemId, l.price) : null;
+    app.bought.render({ ...boughtSince(trade, { inside: onTradePage ? check.inside : null }), onTradePage, key: trade.key, cart });
 }
 
 /* Unplanned buys: each card's stock on the bazaar you are on, kept for this tab. */
@@ -2845,6 +2851,8 @@ function trackTradeBuying(listings) {
         // Next stays on this bazaar: another item of the trade is here too.
         same: Boolean(here && here.trade.items.some((i) => (i.steps || []).some((st) => st !== here.step && !stepDone(st) && String(st.sellerId) === String(here.step.sellerId)))),
     });
+    // The checkout cart, now that the step you are on and what you took here are known.
+    updateBoughtWindow();
 }
 
 /** One line of a trade changed on the desk (ticked, a number, Add). */

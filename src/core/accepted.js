@@ -292,6 +292,56 @@ export function boughtSince(trade, { inside = null } = {}) {
     };
 }
 
+/*
+ * The checkout cart (3.15.1, the owner: "we have the Next bazaar, we need the
+ * LIST OF ITEMS from the PLAN in a separate overlay... and it automatically
+ * checks if he's bought it or not? Like a checkout cart"). Every step of
+ * the accepted plan, in the order Next bazaar goes, each ticking itself off
+ * from what the buying run counted.
+ */
+
+/**
+ * @param {object} trade - an accepted trade
+ * @param {object} [o]
+ * @param {{line: string, index: number, took: number}|null} [o.here] - the step
+ *   whose bazaar you are on, and what the page counted you took so far (not
+ *   recorded until Next)
+ * @returns {{lines: Array<{line, index, itemId, name, qty, price, bid, sellerId, seller, state, bought}>, bazaars: number, bazaarsLeft: number, units: number, unitsBought: number, cost: number, done: boolean}}
+ *   state: 'todo' | 'here' | 'part' (bought fewer than planned) | 'done' | 'skipped'
+ */
+export function checkoutList(trade, { here = null } = {}) {
+    const lines = [];
+    for (const i of (trade && trade.items) || []) {
+        if (i.kind !== 'flip') continue;
+        (i.steps || []).forEach((st, k) => {
+            const line = i.line || 'flip:' + i.itemId;
+            const isHere = Boolean(here && here.line === line && here.index === k && !stepDone(st));
+            let state = 'todo';
+            let bought = 0;
+            if (stepDone(st)) {
+                bought = st.boughtQty > 0 ? st.boughtQty : st.bought ? st.qty : 0;
+                state = st.skipped && !bought ? 'skipped' : bought >= st.qty ? 'done' : 'part';
+            } else if (isHere) {
+                state = 'here';
+                bought = Math.max(0, Math.min(st.qty, Number(here.took) || 0));
+            }
+            lines.push({ line, index: k, itemId: String(i.itemId), name: i.name, qty: st.qty, price: st.price, bid: i.bid, sellerId: st.sellerId ? String(st.sellerId) : null, seller: st.sellerName || null, state, bought });
+        });
+    }
+    // Bazaars: one visit buys every line at that seller (Next stays there for the next one).
+    const sellers = new Set(lines.map((l) => l.sellerId || l.seller || '?'));
+    const open = new Set(lines.filter((l) => l.state === 'todo' || l.state === 'here').map((l) => l.sellerId || l.seller || '?'));
+    return {
+        lines,
+        bazaars: sellers.size,
+        bazaarsLeft: open.size,
+        units: lines.reduce((a, l) => a + l.qty, 0),
+        unitsBought: lines.reduce((a, l) => a + l.bought, 0),
+        cost: lines.reduce((a, l) => a + l.bought * l.price, 0),
+        done: lines.length > 0 && open.size === 0,
+    };
+}
+
 /**
  * The next cheapest listing still under the trader's price, when a step's
  * listing is gone or re-priced (the friend: "sometimes their prices change,

@@ -576,6 +576,18 @@ and left off when the trader does not buy that item. On Torn's trade page it is 
 each item "✓ in" once it is in the trade, and anything bought but not added
 is named. It never presses anything of Torn's, and goes at Traded - done.
 
+**Checkout** (3.15.1, the owner: "we need the LIST OF ITEMS from the PLAN in
+a separate overlay... it automatically checks if he's bought it - like a
+checkout cart"): that window is now *Checkout · Bob*. **To buy** lists every
+item of the accepted plan in the order Next bazaar goes - how many, from
+whom, at what price, an *Open* link for each bazaar still to go to - and
+ticks itself off from the buying run: ▶ *here* with "20 of 53" as the page
+counts what you take, ✓ bought, an amber ✓ for fewer than planned, *skipped*.
+The header says how many bazaars are left; folded it reads "2 bazaars to go
+· 53 of 57 items · +$26,500". **Bought** (profit, unplanned buys, the trade
+page checklist) is below it as before. Before you drag it, it starts above
+NPC Arbitrage when it fits, else beside it - never over its Next button.
+
 **Cancel trade** (3.14.5): they accepted, then the trade was called off - the
 flip plan is gone. In the overlay's buying box, the Bought window and Torn
 Bids' accepted card, only while a trade is accepted; it asks first ("Cancel

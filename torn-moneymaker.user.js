@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      3.15.0
+// @version      3.15.1
 // @description  Finds Bazaar and Item Market listings below NPC / market value - on the page you are viewing, and live from the Torn API and TornW3B - ranked by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -42,7 +42,7 @@
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '3.15.0';
+    const TTV2_BUILD_VERSION = '3.15.1';
 
     /* ===== src/platform/gm.js ===== */
     /*
@@ -3455,6 +3455,56 @@
         };
     }
 
+    /*
+     * The checkout cart (3.15.1, the owner: "we have the Next bazaar, we need the
+     * LIST OF ITEMS from the PLAN in a separate overlay... and it automatically
+     * checks if he's bought it or not? Like a checkout cart"). Every step of
+     * the accepted plan, in the order Next bazaar goes, each ticking itself off
+     * from what the buying run counted.
+     */
+
+    /**
+     * @param {object} trade - an accepted trade
+     * @param {object} [o]
+     * @param {{line: string, index: number, took: number}|null} [o.here] - the step
+     *   whose bazaar you are on, and what the page counted you took so far (not
+     *   recorded until Next)
+     * @returns {{lines: Array<{line, index, itemId, name, qty, price, bid, sellerId, seller, state, bought}>, bazaars: number, bazaarsLeft: number, units: number, unitsBought: number, cost: number, done: boolean}}
+     *   state: 'todo' | 'here' | 'part' (bought fewer than planned) | 'done' | 'skipped'
+     */
+    function checkoutList(trade, { here = null } = {}) {
+        const lines = [];
+        for (const i of (trade && trade.items) || []) {
+            if (i.kind !== 'flip') continue;
+            (i.steps || []).forEach((st, k) => {
+                const line = i.line || 'flip:' + i.itemId;
+                const isHere = Boolean(here && here.line === line && here.index === k && !stepDone(st));
+                let state = 'todo';
+                let bought = 0;
+                if (stepDone(st)) {
+                    bought = st.boughtQty > 0 ? st.boughtQty : st.bought ? st.qty : 0;
+                    state = st.skipped && !bought ? 'skipped' : bought >= st.qty ? 'done' : 'part';
+                } else if (isHere) {
+                    state = 'here';
+                    bought = Math.max(0, Math.min(st.qty, Number(here.took) || 0));
+                }
+                lines.push({ line, index: k, itemId: String(i.itemId), name: i.name, qty: st.qty, price: st.price, bid: i.bid, sellerId: st.sellerId ? String(st.sellerId) : null, seller: st.sellerName || null, state, bought });
+            });
+        }
+        // Bazaars: one visit buys every line at that seller (Next stays there for the next one).
+        const sellers = new Set(lines.map((l) => l.sellerId || l.seller || '?'));
+        const open = new Set(lines.filter((l) => l.state === 'todo' || l.state === 'here').map((l) => l.sellerId || l.seller || '?'));
+        return {
+            lines,
+            bazaars: sellers.size,
+            bazaarsLeft: open.size,
+            units: lines.reduce((a, l) => a + l.qty, 0),
+            unitsBought: lines.reduce((a, l) => a + l.bought, 0),
+            cost: lines.reduce((a, l) => a + l.bought * l.price, 0),
+            done: lines.length > 0 && open.size === 0,
+        };
+    }
+
     /**
      * The next cheapest listing still under the trader's price, when a step's
      * listing is gone or re-priced (the friend: "sometimes their prices change,
@@ -4267,6 +4317,23 @@
         };
     }
 
+    /**
+     * Where the window starts, before you drag it (3.15.1): just above NPC
+     * Arbitrage when it fits there; else beside it, to its left - it used to be
+     * pushed down over the panel and its Next bazaar button once the checkout
+     * list made it taller. Pure - tested.
+     *
+     * @param {{left, top, right, width, height}|null} panel
+     * @returns {{x: number, y: number}}
+     */
+    function windowStart(panel, { width, height, viewW }) {
+        if (!panel || !panel.width) return { x: viewW - 16 - width, y: 64 };
+        const above = panel.top - 8 - height;
+        if (above >= 8) return { x: panel.right - width, y: above };
+        if (panel.left - 8 - width >= 0) return { x: panel.left - 8 - width, y: Math.max(8, panel.top) };
+        return { x: panel.right - width, y: 8 };
+    }
+
     class BoughtWindow {
         /**
          * @param {object} h - onMove({x, y}), onFold(folded), panelRect() - NPC Arbitrage's box, to sit above it
@@ -4314,10 +4381,7 @@
                 // Right-aligned with NPC Arbitrage, ending just above it (mockup B): the
                 // free space right of Torn's content, never on Torn's own page by itself.
                 const panel = this.h.panelRect ? this.h.panelRect() : null;
-                const height = this.box.offsetHeight || 200;
-                const right = panel && panel.width ? panel.right : viewW - 16;
-                const top = panel && panel.height ? panel.top - 8 - height : 64;
-                p = { x: right - width, y: Math.max(8, top) };
+                p = windowStart(panel, { width, height: this.box.offsetHeight || 200, viewW });
             }
             const c = clampWindowPos(p.x, p.y, { width, height: this.box.offsetHeight, viewW, viewH });
             this.box.style.left = c.x + 'px';
@@ -4379,7 +4443,31 @@
         }
 
         /**
-         * @param {object|null} m - boughtSince(trade, {inside}) plus {onTradePage, key}; null hides it
+         * One line of the cart: a tick that follows the buying run (to buy, you
+         * are here, bought, fewer than planned, skipped), what and from whom, and
+         * the bazaar - a plain link, opened by you.
+         */
+        cartRow(l, m) {
+            const mark = { todo: ['bw-m-todo', '☐', 'To buy'], here: ['bw-m-here', '▶', 'You are on this bazaar'], done: ['bw-m-done', '✓', 'Bought'], part: ['bw-m-part', '✓', 'Bought fewer than planned'], skipped: ['bw-m-skip', '–', 'Skipped'] }[l.state] || ['bw-m-todo', '☐', ''];
+            const count = l.state === 'here' ? l.bought.toLocaleString('en-US') + ' of ' + l.qty.toLocaleString('en-US')
+                : l.state === 'part' ? l.bought.toLocaleString('en-US') + ' of ' + l.qty.toLocaleString('en-US')
+                : '×' + l.qty.toLocaleString('en-US');
+            // Open: only a bazaar still to go to (not the one you are on).
+            const open = l.state === 'todo' && l.url;
+            return bwEl('div', { class: 'bw-cart bw-cart-' + l.state }, [
+                bwEl('span', { class: 'bw-mark ' + mark[0], title: mark[2], 'aria-label': mark[2], text: mark[1] }),
+                bwEl('span', { class: 'bw-n' }, [
+                    bwEl('b', { text: l.name }),
+                    ' ' + count,
+                    l.state === 'skipped' ? bwEl('span', { class: 'bw-tag bw-tag-mute', text: 'skipped' }) : l.state === 'here' ? bwEl('span', { class: 'bw-tag bw-tag-here', text: 'here' }) : null,
+                ]),
+                open ? bwEl('a', { class: 'bw-open', href: l.url, title: 'Open ' + (l.seller || 'this') + '\'s bazaar', text: 'Open' }) : bwEl('span'),
+                bwEl('span', { class: 'bw-d', text: 'from ' + (l.seller || 'Player ' + l.sellerId) + ' at ' + bwMoney(l.price) + ' · ' + (m.trader || 'they') + ' pays ' + bwMoney(l.bid) }),
+            ]);
+        }
+
+        /**
+         * @param {object|null} m - boughtSince(trade, {inside}) plus {onTradePage, key, cart: checkoutList(...) with each line's url}; null hides it
          */
         render(m) {
             if (!m) {
@@ -4410,10 +4498,17 @@
                     this.render(m);
                 },
             });
+            // The checkout cart (3.15.1): the plan's lines, each ticking itself off.
+            const cart = m.cart || null;
+            const cartLines = cart ? cart.lines : [];
+            const left = cart ? cart.bazaarsLeft : 0;
+            const mini = cart && cartLines.length
+                ? ' · ' + (cart.done ? 'all bought' : left + (left === 1 ? ' bazaar' : ' bazaars') + ' to go') + ' · ' + cart.unitsBought.toLocaleString('en-US') + ' of ' + cart.units.toLocaleString('en-US') + ' items' + (buys ? ' · ' + bwSigned(m.totals.profit) : '')
+                : ' · ' + buys + (buys === 1 ? ' buy' : ' buys') + ' · ' + bwSigned(m.totals.profit) + (m.toBuy ? ' · ' + m.toBuy + ' to buy' : '');
             const head = bwEl('div', { class: 'bw-hd', title: 'Drag to move it anywhere' }, [
                 bwEl('span', { class: 'bw-ti' }, [
-                    'Bought for ' + (m.trader || 'the trade'),
-                    this.folded ? bwEl('span', { class: 'bw-mini', text: ' · ' + buys + (buys === 1 ? ' buy' : ' buys') + ' · ' + bwSigned(m.totals.profit) + (m.toBuy ? ' · ' + m.toBuy + ' to buy' : '') }) : null,
+                    'Checkout · ' + (m.trader || 'the trade'),
+                    this.folded ? bwEl('span', { class: 'bw-mini', text: mini }) : null,
                 ]),
                 fold,
             ]);
@@ -4426,7 +4521,15 @@
 
             const body = bwEl('div', { class: 'bw-body' });
             body.appendChild(bwEl('div', { class: 'bw-since', text: 'Since "' + (m.trader || 'they') + ' accepted"' + (m.at ? ' at ' + bwTime(m.at) : '') }));
-            if (!buys) body.appendChild(bwEl('p', { class: 'bw-empty', text: 'Nothing bought yet. What you buy for this trade shows here.' }));
+            if (cartLines.length) {
+                body.appendChild(bwEl('div', { class: 'bw-sec' }, [
+                    bwEl('span', { text: 'To buy' }),
+                    bwEl('span', { class: cart.done ? 'bw-g' : '', text: cart.done ? 'all done ✓' : left + ' of ' + cart.bazaars + (cart.bazaars === 1 ? ' bazaar' : ' bazaars') + ' left' }),
+                ]));
+                for (const l of cartLines) body.appendChild(this.cartRow(l, m));
+                body.appendChild(bwEl('div', { class: 'bw-sec' }, [bwEl('span', { text: 'Bought' }), bwEl('span', { text: buys ? bwSigned(m.totals.profit) : '' })]));
+            }
+            if (!buys) body.appendChild(bwEl('p', { class: 'bw-empty', text: cartLines.length ? 'Nothing recorded yet: what you take at a bazaar is added here when you press Next.' : 'Nothing bought yet. What you buy for this trade shows here.' }));
             for (const r of m.rows) {
                 const check = m.onTradePage
                     ? r.inTrade >= r.send
@@ -4450,7 +4553,8 @@
                     bwEl('span', { text: 'Profit' }), bwEl('b', { class: m.totals.profit >= 0 ? 'bw-g' : 'bw-neg', text: bwSigned(m.totals.profit) }),
                 ]));
             }
-            if (m.toBuy) body.appendChild(bwEl('p', { class: 'bw-todo', text: 'Still to buy: ' + m.toBuy + (m.toBuy === 1 ? ' bazaar' : ' bazaars') }));
+            // Without the cart (no plan lines): the count, as before.
+            if (m.toBuy && !cartLines.length) body.appendChild(bwEl('p', { class: 'bw-todo', text: 'Still to buy: ' + m.toBuy + (m.toBuy === 1 ? ' bazaar' : ' bazaars') }));
             // The checklist's verdict on the trade page: all in, or what is missing.
             if (m.onTradePage && buys) {
                 body.appendChild(m.missing.length
@@ -4508,6 +4612,24 @@
     .bw-warn { margin: 8px 0 0; font-size: 12px; font-weight: bold; color: var(--warn); }
     .bw-ok { margin: 8px 0 0; font-size: 12px; font-weight: bold; color: var(--profit); }
     .bw-cancel { margin-top: 8px; text-align: right; }
+    .bw-sec { display: flex; justify-content: space-between; margin: 8px 0 6px; font-size: 11px; font-weight: bold; letter-spacing: 0.5px; text-transform: uppercase; color: var(--muted); }
+    .bw-sec:first-of-type { margin-top: 2px; }
+    .bw-sec .bw-g { color: var(--profit); }
+    .bw-cart { display: grid; grid-template-columns: 18px minmax(0, 1fr) auto; gap: 2px 8px; align-items: baseline; padding: 6px 8px; margin-bottom: 4px; background: var(--row); border: 1px solid var(--line); border-radius: 4px; }
+    .bw-cart .bw-d { grid-column: 2 / -1; }
+    .bw-cart-here { border-color: var(--buy); box-shadow: inset 3px 0 0 var(--buy); }
+    .bw-cart-done .bw-n, .bw-cart-skipped .bw-n { color: var(--muted); }
+    .bw-cart-done .bw-n b, .bw-cart-skipped .bw-n b { color: var(--muted); text-decoration: line-through; }
+    .bw-mark { font-weight: bold; text-align: center; }
+    .bw-m-todo { color: var(--muted); }
+    .bw-m-here { color: var(--buy); }
+    .bw-m-done { color: var(--profit); }
+    .bw-m-part { color: var(--warn); }
+    .bw-m-skip { color: var(--muted); }
+    .bw-tag-here { color: var(--buy); }
+    .bw-tag-mute { color: var(--muted); }
+    .bw-open { color: var(--buy); font-size: 12px; text-decoration: none; white-space: nowrap; }
+    .bw-open:hover { text-decoration: underline; }
     .bw-cancel.bw-ask { display: flex; flex-wrap: wrap; gap: 6px; text-align: left; }
     .bw-cancel.bw-ask .bw-warn { flex: 1 1 100%; margin: 0; }
     .bw-link { padding: 0; border: 0; background: none; color: var(--muted); font: 12px Arial, Helvetica, sans-serif; text-decoration: underline; cursor: pointer; }
@@ -22184,7 +22306,13 @@
             }, { pos: saved.pos || null, folded: Boolean(saved.folded) });
         }
         const onTradePage = Boolean(check && check.key === trade.key);
-        app.bought.render({ ...boughtSince(trade, { inside: onTradePage ? check.inside : null }), onTradePage, key: trade.key });
+        // The checkout cart (3.15.1): the step you are on counts what the page saw you take, before Next records it.
+        const here = app.buyHere && app.buyHere.trade.key === trade.key && buyRun.firstSeen !== null
+            ? { line: app.buyHere.line, index: app.buyHere.index, took: boughtFromStock(buyRun.firstSeen, buyRun.nowSeen, app.buyHere.step.qty) }
+            : app.buyHere && app.buyHere.trade.key === trade.key ? { line: app.buyHere.line, index: app.buyHere.index, took: 0 } : null;
+        const cart = checkoutList(trade, { here });
+        for (const l of cart.lines) l.url = l.sellerId ? bazaarUrl(l.sellerId, l.itemId, l.price) : null;
+        app.bought.render({ ...boughtSince(trade, { inside: onTradePage ? check.inside : null }), onTradePage, key: trade.key, cart });
     }
 
     /* Unplanned buys: each card's stock on the bazaar you are on, kept for this tab. */
@@ -22355,6 +22483,8 @@
             // Next stays on this bazaar: another item of the trade is here too.
             same: Boolean(here && here.trade.items.some((i) => (i.steps || []).some((st) => st !== here.step && !stepDone(st) && String(st.sellerId) === String(here.step.sellerId)))),
         });
+        // The checkout cart, now that the step you are on and what you took here are known.
+        updateBoughtWindow();
     }
 
     /** One line of a trade changed on the desk (ticked, a number, Add). */

@@ -84,3 +84,49 @@ test('an unplanned buy joins the trade, merged with the same item and seller', (
     t = addExtraBuy(t, { itemId: '1', name: 'Hammer', price: 50, qty: 2, bid: 70, sellerId: '9' }, 20);
     assert.deepEqual(t.extra.map((x) => [x.name, x.qty, x.at]), [['Hammer', 5, 20]]);
 });
+
+import { checkoutList, acceptTrade } from '../src/core/accepted.js';
+
+test('checkout cart: every item of the plan in Next bazaar order, each ticking itself off (3.15.1)', () => {
+    const CH = {
+        key: 'id:11',
+        buyer: { id: '11', name: 'Bob', price: 18000 },
+        flips: [
+            { itemId: '335', name: 'Stick of Dynamite', units: 53, bid: 18000, steps: [{ sellerId: '2', sellerName: 'Y', qty: 40, price: 17500 }, { sellerId: '3', sellerName: 'Z', qty: 13, price: 17600 }] },
+            { itemId: '206', name: 'Xanax', units: 2, bid: 850000, steps: [{ sellerId: '2', sellerName: 'Y', qty: 2, price: 840000 }] },
+        ],
+        held: [{ itemId: '1', name: 'Hammer', units: 10, bid: 110 }],
+    };
+    let t = acceptTrade(CH, '335', 1000);
+    let c = checkoutList(t);
+    assert.deepEqual(c.lines.map((l) => [l.name, l.qty, l.seller, l.state]), [
+        ['Stick of Dynamite', 40, 'Y', 'todo'],
+        ['Stick of Dynamite', 13, 'Z', 'todo'],
+        ['Xanax', 2, 'Y', 'todo'],
+    ], 'your own Hammer is not bought: not in the cart');
+    assert.equal(c.bazaars, 2, 'Y and Z: two bazaars');
+    // On Y's bazaar, 25 taken so far (counted from the page, not yet recorded).
+    c = checkoutList(t, { here: { line: 'flip:335', index: 0, took: 25 } });
+    assert.deepEqual([c.lines[0].state, c.lines[0].bought], ['here', 25]);
+    // Next: 25 recorded (fewer than planned), Xanax skipped, Z bought in full.
+    t = recordBuy(t, 'flip:335', 0, 25);
+    t = recordBuy(t, 'flip:206', 0, 0);
+    t = recordBuy(t, 'flip:335', 1, 13);
+    c = checkoutList(t);
+    assert.deepEqual(c.lines.map((l) => l.state), ['part', 'done', 'skipped']);
+    assert.equal(c.unitsBought, 38);
+    assert.equal(c.cost, 25 * 17500 + 13 * 17600);
+    assert.equal(c.bazaarsLeft, 0);
+    assert.equal(c.done, true);
+});
+
+import { windowStart } from '../src/ui/bought-window.js';
+
+test('the checkout window starts clear of NPC Arbitrage: above it if it fits, else beside it (3.15.1)', () => {
+    const panel = { left: 1300, top: 60, right: 1600, width: 300, height: 700 };
+    // Tall (the checkout list) with the panel near the top: beside it, not over its Next button.
+    assert.deepEqual(windowStart(panel, { width: 300, height: 420, viewW: 1616 }), { x: 992, y: 60 });
+    // Room above: just above it, right-aligned.
+    assert.deepEqual(windowStart({ ...panel, top: 500 }, { width: 300, height: 300, viewW: 1616 }), { x: 1300, y: 192 });
+    assert.deepEqual(windowStart(null, { width: 300, height: 300, viewW: 1616 }), { x: 1300, y: 64 });
+});
