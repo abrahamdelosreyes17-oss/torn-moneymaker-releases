@@ -30,19 +30,6 @@ Nothing of 3.14.x / 3.15.0 has been seen on real Torn pages - harness only.
    local, no server. NOT trader-acceptance learning without asking (the
    owner's "never a ranking bias toward a named trader"). Restate + measure
    (flips found per 100 reads, harness `&bigflip=1`) before and after.
-   **The owner, 2026-09-29, wants it to self-train and to learn the API
-   budget too** ("the AI can also see the API usage and how to utilise it...
-   self-train... neural networks?"). Agreed direction: (a) FIRST log
-   outcomes - each read, what it was for, and what it found (a flip? profit?
-   a price list changed?) - into the Export API usage zip (the learning data,
-   and what the session reads); (b) a bandit over where the budget goes
-   (flips vs sweep vs price lists vs the TornExchange scan vs Torn statuses),
-   reward = profit found per request, learning online in the browser; (c) a
-   small neural network only later, trained offline on weeks of both
-   players' exports, if the bandit shows patterns worth more (told the owner:
-   too little data, a market that shifts hourly, and no way to see why for
-   a network now). Show what it learned in Settings › API use ("reads Xanax
-   often: 40% found a flip").
 4. **The overlay shopping cart** (the friend): once "X accepted", the whole
    still-to-buy list in the overlay (today the buying box shows one bazaar
    at a time). Mockups first.
