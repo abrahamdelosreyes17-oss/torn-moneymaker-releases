@@ -144,7 +144,37 @@ export class BoughtWindow {
     }
 
     /**
-     * @param {object|null} m - boughtSince(trade, {inside}) plus {onTradePage}; null hides it
+     * Cancel trade (the owner, 2026-09-29): they accepted, then it was called
+     * off - this window and the plan go. Asked first: "Cancel the trade with X?".
+     */
+    cancelPart(m) {
+        const again = () => {
+            this.sig = null;
+            this.render(m);
+        };
+        if (this.cancelAsk !== m.key) {
+            return bwEl('div', { class: 'bw-cancel' }, [
+                bwEl('button', { type: 'button', class: 'bw-link', title: 'They accepted, then the trade was called off: this flip plan goes (not marked declined)', text: 'Cancel trade', onclick: () => {
+                    this.cancelAsk = m.key;
+                    again();
+                } }),
+            ]);
+        }
+        return bwEl('div', { class: 'bw-cancel bw-ask' }, [
+            bwEl('p', { class: 'bw-warn', text: 'Cancel the trade with ' + (m.trader || 'them') + '? What you already bought stays yours to sell.' }),
+            bwEl('button', { type: 'button', class: 'bw-btn', text: 'Yes, cancel it', onclick: () => {
+                this.cancelAsk = null;
+                if (this.h.onCancel) this.h.onCancel(m.key);
+            } }),
+            bwEl('button', { type: 'button', class: 'bw-btn', text: 'Keep it', onclick: () => {
+                this.cancelAsk = null;
+                again();
+            } }),
+        ]);
+    }
+
+    /**
+     * @param {object|null} m - boughtSince(trade, {inside}) plus {onTradePage, key}; null hides it
      */
     render(m) {
         if (!m) {
@@ -152,7 +182,8 @@ export class BoughtWindow {
             return;
         }
         this.mount();
-        const sig = JSON.stringify([m, this.folded]);
+        if (this.cancelAsk !== m.key) this.cancelAsk = null;
+        const sig = JSON.stringify([m, this.folded, this.cancelAsk]);
         if (sig === this.sig) return;
         this.sig = sig;
         const box = this.box;
@@ -221,6 +252,7 @@ export class BoughtWindow {
                 ? bwEl('p', { class: 'bw-warn', role: 'status', text: 'Not in the trade yet: ' + m.missing.map((x) => x.name + ' ×' + x.qty.toLocaleString('en-US')).join(', ') })
                 : bwEl('p', { class: 'bw-ok', role: 'status', text: 'Everything you bought is in the trade ✓' }));
         }
+        body.appendChild(this.cancelPart(m));
         box.appendChild(body);
         this.place();
     }
@@ -270,4 +302,12 @@ export const BOUGHT_CSS = `
 .bw-todo { margin: 8px 0 0; font-size: 12px; color: var(--buy); }
 .bw-warn { margin: 8px 0 0; font-size: 12px; font-weight: bold; color: var(--warn); }
 .bw-ok { margin: 8px 0 0; font-size: 12px; font-weight: bold; color: var(--profit); }
+.bw-cancel { margin-top: 8px; text-align: right; }
+.bw-cancel.bw-ask { display: flex; flex-wrap: wrap; gap: 6px; text-align: left; }
+.bw-cancel.bw-ask .bw-warn { flex: 1 1 100%; margin: 0; }
+.bw-link { padding: 0; border: 0; background: none; color: var(--muted); font: 12px Arial, Helvetica, sans-serif; text-decoration: underline; cursor: pointer; }
+.bw-link:hover { color: var(--text); }
+.bw-btn { flex: 1; min-height: 26px; padding: 3px 8px; border: 1px solid var(--line); border-radius: 4px; background: #3a3a3a; color: var(--text); font: 12px Arial, Helvetica, sans-serif; cursor: pointer; }
+.bw-btn:hover { border-color: var(--buy); }
+.bw-link:focus-visible, .bw-btn:focus-visible { outline: 2px solid var(--profit); outline-offset: 1px; }
 `;

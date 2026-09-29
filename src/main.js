@@ -55,7 +55,7 @@ import { planTrade, keepAfter } from './core/trade.js';
 import { holdTrade, holdKey, resolveEstimated, priceHeld, livePins, editHeld, HOLD_MS } from './core/held.js';
 import { deskItem, nextW3bRead, backgroundSlot, backgroundListSlot, flipsStale, W3B_HIDDEN_PER_MIN, HIDDEN_RENDER_MS, declineKey, declinedOn } from './core/desk.js';
 import { liquidityKind, unitsMoved, addMovement, stopsMinutes, EXTRA_CAP } from './core/liquidity.js';
-import { boughtSince, stockBuys, addExtraBuy, acceptTrade, liveAccepted, stepState, tickAccepted, stepDone, nextStep, boughtFromStock, recordBuy, sendUnits, acceptedTotals, replacementFor, replaceStep, dropLine, markLeft, leftoversOf, addLeftovers, takenUnits, fillNote } from './core/accepted.js';
+import { boughtSince, stockBuys, addExtraBuy, acceptTrade, liveAccepted, stepState, tickAccepted, stepDone, nextStep, boughtFromStock, recordBuy, sendUnits, acceptedTotals, replacementFor, replaceStep, dropLine, markLeft, leftoversOf, cancelledLeftovers, addLeftovers, takenUnits, fillNote } from './core/accepted.js';
 import { readTradeView, readTradeAddRows } from './sources/dom/trade.js';
 import { BoughtWindow } from './ui/bought-window.js';
 import { makeTabId, LEADER_HEARTBEAT_MS } from './core/leader.js';
@@ -97,12 +97,15 @@ import {
     buyersForItem,
     indexW3bByItem,
     onlineOnly,
+    hiddenBuyers,
     traderLinksIn,
     traderNamesInText,
     traderIdsByName,
     markW3bDue,
     pruneTraderDb,
     votesByTrader,
+    rememberVotes,
+    rememberedVotes,
     ratingsInText,
     trustedOnly,
     liveW3bPrices,
@@ -220,6 +223,8 @@ const STORE_TE = 'teCache';
 const STORE_TE_STATE = 'teState';
 const STORE_TE_LISTS = 'teLists';
 const STORE_TE_IDS = 'teIds';
+/* TornExchange votes last seen per trader (a week): {id: [score, at]}. */
+const STORE_TE_VOTES = 'teVotes';
 const STORE_INVENTORY = 'inventory';
 const STORE_SELL_PREFS = 'sellingPage';
 /* Our own trader database: every trader we know of, and their TornW3B list. */
@@ -247,6 +252,8 @@ const TRADE_NOTE_CLASS = 'ttv2-fillnote';
 const STORE_SELL_DECLINED = 'sellDeclined';
 /* Trades a trader said yes to, frozen (core/accepted.js): trader key -> trade. Torn Bids and the overlay's trade page share it. */
 const STORE_SELL_ACCEPTED = 'sellAccepted';
+/* Trades cancelled after they accepted, from either page: trader key -> {itemId, at}. Torn Bids clears its pick from it. */
+const STORE_SELL_CANCELLED = 'sellCancelled';
 /* Trades you pinned (core/held.js): 'item|trader key' -> held trade. Only prices move in them. */
 const STORE_SELL_PINNED = 'sellPinned';
 /* The Bought window (3.14.3): {pos: {x, y}|null, folded}. Where you dragged it, kept. */
@@ -981,6 +988,7 @@ function trustedBuyerOf(itemId) {
                 db,
                 w3bByItem: indexW3bByItem(db, now),
                 dbIdsByName: traderIdsByName(db),
+                votes: rememberedVotes(gmGet(STORE_TE_VOTES, null), now),
             }),
         };
     }
@@ -2648,10 +2656,11 @@ function updateBoughtWindow() {
             onMove: (pos) => gmSet(STORE_BOUGHT_WINDOW, { ...(gmGet(STORE_BOUGHT_WINDOW, null) || {}), pos }),
             onFold: (folded) => gmSet(STORE_BOUGHT_WINDOW, { ...(gmGet(STORE_BOUGHT_WINDOW, null) || {}), folded }),
             panelRect: () => (app.panel && app.panel.root ? app.panel.root.getBoundingClientRect() : null),
+            onCancel: (key) => onOverlayTradeCancel(key),
         }, { pos: saved.pos || null, folded: Boolean(saved.folded) });
     }
     const onTradePage = Boolean(check && check.key === trade.key);
-    app.bought.render({ ...boughtSince(trade, { inside: onTradePage ? check.inside : null }), onTradePage });
+    app.bought.render({ ...boughtSince(trade, { inside: onTradePage ? check.inside : null }), onTradePage, key: trade.key });
 }
 
 /* Unplanned buys: each card's stock on the bazaar you are on, kept for this tab. */
@@ -2796,6 +2805,7 @@ function trackTradeBuying(listings) {
     const bought = here && buyRun.firstSeen !== null ? boughtFromStock(buyRun.firstSeen, buyRun.nowSeen, here.step.qty) : 0;
     const next = nextStep(t);
     app.panel.setBuying({
+        key: t.key,
         trader: t.trader.name,
         // Minutes since they said yes (the box turns amber after ten).
         age: Math.floor((Date.now() - Number(t.at || Date.now())) / 60000) * 60000,
@@ -2821,6 +2831,41 @@ function trackTradeBuying(listings) {
         // Next stays on this bazaar: another item of the trade is here too.
         same: Boolean(here && here.trade.items.some((i) => (i.steps || []).some((st) => st !== here.step && !stepDone(st) && String(st.sellerId) === String(here.step.sellerId)))),
     });
+}
+
+/** One line of a trade changed on the desk (ticked, a number, Add). */
+function applyTradeEdit(key, itemId, edit) {
+    const e = { ...(sell.tradeEdits.get(key) || {}) };
+    if (edit && (edit.off || edit.qty > 0)) e[String(itemId)] = edit;
+    else delete e[String(itemId)];
+    sell.tradeEdits.set(key, e);
+    // A held trade: only the line you changed changes.
+    const he = sell.heldEdit;
+    if (he && he.key === key) {
+        const h = heldTradeFor(he.pickId, key);
+        if (h) {
+            const next = editHeld(h.held, itemId, edit, he.repick, he.info(String(itemId)));
+            if (next !== h.held) saveHeldTrade(he.pickId, key, next, h.pinned);
+        }
+    }
+}
+
+/** Cancel trade on Torn's pages (the buying box, the Bought window): as in Torn Bids. */
+function onOverlayTradeCancel(key) {
+    // What you took at this bazaar is counted first (Next would have): it is yours to sell.
+    const here = app.buyHere;
+    if (here && here.trade.key === key && buyRun.firstSeen !== null) {
+        const took = boughtFromStock(buyRun.firstSeen, buyRun.nowSeen, here.step.qty);
+        const all = sellAccepted();
+        if (took > 0 && all[key]) saveSellAccepted({ ...all, [key]: recordBuy(all[key], here.line, here.index, took) });
+    }
+    if (buyRun.stepKey) saveBuyRunSeen(buyRun.stepKey, null);
+    cancelSellAccepted(key);
+    buyRun.stepKey = null;
+    app.buyAsk = null;
+    scanTradePage();
+    if (app.pageType === PAGE_BAZAAR) rescan();
+    else trackTradeBuying([]);
 }
 
 /**
@@ -3493,7 +3538,7 @@ const SCRIPT_START_MS = typeof performance !== 'undefined' ? Math.round(performa
 function storageSizes() {
     const keys = [
         STORE_KEY, STORE_ITEMS, STORE_NPC, STORE_MANUAL_NPC, STORE_SETTINGS, STORE_KEY_ACCESS, STORE_API_WINDOW + '.tabs', STORE_W3B_WINDOW + '.tabs', STORE_TORN_PAUSE, STORE_KEY_DEAD, STORE_OPENED,
-        STORE_SELL_KEY, STORE_SELL_KEY_DEAD, STORE_SELL_KEY_ACCESS, STORE_TE_KEY, STORE_TE, STORE_TE_STATE, STORE_TE_LISTS, STORE_TE_IDS,
+        STORE_SELL_KEY, STORE_SELL_KEY_DEAD, STORE_SELL_KEY_ACCESS, STORE_TE_KEY, STORE_TE, STORE_TE_STATE, STORE_TE_LISTS, STORE_TE_IDS, STORE_TE_VOTES,
         STORE_INVENTORY, STORE_SELL_PREFS, STORE_TRADER_DB, STORE_TE_ONE, STORE_SELL_SELF, STORE_SELL_NETWORTH, STORE_SELL_ACCEPTED, STORE_SELL_PINNED,
         STORE_LEDGER_KEY, STORE_LEDGER_KEY_DEAD, STORE_LEDGER_SELF, STORE_LEDGER,
         STORE_FILL, STORE_FILL_OWN_IM, STORE_SELF, STORE_HISTORY, STORE_W3B_SUMMARY, FEED_STORE_KEY,
@@ -4108,6 +4153,42 @@ function saveSellLeftovers(list) {
     gmSet(STORE_SELL_LEFTOVERS, list);
 }
 
+/**
+ * Cancel trade (the owner, 2026-09-29): they accepted, then the trade was
+ * called off - the flip plan is gone. From the overlay or Torn Bids: the
+ * accepted trade goes, its accepted prices go (the Ledger never splits a
+ * later trade by them), what you already bought is kept to sell elsewhere,
+ * and Torn Bids lets go of the plan (never marked Declined; a pin stays).
+ */
+function cancelSellAccepted(key, now = Date.now()) {
+    const all = sellAccepted(now);
+    const t = all[key];
+    if (!t) return;
+    const left = cancelledLeftovers(t, now);
+    if (left.length) saveSellLeftovers(addLeftovers(sellLeftovers(now), left));
+    const recs = gmGet(STORE_SELL_PRICE_RECORDS, []) || [];
+    const id = t.trader && t.trader.id ? String(t.trader.id) : null;
+    const kept = recs.filter((r) => !(r && id && String(r.traderId) === id && Number(r.at) === Number(t.at)));
+    if (kept.length !== recs.length) gmSet(STORE_SELL_PRICE_RECORDS, kept);
+    delete all[key];
+    saveSellAccepted(all);
+    const cancelled = gmGet(STORE_SELL_CANCELLED, {}) || {};
+    gmSet(STORE_SELL_CANCELLED, { ...cancelled, [key]: { itemId: String(t.itemId), at: now } });
+}
+
+/** Torn Bids: a trade cancelled here or on Torn's pages - its pick and held plan go. */
+function takeSellCancelled() {
+    const cancelled = gmGet(STORE_SELL_CANCELLED, {}) || {};
+    const keys = Object.keys(cancelled);
+    if (!keys.length) return;
+    for (const key of keys) {
+        const itemId = String(cancelled[key].itemId);
+        if (sell.tradePick.get(itemId) === key) sell.tradePick.delete(itemId);
+        sell.tradeHold.delete(holdKey(itemId, key));
+    }
+    gmSet(STORE_SELL_CANCELLED, {});
+}
+
 function setSellDeclined(key, until) {
     const next = Object.fromEntries(sellDeclined());
     if (until) next[key] = until;
@@ -4318,12 +4399,14 @@ function loadSelfId() {
  * trader database's TornW3B lists. Answers are kept per item for one pass.
  * The traders page and the panel's bazaar tags both use it.
  */
-function buyerLookup({ teMap, lists, teOne, idsByName, db, w3bByItem, dbIdsByName, teOwn = new Map() }) {
-    // TornExchange's votes for the trust badge, from every answer we have.
+function buyerLookup({ teMap, lists, teOne, idsByName, db, w3bByItem, dbIdsByName, teOwn = new Map(), votes = new Map() }) {
+    // TornExchange's votes for the trust badge, from every answer we have,
+    // then the ones remembered from earlier answers.
     const votesById = votesByTrader([
         ...teMap.values(),
         ...[...teOne.values()].filter((rec) => rec.best).map((rec) => [rec.best]),
     ]);
+    for (const [id, score] of votes) if (!votesById.has(id)) votesById.set(id, score);
     const cache = new Map();
     return (itemId) => {
         const id = String(itemId);
@@ -4389,11 +4472,11 @@ function renderSellingNow() {
     const favsNow = favouriteTraders(now);
     const ownLists = sellTeOwn();
     const ownByItem = teOwnByItem(now, { favs: favsNow, lists: ownLists });
-    const buyersAll = buyerLookup({ teMap, lists: sell.lists, teOne: sell.teOne, idsByName: sell.idsByName, db: sell.db, w3bByItem, dbIdsByName: sell.dbIdsByName, teOwn: ownByItem });
+    const buyersAll = buyerLookup({ teMap, lists: sell.lists, teOne: sell.teOne, idsByName: sell.idsByName, db: sell.db, w3bByItem, dbIdsByName: sell.dbIdsByName, teOwn: ownByItem, votes: sell.votes || new Map() });
     const levelOf = (id) => presenceLevel(sellPresenceOf(id));
     // Trusted means Known (20+ votes) or Trusted; while TornExchange's votes
     // are not loaded, a trader without any is kept ("no votes yet").
-    const votesMissing = !(teMap.size > 0);
+    const votesMissing = !(teMap.size > 0) && !(sell.votes && sell.votes.size > 0);
     const shownCache = new Map();
     // Your traders: history by id (and name, for name-only buyers), favourites, the blacklist.
     const partnerOf = new Map();
@@ -4807,7 +4890,7 @@ function renderSellingNow() {
                 const p = pickBazaars(list, bid, { maxUnits: n, minPct: prefs.minProfitPct, maxStops: MAIN_STOPS, exclude: chosen.buyer.id || null });
                 return p && p.units > 0 ? p.steps : null;
             },
-            info: (id) => ({ name: nameOf(id), bid: bidNow(id), kind: kindOf(id), units: Math.min(prefs.maxPerFlip || 100, EXTRA_CAP[kindOf(id)] || 10) }),
+            info: (id) => ({ name: nameOf(id), bid: bidNow(id), kind: kindOf(id), units: Math.min(prefs.maxPerFlip || 100, EXTRA_CAP[kindOf(id)] || 10), price: lowestOf(id) }),
         };
         const w3bT = chosen.buyer.id && sell.db.traders[chosen.buyer.id] ? sell.db.traders[chosen.buyer.id].w3b : null;
         const common = {
@@ -5009,6 +5092,10 @@ function renderSellingNow() {
         // A bid over 3x the Item Market Average is shown, marked, and never counted (troll bids).
         const buyers = buyersOf(pick).map((x) => ({ ...x, tradeKey: traderKey(x), troll: pickAvg > 0 && !believableBid(x.price, pickAvg), traded: tradedLine(statOf(x), now), favourite: favOf(x) }));
         const realBid = pickAvg > 0 ? listBid(buyers, pickAvg) || null : buyers[0] ? buyers[0].price : null;
+        // Traders Online only / Trusted only leave out here: counted and named, never just gone.
+        const shownKeys = new Set(buyers.map((x) => x.tradeKey));
+        const hidden = hiddenBuyers(withoutBlacklisted(buyersAll(pick), blacklist).filter((x) => !shownKeys.has(traderKey(x))), { prefs, levelOf, votesMissing })
+            .map((x) => ({ ...x, tradeKey: traderKey(x), traded: tradedLine(statOf(x), now), favourite: favOf(x) }));
         const b = sell.bazaars.get(pick);
         const held = heldQty.get(pick) || 0;
         const m = sell.market.get(pick);
@@ -5025,7 +5112,8 @@ function renderSellingNow() {
             buyers,
             buyersTotal: buyers.length,
             buyersLoading: Boolean(load.loading),
-            pending: !buyers.length && (pendingFor(pick) || statusPending),
+            hidden,
+            pending: !buyers.length && !hidden.length && (pendingFor(pick) || statusPending),
             sellers: {
                 state: b && b.at ? 'ok' : b && b.error ? 'error' : 'loading',
                 rows: sellersOf(pick) || [],
@@ -5249,8 +5337,19 @@ async function loadSellInventory({ force = false } = {}) {
 function loadSellTraders(now = Date.now()) {
     const entry = gmGet(STORE_TE, null);
     const fetchedAt = entry && entry.fetchedAt;
-    if (sell.traders && sell.traders.fetchedAt === fetchedAt) return;
+    if (sell.traders && sell.traders.fetchedAt === fetchedAt) {
+        if (!sell.votes) sell.votes = rememberedVotes(gmGet(STORE_TE_VOTES, null), now);
+        return;
+    }
     sell.traders = readTeCacheEntry(entry, now);
+    // Every trader's votes, kept a week: a trader out of today's top threes keeps their badge.
+    let votes = gmGet(STORE_TE_VOTES, null);
+    if (sell.traders) {
+        const next = rememberVotes(votes, votesByTrader(sell.traders.map.values()), sell.traders.fetchedAt, now);
+        if (JSON.stringify(next) !== JSON.stringify(votes)) gmSet(STORE_TE_VOTES, next);
+        votes = next;
+    }
+    sell.votes = rememberedVotes(votes, now);
 
     const ids = gmGet(STORE_TE_IDS, null);
     if (ids && ids.map && now - ids.fetchedAt < TE_IDS_MAX_AGE_MS) {
@@ -5917,6 +6016,12 @@ function bootSellingPage() {
             }
             renderSellingNow();
         },
+        // Cancel trade: they accepted, then it was called off - the plan is gone.
+        onTradeCancel: (key) => {
+            cancelSellAccepted(key);
+            takeSellCancelled();
+            renderSellingNow();
+        },
         // How many of a line the trader did not take (0: they took all).
         onTradeLeft: (key, line, n) => {
             const all = sellAccepted();
@@ -5951,19 +6056,12 @@ function bootSellingPage() {
             renderSellingNow();
         },
         onTradeEdit: (key, itemId, edit) => {
-            const e = { ...(sell.tradeEdits.get(key) || {}) };
-            if (edit && (edit.off || edit.qty > 0)) e[String(itemId)] = edit;
-            else delete e[String(itemId)];
-            sell.tradeEdits.set(key, e);
-            // A held trade: only the line you changed changes.
-            const he = sell.heldEdit;
-            if (he && he.key === key) {
-                const h = heldTradeFor(he.pickId, key);
-                if (h) {
-                    const next = editHeld(h.held, itemId, edit, he.repick, he.info(String(itemId)));
-                    if (next !== h.held) saveHeldTrade(he.pickId, key, next, h.pinned);
-                }
-            }
+            applyTradeEdit(key, itemId, edit);
+            renderSellingNow();
+        },
+        // Add all (the friend, 2026-09-29): every item left out of the trade, in one press - past Extras per trade too.
+        onTradeAddAll: (key, lines) => {
+            for (const l of lines || []) applyTradeEdit(key, l.itemId, { qty: l.units });
             renderSellingNow();
         },
         onTradeHeld: (itemId, held, give, key) => {
@@ -6007,6 +6105,12 @@ function bootSellingPage() {
     gmOnChange(STORE_SELL_PREFS, () => renderSellingNow());
     // Ticks made on Torn's trade page (the overlay) show here at once.
     gmOnChange(STORE_SELL_ACCEPTED, () => renderSellingNow());
+    // Cancelled on Torn's pages (the overlay): the plan goes here too.
+    takeSellCancelled();
+    gmOnChange(STORE_SELL_CANCELLED, () => {
+        takeSellCancelled();
+        renderSellingNow();
+    });
     gmOnChange(STORE_SELL_PINNED, () => renderSellingNow());
     const onSellKeyElsewhere = () => {
         const dead = Boolean(gmGet(STORE_SELL_KEY_DEAD, false));
@@ -6556,6 +6660,7 @@ export function boot() {
         },
         getApiUse: () => (app.client ? app.client.stats() : null),
         onBuyNext,
+        onTradeCancel: onOverlayTradeCancel,
         // A tick on Torn's trade page: shared with Torn Bids.
         onTradeSent: (key, line, sent) => {
             tickSellAccepted(key, line, { sent });

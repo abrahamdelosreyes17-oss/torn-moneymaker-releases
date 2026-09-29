@@ -4,9 +4,39 @@ Read this first, then `README.md`. The README holds the product and the binding
 rules; this file holds where we are, how the owner works, and what is settled.
 Everything below "History" is the record of how we got here.
 
-## Start here (state on 2026-09-28, end of the third session)
+## Start here (state on 2026-09-29, fourth session)
 
-- **Released: 3.14.4** (3.14.3 + unplanned buys in the Bought window; see
+- **Released: 3.14.5** (2026-09-29, fourth session), and **`main` now follows
+  every release** (the owner: "yes please move to main on each new release"):
+  every install auto-updates from `main` (Tampermonkey checks about daily, or
+  at once with "Check for userscript updates"). Release = bump, commit on the
+  branch, push the branch, then fast-forward `main` to it and push `main`.
+  No more pinned links needed (they still work).
+  3.14.5, all from the friend's reports (through the owner, in Tagalog):
+  - **Buyers vanished from the desk** ("the list of buyers suddenly
+    disappears and it says loading more buyers"): reproduced with harness
+    `&teslow=1` + `&w3btrader=1` (Bottle of Beer). Cause: *Trusted buyers
+    only* - votes come only with an item's top three, so a trader out of every
+    top three (a refresh, a late load) lost the badge and was hidden, and the
+    card said "Checking…" forever. Fix: votes remembered a week
+    (`rememberVotes`, `STORE_TE_VOTES`); the desk says "Trusted buyers only
+    hides N traders here · Show them" (`hiddenBuyers`). First-ever load can
+    still show an unrated trader until votes arrive (then it is hidden, with
+    that line).
+  - **Cancel trade** (the friend: a cancelled trade was still remembered next
+    time; accepted trades live 24 h): overlay buying box, Bought window, Torn
+    Bids' accepted card; asks first; `cancelSellAccepted` (bought -> leftovers,
+    counted up to the bazaar you are on; price record dropped; not declined;
+    pins stay) and `STORE_SELL_CANCELLED` so Torn Bids lets go of the pick.
+  - **Add all** on "X buys N more items… Show them" (the friend wants more
+    than 10 extras sometimes; the owner: Extras per trade is a setting, not
+    their rule). Fixed on the way: Add on a held trade dropped an item whose
+    bazaars were not read (`editHeld` now adds it as an ≈ line).
+  - Not done, next: the overlay **shopping cart** (the whole still-to-buy list
+    in the overlay once accepted; today the buying box shows one bazaar at a
+    time) - mockup first. Then the fourth-session agenda below (live check,
+    Unplan, cursor, favourites list).
+- Before it: **3.14.4** (3.14.3 + unplanned buys in the Bought window; see
   "What the 2026-09-28 third session did"), pushed (`9b7cd49`). Install link
   given to the owner:
   `https://raw.githubusercontent.com/abrahamdelosreyes17-oss/torn-moneymaker-releases/9b7cd49377c8219c3bc3d6e73192a4880613f749/torn-moneymaker.user.js`
@@ -28,11 +58,11 @@ Everything below "History" is the record of how we got here.
 - **The owner had the script switched off** in Tampermonkey while testing the
   trade page (2026-09-27): when something "isn't there", ask them to check the
   Tampermonkey icon (script on, version) before anything else.
-- **`main` is still at 2.9.3.** The script's `@updateURL` points at `main`, so
-  installs go through **pinned links** (`.../<commit>/torn-moneymaker.user.js`).
-  Merging to `main` makes every install auto-update: only if the owner asks.
+- **`main` = the latest release** since 3.14.5 (it was 2.9.3 until then).
+  The script's `@updateURL` points at `main`: moving `main` IS releasing to
+  the owner and the friend.
 - Nothing uncommitted except `mockups/` and `.claude/` (untracked on purpose).
-- 277 unit tests (`npm test`); `test/ux-check.mjs` has never run here. For
+- 324 unit tests (`npm test`); `test/ux-check.mjs` has never run here. For
   screenshots, 2026-09-28 used `playwright-core` installed in the session's
   scratchpad with the system Chrome (`executablePath`), never the repo. **Block
   torn.com in every Playwright context** (`ctx.route(/torn\.com\//, r =>

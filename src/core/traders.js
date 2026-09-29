@@ -422,6 +422,44 @@ export function votesByTrader(lists) {
     return out;
 }
 
+/* A trader's TornExchange votes are remembered this long after last seen. */
+export const VOTES_KEEP_MS = 7 * 24 * 60 * 60 * 1000;
+/* At most this many traders' votes are remembered (the most recently seen). */
+export const VOTES_KEEP_MAX = 5000;
+
+/**
+ * Votes only come with an item's top three, so a trader who drops out of
+ * every top three at a refresh lost their trust badge, and with "Trusted
+ * buyers only" vanished from the desk (the friend, 3.14.4: "the list of
+ * buyers suddenly disappears"). The last votes seen are kept for a week.
+ *
+ * @param {object|null} stored - {id: [score, at]}
+ * @param {Map<string, number>} current - votesByTrader of the newest answer
+ * @param {number} at - when that answer was read
+ * @returns {object} the new stored form
+ */
+export function rememberVotes(stored, current, at, now = Date.now()) {
+    const all = new Map();
+    for (const [id, v] of Object.entries(stored && typeof stored === 'object' ? stored : {})) {
+        if (Array.isArray(v) && Number.isFinite(v[0]) && now - Number(v[1]) <= VOTES_KEEP_MS) all.set(id, [v[0], Number(v[1])]);
+    }
+    for (const [id, score] of current || []) {
+        const old = all.get(id);
+        if (!old || !(old[1] > at)) all.set(id, [score, at]);
+    }
+    const keep = [...all.entries()].sort((a, b) => b[1][1] - a[1][1]).slice(0, VOTES_KEEP_MAX);
+    return Object.fromEntries(keep);
+}
+
+/** The remembered votes, as votesByTrader's map (too old ones left out). */
+export function rememberedVotes(stored, now = Date.now()) {
+    const out = new Map();
+    for (const [id, v] of Object.entries(stored && typeof stored === 'object' ? stored : {})) {
+        if (Array.isArray(v) && Number.isFinite(v[0]) && now - Number(v[1]) <= VOTES_KEEP_MS) out.set(id, v[0]);
+    }
+    return out;
+}
+
 /**
  * Who pays the most for the most of your items. In Torn you trade with one
  * person at a time, so the trader with the best price on many of your items
@@ -493,6 +531,24 @@ export function indexW3bByItem(db, now = Date.now()) {
  */
 export function onlineOnly(buyers, levelOf) {
     return buyers.filter((b) => !(b.id && levelOf(b.id) === 'offline'));
+}
+
+/**
+ * The buyers "Buyers online only" and "Trusted buyers only" leave out, each
+ * with why (`hiddenBy`: 'offline' or 'trust'), so the desk can say so: a
+ * list that empties with no reason reads as broken (the friend, 3.14.4).
+ * The same rules as onlineOnly and trustedOnly({min: 'Known'}).
+ *
+ * @param {Array} buyers - the allowed buyers (blacklist already out)
+ * @param {{prefs: {onlineOnly?: boolean, trustedOnly?: boolean}, levelOf: Function, votesMissing?: boolean}} opts
+ */
+export function hiddenBuyers(buyers, { prefs = {}, levelOf = () => 'unknown', votesMissing = false } = {}) {
+    const out = [];
+    for (const b of buyers || []) {
+        if (prefs.onlineOnly && b.id && levelOf(b.id) === 'offline') out.push({ ...b, hiddenBy: 'offline' });
+        else if (prefs.trustedOnly && !(b.trust ? b.trust.level === 'Trusted' || b.trust.level === 'Known' : votesMissing)) out.push({ ...b, hiddenBy: 'trust' });
+    }
+    return out;
 }
 
 /**

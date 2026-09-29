@@ -1744,7 +1744,7 @@ export class SellingPage {
     renderDesk() {
         const d = this.state.desk;
         const box = this.deskEl;
-        if (d && this.showAll.item !== d.itemId) this.showAll = { item: d.itemId, buyers: false, sellers: false };
+        if (d && this.showAll.item !== d.itemId) this.showAll = { item: d.itemId, buyers: false, sellers: false, hidden: false };
         const statusOf = (b) => {
             const st = b.id && this.state.statuses ? this.state.statuses.get(String(b.id)) : null;
             return st ? st.level + st.text : '';
@@ -1757,6 +1757,7 @@ export class SellingPage {
                 d.itemId, d.name, d.held, d.avg, d.bazaars, d.buyersTotal, d.buyersLoading, d.pending, d.planWhy,
                 d.buyers.map((b) => [b.id, b.name, b.price, b.te, b.teTop, b.teList, b.w3b, statusOf(b), b.trust ? b.trust.level + b.trust.score : '', this.state.networth && b.id ? this.state.networth.get(String(b.id)) : null, Boolean(b.favourite), b.traded || '', Boolean(b.troll), Boolean(b.lastPaidOnly)]),
                 this.justBlacklisted ? this.justBlacklisted.at : 0,
+                (d.hidden || []).map((b) => [b.tradeKey, b.price, b.hiddenBy, statusOf(b), b.trust ? b.trust.level + b.trust.score : '']),
                 p.networthPct,
                 d.sellers.state, d.sellers.error,
                 d.sellers.rows.map((r) => [r.sellerId, r.sellerName, r.price, r.qty, r.stale, Math.floor((now - (r.dataAt || 0)) / 60000)]),
@@ -1880,7 +1881,50 @@ export class SellingPage {
                 },
             }));
         }
+        this.hiddenBuyersPart(card, d);
         return card;
+    }
+
+    /**
+     * Traders your Buyers online only / Trusted buyers only leave out here:
+     * how many and which switch, and on a press, who (greyed, never planned).
+     * The list never empties with no reason (the friend, 3.14.4).
+     */
+    hiddenBuyersPart(card, d) {
+        const hidden = d.hidden || [];
+        if (!hidden.length) return;
+        const open = Boolean(this.showAll.hidden);
+        const n = (k) => hidden.filter((b) => b.hiddenBy === k).length;
+        const parts = [];
+        if (n('trust')) parts.push('Trusted buyers only hides ' + count(n('trust')) + (n('trust') === 1 ? ' trader' : ' traders'));
+        if (n('offline')) parts.push('Buyers online only hides ' + count(n('offline')) + (n('offline') === 1 ? ' trader' : ' traders') + ' (offline)');
+        card.appendChild(spEl('p', { class: 'sp-note sp-hidnote' }, [
+            parts.join(' · ') + ' here. ',
+            spEl('button', { type: 'button', class: 'sp-link', 'aria-expanded': String(open), 'data-focus': 'desk:hidden', text: open ? 'Hide them' : 'Show them', onclick: () => {
+                this.showAll.hidden = !open;
+                this.deskSig = null;
+                this.renderDesk();
+                this.fitDesk();
+            } }),
+        ]));
+        if (!open) return;
+        for (const b of hidden) {
+            const why = b.hiddenBy === 'offline'
+                ? 'Offline: hidden by Buyers online only'
+                : !b.trust ? 'No votes yet: hidden by Trusted buyers only'
+                : b.trust.level === 'Caution' ? 'More votes against than for: hidden by Trusted buyers only'
+                : 'Fewer than 20 votes: hidden by Trusted buyers only';
+            card.appendChild(spEl('div', { class: 'sp-tr sp-hidden' }, [
+                spEl('span', { class: 'sp-tr-l' }, [
+                    spEl('span', { class: 'sp-trader-l' }, [this.playerName(b.name, b.id, 'hidden:' + (b.id || b.name)), this.trustBadge(b)]),
+                    this.status(b),
+                    b.traded ? spEl('small', { class: 'sp-traded', text: b.traded }) : null,
+                    spEl('small', { class: 'sp-differ', text: why }),
+                ]),
+                spEl('span', { class: 'sp-tprice', text: formatMoney(b.price) }),
+                this.traderLinks(b),
+            ]));
+        }
     }
 
     /**
@@ -2240,6 +2284,10 @@ export class SellingPage {
                     this.deskSig = null;
                     this.renderDesk();
                 } }),
+                // Add all (the friend, 2026-09-29): every one of them in one press, past Extras per trade.
+                (c.left || []).length > 1
+                    ? spEl('span', {}, [' · ', spEl('button', { type: 'button', class: 'sp-link', 'data-focus': 'trade:addall', title: 'Put every item ' + b.name + ' buys into this trade (more bazaars to visit)', text: 'Add all ' + count(c.left.length), onclick: () => this.h.onTradeAddAll && this.h.onTradeAddAll(c.key, c.left.map((r) => ({ itemId: r.itemId, units: r.units }))) })])
+                    : null,
             ]));
             if (open) {
                 for (const r of c.left || []) {
@@ -2442,10 +2490,34 @@ export class SellingPage {
                 ]))) : null,
             ]));
         }
-        // Back (the plan unfreezes) on the left, apart from Traded - done on the right.
+        // Cancel trade (the owner, 2026-09-29): they accepted, then it was
+        // called off - the plan goes. Asked first, like on Torn's pages.
+        if (this.cancelAsk === A.key) {
+            card.appendChild(spEl('div', { class: 'sp-tpick sp-acc-foot sp-cancelask' }, [
+                spEl('span', { class: 'sp-warnnote', text: 'Cancel the trade with ' + b.name + '? This flip plan goes (they are not marked declined); what you already bought stays yours to sell.' }),
+                spEl('span', { class: 'sp-tpick-b' }, [
+                    spEl('button', { type: 'button', class: 'sp-btn', 'data-focus': 'acc:cancel-yes', text: 'Yes, cancel it', onclick: () => {
+                        this.cancelAsk = null;
+                        if (this.h.onTradeCancel) this.h.onTradeCancel(A.key);
+                    } }),
+                    spEl('button', { type: 'button', class: 'sp-link', 'data-focus': 'acc:cancel-no', text: 'Keep it', onclick: () => {
+                        this.cancelAsk = null;
+                        this.deskSig = null;
+                        this.renderDesk();
+                    } }),
+                ]),
+            ]));
+            return card;
+        }
+        // Back (the plan unfreezes) and Cancel trade on the left, apart from Traded - done on the right.
         card.appendChild(spEl('div', { class: 'sp-tpick sp-acc-foot' }, [
             spEl('span', { class: 'sp-tpick-b' }, [
                 spEl('button', { type: 'button', class: 'sp-link', 'data-focus': 'acc:back', title: 'Unfreeze: back to the live plan (nothing is kept)', text: '← Back to the live plan', onclick: () => this.h.onTradeClose && this.h.onTradeClose(A.key, false) }),
+                spEl('button', { type: 'button', class: 'sp-link', 'data-focus': 'acc:cancel', title: 'They accepted, then the trade was called off: this flip plan goes (not marked declined)', text: 'Cancel trade', onclick: () => {
+                    this.cancelAsk = A.key;
+                    this.deskSig = null;
+                    this.renderDesk();
+                } }),
                 this.stepTraderLinks(b, { trade: false }),
             ]),
             spEl('button', { type: 'button', class: 'sp-btn', 'data-focus': 'acc:done', title: 'The trade went through: close it' + (A.items.some((i) => i.left > 0 && i.kind === 'flip') ? ', and keep what they did not take to sell elsewhere' : ''), text: 'Traded - done', onclick: () => this.h.onTradeClose && this.h.onTradeClose(A.key, true) }),
@@ -2776,6 +2848,9 @@ a.sp-btn { display: inline-flex; align-items: center; text-decoration: none; }
 .sp-left { display: block; margin-top: 2px; }
 .sp-left .sp-qty { width: 56px; }
 .sp-acc-foot { margin-top: 10px; }
+.sp-cancelask { justify-content: flex-start; }
+.sp-cancelask > .sp-warnnote { flex: 1 1 100%; color: var(--warn); font-size: 13px; }
+.sp-tpick-b { align-items: center; }
 .sp-fc.sp-lo { border-style: dashed; }
 /* The pin sits in the card's corner, out of the flow: the card's contents
    are where they always were, pinned or not (the owner: "you moved the contents"). */
@@ -2858,7 +2933,7 @@ a.sp-btn { display: inline-flex; align-items: center; text-decoration: none; }
 .sp-plan-on { display: inline-flex; align-items: center; border-radius: 13px; border: 1px solid var(--hot-line); color: var(--price); font-weight: bold; background: var(--green-bg); }
 .sp-tr.sp-planning { box-shadow: inset 3px 0 0 var(--price); }
 /* Dimmed by colour, not see-through: its words stay readable (review M10). */
-.sp-tr.sp-declined .sp-tprice, .sp-tr.sp-declined .sp-trader-l, .sp-tr.sp-declined small { color: #8c8c8c; }
+.sp-tr.sp-declined .sp-tprice, .sp-tr.sp-declined .sp-trader-l, .sp-tr.sp-declined small, .sp-tr.sp-hidden .sp-tprice, .sp-tr.sp-hidden .sp-trader-l, .sp-tr.sp-hidden small { color: #8c8c8c; }
 .sp-tr.sp-troll .sp-tprice { color: var(--muted); text-decoration: line-through; }
 .sp-scan { display: flex; flex-direction: column; gap: 8px; margin: 0 0 16px; }
 .sp-scanh { margin: 0; }

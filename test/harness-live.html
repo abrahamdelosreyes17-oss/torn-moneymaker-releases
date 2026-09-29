@@ -216,6 +216,7 @@ if (/[?&]awake=1/.test(location.search)) {
 }
 // ?slow=1 answers profile (status) lookups after 2s, like a slow API.
 const SLOW = /[?&]slow=1/.test(location.search);
+const TESLOW = /[?&]teslow=1/.test(location.search);
 
 function GM_getValue(k, d) { return k in _store ? _store[k] : d; }
 function GM_setValue(k, v) { _store[k] = v; }
@@ -547,7 +548,9 @@ function GM_xmlhttpRequest(opts) {
         } catch (e) {
             opts.onerror(e);
         }
-    }, SLOW && /\/v2\/user\/\d+\/profile/.test(opts.url) ? 2000 : 5);
+    }, SLOW && /\/v2\/user\/\d+\/profile/.test(opts.url) ? 2000
+        // &teslow=1: TornExchange's top three (with the votes) and item lists answer 15 s late.
+        : TESLOW && /tornexchange\.com\/api\/(all_best_listings|listings)/.test(opts.url) ? 15000 : 5);
 }
 window.onerror = (m) => { document.getElementById('out').textContent = 'BOOT ERROR: ' + m; };
 </script>

@@ -983,7 +983,9 @@ export class Panel {
     setBuying(v) {
         const box = this.buyBoxEl;
         if (!box) return;
-        const sig = JSON.stringify(v);
+        // Cancel trade asks first (a buying run is not thrown away by a slip).
+        if (!v || this.cancelAsk !== v.key) this.cancelAsk = null;
+        const sig = JSON.stringify([v, this.cancelAsk]);
         if (sig === this.buySig) return;
         this.buySig = sig;
         box.textContent = '';
@@ -1023,6 +1025,37 @@ export class Panel {
         const label = v.here && (!v.next || v.last) ? 'Done - go to the trade' : v.here && !v.here.listed ? 'Not here - next' : v.here && v.same ? 'Next item here' : v.here ? 'Next bazaar' : 'Open the next bazaar' + (v.next ? ': ' + v.next.seller : '');
         this.buyNextBtn = el('button', { type: 'button', class: 'ttv2-primary ttv2-buynext', title: this.buyHereActive ? 'Key: N' : null, onclick: () => this.handlers.onBuyNext && this.handlers.onBuyNext() }, [label, this.buyHereActive ? el('span', { class: 'ttv2-kbd', text: 'N' }) : null]);
         box.appendChild(this.buyNextBtn);
+        box.appendChild(this.cancelTradePart(v, () => this.setBuying(v)));
+    }
+
+    /**
+     * Cancel trade (the owner, 2026-09-29): they accepted, then it was called
+     * off. A link, then "Cancel the trade with X?" - Yes / Keep it.
+     */
+    cancelTradePart(v, redraw) {
+        const again = () => {
+            this.buySig = null;
+            redraw();
+        };
+        if (this.cancelAsk !== v.key) {
+            return el('div', { class: 'ttv2-tb-cancel' }, [
+                el('button', { type: 'button', class: 'ttv2-linkbtn', title: 'They accepted, then the trade was called off: this flip plan goes (not marked declined)', text: 'Cancel trade', onclick: () => {
+                    this.cancelAsk = v.key;
+                    again();
+                } }),
+            ]);
+        }
+        return el('div', { class: 'ttv2-tb-cancel ttv2-tb-ask' }, [
+            el('div', { class: 'ttv2-tb-warn', text: 'Cancel the trade with ' + v.trader + '? What you already bought stays yours to sell.' }),
+            el('button', { type: 'button', text: 'Yes, cancel it', onclick: () => {
+                this.cancelAsk = null;
+                if (this.handlers.onTradeCancel) this.handlers.onTradeCancel(v.key);
+            } }),
+            el('button', { type: 'button', text: 'Keep it', onclick: () => {
+                this.cancelAsk = null;
+                again();
+            } }),
+        ]);
     }
 
     /** "Torn API calls in the last minute: 12 of 70", every tab together. */

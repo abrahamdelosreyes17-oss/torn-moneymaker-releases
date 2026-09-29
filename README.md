@@ -436,6 +436,12 @@ you: every link is one you follow yourself, one page per click.
   keeps Trusted and Known (20+ votes); while TornExchange's votes are not
   loaded, a trader without any is kept. The badge shows the score (*TRUSTED
   180*). The overlay's bazaar-card tag still needs the Trusted badge.
+- **3.14.5:** a trader's TornExchange votes are remembered for a week (they
+  only come with an item's top three, so a trader who dropped out of every top
+  three at a refresh lost the badge and vanished from the desk). The desk never
+  empties without a reason: *"Trusted buyers only hides 2 traders here · Show
+  them"* (and the same for *Buyers online only*); shown, they are greyed with
+  why, and never planned.
 - **Trusted buyers only** (on from the start: money changes hands on trust)
   and **Buyers online only** apply to the whole page - flips, the desk, the
   badges. A trader's status comes from Torn's public profile, at most 30 a
@@ -569,6 +575,21 @@ vanishes only when you pressed its button), shown orange - red at a loss -
 and left off when the trader does not buy that item. On Torn's trade page it is a checklist:
 each item "✓ in" once it is in the trade, and anything bought but not added
 is named. It never presses anything of Torn's, and goes at Traded - done.
+
+**Cancel trade** (3.14.5): they accepted, then the trade was called off - the
+flip plan is gone. In the overlay's buying box, the Bought window and Torn
+Bids' accepted card, only while a trade is accepted; it asks first ("Cancel
+the trade with Bob?"). The trader is not marked Declined, a pin stays, the
+accepted prices are dropped (the Ledger never splits a later trade by them),
+and whatever you already bought for it - counted up to the bazaar you are on -
+goes to your leftovers, to sell elsewhere. *← Back to the live plan* is
+unchanged (unfreezes the plan, nothing kept).
+
+**Add all** (3.14.5): beside *"X buys N more items, left out to keep it
+quick · Show them"*, one press puts every one of them in the trade, past
+Extras per trade. On a held trade an item whose bazaars are not read yet goes
+in as an ≈ line and fills in once read (a single Add used to drop such an
+item from the trade and from the list).
 
 **Settings** (⚙, and where the page opens until the Limited key is saved).
 There are no Save buttons (3.14.3): each box shows what is saved; Enter, Tab

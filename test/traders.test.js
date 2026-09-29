@@ -14,6 +14,10 @@ import {
     buyersForItem,
     indexW3bByItem,
     onlineOnly,
+    hiddenBuyers,
+    rememberVotes,
+    rememberedVotes,
+    VOTES_KEEP_MS,
     itemRows,
     traderLinksIn,
     traderNamesInText,
@@ -586,4 +590,35 @@ test('a 401 from TornExchange never puts a key on the page', async () => {
     const KEY = 'AbCdEfGh12345678';
     const c = new TeClient3143({ getKey: () => KEY, now: () => 1_000_000, fetchImpl: async () => ({ ok: false, status: 401, json: async () => ({ message: 'Invalid key ' + KEY }) }) });
     await assert.rejects(c.get('all_best_listings'), (e) => !e.message.includes(KEY));
+});
+
+test('votes are remembered: a trader out of every top three keeps their badge for a week (the friend: buyers vanished)', () => {
+    const now = 1_000_000_000_000;
+    // 10:00 - Carol is in an item's top three with 150 votes.
+    let stored = rememberVotes(null, votesByTrader([[{ id: '44', score: 150 }, { id: '11', score: 214 }]]), now, now);
+    // 10:10 - the refresh: Carol dropped out of every top three.
+    stored = rememberVotes(stored, votesByTrader([[{ id: '11', score: 220 }]]), now + 600000, now + 600000);
+    const votes = rememberedVotes(stored, now + 600000);
+    assert.equal(votes.get('44'), 150);
+    assert.equal(votes.get('11'), 220, 'the newest answer wins');
+    // Her row still has votes, so Trusted buyers only still shows her.
+    const [carol] = buyersForItem('335', { db: { traders: { 44: { name: 'Carol', w3b: { found: true, at: now, prices: { 335: 18400 } } } } }, w3bByItem: new Map([['335', [{ id: '44', price: 18400 }]]]), votesById: votes });
+    assert.equal(carol.trust.level, 'Trusted');
+    // A week later, not seen since: forgotten.
+    assert.equal(rememberedVotes(stored, now + VOTES_KEEP_MS + 1).has('44'), false);
+});
+
+test('hiddenBuyers: what Buyers online only / Trusted buyers only leave out, and why', () => {
+    const b = [
+        { id: '1', name: 'A', trust: { level: 'Trusted' } },
+        { id: '2', name: 'B', trust: { level: 'New' } },
+        { id: '3', name: 'C', trust: null },
+        { id: '4', name: 'D', trust: { level: 'Known' } },
+    ];
+    const levelOf = (id) => (id === '4' ? 'offline' : 'online');
+    const h = hiddenBuyers(b, { prefs: { onlineOnly: true, trustedOnly: true }, levelOf });
+    assert.deepEqual(h.map((x) => x.name + ':' + x.hiddenBy), ['B:trust', 'C:trust', 'D:offline']);
+    // While votes are not loaded at all, a trader with none is kept (as trustedOnly's keepUnrated).
+    assert.deepEqual(hiddenBuyers(b, { prefs: { trustedOnly: true }, levelOf, votesMissing: true }).map((x) => x.name), ['B']);
+    assert.deepEqual(hiddenBuyers(b, { prefs: {}, levelOf }), []);
 });

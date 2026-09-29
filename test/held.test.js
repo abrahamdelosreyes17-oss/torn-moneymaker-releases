@@ -152,3 +152,19 @@ test('pins: newest first, at most a few, a week at most', () => {
     assert.equal(Object.keys(out)[0], 'i0|k');
     assert.equal('old|k' in out, false);
 });
+
+test('Add (and Add all) on a held trade before the item\'s bazaars are read: in as an ≈ line, filled in once read', () => {
+    const held = holdTrade(CHOSEN, '870');
+    const unread = () => null;
+    const added = editHeld(held, '1020', { qty: 40 }, unread, { name: 'Gold Ribbon', bid: 900, kind: 'normal', price: 700 });
+    const line = added.lines.find((l) => l.itemId === '1020');
+    assert.ok(line, 'it used to be dropped: gone from the trade and from the left-out list');
+    assert.equal(line.estimated, true);
+    assert.equal(line.units, 40);
+    assert.deepEqual(line.steps, [{ sellerId: null, sellerName: null, qty: 40, price: 700 }]);
+    // Its bazaars read: the live plan's steps for it.
+    const done = resolveEstimated(added, [{ itemId: '1020', units: 40, steps: [{ sellerId: 'G', sellerName: 'G', qty: 40, price: 690 }] }]);
+    assert.equal(done.lines.find((l) => l.itemId === '1020').estimated, false);
+    // No price known at all: nothing to go on, left as it was.
+    assert.equal(editHeld(held, '1020', { qty: 40 }, unread, { name: 'Gold Ribbon' }), held);
+});

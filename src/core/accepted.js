@@ -383,6 +383,26 @@ export function leftoversOf(trade, now = Date.now()) {
     return out;
 }
 
+/**
+ * A trade cancelled after they accepted (the owner, 2026-09-29: "they did
+ * accept but then chose to cancel, meaning that flip plan is now gone"):
+ * everything already bought for it - planned and unplanned - is yours to
+ * sell elsewhere, as leftovers.
+ */
+export function cancelledLeftovers(trade, now = Date.now()) {
+    const from = trade && trade.trader ? trade.trader.name : null;
+    const out = [];
+    for (const i of (trade && trade.items) || []) {
+        if (i.kind !== 'flip' || !(i.steps || []).some(stepDone)) continue;
+        const n = sendUnits(i);
+        if (n > 0) out.push({ itemId: String(i.itemId), name: i.name, qty: n, each: Math.round(costEach(i)), from, at: now });
+    }
+    for (const x of (trade && trade.extra) || []) {
+        if (x && Number(x.qty) > 0) out.push({ itemId: String(x.itemId), name: x.name, qty: Number(x.qty), each: Math.round(Number(x.price) || 0), from, at: now });
+    }
+    return addLeftovers([], out);
+}
+
 /** Leftovers added to a stored list: one row per item, the cost averaged over both. */
 export function addLeftovers(list, add) {
     const out = (Array.isArray(list) ? list : []).map((l) => ({ ...l }));

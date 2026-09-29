@@ -201,7 +201,15 @@ export function editHeld(held, itemId, edit, repick, info = {}) {
     }
     const n = edit && edit.qty > 0 ? Math.floor(edit.qty) : (was && was.units) || Math.floor(Number(info.units) || 0);
     const steps = n > 0 ? repick(id, n) : null;
-    if (!steps || !steps.length) return held;
+    if (!steps || !steps.length) {
+        // Added (Add, Add all) before its bazaars were read: in as an ≈ line at
+        // the cheapest price known; its bazaars fill in once read (resolveEstimated).
+        // It used to be dropped: gone from the trade and from "left out" alike.
+        const price = Number(info.price) || 0;
+        if (!(edit && edit.qty > 0) || at >= 0 || !(n > 0) || !(price > 0)) return held;
+        lines.push({ ...(was || { itemId: id, name: info.name || null, bid: info.bid || null, kind: info.kind || null, role: 'extra' }), estimated: true, units: n, steps: [{ sellerId: null, sellerName: null, qty: n, price }] });
+        return { ...held, lines, off };
+    }
     const line = { ...(was || { itemId: id, name: info.name || null, bid: info.bid || null, kind: info.kind || null, role: 'extra' }), estimated: false, units: steps.reduce((a, st) => a + st.qty, 0), steps: steps.map((st) => ({ sellerId: st.sellerId ? String(st.sellerId) : null, sellerName: st.sellerName || null, qty: st.qty, price: st.price })) };
     if (at >= 0) lines.splice(at, 0, line);
     else lines.push(line);

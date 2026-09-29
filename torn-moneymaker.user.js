@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      3.14.4
+// @version      3.14.5
 // @description  Finds Bazaar and Item Market listings below NPC / market value - on the page you are viewing, and live from the Torn API and TornW3B - ranked by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -42,7 +42,7 @@
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '3.14.4';
+    const TTV2_BUILD_VERSION = '3.14.5';
 
     /* ===== src/platform/gm.js ===== */
     /*
@@ -2727,7 +2727,15 @@
         }
         const n = edit && edit.qty > 0 ? Math.floor(edit.qty) : (was && was.units) || Math.floor(Number(info.units) || 0);
         const steps = n > 0 ? repick(id, n) : null;
-        if (!steps || !steps.length) return held;
+        if (!steps || !steps.length) {
+            // Added (Add, Add all) before its bazaars were read: in as an ≈ line at
+            // the cheapest price known; its bazaars fill in once read (resolveEstimated).
+            // It used to be dropped: gone from the trade and from "left out" alike.
+            const price = Number(info.price) || 0;
+            if (!(edit && edit.qty > 0) || at >= 0 || !(n > 0) || !(price > 0)) return held;
+            lines.push({ ...(was || { itemId: id, name: info.name || null, bid: info.bid || null, kind: info.kind || null, role: 'extra' }), estimated: true, units: n, steps: [{ sellerId: null, sellerName: null, qty: n, price }] });
+            return { ...held, lines, off };
+        }
         const line = { ...(was || { itemId: id, name: info.name || null, bid: info.bid || null, kind: info.kind || null, role: 'extra' }), estimated: false, units: steps.reduce((a, st) => a + st.qty, 0), steps: steps.map((st) => ({ sellerId: st.sellerId ? String(st.sellerId) : null, sellerName: st.sellerName || null, qty: st.qty, price: st.price })) };
         if (at >= 0) lines.splice(at, 0, line);
         else lines.push(line);
@@ -3262,6 +3270,26 @@
             out.push({ itemId: String(i.itemId), name: i.name, qty: n, each: Math.round(costEach(i)), from: trade.trader ? trade.trader.name : null, at: now });
         }
         return out;
+    }
+
+    /**
+     * A trade cancelled after they accepted (the owner, 2026-09-29: "they did
+     * accept but then chose to cancel, meaning that flip plan is now gone"):
+     * everything already bought for it - planned and unplanned - is yours to
+     * sell elsewhere, as leftovers.
+     */
+    function cancelledLeftovers(trade, now = Date.now()) {
+        const from = trade && trade.trader ? trade.trader.name : null;
+        const out = [];
+        for (const i of (trade && trade.items) || []) {
+            if (i.kind !== 'flip' || !(i.steps || []).some(stepDone)) continue;
+            const n = sendUnits(i);
+            if (n > 0) out.push({ itemId: String(i.itemId), name: i.name, qty: n, each: Math.round(costEach(i)), from, at: now });
+        }
+        for (const x of (trade && trade.extra) || []) {
+            if (x && Number(x.qty) > 0) out.push({ itemId: String(x.itemId), name: x.name, qty: Number(x.qty), each: Math.round(Number(x.price) || 0), from, at: now });
+        }
+        return addLeftovers([], out);
     }
 
     /** Leftovers added to a stored list: one row per item, the cost averaged over both. */
@@ -4047,7 +4075,37 @@
         }
 
         /**
-         * @param {object|null} m - boughtSince(trade, {inside}) plus {onTradePage}; null hides it
+         * Cancel trade (the owner, 2026-09-29): they accepted, then it was called
+         * off - this window and the plan go. Asked first: "Cancel the trade with X?".
+         */
+        cancelPart(m) {
+            const again = () => {
+                this.sig = null;
+                this.render(m);
+            };
+            if (this.cancelAsk !== m.key) {
+                return bwEl('div', { class: 'bw-cancel' }, [
+                    bwEl('button', { type: 'button', class: 'bw-link', title: 'They accepted, then the trade was called off: this flip plan goes (not marked declined)', text: 'Cancel trade', onclick: () => {
+                        this.cancelAsk = m.key;
+                        again();
+                    } }),
+                ]);
+            }
+            return bwEl('div', { class: 'bw-cancel bw-ask' }, [
+                bwEl('p', { class: 'bw-warn', text: 'Cancel the trade with ' + (m.trader || 'them') + '? What you already bought stays yours to sell.' }),
+                bwEl('button', { type: 'button', class: 'bw-btn', text: 'Yes, cancel it', onclick: () => {
+                    this.cancelAsk = null;
+                    if (this.h.onCancel) this.h.onCancel(m.key);
+                } }),
+                bwEl('button', { type: 'button', class: 'bw-btn', text: 'Keep it', onclick: () => {
+                    this.cancelAsk = null;
+                    again();
+                } }),
+            ]);
+        }
+
+        /**
+         * @param {object|null} m - boughtSince(trade, {inside}) plus {onTradePage, key}; null hides it
          */
         render(m) {
             if (!m) {
@@ -4055,7 +4113,8 @@
                 return;
             }
             this.mount();
-            const sig = JSON.stringify([m, this.folded]);
+            if (this.cancelAsk !== m.key) this.cancelAsk = null;
+            const sig = JSON.stringify([m, this.folded, this.cancelAsk]);
             if (sig === this.sig) return;
             this.sig = sig;
             const box = this.box;
@@ -4124,6 +4183,7 @@
                     ? bwEl('p', { class: 'bw-warn', role: 'status', text: 'Not in the trade yet: ' + m.missing.map((x) => x.name + ' ×' + x.qty.toLocaleString('en-US')).join(', ') })
                     : bwEl('p', { class: 'bw-ok', role: 'status', text: 'Everything you bought is in the trade ✓' }));
             }
+            body.appendChild(this.cancelPart(m));
             box.appendChild(body);
             this.place();
         }
@@ -4173,6 +4233,14 @@
     .bw-todo { margin: 8px 0 0; font-size: 12px; color: var(--buy); }
     .bw-warn { margin: 8px 0 0; font-size: 12px; font-weight: bold; color: var(--warn); }
     .bw-ok { margin: 8px 0 0; font-size: 12px; font-weight: bold; color: var(--profit); }
+    .bw-cancel { margin-top: 8px; text-align: right; }
+    .bw-cancel.bw-ask { display: flex; flex-wrap: wrap; gap: 6px; text-align: left; }
+    .bw-cancel.bw-ask .bw-warn { flex: 1 1 100%; margin: 0; }
+    .bw-link { padding: 0; border: 0; background: none; color: var(--muted); font: 12px Arial, Helvetica, sans-serif; text-decoration: underline; cursor: pointer; }
+    .bw-link:hover { color: var(--text); }
+    .bw-btn { flex: 1; min-height: 26px; padding: 3px 8px; border: 1px solid var(--line); border-radius: 4px; background: #3a3a3a; color: var(--text); font: 12px Arial, Helvetica, sans-serif; cursor: pointer; }
+    .bw-btn:hover { border-color: var(--buy); }
+    .bw-link:focus-visible, .bw-btn:focus-visible { outline: 2px solid var(--profit); outline-offset: 1px; }
     `;
 
     /* ===== src/core/leader.js ===== */
@@ -7128,6 +7196,44 @@
         return out;
     }
 
+    /* A trader's TornExchange votes are remembered this long after last seen. */
+    const VOTES_KEEP_MS = 7 * 24 * 60 * 60 * 1000;
+    /* At most this many traders' votes are remembered (the most recently seen). */
+    const VOTES_KEEP_MAX = 5000;
+
+    /**
+     * Votes only come with an item's top three, so a trader who drops out of
+     * every top three at a refresh lost their trust badge, and with "Trusted
+     * buyers only" vanished from the desk (the friend, 3.14.4: "the list of
+     * buyers suddenly disappears"). The last votes seen are kept for a week.
+     *
+     * @param {object|null} stored - {id: [score, at]}
+     * @param {Map<string, number>} current - votesByTrader of the newest answer
+     * @param {number} at - when that answer was read
+     * @returns {object} the new stored form
+     */
+    function rememberVotes(stored, current, at, now = Date.now()) {
+        const all = new Map();
+        for (const [id, v] of Object.entries(stored && typeof stored === 'object' ? stored : {})) {
+            if (Array.isArray(v) && Number.isFinite(v[0]) && now - Number(v[1]) <= VOTES_KEEP_MS) all.set(id, [v[0], Number(v[1])]);
+        }
+        for (const [id, score] of current || []) {
+            const old = all.get(id);
+            if (!old || !(old[1] > at)) all.set(id, [score, at]);
+        }
+        const keep = [...all.entries()].sort((a, b) => b[1][1] - a[1][1]).slice(0, VOTES_KEEP_MAX);
+        return Object.fromEntries(keep);
+    }
+
+    /** The remembered votes, as votesByTrader's map (too old ones left out). */
+    function rememberedVotes(stored, now = Date.now()) {
+        const out = new Map();
+        for (const [id, v] of Object.entries(stored && typeof stored === 'object' ? stored : {})) {
+            if (Array.isArray(v) && Number.isFinite(v[0]) && now - Number(v[1]) <= VOTES_KEEP_MS) out.set(id, v[0]);
+        }
+        return out;
+    }
+
     /**
      * Who pays the most for the most of your items. In Torn you trade with one
      * person at a time, so the trader with the best price on many of your items
@@ -7199,6 +7305,24 @@
      */
     function onlineOnly(buyers, levelOf) {
         return buyers.filter((b) => !(b.id && levelOf(b.id) === 'offline'));
+    }
+
+    /**
+     * The buyers "Buyers online only" and "Trusted buyers only" leave out, each
+     * with why (`hiddenBy`: 'offline' or 'trust'), so the desk can say so: a
+     * list that empties with no reason reads as broken (the friend, 3.14.4).
+     * The same rules as onlineOnly and trustedOnly({min: 'Known'}).
+     *
+     * @param {Array} buyers - the allowed buyers (blacklist already out)
+     * @param {{prefs: {onlineOnly?: boolean, trustedOnly?: boolean}, levelOf: Function, votesMissing?: boolean}} opts
+     */
+    function hiddenBuyers(buyers, { prefs = {}, levelOf = () => 'unknown', votesMissing = false } = {}) {
+        const out = [];
+        for (const b of buyers || []) {
+            if (prefs.onlineOnly && b.id && levelOf(b.id) === 'offline') out.push({ ...b, hiddenBy: 'offline' });
+            else if (prefs.trustedOnly && !(b.trust ? b.trust.level === 'Trusted' || b.trust.level === 'Known' : votesMissing)) out.push({ ...b, hiddenBy: 'trust' });
+        }
+        return out;
     }
 
     /**
@@ -10503,6 +10627,28 @@
 
     .ttv2-tb-ask button { flex: 1; }
 
+    /* Cancel trade (3.14.5): a quiet link under Next; asked before it acts. */
+    .ttv2-tb-cancel {
+        margin-top: 6px;
+        text-align: right;
+    }
+
+    .ttv2-tb-cancel.ttv2-tb-ask { flex-wrap: wrap; text-align: left; }
+    .ttv2-tb-cancel.ttv2-tb-ask .ttv2-tb-warn { flex: 1 1 100%; margin-top: 0; }
+
+    .ttv2-panel button.ttv2-linkbtn {
+        height: auto;
+        padding: 0;
+        border: 0;
+        background: none;
+        color: #b3b3b3;
+        font-size: 12px;
+        text-decoration: underline;
+        cursor: pointer;
+    }
+
+    .ttv2-panel button.ttv2-linkbtn:hover { color: var(--text, #ddd); }
+
     .ttv2-tb-ok {
         color: var(--profit);
         font-size: 12px;
@@ -12598,7 +12744,9 @@
         setBuying(v) {
             const box = this.buyBoxEl;
             if (!box) return;
-            const sig = JSON.stringify(v);
+            // Cancel trade asks first (a buying run is not thrown away by a slip).
+            if (!v || this.cancelAsk !== v.key) this.cancelAsk = null;
+            const sig = JSON.stringify([v, this.cancelAsk]);
             if (sig === this.buySig) return;
             this.buySig = sig;
             box.textContent = '';
@@ -12638,6 +12786,37 @@
             const label = v.here && (!v.next || v.last) ? 'Done - go to the trade' : v.here && !v.here.listed ? 'Not here - next' : v.here && v.same ? 'Next item here' : v.here ? 'Next bazaar' : 'Open the next bazaar' + (v.next ? ': ' + v.next.seller : '');
             this.buyNextBtn = el('button', { type: 'button', class: 'ttv2-primary ttv2-buynext', title: this.buyHereActive ? 'Key: N' : null, onclick: () => this.handlers.onBuyNext && this.handlers.onBuyNext() }, [label, this.buyHereActive ? el('span', { class: 'ttv2-kbd', text: 'N' }) : null]);
             box.appendChild(this.buyNextBtn);
+            box.appendChild(this.cancelTradePart(v, () => this.setBuying(v)));
+        }
+
+        /**
+         * Cancel trade (the owner, 2026-09-29): they accepted, then it was called
+         * off. A link, then "Cancel the trade with X?" - Yes / Keep it.
+         */
+        cancelTradePart(v, redraw) {
+            const again = () => {
+                this.buySig = null;
+                redraw();
+            };
+            if (this.cancelAsk !== v.key) {
+                return el('div', { class: 'ttv2-tb-cancel' }, [
+                    el('button', { type: 'button', class: 'ttv2-linkbtn', title: 'They accepted, then the trade was called off: this flip plan goes (not marked declined)', text: 'Cancel trade', onclick: () => {
+                        this.cancelAsk = v.key;
+                        again();
+                    } }),
+                ]);
+            }
+            return el('div', { class: 'ttv2-tb-cancel ttv2-tb-ask' }, [
+                el('div', { class: 'ttv2-tb-warn', text: 'Cancel the trade with ' + v.trader + '? What you already bought stays yours to sell.' }),
+                el('button', { type: 'button', text: 'Yes, cancel it', onclick: () => {
+                    this.cancelAsk = null;
+                    if (this.handlers.onTradeCancel) this.handlers.onTradeCancel(v.key);
+                } }),
+                el('button', { type: 'button', text: 'Keep it', onclick: () => {
+                    this.cancelAsk = null;
+                    again();
+                } }),
+            ]);
         }
 
         /** "Torn API calls in the last minute: 12 of 70", every tab together. */
@@ -16231,7 +16410,7 @@
         renderDesk() {
             const d = this.state.desk;
             const box = this.deskEl;
-            if (d && this.showAll.item !== d.itemId) this.showAll = { item: d.itemId, buyers: false, sellers: false };
+            if (d && this.showAll.item !== d.itemId) this.showAll = { item: d.itemId, buyers: false, sellers: false, hidden: false };
             const statusOf = (b) => {
                 const st = b.id && this.state.statuses ? this.state.statuses.get(String(b.id)) : null;
                 return st ? st.level + st.text : '';
@@ -16244,6 +16423,7 @@
                     d.itemId, d.name, d.held, d.avg, d.bazaars, d.buyersTotal, d.buyersLoading, d.pending, d.planWhy,
                     d.buyers.map((b) => [b.id, b.name, b.price, b.te, b.teTop, b.teList, b.w3b, statusOf(b), b.trust ? b.trust.level + b.trust.score : '', this.state.networth && b.id ? this.state.networth.get(String(b.id)) : null, Boolean(b.favourite), b.traded || '', Boolean(b.troll), Boolean(b.lastPaidOnly)]),
                     this.justBlacklisted ? this.justBlacklisted.at : 0,
+                    (d.hidden || []).map((b) => [b.tradeKey, b.price, b.hiddenBy, statusOf(b), b.trust ? b.trust.level + b.trust.score : '']),
                     p.networthPct,
                     d.sellers.state, d.sellers.error,
                     d.sellers.rows.map((r) => [r.sellerId, r.sellerName, r.price, r.qty, r.stale, Math.floor((now - (r.dataAt || 0)) / 60000)]),
@@ -16367,7 +16547,50 @@
                     },
                 }));
             }
+            this.hiddenBuyersPart(card, d);
             return card;
+        }
+
+        /**
+         * Traders your Buyers online only / Trusted buyers only leave out here:
+         * how many and which switch, and on a press, who (greyed, never planned).
+         * The list never empties with no reason (the friend, 3.14.4).
+         */
+        hiddenBuyersPart(card, d) {
+            const hidden = d.hidden || [];
+            if (!hidden.length) return;
+            const open = Boolean(this.showAll.hidden);
+            const n = (k) => hidden.filter((b) => b.hiddenBy === k).length;
+            const parts = [];
+            if (n('trust')) parts.push('Trusted buyers only hides ' + count(n('trust')) + (n('trust') === 1 ? ' trader' : ' traders'));
+            if (n('offline')) parts.push('Buyers online only hides ' + count(n('offline')) + (n('offline') === 1 ? ' trader' : ' traders') + ' (offline)');
+            card.appendChild(spEl('p', { class: 'sp-note sp-hidnote' }, [
+                parts.join(' · ') + ' here. ',
+                spEl('button', { type: 'button', class: 'sp-link', 'aria-expanded': String(open), 'data-focus': 'desk:hidden', text: open ? 'Hide them' : 'Show them', onclick: () => {
+                    this.showAll.hidden = !open;
+                    this.deskSig = null;
+                    this.renderDesk();
+                    this.fitDesk();
+                } }),
+            ]));
+            if (!open) return;
+            for (const b of hidden) {
+                const why = b.hiddenBy === 'offline'
+                    ? 'Offline: hidden by Buyers online only'
+                    : !b.trust ? 'No votes yet: hidden by Trusted buyers only'
+                    : b.trust.level === 'Caution' ? 'More votes against than for: hidden by Trusted buyers only'
+                    : 'Fewer than 20 votes: hidden by Trusted buyers only';
+                card.appendChild(spEl('div', { class: 'sp-tr sp-hidden' }, [
+                    spEl('span', { class: 'sp-tr-l' }, [
+                        spEl('span', { class: 'sp-trader-l' }, [this.playerName(b.name, b.id, 'hidden:' + (b.id || b.name)), this.trustBadge(b)]),
+                        this.status(b),
+                        b.traded ? spEl('small', { class: 'sp-traded', text: b.traded }) : null,
+                        spEl('small', { class: 'sp-differ', text: why }),
+                    ]),
+                    spEl('span', { class: 'sp-tprice', text: formatMoney(b.price) }),
+                    this.traderLinks(b),
+                ]));
+            }
         }
 
         /**
@@ -16727,6 +16950,10 @@
                         this.deskSig = null;
                         this.renderDesk();
                     } }),
+                    // Add all (the friend, 2026-09-29): every one of them in one press, past Extras per trade.
+                    (c.left || []).length > 1
+                        ? spEl('span', {}, [' · ', spEl('button', { type: 'button', class: 'sp-link', 'data-focus': 'trade:addall', title: 'Put every item ' + b.name + ' buys into this trade (more bazaars to visit)', text: 'Add all ' + count(c.left.length), onclick: () => this.h.onTradeAddAll && this.h.onTradeAddAll(c.key, c.left.map((r) => ({ itemId: r.itemId, units: r.units }))) })])
+                        : null,
                 ]));
                 if (open) {
                     for (const r of c.left || []) {
@@ -16929,10 +17156,34 @@
                     ]))) : null,
                 ]));
             }
-            // Back (the plan unfreezes) on the left, apart from Traded - done on the right.
+            // Cancel trade (the owner, 2026-09-29): they accepted, then it was
+            // called off - the plan goes. Asked first, like on Torn's pages.
+            if (this.cancelAsk === A.key) {
+                card.appendChild(spEl('div', { class: 'sp-tpick sp-acc-foot sp-cancelask' }, [
+                    spEl('span', { class: 'sp-warnnote', text: 'Cancel the trade with ' + b.name + '? This flip plan goes (they are not marked declined); what you already bought stays yours to sell.' }),
+                    spEl('span', { class: 'sp-tpick-b' }, [
+                        spEl('button', { type: 'button', class: 'sp-btn', 'data-focus': 'acc:cancel-yes', text: 'Yes, cancel it', onclick: () => {
+                            this.cancelAsk = null;
+                            if (this.h.onTradeCancel) this.h.onTradeCancel(A.key);
+                        } }),
+                        spEl('button', { type: 'button', class: 'sp-link', 'data-focus': 'acc:cancel-no', text: 'Keep it', onclick: () => {
+                            this.cancelAsk = null;
+                            this.deskSig = null;
+                            this.renderDesk();
+                        } }),
+                    ]),
+                ]));
+                return card;
+            }
+            // Back (the plan unfreezes) and Cancel trade on the left, apart from Traded - done on the right.
             card.appendChild(spEl('div', { class: 'sp-tpick sp-acc-foot' }, [
                 spEl('span', { class: 'sp-tpick-b' }, [
                     spEl('button', { type: 'button', class: 'sp-link', 'data-focus': 'acc:back', title: 'Unfreeze: back to the live plan (nothing is kept)', text: '← Back to the live plan', onclick: () => this.h.onTradeClose && this.h.onTradeClose(A.key, false) }),
+                    spEl('button', { type: 'button', class: 'sp-link', 'data-focus': 'acc:cancel', title: 'They accepted, then the trade was called off: this flip plan goes (not marked declined)', text: 'Cancel trade', onclick: () => {
+                        this.cancelAsk = A.key;
+                        this.deskSig = null;
+                        this.renderDesk();
+                    } }),
                     this.stepTraderLinks(b, { trade: false }),
                 ]),
                 spEl('button', { type: 'button', class: 'sp-btn', 'data-focus': 'acc:done', title: 'The trade went through: close it' + (A.items.some((i) => i.left > 0 && i.kind === 'flip') ? ', and keep what they did not take to sell elsewhere' : ''), text: 'Traded - done', onclick: () => this.h.onTradeClose && this.h.onTradeClose(A.key, true) }),
@@ -17263,6 +17514,9 @@
     .sp-left { display: block; margin-top: 2px; }
     .sp-left .sp-qty { width: 56px; }
     .sp-acc-foot { margin-top: 10px; }
+    .sp-cancelask { justify-content: flex-start; }
+    .sp-cancelask > .sp-warnnote { flex: 1 1 100%; color: var(--warn); font-size: 13px; }
+    .sp-tpick-b { align-items: center; }
     .sp-fc.sp-lo { border-style: dashed; }
     /* The pin sits in the card's corner, out of the flow: the card's contents
        are where they always were, pinned or not (the owner: "you moved the contents"). */
@@ -17345,7 +17599,7 @@
     .sp-plan-on { display: inline-flex; align-items: center; border-radius: 13px; border: 1px solid var(--hot-line); color: var(--price); font-weight: bold; background: var(--green-bg); }
     .sp-tr.sp-planning { box-shadow: inset 3px 0 0 var(--price); }
     /* Dimmed by colour, not see-through: its words stay readable (review M10). */
-    .sp-tr.sp-declined .sp-tprice, .sp-tr.sp-declined .sp-trader-l, .sp-tr.sp-declined small { color: #8c8c8c; }
+    .sp-tr.sp-declined .sp-tprice, .sp-tr.sp-declined .sp-trader-l, .sp-tr.sp-declined small, .sp-tr.sp-hidden .sp-tprice, .sp-tr.sp-hidden .sp-trader-l, .sp-tr.sp-hidden small { color: #8c8c8c; }
     .sp-tr.sp-troll .sp-tprice { color: var(--muted); text-decoration: line-through; }
     .sp-scan { display: flex; flex-direction: column; gap: 8px; margin: 0 0 16px; }
     .sp-scanh { margin: 0; }
@@ -18236,6 +18490,8 @@
     const STORE_TE_STATE = 'teState';
     const STORE_TE_LISTS = 'teLists';
     const STORE_TE_IDS = 'teIds';
+    /* TornExchange votes last seen per trader (a week): {id: [score, at]}. */
+    const STORE_TE_VOTES = 'teVotes';
     const STORE_INVENTORY = 'inventory';
     const STORE_SELL_PREFS = 'sellingPage';
     /* Our own trader database: every trader we know of, and their TornW3B list. */
@@ -18263,6 +18519,8 @@
     const STORE_SELL_DECLINED = 'sellDeclined';
     /* Trades a trader said yes to, frozen (core/accepted.js): trader key -> trade. Torn Bids and the overlay's trade page share it. */
     const STORE_SELL_ACCEPTED = 'sellAccepted';
+    /* Trades cancelled after they accepted, from either page: trader key -> {itemId, at}. Torn Bids clears its pick from it. */
+    const STORE_SELL_CANCELLED = 'sellCancelled';
     /* Trades you pinned (core/held.js): 'item|trader key' -> held trade. Only prices move in them. */
     const STORE_SELL_PINNED = 'sellPinned';
     /* The Bought window (3.14.3): {pos: {x, y}|null, folded}. Where you dragged it, kept. */
@@ -18997,6 +19255,7 @@
                     db,
                     w3bByItem: indexW3bByItem(db, now),
                     dbIdsByName: traderIdsByName(db),
+                    votes: rememberedVotes(gmGet(STORE_TE_VOTES, null), now),
                 }),
             };
         }
@@ -20664,10 +20923,11 @@
                 onMove: (pos) => gmSet(STORE_BOUGHT_WINDOW, { ...(gmGet(STORE_BOUGHT_WINDOW, null) || {}), pos }),
                 onFold: (folded) => gmSet(STORE_BOUGHT_WINDOW, { ...(gmGet(STORE_BOUGHT_WINDOW, null) || {}), folded }),
                 panelRect: () => (app.panel && app.panel.root ? app.panel.root.getBoundingClientRect() : null),
+                onCancel: (key) => onOverlayTradeCancel(key),
             }, { pos: saved.pos || null, folded: Boolean(saved.folded) });
         }
         const onTradePage = Boolean(check && check.key === trade.key);
-        app.bought.render({ ...boughtSince(trade, { inside: onTradePage ? check.inside : null }), onTradePage });
+        app.bought.render({ ...boughtSince(trade, { inside: onTradePage ? check.inside : null }), onTradePage, key: trade.key });
     }
 
     /* Unplanned buys: each card's stock on the bazaar you are on, kept for this tab. */
@@ -20812,6 +21072,7 @@
         const bought = here && buyRun.firstSeen !== null ? boughtFromStock(buyRun.firstSeen, buyRun.nowSeen, here.step.qty) : 0;
         const next = nextStep(t);
         app.panel.setBuying({
+            key: t.key,
             trader: t.trader.name,
             // Minutes since they said yes (the box turns amber after ten).
             age: Math.floor((Date.now() - Number(t.at || Date.now())) / 60000) * 60000,
@@ -20837,6 +21098,41 @@
             // Next stays on this bazaar: another item of the trade is here too.
             same: Boolean(here && here.trade.items.some((i) => (i.steps || []).some((st) => st !== here.step && !stepDone(st) && String(st.sellerId) === String(here.step.sellerId)))),
         });
+    }
+
+    /** One line of a trade changed on the desk (ticked, a number, Add). */
+    function applyTradeEdit(key, itemId, edit) {
+        const e = { ...(sell.tradeEdits.get(key) || {}) };
+        if (edit && (edit.off || edit.qty > 0)) e[String(itemId)] = edit;
+        else delete e[String(itemId)];
+        sell.tradeEdits.set(key, e);
+        // A held trade: only the line you changed changes.
+        const he = sell.heldEdit;
+        if (he && he.key === key) {
+            const h = heldTradeFor(he.pickId, key);
+            if (h) {
+                const next = editHeld(h.held, itemId, edit, he.repick, he.info(String(itemId)));
+                if (next !== h.held) saveHeldTrade(he.pickId, key, next, h.pinned);
+            }
+        }
+    }
+
+    /** Cancel trade on Torn's pages (the buying box, the Bought window): as in Torn Bids. */
+    function onOverlayTradeCancel(key) {
+        // What you took at this bazaar is counted first (Next would have): it is yours to sell.
+        const here = app.buyHere;
+        if (here && here.trade.key === key && buyRun.firstSeen !== null) {
+            const took = boughtFromStock(buyRun.firstSeen, buyRun.nowSeen, here.step.qty);
+            const all = sellAccepted();
+            if (took > 0 && all[key]) saveSellAccepted({ ...all, [key]: recordBuy(all[key], here.line, here.index, took) });
+        }
+        if (buyRun.stepKey) saveBuyRunSeen(buyRun.stepKey, null);
+        cancelSellAccepted(key);
+        buyRun.stepKey = null;
+        app.buyAsk = null;
+        scanTradePage();
+        if (app.pageType === PAGE_BAZAAR) rescan();
+        else trackTradeBuying([]);
     }
 
     /**
@@ -21509,7 +21805,7 @@
     function storageSizes() {
         const keys = [
             STORE_KEY, STORE_ITEMS, STORE_NPC, STORE_MANUAL_NPC, STORE_SETTINGS, STORE_KEY_ACCESS, STORE_API_WINDOW + '.tabs', STORE_W3B_WINDOW + '.tabs', STORE_TORN_PAUSE, STORE_KEY_DEAD, STORE_OPENED,
-            STORE_SELL_KEY, STORE_SELL_KEY_DEAD, STORE_SELL_KEY_ACCESS, STORE_TE_KEY, STORE_TE, STORE_TE_STATE, STORE_TE_LISTS, STORE_TE_IDS,
+            STORE_SELL_KEY, STORE_SELL_KEY_DEAD, STORE_SELL_KEY_ACCESS, STORE_TE_KEY, STORE_TE, STORE_TE_STATE, STORE_TE_LISTS, STORE_TE_IDS, STORE_TE_VOTES,
             STORE_INVENTORY, STORE_SELL_PREFS, STORE_TRADER_DB, STORE_TE_ONE, STORE_SELL_SELF, STORE_SELL_NETWORTH, STORE_SELL_ACCEPTED, STORE_SELL_PINNED,
             STORE_LEDGER_KEY, STORE_LEDGER_KEY_DEAD, STORE_LEDGER_SELF, STORE_LEDGER,
             STORE_FILL, STORE_FILL_OWN_IM, STORE_SELF, STORE_HISTORY, STORE_W3B_SUMMARY, FEED_STORE_KEY,
@@ -22124,6 +22420,42 @@
         gmSet(STORE_SELL_LEFTOVERS, list);
     }
 
+    /**
+     * Cancel trade (the owner, 2026-09-29): they accepted, then the trade was
+     * called off - the flip plan is gone. From the overlay or Torn Bids: the
+     * accepted trade goes, its accepted prices go (the Ledger never splits a
+     * later trade by them), what you already bought is kept to sell elsewhere,
+     * and Torn Bids lets go of the plan (never marked Declined; a pin stays).
+     */
+    function cancelSellAccepted(key, now = Date.now()) {
+        const all = sellAccepted(now);
+        const t = all[key];
+        if (!t) return;
+        const left = cancelledLeftovers(t, now);
+        if (left.length) saveSellLeftovers(addLeftovers(sellLeftovers(now), left));
+        const recs = gmGet(STORE_SELL_PRICE_RECORDS, []) || [];
+        const id = t.trader && t.trader.id ? String(t.trader.id) : null;
+        const kept = recs.filter((r) => !(r && id && String(r.traderId) === id && Number(r.at) === Number(t.at)));
+        if (kept.length !== recs.length) gmSet(STORE_SELL_PRICE_RECORDS, kept);
+        delete all[key];
+        saveSellAccepted(all);
+        const cancelled = gmGet(STORE_SELL_CANCELLED, {}) || {};
+        gmSet(STORE_SELL_CANCELLED, { ...cancelled, [key]: { itemId: String(t.itemId), at: now } });
+    }
+
+    /** Torn Bids: a trade cancelled here or on Torn's pages - its pick and held plan go. */
+    function takeSellCancelled() {
+        const cancelled = gmGet(STORE_SELL_CANCELLED, {}) || {};
+        const keys = Object.keys(cancelled);
+        if (!keys.length) return;
+        for (const key of keys) {
+            const itemId = String(cancelled[key].itemId);
+            if (sell.tradePick.get(itemId) === key) sell.tradePick.delete(itemId);
+            sell.tradeHold.delete(holdKey(itemId, key));
+        }
+        gmSet(STORE_SELL_CANCELLED, {});
+    }
+
     function setSellDeclined(key, until) {
         const next = Object.fromEntries(sellDeclined());
         if (until) next[key] = until;
@@ -22334,12 +22666,14 @@
      * trader database's TornW3B lists. Answers are kept per item for one pass.
      * The traders page and the panel's bazaar tags both use it.
      */
-    function buyerLookup({ teMap, lists, teOne, idsByName, db, w3bByItem, dbIdsByName, teOwn = new Map() }) {
-        // TornExchange's votes for the trust badge, from every answer we have.
+    function buyerLookup({ teMap, lists, teOne, idsByName, db, w3bByItem, dbIdsByName, teOwn = new Map(), votes = new Map() }) {
+        // TornExchange's votes for the trust badge, from every answer we have,
+        // then the ones remembered from earlier answers.
         const votesById = votesByTrader([
             ...teMap.values(),
             ...[...teOne.values()].filter((rec) => rec.best).map((rec) => [rec.best]),
         ]);
+        for (const [id, score] of votes) if (!votesById.has(id)) votesById.set(id, score);
         const cache = new Map();
         return (itemId) => {
             const id = String(itemId);
@@ -22405,11 +22739,11 @@
         const favsNow = favouriteTraders(now);
         const ownLists = sellTeOwn();
         const ownByItem = teOwnByItem(now, { favs: favsNow, lists: ownLists });
-        const buyersAll = buyerLookup({ teMap, lists: sell.lists, teOne: sell.teOne, idsByName: sell.idsByName, db: sell.db, w3bByItem, dbIdsByName: sell.dbIdsByName, teOwn: ownByItem });
+        const buyersAll = buyerLookup({ teMap, lists: sell.lists, teOne: sell.teOne, idsByName: sell.idsByName, db: sell.db, w3bByItem, dbIdsByName: sell.dbIdsByName, teOwn: ownByItem, votes: sell.votes || new Map() });
         const levelOf = (id) => presenceLevel(sellPresenceOf(id));
         // Trusted means Known (20+ votes) or Trusted; while TornExchange's votes
         // are not loaded, a trader without any is kept ("no votes yet").
-        const votesMissing = !(teMap.size > 0);
+        const votesMissing = !(teMap.size > 0) && !(sell.votes && sell.votes.size > 0);
         const shownCache = new Map();
         // Your traders: history by id (and name, for name-only buyers), favourites, the blacklist.
         const partnerOf = new Map();
@@ -22823,7 +23157,7 @@
                     const p = pickBazaars(list, bid, { maxUnits: n, minPct: prefs.minProfitPct, maxStops: MAIN_STOPS, exclude: chosen.buyer.id || null });
                     return p && p.units > 0 ? p.steps : null;
                 },
-                info: (id) => ({ name: nameOf(id), bid: bidNow(id), kind: kindOf(id), units: Math.min(prefs.maxPerFlip || 100, EXTRA_CAP[kindOf(id)] || 10) }),
+                info: (id) => ({ name: nameOf(id), bid: bidNow(id), kind: kindOf(id), units: Math.min(prefs.maxPerFlip || 100, EXTRA_CAP[kindOf(id)] || 10), price: lowestOf(id) }),
             };
             const w3bT = chosen.buyer.id && sell.db.traders[chosen.buyer.id] ? sell.db.traders[chosen.buyer.id].w3b : null;
             const common = {
@@ -23025,6 +23359,10 @@
             // A bid over 3x the Item Market Average is shown, marked, and never counted (troll bids).
             const buyers = buyersOf(pick).map((x) => ({ ...x, tradeKey: traderKey(x), troll: pickAvg > 0 && !believableBid(x.price, pickAvg), traded: tradedLine(statOf(x), now), favourite: favOf(x) }));
             const realBid = pickAvg > 0 ? listBid(buyers, pickAvg) || null : buyers[0] ? buyers[0].price : null;
+            // Traders Online only / Trusted only leave out here: counted and named, never just gone.
+            const shownKeys = new Set(buyers.map((x) => x.tradeKey));
+            const hidden = hiddenBuyers(withoutBlacklisted(buyersAll(pick), blacklist).filter((x) => !shownKeys.has(traderKey(x))), { prefs, levelOf, votesMissing })
+                .map((x) => ({ ...x, tradeKey: traderKey(x), traded: tradedLine(statOf(x), now), favourite: favOf(x) }));
             const b = sell.bazaars.get(pick);
             const held = heldQty.get(pick) || 0;
             const m = sell.market.get(pick);
@@ -23041,7 +23379,8 @@
                 buyers,
                 buyersTotal: buyers.length,
                 buyersLoading: Boolean(load.loading),
-                pending: !buyers.length && (pendingFor(pick) || statusPending),
+                hidden,
+                pending: !buyers.length && !hidden.length && (pendingFor(pick) || statusPending),
                 sellers: {
                     state: b && b.at ? 'ok' : b && b.error ? 'error' : 'loading',
                     rows: sellersOf(pick) || [],
@@ -23265,8 +23604,19 @@
     function loadSellTraders(now = Date.now()) {
         const entry = gmGet(STORE_TE, null);
         const fetchedAt = entry && entry.fetchedAt;
-        if (sell.traders && sell.traders.fetchedAt === fetchedAt) return;
+        if (sell.traders && sell.traders.fetchedAt === fetchedAt) {
+            if (!sell.votes) sell.votes = rememberedVotes(gmGet(STORE_TE_VOTES, null), now);
+            return;
+        }
         sell.traders = readTeCacheEntry(entry, now);
+        // Every trader's votes, kept a week: a trader out of today's top threes keeps their badge.
+        let votes = gmGet(STORE_TE_VOTES, null);
+        if (sell.traders) {
+            const next = rememberVotes(votes, votesByTrader(sell.traders.map.values()), sell.traders.fetchedAt, now);
+            if (JSON.stringify(next) !== JSON.stringify(votes)) gmSet(STORE_TE_VOTES, next);
+            votes = next;
+        }
+        sell.votes = rememberedVotes(votes, now);
 
         const ids = gmGet(STORE_TE_IDS, null);
         if (ids && ids.map && now - ids.fetchedAt < TE_IDS_MAX_AGE_MS) {
@@ -23933,6 +24283,12 @@
                 }
                 renderSellingNow();
             },
+            // Cancel trade: they accepted, then it was called off - the plan is gone.
+            onTradeCancel: (key) => {
+                cancelSellAccepted(key);
+                takeSellCancelled();
+                renderSellingNow();
+            },
             // How many of a line the trader did not take (0: they took all).
             onTradeLeft: (key, line, n) => {
                 const all = sellAccepted();
@@ -23967,19 +24323,12 @@
                 renderSellingNow();
             },
             onTradeEdit: (key, itemId, edit) => {
-                const e = { ...(sell.tradeEdits.get(key) || {}) };
-                if (edit && (edit.off || edit.qty > 0)) e[String(itemId)] = edit;
-                else delete e[String(itemId)];
-                sell.tradeEdits.set(key, e);
-                // A held trade: only the line you changed changes.
-                const he = sell.heldEdit;
-                if (he && he.key === key) {
-                    const h = heldTradeFor(he.pickId, key);
-                    if (h) {
-                        const next = editHeld(h.held, itemId, edit, he.repick, he.info(String(itemId)));
-                        if (next !== h.held) saveHeldTrade(he.pickId, key, next, h.pinned);
-                    }
-                }
+                applyTradeEdit(key, itemId, edit);
+                renderSellingNow();
+            },
+            // Add all (the friend, 2026-09-29): every item left out of the trade, in one press - past Extras per trade too.
+            onTradeAddAll: (key, lines) => {
+                for (const l of lines || []) applyTradeEdit(key, l.itemId, { qty: l.units });
                 renderSellingNow();
             },
             onTradeHeld: (itemId, held, give, key) => {
@@ -24023,6 +24372,12 @@
         gmOnChange(STORE_SELL_PREFS, () => renderSellingNow());
         // Ticks made on Torn's trade page (the overlay) show here at once.
         gmOnChange(STORE_SELL_ACCEPTED, () => renderSellingNow());
+        // Cancelled on Torn's pages (the overlay): the plan goes here too.
+        takeSellCancelled();
+        gmOnChange(STORE_SELL_CANCELLED, () => {
+            takeSellCancelled();
+            renderSellingNow();
+        });
         gmOnChange(STORE_SELL_PINNED, () => renderSellingNow());
         const onSellKeyElsewhere = () => {
             const dead = Boolean(gmGet(STORE_SELL_KEY_DEAD, false));
@@ -24572,6 +24927,7 @@
             },
             getApiUse: () => (app.client ? app.client.stats() : null),
             onBuyNext,
+            onTradeCancel: onOverlayTradeCancel,
             // A tick on Torn's trade page: shared with Torn Bids.
             onTradeSent: (key, line, sent) => {
                 tickSellAccepted(key, line, { sent });

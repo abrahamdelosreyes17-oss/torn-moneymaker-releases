@@ -1068,6 +1068,28 @@ ${TOKENS_CSS}
 
 .ttv2-tb-ask button { flex: 1; }
 
+/* Cancel trade (3.14.5): a quiet link under Next; asked before it acts. */
+.ttv2-tb-cancel {
+    margin-top: 6px;
+    text-align: right;
+}
+
+.ttv2-tb-cancel.ttv2-tb-ask { flex-wrap: wrap; text-align: left; }
+.ttv2-tb-cancel.ttv2-tb-ask .ttv2-tb-warn { flex: 1 1 100%; margin-top: 0; }
+
+.ttv2-panel button.ttv2-linkbtn {
+    height: auto;
+    padding: 0;
+    border: 0;
+    background: none;
+    color: #b3b3b3;
+    font-size: 12px;
+    text-decoration: underline;
+    cursor: pointer;
+}
+
+.ttv2-panel button.ttv2-linkbtn:hover { color: var(--text, #ddd); }
+
 .ttv2-tb-ok {
     color: var(--profit);
     font-size: 12px;

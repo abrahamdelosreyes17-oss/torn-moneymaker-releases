@@ -140,3 +140,16 @@ test('the buying box: its status never breaks inside, the time in hours and minu
     assert.match(rule[1], /height: auto/);
     assert.match(PANEL_CSS, /\.ttv2-nobr \{ white-space: nowrap; \}/);
 });
+
+import { cancelledLeftovers, addExtraBuy } from '../src/core/accepted.js';
+
+test('Cancel trade: what you already bought for it (planned and not) is yours to sell elsewhere', () => {
+    let t = acceptTrade(CHOSEN, '335', 1000);
+    // 40 of the 53 Dynamite bought, Xanax not started; one unplanned Beer bought on the way.
+    t = recordBuy(t, 'flip:335', 0, 40);
+    t = addExtraBuy(t, { itemId: '180', name: 'Beer', qty: 3, price: 55, bid: 60, sellerId: '321' });
+    const left = cancelledLeftovers(t, 5000);
+    assert.deepEqual(left.map((l) => [l.itemId, l.qty, l.each, l.from]), [['335', 40, 17500, 'Bob'], ['180', 3, 55, 'Bob']]);
+    // Nothing bought yet: nothing to keep (your own items were never moved).
+    assert.deepEqual(cancelledLeftovers(acceptTrade(CHOSEN, '335', 1000)), []);
+});
