@@ -57,7 +57,7 @@ import { deskItem, nextW3bRead, backgroundSlot, backgroundListSlot, flipsStale, 
 import { liquidityKind, unitsMoved, addMovement, stopsMinutes, EXTRA_CAP } from './core/liquidity.js';
 import { usageAdd, usageMerge, usageSeries, USAGE_SERVICES, USAGE_RANGES, USAGE_LABELS } from './core/usage.js';
 import { addLogEntries, logText } from './core/errlog.js';
-import { checkoutList, boughtSince, stockBuys, addExtraBuy, applyLogBuys, bazaarBuyRows, addLogBuys, splitLogBuys, sellElsewhere, LOG_BUY_SLACK_MS, acceptTrade, liveAccepted, stepState, tickAccepted, stepDone, nextStep, boughtFromStock, recordBuy, sendUnits, acceptedTotals, replacementFor, replaceStep, dropLine, markLeft, leftoversOf, cancelledLeftovers, addLeftovers, takenUnits, fillNote, finishedTradeFor, tradedLeftovers, removeLeftovers, itemsGiven, tradePartnerId, tradeFinishedAt, TRADE_DONE_SLACK_MS } from './core/accepted.js';
+import { checkoutList, boughtSince, stockBuys, addExtraBuy, applyLogBuys, bazaarBuyRows, addLogBuys, splitLogBuys, sellElsewhere, LOG_BUY_SLACK_MS, acceptTrade, liveAccepted, stepState, tickAccepted, stepDone, nextStep, boughtFromStock, recordBuy, sendUnits, acceptedTotals, replacementFor, replaceStep, dropLine, markLeft, leftoversOf, cancelledLeftovers, addLeftovers, takenUnits, fillNote, finishedTradeFor, tradedLeftovers, removeLeftovers, itemsGiven, tradePartnerId, tradeFinishedAt, TRADE_DONE_SLACK_MS, leftoversAfterSales } from './core/accepted.js';
 import { readTradeView, readTradeAddRows } from './sources/dom/trade.js';
 import { BoughtWindow } from './ui/bought-window.js';
 import { makeTabId, LEADER_HEARTBEAT_MS } from './core/leader.js';
@@ -5066,6 +5066,14 @@ function renderSellingNow() {
         const pruned = leftovers.map((l) => (sell.inventoryAt > l.at + 60 * 60 * 1000 ? { ...l, qty: Math.min(l.qty, invQty.get(String(l.itemId)) || 0) } : l)).filter((l) => l.qty > 0);
         if (pruned.length !== leftovers.length || pruned.some((l, i) => l.qty !== leftovers[i].qty)) saveSellLeftovers(pruned);
         leftovers = pruned;
+    }
+    // Sold since it was kept, as your Ledger read it (3.16.2; the friend: "I
+    // already sold this", and still had to press Sold ✓): it comes off.
+    const ledgerRows = leftovers.length && getLedgerKey() && led.loaded ? ledgerData().rows : null;
+    if (ledgerRows && ledgerRows.length) {
+        const sold = leftoversAfterSales(leftovers, ledgerRows);
+        if (sold.length !== leftovers.length || sold.some((l, i) => l !== leftovers[i])) saveSellLeftovers(sold);
+        leftovers = sold;
     }
     const leftQty = new Map();
     for (const l of leftovers) leftQty.set(String(l.itemId), (leftQty.get(String(l.itemId)) || 0) + l.qty);

@@ -259,6 +259,14 @@ if (MANY) {
  * KayMalta's trade was cancelled 10 minutes ago although it had gone through
  * 15 minutes ago (trade 702, all 10 Beers): the cancel is put right.
  */
+const LEFTOVERSOLD = /[?&]leftoversold=1/.test(location.search);
+if (LEFTOVERSOLD) {
+    _store[NS + 'ledgerSelf'] = JSON.stringify('999');
+    _store[NS + 'sellLeftovers'] = JSON.stringify([
+        { itemId: '384', name: 'Camel Plushie', qty: 1, each: 70000, from: 'Bob', at: Date.now() - 30 * 60000 },
+        { itemId: '206', name: 'Xanax', qty: 2, each: 820000, from: 'Bob', at: Date.now() - 30 * 60000 },
+    ]);
+}
 const TRADEDONE = /[?&]tradedone=1/.test(location.search);
 const TRADEDONE_TRADES = {};
 if (TRADEDONE) {
@@ -415,6 +423,8 @@ function respond(url) {
                 // Two muggings: one by player 4242, one anonymous.
                 { id: 'l10', timestamp: NOW_S - 2 * D, details: { id: 8156 }, data: { attacker: 4242, money_mugged: 250000 } },
                 { id: 'l11', timestamp: NOW_S - 3 * 3600, details: { id: 8156 }, data: { anonymous: 1, money: 13584 } },
+                // &leftoversold=1 (3.16.2): the Camel Plushie left over half an hour ago, sold on your bazaar 10 minutes ago.
+                ...(LEFTOVERSOLD ? [{ id: 'l12', timestamp: NOW_S - 600, details: { id: 1226 }, data: { buyer: 4172398, items: [{ id: 384, qty: 1 }], cost_each: 74000, cost_total: 74000 } }] : []),
             ];
             const from = Number(u.searchParams.get('from')) || 0;
             const to = Number(u.searchParams.get('to')) || Infinity;

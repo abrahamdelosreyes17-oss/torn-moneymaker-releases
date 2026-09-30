@@ -137,3 +137,39 @@ test('TornExchange: every active trader is waited for longer than other calls (1
     await assert.rejects(slow.get('all_best_listings'), (e) => e.reason === 'no answer in 30 s');
     assert.equal(seen[2], undefined);
 });
+
+import { leftoversAfterSales, LEFTOVER_SALE_MARGIN_MS } from '../src/core/accepted.js';
+
+test('3.16.2: a leftover you sold goes by itself ("binenta ko na to ah") - from your Ledger\'s sales', () => {
+    const at = AT;
+    const left = [{ itemId: '203', name: 'Shrooms', qty: 11, each: 1937, from: 'KOMBAJN1', at }, { itemId: '9', name: 'Compass', qty: 3, each: 16372, from: 'KOMBAJN1', at }];
+    const later = at + LEFTOVER_SALE_MARGIN_MS + 60_000;
+    // Sold 11 Shrooms on his bazaar and 2 Compasses on the Item Market.
+    const rows = [
+        { t: later, itemId: '203', qty: 11, side: 'sell', venue: 'bazaar' },
+        { t: later + 1, itemId: '9', qty: 2, side: 'sell', venue: 'market' },
+    ];
+    const once = leftoversAfterSales(left, rows);
+    assert.deepEqual(once.map((l) => [l.itemId, l.qty]), [['9', 1]]);
+    // Read again: nothing counts twice.
+    assert.deepEqual(leftoversAfterSales(once, rows), once);
+    // A later sale of the last one: gone.
+    assert.deepEqual(leftoversAfterSales(once, [...rows, { t: later + 5, itemId: '9', qty: 1, side: 'give', venue: 'trade' }]), []);
+});
+
+test('3.16.2: the trade it was left over from, and units bought again since, never take a leftover off', () => {
+    const at = AT;
+    const left = [{ itemId: '203', name: 'Shrooms', qty: 11, each: 1937, at }];
+    // The trade that left it over finished just before (or, by Torn's clock, just after) it was kept.
+    assert.deepEqual(leftoversAfterSales(left, [{ t: at - 30_000, itemId: '203', qty: 60, side: 'sell' }, { t: at + 60_000, itemId: '203', qty: 60, side: 'sell' }]), left);
+    // Bought 71 more for another flip and traded those 71: the 11 are still yours.
+    const later = at + LEFTOVER_SALE_MARGIN_MS + 1;
+    const flip = [{ t: later, itemId: '203', qty: 71, side: 'buy' }, { t: later + 10, itemId: '203', qty: 71, side: 'sell' }];
+    assert.deepEqual(leftoversAfterSales(left, flip).map((l) => l.qty), [11]);
+    // Sold 80 in all after buying 71: 9 of the 11 went.
+    const more = leftoversAfterSales(left, [...flip, { t: later + 20, itemId: '203', qty: 9, side: 'sell' }]);
+    assert.deepEqual(more.map((l) => l.qty), [2]);
+    // Another item's sales are not this one's; no rows, nothing changes.
+    assert.deepEqual(leftoversAfterSales(left, [{ t: later, itemId: '9', qty: 5, side: 'sell' }]), left);
+    assert.deepEqual(leftoversAfterSales(left, []), left);
+});

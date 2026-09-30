@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      3.16.1
+// @version      3.16.2
 // @description  Finds Bazaar and Item Market listings below NPC / market value - on the page you are viewing, and live from the Torn API and TornW3B - ranked by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -42,7 +42,7 @@
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '3.16.1';
+    const TTV2_BUILD_VERSION = '3.16.2';
 
     /* ===== src/platform/gm.js ===== */
     /*
@@ -3997,6 +3997,57 @@
             same.qty = rest;
         }
         return out.filter((l) => l.qty > 0);
+    }
+
+    /* ------------------------------------ leftovers you sold go by themselves (3.16.2) */
+
+    /*
+     * The friend, 2026-09-30: "binenta ko na to ah" (I already sold this) - and
+     * he still had to press Sold ✓. Only his inventory ever took a leftover off,
+     * and only from a read an hour after it was kept (Torn caches it), made
+     * hourly while Torn Bids is in view. The Ledger reads every sale from his
+     * log - bazaar, Item Market, shop, trade - so what went out of that item
+     * since the leftover was kept comes off it; what came in since (bought
+     * again) is sold first. Each sale counts once (`seenTo`, `spare` carried).
+     */
+
+    /**
+     * Sales this soon after a leftover was kept are not counted: Torn's clock and
+     * yours differ, and the trade it was left over from finished just before.
+     */
+    const LEFTOVER_SALE_MARGIN_MS = 5 * 60 * 1000;
+
+    /**
+     * @param {Array} leftovers - [{itemId, qty, at, seenTo?, spare?}]
+     * @param {Array} rows - Ledger rows {t, itemId, qty, side: 'buy' | 'sell' | 'give'}
+     * @returns {Array} the leftovers, less what was sold since; none left - gone
+     */
+    function leftoversAfterSales(leftovers, rows) {
+        const byItem = new Map();
+        for (const r of rows || []) {
+            if (!r || !r.itemId || !(Number(r.qty) > 0) || !(Number(r.t) > 0)) continue;
+            const id = String(r.itemId);
+            if (!byItem.has(id)) byItem.set(id, []);
+            byItem.get(id).push(r);
+        }
+        return (leftovers || []).map((l) => {
+            const from = Math.max(Number(l.at) + LEFTOVER_SALE_MARGIN_MS, Number(l.seenTo) || 0);
+            const mine = (byItem.get(String(l.itemId)) || []).filter((r) => Number(r.t) > from).sort((a, b) => a.t - b.t);
+            if (!mine.length) return l;
+            let spare = Math.max(0, Number(l.spare) || 0);
+            let gone = 0;
+            for (const r of mine) {
+                const n = Number(r.qty);
+                if (r.side === 'buy') {
+                    spare += n;
+                } else {
+                    const fromSpare = Math.min(spare, n);
+                    spare -= fromSpare;
+                    gone += n - fromSpare;
+                }
+            }
+            return { ...l, qty: l.qty - Math.min(l.qty, gone), spare, seenTo: Number(mine[mine.length - 1].t) };
+        }).filter((l) => l.qty > 0);
     }
 
     /* ===== src/sources/dom/detect.js ===== */
@@ -25144,6 +25195,14 @@
             const pruned = leftovers.map((l) => (sell.inventoryAt > l.at + 60 * 60 * 1000 ? { ...l, qty: Math.min(l.qty, invQty.get(String(l.itemId)) || 0) } : l)).filter((l) => l.qty > 0);
             if (pruned.length !== leftovers.length || pruned.some((l, i) => l.qty !== leftovers[i].qty)) saveSellLeftovers(pruned);
             leftovers = pruned;
+        }
+        // Sold since it was kept, as your Ledger read it (3.16.2; the friend: "I
+        // already sold this", and still had to press Sold ✓): it comes off.
+        const ledgerRows = leftovers.length && getLedgerKey() && led.loaded ? ledgerData().rows : null;
+        if (ledgerRows && ledgerRows.length) {
+            const sold = leftoversAfterSales(leftovers, ledgerRows);
+            if (sold.length !== leftovers.length || sold.some((l, i) => l !== leftovers[i])) saveSellLeftovers(sold);
+            leftovers = sold;
         }
         const leftQty = new Map();
         for (const l of leftovers) leftQty.set(String(l.itemId), (leftQty.get(String(l.itemId)) || 0) + l.qty);

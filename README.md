@@ -377,7 +377,11 @@ you: every link is one you follow yourself, one page per click.
     keeps those as **leftovers**: first in the Best flips strip, with what
     they cost and the best other trader now, merged into what you hold (so
     Where to sell and other trades use them) until the inventory shows them
-    gone. On the bazaar, **Fill N** (types the amount into the card's own box;
+    gone - or (3.16.2, the friend: "binenta ko na to ah", I already sold
+    this) until your Ledger shows them sold: what went out of that item since
+    (bazaar, Item Market, shop, trade; from 5 minutes after it was kept), less
+    what you bought again since, comes off it (`leftoversAfterSales`); no Sold ✓
+    press needed. On the bazaar, **Fill N** (types the amount into the card's own box;
     you press Buy) and **Next ›** sit on the marked card; Next stays on the
     same bazaar when that seller has more for the trade; the panel's buying
     box sits under its header (also collapsed, also in Settings), shows
