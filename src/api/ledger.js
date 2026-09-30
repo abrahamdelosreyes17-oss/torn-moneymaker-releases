@@ -103,17 +103,17 @@ export async function fetchLogPage(client, { from = null, to = null, types = LED
 }
 
 /** Your finished trades since `from` (seconds), oldest first, at most 100. */
-export async function fetchTradesPage(client, { from = null } = {}) {
+export async function fetchTradesPage(client, { from = null, use = undefined } = {}) {
     const params = { cat: 'finished', limit: 100, sort: 'ASC' };
     if (from) params.from = from;
-    const data = await client.get('v2/user/trades', params);
+    const data = await client.get('v2/user/trades', params, use);
     return Array.isArray(data && data.trades) ? data.trades : [];
 }
 
 /** One trade: both sides' items and money. */
-export async function fetchTrade(client, tradeId) {
+export async function fetchTrade(client, tradeId, use = undefined) {
     const id = String(tradeId).replace(/\D/g, '');
     if (!id) return null;
-    const data = await client.get('v2/user/' + id + '/trade');
+    const data = await client.get('v2/user/' + id + '/trade', {}, use);
     return (data && data.trade) || null;
 }

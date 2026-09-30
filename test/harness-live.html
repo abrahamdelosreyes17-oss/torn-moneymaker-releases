@@ -252,6 +252,36 @@ if (MANY) {
     _store[NS + 'sellPriceRecords'] = JSON.stringify([612, 611].map((id) => ({ traderId: '5001', name: 'KayMalta', at: (MANY_TRADES[id].completed_at - 3600) * 1000, prices: { 384: 1000, 180: 200 } })));
 }
 
+/*
+ * &tradedone=1 (3.16.1, the friend's second report): Bob accepted 20 minutes
+ * ago, 5 Camel Plushies were bought for him, and the trade went through 5
+ * minutes ago with 4 in it (trade 701) - it closes by itself, 1 left over.
+ * KayMalta's trade was cancelled 10 minutes ago although it had gone through
+ * 15 minutes ago (trade 702, all 10 Beers): the cancel is put right.
+ */
+const TRADEDONE = /[?&]tradedone=1/.test(location.search);
+const TRADEDONE_TRADES = {};
+if (TRADEDONE) {
+    const now = Date.now();
+    const me = { id: 999, name: 'Me' };
+    // Whose the Ledger's key is: learned when it was saved.
+    _store[NS + 'ledgerSelf'] = JSON.stringify('999');
+    const flip =(itemId, name, qty, price, bid, seller) => ({ line: 'flip:' + itemId, itemId: String(itemId), name, units: qty, bid, kind: 'flip', sent: false, steps: [{ sellerId: String(seller), qty, price, bought: true, boughtQty: qty, boughtAt: now - 15 * 60000 }] });
+    _store[NS + 'sellAccepted'] = JSON.stringify({ 'id:11': { key: 'id:11', trader: { id: '11', name: 'Bob' }, itemId: '384', at: now - 20 * 60000, items: [flip(384, 'Camel Plushie', 5, 70000, 73500, 777)], cost: 350000, pays: 367500, profit: 17500 } });
+    const kay = { key: 'id:5001', trader: { id: '5001', name: 'KayMalta' }, itemId: '180', at: now - 40 * 60000, items: [flip(180, 'Bottle of Beer', 10, 40, 60, 66)], cost: 400, pays: 600, profit: 200 };
+    const kayLeft = [{ itemId: '180', name: 'Bottle of Beer', qty: 10, each: 40, from: 'KayMalta', at: now - 10 * 60000 }];
+    _store[NS + 'sellCancelUndo'] = JSON.stringify({ 'id:5001': { trade: kay, left: kayLeft, recs: [{ traderId: '5001', name: 'KayMalta', at: kay.at, prices: { 180: 60 } }], at: now - 10 * 60000 } });
+    _store[NS + 'sellLeftovers'] = JSON.stringify(kayLeft);
+    const sale = (id, ago, trader, items, money) => {
+        TRADEDONE_TRADES[id] = { id, completed_at: NOW_S - ago, user: me, trader, items: [
+            ...items.map(([item, amount]) => ({ user_id: 999, type: 'Item', details: { id: item, uid: null, amount } })),
+            { user_id: trader.id, type: 'Money', details: { amount: money } },
+        ] };
+    };
+    sale(701, 5 * 60, { id: 11, name: 'Bob' }, [[384, 4]], 4 * 73500);
+    sale(702, 15 * 60, { id: 5001, name: 'KayMalta' }, [[180, 10]], 600);
+}
+
 const ITEMS = {
     1: { name: 'Hammer', type: 'Melee', sell_price: 100, market_value: 120 },
     206: { name: 'Xanax', type: 'Drug', sell_price: 600, market_value: 830000 },
@@ -392,10 +422,14 @@ function respond(url) {
         }
         if (u.pathname === '/v2/user/trades') {
             if (MANY) return { trades: Object.values(MANY_TRADES).map((t) => ({ id: t.id, completed_at: t.completed_at, user: t.user, trader: t.trader })), _metadata: { links: {} } };
-            return { trades: [{ id: 501, completed_at: NOW_S - 3 * 86400, user: { id: 999, name: 'Me' }, trader: { id: 11, name: 'Bob' } }], _metadata: { links: {} } };
+            const done = Object.values(TRADEDONE_TRADES).map((t) => ({ id: t.id, completed_at: t.completed_at, user: t.user, trader: t.trader }));
+            const from = Number(u.searchParams.get('from')) || 0;
+            return { trades: [{ id: 501, completed_at: NOW_S - 3 * 86400, user: { id: 999, name: 'Me' }, trader: { id: 11, name: 'Bob' } }, ...done].filter((t) => t.completed_at >= from), _metadata: { links: {} } };
         }
         const manyT = MANY && u.pathname.match(/^\/v2\/user\/(\d+)\/trade$/);
         if (manyT && MANY_TRADES[manyT[1]]) return { trade: MANY_TRADES[manyT[1]] };
+        const doneT = u.pathname.match(/^\/v2\/user\/(\d+)\/trade$/);
+        if (doneT && TRADEDONE_TRADES[doneT[1]]) return { trade: TRADEDONE_TRADES[doneT[1]] };
         if (u.pathname === '/v2/user/501/trade') {
             return { trade: { id: 501, completed_at: NOW_S - 3 * 86400, user: { id: 999, name: 'Me' }, trader: { id: 11, name: 'Bob' }, items: [
                 { user_id: 999, type: 'Item', details: { id: 384, uid: null, amount: 5 } },

@@ -90,9 +90,11 @@ export function gmMenu(label, handler) {
  * Falls back to fetch when the host does not provide it (and under node, for
  * the tests).
  *
+ * @param {string} url
+ * @param {{timeoutMs?: number}} [options] - how long to wait for the answer (30 s)
  * @returns {Promise<{ok: boolean, status: number, json: function}>}
  */
-export function gmFetch(url) {
+export function gmFetch(url, { timeoutMs = 30000 } = {}) {
     if (typeof GM_xmlhttpRequest !== 'function') {
         if (typeof fetch === 'function') return fetch(url);
         return Promise.reject(new Error('No HTTP transport available.'));
@@ -102,7 +104,7 @@ export function gmFetch(url) {
         GM_xmlhttpRequest({
             method: 'GET',
             url,
-            timeout: 30000,
+            timeout: timeoutMs,
             onload(response) {
                 resolve({
                     ok: response.status >= 200 && response.status < 300,

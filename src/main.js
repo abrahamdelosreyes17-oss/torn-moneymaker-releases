@@ -57,7 +57,7 @@ import { deskItem, nextW3bRead, backgroundSlot, backgroundListSlot, flipsStale, 
 import { liquidityKind, unitsMoved, addMovement, stopsMinutes, EXTRA_CAP } from './core/liquidity.js';
 import { usageAdd, usageMerge, usageSeries, USAGE_SERVICES, USAGE_RANGES, USAGE_LABELS } from './core/usage.js';
 import { addLogEntries, logText } from './core/errlog.js';
-import { checkoutList, boughtSince, stockBuys, addExtraBuy, applyLogBuys, bazaarBuyRows, addLogBuys, splitLogBuys, sellElsewhere, LOG_BUY_SLACK_MS, acceptTrade, liveAccepted, stepState, tickAccepted, stepDone, nextStep, boughtFromStock, recordBuy, sendUnits, acceptedTotals, replacementFor, replaceStep, dropLine, markLeft, leftoversOf, cancelledLeftovers, addLeftovers, takenUnits, fillNote } from './core/accepted.js';
+import { checkoutList, boughtSince, stockBuys, addExtraBuy, applyLogBuys, bazaarBuyRows, addLogBuys, splitLogBuys, sellElsewhere, LOG_BUY_SLACK_MS, acceptTrade, liveAccepted, stepState, tickAccepted, stepDone, nextStep, boughtFromStock, recordBuy, sendUnits, acceptedTotals, replacementFor, replaceStep, dropLine, markLeft, leftoversOf, cancelledLeftovers, addLeftovers, takenUnits, fillNote, finishedTradeFor, tradedLeftovers, removeLeftovers, itemsGiven, tradePartnerId, tradeFinishedAt, TRADE_DONE_SLACK_MS } from './core/accepted.js';
 import { readTradeView, readTradeAddRows } from './sources/dom/trade.js';
 import { BoughtWindow } from './ui/bought-window.js';
 import { makeTabId, LEADER_HEARTBEAT_MS } from './core/leader.js';
@@ -298,6 +298,13 @@ const STORE_SELL_LEFTOVERS = 'sellLeftovers';
  * {buys: [{id, t, itemId, qty, each, sellerId}], readTo, at, state: 'on' | 'nokey' | 'error'}
  */
 const STORE_SELL_LOG_BUYS = 'sellLogBuys';
+/*
+ * Did an accepted trade go through (3.16.1): your finished trades as Torn
+ * Bids last read them. {at, seen: {tradeId: {t, partnerId, gave: {itemId: n}|null}}, used: [tradeId]}
+ */
+const STORE_SELL_TRADES_SEEN = 'sellTradesSeen';
+/* Trades you cancelled, a while (3.16.1): trader key -> {trade, left, recs, at}; put right if Torn shows them traded. */
+const STORE_SELL_CANCEL_UNDO = 'sellCancelUndo';
 const SELL_LEFTOVERS_KEEP_MS = 7 * 24 * 60 * 60 * 1000;
 /* When the ledger was last saved (its rows are in Torn Bids' IndexedDB): other tabs re-read on a change. */
 const STORE_LEDGER_REV = 'ledgerRev';
@@ -3786,6 +3793,7 @@ function storageSizes() {
         STORE_KEY, STORE_ITEMS, STORE_NPC, STORE_MANUAL_NPC, STORE_SETTINGS, STORE_KEY_ACCESS, STORE_API_WINDOW + '.tabs', STORE_W3B_WINDOW + '.tabs', STORE_TORN_PAUSE, STORE_KEY_DEAD, STORE_OPENED,
         STORE_SELL_KEY, STORE_SELL_KEY_DEAD, STORE_SELL_KEY_ACCESS, STORE_TE_KEY, STORE_TE, STORE_TE_STATE, STORE_TE_LISTS, STORE_TE_IDS, STORE_TE_VOTES, STORE_API_USAGE, STORE_PROBLEM_LOG,
         STORE_INVENTORY, STORE_SELL_PREFS, STORE_TRADER_DB, STORE_TE_ONE, STORE_SELL_SELF, STORE_SELL_NETWORTH, STORE_SELL_ACCEPTED, STORE_SELL_PINNED,
+        STORE_SELL_LOG_BUYS, STORE_SELL_TRADES_SEEN, STORE_SELL_CANCEL_UNDO, STORE_SELL_LEFTOVERS,
         STORE_LEDGER_KEY, STORE_LEDGER_KEY_DEAD, STORE_LEDGER_SELF, STORE_LEDGER,
         STORE_FILL, STORE_FILL_OWN_IM, STORE_SELF, STORE_HISTORY, STORE_W3B_SUMMARY, FEED_STORE_KEY,
     ];
@@ -4009,6 +4017,8 @@ const STORE_SELL_PRESENCE = 'sellPresence';
 const SELL_PRESENCE_KEEP = 400;
 /* A failed TornExchange call is not retried sooner than this. */
 const TE_RETRY_MS = 5 * 60 * 1000;
+/* Every active trader, after failures in a row: twice as long each time, at most this (3.16.1). */
+const TE_IDS_RETRY_MAX_MS = 2 * 60 * 60 * 1000;
 /* Inventory is asked again after this, or on Refresh. */
 /* Torn caches your inventory for about an hour: asking more often got the same answer (3.15). */
 const INVENTORY_REFRESH_MS = 60 * 60 * 1000;
@@ -4587,11 +4597,48 @@ function cancelSellAccepted(key, now = Date.now()) {
     const id = t.trader && t.trader.id ? String(t.trader.id) : null;
     const kept = recs.filter((r) => !(r && id && String(r.traderId) === id && Number(r.at) === Number(t.at)));
     if (kept.length !== recs.length) gmSet(STORE_SELL_PRICE_RECORDS, kept);
+    // Kept a while (3.16.1): a trade that had in fact gone through is put right
+    // once your finished trades show it (the friend cancelled one that had).
+    if (id) gmSet(STORE_SELL_CANCEL_UNDO, { ...sellCancelUndo(now), [key]: { trade: t, left, recs: recs.filter((r) => !kept.includes(r)), at: now } });
     forgetLogBuysOf(key, all);
     delete all[key];
     saveSellAccepted(all);
     const cancelled = gmGet(STORE_SELL_CANCELLED, {}) || {};
     gmSet(STORE_SELL_CANCELLED, { ...cancelled, [key]: { itemId: String(t.itemId), at: now } });
+}
+
+/** Trades cancelled in the last 3 hours, as they were: trader key -> {trade, left, recs, at}. */
+function sellCancelUndo(now = Date.now()) {
+    const all = gmGet(STORE_SELL_CANCEL_UNDO, null) || {};
+    const out = {};
+    for (const [k, u] of Object.entries(all)) if (u && u.trade && now - Number(u.at) < CANCEL_UNDO_KEEP_MS) out[k] = u;
+    return out;
+}
+
+/**
+ * Traded (done): the frozen trade goes, and what the trader did not take
+ * stays yours to sell, as leftovers - `left` from what you really gave
+ * (3.16.1), else what you marked; its pin goes too. Back to the live plan
+ * (done false) keeps nothing, and keeps the pin.
+ */
+function closeSellAccepted(key, { done = false, left = null } = {}) {
+    const all = sellAccepted();
+    if (done && all[key]) {
+        const rest = left || leftoversOf(all[key]);
+        if (rest.length) saveSellLeftovers(addLeftovers(sellLeftovers(), rest));
+    }
+    const itemId = all[key] ? String(all[key].itemId) : null;
+    forgetLogBuysOf(key, all);
+    delete all[key];
+    saveSellAccepted(all);
+    if (done && itemId) {
+        const pins = sellPinned();
+        if (pins[holdKey(itemId, key)]) {
+            delete pins[holdKey(itemId, key)];
+            saveSellPinned(pins);
+        }
+        sell.tradeHold.delete(holdKey(itemId, key));
+    }
 }
 
 /** Torn Bids: a trade cancelled here or on Torn's pages - its pick and held plan go. */
@@ -5960,18 +6007,31 @@ function refreshTeActiveTraders() {
     const ids = gmGet(STORE_TE_IDS, null);
     if (ids && Date.now() - ids.fetchedAt < TE_REFRESH_MS * 3) return;
     const st = teState();
-    if (Date.now() - (st.idsAttemptAt || 0) < TE_RETRY_MS) return;
+    // Failed in a row (the friend's 3.16.0 report: 18 asks of 20 timed out):
+    // 5 minutes, then twice as long each time, 2 hours at most. The list last
+    // read is used meanwhile.
+    const wait = Math.min(TE_IDS_RETRY_MAX_MS, TE_RETRY_MS * 2 ** Math.min(6, Number(st.idsFails) || 0));
+    if (Date.now() - (st.idsAttemptAt || 0) < wait) return;
     setTeState({ idsAttemptAt: Date.now() });
     sell.teIdsLoading = true;
+    // Its slot in the line is the sending: the slow answer (up to 90 s) is
+    // waited for outside it, so no other TornExchange call waits behind it.
     sell.queue
-        .enqueue(() => fetchTeActiveTraderList(sell.te))
+        .enqueue(() => ({ answer: fetchTeActiveTraderList(sell.te) }))
+        .then(({ answer }) => answer)
         .then(({ byName, list }) => {
+            if (teState().idsFails) setTeState({ idsFails: 0 });
             gmSet(STORE_TE_IDS, { fetchedAt: Date.now(), map: Object.fromEntries(byName) });
             sell.idsByName = byName;
             learnTraders(list);
             saveTraderDb(true);
         })
-        .catch(() => {})
+        .catch((error) => {
+            if (error && error.tooSoon) return;
+            setTeState({ idsFails: (Number(teState().idsFails) || 0) + 1 });
+            // Its slot was settled when it was sent: the failure is said here.
+            onTeSettled(error);
+        })
         .finally(() => {
             sell.teIdsLoading = false;
             renderSelling();
@@ -6557,24 +6617,7 @@ function bootSellingPage() {
         // keeps what they did not take, to sell elsewhere.
         onTradeClose: (key, done) => {
             logAction(done ? 'Traded - done' : 'Back to the live plan');
-            const all = sellAccepted();
-            if (done && all[key]) {
-                const left = leftoversOf(all[key]);
-                if (left.length) saveSellLeftovers(addLeftovers(sellLeftovers(), left));
-            }
-            const itemId = all[key] ? String(all[key].itemId) : null;
-            forgetLogBuysOf(key, all);
-            delete all[key];
-            saveSellAccepted(all);
-            // Traded: its pin goes too (back to the live plan keeps it).
-            if (done && itemId) {
-                const pins = sellPinned();
-                if (pins[holdKey(itemId, key)]) {
-                    delete pins[holdKey(itemId, key)];
-                    saveSellPinned(pins);
-                }
-                sell.tradeHold.delete(holdKey(itemId, key));
-            }
+            closeSellAccepted(key, { done });
             renderSellingNow();
         },
         // Cancel trade: they accepted, then it was called off - the plan is gone.
@@ -6752,7 +6795,11 @@ function bootSellingPage() {
         isVisible: () => true,
     });
     watchAcceptedBuys();
-    setInterval(() => watchAcceptedBuys(), 15000);
+    watchFinishedTrades();
+    setInterval(() => {
+        watchAcceptedBuys();
+        watchFinishedTrades();
+    }, 15000);
     gmOnChange(STORE_SELL_LOG_BUYS, () => renderSellingNow());
 
     setInterval(() => {
@@ -7180,6 +7227,112 @@ async function watchAcceptedBuys(now = Date.now()) {
         gmSet(STORE_SELL_LOG_BUYS, { ...(gmGet(STORE_SELL_LOG_BUYS, null) || stored), state: 'error', at: Date.now() });
     } finally {
         led.buysBusy = false;
+    }
+}
+
+/*
+ * Did an accepted trade go through (3.16.1; the friend: the Checkout "still
+ * stays even though my trade with this trader is already done", so he
+ * pressed Cancel trade, and what the trader had taken became leftovers).
+ * While a trade is accepted, or was cancelled in the last 3 hours, Torn Bids
+ * reads your finished trades with the Ledger's key: once a minute while one
+ * is under 3 hours old - also from a hidden tab, as the buys - else every 5
+ * minutes; each new finished trade with a trader it waits on is read in full
+ * once (what you gave). One with that trader since they accepted closes the
+ * trade as traded, what they did not take kept as leftovers; one that
+ * finished before you cancelled puts the cancel right.
+ */
+const TRADED_EVERY_MS = 60 * 1000;
+const TRADED_SLOW_MS = 5 * 60 * 1000;
+const CANCEL_UNDO_KEEP_MS = 3 * 60 * 60 * 1000;
+/* Finished trades are asked for from this long before the oldest "accepted" (a trade opened before they said yes). */
+const TRADED_LOOKBACK_MS = 6 * 60 * 60 * 1000;
+/* Full trades read per check at most (each once). */
+const TRADED_READS_PER_CHECK = 3;
+const TRADED_SEEN_KEEP_MS = 24 * 60 * 60 * 1000;
+
+async function watchFinishedTrades(now = Date.now()) {
+    if (led.tradedBusy || !led.buysClient || now < (led.tradedNextAt || 0)) return;
+    const open = Object.values(sellAccepted(now)).filter((t) => t.trader && t.trader.id);
+    const undo = Object.values(sellCancelUndo(now)).filter((u) => u.trade.trader && u.trade.trader.id);
+    if (!open.length && !undo.length) return;
+    if (!getLedgerKey() || gmGet(STORE_LEDGER_KEY_DEAD, null)) return;
+    const recent = [...open.map((t) => Number(t.at)), ...undo.map((u) => Number(u.at))].some((at) => now - at < BUYS_WATCH_MS);
+    const every = recent ? TRADED_EVERY_MS : TRADED_SLOW_MS;
+    const stored = gmGet(STORE_SELL_TRADES_SEEN, null) || {};
+    // Two Torn Bids tabs: one read between them.
+    if (now - (Number(stored.at) || 0) < every - 5000) return;
+    led.tradedBusy = true;
+    led.tradedNextAt = now + every;
+    const use = { tag: 't.traded', priority: 'normal' };
+    try {
+        // Whose key it is: learned when it was saved (else the Ledger's next run asks).
+        const self = gmGet(STORE_LEDGER_SELF, null);
+        if (!self) return;
+        const since = Math.min(...open.map((t) => Number(t.at)), ...undo.map((u) => Number(u.trade.at))) - TRADE_DONE_SLACK_MS;
+        const list = await fetchTradesPage(led.buysClient, { from: Math.floor((since - TRADED_LOOKBACK_MS) / 1000), use });
+        const seen = {};
+        for (const [id, x] of Object.entries(stored.seen || {})) if (x && Date.now() - Number(x.t) < TRADED_SEEN_KEEP_MS) seen[id] = x;
+        const waited = new Set([...open.map((t) => String(t.trader.id)), ...undo.map((u) => String(u.trade.trader.id))]);
+        let reads = 0;
+        for (const x of list) {
+            if (!x || !x.id || seen[String(x.id)]) continue;
+            const id = String(x.id);
+            const t = tradeFinishedAt(x);
+            if (t && t < since) continue;
+            const partnerId = tradePartnerId(x, self);
+            // With nobody we wait on: never read in full.
+            if (partnerId && !waited.has(partnerId)) {
+                seen[id] = { t: t || Date.now(), partnerId, gave: null };
+                continue;
+            }
+            if (reads >= TRADED_READS_PER_CHECK) break;
+            reads += 1;
+            const full = await fetchTrade(led.buysClient, id, use);
+            if (!full) continue;
+            const whole = { ...x, ...full };
+            seen[id] = { t: tradeFinishedAt(whole) || t || Date.now(), partnerId: tradePartnerId(whole, self), gave: Object.fromEntries(itemsGiven(whole, self)) };
+        }
+        const used = new Set(Array.isArray(stored.used) ? stored.used.map(String) : []);
+        let avail = Object.entries(seen).filter(([id, x]) => x.gave && x.partnerId && !used.has(id)).map(([id, x]) => ({ id, t: Number(x.t), partnerId: x.partnerId, gave: x.gave }));
+        const take = (f) => {
+            used.add(f.id);
+            avail = avail.filter((a) => a.id !== f.id);
+            return new Map(Object.entries(f.gave).map(([k, v]) => [k, Number(v) || 0]));
+        };
+        let changed = false;
+        // Went through: closed as traded, what they did not take kept to sell.
+        for (const t of open.sort((a, b) => a.at - b.at)) {
+            const f = finishedTradeFor(t, avail);
+            if (!f) continue;
+            closeSellAccepted(t.key, { done: true, left: tradedLeftovers(t, take(f)) });
+            logAction('Traded - done (your Torn trades show it; item ' + t.itemId + ')');
+            changed = true;
+        }
+        // Cancelled, but it had gone through before you did: what they took is
+        // no longer a leftover, and their accepted prices are kept again.
+        const undoAll = sellCancelUndo();
+        for (const u of undo) {
+            const f = finishedTradeFor(u.trade, avail, Number(u.at) + TRADE_DONE_SLACK_MS);
+            if (!f) continue;
+            const left = tradedLeftovers(u.trade, take(f));
+            saveSellLeftovers(addLeftovers(removeLeftovers(sellLeftovers(), u.left || []), left));
+            let recs = gmGet(STORE_SELL_PRICE_RECORDS, []) || [];
+            for (const r of u.recs || []) recs = addPriceRecord(recs, r);
+            gmSet(STORE_SELL_PRICE_RECORDS, recs);
+            delete undoAll[u.trade.key];
+            logAction('Cancel trade put right: it had gone through (item ' + u.trade.itemId + ')');
+            changed = true;
+        }
+        if (changed) gmSet(STORE_SELL_CANCEL_UNDO, undoAll);
+        gmSet(STORE_SELL_TRADES_SEEN, { at: Date.now(), seen, used: [...used].slice(-200) });
+        if (changed) renderSellingNow();
+    } catch (error) {
+        if (error && (KEY_DEAD_CODES.has(error.code) || error.code === 16)) markLedgerKeyDead(error);
+        // Torn asked to slow down, or a pause is on: a longer wait.
+        if (error && (error.code === 5 || error.paused)) led.tradedNextAt = Date.now() + 3 * every;
+    } finally {
+        led.tradedBusy = false;
     }
 }
 

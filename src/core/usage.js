@@ -36,6 +36,7 @@ export const USAGE_LABELS = {
     't.networth': { name: 'Trader networth', lane: 'low' },
     't.ledger': { name: 'Ledger', lane: 'low' },
     't.buys': { name: 'Buys for an accepted trade (your log)', lane: 'normal' },
+    't.traded': { name: 'Did an accepted trade go through (your trades)', lane: 'normal' },
     't.other': { name: 'Other', lane: 'high' },
     'w.summary': { name: 'Bazaar summary' },
     'w.feed': { name: 'Overlay bazaar deals' },

@@ -542,7 +542,10 @@ and can be retried at once with **Try again**.
 **Where traders come from - our own trader database.** Traders publish buy
 prices in two places, and TornW3B has no list of its traders, so the script
 keeps its own:
-- every active **TornExchange** trader (`/api/active_traders`, with ids), and
+- every active **TornExchange** trader (`/api/active_traders`, with ids; a
+  slow answer, waited for up to 90 s outside the line so nothing waits behind
+  it, and after failures in a row asked again 5, 10, 20... minutes later, 2
+  hours at most - the list last read is used meanwhile: 3.16.1), and
   the top three buyers of every item (`/api/all_best_listings`, every 10 min);
   an item's **full** buyer list (`/api/listings`) only when you pick it; and
   (3.14.3) each of your **favourite** traders' whole list (`/api/prices/{id}`,
@@ -632,6 +635,23 @@ key it counts from the page as before.
   trade, each with who pays most for it now (never that trader, never a
   blacklisted one); it all goes to Torn Bids' leftovers. At Traded - done,
   unplanned buys the trader does not take become leftovers too.
+
+**A trade that went through closes itself** (3.16.1, after the friend's
+second live report: the Checkout "still stays even though my trade with this
+trader is already done", so he pressed Cancel trade, and what the trader had
+already taken became leftovers to sell). While a trade is accepted, Torn Bids
+reads your finished trades (`/v2/user/trades`) with the Ledger's Full key -
+once a minute while the trade is under 3 hours old, also from a hidden tab,
+else every 5 minutes - and each new one with a trader it waits on in full,
+once (`/v2/user/{id}/trade`: what you gave). A finished trade with that
+trader since they accepted, with some of the plan's items in it, closes the
+trade as Traded - done: the Checkout goes on every page, and what you bought
+but did not give stays in Torn Bids as leftovers (`core/accepted.js`
+`finishedTradeFor`, `tradedLeftovers`). **Cancel trade on a trade that had
+gone through** is put right the same way: for 3 hours after a cancel, a
+finished trade with that trader from before you cancelled takes its items
+back off the leftovers and keeps their accepted prices for the Ledger.
+Without a Ledger key, Traded - done in Torn Bids closes it as before.
 
 **Add all** (3.14.5): beside *"X buys N more items, left out to keep it
 quick · Show them"*, one press puts every one of them in the trade, past
@@ -964,7 +984,8 @@ code flaw. These measures address both halves.
    keep going in the background, slowly - they are not Torn; the Torn API
    never does - with one exception since 3.16: while a trade you accepted is
    under 3 hours old, Torn Bids reads your own bazaar buys (log 1225) once
-   a minute with the Ledger's key from a hidden tab too, in the shared window,
+   a minute with the Ledger's key from a hidden tab too - and (3.16.1) your
+   finished trades, to close a trade that went through - in the shared window,
    shown only on pages you look at - no alert of any kind. Torn's rule is
    about unfocused pages drawing attention; this draws none.) The item list's v1 fallback gives no NPC prices at all (it
    cannot show a shop in Torn buys an item) and is retried after 5 minutes.

@@ -149,6 +149,7 @@ export class TeClient {
      * @param {object} [options]
      * @param {boolean} [options.keyless] - an endpoint that needs no key
      *   (best_listing): sent without one, on the same shared pace.
+     * @param {number} [options.timeoutMs] - how long to wait for the answer (30 s)
      */
     async get(path, params = {}, options = {}) {
         try {
@@ -165,7 +166,7 @@ export class TeClient {
         }
     }
 
-    async request(path, params = {}, { keyless = false, tag = null } = {}) {
+    async request(path, params = {}, { keyless = false, tag = null, timeoutMs = null } = {}) {
         const key = keyless ? '' : String(this.getKey() || '').trim();
         if (!key && !keyless) throw new TeError('No TornExchange key.', { badKey: true });
 
@@ -202,11 +203,11 @@ export class TeClient {
 
         let response;
         try {
-            response = await this.fetchImpl(url.toString());
+            response = timeoutMs ? await this.fetchImpl(url.toString(), { timeoutMs }) : await this.fetchImpl(url.toString());
         } catch (error) {
             // The message never carries the URL, so never the key.
             const timedOut = /timed out/i.test(String((error && error.message) || ''));
-            throw new TeError(timedOut ? 'TornExchange timed out.' : 'TornExchange network error.', { reason: timedOut ? 'no answer in 30 s' : 'no connection' });
+            throw new TeError(timedOut ? 'TornExchange timed out.' : 'TornExchange network error.', { reason: timedOut ? 'no answer in ' + Math.round((timeoutMs || 30000) / 1000) + ' s' : 'no connection' });
         }
 
         let body = null;
@@ -529,12 +530,19 @@ export function parseTeListings(body) {
 }
 
 /**
+ * Every active trader (all of them in one answer) is slow to come: the
+ * friend's 3.16.0 report had 18 of 20 asks time out at 30 s. It is waited
+ * for longer than the rest.
+ */
+export const TE_ACTIVE_TIMEOUT_MS = 90 * 1000;
+
+/**
  * Every active trader's name and Torn id: /api/active_traders. Used to give
  * a name from a buyer list its id (for the profile link and online status).
  * @returns {Promise<Map<string, string>>} lowercase name -> torn id
  */
 export async function fetchTeActiveTraders(client) {
-    return parseTeActiveTraders(await client.get('active_traders'));
+    return parseTeActiveTraders(await client.get('active_traders', {}, { timeoutMs: TE_ACTIVE_TIMEOUT_MS }));
 }
 
 export function parseTeActiveTraders(body) {
@@ -557,6 +565,6 @@ export function parseTeActiveTraderList(body) {
 
 /** Both forms from one call: {byName: lowercase name -> id, list: [{id, name}]}. */
 export async function fetchTeActiveTraderList(client) {
-    const body = await client.get('active_traders');
+    const body = await client.get('active_traders', {}, { timeoutMs: TE_ACTIVE_TIMEOUT_MS });
     return { byName: parseTeActiveTraders(body), list: parseTeActiveTraderList(body) };
 }

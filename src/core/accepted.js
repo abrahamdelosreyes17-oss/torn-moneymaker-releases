@@ -714,3 +714,120 @@ export function splitLogBuys(trades, buys) {
     }
     return out;
 }
+
+/* ------------------------------------------- the trade went through (3.16.1) */
+
+/*
+ * The friend (3.16.0, 2026-09-30): "This interface still stays even though my
+ * trade with this trader is already done", so he pressed Cancel trade - and
+ * what the trader had already taken became leftovers to sell. Only Traded -
+ * done in Torn Bids closed an accepted trade. Torn lists your finished trades
+ * (/v2/user/trades, read with the Ledger's key): one with this trader,
+ * finished after they accepted, is this trade gone through - it closes as
+ * traded, and what you really gave says what they did not take.
+ */
+
+/** A finished trade this long before "accepted" still counts (Torn's clock and yours differ a little). */
+export const TRADE_DONE_SLACK_MS = 2 * 60 * 1000;
+
+/** When a finished trade (Torn's /v2/user/trades or /trade) finished, in ms (0: not said). */
+export function tradeFinishedAt(t) {
+    const s = Number(t && (t.completed_at || t.timestamp || t.modified_at));
+    return Number.isFinite(s) && s > 0 ? s * 1000 : 0;
+}
+
+/** Who a finished trade was with (not you): their Torn id, or null when Torn does not say. */
+export function tradePartnerId(t, selfId) {
+    if (!t || !selfId) return null;
+    const p = [t.trader, t.user].find((x) => x && x.id && String(x.id) !== String(selfId));
+    return p ? String(p.id) : null;
+}
+
+/** What you gave in a finished trade (Torn's /v2/user/{id}/trade): itemId -> units. */
+export function itemsGiven(full, selfId) {
+    const out = new Map();
+    if (!full || !Array.isArray(full.items) || !selfId) return out;
+    for (const x of full.items) {
+        if (!x || String(x.user_id) !== String(selfId) || x.type !== 'Item' || !x.details) continue;
+        const id = String(x.details.id || '');
+        const n = Number(x.details.amount) || 0;
+        if (id && n > 0) out.set(id, (out.get(id) || 0) + n);
+    }
+    return out;
+}
+
+/**
+ * The finished trade that closes an accepted one: with its trader, finished
+ * after they accepted - and, for a trade you cancelled, before you did (a
+ * later trade with them is another trade). When what you gave is known, some
+ * of it must be the plan's items (anything else with them is another deal).
+ * The earliest such.
+ *
+ * @param {object} trade - an accepted trade
+ * @param {Array<{id, t, partnerId, gave?: object}>} finished - t in ms; gave: itemId -> units
+ * @param {number} [until] - finished no later than this (ms)
+ */
+export function finishedTradeFor(trade, finished, until = Infinity) {
+    const id = trade && trade.trader && trade.trader.id ? String(trade.trader.id) : null;
+    if (!id) return null;
+    const from = Number(trade.at) - TRADE_DONE_SLACK_MS;
+    const planned = new Set([...(trade.items || []).map((i) => String(i.itemId)), ...(trade.extra || []).filter(Boolean).map((x) => String(x.itemId))]);
+    const ours = (gave) => !gave || Object.entries(gave).some(([k, v]) => planned.has(String(k)) && Number(v) > 0);
+    const hits = (finished || []).filter((f) => f && f.partnerId && String(f.partnerId) === id && Number(f.t) >= from && Number(f.t) <= until && ours(f.gave));
+    return hits.sort((a, b) => a.t - b.t)[0] || null;
+}
+
+/**
+ * What a trade that went through leaves you, from what you really gave
+ * (itemsGiven): per item, what you bought for it - planned and unplanned -
+ * minus what went in, at what it cost you each. Your own items planned in
+ * the trade count as given first.
+ */
+export function tradedLeftovers(trade, gave, now = Date.now()) {
+    const from = trade && trade.trader ? trade.trader.name : null;
+    const given = new Map();
+    for (const [k, v] of gave || []) given.set(String(k), Number(v) || 0);
+    const bought = new Map();
+    const add = (itemId, name, qty, each) => {
+        const id = String(itemId);
+        const b = bought.get(id) || { itemId: id, name, qty: 0, cost: 0 };
+        b.qty += qty;
+        b.cost += qty * each;
+        b.name = b.name || name;
+        bought.set(id, b);
+    };
+    for (const i of (trade && trade.items) || []) {
+        const id = String(i.itemId);
+        if (i.kind === 'yours') {
+            if (given.has(id)) given.set(id, Math.max(0, given.get(id) - (Number(i.units) || 0)));
+            continue;
+        }
+        if (i.kind !== 'flip' || !(i.steps || []).some(stepDone)) continue;
+        const n = sendUnits(i);
+        if (n > 0) add(id, i.name, n, costEach(i));
+    }
+    for (const x of (trade && trade.extra) || []) {
+        if (x && Number(x.qty) > 0) add(x.itemId, x.name, Number(x.qty), Number(x.price) || 0);
+    }
+    const out = [];
+    for (const b of bought.values()) {
+        const left = b.qty - Math.min(b.qty, given.get(b.itemId) || 0);
+        if (left > 0) out.push({ itemId: b.itemId, name: b.name, qty: left, each: Math.round(b.cost / b.qty), from, at: now });
+    }
+    return out;
+}
+
+/** Leftovers with some taken back off (a cancel that turns out traded): per item fewer, none left - gone. */
+export function removeLeftovers(list, sub) {
+    const out = (Array.isArray(list) ? list : []).map((l) => ({ ...l }));
+    for (const s of sub || []) {
+        const same = out.find((l) => String(l.itemId) === String(s.itemId));
+        if (!same) continue;
+        const n = Math.min(same.qty, Math.max(0, Number(s.qty) || 0));
+        const rest = same.qty - n;
+        // The cost of what stays: the total less what goes, at what it cost.
+        if (rest > 0) same.each = Math.max(0, Math.round((same.each * same.qty - (Number(s.each) || 0) * n) / rest));
+        same.qty = rest;
+    }
+    return out.filter((l) => l.qty > 0);
+}
