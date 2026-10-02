@@ -21,8 +21,37 @@ function gmKey(key) {
     return GM_NAMESPACE + key;
 }
 
+/*
+ * The speed log's probe (3.17.0, platform/perf.js): told of each read and
+ * write - the value's name, how long it took, how long its text is. Two
+ * clock reads a call while one is set; nothing at all otherwise (the tests).
+ */
+let gmProbe = null;
+const gmClock = typeof performance !== 'undefined' && typeof performance.now === 'function' ? () => performance.now() : () => 0;
+
+/** @param {null|function(string, boolean, number, number)} probe - (key, isWrite, ms, textLength) */
+export function gmSetProbe(probe) {
+    gmProbe = typeof probe === 'function' ? probe : null;
+}
+
+/** How long a stored value's text is (0 when absent) - its size, without parsing it. */
+export function gmSize(key) {
+    const full = gmKey(key);
+    const raw = gmHasStorage ? GM_getValue(full, null) : gmMemoryStore.has(full) ? gmMemoryStore.get(full) : null;
+    return typeof raw === 'string' ? raw.length : 0;
+}
+
 /** Read a JSON-serialisable value. Returns `fallback` if absent or corrupt. */
 export function gmGet(key, fallback = null) {
+    if (!gmProbe) return gmRead(key, fallback, null);
+    const t = gmClock();
+    const size = [0];
+    const out = gmRead(key, fallback, size);
+    gmProbe(key, false, gmClock() - t, size[0]);
+    return out;
+}
+
+function gmRead(key, fallback, size) {
     const full = gmKey(key);
 
     let raw;
@@ -33,6 +62,7 @@ export function gmGet(key, fallback = null) {
     }
 
     if (raw === null || raw === undefined || raw === '') return fallback;
+    if (size && typeof raw === 'string') size[0] = raw.length;
 
     try {
         return JSON.parse(raw);
@@ -44,6 +74,7 @@ export function gmGet(key, fallback = null) {
 
 /** Write a JSON-serialisable value. */
 export function gmSet(key, value) {
+    const t = gmProbe ? gmClock() : 0;
     const full = gmKey(key);
     const raw = JSON.stringify(value);
 
@@ -52,6 +83,7 @@ export function gmSet(key, value) {
     } else {
         gmMemoryStore.set(full, raw);
     }
+    if (gmProbe) gmProbe(key, true, gmClock() - t, typeof raw === 'string' ? raw.length : 0);
 }
 
 /** Remove a stored value. */

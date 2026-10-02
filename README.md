@@ -883,8 +883,8 @@ services that do sat mostly idle.
   a bar's breakdown, and a table of every use with its lane and share. Every
   tab adds its counts to the record every 10 s; a day of minutes, then hours
   for a week. **Export API usage** downloads one .zip to send (the record,
-  by-minute / by-hour CSVs, the page's switches, limits and coverage; no key,
-  no player id or name).
+  by-minute / by-hour CSVs, the page's switches, limits and coverage - and,
+  3.17.0, `speed/` and `trades/`, see "The speed log" below; no key).
 - **Settings › Report a problem:** what happened, what you expected,
   screenshots, and a list of what goes in - then **Download report (.zip)**:
   your words, the screenshots, the problem log, the API use and the page's
@@ -897,6 +897,96 @@ services that do sat mostly idle.
   download (3.16) the words, screenshots and log are cleared for the next
   report, with *Download it again*; the inventory's "Incorrect category"
   answer (Torn then gets asked per category) is no longer logged as an error.
+  3.17.0: the zip also holds `speed/` and `trades/` (below).
+
+### The speed log, your trades in the zip, and the tidy-up (3.17.0)
+
+The friend: it lags on his laptop (an i5-1235U beside TornTools; every speed
+number in this file was measured on the owner's i7 without it). He will not
+measure it for us, so the script keeps its own evidence, and it rides in the
+two zips that already exist - **no new button, nothing looks different**. This
+release only measures and tidies; making the same work cheaper comes after
+his next zip says where the time goes (`PLAN-speed.md`, Part 3).
+
+**The speed log** (`core/speed.js`, `platform/perf.js`; in the overlay on
+Torn's pages and in Torn Bids alike):
+
+- **Our own work, by kind:** how often, how long in all, the longest. Each
+  scan of a Torn page by the kind of page and by what asked for it (the
+  timer, a page change, the rows changing, another tab); each panel redraw
+  and why; the trade page's scan; the trader tags' lists read again; Torn
+  Bids' redraw and the page rebuild inside it; the hourly tidy-up.
+- **Freezes and slow presses, as the browser counts them:** every stretch
+  the tab was stuck for 50 ms or more (long tasks - any script on the page,
+  not only this one), and every click or key press that took over 100 ms to
+  show, each press counted once. By the kind of page, hidden tabs apart.
+- **Stored values:** every read and write, how long it took and how big its
+  text is; and, when a zip is made, the size of everything stored.
+- **Changes in the rows we watch that we did not make** (Torn redrawing, or
+  another extension writing into them): how often, how many, the busiest
+  minute - the TornTools question, answered without its code.
+- **Start-up** (script started, panel shown, item data ready), **the 50
+  slowest single events**, and **the machine** as the browser tells any
+  page (processor threads, memory class, screen, window).
+- **It holds no name, id, item, price or key:** every label is the script's
+  own word, a stored value's name, or a kind of page.
+- **It does not lag:** two clock reads around work already happening and a
+  counter in memory. Written at most once a minute and when the tab goes,
+  added to what the other tabs stored; a tab doing nothing writes nothing
+  (the record's own reads and writes are not counted, or it would never go
+  quiet). By the hour for a day, then by the
+  day for a week; each label written once - about 20 KB for a week of
+  ordinary use (`speedLog`).
+- **In both zips:** `speed/speed.txt` (to read, the most time first) and
+  `speed/speed.json`.
+
+**Your trades in the zip** (`core/trades-export.js`): `trades/receipts.json`
+and `receipts.csv` (one receipt per finished trade the Ledger read: who
+with, each item given and got, what it cost and made),
+`accepted-prices.json` (what each accepted trade recorded) and
+`leftovers.json`. **These name the other traders - their Torn names and ids -
+by the owner's decision (2026-10-03).** So the zips no longer say "no player
+id or name": they say no API key is in them, that `trades/` names the traders
+you traded with, and that nothing else there holds a name or an id. The
+Ledger key's table in Settings says the same under Data sharing. Nothing is
+sent by the script: the player downloads the zip and sends it.
+
+**Stored data nobody uses is deleted** (`core/tidy.js`):
+
+- **Once:** `npcManual` (read on every page, never written by any version),
+  `tradersPage` (left by 3.7.0), and the old single `apiWindow` /
+  `w3bWindow` arrays (until now looked for on every page load).
+- **About once an hour, in the tab in view:** accepted trades, pins,
+  declined trades, cancelled trades kept to be put right, leftovers, gone
+  marks, page stocks, own buys and TornExchange's per-item lists are written
+  back without their expired entries. Every reader already passed over those
+  entries, so nothing a feature shows changes - `test/tidy.test.js` proves
+  it for each: what a reader gets from the tidied value is what it gets from
+  the stored one. Never from a hidden tab (it may hold an older copy of a
+  value another tab just wrote), and a value is written only when something
+  in it had expired.
+- **Left alone, and why:** TornExchange's top buyers (`teCache`: a Torn
+  Bids tab left open goes on showing its copy past a day, and deleting the
+  stored one would take those buyers off it); removed fields inside
+  `settings` (a few bytes, and one of them is still read by the export);
+  `opened` (capped at 200 already, and its order is read); the trade page's notes in sessionStorage
+  (they go with the tab); and the per-tab request windows orphaned by a tab
+  that closed mid-race - the script cannot list its own values without the
+  `GM_listValues` grant, and whether Tampermonkey would ask a player to
+  approve an update that adds a grant could not be established, so no grant
+  was added.
+
+**The bench** (`node test/bench.mjs`, or `npm run bench`): the harness in
+a real Chrome with the processor slowed four times, rows another extension
+keeps writing into (`&ttbusy=1`) and a 1.2 MB trader database
+(`&bigstore=2000`), five scenes, the script's own speed log printed for
+each and for all together. No dependencies (it speaks the DevTools protocol
+itself). It is how each step of Part 3 is measured before and after.
+`--compare <build>` runs every scene on that build and on this one, each
+from empty browser storage, and says whether both sent the same requests and
+drew the same page (`git show HEAD:torn-moneymaker.user.js >
+dist/before.user.js` gives it the released one): the test that nothing was
+compromised.
 
 ---
 
@@ -1070,7 +1160,7 @@ The Torn Ledger's key (its own table beside its own field):
 
 | Data storage | Data sharing | Purpose of use | Key storage & sharing | Key access level |
 |---|---|---|---|---|
-| Only locally: time, item, quantity, price, where, who - never the log's own text | Nobody | Personal: profit tracking, and checking what you bought for a trade you accepted | Stored locally / Not shared | Full, used only for your log (user: log - bazaar and Item Market buys and sells), your trades (user: trades, trade) and key: info |
+| Only locally: time, item, quantity, price, where, who - never the log's own text | Nobody. Your trades go into a zip only when you download one yourself (Report a problem, Export API usage): it names the traders you traded with, and you choose who gets it | Personal: profit tracking, and checking what you bought for a trade you accepted | Stored locally / Not shared | Full, used only for your log (user: log - bazaar and Item Market buys and sells), your trades (user: trades, trade) and key: info |
 
 Plus: *Other services: none - never sent to TornExchange or TornW3B.*
 

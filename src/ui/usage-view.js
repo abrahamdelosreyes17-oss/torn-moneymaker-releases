@@ -58,13 +58,16 @@ const UV_LANE_WORDS = { high: 'goes first', normal: 'normal', low: 'waits for ro
 export const USAGE_EXPORT_KIND = 'torn-trading-api-usage';
 
 /**
- * The files in the zip: counts, settings and coverage only - no key, no
- * player id, no name. `state`: what the page adds (version, switches,
- * coverage) - see usageNow in main.js.
+ * The files in the zip: counts, settings and coverage - no key. `state`: what
+ * the page adds (version, switches, coverage) - see usageNow in main.js.
+ * `extra` (3.17.0): the speed log and your trades, as speed/... and
+ * trades/... (main.js exportExtras) - the trades name the other traders.
+ * `beside`: the same files when they sit beside this folder in a bigger zip
+ * (the problem report), so its last line still says the truth.
  *
  * @returns {Array<{name: string, text: string}>}
  */
-export function usageExportFiles(record, { state = {}, now = Date.now() } = {}) {
+export function usageExportFiles(record, { state = {}, now = Date.now(), extra = [], beside = [] } = {}) {
     const rec = { m: (record && record.m) || {}, h: (record && record.h) || {} };
     const stamp = new Date(now).toISOString();
     const tz = -new Date(now).getTimezoneOffset();
@@ -77,13 +80,33 @@ export function usageExportFiles(record, { state = {}, now = Date.now() } = {}) 
             'by-minute.csv   the same, one row per minute, service and use (local time) - opens in Excel.',
             'by-hour.csv     the same per hour.',
             'state.json      the script version, the page\'s switches and limits, and how much it had covered when exported.',
-            '',
-            'No API key, player id or name is in these files.',
+            ...usageExtraLines(extra, undefined, beside),
         ].join('\n') + '\n' },
         { name: 'api-usage.json', text: JSON.stringify({ kind: USAGE_EXPORT_KIND, v: 1, exportedAt: stamp, tzOffsetMin: tz, limits: Object.fromEntries(Object.entries(USAGE_SERVICES).map(([id, sv]) => [id, sv.perMin])), record: rec }) },
         { name: 'by-minute.csv', text: usageCsv(rec, { by: 'minute' }) },
         { name: 'by-hour.csv', text: usageCsv(rec, { by: 'hour' }) },
         { name: 'state.json', text: JSON.stringify({ exportedAt: stamp, ...state }, null, 2) },
+        ...extra,
+    ];
+}
+
+/**
+ * What a zip says of itself at the end of its list (3.17.0): the speed log
+ * and the trades when they are in it, and what is and is not in these files.
+ * The trades name the other traders; nothing else holds a name or an id.
+ */
+export function usageExtraLines(extra = [], line = (name, text) => name.padEnd(16) + text, beside = []) {
+    const has = (dir) => extra.some((f) => f && String(f.name).startsWith(dir + '/'));
+    const near = beside.some((f) => f && String(f.name).startsWith('trades/'));
+    return [
+        ...(has('speed') ? [line('speed/', 'how long the script\'s own work took, the freezes and slow clicks the browser counted, and what is stored - the last week (speed.txt to read, speed.json the same as data).')] : []),
+        ...(has('trades') ? [line('trades/', 'your finished trades as the Ledger read them, the prices each accepted trade recorded, and your leftovers (see its README).')] : []),
+        '',
+        has('trades')
+            ? 'No API key is in these files. trades/ names the traders you traded with (their Torn names and ids); nothing else here holds a name or a player id.'
+            : near
+                ? 'No API key, player id or name is in this folder\'s files. The trades/ folder beside it names the traders you traded with.'
+                : 'No API key, player id or name is in these files.',
     ];
 }
 
@@ -94,7 +117,9 @@ function uvTime(at, range) {
 }
 
 export class UsageView {
-    constructor() {
+    /** @param {{getExtras?: function}} [h] - the speed log and trades files, made when a zip is (3.17.0) */
+    constructor(h = {}) {
+        this.h = h;
         this.service = 't';
         this.range = '1h';
         this.data = null;
@@ -113,7 +138,8 @@ export class UsageView {
     exportZip() {
         if (!this.data) return;
         const now = Date.now();
-        const zip = makeZip(usageExportFiles(this.data.record, { state: this.data.state || {}, now }), new Date(now));
+        const extra = this.h.getExtras ? this.h.getExtras() : [];
+        const zip = makeZip(usageExportFiles(this.data.record, { state: this.data.state || {}, now, extra }), new Date(now));
         const a = document.createElement('a');
         a.href = URL.createObjectURL(new Blob([zip], { type: 'application/zip' }));
         const d = new Date(now);
@@ -121,7 +147,7 @@ export class UsageView {
         a.download = 'torn-api-usage-' + d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + '-' + pad(d.getHours()) + pad(d.getMinutes()) + '.zip';
         a.click();
         setTimeout(() => URL.revokeObjectURL(a.href), 10000);
-        this.exportNote.textContent = 'Saved ' + a.download + ' to your downloads: send that file (no key or name is in it).';
+        this.exportNote.textContent = 'Saved ' + a.download + ' to your downloads: send that file (no key is in it; your trades in it name the traders you traded with).';
     }
 
     /**
@@ -184,7 +210,7 @@ export class UsageView {
                     this.hover = null;
                     this.render(this.data);
                 }, 'Time'),
-                uvEl('button', { type: 'button', class: 'uv-btn', title: 'Download a .zip of the last week\'s API use and this page\'s settings, to send for a look (no key, no names)', text: 'Export API usage', onclick: () => this.exportZip() }),
+                uvEl('button', { type: 'button', class: 'uv-btn', title: 'Download a .zip of the last week\'s API use, the speed log, your trades and this page\'s settings, to send for a look (no key; your trades name the traders you traded with)', text: 'Export API usage', onclick: () => this.exportZip() }),
             ]),
         );
     }

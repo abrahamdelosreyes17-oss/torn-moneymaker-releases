@@ -241,6 +241,23 @@ if (_bzWindow) {
             }
         };
         draw(true);
+        // &ttbusy=1 (3.17.0, the speed bench): another extension writing into every card twice a
+        // second, as TornTools does into Torn's rows - each write is a change in the rows we watch.
+        if (/[?&]ttbusy=1/.test(location.search)) {
+            let n = 0;
+            setInterval(() => {
+                n += 1;
+                for (const c of list.querySelectorAll('[data-testid="item-description"]')) {
+                    let s = c.querySelector('.tt-fake');
+                    if (!s) {
+                        s = document.createElement('span');
+                        s.className = 'tt-fake';
+                        c.appendChild(s);
+                    }
+                    s.textContent = 'tt ' + n;
+                }
+            }, 500);
+        }
         window.addEventListener('scroll', () => draw(false), { passive: true });
         // A background preview fires no scroll events: a check calls this after scrollTo().
         window.__draw = () => draw(false);
@@ -478,6 +495,24 @@ if (BIG) {
         5003: { name: 'Mil-Soul', from: 'w3b', seenAt: t, w3b: null, rating: { up: 300, down: 2, at: t } },
         5002: { name: 'SweetTooth', from: 'w3b', seenAt: t, w3b: null, rating: { up: 150, down: 1, at: t } },
     } });
+}
+
+/*
+ * &bigstore=<n> (3.17.0, the speed bench): a trader database as big as a
+ * long-time player's - n traders more, each with a TornW3B price list of 40
+ * items - so reading it costs what it costs him (2000 is about 1.4 MB).
+ */
+const _bigStore = Number(new URLSearchParams(location.search).get('bigstore')) || 0;
+if (_bigStore) {
+    const t = Date.now();
+    const db = _store[NS + 'traderDb'] ? JSON.parse(_store[NS + 'traderDb']) : { version: 1, traders: {} };
+    const ids = Object.keys(ITEMS);
+    for (let i = 0; i < _bigStore; i++) {
+        const prices = {};
+        for (let k = 0; k < 40; k++) prices[k < ids.length ? ids[k] : 20000 + ((i * 7 + k * 13) % 900)] = 100 + ((i * 31 + k * 17) % 5000);
+        db.traders[900000 + i] = { name: 'Filler' + i, from: 'w3b', seenAt: t, w3b: { checkedAt: t, at: t, found: true, prices } };
+    }
+    _store[NS + 'traderDb'] = JSON.stringify(db);
 }
 
 window.__requests = [];
@@ -734,7 +769,10 @@ window.onerror = (m) => { document.getElementById('out').textContent = 'BOOT ERR
 </script>
 <script>
 // Always the build just made, never a cached copy.
-document.write('<script src="../torn-moneymaker.user.js?v=' + Date.now() + '"><' + '/script>');
+// &script=<path from the repo root> loads another build (the bench's --compare: the released one beside the new one).
+const _alt = new URLSearchParams(location.search).get('script');
+if (_alt && (!/^[\w./-]+$/.test(_alt) || _alt.includes('..'))) throw new Error('harness: &script= must be a path inside the repo, with / between its parts: ' + _alt);
+document.write('<script src="../' + (_alt || 'torn-moneymaker.user.js') + '?v=' + Date.now() + '"><' + '/script>');
 </script>
 <script>
 // The panel is in a shadow root; look inside it.

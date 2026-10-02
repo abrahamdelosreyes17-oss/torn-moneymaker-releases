@@ -880,7 +880,7 @@ export class SellingPage {
 
         /* API use (3.15): what every request to Torn, TornW3B and TornExchange was for, over time */
         group('API use');
-        this.usageView = new UsageView();
+        this.usageView = new UsageView({ getExtras: () => (this.h.getExtras ? this.h.getExtras() : []) });
         section('api', 'API use', [
             'Every request this script sends, from every tab - Torn Bids and Torn\'s pages - by what it was for. ',
             'Torn\'s limit is shared by everything you run with your keys, so its calls wait in lanes: what you are doing now goes first, statuses and the Ledger wait for room.',
@@ -888,7 +888,7 @@ export class SellingPage {
 
         /* Report a problem (3.15): your words, screenshots, the problem log - one zip to send */
         group('Help');
-        this.reportView = new ReportView({ getReport: () => (this.h.getReport ? this.h.getReport() : { log: [] }), onClearLog: () => this.h.onClearLog && this.h.onClearLog() });
+        this.reportView = new ReportView({ getReport: () => (this.h.getReport ? this.h.getReport() : { log: [] }), onClearLog: () => this.h.onClearLog && this.h.onClearLog(), getExtras: () => (this.h.getExtras ? this.h.getExtras() : []) });
         section('report', 'Report a problem', 'Found a bug? Say what happened, add screenshots, and download one .zip to send. It also holds the problem log - what failed and what you did just before, in every tab - so the cause can be found without guessing. Nothing is sent anywhere by this page.', [this.reportView.el]);
 
         group('Torn Bids');
@@ -991,7 +991,7 @@ export class SellingPage {
         const ledgerTos = spEl('table', { class: 'sp-tos sp-tos-ledger' });
         for (const [k, v] of [
             ['Data storage', 'Only locally, in this browser: time, item, quantity, price, where, who. Never the log\'s own text.'],
-            ['Data sharing', 'Nobody'],
+            ['Data sharing', 'Nobody. Your trades go into a zip only when you download one yourself (Report a problem, Export API usage): it names the traders you traded with, and you choose who gets it.'],
             ['Purpose of use', 'Personal: profit tracking'],
             ['Key storage & sharing', 'Stored locally / Not shared'],
             ['Key access level', 'Full, used only for your log (bazaar, Item Market and NPC shop buys and sells, and muggings), your trades, and key info'],

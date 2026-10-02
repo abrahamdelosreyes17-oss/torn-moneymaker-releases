@@ -18,7 +18,12 @@ import {
     gmMenu,
     gmOpenTab,
     gmOnChange,
+    gmSize,
 } from './platform/gm.js';
+import { perfStart, perfNow, perfDone, perfTimed, perfForeign, perfStartup, perfRecord, perfMachine, SPEED_STORE_KEY } from './platform/perf.js';
+import { speedFiles } from './core/speed.js';
+import { tradesFiles } from './core/trades-export.js';
+import { tidyAccepted, tidyPins, tidyGone, tidyStock, tidyBought, tidyDeclined, tidyCancelUndo, tidyLeftovers, tidyTeLists } from './core/tidy.js';
 import {
     buildItemIndex,
     makeItemsCacheEntry,
@@ -202,6 +207,9 @@ import {
 import {
     LiveFeed,
     FEED_STORE_KEY,
+    FEED_LEADER_KEY,
+    FEED_RECHECK_KEY,
+    FEED_REFRESH_KEY,
     watching,
 } from './feed/controller.js';
 import { formatMoney } from './core/parse.js';
@@ -326,6 +334,17 @@ const STORE_SELL_GONE = 'sellGone';
 const STORE_SELL_STOCK = 'sellStock';
 const STORE_SELL_BOUGHT = 'sellBought';
 const SELL_LEFTOVERS_KEEP_MS = 7 * 24 * 60 * 60 * 1000;
+/*
+ * Stored data nobody uses is deleted (3.17.0): which one-off clean-up has run
+ * (`v`), and when a tab last tidied the values whose entries expire
+ * (`tidyAt`). {v, tidyAt}
+ */
+const STORE_CLEANED = 'cleaned';
+const CLEAN_MARK = 1;
+/* The tidy-up runs about once an hour, in whichever tab finds the hour up; each tab looks every ten minutes. */
+const TIDY_EVERY_MS = 60 * 60 * 1000;
+const TIDY_STEP_MS = 10 * 60 * 1000;
+const TIDY_FIRST_MS = 2 * 60 * 1000;
 /* When the ledger was last saved (its rows are in Torn Bids' IndexedDB): other tabs re-read on a change. */
 const STORE_LEDGER_REV = 'ledgerRev';
 /* A run makes at most this many calls; new entries every 5 minutes; a year back, a few pages a minute. */
@@ -769,8 +788,6 @@ async function loadReferenceData() {
                 (error && error.message) || 'shop data unavailable';
         }
     }
-
-    app.manualNpc = gmGet(STORE_MANUAL_NPC, {}) || {};
 }
 
 /**
@@ -896,8 +913,29 @@ function rankSettings(extra = {}) {
     return { ...app.settings, includeUnverifiedNpc: true, ...extra };
 }
 
+/*
+ * The speed log (3.17.0) times each scan by the kind of page and by what
+ * asked for it: the timer, a page change, a change in the rows we watch,
+ * another tab. Nothing else changes: rescanNow is the scan as it was.
+ */
+function rescan(why = 'other') {
+    const t0 = perfNow();
+    app.inScan = true;
+    try {
+        rescanNow();
+    } finally {
+        app.inScan = false;
+        perfDone('scan ' + (app.ownBazaar ? 'own listing' : app.pageType || 'other page') + ' · ' + why, t0);
+        // This page load's start-up, once its item data is there.
+        if (app.index && !app.perfStartNoted) {
+            app.perfStartNoted = true;
+            perfStartup({ script: SCRIPT_START_MS, panel: app.panelShownAt, items: perfNow() });
+        }
+    }
+}
+
 /** Read the page, fold it into memory, correct the feed, then render. */
-function rescan() {
+function rescanNow() {
     /*
      * Re-detect the page every scan.
      *
@@ -1053,6 +1091,7 @@ const TRADER_TAG_REFRESH_MS = 60000;
 function trustedBuyerOf(itemId) {
     const now = Date.now();
     if (!app.traderLookup || now - app.traderLookup.at > TRADER_TAG_REFRESH_MS) {
+        const t0 = perfNow();
         const db = readTraderDb(gmGet(STORE_TRADER_DB, null));
         const te = readTeCacheEntry(gmGet(STORE_TE, null), now);
         const ids = gmGet(STORE_TE_IDS, null);
@@ -1070,6 +1109,7 @@ function trustedBuyerOf(itemId) {
                 votes: rememberedVotes(gmGet(STORE_TE_VOTES, null), now),
             }),
         };
+        perfDone('trader tags: the lists read again', t0);
     }
     const id = String(itemId);
     const lookup = app.traderLookup;
@@ -1130,7 +1170,16 @@ function showBazaarTarget(listings) {
  * another tab updates storage. Its only requests are the rate-limited seller
  * status lookups in updatePresence().
  */
-function refreshView() {
+function refreshView(why = null) {
+    const t0 = perfNow();
+    try {
+        refreshViewNow();
+    } finally {
+        perfDone('panel redraw' + (app.inScan ? ' (the end of a scan)' : why ? ' · ' + why : ''), t0);
+    }
+}
+
+function refreshViewNow() {
     if (!app.panel) return;
 
     const now = Date.now();
@@ -2631,7 +2680,7 @@ function scanBurst() {
             if (!app.index || document.visibilityState !== 'visible') return;
             if (app.announcedHref === href) return;
 
-            rescan();
+            rescan('page change');
 
             if (app.pageType === PAGE_NONE) return;
             if (app.pageDiagnostics && app.pageDiagnostics.listings > 0) {
@@ -3364,6 +3413,12 @@ function markChatButton() {
 }
 
 function scanTradePage() {
+    // Off the trade page it leaves at once: nothing to time.
+    if (!app.panel || !isTradePage(location.href)) return scanTradePageNow();
+    return perfTimed('trade page scan', scanTradePageNow);
+}
+
+function scanTradePageNow() {
     if (!app.panel) return;
     if (!isTradePage(location.href)) {
         clearSendMarks();
@@ -3839,7 +3894,7 @@ function debounce(fn, ms) {
     };
 }
 
-const debouncedRescan = debounce(() => rescan(), RESCAN_DEBOUNCE_MS);
+const debouncedRescan = debounce(() => rescan('rows changed'), RESCAN_DEBOUNCE_MS);
 
 /**
  * Ignore anything the panel does to itself.
@@ -3857,7 +3912,11 @@ function onMutations(mutations) {
         (m) => (!panelRoot || !panelRoot.contains(m.target)) && !isOwnTagMutation(m),
     );
 
-    if (fromPage) debouncedRescan();
+    if (fromPage) {
+        // For the speed log: how often the rows change under us (Torn, or another extension).
+        perfForeign(mutations.length);
+        debouncedRescan();
+    }
 }
 
 /** A change to, or inside, one of the helper's own price tags is not the page changing. */
@@ -3912,7 +3971,7 @@ function applyPageType(next, { initial = false } = {}) {
      * live feed prices listings against it. It is a cached, one-time load.
      */
     if (app.index) {
-        rescan();
+        rescan('page change');
         return;
     }
 
@@ -4181,7 +4240,7 @@ function startLiveFeed() {
         isVisible: () => document.visibilityState === 'visible',
         load: (key) => gmGet(key, null),
         save: (key, value) => gmSet(key, value),
-        onChange: () => refreshView(),
+        onChange: () => refreshView('the feed changed'),
         isKeyDead: isKeyDeadError,
         onKeyDead: markKeyDead,
         onSummary: onW3bSummary,
@@ -4189,7 +4248,7 @@ function startLiveFeed() {
     });
 
     // Follower tabs re-render the moment the leader stores something new.
-    const listening = gmOnChange(FEED_STORE_KEY, () => refreshView());
+    const listening = gmOnChange(FEED_STORE_KEY, () => refreshView('the feed, from another tab'));
 
     const tick = () => {
         app.feed
@@ -4197,7 +4256,7 @@ function startLiveFeed() {
             .catch(() => {})
             .finally(() => {
                 // Without a change listener, followers refresh on the tick.
-                if (!listening || app.feed.leading) refreshView();
+                if (!listening || app.feed.leading) refreshView('the feed tick');
             });
     };
 
@@ -4234,6 +4293,51 @@ function startLiveFeed() {
 /** When the script started, in ms after the page began to load (performance.now()). */
 const SCRIPT_START_MS = typeof performance !== 'undefined' ? Math.round(performance.now()) : null;
 
+/**
+ * Values nothing reads any more, deleted once (3.17.0):
+ *   npcManual   read on every page and never written by any version (always empty);
+ *   tradersPage left by 3.7.0's traders page (3.8.0 moved it);
+ *   apiWindow / w3bWindow as single arrays (before 3.12.5: one per tab since) -
+ *               until now looked for on every page load.
+ * The Ledger's old copy needs nothing here: loading the Ledger moves it and
+ * deletes it (loadLedgerStore).
+ */
+function cleanStoredOnce() {
+    const c = gmGet(STORE_CLEANED, null) || {};
+    if (c.v === CLEAN_MARK) return;
+    for (const k of [STORE_MANUAL_NPC, 'tradersPage', STORE_API_WINDOW, STORE_W3B_WINDOW]) if (gmSize(k)) gmDel(k);
+    gmSet(STORE_CLEANED, { ...c, v: CLEAN_MARK });
+}
+
+/**
+ * The hourly tidy-up (core/tidy.js): each value whose entries have a life is
+ * written back without the expired ones - which every reader passes over
+ * already, so nothing a feature shows changes. One tab does it: the one in
+ * view that finds the hour up claims it first.
+ */
+function tidyStored(now = Date.now()) {
+    // Only the tab in view: a hidden tab is slowed by the browser and may hold an older
+    // copy of a value another tab just wrote - writing that back would undo the newer one.
+    if (document.visibilityState !== 'visible') return;
+    const c = gmGet(STORE_CLEANED, null) || {};
+    if (now - (Number(c.tidyAt) || 0) < TIDY_EVERY_MS) return;
+    gmSet(STORE_CLEANED, { ...c, tidyAt: now });
+    perfTimed('hourly tidy-up of stored values', () => {
+        const rules = [
+            [STORE_SELL_ACCEPTED, tidyAccepted], [STORE_SELL_PINNED, tidyPins], [STORE_SELL_GONE, tidyGone], [STORE_SELL_STOCK, tidyStock], [STORE_SELL_BOUGHT, tidyBought],
+            [STORE_SELL_DECLINED, tidyDeclined], [STORE_SELL_CANCEL_UNDO, (s, t) => tidyCancelUndo(s, t, CANCEL_UNDO_KEEP_MS)], [STORE_SELL_LEFTOVERS, (s, t) => tidyLeftovers(s, t, SELL_LEFTOVERS_KEEP_MS)],
+            [STORE_TE_LISTS, tidyTeLists],
+        ];
+        for (const [key, rule] of rules) {
+            if (!gmSize(key)) continue;
+            const stored = gmGet(key, null);
+            const next = rule(stored, now);
+            // The same object back: nothing expired, nothing is written.
+            if (next !== stored && next !== null && next !== undefined) gmSet(key, next);
+        }
+    });
+}
+
 /** Every stored value's size (names and sizes only - never a value, never a key). */
 function storageSizes() {
     const keys = [
@@ -4244,18 +4348,59 @@ function storageSizes() {
         STORE_LEDGER_KEY, STORE_LEDGER_KEY_DEAD, STORE_LEDGER_SELF, STORE_LEDGER,
         STORE_FILL, STORE_FILL_OWN_IM, STORE_SELF, STORE_HISTORY, STORE_W3B_SUMMARY, FEED_STORE_KEY,
     ];
+    // The values the first list missed (3.17.0: the speed log's "everything stored"), and this tab's own request windows.
+    keys.push(
+        STORE_W3B_COOLDOWN, STORE_IM_WATCH, STORE_SELL_DECLINED, STORE_SELL_CANCELLED, STORE_BOUGHT_WINDOW, STORE_SELL_PRICE_RECORDS, STORE_SELL_BLACKLIST,
+        STORE_SELL_FAVOURITES, STORE_SELL_TE_OWN, STORE_CHAT_WANTED, STORE_SELL_MOVES, STORE_LEDGER_REV, STORE_SELL_PRESENCE,
+        FEED_LEADER_KEY, FEED_RECHECK_KEY, FEED_REFRESH_KEY, SPEED_STORE_KEY, STORE_CLEANED,
+        STORE_API_WINDOW + '.' + app.tabId, STORE_W3B_WINDOW + '.' + app.tabId,
+    );
     const rows = [];
     let total = 0;
     for (const k of [...new Set(keys)]) {
-        const v = gmGet(k, undefined);
-        if (v === undefined || v === null) continue;
-        const n = JSON.stringify(v).length;
+        // Its text's length, as it is stored: nothing is parsed for this.
+        const n = gmSize(k);
+        if (!n) continue;
         total += n;
         rows.push([k, n]);
     }
     rows.sort((a, b) => b[1] - a[1]);
     const kb = (n) => (n / 1024).toFixed(n < 10240 ? 1 : 0) + ' KB';
-    return { total, lines: rows.map(([k, n]) => k + ': ' + kb(n)), totalText: kb(total) };
+    return { total, rows, lines: rows.map(([k, n]) => k + ': ' + kb(n)), totalText: kb(total) };
+}
+
+/*
+ * What rides in both zips besides what they always held (3.17.0, no new
+ * button): speed/ - the speed log (core/speed.js: counts and milliseconds,
+ * no name, id, item, price or key) - and trades/ - the Ledger's receipts,
+ * the accepted prices and the leftovers (core/trades-export.js: these name
+ * the other traders, the owner's decision). Worked out only when a zip is
+ * made, never on a redraw.
+ */
+function exportExtras(now = Date.now()) {
+    const version = typeof TTV2_BUILD_VERSION !== 'undefined' ? TTV2_BUILD_VERSION : null;
+    const tabs = Object.keys(gmGet(STORE_API_WINDOW + '.tabs', null) || {}).length;
+    const machine = { ...perfMachine(), 'tabs of the script that asked Torn something in the last 2 minutes': tabs };
+    // The tab ids in the request windows' names are left out of the list (speedKey does the same in the record).
+    const sizes = storageSizes().rows.map(([k, n]) => [k.replace('.' + app.tabId, '.this-tab'), n]);
+    // Each part on its own: one that cannot be made says so in its place, and the zip is made all the same.
+    const part = (dir, make) => {
+        try {
+            return make().map((f) => ({ ...f, name: dir + '/' + f.name }));
+        } catch (error) {
+            return [{ name: dir + '/COULD-NOT-BE-MADE.txt', text: 'This part of the zip could not be made: ' + logText((error && error.message) || String(error)) + '\n' }];
+        }
+    };
+    return [
+        ...part('speed', () => speedFiles(perfRecord(now), { sizes, machine, version, now })),
+        ...part('trades', () => tradesFiles({
+            rows: getLedgerKey() && led.loaded ? ledgerData().rows : [],
+            priceRecords: gmGet(STORE_SELL_PRICE_RECORDS, []) || [],
+            leftovers: sellLeftovers(now),
+            nameOf: (id) => itemNameAnywhere(id),
+            now,
+        })),
+    ];
 }
 
 function registerMenu() {
@@ -5432,6 +5577,21 @@ function renderSelling() {
 }
 
 function renderSellingNow() {
+    const t0 = perfNow();
+    sell.drew = false;
+    try {
+        renderSellingWork();
+    } finally {
+        // The page rebuild is counted apart and is inside this one.
+        perfDone(sell.drew ? 'Torn Bids redraw (working out + page)' : 'Torn Bids redraw not due (hidden tab)', t0);
+        if (sell.drew && !sell.perfStartNoted) {
+            sell.perfStartNoted = true;
+            perfStartup({ script: SCRIPT_START_MS, panel: perfNow(), items: null });
+        }
+    }
+}
+
+function renderSellingWork() {
     if (sell.renderTimer) {
         clearTimeout(sell.renderTimer);
         sell.renderTimer = null;
@@ -6246,6 +6406,8 @@ function renderSellingNow() {
         const top = buyersOf(l.itemId).find((b) => !l.from || String(b.name).toLowerCase() !== String(l.from).toLowerCase()) || null;
         return { ...l, best: top ? { name: top.name, price: top.price } : null, gain: top ? (top.price - l.each) * l.qty : null };
     });
+    const pageT0 = perfNow();
+    sell.drew = true;
     sell.page.render({
         strip,
         pinned,
@@ -6303,6 +6465,7 @@ function renderSellingNow() {
             statusesWanted: watch.ids.length,
         },
     });
+    perfDone('Torn Bids page rebuild (inside the redraw)', pageT0);
 }
 
 /** Distinct traders buying anything, for the status line. */
@@ -7193,6 +7356,7 @@ function bootSellingPage() {
         },
         onOpenUrl: openSellLink,
         getUsage: usageNow,
+        getExtras: exportExtras,
         getReport: () => ({ log: addLogEntries(gmGet(STORE_PROBLEM_LOG, null), logPending), usage: usageNow() }),
         onClearLog: () => {
             logPending = [];
@@ -7669,6 +7833,8 @@ function ledgerReaches(from) {
 
 /** A leftover was just kept: the next read of your log is not five minutes away. */
 function ledgerSoon(now = Date.now()) {
+    // Only while a leftover under an hour old is on the list (a week-old one going changes nothing here).
+    if (ledgerEveryMs(now) !== LEDGER_LEFTOVER_EVERY_MS) return;
     if (led.nextAt > now + LEDGER_LEFTOVER_EVERY_MS) led.nextAt = now + LEDGER_LEFTOVER_EVERY_MS;
 }
 
@@ -8008,9 +8174,13 @@ export function boot() {
         return;
     }
 
-    // Before 3.12.5 the shared windows were single arrays; now one per tab.
-    if (gmGet(STORE_API_WINDOW, null) !== null) gmDel(STORE_API_WINDOW);
-    if (gmGet(STORE_W3B_WINDOW, null) !== null) gmDel(STORE_W3B_WINDOW);
+    // The speed log (3.17.0): from here on, in the overlay and in Torn Bids alike.
+    perfStart({ where: () => (isTradersPageUrl(location.href) ? 'Torn Bids' : isTradePage(location.href) ? 'trade' : app.ownBazaar ? 'own listing' : app.pageType || 'other Torn page') });
+
+    // Stored values nothing reads any more go, once (3.17.0); the hourly tidy-up follows.
+    cleanStoredOnce();
+    setTimeout(tidyStored, TIDY_FIRST_MS);
+    setInterval(tidyStored, TIDY_STEP_MS);
 
     // A tab opened for the traders page: this whole tab is the page.
     if (isTradersPageUrl(location.href)) {
@@ -8026,7 +8196,7 @@ export function boot() {
     // A trade accepted, bought or changed in another tab: the marks and boxes follow.
     const onAcceptedElsewhere = () => {
         scanTradePage();
-        if (app.pageType === PAGE_BAZAAR) rescan();
+        if (app.pageType === PAGE_BAZAAR) rescan('another tab');
         else trackTradeBuying([]);
     };
     gmOnChange(STORE_SELL_ACCEPTED, onAcceptedElsewhere);
@@ -8135,7 +8305,7 @@ export function boot() {
         saveHistoryIfDue();
 
         if (detectPage(location.href) === PAGE_NONE) {
-            if (app.pageType !== PAGE_NONE) rescan();
+            if (app.pageType !== PAGE_NONE) rescan('timer');
             // Torn's trade page, and the buying box on other pages.
             if (isTradePage(location.href)) scanTradePage();
             markChatButton();
@@ -8143,7 +8313,7 @@ export function boot() {
             return;
         }
 
-        rescan();
+        rescan('timer');
     }, POLL_INTERVAL_MS);
 
     startPageWatch();

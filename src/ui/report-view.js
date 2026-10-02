@@ -8,7 +8,7 @@
  */
 import { makeZip } from '../core/zip.js';
 import { logAsText } from '../core/errlog.js';
-import { usageExportFiles } from './usage-view.js';
+import { usageExportFiles, usageExtraLines } from './usage-view.js';
 
 function rvEl(tag, attrs = {}, children = []) {
     const node = document.createElement(tag);
@@ -30,7 +30,8 @@ const rvStamp = (ms) => {
 
 /**
  * What goes in the report zip (pure, tested): the words, the screenshots,
- * the problem log, the API use and the page's state. No key, no player id.
+ * the problem log, the API use and the page's state - and (3.17.0, `extra`)
+ * the speed log and your trades. No key; the trades name the other traders.
  *
  * @param {object} r
  * @param {string} r.happened
@@ -39,9 +40,10 @@ const rvStamp = (ms) => {
  * @param {Array} r.log - the problem log (core/errlog.js)
  * @param {object} r.usage - getUsage(): {record, state}
  * @param {object} [r.env] - {userAgent, screen}
+ * @param {Array<{name: string, text: string}>} [r.extra] - speed/... and trades/... (main.js exportExtras)
  * @returns {Array<{name: string, text?: string, data?: Uint8Array}>}
  */
-export function reportFiles({ happened = '', expected = '', shots = [], log = [], usage = {}, env = {}, now = Date.now() }) {
+export function reportFiles({ happened = '', expected = '', shots = [], log = [], usage = {}, env = {}, extra = [], now = Date.now() }) {
     const state = usage.state || {};
     const errors = log.filter((e) => e.kind === 'error');
     const safe = (n) => String(n || 'screenshot').replace(/[^\w.-]+/g, '_').slice(0, 60);
@@ -62,20 +64,20 @@ export function reportFiles({ happened = '', expected = '', shots = [], log = []
             '  problem-log.txt - ' + errors.length + ' errors and ' + (log.length - errors.length) + ' other lines, the last 7 days',
             '  api-usage/ - every request by what it was for (see its README)',
             '  state.json - the page\'s switches, limits and coverage',
-            '',
-            'No API key, player id or name is in these files.',
+            ...usageExtraLines(extra, (name, text) => '  ' + name + ' - ' + text),
         ].join('\n') + '\n' },
         { name: 'problem-log.txt', text: logAsText(log) },
         { name: 'problem-log.json', text: JSON.stringify(log) },
         { name: 'state.json', text: JSON.stringify(state, null, 2) },
     ];
     shots.forEach((s, i) => files.push({ name: 'screenshots/' + (i + 1) + '-' + safe(s.name), data: s.data }));
-    for (const f of usageExportFiles(usage.record, { state, now })) files.push({ ...f, name: 'api-usage/' + f.name });
+    for (const f of usageExportFiles(usage.record, { state, now, beside: extra })) files.push({ ...f, name: 'api-usage/' + f.name });
+    for (const f of extra) files.push(f);
     return files;
 }
 
 export class ReportView {
-    /** @param {{getReport: function, onClearLog: function}} h */
+    /** @param {{getReport: function, onClearLog: function, getExtras?: function}} h */
     constructor(h) {
         this.h = h;
         this.shots = [];
@@ -148,7 +150,10 @@ export class ReportView {
             this.shots.length ? this.shots.length + (this.shots.length === 1 ? ' screenshot' : ' screenshots') : 'No screenshots yet',
             'The problem log: ' + errors + (errors === 1 ? ' error' : ' errors') + ' and ' + (log.length - errors) + ' of your steps, the last 7 days (every tab: Torn Bids and Torn\'s pages)',
             'API use: every request by what it was for, the last week',
-            'This page\'s version, switches and limits - no API key, no player id or name',
+            'The speed log: how long the script\'s own work took and where the page froze, the last week - counts and milliseconds only',
+            'Your trades: the Ledger\'s receipts, the prices each accepted trade recorded and your leftovers - these name the traders you traded with',
+            'This page\'s version, switches and limits',
+            'No API key is in the zip',
         ]) this.includesEl.appendChild(rvEl('li', { text: line }));
         if (!this.logEl.hidden) this.logEl.textContent = logAsText(log.slice(-40)) || 'Nothing logged yet.';
     }
@@ -168,6 +173,7 @@ export class ReportView {
             log: r.log || [],
             usage: r.usage || {},
             env: { userAgent: navigator.userAgent, screen: window.screen ? window.screen.width + 'x' + window.screen.height : '' },
+            extra: this.h.getExtras ? this.h.getExtras() : [],
             now,
         });
         this.lastZip = { data: makeZip(files, new Date(now)), name: 'torn-trading-report-' + rvStamp(now) + '.zip' };
