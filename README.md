@@ -988,7 +988,7 @@ sent by the script: the player downloads the zip and sends it.
 **The bench** (`node test/bench.mjs`, or `npm run bench`): the harness in
 a real Chrome with the processor slowed four times, rows another extension
 keeps writing into (`&ttbusy=1`) and a 1.2 MB trader database
-(`&bigstore=2000`), five scenes, the script's own speed log printed for
+(`&bigstore=2000`), six scenes, the script's own speed log printed for
 each and for all together. No dependencies (it speaks the DevTools protocol
 itself). It is how each step of Part 3 is measured before and after.
 `--compare <build>` runs every scene on that build and on this one, each
@@ -996,6 +996,16 @@ from empty browser storage, and says whether both sent the same requests and
 drew the same page (`git show HEAD:torn-moneymaker.user.js >
 dist/before.user.js` gives it the released one): the test that nothing was
 compromised.
+
+Since 3.19.0: one scene types in Torn Bids' search box and picks flips while
+the page loads, with a real mouse and keyboard (the browser times only
+those) - it is timed, not compared, since what is pressed decides what is
+asked. The page is kept drawing frames, as a window in view is: a headless
+page that goes quiet lets its timers run late (the script's once-a-second
+read fired 74 times in 90 s there, against every 1,000 ms in a real
+browser), so a build that leaves the page free more often looked as if it
+read less. And the page check passes over whether an item's picture has
+failed to load yet (`sp-img-none`): the browser's doing, not the script's.
 
 ### The same work, cheaper (3.17.1)
 
@@ -1056,6 +1066,80 @@ trader back to be worked out. No place that changes a list can be forgotten.
 
 Next in the redraw: the TornW3B lists index rebuilt whole on every list read
 (step 14), then the page rebuild.
+
+### Torn Bids on a slow laptop: start-up (3.19.0)
+
+The owner: "the bazaar and flips load really slowly for him, even in
+startup ... cant we chunk or throttle? open html first? then slowly load?
+... i dont want it to look and feel weird." The friend's speed log said why:
+a redraw took 788 ms on his laptop and an answer a second came in, each
+asking for one 120 ms later - the page was redrawing most of every minute.
+Frozen, not short of data. `src/core/start-up.js` holds the three answers;
+none sends one more request than before, and which read goes next is as it
+was (flips and price lists take turns, one read a second).
+
+- **Redraws on a budget.** A redraw asked for by arriving data waits three
+  times as long as the last redraw took, counted from its end - 120 ms at
+  least (so up to 40 ms a redraw nothing changes at all), 3 s at most (the
+  numbers still move). What you do yourself is drawn at once, as before:
+  clicks and typing through `renderSellingNow()`, and the answer to
+  something you pressed (a key saved, Forget, Try again, Refresh, Show more,
+  the full list of the item you picked) through `renderSelling(true)`,
+  which never waits on the budget; typing in the search box as below.
+- **The working-out in pieces.** A data redraw first works out every item's
+  buyers about 30 ms at a time, the page free between two pieces, then draws
+  with what the pieces filled. When nothing needs working out the one piece
+  and the draw are one stretch, as before. What arrives while the pieces run
+  gets one more redraw after the draw; something you press stops them and
+  draws in one go. A hidden tab: in one go, as before. Since the page is
+  free between two pieces, an answer can land between the kept buyers' look
+  at what items share (3.18.0) and an item being asked for: after each
+  piece they look again before the next item (`unsettled()`), so what is
+  worked out is kept against what it read - even a rating that moves and
+  moves back before the next redraw leaves nothing wrong behind - and their
+  own check keeps running. `test/kept-buyers.test.js` replays the long
+  session with a change between two pieces of every redraw; without the
+  second look it fails, and the check trips.
+- **The speed log:** "Torn Bids redraw (working out + page)" is now the
+  last piece and the draw; the pieces before it are their own line ("buyers
+  worked out in pieces"). Added together they compare with 3.18.0's redraw.
+- **The reads remembered.** Each item's bazaar listings, as last read, are
+  kept in the page's own storage (`ttv2.bids.reads` in Torn Bids' origin -
+  not the script's storage, which Torn's pages load too) and are there again
+  when the page opens: in the harness a reload showed the best flips
+  before any bazaar read was made. Nothing is trusted longer than before -
+  every listing carries when TornW3B last checked it, nothing over an hour
+  old is brought back, and every item brought back is read again in its
+  turn, exactly as on a page just opened: the kept reads are what to show
+  meanwhile, never a reason to read later (TornW3B may have checked since). Written when the page goes, when it is put away (every 10 s
+  at most: a buying run goes to Torn and back), and once a minute at most
+  otherwise; each listing is kept without its field names (a full
+  page's reads are about 1.7 MB of text that way, 3.4 MB with them - a
+  browser gives a page about 5). A full or missing store costs the head
+  start and nothing else. A stored listing is believed only with every
+  value of the type a fresh read gives it.
+- **Typing in the search box** is drawn in a task of its own right after
+  the key, so keys typed while the page is busy share one draw, and that
+  draw works out nothing new: a search changes which items are shown, not
+  who buys them, so it draws with the buyers of the last draw (or finishes
+  the pieces under way with theirs) - what arrived since keeps its own
+  redraw on the budget. Without this a key paid for all the data waiting.
+- **Measured** (bench, processor slowed 4x, Torn Bids for 40 s, one run
+  each): frozen **13.3 s -> 7.1 s**, the longest freeze **1,087 -> 597
+  ms**, 53 redraws -> 28. `--compare` against 3.18.0 at 90 s: the same page,
+  the same TornW3B and TornExchange reads; the Torn API reads differ by a
+  few (a trader's status, networth or the Item Market of a flip the desk
+  showed for a moment - fewer redraws catch fewer such moments). At 40 s the
+  page can differ by such a moment too, as two runs of 3.18.0 do.
+- **Typing while the page loads** (the new scene, typing 2.2 s after
+  opening, three runs each; from each key to the list on screen with it):
+  about **195 ms** against 250 ms, the slowest **0.63 s against 1.7 s**.
+  The browser's own count of slow key presses: 6-9 against 12-14, the
+  slowest 0.29 s against 1.7 s. (Without the typing change above this
+  build was slower than 3.18.0: about 470 ms a key.)
+
+Tried and taken out: reading the possible flips before the price lists at
+start-up (the owner: "i dont like that prioritizing flips at startup").
 
 ---
 

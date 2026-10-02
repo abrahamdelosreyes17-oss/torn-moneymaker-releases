@@ -78,12 +78,26 @@ export function makeBuyersKeeper({ compute = buyersForItem, onDiffer = null, fre
     let hits = 0;
     let lastHits = 0;
     let checkAt = 0;
+    // What this redraw's begin() was handed, and whether it is still what was looked at (see `unsettled`).
+    let shared = {};
+    let settled = true;
 
     /** Once a redraw, before any buyers(): what every item shares is looked at. */
-    function begin({ idsByName = null, dbIdsByName = null, votesById = null, db = null } = {}) {
+    function begin(given = {}) {
         lastHits = hits;
         hits = 0;
         checkAt = lastHits ? (checkAt + 7) % lastHits : 0;
+        shared = given || {};
+        settled = true;
+        look(shared);
+    }
+
+    /**
+     * What every item shares, against what was last seen: a trader whose
+     * votes, name or rating moved sends the items that read them back to be
+     * worked out; a name list that moved changes the items that read it whole.
+     */
+    function look({ idsByName = null, dbIdsByName = null, votesById = null, db = null } = {}) {
         if (!keptSameMap(votes, votesById)) {
             const now = votesById || new Map();
             for (const [id, v] of now) if (!Object.is(votes.get(id), v) || !votes.has(id)) changedTrader(id);
@@ -194,6 +208,12 @@ export function makeBuyersKeeper({ compute = buyersForItem, onDiffer = null, fre
     function buyers(itemId, src = {}) {
         const id = String(itemId);
         if (off) return compute(id, src);
+        // The page was free since the last look: what items share is looked at again first, so what is worked
+        // out now is kept against what it read (and nothing kept outlives a change that went and came back).
+        if (!settled) {
+            settled = true;
+            look(shared);
+        }
         const list = (src.w3bByItem && src.w3bByItem.get(id)) || KEPT_NO_ROWS;
         const tk = tokensOf(src);
         const was = kept.get(id);
@@ -241,6 +261,14 @@ export function makeBuyersKeeper({ compute = buyersForItem, onDiffer = null, fre
         stats,
         /** Whether keeping is still on (off after a kept item differed). */
         on: () => !off,
+        /**
+         * The page was free since begin() (a redraw worked out in pieces,
+         * 3.19.0): what items share may have moved, so the next buyers()
+         * looks at it again before anything is handed out or kept.
+         */
+        unsettled: () => {
+            settled = false;
+        },
         clear: () => kept.clear(),
     };
 }

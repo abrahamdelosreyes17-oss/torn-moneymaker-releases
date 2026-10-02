@@ -285,6 +285,125 @@ test('kept buyers: should a kept item ever differ from a fresh one, keeping stop
     assert.equal(keeper.on(), false, 'and keeping is off from then on');
 });
 
+test('kept buyers: a redraw worked out in pieces - a rating that moves between two pieces does not trip the check, and the next redraw has it', () => {
+    // 3.19.0 (core/start-up.js): the page is free between two pieces, so an answer can land after begin() and before an item is asked for.
+    for (let seed = 1; seed <= 20; seed += 1) {
+        const { s } = world(rng(seed));
+        const keeper = makeBuyersKeeper({ onDiffer: (id) => assert.fail('the check tripped on a change made between two pieces (seed ' + seed + ', item ' + id + ')') });
+        const begin = () => {
+            const { votesById, of } = sources(s);
+            keeper.begin({ idsByName: s.idsByName, dbIdsByName: s.dbIds, votesById, db: s.db });
+            return of;
+        };
+        // Two whole redraws: every item kept, and the check has an item to look at.
+        for (let i = 0; i < 2; i += 1) {
+            const of = begin();
+            for (const id of ITEMS) keeper.buyers(id, of(id));
+        }
+        // Redraw after redraw in two pieces, every rated trader's rating moving in between: whichever item the check is on.
+        for (let i = 0; i < ITEMS.length + 2; i += 1) {
+            const of = begin();
+            for (const id of ITEMS.slice(0, 2)) keeper.buyers(id, of(id));
+            keeper.unsettled();
+            for (const t of Object.values(s.db.traders)) if (t.rating) t.rating.up += 1;
+            for (const id of ITEMS.slice(2)) keeper.buyers(id, of(id));
+            // The next redraw, in one go: what moved is in it.
+            const next = begin();
+            for (const id of ITEMS) assert.deepEqual(keeper.buyers(id, next(id)), buyersForItem(id, next(id)), 'seed ' + seed + ', round ' + i + ', item ' + id);
+        }
+        assert.ok(keeper.on());
+    }
+});
+
+test('kept buyers: a rating that moves between two pieces and back before the next redraw leaves no wrong rows behind', () => {
+    // The independent review's case: worked out mid-redraw with the moved rating, then the rating went back - begin() saw no change.
+    for (let seed = 1; seed <= 20; seed += 1) {
+        const { s } = world(rng(seed));
+        const keeper = makeBuyersKeeper({ onDiffer: (id) => assert.fail('the check tripped (seed ' + seed + ', item ' + id + ')') });
+        const begin = () => {
+            const { votesById, of } = sources(s);
+            keeper.begin({ idsByName: s.idsByName, dbIdsByName: s.dbIds, votesById, db: s.db });
+            return of;
+        };
+        const flip = () => {
+            for (const t of Object.values(s.db.traders)) {
+                if (t.rating) t.rating.down += 7;
+                t.name = t.name + ' ';
+            }
+        };
+        const back = () => {
+            for (const t of Object.values(s.db.traders)) {
+                if (t.rating) t.rating.down -= 7;
+                t.name = t.name.slice(0, -1);
+            }
+        };
+        // One redraw in two pieces: the second half worked out while the ratings and names had moved.
+        let of = begin();
+        for (const id of ITEMS.slice(0, 12)) keeper.buyers(id, of(id));
+        keeper.unsettled();
+        flip();
+        for (const id of ITEMS.slice(12)) keeper.buyers(id, of(id));
+        back();
+        // The next redraws: every item as a fresh working-out says.
+        for (let i = 0; i < 3; i += 1) {
+            of = begin();
+            for (const id of ITEMS) assert.deepEqual(keeper.buyers(id, of(id)), buyersForItem(id, of(id)), 'seed ' + seed + ', redraw ' + i + ', item ' + id);
+        }
+        assert.ok(keeper.on());
+    }
+});
+
+test('kept buyers: the long session replayed in pieces - anything can happen between two pieces, and the next redraw is right', () => {
+    for (let seed = 1; seed <= 20; seed += 1) {
+        const r = rng(1000 + seed);
+        const { s, moves, pick, int } = world(r);
+        const keeper = makeBuyersKeeper({ freeze: true, onDiffer: (id) => assert.fail('the keeper\'s own check found a difference (seed ' + seed + ', item ' + id + ')') });
+        for (let step = 0; step < 300; step += 1) {
+            if (s.pending) {
+                s.pending();
+                s.pending = null;
+            }
+            // One redraw as main.js makes it: what it reads is taken once (the objects, not copies), then pieces.
+            const snap = { ...s };
+            const { votesById, of } = sources(snap);
+            keeper.begin({ idsByName: snap.idsByName, dbIdsByName: snap.dbIds, votesById, db: snap.db });
+            const cut = int(ITEMS.length + 1);
+            for (const id of ITEMS.slice(0, cut)) keeper.buyers(id, of(id));
+            keeper.unsettled();
+            const [what, move] = pick(moves);
+            move();
+            for (const id of ITEMS.slice(cut)) keeper.buyers(id, of(id));
+            // The next redraw, in one go: every item as a fresh working-out says.
+            const next = { ...s };
+            const fresh = sources(next);
+            keeper.begin({ idsByName: next.idsByName, dbIdsByName: next.dbIds, votesById: fresh.votesById, db: next.db });
+            for (const id of ITEMS) assert.deepEqual(keeper.buyers(id, fresh.of(id)), buyersForItem(id, fresh.of(id)), 'seed ' + seed + ', step ' + step + ' (' + what + ' between two pieces), item ' + id);
+        }
+        assert.ok(keeper.on());
+    }
+});
+
+test('kept buyers: after the page was free, the check still runs on the next item', () => {
+    const { s } = world(rng(5));
+    const keeper = makeBuyersKeeper();
+    const begin = () => {
+        const { votesById, of } = sources(s);
+        keeper.begin({ idsByName: s.idsByName, dbIdsByName: s.dbIds, votesById, db: s.db });
+        return of;
+    };
+    for (let i = 0; i < 2; i += 1) {
+        const of = begin();
+        for (const id of ITEMS) keeper.buyers(id, of(id));
+    }
+    const checked = keeper.stats.checked;
+    // A redraw whose first piece did one item: the check (on a later item) is not skipped.
+    const of = begin();
+    keeper.buyers(ITEMS[0], of(ITEMS[0]));
+    keeper.unsettled();
+    for (const id of ITEMS.slice(1)) keeper.buyers(id, of(id));
+    assert.equal(keeper.stats.checked, checked + 1);
+});
+
 test('kept buyers: a list entry whose row is dropped still ties its trader to the item (the name can join it to a TornExchange row)', () => {
     // TornExchange knows "Bob" by name only; trader 77 lists the item at 0 (no row of their own) and is called Robert.
     const db = { traders: { 77: { name: 'Robert', w3b: { found: true, prices: { 206: 0 }, at: 1000 } } } };

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      3.18.0
+// @version      3.19.0
 // @description  Finds Bazaar and Item Market listings below NPC / market value - on the page you are viewing, and live from the Torn API and TornW3B - ranked by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -42,7 +42,7 @@
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '3.18.0';
+    const TTV2_BUILD_VERSION = '3.19.0';
 
     /* ===== src/platform/gm.js ===== */
     /*
@@ -9988,12 +9988,26 @@
         let hits = 0;
         let lastHits = 0;
         let checkAt = 0;
+        // What this redraw's begin() was handed, and whether it is still what was looked at (see `unsettled`).
+        let shared = {};
+        let settled = true;
 
         /** Once a redraw, before any buyers(): what every item shares is looked at. */
-        function begin({ idsByName = null, dbIdsByName = null, votesById = null, db = null } = {}) {
+        function begin(given = {}) {
             lastHits = hits;
             hits = 0;
             checkAt = lastHits ? (checkAt + 7) % lastHits : 0;
+            shared = given || {};
+            settled = true;
+            look(shared);
+        }
+
+        /**
+         * What every item shares, against what was last seen: a trader whose
+         * votes, name or rating moved sends the items that read them back to be
+         * worked out; a name list that moved changes the items that read it whole.
+         */
+        function look({ idsByName = null, dbIdsByName = null, votesById = null, db = null } = {}) {
             if (!keptSameMap(votes, votesById)) {
                 const now = votesById || new Map();
                 for (const [id, v] of now) if (!Object.is(votes.get(id), v) || !votes.has(id)) changedTrader(id);
@@ -10104,6 +10118,12 @@
         function buyers(itemId, src = {}) {
             const id = String(itemId);
             if (off) return compute(id, src);
+            // The page was free since the last look: what items share is looked at again first, so what is worked
+            // out now is kept against what it read (and nothing kept outlives a change that went and came back).
+            if (!settled) {
+                settled = true;
+                look(shared);
+            }
             const list = (src.w3bByItem && src.w3bByItem.get(id)) || KEPT_NO_ROWS;
             const tk = tokensOf(src);
             const was = kept.get(id);
@@ -10151,8 +10171,171 @@
             stats,
             /** Whether keeping is still on (off after a kept item differed). */
             on: () => !off,
+            /**
+             * The page was free since begin() (a redraw worked out in pieces,
+             * 3.19.0): what items share may have moved, so the next buyers()
+             * looks at it again before anything is handed out or kept.
+             */
+            unsettled: () => {
+                settled = false;
+            },
             clear: () => kept.clear(),
         };
+    }
+
+    /* ===== src/core/start-up.js ===== */
+    /*
+     * Torn Bids on a slow laptop (3.19.0; the owner, 2026-10-03: "the bazaar and
+     * flips load really slowly for him, even in startup ... cant we chunk or
+     * throttle? open html first? then slowly load? ... i dont want it to look
+     * and feel weird").
+     *
+     * What it was (the friend's speed log, 3.17.1): a redraw took 788 ms on his
+     * laptop, and in a session's first minutes 60 to 90 answers a minute came in,
+     * each asking for one - 120 ms later. The page was redrawing most of every
+     * minute: frozen, not short of data.
+     *
+     * Three things, none of them one more request than before:
+     *
+     *   1. Redraws on a budget. A redraw asked for by arriving data waits a few
+     *      times as long as the last redraw took, counted from its end - so the
+     *      page is free most of the time, however slow the machine. Where a
+     *      redraw is quick the wait is what it always was (120 ms). What you do
+     *      yourself - a click, a key - is drawn at once, as before.
+     *   2. The first working-out in pieces. A page just opened has every item's
+     *      buyers to work out, in one go (his longest redraw: 2.8 s). Now they
+     *      are worked out a piece at a time before the first full draw, the page
+     *      free between pieces; the draw then finds them done.
+     *   3. The reads are remembered. Each item's bazaar listings, as last read,
+     *      are kept in the page's own storage (not the script's: Torn's pages
+     *      never load them) and are there again when the page opens. Nothing is
+     *      trusted for longer than before: every listing carries when TornW3B
+     *      last checked it, and one checked over half an hour ago is no flip,
+     *      kept or not; and every kept item is read again in its turn, as on a
+     *      page just opened - the kept reads are something to show meanwhile.
+     *
+     * Which read goes next is as it was: flips and price lists take turns, one
+     * read a second.
+     *
+     * Pure: no DOM, no storage, no clock of its own.
+     */
+
+    /** A redraw asked for by data waits this many times as long as the last redraw took. */
+    const REDRAW_BUDGET_TIMES = 3;
+
+    /** ...and never longer than this: on the slowest machine the numbers still move every few seconds. */
+    const REDRAW_WAIT_MAX_MS = 3000;
+
+    /** The first working-out goes in pieces of this long, the page free between them. */
+    const WARM_SLICE_MS = 30;
+
+    /**
+     * How long a redraw asked for by arriving data waits before it runs.
+     *
+     * The next one may not start before `ended + REDRAW_BUDGET_TIMES * took`
+     * (never more than REDRAW_WAIT_MAX_MS after `ended`), and never sooner than
+     * `base` from now - answers a moment apart share one redraw, as before.
+     *
+     * @param {object} p
+     * @param {number} p.base - the shortest wait (SELL_RENDER_MS)
+     * @param {number} p.took - how long the last redraw took (ms; 0: none yet)
+     * @param {number} p.ended - when it ended, on the same clock as `now`
+     * @param {number} p.now
+     * @returns {number} ms from now
+     */
+    function redrawWait({ base = 0, took = 0, ended = 0, now = 0 } = {}) {
+        const b = Math.max(0, Number(base) || 0);
+        const t = Number(took);
+        if (!(t > 0) || !Number.isFinite(t)) return b;
+        const rest = Math.min(REDRAW_WAIT_MAX_MS, REDRAW_BUDGET_TIMES * t);
+        const since = Number(now) - Number(ended);
+        // A clock that went back (or no clock): the whole rest, never more.
+        const left = since >= 0 ? rest - since : rest;
+        return Math.max(b, Math.min(rest, left));
+    }
+
+    /**
+     * One piece of a long working-out: `work(id)` for each id from `from` on,
+     * until `ms` have gone by - always at least one, so it ends.
+     *
+     * @param {string[]} ids
+     * @param {number} from - where this piece starts
+     * @param {function} work - (id) => void
+     * @param {object} o
+     * @param {function} o.clock - () => ms
+     * @param {number} [o.ms] - how long a piece may take
+     * @param {number} [o.since] - when this piece's work began, if before now (what led up to it counts)
+     * @returns {number} where the next piece starts (ids.length: all done)
+     */
+    function warmSlice(ids, from, work, { clock, ms = WARM_SLICE_MS, since = null } = {}) {
+        const t0 = since === null ? clock() : since;
+        let i = Math.max(0, Number(from) || 0);
+        while (i < ids.length) {
+            work(ids[i]);
+            i += 1;
+            if (clock() - t0 >= ms) break;
+        }
+        return i;
+    }
+
+    /** Kept reads older than this are not brought back (the page forgets them after as long). */
+    const KEPT_READS_MAX_AGE_MS = 60 * 60 * 1000;
+
+    /*
+     * A listing as it is kept: its values in this order, without their names. A
+     * page with 150 possible flips read holds some 20,000 listings; named, that
+     * is over 3 MB of text to write (a browser gives a page about 5) - like this,
+     * under half of it.
+     */
+    const KEPT_ROW = ['sellerId', 'sellerName', 'price', 'qty', 'dataAt', 'changedAt', 'sponsored'];
+
+    /**
+     * The reads to keep: {v, at, items: {itemId: {at, sweep, rows}}}, each row
+     * its values in KEPT_ROW's order. Only whole reads (not one under way, not a
+     * failed one with nothing), and none too old to be brought back.
+     *
+     * @param {Map<string, {at, rows, error, loading, sweep}>} reads - sell.bazaars
+     */
+    function packBazaarReads(reads, now = Date.now()) {
+        const items = {};
+        for (const [id, b] of reads || []) {
+            if (!b || !(Number(b.at) > 0) || !Array.isArray(b.rows) || now - Number(b.at) >= KEPT_READS_MAX_AGE_MS) continue;
+            items[String(id)] = { at: Number(b.at), sweep: Boolean(b.sweep), rows: b.rows.map((r) => KEPT_ROW.map((k) => (r ? r[k] : null))) };
+        }
+        return { v: 1, at: now, items };
+    }
+
+    /**
+     * The kept reads, as the page holds them - what is whole and young enough.
+     * A read "from the future" (the clock was changed) is not believed.
+     *
+     * @returns {Map<string, {at, triedAt, rows, error: null, loading: false, sweep}>}
+     */
+    function unpackBazaarReads(stored, now = Date.now()) {
+        const out = new Map();
+        const items = stored && stored.v === 1 && stored.items && typeof stored.items === 'object' ? stored.items : null;
+        if (!items) return out;
+        for (const [id, b] of Object.entries(items)) {
+            const at = Number(b && b.at);
+            if (!(at > 0) || at > now + 60000 || now - at >= KEPT_READS_MAX_AGE_MS || !Array.isArray(b.rows)) continue;
+            const rows = [];
+            for (const kept of b.rows) {
+                if (!Array.isArray(kept) || kept.length !== KEPT_ROW.length) break;
+                const [sellerId, sellerName, price, qty, dataAt, changedAt, sponsored] = kept;
+                // Each value of the type a fresh read gives it (a stored value is not believed to be one).
+                const when = (v) => (v === null ? null : typeof v === 'number' && v > 0 && Number.isFinite(v) ? v : undefined);
+                const r = { sellerId, sellerName, price, qty, dataAt: when(dataAt), changedAt: when(changedAt), sponsored };
+                if (typeof sellerId !== 'string' || !sellerId || !(sellerName === null || typeof sellerName === 'string')) break;
+                if (typeof price !== 'number' || !(price > 1) || !Number.isFinite(price) || !Number.isInteger(qty) || !(qty > 0)) break;
+                if (r.dataAt === undefined || r.changedAt === undefined || typeof sponsored !== 'boolean') break;
+                rows.push(r);
+            }
+            // A read with a broken row is not half-believed: read again.
+            if (rows.length !== b.rows.length) continue;
+            // `kept`: shown until it is read again, in its turn, as on a page just opened (TornW3B may have checked since).
+            out.set(String(id), { at, triedAt: at, rows, error: null, loading: false, sweep: Boolean(b.sweep), kept: true });
+        }
+        return out;
     }
 
     /* ===== src/core/inventory.js ===== */
@@ -22069,6 +22252,7 @@
 
 
 
+
     const STORE_KEY = 'apiKey';
     const STORE_ITEMS = 'itemsCache';
     const STORE_NPC = 'npcCache';
@@ -26399,6 +26583,22 @@
     const sell = {
         /* Each item's buyers, kept between redraws (core/kept-buyers.js). */
         buyersKeeper: null,
+        /* The redraw budget (core/start-up.js): how long the last redraw took, and when it ended (the page's own clock). */
+        redrawTook: 0,
+        redrawEnded: 0,
+        /* The redraw on its way (renderSelling): when it is due, and whether it answers something you pressed. */
+        renderDue: 0,
+        renderYours: false,
+        /* The draw for keys typed in the search box, on its way (renderSellingTyped): one for all keys typed meanwhile. */
+        typedTimer: null,
+        /* The buyers the last draw was made with, and when they were worked out (a search draws with them again). */
+        lastSrc: null,
+        lastSrcAt: 0,
+        /* The buyers worked out in pieces before a redraw (core/start-up.js): {src, ids, at, asked, timer} while under way, else null. */
+        warm: null,
+        /* The reads kept for next time (core/start-up.js): something new to write, and when it was last written. */
+        bazaarsDirty: false,
+        bazaarsSavedAt: 0,
         /* Traders' TornExchange / TornW3B badges seen so far (the Ledger's Traders tab shows them). */
         trustById: new Map(),
         /* Every TornW3B buyer of an item (3.15, /traders): itemId -> {at, triedAt, total, traders, loading, error}. */
@@ -27205,12 +27405,59 @@
         });
     }
 
+    /*
+     * The reads, remembered (3.19.0, core/start-up.js): each item's listings as
+     * last read, in the page's own storage - Torn Bids' origin, so no Torn page
+     * is ever handed them. Written when the page goes; when it is put away, at
+     * most every BAZAAR_READS_AWAY_MS (a buying run goes to Torn and back every
+     * few seconds); and, for a browser that dies, at most every
+     * BAZAAR_READS_SAVE_MS - a full page's reads are some 1.7 MB of text, not a
+     * write for every few seconds on a slow machine. A full or missing store
+     * costs nothing but the head start.
+     */
+    const BAZAAR_READS_KEY = 'ttv2.bids.reads';
+    const BAZAAR_READS_SAVE_MS = 60000;
+    const BAZAAR_READS_AWAY_MS = 10000;
+
+    /** `gap`: not if the last write was less than this long ago (0: now, whatever). */
+    function saveBazaarReads(gap = BAZAAR_READS_SAVE_MS) {
+        if (!sell.bazaarsDirty) return;
+        const now = Date.now();
+        if (now - (sell.bazaarsSavedAt || 0) < gap) return;
+        sell.bazaarsDirty = false;
+        sell.bazaarsSavedAt = now;
+        perfTimed('Torn Bids: the reads kept for next time', () => {
+            try {
+                localStorage.setItem(BAZAAR_READS_KEY, JSON.stringify(packBazaarReads(sell.bazaars, now)));
+            } catch {
+                // Full, or not allowed: nothing is kept, and what was there is not left half-true.
+                try {
+                    localStorage.removeItem(BAZAAR_READS_KEY);
+                } catch {
+                    /* no page storage at all */
+                }
+            }
+        });
+    }
+
+    function restoreBazaarReads() {
+        let stored = null;
+        try {
+            stored = JSON.parse(localStorage.getItem(BAZAAR_READS_KEY) || 'null');
+        } catch {
+            stored = null;
+        }
+        for (const [id, b] of unpackBazaarReads(stored, Date.now())) if (!sell.bazaars.has(id)) sell.bazaars.set(id, b);
+    }
+
     /** Are an item's bazaar listings due to be read? */
     function bazaarsDue(itemId, every, now) {
         const b = sell.bazaars.get(String(itemId));
         if (!b) return true;
         if (b.loading) return false;
         if (b.error) return now - b.triedAt >= W3B_FAILED_RETRY_MS;
+        // Brought back from the last visit (3.19.0): read again in its turn, as on a page just opened.
+        if (b.kept) return true;
         return now - b.at >= every;
     }
 
@@ -27354,6 +27601,7 @@
                 const suspect = rows.length === 0 && (prev.rows || []).length > 0;
                 if (!sweep && !prev.sweep && prev.at && at - prev.at <= SELL_MOVES_GAP_MS && !suspect) noteMovement(id, unitsMoved(prev.rows, rows, (listings || []).length >= 100), at - prev.at, at);
                 sell.bazaars.set(id, { at, triedAt: at, rows, error: null, loading: false, sweep });
+                sell.bazaarsDirty = true;
             })
             .catch((error) => {
                 sell.bazaars.set(id, { ...prev, triedAt: Date.now(), error: 'TornW3B did not answer. Trying again soon.', loading: false });
@@ -27493,25 +27741,175 @@
      * and each used to recompute the whole page at once. Now they share one
      * redraw every SELL_RENDER_MS; what you do yourself (pick, filter, search,
      * category, settings) still draws at once through renderSellingNow().
+     *
+     * 3.19.0 (core/start-up.js; the friend's laptop: 788 ms a redraw, an answer
+     * a second): a redraw asked for by arriving data also waits a few times as
+     * long as the last redraw took, so the page is free most of the time on any
+     * machine - where a redraw is quick, that is no wait at all. And its buyers
+     * are worked out in pieces first (the page free between them), so a page
+     * just opened is not stuck while every item is worked out at once.
+     * renderSelling(true): the answer to something you pressed - after
+     * SELL_RENDER_MS as always, in one go, whatever the last redraw took.
      */
     const SELL_RENDER_MS = 120;
 
-    function renderSelling() {
-        if (sell.renderTimer) return;
-        sell.renderTimer = setTimeout(() => {
-            sell.renderTimer = null;
-            renderSellingNow();
-        }, SELL_RENDER_MS);
+    /** The page's own clock (it never goes back); the wall clock where there is none. */
+    function sellClock() {
+        return typeof performance !== 'undefined' && typeof performance.now === 'function' ? performance.now() : Date.now();
     }
 
-    function renderSellingNow() {
-        const t0 = perfNow();
-        sell.drew = false;
+    function renderSelling(yours = false) {
+        if (sell.warm) {
+            // The buyers are being worked out in pieces: the draw follows them, and one more for this.
+            if (!yours) {
+                sell.warm.asked = true;
+                return;
+            }
+            // Something you pressed does not wait for them: its own draw, in one go.
+            stopSellWarm();
+        }
+        const now = sellClock();
+        let due = now + (yours ? SELL_RENDER_MS : redrawWait({ base: SELL_RENDER_MS, took: sell.redrawTook, ended: sell.redrawEnded, now }));
+        if (sell.renderTimer) {
+            // One is on its way; only something you pressed brings it forward (never back).
+            if (!yours || sell.renderYours) return;
+            clearTimeout(sell.renderTimer);
+            due = Math.min(due, sell.renderDue);
+        }
+        sell.renderDue = due;
+        sell.renderYours = yours;
+        sell.renderTimer = setTimeout(() => {
+            sell.renderTimer = null;
+            if (sell.renderYours) renderSellingNow();
+            else renderSellingInPieces();
+        }, Math.max(0, due - now));
+    }
+
+    /**
+     * A redraw asked for by data: every item's buyers first, a piece at a time
+     * (WARM_SLICE_MS each, the page free between two), then the draw - which
+     * finds them worked out. When nothing needs working out (most redraws: one
+     * answer changes one item) one piece is all of them - the second, when
+     * making the lookup used up the first - and the draw follows in the same
+     * breath.
+     */
+    function renderSellingInPieces() {
+        // Hidden, a tab's timers fire once a second at best: in one go, as before.
+        if (!sell.page || document.visibilityState !== 'visible') return renderSellingNow();
+        stopSellWarm();
+        const t0 = sellClock();
+        const src = sellBuyerSources(Date.now());
+        const ids = [...new Set([...(sell.inventory || []).map((it) => String(it.id)), ...src.teMap.keys(), ...src.w3bByItem.keys(), ...sell.teOne.keys()])];
+        sell.warm = { src, ids, at: 0, asked: false, timer: null, worked: 0 };
+        stepSellWarm(t0);
+    }
+
+    /** One piece; `t0`: when this piece's work began (the first one's includes making the lookup). */
+    function stepSellWarm(t0 = sellClock()) {
+        const w = sell.warm;
+        if (!w) return;
+        w.timer = null;
         try {
-            renderSellingWork();
+            w.at = warmSlice(w.ids, w.at, w.src.buyersAll, { clock: sellClock, since: t0, ms: document.visibilityState === 'visible' ? WARM_SLICE_MS : Infinity });
+        } catch {
+            // Whatever went wrong in a piece goes wrong in the draw too, where it is reported as ever.
+            w.at = w.ids.length;
+        }
+        if (w.at < w.ids.length) {
+            perfDone('Torn Bids buyers worked out in pieces (before a redraw)', t0);
+            w.worked += sellClock() - t0;
+            // The page is free until the next piece: an answer may land, so the kept buyers look again before the next item.
+            sellBuyersKeeper().unsettled();
+            w.timer = setTimeout(() => stepSellWarm(), 0);
+            return;
+        }
+        sell.warm = null;
+        // The last piece and the draw are one stretch of work: counted as one redraw.
+        try {
+            renderSellingNow(w.src, t0, w.worked);
+        } finally {
+            // What arrived while the pieces were worked out is in the next one (also after a draw that went wrong).
+            if (w.asked) renderSelling();
+        }
+    }
+
+    /*
+     * Typing in the search box (3.19.0): drawn at once, in a task of its own
+     * right after the key - so keys typed while the page was busy, each of which
+     * used to wait for the draw of the one before, share one draw (the box shows
+     * every letter as it is typed; the list follows with all of them).
+     *
+     * A search changes which items are shown, not who buys them, so its draw
+     * works out nothing new: it draws with the buyers of the last draw (or
+     * finishes the pieces under way with theirs), and what arrived since keeps
+     * its own redraw on the budget - a key no longer pays for the data waiting.
+     * Not with buyers older than SELL_TYPED_SOURCES_MS (a quiet page: drawn
+     * afresh).
+     */
+    const SELL_TYPED_SOURCES_MS = 30000;
+
+    function renderSellingTyped() {
+        if (sell.typedTimer) return;
+        sell.typedTimer = setTimeout(() => {
+            sell.typedTimer = null;
+            if (document.visibilityState !== 'visible') {
+                renderSellingNow();
+                return;
+            }
+            const w = sell.warm;
+            if (w) {
+                if (w.timer) clearTimeout(w.timer);
+                sell.warm = null;
+                // The page was free since the last piece: the kept buyers look again before the rest.
+                sellBuyersKeeper().unsettled();
+                try {
+                    renderSellingNow(w.src, sellClock(), w.worked);
+                } finally {
+                    if (w.asked) renderSelling();
+                }
+                return;
+            }
+            if (!sell.lastSrc || Date.now() - (sell.lastSrcAt || 0) > SELL_TYPED_SOURCES_MS) {
+                renderSellingNow();
+                return;
+            }
+            // The redraw for data on its way stays on its way (the draw below would clear it).
+            const dataDue = Boolean(sell.renderTimer) && !sell.renderYours;
+            // Anything not worked out in it yet is worked out against what items share now.
+            sellBuyersKeeper().unsettled();
+            try {
+                renderSellingNow(sell.lastSrc);
+            } finally {
+                if (dataDue) renderSelling();
+            }
+        }, 0);
+    }
+
+    function stopSellWarm() {
+        if (!sell.warm) return;
+        if (sell.warm.timer) clearTimeout(sell.warm.timer);
+        sell.warm = null;
+    }
+
+    /**
+     * The draw, now and in one go. From renderSellingInPieces it is handed the
+     * lookup the pieces filled (`src`), when this stretch of work began (`t0`)
+     * and how long the pieces before it took (`before`).
+     */
+    function renderSellingNow(src = null, t0 = sellClock(), before = 0) {
+        sell.drew = false;
+        // Pieces under way are overtaken by this draw (it works out what they had not reached).
+        stopSellWarm();
+        try {
+            renderSellingWork(src);
         } finally {
             // The page rebuild is counted apart and is inside this one.
             perfDone(sell.drew ? 'Torn Bids redraw (working out + page)' : 'Torn Bids redraw not due (hidden tab)', t0);
+            if (sell.drew) {
+                // The redraw budget: the next one asked for by data waits by all the work this one was.
+                sell.redrawEnded = sellClock();
+                sell.redrawTook = sell.redrawEnded - t0 + before;
+            }
             if (sell.drew && !sell.perfStartNoted) {
                 sell.perfStartNoted = true;
                 perfStartup({ script: SCRIPT_START_MS, panel: perfNow(), items: null });
@@ -27519,23 +27917,13 @@
         }
     }
 
-    function renderSellingWork() {
-        if (sell.renderTimer) {
-            clearTimeout(sell.renderTimer);
-            sell.renderTimer = null;
-        }
-        // A hidden tab works out the flips now and then (which bazaars to read
-        // next depends on it), and draws in full on becoming visible again.
-        if (!sell.page) return;
-        const now = Date.now();
-        if (document.visibilityState !== 'visible') {
-            if (now - (sell.hiddenRenderAt || 0) < HIDDEN_RENDER_MS) return;
-            sell.hiddenRenderAt = now;
-        }
-        const prefs = sellPrefs();
-        const st = teState();
-        const access = gmGet(STORE_SELL_KEY_ACCESS, null);
-
+    /**
+     * Who buys what, from everything loaded now: the lists index, TornExchange's
+     * top three, your favourites and their own lists, and the lookup over them
+     * (each item's rows kept between redraws, core/kept-buyers.js). Made once a
+     * redraw - by its pieces when it has them, else by the draw itself.
+     */
+    function sellBuyerSources(now) {
         const w3bByItem = w3bIndex(now);
         const teMap = sell.traders ? sell.traders.map : new Map();
         // Your favourites and their own lists: read once per redraw (review M6).
@@ -27550,6 +27938,39 @@
             if (add.length) ownByItem.set(itemId, [...have, ...add]);
         }
         const buyersAll = buyerLookup({ teMap, lists: sell.lists, teOne: sell.teOne, idsByName: sell.idsByName, db: sell.db, w3bByItem, dbIdsByName: sell.dbIdsByName, teOwn: ownByItem, votes: sell.votes || new Map(), itemTraders: sell.itemTraders, now, keeper: sellBuyersKeeper() });
+        return { w3bByItem, teMap, favsNow, ownLists, ownByItem, buyersAll };
+    }
+
+    function renderSellingWork(src = null) {
+        if (sell.renderTimer) {
+            clearTimeout(sell.renderTimer);
+            sell.renderTimer = null;
+        }
+        // A draw for keys typed is in this one too.
+        if (sell.typedTimer) {
+            clearTimeout(sell.typedTimer);
+            sell.typedTimer = null;
+        }
+        // A hidden tab works out the flips now and then (which bazaars to read
+        // next depends on it), and draws in full on becoming visible again.
+        if (!sell.page) return;
+        const now = Date.now();
+        if (document.visibilityState !== 'visible') {
+            if (now - (sell.hiddenRenderAt || 0) < HIDDEN_RENDER_MS) return;
+            sell.hiddenRenderAt = now;
+        }
+        const prefs = sellPrefs();
+        const st = teState();
+        const access = gmGet(STORE_SELL_KEY_ACCESS, null);
+
+        // Worked out in pieces a moment ago (renderSellingInPieces), or here.
+        const sources = src || sellBuyerSources(now);
+        const { w3bByItem, teMap, favsNow, ownLists, ownByItem, buyersAll } = sources;
+        // A search may draw with them again (renderSellingTyped).
+        if (sources !== sell.lastSrc) {
+            sell.lastSrc = sources;
+            sell.lastSrcAt = now;
+        }
         const levelOf = (id) => presenceLevel(sellPresenceOf(id));
         // Trusted means Known (20+ votes) or Trusted; while TornExchange's votes
         // are not loaded, a trader without any is kept ("no votes yet").
@@ -28682,7 +29103,7 @@
                 // Said on the desk, not just gone (the friend: "loading more buyers" then nothing).
                 sell.listState.set(id, { loading: false, error: 'TornExchange did not send its full list; trying again after ' + new Date(retryAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) + '.', at, retryAt });
             })
-            .finally(() => renderSelling());
+            .finally(() => renderSelling(true));
     }
 
     /**
@@ -28815,21 +29236,21 @@
         key = String(key || '').trim();
         if (!key) {
             sell.keyError = 'Paste a key first.';
-            renderSelling();
+            renderSelling(true);
             return;
         }
         // The Ledger's Full key stays with the Ledger: this box's key can be
         // copied to TornExchange ("Use my Limited key").
         if (key === getLedgerKey()) {
             sell.keyError = 'That is your Full (Ledger) key. Paste a Limited key here.';
-            renderSelling();
+            renderSelling(true);
             return;
         }
         // Checked before it replaces the key you have (3.14.3: a typo replaced a
         // working key, as the Ledger's and the overlay's keys never could).
         if (!looksLikeTornKey(key)) {
             sell.keyError = 'A Torn key is 16 letters and digits. Your saved key is unchanged.';
-            renderSelling();
+            renderSelling(true);
             return;
         }
         const probe = new TornApiClient({ getKey: () => key, ...tornSharing(), maxRetries: 0 });
@@ -28843,7 +29264,7 @@
                 const why = keyTooLowForInventory(info);
                 if (why) {
                     sell.keyError = why + ' Your saved key is unchanged.';
-                    renderSelling();
+                    renderSelling(true);
                     return;
                 }
                 useSellKey(key);
@@ -28853,7 +29274,7 @@
                 // Torn said no: the key you had stays. Anything else (no answer): saved, as before.
                 if (isKeyDeadError(error)) {
                     sell.keyError = 'Torn does not accept that key. Your saved key is unchanged.';
-                    renderSelling();
+                    renderSelling(true);
                     return;
                 }
                 useSellKey(key);
@@ -28875,6 +29296,8 @@
         forgetSelf();
         sell.page.showView('list');
         loadSellInventory({ force: true }).then(() => refreshSellTraders());
+        // The answer to Save: the old key's error goes at once, not on the data redraws' budget.
+        renderSelling(true);
     }
 
     function onSellForgetKey() {
@@ -28887,7 +29310,7 @@
         sell.inventory = null;
         sell.inventoryAt = null;
         forgetSelf();
-        renderSelling();
+        renderSelling(true);
     }
 
     /** A new key may be another player: whose listings are "yours" is asked again. */
@@ -28907,7 +29330,7 @@
         key = String(key || '').trim();
         if (!key) {
             sell.teKeyMsg = 'Paste a key first.';
-            renderSelling();
+            renderSelling(true);
             return;
         }
         // A Full-access key never goes to a third party: not the Ledger's, and
@@ -28916,13 +29339,13 @@
         // A refused key is said in its own field - never as a TornExchange outage on the pill (review M5).
         if (key === getLedgerKey() || (key === getSellKey() && isFullKey(access))) {
             sell.teKeyMsg = 'That key has Full access. TornExchange never gets it: paste the Limited key you log into tornexchange.com with. Your saved key is unchanged.';
-            renderSelling();
+            renderSelling(true);
             return;
         }
         // Its key is a Torn key: a typo never replaces the one you have (3.14.3).
         if (!looksLikeTornKey(key)) {
             sell.teKeyMsg = 'A Torn key is 16 letters and digits. Your saved key is unchanged.';
-            renderSelling();
+            renderSelling(true);
             return;
         }
         sell.teKeyMsg = null;
@@ -28931,14 +29354,14 @@
         setTeState({ badKey: false, error: null, lastAttemptAt: 0 });
         sell.page.showView('list');
         refreshSellTraders({ force: true });
-        renderSelling();
+        renderSelling(true);
     }
 
     /** "Try again": ask TornExchange with the saved key now (after logging in there again). */
     function onSellRetryTe() {
         setTeState({ badKey: false, error: null, lastAttemptAt: 0, idsAttemptAt: 0 });
         refreshSellTraders({ force: true });
-        renderSelling();
+        renderSelling(true);
     }
 
     function onSellForgetTeKey() {
@@ -28950,7 +29373,7 @@
         sell.traders = null;
         sell.lists = new Map();
         sell.idsByName = new Map();
-        renderSelling();
+        renderSelling(true);
     }
 
     function onSellRefresh() {
@@ -28970,7 +29393,7 @@
             sell.market.delete(sell.selected);
         }
         loadSellInventory({ force: true }).then(() => refreshSellTraders({ force: true }));
-        renderSelling();
+        renderSelling(true);
     }
 
     /**
@@ -29007,7 +29430,7 @@
     function onSellQuery(text) {
         sell.query = String(text || '');
         sell.allShown = ALL_ITEMS_PAGE;
-        renderSellingNow();
+        renderSellingTyped();
     }
 
     function openSellLink(url) {
@@ -29045,6 +29468,8 @@
         });
         // Its own TornW3B budget, well under TornW3B's 100 a minute per IP.
         sell.w3b = newW3bClient({ maxPerMinute: SELL_W3B_PER_MIN, background: true, who: 'sell' });
+        // The reads of last time are here from the start (3.19.0): what is due is read again, in the usual turns.
+        restoreBazaarReads();
         sell.keyDead = Boolean(gmGet(STORE_SELL_KEY_DEAD, false));
         if (sell.keyDead) sell.keyError = 'Torn rejected this key. Paste a new Limited key.';
 
@@ -29083,6 +29508,7 @@
             onLedgerRead: () => {
                 led.nextAt = 0;
                 runLedger();
+                renderSelling(true);
             },
             onRetryTe: onSellRetryTe,
             onRevealTeKey: () => getTeKey(),
@@ -29288,7 +29714,7 @@
             onCategory: onSellCategory,
             onMore: () => {
                 sell.allShown += ALL_ITEMS_PAGE;
-                renderSelling();
+                renderSelling(true);
             },
             onOpenUrl: openSellLink,
             getUsage: usageNow,
@@ -29424,6 +29850,7 @@
             if (due && !sell.loading && getSellKey()) loadSellInventory({ force: true });
             loadSelfId();
             saveTraderDb();
+            saveBazaarReads();
             renderSelling();
         }, 15000);
 
@@ -29435,9 +29862,13 @@
                 renderSellingNow();
             } else {
                 saveTraderDb(true);
+                saveBazaarReads(BAZAAR_READS_AWAY_MS);
             }
         });
-        window.addEventListener('pagehide', () => saveTraderDb(true));
+        window.addEventListener('pagehide', () => {
+            saveTraderDb(true);
+            saveBazaarReads(0);
+        });
     }
 
     /* ------------------------------------------------------------------ *
@@ -29541,16 +29972,16 @@
         led.saveMsg = null;
         if (!key) {
             led.saveMsg = { bad: true, at: Date.now(), text: 'Paste your Full key first.' };
-            renderSelling();
+            renderSelling(true);
             return;
         }
         if (!/^[A-Za-z0-9]{16}$/.test(key)) {
             led.saveMsg = { bad: true, at: Date.now(), text: 'A Torn key is 16 letters and digits.' + (getLedgerKey() ? ' Your saved key is unchanged.' : '') };
-            renderSelling();
+            renderSelling(true);
             return;
         }
         led.checking = true;
-        renderSelling();
+        renderSelling(true);
         const probe = new LedgerClient({
             getKey: () => key,
             ...tornSharing(),
@@ -29580,7 +30011,7 @@
             led.saveMsg = { bad: true, at: Date.now(), text: redactKey(ledgerErrorText(error), key) };
         } finally {
             led.checking = false;
-            renderSelling();
+            renderSelling(true);
         }
     }
 
@@ -29593,7 +30024,7 @@
         led.keyError = null;
         led.error = null;
         led.saveMsg = { bad: false, text: 'Key and ledger deleted.' };
-        renderSelling();
+        renderSelling(true);
     }
 
     /**

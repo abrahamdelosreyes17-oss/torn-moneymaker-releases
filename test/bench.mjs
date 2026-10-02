@@ -64,13 +64,34 @@ const BUILD = buildArg('build');
 
 /*
  * The scenes. Each is a harness page and what a player does on it; `run` is
- * evaluated in the page and may use wait(ms).
+ * evaluated in the page and may use wait(ms). `input` (3.19.0) is a real
+ * mouse and keyboard, sent by the browser itself at `at` ms into the scene:
+ * a click on the first element matching a selector, text typed, keys pressed -
+ * the speed log's SLOW CLICKS AND KEY PRESSES counts only those.
  */
 const SCENES = [
     {
         name: 'Torn Bids, a large trader list',
         url: 'test/harness-live.html?ttv2=traders&sellkeys=1&bigflip=1&ledgerkey=1&manytrades=1&leftmany=1&awake=1&bigstore=2000',
         run: 'await wait(' + SECONDS * 1000 + ');',
+    },
+    {
+        // 3.19.0: what the page feels like while it loads - a real mouse and keyboard (the browser times only those).
+        // What is pressed, and when, decides what is asked and drawn: timed, not compared.
+        name: 'typing in the search box and picking flips while the traders page loads',
+        url: 'test/harness-live.html?ttv2=traders&sellkeys=1&bigflip=1&ledgerkey=1&manytrades=1&leftmany=1&awake=1&bigstore=2000',
+        run: 'await wait(' + SECONDS * 1000 + ');',
+        timedOnly: true,
+        input: [
+            { at: 3000, click: '.sp-search' },
+            { at: 3400, type: 'gent', every: 220 },
+            { at: 5500, keys: ['Backspace', 'Backspace', 'Backspace', 'Backspace'], every: 220 },
+            { at: 7500, click: '.sp-fc:not(.sp-tc):not(.sp-lo)' },
+            { at: 9000, click: '.sp-search' },
+            { at: 9400, type: 'bag', every: 220 },
+            { at: 11000, keys: ['Backspace', 'Backspace', 'Backspace'], every: 220 },
+            { at: 12500, click: '.sp-fc:not(.sp-tc):not(.sp-lo):not(.sp-sel)' },
+        ],
     },
     {
         name: 'a long bazaar, another extension writing into its rows',
@@ -93,6 +114,9 @@ const SCENES = [
         run: 'await wait(3000); const b = document.querySelector(".ttv2-sendfillall"); if (b) b.click(); await wait(' + Math.max(1000, SECONDS * 1000 - 3000) + ');',
     },
 ];
+
+/* Run in the page: the middle of the first element matching `sel` (looked for in shadow roots too), scrolled into view; null when there is none. */
+const CENTRE_OF = '(sel) => { const find = (root) => { const e = root.querySelector(sel); if (e) return e; for (const h of root.querySelectorAll("*")) { const f = h.shadowRoot ? find(h.shadowRoot) : null; if (f) return f; } return null; }; const e = find(document); if (!e) return null; e.scrollIntoView({ block: "center" }); const r = e.getBoundingClientRect(); return r.width && r.height ? [Math.round(r.left + r.width / 2), Math.round(r.top + r.height / 2)] : null; }';
 
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.mjs': 'text/javascript; charset=utf-8', '.json': 'application/json', '.css': 'text/css', '.png': 'image/png', '.svg': 'image/svg+xml' };
 
@@ -191,7 +215,10 @@ async function runScene(port, base, scene, script = null) {
         await page.send('Emulation.setDeviceMetricsOverride', { width: 1600, height: 1000, deviceScaleFactor: 1, mobile: false });
         await page.send('Emulation.setCPUThrottlingRate', { rate: RATE });
         // Script errors on the page are part of the result.
-        await page.send('Page.addScriptToEvaluateOnNewDocument', { source: 'window.__benchErrors = []; window.addEventListener("error", (e) => window.__benchErrors.push(String(e.message)));' });
+        // And the page is kept drawing frames, as a window in view is (3.19.0): a headless page that goes quiet has
+        // its timers run late - the script's once-a-second read fired 74 times in 90 s, against every 1,000 ms in a
+        // real browser - so a build that leaves the page free more often looked as if it read less.
+        await page.send('Page.addScriptToEvaluateOnNewDocument', { source: 'window.__benchErrors = []; window.addEventListener("error", (e) => window.__benchErrors.push(String(e.message))); (function awake() { requestAnimationFrame(awake); })();' });
         // Each run starts with nothing stored in the browser (the Ledger keeps its rows in IndexedDB).
         await page.send('Storage.clearDataForOrigin', { origin: base.slice(0, -1), storageTypes: 'all' });
         const loaded = page.once('Page.loadEventFired');
@@ -206,11 +233,37 @@ async function runScene(port, base, scene, script = null) {
             'const sizes = Object.entries(store).filter(([k]) => k.startsWith("tornTrading.v2.")).map(([k, v]) => [k.slice(15).replace(/\\.[a-z0-9]+-[a-z0-9]+$/, ".this-tab"), String(v).length]);' +
             // What was asked of the three services (keys and clock values out), and the page as drawn:
             // every element by tag and class, in the document and in each shadow root, with its text's digits out
-            // (but for the harness's own status line, #out: it is the harness's, and says what the clock made of the run).
+            // (but for the harness's own status line, #out: it is the harness's, and says what the clock made of the run;
+            // and but for whether an item's picture has failed to load yet, sp-img-none: the browser's doing, not the script's).
             'const requests = (window.__requests || []).map((u) => String(u).replace(/key=[^&]+/g, "key=K").replace(/\\d{9,}/g, "T"));' +
-            'const shape = (root) => [...root.querySelectorAll("*")].filter((e) => !/^(SCRIPT|STYLE)$/.test(e.tagName) && e.id !== "out").map((e) => e.tagName + "." + (typeof e.className === "string" ? e.className : "") + (e.children.length ? "" : ":" + (e.textContent || "").replace(/\\d+/g, "#").slice(0, 60)) + (e.shadowRoot ? "{" + shape(e.shadowRoot) + "}" : "")).join("|");' +
+            'const shape = (root) => [...root.querySelectorAll("*")].filter((e) => !/^(SCRIPT|STYLE)$/.test(e.tagName) && e.id !== "out").map((e) => e.tagName + "." + (typeof e.className === "string" ? e.className.replace(" sp-img-none", "") : "") + (e.children.length ? "" : ":" + (e.textContent || "").replace(/\\d+/g, "#").slice(0, 60)) + (e.shadowRoot ? "{" + shape(e.shadowRoot) + "}" : "")).join("|");' +
             'return JSON.stringify({ record: store["tornTrading.v2.speedLog"] ? JSON.parse(store["tornTrading.v2.speedLog"]) : null, sizes, errors: window.__benchErrors || [], requests, dom: shape(document) });';
-        const out = await page.send('Runtime.evaluate', { expression: '(async () => {' + body + '})()', awaitPromise: true, returnByValue: true, timeout: (SECONDS + 30) * 1000 });
+        const began = Date.now();
+        const running = page.send('Runtime.evaluate', { expression: '(async () => {' + body + '})()', awaitPromise: true, returnByValue: true, timeout: (SECONDS + 30) * 1000 });
+        // A real mouse and keyboard, while the scene runs (a step whose element is not in the page is skipped).
+        for (const step of scene.input || []) {
+            await sleep(Math.max(0, began + step.at - Date.now()));
+            if (step.click) {
+                const at = await page.send('Runtime.evaluate', { expression: '(' + CENTRE_OF + ')(' + JSON.stringify(step.click) + ')', returnByValue: true });
+                const xy = at.result && at.result.value;
+                if (!xy) continue;
+                await page.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: xy[0], y: xy[1] });
+                await page.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: xy[0], y: xy[1], button: 'left', clickCount: 1 });
+                await page.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: xy[0], y: xy[1], button: 'left', clickCount: 1 });
+            }
+            for (const ch of step.type || []) {
+                await page.send('Input.dispatchKeyEvent', { type: 'keyDown', key: ch, text: ch });
+                await page.send('Input.dispatchKeyEvent', { type: 'keyUp', key: ch });
+                await sleep(step.every || 200);
+            }
+            for (const key of step.keys || []) {
+                const code = { Backspace: 8, Enter: 13, Escape: 27 }[key] || 0;
+                await page.send('Input.dispatchKeyEvent', { type: 'rawKeyDown', key, code: key, windowsVirtualKeyCode: code });
+                await page.send('Input.dispatchKeyEvent', { type: 'keyUp', key, code: key, windowsVirtualKeyCode: code });
+                await sleep(step.every || 200);
+            }
+        }
+        const out = await running;
         if (out.exceptionDetails) throw new Error(scene.name + ': ' + (out.exceptionDetails.exception && out.exceptionDetails.exception.description || out.exceptionDetails.text));
         return JSON.parse(out.result.value);
     } finally {
@@ -250,6 +303,7 @@ async function main() {
             // Nothing compromised: the same requests and the same page - before and after.
             let same = true;
             for (const scene of scenes) {
+                if (scene.timedOnly) continue;
                 const before = await runScene(port, base, scene, COMPARE);
                 const after = await runScene(port, base, scene);
                 const firstDiff = (a, b) => {
