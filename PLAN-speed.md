@@ -43,6 +43,14 @@ when changed), 8, 9, and the ticker. What dominates now is
 `buyersForItem` for every item every redraw (4.5 s of 12 s profiled) and
 `indexW3bByItem` (1 s): that is Part 3 B, steps 11 and 14.
 
+**Part 3 B, step 11, is BUILT as 3.18.0** (not released as this is
+written): `src/core/kept-buyers.js`, proven by `test/kept-buyers.test.js`.
+The friend's first speed log (3.17.1, 2026-10-03) said 788 ms a redraw on his
+laptop, twice the bench. On the bench (4x, 40 s): 355 -> 189 ms each. What
+is left, in order: `indexW3bByItem` rebuilt whole on every list read (step
+14), the page rebuild (step 12), the shown list per item (favourites first,
+online, trusted), `nextW3bTrader` walking every trader per read.
+
 The rest of this file is the plan as written.
 
 Written 2026-10-03, after 3.16.4. **Nothing below is built.** The owner said

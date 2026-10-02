@@ -11,6 +11,9 @@
  *     node test/bench.mjs --rate 1        this machine as it is
  *     node test/bench.mjs --only bazaar   one scene (a word of its name)
  *     node test/bench.mjs --json out.json the records as data too
+ *     node test/bench.mjs --build dist/before.user.js
+ *                                         time another build (one inside the repo)
+ *                                         on the same scenes: the before of an after
  *     node test/bench.mjs --compare dist/before.user.js
  *                                         each scene twice - that build, then
  *                                         this one - and whether both sent the
@@ -45,16 +48,19 @@ const ONLY = arg('only', null);
 const JSON_OUT = arg('json', null);
 const SECONDS = Number(arg('seconds', 14)) || 14;
 // The build to compare with: a path inside the repo, as the harness page will ask for it (with / between its parts).
-const COMPARE = (() => {
-    const given = arg('compare', null);
+const buildArg = (name) => {
+    const given = arg(name, null);
     if (!given) return null;
     const rel = relative(ROOT, resolve(process.cwd(), given)).split(sep).join('/');
     if (!rel || rel.startsWith('..') || !/^[\w./-]+$/.test(rel) || !existsSync(resolve(ROOT, rel))) {
-        console.error('--compare needs a build inside the repo (for example dist/before.user.js); not found or not usable: ' + given);
+        console.error('--' + name + ' needs a build inside the repo (for example dist/before.user.js); not found or not usable: ' + given);
         process.exit(1);
     }
     return rel;
-})();
+};
+const COMPARE = buildArg('compare');
+// Another build to time instead of this one (3.18.0): the same scenes, the same slow processor.
+const BUILD = buildArg('build');
 
 /*
  * The scenes. Each is a harness page and what a player does on it; `run` is
@@ -239,7 +245,7 @@ async function main() {
         }
         if (!port) throw new Error('The browser did not start.');
 
-        console.log('Torn Trading speed bench - processor slowed ' + RATE + 'x, ' + SECONDS + ' s a scene, ' + exe.replace(/.*[\\/]/, ''));
+        console.log('Torn Trading speed bench - processor slowed ' + RATE + 'x, ' + SECONDS + ' s a scene, ' + exe.replace(/.*[\\/]/, '') + (BUILD ? ' - the build ' + BUILD : ''));
         if (COMPARE) {
             // Nothing compromised: the same requests and the same page - before and after.
             let same = true;
@@ -268,7 +274,7 @@ async function main() {
             return;
         }
         for (const scene of scenes) {
-            const got = await runScene(port, base, scene);
+            const got = await runScene(port, base, scene, BUILD);
             results.push({ scene: scene.name, ...got });
             const now = Date.now();
             console.log('\n' + '='.repeat(100) + '\n' + scene.name.toUpperCase() + '\n' + '='.repeat(100));

@@ -153,3 +153,70 @@ test('Cancel trade: what you already bought for it (planned and not) is yours to
     // Nothing bought yet: nothing to keep (your own items were never moved).
     assert.deepEqual(cancelledLeftovers(acceptTrade(CHOSEN, '335', 1000)), []);
 });
+
+import { sendList, fillNote } from '../src/core/accepted.js';
+
+/*
+ * The friend, 2026-10-03 (3.17.1 live): ELIZA_BITE accepted four items; he
+ * bought 1,320 Camel Plushies, ran out of cash for the other three, and made
+ * the trade mid flip. The add step had no Fill all, then - with all 1,320 in
+ * the trade - said "none of ELIZA_BITE's items are in this list".
+ */
+const MID = () => {
+    const chosen = {
+        key: 'id:3767921',
+        buyer: { id: '3767921', name: 'ELIZA_BITE', price: 71620 },
+        flips: [
+            { itemId: '384', name: 'Camel Plushie', units: 1320, bid: 71620, steps: [{ sellerId: '5', sellerName: 'S', qty: 1320, price: 70000 }] },
+            { itemId: '35', name: 'Box of Chocolate Bars', units: 200, bid: 805, steps: [{ sellerId: '6', sellerName: 'T', qty: 200, price: 780 }] },
+            { itemId: '260', name: 'Dahlia', units: 400, bid: 2413, steps: [{ sellerId: '7', sellerName: 'U', qty: 400, price: 2300 }] },
+        ],
+        held: [],
+    };
+    return acceptTrade(chosen, '384', 1000);
+};
+
+test('a trade made mid flip: what goes in is what you bought; the rest is "not bought yet", never offered to Fill', () => {
+    const fresh = MID();
+    // Nothing counted yet: the plan's numbers, as before.
+    assert.deepEqual(sendList(fresh).send.map((n) => [n.name, n.qty]), [['Camel Plushie', 1320], ['Box of Chocolate Bars', 200], ['Dahlia', 400]]);
+    assert.deepEqual(sendList(fresh).waiting, []);
+    assert.equal(sendList(fresh).pays, acceptedTotals(fresh).pays);
+
+    const mid = recordBuy(fresh, 'flip:384', 0, 1320, 5000);
+    const list = sendList(mid);
+    assert.deepEqual(list.send, [{ itemId: '384', name: 'Camel Plushie', qty: 1320 }], 'only what was bought goes in');
+    assert.deepEqual(list.waiting, ['Box of Chocolate Bars', 'Dahlia']);
+    assert.equal(list.pays, 1320 * 71620, 'and they pay for that, not for the whole plan');
+
+    // An unplanned buy this trader pays for goes in too (the Bought window lists it); one they do not buy never.
+    const extra = addExtraBuy(addExtraBuy(mid, { itemId: '187', name: 'Teddy Bear Plushie', qty: 3, price: 400, bid: 486 }, 6000), { itemId: '9', name: 'Junk', qty: 5, price: 10, bid: 0 }, 6000);
+    assert.deepEqual(sendList(extra).send.map((n) => [n.name, n.qty]), [['Camel Plushie', 1320], ['Teddy Bear Plushie', 3]]);
+    assert.equal(sendList(extra).pays, 1320 * 71620 + 3 * 486);
+
+    // A skipped line is neither sent nor waiting; a part-bought one sends what was bought.
+    const skipped = recordBuy(recordBuy(mid, 'flip:35', 0, 0, 7000), 'flip:260', 0, 150, 7000);
+    assert.deepEqual(sendList(skipped).send.map((n) => [n.name, n.qty]), [['Camel Plushie', 1320], ['Dahlia', 150]]);
+    assert.deepEqual(sendList(skipped).waiting, []);
+});
+
+test('your own items in a trade always go in, bought or not', () => {
+    const t = acceptTrade(CHOSEN, '335', 1000);
+    const run = recordBuy(t, 'flip:335', 0, 53, 2000);
+    assert.deepEqual(sendList(run).send.map((n) => [n.name, n.qty]), [['Hammer', 10], ['Stick of Dynamite', 53]]);
+    assert.deepEqual(sendList(run).waiting, ['Xanax']);
+    assert.equal(sendList(run).pays, 10 * 110 + 53 * 18000);
+});
+
+test('Fill\'s line on a part-bought trade: says it is all in, and how many are not bought yet', () => {
+    const base = { accepted: ['ELIZA_BITE'], trader: 'ELIZA_BITE' };
+    // Everything bought is in the trade: said so - never "none of their items are in this list".
+    const allIn = fillNote({ ...base, toSend: 1, marked: 0, open: 0, waiting: ['Box of Chocolate Bars', 'Dahlia'] });
+    assert.equal(allIn.text, 'Fill: everything you bought for ELIZA_BITE is in the trade · 2 not bought yet');
+    assert.equal(allIn.ok, true);
+    assert.equal(fillNote({ ...base, toSend: 2, marked: 2, open: 0 }).text, 'Fill: everything for ELIZA_BITE is in the trade');
+    // Still to add, its row marked.
+    assert.equal(fillNote({ ...base, toSend: 1, marked: 1, open: 1, waiting: ['Dahlia'] }).text, 'Fill for ELIZA_BITE: 1 item marked · 1 not bought yet');
+    // Still to add, no row here.
+    assert.match(fillNote({ ...base, toSend: 1, marked: 0, open: 1 }).text, /none of ELIZA_BITE's items are in this list/);
+});

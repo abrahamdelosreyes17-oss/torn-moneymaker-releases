@@ -578,6 +578,51 @@ export function acceptedTotals(trade) {
     return { pays, cost, profit };
 }
 
+/* ---------------------------------- What goes into the trade now (3.17.2) */
+
+/*
+ * The friend, 2026-10-03 (3.17.1 live): he made the trade mid flip - 1,320
+ * Camel Plushies bought, out of cash for the plan's other three items. The
+ * add step had no Fill all, and with all 1,320 in the trade it said "none of
+ * ELIZA_BITE's items are in this list": the three items not bought yet were
+ * counted at the plan's numbers, as things to send.
+ *
+ * Once a buy is counted, what goes in is what you bought - the Bought window's
+ * own rows (the plan's buys, and unplanned ones this trader pays for) - with
+ * your own items in the trade. A line not bought yet waits: it is said so,
+ * never offered to Fill, and not in the money expected. Before any buy is
+ * counted, the plan's numbers, as before.
+ */
+
+/**
+ * @param {object} trade - an accepted trade
+ * @returns {{send: Array<{itemId: string, name: string, qty: number}>, pays: number, waiting: string[]}}
+ *   send: one row per item; pays: what they should put in for it; waiting: the
+ *   names of the plan's lines not bought yet
+ */
+export function sendList(trade) {
+    const items = (trade && trade.items) || [];
+    const send = new Map();
+    let pays = 0;
+    const add = (itemId, name, qty, bid) => {
+        if (!(qty > 0)) return;
+        const id = String(itemId);
+        const was = send.get(id);
+        send.set(id, { itemId: id, name: was ? was.name : name, qty: (was ? was.qty : 0) + qty });
+        pays += qty * (Number(bid) || 0);
+    };
+    const bought = boughtSince(trade);
+    const running = bought.rows.length > 0 || items.some((i) => i.kind === 'flip' && (i.steps || []).some(stepDone));
+    if (!running) {
+        for (const i of items) add(i.itemId, i.name, takenUnits(i), i.bid);
+        return { send: [...send.values()], pays, waiting: [] };
+    }
+    for (const i of items) if (i.kind !== 'flip') add(i.itemId, i.name, takenUnits(i), i.bid);
+    for (const r of bought.rows) add(r.itemId, r.name, r.send, r.bid);
+    const waiting = items.filter((i) => i.kind === 'flip' && !send.has(String(i.itemId)) && (i.steps || []).some((st) => !stepDone(st))).map((i) => i.name);
+    return { send: [...send.values()], pays, waiting };
+}
+
 /* ------------------------------------------ Fill on Torn's trade page (3.14.2) */
 
 /*
@@ -595,17 +640,23 @@ export function acceptedTotals(trade) {
  * @param {string|null} p.partner - who this Torn trade is with, when known
  * @param {number} p.toSend - items of that trade with something to send
  * @param {number} p.marked - rows marked with Fill on this page
+ * @param {number|null} [p.open] - items of it still to add (not all in the trade yet); null: not known
+ * @param {string[]} [p.waiting] - the plan's lines not bought yet (sendList)
  * @returns {{ok: boolean, text: string}}
  */
-export function fillNote({ accepted = [], trader = null, partner = null, toSend = 0, marked = 0, missing = [] }) {
+export function fillNote({ accepted = [], trader = null, partner = null, toSend = 0, marked = 0, missing = [], open = null, waiting = [] }) {
     if (!accepted.length) return { ok: false, text: 'Fill: no trade accepted in Torn Bids on this browser' };
     if (!trader && partner) return { ok: false, text: 'Fill: this trade is with ' + partner + '; you accepted ' + accepted.join(', ') };
     if (!trader) return { ok: false, text: 'Fill: which trade? You accepted ' + accepted.join(', ') + ' - open it from its first page' };
     if (!toSend) return { ok: false, text: 'Fill: nothing recorded as bought for ' + trader + ' - tick Bought in Torn Bids' };
-    if (!marked) return { ok: false, text: 'Fill: none of ' + trader + '\'s items are in this list' };
+    // A trade made mid flip (3.17.2): how many of the plan's items are not bought yet (Checkout names them).
+    const later = waiting.length ? ' · ' + waiting.length + ' not bought yet' : '';
+    // All of it is in already: said so (it read "none of X's items are in this list" - their rows had left the list).
+    if (open === 0) return { ok: true, text: 'Fill: everything ' + (waiting.length ? 'you bought ' : '') + 'for ' + trader + ' is in the trade' + later };
+    if (!marked) return { ok: false, text: 'Fill: none of ' + trader + '\'s items are in this list' + later };
     // Items to send with no row here (not in your items, or on another tab): named, so none is missed.
     const gone = missing.length ? ' · not in this list: ' + missing.join(', ') : '';
-    return { ok: !missing.length, text: 'Fill for ' + trader + ': ' + marked + (marked === 1 ? ' item' : ' items') + ' marked' + gone };
+    return { ok: !missing.length, text: 'Fill for ' + trader + ': ' + marked + (marked === 1 ? ' item' : ' items') + ' marked' + gone + later };
 }
 
 /* ------------------------------------ Buys confirmed from your log (3.16) */

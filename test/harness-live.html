@@ -385,10 +385,17 @@ if (LEFTGONE) {
  * The add step marks the three rows; Fill all types 10 and 2 (the Hammer has
  * Torn's tick box - never ticked for you).
  */
-if (/[?&]sendplan=1/.test(location.search)) {
+if (/[?&]sendplan=(1|mid)/.test(location.search)) {
     const now = Date.now();
     const flip = (itemId, name, qty, price, bid) => ({ line: 'flip:' + itemId, itemId: String(itemId), name, units: qty, bid, kind: 'flip', sent: false, steps: [{ sellerId: '777', qty, price, bought: true, boughtQty: qty, boughtAt: now - 5 * 60000 }] });
-    _store[NS + 'sellAccepted'] = JSON.stringify({ 'id:11': { key: 'id:11', trader: { id: '11', name: 'Bob' }, itemId: '206', at: now - 20 * 60000, items: [flip(180, 'Bottle of Beer', 10, 40, 60), flip(206, 'Xanax', 2, 830000, 850000), flip(1, 'Hammer', 1, 100, 120)], cost: 1660500, pays: 1700720, profit: 40220 } });
+    // &sendplan=mid (3.17.2, the friend's trade made mid flip): only the Beer was bought - the Xanax and the Hammer are not bought yet.
+    const mid = /[?&]sendplan=mid/.test(location.search);
+    const todo = (line) => (mid ? { ...line, steps: line.steps.map((st) => ({ sellerId: st.sellerId, qty: st.qty, price: st.price, bought: false })) } : line);
+    _store[NS + 'sellAccepted'] = JSON.stringify({ 'id:11': { key: 'id:11', trader: { id: '11', name: 'Bob' }, itemId: '206', at: now - 20 * 60000, items: [flip(180, 'Bottle of Beer', 10, 40, 60), todo(flip(206, 'Xanax', 2, 830000, 850000)), todo(flip(1, 'Hammer', 1, 100, 120))], cost: 1660500, pays: 1700720, profit: 40220 } });
+    // &intrade=N: the trade view, seen earlier in this tab, had N Bottles of Beer in it (trade ID 5).
+    const inTrade = (location.search.match(/[?&]intrade=(\d+)/) || [])[1];
+    if (inTrade) sessionStorage.setItem('ttv2-tradeinside-5', JSON.stringify([{ name: 'Bottle of Beer', qty: Number(inTrade) }]));
+    else sessionStorage.removeItem('ttv2-tradeinside-5');
 }
 const TRADEDONE = /[?&]tradedone=1/.test(location.search);
 const TRADEDONE_TRADES = {};

@@ -352,13 +352,22 @@ you: every link is one you follow yourself, one page per click.
     of each are in already, and on the add step marks each row to send with
     **Fill N for Bob** - one press types that row's quantity into Torn's Qty
     box (a second puts back what was there); you press ADD TO TRADE and
-    Accept. **Fill all** (3.16.4, beside Torn's ADD TO TRADE, when two or
-    more rows are marked): one press types every marked row's quantity - the
+    Accept. **Fill all** (3.16.4, beside Torn's ADD TO TRADE, whenever a row
+    is marked - since 3.17.2 for one row too: it wanted two, and a trade made
+    mid flip with one item bought had none): one press types every marked row's quantity - the
     Checkout's numbers, the rows of the list you are on, one row per item -
     and a second press puts each box back as it was; rows already filled by
     their own Fill are left as they are. It never presses ADD TO TRADE,
     never ticks a box and never scrolls the list (after you scroll a long one
-    it offers the rows that came into the page). One-of-a-kind rows (weapons)
+    it offers the rows that came into the page). **A trade made mid flip
+    (3.17.2, the friend: out of cash after the first item):** once a buy is
+    counted, what goes in is what you bought (`sendList`, core/accepted.js -
+    the Bought window's rows: the plan's buys and unplanned ones this trader
+    pays for, with your own items); the plan's items not bought yet are
+    "not bought yet" - never offered to Fill, not in the money expected - and
+    with everything in, Fill's line says so (it said "none of X's items are in
+    this list"). What is in the trade is kept for the tab, so a reload of the
+    add step still knows. One-of-a-kind rows (weapons)
     say "tick Torn's box". Read off the
     owner's real trade page (2026-09-27, read only). **3.12.9:** Fill sits
     after the item's name (Torn hides the row's price/info cell on this page,
@@ -1016,6 +1025,37 @@ ms** each (longest 886 -> 607), the page rebuild inside it unchanged at about
 all five scenes; `test/faster.test.js` runs the old way beside the new one.
 What is left of the redraw is building each item's buyers anew every time
 (Part 3 B: kept between redraws, with a replay test to prove it equal).
+
+### Each item's buyers, kept between redraws (3.18.0)
+
+The friend's first speed log (3.17.1 on his laptop, 42 minutes): Torn Bids
+redrew 271 times at **788 ms each** - twice what the bench says - and the
+page rebuild was 7.7 ms of it. The rest is working out, and half of that was
+`buyersForItem`, run for every item on every redraw, though a redraw follows
+one answer (a bazaar read, a status, one trader's list) and nearly every
+item's buyers are what they were.
+
+`src/core/kept-buyers.js` (`PLAN-speed.md` Part 3 B, step 11) hands an item's
+rows back as they were while everything `buyersForItem` would read for it is
+unchanged. Nothing tells it when something changes - each redraw it looks:
+the item's own sources value by value, and each trader's votes, name and
+rating once a redraw, so that a change sends only the items that read that
+trader back to be worked out. No place that changes a list can be forgotten.
+
+- **Proof:** `test/kept-buyers.test.js` replays 8,000 redraws of a made-up
+  session (lists read, traders learned and dropped, ratings and votes moving,
+  things changed in place) and compares every item's kept rows with a fresh
+  `buyersForItem` at every step. Fifteen ways of breaking the keeper were
+  tried by hand; the test fails on each.
+- **In use:** one kept item each redraw is worked out again and compared.
+  Should they ever differ, keeping stops for that page (every item worked
+  out each redraw, as before) and the problem log says so.
+- **Measured** (bench, processor slowed 4x, 40 s, `--build` for the before):
+  Torn Bids' redraw **355 ms -> 189 ms** each, frozen time 16.9 s -> 9.8 s.
+  `--compare`: the same requests and the same page on all five scenes.
+
+Next in the redraw: the TornW3B lists index rebuilt whole on every list read
+(step 14), then the page rebuild.
 
 ---
 

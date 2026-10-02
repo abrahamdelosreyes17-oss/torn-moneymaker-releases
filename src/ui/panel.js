@@ -925,7 +925,7 @@ export class Panel {
      *
      * @param {Array|null} trades - accepted trades (core/accepted.js); null hides the box
      * @param {object} [ctx] - {partner, match: 'ok'|'other'|null, wanted: string[],
-     *   need: [{name, qty, inside}], money: {offer, expected}|null}
+     *   need: [{name, qty, inside}], waiting: string[], expected: number, money: {offer, expected}|null}
      */
     setTrades(trades, ctx = {}) {
         const box = this.tradeBoxEl;
@@ -944,7 +944,8 @@ export class Panel {
         }
         for (const t of list) {
             const need = ctx.need && list.length === 1 ? ctx.need : t.items.map((i) => ({ name: i.name, qty: i.units, inside: 0 }));
-            const expected = ctx.money ? ctx.money.expected : t.pays;
+            // What goes in now (3.17.2: a trade made mid flip is not the whole plan's money).
+            const expected = ctx.money ? ctx.money.expected : list.length === 1 && ctx.expected > 0 ? ctx.expected : t.pays;
             const block = el('div', { class: 'ttv2-tb' }, [
                 el('div', { class: 'ttv2-tb-head' }, [
                     el('b', { text: 'Trade with ' + t.trader.name }),
@@ -972,6 +973,8 @@ export class Panel {
                     el('span', { class: 'ttv2-tb-in', text: n.inside ? n.inside.toLocaleString('en-US') + ' in' : '' }),
                 ]));
             }
+            // A trade made mid flip (3.17.2): the plan's items not bought yet - not to send, not in the money above.
+            if (ctx.waiting && ctx.waiting.length && list.length === 1) block.appendChild(el('div', { class: 'ttv2-sub', text: 'Not bought yet: ' + ctx.waiting.join(', ') }));
             box.appendChild(block);
         }
     }

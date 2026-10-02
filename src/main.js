@@ -64,7 +64,7 @@ import { deskItem, nextW3bRead, backgroundSlot, backgroundListSlot, flipsStale, 
 import { liquidityKind, unitsMoved, addMovement, stopsMinutes, EXTRA_CAP } from './core/liquidity.js';
 import { usageAdd, usageMerge, usageSeries, USAGE_SERVICES, USAGE_RANGES, USAGE_LABELS } from './core/usage.js';
 import { addLogEntries, logText } from './core/errlog.js';
-import { checkoutList, boughtSince, stockBuys, addExtraBuy, applyLogBuys, bazaarBuyRows, addLogBuys, splitLogBuys, sellElsewhere, LOG_BUY_SLACK_MS, acceptTrade, liveAccepted, stepState, tickAccepted, stepDone, nextStep, boughtFromStock, recordBuy, sendUnits, acceptedTotals, replacementFor, replaceStep, dropLine, markLeft, leftoversOf, cancelledLeftovers, addLeftovers, takenUnits, fillNote, finishedTradeFor, tradedLeftovers, removeLeftovers, itemsGiven, tradePartnerId, tradeFinishedAt, TRADE_DONE_SLACK_MS, leftoversAfterSales, leftoverFrom } from './core/accepted.js';
+import { checkoutList, boughtSince, stockBuys, addExtraBuy, applyLogBuys, bazaarBuyRows, addLogBuys, splitLogBuys, sellElsewhere, LOG_BUY_SLACK_MS, acceptTrade, liveAccepted, stepState, tickAccepted, stepDone, nextStep, boughtFromStock, recordBuy, sendUnits, acceptedTotals, replacementFor, replaceStep, dropLine, markLeft, leftoversOf, cancelledLeftovers, addLeftovers, sendList, fillNote, finishedTradeFor, tradedLeftovers, removeLeftovers, itemsGiven, tradePartnerId, tradeFinishedAt, TRADE_DONE_SLACK_MS, leftoversAfterSales, leftoverFrom } from './core/accepted.js';
 import { readTradeView, readTradeAddRows } from './sources/dom/trade.js';
 import { BoughtWindow } from './ui/bought-window.js';
 import { makeTabId, LEADER_HEARTBEAT_MS } from './core/leader.js';
@@ -121,6 +121,7 @@ import {
     trustedOnly,
     liveW3bPrices,
 } from './core/traders.js';
+import { makeBuyersKeeper } from './core/kept-buyers.js';
 import {
     mergeInventory,
     makeInventoryCacheEntry,
@@ -497,6 +498,7 @@ const app = {
     /* Torn's trade page: who each trade (by its ID) is with, and what you have put in. */
     tradePartners: new Map(),
     tradeInside: new Map(),
+    tradeInsideKept: new Map(),
     buyHere: null,
     /*
      * The bazaar you are on (3.16.3): what of its list is in the page now
@@ -3451,7 +3453,28 @@ function scanTradePageNow() {
             /* this page load only */
         }
     }
-    if (view && tradeId) app.tradeInside.set(tradeId, view.you.items);
+    if (view && tradeId) {
+        app.tradeInside.set(tradeId, view.you.items);
+        // Kept for this tab, like the partner: a reload of the add step still knows what is in (3.17.2).
+        const now = JSON.stringify(view.you.items);
+        if (app.tradeInsideKept.get(tradeId) !== now) {
+            app.tradeInsideKept.set(tradeId, now);
+            try {
+                sessionStorage.setItem('ttv2-tradeinside-' + tradeId, now);
+            } catch {
+                /* this page load only */
+            }
+        }
+    } else if (tradeId && !app.tradeInside.has(tradeId)) {
+        let was = null;
+        try {
+            was = JSON.parse(sessionStorage.getItem('ttv2-tradeinside-' + tradeId) || 'null');
+        } catch {
+            was = null;
+        }
+        // Looked for once: no trade view seen in this tab means nothing known, not nothing in.
+        app.tradeInside.set(tradeId, Array.isArray(was) ? was.filter((it) => it && it.name && Number(it.qty) > 0) : []);
+    }
     // Who the trade is with by Torn id: "#step=start&userID=N" (the Trade link
     // Torn Bids opens) is kept for this tab and tied to the trade that follows.
     let userId = null;
@@ -3481,16 +3504,14 @@ function scanTradePageNow() {
     const byId = userId ? accepted.find((t) => t.trader.id && String(t.trader.id) === String(userId)) : null;
     const trade = (partner ? accepted.find((t) => lower(t.trader.name) === lower(partner)) : null) || byId || (!partner && accepted.length === 1 ? accepted[0] : null);
 
-    // What goes in, per item (one item can be in a trade twice: flipped and yours).
-    const need = new Map();
-    for (const i of (trade && trade.items) || []) {
-        // What goes to them: what you bought, minus what they said they won't take.
-        const n = takenUnits(i);
-        if (n > 0) need.set(i.itemId, { name: i.name, qty: (need.get(i.itemId) || { qty: 0 }).qty + n });
-    }
+    // What goes in, per item (one item can be in a trade twice: flipped and yours):
+    // what you bought, minus what they said they won't take. A trade made mid
+    // flip (3.17.2): the plan's lines not bought yet wait, and are not expected money.
+    const list = sendList(trade);
+    const need = new Map(list.send.map((n) => [n.itemId, { name: n.name, qty: n.qty }]));
     const inside = new Map();
     for (const it of (tradeId && app.tradeInside.get(tradeId)) || []) inside.set(lower(it.name), (inside.get(lower(it.name)) || 0) + it.qty);
-    const expected = trade ? acceptedTotals(trade).pays : 0;
+    const expected = list.pays;
     // The Bought window's checklist: this trade, and what is in it now.
     app.tradeCheck = trade ? { key: trade.key, inside, at: Date.now() } : null;
     updateBoughtWindow();
@@ -3500,12 +3521,15 @@ function scanTradePageNow() {
         match: trade ? 'ok' : partner && accepted.length ? 'other' : null,
         wanted: accepted.map((t) => t.trader.name),
         need: [...need.values()].map((n) => ({ ...n, inside: inside.get(lower(n.name)) || 0 })),
+        waiting: list.waiting,
+        expected,
         money: view && trade ? { offer: view.them.money, expected } : null,
     });
 
     // The add step: mark each row to send, with Fill. Updated in place, not
     // redrawn: a chip replaced under a press would swallow it.
-    const note = (marked, missing = []) => showFillNote(fillNote({ accepted: accepted.map((t) => t.trader.name), trader: trade ? trade.trader.name : null, partner, toSend: need.size, marked, missing }));
+    const open = [...need.values()].filter((n) => n.qty > (inside.get(lower(n.name)) || 0)).length;
+    const note = (marked, missing = []) => showFillNote(fillNote({ accepted: accepted.map((t) => t.trader.name), trader: trade ? trade.trader.name : null, partner, toSend: need.size, marked, missing, open, waiting: list.waiting }));
     if (!trade) {
         clearSendMarks();
         note(0);
@@ -3606,9 +3630,10 @@ function fillAllChips() {
 function showFillAll(trader) {
     const chips = fillAllChips();
     let btn = document.querySelector('.' + TRADE_FILLALL_CLASS);
-    // One row has its own Fill; this is for several (and with fewer, Torn's bar is not even looked for).
-    const bar = chips.length < 2 ? null : tradeAddBar();
-    if (!bar || !bar.parentElement || chips.length < 2) {
+    // For one row too (3.17.2; it wanted two, and the friend - one item bought, mid flip - had no Fill all:
+    // its row is far down a long list). With none, Torn's bar is not even looked for.
+    const bar = chips.length ? tradeAddBar() : null;
+    if (!bar || !bar.parentElement) {
         if (btn) btn.remove();
         return;
     }
@@ -3622,7 +3647,7 @@ function showFillAll(trader) {
     const noteTag = bar.parentElement.querySelector('.' + TRADE_NOTE_CLASS);
     if (btn.parentElement !== bar.parentElement || (noteTag && btn.nextSibling !== noteTag)) bar.parentElement.insertBefore(btn, noteTag);
     const todo = chips.filter((c) => c.getAttribute('aria-pressed') !== 'true').length;
-    const text = todo ? '☐ Fill all ' + todo + (todo === 1 ? ' item' : ' items') + ' for ' + trader : '☑ All ' + chips.length + ' items filled for ' + trader;
+    const text = todo ? '☐ Fill all ' + todo + (todo === 1 ? ' item' : ' items') + ' for ' + trader : (chips.length === 1 ? '☑ 1 item' : '☑ All ' + chips.length + ' items') + ' filled for ' + trader;
     const title = todo ? 'Type each marked row\'s quantity into its Qty box. You press ADD TO TRADE.' : 'Untick to put back what was in the boxes';
     if (btn.textContent !== text) btn.textContent = text;
     if (btn.title !== title) btn.title = title;
@@ -4518,6 +4543,8 @@ function registerMenu() {
 const led = { client: null, data: null, busy: false, checking: false, error: null, keyError: null, saveMsg: null, nextAt: 0, buysClient: null, buysBusy: false, buysNextAt: 0 };
 
 const sell = {
+    /* Each item's buyers, kept between redraws (core/kept-buyers.js). */
+    buyersKeeper: null,
     /* Traders' TornExchange / TornW3B badges seen so far (the Ledger's Traders tab shows them). */
     trustById: new Map(),
     /* Every TornW3B buyer of an item (3.15, /traders): itemId -> {at, triedAt, total, traders, loading, error}. */
@@ -5550,7 +5577,7 @@ function loadSelfId() {
  * trader database's TornW3B lists. Answers are kept per item for one pass.
  * The traders page and the panel's bazaar tags both use it.
  */
-function buyerLookup({ teMap, lists, teOne, idsByName, db, w3bByItem, dbIdsByName, teOwn = new Map(), votes = new Map(), itemTraders = null, now = Date.now() }) {
+function buyerLookup({ teMap, lists, teOne, idsByName, db, w3bByItem, dbIdsByName, teOwn = new Map(), votes = new Map(), itemTraders = null, now = Date.now(), keeper = null }) {
     // TornExchange's votes for the trust badge, from every answer we have,
     // then the ones remembered from earlier answers.
     const votesById = votesByTrader([
@@ -5558,6 +5585,8 @@ function buyerLookup({ teMap, lists, teOne, idsByName, db, w3bByItem, dbIdsByNam
         ...[...teOne.values()].filter((rec) => rec.best).map((rec) => [rec.best]),
     ]);
     for (const [id, score] of votes) if (!votesById.has(id)) votesById.set(id, score);
+    // Torn Bids keeps each item's rows between redraws (3.18.0, core/kept-buyers.js): what every item shares is looked at once here.
+    if (keeper) keeper.begin({ idsByName, dbIdsByName, votesById, db });
     const cache = new Map();
     return (itemId) => {
         const id = String(itemId);
@@ -5565,7 +5594,7 @@ function buyerLookup({ teMap, lists, teOne, idsByName, db, w3bByItem, dbIdsByNam
         if (!b) {
             const full = lists.get(id);
             const one = teOne.get(id);
-            b = buyersForItem(id, {
+            const src = {
                 // The keyed top three when TornExchange has them; else its
                 // keyless best buyer for this item.
                 teBest: teMap.get(id) || (one && one.best ? [one.best] : []),
@@ -5581,11 +5610,27 @@ function buyerLookup({ teMap, lists, teOne, idsByName, db, w3bByItem, dbIdsByNam
                     const it = itemTraders && itemTraders.get(id);
                     return it && it.at && now - it.at < W3B_BUYERS_TTL_MS ? it.traders : null;
                 })(),
-            });
+            };
+            b = keeper ? keeper.buyers(id, src) : buyersForItem(id, src);
             cache.set(id, b);
         }
         return b;
     };
+}
+
+/**
+ * Torn Bids' kept buyers (3.18.0): made once a page. Should its own check
+ * ever find a kept item different from a fresh one, it stops keeping (every
+ * redraw then works every item out, as before 3.18.0) and the problem log
+ * says so - the next zip shows it.
+ */
+function sellBuyersKeeper() {
+    if (!sell.buyersKeeper) {
+        sell.buyersKeeper = makeBuyersKeeper({
+            onDiffer: (itemId) => logProblem('error', 'Kept buyers differed from fresh ones (item ' + itemId + ')', 'keeping is off until this page is reloaded; nothing shown was wrong after this line'),
+        });
+    }
+    return sell.buyersKeeper;
 }
 
 /** Everything the page shows, from what is loaded now. */
@@ -5650,7 +5695,7 @@ function renderSellingWork() {
         const add = list.filter((r) => !seen.has(String(r.id)));
         if (add.length) ownByItem.set(itemId, [...have, ...add]);
     }
-    const buyersAll = buyerLookup({ teMap, lists: sell.lists, teOne: sell.teOne, idsByName: sell.idsByName, db: sell.db, w3bByItem, dbIdsByName: sell.dbIdsByName, teOwn: ownByItem, votes: sell.votes || new Map(), itemTraders: sell.itemTraders, now });
+    const buyersAll = buyerLookup({ teMap, lists: sell.lists, teOne: sell.teOne, idsByName: sell.idsByName, db: sell.db, w3bByItem, dbIdsByName: sell.dbIdsByName, teOwn: ownByItem, votes: sell.votes || new Map(), itemTraders: sell.itemTraders, now, keeper: sellBuyersKeeper() });
     const levelOf = (id) => presenceLevel(sellPresenceOf(id));
     // Trusted means Known (20+ votes) or Trusted; while TornExchange's votes
     // are not loaded, a trader without any is kept ("no votes yet").

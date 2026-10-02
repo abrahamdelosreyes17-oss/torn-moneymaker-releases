@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      3.17.1
+// @version      3.18.0
 // @description  Finds Bazaar and Item Market listings below NPC / market value - on the page you are viewing, and live from the Torn API and TornW3B - ranked by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -42,7 +42,7 @@
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '3.17.1';
+    const TTV2_BUILD_VERSION = '3.18.0';
 
     /* ===== src/platform/gm.js ===== */
     /*
@@ -1950,6 +1950,51 @@
         return { pays, cost, profit };
     }
 
+    /* ---------------------------------- What goes into the trade now (3.17.2) */
+
+    /*
+     * The friend, 2026-10-03 (3.17.1 live): he made the trade mid flip - 1,320
+     * Camel Plushies bought, out of cash for the plan's other three items. The
+     * add step had no Fill all, and with all 1,320 in the trade it said "none of
+     * ELIZA_BITE's items are in this list": the three items not bought yet were
+     * counted at the plan's numbers, as things to send.
+     *
+     * Once a buy is counted, what goes in is what you bought - the Bought window's
+     * own rows (the plan's buys, and unplanned ones this trader pays for) - with
+     * your own items in the trade. A line not bought yet waits: it is said so,
+     * never offered to Fill, and not in the money expected. Before any buy is
+     * counted, the plan's numbers, as before.
+     */
+
+    /**
+     * @param {object} trade - an accepted trade
+     * @returns {{send: Array<{itemId: string, name: string, qty: number}>, pays: number, waiting: string[]}}
+     *   send: one row per item; pays: what they should put in for it; waiting: the
+     *   names of the plan's lines not bought yet
+     */
+    function sendList(trade) {
+        const items = (trade && trade.items) || [];
+        const send = new Map();
+        let pays = 0;
+        const add = (itemId, name, qty, bid) => {
+            if (!(qty > 0)) return;
+            const id = String(itemId);
+            const was = send.get(id);
+            send.set(id, { itemId: id, name: was ? was.name : name, qty: (was ? was.qty : 0) + qty });
+            pays += qty * (Number(bid) || 0);
+        };
+        const bought = boughtSince(trade);
+        const running = bought.rows.length > 0 || items.some((i) => i.kind === 'flip' && (i.steps || []).some(stepDone));
+        if (!running) {
+            for (const i of items) add(i.itemId, i.name, takenUnits(i), i.bid);
+            return { send: [...send.values()], pays, waiting: [] };
+        }
+        for (const i of items) if (i.kind !== 'flip') add(i.itemId, i.name, takenUnits(i), i.bid);
+        for (const r of bought.rows) add(r.itemId, r.name, r.send, r.bid);
+        const waiting = items.filter((i) => i.kind === 'flip' && !send.has(String(i.itemId)) && (i.steps || []).some((st) => !stepDone(st))).map((i) => i.name);
+        return { send: [...send.values()], pays, waiting };
+    }
+
     /* ------------------------------------------ Fill on Torn's trade page (3.14.2) */
 
     /*
@@ -1967,17 +2012,23 @@
      * @param {string|null} p.partner - who this Torn trade is with, when known
      * @param {number} p.toSend - items of that trade with something to send
      * @param {number} p.marked - rows marked with Fill on this page
+     * @param {number|null} [p.open] - items of it still to add (not all in the trade yet); null: not known
+     * @param {string[]} [p.waiting] - the plan's lines not bought yet (sendList)
      * @returns {{ok: boolean, text: string}}
      */
-    function fillNote({ accepted = [], trader = null, partner = null, toSend = 0, marked = 0, missing = [] }) {
+    function fillNote({ accepted = [], trader = null, partner = null, toSend = 0, marked = 0, missing = [], open = null, waiting = [] }) {
         if (!accepted.length) return { ok: false, text: 'Fill: no trade accepted in Torn Bids on this browser' };
         if (!trader && partner) return { ok: false, text: 'Fill: this trade is with ' + partner + '; you accepted ' + accepted.join(', ') };
         if (!trader) return { ok: false, text: 'Fill: which trade? You accepted ' + accepted.join(', ') + ' - open it from its first page' };
         if (!toSend) return { ok: false, text: 'Fill: nothing recorded as bought for ' + trader + ' - tick Bought in Torn Bids' };
-        if (!marked) return { ok: false, text: 'Fill: none of ' + trader + '\'s items are in this list' };
+        // A trade made mid flip (3.17.2): how many of the plan's items are not bought yet (Checkout names them).
+        const later = waiting.length ? ' · ' + waiting.length + ' not bought yet' : '';
+        // All of it is in already: said so (it read "none of X's items are in this list" - their rows had left the list).
+        if (open === 0) return { ok: true, text: 'Fill: everything ' + (waiting.length ? 'you bought ' : '') + 'for ' + trader + ' is in the trade' + later };
+        if (!marked) return { ok: false, text: 'Fill: none of ' + trader + '\'s items are in this list' + later };
         // Items to send with no row here (not in your items, or on another tab): named, so none is missed.
         const gone = missing.length ? ' · not in this list: ' + missing.join(', ') : '';
-        return { ok: !missing.length, text: 'Fill for ' + trader + ': ' + marked + (marked === 1 ? ' item' : ' items') + ' marked' + gone };
+        return { ok: !missing.length, text: 'Fill for ' + trader + ': ' + marked + (marked === 1 ? ' item' : ' items') + ' marked' + gone + later };
     }
 
     /* ------------------------------------ Buys confirmed from your log (3.16) */
@@ -9856,6 +9907,254 @@
         return [...out.values()];
     }
 
+    /* ===== src/core/kept-buyers.js ===== */
+    /*
+     * Each item's buyers, kept between Torn Bids' redraws (3.18.0; PLAN-speed.md
+     * Part 3 B, step 11).
+     *
+     * The friend's speed log (2026-10-03, 3.17.1 on his laptop): Torn Bids redrew
+     * 271 times in 42 minutes at 788 ms each, the page rebuild only 7.7 ms of it.
+     * A profile of the bench says where the rest goes: buyersForItem, run anew
+     * for every item on every redraw - though a redraw follows one answer (a
+     * bazaar read, a status, one trader's list) and nearly every item's buyers
+     * are what they were.
+     *
+     * Kept here: an item's rows are handed back as they were while everything
+     * buyersForItem would read for that item is what it read last time. Nothing
+     * is told to this file when something changes - each redraw it LOOKS: the
+     * item's own sources are compared value by value (TornExchange's top three,
+     * its full list, your traders' own lists, TornW3B's buyers of it, the lists
+     * index), and what items share - each trader's votes, name and rating - is
+     * compared once a redraw, trader by trader: an item is worked out again when
+     * a trader in its rows or its TornW3B list changed, and only then (a list
+     * read brings one trader's rating; it must not throw every item away).
+     * Anything different: worked out again. So no place that changes a list can
+     * be forgotten.
+     *
+     * Proof (test/kept-buyers.test.js): a long made-up session - lists read,
+     * traders learned and dropped, ratings and votes moving, lists ageing out -
+     * with the kept rows compared with a fresh buyersForItem for every item at
+     * every step. And in use, one kept item each redraw is worked out again and
+     * compared: should they ever differ, keeping stops for that page and it is
+     * written in the problem log.
+     *
+     * Pure: no DOM, no storage, no clock.
+     */
+
+
+
+    const KEPT_NO_ROWS = [];
+
+    /** The same keys with the same values (b may be null: no entries). */
+    function keptSameMap(a, b) {
+        const size = b ? b.size : 0;
+        if (a.size !== size) return false;
+        if (!size) return true;
+        for (const [k, v] of b) {
+            const was = a.get(k);
+            if (!Object.is(was, v) || (was === undefined && !a.has(k))) return false;
+        }
+        return true;
+    }
+
+    /**
+     * @param {object} [o]
+     * @param {function} [o.compute] - buyersForItem (a test may count its calls)
+     * @param {function} [o.onDiffer] - (itemId) => void: a kept item differed from a fresh one (keeping is then off)
+     * @param {boolean} [o.freeze] - freeze what is handed out (tests: a caller writing into kept rows fails loudly)
+     */
+    function makeBuyersKeeper({ compute = buyersForItem, onDiffer = null, freeze = false } = {}) {
+        const kept = new Map();
+        const stats = { kept: 0, redone: 0, checked: 0, differed: 0 };
+        // What items share, as last seen. Votes, names and ratings: per trader (see `dependents`).
+        // The two name lists: a number that moves when one changes (only an item with a full list reads them whole).
+        let votes = new Map();
+        let ids = new Map();
+        let idsVer = 0;
+        let dbIds = new Map();
+        let dbIdsVer = 0;
+        const people = new Map();
+        // Trader id -> the items whose kept rows read that trader's votes, name or rating.
+        // (An item stays listed after it is worked out again without them: it is then only looked at once too often.)
+        const dependents = new Map();
+        const changedTrader = (id) => {
+            const items = dependents.get(id);
+            if (!items) return;
+            for (const itemId of items) kept.delete(itemId);
+            items.clear();
+        };
+        let off = false;
+        // One kept item a redraw is worked out again and compared: which one moves on each redraw.
+        let hits = 0;
+        let lastHits = 0;
+        let checkAt = 0;
+
+        /** Once a redraw, before any buyers(): what every item shares is looked at. */
+        function begin({ idsByName = null, dbIdsByName = null, votesById = null, db = null } = {}) {
+            lastHits = hits;
+            hits = 0;
+            checkAt = lastHits ? (checkAt + 7) % lastHits : 0;
+            if (!keptSameMap(votes, votesById)) {
+                const now = votesById || new Map();
+                for (const [id, v] of now) if (!Object.is(votes.get(id), v) || !votes.has(id)) changedTrader(id);
+                for (const id of votes.keys()) if (!now.has(id)) changedTrader(id);
+                votes = new Map(now);
+            }
+            if (!keptSameMap(ids, idsByName)) {
+                ids = new Map(idsByName || []);
+                idsVer += 1;
+            }
+            if (!keptSameMap(dbIds, dbIdsByName)) {
+                dbIds = new Map(dbIdsByName || []);
+                dbIdsVer += 1;
+            }
+            // The traders' names and ratings, as buyersForItem reads them: one
+            // learned, dropped or changed sends the items that read them back to be worked out.
+            const traders = (db && db.traders) || {};
+            let seen = 0;
+            for (const id in traders) {
+                if (!Object.prototype.hasOwnProperty.call(traders, id)) continue;
+                seen += 1;
+                const t = traders[id];
+                const name = t ? t.name : undefined;
+                const rating = (t && t.rating) || null;
+                const up = rating ? rating.up : null;
+                const down = rating ? rating.down : null;
+                const p = people.get(id);
+                if (!p) {
+                    people.set(id, { there: Boolean(t), name, rated: Boolean(rating), up, down });
+                    changedTrader(id);
+                } else if (p.there !== Boolean(t) || p.name !== name || p.rated !== Boolean(rating) || !Object.is(p.up, up) || !Object.is(p.down, down)) {
+                    p.there = Boolean(t);
+                    p.name = name;
+                    p.rated = Boolean(rating);
+                    p.up = up;
+                    p.down = down;
+                    changedTrader(id);
+                }
+            }
+            if (people.size !== seen) {
+                for (const id of [...people.keys()]) {
+                    if (Object.prototype.hasOwnProperty.call(traders, id)) continue;
+                    people.delete(id);
+                    changedTrader(id);
+                }
+            }
+        }
+
+        /** Everything buyersForItem reads for this item but the lists index: one flat row of values. */
+        function tokensOf(src) {
+            const tk = [Boolean(src.db), Boolean(src.votesById)];
+            const idsByName = src.idsByName || null;
+            const dbIdsByName = src.dbIdsByName || null;
+            const teBest = src.teBest || KEPT_NO_ROWS;
+            tk.push(teBest.length);
+            for (const t of teBest) {
+                if (!t) {
+                    tk.push(null);
+                    continue;
+                }
+                tk.push(t.name, t.price, t.score, t.id);
+                // Who that name is: asked of the two name lists for this name only (a trader learned elsewhere changes no other item).
+                if (t.name) {
+                    const lower = String(t.name).toLowerCase();
+                    tk.push(idsByName ? idsByName.get(lower) : undefined, dbIdsByName ? dbIdsByName.get(lower) : undefined);
+                }
+            }
+            // A full list looks every name up, and whether the active traders are known at all.
+            if (Array.isArray(src.teFull)) {
+                tk.push('full', idsVer, dbIdsVer, src.teFull.length);
+                for (const t of src.teFull) tk.push(t ? t.name : null, t ? t.price : null);
+            } else {
+                tk.push('nofull');
+            }
+            const own = src.teOwn || KEPT_NO_ROWS;
+            tk.push(own.length);
+            for (const t of own) tk.push(t ? t.id : null, t ? t.name : null, t ? t.price : null, t ? t.lastPaid : null);
+            const item = src.w3bItem || KEPT_NO_ROWS;
+            tk.push(item.length);
+            for (const t of item) tk.push(t ? t.id : null, t ? t.name : null, t ? t.price : null, t ? t.up : null, t ? t.down : null);
+            return tk;
+        }
+
+        function sameTokens(a, b) {
+            if (a.length !== b.length) return false;
+            for (let i = 0; i < a.length; i += 1) if (!Object.is(a[i], b[i])) return false;
+            return true;
+        }
+
+        /** The item's TornW3B list in the index: the same list, or one that says the same (the index is rebuilt each minute). */
+        function sameW3b(was, list) {
+            if (was.w3b === list) return true;
+            const old = was.w3b;
+            if (old.length !== list.length) return false;
+            for (let i = 0; i < list.length; i += 1) {
+                const a = old[i];
+                const b = list[i];
+                if (a !== b && (!a || !b || a.id !== b.id || !Object.is(a.price, b.price))) return false;
+            }
+            was.w3b = list;
+            return true;
+        }
+
+        /**
+         * buyersForItem(itemId, src), or the rows it gave last time when it would
+         * give the same again. `src` is what buyersForItem takes.
+         */
+        function buyers(itemId, src = {}) {
+            const id = String(itemId);
+            if (off) return compute(id, src);
+            const list = (src.w3bByItem && src.w3bByItem.get(id)) || KEPT_NO_ROWS;
+            const tk = tokensOf(src);
+            const was = kept.get(id);
+            if (was && sameTokens(was.tk, tk) && sameW3b(was, list)) {
+                stats.kept += 1;
+                hits += 1;
+                if (hits - 1 !== checkAt) return was.out;
+                // This redraw's check: the kept rows against fresh ones.
+                const fresh = compute(id, src);
+                stats.checked += 1;
+                if (JSON.stringify(fresh) === JSON.stringify(was.out)) return was.out;
+                stats.differed += 1;
+                off = true;
+                kept.clear();
+                if (onDiffer) onDiffer(id);
+                return fresh;
+            }
+            const out = compute(id, src);
+            stats.redone += 1;
+            // Whose votes, name or rating these rows read: every trader of the item's TornW3B list (the name), every row (votes, rating).
+            const depend = (traderId) => {
+                if (!traderId) return;
+                const key = String(traderId);
+                let items = dependents.get(key);
+                if (!items) dependents.set(key, (items = new Set()));
+                items.add(id);
+            };
+            for (let i = 0; i < list.length; i += 1) depend(list[i] && list[i].id);
+            for (const r of out) depend(r.id);
+            if (freeze) {
+                for (const r of out) {
+                    if (r.trust) Object.freeze(r.trust);
+                    if (r.itemRating) Object.freeze(r.itemRating);
+                    Object.freeze(r);
+                }
+                Object.freeze(out);
+            }
+            kept.set(id, { tk, w3b: list, out });
+            return out;
+        }
+
+        return {
+            begin,
+            buyers,
+            stats,
+            /** Whether keeping is still on (off after a kept item differed). */
+            on: () => !off,
+            clear: () => kept.clear(),
+        };
+    }
+
     /* ===== src/core/inventory.js ===== */
     /*
      * Your inventory, from GET /v2/user/inventory (Limited key). Pure.
@@ -15150,7 +15449,7 @@
          *
          * @param {Array|null} trades - accepted trades (core/accepted.js); null hides the box
          * @param {object} [ctx] - {partner, match: 'ok'|'other'|null, wanted: string[],
-         *   need: [{name, qty, inside}], money: {offer, expected}|null}
+         *   need: [{name, qty, inside}], waiting: string[], expected: number, money: {offer, expected}|null}
          */
         setTrades(trades, ctx = {}) {
             const box = this.tradeBoxEl;
@@ -15169,7 +15468,8 @@
             }
             for (const t of list) {
                 const need = ctx.need && list.length === 1 ? ctx.need : t.items.map((i) => ({ name: i.name, qty: i.units, inside: 0 }));
-                const expected = ctx.money ? ctx.money.expected : t.pays;
+                // What goes in now (3.17.2: a trade made mid flip is not the whole plan's money).
+                const expected = ctx.money ? ctx.money.expected : list.length === 1 && ctx.expected > 0 ? ctx.expected : t.pays;
                 const block = el('div', { class: 'ttv2-tb' }, [
                     el('div', { class: 'ttv2-tb-head' }, [
                         el('b', { text: 'Trade with ' + t.trader.name }),
@@ -15197,6 +15497,8 @@
                         el('span', { class: 'ttv2-tb-in', text: n.inside ? n.inside.toLocaleString('en-US') + ' in' : '' }),
                     ]));
                 }
+                // A trade made mid flip (3.17.2): the plan's items not bought yet - not to send, not in the money above.
+                if (ctx.waiting && ctx.waiting.length && list.length === 1) block.appendChild(el('div', { class: 'ttv2-sub', text: 'Not bought yet: ' + ctx.waiting.join(', ') }));
                 box.appendChild(block);
             }
         }
@@ -21766,6 +22068,7 @@
 
 
 
+
     const STORE_KEY = 'apiKey';
     const STORE_ITEMS = 'itemsCache';
     const STORE_NPC = 'npcCache';
@@ -22049,6 +22352,7 @@
         /* Torn's trade page: who each trade (by its ID) is with, and what you have put in. */
         tradePartners: new Map(),
         tradeInside: new Map(),
+        tradeInsideKept: new Map(),
         buyHere: null,
         /*
          * The bazaar you are on (3.16.3): what of its list is in the page now
@@ -25003,7 +25307,28 @@
                 /* this page load only */
             }
         }
-        if (view && tradeId) app.tradeInside.set(tradeId, view.you.items);
+        if (view && tradeId) {
+            app.tradeInside.set(tradeId, view.you.items);
+            // Kept for this tab, like the partner: a reload of the add step still knows what is in (3.17.2).
+            const now = JSON.stringify(view.you.items);
+            if (app.tradeInsideKept.get(tradeId) !== now) {
+                app.tradeInsideKept.set(tradeId, now);
+                try {
+                    sessionStorage.setItem('ttv2-tradeinside-' + tradeId, now);
+                } catch {
+                    /* this page load only */
+                }
+            }
+        } else if (tradeId && !app.tradeInside.has(tradeId)) {
+            let was = null;
+            try {
+                was = JSON.parse(sessionStorage.getItem('ttv2-tradeinside-' + tradeId) || 'null');
+            } catch {
+                was = null;
+            }
+            // Looked for once: no trade view seen in this tab means nothing known, not nothing in.
+            app.tradeInside.set(tradeId, Array.isArray(was) ? was.filter((it) => it && it.name && Number(it.qty) > 0) : []);
+        }
         // Who the trade is with by Torn id: "#step=start&userID=N" (the Trade link
         // Torn Bids opens) is kept for this tab and tied to the trade that follows.
         let userId = null;
@@ -25033,16 +25358,14 @@
         const byId = userId ? accepted.find((t) => t.trader.id && String(t.trader.id) === String(userId)) : null;
         const trade = (partner ? accepted.find((t) => lower(t.trader.name) === lower(partner)) : null) || byId || (!partner && accepted.length === 1 ? accepted[0] : null);
 
-        // What goes in, per item (one item can be in a trade twice: flipped and yours).
-        const need = new Map();
-        for (const i of (trade && trade.items) || []) {
-            // What goes to them: what you bought, minus what they said they won't take.
-            const n = takenUnits(i);
-            if (n > 0) need.set(i.itemId, { name: i.name, qty: (need.get(i.itemId) || { qty: 0 }).qty + n });
-        }
+        // What goes in, per item (one item can be in a trade twice: flipped and yours):
+        // what you bought, minus what they said they won't take. A trade made mid
+        // flip (3.17.2): the plan's lines not bought yet wait, and are not expected money.
+        const list = sendList(trade);
+        const need = new Map(list.send.map((n) => [n.itemId, { name: n.name, qty: n.qty }]));
         const inside = new Map();
         for (const it of (tradeId && app.tradeInside.get(tradeId)) || []) inside.set(lower(it.name), (inside.get(lower(it.name)) || 0) + it.qty);
-        const expected = trade ? acceptedTotals(trade).pays : 0;
+        const expected = list.pays;
         // The Bought window's checklist: this trade, and what is in it now.
         app.tradeCheck = trade ? { key: trade.key, inside, at: Date.now() } : null;
         updateBoughtWindow();
@@ -25052,12 +25375,15 @@
             match: trade ? 'ok' : partner && accepted.length ? 'other' : null,
             wanted: accepted.map((t) => t.trader.name),
             need: [...need.values()].map((n) => ({ ...n, inside: inside.get(lower(n.name)) || 0 })),
+            waiting: list.waiting,
+            expected,
             money: view && trade ? { offer: view.them.money, expected } : null,
         });
 
         // The add step: mark each row to send, with Fill. Updated in place, not
         // redrawn: a chip replaced under a press would swallow it.
-        const note = (marked, missing = []) => showFillNote(fillNote({ accepted: accepted.map((t) => t.trader.name), trader: trade ? trade.trader.name : null, partner, toSend: need.size, marked, missing }));
+        const open = [...need.values()].filter((n) => n.qty > (inside.get(lower(n.name)) || 0)).length;
+        const note = (marked, missing = []) => showFillNote(fillNote({ accepted: accepted.map((t) => t.trader.name), trader: trade ? trade.trader.name : null, partner, toSend: need.size, marked, missing, open, waiting: list.waiting }));
         if (!trade) {
             clearSendMarks();
             note(0);
@@ -25158,9 +25484,10 @@
     function showFillAll(trader) {
         const chips = fillAllChips();
         let btn = document.querySelector('.' + TRADE_FILLALL_CLASS);
-        // One row has its own Fill; this is for several (and with fewer, Torn's bar is not even looked for).
-        const bar = chips.length < 2 ? null : tradeAddBar();
-        if (!bar || !bar.parentElement || chips.length < 2) {
+        // For one row too (3.17.2; it wanted two, and the friend - one item bought, mid flip - had no Fill all:
+        // its row is far down a long list). With none, Torn's bar is not even looked for.
+        const bar = chips.length ? tradeAddBar() : null;
+        if (!bar || !bar.parentElement) {
             if (btn) btn.remove();
             return;
         }
@@ -25174,7 +25501,7 @@
         const noteTag = bar.parentElement.querySelector('.' + TRADE_NOTE_CLASS);
         if (btn.parentElement !== bar.parentElement || (noteTag && btn.nextSibling !== noteTag)) bar.parentElement.insertBefore(btn, noteTag);
         const todo = chips.filter((c) => c.getAttribute('aria-pressed') !== 'true').length;
-        const text = todo ? '☐ Fill all ' + todo + (todo === 1 ? ' item' : ' items') + ' for ' + trader : '☑ All ' + chips.length + ' items filled for ' + trader;
+        const text = todo ? '☐ Fill all ' + todo + (todo === 1 ? ' item' : ' items') + ' for ' + trader : (chips.length === 1 ? '☑ 1 item' : '☑ All ' + chips.length + ' items') + ' filled for ' + trader;
         const title = todo ? 'Type each marked row\'s quantity into its Qty box. You press ADD TO TRADE.' : 'Untick to put back what was in the boxes';
         if (btn.textContent !== text) btn.textContent = text;
         if (btn.title !== title) btn.title = title;
@@ -26070,6 +26397,8 @@
     const led = { client: null, data: null, busy: false, checking: false, error: null, keyError: null, saveMsg: null, nextAt: 0, buysClient: null, buysBusy: false, buysNextAt: 0 };
 
     const sell = {
+        /* Each item's buyers, kept between redraws (core/kept-buyers.js). */
+        buyersKeeper: null,
         /* Traders' TornExchange / TornW3B badges seen so far (the Ledger's Traders tab shows them). */
         trustById: new Map(),
         /* Every TornW3B buyer of an item (3.15, /traders): itemId -> {at, triedAt, total, traders, loading, error}. */
@@ -27102,7 +27431,7 @@
      * trader database's TornW3B lists. Answers are kept per item for one pass.
      * The traders page and the panel's bazaar tags both use it.
      */
-    function buyerLookup({ teMap, lists, teOne, idsByName, db, w3bByItem, dbIdsByName, teOwn = new Map(), votes = new Map(), itemTraders = null, now = Date.now() }) {
+    function buyerLookup({ teMap, lists, teOne, idsByName, db, w3bByItem, dbIdsByName, teOwn = new Map(), votes = new Map(), itemTraders = null, now = Date.now(), keeper = null }) {
         // TornExchange's votes for the trust badge, from every answer we have,
         // then the ones remembered from earlier answers.
         const votesById = votesByTrader([
@@ -27110,6 +27439,8 @@
             ...[...teOne.values()].filter((rec) => rec.best).map((rec) => [rec.best]),
         ]);
         for (const [id, score] of votes) if (!votesById.has(id)) votesById.set(id, score);
+        // Torn Bids keeps each item's rows between redraws (3.18.0, core/kept-buyers.js): what every item shares is looked at once here.
+        if (keeper) keeper.begin({ idsByName, dbIdsByName, votesById, db });
         const cache = new Map();
         return (itemId) => {
             const id = String(itemId);
@@ -27117,7 +27448,7 @@
             if (!b) {
                 const full = lists.get(id);
                 const one = teOne.get(id);
-                b = buyersForItem(id, {
+                const src = {
                     // The keyed top three when TornExchange has them; else its
                     // keyless best buyer for this item.
                     teBest: teMap.get(id) || (one && one.best ? [one.best] : []),
@@ -27133,11 +27464,27 @@
                         const it = itemTraders && itemTraders.get(id);
                         return it && it.at && now - it.at < W3B_BUYERS_TTL_MS ? it.traders : null;
                     })(),
-                });
+                };
+                b = keeper ? keeper.buyers(id, src) : buyersForItem(id, src);
                 cache.set(id, b);
             }
             return b;
         };
+    }
+
+    /**
+     * Torn Bids' kept buyers (3.18.0): made once a page. Should its own check
+     * ever find a kept item different from a fresh one, it stops keeping (every
+     * redraw then works every item out, as before 3.18.0) and the problem log
+     * says so - the next zip shows it.
+     */
+    function sellBuyersKeeper() {
+        if (!sell.buyersKeeper) {
+            sell.buyersKeeper = makeBuyersKeeper({
+                onDiffer: (itemId) => logProblem('error', 'Kept buyers differed from fresh ones (item ' + itemId + ')', 'keeping is off until this page is reloaded; nothing shown was wrong after this line'),
+            });
+        }
+        return sell.buyersKeeper;
     }
 
     /** Everything the page shows, from what is loaded now. */
@@ -27202,7 +27549,7 @@
             const add = list.filter((r) => !seen.has(String(r.id)));
             if (add.length) ownByItem.set(itemId, [...have, ...add]);
         }
-        const buyersAll = buyerLookup({ teMap, lists: sell.lists, teOne: sell.teOne, idsByName: sell.idsByName, db: sell.db, w3bByItem, dbIdsByName: sell.dbIdsByName, teOwn: ownByItem, votes: sell.votes || new Map(), itemTraders: sell.itemTraders, now });
+        const buyersAll = buyerLookup({ teMap, lists: sell.lists, teOne: sell.teOne, idsByName: sell.idsByName, db: sell.db, w3bByItem, dbIdsByName: sell.dbIdsByName, teOwn: ownByItem, votes: sell.votes || new Map(), itemTraders: sell.itemTraders, now, keeper: sellBuyersKeeper() });
         const levelOf = (id) => presenceLevel(sellPresenceOf(id));
         // Trusted means Known (20+ votes) or Trusted; while TornExchange's votes
         // are not loaded, a trader without any is kept ("no votes yet").
