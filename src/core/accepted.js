@@ -84,7 +84,8 @@ export function stepState(step, rows) {
     if (!mine.length) return { state: 'gone' };
     const same = mine.find((r) => r.price === step.price);
     if (!same) return { state: 'price', price: Math.min(...mine.map((r) => r.price)), seenAt: mine[0].dataAt || null };
-    if (same.qty < step.qty) return { state: 'short', qty: same.qty, seenAt: same.dataAt || null };
+    // Fewer than you still need: what you already took of this step is yours (and, 3.16.4, off the listing's number).
+    if (same.qty < step.qty - (step.boughtQty > 0 ? step.boughtQty : 0)) return { state: 'short', qty: same.qty, seenAt: same.dataAt || null };
     return { state: 'ok', seenAt: same.dataAt || null };
 }
 
@@ -153,6 +154,26 @@ export function buyingStatus(done, total, age) {
     const m = Math.floor((Number(age) || 0) / 60000);
     if (m >= 1) out.push('yes ' + (m < 60 ? m + 'm' : Math.floor(m / 60) + 'h' + (m % 60 ? ' ' + (m % 60) + 'm' : '')) + ' ago');
     return out;
+}
+
+/**
+ * The buying box's line when the listing to buy is not among the page's
+ * cards (3.16.3): Torn keeps only the rows near the screen in the page, so
+ * "not on the page" is said as what it is - not in this bazaar at all, or
+ * further down a long one - with how much of the bazaar was read.
+ *
+ * @param {{where?: string|null, listings?: {n: number, exact: boolean}|null, listingsRead?: number|null}} here
+ */
+export function buyingWhereText(here) {
+    const where = here && here.where;
+    const all = here && here.listings;
+    const total = all ? (all.exact ? '' : 'about ') + all.n.toLocaleString('en-US') + (all.n === 1 ? ' listing' : ' listings') : null;
+    if (where === 'absent') return 'Not in this bazaar: ' + (total ? total + ' read' : 'every listing read') + ', none of them this item.';
+    if (where === 'below') return 'Not in the page yet: this bazaar has ' + (total || 'more listings') + ', and ' + (Number(here.listingsRead) || 0).toLocaleString('en-US') + ' were read so far. Scroll down, or type its name in the bazaar\'s search box - it is marked when it shows.';
+    if (where === 'searching') return 'Not among the listings the bazaar\'s search box shows.';
+    // Seen here before, and not known gone: Torn took its row out of the page as you scrolled.
+    if (where === 'away') return 'Out of the page now: scroll back to it, or type its name in the bazaar\'s search box - it is marked when it shows.';
+    return 'Not on this page any more.';
 }
 
 /**
@@ -443,6 +464,40 @@ export function costEach(line) {
     return units ? cost / units : 0;
 }
 
+/*
+ * What counts as left over from a trade (3.16.4). The friend's Torn Bids was
+ * full of "Left over" cards (2026-10-02) for things he no longer had, and
+ * the owner asked why they were there at all.
+ *
+ * - Only what was bought FOR the trade can be left over from it: the plan's
+ *   items, and unplanned buys this trader pays for. Since 3.16.0 every bazaar
+ *   buy in your log while a trade was accepted - whatever it was for - was
+ *   attached to it, and became a card when the trade closed. A buy the
+ *   trader does not buy is no longer one.
+ * - A leftover says from when what leaves your stock counts against it
+ *   (`since`), so a card whose item already went is taken off at the next
+ *   Ledger read, not left for a press (leftoversAfterSales):
+ *     a trade seen finished - from that trade on (what it took is already
+ *       off the card);
+ *     Cancel trade - from your last buy for it (if the trade had in fact
+ *       gone through, what it took comes off);
+ *     Traded - done pressed by hand - not said (when it went through is not
+ *       known): from five minutes after the card, as before.
+ */
+
+/** When you last bought for a trade (ms), from what its steps and unplanned buys say; null when none says. */
+function lastBuyAt(trade) {
+    let at = 0;
+    for (const i of (trade && trade.items) || []) for (const st of i.steps || []) if (stepDone(st) && Number(st.boughtAt) > at) at = Number(st.boughtAt);
+    for (const x of (trade && trade.extra) || []) if (extraForTrade(x) && Number(x.at) > at) at = Number(x.at);
+    return at > 0 ? at : null;
+}
+
+/** Is this unplanned buy part of the trade: one its trader pays for. */
+function extraForTrade(x) {
+    return Boolean(x && Number(x.bid) > 0 && Number(x.qty) > 0);
+}
+
 /** The leftovers a finished trade leaves: bought items the trader did not take. */
 export function leftoversOf(trade, now = Date.now()) {
     const out = [];
@@ -450,10 +505,6 @@ export function leftoversOf(trade, now = Date.now()) {
         const n = Math.min(sendUnits(i), Math.max(0, Math.floor(Number(i.left) || 0)));
         if (i.kind !== 'flip' || !(n > 0)) continue;
         out.push({ itemId: String(i.itemId), name: i.name, qty: n, each: Math.round(costEach(i)), from: trade.trader ? trade.trader.name : null, at: now });
-    }
-    // Bought on the way that this trader does not buy (3.16): never in the trade, still yours to sell.
-    for (const x of (trade && trade.extra) || []) {
-        if (x && !(Number(x.bid) > 0) && Number(x.qty) > 0) out.push({ itemId: String(x.itemId), name: x.name, qty: Number(x.qty), each: Math.round(Number(x.price) || 0), from: trade.trader ? trade.trader.name : null, at: now });
     }
     return out;
 }
@@ -466,14 +517,16 @@ export function leftoversOf(trade, now = Date.now()) {
  */
 export function cancelledLeftovers(trade, now = Date.now()) {
     const from = trade && trade.trader ? trade.trader.name : null;
+    const since = lastBuyAt(trade);
+    const stamp = since ? { since } : {};
     const out = [];
     for (const i of (trade && trade.items) || []) {
         if (i.kind !== 'flip' || !(i.steps || []).some(stepDone)) continue;
         const n = sendUnits(i);
-        if (n > 0) out.push({ itemId: String(i.itemId), name: i.name, qty: n, each: Math.round(costEach(i)), from, at: now });
+        if (n > 0) out.push({ itemId: String(i.itemId), name: i.name, qty: n, each: Math.round(costEach(i)), from, at: now, ...stamp });
     }
     for (const x of (trade && trade.extra) || []) {
-        if (x && Number(x.qty) > 0) out.push({ itemId: String(x.itemId), name: x.name, qty: Number(x.qty), each: Math.round(Number(x.price) || 0), from, at: now });
+        if (extraForTrade(x)) out.push({ itemId: String(x.itemId), name: x.name, qty: Number(x.qty), each: Math.round(Number(x.price) || 0), from, at: now, ...stamp });
     }
     return addLeftovers([], out);
 }
@@ -485,10 +538,14 @@ export function addLeftovers(list, add) {
         const same = out.find((l) => String(l.itemId) === String(a.itemId));
         if (same) {
             const qty = same.qty + a.qty;
+            // One row, counted from the later of the two starts: what left before the newer one's start
+            // is not known to be the older one's (it may be the newer trade's own), so it is not counted.
+            const since = Number(same.since) > 0 || Number(a.since) > 0 ? Math.max(leftoverFrom(same), leftoverFrom(a)) : null;
             same.each = Math.round((same.each * same.qty + a.each * a.qty) / qty);
             same.qty = qty;
             same.at = Math.max(Number(same.at) || 0, Number(a.at) || 0);
             same.from = a.from || same.from;
+            if (since) same.since = since;
         } else {
             out.push({ ...a });
         }
@@ -781,9 +838,11 @@ export function finishedTradeFor(trade, finished, until = Infinity) {
  * What a trade that went through leaves you, from what you really gave
  * (itemsGiven): per item, what you bought for it - planned and unplanned -
  * minus what went in, at what it cost you each. Your own items planned in
- * the trade count as given first.
+ * the trade count as given first. `finishedAt`: when that trade finished
+ * (Torn's clock, ms) - from then on what leaves your stock counts against
+ * these (leftoversAfterSales).
  */
-export function tradedLeftovers(trade, gave, now = Date.now()) {
+export function tradedLeftovers(trade, gave, now = Date.now(), finishedAt = null) {
     const from = trade && trade.trader ? trade.trader.name : null;
     const given = new Map();
     for (const [k, v] of gave || []) given.set(String(k), Number(v) || 0);
@@ -807,12 +866,14 @@ export function tradedLeftovers(trade, gave, now = Date.now()) {
         if (n > 0) add(id, i.name, n, costEach(i));
     }
     for (const x of (trade && trade.extra) || []) {
-        if (x && Number(x.qty) > 0) add(x.itemId, x.name, Number(x.qty), Number(x.price) || 0);
+        if (extraForTrade(x)) add(x.itemId, x.name, Number(x.qty), Number(x.price) || 0);
     }
+    // Counted from when the trade finished (3.16.4): what it took is off already; what leaves after it is the leftover going.
+    const stamp = Number(finishedAt) > 0 ? { since: Number(finishedAt) } : {};
     const out = [];
     for (const b of bought.values()) {
         const left = b.qty - Math.min(b.qty, given.get(b.itemId) || 0);
-        if (left > 0) out.push({ itemId: b.itemId, name: b.name, qty: left, each: Math.round(b.cost / b.qty), from, at: now });
+        if (left > 0) out.push({ itemId: b.itemId, name: b.name, qty: left, each: Math.round(b.cost / b.qty), from, at: now, ...stamp });
     }
     return out;
 }
@@ -850,8 +911,29 @@ export function removeLeftovers(list, sub) {
  */
 export const LEFTOVER_SALE_MARGIN_MS = 5 * 60 * 1000;
 
+/*
+ * 3.16.4 (the owner: "the sold cards should update automatically, and it
+ * shouldn't take that long"). Counting only sales made five minutes after
+ * the card appeared missed the usual case: the item had ALREADY gone - given
+ * in a trade he then cancelled in the script (twelve hours on, with the
+ * Checkout still showing), or passed to another trader at once - so the card
+ * stayed until he pressed Sold ✓. A leftover now says from when sales count
+ * against it (`since`, see "What counts as left over" above): the same
+ * count, started where it should be. Cards kept before 3.16.4, and ones from
+ * Traded - done pressed by hand, say nothing and count as before.
+ *
+ * Still one sale once (`seenTo`), still what you bought again sold first
+ * (`spare`). What you held of the item before is not told apart from the
+ * leftover: selling that counts too, as it always did.
+ */
+
+/** From when the Ledger's rows count against a leftover (ms): its `since`, else five minutes after it was kept. */
+export function leftoverFrom(l) {
+    return Number(l && l.since) > 0 ? Number(l.since) : Number(l && l.at) + LEFTOVER_SALE_MARGIN_MS;
+}
+
 /**
- * @param {Array} leftovers - [{itemId, qty, at, seenTo?, spare?}]
+ * @param {Array} leftovers - [{itemId, qty, at, since?, seenTo?, spare?}]
  * @param {Array} rows - Ledger rows {t, itemId, qty, side: 'buy' | 'sell' | 'give'}
  * @returns {Array} the leftovers, less what was sold since; none left - gone
  */
@@ -864,7 +946,7 @@ export function leftoversAfterSales(leftovers, rows) {
         byItem.get(id).push(r);
     }
     return (leftovers || []).map((l) => {
-        const from = Math.max(Number(l.at) + LEFTOVER_SALE_MARGIN_MS, Number(l.seenTo) || 0);
+        const from = Math.max(leftoverFrom(l), Number(l.seenTo) || 0);
         const mine = (byItem.get(String(l.itemId)) || []).filter((r) => Number(r.t) > from).sort((a, b) => a.t - b.t);
         if (!mine.length) return l;
         let spare = Math.max(0, Number(l.spare) || 0);

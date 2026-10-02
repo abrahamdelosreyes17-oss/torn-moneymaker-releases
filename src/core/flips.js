@@ -138,6 +138,199 @@ export function bazaarSellers(rows, { selfId = null, now = Date.now(), freshMs =
         .sort((a, b) => a.price - b.price);
 }
 
+/* ------------------------------ listings you saw are not there (3.16.3) */
+
+/*
+ * The friend, 2026-10-02 (3.16.2): of the bazaars a plan sent him to, 13
+ * held no such listing - the whole bazaar was in the page and the item was
+ * not in it - and two of them were in his next plan minutes later, for the
+ * same item at the same price. TornW3B's copy of a bazaar can be half an
+ * hour old; the page you are on is not. So what the page showed is kept:
+ * "this seller does not list this item" as of when you looked, and a listing
+ * TornW3B last checked BEFORE you looked is left out of every plan. A newer
+ * check by TornW3B wins again (they listed it again).
+ *
+ * A mark older than FLIP_FRESH_MS has nothing left to hide - any listing
+ * last checked before it is stale by then, and no flip is planned on a stale
+ * listing - so it is let go.
+ */
+
+/** At most this many marks are kept (the newest). */
+export const GONE_MAX = 200;
+
+export function goneKey(sellerId, itemId) {
+    return String(sellerId) + '|' + String(itemId);
+}
+
+/** Stored marks still worth keeping: {'seller|item': {at}}. */
+export function liveGone(stored, now = Date.now()) {
+    const out = {};
+    const all = Object.entries(stored && typeof stored === 'object' && !Array.isArray(stored) ? stored : {})
+        .filter(([, g]) => g && Number(g.at) > 0 && now - Number(g.at) < FLIP_FRESH_MS)
+        .sort((a, b) => Number(b[1].at) - Number(a[1].at))
+        .slice(0, GONE_MAX);
+    for (const [k, g] of all) out[k] = { at: Number(g.at) };
+    return out;
+}
+
+/** The marks with one more: this seller's bazaar had none of this item when you looked. */
+export function markGone(stored, sellerId, itemId, now = Date.now()) {
+    if (!sellerId || !itemId) return liveGone(stored, now);
+    return liveGone({ ...liveGone(stored, now), [goneKey(sellerId, itemId)]: { at: now } }, now);
+}
+
+/**
+ * An item's bazaar listings without the ones you saw are not there: a row
+ * of a marked seller stays out until TornW3B has checked it after the mark.
+ *
+ * @param {Array<{sellerId, dataAt}>} rows - normalizeW3bListings output
+ * @param {string} itemId
+ * @param {object} gone - liveGone
+ */
+export function withoutGone(rows, itemId, gone, marginMs = SEEN_MARGIN_MS) {
+    if (!rows || !gone || !Object.keys(gone).length) return rows;
+    return rows.filter((r) => {
+        const g = r && r.sellerId ? gone[goneKey(r.sellerId, itemId)] : null;
+        // Clearly after you looked (3.16.4: a check within seconds may still carry the number from before).
+        return !g || Number(r.dataAt) > Number(g.at) + marginMs;
+    });
+}
+
+/* ------------------- what you bought comes off TornW3B's number (3.16.4) */
+
+/*
+ * The friend, 2026-10-02: he bought Xanax for one trader, traded it, and the
+ * plan for the next trader still counted on the same listings - "ako bumili
+ * pero sinusuggest parin sakin". TornW3B checks a bazaar again about every
+ * five minutes (measured: median 5, nine in ten within 10.5), and until it
+ * does its row keeps the quantity from before your buy.
+ *
+ * So your own buys come off that one row - the item, at that bazaar - until
+ * TornW3B has checked it since (the owner: "yung item lang na yun"). Two
+ * things say what you bought, and no buy may be missed:
+ *
+ *   stock   what a bazaar page showed of a listing after its stock dropped
+ *           in front of you (the overlay): an absolute number, as of then;
+ *   bought  your bazaar buys from your Torn log (Torn Bids, with the
+ *           Ledger's key): seller, item, how many, when - also the buys no
+ *           page saw.
+ *
+ * Never counted twice: the page's number already holds every buy made before
+ * it, so only log buys clearly AFTER it come off it; with no page number,
+ * the log buys TornW3B has not checked past come off TornW3B's.
+ *
+ * "Checked since" keeps a margin: TornW3B's `last_checked` moved with every
+ * quantity change measured (11 of 11), but a check made within seconds of a
+ * buy may still carry the number from before it (Torn's own API caches for
+ * some seconds). Its `content_updated` is per bazaar and says nothing more.
+ *
+ * Both are let go after FLIP_FRESH_MS: a row not checked since is stale by
+ * then, and no flip is planned on a stale listing.
+ */
+
+/** A check by TornW3B counts as "since" only this long after what you saw or bought. */
+export const SEEN_MARGIN_MS = 60 * 1000;
+/** At most this many page stocks, and this many own buys, are kept (the newest). */
+export const STOCK_MAX = 300;
+export const BOUGHT_MAX = 500;
+
+/** Stored page stocks still worth keeping: {'seller|item': {qty, price, at}}. */
+export function liveStock(stored, now = Date.now()) {
+    const out = {};
+    const all = Object.entries(stored && typeof stored === 'object' && !Array.isArray(stored) ? stored : {})
+        .filter(([, s]) => s && Number(s.qty) > 0 && Number(s.at) > 0 && now - Number(s.at) < FLIP_FRESH_MS)
+        .sort((a, b) => Number(b[1].at) - Number(a[1].at))
+        .slice(0, STOCK_MAX);
+    for (const [k, s] of all) out[k] = { qty: Math.floor(Number(s.qty)), price: Number(s.price) || null, at: Number(s.at) };
+    return out;
+}
+
+/** The page stocks with one more: this seller's listing of this item held `qty` when you looked. */
+export function noteStock(stored, sellerId, itemId, qty, price = null, now = Date.now()) {
+    if (!sellerId || !itemId || !(Number(qty) > 0)) return liveStock(stored, now);
+    return liveStock({ ...liveStock(stored, now), [goneKey(sellerId, itemId)]: { qty: Number(qty), price: Number(price) || null, at: now } }, now);
+}
+
+/** Stored own buys still worth keeping: [{id, sellerId, itemId, qty, each, t}], oldest first, one per log line. */
+export function liveBought(stored, now = Date.now()) {
+    const byId = new Map();
+    for (const b of Array.isArray(stored) ? stored : []) {
+        if (!b || !b.id || !b.sellerId || !b.itemId || !(Number(b.qty) > 0) || !(Number(b.t) > 0) || now - Number(b.t) >= FLIP_FRESH_MS) continue;
+        byId.set(String(b.id), { id: String(b.id), sellerId: String(b.sellerId), itemId: String(b.itemId), qty: Number(b.qty), each: Number(b.each) || 0, t: Number(b.t) });
+    }
+    return [...byId.values()].sort((a, b) => a.t - b.t || a.id.localeCompare(b.id)).slice(-BOUGHT_MAX);
+}
+
+/** The own buys with more (core/accepted.js bazaarBuyRows): each log line once. */
+export function addBought(stored, buys, now = Date.now()) {
+    return liveBought([...(Array.isArray(stored) ? stored : []), ...(buys || [])], now);
+}
+
+/**
+ * An item's bazaar listings with your own buys taken off: fewer units at the
+ * bazaars you bought from, and a listing you emptied gone - each until
+ * TornW3B has checked it since. Rows it does not touch are returned as they
+ * are; the list itself when nothing changes.
+ *
+ * A seller with several rows of the item: the one at the price you saw or
+ * paid, else their cheapest.
+ *
+ * @param {Array<{sellerId, price, qty, dataAt}>} rows - normalizeW3bListings output
+ * @param {string} itemId
+ * @param {object} [own]
+ * @param {object|null} [own.stock] - liveStock
+ * @param {Array|null} [own.bought] - liveBought (any items; only this one's count)
+ * @param {number} [marginMs]
+ */
+export function withOwnBuys(rows, itemId, { stock = null, bought = null } = {}, marginMs = SEEN_MARGIN_MS) {
+    if (!rows || !rows.length) return rows;
+    const id = String(itemId);
+    const buys = (Array.isArray(bought) ? bought : []).filter((b) => b && String(b.itemId) === id && Number(b.qty) > 0 && b.sellerId);
+    const seenOf = (sellerId) => (stock && stock[goneKey(sellerId, id)]) || null;
+    const bySeller = new Map();
+    rows.forEach((r, i) => {
+        if (!r || !r.sellerId) return;
+        const k = String(r.sellerId);
+        if (!bySeller.has(k)) bySeller.set(k, []);
+        bySeller.get(k).push(i);
+    });
+    const qty = rows.map((r) => (r ? r.qty : 0));
+    for (const [sellerId, idx] of bySeller) {
+        const seen = seenOf(sellerId);
+        const mine = buys.filter((b) => String(b.sellerId) === sellerId);
+        if (!seen && !mine.length) continue;
+        const pick = (price) => {
+            const same = idx.find((i) => rows[i].price === price);
+            return same === undefined ? idx[0] : same;
+        };
+        // The rows whose number is now the page's, and from when.
+        const seenAt = new Map();
+        if (seen) {
+            const i = pick(Number(seen.price));
+            // TornW3B's check wins only when clearly later than what you saw.
+            if (!(Number(rows[i].dataAt) > Number(seen.at) + marginMs)) {
+                qty[i] = Math.min(qty[i], Number(seen.qty));
+                seenAt.set(i, Number(seen.at));
+            }
+        }
+        for (const b of mine) {
+            const i = pick(Number(b.each));
+            // In TornW3B's number already: it checked this bazaar well after the buy.
+            if (Number(rows[i].dataAt) > Number(b.t) + marginMs) continue;
+            // In what the page showed already: bought before you saw that stock.
+            if (seenAt.has(i) && !(Number(b.t) > seenAt.get(i) + marginMs)) continue;
+            qty[i] -= Number(b.qty);
+        }
+    }
+    if (rows.every((r, i) => !r || qty[i] === r.qty)) return rows;
+    const out = [];
+    rows.forEach((r, i) => {
+        if (!r || qty[i] === r.qty) out.push(r);
+        else if (qty[i] > 0) out.push({ ...r, qty: qty[i] });
+    });
+    return out;
+}
+
 /*
  * How many bazaars a flip may take (the owner, 2026-09-28: "the app will
  * suggest 100 bazaars if it can. 1 item 1 bazaar best, 1 item 3 bazaars

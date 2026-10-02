@@ -315,6 +315,25 @@ export const PAGE_CSS = `
 .ttv2-sendfill[data-fill] { cursor: pointer; }
 .ttv2-sendfill[aria-pressed="true"] { background: #4dabf7; color: #10202c; }
 
+/* One Fill for every marked row (3.16.4), beside Torn's ADD TO TRADE: the row chips' look, a size up. */
+.ttv2-sendfillall {
+    display: inline-block;
+    margin-left: 12px;
+    padding: 3px 10px;
+    border: 1px solid #4dabf7;
+    border-radius: 12px;
+    color: #9ad0fa;
+    font: bold 12px/18px Arial, sans-serif;
+    white-space: nowrap;
+    vertical-align: middle;
+    cursor: pointer;
+    user-select: none;
+}
+
+.ttv2-sendfillall:hover { background: rgba(77, 171, 247, 0.16); }
+.ttv2-sendfillall:focus-visible { outline: 2px solid #4dabf7; outline-offset: 1px; }
+.ttv2-sendfillall[aria-pressed="true"] { background: #4dabf7; color: #10202c; }
+
 /* The listing a feed link was opened for: light red (3.14.2, the owner; it was yellow). Paint-only, like .ttv2-hit. */
 .ttv2-target {
     box-shadow:
@@ -440,9 +459,33 @@ export const PAGE_CSS = `
 .ttv2-bzchip-bp b { color: #74c0fc; }
 .ttv2-bzchip:hover,
 .ttv2-bzchips[data-selected="true"] .ttv2-bzchip { border-color: #99cc00; }
-.ttv2-bzchips .ttv2-fillbox { margin-left: 0; }
-.ttv2-bzchips .ttv2-filltag { display: none; }
-.ttv2-bzchips .ttv2-fillbtn { height: 20px; font-size: 11px; }
+
+/*
+ * The Fill tick on that page: at the right edge of Torn's value cell, the
+ * same place in every row. The cell keeps its own size and gives the tick
+ * room from inside it, so its line (Torn's price, the chips) ends before the
+ * tick instead of running under it. A row with no room for both chips shows
+ * one, or none - whole chips only (main.js fitBazaarCells sets data-tight).
+ */
+.ttv2-bzcell {
+    position: relative;
+    box-sizing: border-box;
+    padding-right: var(--ttv2-fillw, 64px) !important;
+}
+
+.ttv2-fillbox.ttv2-fillcell {
+    position: absolute;
+    right: 0;
+    top: 50%;
+    transform: translateY(-50%);
+    margin: 0;
+    flex-wrap: nowrap;
+}
+
+.ttv2-fillcell .ttv2-filltag { display: none; }
+.ttv2-fillcell .ttv2-fillbtn { height: 20px; font-size: 11px; }
+.ttv2-bzchips[data-tight="1"] .ttv2-bzchip-ima { display: none; }
+.ttv2-bzchips.ttv2-bzchips[data-tight="2"] { display: none; }
 .ttv2-fillbtn[data-level="good"] .ttv2-filllabel { color: #a8dd1c; }
 .ttv2-fillbtn[data-level="warn"] .ttv2-filllabel { color: #f0a020; }
 .ttv2-fillbtn[data-level="bad"] { border-color: #ff8a80; }

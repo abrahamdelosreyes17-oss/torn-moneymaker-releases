@@ -13,8 +13,11 @@
  *   /v2/user/{id}/trade   - one trade's items and money
  *
  * It shares the one request window (70 a minute across every tab) with the
- * other clients. Only Torn Bids makes one; the panel on torn.com never reads
- * the Ledger's key.
+ * other clients. Torn Bids makes one - and, since 3.16.3, so does the Torn
+ * page you are viewing, for ONE question only: did a trade you accepted go
+ * through (/v2/user/trades and that trade), asked there only while no Torn
+ * Bids tab is open to ask it, and only from the tab in view. The panel on
+ * torn.com reads the Ledger's key for nothing else: never your log.
  */
 
 import { TornApiClient, TornApiError, TORN_API_BASE } from './client.js';

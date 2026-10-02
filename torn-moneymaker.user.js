@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      3.16.2
+// @version      3.16.4
 // @description  Finds Bazaar and Item Market listings below NPC / market value - on the page you are viewing, and live from the Torn API and TornW3B - ranked by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -42,7 +42,7 @@
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '3.16.2';
+    const TTV2_BUILD_VERSION = '3.16.4';
 
     /* ===== src/platform/gm.js ===== */
     /*
@@ -1659,6 +1659,199 @@
             .sort((a, b) => a.price - b.price);
     }
 
+    /* ------------------------------ listings you saw are not there (3.16.3) */
+
+    /*
+     * The friend, 2026-10-02 (3.16.2): of the bazaars a plan sent him to, 13
+     * held no such listing - the whole bazaar was in the page and the item was
+     * not in it - and two of them were in his next plan minutes later, for the
+     * same item at the same price. TornW3B's copy of a bazaar can be half an
+     * hour old; the page you are on is not. So what the page showed is kept:
+     * "this seller does not list this item" as of when you looked, and a listing
+     * TornW3B last checked BEFORE you looked is left out of every plan. A newer
+     * check by TornW3B wins again (they listed it again).
+     *
+     * A mark older than FLIP_FRESH_MS has nothing left to hide - any listing
+     * last checked before it is stale by then, and no flip is planned on a stale
+     * listing - so it is let go.
+     */
+
+    /** At most this many marks are kept (the newest). */
+    const GONE_MAX = 200;
+
+    function goneKey(sellerId, itemId) {
+        return String(sellerId) + '|' + String(itemId);
+    }
+
+    /** Stored marks still worth keeping: {'seller|item': {at}}. */
+    function liveGone(stored, now = Date.now()) {
+        const out = {};
+        const all = Object.entries(stored && typeof stored === 'object' && !Array.isArray(stored) ? stored : {})
+            .filter(([, g]) => g && Number(g.at) > 0 && now - Number(g.at) < FLIP_FRESH_MS)
+            .sort((a, b) => Number(b[1].at) - Number(a[1].at))
+            .slice(0, GONE_MAX);
+        for (const [k, g] of all) out[k] = { at: Number(g.at) };
+        return out;
+    }
+
+    /** The marks with one more: this seller's bazaar had none of this item when you looked. */
+    function markGone(stored, sellerId, itemId, now = Date.now()) {
+        if (!sellerId || !itemId) return liveGone(stored, now);
+        return liveGone({ ...liveGone(stored, now), [goneKey(sellerId, itemId)]: { at: now } }, now);
+    }
+
+    /**
+     * An item's bazaar listings without the ones you saw are not there: a row
+     * of a marked seller stays out until TornW3B has checked it after the mark.
+     *
+     * @param {Array<{sellerId, dataAt}>} rows - normalizeW3bListings output
+     * @param {string} itemId
+     * @param {object} gone - liveGone
+     */
+    function withoutGone(rows, itemId, gone, marginMs = SEEN_MARGIN_MS) {
+        if (!rows || !gone || !Object.keys(gone).length) return rows;
+        return rows.filter((r) => {
+            const g = r && r.sellerId ? gone[goneKey(r.sellerId, itemId)] : null;
+            // Clearly after you looked (3.16.4: a check within seconds may still carry the number from before).
+            return !g || Number(r.dataAt) > Number(g.at) + marginMs;
+        });
+    }
+
+    /* ------------------- what you bought comes off TornW3B's number (3.16.4) */
+
+    /*
+     * The friend, 2026-10-02: he bought Xanax for one trader, traded it, and the
+     * plan for the next trader still counted on the same listings - "ako bumili
+     * pero sinusuggest parin sakin". TornW3B checks a bazaar again about every
+     * five minutes (measured: median 5, nine in ten within 10.5), and until it
+     * does its row keeps the quantity from before your buy.
+     *
+     * So your own buys come off that one row - the item, at that bazaar - until
+     * TornW3B has checked it since (the owner: "yung item lang na yun"). Two
+     * things say what you bought, and no buy may be missed:
+     *
+     *   stock   what a bazaar page showed of a listing after its stock dropped
+     *           in front of you (the overlay): an absolute number, as of then;
+     *   bought  your bazaar buys from your Torn log (Torn Bids, with the
+     *           Ledger's key): seller, item, how many, when - also the buys no
+     *           page saw.
+     *
+     * Never counted twice: the page's number already holds every buy made before
+     * it, so only log buys clearly AFTER it come off it; with no page number,
+     * the log buys TornW3B has not checked past come off TornW3B's.
+     *
+     * "Checked since" keeps a margin: TornW3B's `last_checked` moved with every
+     * quantity change measured (11 of 11), but a check made within seconds of a
+     * buy may still carry the number from before it (Torn's own API caches for
+     * some seconds). Its `content_updated` is per bazaar and says nothing more.
+     *
+     * Both are let go after FLIP_FRESH_MS: a row not checked since is stale by
+     * then, and no flip is planned on a stale listing.
+     */
+
+    /** A check by TornW3B counts as "since" only this long after what you saw or bought. */
+    const SEEN_MARGIN_MS = 60 * 1000;
+    /** At most this many page stocks, and this many own buys, are kept (the newest). */
+    const STOCK_MAX = 300;
+    const BOUGHT_MAX = 500;
+
+    /** Stored page stocks still worth keeping: {'seller|item': {qty, price, at}}. */
+    function liveStock(stored, now = Date.now()) {
+        const out = {};
+        const all = Object.entries(stored && typeof stored === 'object' && !Array.isArray(stored) ? stored : {})
+            .filter(([, s]) => s && Number(s.qty) > 0 && Number(s.at) > 0 && now - Number(s.at) < FLIP_FRESH_MS)
+            .sort((a, b) => Number(b[1].at) - Number(a[1].at))
+            .slice(0, STOCK_MAX);
+        for (const [k, s] of all) out[k] = { qty: Math.floor(Number(s.qty)), price: Number(s.price) || null, at: Number(s.at) };
+        return out;
+    }
+
+    /** The page stocks with one more: this seller's listing of this item held `qty` when you looked. */
+    function noteStock(stored, sellerId, itemId, qty, price = null, now = Date.now()) {
+        if (!sellerId || !itemId || !(Number(qty) > 0)) return liveStock(stored, now);
+        return liveStock({ ...liveStock(stored, now), [goneKey(sellerId, itemId)]: { qty: Number(qty), price: Number(price) || null, at: now } }, now);
+    }
+
+    /** Stored own buys still worth keeping: [{id, sellerId, itemId, qty, each, t}], oldest first, one per log line. */
+    function liveBought(stored, now = Date.now()) {
+        const byId = new Map();
+        for (const b of Array.isArray(stored) ? stored : []) {
+            if (!b || !b.id || !b.sellerId || !b.itemId || !(Number(b.qty) > 0) || !(Number(b.t) > 0) || now - Number(b.t) >= FLIP_FRESH_MS) continue;
+            byId.set(String(b.id), { id: String(b.id), sellerId: String(b.sellerId), itemId: String(b.itemId), qty: Number(b.qty), each: Number(b.each) || 0, t: Number(b.t) });
+        }
+        return [...byId.values()].sort((a, b) => a.t - b.t || a.id.localeCompare(b.id)).slice(-BOUGHT_MAX);
+    }
+
+    /** The own buys with more (core/accepted.js bazaarBuyRows): each log line once. */
+    function addBought(stored, buys, now = Date.now()) {
+        return liveBought([...(Array.isArray(stored) ? stored : []), ...(buys || [])], now);
+    }
+
+    /**
+     * An item's bazaar listings with your own buys taken off: fewer units at the
+     * bazaars you bought from, and a listing you emptied gone - each until
+     * TornW3B has checked it since. Rows it does not touch are returned as they
+     * are; the list itself when nothing changes.
+     *
+     * A seller with several rows of the item: the one at the price you saw or
+     * paid, else their cheapest.
+     *
+     * @param {Array<{sellerId, price, qty, dataAt}>} rows - normalizeW3bListings output
+     * @param {string} itemId
+     * @param {object} [own]
+     * @param {object|null} [own.stock] - liveStock
+     * @param {Array|null} [own.bought] - liveBought (any items; only this one's count)
+     * @param {number} [marginMs]
+     */
+    function withOwnBuys(rows, itemId, { stock = null, bought = null } = {}, marginMs = SEEN_MARGIN_MS) {
+        if (!rows || !rows.length) return rows;
+        const id = String(itemId);
+        const buys = (Array.isArray(bought) ? bought : []).filter((b) => b && String(b.itemId) === id && Number(b.qty) > 0 && b.sellerId);
+        const seenOf = (sellerId) => (stock && stock[goneKey(sellerId, id)]) || null;
+        const bySeller = new Map();
+        rows.forEach((r, i) => {
+            if (!r || !r.sellerId) return;
+            const k = String(r.sellerId);
+            if (!bySeller.has(k)) bySeller.set(k, []);
+            bySeller.get(k).push(i);
+        });
+        const qty = rows.map((r) => (r ? r.qty : 0));
+        for (const [sellerId, idx] of bySeller) {
+            const seen = seenOf(sellerId);
+            const mine = buys.filter((b) => String(b.sellerId) === sellerId);
+            if (!seen && !mine.length) continue;
+            const pick = (price) => {
+                const same = idx.find((i) => rows[i].price === price);
+                return same === undefined ? idx[0] : same;
+            };
+            // The rows whose number is now the page's, and from when.
+            const seenAt = new Map();
+            if (seen) {
+                const i = pick(Number(seen.price));
+                // TornW3B's check wins only when clearly later than what you saw.
+                if (!(Number(rows[i].dataAt) > Number(seen.at) + marginMs)) {
+                    qty[i] = Math.min(qty[i], Number(seen.qty));
+                    seenAt.set(i, Number(seen.at));
+                }
+            }
+            for (const b of mine) {
+                const i = pick(Number(b.each));
+                // In TornW3B's number already: it checked this bazaar well after the buy.
+                if (Number(rows[i].dataAt) > Number(b.t) + marginMs) continue;
+                // In what the page showed already: bought before you saw that stock.
+                if (seenAt.has(i) && !(Number(b.t) > seenAt.get(i) + marginMs)) continue;
+                qty[i] -= Number(b.qty);
+            }
+        }
+        if (rows.every((r, i) => !r || qty[i] === r.qty)) return rows;
+        const out = [];
+        rows.forEach((r, i) => {
+            if (!r || qty[i] === r.qty) out.push(r);
+            else if (qty[i] > 0) out.push({ ...r, qty: qty[i] });
+        });
+        return out;
+    }
+
     /*
      * How many bazaars a flip may take (the owner, 2026-09-28: "the app will
      * suggest 100 bazaars if it can. 1 item 1 bazaar best, 1 item 3 bazaars
@@ -2009,6 +2202,487 @@
         if (!buyer || !buyer.trust || buyer.trust.level !== 'Trusted') return null;
         if (!(buyer.price > listingPrice) || !(listingPrice > 0)) return null;
         return buyer.name + ' pays ' + formatMoney(buyer.price) + '\n+' + formatMoney(buyer.price - listingPrice) + ' each';
+    }
+
+    /* ===== src/core/bazaar-cover.js ===== */
+    /*
+     * How much of a player's bazaar has been read (3.16.3).
+     *
+     * Torn draws a bazaar's listings in rows of three, and keeps only the rows
+     * near the screen in the page: a bazaar of 250 listings has about 54 of them
+     * in the page at any time, and the rows you scroll away from are taken out
+     * again (read on real bazaars with the owner, 2026-10-02). So a listing that
+     * is not in the page proves nothing by itself - unless every row of the
+     * bazaar has been in the page since you opened it, in the order it has now.
+     *
+     * This keeps that account, from what each read of the page says (sources/
+     * dom/bazaar-list.js). Pure: no DOM, no network.
+     *
+     *   read     {rowsTotal, perRow, rows: [{index, ids: [itemId]}], searching}
+     *   cover    {key, total, perRow, searching, rows: {index: 'id,id,id'}}
+     */
+
+    /**
+     * The account after one more read of the page.
+     *
+     * It starts again - only this read counts - when the page is another bazaar
+     * (`key`), when the list got longer or shorter, when the bazaar's search box
+     * came into or went out of use, and when a row read before now holds other
+     * items (sorted another way, or a listing sold and the rest moved up): what
+     * was read is then not what is there.
+     *
+     * A row counts as read only when it is whole: three listings (as many as the
+     * fullest row), or the last row with at least one. A row still being drawn
+     * is not "read, and the item is not in it".
+     *
+     * @param {object|null} prev - the account so far
+     * @param {string} key - which bazaar page this is
+     * @param {object|null} read - what the page shows now (null: no such list on the page)
+     * @returns {object|null}
+     */
+    function coverAfter(prev, key, read) {
+        if (!read || !(read.rowsTotal > 0)) return null;
+        const searching = Boolean(read.searching);
+        const same = Boolean(prev && prev.key === key && prev.total === read.rowsTotal && Boolean(prev.searching) === searching);
+        const perRow = Math.max(Number(read.perRow) || 0, same ? Number(prev.perRow) || 0 : 0);
+        const whole = (read.rows || []).filter((r) => r && Number.isInteger(r.index) && r.index >= 0 && r.index < read.rowsTotal && r.ids.length >= 1 && (r.index === read.rowsTotal - 1 || r.ids.length >= perRow));
+        const sigs = whole.map((r) => [String(r.index), r.ids.map(String).join(',')]);
+        const moved = same && sigs.some(([i, s]) => i in prev.rows && prev.rows[i] !== s);
+        const rows = same && !moved ? { ...prev.rows } : {};
+        for (const [i, s] of sigs) rows[i] = s;
+        return { key, total: read.rowsTotal, perRow, searching, rows };
+    }
+
+    /** How many of the bazaar's rows have been read. */
+    function coverRowsRead(cover) {
+        return cover && cover.rows ? Object.keys(cover.rows).length : 0;
+    }
+
+    /**
+     * Has every row of the bazaar been read? Never while its search box is in
+     * use: the list is then only what the search shows.
+     */
+    function coverWhole(cover) {
+        return Boolean(cover && !cover.searching && cover.total > 0 && coverRowsRead(cover) >= cover.total);
+    }
+
+    /** Is this item in a row that was read? */
+    function coverHasItem(cover, itemId) {
+        const id = String(itemId);
+        return Boolean(cover && cover.rows && Object.values(cover.rows).some((s) => String(s).split(',').includes(id)));
+    }
+
+    /** How many listings the rows read hold. */
+    function coverListingsRead(cover) {
+        return cover && cover.rows ? Object.values(cover.rows).reduce((a, s) => a + (s ? String(s).split(',').length : 0), 0) : 0;
+    }
+
+    /**
+     * How many listings the bazaar holds: exact once its last row was read,
+     * else as if the last row were full (at most two too many).
+     * @returns {{n: number, exact: boolean}|null}
+     */
+    function coverListings(cover) {
+        if (!cover || !(cover.total > 0) || !(cover.perRow > 0)) return null;
+        const last = cover.rows[String(cover.total - 1)];
+        if (last) return { n: (cover.total - 1) * cover.perRow + String(last).split(',').length, exact: true };
+        return { n: cover.total * cover.perRow, exact: false };
+    }
+
+    /**
+     * A listing you were counting is not among the page's cards: was it bought
+     * out, or is it only out of the page? Before 3.16.3 "not on the page" always
+     * counted as bought out - scrolling away from a listing bought all of it.
+     *
+     * Bought out:
+     *   - where the page never had a list of rows to go by (as before);
+     *   - when every row was read and it is in none (`absent`);
+     *   - when the row it was last seen in is in the page as it was then, less
+     *     this listing and with the next ones moved up - what a listing bought
+     *     out leaves; sorting the list, or typing in its search box, does not -
+     *     or it was alone in the last row and the list is one row shorter;
+     *   - when the list itself went and this listing was all it held.
+     * Compared with the row as it was when the listing was LAST SEEN, so it
+     * holds however many reads come after, and under the search box too, as long
+     * as the search is as it was. Anything else: not known (false).
+     *
+     * @param {string} itemId
+     * @param {{row: number|null, rowIds: string[]|null, rowTotal: number|null, rowSearch: boolean|null}} last
+     *   the row the listing was in when last seen, the list's rows then, and
+     *   whether its search box was in use
+     * @param {object|null} read - what the page shows of the list now
+     * @param {object} [o]
+     * @param {boolean} [o.hadList] - this page has had a list of rows
+     * @param {boolean} [o.absent] - every row was read, and the item is in none
+     */
+    function listingBoughtOut(itemId, last, read, { hadList = false, absent = false } = {}) {
+        const id = String(itemId);
+        const ids = last && Array.isArray(last.rowIds) ? last.rowIds.map(String) : null;
+        const at = ids ? ids.indexOf(id) : -1;
+        // The row it was in, without it.
+        const rest = at >= 0 ? ids.filter((x, i) => i !== at) : null;
+        if (!read) {
+            if (!hadList) return true;
+            return Boolean(rest && !rest.length && last.rowTotal === 1);
+        }
+        if (absent) return true;
+        if (!rest || last.row === null || last.row === undefined || Boolean(read.searching) !== Boolean(last.rowSearch)) return false;
+        if (read.rows.some((r) => r.ids.map(String).includes(id))) return false;
+        // One listing fewer: as many rows, or one less.
+        if (read.rowsTotal !== last.rowTotal && read.rowsTotal !== last.rowTotal - 1) return false;
+        // A listing sold further up moves every one after it up a place: the first
+        // of a row goes to the end of the row before, and its old row then looks
+        // just as if it had left. So the row before must be in the page too (and,
+        // by the line above, without it) - else it may only have moved out of the
+        // part of the list Torn keeps in the page (3.16.4).
+        if (last.row > 0 && !read.rows.some((r) => r.index === last.row - 1)) return false;
+        if (!rest.length) return last.row >= read.rowsTotal;
+        const now = read.rows.find((r) => r.index === last.row);
+        return Boolean(now) && rest.every((x, i) => String(now.ids[i]) === x);
+    }
+
+    /**
+     * Where a listing you were sent for stands, when it is not among the page's
+     * cards:
+     *   'absent'    - every row was read and the item is in none: not in this bazaar
+     *   'below'     - rows not read yet: it may be further down
+     *   'searching' - the bazaar's search box is in use: only what it shows was read
+     *   'unknown'   - nothing can be said (no such list on the page, or the item
+     *                 is there but cannot be bought or read: locked, no price)
+     * (The buying run adds 'away': seen here, and since out of the page.)
+     */
+    function coverVerdict(cover, itemId) {
+        if (!cover) return 'unknown';
+        if (coverHasItem(cover, itemId)) return 'unknown';
+        if (cover.searching) return 'searching';
+        return coverWhole(cover) ? 'absent' : 'below';
+    }
+
+    /* ===== src/sources/dom/detect.js ===== */
+    /*
+     * Finding the listing cards on the page.
+     *
+     * This is the part that has to work, so it uses two strategies and prefers
+     * whichever actually finds cards:
+     *
+     *   1. Image-anchored. Every listing carries an item image whose path holds
+     *      the item id (/images/items/206/large.png). Starting there and climbing
+     *      to the card is cheap and precise.
+     *
+     *   2. Content-shaped. Walk the document for elements whose text contains a
+     *      price AND "in stock", that are visible and card-sized, then climb to
+     *      the smallest ancestor that looks like a whole card (price + stock +
+     *      image + plausible dimensions).
+     *
+     * Strategy 2 is deliberately the same approach as the script that is known to
+     * work on live Torn pages. It is slower, so it runs only when strategy 1
+     * finds nothing - which keeps the fast path fast without betting the whole
+     * feature on it.
+     */
+
+    const ITEM_IMAGE_SELECTOR =
+        'img[src*="/images/items/"], img[srcset*="/images/items/"]';
+
+    const ITEM_IMAGE_ID_RE = /\/images\/items\/(\d+)\//;
+
+    /** Known card containers, tightest first. */
+    const CARD_SELECTOR = [
+        '[class*="itemTile"]',
+        '[data-testid="item-description"]',
+        '[class*="itemDescription"]',
+        '[class*="sellerRow"]',
+        '[class*="listItem"]',
+    ].join(', ');
+
+    const PRICE_RE = /\$\s*[\d,]+/;
+    const STOCK_RE = /in\s+stock|in\s+total/i;
+
+    const MAX_CLIMB = 8;
+
+    /** The item id from an image path, or null if it is not an item image. */
+    function itemIdFromImage(img) {
+        if (!img || typeof img.getAttribute !== 'function') return null;
+
+        const src = img.getAttribute('src') || img.getAttribute('srcset') || '';
+        const match = src.match(ITEM_IMAGE_ID_RE);
+
+        return match ? match[1] : null;
+    }
+
+    function isVisible(el) {
+        if (!el || typeof window === 'undefined') return true;
+
+        const style = window.getComputedStyle(el);
+        if (style.display === 'none' || style.visibility === 'hidden') return false;
+
+        const rect = el.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+    }
+
+    function boxOf(el) {
+        if (!el || typeof el.getBoundingClientRect !== 'function') {
+            return { width: 0, height: 0 };
+        }
+        return el.getBoundingClientRect();
+    }
+
+    function countItemImages(el) {
+        try {
+            return el.querySelectorAll(ITEM_IMAGE_SELECTOR).length;
+        } catch {
+            return 0;
+        }
+    }
+
+    /**
+     * Climb from an item image to the element representing ONE listing.
+     *
+     * The guard that matters: the moment an ancestor contains more than one item
+     * image we have climbed into a container holding several listings and must
+     * stop. Without it, one card's name gets paired with another card's price -
+     * which is the oldest bug in this project.
+     */
+    function cardFromImage(img) {
+        const preferred = img.closest ? img.closest(CARD_SELECTOR) : null;
+        if (preferred && countItemImages(preferred) === 1) return preferred;
+
+        let node = img.parentElement;
+        let best = null;
+
+        for (let depth = 0; depth < MAX_CLIMB && node; depth += 1) {
+            if (countItemImages(node) > 1) break;
+
+            best = node;
+
+            const text = node.textContent || '';
+            if (node.querySelector('[aria-label^="Buy"]') || PRICE_RE.test(text)) {
+                return node;
+            }
+
+            node = node.parentElement;
+        }
+
+        return best;
+    }
+
+    /** Climb from a price-bearing element to something card-shaped. */
+    function cardFromContent(el) {
+        let node = el;
+
+        for (let depth = 0; depth < MAX_CLIMB && node; depth += 1) {
+            const text = node.textContent || '';
+            const box = boxOf(node);
+
+            if (
+                PRICE_RE.test(text) &&
+                STOCK_RE.test(text) &&
+                node.querySelector('img') &&
+                box.width >= 150 &&
+                box.width <= 600 &&
+                box.height >= 60 &&
+                box.height <= 400
+            ) {
+                return node;
+            }
+
+            node = node.parentElement;
+        }
+
+        return null;
+    }
+
+    function dedupe(cards) {
+        const seen = new Set();
+        const out = [];
+
+        for (const card of cards) {
+            if (!card || seen.has(card)) continue;
+            seen.add(card);
+            out.push(card);
+        }
+
+        return out;
+    }
+
+    /** Strategy 1: anchored on item images. */
+    function findByImage(root) {
+        let images;
+        try {
+            images = Array.from(root.querySelectorAll(ITEM_IMAGE_SELECTOR));
+        } catch {
+            return { cards: [], images: 0 };
+        }
+
+        const cards = dedupe(images.map(cardFromImage).filter(Boolean));
+
+        return { cards, images: images.length };
+    }
+
+    /** Is this element card-sized text with a price and a stock count? */
+    function looksLikeListing(el) {
+        const text = el.textContent || '';
+        if (!text || text.length > 500) return false;
+        if (!PRICE_RE.test(text) || !STOCK_RE.test(text)) return false;
+        if (!isVisible(el)) return false;
+        const box = boxOf(el);
+        return box.width >= 120 && box.height >= 60;
+    }
+
+    /**
+     * Strategy 2: shaped like a listing card.
+     *
+     * Starts from the text that holds a "$" and climbs a few parents, instead of
+     * reading the text of EVERY element on the page (each one re-reading all of
+     * its children): that ran on every 2.5 s scan of a page with no item images
+     * (your own storefront, a page still loading) and cost far more than the page
+     * it looked at. A listing's price is always in its own text, so the same
+     * cards are found; the climb stops where the text grows past a card's.
+     */
+    function findByContent(root) {
+        const doc = root && (root.nodeType === 9 ? root : root.ownerDocument);
+        const start = root && root.nodeType === 9 ? root.body : root;
+        if (!doc || !start || typeof doc.createTreeWalker !== 'function') return [];
+
+        const candidates = [];
+        const tried = new Set();
+        let walker;
+        try {
+            walker = doc.createTreeWalker(start, 4 /* NodeFilter.SHOW_TEXT */);
+        } catch {
+            return [];
+        }
+
+        for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+            if (!node.nodeValue || node.nodeValue.indexOf('$') < 0) continue;
+            let el = node.parentElement;
+            for (let depth = 0; depth < MAX_CLIMB && el; depth += 1, el = el.parentElement) {
+                if (tried.has(el)) break;
+                tried.add(el);
+                if ((el.textContent || '').length > 500) break;
+                if (looksLikeListing(el)) candidates.push(el);
+            }
+        }
+
+        // In page order, as the old walk over every element returned them.
+        const cards = dedupe(candidates.map(cardFromContent).filter(Boolean));
+        return cards.sort((a, b) => (a === b ? 0 : a.compareDocumentPosition(b) & 4 ? -1 : 1));
+    }
+
+    /**
+     * Find every listing card on the page.
+     *
+     * @returns {{cards: Element[], strategy: string, images: number}}
+     */
+    function findCards(root) {
+        if (!root) return { cards: [], strategy: 'none', images: 0 };
+
+        const byImage = findByImage(root);
+        if (byImage.cards.length > 0) {
+            return {
+                cards: byImage.cards,
+                strategy: 'image',
+                images: byImage.images,
+            };
+        }
+
+        const byContent = findByContent(root);
+
+        return {
+            cards: byContent,
+            strategy: byContent.length > 0 ? 'content' : 'none',
+            images: byImage.images,
+        };
+    }
+
+    /* ===== src/sources/dom/bazaar-list.js ===== */
+    /*
+     * How much of a player's bazaar is in the page, read only.
+     *
+     * Markup read on real bazaars with the owner, 2026-10-02 (a bazaar of 17
+     * listings, and one of 250), nothing touched:
+     *
+     *   div[data-testid="bazaar-items"]         style="position: relative; width: 100%; height: 6720px"
+     *     div[data-testid="bazaar-items-row"]   style="position: absolute; ...; height: 80px; transform: translateY(1360px)"
+     *       div[data-testid="row-items"]
+     *         div[data-testid="item"] x3        (the cards: sources/dom/detect.js)
+     *
+     * The list is as tall as every row together; only the rows near the screen
+     * are in the page (18 of 84 at the top of the big one), each placed by its
+     * offset, and the rows scrolled away from are taken out again. A row's
+     * offset says which row it is; the list's height says how many there are.
+     *
+     * Anything not laid out this way reads as null, and the caller carries on as
+     * it did before it knew any of this.
+     */
+
+
+
+    const BAZAAR_LIST_SELECTOR = '[data-testid="bazaar-items"]';
+    const BAZAAR_ROW_SELECTOR = '[data-testid="bazaar-items-row"]';
+
+    const HEIGHT_RE = /(?:^|;)\s*height:\s*([\d.]+)px/i;
+    const OFFSET_RE = /translateY\(\s*(-?[\d.]+)px\s*\)/i;
+
+    function styleNumber(el, re) {
+        const m = String((el && el.getAttribute && el.getAttribute('style')) || '').match(re);
+        const n = m ? Number(m[1]) : NaN;
+        return Number.isFinite(n) ? n : null;
+    }
+
+    /** How far up from the list the bazaar's own search box is looked for. */
+    const SEARCH_CLIMB = 6;
+
+    /**
+     * Is the bazaar's own search box in use? The nearest box around the list
+     * that calls itself a search (Torn's reads "search..."); the site's search in
+     * the page header is further out and is never reached when the bazaar has
+     * its own. No such box: not in use.
+     */
+    function bazaarSearchInUse(list) {
+        let node = list ? list.parentElement : null;
+        for (let depth = 0; depth < SEARCH_CLIMB && node; depth += 1, node = node.parentElement) {
+            const boxes = [...node.querySelectorAll('input')].filter((i) => {
+                if (i.type === 'hidden' || i.type === 'checkbox' || i.type === 'radio') return false;
+                if (list.contains(i)) return false;
+                return /search/i.test([i.getAttribute('placeholder'), i.getAttribute('aria-label'), i.getAttribute('name'), i.getAttribute('class'), i.getAttribute('type')].join(' '));
+            });
+            if (boxes.length) return boxes.some((i) => String(i.value || '').trim() !== '');
+        }
+        return false;
+    }
+
+    /**
+     * What the page shows of the bazaar's list now.
+     *
+     * @param {Document|Element} root
+     * @returns {null|{rowsTotal: number, perRow: number, rows: Array<{index: number, ids: string[], el: Element}>, searching: boolean}}
+     */
+    function readBazaarList(root) {
+        const list = root && root.querySelector ? root.querySelector(BAZAAR_LIST_SELECTOR) : null;
+        if (!list) return null;
+        const els = [...list.querySelectorAll(BAZAAR_ROW_SELECTOR)];
+        if (!els.length) return null;
+        const rowHeight = styleNumber(els[0], HEIGHT_RE);
+        const listHeight = styleNumber(list, HEIGHT_RE);
+        if (!(rowHeight > 0) || !(listHeight > 0)) return null;
+        const rows = [];
+        for (const el of els) {
+            const y = styleNumber(el, OFFSET_RE);
+            // A row not placed by its offset: not the list read above.
+            if (y === null || y < 0) return null;
+            const ids = [...el.querySelectorAll(ITEM_IMAGE_SELECTOR)].map(itemIdFromImage).filter(Boolean).map(String);
+            rows.push({ index: Math.round(y / rowHeight), ids, el });
+        }
+        const rowsTotal = Math.round(listHeight / rowHeight);
+        if (!(rowsTotal > 0)) return null;
+        return { rowsTotal, perRow: rows.reduce((a, r) => Math.max(a, r.ids.length), 0), rows, searching: bazaarSearchInUse(list) };
+    }
+
+    /** Which row of the list a card is in (its index), or null. */
+    function bazaarRowOf(read, el) {
+        if (!read || !el) return null;
+        const row = read.rows.find((r) => r.el === el || r.el.contains(el));
+        return row ? row.index : null;
     }
 
     /* ===== src/core/liquidity.js ===== */
@@ -3251,7 +3925,8 @@
         if (!mine.length) return { state: 'gone' };
         const same = mine.find((r) => r.price === step.price);
         if (!same) return { state: 'price', price: Math.min(...mine.map((r) => r.price)), seenAt: mine[0].dataAt || null };
-        if (same.qty < step.qty) return { state: 'short', qty: same.qty, seenAt: same.dataAt || null };
+        // Fewer than you still need: what you already took of this step is yours (and, 3.16.4, off the listing's number).
+        if (same.qty < step.qty - (step.boughtQty > 0 ? step.boughtQty : 0)) return { state: 'short', qty: same.qty, seenAt: same.dataAt || null };
         return { state: 'ok', seenAt: same.dataAt || null };
     }
 
@@ -3320,6 +3995,26 @@
         const m = Math.floor((Number(age) || 0) / 60000);
         if (m >= 1) out.push('yes ' + (m < 60 ? m + 'm' : Math.floor(m / 60) + 'h' + (m % 60 ? ' ' + (m % 60) + 'm' : '')) + ' ago');
         return out;
+    }
+
+    /**
+     * The buying box's line when the listing to buy is not among the page's
+     * cards (3.16.3): Torn keeps only the rows near the screen in the page, so
+     * "not on the page" is said as what it is - not in this bazaar at all, or
+     * further down a long one - with how much of the bazaar was read.
+     *
+     * @param {{where?: string|null, listings?: {n: number, exact: boolean}|null, listingsRead?: number|null}} here
+     */
+    function buyingWhereText(here) {
+        const where = here && here.where;
+        const all = here && here.listings;
+        const total = all ? (all.exact ? '' : 'about ') + all.n.toLocaleString('en-US') + (all.n === 1 ? ' listing' : ' listings') : null;
+        if (where === 'absent') return 'Not in this bazaar: ' + (total ? total + ' read' : 'every listing read') + ', none of them this item.';
+        if (where === 'below') return 'Not in the page yet: this bazaar has ' + (total || 'more listings') + ', and ' + (Number(here.listingsRead) || 0).toLocaleString('en-US') + ' were read so far. Scroll down, or type its name in the bazaar\'s search box - it is marked when it shows.';
+        if (where === 'searching') return 'Not among the listings the bazaar\'s search box shows.';
+        // Seen here before, and not known gone: Torn took its row out of the page as you scrolled.
+        if (where === 'away') return 'Out of the page now: scroll back to it, or type its name in the bazaar\'s search box - it is marked when it shows.';
+        return 'Not on this page any more.';
     }
 
     /**
@@ -3610,6 +4305,40 @@
         return units ? cost / units : 0;
     }
 
+    /*
+     * What counts as left over from a trade (3.16.4). The friend's Torn Bids was
+     * full of "Left over" cards (2026-10-02) for things he no longer had, and
+     * the owner asked why they were there at all.
+     *
+     * - Only what was bought FOR the trade can be left over from it: the plan's
+     *   items, and unplanned buys this trader pays for. Since 3.16.0 every bazaar
+     *   buy in your log while a trade was accepted - whatever it was for - was
+     *   attached to it, and became a card when the trade closed. A buy the
+     *   trader does not buy is no longer one.
+     * - A leftover says from when what leaves your stock counts against it
+     *   (`since`), so a card whose item already went is taken off at the next
+     *   Ledger read, not left for a press (leftoversAfterSales):
+     *     a trade seen finished - from that trade on (what it took is already
+     *       off the card);
+     *     Cancel trade - from your last buy for it (if the trade had in fact
+     *       gone through, what it took comes off);
+     *     Traded - done pressed by hand - not said (when it went through is not
+     *       known): from five minutes after the card, as before.
+     */
+
+    /** When you last bought for a trade (ms), from what its steps and unplanned buys say; null when none says. */
+    function lastBuyAt(trade) {
+        let at = 0;
+        for (const i of (trade && trade.items) || []) for (const st of i.steps || []) if (stepDone(st) && Number(st.boughtAt) > at) at = Number(st.boughtAt);
+        for (const x of (trade && trade.extra) || []) if (extraForTrade(x) && Number(x.at) > at) at = Number(x.at);
+        return at > 0 ? at : null;
+    }
+
+    /** Is this unplanned buy part of the trade: one its trader pays for. */
+    function extraForTrade(x) {
+        return Boolean(x && Number(x.bid) > 0 && Number(x.qty) > 0);
+    }
+
     /** The leftovers a finished trade leaves: bought items the trader did not take. */
     function leftoversOf(trade, now = Date.now()) {
         const out = [];
@@ -3617,10 +4346,6 @@
             const n = Math.min(sendUnits(i), Math.max(0, Math.floor(Number(i.left) || 0)));
             if (i.kind !== 'flip' || !(n > 0)) continue;
             out.push({ itemId: String(i.itemId), name: i.name, qty: n, each: Math.round(costEach(i)), from: trade.trader ? trade.trader.name : null, at: now });
-        }
-        // Bought on the way that this trader does not buy (3.16): never in the trade, still yours to sell.
-        for (const x of (trade && trade.extra) || []) {
-            if (x && !(Number(x.bid) > 0) && Number(x.qty) > 0) out.push({ itemId: String(x.itemId), name: x.name, qty: Number(x.qty), each: Math.round(Number(x.price) || 0), from: trade.trader ? trade.trader.name : null, at: now });
         }
         return out;
     }
@@ -3633,14 +4358,16 @@
      */
     function cancelledLeftovers(trade, now = Date.now()) {
         const from = trade && trade.trader ? trade.trader.name : null;
+        const since = lastBuyAt(trade);
+        const stamp = since ? { since } : {};
         const out = [];
         for (const i of (trade && trade.items) || []) {
             if (i.kind !== 'flip' || !(i.steps || []).some(stepDone)) continue;
             const n = sendUnits(i);
-            if (n > 0) out.push({ itemId: String(i.itemId), name: i.name, qty: n, each: Math.round(costEach(i)), from, at: now });
+            if (n > 0) out.push({ itemId: String(i.itemId), name: i.name, qty: n, each: Math.round(costEach(i)), from, at: now, ...stamp });
         }
         for (const x of (trade && trade.extra) || []) {
-            if (x && Number(x.qty) > 0) out.push({ itemId: String(x.itemId), name: x.name, qty: Number(x.qty), each: Math.round(Number(x.price) || 0), from, at: now });
+            if (extraForTrade(x)) out.push({ itemId: String(x.itemId), name: x.name, qty: Number(x.qty), each: Math.round(Number(x.price) || 0), from, at: now, ...stamp });
         }
         return addLeftovers([], out);
     }
@@ -3652,10 +4379,14 @@
             const same = out.find((l) => String(l.itemId) === String(a.itemId));
             if (same) {
                 const qty = same.qty + a.qty;
+                // One row, counted from the later of the two starts: what left before the newer one's start
+                // is not known to be the older one's (it may be the newer trade's own), so it is not counted.
+                const since = Number(same.since) > 0 || Number(a.since) > 0 ? Math.max(leftoverFrom(same), leftoverFrom(a)) : null;
                 same.each = Math.round((same.each * same.qty + a.each * a.qty) / qty);
                 same.qty = qty;
                 same.at = Math.max(Number(same.at) || 0, Number(a.at) || 0);
                 same.from = a.from || same.from;
+                if (since) same.since = since;
             } else {
                 out.push({ ...a });
             }
@@ -3948,9 +4679,11 @@
      * What a trade that went through leaves you, from what you really gave
      * (itemsGiven): per item, what you bought for it - planned and unplanned -
      * minus what went in, at what it cost you each. Your own items planned in
-     * the trade count as given first.
+     * the trade count as given first. `finishedAt`: when that trade finished
+     * (Torn's clock, ms) - from then on what leaves your stock counts against
+     * these (leftoversAfterSales).
      */
-    function tradedLeftovers(trade, gave, now = Date.now()) {
+    function tradedLeftovers(trade, gave, now = Date.now(), finishedAt = null) {
         const from = trade && trade.trader ? trade.trader.name : null;
         const given = new Map();
         for (const [k, v] of gave || []) given.set(String(k), Number(v) || 0);
@@ -3974,12 +4707,14 @@
             if (n > 0) add(id, i.name, n, costEach(i));
         }
         for (const x of (trade && trade.extra) || []) {
-            if (x && Number(x.qty) > 0) add(x.itemId, x.name, Number(x.qty), Number(x.price) || 0);
+            if (extraForTrade(x)) add(x.itemId, x.name, Number(x.qty), Number(x.price) || 0);
         }
+        // Counted from when the trade finished (3.16.4): what it took is off already; what leaves after it is the leftover going.
+        const stamp = Number(finishedAt) > 0 ? { since: Number(finishedAt) } : {};
         const out = [];
         for (const b of bought.values()) {
             const left = b.qty - Math.min(b.qty, given.get(b.itemId) || 0);
-            if (left > 0) out.push({ itemId: b.itemId, name: b.name, qty: left, each: Math.round(b.cost / b.qty), from, at: now });
+            if (left > 0) out.push({ itemId: b.itemId, name: b.name, qty: left, each: Math.round(b.cost / b.qty), from, at: now, ...stamp });
         }
         return out;
     }
@@ -4017,8 +4752,29 @@
      */
     const LEFTOVER_SALE_MARGIN_MS = 5 * 60 * 1000;
 
+    /*
+     * 3.16.4 (the owner: "the sold cards should update automatically, and it
+     * shouldn't take that long"). Counting only sales made five minutes after
+     * the card appeared missed the usual case: the item had ALREADY gone - given
+     * in a trade he then cancelled in the script (twelve hours on, with the
+     * Checkout still showing), or passed to another trader at once - so the card
+     * stayed until he pressed Sold ✓. A leftover now says from when sales count
+     * against it (`since`, see "What counts as left over" above): the same
+     * count, started where it should be. Cards kept before 3.16.4, and ones from
+     * Traded - done pressed by hand, say nothing and count as before.
+     *
+     * Still one sale once (`seenTo`), still what you bought again sold first
+     * (`spare`). What you held of the item before is not told apart from the
+     * leftover: selling that counts too, as it always did.
+     */
+
+    /** From when the Ledger's rows count against a leftover (ms): its `since`, else five minutes after it was kept. */
+    function leftoverFrom(l) {
+        return Number(l && l.since) > 0 ? Number(l.since) : Number(l && l.at) + LEFTOVER_SALE_MARGIN_MS;
+    }
+
     /**
-     * @param {Array} leftovers - [{itemId, qty, at, seenTo?, spare?}]
+     * @param {Array} leftovers - [{itemId, qty, at, since?, seenTo?, spare?}]
      * @param {Array} rows - Ledger rows {t, itemId, qty, side: 'buy' | 'sell' | 'give'}
      * @returns {Array} the leftovers, less what was sold since; none left - gone
      */
@@ -4031,7 +4787,7 @@
             byItem.get(id).push(r);
         }
         return (leftovers || []).map((l) => {
-            const from = Math.max(Number(l.at) + LEFTOVER_SALE_MARGIN_MS, Number(l.seenTo) || 0);
+            const from = Math.max(leftoverFrom(l), Number(l.seenTo) || 0);
             const mine = (byItem.get(String(l.itemId)) || []).filter((r) => Number(r.t) > from).sort((a, b) => a.t - b.t);
             if (!mine.length) return l;
             let spare = Math.max(0, Number(l.spare) || 0);
@@ -4048,242 +4804,6 @@
             }
             return { ...l, qty: l.qty - Math.min(l.qty, gone), spare, seenTo: Number(mine[mine.length - 1].t) };
         }).filter((l) => l.qty > 0);
-    }
-
-    /* ===== src/sources/dom/detect.js ===== */
-    /*
-     * Finding the listing cards on the page.
-     *
-     * This is the part that has to work, so it uses two strategies and prefers
-     * whichever actually finds cards:
-     *
-     *   1. Image-anchored. Every listing carries an item image whose path holds
-     *      the item id (/images/items/206/large.png). Starting there and climbing
-     *      to the card is cheap and precise.
-     *
-     *   2. Content-shaped. Walk the document for elements whose text contains a
-     *      price AND "in stock", that are visible and card-sized, then climb to
-     *      the smallest ancestor that looks like a whole card (price + stock +
-     *      image + plausible dimensions).
-     *
-     * Strategy 2 is deliberately the same approach as the script that is known to
-     * work on live Torn pages. It is slower, so it runs only when strategy 1
-     * finds nothing - which keeps the fast path fast without betting the whole
-     * feature on it.
-     */
-
-    const ITEM_IMAGE_SELECTOR =
-        'img[src*="/images/items/"], img[srcset*="/images/items/"]';
-
-    const ITEM_IMAGE_ID_RE = /\/images\/items\/(\d+)\//;
-
-    /** Known card containers, tightest first. */
-    const CARD_SELECTOR = [
-        '[class*="itemTile"]',
-        '[data-testid="item-description"]',
-        '[class*="itemDescription"]',
-        '[class*="sellerRow"]',
-        '[class*="listItem"]',
-    ].join(', ');
-
-    const PRICE_RE = /\$\s*[\d,]+/;
-    const STOCK_RE = /in\s+stock|in\s+total/i;
-
-    const MAX_CLIMB = 8;
-
-    /** The item id from an image path, or null if it is not an item image. */
-    function itemIdFromImage(img) {
-        if (!img || typeof img.getAttribute !== 'function') return null;
-
-        const src = img.getAttribute('src') || img.getAttribute('srcset') || '';
-        const match = src.match(ITEM_IMAGE_ID_RE);
-
-        return match ? match[1] : null;
-    }
-
-    function isVisible(el) {
-        if (!el || typeof window === 'undefined') return true;
-
-        const style = window.getComputedStyle(el);
-        if (style.display === 'none' || style.visibility === 'hidden') return false;
-
-        const rect = el.getBoundingClientRect();
-        return rect.width > 0 && rect.height > 0;
-    }
-
-    function boxOf(el) {
-        if (!el || typeof el.getBoundingClientRect !== 'function') {
-            return { width: 0, height: 0 };
-        }
-        return el.getBoundingClientRect();
-    }
-
-    function countItemImages(el) {
-        try {
-            return el.querySelectorAll(ITEM_IMAGE_SELECTOR).length;
-        } catch {
-            return 0;
-        }
-    }
-
-    /**
-     * Climb from an item image to the element representing ONE listing.
-     *
-     * The guard that matters: the moment an ancestor contains more than one item
-     * image we have climbed into a container holding several listings and must
-     * stop. Without it, one card's name gets paired with another card's price -
-     * which is the oldest bug in this project.
-     */
-    function cardFromImage(img) {
-        const preferred = img.closest ? img.closest(CARD_SELECTOR) : null;
-        if (preferred && countItemImages(preferred) === 1) return preferred;
-
-        let node = img.parentElement;
-        let best = null;
-
-        for (let depth = 0; depth < MAX_CLIMB && node; depth += 1) {
-            if (countItemImages(node) > 1) break;
-
-            best = node;
-
-            const text = node.textContent || '';
-            if (node.querySelector('[aria-label^="Buy"]') || PRICE_RE.test(text)) {
-                return node;
-            }
-
-            node = node.parentElement;
-        }
-
-        return best;
-    }
-
-    /** Climb from a price-bearing element to something card-shaped. */
-    function cardFromContent(el) {
-        let node = el;
-
-        for (let depth = 0; depth < MAX_CLIMB && node; depth += 1) {
-            const text = node.textContent || '';
-            const box = boxOf(node);
-
-            if (
-                PRICE_RE.test(text) &&
-                STOCK_RE.test(text) &&
-                node.querySelector('img') &&
-                box.width >= 150 &&
-                box.width <= 600 &&
-                box.height >= 60 &&
-                box.height <= 400
-            ) {
-                return node;
-            }
-
-            node = node.parentElement;
-        }
-
-        return null;
-    }
-
-    function dedupe(cards) {
-        const seen = new Set();
-        const out = [];
-
-        for (const card of cards) {
-            if (!card || seen.has(card)) continue;
-            seen.add(card);
-            out.push(card);
-        }
-
-        return out;
-    }
-
-    /** Strategy 1: anchored on item images. */
-    function findByImage(root) {
-        let images;
-        try {
-            images = Array.from(root.querySelectorAll(ITEM_IMAGE_SELECTOR));
-        } catch {
-            return { cards: [], images: 0 };
-        }
-
-        const cards = dedupe(images.map(cardFromImage).filter(Boolean));
-
-        return { cards, images: images.length };
-    }
-
-    /** Is this element card-sized text with a price and a stock count? */
-    function looksLikeListing(el) {
-        const text = el.textContent || '';
-        if (!text || text.length > 500) return false;
-        if (!PRICE_RE.test(text) || !STOCK_RE.test(text)) return false;
-        if (!isVisible(el)) return false;
-        const box = boxOf(el);
-        return box.width >= 120 && box.height >= 60;
-    }
-
-    /**
-     * Strategy 2: shaped like a listing card.
-     *
-     * Starts from the text that holds a "$" and climbs a few parents, instead of
-     * reading the text of EVERY element on the page (each one re-reading all of
-     * its children): that ran on every 2.5 s scan of a page with no item images
-     * (your own storefront, a page still loading) and cost far more than the page
-     * it looked at. A listing's price is always in its own text, so the same
-     * cards are found; the climb stops where the text grows past a card's.
-     */
-    function findByContent(root) {
-        const doc = root && (root.nodeType === 9 ? root : root.ownerDocument);
-        const start = root && root.nodeType === 9 ? root.body : root;
-        if (!doc || !start || typeof doc.createTreeWalker !== 'function') return [];
-
-        const candidates = [];
-        const tried = new Set();
-        let walker;
-        try {
-            walker = doc.createTreeWalker(start, 4 /* NodeFilter.SHOW_TEXT */);
-        } catch {
-            return [];
-        }
-
-        for (let node = walker.nextNode(); node; node = walker.nextNode()) {
-            if (!node.nodeValue || node.nodeValue.indexOf('$') < 0) continue;
-            let el = node.parentElement;
-            for (let depth = 0; depth < MAX_CLIMB && el; depth += 1, el = el.parentElement) {
-                if (tried.has(el)) break;
-                tried.add(el);
-                if ((el.textContent || '').length > 500) break;
-                if (looksLikeListing(el)) candidates.push(el);
-            }
-        }
-
-        // In page order, as the old walk over every element returned them.
-        const cards = dedupe(candidates.map(cardFromContent).filter(Boolean));
-        return cards.sort((a, b) => (a === b ? 0 : a.compareDocumentPosition(b) & 4 ? -1 : 1));
-    }
-
-    /**
-     * Find every listing card on the page.
-     *
-     * @returns {{cards: Element[], strategy: string, images: number}}
-     */
-    function findCards(root) {
-        if (!root) return { cards: [], strategy: 'none', images: 0 };
-
-        const byImage = findByImage(root);
-        if (byImage.cards.length > 0) {
-            return {
-                cards: byImage.cards,
-                strategy: 'image',
-                images: byImage.images,
-            };
-        }
-
-        const byContent = findByContent(root);
-
-        return {
-            cards: byContent,
-            strategy: byContent.length > 0 ? 'content' : 'none',
-            images: byImage.images,
-        };
     }
 
     /* ===== src/sources/dom/fill.js ===== */
@@ -6911,8 +7431,11 @@
      *   /v2/user/{id}/trade   - one trade's items and money
      *
      * It shares the one request window (70 a minute across every tab) with the
-     * other clients. Only Torn Bids makes one; the panel on torn.com never reads
-     * the Ledger's key.
+     * other clients. Torn Bids makes one - and, since 3.16.3, so does the Torn
+     * page you are viewing, for ONE question only: did a trade you accepted go
+     * through (/v2/user/trades and that trade), asked there only while no Torn
+     * Bids tab is open to ask it, and only from the tab in view. The panel on
+     * torn.com reads the Ledger's key for nothing else: never your log.
      */
 
 
@@ -10982,6 +11505,25 @@
     .ttv2-sendfill[data-fill] { cursor: pointer; }
     .ttv2-sendfill[aria-pressed="true"] { background: #4dabf7; color: #10202c; }
 
+    /* One Fill for every marked row (3.16.4), beside Torn's ADD TO TRADE: the row chips' look, a size up. */
+    .ttv2-sendfillall {
+        display: inline-block;
+        margin-left: 12px;
+        padding: 3px 10px;
+        border: 1px solid #4dabf7;
+        border-radius: 12px;
+        color: #9ad0fa;
+        font: bold 12px/18px Arial, sans-serif;
+        white-space: nowrap;
+        vertical-align: middle;
+        cursor: pointer;
+        user-select: none;
+    }
+
+    .ttv2-sendfillall:hover { background: rgba(77, 171, 247, 0.16); }
+    .ttv2-sendfillall:focus-visible { outline: 2px solid #4dabf7; outline-offset: 1px; }
+    .ttv2-sendfillall[aria-pressed="true"] { background: #4dabf7; color: #10202c; }
+
     /* The listing a feed link was opened for: light red (3.14.2, the owner; it was yellow). Paint-only, like .ttv2-hit. */
     .ttv2-target {
         box-shadow:
@@ -11107,9 +11649,33 @@
     .ttv2-bzchip-bp b { color: #74c0fc; }
     .ttv2-bzchip:hover,
     .ttv2-bzchips[data-selected="true"] .ttv2-bzchip { border-color: #99cc00; }
-    .ttv2-bzchips .ttv2-fillbox { margin-left: 0; }
-    .ttv2-bzchips .ttv2-filltag { display: none; }
-    .ttv2-bzchips .ttv2-fillbtn { height: 20px; font-size: 11px; }
+
+    /*
+     * The Fill tick on that page: at the right edge of Torn's value cell, the
+     * same place in every row. The cell keeps its own size and gives the tick
+     * room from inside it, so its line (Torn's price, the chips) ends before the
+     * tick instead of running under it. A row with no room for both chips shows
+     * one, or none - whole chips only (main.js fitBazaarCells sets data-tight).
+     */
+    .ttv2-bzcell {
+        position: relative;
+        box-sizing: border-box;
+        padding-right: var(--ttv2-fillw, 64px) !important;
+    }
+
+    .ttv2-fillbox.ttv2-fillcell {
+        position: absolute;
+        right: 0;
+        top: 50%;
+        transform: translateY(-50%);
+        margin: 0;
+        flex-wrap: nowrap;
+    }
+
+    .ttv2-fillcell .ttv2-filltag { display: none; }
+    .ttv2-fillcell .ttv2-fillbtn { height: 20px; font-size: 11px; }
+    .ttv2-bzchips[data-tight="1"] .ttv2-bzchip-ima { display: none; }
+    .ttv2-bzchips.ttv2-bzchips[data-tight="2"] { display: none; }
     .ttv2-fillbtn[data-level="good"] .ttv2-filllabel { color: #a8dd1c; }
     .ttv2-fillbtn[data-level="warn"] .ttv2-filllabel { color: #f0a020; }
     .ttv2-fillbtn[data-level="bad"] { border-color: #ff8a80; }
@@ -13897,7 +14463,7 @@
                         text: 'Now ' + formatMoney(h.nowPrice) + ' each (planned ' + formatMoney(h.price) + ')' + (h.bid && h.nowPrice >= h.bid ? ' - not under what ' + v.trader + ' pays (' + formatMoney(h.bid) + '): skip it.' : '.'),
                     }));
                 }
-                if (!v.ask) box.appendChild(el('div', { class: h.bought >= h.qty ? 'ttv2-tb-ok' : h.listed ? 'ttv2-sub' : 'ttv2-tb-warn', text: h.bought ? 'You took ' + h.bought.toLocaleString('en-US') + ' of ' + h.qty.toLocaleString('en-US') + (h.bought >= h.qty ? ' ✓' : '') : h.listed ? 'Not bought yet - or skip it: Next counts only what you took.' : 'Not on this page any more.' }));
+                if (!v.ask) box.appendChild(el('div', { class: h.bought >= h.qty ? 'ttv2-tb-ok' : h.listed ? 'ttv2-sub' : 'ttv2-tb-warn', text: h.bought ? 'You took ' + h.bought.toLocaleString('en-US') + ' of ' + h.qty.toLocaleString('en-US') + (h.bought >= h.qty ? ' ✓' : '') : h.listed ? 'Not bought yet - or skip it: Next counts only what you took.' : buyingWhereText(h) }));
             }
             // The listing was never seen here, so nothing could be counted: ask.
             if (v.ask && v.here) {
@@ -13917,7 +14483,9 @@
                 if (!waiting && first && this.root && this.root.getRootNode().activeElement === null) first.focus({ preventScroll: true });
                 return;
             }
-            const label = v.here && (!v.next || v.last) ? 'Done - go to the trade' : v.here && !v.here.listed ? 'Not here - next' : v.here && v.same ? 'Next item here' : v.here ? 'Next bazaar' : 'Open the next bazaar' + (v.next ? ': ' + v.next.seller : '');
+            // "Not here" only when it is not: a listing further down a long bazaar is still here.
+            const notHere = v.here && !v.here.listed && !['below', 'searching', 'away'].includes(v.here.where);
+            const label = v.here && (!v.next || v.last) ? 'Done - go to the trade' : notHere ? 'Not here - next' : v.here && v.same ? 'Next item here' : v.here ? 'Next bazaar' : 'Open the next bazaar' + (v.next ? ': ' + v.next.seller : '');
             this.buyNextBtn = el('button', { type: 'button', class: 'ttv2-primary ttv2-buynext', title: this.buyHereActive ? 'Key: N' : null, onclick: () => this.handlers.onBuyNext && this.handlers.onBuyNext() }, [label, this.buyHereActive ? el('span', { class: 'ttv2-kbd', text: 'N' }) : null]);
             box.appendChild(this.buyNextBtn);
             box.appendChild(this.cancelTradePart(v, () => this.setBuying(v)));
@@ -18000,6 +18568,7 @@
                 s.prefs.onlineOnly,
                 s.prefs.trustedOnly,
                 (s.leftovers || []).map((l) => [l.itemId, l.qty, l.each, l.best && l.best.name, l.best && l.best.price]),
+                Boolean(this.leftoversOpen),
             ]);
             if (sig === this.stripSig) return;
             this.stripSig = sig;
@@ -18010,8 +18579,48 @@
             box.textContent = '';
             // Leftovers and flips below: focus goes back once they are drawn.
             queueMicrotask(() => this.focusBack(box, refocus));
-            // What a trader did not take: first, until it is sold (or you drop it).
-            for (const l of s.leftovers || []) {
+            // What a trader did not take: first, until it is sold. One card for all
+            // of it (3.16.4: the friend's page was two dozen of these, each with a
+            // Sold ✓ to press; the owner: "why is it there?") - opened, it lists
+            // them. They go by themselves as your Ledger shows them sold.
+            const left = s.leftovers || [];
+            if (left.length) {
+                const open = Boolean(this.leftoversOpen);
+                const priced = left.filter((l) => l.gain !== null);
+                const paid = left.reduce((a, l) => a + l.qty * l.each, 0);
+                const toggle = () => {
+                    this.leftoversOpen = !open;
+                    this.renderStrip();
+                };
+                const all = spEl('div', {
+                    class: 'sp-fc sp-lo sp-lo-all',
+                    role: 'button',
+                    tabindex: '0',
+                    'data-focus': 'left:all',
+                    'aria-expanded': String(open),
+                    title: open ? 'Hide the leftovers' : 'What traders did not take: show each, and where to sell it',
+                }, [
+                    spEl('span', { class: 'sp-fc-top' }, [
+                        spEl('b', { class: 'sp-iname', text: 'Left over · ' + count(left.length) + (left.length === 1 ? ' item' : ' items') }),
+                        open ? spEl('button', { type: 'button', class: 'sp-link sp-lo-x', title: 'Take every leftover off this list. They also go by themselves, as your Ledger shows them sold.', text: 'Clear all', onclick: (event) => {
+                            event.stopPropagation();
+                            this.leftoversOpen = false;
+                            if (this.h.onLeftoversClear) this.h.onLeftoversClear();
+                        } }) : null,
+                    ]),
+                    spEl('span', { class: 'sp-fc-p', text: priced.length ? signed(priced.reduce((a, l) => a + l.gain, 0)) : '–' }),
+                    spEl('small', { text: (priced.length ? 'If sold to traders now' : 'No trader buys them now') + ' · paid ' + formatMoney(paid) + ' in all' }),
+                    spEl('small', { class: 'sp-fc-sell', text: open ? 'Hide them ▴' : 'Show them ▾' }),
+                ]);
+                all.addEventListener('click', toggle);
+                all.addEventListener('keydown', (event) => {
+                    if (event.key !== 'Enter' && event.key !== ' ') return;
+                    event.preventDefault();
+                    toggle();
+                });
+                box.appendChild(all);
+            }
+            for (const l of this.leftoversOpen ? left : []) {
                 const on = Boolean(s.desk && s.desk.itemId === String(l.itemId));
                 const card = spEl('div', {
                     class: 'sp-fc sp-lo' + (on ? ' sp-sel' : ''),
@@ -18024,10 +18633,6 @@
                     spEl('span', { class: 'sp-fc-top' }, [
                         spEl('span', { class: 'sp-pic sp-pic-s' }, [this.image('left', l.itemId)]),
                         spEl('b', { class: 'sp-iname', text: count(l.qty) + ' ' + l.name }),
-                        spEl('button', { type: 'button', class: 'sp-link sp-lo-x', title: 'Sold or kept: take it off this list', 'aria-label': 'Sold: take ' + l.name + ' off the leftovers', text: 'Sold ✓', onclick: (event) => {
-                            event.stopPropagation();
-                            if (this.h.onLeftoverRemove) this.h.onLeftoverRemove(l.itemId);
-                        } }),
                     ]),
                     spEl('span', { class: 'sp-fc-p', text: l.gain !== null ? signed(l.gain) : '–' }),
                     spEl('small', { text: 'Left over · paid ' + formatMoney(l.each) + ' each' }),
@@ -20333,6 +20938,8 @@
 
 
 
+
+
     const STORE_KEY = 'apiKey';
     const STORE_ITEMS = 'itemsCache';
     const STORE_NPC = 'npcCache';
@@ -20390,6 +20997,8 @@
     const TRADE_BUYBAR_CLASS = 'ttv2-buybar';
     /* Fill's line beside Torn's ADD TO TRADE (3.14.2): what it marked, or why nothing. */
     const TRADE_NOTE_CLASS = 'ttv2-fillnote';
+    /* One Fill for every marked row of the trade page's add step (3.16.4). */
+    const TRADE_FILLALL_CLASS = 'ttv2-sendfillall';
     /* Traders you marked Declined in Torn Bids: trader key -> until (an hour). */
     const STORE_SELL_DECLINED = 'sellDeclined';
     /* Trades a trader said yes to, frozen (core/accepted.js): trader key -> trade. Torn Bids and the overlay's trade page share it. */
@@ -20434,6 +21043,22 @@
     const STORE_SELL_TRADES_SEEN = 'sellTradesSeen';
     /* Trades you cancelled, a while (3.16.1): trader key -> {trade, left, recs, at}; put right if Torn shows them traded. */
     const STORE_SELL_CANCEL_UNDO = 'sellCancelUndo';
+    /*
+     * Listings a bazaar page showed are not there (3.16.3, core/flips.js
+     * markGone): written on Torn's bazaar pages during a buying run, read by
+     * Torn Bids so no plan sends you back. {'seller|item': {at}}
+     */
+    const STORE_SELL_GONE = 'sellGone';
+    /*
+     * What you bought comes off TornW3B's numbers (3.16.4, core/flips.js
+     * withOwnBuys), until TornW3B has checked that bazaar since:
+     *   sellStock   a listing's stock as a bazaar page showed it after it dropped
+     *               in front of you (the overlay). {'seller|item': {qty, price, at}}
+     *   sellBought  your bazaar buys from your Torn log, half an hour of them
+     *               (Torn Bids, the Ledger's key). [{id, sellerId, itemId, qty, each, t}]
+     */
+    const STORE_SELL_STOCK = 'sellStock';
+    const STORE_SELL_BOUGHT = 'sellBought';
     const SELL_LEFTOVERS_KEEP_MS = 7 * 24 * 60 * 60 * 1000;
     /* When the ledger was last saved (its rows are in Torn Bids' IndexedDB): other tabs re-read on a change. */
     const STORE_LEDGER_REV = 'ledgerRev';
@@ -20588,6 +21213,24 @@
         tradePartners: new Map(),
         tradeInside: new Map(),
         buyHere: null,
+        /*
+         * The bazaar you are on (3.16.3): what of its list is in the page now
+         * (sources/dom/bazaar-list.js), and how much of it has been read since
+         * you opened it (core/bazaar-cover.js). Null off a bazaar, and where the
+         * list is not laid out in rows.
+         */
+        bzRead: null,
+        bzCover: null,
+        /* This page has had a list of rows (else: an older layout, read as before). */
+        bzHadList: false,
+        /* Every item that has been in a row of this page's list, whatever became of it. */
+        bzEver: new Set(),
+        /* How long after this page showed its list was first read (ms; Infinity: not known to be early). */
+        bzReadAfter: null,
+        /* Where the listing to buy stands when it is not among the page's cards: 'absent' | 'below' | 'searching' | 'unknown'. */
+        buyWhere: null,
+        /* Listings noted as not there, once per page load: 'seller|item'. */
+        goneNoted: new Set(),
         tradeFillBound: false,
         // The buying run's "did you buy it?" (the step key it asks about).
         buyAsk: null,
@@ -21007,6 +21650,10 @@
         }
 
         if (location.href !== app.pageHref) {
+            // Torn moved to another page without a load: its list was not read early.
+            app.bzReadAfter = app.pageHref === null ? null : Infinity;
+            app.bzHadList = false;
+            app.bzEver = new Set();
             app.pageHref = location.href;
             app.pageFirstSeen = new Map();
             app.targetShown = null;
@@ -21110,6 +21757,15 @@
         // A trusted trader pays more than a listing here asks: named on its card.
         markTraderTags(app.pageType === PAGE_BAZAAR && sellerId && !closedHere ? traderTags(listings) : []);
         showBazaarTarget(listings);
+        // How much of this bazaar is in the page, and how much of it has been read (3.16.3).
+        app.bzRead = app.pageType === PAGE_BAZAAR && sellerId ? readBazaarList(document) : null;
+        if (app.bzRead) {
+            app.bzHadList = true;
+            for (const r of app.bzRead.rows) for (const id of r.ids) app.bzEver.add(id);
+        }
+        app.bzCover = coverAfter(app.bzCover, location.href, app.bzRead);
+        // How soon after this page showed its list was first read (see BUY_EARLY_READ_MS).
+        if (app.bzCover && app.bzReadAfter === null) app.bzReadAfter = pageShownAt === null ? Infinity : Math.max(0, performance.now() - pageShownAt);
         trackTradeBuying(app.pageType === PAGE_BAZAAR ? listings : []);
 
         app.lastScanAt = now;
@@ -21589,6 +22245,7 @@
             if (!tag.classList.contains('ttv2-bzchips') && tag.title !== 'Show its graph') tag.title = 'Show its graph';
             if (ensureFillControls(row, which, tag)) app.bzDiagnostics.fills += 1;
         }
+        fitBazaarCells();
         bindRowTagPress();
         ensureFillSettingsLink();
         if (changed) markHistoryDirty();
@@ -21842,6 +22499,7 @@
             paintRowTag(tag, row.itemId);
             ensureFillControls(row, app.ownBazaar, tag);
         }
+        fitBazaarCells();
         renderMyBazaar();
     }
 
@@ -22160,7 +22818,12 @@
         const inputs = rowInputs(kind, row.el);
         let box = row.el.querySelector('.ttv2-fillbox');
         if (!inputs.price.length) {
-            if (box) box.remove();
+            if (box) {
+                const cell = box.parentNode;
+                box.remove();
+                // No tick: its cell keeps no room for one.
+                if (cell && cell.classList && cell.classList.contains(BZ_CELL_CLASS)) releaseBazaarCell(cell);
+            }
             return false;
         }
         if (!box) {
@@ -22179,10 +22842,17 @@
             const line = document.createElement('span');
             line.className = FILL_TAG_CLASS;
             box.append(btn, line);
-            if (tag && tag.classList.contains('ttv2-bzchips')) tag.appendChild(box);
-            else if (tag && tag.parentNode) tag.parentNode.insertBefore(box, tag.nextSibling);
+            if (tag && tag.classList.contains('ttv2-bzchips') && tag.parentNode) {
+                // #/add (3.16.3): held at the right edge of Torn's value cell, the
+                // same place in every row - not at the end of the cell's line, where
+                // a long row pushed it out of sight (see fitBazaarCells).
+                box.classList.add(BZ_FILL_CELL_CLASS);
+                tag.parentNode.appendChild(box);
+            } else if (tag && tag.parentNode) tag.parentNode.insertBefore(box, tag.nextSibling);
             else row.el.appendChild(box);
         }
+        // The cell it sits in keeps room for it (Torn may have drawn the cell again).
+        if (box.classList.contains(BZ_FILL_CELL_CLASS) && box.parentNode && box.parentNode.classList && !box.parentNode.classList.contains(BZ_CELL_CLASS)) box.parentNode.classList.add(BZ_CELL_CLASS);
         const btn = box.querySelector('.' + FILL_BUTTON_CLASS);
         if (btn.dataset.itemId !== String(row.itemId)) btn.dataset.itemId = String(row.itemId);
         paintFill(box, row.el, row.itemId);
@@ -22251,7 +22921,7 @@
         const current = done && done.itemId === String(itemId) && stillFilled(done, rowEl) ? done : null;
         if (done && !current) app.fill.done.delete(key);
         const busy = app.fill.busy.has(rowEl);
-        const compact = Boolean(box.parentNode && box.parentNode.classList && box.parentNode.classList.contains('ttv2-bzchips'));
+        const compact = box.classList.contains(BZ_FILL_CELL_CLASS);
         const failedNow = !current && app.fill.last.get(String(itemId));
         // Something you must do (tick Torn's box, type the quantity) or a warning:
         // a "!" on the one-line row; the words are in the panel and on hover.
@@ -22282,10 +22952,72 @@
             const box = row.el.querySelector('.ttv2-fillbox');
             if (box) paintFill(box, row.el, row.itemId);
         }
+        fitBazaarCells();
     }
 
     function removeFillControls(root = document) {
         for (const n of root.querySelectorAll('.ttv2-fillbox, .ttv2-fillset, .ttv2-bzchips')) n.remove();
+        // Torn's value cells are as they were: no room kept for a tick that is gone.
+        for (const c of root.querySelectorAll('.' + BZ_CELL_CLASS)) releaseBazaarCell(c);
+    }
+
+    /** One of Torn's value cells, given back as it was. */
+    function releaseBazaarCell(cell) {
+        cell.classList.remove(BZ_CELL_CLASS);
+        cell.style.removeProperty('--ttv2-fillw');
+        delete cell.dataset.ttv2Fit;
+        const chips = cell.querySelector('.ttv2-bzchips');
+        if (chips && chips.dataset.tight) delete chips.dataset.tight;
+    }
+
+    /* Our marks on your bazaar's add page: Torn's value cell, and the Fill tick held at its right edge. */
+    const BZ_CELL_CLASS = 'ttv2-bzcell';
+    const BZ_FILL_CELL_CLASS = 'ttv2-fillcell';
+    /* Clear space between the cell's own line and the Fill tick. */
+    const BZ_FILL_GAP_PX = 8;
+
+    /**
+     * One line per row on your bazaar's add page, the Fill tick always in it
+     * (3.16.3, the friend: "Fill button UI doesn't seem to be consistent?
+     * Sometimes it's pushed far sometimes you don't see it").
+     *
+     * The chips and the tick used to follow Torn's price in the cell's one line.
+     * With a quantity in the row another script writes "$29,782 | 2x = $59,564"
+     * there, the line no longer fitted, and the cell (Torn clips it with "…")
+     * dropped our whole group - all but the tick's square, left hanging at the
+     * far edge. Now the tick is held at the cell's right edge and the cell keeps
+     * that much room for it; when the rest still does not fit, IMA goes first
+     * (it is the same number Torn prints in that cell), then BP - whole chips,
+     * never a cut one. Both stay in My bazaar's list beside the page.
+     *
+     * Measured, not guessed: all reads, then all writes, so a page of 200 rows
+     * costs a few layouts, and only rows whose words or width changed are done.
+     */
+    function fitBazaarCells() {
+        if (app.ownBazaar !== 'add') return;
+        const todo = [];
+        for (const row of app.bzRows) {
+            const box = row.el.querySelector('.' + BZ_FILL_CELL_CLASS);
+            const cell = box ? box.parentNode : null;
+            const chips = cell && cell.querySelector ? cell.querySelector('.ttv2-bzchips') : null;
+            if (!cell || !chips) continue;
+            const room = box.offsetWidth;
+            const key = cell.clientWidth + '|' + room + '|' + cell.textContent;
+            if (cell.dataset.ttv2Fit === key) continue;
+            todo.push({ cell, chips, key, room });
+        }
+        if (!todo.length) return;
+        for (const t of todo) {
+            t.cell.style.setProperty('--ttv2-fillw', t.room + BZ_FILL_GAP_PX + 'px');
+            if (t.chips.dataset.tight) delete t.chips.dataset.tight;
+        }
+        // '1': without IMA; '2': without both chips.
+        for (const level of ['1', '2']) {
+            const over = todo.filter((t) => t.cell.scrollWidth > t.cell.clientWidth);
+            if (!over.length) break;
+            for (const t of over) t.chips.dataset.tight = level;
+        }
+        for (const t of todo) t.cell.dataset.ttv2Fit = t.key;
     }
 
     /**
@@ -22734,7 +23466,79 @@
      * listing's stock on the page (the page you are viewing - read only). One
      * click, one page: never several at once.
      */
-    const buyRun = { stepKey: null, firstSeen: null, nowSeen: null, seenGone: false, seenThisLoad: false };
+    const buyRun = { stepKey: null, firstSeen: null, nowSeen: null, seenGone: false, seenThisLoad: false, row: null, rowIds: null, rowTotal: null, rowSearch: null, lastStock: null, revealed: false };
+
+    /** A step's count starts again: nothing seen of it on this page yet. */
+    function startBuyRun(key) {
+        Object.assign(buyRun, { stepKey: key, firstSeen: key ? loadBuyRunSeen(key) : null, nowSeen: null, seenGone: false, seenThisLoad: false, row: null, rowIds: null, rowTotal: null, rowSearch: null, lastStock: null, revealed: false });
+    }
+
+    /*
+     * A bazaar read this soon after its page first showed was read before you
+     * could have bought anything on it (a buy is a press, a number, Buy, Yes).
+     * Only then is "every listing here was read, and it is not among them" taken
+     * as "not bought" without asking; read later, Next asks, as before.
+     */
+    const BUY_EARLY_READ_MS = 5000;
+
+    /* When this page first showed (ms on performance.now()'s clock): at once, or when its tab first came into view. */
+    let pageShownAt = typeof document !== 'undefined' && document.visibilityState !== 'visible' ? null : 0;
+    if (typeof document !== 'undefined' && pageShownAt === null) {
+        const onShown = () => {
+            if (document.visibilityState !== 'visible') return;
+            pageShownAt = performance.now();
+            document.removeEventListener('visibilitychange', onShown);
+        };
+        document.addEventListener('visibilitychange', onShown);
+    }
+
+    /**
+     * The listing you were counting is not among the page's cards: is it gone
+     * (bought out), or only out of the page? Torn keeps just the rows near the
+     * screen in the page (3.16.3) - before, scrolling away from a listing
+     * counted all of it as bought.
+     *
+     * The rule is core/bazaar-cover.js listingBoughtOut (the row as it was when
+     * the listing was last seen, against the page now). Once gone it stays gone
+     * until it shows again.
+     */
+    function buyListingGone(itemId) {
+        if (buyRun.seenGone) return true;
+        return listingBoughtOut(itemId, buyRun, app.bzRead, { hadList: app.bzHadList, absent: coverVerdict(app.bzCover, itemId) === 'absent' });
+    }
+
+    /** This seller's bazaar was seen to hold none of this item: kept, so no plan sends you back (once per page). */
+    function noteGoneListing(sellerId, itemId) {
+        const k = goneKey(sellerId, itemId);
+        if (app.goneNoted.has(k)) return;
+        app.goneNoted.add(k);
+        gmSet(STORE_SELL_GONE, markGone(gmGet(STORE_SELL_GONE, null), sellerId, itemId));
+        // The stock it showed before it went (3.16.4) says nothing any more.
+        const stock = liveStock(gmGet(STORE_SELL_STOCK, null));
+        if (stock[k]) {
+            delete stock[k];
+            gmSet(STORE_SELL_STOCK, stock);
+        }
+    }
+
+    /** ...and it is on the page after all (a read that was wrong): the mark this page made is taken back. */
+    function forgetGoneListing(sellerId, itemId) {
+        const k = goneKey(sellerId, itemId);
+        if (!app.goneNoted.has(k)) return;
+        app.goneNoted.delete(k);
+        const all = liveGone(gmGet(STORE_SELL_GONE, null));
+        if (!all[k]) return;
+        delete all[k];
+        gmSet(STORE_SELL_GONE, all);
+    }
+
+    /** What the page held of this bazaar, in words, for the problem log. */
+    function bazaarReadNote() {
+        const c = app.bzCover;
+        if (!c) return 'no list of rows on the page';
+        const all = coverListings(c);
+        return coverRowsRead(c) + ' of ' + c.total + ' rows read, ' + coverListingsRead(c) + ' of ' + (all ? (all.exact ? '' : 'about ') + all.n : '?') + ' listings' + (c.searching ? ', its search box in use' : '');
+    }
 
     /*
      * What you had in front of you when you arrived, kept for this tab (a reload
@@ -22868,7 +23672,109 @@
             for (const c of app.extraCards || []) {
                 if (c.el && c.el.contains(target)) (app.extraPressed = app.extraPressed || []).push(String(c.itemId) + '|' + Number(c.listingPrice));
             }
+            // ...and when, for a card that then leaves a page with no list of rows to go by (trackSeenStock).
+            for (const c of app.stockCards || []) {
+                if (c.el && c.el.contains(target)) (app.stockPressed = app.stockPressed || new Map()).set(String(c.itemId) + '|' + Number(c.listingPrice), Date.now());
+            }
         }, true);
+    }
+
+    /**
+     * A per-bazaar store kept to its newest `max` entries, by each one's `at`.
+     * (Not by the order of its keys: seller ids are numbers, and an object lists
+     * those in numeric order - the "oldest" ten dropped that way took the bazaar
+     * just written with them once ten were stored.)
+     */
+    function trimNewest(store, max) {
+        const keys = Object.keys(store).sort((a, b) => (Number(store[a] && store[a].at) || 0) - (Number(store[b] && store[b].at) || 0));
+        for (const k of keys.slice(0, Math.max(0, keys.length - max))) delete store[k];
+    }
+
+    /* Each card's stock on the bazaars you opened, kept for this tab (3.16.4). */
+    const STOCK_SEEN_SESSION = 'ttv2-stock-seen';
+    /* A press on a card's button counts for a card that is gone this soon after. */
+    const STOCK_PRESS_MS = 90 * 1000;
+
+    /**
+     * What a bazaar page shows beats TornW3B's older number (3.16.4; the friend:
+     * "ako bumili pero sinusuggest parin sakin"). A listing whose stock dropped
+     * while you were on its page - you bought some - is kept with the stock it
+     * has now (STORE_SELL_STOCK), and one that is no longer in the bazaar is
+     * marked gone (STORE_SELL_GONE), so Torn Bids' next plan does not count on
+     * units you already took. On every bazaar you open, with or without an
+     * accepted trade. Read only: nothing is pressed, nothing is sent.
+     *
+     * Torn keeps only the rows near the screen in the page, so a card that is
+     * not there is "gone" only by the rule the buying run uses (core/bazaar-
+     * cover.js listingBoughtOut: the whole bazaar read without the item, or its
+     * row still in the page with the next listings moved up) - or, on a page
+     * with no list of rows to go by, when you had just pressed a button on it.
+     * Otherwise its last stock is kept for when it is drawn again. (A buy this
+     * misses is in your Torn log, which Torn Bids reads: STORE_SELL_BOUGHT.)
+     */
+    function trackSeenStock(listings) {
+        const seller = bazaarOwnerId(location.href);
+        if (!seller || !Array.isArray(listings) || !listings.length) return;
+        app.stockCards = listings;
+        bindExtraPress();
+        let store = {};
+        try {
+            store = JSON.parse(sessionStorage.getItem(STOCK_SEEN_SESSION) || '{}') || {};
+        } catch {
+            store = {};
+        }
+        const was = store[seller] && store[seller].cards && typeof store[seller].cards === 'object' ? store[seller].cards : {};
+        const now = Date.now();
+        const { bought: dropped, seen } = stockBuys(was, listings);
+        // Cards read on this load of the page: only their rows are evidence (the list may be sorted another way after a reload).
+        app.stockSeenLoad = app.stockSeenLoad || new Set();
+        for (const key of Object.keys(seen)) app.stockSeenLoad.add(seller + '|' + key);
+        const here = Object.values(seen);
+        // Each card's row of the list, as it is now: says later whether a card left the page or was bought out.
+        const read = app.bzRead;
+        if (read) {
+            for (const l of listings) {
+                const e = l && l.el ? seen[String(l.itemId) + '|' + Number(l.listingPrice)] : null;
+                const row = e ? read.rows.find((r) => r.el === l.el || r.el.contains(l.el)) : null;
+                if (row) Object.assign(e, { row: row.index, rowIds: [...row.ids], rowTotal: read.rowsTotal, rowSearch: read.searching });
+            }
+        }
+        for (const b of dropped) {
+            const mine = here.filter((x) => x.itemId === String(b.itemId));
+            const qty = mine.reduce((a, x) => a + x.qty, 0);
+            if (!(qty > 0)) continue;
+            gmSet(STORE_SELL_STOCK, noteStock(gmGet(STORE_SELL_STOCK, null), seller, b.itemId, qty, Math.min(...mine.map((x) => x.price)), now));
+            logProblem('note', 'Stock of a listing dropped on the page (item ' + b.itemId + '): ' + b.qty + ' fewer, ' + qty + ' left - kept for the plans in Torn Bids');
+        }
+        // On the page: not gone, whatever this page said before.
+        for (const id of new Set(here.map((x) => x.itemId))) forgetGoneListing(seller, id);
+        const kept = {};
+        for (const [key, w] of Object.entries(was)) {
+            if (!w || seen[key]) continue;
+            // The item is here at another price: re-priced, counted from its new card.
+            if (here.some((x) => x.itemId === w.itemId)) continue;
+            const pressedAt = app.stockPressed ? app.stockPressed.get(key) : null;
+            const absent = Boolean(read) && coverVerdict(app.bzCover, w.itemId) === 'absent';
+            // Its row as evidence: read on this load, no search in use then or now, and
+            // the row as it is now drawn whole (a row still being drawn looks like one a listing left).
+            const rowNow = read && Number.isInteger(w.row) ? read.rows.find((r) => r.index === w.row) : null;
+            const byRow = Boolean(read) && app.stockSeenLoad.has(seller + '|' + key) && !read.searching && !w.rowSearch
+                && (!rowNow || rowNow.ids.length >= read.perRow || rowNow.index === read.rowsTotal - 1);
+            const gone = read
+                ? absent || (byRow && listingBoughtOut(w.itemId, w, read, { hadList: true, absent: false }))
+                : !app.bzHadList && Boolean(pressedAt && now - pressedAt < STOCK_PRESS_MS);
+            if (gone) {
+                if (!app.goneNoted.has(goneKey(seller, w.itemId))) logProblem('note', 'A listing is no longer in this bazaar (item ' + w.itemId + ', ' + w.qty + ' when last seen) - left out of the plans in Torn Bids');
+                noteGoneListing(seller, w.itemId);
+            } else kept[key] = w;
+        }
+        store[seller] = { at: now, cards: { ...kept, ...seen } };
+        trimNewest(store, 10);
+        try {
+            sessionStorage.setItem(STOCK_SEEN_SESSION, JSON.stringify(store));
+        } catch {
+            /* this read only */
+        }
     }
 
     /**
@@ -22910,9 +23816,8 @@
             if (!(bid > 0)) continue;
             t = addExtraBuy(t, { ...b, bid, sellerId: seller, seller: sellerName });
         }
-        store[seller] = { trade: trade.key, seen };
-        const keys = Object.keys(store);
-        for (const k of keys.slice(0, Math.max(0, keys.length - 10))) delete store[k];
+        store[seller] = { trade: trade.key, seen, at: Date.now() };
+        trimNewest(store, 10);
         try {
             sessionStorage.setItem(EXTRA_SEEN_SESSION, JSON.stringify(store));
         } catch {
@@ -22928,7 +23833,10 @@
      */
     function trackTradeBuying(listings) {
         if (!app.panel) return;
-        if (detectPage(location.href) === PAGE_BAZAAR) trackExtraBuys(listings);
+        if (detectPage(location.href) === PAGE_BAZAAR) {
+            trackExtraBuys(listings);
+            trackSeenStock(listings);
+        }
         updateBoughtWindow();
         const scanned = Array.isArray(listings);
         const pending = Object.values(sellAccepted()).filter((t) => nextStep(t));
@@ -22945,8 +23853,9 @@
         if (here) {
             const key = here.trade.key + '|' + here.line + '|' + here.index + '|' + here.step.sellerId;
             if (buyRun.stepKey !== key) {
-                Object.assign(buyRun, { stepKey: key, firstSeen: loadBuyRunSeen(key), nowSeen: null, seenGone: false, seenThisLoad: false });
+                startBuyRun(key);
                 app.buyAsk = null;
+                app.buyWhere = null;
             }
             const stock = here.listing ? Number(here.listing.qty) || null : null;
             if (scanned && here.listing && buyRun.firstSeen === null) {
@@ -22962,26 +23871,57 @@
                         if (other === key || loadBuyRunSeen(other) !== null) return;
                         const mine = listings.filter((l) => String(l.itemId) === String(i.itemId)).sort((a, b) => a.listingPrice - b.listingPrice);
                         const l = mine.find((x) => x.listingPrice <= st.price) || mine[0];
+                        if (l) forgetGoneListing(st.sellerId, i.itemId);
                         if (l && Number(l.qty) > 0) saveBuyRunSeen(other, Number(l.qty));
+                        // The whole bazaar read, and none of it here: no plan sends you back for it.
+                        else if (!l && coverVerdict(app.bzCover, i.itemId) === 'absent') noteGoneListing(st.sellerId, i.itemId);
                     });
                 }
             }
-            if (scanned && here.listing) buyRun.seenThisLoad = true;
+            if (scanned && here.listing) {
+                buyRun.seenThisLoad = true;
+                forgetGoneListing(here.step.sellerId, here.item.itemId);
+                // The row of the list it is in, as it is now: says later whether it
+                // left the page or was bought out (buyListingGone).
+                const read = app.bzRead;
+                const row = read ? read.rows.find((r) => r.el === here.listing.el || r.el.contains(here.listing.el)) : null;
+                Object.assign(buyRun, { row: row ? row.index : null, rowIds: row ? [...row.ids] : null, rowTotal: read ? read.rowsTotal : null, rowSearch: read ? read.searching : null });
+            }
             // Not on the page: gone (bought out) - unless the page has not drawn
-            // its cards yet (an empty scan before the listing was ever seen here).
+            // its cards yet (an empty scan before the listing was ever seen here),
+            // or the listing is only out of the page (3.16.3: Torn keeps just the
+            // rows near the screen in it).
             const readable = scanned && (Boolean(here.listing) || listings.length > 0 || buyRun.seenThisLoad);
             if (readable && buyRun.firstSeen !== null) {
-                buyRun.nowSeen = here.listing ? stock : null;
-                buyRun.seenGone = !here.listing;
+                if (here.listing) {
+                    buyRun.nowSeen = stock;
+                    buyRun.lastStock = stock;
+                    buyRun.seenGone = false;
+                } else if (buyListingGone(here.item.itemId)) {
+                    buyRun.nowSeen = null;
+                    buyRun.seenGone = true;
+                } else {
+                    // Out of the page, not known gone: what was last counted stands.
+                    buyRun.nowSeen = buyRun.lastStock !== null ? buyRun.lastStock : buyRun.firstSeen;
+                    buyRun.seenGone = false;
+                }
             }
             if (scanned) {
+                // Never seen here: is it not in this bazaar, or only not in the page yet?
+                // Seen, and not known gone: it is out of the page ('away').
+                app.buyWhere = here.listing ? null : buyRun.firstSeen === null ? coverVerdict(app.bzCover, here.item.itemId) : readable && !buyRun.seenGone ? 'away' : null;
+                // Bought out in front of you (3.16.4: also on a long bazaar not read whole), or the whole bazaar read without it.
+                if (app.buyWhere === 'absent' || buyRun.seenGone) noteGoneListing(here.step.sellerId, here.item.itemId);
                 // The last bazaar of the trade: Next goes to the trade itself.
                 const stepsLeft = here.trade.items.reduce((a, i) => a + (i.steps || []).filter((st) => !stepDone(st)).length, 0);
                 const sameHere = here.trade.items.some((i) => (i.steps || []).some((st) => st !== here.step && !stepDone(st) && String(st.sellerId) === String(here.step.sellerId)));
-                markTradeTarget(here.listing ? here.listing.el : null, 'Buy ' + here.step.qty.toLocaleString('en-US') + ' for ' + here.trade.trader.name, { qty: here.step.qty, short: 'Buy ' + here.step.qty.toLocaleString('en-US'), next: stepsLeft <= 1 ? 'Trade ›' : 'Next ›', nextTitle: stepsLeft <= 1 ? 'Count what you took here, then the trade with ' + here.trade.trader.name + ' (key: N)' : sameHere ? 'Count what you took, then the next item in this same bazaar (key: N)' : 'Count what you took here, then the next bazaar (key: N)' });
+                // Brought into view once per step: a card Torn takes out of the page and draws again does not pull the page back.
+                markTradeTarget(here.listing ? here.listing.el : null, 'Buy ' + here.step.qty.toLocaleString('en-US') + ' for ' + here.trade.trader.name, { qty: here.step.qty, short: 'Buy ' + here.step.qty.toLocaleString('en-US'), next: stepsLeft <= 1 ? 'Trade ›' : 'Next ›', nextTitle: stepsLeft <= 1 ? 'Count what you took here, then the trade with ' + here.trade.trader.name + ' (key: N)' : sameHere ? 'Count what you took, then the next item in this same bazaar (key: N)' : 'Count what you took here, then the next bazaar (key: N)' }, !buyRun.revealed);
+                if (here.listing) buyRun.revealed = true;
             }
         } else {
             clearBuyMarks();
+            if (scanned) app.buyWhere = null;
         }
         const t = here ? here.trade : pending[0];
         const steps = t.items.flatMap((i) => i.steps || []);
@@ -23002,6 +23942,11 @@
                     price: here.step.price,
                     seller: here.step.sellerName || 'this bazaar',
                     listed: Boolean(here.listing) || !scanned,
+                    // Not among the page's cards, never seen here (3.16.3): not in this
+                    // bazaar, or only not in the page yet - with how much of it was read.
+                    where: here.listing ? null : app.buyWhere,
+                    listings: !here.listing && app.buyWhere ? coverListings(app.bzCover) : null,
+                    listingsRead: !here.listing && app.buyWhere ? coverListingsRead(app.bzCover) : null,
                     // Re-priced since the plan: what it costs now, and what they pay.
                     nowPrice: here.listing && here.listing.listingPrice > here.step.price ? here.listing.listingPrice : null,
                     bid: here.item.bid,
@@ -23067,15 +24012,30 @@
         let t = here ? all[here.trade.key] : Object.values(all).find((x) => nextStep(x));
         if (!t) return;
         if (here) {
-            const counted = buyRun.firstSeen !== null;
+            // Counted: seen on this page (or known gone from it). A count kept from
+            // before a reload, with the listing neither seen nor known gone since,
+            // says nothing about now - that asks, like a listing never seen.
+            const counted = buyRun.firstSeen !== null && (buyRun.seenThisLoad || buyRun.seenGone);
             if (!counted && answer === undefined) {
-                app.buyAsk = buyRun.stepKey;
                 // What the page showed, for the next problem report (3.16: in the
-                // friend's run the listing was never recognised on the real page).
+                // friend's run the listing was never recognised on the real page;
+                // 3.16.3: and how much of the bazaar was in the page at all).
                 const d = app.pageDiagnostics || {};
-                logProblem('note', 'Bazaar: the listing to buy was not seen (' + (here.item.name || 'item ' + here.item.itemId) + ')', 'wanted item ' + here.item.itemId + ' at $' + here.step.price + ' · the page: ' + (d.cards || 0) + ' cards found (' + (d.strategy || '?') + '), ' + (d.listings || 0) + ' read, ' + (d.noItem || 0) + ' item not known, ' + (d.noPrice || 0) + ' no price, ' + (d.locked || 0) + ' locked · items read: ' + ((app.bazaarIds || []).slice(0, 25).join(',') || 'none'));
-                trackTradeBuying(null);
-                return;
+                const detail = 'wanted item ' + here.item.itemId + ' at $' + here.step.price + ' · the page: ' + (d.cards || 0) + ' cards found (' + (d.strategy || '?') + '), ' + (d.listings || 0) + ' read, ' + (d.noItem || 0) + ' item not known, ' + (d.noPrice || 0) + ' no price, ' + (d.locked || 0) + ' locked · items read: ' + ((app.bazaarIds || []).slice(0, 25).join(',') || 'none')
+                    + ' · the bazaar: ' + bazaarReadNote() + (Number.isFinite(app.bzReadAfter) ? ', first read ' + (app.bzReadAfter / 1000).toFixed(1) + 's after the page showed' : '');
+                const name = here.item.name || 'item ' + here.item.itemId;
+                // Every listing of this bazaar was read, from before you could have
+                // bought any, and the item was never in the page (not even as a card
+                // that could not be read): nothing to ask - it is not bought.
+                if (app.buyWhere === 'absent' && app.bzReadAfter !== null && app.bzReadAfter <= BUY_EARLY_READ_MS && !app.bzEver.has(String(here.item.itemId))) {
+                    logProblem('note', 'Bazaar: the listing to buy is not in this bazaar (' + name + ')', detail);
+                    answer = false;
+                } else {
+                    app.buyAsk = buyRun.stepKey;
+                    logProblem('note', 'Bazaar: the listing to buy was not seen (' + name + ')', detail);
+                    trackTradeBuying(null);
+                    return;
+                }
             }
             const took = counted ? boughtFromStock(buyRun.firstSeen, buyRun.nowSeen, here.step.qty) : answer ? here.step.qty : 0;
             // The step as it is now: Torn Bids may have replaced it since this page read it.
@@ -23274,7 +24234,66 @@
         const markedIds = new Set([...marked].map((c) => c.dataset.itemId));
         const missing = [...need.entries()].filter(([id, n]) => !markedIds.has(id) && Math.max(0, n.qty - (inside.get(lower(n.name)) || 0)) > 0).map(([, n]) => n.name);
         note(markedIds.size, missing);
+        showFillAll(trade.trader.name);
         bindTradeFillPress();
+    }
+
+    /**
+     * The rows one Fill all types into: each marked row with a quantity to type,
+     * in the list you are looking at - one row per item (Torn lists an item in
+     * All and again in its category; only the tab you are on shows, and a number
+     * typed into both would be counted twice).
+     */
+    function fillAllChips() {
+        const seen = new Set();
+        const out = [];
+        for (const c of document.querySelectorAll('.' + TRADE_FILL_CLASS + '[data-fill]')) {
+            if (c.offsetParent === null || seen.has(c.dataset.itemId)) continue;
+            seen.add(c.dataset.itemId);
+            out.push(c);
+        }
+        return out;
+    }
+
+    /**
+     * One Fill for the whole trade (3.16.4; the owner: "just 1 fill button at the
+     * top and fills all ... it only does what the checkout list is with the
+     * number"). Beside Torn's ADD TO TRADE: one press types every marked row's
+     * quantity into its own Qty box - the same numbers the row chips say, only
+     * the rows in the page, never a tick box - and a second press puts back what
+     * was there. You press ADD TO TRADE.
+     *
+     * Within Torn's script rules as read with the owner on 2026-10-02: typing
+     * into a page's boxes sends nothing to Torn (watched on the real page: three
+     * quantities typed, no request), and the one request is your own press of
+     * Torn's button. It never presses or ticks anything, and never scrolls the
+     * list to load more rows - press it again after you do.
+     */
+    function showFillAll(trader) {
+        const bar = [...document.querySelectorAll('button, input[type=submit], input[type=button], a, span, div')]
+            .find((e) => e.children.length === 0 && /^\s*add to trade\s*$/i.test(e.value || e.textContent || ''));
+        const chips = fillAllChips();
+        let btn = document.querySelector('.' + TRADE_FILLALL_CLASS);
+        // One row has its own Fill; this is for several.
+        if (!bar || !bar.parentElement || chips.length < 2) {
+            if (btn) btn.remove();
+            return;
+        }
+        if (!btn) {
+            btn = document.createElement('span');
+            btn.className = TRADE_FILLALL_CLASS;
+            btn.setAttribute('role', 'button');
+            btn.tabIndex = 0;
+        }
+        // Before Fill's line, after Torn's own.
+        const noteTag = bar.parentElement.querySelector('.' + TRADE_NOTE_CLASS);
+        if (btn.parentElement !== bar.parentElement || (noteTag && btn.nextSibling !== noteTag)) bar.parentElement.insertBefore(btn, noteTag);
+        const todo = chips.filter((c) => c.getAttribute('aria-pressed') !== 'true').length;
+        const text = todo ? '☐ Fill all ' + todo + (todo === 1 ? ' item' : ' items') + ' for ' + trader : '☑ All ' + chips.length + ' items filled for ' + trader;
+        const title = todo ? 'Type each marked row\'s quantity into its Qty box. You press ADD TO TRADE.' : 'Untick to put back what was in the boxes';
+        if (btn.textContent !== text) btn.textContent = text;
+        if (btn.title !== title) btn.title = title;
+        if (btn.getAttribute('aria-pressed') !== String(!todo)) btn.setAttribute('aria-pressed', String(!todo));
     }
 
     /**
@@ -23302,7 +24321,7 @@
 
     /** The trade page's marks (rows to send, Fill), gone before they are drawn again. */
     function clearSendMarks() {
-        for (const n of document.querySelectorAll('.' + TRADE_FILL_CLASS)) n.remove();
+        for (const n of document.querySelectorAll('.' + TRADE_FILL_CLASS + ', .' + TRADE_FILLALL_CLASS)) n.remove();
         if (!isTradePage(location.href)) for (const n of document.querySelectorAll('.' + TRADE_NOTE_CLASS)) n.remove();
         for (const n of document.querySelectorAll('.' + TRADE_SEND_CLASS)) n.classList.remove(TRADE_SEND_CLASS);
     }
@@ -23332,7 +24351,7 @@
      * NPC deals' marks - and on it, Fill (types how many into the card's own
      * box; you press Buy) and Next (the panel's Next, one bazaar per press).
      */
-    function markTradeTarget(el, words, bar = null) {
+    function markTradeTarget(el, words, bar = null, reveal = true) {
         for (const n of document.querySelectorAll('.' + TRADE_BUY_CLASS)) {
             if (n !== el) {
                 n.classList.remove(TRADE_BUY_CLASS, 'ttv2-hasbar');
@@ -23343,7 +24362,7 @@
         if (!el) return;
         if (!el.classList.contains(TRADE_BUY_CLASS)) {
             el.classList.add(TRADE_BUY_CLASS);
-            if (el.scrollIntoView) el.scrollIntoView({ block: 'center' });
+            if (reveal && el.scrollIntoView) el.scrollIntoView({ block: 'center' });
         }
         if (el.dataset.ttv2Buy !== words) el.dataset.ttv2Buy = words;
         if (!bar) return;
@@ -23442,11 +24461,12 @@
      * Fill on the trade page, caught once in the capture phase (as on your
      * bazaar's add page: Torn's rows react to a press before a click lands).
      * One press types one row's quantity; a second press puts back what was there.
+     * Fill all (3.16.4) is the same press for every marked row in the page.
      */
     function bindTradeFillPress() {
         if (app.tradeFillBound) return;
         app.tradeFillBound = true;
-        const chipOf = (event) => (event.target && event.target.closest ? event.target.closest('.' + TRADE_FILL_CLASS + '[data-fill]') : null);
+        const chipOf = (event) => (event.target && event.target.closest ? event.target.closest('.' + TRADE_FILL_CLASS + '[data-fill], .' + TRADE_FILLALL_CLASS) : null);
         for (const type of ['mousedown', 'pointerdown', 'touchstart']) {
             window.addEventListener(type, (event) => {
                 if (chipOf(event)) event.stopPropagation();
@@ -23464,6 +24484,10 @@
             if (!chip) return;
             event.preventDefault();
             event.stopPropagation();
+            if (chip.classList.contains(TRADE_FILLALL_CLASS)) {
+                fillAllTradeRows();
+                return;
+            }
             // This chip's own row (the item is in the All list and its category's list).
             const li = chip.closest('li');
             const row = readTradeAddRows(document).find((r) => r.el === li);
@@ -23478,6 +24502,31 @@
             }
             scanTradePage();
         }, true);
+    }
+
+    /**
+     * Fill all's press: every marked row not yet filled gets its quantity typed
+     * in; when all are, each is put back as it was. Only types - never presses
+     * Torn's button, never ticks a box, never scrolls.
+     */
+    function fillAllTradeRows() {
+        const rows = readTradeAddRows(document);
+        const pairs = fillAllChips().map((chip) => ({ chip, row: rows.find((r) => r.el === chip.closest('li')) })).filter((p) => p.row && p.row.qty);
+        const todo = pairs.filter((p) => !(tradeFill.has(p.row.el) && p.row.qty.value === p.chip.dataset.fill));
+        if (todo.length) {
+            for (const p of todo) {
+                tradeFill.set(p.row.el, p.row.qty.value);
+                writeInputs([p.row.qty], p.chip.dataset.fill);
+            }
+            logAction('Fill all on the trade page: ' + todo.length + ' rows typed');
+        } else {
+            for (const p of pairs) {
+                writeInputs([p.row.qty], tradeFill.get(p.row.el));
+                tradeFill.delete(p.row.el);
+            }
+            if (pairs.length) logAction('Fill all on the trade page: ' + pairs.length + ' rows put back');
+        }
+        scanTradePage();
     }
 
     /** Settings each tab keeps to itself: where its panel sits and which list it shows. */
@@ -23571,7 +24620,10 @@
         const anchor = listings.find((l) => l.el && l.el.parentElement);
         if (!anchor) return;
 
-        const target = anchor.el.parentElement;
+        // A player's bazaar: the whole list, so rows Torn draws as you scroll are
+        // read at once (3.16.3: a card's parent there is its own tile - one card).
+        const list = anchor.el.closest ? anchor.el.closest(BAZAAR_LIST_SELECTOR) : null;
+        const target = list || anchor.el.parentElement;
 
         if (app.observer) {
             if (app.observerTarget === target) return;
@@ -23922,7 +24974,7 @@
             STORE_KEY, STORE_ITEMS, STORE_NPC, STORE_MANUAL_NPC, STORE_SETTINGS, STORE_KEY_ACCESS, STORE_API_WINDOW + '.tabs', STORE_W3B_WINDOW + '.tabs', STORE_TORN_PAUSE, STORE_KEY_DEAD, STORE_OPENED,
             STORE_SELL_KEY, STORE_SELL_KEY_DEAD, STORE_SELL_KEY_ACCESS, STORE_TE_KEY, STORE_TE, STORE_TE_STATE, STORE_TE_LISTS, STORE_TE_IDS, STORE_TE_VOTES, STORE_API_USAGE, STORE_PROBLEM_LOG,
             STORE_INVENTORY, STORE_SELL_PREFS, STORE_TRADER_DB, STORE_TE_ONE, STORE_SELL_SELF, STORE_SELL_NETWORTH, STORE_SELL_ACCEPTED, STORE_SELL_PINNED,
-            STORE_SELL_LOG_BUYS, STORE_SELL_TRADES_SEEN, STORE_SELL_CANCEL_UNDO, STORE_SELL_LEFTOVERS,
+            STORE_SELL_LOG_BUYS, STORE_SELL_TRADES_SEEN, STORE_SELL_CANCEL_UNDO, STORE_SELL_LEFTOVERS, STORE_SELL_GONE, STORE_SELL_STOCK, STORE_SELL_BOUGHT,
             STORE_LEDGER_KEY, STORE_LEDGER_KEY_DEAD, STORE_LEDGER_SELF, STORE_LEDGER,
             STORE_FILL, STORE_FILL_OWN_IM, STORE_SELF, STORE_HISTORY, STORE_W3B_SUMMARY, FEED_STORE_KEY,
         ];
@@ -24707,6 +25759,8 @@
 
     function saveSellLeftovers(list) {
         gmSet(STORE_SELL_LEFTOVERS, list);
+        // This tab is not told of its own write (3.16.4): its log is read soon, to see what of them you still hold.
+        if (led.client) ledgerSoon();
     }
 
     /**
@@ -25198,7 +26252,9 @@
         }
         // Sold since it was kept, as your Ledger read it (3.16.2; the friend: "I
         // already sold this", and still had to press Sold ✓): it comes off.
-        const ledgerRows = leftovers.length && getLedgerKey() && led.loaded ? ledgerData().rows : null;
+        // Only from a Ledger read through to before they count (3.16.4): half the story - a stretch of
+        // your log still being read, or not read back that far yet - takes nothing off.
+        const ledgerRows = leftovers.length && getLedgerKey() && led.loaded && ledgerReaches(Math.min(...leftovers.map(leftoverFrom))) ? ledgerData().rows : null;
         if (ledgerRows && ledgerRows.length) {
             const sold = leftoversAfterSales(leftovers, ledgerRows);
             if (sold.length !== leftovers.length || sold.some((l, i) => l !== leftovers[i])) saveSellLeftovers(sold);
@@ -25247,9 +26303,43 @@
         };
 
         /* The bazaar side: every listing once read, else the summary's cheapest. */
+        // Listings a bazaar page showed are not there (3.16.3): out, until TornW3B has checked them since.
+        const gone = liveGone(gmGet(STORE_SELL_GONE, null), now);
+        // What you bought is off TornW3B's number (3.16.4), until TornW3B has checked that bazaar since.
+        // Here only: sell.bazaars keeps TornW3B's own rows (the read times, the movement record).
+        const ownStock = liveStock(gmGet(STORE_SELL_STOCK, null), now);
+        const ownBought = new Map();
+        for (const b of liveBought(gmGet(STORE_SELL_BOUGHT, null), now)) {
+            if (!ownBought.has(b.itemId)) ownBought.set(b.itemId, []);
+            ownBought.get(b.itemId).push(b);
+        }
+        // In the problem log, once per read of an item's bazaars: the friend's next report shows it working.
+        for (const id of new Set([...ownBought.keys(), ...Object.keys(ownStock).map((k) => k.split('|')[1])])) {
+            const b = sell.bazaars.get(id);
+            if (!b || !b.at) continue;
+            const before = withoutGone(b.rows, id, gone);
+            const after = withOwnBuys(before, id, { stock: ownStock, bought: ownBought.get(id) || null });
+            if (after === before) continue;
+            const units = before.reduce((a, r) => a + r.qty, 0) - after.reduce((a, r) => a + r.qty, 0);
+            const sig = id + '|' + units + '|' + b.at;
+            if (ownBuysLogged.has(sig)) continue;
+            if (ownBuysLogged.size > 500) ownBuysLogged.clear();
+            ownBuysLogged.add(sig);
+            logProblem('note', 'Your buys taken off the TornW3B number (item ' + id + '): ' + units + ' fewer, ' + (before.length - after.length) + ' listings gone', 'its bazaars read ' + Math.round((now - b.at) / 1000) + ' s ago');
+        }
         const sellersOf = (id) => {
             const b = sell.bazaars.get(String(id));
-            return b && b.at ? bazaarSellers(b.rows, { selfId: sell.selfId, now }) : null;
+            return b && b.at ? bazaarSellers(withOwnBuys(withoutGone(b.rows, String(id), gone), String(id), { stock: ownStock, bought: ownBought.get(String(id)) || null }), { selfId: sell.selfId, now }) : null;
+        };
+        // For an accepted trade's own steps: only what you bought BEFORE they said yes comes off. A buy
+        // since is most likely that step's own, a moment before Next or your log ticks it - it must not
+        // read as "short" with a replacement offered for units you already hold.
+        const sellersBefore = (id, at) => {
+            const b = sell.bazaars.get(String(id));
+            if (!b || !b.at) return null;
+            const stock = Object.fromEntries(Object.entries(ownStock).filter(([, s]) => s.at < at));
+            const bought = (ownBought.get(String(id)) || []).filter((x) => x.t < at);
+            return bazaarSellers(withOwnBuys(withoutGone(b.rows, String(id), gone), String(id), { stock, bought }), { selfId: sell.selfId, now });
         };
         // Units other sellers list near the cheapest (fresh listings): the most a listing is counted for.
         const bazaarDepthOf = (id) => {
@@ -25557,7 +26647,7 @@
                             ...i,
                             send: sendUnits(i),
                             steps: i.steps.map((st) => {
-                                const check = stepState(st, sellersOf(i.itemId));
+                                const check = stepState(st, sellersBefore(i.itemId, Number(acc.at) - LOG_BUY_SLACK_MS));
                                 // Gone, re-priced or short: the next cheapest still under their price
                                 // (the friend: "their prices change, or not available any more").
                                 const repl = ['gone', 'price', 'short'].includes(check.state) && !stepDone(st)
@@ -26776,8 +27866,9 @@
             onChatWanted: (id, name) => {
                 if (id) gmSet(STORE_CHAT_WANTED, { id: String(id), name: String(name || ''), at: Date.now() });
             },
-            onLeftoverRemove: (itemId) => {
-                saveSellLeftovers(sellLeftovers().filter((l) => String(l.itemId) !== String(itemId)));
+            // The one thing left to press (3.16.4): the whole list off, for when the Ledger cannot say (no key).
+            onLeftoversClear: () => {
+                saveSellLeftovers([]);
                 renderSellingNow();
             },
             // They said no to this trade: it is passed over for an hour - that
@@ -26861,6 +27952,16 @@
             renderSellingNow();
         });
         gmOnChange(STORE_SELL_PINNED, () => renderSellingNow());
+        // A bazaar page showed a listing is not there: the plans leave it out.
+        gmOnChange(STORE_SELL_GONE, () => renderSelling());
+        // ...or showed fewer of it after you bought (3.16.4): the plans count on what is left.
+        gmOnChange(STORE_SELL_STOCK, () => renderSelling());
+        gmOnChange(STORE_SELL_BOUGHT, () => renderSelling());
+        // A leftover kept on Torn's pages (Cancel trade in the overlay): shown here, and checked with your Ledger at once.
+        gmOnChange(STORE_SELL_LEFTOVERS, () => {
+            ledgerSoon();
+            renderSellingNow();
+        });
         const onSellKeyElsewhere = () => {
             const dead = Boolean(gmGet(STORE_SELL_KEY_DEAD, false));
             if (dead === sell.keyDead) return renderSelling();
@@ -27256,7 +28357,9 @@
             }
             data.readAt = Date.now();
             if (same()) saveLedger();
-            led.nextAt = Date.now() + (data.backfilled && !data.gap ? LEDGER_EVERY_MS : LEDGER_BACKFILL_GAP_MS);
+            // The buys no accepted trade was watching (3.16.4): off TornW3B's numbers as well.
+            if (same()) noteOwnBuys(bazaarBuyRows(data.rows.filter((r) => r && Date.now() - Number(r.t) < FLIP_FRESH_MS)));
+            led.nextAt = Date.now() + (data.backfilled && !data.gap ? ledgerEveryMs() : LEDGER_BACKFILL_GAP_MS);
         } catch (error) {
             if (error instanceof LedgerKeyChanged || !same()) {
                 // Forgotten or replaced mid-run: nothing kept, nothing marked; the new key reads at once.
@@ -27277,6 +28380,43 @@
 
     /** A run noticed its key was forgotten or replaced. */
     class LedgerKeyChanged extends Error {}
+
+    /*
+     * Leftover cards go by themselves, and soon (3.16.4; the owner: "it shouldn't
+     * take that long"): while a leftover under an hour old is on the list, your
+     * log is read every minute instead of every five - still only while Torn
+     * Bids is in front. After the hour your inventory says it too.
+     */
+    const LEDGER_LEFTOVER_EVERY_MS = 60 * 1000;
+    const LEDGER_LEFTOVER_FAST_MS = 60 * 60 * 1000;
+
+    function ledgerEveryMs(now = Date.now()) {
+        return sellLeftovers(now).some((l) => now - Number(l.at) < LEDGER_LEFTOVER_FAST_MS) ? LEDGER_LEFTOVER_EVERY_MS : LEDGER_EVERY_MS;
+    }
+
+    /** Has your log been read, with no stretch still open, from `from` (ms) to its newest entry? */
+    function ledgerReaches(from) {
+        const data = ledgerData();
+        if (!data || data.gap || !data.newestAt) return false;
+        return Boolean(data.backfilled) || (Number(data.oldestAt) > 0 && Number(data.oldestAt) * 1000 <= from);
+    }
+
+    /** A leftover was just kept: the next read of your log is not five minutes away. */
+    function ledgerSoon(now = Date.now()) {
+        if (led.nextAt > now + LEDGER_LEFTOVER_EVERY_MS) led.nextAt = now + LEDGER_LEFTOVER_EVERY_MS;
+    }
+
+    /* What the problem log already says about own buys taken off (one line per item and read). */
+    const ownBuysLogged = new Set();
+
+    /** Your bazaar buys as your log has them, kept half an hour for the plans (core/flips.js withOwnBuys). */
+    function noteOwnBuys(buys) {
+        if (!buys || !buys.length) return;
+        const stored = gmGet(STORE_SELL_BOUGHT, null);
+        const was = liveBought(stored);
+        const next = addBought(stored, buys);
+        if (next.length !== was.length || next.some((b, i) => b.id !== was[i].id)) gmSet(STORE_SELL_BOUGHT, next);
+    }
 
     /*
      * Buys for an accepted trade, from your Torn log (3.16; the friend's first
@@ -27355,6 +28495,8 @@
                 at: Date.now(),
                 state: 'on',
             });
+            // Off TornW3B's numbers too (3.16.4) - kept apart from this store, which goes when the trade does.
+            noteOwnBuys(buys);
             // This tab is not told of its own write: its accepted cards show the buys now.
             if (document.visibilityState === 'visible') renderSelling();
         } catch (error) {
@@ -27388,24 +28530,48 @@
     const TRADED_READS_PER_CHECK = 3;
     const TRADED_SEEN_KEEP_MS = 24 * 60 * 60 * 1000;
 
-    async function watchFinishedTrades(now = Date.now()) {
-        if (led.tradedBusy || !led.buysClient || now < (led.tradedNextAt || 0)) return;
+    /*
+     * Torn Bids closed (3.16.3; the friend's third report): he accepted, traded,
+     * shut the browser - and Checkout was still there twelve hours later, so he
+     * pressed Cancel trade again. Only a Torn Bids tab asked Torn whether the
+     * trade went through. Now the Torn page you are viewing asks too, when no
+     * Torn Bids tab has for this long past its turn: the same one call, the same
+     * key through the same walled client (api/ledger.js), only from the tab in
+     * view - never from a hidden Torn tab.
+     */
+    const TRADED_BACKUP_MS = 30 * 1000;
+    /* How often a Torn page looks whether it is its turn to ask (the asking itself: once a minute at most, as in Torn Bids). */
+    const TRADED_HERE_STEP_MS = 15 * 1000;
+
+    /**
+     * @param {number} [now]
+     * @param {object} [o]
+     * @param {boolean} [o.backup] - a Torn page standing in for a closed Torn Bids
+     * @returns {Promise<boolean>} whether a trade was closed or a cancel put right
+     */
+    async function watchFinishedTrades(now = Date.now(), { backup = false } = {}) {
+        if (led.tradedBusy || !led.buysClient || now < (led.tradedNextAt || 0)) return false;
         const open = Object.values(sellAccepted(now)).filter((t) => t.trader && t.trader.id);
         const undo = Object.values(sellCancelUndo(now)).filter((u) => u.trade.trader && u.trade.trader.id);
-        if (!open.length && !undo.length) return;
-        if (!getLedgerKey() || gmGet(STORE_LEDGER_KEY_DEAD, null)) return;
+        if (!open.length && !undo.length) return false;
+        if (!getLedgerKey() || gmGet(STORE_LEDGER_KEY_DEAD, null)) return false;
         const recent = [...open.map((t) => Number(t.at)), ...undo.map((u) => Number(u.at))].some((at) => now - at < BUYS_WATCH_MS);
         const every = recent ? TRADED_EVERY_MS : TRADED_SLOW_MS;
         const stored = gmGet(STORE_SELL_TRADES_SEEN, null) || {};
-        // Two Torn Bids tabs: one read between them.
-        if (now - (Number(stored.at) || 0) < every - 5000) return;
+        // Two Torn Bids tabs: one read between them. A Torn page waits for Torn Bids to miss its turn.
+        // Counted from the last try, not only the last answer (3.16.3): a Torn page
+        // is loaded anew at every Next, and while Torn was failing each load asked again.
+        const lastAt = Math.max(Number(stored.at) || 0, Number(stored.triedAt) || 0);
+        if (now - lastAt < (backup ? every + TRADED_BACKUP_MS : every - 5000)) return false;
+        gmSet(STORE_SELL_TRADES_SEEN, { ...stored, triedAt: now });
         led.tradedBusy = true;
         led.tradedNextAt = now + every;
         const use = { tag: 't.traded', priority: 'normal' };
+        let changed = false;
         try {
             // Whose key it is: learned when it was saved (else the Ledger's next run asks).
             const self = gmGet(STORE_LEDGER_SELF, null);
-            if (!self) return;
+            if (!self) return false;
             const since = Math.min(...open.map((t) => Number(t.at)), ...undo.map((u) => Number(u.trade.at))) - TRADE_DONE_SLACK_MS;
             const list = await fetchTradesPage(led.buysClient, { from: Math.floor((since - TRADED_LOOKBACK_MS) / 1000), use });
             const seen = {};
@@ -27437,12 +28603,11 @@
                 avail = avail.filter((a) => a.id !== f.id);
                 return new Map(Object.entries(f.gave).map(([k, v]) => [k, Number(v) || 0]));
             };
-            let changed = false;
             // Went through: closed as traded, what they did not take kept to sell.
             for (const t of open.sort((a, b) => a.at - b.at)) {
                 const f = finishedTradeFor(t, avail);
                 if (!f) continue;
-                closeSellAccepted(t.key, { done: true, left: tradedLeftovers(t, take(f)) });
+                closeSellAccepted(t.key, { done: true, left: tradedLeftovers(t, take(f), Date.now(), f.t) });
                 logAction('Traded - done (your Torn trades show it; item ' + t.itemId + ')');
                 changed = true;
             }
@@ -27452,7 +28617,7 @@
             for (const u of undo) {
                 const f = finishedTradeFor(u.trade, avail, Number(u.at) + TRADE_DONE_SLACK_MS);
                 if (!f) continue;
-                const left = tradedLeftovers(u.trade, take(f));
+                const left = tradedLeftovers(u.trade, take(f), Date.now(), f.t);
                 saveSellLeftovers(addLeftovers(removeLeftovers(sellLeftovers(), u.left || []), left));
                 let recs = gmGet(STORE_SELL_PRICE_RECORDS, []) || [];
                 for (const r of u.recs || []) recs = addPriceRecord(recs, r);
@@ -27471,6 +28636,25 @@
         } finally {
             led.tradedBusy = false;
         }
+        return changed;
+    }
+
+    /**
+     * On a Torn page: ask whether an accepted trade went through, when Torn Bids
+     * has not (see TRADED_BACKUP_MS). Only while this tab is in view; the client
+     * is made the first time there is something to ask.
+     */
+    function watchFinishedTradesHere() {
+        if (document.visibilityState !== 'visible' || !getLedgerKey()) return;
+        if (!Object.keys(gmGet(STORE_SELL_ACCEPTED, null) || {}).length && !Object.keys(gmGet(STORE_SELL_CANCEL_UNDO, null) || {}).length) return;
+        if (!led.buysClient) led.buysClient = new LedgerClient({ getKey: getLedgerKey, ...tornSharing('led') });
+        watchFinishedTrades(Date.now(), { backup: true }).then((changed) => {
+            if (!changed) return;
+            // As when Torn Bids closes it: Checkout goes, the marks and boxes follow.
+            scanTradePage();
+            if (app.pageType === PAGE_BAZAAR) rescan();
+            else trackTradeBuying([]);
+        }).catch(() => {});
     }
 
     /** What the page shows about the Ledger: its key's state and the rows (no key, ever). */
@@ -27700,6 +28884,9 @@
         startLiveFeed();
         scanTradePage();
         trackTradeBuying(null);
+        // Did an accepted trade go through, when no Torn Bids tab is open to ask (3.16.3).
+        watchFinishedTradesHere();
+        setInterval(watchFinishedTradesHere, TRADED_HERE_STEP_MS);
     }
 
     boot();

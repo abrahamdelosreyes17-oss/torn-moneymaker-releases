@@ -95,10 +95,12 @@ test('what they did not take stays yours: bought minus given, at what it cost', 
         { itemId: '203', name: 'Shrooms', qty: 11, each: 1937, from: 'KOMBAJN1', at: AT + 1 },
         { itemId: '9', name: 'Compass', qty: 3, each: 16372, from: 'KOMBAJN1', at: AT + 1 },
     ]);
+    // 3.16.4: told when the trade finished, each says so - from then on what leaves your stock counts against it.
+    assert.deepEqual(tradedLeftovers(t, new Map([['203', 60]]), AT + 1, AT - 5000).map((l) => l.since), [AT - 5000, AT - 5000]);
     // Unplanned buys count as bought; your own planned items went in first.
-    const withExtra = { ...t, extra: [{ itemId: '203', name: 'Shrooms', qty: 9, price: 1900 }, { itemId: '1', name: 'Hammer', qty: 2, price: 50 }], items: [...t.items, { line: 'yours:9', itemId: '9', name: 'Compass', units: 1, kind: 'yours', steps: [] }] };
+    const withExtra = { ...t, extra: [{ itemId: '203', name: 'Shrooms', qty: 9, price: 1900, bid: 2141 }, { itemId: '1', name: 'Hammer', qty: 2, price: 50, bid: 70 }, { itemId: '4', name: 'Rock', qty: 5, price: 10, bid: 0, fromLog: true }], items: [...t.items, { line: 'yours:9', itemId: '9', name: 'Compass', units: 1, kind: 'yours', steps: [] }] };
     const l2 = tradedLeftovers(withExtra, new Map([['203', 80], ['9', 4]]), AT + 1);
-    assert.deepEqual(l2.map((l) => [l.itemId, l.qty]), [['1', 2]], 'Shrooms 71+9 all went, Compass 3 of 4 given were bought, the Hammer was never given');
+    assert.deepEqual(l2.map((l) => [l.itemId, l.qty]), [['1', 2]], 'Shrooms 71+9 all went, Compass 3 of 4 given were bought, the Hammer was never given; the Rocks they do not buy were not for this trade (3.16.4)');
 });
 
 test('Cancel trade on a trade that had gone through is put right: its leftovers come off again', () => {

@@ -168,7 +168,17 @@ scrolls to it when it is on the page you are viewing. Nothing is ever bought for
   chips in Torn's own value column, after its price, so the row stays one line:
   **IMA** (Item Market Average - press it for the graph) and **BP** (lowest
   bazaar price - press it for the cheapest listings and who sells them), then
-  the Fill tick, which shows the price it typed.
+  the Fill tick, which shows the price it typed. **The tick is held at the
+  right edge of that cell, the same place in every row** (3.16.3, the friend:
+  "Fill button UI doesn't seem to be consistent? Sometimes it's pushed far
+  sometimes you don't see it"): the three used to follow Torn's price in the
+  cell's one line, and where another script writes "$29,782 | 2x = $59,564"
+  there the line no longer fitted - the cell, which Torn clips with "…",
+  dropped the whole group but the tick's square, left at the far edge. The
+  cell keeps its size and gives the tick room from inside it; when the rest
+  still does not fit, IMA goes first (it is the number Torn prints in that
+  cell), then BP - whole chips, never a cut one (`fitBazaarCells`, measured).
+  Both stay in My bazaar's list beside the page.
 - **Fill** (the friend's request, after Greasy Fork's *Customizable Bazaar
   Filler* 527925 and *Torn Market Filler* 513920): a **tick box** in each row of your
   bazaar's **#/add** and **#/manage** and the Item Market's **add-listing** and
@@ -342,7 +352,14 @@ you: every link is one you follow yourself, one page per click.
     of each are in already, and on the add step marks each row to send with
     **Fill N for Bob** - one press types that row's quantity into Torn's Qty
     box (a second puts back what was there); you press ADD TO TRADE and
-    Accept. One-of-a-kind rows (weapons) say "tick Torn's box". Read off the
+    Accept. **Fill all** (3.16.4, beside Torn's ADD TO TRADE, when two or
+    more rows are marked): one press types every marked row's quantity - the
+    Checkout's numbers, the rows of the list you are on, one row per item -
+    and a second press puts each box back as it was; rows already filled by
+    their own Fill are left as they are. It never presses ADD TO TRADE,
+    never ticks a box and never scrolls the list (after you scroll a long one
+    it offers the rows that came into the page). One-of-a-kind rows (weapons)
+    say "tick Torn's box". Read off the
     owner's real trade page (2026-09-27, read only). **3.12.9:** Fill sits
     after the item's name (Torn hides the row's price/info cell on this page,
     where 3.12.8 put it, so it was never seen), on every category tab's list,
@@ -374,14 +391,13 @@ you: every link is one you follow yourself, one page per click.
     fold); Trade opens only after buying. The accepted card has one main
     button at a time (Start / Continue buying, then Open the trade), **Not
     taken?** per item (how many the trader refused), and **Traded - done**
-    keeps those as **leftovers**: first in the Best flips strip, with what
-    they cost and the best other trader now, merged into what you hold (so
-    Where to sell and other trades use them) until the inventory shows them
-    gone - or (3.16.2, the friend: "binenta ko na to ah", I already sold
-    this) until your Ledger shows them sold: what went out of that item since
-    (bazaar, Item Market, shop, trade; from 5 minutes after it was kept), less
-    what you bought again since, comes off it (`leftoversAfterSales`); no Sold ✓
-    press needed. On the bazaar, **Fill N** (types the amount into the card's own box;
+    keeps those as **leftovers**: one **Left over** card first in the Best
+    flips strip (3.16.4: how many items, what selling them to traders makes
+    now, what they cost; pressed, it lists each with its best other trader),
+    merged into what you hold (so Where to sell and other trades use them)
+    until the inventory shows them gone - or (3.16.2, the friend: "binenta ko
+    na to ah", I already sold this) until your Ledger shows them sold; see
+    "Leftover cards go by themselves" below. On the bazaar, **Fill N** (types the amount into the card's own box;
     you press Buy) and **Next ›** sit on the marked card; Next stays on the
     same bazaar when that seller has more for the trade; the panel's buying
     box sits under its header (also collapsed, also in Settings), shows
@@ -498,7 +514,7 @@ Its filters: the period or any **dates** (from - to, both days included; the
 Trading tab has them too), who mugged you, named or anonymous, and at least
 an amount. It reads a year back a few
 pages at a time, then only what is new, every 5 minutes while Torn Bids is in
-front.
+front (every minute while a leftover under an hour old is on the list, 3.16.4).
 - **Its own Full key**, apart from the Limited key: Torn is asked (key info)
   whether it is Full before it is saved - anything else is refused, with why.
   Masked while typed, never shown again (no Show), redacted from every error,
@@ -637,8 +653,9 @@ key it counts from the page as before.
   twice (planned and unplanned) is never ticked twice from one count.
 - **Sell what you're holding:** Cancel trade lists everything bought for the
   trade, each with who pays most for it now (never that trader, never a
-  blacklisted one); it all goes to Torn Bids' leftovers. At Traded - done,
-  unplanned buys the trader does not take become leftovers too.
+  blacklisted one); it all goes to Torn Bids' leftovers. "For the trade" is
+  the plan's items and unplanned buys this trader pays for (3.16.4): a buy
+  they do not buy was not for it, and is no leftover of it.
 
 **A trade that went through closes itself** (3.16.1, after the friend's
 second live report: the Checkout "still stays even though my trade with this
@@ -656,6 +673,131 @@ gone through** is put right the same way: for 3 hours after a cancel, a
 finished trade with that trader from before you cancelled takes its items
 back off the leftovers and keeps their accepted prices for the Ledger.
 Without a Ledger key, Traded - done in Torn Bids closes it as before.
+**With Torn Bids closed** (3.16.3, the friend's third report: he accepted,
+traded, shut the browser, and Checkout was still there twelve hours later -
+so he pressed Cancel trade again) the Torn page you are viewing asks instead:
+the same call with the same key through the same walled client, only when no
+Torn Bids tab has asked for 30 seconds past its turn, and only from the tab
+in view. It is the one thing the pages on torn.com use the Ledger's key for;
+they never read your log.
+
+**A bazaar is only partly in the page** (3.16.3; two real bazaars read with
+the owner, 2026-10-02). Torn draws a bazaar's listings in rows of three and
+keeps only the rows near the screen in the page - 54 of 250 listings at the
+top of a long one - taking out the rows you scroll away from. Every row says
+which one it is and the list says how many there are, so the script keeps an
+account of what was read since you opened the page (`sources/dom/
+bazaar-list.js`, `core/bazaar-cover.js`; it starts again when the list is
+sorted, searched, or a listing sells and the rest move up):
+
+- **The buying box says where the listing stands** instead of "Not on this
+  page any more": *Not in this bazaar: 7 listings read, none of them this
+  item*; *Not in the page yet: this bazaar has about 252 listings, and 54 were
+  read so far. Scroll down, or type its name in the bazaar's search box*; or
+  *Out of the page now* once you scrolled away from it. It is marked, and
+  brought into view once, when its row is drawn.
+- **Scrolling away is not buying.** A listing out of the page used to count
+  as bought out. It is gone only when every row was read and it is in none,
+  or the row it was last seen in is in the page as it was then less that one
+  listing (the rest moved up - sorting the list, or typing in its search box,
+  does not look like that), or it was alone in the last row and the list is
+  one row shorter. A count kept from before a reload, with the listing
+  neither seen nor known gone since, says nothing about now: Next asks.
+- **No question when there is nothing to ask:** every listing read within 5
+  seconds of the page showing (before you could have bought anything), and
+  the item never in the page since - not even as a card that could not be
+  read - Next records "not bought" and goes on. Read later, or only partly,
+  it asks "Did you buy?" as before.
+- **It is not planned again:** that seller's listing of that item is marked
+  as not there (`core/flips.js` `markGone`), and Torn Bids leaves it out of
+  every plan until TornW3B has checked that bazaar after you looked (13 of
+  the friend's 16 stops that day held no such listing; two were in his next
+  plan minutes later). A mark lasts 30 minutes at most: by then a listing
+  not checked since is stale and no flip is planned on it anyway. A mark is
+  taken back if the listing is then seen on that page after all.
+- **The problem log says how much was read**: "3 of 3 rows read, 7 of 7
+  listings, first read 1.2s after the page showed", so a report tells a
+  sold-out listing from one that was further down.
+
+**What you bought comes off TornW3B's number** (3.16.4; the friend,
+2026-10-02: he bought Xanax for one trader, traded it, and the plan for the
+next trader still counted on the same listings - "ako bumili pero
+sinusuggest parin sakin"). TornW3B checks a bazaar again about every five
+minutes (measured on Xanax, 11 reads: median 5, nine in ten within 10.5), and
+until then its row keeps the quantity from before your buy. So your own buys
+come off that one row - that item, at that bazaar (the owner: "yung item lang
+na yun") - until TornW3B has checked it since; a listing you emptied is gone.
+Torn Bids just shows the smaller number. No buy may be missed, so two things
+say what you bought (`core/flips.js` `withOwnBuys`):
+
+- **The page** (the overlay, on every bazaar you open, with or without an
+  accepted trade; read only): a listing whose stock dropped in front of you
+  is kept with the stock it has now (`sellStock`), and one that is no longer
+  in the bazaar is marked gone (`sellGone`, as above - now also when you
+  bought it out on a long bazaar that was not read whole: its row is still
+  in the page with the next listings moved up).
+- **Your Torn log** (Torn Bids, the Ledger's key): your bazaar buys - seller,
+  item, how many, when - kept half an hour (`sellBought`), from the read made
+  once a minute while a trade is accepted (also from a hidden tab, 3.16.0)
+  and from the Ledger's own read. These are the buys no page saw. No new API
+  call is made for any of this.
+
+Never counted twice: the page's number already holds every buy made before
+it, so only log buys clearly after it come off it; with no page number, the
+log buys come off TornW3B's. "Checked since" keeps a 60 s margin either way:
+TornW3B's `last_checked` moved with every quantity change measured (11 of
+11), but a check made within seconds of a buy may still carry the old number
+(its `content_updated` is per bazaar and adds nothing). It is done in the one
+place every plan reads listings (`sellersOf` in `renderSellingNow`, where
+the gone marks are): the flips, Your traders, the trade's checks, Where to
+sell, held and pinned trades. TornW3B's own rows (`sell.bazaars`) are never
+changed, so when bazaars are read again and the record of how fast an item
+sells are as before. A step you took part of reads "short" only when fewer
+are left than you still need; and an accepted trade's own steps are checked
+without what you bought since they said yes (that buy is most likely the
+step's own, a moment before it is ticked - it must not offer a replacement
+for units you hold). The gone marks keep the same 60 s margin. On a long
+bazaar a card counts as bought out by its row only when that row was read on
+this load of the page, is drawn whole, no search is in use, and the row
+before it is in the page too: a listing sold further up moves every one
+after it up a place, which looks the same from one row alone
+(`listingBoughtOut`, the buying run's rule too). The problem log says each one: *Your buys taken
+off the TornW3B number (item 206): 120 fewer, 1 listings gone*.
+
+**Leftover cards go by themselves** (3.16.4; the friend's Torn Bids was two
+dozen "Left over" cards, each with a Sold ✓ to press; the owner: "why is it
+there? ... the sold cards should update automatically, and it shouldn't take
+that long").
+
+- **Why they stayed:** only sales your Ledger saw five minutes or more AFTER
+  a card was made took it off. The usual case was the other way round - the
+  item had already gone (given in a trade he then cancelled in the script,
+  passed to another trader, sold at once) - so the card waited for a press.
+- **Now counted from the right moment:** a leftover says from when what
+  leaves your stock (bazaar, Item Market, shop, trade) counts against it
+  (`since`; `leftoversAfterSales`). A trade seen finished: from that trade
+  on - what it took is already off the card, and the trade itself never
+  counts against it (so your own units of the item going into the same trade
+  change nothing). Cancel trade: from your last buy for the trade - if it had
+  in fact gone through, what it took comes off. Traded - done pressed by
+  hand, and cards kept before 3.16.4: nothing said, five minutes after the
+  card as before. Still each sale once, and what you bought again since sold
+  first. Two trades leaving the same item make one row, counted from the
+  later start. Only from a Ledger that has read through to before that
+  moment with no stretch of your log still open (`ledgerReaches`): half the
+  story takes nothing off. What you held of the item before is not told
+  apart from the leftover - selling that counts too, as it always did.
+- **Soon:** while a leftover under an hour old is on the list your log is
+  read every minute instead of every five (still only while Torn Bids is in
+  front); after the hour your inventory says it too.
+- **Fewer are made:** only what was bought FOR the trade can be left over
+  from it - the plan's items, and unplanned buys this trader pays for. Since
+  3.16.0 every bazaar buy in your log while a trade was accepted, whatever it
+  was for, was attached to it and became a card when it closed.
+- **One card, no Sold ✓:** *Left over · 16 items*, what selling them to
+  traders makes now, what they cost; pressed, it lists each (press one for
+  where to sell it). **Clear all** in the open card is the one thing left to
+  press, for when the Ledger cannot say (no Full key).
 
 **Add all** (3.14.5): beside *"X buys N more items, left out to keep it
 quick · Show them"*, one press puts every one of them in the trade, past
@@ -818,8 +960,6 @@ npm test          # core + api unit tests
 npm run check     # build, syntax-check the bundle, then test
 ```
 
----
-
 ## Rules compliance — do not regress these
 
 Torn permits third-party software only when it uses data from **the API** or from
@@ -832,8 +972,18 @@ them.
    or scrolls. A user click never triggers a chain of game actions. **Fill types
    one row's price (and quantity) only on your click, into your own listing
    form, and never presses Torn's buttons** - you confirm. Nothing is filled
-   before you click, and there is no Fill All. The same holds for the trade
-   page's Fill (one row's quantity) and, since 3.13, **Fill on the bazaar card
+   before you click. On your own listing pages a press fills one row (no
+   Fill all there: it would type a quantity into every item you own). The
+   same holds for the trade page's Fill (one row's quantity) - and its
+   **Fill all** (3.16.4): one press types the quantities of the rows marked
+   for the trade you accepted, and nothing else. Typing into a page's boxes
+   is not a request to Torn ("Editing text inputs ... is allowed, as long as
+   it doesn't result in a network request" - the scripting guide on Torn's
+   forums, read with the owner on 2026-10-02; watched on the real add step
+   the same day: three quantities typed, no request sent). What stays
+   forbidden, and is never done: one press that presses several of Torn's
+   buttons or sends several requests, anything filled or sent without a
+   press, and scrolling the page to load rows. Since 3.13, **Fill on the bazaar card
    you are buying from for an accepted trade**: one press types that step's
    quantity into the card's own box - you press Torn's Buy and confirm. Its
    Next (and the N key, only on that bazaar) is the panel's Next: it counts
@@ -853,6 +1003,9 @@ them.
    the selections its disclosure table names. The **Torn Ledger** keeps a third,
    **Full** key, used only for your own log, your trades and key info, through a
    client that refuses every other path. No key is ever used for another's job.
+   (3.16.3: the pages on torn.com use the Ledger's key for one question - did
+   a trade you accepted go through - and only when no Torn Bids tab is open to
+   ask it; the panel's own work still needs the Public key and nothing more.)
 4. **Rate-limit everything.** All Torn API calls pass through one queue capped at
    70/min, **shared by every open tab**, with dedup and backoff; the live feed
    spends at most 30/min of it; TornW3B gets at most 60/min of its 100/min. Torn's 100/min is per user across all tools. Do not
@@ -991,7 +1144,9 @@ code flaw. These measures address both halves.
    a minute with the Ledger's key from a hidden tab too - and (3.16.1) your
    finished trades, to close a trade that went through - in the shared window,
    shown only on pages you look at - no alert of any kind. Torn's rule is
-   about unfocused pages drawing attention; this draws none.) The item list's v1 fallback gives no NPC prices at all (it
+   about unfocused pages drawing attention; this draws none. 3.16.3: a page
+   on torn.com asks about your finished trades too when no Torn Bids tab is
+   open to - only while it is the tab in view, never hidden.) The item list's v1 fallback gives no NPC prices at all (it
    cannot show a shop in Torn buys an item) and is retried after 5 minutes.
 
 ### Out of scope, deliberately
@@ -1040,7 +1195,7 @@ throws on load, so this is the one that catches "installed, and nothing appears"
 Torn API, TornW3B and TornExchange responses (including `/v2/user/inventory`,
 which only answers the Limited key), waits for the live feed, and prints the
 rows, every request URL, and whether a key ever reached weav3r.dev (it must
-not). With `?ttv2=traders&sellkeys=1` it boots the traders page with its keys (`&sellsame=1`: the same Limited key for both; `&w3btrader=1`: a trader known only from TornW3B; `&sellprefs=<json>`: the page's preferences; `?ownbazaar=1&page=bazaar#/add`: your own add page with a week of recorded prices; `?traders=1`: trader prices already stored, for the bazaar-page tag; `&awake=1`: the page reports itself visible, for a background preview where the traders page would rightly pause).
+not). With `?ttv2=traders&sellkeys=1` it boots the traders page with its keys (`&sellsame=1`: the same Limited key for both; `&w3btrader=1`: a trader known only from TornW3B; `&sellprefs=<json>`: the page's preferences; `?ownbazaar=1&page=bazaar#/add`: your own add page with a week of recorded prices (`&ttvalues=1`: with another script's "| 2x = $total" after Torn's price, as on the friend's page); `?page=bazaar&userId=<id>&bazaarwindow=<n>`: a player's bazaar of n listings laid out as Torn's, only the rows near the screen in the page (`&want=<k>`: the item to buy is listing k; `&buyplan=1`: a trade accepted with a step at that seller); `?traders=1`: trader prices already stored, for the bazaar-page tag; `&awake=1`: the page reports itself visible, for a background preview where the traders page would rightly pause).
 
 `test/ux-check.mjs` clicks every control in the panel and the traders page in
 Chromium against the built script - the cash rules, your own bazaar's add page

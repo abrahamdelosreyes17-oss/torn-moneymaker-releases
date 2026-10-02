@@ -1517,6 +1517,7 @@ export class SellingPage {
             s.prefs.onlineOnly,
             s.prefs.trustedOnly,
             (s.leftovers || []).map((l) => [l.itemId, l.qty, l.each, l.best && l.best.name, l.best && l.best.price]),
+            Boolean(this.leftoversOpen),
         ]);
         if (sig === this.stripSig) return;
         this.stripSig = sig;
@@ -1527,8 +1528,48 @@ export class SellingPage {
         box.textContent = '';
         // Leftovers and flips below: focus goes back once they are drawn.
         queueMicrotask(() => this.focusBack(box, refocus));
-        // What a trader did not take: first, until it is sold (or you drop it).
-        for (const l of s.leftovers || []) {
+        // What a trader did not take: first, until it is sold. One card for all
+        // of it (3.16.4: the friend's page was two dozen of these, each with a
+        // Sold ✓ to press; the owner: "why is it there?") - opened, it lists
+        // them. They go by themselves as your Ledger shows them sold.
+        const left = s.leftovers || [];
+        if (left.length) {
+            const open = Boolean(this.leftoversOpen);
+            const priced = left.filter((l) => l.gain !== null);
+            const paid = left.reduce((a, l) => a + l.qty * l.each, 0);
+            const toggle = () => {
+                this.leftoversOpen = !open;
+                this.renderStrip();
+            };
+            const all = spEl('div', {
+                class: 'sp-fc sp-lo sp-lo-all',
+                role: 'button',
+                tabindex: '0',
+                'data-focus': 'left:all',
+                'aria-expanded': String(open),
+                title: open ? 'Hide the leftovers' : 'What traders did not take: show each, and where to sell it',
+            }, [
+                spEl('span', { class: 'sp-fc-top' }, [
+                    spEl('b', { class: 'sp-iname', text: 'Left over · ' + count(left.length) + (left.length === 1 ? ' item' : ' items') }),
+                    open ? spEl('button', { type: 'button', class: 'sp-link sp-lo-x', title: 'Take every leftover off this list. They also go by themselves, as your Ledger shows them sold.', text: 'Clear all', onclick: (event) => {
+                        event.stopPropagation();
+                        this.leftoversOpen = false;
+                        if (this.h.onLeftoversClear) this.h.onLeftoversClear();
+                    } }) : null,
+                ]),
+                spEl('span', { class: 'sp-fc-p', text: priced.length ? signed(priced.reduce((a, l) => a + l.gain, 0)) : '–' }),
+                spEl('small', { text: (priced.length ? 'If sold to traders now' : 'No trader buys them now') + ' · paid ' + formatMoney(paid) + ' in all' }),
+                spEl('small', { class: 'sp-fc-sell', text: open ? 'Hide them ▴' : 'Show them ▾' }),
+            ]);
+            all.addEventListener('click', toggle);
+            all.addEventListener('keydown', (event) => {
+                if (event.key !== 'Enter' && event.key !== ' ') return;
+                event.preventDefault();
+                toggle();
+            });
+            box.appendChild(all);
+        }
+        for (const l of this.leftoversOpen ? left : []) {
             const on = Boolean(s.desk && s.desk.itemId === String(l.itemId));
             const card = spEl('div', {
                 class: 'sp-fc sp-lo' + (on ? ' sp-sel' : ''),
@@ -1541,10 +1582,6 @@ export class SellingPage {
                 spEl('span', { class: 'sp-fc-top' }, [
                     spEl('span', { class: 'sp-pic sp-pic-s' }, [this.image('left', l.itemId)]),
                     spEl('b', { class: 'sp-iname', text: count(l.qty) + ' ' + l.name }),
-                    spEl('button', { type: 'button', class: 'sp-link sp-lo-x', title: 'Sold or kept: take it off this list', 'aria-label': 'Sold: take ' + l.name + ' off the leftovers', text: 'Sold ✓', onclick: (event) => {
-                        event.stopPropagation();
-                        if (this.h.onLeftoverRemove) this.h.onLeftoverRemove(l.itemId);
-                    } }),
                 ]),
                 spEl('span', { class: 'sp-fc-p', text: l.gain !== null ? signed(l.gain) : '–' }),
                 spEl('small', { text: 'Left over · paid ' + formatMoney(l.each) + ' each' }),

@@ -168,10 +168,17 @@ test('sell what you are holding: each bought item with its best OTHER buyer', ()
     const got = applyLogBuys(trade(), buys(logEntry('a', 1_100_000, 1, 268, 200, 30000), logEntry('c', 1_120_000, 6, 263, 362, 54400)), { readTo: 1_300_000, nameOf: () => 'Peony' });
     const buyers = { 268: [{ id: '77', name: 'Foxy', price: 31000 }, { id: '5', name: 'Next', price: 30800 }], 263: [] };
     const s = sellElsewhere(got, (id) => buyers[id]);
-    assert.deepEqual(s.map((l) => [l.name, l.qty, l.best && l.best.name, l.gain]), [['Red Fox Plushie', 200, 'Next', 200 * 800], ['Peony', 362, null, null]]);
+    // 3.16.4: the Peony was not for this trade (Foxy does not buy it) - it is no leftover of it.
+    assert.deepEqual(s.map((l) => [l.name, l.qty, l.best && l.best.name, l.gain]), [['Red Fox Plushie', 200, 'Next', 200 * 800]]);
+    // One Foxy pays for is.
+    const paid = applyLogBuys(trade(), buys(logEntry('c', 1_120_000, 6, 263, 362, 54400)), { readTo: 1_300_000, nameOf: () => 'Peony', bidOf: () => 55000 });
+    assert.deepEqual(sellElsewhere(paid, () => []).map((l) => [l.name, l.qty, l.best]), [['Peony', 362, null]]);
 });
 
-test('traded - done: unplanned buys this trader does not take stay yours as leftovers', () => {
-    const t = { ...trade(), extra: [{ itemId: '263', name: 'Peony', qty: 362, price: 54400, bid: 0, at: 5 }, { itemId: '1', name: 'Hammer', qty: 2, price: 50, bid: 70, at: 5 }] };
-    assert.deepEqual(leftoversOf(t, 9).map((l) => [l.name, l.qty, l.each]), [['Peony', 362, 54400]]);
+test('3.16.4: a buy this trader does not pay for was not for the trade - never a leftover of it', () => {
+    // The friend's Torn Bids, 2026-10-02: two dozen "Left over" cards. Every bazaar buy in his log
+    // while a trade was accepted had been attached to it, and became a card when it closed.
+    const t = { ...trade(), extra: [{ itemId: '263', name: 'Peony', qty: 362, price: 54400, bid: 0, at: 5, fromLog: true }, { itemId: '1', name: 'Hammer', qty: 2, price: 50, bid: 70, at: 5 }] };
+    assert.deepEqual(leftoversOf(t, 9), [], 'Traded - done: what they pay for went into the trade');
+    assert.deepEqual(cancelledLeftovers(t, 9).map((l) => [l.name, l.qty, l.each]), [['Hammer', 2, 50]], 'Cancel trade: only what was bought for them');
 });

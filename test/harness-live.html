@@ -77,7 +77,8 @@ if (/[?&]ownbazaar=1/.test(location.search)) {
             '<div class="actions-main-wrap clearfix"><div class="amount-main-wrap">' +
             (weapon ? '<div class="amount choice-container"><input class="checkbox-css" type="checkbox" name="amount"></div>' : '<div class="amount"><input type="text" class="clear-all" placeholder="Qty"></div>') +
             '<div class="price"><div class="input-money-group"><input type="text" class="clear-all input-money" placeholder="Price"><input type="hidden" name="price" class="clear-all input-money"></div></div></div>' +
-            '<div class="info-main-wrap"><div class="info-wrap t-overflow">$' + value.toLocaleString('en-US') + '</div></div></div></li>';
+            // &ttvalues=1: another script's "| 2x = $total" after Torn's price (the friend's page, 2026-10-02).
+            '<div class="info-main-wrap"><div class="info-wrap t-overflow">$' + value.toLocaleString('en-US') + (have > 1 && /[?&]ttvalues=1/.test(location.search) ? ' | ' + have + 'x = $' + (have * value).toLocaleString('en-US') : '') + '</div></div></div></li>';
         const d = document.createElement('div');
         d.id = 'fake-own';
         d.innerHTML = '<input type="hidden" id="torn-user" value=\'{"id":999,"playername":"Me"}\'>' +
@@ -177,6 +178,84 @@ if (/[?&]bazaarcards=1/.test(location.search)) {
         };
     });
 }
+// &bazaarwindow=<n> (with page=bazaar&userId=<seller>): a player's bazaar laid
+// out as Torn's is (read on real bazaars, 2026-10-02): n listings in rows of
+// three, 80px a row, the list as tall as all of them, and only the rows near
+// the screen in the page - rows scrolled away from are taken out. Its search
+// box filters by name. &want=<k>: Xanax ($840,000, 5 in stock) is listing k
+// (none without it). &buyplan=1: Bob accepted a trade a minute ago with a step
+// for 2 Xanax at this seller (and one more at another).
+// window.__buy(id, n) takes n off a listing, as a purchase does.
+const _bzWindow = Number(new URLSearchParams(location.search).get('bazaarwindow')) || 0;
+const BZW_ITEMS = {};
+if (_bzWindow) {
+    const q = new URLSearchParams(location.search);
+    const want = q.has('want') ? Number(q.get('want')) : -1;
+    const seller = q.get('userId') || '777';
+    for (let i = 0; i < _bzWindow; i++) BZW_ITEMS[3000 + i] = { name: 'Thing ' + (i + 1), type: 'Other', sell_price: 10, market_value: 400 };
+    if (/[?&]buyplan=[12]/.test(location.search)) {
+        const now = Date.now();
+        _store[NS + 'sellAccepted'] = JSON.stringify({ 'id:11': { key: 'id:11', trader: { id: '11', name: 'Bob' }, itemId: '206', at: now - 60000, cost: 2521000, pays: 2550000, profit: 29000, items: [
+            { line: 'flip:206', itemId: '206', name: 'Xanax', units: 3, bid: 850000, kind: 'flip', sent: false, steps: [
+                { sellerId: seller, sellerName: 'BigSeller', qty: 2, price: 840000, bought: false },
+                { sellerId: '4242', sellerName: 'Other', qty: 1, price: 841000, bought: false },
+            ] },
+            // &buyplan=2: and 2 of Thing 2 at this same seller, so Next stays on this page.
+            ...(/[?&]buyplan=2/.test(location.search) ? [{ line: 'flip:3001', itemId: '3001', name: 'Thing 2', units: 2, bid: 600, kind: 'flip', sent: false, steps: [{ sellerId: seller, sellerName: 'BigSeller', qty: 2, price: 501, bought: false }] }] : []),
+        ] } });
+    }
+    document.addEventListener('DOMContentLoaded', () => {
+        const ROW = 80, OVER = 10;
+        let data = [];
+        for (let i = 0; i < _bzWindow; i++) data.push(i === want ? { id: 206, name: 'Xanax', price: 840000, stock: 5 } : { id: 3000 + i, name: 'Thing ' + (i + 1), price: 500 + i, stock: 3 });
+        const d = document.createElement('div');
+        d.id = 'fake-bazaar';
+        d.innerHTML = '<div style="height:120px;padding:8px;color:#ddd;font:12px Arial">BigSeller\'s bazaar <div class="searchBar___x"><input type="text" placeholder="search..." aria-label="Search bazaar" style="width:160px"></div></div>' +
+            '<div class="itemsContainner___x" style="width:700px"><div><div data-testid="bazaar-items" style="position: relative; width: 100%; height: 0px;"></div></div></div>';
+        document.body.prepend(d);
+        const list = d.querySelector('[data-testid="bazaar-items"]');
+        const search = d.querySelector('input');
+        const card = (x) => '<div class="item___x" data-testid="item" style="display:inline-block;width:220px;height:72px;margin:2px;background:#333;color:#ddd;font:12px Arial;vertical-align:top;position:relative"><div class="itemDescription___x" data-testid="item-description" data-id="' + x.id + '">' +
+            '<div class="imgBar___x" role="button" aria-label="' + x.name + '"><div data-testid="img-container"><img class="item-plate" alt="' + x.name + '" src="https://www.torn.com/images/items/' + x.id + '/large.png" style="height:24px"></div></div>' +
+            '<div data-testid="description"><p data-testid="name" class="name___x" style="margin:0">' + x.name + '</p><div data-testid="price" class="price___x">$' + x.price.toLocaleString('en-US') + '</div>' +
+            '<p class="amount___x" style="margin:0">(<span data-testid="amount-value">' + x.stock + '</span> in stock)</p></div></div></div>';
+        const shown = () => (search.value.trim() ? data.filter((x) => x.name.toLowerCase().includes(search.value.trim().toLowerCase())) : data);
+        const draw = (fresh) => {
+            const rows = shown();
+            const total = Math.ceil(rows.length / 3);
+            list.style.height = total * ROW + 'px';
+            const top = list.getBoundingClientRect().top;
+            const from = Math.max(0, Math.floor(-top / ROW) - OVER);
+            const to = Math.min(total - 1, Math.floor((-top + innerHeight) / ROW) + OVER);
+            if (fresh) list.textContent = '';
+            const have = new Map([...list.children].map((r) => [Number(r.dataset.i), r]));
+            for (const [i, r] of have) if (i < from || i > to) r.remove();
+            for (let i = from; i <= to; i++) {
+                if (have.has(i)) continue;
+                const r = document.createElement('div');
+                r.dataset.i = i;
+                r.setAttribute('data-testid', 'bazaar-items-row');
+                r.setAttribute('style', 'position: absolute; inset: 0px; height: ' + ROW + 'px; transform: translateY(' + i * ROW + 'px);');
+                r.innerHTML = '<div data-testid="row-items">' + rows.slice(i * 3, i * 3 + 3).map(card).join('') + '</div>';
+                list.appendChild(r);
+            }
+        };
+        draw(true);
+        window.addEventListener('scroll', () => draw(false), { passive: true });
+        // A background preview fires no scroll events: a check calls this after scrollTo().
+        window.__draw = () => draw(false);
+        search.addEventListener('input', () => draw(true));
+        window.__buy = (id, n) => {
+            const x = data.find((y) => y.id === id);
+            if (!x) return;
+            x.stock -= n;
+            if (x.stock <= 0) data = data.filter((y) => y !== x);
+            draw(true);
+        };
+        // Sorted another way (Torn's Name / Cost tabs): the same listings, another order.
+        window.__sort = () => { data = [...data].reverse(); draw(true); };
+    });
+}
 // ?from381=1: left as 3.8.1 left it when it refused the Limited key as the
 // TornExchange key - the Limited key saved, no TornExchange key, and its
 // refusal message still stored.
@@ -267,6 +346,33 @@ if (LEFTOVERSOLD) {
         { itemId: '206', name: 'Xanax', qty: 2, each: 820000, from: 'Bob', at: Date.now() - 30 * 60000 },
     ]);
 }
+/*
+ * &leftgone=1 (3.16.4, with &ledgerkey=1): 30 Bottles of Beer bought for a
+ * trade an hour and a half ago and traded away an hour ago - then Cancel
+ * trade was pressed five minutes ago, which made a card of them, counted from
+ * the last buy for the trade (85 minutes ago). The Ledger shows them going
+ * since: the card goes by itself. The 2 Xanax, which it shows nothing of, stay.
+ */
+const LEFTGONE = /[?&]leftgone=1/.test(location.search);
+if (LEFTGONE) {
+    const now = Date.now();
+    _store[NS + 'ledgerSelf'] = JSON.stringify('999');
+    _store[NS + 'sellLeftovers'] = JSON.stringify([
+        { itemId: '180', name: 'Bottle of Beer', qty: 30, each: 40, from: 'KayMalta', at: now - 5 * 60000, since: now - 85 * 60000 },
+        { itemId: '206', name: 'Xanax', qty: 2, each: 820000, from: 'Bob', at: now - 5 * 60000, since: now - 85 * 60000 },
+    ]);
+}
+/*
+ * &sendplan=1 (3.16.4, with ?ownbazaar=1&page=trade#step=add&ID=5): Bob
+ * accepted, and 10 Bottles of Beer, 2 Xanax and a Hammer were bought for him.
+ * The add step marks the three rows; Fill all types 10 and 2 (the Hammer has
+ * Torn's tick box - never ticked for you).
+ */
+if (/[?&]sendplan=1/.test(location.search)) {
+    const now = Date.now();
+    const flip = (itemId, name, qty, price, bid) => ({ line: 'flip:' + itemId, itemId: String(itemId), name, units: qty, bid, kind: 'flip', sent: false, steps: [{ sellerId: '777', qty, price, bought: true, boughtQty: qty, boughtAt: now - 5 * 60000 }] });
+    _store[NS + 'sellAccepted'] = JSON.stringify({ 'id:11': { key: 'id:11', trader: { id: '11', name: 'Bob' }, itemId: '206', at: now - 20 * 60000, items: [flip(180, 'Bottle of Beer', 10, 40, 60), flip(206, 'Xanax', 2, 830000, 850000), flip(1, 'Hammer', 1, 100, 120)], cost: 1660500, pays: 1700720, profit: 40220 } });
+}
 const TRADEDONE = /[?&]tradedone=1/.test(location.search);
 const TRADEDONE_TRADES = {};
 if (TRADEDONE) {
@@ -286,8 +392,33 @@ if (TRADEDONE) {
             { user_id: trader.id, type: 'Money', details: { amount: money } },
         ] };
     };
+    // &tradesseen=1: a Torn Bids tab asked Torn a moment ago (a Torn page then stays out of it, 3.16.3).
+    if (/[?&]tradesseen=1/.test(location.search)) _store[NS + 'sellTradesSeen'] = JSON.stringify({ at: now, seen: {}, used: [] });
     sale(701, 5 * 60, { id: 11, name: 'Bob' }, [[384, 4]], 4 * 73500);
     sale(702, 15 * 60, { id: 5001, name: 'KayMalta' }, [[180, 10]], 600);
+}
+
+/*
+ * &ownbuys=1 (3.16.4, with &bigflip=1): you bought all 30 Stealth Viruses at
+ * VirusA's a minute ago (your Torn log), and VirusB's card read 5 after you
+ * took 7 of its 12 (the overlay) - TornW3B, checked 20 s ago, still says 30
+ * and 12. The plan counts on neither: 5 at VirusB, 6 at VirusC.
+ */
+if (/[?&]ownbuys=1/.test(location.search)) {
+    const now = Date.now();
+    _store[NS + 'sellBought'] = JSON.stringify([{ id: 'own1:0', sellerId: '6001', itemId: '870', qty: 30, each: 809351, t: now - 60000 }]);
+    _store[NS + 'sellStock'] = JSON.stringify({ '6002|870': { qty: 5, price: 812000, at: now - 30000 } });
+}
+/*
+ * &leftmany=1 (3.16.4, with &bigflip=1): the friend's Torn Bids, 2026-10-02 -
+ * sixteen things left over. One card for all of them, opened to see each;
+ * no Sold ✓ anywhere.
+ */
+if (/[?&]leftmany=1/.test(location.search)) {
+    const now = Date.now();
+    const left = [[870, 'Stealth Virus', 1, 809351], [1002, 'Bag of Bon Bons', 110, 85], [1003, 'Box of Sweet Hearts', 93, 160], [1004, 'Small First Aid Kit', 7, 250], [1005, 'Gentleman Cache', 1, 55000], [1006, 'Dahlia', 42, 1100], [1007, 'Teddy Bear Plushie', 9, 600]];
+    for (let i = 0; i < 9; i++) left.push([1010 + i, 'Lollipop ' + (i + 1), 2 + i, 300 + i]);
+    _store[NS + 'sellLeftovers'] = JSON.stringify(left.map(([itemId, name, qty, each], i) => ({ itemId: String(itemId), name, qty, each, from: 'Picex', at: now - (i + 1) * 60000, since: now - 3 * 3600000 })));
 }
 
 const ITEMS = {
@@ -322,6 +453,7 @@ for (let i = 0; i < 9; i++) BIG_ITEMS[1010 + i] = { name: 'Lollipop ' + (i + 1),
 // An item of Torn's "Other" type, sold on the virus route: never flipped (3.14.2).
 BIG_ITEMS[1030] = { name: 'Blank Card', type: 'Other', sell_price: 10, market_value: 5000 };
 if (BIG) Object.assign(ITEMS, BIG_ITEMS);
+Object.assign(ITEMS, BZW_ITEMS);
 const bigRow = (id, name, price, qty) => ({ player_id: id, player_name: name, price, quantity: qty, last_checked: NOW_S - 20 });
 const BIG_BAZAARS = {
     870: [bigRow(6001, 'VirusA', 809351, 30), bigRow(6002, 'VirusB', 812000, 12), bigRow(6003, 'VirusC', 820000, 6)],
@@ -425,6 +557,8 @@ function respond(url) {
                 { id: 'l11', timestamp: NOW_S - 3 * 3600, details: { id: 8156 }, data: { anonymous: 1, money: 13584 } },
                 // &leftoversold=1 (3.16.2): the Camel Plushie left over half an hour ago, sold on your bazaar 10 minutes ago.
                 ...(LEFTOVERSOLD ? [{ id: 'l12', timestamp: NOW_S - 600, details: { id: 1226 }, data: { buyer: 4172398, items: [{ id: 384, qty: 1 }], cost_each: 74000, cost_total: 74000 } }] : []),
+                // &leftgone=1 (3.16.4): the Beers bought for the trade 90 minutes ago (l7 sold them an hour ago, before the card was made).
+                ...(LEFTGONE ? [{ id: 'l13', timestamp: NOW_S - 5400, details: { id: 1225 }, data: { seller: 66, items: [{ id: 180, qty: 30 }], cost_each: 40, cost_total: 1200 } }] : []),
             ];
             const from = Number(u.searchParams.get('from')) || 0;
             const to = Number(u.searchParams.get('to')) || Infinity;

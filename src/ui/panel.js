@@ -23,7 +23,7 @@ import {
     parseMoneyInput,
 } from '../core/parse.js';
 import { VENUE_LABELS } from '../core/profit.js';
-import { buyingStatus } from '../core/accepted.js';
+import { buyingStatus, buyingWhereText } from '../core/accepted.js';
 import { W3B_TERMS_URL, W3B_SITE_URL } from '../api/w3b.js';
 import { panelStyleElement } from './styles.js';
 import { renderPriceGraph } from './graph.js';
@@ -1028,7 +1028,7 @@ export class Panel {
                     text: 'Now ' + formatMoney(h.nowPrice) + ' each (planned ' + formatMoney(h.price) + ')' + (h.bid && h.nowPrice >= h.bid ? ' - not under what ' + v.trader + ' pays (' + formatMoney(h.bid) + '): skip it.' : '.'),
                 }));
             }
-            if (!v.ask) box.appendChild(el('div', { class: h.bought >= h.qty ? 'ttv2-tb-ok' : h.listed ? 'ttv2-sub' : 'ttv2-tb-warn', text: h.bought ? 'You took ' + h.bought.toLocaleString('en-US') + ' of ' + h.qty.toLocaleString('en-US') + (h.bought >= h.qty ? ' ✓' : '') : h.listed ? 'Not bought yet - or skip it: Next counts only what you took.' : 'Not on this page any more.' }));
+            if (!v.ask) box.appendChild(el('div', { class: h.bought >= h.qty ? 'ttv2-tb-ok' : h.listed ? 'ttv2-sub' : 'ttv2-tb-warn', text: h.bought ? 'You took ' + h.bought.toLocaleString('en-US') + ' of ' + h.qty.toLocaleString('en-US') + (h.bought >= h.qty ? ' ✓' : '') : h.listed ? 'Not bought yet - or skip it: Next counts only what you took.' : buyingWhereText(h) }));
         }
         // The listing was never seen here, so nothing could be counted: ask.
         if (v.ask && v.here) {
@@ -1048,7 +1048,9 @@ export class Panel {
             if (!waiting && first && this.root && this.root.getRootNode().activeElement === null) first.focus({ preventScroll: true });
             return;
         }
-        const label = v.here && (!v.next || v.last) ? 'Done - go to the trade' : v.here && !v.here.listed ? 'Not here - next' : v.here && v.same ? 'Next item here' : v.here ? 'Next bazaar' : 'Open the next bazaar' + (v.next ? ': ' + v.next.seller : '');
+        // "Not here" only when it is not: a listing further down a long bazaar is still here.
+        const notHere = v.here && !v.here.listed && !['below', 'searching', 'away'].includes(v.here.where);
+        const label = v.here && (!v.next || v.last) ? 'Done - go to the trade' : notHere ? 'Not here - next' : v.here && v.same ? 'Next item here' : v.here ? 'Next bazaar' : 'Open the next bazaar' + (v.next ? ': ' + v.next.seller : '');
         this.buyNextBtn = el('button', { type: 'button', class: 'ttv2-primary ttv2-buynext', title: this.buyHereActive ? 'Key: N' : null, onclick: () => this.handlers.onBuyNext && this.handlers.onBuyNext() }, [label, this.buyHereActive ? el('span', { class: 'ttv2-kbd', text: 'N' }) : null]);
         box.appendChild(this.buyNextBtn);
         box.appendChild(this.cancelTradePart(v, () => this.setBuying(v)));
