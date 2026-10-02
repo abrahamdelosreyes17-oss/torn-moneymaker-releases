@@ -31,6 +31,18 @@ where it differs from the text below:
   is the cost; 24 freezes in 14 s on Torn Bids; a bazaar scan 20-40 ms; the
   trade page scan 75 ms each; `traderDb` 20 ms a read and 53 ms a write.
 
+**Part 3 A, first cut, is BUILT as 3.17.1** (the owner: "optimise now").
+A profile showed storage reads were under 1% of Torn Bids' redraw, so steps
+1 and 2 were left out as not worth a change; done: lazy favourites on a tie
+(not in the plan - the profile found it), one collator for names, step 3
+(`sellersOf` kept within a redraw), step 5 (a hidden Torn tab's panel waits
+for the feed; the one-second ticker NOT yet), step 7 (the trade page's bar
+found once a scan). Torn Bids' redraw 522 -> 378 ms each on the bench.
+Still open in A: 4 (marks only where they differ), 6 (feed written only
+when changed), 8, 9, and the ticker. What dominates now is
+`buyersForItem` for every item every redraw (4.5 s of 12 s profiled) and
+`indexW3bByItem` (1 s): that is Part 3 B, steps 11 and 14.
+
 The rest of this file is the plan as written.
 
 Written 2026-10-03, after 3.16.4. **Nothing below is built.** The owner said

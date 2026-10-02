@@ -102,9 +102,13 @@ export function tradedLine(stat, now = Date.now()) {
  * better place than their price earns (no ranking bias toward anyone).
  */
 export function favouritesFirstOnTie(buyers, isFav) {
+    // Whether a buyer is a favourite only matters between two at the same price: it is asked
+    // only then, and once per buyer (3.17.1 - asking it of every buyer of every item was a
+    // fifth of Torn Bids' redraw). The order that comes out is the same.
+    const rank = (x) => (x.f === null ? (x.f = isFav(x.b) ? 0 : 1) : x.f);
     return (buyers || [])
-        .map((b, i) => ({ b, i, f: isFav(b) ? 0 : 1 }))
-        .sort((x, y) => (Number(y.b.price) || 0) - (Number(x.b.price) || 0) || x.f - y.f || x.i - y.i)
+        .map((b, i) => ({ b, i, f: null }))
+        .sort((x, y) => (Number(y.b.price) || 0) - (Number(x.b.price) || 0) || rank(x) - rank(y) || x.i - y.i)
         .map((x) => x.b);
 }
 

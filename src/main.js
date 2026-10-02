@@ -1171,6 +1171,14 @@ function showBazaarTarget(listings) {
  * status lookups in updatePresence().
  */
 function refreshView(why = null) {
+    // The feed changes every few seconds, and every Torn tab used to redraw its panel each time -
+    // the hidden ones too, where nobody sees it. A hidden tab now waits, and draws once when it
+    // is looked at again (3.17.1; Torn Bids already worked this way). Scans and presses draw as before.
+    if (why && FEED_REDRAWS.has(why) && document.visibilityState !== 'visible') {
+        app.viewStale = true;
+        return;
+    }
+    app.viewStale = false;
     const t0 = perfNow();
     try {
         refreshViewNow();
@@ -1178,6 +1186,9 @@ function refreshView(why = null) {
         perfDone('panel redraw' + (app.inScan ? ' (the end of a scan)' : why ? ' · ' + why : ''), t0);
     }
 }
+
+/* The panel redraws a change of the feed asks for (refreshView's `why`): the ones a hidden tab puts off. */
+const FEED_REDRAWS = new Set(['the feed changed', 'the feed, from another tab', 'the feed tick']);
 
 function refreshViewNow() {
     if (!app.panel) return;
@@ -3420,6 +3431,8 @@ function scanTradePage() {
 
 function scanTradePageNow() {
     if (!app.panel) return;
+    // Torn's ADD TO TRADE bar: looked for afresh by this scan's first asker (tradeAddBar).
+    app.tradeBarLooked = false;
     if (!isTradePage(location.href)) {
         clearSendMarks();
         app.tradeCheck = null;
@@ -3591,11 +3604,10 @@ function fillAllChips() {
  * list to load more rows - press it again after you do.
  */
 function showFillAll(trader) {
-    const bar = [...document.querySelectorAll('button, input[type=submit], input[type=button], a, span, div')]
-        .find((e) => e.children.length === 0 && /^\s*add to trade\s*$/i.test(e.value || e.textContent || ''));
     const chips = fillAllChips();
     let btn = document.querySelector('.' + TRADE_FILLALL_CLASS);
-    // One row has its own Fill; this is for several.
+    // One row has its own Fill; this is for several (and with fewer, Torn's bar is not even looked for).
+    const bar = chips.length < 2 ? null : tradeAddBar();
     if (!bar || !bar.parentElement || chips.length < 2) {
         if (btn) btn.remove();
         return;
@@ -3622,9 +3634,24 @@ function showFillAll(trader) {
  * adding 0 items ... Clear all"): what it marked, or why nothing - the reason
  * used to live only in the panel, which is often collapsed. Updated in place.
  */
+/**
+ * Torn's ADD TO TRADE on the add step, or null. Finding it walks the whole
+ * page, and both Fill's line and Fill all need it on every scan: it is looked
+ * for once a scan, and the one found is kept for as long as it is still in
+ * the page and still says so (3.17.1 - two walks every 2.5 s before).
+ */
+function tradeAddBar() {
+    const is = (e) => Boolean(e && e.isConnected && e.children.length === 0 && /^\s*add to trade\s*$/i.test(e.value || e.textContent || ''));
+    if (app.tradeBarLooked) return app.tradeBar;
+    app.tradeBarLooked = true;
+    if (!is(app.tradeBar)) {
+        app.tradeBar = [...document.querySelectorAll('button, input[type=submit], input[type=button], a, span, div')].find(is) || null;
+    }
+    return app.tradeBar;
+}
+
 function showFillNote(n) {
-    const bar = [...document.querySelectorAll('button, input[type=submit], input[type=button], a, span, div')]
-        .find((e) => e.children.length === 0 && /^\s*add to trade\s*$/i.test(e.value || e.textContent || ''));
+    const bar = tradeAddBar();
     let tag = document.querySelector('.' + TRADE_NOTE_CLASS);
     if (!bar || !bar.parentElement) {
         if (tag) tag.remove();
@@ -4280,6 +4307,8 @@ function startLiveFeed() {
             .filter(Boolean);
         if (ids.length) app.feed.requestRecheck(ids.slice(-10));
 
+        // What the feed changed while this tab was hidden: drawn now.
+        if (app.viewStale) refreshView('back in view');
         tick();
     });
 
@@ -5634,10 +5663,12 @@ function renderSellingWork() {
         if (st.whoName) partnerOf.set('name:' + String(st.whoName).toLowerCase(), st);
     }
     const favEdits = sellFavourites();
+    // Added by hand: looked up, not searched for, per buyer (3.17.1; the same answer).
+    const favAdded = new Set((favEdits.added || []).map(String));
     const statOf = (b) => partnerOf.get(partnerKey(b)) || (b && b.name ? partnerOf.get('name:' + String(b.name).toLowerCase()) : null) || null;
     const favOf = (b) => {
         const st = statOf(b);
-        return st ? isFavourite(st, favEdits, now) : Boolean(b && b.id && (favEdits.added || []).map(String).includes(String(b.id)));
+        return st ? isFavourite(st, favEdits, now) : Boolean(b && b.id && favAdded.has(String(b.id)));
     };
     const blacklist = blacklistKeys(sellBlacklist());
     // Every buyer lookup that is not the shown list (a pinned or picked trade, its bids) skips them too.
@@ -5753,9 +5784,15 @@ function renderSellingWork() {
         ownBuysLogged.add(sig);
         logProblem('note', 'Your buys taken off the TornW3B number (item ' + id + '): ' + units + ' fewer, ' + (before.length - after.length) + ' listings gone', 'its bazaars read ' + Math.round((now - b.at) / 1000) + ' s ago');
     }
+    // Worked out once a redraw per item (3.17.1): a dozen places ask, and each used to filter, copy and sort the rows again.
+    const sellersKept = new Map();
     const sellersOf = (id) => {
-        const b = sell.bazaars.get(String(id));
-        return b && b.at ? bazaarSellers(withOwnBuys(withoutGone(b.rows, String(id), gone), String(id), { stock: ownStock, bought: ownBought.get(String(id)) || null }), { selfId: sell.selfId, now }) : null;
+        const key = String(id);
+        if (sellersKept.has(key)) return sellersKept.get(key);
+        const b = sell.bazaars.get(key);
+        const rows = b && b.at ? bazaarSellers(withOwnBuys(withoutGone(b.rows, key, gone), key, { stock: ownStock, bought: ownBought.get(key) || null }), { selfId: sell.selfId, now }) : null;
+        sellersKept.set(key, rows);
+        return rows;
     };
     // For an accepted trade's own steps: only what you bought BEFORE they said yes comes off. A buy
     // since is most likely that step's own, a moment before Next or your log ticks it - it must not

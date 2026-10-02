@@ -199,9 +199,10 @@ async function runScene(port, base, scene, script = null) {
             'const store = typeof _store === "object" ? _store : {};' +
             'const sizes = Object.entries(store).filter(([k]) => k.startsWith("tornTrading.v2.")).map(([k, v]) => [k.slice(15).replace(/\\.[a-z0-9]+-[a-z0-9]+$/, ".this-tab"), String(v).length]);' +
             // What was asked of the three services (keys and clock values out), and the page as drawn:
-            // every element by tag and class, in the document and in each shadow root, with its text's digits out.
+            // every element by tag and class, in the document and in each shadow root, with its text's digits out
+            // (but for the harness's own status line, #out: it is the harness's, and says what the clock made of the run).
             'const requests = (window.__requests || []).map((u) => String(u).replace(/key=[^&]+/g, "key=K").replace(/\\d{9,}/g, "T"));' +
-            'const shape = (root) => [...root.querySelectorAll("*")].filter((e) => !/^(SCRIPT|STYLE)$/.test(e.tagName)).map((e) => e.tagName + "." + (typeof e.className === "string" ? e.className : "") + (e.children.length ? "" : ":" + (e.textContent || "").replace(/\\d+/g, "#").slice(0, 60)) + (e.shadowRoot ? "{" + shape(e.shadowRoot) + "}" : "")).join("|");' +
+            'const shape = (root) => [...root.querySelectorAll("*")].filter((e) => !/^(SCRIPT|STYLE)$/.test(e.tagName) && e.id !== "out").map((e) => e.tagName + "." + (typeof e.className === "string" ? e.className : "") + (e.children.length ? "" : ":" + (e.textContent || "").replace(/\\d+/g, "#").slice(0, 60)) + (e.shadowRoot ? "{" + shape(e.shadowRoot) + "}" : "")).join("|");' +
             'return JSON.stringify({ record: store["tornTrading.v2.speedLog"] ? JSON.parse(store["tornTrading.v2.speedLog"]) : null, sizes, errors: window.__benchErrors || [], requests, dom: shape(document) });';
         const out = await page.send('Runtime.evaluate', { expression: '(async () => {' + body + '})()', awaitPromise: true, returnByValue: true, timeout: (SECONDS + 30) * 1000 });
         if (out.exceptionDetails) throw new Error(scene.name + ': ' + (out.exceptionDetails.exception && out.exceptionDetails.exception.description || out.exceptionDetails.text));

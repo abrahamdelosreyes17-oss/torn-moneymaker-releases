@@ -988,6 +988,35 @@ drew the same page (`git show HEAD:torn-moneymaker.user.js >
 dist/before.user.js` gives it the released one): the test that nothing was
 compromised.
 
+### The same work, cheaper (3.17.1)
+
+The first speed-ups (`PLAN-speed.md`, Part 3 A): waste taken out, results
+untouched. A profile of Torn Bids on the bench (processor slowed four times,
+a 1.2 MB trader list) said where the redraw's time went - and that reading
+stored values was under 1% of it, so that step of the plan was left out.
+
+- **Favourites on a tie:** whether a buyer is a favourite matters only
+  between two at the same price; it is now asked only then, once per buyer
+  (it was asked of every buyer of every item, every redraw - a fifth of the
+  redraw). Favourites added by hand are looked up in a set made once.
+- **Names at the same price** are ordered by one collator made once - the
+  very order `localeCompare` gives, which made a collator per comparison.
+- **An item's bazaar listings** are worked out once a redraw, whoever asks.
+- **A buyer already known by id** is not looked up by name when no
+  TornExchange row is known by name at all.
+- **The trade page:** Torn's ADD TO TRADE is looked for once a scan and kept
+  while it is still in the page (two whole-page walks every 2.5 s before).
+- **A hidden Torn tab** no longer redraws its panel each time the feed
+  changes (every few seconds, in every Torn tab); it draws once when it is
+  looked at again, as Torn Bids already did. Scans and presses draw as before.
+
+Measured on the bench, before and after: Torn Bids' redraw **522 ms -> 378
+ms** each (longest 886 -> 607), the page rebuild inside it unchanged at about
+60 ms. `--compare` against 3.17.0: the same requests and the same page on
+all five scenes; `test/faster.test.js` runs the old way beside the new one.
+What is left of the redraw is building each item's buyers anew every time
+(Part 3 B: kept between redraws, with a replay test to prove it equal).
+
 ---
 
 ## Architecture

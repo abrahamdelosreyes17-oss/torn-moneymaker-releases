@@ -385,7 +385,8 @@ export function buyersForItem(itemId, { teBest = [], teFull = null, idsByName = 
         // The same trader already here by name only (a TornExchange row with
         // no id yet): one row, now with the id.
         let r = rows.get('id:' + id);
-        if (!r && t) {
+        // (No TornExchange row by name at all: nothing to look up - 3.17.1, the same result.)
+        if (!r && t && byName.size) {
             const named = byName.get(String(t.name).toLowerCase());
             if (named && !named.id) {
                 rows.delete('name:' + String(named.name).toLowerCase());
@@ -404,7 +405,7 @@ export function buyersForItem(itemId, { teBest = [], teFull = null, idsByName = 
         const id = cleanId(t && t.id);
         if (!id || !(t.price > 0)) continue;
         let r = rows.get('id:' + id);
-        if (!r && t.name) {
+        if (!r && t.name && byName.size) {
             const named = byName.get(String(t.name).toLowerCase());
             if (named && !named.id) {
                 rows.delete('name:' + String(named.name).toLowerCase());
@@ -435,9 +436,16 @@ export function buyersForItem(itemId, { teBest = [], teFull = null, idsByName = 
         r.trust = trustOf(r.votes, r.rating);
         out.push(r);
     }
-    out.sort((a, b) => b.price - a.price || String(a.name).localeCompare(String(b.name)));
+    out.sort((a, b) => b.price - a.price || TRADER_NAME_ORDER.compare(String(a.name), String(b.name)));
     return out;
 }
+
+/*
+ * Names at the same price, in the order String.localeCompare gives them: it
+ * is this same collator (the default locale, no options) - made once here
+ * instead of once per comparison (3.17.1).
+ */
+const TRADER_NAME_ORDER = new Intl.Collator();
 
 /**
  * A trader's trust, from the votes other players left after trading with
