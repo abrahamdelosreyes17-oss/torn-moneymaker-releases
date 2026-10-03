@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      3.20.1
+// @version      3.20.2
 // @description  Finds Bazaar and Item Market listings below NPC / market value - on the page you are viewing, and live from the Torn API and TornW3B - ranked by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -42,7 +42,7 @@
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '3.20.1';
+    const TTV2_BUILD_VERSION = '3.20.2';
 
     /* ===== src/platform/gm.js ===== */
     /*
@@ -19510,6 +19510,7 @@
          *   onSaveTeKey(key), onForgetTeKey(), onRevealTeKey(), onRetryTe()
          *   onRefresh(), onPrefsChange(partial)
          *   onSelect(itemId)            - pick an item for the desk
+     *   onTradeUnpick(itemId, key)  - Planning pressed again: that plan off the desk
          *   onFilter(key), onQuery(text), onCategory(category), onMore()
          *   onOpenUrl(url)
          */
@@ -21393,6 +21394,9 @@
             if (until) {
                 words.unshift('Declined · passed over for ' + formatAge(until - Date.now()).replace(' ago', ''));
                 btn = spEl('button', { type: 'button', class: 'sp-btn sp-plan', 'data-focus': 'plan:' + b.tradeKey, text: 'Undo', onclick: () => this.h.onTradeUndecline && this.h.onTradeUndecline(b.tradeKey) });
+            } else if (planning && !d.trade.accepted && d.trade.picked) {
+                // Pressed again, it comes off the desk (3.20.2): you planned it, nothing was said yet.
+                btn = spEl('button', { type: 'button', class: 'sp-btn sp-plan sp-plan-on', 'data-focus': 'plan:' + b.tradeKey, 'aria-pressed': 'true', title: 'Planning with ' + b.name + ': press to take this plan off the desk', text: 'Planning', onclick: () => this.h.onTradeUnpick && this.h.onTradeUnpick(d.itemId, b.tradeKey) });
             } else if (planning) {
                 btn = spEl('span', { class: 'sp-plan sp-plan-on', text: d.trade.accepted ? 'Accepted' : 'Planning' });
             } else {
@@ -22412,6 +22416,7 @@
     .sp-tradeline small { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
     .sp-plan { height: 26px; padding: 0 10px; font-size: 12px; border-radius: 8px; }
     .sp-plan-on { display: inline-flex; align-items: center; border-radius: 8px; border: 0; color: var(--on-profit); font-weight: 650; background: var(--profit); }
+    .sp-btn.sp-plan-on:hover { background: #86e594; }
     .sp-tr.sp-planning { box-shadow: inset 3px 0 0 var(--profit); }
     /* Dimmed by colour, not see-through: its words stay readable (review M10). */
     .sp-tr.sp-declined .sp-tprice, .sp-tr.sp-declined .sp-trader-l, .sp-tr.sp-declined small, .sp-tr.sp-hidden .sp-tprice, .sp-tr.sp-hidden .sp-trader-l, .sp-tr.sp-hidden small { color: var(--faint); }
@@ -30675,6 +30680,16 @@
                 sell.pickedByYou = true;
                 // Planning a trader you declined means you are trying them again.
                 if (sellDeclined().has(declineKey(itemId, key))) setSellDeclined(declineKey(itemId, key), null);
+                renderSellingNow();
+            },
+            // Planning pressed again (3.20.2, the owner): the plan with them comes off
+            // the desk - not declined, nothing kept - and the desk shows the best
+            // trade again. A pin stays until you unpin it.
+            onTradeUnpick: (itemId, key) => {
+                logAction('Unplanned trade on item ' + itemId);
+                const id = String(itemId);
+                if (sell.tradePick.get(id) === key) sell.tradePick.delete(id);
+                sell.tradeHold.delete(holdKey(id, key));
                 renderSellingNow();
             },
             onTradePin: (itemId, key) => {

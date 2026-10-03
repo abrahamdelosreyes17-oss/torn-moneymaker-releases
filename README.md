@@ -1164,7 +1164,9 @@ does is as it was.
 - **Your traders on top, Best flips under it** (the owner's order), with
   Buyers online only and Trusted buyers only in its header - they filter the
   whole page. **3.20.1:** Favourites and Trusted are one row each, as many
-  cards as fit across; the rest under *Show all*.
+  cards as fit across; the rest under *Show all*. **3.20.2:** a plan you
+  started with *Plan trade* comes off the desk when you press *Planning*
+  again (until they accept; not marked declined, a pin stays).
 - **Favourites have a place of their own:** a gold Favourites row above
   Trusted in Your traders, every favourite always shown; a gold edge and a
   Favourite tag on the desk's trader rows and in the Ledger's Traders tab,

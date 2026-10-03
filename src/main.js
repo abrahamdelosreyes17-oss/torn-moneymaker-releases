@@ -7581,6 +7581,16 @@ function bootSellingPage() {
             if (sellDeclined().has(declineKey(itemId, key))) setSellDeclined(declineKey(itemId, key), null);
             renderSellingNow();
         },
+        // Planning pressed again (3.20.2, the owner): the plan with them comes off
+        // the desk - not declined, nothing kept - and the desk shows the best
+        // trade again. A pin stays until you unpin it.
+        onTradeUnpick: (itemId, key) => {
+            logAction('Unplanned trade on item ' + itemId);
+            const id = String(itemId);
+            if (sell.tradePick.get(id) === key) sell.tradePick.delete(id);
+            sell.tradeHold.delete(holdKey(id, key));
+            renderSellingNow();
+        },
         onTradePin: (itemId, key) => {
             // The friend (2026-09-27): mid-trade, the plan "suddenly disappeared".
             // The desk followed the best flip, and the trader followed the best

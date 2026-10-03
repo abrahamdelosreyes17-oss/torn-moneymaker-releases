@@ -277,6 +277,7 @@ export class SellingPage {
      *   onSaveTeKey(key), onForgetTeKey(), onRevealTeKey(), onRetryTe()
      *   onRefresh(), onPrefsChange(partial)
      *   onSelect(itemId)            - pick an item for the desk
+ *   onTradeUnpick(itemId, key)  - Planning pressed again: that plan off the desk
      *   onFilter(key), onQuery(text), onCategory(category), onMore()
      *   onOpenUrl(url)
      */
@@ -2160,6 +2161,9 @@ export class SellingPage {
         if (until) {
             words.unshift('Declined · passed over for ' + formatAge(until - Date.now()).replace(' ago', ''));
             btn = spEl('button', { type: 'button', class: 'sp-btn sp-plan', 'data-focus': 'plan:' + b.tradeKey, text: 'Undo', onclick: () => this.h.onTradeUndecline && this.h.onTradeUndecline(b.tradeKey) });
+        } else if (planning && !d.trade.accepted && d.trade.picked) {
+            // Pressed again, it comes off the desk (3.20.2): you planned it, nothing was said yet.
+            btn = spEl('button', { type: 'button', class: 'sp-btn sp-plan sp-plan-on', 'data-focus': 'plan:' + b.tradeKey, 'aria-pressed': 'true', title: 'Planning with ' + b.name + ': press to take this plan off the desk', text: 'Planning', onclick: () => this.h.onTradeUnpick && this.h.onTradeUnpick(d.itemId, b.tradeKey) });
         } else if (planning) {
             btn = spEl('span', { class: 'sp-plan sp-plan-on', text: d.trade.accepted ? 'Accepted' : 'Planning' });
         } else {
@@ -3179,6 +3183,7 @@ a.sp-btn { display: inline-flex; align-items: center; text-decoration: none; }
 .sp-tradeline small { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
 .sp-plan { height: 26px; padding: 0 10px; font-size: 12px; border-radius: 8px; }
 .sp-plan-on { display: inline-flex; align-items: center; border-radius: 8px; border: 0; color: var(--on-profit); font-weight: 650; background: var(--profit); }
+.sp-btn.sp-plan-on:hover { background: #86e594; }
 .sp-tr.sp-planning { box-shadow: inset 3px 0 0 var(--profit); }
 /* Dimmed by colour, not see-through: its words stay readable (review M10). */
 .sp-tr.sp-declined .sp-tprice, .sp-tr.sp-declined .sp-trader-l, .sp-tr.sp-declined small, .sp-tr.sp-hidden .sp-tprice, .sp-tr.sp-hidden .sp-trader-l, .sp-tr.sp-hidden small { color: var(--faint); }
