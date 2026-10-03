@@ -4,7 +4,7 @@
  * the failed trade holds and we can still sell on profit"; mockup U, B).
  *
  * What you bought to resell and still hold - a cancelled trade's items, what
- * a trader did not take, a blue-tagged buy made outside any trade - is one
+ * a trader did not take, a bazaar buy made outside any trade - is one
  * list (the leftovers, core/accepted.js), each with why it is there. This is
  * that list as the tab shows it, the board that groups it by who pays most,
  * and the lines it puts into a trade. Pure - no DOM, no network.
@@ -16,6 +16,15 @@ export const TO_SELL_WHY = { cancel: 'Cancelled', left: 'Not taken', extra: 'Ext
 export function toSellWhy(why) {
     return Object.prototype.hasOwnProperty.call(TO_SELL_WHY, why) ? why : 'left';
 }
+
+/*
+ * Extra buys (3.21.1; the owner, 2026-10-03: "the extra items i bought even
+ * though its not part of a trade? just most recent?"). Every bazaar buy no
+ * trade takes is kept; the ones a trader pays enough for are all listed, and
+ * of the ones still waiting for a price only the newest few - the rest come
+ * back by themselves when a trader pays more than you paid.
+ */
+export const TO_SELL_EXTRA_WAITING = 10;
 
 function sameTrader(name, from) {
     return Boolean(name && from) && String(name).toLowerCase() === String(from).toLowerCase();
@@ -35,14 +44,17 @@ function sameTrader(name, from) {
  * @param {function} [o.keyOf] - (buyer) => the trade key of a trader
  * @param {function} [o.enough] - (profitEach, paidEach) => boolean
  */
-export function toSellRows(leftovers, { buyersOf, keyOf = (b) => (b.id ? 'id:' + b.id : 'name:' + String(b.name).toLowerCase()), enough = (profit) => profit > 0 } = {}) {
+export function toSellRows(leftovers, { buyersOf, keyOf = (b) => (b.id ? 'id:' + b.id : 'name:' + String(b.name).toLowerCase()), enough = (profit) => profit > 0, extraWaiting = TO_SELL_EXTRA_WAITING } = {}) {
     const rows = [];
+    // Extra buys still waiting for a price: the newest few only.
+    const waitingExtras = [];
     for (const l of leftovers || []) {
         if (!l || !l.itemId || !(Number(l.qty) > 0)) continue;
         const each = Number(l.each) || 0;
         const top = (buyersOf(String(l.itemId)) || []).find((b) => b && Number(b.price) > 0 && !sameTrader(b.name, l.from)) || null;
         const per = top ? Number(top.price) - each : null;
         const ready = top !== null && per > 0 && Boolean(enough(per, each));
+        if (!ready && toSellWhy(l.why) === 'extra') waitingExtras.push({ itemId: String(l.itemId), at: Number(l.at) || 0 });
         rows.push({
             itemId: String(l.itemId),
             name: l.name || 'Item ' + l.itemId,
@@ -57,8 +69,9 @@ export function toSellRows(leftovers, { buyersOf, keyOf = (b) => (b.id ? 'id:' +
             short: top && !ready ? each - Number(top.price) : null,
         });
     }
+    const old = new Set(waitingExtras.sort((a, b) => b.at - a.at).slice(Math.max(0, extraWaiting)).map((x) => x.itemId));
     const rank = (r) => (r.ready ? 0 : r.best ? 1 : 2);
-    return rows.sort((a, b) => rank(a) - rank(b) || (a.ready ? b.gain - a.gain : (a.short ?? 0) - (b.short ?? 0)) || String(a.name).localeCompare(String(b.name)));
+    return rows.filter((r) => !old.has(r.itemId)).sort((a, b) => rank(a) - rank(b) || (a.ready ? b.gain - a.gain : (a.short ?? 0) - (b.short ?? 0)) || String(a.name).localeCompare(String(b.name)));
 }
 
 /**

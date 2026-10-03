@@ -119,7 +119,7 @@ test('Fill on the trade page never fails silently: one line says what it did, or
     // An item to send with no row here is named, never silently missed.
     const miss = fillNote({ accepted: ['A'], trader: 'A', toSend: 2, marked: 1, missing: ['Stick of Dynamite'] });
     assert.equal(miss.ok, false);
-    assert.equal(miss.text, 'Fill for A: 1 item marked · not in this list: Stick of Dynamite');
+    assert.equal(miss.text, 'Fill for A: 1 item marked · not in this list yet: Stick of Dynamite (scroll down, or open its category tab)');
 });
 
 import { declineKey, declinedOn } from '../src/core/desk.js';

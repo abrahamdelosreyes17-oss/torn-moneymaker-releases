@@ -208,6 +208,44 @@ export function recordBuy(trade, line, index, boughtQty, now = Date.now()) {
     };
 }
 
+/**
+ * A buy at a bazaar whose step you had already been through (3.21.1; the
+ * owner, 2026-10-03: "i accidentally clicked next bazaar. i went back ... i
+ * bought it it wasnt in checkout and i couldnt find it in my cart so i didnt
+ * sell"). Next had recorded the step as skipped, and from then on nothing on
+ * the page counted it: the buying run only counts a step still to buy, and
+ * the unplanned buys left every planned item to the buying run.
+ *
+ * What you take there now fills that step - skipped, or bought short - up to
+ * what was planned, at the price you paid. `rest`: what is over that (the
+ * caller keeps it as an unplanned buy).
+ *
+ * @returns {{trade: object, rest: number}}
+ */
+export function recordLateBuy(trade, sellerId, itemId, qty, price, now = Date.now()) {
+    let rest = Math.max(0, Math.floor(Number(qty) || 0));
+    if (!trade || !Array.isArray(trade.items) || !rest) return { trade, rest };
+    const paid = Number(price) > 0 ? Number(price) : 0;
+    let changed = false;
+    const items = trade.items.map((i) => {
+        if (i.kind !== 'flip' || String(i.itemId) !== String(itemId) || !rest) return i;
+        const steps = (i.steps || []).map((st) => {
+            if (!rest || !stepDone(st) || String(st.sellerId) !== String(sellerId)) return st;
+            const had = st.boughtQty > 0 ? st.boughtQty : st.bought ? st.qty : 0;
+            const take = Math.min(rest, st.qty - had);
+            if (!(take > 0)) return st;
+            rest -= take;
+            changed = true;
+            const n = had + take;
+            // What it cost: the units counted before at the step's price, these at what the card asked.
+            const each = paid > 0 ? (had * st.price + take * paid) / n : st.price;
+            return { ...st, price: each, planned: st.planned || st.price, boughtQty: n, bought: n >= st.qty, skipped: false, boughtAt: now };
+        });
+        return { ...i, steps };
+    });
+    return { trade: changed ? { ...trade, items } : trade, rest };
+}
+
 /* ------------------------------------ Bought since you accepted (3.14.3) */
 
 /*
@@ -666,9 +704,10 @@ export function fillNote({ accepted = [], trader = null, partner = null, toSend 
     const later = waiting.length ? ' · ' + waiting.length + ' not bought yet' : '';
     // All of it is in already: said so (it read "none of X's items are in this list" - their rows had left the list).
     if (open === 0) return { ok: true, text: 'Fill: everything ' + (waiting.length ? 'you bought ' : '') + 'for ' + trader + ' is in the trade' + later };
-    if (!marked) return { ok: false, text: 'Fill: none of ' + trader + '\'s items are in this list' + later };
-    // Items to send with no row here (not in your items, or on another tab): named, so none is missed.
-    const gone = missing.length ? ' · not in this list: ' + missing.join(', ') : '';
+    // Torn adds the list's rows as you scroll it (3.21.1: said, with the way to them - Fill never scrolls for you).
+    if (!marked) return { ok: false, text: 'Fill: none of ' + trader + '\'s items are in this list yet' + (missing.length ? ': ' + missing.join(', ') : '') + ' - scroll it down to load more rows, or open the item\'s category tab' + later };
+    // Items to send with no row here (not loaded yet, not in your items, or on another tab): named, so none is missed.
+    const gone = missing.length ? ' · not in this list yet: ' + missing.join(', ') + ' (scroll down, or open its category tab)' : '';
     return { ok: !missing.length, text: 'Fill for ' + trader + ': ' + marked + (marked === 1 ? ' item' : ' items') + ' marked' + gone + later };
 }
 

@@ -1364,6 +1364,55 @@ longer hold it, or a week).
 
 ---
 
+### A buy after Next, and every extra buy, is written down (3.21.1)
+
+The owner, 2026-10-03: "i bought an extra item, i forgot what it is, where
+can i see it? cant we have that in the to sell as well? the extra items i
+bought even though its not part of a trade? just most recent?" - and his
+example: an item of the trade, "but i accidentally clicked next bazaar. i
+went back ... i bought it it wasnt in checkout and i couldnt find it in my
+cart so i didnt sell".
+
+- **A buy at a bazaar you had already passed counts for the trade.** Next
+  with nothing taken records the step as skipped, and from then on nothing on
+  the page counted a buy of it: the buying run only counts a step still to
+  buy, and the unplanned buys left every planned item to the buying run. Only
+  your Torn log put it right (a Ledger key, and Torn Bids open). Now what you
+  take there fills that step - skipped, or bought short - up to what was
+  planned, at what you paid (`recordLateBuy` in core/accepted.js, from
+  `trackExtraBuys`); more than planned is a "Not planned" buy as before. So
+  it is in Checkout, the cart ticks, and Fill sends it. Your log, when it is
+  read, still has the last word.
+- **Every bazaar buy no trade takes joins To sell** as an "Extra buy", at
+  what you paid - 3.21.0 kept only the ones under the blue tag, so anything
+  else you bought was written down nowhere. The ones a trader pays enough for
+  are all listed; of the ones still waiting for a price, the newest 10
+  (`TO_SELL_EXTRA_WAITING`) - an older one comes back by itself when a trader
+  pays more than you paid. As any To sell item, it leaves when you no longer
+  hold it, or after a week.
+- **Only a drop in front of you is your buy.** Each card's last stock is kept
+  for the tab, and a bazaar opened again was compared with what the visit
+  before saw: stock other players bought in between counted as yours (in
+  3.21.0, a false "Extra buy"; since 3.14.3, a false "Not planned" buy). A
+  drop now counts only against what this load of the page showed.
+- The "Left over" card in Best flips lists what a trade left; extra buys are
+  in the To sell tab only.
+- **Fill all on the trade page shows as soon as its rows do.** The owner:
+  "i have to scroll down for fill all to show up, also takes forever to show
+  up". Torn adds the add step's rows as you scroll its list, Fill all needs
+  a row to type into, and the page was read only every 2.5 s - so it showed
+  up to 2.5 s after the row did. The page is now read again a moment (0.12
+  s) after rows are added to Torn's list, after the trade view is drawn, and
+  after a press on the page (`watchTradePage` in main.js). Fill's line in the
+  panel says the way to rows not loaded yet: "not in this list yet: X
+  (scroll down, or open its category tab)". It still never scrolls or loads
+  rows for you (rule 1 below).
+
+Not counted still: an Item Market buy (only bazaar pages are read), and a buy
+made while the overlay is off.
+
+---
+
 ## Architecture
 
 ```
