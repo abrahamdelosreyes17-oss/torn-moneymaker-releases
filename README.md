@@ -1232,6 +1232,58 @@ does is as it was.
 
 ---
 
+### Who is online, and Torn Bids first (3.20.5)
+
+The friend, 2026-10-03, with "Buyers online only" on: "pag start up
+nirerecommend niya mga offline naman" and "parang tumagal na yung paghanap
+niya ng deals". His zip (3.20.4) and the harness showed why.
+
+- **A card waits for its trader's status** (`src/core/status.js`). With
+  Buyers online only on, a trader whose status was not read yet stayed in
+  (dropping them emptied the lists, 3.14). So a page just opened showed the
+  remembered flips at once, with whoever paid most - logged off or not - and
+  Your traders offered "Trade +$X" with a trader nobody had asked about. Now
+  a Best flips card is shown once its buyer's status is read (`flipCards`;
+  until then the next flips with a known buyer take its place, or "Checking
+  who is online…"), and a Your traders card says "Checking if they are
+  online…" instead of offering its trade (`traderCards`). Only while a status
+  can be read: the switch on, a key, the tab in view; a failed read is not
+  waited for. A status Torn gave more than 10 minutes ago counts as not read.
+- **The cards' traders are read every 90 s:** the Best flips cards' buyers
+  and the first six cards of each Your traders row (with the switch on), as
+  the desk's rows already were. They were read every 10 minutes, or - Your
+  traders - not at all unless they were also on the desk or a flip card: a
+  trader could be recommended up to 10 minutes after logging off. In the
+  harness (3.20.4): an offline trader kept "Trade +$21,200" for 10 seconds
+  after the page loaded; now never.
+- **Your traders is worked out again when a status changes** (it was kept
+  for 10 seconds whatever was read meanwhile).
+- **Something you press reads the traders in front of you first:** picking a
+  flip, Plan trade / Put on desk, and coming back to the tab ask for the
+  desk's and the cards' traders whose status is over 20 s old ahead of every
+  other Torn call (`statusAsks`, the 'high' lane), and the answer is drawn at
+  once. Of the 30 status asks a minute, the last 10 are kept for the desk and
+  the cards: what you hold and the list never use them up.
+- **TornW3B's "last active" is kept across a reload** (`ttv2.bids.active` in
+  the page's own storage, what was read in the last 20 minutes): a page just
+  opened knows who TornW3B saw a moment ago without asking Torn.
+- **Torn Bids first** (the owner: "when we're in Torn Bids, we prioritize
+  Torn Bids, not the NPC arbitrage"). Every tab shares 80 TornW3B reads a
+  minute; the overlay on Torn's pages took up to 59 of them (the friend's
+  zip, `w.feed`), and Torn Bids had what was left of that minute (his page
+  had 33 of 150 possible flips checked when the zip was made). While Torn Bids is in use (in view now or in the last 5 minutes;
+  a buying run goes back and forth) the overlay takes 20 a minute at most,
+  what Torn Bids' own 60 leave (`overlayPerMinute` in `src/api/w3b.js`; Torn
+  Bids says it is in view in the stored value `bidsSeen`). With Torn Bids
+  closed, the overlay has its 60 as before.
+
+Not changed, and still to do: the status dot on a flip card's "seen Xm" line
+looks like a trader's status (a mockup first); a trader Torn said was offline
+long ago stays hidden until asked again; Torn Bids' redraw on the friend's
+laptop is still 855 ms each (his zip), 3-4 s in a hidden tab.
+
+---
+
 ## Architecture
 
 ```

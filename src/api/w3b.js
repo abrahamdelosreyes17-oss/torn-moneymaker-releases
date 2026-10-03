@@ -40,6 +40,26 @@ export const W3B_SHARED_PER_MINUTE = 80;
 /** After a 429 or a challenge page, stop asking for this long. */
 export const W3B_COOLDOWN_MS = 60000;
 
+/*
+ * Torn Bids first (3.20.5, the owner: "when we're in Torn Bids, we prioritize
+ * Torn Bids, not the NPC arbitrage"). The overlay on Torn's pages took up to
+ * 59 of every tab's 80 reads a minute (the friend's zip); back on Torn Bids,
+ * its flips had what was left of that minute. While Torn Bids is in use - in view now, or within the last
+ * 5 minutes: a buying run goes back and forth - the overlay takes what
+ * Torn Bids' 60 leave of the 80.
+ */
+export const W3B_BESIDE_BIDS_PER_MINUTE = W3B_SHARED_PER_MINUTE - W3B_MAX_PER_MINUTE;
+export const W3B_BIDS_IN_USE_MS = 5 * 60 * 1000;
+
+/**
+ * The overlay's reads a minute, given when Torn Bids was last in view.
+ * A time "from the future" (the clock was changed) is not believed.
+ */
+export function overlayPerMinute(bidsSeenAt, now = Date.now()) {
+    const at = Number(bidsSeenAt) || 0;
+    return at > 0 && at <= now + 60000 && now - at < W3B_BIDS_IN_USE_MS ? W3B_BESIDE_BIDS_PER_MINUTE : W3B_MAX_PER_MINUTE;
+}
+
 export class W3bError extends Error {
     constructor(message, { http = null, blocked = false } = {}) {
         super(message);
@@ -58,6 +78,8 @@ export class W3bClient {
      * @param {object} [options]
      * @param {function} [options.fetchImpl] - injectable for tests
      * @param {number} [options.maxPerMinute]
+     * @param {function} [options.perMinute] - () => number: the ceiling right
+     *   now, when it is lower than maxPerMinute (the overlay beside Torn Bids)
      * @param {function} [options.now]
      * @param {function} [options.loadShared] - () => {recent: number[], cooldownUntil}
      *   stored for every tab: one window across all of them, and a 429 seen
@@ -83,7 +105,9 @@ export class W3bClient {
         addShared = null,
         onSent = null,
         onFailed = null,
+        perMinute = null,
     } = {}) {
+        this.perMinute = perMinute;
         /** ({path, tag}) => void, each request that leaves: the usage record (3.15). */
         this.onSent = onSent;
         /** ({path, tag, error}) => void, a request that failed: the problem log (3.15). */
@@ -132,12 +156,24 @@ export class W3bClient {
         return Math.max(this.cooldownUntil, this.readShared(t).cooldownUntil);
     }
 
+    /** This tab's ceiling now: maxPerMinute, or less while perMinute() says so. Never under 1. */
+    limit() {
+        if (!this.perMinute) return this.maxPerMinute;
+        let n;
+        try {
+            n = Number(this.perMinute());
+        } catch {
+            return this.maxPerMinute;
+        }
+        return Number.isFinite(n) ? Math.max(1, Math.min(this.maxPerMinute, Math.floor(n))) : this.maxPerMinute;
+    }
+
     stats() {
         const t = this.now();
         const used = this.recent.filter((x) => t - x < 60000).length;
         return {
             usedLastMinute: used,
-            remaining: Math.max(0, this.maxPerMinute - used),
+            remaining: Math.max(0, this.limit() - used),
             coolingDown: t < this.blockedUntil(t),
             sharedLastMinute: this.loadShared ? this.readShared(t).recent.length : used,
         };
@@ -154,8 +190,9 @@ export class W3bClient {
             this.recent = this.recent.filter((x) => t - x < 60000);
             const shared = this.readShared(t);
             const sharedFull = this.loadShared && shared.recent.length >= this.sharedPerMinute;
+            const limit = this.limit();
 
-            if (this.recent.length < this.maxPerMinute && !sharedFull) {
+            if (this.recent.length < limit && !sharedFull) {
                 this.recent.push(t);
                 if (this.addShared) {
                     try {
@@ -171,7 +208,7 @@ export class W3bClient {
 
             // Wait until every full window has a slot again.
             const frees = [];
-            if (this.recent.length >= this.maxPerMinute) frees.push(this.recent[this.recent.length - this.maxPerMinute]);
+            if (this.recent.length >= limit) frees.push(this.recent[this.recent.length - limit]);
             if (sharedFull) frees.push(shared.recent[shared.recent.length - this.sharedPerMinute]);
             await this.sleep(Math.max(50, 60000 - (t - Math.max(...frees)) + 25));
         }

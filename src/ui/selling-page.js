@@ -1511,7 +1511,7 @@ export class SellingPage {
         const refocus = this.focusKeyIn(box);
         queueMicrotask(() => this.focusBack(box, refocus));
         const sig = JSON.stringify([sc.open, sc.favourites, sc.trusted, this.scanAll, s.desk && s.desk.itemId, s.desk && s.desk.trade && s.desk.trade.chosen && s.desk.trade.chosen.key,
-            sc.list.map((x) => [x.id, x.name, x.profit, x.items, x.stops, x.reading, x.lastPaid, x.mainId, x.mainUnits, x.favourite, x.hiddenBy, x.hiddenBy && s.statuses && JSON.stringify(s.statuses.get(String(x.id)) || null), x.traded, x.trust && x.trust.level + x.trust.score])]);
+            sc.list.map((x) => [x.id, x.name, x.profit, x.items, x.stops, x.reading, x.lastPaid, x.mainId, x.mainUnits, x.favourite, x.waiting, x.hiddenBy, x.hiddenBy && s.statuses && JSON.stringify(s.statuses.get(String(x.id)) || null), x.traded, x.trust && x.trust.level + x.trust.score])]);
         if (sig === this.scanSig) return;
         this.scanSig = sig;
         box.textContent = '';
@@ -1538,7 +1538,8 @@ export class SellingPage {
         // One row each (3.20.1, the owner: "one row for favorites, and one row for
         // trusted"): as many cards as fit across; the rest under Show all.
         const card = (x) => {
-            const ready = x.items > 0 && x.profit > 0 && !x.hiddenBy;
+            // Buyers online only (3.20.5): no trade offered until their status is read.
+            const ready = x.items > 0 && x.profit > 0 && !x.hiddenBy && !x.waiting;
             const sel = ready && onDesk === x.key && s.desk && s.desk.itemId === x.mainId;
             const head = spEl('span', { class: 'sp-fc-top' }, [
                 x.favourite ? spEl('span', { class: 'sp-star', title: 'Favourite', text: '★' }) : null,
@@ -1559,7 +1560,7 @@ export class SellingPage {
                     spEl('small', {}, [spEl('b', { text: count(x.items) + (x.items === 1 ? ' item' : ' items') }), ' · ' + count(x.stops) + (x.stops === 1 ? ' bazaar' : ' bazaars') + (x.mainName ? ' · ' + x.mainName + ' ×' + count(x.mainUnits) + (x.items > 1 ? ' + ' + count(x.items - 1) + (x.items === 2 ? ' extra' : ' extras') : '') : '')]),
                 );
             } else {
-                el.appendChild(spEl('small', { text: x.reading ? 'Reading their list…' : 'No trade now: nothing in bazaars under their prices' }));
+                el.appendChild(spEl('small', { text: x.waiting ? 'Checking if they are online…' : x.reading ? 'Reading their list…' : 'No trade now: nothing in bazaars under their prices' }));
             }
             if (x.traded) el.appendChild(spEl('small', { class: 'sp-traded', text: x.traded }));
             el.appendChild(spEl('button', {
@@ -1639,6 +1640,7 @@ export class SellingPage {
             info.flipsWanted,
             Boolean(info.bazaarsAt),
             info.tradersLoading,
+            Boolean(info.flipsWaiting),
             s.prefs.onlineOnly,
             s.prefs.trustedOnly,
             (s.leftovers || []).map((l) => [l.itemId, l.qty, l.each, l.best && l.best.name, l.best && l.best.price]),
@@ -1926,6 +1928,8 @@ export class SellingPage {
         if (!info.bazaarsAt) return 'Loading bazaar prices…';
         // Never "looking" forever when TornExchange has refused the key (review M13).
         if (info.teBadKey && !info.knownTraders) return 'No traders: TornExchange refused the key.';
+        // Buyers online only (3.20.5): flips are found, their buyers' statuses are being read.
+        if (info.flipsWaiting) return 'Checking who is online…';
         if (info.flipsChecked < info.flipsWanted) return 'No flips found yet. Checking ' + info.flipsChecked + ' of ' + info.flipsWanted + '.';
         if (info.tradersLoading) return 'Looking for traders…';
         return 'No flips with these settings right now.';

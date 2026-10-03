@@ -7,7 +7,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { W3bClient } from '../src/api/w3b.js';
+import { W3bClient, overlayPerMinute, W3B_MAX_PER_MINUTE, W3B_SHARED_PER_MINUTE, W3B_BESIDE_BIDS_PER_MINUTE, W3B_BIDS_IN_USE_MS } from '../src/api/w3b.js';
 import { LiveFeed, watching } from '../src/feed/controller.js';
 import { buildItemIndex } from '../src/core/items.js';
 import { bazaarDue, emptyFeed, setBazaarSnapshot } from '../src/core/feed.js';
@@ -169,4 +169,56 @@ test('watching: either switch on is enough', () => {
     assert.equal(watching({ liveFeed: false, useW3b: true }), true);
     assert.equal(watching({ liveFeed: true, useW3b: false }), true);
     assert.equal(watching({ liveFeed: false, useW3b: false }), false);
+});
+
+test('Torn Bids first (3.20.5): while it is in use, the overlay takes only what the 60 of Torn Bids leave of the 80', () => {
+    assert.equal(W3B_BESIDE_BIDS_PER_MINUTE, W3B_SHARED_PER_MINUTE - W3B_MAX_PER_MINUTE);
+    // Torn Bids never opened, or not seen for 5 minutes: the overlay's own 60, as before.
+    assert.equal(overlayPerMinute(0, T0), W3B_MAX_PER_MINUTE);
+    assert.equal(overlayPerMinute(null, T0), W3B_MAX_PER_MINUTE);
+    assert.equal(overlayPerMinute(T0 - W3B_BIDS_IN_USE_MS, T0), W3B_MAX_PER_MINUTE);
+    // In view now, or a moment ago (a buying run goes back and forth): it steps back.
+    assert.equal(overlayPerMinute(T0, T0), W3B_BESIDE_BIDS_PER_MINUTE);
+    assert.equal(overlayPerMinute(T0 - W3B_BIDS_IN_USE_MS + 1, T0), W3B_BESIDE_BIDS_PER_MINUTE);
+    // A time from the future (the clock was changed) is not believed for ever.
+    assert.equal(overlayPerMinute(T0 + 30000, T0), W3B_BESIDE_BIDS_PER_MINUTE);
+    assert.equal(overlayPerMinute(T0 + 3600000, T0), W3B_MAX_PER_MINUTE);
+    assert.equal(overlayPerMinute('rubbish', T0), W3B_MAX_PER_MINUTE);
+});
+
+test('a client with a ceiling that moves: the overlay waits at 20 a minute while Torn Bids is in use, Torn Bids does not', async () => {
+    let t = T0;
+    let bidsSeen = 0;
+    const calls = [];
+    const slept = [];
+    const make = (extra) => new W3bClient({
+        now: () => t,
+        sleep: async (ms) => {
+            slept.push(ms);
+            t += ms;
+        },
+        fetchImpl: async () => {
+            calls.push(t);
+            return json({ items: [] });
+        },
+        ...extra,
+    });
+    const overlay = make({ perMinute: () => overlayPerMinute(bidsSeen, t) });
+    // Torn Bids not in use: 60 go at once, as before.
+    for (let i = 0; i < 25; i++) await overlay.get('marketplace');
+    assert.equal(slept.length, 0);
+    assert.equal(overlay.stats().remaining, 35);
+    // Torn Bids comes into view: over its share already, the next read waits until it is under 20 again.
+    bidsSeen = t;
+    assert.equal(overlay.limit(), W3B_BESIDE_BIDS_PER_MINUTE);
+    assert.equal(overlay.stats().remaining, 0);
+    await overlay.get('marketplace');
+    assert.equal(slept.length, 1);
+    assert.ok(calls[25] >= T0 + 60000, 'it waited for its own reads to leave the minute');
+    // A ceiling that is rubbish, or throws: the client's own. Never more than its own, never under one.
+    assert.equal(make({ perMinute: () => NaN }).limit(), W3B_MAX_PER_MINUTE);
+    assert.equal(make({ perMinute: () => { throw new Error('x'); } }).limit(), W3B_MAX_PER_MINUTE);
+    assert.equal(make({ perMinute: () => 500 }).limit(), W3B_MAX_PER_MINUTE);
+    assert.equal(make({ perMinute: () => 0 }).limit(), 1);
+    assert.equal(make({}).limit(), W3B_MAX_PER_MINUTE);
 });
