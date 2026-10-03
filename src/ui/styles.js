@@ -616,6 +616,12 @@ export const PAGE_CSS = `
     box-shadow: inset 3px 0 0 #5aa7ff, inset 0 0 0 9999px rgba(90, 167, 255, 0.08) !important;
 }
 
+/* The row an item of the panel was pressed for (3.22.1): lit for a moment. */
+.ttv2-rowflash {
+    box-shadow: inset 0 0 0 2px #6fdc7f, inset 0 0 0 9999px rgba(111, 220, 127, 0.14) !important;
+    transition: box-shadow 0.3s ease-out;
+}
+
 .ttv2-bzchip-paid { border-color: rgba(246, 183, 74, 0.5); }
 .ttv2-bzchip-paid b { color: #f6b74a; }
 
@@ -671,6 +677,28 @@ input.ttv2-underpaid {
     0%, 100% { box-shadow: 0 0 0 0 rgba(255, 90, 77, 0.85); }
     50% { box-shadow: 0 0 0 7px rgba(255, 90, 77, 0); }
 }
+/*
+ * How a price on the add page stands (3.22.1), on its box and on its tick:
+ * red and pulsing under what you paid (above), amber over the lowest bazaar
+ * price, green otherwise.
+ */
+input.ttv2-overlow {
+    outline: 2px solid #f6b74a !important;
+    outline-offset: 1px;
+    color: #f6b74a !important;
+}
+
+input.ttv2-priceok {
+    outline: 2px solid #4fbf63 !important;
+    outline-offset: 1px;
+    color: #6fdc7f !important;
+}
+
+.ttv2-fillbtn[data-level="under"] {
+    border-color: #ff5a4d;
+    animation: ttv2-underpulse 1.1s ease-in-out infinite;
+}
+.ttv2-fillbtn[data-level="under"] .ttv2-filllabel { color: #ff8a80; }
 .ttv2-fillbtn[data-level="good"] .ttv2-filllabel { color: #6fdc7f; }
 .ttv2-fillbtn[data-level="warn"] .ttv2-filllabel { color: #f6b74a; }
 .ttv2-fillbtn[data-level="bad"] { border-color: #ff7b6e; }

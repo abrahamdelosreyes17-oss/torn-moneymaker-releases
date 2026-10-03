@@ -3387,6 +3387,10 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .sp-search::placeholder { color: var(--faint); }
 .sp-cat { flex: 0 0 auto; height: 34px; padding: 0 10px; border-radius: 10px; border: 1px solid var(--line2); background: var(--surface); color: var(--text); font: inherit; font-weight: 500; cursor: pointer; }
 .sp-cat.sp-cat-on { border-color: var(--profit-line); background: var(--profit-bg); color: var(--text); }
+/* The list a dropdown opens (3.22.1): its own dark ground and light words. It took the box's see-through
+   green over the browser's white list once a category was picked - white words on near-white. */
+.sp-cat, select { color-scheme: dark; }
+.sp-cat option, select option, select optgroup { background-color: #1c1e23; color: #e6e8ee; }
 .sp-catline { display: flex; align-items: center; gap: 8px; margin: -12px 0 16px; font-size: 12px; color: var(--muted); }
 .sp-catline b { color: var(--text); }
 .sp-catline .sp-link { font-size: 12px; }

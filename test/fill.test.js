@@ -10,6 +10,10 @@ import {
     ordinalLowest,
     FILL_DEFAULTS,
     FILL_FRESH_MS,
+    FILL_REUSE_MS,
+    FILL_WARM_MS,
+    priceTone,
+    nextWarmRead,
 } from '../src/core/fill.js';
 
 const NOW = 1_800_000_000_000;
@@ -122,4 +126,45 @@ test('ordinals read like a person would say them', () => {
 test('realListings sorts cheapest first', () => {
     const { rows } = realListings([fresh(30), fresh(10), fresh(20)], { now: NOW });
     assert.deepEqual(rows.map((r) => r.price), [10, 20, 30]);
+});
+
+test('a price on the add page: red under what you paid, amber over the lowest bazaar, green otherwise', () => {
+    assert.equal(priceTone(90, { paid: 100, lowest: 120 }), 'under');
+    assert.equal(priceTone(130, { paid: 100, lowest: 120 }), 'over');
+    assert.equal(priceTone(119, { paid: 100, lowest: 120 }), 'ok');
+    // At the lowest bazaar price, or at what you paid: neither a loss nor over.
+    assert.equal(priceTone(120, { paid: 100, lowest: 120 }), 'ok');
+    assert.equal(priceTone(100, { paid: 100, lowest: 120 }), 'ok');
+    // Under what you paid AND over the lowest bazaar: the loss is said.
+    assert.equal(priceTone(70, { paid: 100, lowest: 50 }), 'under');
+});
+
+test('a price with only one thing to hold it against, or none', () => {
+    assert.equal(priceTone(130, { lowest: 120 }), 'over');
+    assert.equal(priceTone(110, { lowest: 120 }), 'ok');
+    assert.equal(priceTone(90, { paid: 100 }), 'under');
+    assert.equal(priceTone(110, { paid: 100 }), 'ok');
+    assert.equal(priceTone(110, {}), null);
+    assert.equal(priceTone(0, { paid: 100, lowest: 120 }), null);
+    assert.equal(priceTone('', { paid: 100, lowest: 120 }), null);
+});
+
+test('listings read ahead: never read first, in the order given; then the oldest past its age', () => {
+    const state = { a: { at: NOW - 30_000 }, b: null, c: null };
+    assert.equal(nextWarmRead(['a', 'b', 'c'], (id) => state[id], { now: NOW }), 'b');
+    state.b = { at: NOW - 10_000 };
+    state.c = { at: NOW - 20_000 };
+    // Every one read, none older than FILL_WARM_MS: nothing to read.
+    assert.equal(nextWarmRead(['a', 'b', 'c'], (id) => state[id], { now: NOW }), null);
+    state.a.at = NOW - FILL_WARM_MS - 5_000;
+    state.c.at = NOW - FILL_WARM_MS - 1_000;
+    assert.equal(nextWarmRead(['c', 'a', 'b'], (id) => state[id], { now: NOW }), 'a');
+});
+
+test('listings read ahead: one being read is passed over, one that failed waits', () => {
+    const state = { a: { promise: {} }, b: { errorAt: NOW - 5_000 }, c: { at: NOW - FILL_WARM_MS - 1 } };
+    assert.equal(nextWarmRead(['a', 'b', 'c'], (id) => state[id], { now: NOW }), 'c');
+    state.b.errorAt = NOW - FILL_REUSE_MS - 1;
+    assert.equal(nextWarmRead(['a', 'b', 'c'], (id) => state[id], { now: NOW }), 'b');
+    assert.equal(nextWarmRead([], () => null, { now: NOW }), null);
 });

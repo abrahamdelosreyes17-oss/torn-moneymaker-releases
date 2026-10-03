@@ -1626,6 +1626,51 @@ On the desk of a To sell item, **Where to sell your N** comes first, across
 the desk - it was the last card, under the list of bazaars - with what you
 paid in its title and, under it, what the best one makes over what you paid.
 
+### Fill types at once, and the page as it opens (3.22.1)
+
+The owner, 2026-10-03, on the real page: "its fast now cus its cache but the
+startup very slow"; earlier the same evening: "its not instant, we already
+have the amount we paid, we already have the lowest bazaar price, why is it
+taking so longer? ... cant it calculate from that?"
+
+- **Fill types at the press.** It waited for a fresh read of the item's
+  bazaar listings at every first press, behind every other TornW3B read of
+  the tab. Now it types from what is already known - the item's listings as
+  read in the last ten minutes, else the lowest price in TornW3B's summary
+  (the BP the row shows) - and reads the listings behind it: the same price,
+  nothing more happens; another, the box is typed again and it says
+  "Corrected to $X"; nothing real to undercut after all (the lowest was your
+  own listing, a $1 one), what it typed is taken back out. Fill all the same,
+  keeping its rule: a price under what you paid is not typed.
+- **The add page reads ahead**: one item's listings at a time while the page
+  is open - what you bought and have not sold first, then the other rows
+  from the top - so a Fill finds them there.
+- **The price box and the tick say how the price stands**: pulsing red under
+  what you paid, amber over the lowest bazaar price (yours would not be the
+  cheapest), green otherwise - whoever typed it.
+- **The page as it opens.** Watched on the real add page (255 rows): it stood
+  still three times for a third of a second as it opened. Every row got its
+  chips and tick in one go, and when TornW3B's prices arrived every row's BP
+  was written, and every row measured again, in one go. Now rows get their
+  marks a screenful at a time (what you bought first, then from the top),
+  prices arriving together are written a part at a time, and where Torn's
+  own words end in a cell is measured once, not again each time one of our
+  chips changes.
+- **An item pressed in the panel brings you to its row** (lit for a moment),
+  and **a row pressed on the page shows that item in the panel**. Only a row
+  Torn has already drawn: nothing is loaded for you.
+- **Torn Bids' Refresh reads what you are looking at first**: the item on
+  the desk, then the list as it shows - its filter, search and category, the
+  first 25 rows - have their bazaars and their buyers read before the usual
+  turn of flips and sweep.
+- **A dropdown's open list is readable**: with a category picked, the list
+  took the box's see-through green over the browser's white - white words on
+  near-white.
+
+Still to do, and waiting for the real pages to be read: on Manage items, what
+you paid, and the tag that covers Torn's RRP column; on the add page, the
+Fill tick over the value of a weapon row.
+
 ---
 
 ## Architecture

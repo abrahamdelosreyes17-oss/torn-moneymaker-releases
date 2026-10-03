@@ -24,6 +24,20 @@ export const FILL_TROLL_SHARE = 0.25;
 /** A price read for Fill is reused for this long, then read again. */
 export const FILL_REUSE_MS = 60 * 1000;
 
+/*
+ * Fill types at once (3.22.1; the owner, 2026-10-03: "its not instant, we
+ * already have the amount we paid, we already have the lowest bazaar price,
+ * why is it taking so longer? ... cant it calculate from that?"). It used to
+ * wait for a fresh read of the item's listings at every press, behind every
+ * other TornW3B read of the tab. Listings read this long ago - or, with none,
+ * the lowest price in TornW3B's summary - price it at the press; the fresh
+ * read is made behind it, and the box is typed again if that moves the price.
+ */
+export const FILL_KNOWN_MS = 10 * 60 * 1000;
+
+/** On your bazaar's add page, the listings of what you bought and have not sold are read again after this. */
+export const FILL_WARM_MS = 2 * 60 * 1000;
+
 /** How many listings the panel shows per market. */
 export const FILL_SHOW_LISTINGS = 5;
 
@@ -139,6 +153,55 @@ export function fillQuantity(have, mode = 'all') {
     if (!(n > 0)) return null;
     const q = mode === 'allbut1' ? n - 1 : n;
     return q > 0 ? q : null;
+}
+
+/**
+ * A price on your bazaar's add page, against what you paid and the lowest
+ * bazaar price (the owner, 2026-10-03: "pulsating red, if the price is lower
+ * than what we paid, and amber if higher than the lowest bazaar price. green
+ * still green").
+ *
+ * @param {number} price - what the box holds
+ * @param {object} [o]
+ * @param {number|null} [o.paid] - what you paid for one; null when not known
+ * @param {number|null} [o.lowest] - the lowest bazaar price now; null when not known
+ * @returns {'under'|'over'|'ok'|null} under what you paid (a loss); over the
+ *   lowest bazaar (yours would not be the cheapest); neither; null with no
+ *   price, or nothing to hold it against
+ */
+export function priceTone(price, { paid = null, lowest = null } = {}) {
+    const p = Number(price);
+    if (!(p > 0)) return null;
+    if (Number(paid) > 0 && p < Number(paid)) return 'under';
+    if (Number(lowest) > 0 && p > Number(lowest)) return 'over';
+    return Number(paid) > 0 || Number(lowest) > 0 ? 'ok' : null;
+}
+
+/**
+ * Whose bazaar listings to read next, so a Fill finds them already there:
+ * the first item never read, in the order given (what you bought and have not
+ * sold, the To sell list first); with every one read, the one read longest
+ * ago, once it is older than `maxAge`. One that failed waits `retry`.
+ *
+ * @param {Array<string>} wanted - item ids, the most wanted first
+ * @param {function} stateOf - (itemId) => {at, errorAt, promise}|null: its listings as kept
+ * @returns {string|null}
+ */
+export function nextWarmRead(wanted, stateOf, { now = Date.now(), maxAge = FILL_WARM_MS, retry = FILL_REUSE_MS } = {}) {
+    let oldest = null;
+    let oldestAt = Infinity;
+    for (const id of wanted || []) {
+        const s = stateOf(id) || {};
+        if (s.promise) continue;
+        if (s.errorAt && now - s.errorAt < retry) continue;
+        const at = Number(s.at) || 0;
+        if (!at) return String(id);
+        if (now - at >= maxAge && at < oldestAt) {
+            oldest = String(id);
+            oldestAt = at;
+        }
+    }
+    return oldest;
 }
 
 /**

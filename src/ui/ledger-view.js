@@ -942,6 +942,8 @@ export const LEDGER_CSS = `
 .lg-tab:hover { color: var(--text); }
 .lg-tab[aria-pressed="true"] { color: var(--text); border-bottom-color: var(--brand); }
 .lg-in.lg-date { min-width: 140px; color-scheme: dark; }
+select.lg-in { color-scheme: dark; }
+select.lg-in option { background-color: #1c1e23; color: #e6e8ee; }
 .lg-in.lg-min { min-width: 110px; width: 120px; }
 .lg-mugline { margin: 0; font-size: 13px; color: var(--muted); display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px; }
 .lg-tile.lg-lossbox { border-color: var(--bad-line); background: var(--bad-bg); }
