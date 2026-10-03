@@ -150,10 +150,16 @@ export function bazaarSellers(rows, { selfId = null, now = Date.now(), freshMs =
  * TornW3B last checked BEFORE you looked is left out of every plan. A newer
  * check by TornW3B wins again (they listed it again).
  *
- * A mark older than FLIP_FRESH_MS has nothing left to hide - any listing
- * last checked before it is stale by then, and no flip is planned on a stale
- * listing - so it is let go.
+ * A mark is kept OWN_KEEP_MS (3.20.6; it was FLIP_FRESH_MS, on the thought
+ * that any listing last checked before it is stale by then). TornW3B goes on
+ * "checking" a bazaar every few minutes without its number moving - see
+ * checkedSince - so a listing that was gone could come back into the plans
+ * half an hour later (the friend, 2026-10-03: Jaguar Plushies bought out at
+ * 16:44; the 17:20 plan's first stop was a bazaar without them).
  */
+
+/** What you saw or bought is kept this long, or until TornW3B has seen the bazaar change since. */
+export const OWN_KEEP_MS = 3 * 60 * 60 * 1000;
 
 /** At most this many marks are kept (the newest). */
 export const GONE_MAX = 200;
@@ -166,7 +172,7 @@ export function goneKey(sellerId, itemId) {
 export function liveGone(stored, now = Date.now()) {
     const out = {};
     const all = Object.entries(stored && typeof stored === 'object' && !Array.isArray(stored) ? stored : {})
-        .filter(([, g]) => g && Number(g.at) > 0 && now - Number(g.at) < FLIP_FRESH_MS)
+        .filter(([, g]) => g && Number(g.at) > 0 && now - Number(g.at) < OWN_KEEP_MS)
         .sort((a, b) => Number(b[1].at) - Number(a[1].at))
         .slice(0, GONE_MAX);
     for (const [k, g] of all) out[k] = { at: Number(g.at) };
@@ -191,8 +197,8 @@ export function withoutGone(rows, itemId, gone, marginMs = SEEN_MARGIN_MS) {
     if (!rows || !gone || !Object.keys(gone).length) return rows;
     return rows.filter((r) => {
         const g = r && r.sellerId ? gone[goneKey(r.sellerId, itemId)] : null;
-        // Clearly after you looked (3.16.4: a check within seconds may still carry the number from before).
-        return !g || Number(r.dataAt) > Number(g.at) + marginMs;
+        // Clearly after you looked, and (3.20.6) it found the bazaar changed since: checkedSince.
+        return !g || checkedSince(r, g.at, marginMs);
     });
 }
 
@@ -219,17 +225,41 @@ export function withoutGone(rows, itemId, gone, marginMs = SEEN_MARGIN_MS) {
  * it, so only log buys clearly AFTER it come off it; with no page number,
  * the log buys TornW3B has not checked past come off TornW3B's.
  *
- * "Checked since" keeps a margin: TornW3B's `last_checked` moved with every
- * quantity change measured (11 of 11), but a check made within seconds of a
- * buy may still carry the number from before it (Torn's own API caches for
- * some seconds). Its `content_updated` is per bazaar and says nothing more.
+ * "Checked since" (checkedSince) keeps a margin - a check made within
+ * seconds of a buy may still carry the number from before it (Torn's own API
+ * caches for some seconds) - and, 3.20.6, asks that TornW3B found the bazaar
+ * changed since (`content_updated`, per bazaar): `last_checked` alone moves
+ * every few minutes whether or not its number did.
  *
- * Both are let go after FLIP_FRESH_MS: a row not checked since is stale by
- * then, and no flip is planned on a stale listing.
+ * Both are let go after OWN_KEEP_MS, or as soon as TornW3B has caught up.
  */
 
 /** A check by TornW3B counts as "since" only this long after what you saw or bought. */
 export const SEEN_MARGIN_MS = 60 * 1000;
+/**
+ * Has TornW3B's number for this listing caught up with what happened in its
+ * bazaar at `t` (a buy of yours, what a page showed)?
+ *
+ * Its check must be clearly later (the margin). And (3.20.6) it must have
+ * found the bazaar CHANGED since: `changedAt` is TornW3B's content_updated,
+ * the last check that found the bazaar different from the one before - hours
+ * old on most rows, while last_checked moves every few minutes. Your buy
+ * changes the bazaar, so a check that has seen it moves content_updated past
+ * it; one that has not leaves it where it was, and its number is still the
+ * one from before. The friend, 2026-10-03: a plan made two minutes after a
+ * buying run sent him to three bazaars without the listing, and a plan 36
+ * minutes after he bought two bazaars out stopped first at one without it -
+ * rows TornW3B went on listing, each with a fresh last_checked.
+ *
+ * A row that does not say when its bazaar last changed: the check's time
+ * alone, as before.
+ */
+export function checkedSince(row, t, marginMs = SEEN_MARGIN_MS) {
+    if (!(Number(row && row.dataAt) > Number(t) + marginMs)) return false;
+    const changed = Number(row.changedAt);
+    return !(changed > 0) || changed > Number(t);
+}
+
 /** At most this many page stocks, and this many own buys, are kept (the newest). */
 export const STOCK_MAX = 300;
 export const BOUGHT_MAX = 500;
@@ -238,7 +268,7 @@ export const BOUGHT_MAX = 500;
 export function liveStock(stored, now = Date.now()) {
     const out = {};
     const all = Object.entries(stored && typeof stored === 'object' && !Array.isArray(stored) ? stored : {})
-        .filter(([, s]) => s && Number(s.qty) > 0 && Number(s.at) > 0 && now - Number(s.at) < FLIP_FRESH_MS)
+        .filter(([, s]) => s && Number(s.qty) > 0 && Number(s.at) > 0 && now - Number(s.at) < OWN_KEEP_MS)
         .sort((a, b) => Number(b[1].at) - Number(a[1].at))
         .slice(0, STOCK_MAX);
     for (const [k, s] of all) out[k] = { qty: Math.floor(Number(s.qty)), price: Number(s.price) || null, at: Number(s.at) };
@@ -255,7 +285,7 @@ export function noteStock(stored, sellerId, itemId, qty, price = null, now = Dat
 export function liveBought(stored, now = Date.now()) {
     const byId = new Map();
     for (const b of Array.isArray(stored) ? stored : []) {
-        if (!b || !b.id || !b.sellerId || !b.itemId || !(Number(b.qty) > 0) || !(Number(b.t) > 0) || now - Number(b.t) >= FLIP_FRESH_MS) continue;
+        if (!b || !b.id || !b.sellerId || !b.itemId || !(Number(b.qty) > 0) || !(Number(b.t) > 0) || now - Number(b.t) >= OWN_KEEP_MS) continue;
         byId.set(String(b.id), { id: String(b.id), sellerId: String(b.sellerId), itemId: String(b.itemId), qty: Number(b.qty), each: Number(b.each) || 0, t: Number(b.t) });
     }
     return [...byId.values()].sort((a, b) => a.t - b.t || a.id.localeCompare(b.id)).slice(-BOUGHT_MAX);
@@ -308,7 +338,7 @@ export function withOwnBuys(rows, itemId, { stock = null, bought = null } = {}, 
         if (seen) {
             const i = pick(Number(seen.price));
             // TornW3B's check wins only when clearly later than what you saw.
-            if (!(Number(rows[i].dataAt) > Number(seen.at) + marginMs)) {
+            if (!checkedSince(rows[i], seen.at, marginMs)) {
                 qty[i] = Math.min(qty[i], Number(seen.qty));
                 seenAt.set(i, Number(seen.at));
             }
@@ -316,7 +346,7 @@ export function withOwnBuys(rows, itemId, { stock = null, bought = null } = {}, 
         for (const b of mine) {
             const i = pick(Number(b.each));
             // In TornW3B's number already: it checked this bazaar well after the buy.
-            if (Number(rows[i].dataAt) > Number(b.t) + marginMs) continue;
+            if (checkedSince(rows[i], b.t, marginMs)) continue;
             // In what the page showed already: bought before you saw that stock.
             if (seenAt.has(i) && !(Number(b.t) > seenAt.get(i) + marginMs)) continue;
             qty[i] -= Number(b.qty);

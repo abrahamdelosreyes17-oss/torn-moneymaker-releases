@@ -12,7 +12,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { withOwnBuys, withoutGone, markGone, liveStock, noteStock, liveBought, addBought, bazaarSellers, pickBazaars, goneKey, SEEN_MARGIN_MS, FLIP_FRESH_MS, STOCK_MAX, BOUGHT_MAX } from '../src/core/flips.js';
+import { checkedSince, withOwnBuys, withoutGone, markGone, liveStock, noteStock, liveBought, addBought, bazaarSellers, pickBazaars, goneKey, SEEN_MARGIN_MS, OWN_KEEP_MS, STOCK_MAX, BOUGHT_MAX } from '../src/core/flips.js';
 import { stepState, leftoversAfterSales, leftoverFrom, cancelledLeftovers, tradedLeftovers, addLeftovers, recordBuy, LEFTOVER_SALE_MARGIN_MS } from '../src/core/accepted.js';
 
 const NOW = 1_790_000_000_000;
@@ -58,6 +58,38 @@ test('until TornW3B has checked that bazaar since - with a margin, never to the 
     assert.equal(withOwnBuys([{ sellerId: '2', price: 872500, qty: 100, dataAt: null }], XANAX, { bought })[0].qty, 60);
     // More bought than TornW3B listed (it was behind already): gone, never below zero.
     assert.deepEqual(withOwnBuys(rows(NOW - 11 * MIN), XANAX, { bought: [buy('c:0', '3', 9, NOW - MIN)] }).map((r) => r.sellerId), ['1', '2']);
+});
+
+test('3.20.6, the friend again: TornW3B looked at the bazaar after his buy and saw no change - its number is still the old one', () => {
+    // 2026-10-03: 177 Jaguar Plushies bought for one trade; two minutes later the next plan took only 89
+    // off TornW3B's numbers and sent him to three bazaars that no longer had the listing. TornW3B had
+    // "checked" those bazaars since (last_checked moved) without finding anything changed
+    // (content_updated hours old): a check that did not see the buy.
+    const H = 60 * MIN;
+    const row = (checked, changed) => [{ sellerId: '2', sellerName: 'Bo', price: 13000, qty: 100, dataAt: checked, changedAt: changed }];
+    const bought = [buy('b:0', '2', 100, NOW - 3 * MIN, 13000)];
+    // Checked two minutes after the buy, the bazaar last seen to change 3 hours ago: the buy is not in that number.
+    assert.deepEqual(withOwnBuys(row(NOW - MIN, NOW - 3 * H), XANAX, { bought }), [], 'the listing he emptied is not suggested again');
+    assert.equal(withOwnBuys(row(NOW - MIN, NOW - 3 * H), XANAX, { bought: [buy('b:0', '2', 40, NOW - 3 * MIN, 13000)] })[0].qty, 60);
+    // TornW3B found the bazaar changed after the buy: its number has it (60 left, or restocked to 500).
+    const seen = [{ sellerId: '2', sellerName: 'Bo', price: 13000, qty: 60, dataAt: NOW - MIN, changedAt: NOW - MIN }];
+    assert.equal(withOwnBuys(seen, XANAX, { bought: [buy('b:0', '2', 40, NOW - 3 * MIN, 13000)] }), seen);
+    // A change it saw BEFORE the buy says nothing about the buy.
+    assert.equal(withOwnBuys(row(NOW - MIN, NOW - 4 * MIN), XANAX, { bought: [buy('b:0', '2', 40, NOW - 3 * MIN, 13000)] })[0].qty, 60);
+    // A row that does not say when the bazaar last changed: the check's time alone, as before.
+    assert.equal(withOwnBuys(row(NOW - MIN, null), XANAX, { bought: [buy('b:0', '2', 40, NOW - 3 * MIN, 13000)] })[0].qty, 100);
+    // What the page showed, and a listing the page showed is not there: the same rule.
+    const stock = noteStock(null, '2', XANAX, 60, 13000, NOW - 3 * MIN);
+    assert.equal(withOwnBuys(row(NOW - MIN, NOW - 3 * H), XANAX, { stock })[0].qty, 60);
+    assert.equal(withOwnBuys(row(NOW - MIN, NOW - MIN), XANAX, { stock })[0].qty, 100);
+    const gone = markGone(null, '2', XANAX, NOW - 3 * MIN);
+    assert.deepEqual(withoutGone(row(NOW - MIN, NOW - 3 * H), XANAX, gone), [], 'still not there: TornW3B saw no change since you looked');
+    assert.equal(withoutGone(row(NOW - MIN, NOW - MIN), XANAX, gone).length, 1, 'listed again: TornW3B saw the bazaar change after you looked');
+    // The rule itself.
+    assert.equal(checkedSince({ dataAt: NOW, changedAt: NOW }, NOW - 2 * MIN), true);
+    assert.equal(checkedSince({ dataAt: NOW, changedAt: NOW - 3 * H }, NOW - 2 * MIN), false);
+    assert.equal(checkedSince({ dataAt: NOW - 2 * MIN + SEEN_MARGIN_MS, changedAt: NOW - 2 * MIN + SEEN_MARGIN_MS }, NOW - 2 * MIN), false, 'within the margin');
+    assert.equal(checkedSince({ dataAt: null, changedAt: NOW }, NOW - 2 * MIN), false);
 });
 
 test('what the page showed after your buy is the number - and no buy counts twice', () => {
@@ -111,8 +143,8 @@ test('nothing to take off: the same list back, untouched', () => {
 test('the stores: half an hour, one per log line, junk left out', () => {
     // After 30 minutes a row not checked since is stale - never planned on - so nothing is left to take off.
     const s = noteStock(null, '2', XANAX, 60, 872500, NOW);
-    assert.deepEqual(liveStock(s, NOW + FLIP_FRESH_MS - 1), { [goneKey('2', XANAX)]: { qty: 60, price: 872500, at: NOW } });
-    assert.deepEqual(liveStock(s, NOW + FLIP_FRESH_MS), {});
+    assert.deepEqual(liveStock(s, NOW + OWN_KEEP_MS - 1), { [goneKey('2', XANAX)]: { qty: 60, price: 872500, at: NOW } });
+    assert.deepEqual(liveStock(s, NOW + OWN_KEEP_MS), {});
     // Seen again: the newer number.
     assert.equal(noteStock(s, '2', XANAX, 20, 872500, NOW + MIN)[goneKey('2', XANAX)].qty, 20);
     // No stock is not a stock (that is a gone mark), no seller is nothing.
@@ -128,8 +160,8 @@ test('the stores: half an hour, one per log line, junk left out', () => {
     const a = buy('a:0', '1', 80, NOW - MIN, 869000);
     const b = addBought([a], [a, buy('b:0', '2', 40, NOW - 2 * MIN)], NOW);
     assert.deepEqual(b.map((x) => x.id), ['b:0', 'a:0'], 'oldest first');
-    assert.deepEqual(addBought(b, [], NOW + FLIP_FRESH_MS - MIN - 1).map((x) => x.id), ['a:0']);
-    assert.deepEqual(addBought(b, [], NOW + FLIP_FRESH_MS), []);
+    assert.deepEqual(addBought(b, [], NOW + OWN_KEEP_MS - MIN - 1).map((x) => x.id), ['a:0']);
+    assert.deepEqual(addBought(b, [], NOW + OWN_KEEP_MS), []);
     assert.deepEqual(liveBought([null, { id: 'x' }, { id: 'y', sellerId: '1', itemId: '2', qty: 0, t: NOW }], NOW), []);
     assert.deepEqual(liveBought('junk', NOW), []);
     const lots = [];

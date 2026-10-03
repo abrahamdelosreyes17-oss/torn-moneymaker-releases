@@ -55,7 +55,7 @@ import {
     SOURCE_BAZAAR,
     SOURCE_ITEM_MARKET,
 } from './core/feed.js';
-import { bazaarSellers, flipPlan, flipBuyer, listBid, believableBid, whereToSell, depthNearCheapest, flipCandidates, nearMisses, traderTagLabel, pickBazaars, MAIN_STOPS, EXTRA_STOPS, liveGone, markGone, withoutGone, goneKey, liveStock, noteStock, liveBought, addBought, withOwnBuys, FLIP_FRESH_MS } from './core/flips.js';
+import { bazaarSellers, flipPlan, flipBuyer, listBid, believableBid, whereToSell, depthNearCheapest, flipCandidates, nearMisses, traderTagLabel, pickBazaars, MAIN_STOPS, EXTRA_STOPS, liveGone, markGone, withoutGone, goneKey, liveStock, noteStock, liveBought, addBought, withOwnBuys, OWN_KEEP_MS } from './core/flips.js';
 import { coverAfter, coverRowsRead, coverListings, coverListingsRead, coverVerdict, listingBoughtOut } from './core/bazaar-cover.js';
 import { readBazaarList, BAZAAR_LIST_SELECTOR } from './sources/dom/bazaar-list.js';
 import { planTrade, keepAfter } from './core/trade.js';
@@ -8292,7 +8292,7 @@ async function runLedger({ now = Date.now() } = {}) {
         data.readAt = Date.now();
         if (same()) saveLedger();
         // The buys no accepted trade was watching (3.16.4): off TornW3B's numbers as well.
-        if (same()) noteOwnBuys(bazaarBuyRows(data.rows.filter((r) => r && Date.now() - Number(r.t) < FLIP_FRESH_MS)));
+        if (same()) noteOwnBuys(bazaarBuyRows(data.rows.filter((r) => r && Date.now() - Number(r.t) < OWN_KEEP_MS)));
         led.nextAt = Date.now() + (data.backfilled && !data.gap ? ledgerEveryMs() : LEDGER_BACKFILL_GAP_MS);
     } catch (error) {
         if (error instanceof LedgerKeyChanged || !same()) {

@@ -9,7 +9,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { coverAfter, coverWhole, coverHasItem, coverRowsRead, coverListings, coverListingsRead, coverVerdict, listingBoughtOut } from '../src/core/bazaar-cover.js';
-import { liveGone, markGone, withoutGone, goneKey, bazaarSellers, flipPlan, FLIP_FRESH_MS, GONE_MAX } from '../src/core/flips.js';
+import { liveGone, markGone, withoutGone, goneKey, bazaarSellers, flipPlan, OWN_KEEP_MS, GONE_MAX } from '../src/core/flips.js';
 import { buyingWhereText, stepState } from '../src/core/accepted.js';
 import { readBazaarList, bazaarRowOf, bazaarSearchInUse } from '../src/sources/dom/bazaar-list.js';
 
@@ -221,8 +221,8 @@ test('TornW3B checking the bazaar again after you looked wins: they listed it ag
 
 test('a mark is let go once it has nothing left to hide, and the store stays small', () => {
     const gone = markGone(null, '1', '277', NOW);
-    assert.equal(Object.keys(liveGone(gone, NOW + FLIP_FRESH_MS - 1)).length, 1);
-    assert.equal(Object.keys(liveGone(gone, NOW + FLIP_FRESH_MS)).length, 0, 'any listing checked before it is stale by now: no flip is planned on it anyway');
+    assert.equal(Object.keys(liveGone(gone, NOW + OWN_KEEP_MS - 1)).length, 1);
+    assert.equal(Object.keys(liveGone(gone, NOW + OWN_KEEP_MS)).length, 0, 'kept three hours, or until TornW3B has seen the bazaar change');
     // Marked again later: the newer time is kept.
     assert.equal(markGone(gone, '1', '277', NOW + MIN)[goneKey('1', '277')].at, NOW + MIN);
     // Junk in storage is dropped, never thrown on.

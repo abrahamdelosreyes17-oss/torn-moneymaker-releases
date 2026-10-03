@@ -1284,6 +1284,36 @@ laptop is still 855 ms each (his zip), 3-4 s in a hidden tab.
 
 ---
 
+### Your own buys, again: a check that saw nothing (3.20.6)
+
+The friend's zip, 2026-10-03 (3.20.4): "Items bought by me are still being
+recommended to me on other traders when done in quick succession." His log
+and receipts say how: 177 Jaguar Plushies bought for one trade
+(17:21-17:22); at 17:24 the next plan took 89 off TornW3B's numbers, and
+sent him to three bazaars that did not have the listing. And the 17:20
+plan's first stop had none either, 36 minutes after he bought two bazaars
+out. Which rows those were is not in the zip; what follows is the rule that
+would have kept them out.
+
+- **A check by TornW3B counts only when it found the bazaar changed**
+  (`checkedSince` in `src/core/flips.js`). 3.16.4 took a buy off a listing
+  "until TornW3B has checked that bazaar since" - `last_checked` over a
+  minute after the buy. But `last_checked` moves every few minutes whether
+  or not the number did; `content_updated` (per bazaar) is the last check
+  that found the bazaar different, hours old on most rows. A buy changes
+  the bazaar, so a check that has seen it moves `content_updated` past it.
+  Now TornW3B's number wins only when both are later than what you saw or
+  bought. The same rule for what a bazaar page showed (its stock, a listing
+  that is not there). A row without `content_updated`: the check's time
+  alone, as before. Measured on TornW3B's Xanax listings (8 reads, 75 s
+  apart): see HANDOFF.
+- **What you saw or bought is kept 3 hours** (`OWN_KEEP_MS`; it was 30
+  minutes, on the thought that a listing not checked since is stale by then
+  - it is "checked" all the time). It stops counting as soon as TornW3B has
+  seen the bazaar change.
+
+---
+
 ## Architecture
 
 ```

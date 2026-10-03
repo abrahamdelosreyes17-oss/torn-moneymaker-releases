@@ -10,7 +10,7 @@ import { tidyAccepted, tidyPins, tidyGone, tidyStock, tidyBought, tidyDeclined, 
 import * as tidyRules from '../src/core/tidy.js';
 import { liveAccepted, ACCEPTED_MAX_AGE_MS } from '../src/core/accepted.js';
 import { livePins } from '../src/core/held.js';
-import { liveGone, liveStock, liveBought, markGone, noteStock, FLIP_FRESH_MS } from '../src/core/flips.js';
+import { liveGone, liveStock, liveBought, markGone, noteStock, OWN_KEEP_MS } from '../src/core/flips.js';
 import { readTeItemLists, TE_ITEM_TTL_MS } from '../src/core/selling.js';
 
 const NOW = 1_790_000_000_000;
@@ -49,16 +49,16 @@ test('pins, gone marks, page stocks, own buys: each as its reader keeps it', () 
     proves(tidyPins, livePins, { '206|id:11': pin(NOW - HOUR), '1|id:11': pin(NOW - 400 * DAY) }, { drops: true });
     proves(tidyPins, livePins, { '206|id:11': pin(NOW - HOUR) }, { drops: false });
 
-    const gone = { ...markGone(null, '1', '206', NOW - MIN), '2|206': { at: NOW - FLIP_FRESH_MS - 1 } };
+    const gone = { ...markGone(null, '1', '206', NOW - MIN), '2|206': { at: NOW - OWN_KEEP_MS - 1 } };
     proves(tidyGone, liveGone, gone, { drops: true });
     proves(tidyGone, liveGone, markGone(null, '1', '206', NOW - MIN), { drops: false });
 
-    const stock = { ...noteStock(null, '1', '206', 60, 840000, NOW - MIN), '2|206': { qty: 5, price: 1, at: NOW - FLIP_FRESH_MS - 1 } };
+    const stock = { ...noteStock(null, '1', '206', 60, 840000, NOW - MIN), '2|206': { qty: 5, price: 1, at: NOW - OWN_KEEP_MS - 1 } };
     proves(tidyStock, liveStock, stock, { drops: true });
     proves(tidyStock, liveStock, noteStock(null, '1', '206', 60, 840000, NOW - MIN), { drops: false });
 
     const buy = (id, t) => ({ id, sellerId: '1', itemId: '206', qty: 2, each: 840000, t });
-    proves(tidyBought, liveBought, [buy('a:0', NOW - FLIP_FRESH_MS - 1), buy('b:0', NOW - MIN)], { drops: true });
+    proves(tidyBought, liveBought, [buy('a:0', NOW - OWN_KEEP_MS - 1), buy('b:0', NOW - MIN)], { drops: true });
     proves(tidyBought, liveBought, [buy('b:0', NOW - MIN)], { drops: false });
 });
 
