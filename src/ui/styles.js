@@ -124,14 +124,14 @@ export const PAGE_CSS = `
      *   Torn's geometry in place, which clipped the label to an 8px sliver.
      * - The chip background: white text alone was invisible against the
      *   tile's artwork.
-     * - Inset from the corner and no wider than the card (3.20): it sits on
-     *   the card, inside it, never over the card's corner or its neighbour.
+     * - On the card's top edge, half in the gap above it, one line (3.20.4,
+     *   the owner: inside the card it covered the item's name and price).
      */
     content: attr(data-ttv2-profit) !important;
 
     display: block !important;
     position: absolute !important;
-    top: 4px !important;
+    top: -13px !important;
     right: 4px !important;
     left: auto !important;
     bottom: auto !important;
@@ -139,7 +139,7 @@ export const PAGE_CSS = `
     width: auto !important;
     height: auto !important;
     min-width: 0 !important;
-    max-width: calc(100% - 8px) !important;
+    max-width: none !important;
     margin: 0 !important;
     padding: 1px 7px !important;
     transform: none !important;
@@ -166,9 +166,9 @@ export const PAGE_CSS = `
 /*
  * A trusted trader pays more than this listing asks: "FAFFO pays $73,500 /
  * +$3,500 each", drawn the same way as the profit label and just as unable
- * to catch a click. In blue (a trader, not an NPC deal); lines that wrap
- * inside the card - never cut, never over the next card. On a card that is
- * also a deal, the trader line goes under the profit.
+ * to catch a click. In blue (a trader, not an NPC deal); one line on the
+ * card's top edge (3.20.4). On a card that is also a deal, profit and
+ * trader share that one line.
  */
 .ttv2-trader {
     position: relative !important;
@@ -179,7 +179,7 @@ export const PAGE_CSS = `
 
     display: block !important;
     position: absolute !important;
-    top: 4px !important;
+    top: -13px !important;
     right: 4px !important;
     left: auto !important;
     bottom: auto !important;
@@ -187,13 +187,13 @@ export const PAGE_CSS = `
     width: auto !important;
     height: auto !important;
     min-width: 0 !important;
-    max-width: calc(100% - 8px) !important;
+    max-width: none !important;
     margin: 0 !important;
     padding: 2px 7px !important;
     transform: none !important;
 
     overflow: visible !important;
-    white-space: pre-line !important;
+    white-space: nowrap !important;
     text-align: right !important;
     opacity: 1 !important;
     visibility: visible !important;
@@ -211,8 +211,8 @@ export const PAGE_CSS = `
 }
 
 .ttv2-hit.ttv2-trader.ttv2-trader::after {
-    content: attr(data-ttv2-profit) "\\A" attr(data-ttv2-trader) !important;
-    white-space: pre-line !important;
+    content: attr(data-ttv2-profit) "  ·  " attr(data-ttv2-trader) !important;
+    white-space: nowrap !important;
     text-align: right !important;
     background: rgba(15, 36, 20, 0.94) !important;
     border-color: rgba(111, 220, 127, 0.55) !important;

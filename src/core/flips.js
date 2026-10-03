@@ -680,5 +680,6 @@ export function nearMisses(summary, bidOf, { pct = 5, limit = 40, exclude = new 
 export function traderTagLabel(buyer, listingPrice) {
     if (!buyer || !buyer.trust || buyer.trust.level !== 'Trusted') return null;
     if (!(buyer.price > listingPrice) || !(listingPrice > 0)) return null;
-    return buyer.name + ' pays ' + formatMoney(buyer.price) + '\n+' + formatMoney(buyer.price - listingPrice) + ' each';
+    // One line (3.20.4, the owner: two lines covered the item and its price).
+    return buyer.name + ' pays ' + formatMoney(buyer.price) + ' · +' + formatMoney(buyer.price - listingPrice) + ' each';
 }

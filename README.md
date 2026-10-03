@@ -1169,7 +1169,9 @@ does is as it was.
   again (until they accept; not marked declined, a pin stays). **3.20.3:**
   the logo and the name never move - Settings and the Ledger read "Torn Bids
   › Settings" after them, and the logo, Esc, or Ledger / ⚙ pressed again goes
-  home (the ← button pushed the header along).
+  home (the ← button pushed the header along). **3.20.4:** the trader and
+  profit labels on bazaar cards are one line on the card's top edge - inside
+  the card, two lines covered the item's name and price.
 - **Favourites have a place of their own:** a gold Favourites row above
   Trusted in Your traders, every favourite always shown; a gold edge and a
   Favourite tag on the desk's trader rows and in the Ledger's Traders tab,

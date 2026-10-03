@@ -134,7 +134,7 @@ test('flip candidates: only where a trader pays more than the cheapest; unafford
 
 test('trader tag: only a Trusted buyer paying more than the listing; two lines, nothing cut', () => {
     const faffo = { name: 'FAFFO', price: 73500, trust: { level: 'Trusted' } };
-    assert.equal(traderTagLabel(faffo, 70000), 'FAFFO pays $73,500\n+$3,500 each');
+    assert.equal(traderTagLabel(faffo, 70000), 'FAFFO pays $73,500 · +$3,500 each');
     assert.equal(traderTagLabel(faffo, 73500), null);
     assert.equal(traderTagLabel({ ...faffo, trust: { level: 'Known' } }, 70000), null);
     assert.equal(traderTagLabel({ ...faffo, trust: null }, 70000), null);
