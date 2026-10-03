@@ -185,8 +185,8 @@ test('the add page: "×10 · $28 after fee" wraps inside its box', () => {
 test('the buying box: grey instructions readable on the blue tint (>= 5.5:1), only there', () => {
     const color = prop(rule(styles.PANEL_CSS, '.ttv2-buybox .ttv2-sub'), 'color');
     assert.ok(color && color.startsWith('#'), 'its own grey: ' + color);
-    // rgba(77, 171, 247, 0.08) over the panel's #2e2e2e.
-    const bg = [77, 171, 247].map((c, i) => Math.round(hex('#2e2e2e')[i] + 0.08 * (c - hex('#2e2e2e')[i])));
+    // 3.20 Graphite: rgba(90, 167, 255, 0.12) over the panel's #1c1e23.
+    const bg = [90, 167, 255].map((c, i) => Math.round(hex('#1c1e23')[i] + 0.12 * (c - hex('#1c1e23')[i])));
     assert.ok(contrast(hex(color), bg) >= 5.5, 'contrast ' + contrast(hex(color), bg).toFixed(2));
     // Everywhere else .ttv2-sub stays --muted.
     assert.equal(prop(rule(styles.PANEL_CSS, '.ttv2-sub'), 'color'), 'var(--muted)');

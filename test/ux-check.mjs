@@ -297,16 +297,17 @@ ok(await hit('open-tile'), 'control: the unlocked $1 card below NPC IS highlight
 ok(!(await hit('locked-tile')), 'the padlocked $1 card is NOT highlighted');
 await p.screenshot({ path: sp + '/ux-scan.png' });
 
-// Bazaar owner: status badge after the name in the page banner, the same
-// line in the panel, and a closed bazaar hides its deals.
+// Bazaar owner: status badge floating at the end of the page banner (3.20:
+// it takes no room in it), the same line in the panel, and a closed bazaar
+// hides its deals.
 const banner = (state) => `<div class="delimiter" id="fake-banner"><div class="msg right-round messageContent___cdSrs"><a href="profiles.php?XID=4254715">DixieNormousss's</a> bazaar, favorited by <b>3</b> citizens, is currently <span class="bold">${state}.</span></div></div>`
   + '<div class="listItem___h3qQ0"><a href="profiles.php?XID=4254715">DixieNormousss\'s Profile</a></div>';
 await p.evaluate((h) => { document.getElementById('fake-market')?.remove(); const d = document.createElement('div'); d.id = 'fake-bz'; d.innerHTML = h; document.body.prepend(d); }, banner('open'));
 await p.evaluate(() => history.pushState({}, '', '/test/harness-live.html?page=bazaar&userId=4254715'));
 await p.waitForTimeout(1500);
-const badge = await p.evaluate(() => [...document.querySelectorAll('.ttv2-owner')].map((b) => [b.dataset.level, b.textContent, b.previousElementSibling && b.previousElementSibling.textContent]));
+const badge = await p.evaluate(() => [...document.querySelectorAll('.ttv2-owner')].map((b) => [b.dataset.level, b.textContent, b.parentElement && b.parentElement.textContent, getComputedStyle(b).position]));
 ok(badge.length === 1, 'one owner badge on the page (not in the dropdown): ' + JSON.stringify(badge));
-ok(badge[0] && badge[0][0] === 'offline' && /Offline · 3h ago · Traveling to Mexico/.test(badge[0][1]) && /DixieNormousss/.test(badge[0][2]), 'badge sits after the name and reads the status');
+ok(badge[0] && badge[0][0] === 'offline' && /Offline · 3h ago · Traveling to Mexico/.test(badge[0][1]) && /DixieNormousss/.test(badge[0][2]) && badge[0][3] === 'absolute', 'badge floats in the banner and reads the status');
 ok(/Seller: DixieNormousss.*Offline · 3h ago/.test(await txt(p, '.ttv2-seller')), 'panel seller line: ' + (await txt(p, '.ttv2-seller')));
 ok(!/closed/i.test(await txt(p, '.ttv2-seller')), 'open bazaar is not flagged closed');
 await p.setViewportSize({ width: 1280, height: 420 });
@@ -347,7 +348,7 @@ await p.evaluate(() => history.pushState({}, '', '/test/harness-live.html?page=b
 await p.waitForTimeout(14000); // the helper asks one Item Market price per 10s, on a 2.5s poll
 const tags = await p.evaluate(() => [...document.querySelectorAll('.ttv2-bztag')].map((t) => t.textContent));
 ok(tags.length === 2, 'a price tag in each own-bazaar row: ' + JSON.stringify(tags));
-ok(await p.evaluate(() => [...document.querySelectorAll('.ttv2-bztag')].every((t) => t.previousElementSibling && t.previousElementSibling.classList.contains('name-wrap'))), 'the tag sits after the name element, not inside it');
+ok(await p.evaluate(() => [...document.querySelectorAll('.ttv2-bztag')].every((t) => t.closest('.ttv2-rowfloat, .ttv2-bzcell') && getComputedStyle(t.closest('.ttv2-rowfloat, .ttv2-bzchips') || t).position === 'absolute')), 'the tag floats in its row (3.20), out of Torn\'s line');
 ok(await p.evaluate(() => [...document.querySelectorAll('#fake-own .name-wrap')].every((n) => !n.querySelector('.ttv2-bztag') && /^(Bottle of Beer x12|Xanax)$/.test(n.textContent.trim()))), 'the name element still reads as the name');
 ok(/^Item Market Average \$55$/.test(tags[0] || ''), 'Beer: its Item Market Average: ' + tags[0]);
 ok(/^Item Market Average \$830,000$/.test(tags[1] || ''), 'Xanax: its Item Market Average, not the $9,999,999 troll listing: ' + tags[1]);

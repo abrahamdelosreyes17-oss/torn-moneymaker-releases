@@ -220,14 +220,3 @@ export function ownIdFromPage(doc = document) {
     return m ? m[1] : null;
 }
 
-/**
- * Where the Fill button goes in a row: after our price tag on the bazaar
- * pages (the tag follows the name), before the price box on the Item Market.
- */
-export function fillAnchor(page, row) {
-    if (page === 'market-add' || page === 'market-view') {
-        const wrap = row.el.querySelector('[class*="priceInputWrapper___"]');
-        return wrap ? { parent: wrap.parentNode, before: wrap } : { parent: row.el, before: null };
-    }
-    return null;
-}

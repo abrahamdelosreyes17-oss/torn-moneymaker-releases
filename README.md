@@ -174,11 +174,12 @@ scrolls to it when it is on the page you are viewing. Nothing is ever bought for
   sometimes you don't see it"): the three used to follow Torn's price in the
   cell's one line, and where another script writes "$29,782 | 2x = $59,564"
   there the line no longer fitted - the cell, which Torn clips with "…",
-  dropped the whole group but the tick's square, left at the far edge. The
-  cell keeps its size and gives the tick room from inside it; when the rest
-  still does not fit, IMA goes first (it is the number Torn prints in that
-  cell), then BP - whole chips, never a cut one (`fitBazaarCells`, measured).
-  Both stay in My bazaar's list beside the page.
+  dropped the whole group but the tick's square, left at the far edge. Since
+  3.20 all three float over the cell's right end and the cell keeps its own
+  size and padding; where they would cover Torn's words in it, IMA goes first
+  (it is the number Torn prints in that cell), then BP - whole chips, never a
+  cut one (`fitBazaarCells`, measured). Both stay in My bazaar's list beside
+  the page.
 - **Fill** (the friend's request, after Greasy Fork's *Customizable Bazaar
   Filler* 527925 and *Torn Market Filler* 513920): a **tick box** in each row of your
   bazaar's **#/add** and **#/manage** and the Item Market's **add-listing** and
@@ -186,8 +187,10 @@ scrolls to it when it is on the page you are viewing. Nothing is ever bought for
   add pages, the quantity (all you have, or all but one) unless you typed one -
   into Torn's own boxes. **You press Torn's button**; Fill never does, and never
   ticks the box of a weapon or armour row (it says to). Unticked, it puts back
-  what was there. **Fill settings** in Torn's links bar (beside Manage items)
-  opens the panel's Settings at Fill.
+  what was there. **Fill settings**, floating beside Torn's links (Manage
+  items, Personalize), opens the panel's Settings at Fill. What Fill typed
+  shows for a few seconds beside the page, on the tick's hover and in My
+  bazaar (3.20: it was a line added to the row).
   - The price: undercut the **lowest** (or 2nd, 3rd...) listing by an amount
     in **$ or %** - default the lowest bazaar listing −$1 on your bazaar, the
     lowest Item Market listing −$1 on the Item Market. Settings › *Fill button*
@@ -1140,6 +1143,82 @@ was (flips and price lists take turns, one read a second).
 
 Tried and taken out: reading the possible flips before the price lists at
 start-up (the owner: "i dont like that prioritizing flips at startup").
+
+---
+
+### Graphite, favourites, bazaar prices, and marks that take no room (3.20.0)
+
+The owner picked `mockups/T-graphite-everything.html` ("love it ... just make
+sure it doesnt break functionality"). Nothing was taken away; what each part
+does is as it was.
+
+- **The look (Graphite).** One set of colour tokens for Torn Bids, the panel,
+  the Checkout window and the Fill form (`TOKENS_CSS` in `src/ui/styles.js`):
+  four surface steps (page, rail, card, raised) so areas separate, and one
+  colour per meaning - green money, blue buying and your trade, amber check
+  this, red gone or refused, gold favourites, teal trust votes, violet the
+  brand. System fonts only (nothing to download), Georgia for titles,
+  figures in columns, radii of 8/12/16 px, spacing in 4/8/12/16/24 px. Only
+  cheap motion (opacity, transform, background), and none under the
+  system's reduced-motion setting.
+- **Your traders on top, Best flips under it** (the owner's order).
+- **Favourites have a place of their own:** a gold Favourites row above
+  Trusted in Your traders, every favourite always shown; a gold edge and a
+  Favourite tag on the desk's trader rows and in the Ledger's Traders tab,
+  where they are listed first. The sums do not change - a favourite's trade
+  is worked out like anyone's and is never ranked up - and the filters still
+  apply: a favourite that Buyers online only or Trusted buyers only leaves
+  out stays in its row, faded, saying which switch hides it. A favourite
+  added by hand keeps the name it had when you starred it (it showed as
+  "Player 12").
+- **Settings › Bazaar prices:** how often each group's bazaars are read
+  again from TornW3B, from every minute to every 10 minutes - the item on
+  the desk and the trade you work on (every minute; it was 2), the top 20
+  possible flips (every 2 minutes; new), the other possible flips (every 10
+  minutes, as before). Under them a live line says whether TornW3B's 60
+  reads a minute keep up with that, or how often the other flips would be
+  read instead; the desk and the top 20 always come first
+  (`freshnessMs`, `keepsUp` in `src/core/desk.js`).
+- **Each flip card says how old its prices are:** "seen 3m ago" - when
+  TornW3B last saw the oldest listing the flip buys (green under 5 minutes,
+  amber under 15).
+- **Marks on Torn's pages take no room** (the owner: "it shouldn't resize a
+  row, add columns etc. it should just sit at the side or on top like a
+  bring to front"). Every mark is now out of Torn's lines, absolutely placed
+  (`src/sources/dom/float.js`); Torn's elements keep their size, padding
+  and wrapping, and only `position: static` is ever turned into `relative`
+  (which moves nothing):
+  - the seller's status floats at the end of the bazaar's banner (it pushed
+    the words after the name);
+  - on the trade page, each row's Fill floats beside the item's name and
+    Fill all beside Torn's bar; Fill's line moves into the panel's trade box;
+  - your bazaar's add page: IMA, BP and the Fill tick float at the right end
+    of Torn's value cell (the cell kept room for the tick with padding);
+    where they would cover Torn's words, IMA goes first, then BP;
+  - your bazaar's manage page and the Item Market: the prices and Fill float
+    together in the row, just left of Torn's boxes (they took a line of
+    their own); where they would cover the name, only Fill stays;
+  - "Fill settings" floats beside Torn's links (it was put first among them);
+  - what Fill typed shows for a few seconds in a note beside the page.
+
+  The labels on bazaar cards sit inside their own card, inset from its
+  corner; the buy bar on the listing to buy is one line (two lines covered
+  the item's picture and name). Checked in the harness: with the marks and
+  without them, no Torn element moves or changes size.
+- **The panel never floats over Torn when there is little room:** it fits
+  free space down to 200 px (it needed 240 and floated at 430 over Torn
+  below that); with less, it takes its smallest size at the window's edge.
+  The Checkout window starts above the panel, its list scrolling inside,
+  when there is a little room there (it went beside the panel, over Torn).
+- **Small things found on the way:** a search moves the desk to what it
+  finds when the item on it is not among them; "Open the next bazaar: the
+  next bazaar"; the buy box counts bazaars as the Checkout does ("1 of 3
+  done" beside "1 of 1 bazaar left"); Scan says "deals on this page" (the
+  panel lists deals from every bazaar); "1 traders"; "← Back to the live
+  plan" and "Cancel trade" apart, Cancel in red; a bigger "They took fewer"
+  box; a left-out extra's Add no longer runs over its picture; TE list /
+  W3B list from the left, with no empty slot; the graph's "Fill" label on
+  the side of its line away from the other lines.
 
 ---
 

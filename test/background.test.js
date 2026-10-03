@@ -142,3 +142,29 @@ test('"Other" joins Never flip once: saved choices kept, and a later removal sti
     // You took Other off again: not added back.
     assert.equal(neverFlipOtherOnce({ ...once, neverFlip: ['Clothing'] }), null);
 });
+
+import { freshMinutes, freshnessMs, keepsUp, FRESH_DEFAULTS } from '../src/core/desk.js';
+
+test('bazaar prices: whole minutes from 1 to 10, else the default', () => {
+    assert.equal(freshMinutes(3, 2), 3);
+    assert.equal(freshMinutes('7', 2), 7);
+    assert.equal(freshMinutes(0, 2), 2);
+    assert.equal(freshMinutes(11, 2), 2);
+    assert.equal(freshMinutes(null, 10), 10);
+    assert.equal(freshMinutes('x', 1), 1);
+    assert.deepEqual(freshnessMs({}), { desk: 60000, top: 120000, other: 600000 });
+    assert.deepEqual(freshnessMs({ freshDeskMin: 2, freshTopMin: 5, freshOtherMin: 1 }), { desk: 120000, top: 300000, other: 60000 });
+    assert.deepEqual(FRESH_DEFAULTS, { desk: 1, top: 2, other: 10 });
+});
+
+test('bazaar prices: the defaults keep up; too fast says how often the other flips are read', () => {
+    const counts = { desk: 10, top: 20, other: 130 };
+    const ok = keepsUp({ desk: 1, top: 2, other: 10 }, counts, 60);
+    assert.equal(ok.ok, true);
+    assert.equal(Math.round(ok.want), 33);
+    const behind = keepsUp({ desk: 1, top: 1, other: 1 }, counts, 60);
+    assert.equal(behind.ok, false);
+    assert.equal(behind.otherEvery, Math.ceil(130 / 15));
+    const none = keepsUp({ desk: 1, top: 1, other: 1 }, { desk: 30, top: 20, other: 130 }, 60);
+    assert.equal(none.otherEvery, null);
+});

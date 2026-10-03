@@ -34,12 +34,12 @@ const uvNum = (n) => Math.round(Number(n) || 0).toLocaleString('en-US');
 /*
  * Each use keeps its colour whatever its rank (a colour follows the use, never
  * its place): seven hues per service, validated for the dark card (the
- * data-viz reference palette's dark steps, all checks passing on #1f1f1f); the
+ * data-viz reference palette's dark steps, all checks passing on #1c1e23); the
  * rest share one grey "Everything else" in the chart and are listed one by one
  * in the table below it.
  */
-const UV_HUES = ['#3987e5', '#d95926', '#199e70', '#c98500', '#d55181', '#008300', '#9085e9'];
-const UV_OTHER_HUE = '#6b6b6b';
+const UV_HUES = ['#3987e5', '#d95926', '#199e70', '#d99a2b', '#d55181', '#008300', '#9085e9'];
+const UV_OTHER_HUE = '#6a7180';
 export const USAGE_COLOURS = {
     t: ['t.feed', 't.status', 't.networth', 't.ledger', 't.inventory', 't.sellers', 't.owner'],
     w: ['w.flips', 'w.buyers', 'w.lists', 'w.sweep', 'w.summary', 'w.desk', 'w.feed'],
@@ -349,46 +349,45 @@ export class UsageView {
 export const USAGE_CSS = `
 .uv { display: flex; flex-direction: column; gap: 14px; }
 .uv-meters { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
-.uv-meter { display: flex; flex-direction: column; gap: 6px; padding: 12px; text-align: left; background: var(--card2); border: 1px solid var(--cline2); border-radius: 10px; color: var(--text); cursor: pointer; }
-.uv-meter:hover { border-color: var(--muted); }
-.uv-meter.uv-on { border-color: var(--hot-line); box-shadow: inset 0 0 0 1px var(--hot-line); }
+.uv-meter { display: flex; flex-direction: column; gap: 6px; padding: 14px; text-align: left; background: var(--raised); border: 1px solid var(--line); border-radius: 12px; color: var(--text); cursor: pointer; font: inherit; transition: border-color 0.15s var(--ease); }
+.uv-meter:hover { border-color: var(--line2); }
+.uv-meter.uv-on { border-color: var(--brand); box-shadow: inset 0 0 0 1px var(--brand); }
 .uv-mname { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
 .uv-mnum { color: var(--muted); }
-.uv-mnum b { color: var(--text); font-size: 20px; font-variant-numeric: tabular-nums; }
+.uv-mnum b { color: var(--text); font: 650 20px var(--sans); font-variant-numeric: tabular-nums; }
 .uv-meter small { color: var(--muted); font-size: 12px; }
-.uv-bar { display: block; height: 8px; border-radius: 4px; background: #333; overflow: hidden; }
-.uv-fill { display: block; height: 100%; border-radius: 4px; background: #3987e5; }
-.uv-fill.uv-warn { background: #c98500; }
-.uv-fill.uv-bad { background: #e66767; }
-.uv-state { font-size: 12px; font-weight: bold; }
+.uv-bar { display: block; height: 6px; border-radius: 999px; background: var(--input); overflow: hidden; }
+.uv-fill { display: block; height: 100%; border-radius: 999px; background: var(--brand); }
+.uv-fill.uv-warn { background: var(--warn); }
+.uv-fill.uv-bad { background: var(--bad); }
+.uv-state { font-size: 12px; font-weight: 600; }
 .uv-state.uv-ok { color: var(--muted); }
-.uv-state.uv-warn { color: #e0a530; }
-.uv-state.uv-bad { color: #ff8a80; }
+.uv-state.uv-warn { color: var(--warn); }
+.uv-state.uv-bad { color: var(--bad); }
 .uv-controls { display: flex; flex-wrap: wrap; gap: 10px; justify-content: space-between; }
-.uv-seg { display: inline-flex; border: 1px solid var(--cline2); border-radius: 8px; overflow: hidden; }
-.uv-seg button { padding: 6px 12px; border: 0; background: none; color: var(--muted); cursor: pointer; }
-.uv-seg button + button { border-left: 1px solid var(--cline2); }
-.uv-seg button.uv-on { background: var(--green-bg); color: var(--text); font-weight: bold; }
+.uv-seg { display: inline-flex; gap: 2px; padding: 3px; border: 1px solid var(--line); border-radius: 11px; background: var(--input); overflow: hidden; }
+.uv-seg button { height: 28px; padding: 0 12px; border: 0; border-radius: 8px; background: none; color: var(--muted); font-weight: 500; cursor: pointer; }
+.uv-seg button.uv-on { background: var(--raised); color: var(--text); box-shadow: 0 1px 2px rgba(0, 0, 0, 0.3); }
 .uv-summary { margin: 0; color: var(--muted); }
 .uv-right { display: inline-flex; flex-wrap: wrap; gap: 8px; }
-.uv-btn { padding: 6px 12px; border: 1px solid var(--cline2); border-radius: 8px; background: var(--card2); color: var(--text); cursor: pointer; }
-.uv-btn:hover { border-color: var(--muted); }
+.uv-btn { height: 30px; padding: 0 12px; border: 1px solid var(--line2); border-radius: 8px; background: var(--raised); color: var(--text); font-weight: 500; cursor: pointer; transition: background-color 0.15s var(--ease); }
+.uv-btn:hover { background: var(--hover); }
 
 .uv-plot { position: relative; }
 .uv-svg { display: block; width: 100%; height: auto; }
-.uv-grid { stroke: #2f2f2f; stroke-width: 1; }
-.uv-cap { stroke: #ff8a80; stroke-width: 1; stroke-dasharray: 4 4; }
-.uv-axis { fill: var(--muted); font-size: 11px; font-family: Arial, Helvetica, sans-serif; }
+.uv-grid { stroke: var(--line); stroke-width: 1; }
+.uv-cap { stroke: var(--bad); stroke-width: 1; stroke-dasharray: 4 4; }
+.uv-axis { fill: var(--muted); font-size: 11px; font-family: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif; }
 .uv-hit { fill: transparent; cursor: default; }
 .uv-hit:hover, .uv-hit:focus { fill: rgba(255, 255, 255, 0.05); outline: none; }
-.uv-tip { position: absolute; top: 0; min-width: 200px; max-width: 280px; padding: 8px 10px; background: #111; border: 1px solid var(--cline2); border-radius: 8px; box-shadow: 0 6px 18px rgba(0, 0, 0, 0.5); pointer-events: none; font-size: 12px; }
+.uv-tip { position: absolute; top: 0; min-width: 200px; max-width: 280px; padding: 8px 10px; background: var(--page); border: 1px solid var(--line2); border-radius: 10px; box-shadow: var(--shadow); pointer-events: none; font-size: 12px; }
 .uv-tip > b { display: block; margin-bottom: 4px; }
 .uv-trow { display: grid; grid-template-columns: 10px 1fr auto; gap: 6px; align-items: center; }
 .uv-sw { display: inline-block; width: 10px; height: 10px; margin-right: 6px; border-radius: 2px; vertical-align: -1px; }
 .uv-trow .uv-sw { margin: 0; }
 .uv-table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
-.uv-table th { text-align: left; font-size: 11px; letter-spacing: 0.4px; text-transform: uppercase; color: var(--muted); padding: 6px 8px; border-bottom: 1px solid var(--cline2); }
-.uv-table td { padding: 6px 8px; border-bottom: 1px solid var(--cline); }
+.uv-table th { text-align: left; font: 650 10.5px/1.3 var(--sans); letter-spacing: 0.08em; text-transform: uppercase; color: var(--faint); padding: 8px 10px; border-bottom: 1px solid var(--line); }
+.uv-table td { padding: 8px 10px; border-bottom: 1px solid var(--line); color: var(--text2); }
 .uv-r { text-align: right; }
 .uv-lane { color: var(--muted); font-size: 12px; }
 .uv-lane-high { color: var(--price); }

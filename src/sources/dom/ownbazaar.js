@@ -15,6 +15,7 @@
 
 import { itemIdFromImage, ITEM_IMAGE_SELECTOR } from './detect.js';
 import { findItemById, findItemByName } from '../../core/items.js';
+import { rowFloat, removeRowFloats, ROW_FLOAT_CLASS } from './float.js';
 
 export const OWN_BAZAAR_ROW_SELECTORS = {
     add: 'ul.items-cont li.clearfix',
@@ -81,20 +82,24 @@ export function scanOwnBazaar(which, root, index) {
 
 /**
  * The tag element in a row, created if missing. Text is set by the caller.
- * Paint-only: a span AFTER the name element (never inside it, so the name
- * still reads as the name on the next scan); never a form field, never a
- * click on Torn's controls. The row's item id is kept on the tag, so a
- * click reads the item of the row as it is NOW: #/manage is a virtualised
- * list whose row elements are reused for other items as you scroll.
+ * Paint-only: a span in the row's floating group (3.20, float.js), never in
+ * the row's line and never inside the name element (so the name still reads
+ * as the name on the next scan); never a form field, never a click on
+ * Torn's controls. The row's item id is kept on the tag, so a click reads
+ * the item of the row as it is NOW: #/manage is a virtualised list whose
+ * row elements are reused for other items as you scroll.
  */
 export function ensureRowTag(row, doc = document) {
     let tag = row.el.querySelector('.' + OWN_BAZAAR_TAG_CLASS);
+    if (tag && !(tag.parentElement && tag.parentElement.classList.contains(ROW_FLOAT_CLASS))) {
+        // One an older version put after the name goes: it took a line of the row.
+        tag.remove();
+        tag = null;
+    }
     if (!tag) {
         tag = doc.createElement('span');
         tag.className = OWN_BAZAAR_TAG_CLASS;
-        const nameEl = row.nameEl && row.nameEl !== row.el ? row.nameEl : null;
-        if (nameEl && nameEl.parentNode) nameEl.parentNode.insertBefore(tag, nameEl.nextSibling);
-        else row.el.appendChild(tag);
+        rowFloat(row.el, doc).appendChild(tag);
     }
     if (tag.dataset.itemId !== String(row.itemId)) tag.dataset.itemId = String(row.itemId);
     return tag;
@@ -102,4 +107,5 @@ export function ensureRowTag(row, doc = document) {
 
 export function removeRowTags(root = document) {
     for (const t of root.querySelectorAll('.' + OWN_BAZAAR_TAG_CLASS)) t.remove();
+    removeRowFloats(root);
 }

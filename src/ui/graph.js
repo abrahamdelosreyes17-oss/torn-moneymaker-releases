@@ -109,7 +109,7 @@ export function renderPriceGraph(data, opts = {}) {
     const width = opts.width || 400;
     const height = opts.height || 160;
     const pad = { l: 8, r: 64, t: 12, b: 20 };
-    const colors = { im: '#74c0fc', mv: '#a8dd1c', ...(opts.colors || {}) };
+    const colors = { im: '#8cc0ff', mv: '#6fdc7f', ...(opts.colors || {}) };
 
     const fig = htmlEl('div', 'ttv2-graph-box');
     const svg = svgEl('svg', {
@@ -217,8 +217,21 @@ export function renderPriceGraph(data, opts = {}) {
     /* the price about to be listed */
     if (mark !== null) {
         const my = y(mark).toFixed(1);
-        svg.appendChild(svgEl('line', { x1: pad.l, x2: pad.l + plotW, y1: my, y2: my, class: 'ttv2-graph-mark', stroke: '#f0a020', 'stroke-width': 1.5, 'stroke-dasharray': '5 3' }));
-        const label = svgEl('text', { x: pad.l + 4, y: Number(my) - 4, class: 'ttv2-graph-marklabel', fill: '#f0a020' });
+        svg.appendChild(svgEl('line', { x1: pad.l, x2: pad.l + plotW, y1: my, y2: my, class: 'ttv2-graph-mark', stroke: '#f6b74a', 'stroke-width': 1.5, 'stroke-dasharray': '5 3' }));
+        // Its words at the right end, on the side of the line away from the
+        // other lines there (3.20: above it, they sat on the average line).
+        const yAt = (list, key) => {
+            const last = list.length ? list[list.length - 1] : null;
+            return last ? y(last[key]) : null;
+        };
+        const near = [yAt(mv, 'mv'), yAt(points, 'im')].filter((v) => v !== null);
+        const above = Number(my) - 5;
+        const below = Number(my) + 13;
+        const clashes = (ly) => near.some((v) => Math.abs(v - (ly - 4)) < 9);
+        const fitsBelow = below <= pad.t + plotH - 2;
+        const fitsAbove = above - 10 >= pad.t;
+        const ly = fitsBelow && (clashes(above) || !fitsAbove) && !clashes(below) ? below : fitsAbove ? above : below;
+        const label = svgEl('text', { x: pad.l + plotW - 4, y: ly, 'text-anchor': 'end', class: 'ttv2-graph-marklabel', fill: '#f6b74a' });
         label.textContent = 'Fill ' + formatMoneyShort(mark);
         svg.appendChild(label);
     }

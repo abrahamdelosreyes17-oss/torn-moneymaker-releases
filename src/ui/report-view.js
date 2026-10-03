@@ -201,20 +201,20 @@ export class ReportView {
 export const REPORT_CSS = `
 .rv { display: flex; flex-direction: column; gap: 14px; }
 .rv-label { display: flex; flex-direction: column; gap: 6px; }
-.rv-text { width: 100%; padding: 8px 10px; border: 1px solid var(--cline2); border-radius: 8px; background: var(--card2); color: var(--text); font: inherit; resize: vertical; }
-.rv-text:focus { outline: 2px solid var(--hot-line); outline-offset: 0; }
+.rv-text { width: 100%; padding: 10px 12px; border: 1px solid var(--line2); border-radius: 10px; background: var(--input); color: var(--text); font: inherit; resize: vertical; }
+.rv-text:focus { outline: none; border-color: var(--brand); }
 .rv-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
 .rv-row small { color: var(--muted); }
-.rv-btn { padding: 7px 14px; border: 1px solid var(--cline2); border-radius: 8px; background: var(--card2); color: var(--text); cursor: pointer; }
-.rv-btn:hover { border-color: var(--muted); }
-.rv-btn.rv-primary { background: var(--price); border-color: var(--price); color: #111; font-weight: bold; }
-.rv-link { padding: 0; border: 0; background: none; color: var(--offer); text-decoration: underline; cursor: pointer; align-self: flex-start; }
+.rv-btn { height: 32px; padding: 0 14px; border: 1px solid var(--line2); border-radius: 10px; background: var(--raised); color: var(--text); font-weight: 500; cursor: pointer; transition: background-color 0.15s var(--ease); }
+.rv-btn:hover { background: var(--hover); }
+.rv-btn.rv-primary { background: var(--profit); border-color: transparent; color: var(--on-profit); font-weight: 600; }
+.rv-link { padding: 0; border: 0; background: none; color: var(--offer); cursor: pointer; align-self: flex-start; }
 .rv-shots { display: flex; flex-wrap: wrap; gap: 8px; }
 .rv-shot { position: relative; }
-.rv-shot img { display: block; height: 72px; border-radius: 6px; border: 1px solid var(--cline2); }
+.rv-shot img { display: block; height: 72px; border-radius: 8px; border: 1px solid var(--line2); }
 .rv-x { position: absolute; top: 2px; right: 2px; width: 20px; height: 20px; padding: 0; border: 0; border-radius: 10px; background: rgba(0, 0, 0, 0.7); color: #fff; cursor: pointer; }
 .rv-includes { margin: 0; padding-left: 18px; color: var(--muted); }
 .rv-includes li::marker { content: '✓  '; color: var(--price); }
-.rv-log { margin: 0; padding: 8px 10px; border: 1px solid var(--cline2); border-radius: 8px; background: #111; font: 11px/1.5 Consolas, monospace; white-space: pre-wrap; }
+.rv-log { margin: 0; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--input); color: var(--text2); font: 11px/1.5 Consolas, monospace; white-space: pre-wrap; }
 .rv-status { margin: 0; color: var(--muted); }
 `;

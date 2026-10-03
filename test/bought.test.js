@@ -129,6 +129,8 @@ test('the checkout window starts clear of NPC Arbitrage: above it if it fits, el
     // Room above: just above it, right-aligned.
     assert.deepEqual(windowStart({ ...panel, top: 500 }, { width: 300, height: 300, viewW: 1616 }), { x: 1300, y: 192 });
     assert.deepEqual(windowStart(null, { width: 300, height: 300, viewW: 1616 }), { x: 1300, y: 64 });
+    // 3.20: a few lines of room above - above it all the same, the list scrolling inside (beside is over Torn).
+    assert.deepEqual(windowStart({ ...panel, top: 244 }, { width: 300, height: 420, viewW: 1616 }), { x: 1300, y: 8, maxHeight: 228 });
 });
 
 import { fitWindow } from '../src/ui/bought-window.js';

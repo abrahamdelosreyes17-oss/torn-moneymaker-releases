@@ -10,35 +10,69 @@
  * Torn's row styles set box-shadow themselves. It is deliberately not used on
  * `outline`, and the marker never touches `position`.
  *
- * Design rules the panel and the selling page share (see README):
- *   font Arial; sizes 11px (uppercase labels only), 12px (secondary), 13px
- *   (body), 15px bold (the key money number); line-height 1.4; spacing in
- *   4/8/12/16px; money right-aligned in tabular figures; colours only from
- *   the tokens below; a Torn-style striped title bar.
+ * Design rules the panel and the selling page share (see README; 3.20
+ * Graphite): system fonts only (nothing to download), Georgia for titles;
+ * sizes 11px (uppercase labels only), 12px (secondary), 13px (body), 15px
+ * semibold (the key money number); line-height 1.5; spacing in
+ * 4/8/12/16/24px; radii 8/12/16; money right-aligned in tabular figures;
+ * colours only from the tokens below; only cheap motion (opacity,
+ * transform, background), none under prefers-reduced-motion.
  */
 
 export const UI_PREFIX = 'ttv2';
 
 /*
- * Colour tokens, shared by the panel and the selling page. All fixed and
- * dark. The background used to borrow Torn's --default-bg-panel-color, but
+ * Colour tokens, shared by the panel and the selling page (3.20: Graphite,
+ * mockups/T-graphite-everything.html - one colour per meaning: green money,
+ * blue buying and your trade, amber check this, red gone, gold favourites,
+ * teal trust, violet the brand). All fixed and dark. The background used to borrow Torn's --default-bg-panel-color, but
  * Torn sets its dark value on <body>; the selling page is attached outside
  * it and got Torn's LIGHT default - light-grey text on a light page.
  */
 import { FILL_FORM_CSS } from './fill-form.js';
 
 export const TOKENS_CSS = `
-    --bg: #2e2e2e;
-    --row: #2b2b2b;
-    --line: #444;
-    --text: #ddd;
-    --muted: #999;
-    --profit: #99cc00;
-    --offer: #74c0fc;
-    --warn: #e0a000;
-    --bad: #d83500;
-    --on-profit: #1b1b1b;
-    --title: repeating-linear-gradient(90deg, #242424 0 2px, #2e2e2e 0 4px);
+    --page: #111215;
+    --rail: #16171b;
+    --surface: #1c1e23;
+    --raised: #24272e;
+    --hover: #2b2f37;
+    --input: #0e0f12;
+    --bg: #1c1e23;
+    --row: #24272e;
+    --line: #2c2f36;
+    --line2: #3a3d45;
+    --text: #f2f4f8;
+    --text2: #cdd2db;
+    --muted: #949bab;
+    --faint: #6a7180;
+    --profit: #6fdc7f;
+    --profit-bg: rgba(111, 220, 127, 0.12);
+    --profit-line: rgba(111, 220, 127, 0.42);
+    --buy: #5aa7ff;
+    --buy-bg: rgba(90, 167, 255, 0.12);
+    --buy-line: rgba(90, 167, 255, 0.45);
+    --offer: #8cc0ff;
+    --warn: #f6b74a;
+    --warn-bg: rgba(246, 183, 74, 0.12);
+    --warn-line: rgba(246, 183, 74, 0.42);
+    --bad: #ff7b6e;
+    --bad-bg: rgba(255, 123, 110, 0.12);
+    --bad-line: rgba(255, 123, 110, 0.42);
+    --fav: #ffcc4d;
+    --fav-bg: rgba(255, 204, 77, 0.10);
+    --fav-line: rgba(255, 204, 77, 0.45);
+    --trust: #43d1be;
+    --trust-bg: rgba(67, 209, 190, 0.12);
+    --known: #b8a4ff;
+    --brand: #8f9bff;
+    --on-profit: #0d1a10;
+    --on-buy: #06121f;
+    --title: #16171b;
+    --shadow: 0 1px 2px rgba(0, 0, 0, 0.35), 0 12px 32px rgba(0, 0, 0, 0.35);
+    --sans: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+    --serif: Georgia, "Iowan Old Style", "Times New Roman", serif;
+    --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
 `;
 
 /*
@@ -50,12 +84,21 @@ export const TOKENS_CSS = `
  * ours cannot leak out.
  */
 export const PAGE_CSS = `
+/*
+ * Every mark on Torn's own pages takes no room (3.20, the owner: "it
+ * shouldn't resize a row, add columns etc. it should just sit at the side or
+ * on top like a bring to front"). Outlines are inset box-shadows, labels are
+ * pseudo-elements or absolutely placed, and nothing sets a Torn element's
+ * size, padding, margin or wrapping. Colours: green money, blue buying and
+ * your trade, amber check this, red the listing you opened (Graphite,
+ * mockups/T-graphite-everything.html).
+ */
 .ttv2-hit {
     position: relative !important;
 
     box-shadow:
-        inset 0 0 0 3px #35d35a,
-        inset 0 0 0 9999px rgba(53, 211, 90, 0.16) !important;
+        inset 0 0 0 2px #6fdc7f,
+        inset 0 0 0 9999px rgba(111, 220, 127, 0.12) !important;
 
     transition: box-shadow 0.15s ease;
 }
@@ -81,22 +124,24 @@ export const PAGE_CSS = `
      *   Torn's geometry in place, which clipped the label to an 8px sliver.
      * - The chip background: white text alone was invisible against the
      *   tile's artwork.
+     * - Inset from the corner and no wider than the card (3.20): it sits on
+     *   the card, inside it, never over the card's corner or its neighbour.
      */
     content: attr(data-ttv2-profit) !important;
 
     display: block !important;
     position: absolute !important;
-    top: 0 !important;
-    right: 0 !important;
+    top: 4px !important;
+    right: 4px !important;
     left: auto !important;
     bottom: auto !important;
 
     width: auto !important;
     height: auto !important;
     min-width: 0 !important;
-    max-width: 100% !important;
+    max-width: calc(100% - 8px) !important;
     margin: 0 !important;
-    padding: 1px 4px !important;
+    padding: 1px 7px !important;
     transform: none !important;
 
     overflow: visible !important;
@@ -105,12 +150,14 @@ export const PAGE_CSS = `
     visibility: visible !important;
     z-index: 2147483000 !important;
 
-    background: rgba(10, 40, 16, 0.92) !important;
-    border: 1px solid #35d35a !important;
-    border-radius: 0 0 0 5px !important;
+    background: rgba(15, 36, 20, 0.94) !important;
+    border: 1px solid rgba(111, 220, 127, 0.55) !important;
+    border-radius: 9px !important;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.5) !important;
 
-    color: #7ee08f !important;
-    font: 800 11px/14px Arial, Helvetica, sans-serif !important;
+    color: #6fdc7f !important;
+    font: 700 11px/15px "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif !important;
+    text-align: right !important;
 
     /* Cannot intercept a click, so it can never block Torn's Buy button. */
     pointer-events: none !important;
@@ -119,8 +166,9 @@ export const PAGE_CSS = `
 /*
  * A trusted trader pays more than this listing asks: "FAFFO pays $73,500 /
  * +$3,500 each", drawn the same way as the profit label and just as unable
- * to catch a click. Two lines that wrap inside the card - never cut. On a
- * card that is also a deal, the trader line goes under the profit.
+ * to catch a click. In blue (a trader, not an NPC deal); lines that wrap
+ * inside the card - never cut, never over the next card. On a card that is
+ * also a deal, the trader line goes under the profit.
  */
 .ttv2-trader {
     position: relative !important;
@@ -131,17 +179,17 @@ export const PAGE_CSS = `
 
     display: block !important;
     position: absolute !important;
-    top: 0 !important;
-    right: 0 !important;
+    top: 4px !important;
+    right: 4px !important;
     left: auto !important;
     bottom: auto !important;
 
     width: auto !important;
     height: auto !important;
     min-width: 0 !important;
-    max-width: 100% !important;
+    max-width: calc(100% - 8px) !important;
     margin: 0 !important;
-    padding: 1px 4px !important;
+    padding: 2px 7px !important;
     transform: none !important;
 
     overflow: visible !important;
@@ -151,12 +199,13 @@ export const PAGE_CSS = `
     visibility: visible !important;
     z-index: 2147483000 !important;
 
-    background: rgba(10, 40, 16, 0.92) !important;
-    border: 1px solid #35d35a !important;
-    border-radius: 0 0 0 5px !important;
+    background: rgba(15, 26, 42, 0.94) !important;
+    border: 1px solid rgba(90, 167, 255, 0.5) !important;
+    border-radius: 9px !important;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.5) !important;
 
-    color: #7ee08f !important;
-    font: 800 11px/14px Arial, Helvetica, sans-serif !important;
+    color: #8cc0ff !important;
+    font: 700 11px/15px "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif !important;
 
     pointer-events: none !important;
 }
@@ -165,6 +214,9 @@ export const PAGE_CSS = `
     content: attr(data-ttv2-profit) "\\A" attr(data-ttv2-trader) !important;
     white-space: pre-line !important;
     text-align: right !important;
+    background: rgba(15, 36, 20, 0.94) !important;
+    border-color: rgba(111, 220, 127, 0.55) !important;
+    color: #6fdc7f !important;
 }
 
 /*
@@ -176,34 +228,27 @@ export const PAGE_CSS = `
 .ttv2-target.ttv2-buyhere {
     position: relative !important;
     box-shadow:
-        inset 0 0 0 3px #4dabf7,
-        inset 0 0 0 9999px rgba(77, 171, 247, 0.16) !important;
+        inset 0 0 0 2px #5aa7ff,
+        inset 0 0 0 9999px rgba(90, 167, 255, 0.12),
+        0 0 14px rgba(90, 167, 255, 0.35) !important;
 }
 
-/* Fill's line beside Torn's ADD TO TRADE (3.14.2): amber when it marks nothing, blue when it does. */
+/* Fill's line on the trade page (3.14.2) moved to the panel's trade box in 3.20: this only hides one an older version left. */
 .ttv2-fillnote {
-    display: inline-block;
-    margin-left: 12px;
-    font: bold 12px/18px Arial, sans-serif;
-    color: #f0a020;
-    vertical-align: middle;
-}
-
-.ttv2-fillnote.ttv2-fillnote-ok {
-    color: #4dabf7;
+    display: none !important;
 }
 
 /* Chat from Torn Bids (3.14): Torn's own Start chat button on that profile, in blue. You press it. */
 .ttv2-chatmark {
-    outline: 3px solid #4dabf7 !important;
+    outline: 3px solid #5aa7ff !important;
     outline-offset: 2px;
     border-radius: 6px;
-    box-shadow: 0 0 0 7px rgba(77, 171, 247, 0.28) !important;
+    box-shadow: 0 0 0 7px rgba(90, 167, 255, 0.28) !important;
     animation: ttv2-chatpulse 1.2s ease-in-out 4;
 }
 
 @keyframes ttv2-chatpulse {
-    50% { box-shadow: 0 0 0 11px rgba(77, 171, 247, 0.12); }
+    50% { box-shadow: 0 0 0 11px rgba(90, 167, 255, 0.12); }
 }
 
 .ttv2-buyhere::before {
@@ -212,11 +257,13 @@ export const PAGE_CSS = `
     top: 4px;
     left: 4px;
     z-index: 2;
-    padding: 1px 6px;
-    border-radius: 3px;
-    background: #4dabf7;
-    color: #10202c;
-    font: bold 11px/16px Arial, sans-serif;
+    max-width: calc(100% - 8px);
+    padding: 1px 7px;
+    border-radius: 9px;
+    background: #5aa7ff;
+    color: #06121f;
+    font: 700 11px/16px "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.45);
     pointer-events: none;
 }
 
@@ -232,7 +279,8 @@ export const PAGE_CSS = `
 /*
  * On the listing you are buying (3.13): one strip across the card's top with
  * the words, Fill and Next, so the pointer does not cross the page to the
- * panel after every buy. It takes the place of the card's own label.
+ * panel after every buy. It takes the place of the card's own label. One
+ * line, always (3.20): two lines covered the item's picture and its name.
  */
 .ttv2-buyhere.ttv2-hasbar::before {
     display: none !important;
@@ -245,34 +293,42 @@ export const PAGE_CSS = `
     right: 0;
     z-index: 3;
     display: flex !important;
-    flex-wrap: wrap;
+    flex-wrap: nowrap;
     align-items: center;
     gap: 4px;
-    padding: 3px 4px;
-    background: rgba(16, 32, 44, 0.92);
-    border-bottom: 1px solid #4dabf7;
+    height: 26px;
+    padding: 0 4px;
+    box-sizing: border-box;
+    border-radius: 4px 4px 0 0;
+    background: #5aa7ff;
+    box-shadow: 0 4px 10px rgba(0, 0, 0, 0.45);
+    white-space: nowrap;
 }
 
 .ttv2-buybar-l {
     margin-right: auto;
-    padding: 0 6px;
-    border-radius: 3px;
-    background: #4dabf7;
-    color: #10202c;
-    font: bold 12px/20px Arial, sans-serif;
+    padding: 0 4px;
+    background: none;
+    color: #06121f;
+    font: 700 11px/18px "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
     white-space: nowrap;
 }
 
 .ttv2-buybar button {
-    height: 24px;
-    padding: 0 9px;
-    border: 1px solid #4dabf7;
-    border-radius: 3px;
-    background: #10202c;
-    color: #9ad0fa;
-    font: bold 12px/22px Arial, sans-serif;
+    flex: 0 0 auto;
+    height: 20px;
+    padding: 0 7px;
+    border: 0;
+    border-radius: 6px;
+    background: rgba(6, 18, 31, 0.18);
+    color: #06121f;
+    font: 700 11px/20px "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
     white-space: nowrap;
     cursor: pointer;
+}
+
+.ttv2-buybar button:hover {
+    background: rgba(6, 18, 31, 0.3);
 }
 
 .ttv2-buybar button:focus-visible {
@@ -281,70 +337,94 @@ export const PAGE_CSS = `
 }
 
 .ttv2-buybar button[data-act="next"] {
-    background: #4dabf7;
-    color: #10202c;
+    background: #06121f;
+    color: #cfe5ff;
 }
 
 .ttv2-sendrow {
-    box-shadow: inset 3px 0 0 #4dabf7, inset 0 0 0 9999px rgba(77, 171, 247, 0.10) !important;
-}
-
-.ttv2-sendfill {
-    display: inline-block;
-    margin-left: 8px;
-    padding: 1px 8px;
-    border: 1px solid #4dabf7;
-    border-radius: 10px;
-    color: #9ad0fa;
-    font: bold 12px/18px Arial, sans-serif;
-    white-space: nowrap;
-    cursor: default;
+    box-shadow: inset 3px 0 0 #5aa7ff, inset 0 0 0 9999px rgba(90, 167, 255, 0.08) !important;
 }
 
 /*
- * Torn's name cell is a fixed 406px: a long name and Fill stay on one line,
- * running on past it (its width kept, so the cell never drops under the picture).
+ * Fill on the trade page: floats beside the item's name (3.20). Taken out of
+ * the line, so Torn's name cell keeps its size and its wrapping; placed by
+ * main.js placeFloat where the cell lays its items out as a row.
  */
+.ttv2-float {
+    position: absolute !important;
+    z-index: 3;
+    box-sizing: border-box;
+    white-space: nowrap !important;
+}
+
 .ttv2-sendrow .name-wrap {
-    white-space: nowrap;
     overflow: visible !important;
 }
 
-.ttv2-sendrow .name-wrap .ttv2-sendfill { vertical-align: middle; }
+.ttv2-sendfill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    height: 22px;
+    margin-left: 10px !important;
+    padding: 0 8px;
+    border: 1px solid rgba(90, 167, 255, 0.45);
+    border-radius: 7px;
+    background: #10233b;
+    color: #cfe5ff;
+    font: 600 11px/20px "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+    box-shadow: 0 3px 10px rgba(0, 0, 0, 0.5);
+    white-space: nowrap;
+    vertical-align: baseline;
+    cursor: default;
+}
 
 .ttv2-sendfill[data-fill] { cursor: pointer; }
-.ttv2-sendfill[aria-pressed="true"] { background: #4dabf7; color: #10202c; }
+.ttv2-sendfill[data-fill]:hover { background: #163152; }
+.ttv2-sendfill[aria-pressed="true"] { background: #5aa7ff; color: #06121f; border-color: transparent; }
+.ttv2-sendfill:not([data-fill]) { background: #23262c; color: #cfd4dc; border-color: rgba(255, 255, 255, 0.14); }
 
 /* One Fill for every marked row (3.16.4), beside Torn's ADD TO TRADE: the row chips' look, a size up. */
 .ttv2-sendfillall {
-    display: inline-block;
-    margin-left: 12px;
-    padding: 3px 10px;
-    border: 1px solid #4dabf7;
-    border-radius: 12px;
-    color: #9ad0fa;
-    font: bold 12px/18px Arial, sans-serif;
+    display: inline-flex;
+    align-items: center;
+    height: 26px;
+    margin-left: 12px !important;
+    padding: 0 10px;
+    border: 1px solid rgba(90, 167, 255, 0.45);
+    border-radius: 8px;
+    background: #10233b;
+    color: #cfe5ff;
+    font: 600 12px/24px "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+    box-shadow: 0 3px 10px rgba(0, 0, 0, 0.5);
     white-space: nowrap;
-    vertical-align: middle;
+    vertical-align: baseline;
     cursor: pointer;
     user-select: none;
 }
 
-.ttv2-sendfillall:hover { background: rgba(77, 171, 247, 0.16); }
-.ttv2-sendfillall:focus-visible { outline: 2px solid #4dabf7; outline-offset: 1px; }
-.ttv2-sendfillall[aria-pressed="true"] { background: #4dabf7; color: #10202c; }
+.ttv2-sendfillall:hover { background: #163152; }
+.ttv2-sendfillall:focus-visible { outline: 2px solid #5aa7ff; outline-offset: 1px; }
+.ttv2-sendfillall[aria-pressed="true"] { background: #5aa7ff; color: #06121f; border-color: transparent; }
 
 /* The listing a feed link was opened for: light red (3.14.2, the owner; it was yellow). Paint-only, like .ttv2-hit. */
 .ttv2-target {
     box-shadow:
-        inset 0 0 0 3px #ff8a80,
-        inset 0 0 0 9999px rgba(255, 138, 128, 0.14) !important;
+        inset 0 0 0 2px #ff7b6e,
+        inset 0 0 0 9999px rgba(255, 123, 110, 0.12) !important;
 }
 
 .ttv2-hit-top {
     box-shadow:
-        inset 0 0 0 3px #7ee08f,
-        inset 0 0 0 9999px rgba(126, 224, 143, 0.24) !important;
+        inset 0 0 0 2px #a6f5b0,
+        inset 0 0 0 9999px rgba(111, 220, 127, 0.2),
+        0 0 12px rgba(111, 220, 127, 0.35) !important;
+}
+
+.ttv2-hit-top.ttv2-hit-top::after {
+    background: #6fdc7f !important;
+    border-color: transparent !important;
+    color: #0d1a10 !important;
 }
 
 /*
@@ -354,59 +434,82 @@ export const PAGE_CSS = `
  */
 .ttv2-hit.ttv2-hit-low {
     box-shadow:
-        inset 0 0 0 2px #f0a020,
-        inset 0 0 0 9999px rgba(240, 160, 32, 0.12) !important;
+        inset 0 0 0 1px #f6b74a,
+        inset 0 0 0 9999px rgba(246, 183, 74, 0.08) !important;
 }
 
 .ttv2-hit.ttv2-hit-low.ttv2-hit-low::after {
-    background: rgba(48, 30, 4, 0.9) !important;
-    border-color: #f0a020 !important;
-    color: #f5c060 !important;
+    background: rgba(42, 33, 16, 0.94) !important;
+    border-color: rgba(246, 183, 74, 0.5) !important;
+    color: #f6b74a !important;
     font-weight: 700 !important;
 }
 
-/* Bazaar owner status, right after their name in the page banner. */
+/* Bazaar owner status: floats at the end of the bazaar's banner line (3.20), taking no room in it. */
 .ttv2-owner {
-    display: inline-block;
-    margin: 0 4px 0 8px;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    height: 20px;
+    margin-left: 10px !important;
     padding: 0 8px;
-    border-radius: 9px;
-    font: bold 12px/18px Arial, Helvetica, sans-serif;
-    color: #ddd;
-    background: rgba(0, 0, 0, 0.35);
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    border-radius: 7px;
+    font: 600 11px/18px "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+    color: #e5e8ee;
+    background: #23262c;
+    box-shadow: 0 3px 10px rgba(0, 0, 0, 0.45);
     white-space: nowrap;
-    vertical-align: middle;
+    vertical-align: baseline;
 }
 
 .ttv2-owner::before {
     content: "";
     display: inline-block;
-    width: 8px;
-    height: 8px;
-    margin-right: 4px;
+    width: 7px;
+    height: 7px;
     border-radius: 50%;
-    background: #999;
-    vertical-align: 0;
+    background: #6a7180;
 }
 
-.ttv2-owner[data-level="online"]::before { background: #99cc00; }
-.ttv2-owner[data-level="idle"]::before { background: #e0a000; }
-.ttv2-owner[data-level="offline"]::before { background: #999; }
+.ttv2-owner[data-level="online"] { color: #6fdc7f; border-color: rgba(111, 220, 127, 0.42); background: #10261a; }
+.ttv2-owner[data-level="online"]::before { background: #6fdc7f; }
+.ttv2-owner[data-level="idle"] { color: #f6b74a; border-color: rgba(246, 183, 74, 0.42); background: #2a2110; }
+.ttv2-owner[data-level="idle"]::before { background: #f6b74a; }
+.ttv2-owner[data-level="offline"]::before { background: #6a7180; }
 
 /*
- * Your own bazaar's add / manage rows: the current asking prices, after the
- * item name. Text only; nothing is filled in or clicked.
+ * Your own bazaar's manage rows and the Item Market's: the asking prices
+ * and Fill, together in one group that floats in the row (3.20): at its
+ * right, just left of Torn's boxes, centred on the row - over the row, never
+ * a line or a column of its own. Text only; nothing is clicked on Torn's.
  */
+.ttv2-rowfloat {
+    position: absolute !important;
+    top: 50%;
+    right: var(--ttv2-fr, 8px);
+    z-index: 3;
+    display: inline-flex !important;
+    align-items: center;
+    gap: 6px;
+    margin: 0 !important;
+    transform: translateY(-50%);
+    white-space: nowrap;
+}
+
+.ttv2-rowfloat[data-tight="1"] .ttv2-bztag { display: none; }
+
 .ttv2-bztag {
     display: inline-block;
-    margin-left: 8px;
+    height: 22px;
     padding: 0 8px;
-    border: 1px solid #444;
-    border-radius: 4px;
-    font: 12px/20px Arial, Helvetica, sans-serif;
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    border-radius: 7px;
+    font: 500 11px/20px "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
     font-variant-numeric: tabular-nums;
-    color: #ddd;
-    background: #2b2b2b;
+    color: #cfd4dc;
+    background: #23262c;
+    box-shadow: 0 3px 10px rgba(0, 0, 0, 0.45);
     white-space: nowrap;
     vertical-align: middle;
     cursor: pointer;
@@ -414,69 +517,72 @@ export const PAGE_CSS = `
 
 .ttv2-bztag:hover,
 .ttv2-bztag[data-selected="true"] {
-    border-color: #99cc00;
+    border-color: rgba(111, 220, 127, 0.55);
 }
 
 .ttv2-bztag b {
-    color: #a8dd1c;
-    font-weight: bold;
+    color: #6fdc7f;
+    font-weight: 650;
 }
 
 .ttv2-bztag .ttv2-bztag-low {
-    color: #74c0fc;
+    color: #8cc0ff;
 }
 
 /*
- * Your bazaar's add page: IMA and BP chips and the Fill tick, in one line in
- * Torn's own value column after its price - the row stays one line.
+ * Your bazaar's add page: IMA and BP chips and the Fill tick float in Torn's
+ * own value column, at its right end (3.20: the cell keeps its own padding -
+ * nothing is pushed). Where they would cover Torn's own words in the cell,
+ * IMA goes first, then BP - whole chips only (main.js fitBazaarCells sets
+ * data-tight); both stay in My bazaar's list beside the page.
  */
+.ttv2-bzcell {
+    position: relative;
+}
+
 .ttv2-bztag.ttv2-bzchips {
+    position: absolute;
+    top: 50%;
+    right: calc(var(--ttv2-fillw, 64px) + 8px);
+    z-index: 3;
     display: inline-flex;
     align-items: center;
-    gap: 6px;
-    margin-left: 10px;
+    gap: 4px;
+    height: auto;
+    margin: 0;
     padding: 0;
     border: 0;
     background: none;
+    box-shadow: none;
+    transform: translateY(-50%);
     cursor: default;
-    vertical-align: middle;
     white-space: nowrap;
 }
 
 .ttv2-bzchip {
     display: inline-block;
-    padding: 0 6px;
-    border: 1px solid #444;
-    border-radius: 4px;
-    background: #2b2b2b;
-    color: #bbb;
-    font: 11px/18px Arial, Helvetica, sans-serif;
+    height: 20px;
+    padding: 0 7px;
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    border-radius: 7px;
+    background: #23262c;
+    color: #cfd4dc;
+    font: 500 11px/18px "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+    box-shadow: 0 3px 10px rgba(0, 0, 0, 0.45);
     cursor: pointer;
 }
 
-.ttv2-bzchip b { font-weight: bold; font-variant-numeric: tabular-nums; }
-.ttv2-bzchip-ima b { color: #a8dd1c; }
-.ttv2-bzchip-bp b { color: #74c0fc; }
+.ttv2-bzchip b { font-weight: 650; font-variant-numeric: tabular-nums; }
+.ttv2-bzchip-ima b { color: #6fdc7f; }
+.ttv2-bzchip-bp b { color: #8cc0ff; }
 .ttv2-bzchip:hover,
-.ttv2-bzchips[data-selected="true"] .ttv2-bzchip { border-color: #99cc00; }
-
-/*
- * The Fill tick on that page: at the right edge of Torn's value cell, the
- * same place in every row. The cell keeps its own size and gives the tick
- * room from inside it, so its line (Torn's price, the chips) ends before the
- * tick instead of running under it. A row with no room for both chips shows
- * one, or none - whole chips only (main.js fitBazaarCells sets data-tight).
- */
-.ttv2-bzcell {
-    position: relative;
-    box-sizing: border-box;
-    padding-right: var(--ttv2-fillw, 64px) !important;
-}
+.ttv2-bzchips[data-selected="true"] .ttv2-bzchip { border-color: rgba(111, 220, 127, 0.55); }
 
 .ttv2-fillbox.ttv2-fillcell {
     position: absolute;
-    right: 0;
+    right: 2px;
     top: 50%;
+    z-index: 3;
     transform: translateY(-50%);
     margin: 0;
     flex-wrap: nowrap;
@@ -486,37 +592,26 @@ export const PAGE_CSS = `
 .ttv2-fillcell .ttv2-fillbtn { height: 20px; font-size: 11px; }
 .ttv2-bzchips[data-tight="1"] .ttv2-bzchip-ima { display: none; }
 .ttv2-bzchips.ttv2-bzchips[data-tight="2"] { display: none; }
-.ttv2-fillbtn[data-level="good"] .ttv2-filllabel { color: #a8dd1c; }
-.ttv2-fillbtn[data-level="warn"] .ttv2-filllabel { color: #f0a020; }
-.ttv2-fillbtn[data-level="bad"] { border-color: #ff8a80; }
-
-/* On the Item Market the tag sits on its own line above the price box. */
-.ttv2-bztag.ttv2-bztag-market {
-    display: block;
-    width: max-content;
-    max-width: 100%;
-    margin: 4px 0;
-    white-space: normal;
-}
+.ttv2-fillbtn[data-level="good"] .ttv2-filllabel { color: #6fdc7f; }
+.ttv2-fillbtn[data-level="warn"] .ttv2-filllabel { color: #f6b74a; }
+.ttv2-fillbtn[data-level="bad"] { border-color: #ff7b6e; }
 
 /*
- * The Fill button: ours, beside the tag. It types into Torn's boxes; it never
- * presses Torn's buttons. Its line says what it typed, or why it could not.
+ * The Fill button: ours, beside the prices. It types into Torn's boxes; it
+ * never presses Torn's buttons. What it typed, or why it could not, shows on
+ * its hover, in the panel's My bazaar, and for a moment in a note beside
+ * Torn's page (the toast) - never as a line in Torn's row.
  */
 .ttv2-fillbox {
     display: inline-flex;
-    flex-wrap: wrap;
+    flex-wrap: nowrap;
     align-items: center;
     gap: 6px;
-    margin-left: 6px;
     vertical-align: middle;
-    font: 12px/20px Arial, Helvetica, sans-serif;
+    font: 12px/20px "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
 }
 
-.ttv2-bztag-market + .ttv2-fillbox {
-    display: flex;
-    margin: 0 0 4px;
-}
+.ttv2-rowfloat .ttv2-filltag { display: none; }
 
 .ttv2-fillbtn {
     display: inline-flex;
@@ -524,56 +619,105 @@ export const PAGE_CSS = `
     gap: 6px;
     height: 22px;
     padding: 0 8px 0 6px;
-    border: 1px solid #555;
-    border-radius: 4px;
-    background: #2b2b2b;
-    color: #ddd;
-    font: bold 12px/20px Arial, Helvetica, sans-serif;
+    border: 1px solid rgba(90, 167, 255, 0.45);
+    border-radius: 7px;
+    background: #10233b;
+    color: #cfe5ff;
+    font: 600 11px/20px "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+    box-shadow: 0 3px 10px rgba(0, 0, 0, 0.5);
     cursor: pointer;
     white-space: nowrap;
 }
 
-.ttv2-fillbtn:hover { border-color: #99cc00; }
+.ttv2-fillbtn:hover { background: #163152; }
 .ttv2-fillbtn:disabled { opacity: 0.6; cursor: progress; }
 
 /* The tick box: empty, or ticked in green once the row is filled. */
 .ttv2-fillmark {
-    width: 12px;
-    height: 12px;
-    border: 1px solid #888;
-    border-radius: 2px;
-    background: #1b1b1b;
+    width: 13px;
+    height: 13px;
+    border: 1.5px solid rgba(255, 255, 255, 0.3);
+    border-radius: 4px;
+    background: #0e0f12;
     box-sizing: border-box;
     position: relative;
 }
 
-.ttv2-fillbtn[aria-checked="true"] { border-color: #99cc00; }
-.ttv2-fillbtn[aria-checked="true"] .ttv2-fillmark { background: #99cc00; border-color: #99cc00; }
+.ttv2-fillbtn[aria-checked="true"] { border-color: rgba(111, 220, 127, 0.55); background: #10261a; color: #6fdc7f; }
+.ttv2-fillbtn[aria-checked="true"] .ttv2-fillmark { background: #6fdc7f; border-color: #6fdc7f; }
 .ttv2-fillbtn[aria-checked="true"] .ttv2-fillmark::after {
     content: '';
     position: absolute;
     left: 3px;
     top: 0;
-    width: 4px;
-    height: 8px;
-    border: solid #1b1b1b;
+    width: 3px;
+    height: 7px;
+    border: solid #0d1a10;
     border-width: 0 2px 2px 0;
     transform: rotate(45deg);
 }
 
-a.ttv2-fillset { cursor: pointer; color: #74c0fc; }
-.ttv2-fillbtn:focus-visible { outline: 2px solid #74c0fc; outline-offset: 1px; }
+/* "Fill settings": floats at the right end of Torn's links bar (3.20), not one of its links. */
+a.ttv2-fillset {
+    position: absolute !important;
+    z-index: 3;
+    display: inline-flex;
+    white-space: nowrap;
+    align-items: center;
+    height: 22px;
+    padding: 0 9px;
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    border-radius: 7px;
+    background: #23262c;
+    color: #cfd4dc !important;
+    font: 600 11px/20px "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+    box-shadow: 0 3px 10px rgba(0, 0, 0, 0.45);
+    text-decoration: none !important;
+    cursor: pointer;
+}
+
+a.ttv2-fillset:hover { border-color: rgba(255, 255, 255, 0.3); }
+.ttv2-fillbtn:focus-visible { outline: 2px solid #8cc0ff; outline-offset: 1px; }
 
 .ttv2-filltag {
-    color: #ddd;
+    color: #e5e8ee;
     white-space: normal;
     font-variant-numeric: tabular-nums;
 }
 
-.ttv2-filltag[data-level="good"] { color: #a8dd1c; }
-.ttv2-filltag[data-level="warn"] { color: #f0a020; }
-.ttv2-filltag[data-level="bad"] { color: #ff8a80; }
+.ttv2-filltag[data-level="good"] { color: #6fdc7f; }
+.ttv2-filltag[data-level="warn"] { color: #f6b74a; }
+.ttv2-filltag[data-level="bad"] { color: #ff7b6e; }
 .ttv2-filltag[hidden] { display: none; }
+
+/* Fill's result, beside Torn's page for a few seconds (3.20): in place of the line it used to add to the row. */
+.ttv2-toast {
+    position: fixed;
+    z-index: 2147483001;
+    max-width: 400px;
+    padding: 8px 12px;
+    border: 1px solid rgba(111, 220, 127, 0.42);
+    border-radius: 10px;
+    background: #1c1e23;
+    color: #cdd2db;
+    font: 12px/1.5 "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.35), 0 12px 32px rgba(0, 0, 0, 0.35);
+    pointer-events: none;
+    animation: ttv2-toast-in 0.2s cubic-bezier(0.2, 0.7, 0.2, 1);
+}
+
+.ttv2-toast[data-level="warn"] { border-color: rgba(246, 183, 74, 0.42); color: #f6b74a; }
+.ttv2-toast[data-level="bad"] { border-color: rgba(255, 123, 110, 0.42); color: #ff7b6e; }
+
+@keyframes ttv2-toast-in {
+    from { opacity: 0; transform: translateY(4px); }
+    to { opacity: 1; transform: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .ttv2-toast, .ttv2-chatmark { animation: none !important; }
+    .ttv2-hit { transition: none !important; }
+}
 `;
 
 export const PANEL_CSS = `
@@ -600,7 +744,7 @@ ${TOKENS_CSS}
     border: 1px solid var(--line);
     border-radius: 4px;
     box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
-    font: 13px/1.4 Arial, Helvetica, sans-serif;
+    font: 13px/1.4 "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
     text-align: left;
     overflow: hidden;
 }
@@ -626,7 +770,7 @@ ${TOKENS_CSS}
 }
 
 .ttv2-panel button {
-    font: bold 12px/1 Arial, Helvetica, sans-serif;
+    font: bold 12px/1 "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
     height: 28px;
     padding: 0 12px;
     color: var(--text);
@@ -674,7 +818,7 @@ ${TOKENS_CSS}
 }
 
 .ttv2-panel input[type="text"] {
-    font: 13px/1.4 Arial, Helvetica, sans-serif;
+    font: 13px/1.4 "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
     height: 28px;
     color: var(--text);
     background: var(--row);
@@ -790,8 +934,8 @@ ${TOKENS_CSS}
 }
 
 @keyframes ttv2-pulse {
-    0% { box-shadow: 0 0 0 0 rgba(153, 204, 0, 0.7); }
-    100% { box-shadow: 0 0 0 8px rgba(153, 204, 0, 0); }
+    0% { box-shadow: 0 0 0 0 rgba(111, 220, 127, 0.7); }
+    100% { box-shadow: 0 0 0 8px rgba(111, 220, 127, 0); }
 }
 
 .ttv2-sweep {
@@ -1047,12 +1191,12 @@ ${TOKENS_CSS}
     padding: 8px 10px;
     border: 1px solid var(--profit);
     border-radius: 6px;
-    background: rgba(153, 204, 0, 0.08);
+    background: rgba(111, 220, 127, 0.08);
 }
 
 .ttv2-buybox {
-    border-color: #4dabf7;
-    background: rgba(77, 171, 247, 0.08);
+    border-color: #5aa7ff;
+    background: rgba(90, 167, 255, 0.08);
 }
 
 .ttv2-buybox .ttv2-sub, .ttv2-buybox .ttv2-tb-ok, .ttv2-buybox .ttv2-tb-warn {
@@ -1061,7 +1205,7 @@ ${TOKENS_CSS}
 
 /* Grey on the blue-tinted box: lighter than --muted, to read (5.7:1, not 4.2:1). */
 .ttv2-buybox .ttv2-sub {
-    color: #b3b3b3;
+    color: #cdd2db;
 }
 
 .ttv2-buynext {
@@ -1125,13 +1269,13 @@ ${TOKENS_CSS}
     padding: 0;
     border: 0;
     background: none;
-    color: #b3b3b3;
+    color: #cdd2db;
     font-size: 12px;
     text-decoration: underline;
     cursor: pointer;
 }
 
-.ttv2-panel button.ttv2-linkbtn:hover { color: var(--text, #ddd); }
+.ttv2-panel button.ttv2-linkbtn:hover { color: var(--text, #e5e8ee); }
 
 .ttv2-tb-ok {
     color: var(--profit);
@@ -1268,7 +1412,7 @@ ${TOKENS_CSS}
 .ttv2-panel button.ttv2-chip[aria-pressed="true"] {
     color: var(--text);
     border-color: var(--profit);
-    background: rgba(153, 204, 0, 0.12);
+    background: rgba(111, 220, 127, 0.12);
 }
 
 .ttv2-panel button.ttv2-chip-set {
@@ -1306,10 +1450,10 @@ ${TOKENS_CSS}
 }
 
 /* A value the box could not read: red, and the reason under the chips.
-   #ff8a80, not --bad: a red that reads on the panel (5.9:1), as Torn Bids' .sp-inerr. */
+   #ff7b6e, not --bad: a red that reads on the panel (5.9:1), as Torn Bids' .sp-inerr. */
 .ttv2-panel input.ttv2-chip-input.ttv2-bad {
-    border-color: #ff8a80;
-    box-shadow: 0 0 0 1px #ff8a80;
+    border-color: #ff7b6e;
+    box-shadow: 0 0 0 1px #ff7b6e;
 }
 
 .ttv2-panel input.ttv2-chip-input.ttv2-bad:focus-visible {
@@ -1345,7 +1489,7 @@ ${TOKENS_CSS}
 }
 
 .ttv2-chip-note[data-level="bad"] {
-    color: #ff8a80;
+    color: #ff7b6e;
 }
 
 .ttv2-chips.ttv2-chips-noted {
@@ -1588,7 +1732,7 @@ ${TOKENS_CSS}
 }
 
 .ttv2-panel button.ttv2-bzrow[aria-pressed="true"] .ttv2-money {
-    color: #a8dd1c;
+    color: #6fdc7f;
     font-weight: bold;
 }
 
@@ -1619,7 +1763,7 @@ ${TOKENS_CSS}
     font-size: 20px;
     font-weight: bold;
     line-height: 1.2;
-    color: #a8dd1c;
+    color: #6fdc7f;
     font-variant-numeric: tabular-nums;
 }
 
@@ -1631,16 +1775,16 @@ ${TOKENS_CSS}
     display: block;
     width: 100%;
     height: auto;
-    background: #262626;
+    background: #24272e;
     border: 1px solid var(--line);
     border-radius: 8px;
     cursor: crosshair;
 }
 
-.ttv2-graph-grid { stroke: #3a3a3a; stroke-width: 1; }
-.ttv2-graph-label { fill: #999; font: 11px Arial, Helvetica, sans-serif; font-variant-numeric: tabular-nums; }
-.ttv2-graph-empty { fill: #999; font: 12px Arial, Helvetica, sans-serif; }
-.ttv2-graph-cursor { stroke: #777; stroke-width: 1; }
+.ttv2-graph-grid { stroke: #383a40; stroke-width: 1; }
+.ttv2-graph-label { fill: #949bab; font: 11px "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif; font-variant-numeric: tabular-nums; }
+.ttv2-graph-empty { fill: #949bab; font: 12px "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif; }
+.ttv2-graph-cursor { stroke: #6a7180; stroke-width: 1; }
 
 .ttv2-graph-tip {
     position: absolute;
@@ -1658,7 +1802,7 @@ ${TOKENS_CSS}
 
 .ttv2-graph-tip[hidden] { display: none; }
 .ttv2-tip-when { color: var(--muted); }
-.ttv2-tip-mv { color: #a8dd1c; font-weight: bold; }
+.ttv2-tip-mv { color: #6fdc7f; font-weight: bold; }
 .ttv2-tip-im { color: var(--offer); }
 
 .ttv2-graph-keys {
@@ -1670,9 +1814,9 @@ ${TOKENS_CSS}
 
 .ttv2-graph-keys span { display: inline-flex; align-items: center; gap: 4px; }
 .ttv2-graph-keys i { display: inline-block; width: 16px; height: 0; border-top: 2px solid; }
-.ttv2-graph-keys .ttv2-key-mv i { border-color: #a8dd1c; }
+.ttv2-graph-keys .ttv2-key-mv i { border-color: #6fdc7f; }
 .ttv2-graph-keys .ttv2-key-im i { border-color: var(--offer); border-top-width: 1px; }
-.ttv2-graph-keys .ttv2-key-mark i { border-color: #f0a020; border-top-style: dashed; }
+.ttv2-graph-keys .ttv2-key-mark i { border-color: #f6b74a; border-top-style: dashed; }
 
 .ttv2-bzrow .ttv2-bzlow { color: var(--offer); }
 
@@ -1685,17 +1829,17 @@ ${TOKENS_CSS}
     border-radius: 6px;
     background: var(--row);
 }
-.ttv2-fillnow-done { border-color: #99cc00; }
+.ttv2-fillnow-done { border-color: #6fdc7f; }
 .ttv2-fillprice {
     font-size: 20px;
     font-weight: bold;
     line-height: 1.2;
-    color: #f0a020;
+    color: #f6b74a;
     font-variant-numeric: tabular-nums;
 }
-.ttv2-fillnow-done .ttv2-fillprice { color: #a8dd1c; }
-.ttv2-verdict[data-level="good"] { color: #a8dd1c; }
-.ttv2-verdict[data-level="warn"] { color: #f0a020; }
+.ttv2-fillnow-done .ttv2-fillprice { color: #6fdc7f; }
+.ttv2-verdict[data-level="good"] { color: #6fdc7f; }
+.ttv2-verdict[data-level="warn"] { color: #f6b74a; }
 .ttv2-panel button.ttv2-fillgo { align-self: flex-start; margin-top: 4px; }
 
 .ttv2-lows {
@@ -1849,6 +1993,434 @@ ${TOKENS_CSS}
     width: 36%;
     color: var(--muted);
     font-weight: normal;
+}
+
+/*
+ * 3.20 Graphite (mockups/T-graphite-everything.html, picked by the owner):
+ * the panel's look, over the rules above - the same parts and sizes the
+ * fitting in panel.js measures, a softer surface, system fonts, a serif
+ * title, one colour per meaning. The narrow steps above still win where
+ * they set a size (they are more specific).
+ */
+.ttv2-panel {
+    background: var(--surface);
+    border: 1px solid var(--line2);
+    border-radius: 14px;
+    box-shadow: var(--shadow);
+    font: 13px/1.5 var(--sans);
+    -webkit-font-smoothing: antialiased;
+}
+
+.ttv2-panel b,
+.ttv2-panel strong {
+    font-weight: 600;
+}
+
+.ttv2-panel a:hover { text-underline-offset: 3px; }
+
+.ttv2-panel button {
+    font: 600 12px/1 var(--sans);
+    border-radius: 7px;
+    background: var(--raised);
+    border: 1px solid var(--line2);
+    color: var(--text2);
+    transition: background-color 0.15s var(--ease);
+}
+
+.ttv2-panel button:hover:not(:disabled) {
+    background: var(--hover);
+    border-color: var(--line2);
+}
+
+.ttv2-panel button.ttv2-primary {
+    color: var(--on-profit);
+    background: var(--profit);
+    border-color: transparent;
+    font-weight: 650;
+}
+
+.ttv2-panel button.ttv2-primary:hover:not(:disabled) {
+    background: #86e594;
+    border-color: transparent;
+}
+
+.ttv2-panel button.ttv2-link,
+.ttv2-panel button.ttv2-link:hover:not(:disabled) {
+    background: none;
+    border: 0;
+    color: var(--offer);
+    font-weight: 500;
+}
+
+.ttv2-panel input[type="text"] {
+    font: 13px/1.4 var(--sans);
+    background: var(--input);
+    border: 1px solid var(--line2);
+    border-radius: 8px;
+}
+
+.ttv2-panel input[type="text"]:focus {
+    border-color: var(--brand);
+    outline: none;
+}
+
+.ttv2-label {
+    font: 650 11px/1.3 var(--sans);
+    letter-spacing: 0.08em;
+    color: var(--faint);
+}
+
+/* Lists scroll inside: a quiet dark scrollbar, not the browser's white one. */
+.ttv2-panel * {
+    scrollbar-width: thin;
+    scrollbar-color: #3a3d45 transparent;
+}
+
+.ttv2-head {
+    height: 40px;
+    gap: 6px;
+    padding: 0 8px 0 14px;
+    background: var(--rail);
+}
+
+.ttv2-title {
+    font: 400 15px/1.2 var(--serif);
+    letter-spacing: 0;
+    color: var(--text);
+    text-shadow: none;
+}
+
+.ttv2-mini {
+    font: 600 12px var(--sans);
+}
+
+.ttv2-panel button.ttv2-icon {
+    height: 26px;
+    border-radius: 7px;
+    color: var(--text2);
+}
+
+.ttv2-panel button.ttv2-icon:hover:not(:disabled) {
+    background: var(--hover);
+}
+
+.ttv2-panel button.ttv2-scan {
+    height: 26px;
+    padding: 0 10px;
+    color: var(--on-profit);
+    background: var(--profit);
+    border-color: transparent;
+    font-weight: 650;
+}
+
+.ttv2-panel button.ttv2-scan:hover:not(:disabled) {
+    background: #86e594;
+    border-color: transparent;
+}
+
+.ttv2-panel button.ttv2-sell {
+    height: 26px;
+    padding: 0 10px;
+    background: transparent;
+    border-color: rgba(143, 155, 255, 0.45);
+    color: var(--brand);
+}
+
+@keyframes ttv2-pulse {
+    0% { box-shadow: 0 0 0 0 rgba(111, 220, 127, 0.6); }
+    100% { box-shadow: 0 0 0 8px rgba(111, 220, 127, 0); }
+}
+
+.ttv2-bar {
+    padding: 10px 14px;
+}
+
+.ttv2-dot {
+    width: 7px;
+    height: 7px;
+}
+
+.ttv2-seller {
+    padding: 8px 14px;
+}
+
+.ttv2-chips {
+    gap: 6px;
+    padding: 10px 14px;
+}
+
+.ttv2-panel button.ttv2-chip {
+    height: 26px;
+    padding: 0 10px;
+    border-radius: 999px;
+    font-weight: 500;
+    background: transparent;
+    border-color: var(--line2);
+    color: var(--text2);
+}
+
+.ttv2-panel button.ttv2-chip[aria-pressed="true"] {
+    color: var(--profit);
+    border-color: var(--profit-line);
+    background: var(--profit-bg);
+}
+
+.ttv2-panel button.ttv2-chip-set {
+    color: var(--text);
+    border-color: var(--line2);
+    background: var(--raised);
+}
+
+.ttv2-panel input.ttv2-chip-input {
+    height: 26px;
+    border-radius: 999px;
+    border-color: var(--brand);
+}
+
+.ttv2-panel button.ttv2-chip-any {
+    color: var(--text);
+    background: var(--raised);
+}
+
+.ttv2-chip-note {
+    padding: 0 14px 8px;
+}
+
+.ttv2-tabs {
+    gap: 4px;
+    padding: 0 14px;
+}
+
+.ttv2-panel button.ttv2-tab {
+    height: 34px;
+    padding: 0 10px;
+    margin-bottom: -1px;
+    border: 0;
+    border-bottom: 2px solid transparent;
+    border-radius: 0;
+    background: transparent;
+    color: var(--muted);
+    font-weight: 500;
+}
+
+.ttv2-panel button.ttv2-tab:hover:not(:disabled) {
+    background: transparent;
+    color: var(--text);
+}
+
+.ttv2-panel button.ttv2-tab.ttv2-tab-on {
+    background: transparent;
+    color: var(--text);
+    font-weight: 600;
+    box-shadow: none;
+    border-bottom-color: var(--profit);
+}
+
+.ttv2-credit {
+    padding-bottom: 0;
+    font-size: 11px;
+    color: var(--faint);
+}
+
+.ttv2-list {
+    padding: 4px 8px 8px;
+}
+
+.ttv2-cols {
+    padding: 10px 14px 4px;
+}
+
+.ttv2-row {
+    padding: 10px;
+    margin-bottom: 4px;
+    background: rgba(255, 255, 255, 0.025);
+    border: 1px solid transparent;
+    border-radius: 10px;
+    transition: background-color 0.15s var(--ease);
+}
+
+.ttv2-row:hover {
+    background: var(--raised);
+}
+
+.ttv2-row.ttv2-onpage {
+    border-color: var(--profit-line);
+    background: rgba(111, 220, 127, 0.05);
+}
+
+.ttv2-row-name {
+    font-weight: 600;
+}
+
+.ttv2-row-profit {
+    font: 650 15px var(--sans);
+    font-variant-numeric: tabular-nums;
+}
+
+.ttv2-row-details b {
+    color: var(--text2);
+    font-weight: 500;
+}
+
+.ttv2-status::before {
+    width: 7px;
+    height: 7px;
+}
+
+.ttv2-panel button.ttv2-go {
+    height: 26px;
+    padding: 0 12px;
+    font-weight: 650;
+    color: var(--text);
+}
+
+.ttv2-empty-text {
+    color: var(--muted);
+}
+
+/* The trade being worked on Torn's trade page, and the buying run. */
+.ttv2-tradebox {
+    padding: 12px;
+    border: 1px solid var(--line2);
+    border-radius: 12px;
+    background: var(--raised);
+}
+
+.ttv2-panel > .ttv2-tradebox {
+    margin: 10px;
+}
+
+.ttv2-buybox {
+    border-color: var(--buy-line);
+    background: var(--buy-bg);
+}
+
+.ttv2-buybox .ttv2-tb-head > b {
+    color: var(--buy);
+}
+
+.ttv2-buybox .ttv2-sub {
+    color: #cdd2db;
+}
+
+.ttv2-panel button.ttv2-buynext {
+    min-height: 32px;
+    border-radius: 10px;
+    background: var(--buy);
+    color: var(--on-buy);
+    border-color: transparent;
+}
+
+.ttv2-panel button.ttv2-buynext:hover:not(:disabled) {
+    background: #77b7ff;
+    border-color: transparent;
+}
+
+.ttv2-panel button.ttv2-linkbtn {
+    color: var(--muted);
+    text-decoration: none;
+    font-weight: 500;
+}
+
+.ttv2-panel button.ttv2-linkbtn:hover:not(:disabled) {
+    background: none;
+    color: var(--text);
+}
+
+.ttv2-tb-mark {
+    color: var(--profit);
+}
+
+.ttv2-tb-fillnote {
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px solid var(--line);
+    font-size: 12px;
+    color: var(--warn);
+}
+
+.ttv2-tb-fillnote.ttv2-tb-fillnote-ok {
+    color: var(--text2);
+}
+
+/* My bazaar */
+.ttv2-panel button.ttv2-bzrow {
+    border-radius: 8px;
+}
+
+.ttv2-panel button.ttv2-bzrow[aria-pressed="true"] {
+    background: var(--raised);
+    border-color: var(--line2);
+}
+
+.ttv2-bzhero h3 {
+    font: 400 16px/1.25 var(--serif);
+    color: var(--text);
+}
+
+.ttv2-bzavg {
+    font: 650 20px/1.2 var(--sans);
+}
+
+.ttv2-graph {
+    background: var(--rail);
+    border-radius: 10px;
+}
+
+.ttv2-graph-tip {
+    background: rgba(17, 18, 21, 0.94);
+    border-radius: 8px;
+}
+
+.ttv2-graph-marklabel {
+    font: 600 11px var(--sans);
+}
+
+.ttv2-graph-keys {
+    flex-wrap: wrap;
+    gap: 4px 14px;
+}
+
+.ttv2-fillnow {
+    padding: 12px;
+    border-radius: 10px;
+    background: var(--raised);
+    border-color: var(--line2);
+}
+
+.ttv2-fillnow-done {
+    border-color: var(--profit-line);
+}
+
+.ttv2-tos-box {
+    border-radius: 10px;
+    background: var(--raised);
+}
+
+/* The serif title reads small at the narrow steps' sans sizes: one step up (still measured to fit). */
+.ttv2-panel.ttv2-narrow .ttv2-head .ttv2-title {
+    font-size: 13px;
+}
+
+.ttv2-panel.ttv2-tight .ttv2-head .ttv2-title {
+    font-size: 12px;
+}
+
+.ttv2-panel.ttv2-tighter .ttv2-tabs {
+    gap: 0;
+}
+
+.ttv2-panel.ttv2-tighter button.ttv2-tab {
+    padding: 0 3px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .ttv2-panel *,
+    .ttv2-panel *::before,
+    .ttv2-panel *::after {
+        animation: none !important;
+        transition: none !important;
+    }
 }
 `;
 

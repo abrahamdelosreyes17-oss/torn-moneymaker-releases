@@ -166,8 +166,10 @@ export function isTypingTarget(event) {
 
 /** The panel's usual width. */
 const PANEL_WIDTH = 430;
-/** It fits beside Torn's content when at least this much room is there. */
-const FIT_MIN_WIDTH = 240;
+/** It fits beside Torn's content when at least this much room is there (3.20: 240 before - 230px of room floated it, 430 wide, over Torn). */
+const FIT_MIN_WIDTH = 200;
+/** With less room than that, its smallest size: it covers as little of Torn as it can. */
+const FIT_SMALLEST = 240;
 /** Space kept between it and Torn's content, and the window edge. */
 const FIT_GAP = 8;
 /** Narrower than this, the header takes two rows instead of cutting anything. */
@@ -937,10 +939,11 @@ export class Panel {
         this.tradeSig = sig;
         box.textContent = '';
         box.style.display = show ? '' : 'none';
-        if (!show) return;
+        this.tradeShown = show;
+        if (!show) return this.renderFillNote();
         if (ctx.match === 'other') {
             box.appendChild(el('div', { class: 'ttv2-tb-warn', text: 'This trade is with ' + ctx.partner + '. The trade you accepted is with ' + (ctx.wanted || []).join(', ') + '.' }));
-            return;
+            return this.renderFillNote();
         }
         for (const t of list) {
             const need = ctx.need && list.length === 1 ? ctx.need : t.items.map((i) => ({ name: i.name, qty: i.units, inside: 0 }));
@@ -977,6 +980,40 @@ export class Panel {
             if (ctx.waiting && ctx.waiting.length && list.length === 1) block.appendChild(el('div', { class: 'ttv2-sub', text: 'Not bought yet: ' + ctx.waiting.join(', ') }));
             box.appendChild(block);
         }
+        this.renderFillNote();
+    }
+
+    /**
+     * Fill's line on Torn's trade page - what it marked, or why nothing
+     * (3.20): at the foot of the trade box. It was a line added after Torn's
+     * ADD TO TRADE, and Torn's pages get nothing that takes room.
+     *
+     * @param {{text: string, ok?: boolean}|null} n
+     */
+    setFillNote(n) {
+        const key = n ? JSON.stringify([n.text, Boolean(n.ok)]) : '';
+        if (key === this.fillNoteKey) return;
+        this.fillNoteKey = key;
+        this.fillNote = n || null;
+        this.renderFillNote();
+    }
+
+    renderFillNote() {
+        const box = this.tradeBoxEl;
+        if (!box) return;
+        let line = box.querySelector(':scope > .ttv2-tb-fillnote');
+        const n = this.fillNote;
+        if (!n) {
+            if (line) line.remove();
+            if (!this.tradeShown) box.style.display = 'none';
+            return;
+        }
+        if (!line) line = el('div', { class: 'ttv2-tb-fillnote' });
+        if (line !== box.lastElementChild) box.appendChild(line);
+        const cls = 'ttv2-tb-fillnote' + (n.ok ? ' ttv2-tb-fillnote-ok' : '');
+        if (line.className !== cls) line.className = cls;
+        if (line.textContent !== n.text) line.textContent = n.text;
+        box.style.display = '';
     }
 
     /**
@@ -1053,7 +1090,7 @@ export class Panel {
         }
         // "Not here" only when it is not: a listing further down a long bazaar is still here.
         const notHere = v.here && !v.here.listed && !['below', 'searching', 'away'].includes(v.here.where);
-        const label = v.here && (!v.next || v.last) ? 'Done - go to the trade' : notHere ? 'Not here - next' : v.here && v.same ? 'Next item here' : v.here ? 'Next bazaar' : 'Open the next bazaar' + (v.next ? ': ' + v.next.seller : '');
+        const label = v.here && (!v.next || v.last) ? 'Done - go to the trade' : notHere ? 'Not here - next' : v.here && v.same ? 'Next item here' : v.here ? 'Next bazaar' : 'Open the next bazaar' + (v.next && v.next.seller ? ': ' + v.next.seller : '');
         this.buyNextBtn = el('button', { type: 'button', class: 'ttv2-primary ttv2-buynext', title: this.buyHereActive ? 'Key: N' : null, onclick: () => this.handlers.onBuyNext && this.handlers.onBuyNext() }, [label, this.buyHereActive ? el('span', { class: 'ttv2-kbd', text: 'N' }) : null]);
         box.appendChild(this.buyNextBtn);
         box.appendChild(this.cancelTradePart(v, () => this.setBuying(v)));
@@ -1277,7 +1314,9 @@ export class Panel {
      * page itself is never touched. Where that space is narrower than usual,
      * the header, the filter chips and the tabs stay one row each, in smaller
      * steps of type and spacing - nothing is cut short. With less than
-     * FIT_MIN_WIDTH of room (a very narrow window), it floats as it always did.
+     * FIT_MIN_WIDTH of room (a very narrow window) there is nowhere it would
+     * not cover Torn: it takes its smallest size at the window's edge, so it
+     * covers as little as it can (3.20; it floated at its full 430px).
      */
     fit() {
         if (!this.root) return;
@@ -1295,6 +1334,8 @@ export class Panel {
         if (rects.length && free >= FIT_MIN_WIDTH) {
             width = Math.min(PANEL_WIDTH, free);
             this.minLeft = Math.ceil(contentRight + FIT_GAP);
+        } else if (rects.length) {
+            width = FIT_SMALLEST;
         }
         this.root.style.setProperty('--fit-width', width + 'px');
 

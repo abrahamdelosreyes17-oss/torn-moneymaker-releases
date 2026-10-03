@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      3.19.0
+// @version      3.20.0
 // @description  Finds Bazaar and Item Market listings below NPC / market value - on the page you are viewing, and live from the Torn API and TornW3B - ranked by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -42,7 +42,7 @@
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '3.19.0';
+    const TTV2_BUILD_VERSION = '3.20.0';
 
     /* ===== src/platform/gm.js ===== */
     /*
@@ -3507,7 +3507,7 @@
             units: p.units,
             cost: p.cost,
             profit: p.profit,
-            steps: p.steps.map(({ sellerId, sellerName, qty, price }) => ({ sellerId, sellerName, qty, price })),
+            steps: p.steps.map(({ sellerId, sellerName, qty, price, dataAt }) => ({ sellerId, sellerName, qty, price, dataAt })),
             stops: p.stops,
             each: bid - under[0].price,
             firstPrice: under[0].price,
@@ -5982,6 +5982,55 @@
         return null;
     }
 
+    /*
+     * Bazaar prices (3.20, the owner: "make it live in settings where they can
+     * change up to 10 mins"): how often each group's bazaars are read again, in
+     * whole minutes, 1 to 10 - the item on the desk and the trade you work on,
+     * the top flips, the other possible flips. Everything else (price lists,
+     * every-buyer lists, near misses, the sweep) has what is left.
+     */
+    const FRESH_MIN = 1;
+    const FRESH_MAX = 10;
+    const FRESH_TOP = 20;
+    const FRESH_DEFAULTS = { desk: 1, top: 2, other: 10 };
+    /* Reads a minute kept for the rest: price lists, buyers, the summary. */
+    const FRESH_REST_PER_MIN = 15;
+
+    /** A minutes setting as a whole number from 1 to 10, else its default. */
+    function freshMinutes(value, fallback) {
+        const n = Math.round(Number(value));
+        return Number.isFinite(n) && n >= FRESH_MIN && n <= FRESH_MAX ? n : fallback;
+    }
+
+    /** The three groups' re-read times in ms, from Torn Bids' prefs. */
+    function freshnessMs(prefs = {}) {
+        const m = 60 * 1000;
+        return {
+            desk: freshMinutes(prefs.freshDeskMin, FRESH_DEFAULTS.desk) * m,
+            top: freshMinutes(prefs.freshTopMin, FRESH_DEFAULTS.top) * m,
+            other: freshMinutes(prefs.freshOtherMin, FRESH_DEFAULTS.other) * m,
+        };
+    }
+
+    /**
+     * Can these settings keep up? Reads a minute each group wants, against the
+     * budget less what the rest keeps. When they cannot, the desk and the top
+     * flips still come first (nextW3bRead's order), so the other flips wait:
+     * `otherEvery` is how often they would be read instead, in minutes (null
+     * when there is no room for them at all).
+     *
+     * @param {{desk: number, top: number, other: number}} minutes
+     * @param {{desk: number, top: number, other: number}} counts - items in each group
+     * @param {number} budget - reads a minute in view
+     */
+    function keepsUp(minutes, counts, budget = 60) {
+        const want = counts.desk / minutes.desk + counts.top / minutes.top + counts.other / minutes.other;
+        const room = budget - FRESH_REST_PER_MIN;
+        if (want <= room) return { ok: true, want, otherEvery: minutes.other };
+        const left = room - counts.desk / minutes.desk - counts.top / minutes.top;
+        return { ok: false, want, otherEvery: left >= 1 && counts.other > 0 ? Math.ceil(counts.other / left) : null };
+    }
+
     /* ===== src/core/usage.js ===== */
     /*
      * API use (3.15, the owner: "I need to see the usage with a graph, so we're
@@ -6447,18 +6496,6 @@
         return m ? m[1] : null;
     }
 
-    /**
-     * Where the Fill button goes in a row: after our price tag on the bazaar
-     * pages (the tag follows the name), before the price box on the Item Market.
-     */
-    function fillAnchor(page, row) {
-        if (page === 'market-add' || page === 'market-view') {
-            const wrap = row.el.querySelector('[class*="priceInputWrapper___"]');
-            return wrap ? { parent: wrap.parentNode, before: wrap } : { parent: row.el, before: null };
-        }
-        return null;
-    }
-
     /* ===== src/sources/dom/trade.js ===== */
     /*
      * Torn's trade page (trade.php), read only. Markup read on the owner's real
@@ -6629,9 +6666,18 @@
         if (!panel || !panel.width) return { x: viewW - 16 - width, y: 64 };
         const above = panel.top - 8 - height;
         if (above >= 8) return { x: panel.right - width, y: above };
+        // Room above for a few lines (3.20): above it all the same, its list
+        // scrolling inside - beside the panel is over Torn's page in a window
+        // whose only free space is the panel's column.
+        if (panel.top - 16 >= ABOVE_MIN) return { x: panel.right - width, y: 8, maxHeight: panel.top - 16 };
         if (panel.left - 8 - width >= 0) return { x: panel.left - 8 - width, y: Math.max(8, panel.top) };
         return { x: panel.right - width, y: 8 };
     }
+
+    /* The least height worth starting above NPC Arbitrage in (its title and two lines). */
+    const ABOVE_MIN = 140;
+    /* Its usual width; in a narrower free column it takes the panel's width. */
+    const WINDOW_WIDTH = 300;
 
     /**
      * The window fits the screen (3.16; the owner: the Checkout list could not
@@ -6693,21 +6739,24 @@
             if (!this.box) return;
             const viewW = document.documentElement.clientWidth || window.innerWidth;
             const viewH = window.innerHeight;
-            const width = this.box.offsetWidth || 300;
+            const panel = this.h.panelRect ? this.h.panelRect() : null;
+            // No wider than NPC Arbitrage when it sits in a narrower free column (3.20).
+            const want = panel && panel.width > 0 && panel.width < WINDOW_WIDTH ? Math.round(panel.width) + 'px' : '';
+            if (this.box.style.width !== want) this.box.style.width = want;
+            this.box.style.maxHeight = '';
+            const width = this.box.offsetWidth || WINDOW_WIDTH;
             let p = this.pos;
             if (!p) {
                 // Right-aligned with NPC Arbitrage, ending just above it (mockup B): the
                 // free space right of Torn's content, never on Torn's own page by itself.
-                const panel = this.h.panelRect ? this.h.panelRect() : null;
                 p = windowStart(panel, { width, height: this.box.offsetHeight || 200, viewW });
             }
             const c = clampWindowPos(p.x, p.y, { width, height: this.box.offsetHeight, viewW, viewH });
             // Its whole height on screen when it fits; else the list scrolls inside (3.16).
-            this.box.style.maxHeight = '';
-            const fit = fitWindow(c.y, { height: this.box.offsetHeight, viewH });
+            const fit = fitWindow(c.y, { height: Math.min(this.box.offsetHeight, p.maxHeight || Infinity), viewH });
             this.box.style.left = c.x + 'px';
             this.box.style.top = fit.y + 'px';
-            this.box.style.maxHeight = fit.maxHeight + 'px';
+            this.box.style.maxHeight = Math.min(fit.maxHeight, p.maxHeight || Infinity) + 'px';
         }
 
         /** Dragged by its title bar: anywhere on the page, kept for next time. */
@@ -6943,68 +6992,71 @@
     :host { all: initial; }
     * { box-sizing: border-box; }
     .bw {
-        --bg: #2e2e2e; --row: #2b2b2b; --line: #444; --text: #ddd; --muted: #b3b3b3; --profit: #99cc00;
-        --buy: #4dabf7; --orange: #ff9f43; --red: #ff8a80; --warn: #f0a020;
+        --bg: #1c1e23; --rail: #16171b; --row: #24272e; --line: #2c2f36; --line2: #3a3d45; --text: #f2f4f8; --muted: #a9b0bd; --faint: #6a7180; --profit: #6fdc7f;
+        --buy: #5aa7ff; --buy-bg: rgba(90, 167, 255, 0.12); --buy-line: rgba(90, 167, 255, 0.45); --orange: #ff9f43; --red: #ff7b6e; --warn: #f6b74a;
+        --serif: Georgia, "Iowan Old Style", "Times New Roman", serif;
         position: fixed; z-index: 2147483001; width: 300px; max-width: calc(100vw - 16px); max-height: calc(100vh - 16px);
         display: flex; flex-direction: column; background: var(--bg); color: var(--text);
-        border: 1px solid var(--buy); border-radius: 4px; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
-        font: 13px/1.4 Arial, Helvetica, sans-serif;
+        border: 1px solid var(--buy-line); border-radius: 14px; box-shadow: 0 1px 2px rgba(0, 0, 0, 0.35), 0 12px 32px rgba(0, 0, 0, 0.35); overflow: hidden;
+        font: 13px/1.5 "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif; -webkit-font-smoothing: antialiased;
     }
     .bw.bw-drag { opacity: 0.92; }
-    .bw-hd { display: flex; align-items: center; gap: 4px; min-height: 30px; padding: 4px 4px 4px 12px; cursor: move; user-select: none;
-        background: repeating-linear-gradient(90deg, #242424 0 2px, #2e2e2e 0 4px); border-bottom: 1px solid var(--line); touch-action: none; }
+    .bw-hd { display: flex; align-items: center; gap: 6px; min-height: 38px; padding: 4px 8px 4px 14px; cursor: move; user-select: none;
+        background: var(--rail); border-bottom: 1px solid var(--line); touch-action: none; }
     .bw-folded .bw-hd { border-bottom: 0; }
-    .bw-ti { flex: 1; min-width: 0; font-weight: bold; color: #fff; overflow-wrap: anywhere; }
-    .bw-mini { font-weight: normal; color: var(--profit); }
-    .bw-ic { width: 24px; height: 24px; padding: 0; border: 1px solid transparent; border-radius: 4px; background: transparent; color: var(--text); font: 15px/22px Arial, Helvetica, sans-serif; cursor: pointer; }
-    .bw-ic:hover { border-color: var(--line); }
+    .bw-ti { flex: 1; min-width: 0; font: 400 14px/1.3 var(--serif); color: var(--text); overflow-wrap: anywhere; }
+    .bw-mini { font: 400 12px "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif; color: var(--muted); font-variant-numeric: tabular-nums; }
+    .bw-ic { width: 26px; height: 26px; padding: 0; border: 1px solid transparent; border-radius: 7px; background: transparent; color: var(--text); font: 15px/22px "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif; cursor: pointer; }
+    .bw-ic:hover { background: #2b2f37; }
     .bw-ic:focus-visible { outline: 2px solid var(--profit); outline-offset: 1px; }
-    .bw-body { padding: 8px 12px 10px; flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
+    .bw-body { padding: 12px 14px; scrollbar-width: thin; scrollbar-color: #3a3d45 transparent; flex: 1 1 auto; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
     .bw-hd { flex: 0 0 auto; }
     .bw-log { font-size: 12px; color: var(--warn); margin: -2px 0 6px; }
     .bw-log.bw-log-ok { color: var(--muted); }
-    .bw-fold { width: 100%; text-align: left; color: var(--text); font: 13px/1.4 Arial, Helvetica, sans-serif; cursor: pointer; }
+    .bw-fold { width: 100%; text-align: left; color: var(--text); font: 13px/1.4 "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif; cursor: pointer; border-radius: 10px; }
     .bw-fold:hover { border-color: var(--buy); }
     .bw-fold:focus-visible { outline: 2px solid var(--profit); outline-offset: 1px; }
     .bw-fold .bw-n { color: var(--muted); }
     .bw-fold-back { display: block; margin: 0 0 6px auto; }
     .bw-hold { flex: 1 1 100%; margin: 0; padding-left: 16px; font-size: 12px; }
     .bw-hold li { margin: 2px 0; overflow-wrap: anywhere; }
-    .bw-hold b { color: #fff; }
+    .bw-hold b { color: var(--text); }
     .bw-g { color: var(--profit); }
     .bw-mute { color: var(--muted); }
     .bw-since { font-size: 12px; color: var(--muted); margin-bottom: 6px; }
     .bw-empty { margin: 0; font-size: 12px; color: var(--muted); }
-    .bw-it { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 8px; padding: 6px 8px; margin-bottom: 6px;
-        background: var(--row); border: 1px solid var(--line); border-left: 3px solid var(--buy); border-radius: 4px; }
-    .bw-it.bw-extra { border-left-color: var(--orange); }
-    .bw-it.bw-loss { border-left-color: var(--red); }
+    .bw-it { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 8px; padding: 8px 10px; margin-bottom: 6px;
+        background: var(--row); border: 0; box-shadow: inset 3px 0 0 var(--buy); border-radius: 10px; }
+    .bw-it.bw-extra { box-shadow: inset 3px 0 0 var(--orange); }
+    .bw-it.bw-loss { box-shadow: inset 3px 0 0 var(--red); }
     .bw-n { min-width: 0; overflow-wrap: anywhere; }
-    .bw-n b { color: #fff; }
+    .bw-n b { color: var(--text); font-weight: 600; }
     .bw-tag { margin-left: 6px; font-size: 11px; font-weight: bold; color: var(--orange); white-space: nowrap; }
     .bw-loss .bw-tag { color: var(--red); }
-    .bw-p { text-align: right; font-weight: bold; color: var(--profit); font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .bw-p { text-align: right; font-weight: 650; color: var(--profit); font-variant-numeric: tabular-nums; white-space: nowrap; }
     .bw-p.bw-neg, .bw-neg { color: var(--red); }
     .bw-d { grid-column: 1 / -1; font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
     .bw-ck { display: block; font-size: 11px; }
     .bw-in { color: var(--profit); }
     .bw-miss { color: var(--warn); }
-    .bw-tot { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 8px; margin-top: 8px; padding-top: 6px; border-top: 1px solid var(--line); font-size: 12px; }
+    .bw-tot { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 8px; margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--line); font-size: 12px; }
     .bw-tot span { color: var(--muted); }
     .bw-tot b { text-align: right; font-variant-numeric: tabular-nums; }
-    .bw-tot b.bw-g { color: var(--profit); font-size: 15px; }
+    .bw-tot b.bw-g { color: var(--profit); font-size: 15px; font-weight: 650; }
     .bw-todo { margin: 8px 0 0; font-size: 12px; color: var(--buy); }
-    .bw-warn { margin: 8px 0 0; font-size: 12px; font-weight: bold; color: var(--warn); }
-    .bw-ok { margin: 8px 0 0; font-size: 12px; font-weight: bold; color: var(--profit); }
+    .bw-warn { margin: 8px 0 0; font-size: 12px; font-weight: 600; color: var(--warn); }
+    .bw-ok { margin: 8px 0 0; font-size: 12px; font-weight: 600; color: var(--profit); }
     .bw-cancel { margin-top: 8px; text-align: right; }
-    .bw-sec { display: flex; justify-content: space-between; margin: 8px 0 6px; font-size: 11px; font-weight: bold; letter-spacing: 0.5px; text-transform: uppercase; color: var(--muted); }
+    .bw-sec { display: flex; justify-content: space-between; margin: 10px 0 6px; font: 650 10px/1.4 "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif; letter-spacing: 0.08em; text-transform: uppercase; color: var(--faint); }
+    .bw-sec > :last-child { letter-spacing: 0; text-transform: none; font-weight: 500; font-size: 11px; }
     .bw-sec:first-of-type { margin-top: 2px; }
     .bw-sec .bw-g { color: var(--profit); }
-    .bw-cart { display: grid; grid-template-columns: 18px minmax(0, 1fr) auto; gap: 2px 8px; align-items: baseline; padding: 6px 8px; margin-bottom: 4px; background: var(--row); border: 1px solid var(--line); border-radius: 4px; }
+    .bw-cart { display: grid; grid-template-columns: 18px minmax(0, 1fr) auto; gap: 2px 8px; align-items: baseline; padding: 8px 10px; margin-bottom: 6px; background: var(--row); border: 1px solid transparent; border-radius: 10px; }
     .bw-cart .bw-d { grid-column: 2 / -1; }
-    .bw-cart-here { border-color: var(--buy); box-shadow: inset 3px 0 0 var(--buy); }
+    .bw-cart-here { border-color: var(--buy-line); background: var(--buy-bg); }
     .bw-cart-done .bw-n, .bw-cart-skipped .bw-n { color: var(--muted); }
-    .bw-cart-done .bw-n b, .bw-cart-skipped .bw-n b { color: var(--muted); text-decoration: line-through; }
+    .bw-cart-done .bw-n b, .bw-cart-skipped .bw-n b { color: var(--muted); }
+    .bw-cart-skipped { opacity: 0.6; }
     .bw-mark { font-weight: bold; text-align: center; }
     .bw-m-todo { color: var(--muted); }
     .bw-m-here { color: var(--buy); }
@@ -7017,10 +7069,10 @@
     .bw-open:hover { text-decoration: underline; }
     .bw-cancel.bw-ask { display: flex; flex-wrap: wrap; gap: 6px; text-align: left; }
     .bw-cancel.bw-ask .bw-warn { flex: 1 1 100%; margin: 0; }
-    .bw-link { padding: 0; border: 0; background: none; color: var(--muted); font: 12px Arial, Helvetica, sans-serif; text-decoration: underline; cursor: pointer; }
+    .bw-link { padding: 0; border: 0; background: none; color: var(--muted); font: 12px "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif; cursor: pointer; }
     .bw-link:hover { color: var(--text); }
-    .bw-btn { flex: 1; min-height: 26px; padding: 3px 8px; border: 1px solid var(--line); border-radius: 4px; background: #3a3a3a; color: var(--text); font: 12px Arial, Helvetica, sans-serif; cursor: pointer; }
-    .bw-btn:hover { border-color: var(--buy); }
+    .bw-btn { flex: 1; min-height: 28px; padding: 3px 10px; border: 1px solid var(--line2); border-radius: 8px; background: var(--row); color: var(--text); font: 12px "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif; cursor: pointer; }
+    .bw-btn:hover { background: #2b2f37; }
     .bw-link:focus-visible, .bw-btn:focus-visible { outline: 2px solid var(--profit); outline-offset: 1px; }
     `;
 
@@ -11786,6 +11838,182 @@
         return { listings, diagnostics };
     }
 
+    /* ===== src/sources/dom/float.js ===== */
+    /*
+     * Marks on Torn's pages take no room (3.20, the owner: "it shouldn't resize
+     * a row, add columns etc. it should just sit at the side or on top like a
+     * bring to front").
+     *
+     * A mark is taken out of the line (absolutely placed, .ttv2-float in
+     * styles.js), so the Torn element it sits in keeps its size, its padding and
+     * its wrapping. Where that element is a block of text, the mark stays just
+     * after what comes before it - its static position - with no measuring at
+     * all. Where it lays its children out as a row or a grid, that position
+     * would be the element's start, over Torn's own content: there the mark is
+     * placed after the element before it, by measure.
+     *
+     * Only our own marks and Torn's element's `position` are ever written (and
+     * that only from static to relative, which moves nothing).
+     */
+
+    const FLOAT_CLASS = 'ttv2-float';
+    /* The group of prices and Fill floating in a row of your bazaar's manage page or the Item Market's. */
+    const ROW_FLOAT_CLASS = 'ttv2-rowfloat';
+    /* Torn's element we made a containing block (static -> relative). */
+    const POSITIONED_FLAG = 'ttv2Pos';
+
+    function viewOf(el) {
+        return (el && el.ownerDocument && el.ownerDocument.defaultView) || null;
+    }
+
+    /** Make Torn's element the containing block of our marks: relative only when it was static. */
+    function holdMarks(el) {
+        const view = viewOf(el);
+        if (!el || !view || el.dataset[POSITIONED_FLAG]) return;
+        if (view.getComputedStyle(el).position === 'static') {
+            el.style.position = 'relative';
+            el.dataset[POSITIONED_FLAG] = '1';
+        }
+    }
+
+    /** Torn's element as it was, once our marks in it are gone. */
+    function releaseMarks(el) {
+        if (!el || !el.dataset || !el.dataset[POSITIONED_FLAG]) return;
+        el.style.removeProperty('position');
+        delete el.dataset[POSITIONED_FLAG];
+    }
+
+    /** The element before `mark` that is Torn's, not one of ours. */
+    function tornBefore(mark) {
+        let prev = mark.previousElementSibling;
+        while (prev && /(^|\s)ttv2-/.test(String(prev.className || ''))) prev = prev.previousElementSibling;
+        return prev;
+    }
+
+    /**
+     * Float `mark` where it sits in its parent: after what comes before it, out
+     * of the line. Cheap when the parent is a block (one style read); measured
+     * when it is a row or a grid. Writes only what changed.
+     */
+    function placeFloat(mark) {
+        if (!mark) return;
+        if (!mark.classList.contains(FLOAT_CLASS)) mark.classList.add(FLOAT_CLASS);
+        const parent = mark.parentElement;
+        const view = viewOf(mark);
+        if (!parent || !view) return;
+        const display = view.getComputedStyle(parent).display;
+        if (!/flex|grid/.test(display)) {
+            if (mark.style.left) mark.style.removeProperty('left');
+            if (mark.style.top) mark.style.removeProperty('top');
+            return;
+        }
+        holdMarks(parent);
+        const box = parent.getBoundingClientRect();
+        const prev = tornBefore(mark);
+        const r = prev ? prev.getBoundingClientRect() : { right: box.left + parent.clientLeft, top: box.top, height: box.height };
+        const left = Math.round(r.right - box.left - parent.clientLeft) + 'px';
+        const top = Math.round(r.top - box.top - parent.clientTop + (r.height - mark.offsetHeight) / 2) + 'px';
+        if (mark.style.left !== left) mark.style.left = left;
+        if (mark.style.top !== top) mark.style.top = top;
+    }
+
+    /**
+     * The group that floats in a row (your bazaar's manage page, the Item
+     * Market's rows): created at the row's end, the row made its containing
+     * block. Placed by fitRowFloats.
+     */
+    function rowFloat(rowEl, doc = document) {
+        let group = rowEl.querySelector(':scope > .' + ROW_FLOAT_CLASS);
+        if (!group) {
+            group = doc.createElement('span');
+            group.className = ROW_FLOAT_CLASS;
+            rowEl.appendChild(group);
+        }
+        holdMarks(rowEl);
+        return group;
+    }
+
+    /**
+     * Where each row's group goes: just left of Torn's first box in the row
+     * (the quantity or the price), centred on the row; with no box, at the row's
+     * right. Where it would cover the item's name, its prices give way and only
+     * Fill stays (data-tight) - the prices are in the panel's My bazaar too.
+     * All reads first, then all writes.
+     *
+     * @param {Array<{el: Element, nameEl?: Element}>} rows
+     */
+    function fitRowFloats(rows) {
+        const todo = [];
+        for (const row of rows || []) {
+            const group = row.el && row.el.querySelector(':scope > .' + ROW_FLOAT_CLASS);
+            if (!group || !group.firstChild) continue;
+            const rect = row.el.getBoundingClientRect();
+            if (!rect.width) continue;
+            const input = [...row.el.querySelectorAll('input')].find((i) => i.type !== 'hidden' && i.type !== 'checkbox' && i.getBoundingClientRect().width > 0);
+            const anchor = input ? input.closest('[class*="InputWrapper"], [class*="inputWrapper"], .input-money-group') || input : null;
+            const a = anchor ? anchor.getBoundingClientRect() : null;
+            const right = a && a.left > rect.left ? Math.round(rect.right - a.left + 8) : 8;
+            const nameEl = row.nameEl && row.nameEl !== row.el ? row.nameEl : null;
+            let nameRight = rect.left;
+            if (nameEl) {
+                const range = nameEl.ownerDocument.createRange();
+                range.selectNodeContents(nameEl);
+                const nr = range.getBoundingClientRect();
+                if (nr.width) nameRight = nr.right;
+            }
+            todo.push({ group, rect, right, nameRight });
+        }
+        for (const t of todo) {
+            const v = t.right + 'px';
+            if (t.group.style.getPropertyValue('--ttv2-fr') !== v) t.group.style.setProperty('--ttv2-fr', v);
+            if (t.group.dataset.tight) delete t.group.dataset.tight;
+        }
+        for (const t of todo) t.width = t.group.offsetWidth;
+        for (const t of todo) {
+            const left = t.rect.right - t.right - t.width;
+            if (left < t.nameRight + 8) t.group.dataset.tight = '1';
+        }
+    }
+
+    /** Every row group gone, and the rows given back as they were. */
+    function removeRowFloats(root = document) {
+        for (const g of root.querySelectorAll('.' + ROW_FLOAT_CLASS)) {
+            const row = g.parentElement;
+            g.remove();
+            if (row && !row.querySelector('.' + ROW_FLOAT_CLASS + ', .ttv2-float')) releaseMarks(row);
+        }
+    }
+
+    /*
+     * Fill's result beside Torn's page for a few seconds (3.20): it used to be a
+     * line added under the row. Fixed in the window, in the free space right of
+     * the row when there is some, else just above the row; it catches no click.
+     */
+    const TOAST_CLASS = 'ttv2-toast';
+    const TOAST_MS = 4500;
+
+    function showToast(rowEl, text, level = '', doc = document) {
+        const view = viewOf(rowEl) || (doc && doc.defaultView);
+        if (!view || !text) return null;
+        for (const old of doc.querySelectorAll('.' + TOAST_CLASS)) old.remove();
+        const toast = doc.createElement('div');
+        toast.className = TOAST_CLASS;
+        toast.setAttribute('role', 'status');
+        if (level) toast.dataset.level = level;
+        toast.textContent = text;
+        doc.body.appendChild(toast);
+        const r = rowEl && rowEl.getBoundingClientRect ? rowEl.getBoundingClientRect() : { left: 16, right: 16, top: 16, bottom: 16 };
+        const w = toast.offsetWidth;
+        const h = toast.offsetHeight;
+        const room = view.innerWidth - r.right - 16;
+        const left = room >= w ? r.right + 12 : Math.max(8, Math.min(view.innerWidth - w - 8, r.right - w));
+        const top = room >= w ? Math.max(8, Math.min(view.innerHeight - h - 8, r.top)) : Math.max(8, r.top - h - 6);
+        toast.style.left = Math.round(left) + 'px';
+        toast.style.top = Math.round(top) + 'px';
+        view.setTimeout(() => toast.remove(), TOAST_MS);
+        return toast;
+    }
+
     /* ===== src/sources/dom/ownbazaar.js ===== */
     /*
      * Reading the rows of YOUR OWN bazaar's add-listings and manage-listings
@@ -11801,6 +12029,7 @@
      * market scanner does. Only the page you are viewing is read; nothing is
      * clicked, filled in or listed for you.
      */
+
 
 
 
@@ -11870,20 +12099,24 @@
 
     /**
      * The tag element in a row, created if missing. Text is set by the caller.
-     * Paint-only: a span AFTER the name element (never inside it, so the name
-     * still reads as the name on the next scan); never a form field, never a
-     * click on Torn's controls. The row's item id is kept on the tag, so a
-     * click reads the item of the row as it is NOW: #/manage is a virtualised
-     * list whose row elements are reused for other items as you scroll.
+     * Paint-only: a span in the row's floating group (3.20, float.js), never in
+     * the row's line and never inside the name element (so the name still reads
+     * as the name on the next scan); never a form field, never a click on
+     * Torn's controls. The row's item id is kept on the tag, so a click reads
+     * the item of the row as it is NOW: #/manage is a virtualised list whose
+     * row elements are reused for other items as you scroll.
      */
     function ensureRowTag(row, doc = document) {
         let tag = row.el.querySelector('.' + OWN_BAZAAR_TAG_CLASS);
+        if (tag && !(tag.parentElement && tag.parentElement.classList.contains(ROW_FLOAT_CLASS))) {
+            // One an older version put after the name goes: it took a line of the row.
+            tag.remove();
+            tag = null;
+        }
         if (!tag) {
             tag = doc.createElement('span');
             tag.className = OWN_BAZAAR_TAG_CLASS;
-            const nameEl = row.nameEl && row.nameEl !== row.el ? row.nameEl : null;
-            if (nameEl && nameEl.parentNode) nameEl.parentNode.insertBefore(tag, nameEl.nextSibling);
-            else row.el.appendChild(tag);
+            rowFloat(row.el, doc).appendChild(tag);
         }
         if (tag.dataset.itemId !== String(row.itemId)) tag.dataset.itemId = String(row.itemId);
         return tag;
@@ -11891,6 +12124,7 @@
 
     function removeRowTags(root = document) {
         for (const t of root.querySelectorAll('.' + OWN_BAZAAR_TAG_CLASS)) t.remove();
+        removeRowFloats(root);
     }
 
     /* ===== src/core/fill.js ===== */
@@ -12297,27 +12531,27 @@
     /** The form's look, for the panel's and Torn Bids' stylesheets alike (their tokens). */
     const FILL_FORM_CSS = `
     .tf-form { display: flex; flex-direction: column; gap: 12px; }
-    .tf-block { display: flex; flex-direction: column; gap: 8px; padding: 12px; border: 1px solid var(--line, #444); border-radius: 8px; background: rgba(0, 0, 0, 0.18); }
-    .tf-title { font-weight: bold; color: #fff; font-size: 13px; }
+    .tf-block { display: flex; flex-direction: column; gap: 10px; padding: 12px; border: 1px solid var(--line, #2c2f36); border-radius: 12px; background: var(--raised, #24272e); }
+    .tf-title { font: 400 15px/1.3 var(--serif, Georgia, serif); color: var(--text, #f2f4f8); }
     .tf-grid { display: grid; grid-template-columns: 72px minmax(0, 1fr); gap: 8px 10px; align-items: center; }
-    .tf-label { font-size: 12px; color: var(--muted, #999); }
-    .tf-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 13px; color: var(--text, #ddd); }
-    .tf-select, .tf-num { height: 30px; padding: 0 8px; border-radius: 6px; border: 1px solid #555; background: #1b1b1b; color: var(--text, #ddd); font: inherit; font-size: 13px; }
+    .tf-label { font-size: 12px; font-weight: 600; color: var(--text2, #cdd2db); }
+    .tf-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 13px; color: var(--text, #e5e8ee); }
+    .tf-select, .tf-num { height: 28px; padding: 0 8px; border-radius: 8px; border: 1px solid var(--line2, #3a3d45); background: var(--input, #0e0f12); color: var(--text, #f2f4f8); font: inherit; font-size: 13px; }
     .tf-form .tf-row input.tf-num { width: 84px; flex: 0 0 84px; text-align: right; font-variant-numeric: tabular-nums; }
-    .tf-form .tf-row input.tf-num.tf-bad { border-color: #ff8a80; box-shadow: 0 0 0 1px #ff8a80; }
+    .tf-form .tf-row input.tf-num.tf-bad { border-color: #ff7b6e; box-shadow: 0 0 0 1px #ff7b6e; }
     .tf-form .tf-row input.tf-num.tf-bad:focus-visible { outline: 0; }
-    .tf-seg { display: inline-flex; border: 1px solid #555; border-radius: 6px; overflow: hidden; }
-    .tf-seg button { height: 28px; padding: 0 10px; border: 0; border-radius: 0; background: none; color: var(--muted, #999); font: inherit; font-size: 13px; font-weight: bold; cursor: pointer; }
-    .tf-seg button[aria-pressed="true"] { background: rgba(153, 204, 0, 0.14); color: #fff; box-shadow: inset 0 0 0 1px var(--profit, #99cc00); }
+    .tf-seg { display: inline-flex; gap: 2px; padding: 3px; border: 1px solid var(--line, #2c2f36); border-radius: 10px; background: var(--input, #0e0f12); overflow: hidden; }
+    .tf-seg button { height: 24px; padding: 0 10px; border: 0; border-radius: 7px; background: none; color: var(--muted, #949bab); font: inherit; font-size: 12px; font-weight: 500; cursor: pointer; }
+    .tf-seg button[aria-pressed="true"] { background: var(--raised, #24272e); color: var(--text, #f2f4f8); box-shadow: 0 1px 2px rgba(0, 0, 0, 0.3); }
     .tf-check { cursor: pointer; }
-    .tf-check input { accent-color: var(--profit, #99cc00); margin: 0; }
-    .tf-example { font-size: 12px; color: var(--muted, #999); font-variant-numeric: tabular-nums; }
-    /* Under the By box, in the grid's second column: Saved ✓ / why not (#ff8a80: red that reads) / a note. */
-    .tf-state { grid-column: 2; margin-top: -4px; font-size: 12px; color: var(--muted, #999); overflow-wrap: anywhere; }
+    .tf-check input { accent-color: var(--profit, #6fdc7f); margin: 0; }
+    .tf-example { font-size: 12px; color: var(--muted, #949bab); font-variant-numeric: tabular-nums; }
+    /* Under the By box, in the grid's second column: Saved ✓ / why not (#ff7b6e: red that reads) / a note. */
+    .tf-state { grid-column: 2; margin-top: -4px; font-size: 12px; color: var(--muted, #949bab); overflow-wrap: anywhere; }
     .tf-state:empty { display: none; }
-    .tf-state[data-level="ok"] { color: var(--profit, #99cc00); }
-    .tf-state[data-level="bad"] { color: #ff8a80; }
-    .tf-note { font-size: 12px; color: var(--muted, #999); }
+    .tf-state[data-level="ok"] { color: var(--profit, #6fdc7f); }
+    .tf-state[data-level="bad"] { color: #ff7b6e; }
+    .tf-note { font-size: 12px; color: var(--muted, #949bab); }
     `;
 
     /* ===== src/sources/dom/owner.js ===== */
@@ -12332,9 +12566,12 @@
      * The same profile link also sits in a (usually hidden) dropdown menu, in a
      * listItem___ wrapper - that one is skipped.
      *
-     * Paint-only: a badge is added after the name. Nothing is clicked or read
-     * beyond this banner.
+     * Paint-only: a badge floats at the end of the banner's line (3.20: it was
+     * put after the name and pushed the words after it along). Nothing is
+     * clicked or read beyond this banner.
      */
+
+
 
     const OWNER_BADGE_CLASS = 'ttv2-owner';
 
@@ -12441,12 +12678,18 @@
         const link = findOwnerLink(root, ownerId);
         if (!link) return false;
 
-        let badge = link.nextElementSibling;
-        if (!badge || !badge.classList.contains(OWNER_BADGE_CLASS)) {
+        // At the end of the banner, out of its line: the banner keeps its size and its words their places.
+        const banner = link.closest('[class*="messageContent"], .msg') || link.parentElement;
+        let badge = banner.querySelector(':scope > .' + OWNER_BADGE_CLASS);
+        if (!badge) {
+            // One left after the name by an older version goes.
+            const old = link.nextElementSibling;
+            if (old && old.classList.contains(OWNER_BADGE_CLASS)) old.remove();
             badge = link.ownerDocument.createElement('span');
             badge.className = OWNER_BADGE_CLASS;
-            link.insertAdjacentElement('afterend', badge);
+            banner.appendChild(badge);
         }
+        placeFloat(badge);
 
         const { level, text } = presenceText(presence, now);
         if (badge.dataset.level !== level) badge.dataset.level = level;
@@ -12472,35 +12715,69 @@
      * Torn's row styles set box-shadow themselves. It is deliberately not used on
      * `outline`, and the marker never touches `position`.
      *
-     * Design rules the panel and the selling page share (see README):
-     *   font Arial; sizes 11px (uppercase labels only), 12px (secondary), 13px
-     *   (body), 15px bold (the key money number); line-height 1.4; spacing in
-     *   4/8/12/16px; money right-aligned in tabular figures; colours only from
-     *   the tokens below; a Torn-style striped title bar.
+     * Design rules the panel and the selling page share (see README; 3.20
+     * Graphite): system fonts only (nothing to download), Georgia for titles;
+     * sizes 11px (uppercase labels only), 12px (secondary), 13px (body), 15px
+     * semibold (the key money number); line-height 1.5; spacing in
+     * 4/8/12/16/24px; radii 8/12/16; money right-aligned in tabular figures;
+     * colours only from the tokens below; only cheap motion (opacity,
+     * transform, background), none under prefers-reduced-motion.
      */
 
     const UI_PREFIX = 'ttv2';
 
     /*
-     * Colour tokens, shared by the panel and the selling page. All fixed and
-     * dark. The background used to borrow Torn's --default-bg-panel-color, but
+     * Colour tokens, shared by the panel and the selling page (3.20: Graphite,
+     * mockups/T-graphite-everything.html - one colour per meaning: green money,
+     * blue buying and your trade, amber check this, red gone, gold favourites,
+     * teal trust, violet the brand). All fixed and dark. The background used to borrow Torn's --default-bg-panel-color, but
      * Torn sets its dark value on <body>; the selling page is attached outside
      * it and got Torn's LIGHT default - light-grey text on a light page.
      */
 
 
     const TOKENS_CSS = `
-        --bg: #2e2e2e;
-        --row: #2b2b2b;
-        --line: #444;
-        --text: #ddd;
-        --muted: #999;
-        --profit: #99cc00;
-        --offer: #74c0fc;
-        --warn: #e0a000;
-        --bad: #d83500;
-        --on-profit: #1b1b1b;
-        --title: repeating-linear-gradient(90deg, #242424 0 2px, #2e2e2e 0 4px);
+        --page: #111215;
+        --rail: #16171b;
+        --surface: #1c1e23;
+        --raised: #24272e;
+        --hover: #2b2f37;
+        --input: #0e0f12;
+        --bg: #1c1e23;
+        --row: #24272e;
+        --line: #2c2f36;
+        --line2: #3a3d45;
+        --text: #f2f4f8;
+        --text2: #cdd2db;
+        --muted: #949bab;
+        --faint: #6a7180;
+        --profit: #6fdc7f;
+        --profit-bg: rgba(111, 220, 127, 0.12);
+        --profit-line: rgba(111, 220, 127, 0.42);
+        --buy: #5aa7ff;
+        --buy-bg: rgba(90, 167, 255, 0.12);
+        --buy-line: rgba(90, 167, 255, 0.45);
+        --offer: #8cc0ff;
+        --warn: #f6b74a;
+        --warn-bg: rgba(246, 183, 74, 0.12);
+        --warn-line: rgba(246, 183, 74, 0.42);
+        --bad: #ff7b6e;
+        --bad-bg: rgba(255, 123, 110, 0.12);
+        --bad-line: rgba(255, 123, 110, 0.42);
+        --fav: #ffcc4d;
+        --fav-bg: rgba(255, 204, 77, 0.10);
+        --fav-line: rgba(255, 204, 77, 0.45);
+        --trust: #43d1be;
+        --trust-bg: rgba(67, 209, 190, 0.12);
+        --known: #b8a4ff;
+        --brand: #8f9bff;
+        --on-profit: #0d1a10;
+        --on-buy: #06121f;
+        --title: #16171b;
+        --shadow: 0 1px 2px rgba(0, 0, 0, 0.35), 0 12px 32px rgba(0, 0, 0, 0.35);
+        --sans: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+        --serif: Georgia, "Iowan Old Style", "Times New Roman", serif;
+        --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
     `;
 
     /*
@@ -12512,12 +12789,21 @@
      * ours cannot leak out.
      */
     const PAGE_CSS = `
+    /*
+     * Every mark on Torn's own pages takes no room (3.20, the owner: "it
+     * shouldn't resize a row, add columns etc. it should just sit at the side or
+     * on top like a bring to front"). Outlines are inset box-shadows, labels are
+     * pseudo-elements or absolutely placed, and nothing sets a Torn element's
+     * size, padding, margin or wrapping. Colours: green money, blue buying and
+     * your trade, amber check this, red the listing you opened (Graphite,
+     * mockups/T-graphite-everything.html).
+     */
     .ttv2-hit {
         position: relative !important;
 
         box-shadow:
-            inset 0 0 0 3px #35d35a,
-            inset 0 0 0 9999px rgba(53, 211, 90, 0.16) !important;
+            inset 0 0 0 2px #6fdc7f,
+            inset 0 0 0 9999px rgba(111, 220, 127, 0.12) !important;
 
         transition: box-shadow 0.15s ease;
     }
@@ -12543,22 +12829,24 @@
          *   Torn's geometry in place, which clipped the label to an 8px sliver.
          * - The chip background: white text alone was invisible against the
          *   tile's artwork.
+         * - Inset from the corner and no wider than the card (3.20): it sits on
+         *   the card, inside it, never over the card's corner or its neighbour.
          */
         content: attr(data-ttv2-profit) !important;
 
         display: block !important;
         position: absolute !important;
-        top: 0 !important;
-        right: 0 !important;
+        top: 4px !important;
+        right: 4px !important;
         left: auto !important;
         bottom: auto !important;
 
         width: auto !important;
         height: auto !important;
         min-width: 0 !important;
-        max-width: 100% !important;
+        max-width: calc(100% - 8px) !important;
         margin: 0 !important;
-        padding: 1px 4px !important;
+        padding: 1px 7px !important;
         transform: none !important;
 
         overflow: visible !important;
@@ -12567,12 +12855,14 @@
         visibility: visible !important;
         z-index: 2147483000 !important;
 
-        background: rgba(10, 40, 16, 0.92) !important;
-        border: 1px solid #35d35a !important;
-        border-radius: 0 0 0 5px !important;
+        background: rgba(15, 36, 20, 0.94) !important;
+        border: 1px solid rgba(111, 220, 127, 0.55) !important;
+        border-radius: 9px !important;
+        box-shadow: 0 2px 6px rgba(0, 0, 0, 0.5) !important;
 
-        color: #7ee08f !important;
-        font: 800 11px/14px Arial, Helvetica, sans-serif !important;
+        color: #6fdc7f !important;
+        font: 700 11px/15px "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif !important;
+        text-align: right !important;
 
         /* Cannot intercept a click, so it can never block Torn's Buy button. */
         pointer-events: none !important;
@@ -12581,8 +12871,9 @@
     /*
      * A trusted trader pays more than this listing asks: "FAFFO pays $73,500 /
      * +$3,500 each", drawn the same way as the profit label and just as unable
-     * to catch a click. Two lines that wrap inside the card - never cut. On a
-     * card that is also a deal, the trader line goes under the profit.
+     * to catch a click. In blue (a trader, not an NPC deal); lines that wrap
+     * inside the card - never cut, never over the next card. On a card that is
+     * also a deal, the trader line goes under the profit.
      */
     .ttv2-trader {
         position: relative !important;
@@ -12593,17 +12884,17 @@
 
         display: block !important;
         position: absolute !important;
-        top: 0 !important;
-        right: 0 !important;
+        top: 4px !important;
+        right: 4px !important;
         left: auto !important;
         bottom: auto !important;
 
         width: auto !important;
         height: auto !important;
         min-width: 0 !important;
-        max-width: 100% !important;
+        max-width: calc(100% - 8px) !important;
         margin: 0 !important;
-        padding: 1px 4px !important;
+        padding: 2px 7px !important;
         transform: none !important;
 
         overflow: visible !important;
@@ -12613,12 +12904,13 @@
         visibility: visible !important;
         z-index: 2147483000 !important;
 
-        background: rgba(10, 40, 16, 0.92) !important;
-        border: 1px solid #35d35a !important;
-        border-radius: 0 0 0 5px !important;
+        background: rgba(15, 26, 42, 0.94) !important;
+        border: 1px solid rgba(90, 167, 255, 0.5) !important;
+        border-radius: 9px !important;
+        box-shadow: 0 2px 6px rgba(0, 0, 0, 0.5) !important;
 
-        color: #7ee08f !important;
-        font: 800 11px/14px Arial, Helvetica, sans-serif !important;
+        color: #8cc0ff !important;
+        font: 700 11px/15px "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif !important;
 
         pointer-events: none !important;
     }
@@ -12627,6 +12919,9 @@
         content: attr(data-ttv2-profit) "\\A" attr(data-ttv2-trader) !important;
         white-space: pre-line !important;
         text-align: right !important;
+        background: rgba(15, 36, 20, 0.94) !important;
+        border-color: rgba(111, 220, 127, 0.55) !important;
+        color: #6fdc7f !important;
     }
 
     /*
@@ -12638,34 +12933,27 @@
     .ttv2-target.ttv2-buyhere {
         position: relative !important;
         box-shadow:
-            inset 0 0 0 3px #4dabf7,
-            inset 0 0 0 9999px rgba(77, 171, 247, 0.16) !important;
+            inset 0 0 0 2px #5aa7ff,
+            inset 0 0 0 9999px rgba(90, 167, 255, 0.12),
+            0 0 14px rgba(90, 167, 255, 0.35) !important;
     }
 
-    /* Fill's line beside Torn's ADD TO TRADE (3.14.2): amber when it marks nothing, blue when it does. */
+    /* Fill's line on the trade page (3.14.2) moved to the panel's trade box in 3.20: this only hides one an older version left. */
     .ttv2-fillnote {
-        display: inline-block;
-        margin-left: 12px;
-        font: bold 12px/18px Arial, sans-serif;
-        color: #f0a020;
-        vertical-align: middle;
-    }
-
-    .ttv2-fillnote.ttv2-fillnote-ok {
-        color: #4dabf7;
+        display: none !important;
     }
 
     /* Chat from Torn Bids (3.14): Torn's own Start chat button on that profile, in blue. You press it. */
     .ttv2-chatmark {
-        outline: 3px solid #4dabf7 !important;
+        outline: 3px solid #5aa7ff !important;
         outline-offset: 2px;
         border-radius: 6px;
-        box-shadow: 0 0 0 7px rgba(77, 171, 247, 0.28) !important;
+        box-shadow: 0 0 0 7px rgba(90, 167, 255, 0.28) !important;
         animation: ttv2-chatpulse 1.2s ease-in-out 4;
     }
 
     @keyframes ttv2-chatpulse {
-        50% { box-shadow: 0 0 0 11px rgba(77, 171, 247, 0.12); }
+        50% { box-shadow: 0 0 0 11px rgba(90, 167, 255, 0.12); }
     }
 
     .ttv2-buyhere::before {
@@ -12674,11 +12962,13 @@
         top: 4px;
         left: 4px;
         z-index: 2;
-        padding: 1px 6px;
-        border-radius: 3px;
-        background: #4dabf7;
-        color: #10202c;
-        font: bold 11px/16px Arial, sans-serif;
+        max-width: calc(100% - 8px);
+        padding: 1px 7px;
+        border-radius: 9px;
+        background: #5aa7ff;
+        color: #06121f;
+        font: 700 11px/16px "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+        box-shadow: 0 2px 6px rgba(0, 0, 0, 0.45);
         pointer-events: none;
     }
 
@@ -12694,7 +12984,8 @@
     /*
      * On the listing you are buying (3.13): one strip across the card's top with
      * the words, Fill and Next, so the pointer does not cross the page to the
-     * panel after every buy. It takes the place of the card's own label.
+     * panel after every buy. It takes the place of the card's own label. One
+     * line, always (3.20): two lines covered the item's picture and its name.
      */
     .ttv2-buyhere.ttv2-hasbar::before {
         display: none !important;
@@ -12707,34 +12998,42 @@
         right: 0;
         z-index: 3;
         display: flex !important;
-        flex-wrap: wrap;
+        flex-wrap: nowrap;
         align-items: center;
         gap: 4px;
-        padding: 3px 4px;
-        background: rgba(16, 32, 44, 0.92);
-        border-bottom: 1px solid #4dabf7;
+        height: 26px;
+        padding: 0 4px;
+        box-sizing: border-box;
+        border-radius: 4px 4px 0 0;
+        background: #5aa7ff;
+        box-shadow: 0 4px 10px rgba(0, 0, 0, 0.45);
+        white-space: nowrap;
     }
 
     .ttv2-buybar-l {
         margin-right: auto;
-        padding: 0 6px;
-        border-radius: 3px;
-        background: #4dabf7;
-        color: #10202c;
-        font: bold 12px/20px Arial, sans-serif;
+        padding: 0 4px;
+        background: none;
+        color: #06121f;
+        font: 700 11px/18px "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
         white-space: nowrap;
     }
 
     .ttv2-buybar button {
-        height: 24px;
-        padding: 0 9px;
-        border: 1px solid #4dabf7;
-        border-radius: 3px;
-        background: #10202c;
-        color: #9ad0fa;
-        font: bold 12px/22px Arial, sans-serif;
+        flex: 0 0 auto;
+        height: 20px;
+        padding: 0 7px;
+        border: 0;
+        border-radius: 6px;
+        background: rgba(6, 18, 31, 0.18);
+        color: #06121f;
+        font: 700 11px/20px "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
         white-space: nowrap;
         cursor: pointer;
+    }
+
+    .ttv2-buybar button:hover {
+        background: rgba(6, 18, 31, 0.3);
     }
 
     .ttv2-buybar button:focus-visible {
@@ -12743,70 +13042,94 @@
     }
 
     .ttv2-buybar button[data-act="next"] {
-        background: #4dabf7;
-        color: #10202c;
+        background: #06121f;
+        color: #cfe5ff;
     }
 
     .ttv2-sendrow {
-        box-shadow: inset 3px 0 0 #4dabf7, inset 0 0 0 9999px rgba(77, 171, 247, 0.10) !important;
-    }
-
-    .ttv2-sendfill {
-        display: inline-block;
-        margin-left: 8px;
-        padding: 1px 8px;
-        border: 1px solid #4dabf7;
-        border-radius: 10px;
-        color: #9ad0fa;
-        font: bold 12px/18px Arial, sans-serif;
-        white-space: nowrap;
-        cursor: default;
+        box-shadow: inset 3px 0 0 #5aa7ff, inset 0 0 0 9999px rgba(90, 167, 255, 0.08) !important;
     }
 
     /*
-     * Torn's name cell is a fixed 406px: a long name and Fill stay on one line,
-     * running on past it (its width kept, so the cell never drops under the picture).
+     * Fill on the trade page: floats beside the item's name (3.20). Taken out of
+     * the line, so Torn's name cell keeps its size and its wrapping; placed by
+     * main.js placeFloat where the cell lays its items out as a row.
      */
+    .ttv2-float {
+        position: absolute !important;
+        z-index: 3;
+        box-sizing: border-box;
+        white-space: nowrap !important;
+    }
+
     .ttv2-sendrow .name-wrap {
-        white-space: nowrap;
         overflow: visible !important;
     }
 
-    .ttv2-sendrow .name-wrap .ttv2-sendfill { vertical-align: middle; }
+    .ttv2-sendfill {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        height: 22px;
+        margin-left: 10px !important;
+        padding: 0 8px;
+        border: 1px solid rgba(90, 167, 255, 0.45);
+        border-radius: 7px;
+        background: #10233b;
+        color: #cfe5ff;
+        font: 600 11px/20px "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+        box-shadow: 0 3px 10px rgba(0, 0, 0, 0.5);
+        white-space: nowrap;
+        vertical-align: baseline;
+        cursor: default;
+    }
 
     .ttv2-sendfill[data-fill] { cursor: pointer; }
-    .ttv2-sendfill[aria-pressed="true"] { background: #4dabf7; color: #10202c; }
+    .ttv2-sendfill[data-fill]:hover { background: #163152; }
+    .ttv2-sendfill[aria-pressed="true"] { background: #5aa7ff; color: #06121f; border-color: transparent; }
+    .ttv2-sendfill:not([data-fill]) { background: #23262c; color: #cfd4dc; border-color: rgba(255, 255, 255, 0.14); }
 
     /* One Fill for every marked row (3.16.4), beside Torn's ADD TO TRADE: the row chips' look, a size up. */
     .ttv2-sendfillall {
-        display: inline-block;
-        margin-left: 12px;
-        padding: 3px 10px;
-        border: 1px solid #4dabf7;
-        border-radius: 12px;
-        color: #9ad0fa;
-        font: bold 12px/18px Arial, sans-serif;
+        display: inline-flex;
+        align-items: center;
+        height: 26px;
+        margin-left: 12px !important;
+        padding: 0 10px;
+        border: 1px solid rgba(90, 167, 255, 0.45);
+        border-radius: 8px;
+        background: #10233b;
+        color: #cfe5ff;
+        font: 600 12px/24px "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+        box-shadow: 0 3px 10px rgba(0, 0, 0, 0.5);
         white-space: nowrap;
-        vertical-align: middle;
+        vertical-align: baseline;
         cursor: pointer;
         user-select: none;
     }
 
-    .ttv2-sendfillall:hover { background: rgba(77, 171, 247, 0.16); }
-    .ttv2-sendfillall:focus-visible { outline: 2px solid #4dabf7; outline-offset: 1px; }
-    .ttv2-sendfillall[aria-pressed="true"] { background: #4dabf7; color: #10202c; }
+    .ttv2-sendfillall:hover { background: #163152; }
+    .ttv2-sendfillall:focus-visible { outline: 2px solid #5aa7ff; outline-offset: 1px; }
+    .ttv2-sendfillall[aria-pressed="true"] { background: #5aa7ff; color: #06121f; border-color: transparent; }
 
     /* The listing a feed link was opened for: light red (3.14.2, the owner; it was yellow). Paint-only, like .ttv2-hit. */
     .ttv2-target {
         box-shadow:
-            inset 0 0 0 3px #ff8a80,
-            inset 0 0 0 9999px rgba(255, 138, 128, 0.14) !important;
+            inset 0 0 0 2px #ff7b6e,
+            inset 0 0 0 9999px rgba(255, 123, 110, 0.12) !important;
     }
 
     .ttv2-hit-top {
         box-shadow:
-            inset 0 0 0 3px #7ee08f,
-            inset 0 0 0 9999px rgba(126, 224, 143, 0.24) !important;
+            inset 0 0 0 2px #a6f5b0,
+            inset 0 0 0 9999px rgba(111, 220, 127, 0.2),
+            0 0 12px rgba(111, 220, 127, 0.35) !important;
+    }
+
+    .ttv2-hit-top.ttv2-hit-top::after {
+        background: #6fdc7f !important;
+        border-color: transparent !important;
+        color: #0d1a10 !important;
     }
 
     /*
@@ -12816,59 +13139,82 @@
      */
     .ttv2-hit.ttv2-hit-low {
         box-shadow:
-            inset 0 0 0 2px #f0a020,
-            inset 0 0 0 9999px rgba(240, 160, 32, 0.12) !important;
+            inset 0 0 0 1px #f6b74a,
+            inset 0 0 0 9999px rgba(246, 183, 74, 0.08) !important;
     }
 
     .ttv2-hit.ttv2-hit-low.ttv2-hit-low::after {
-        background: rgba(48, 30, 4, 0.9) !important;
-        border-color: #f0a020 !important;
-        color: #f5c060 !important;
+        background: rgba(42, 33, 16, 0.94) !important;
+        border-color: rgba(246, 183, 74, 0.5) !important;
+        color: #f6b74a !important;
         font-weight: 700 !important;
     }
 
-    /* Bazaar owner status, right after their name in the page banner. */
+    /* Bazaar owner status: floats at the end of the bazaar's banner line (3.20), taking no room in it. */
     .ttv2-owner {
-        display: inline-block;
-        margin: 0 4px 0 8px;
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+        height: 20px;
+        margin-left: 10px !important;
         padding: 0 8px;
-        border-radius: 9px;
-        font: bold 12px/18px Arial, Helvetica, sans-serif;
-        color: #ddd;
-        background: rgba(0, 0, 0, 0.35);
+        border: 1px solid rgba(255, 255, 255, 0.14);
+        border-radius: 7px;
+        font: 600 11px/18px "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+        color: #e5e8ee;
+        background: #23262c;
+        box-shadow: 0 3px 10px rgba(0, 0, 0, 0.45);
         white-space: nowrap;
-        vertical-align: middle;
+        vertical-align: baseline;
     }
 
     .ttv2-owner::before {
         content: "";
         display: inline-block;
-        width: 8px;
-        height: 8px;
-        margin-right: 4px;
+        width: 7px;
+        height: 7px;
         border-radius: 50%;
-        background: #999;
-        vertical-align: 0;
+        background: #6a7180;
     }
 
-    .ttv2-owner[data-level="online"]::before { background: #99cc00; }
-    .ttv2-owner[data-level="idle"]::before { background: #e0a000; }
-    .ttv2-owner[data-level="offline"]::before { background: #999; }
+    .ttv2-owner[data-level="online"] { color: #6fdc7f; border-color: rgba(111, 220, 127, 0.42); background: #10261a; }
+    .ttv2-owner[data-level="online"]::before { background: #6fdc7f; }
+    .ttv2-owner[data-level="idle"] { color: #f6b74a; border-color: rgba(246, 183, 74, 0.42); background: #2a2110; }
+    .ttv2-owner[data-level="idle"]::before { background: #f6b74a; }
+    .ttv2-owner[data-level="offline"]::before { background: #6a7180; }
 
     /*
-     * Your own bazaar's add / manage rows: the current asking prices, after the
-     * item name. Text only; nothing is filled in or clicked.
+     * Your own bazaar's manage rows and the Item Market's: the asking prices
+     * and Fill, together in one group that floats in the row (3.20): at its
+     * right, just left of Torn's boxes, centred on the row - over the row, never
+     * a line or a column of its own. Text only; nothing is clicked on Torn's.
      */
+    .ttv2-rowfloat {
+        position: absolute !important;
+        top: 50%;
+        right: var(--ttv2-fr, 8px);
+        z-index: 3;
+        display: inline-flex !important;
+        align-items: center;
+        gap: 6px;
+        margin: 0 !important;
+        transform: translateY(-50%);
+        white-space: nowrap;
+    }
+
+    .ttv2-rowfloat[data-tight="1"] .ttv2-bztag { display: none; }
+
     .ttv2-bztag {
         display: inline-block;
-        margin-left: 8px;
+        height: 22px;
         padding: 0 8px;
-        border: 1px solid #444;
-        border-radius: 4px;
-        font: 12px/20px Arial, Helvetica, sans-serif;
+        border: 1px solid rgba(255, 255, 255, 0.14);
+        border-radius: 7px;
+        font: 500 11px/20px "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
         font-variant-numeric: tabular-nums;
-        color: #ddd;
-        background: #2b2b2b;
+        color: #cfd4dc;
+        background: #23262c;
+        box-shadow: 0 3px 10px rgba(0, 0, 0, 0.45);
         white-space: nowrap;
         vertical-align: middle;
         cursor: pointer;
@@ -12876,69 +13222,72 @@
 
     .ttv2-bztag:hover,
     .ttv2-bztag[data-selected="true"] {
-        border-color: #99cc00;
+        border-color: rgba(111, 220, 127, 0.55);
     }
 
     .ttv2-bztag b {
-        color: #a8dd1c;
-        font-weight: bold;
+        color: #6fdc7f;
+        font-weight: 650;
     }
 
     .ttv2-bztag .ttv2-bztag-low {
-        color: #74c0fc;
+        color: #8cc0ff;
     }
 
     /*
-     * Your bazaar's add page: IMA and BP chips and the Fill tick, in one line in
-     * Torn's own value column after its price - the row stays one line.
+     * Your bazaar's add page: IMA and BP chips and the Fill tick float in Torn's
+     * own value column, at its right end (3.20: the cell keeps its own padding -
+     * nothing is pushed). Where they would cover Torn's own words in the cell,
+     * IMA goes first, then BP - whole chips only (main.js fitBazaarCells sets
+     * data-tight); both stay in My bazaar's list beside the page.
      */
+    .ttv2-bzcell {
+        position: relative;
+    }
+
     .ttv2-bztag.ttv2-bzchips {
+        position: absolute;
+        top: 50%;
+        right: calc(var(--ttv2-fillw, 64px) + 8px);
+        z-index: 3;
         display: inline-flex;
         align-items: center;
-        gap: 6px;
-        margin-left: 10px;
+        gap: 4px;
+        height: auto;
+        margin: 0;
         padding: 0;
         border: 0;
         background: none;
+        box-shadow: none;
+        transform: translateY(-50%);
         cursor: default;
-        vertical-align: middle;
         white-space: nowrap;
     }
 
     .ttv2-bzchip {
         display: inline-block;
-        padding: 0 6px;
-        border: 1px solid #444;
-        border-radius: 4px;
-        background: #2b2b2b;
-        color: #bbb;
-        font: 11px/18px Arial, Helvetica, sans-serif;
+        height: 20px;
+        padding: 0 7px;
+        border: 1px solid rgba(255, 255, 255, 0.14);
+        border-radius: 7px;
+        background: #23262c;
+        color: #cfd4dc;
+        font: 500 11px/18px "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+        box-shadow: 0 3px 10px rgba(0, 0, 0, 0.45);
         cursor: pointer;
     }
 
-    .ttv2-bzchip b { font-weight: bold; font-variant-numeric: tabular-nums; }
-    .ttv2-bzchip-ima b { color: #a8dd1c; }
-    .ttv2-bzchip-bp b { color: #74c0fc; }
+    .ttv2-bzchip b { font-weight: 650; font-variant-numeric: tabular-nums; }
+    .ttv2-bzchip-ima b { color: #6fdc7f; }
+    .ttv2-bzchip-bp b { color: #8cc0ff; }
     .ttv2-bzchip:hover,
-    .ttv2-bzchips[data-selected="true"] .ttv2-bzchip { border-color: #99cc00; }
-
-    /*
-     * The Fill tick on that page: at the right edge of Torn's value cell, the
-     * same place in every row. The cell keeps its own size and gives the tick
-     * room from inside it, so its line (Torn's price, the chips) ends before the
-     * tick instead of running under it. A row with no room for both chips shows
-     * one, or none - whole chips only (main.js fitBazaarCells sets data-tight).
-     */
-    .ttv2-bzcell {
-        position: relative;
-        box-sizing: border-box;
-        padding-right: var(--ttv2-fillw, 64px) !important;
-    }
+    .ttv2-bzchips[data-selected="true"] .ttv2-bzchip { border-color: rgba(111, 220, 127, 0.55); }
 
     .ttv2-fillbox.ttv2-fillcell {
         position: absolute;
-        right: 0;
+        right: 2px;
         top: 50%;
+        z-index: 3;
         transform: translateY(-50%);
         margin: 0;
         flex-wrap: nowrap;
@@ -12948,37 +13297,26 @@
     .ttv2-fillcell .ttv2-fillbtn { height: 20px; font-size: 11px; }
     .ttv2-bzchips[data-tight="1"] .ttv2-bzchip-ima { display: none; }
     .ttv2-bzchips.ttv2-bzchips[data-tight="2"] { display: none; }
-    .ttv2-fillbtn[data-level="good"] .ttv2-filllabel { color: #a8dd1c; }
-    .ttv2-fillbtn[data-level="warn"] .ttv2-filllabel { color: #f0a020; }
-    .ttv2-fillbtn[data-level="bad"] { border-color: #ff8a80; }
-
-    /* On the Item Market the tag sits on its own line above the price box. */
-    .ttv2-bztag.ttv2-bztag-market {
-        display: block;
-        width: max-content;
-        max-width: 100%;
-        margin: 4px 0;
-        white-space: normal;
-    }
+    .ttv2-fillbtn[data-level="good"] .ttv2-filllabel { color: #6fdc7f; }
+    .ttv2-fillbtn[data-level="warn"] .ttv2-filllabel { color: #f6b74a; }
+    .ttv2-fillbtn[data-level="bad"] { border-color: #ff7b6e; }
 
     /*
-     * The Fill button: ours, beside the tag. It types into Torn's boxes; it never
-     * presses Torn's buttons. Its line says what it typed, or why it could not.
+     * The Fill button: ours, beside the prices. It types into Torn's boxes; it
+     * never presses Torn's buttons. What it typed, or why it could not, shows on
+     * its hover, in the panel's My bazaar, and for a moment in a note beside
+     * Torn's page (the toast) - never as a line in Torn's row.
      */
     .ttv2-fillbox {
         display: inline-flex;
-        flex-wrap: wrap;
+        flex-wrap: nowrap;
         align-items: center;
         gap: 6px;
-        margin-left: 6px;
         vertical-align: middle;
-        font: 12px/20px Arial, Helvetica, sans-serif;
+        font: 12px/20px "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
     }
 
-    .ttv2-bztag-market + .ttv2-fillbox {
-        display: flex;
-        margin: 0 0 4px;
-    }
+    .ttv2-rowfloat .ttv2-filltag { display: none; }
 
     .ttv2-fillbtn {
         display: inline-flex;
@@ -12986,56 +13324,105 @@
         gap: 6px;
         height: 22px;
         padding: 0 8px 0 6px;
-        border: 1px solid #555;
-        border-radius: 4px;
-        background: #2b2b2b;
-        color: #ddd;
-        font: bold 12px/20px Arial, Helvetica, sans-serif;
+        border: 1px solid rgba(90, 167, 255, 0.45);
+        border-radius: 7px;
+        background: #10233b;
+        color: #cfe5ff;
+        font: 600 11px/20px "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+        box-shadow: 0 3px 10px rgba(0, 0, 0, 0.5);
         cursor: pointer;
         white-space: nowrap;
     }
 
-    .ttv2-fillbtn:hover { border-color: #99cc00; }
+    .ttv2-fillbtn:hover { background: #163152; }
     .ttv2-fillbtn:disabled { opacity: 0.6; cursor: progress; }
 
     /* The tick box: empty, or ticked in green once the row is filled. */
     .ttv2-fillmark {
-        width: 12px;
-        height: 12px;
-        border: 1px solid #888;
-        border-radius: 2px;
-        background: #1b1b1b;
+        width: 13px;
+        height: 13px;
+        border: 1.5px solid rgba(255, 255, 255, 0.3);
+        border-radius: 4px;
+        background: #0e0f12;
         box-sizing: border-box;
         position: relative;
     }
 
-    .ttv2-fillbtn[aria-checked="true"] { border-color: #99cc00; }
-    .ttv2-fillbtn[aria-checked="true"] .ttv2-fillmark { background: #99cc00; border-color: #99cc00; }
+    .ttv2-fillbtn[aria-checked="true"] { border-color: rgba(111, 220, 127, 0.55); background: #10261a; color: #6fdc7f; }
+    .ttv2-fillbtn[aria-checked="true"] .ttv2-fillmark { background: #6fdc7f; border-color: #6fdc7f; }
     .ttv2-fillbtn[aria-checked="true"] .ttv2-fillmark::after {
         content: '';
         position: absolute;
         left: 3px;
         top: 0;
-        width: 4px;
-        height: 8px;
-        border: solid #1b1b1b;
+        width: 3px;
+        height: 7px;
+        border: solid #0d1a10;
         border-width: 0 2px 2px 0;
         transform: rotate(45deg);
     }
 
-    a.ttv2-fillset { cursor: pointer; color: #74c0fc; }
-    .ttv2-fillbtn:focus-visible { outline: 2px solid #74c0fc; outline-offset: 1px; }
+    /* "Fill settings": floats at the right end of Torn's links bar (3.20), not one of its links. */
+    a.ttv2-fillset {
+        position: absolute !important;
+        z-index: 3;
+        display: inline-flex;
+        white-space: nowrap;
+        align-items: center;
+        height: 22px;
+        padding: 0 9px;
+        border: 1px solid rgba(255, 255, 255, 0.14);
+        border-radius: 7px;
+        background: #23262c;
+        color: #cfd4dc !important;
+        font: 600 11px/20px "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+        box-shadow: 0 3px 10px rgba(0, 0, 0, 0.45);
+        text-decoration: none !important;
+        cursor: pointer;
+    }
+
+    a.ttv2-fillset:hover { border-color: rgba(255, 255, 255, 0.3); }
+    .ttv2-fillbtn:focus-visible { outline: 2px solid #8cc0ff; outline-offset: 1px; }
 
     .ttv2-filltag {
-        color: #ddd;
+        color: #e5e8ee;
         white-space: normal;
         font-variant-numeric: tabular-nums;
     }
 
-    .ttv2-filltag[data-level="good"] { color: #a8dd1c; }
-    .ttv2-filltag[data-level="warn"] { color: #f0a020; }
-    .ttv2-filltag[data-level="bad"] { color: #ff8a80; }
+    .ttv2-filltag[data-level="good"] { color: #6fdc7f; }
+    .ttv2-filltag[data-level="warn"] { color: #f6b74a; }
+    .ttv2-filltag[data-level="bad"] { color: #ff7b6e; }
     .ttv2-filltag[hidden] { display: none; }
+
+    /* Fill's result, beside Torn's page for a few seconds (3.20): in place of the line it used to add to the row. */
+    .ttv2-toast {
+        position: fixed;
+        z-index: 2147483001;
+        max-width: 400px;
+        padding: 8px 12px;
+        border: 1px solid rgba(111, 220, 127, 0.42);
+        border-radius: 10px;
+        background: #1c1e23;
+        color: #cdd2db;
+        font: 12px/1.5 "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+        box-shadow: 0 1px 2px rgba(0, 0, 0, 0.35), 0 12px 32px rgba(0, 0, 0, 0.35);
+        pointer-events: none;
+        animation: ttv2-toast-in 0.2s cubic-bezier(0.2, 0.7, 0.2, 1);
+    }
+
+    .ttv2-toast[data-level="warn"] { border-color: rgba(246, 183, 74, 0.42); color: #f6b74a; }
+    .ttv2-toast[data-level="bad"] { border-color: rgba(255, 123, 110, 0.42); color: #ff7b6e; }
+
+    @keyframes ttv2-toast-in {
+        from { opacity: 0; transform: translateY(4px); }
+        to { opacity: 1; transform: none; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+        .ttv2-toast, .ttv2-chatmark { animation: none !important; }
+        .ttv2-hit { transition: none !important; }
+    }
     `;
 
     const PANEL_CSS = `
@@ -13062,7 +13449,7 @@
         border: 1px solid var(--line);
         border-radius: 4px;
         box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
-        font: 13px/1.4 Arial, Helvetica, sans-serif;
+        font: 13px/1.4 "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
         text-align: left;
         overflow: hidden;
     }
@@ -13088,7 +13475,7 @@
     }
 
     .ttv2-panel button {
-        font: bold 12px/1 Arial, Helvetica, sans-serif;
+        font: bold 12px/1 "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
         height: 28px;
         padding: 0 12px;
         color: var(--text);
@@ -13136,7 +13523,7 @@
     }
 
     .ttv2-panel input[type="text"] {
-        font: 13px/1.4 Arial, Helvetica, sans-serif;
+        font: 13px/1.4 "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
         height: 28px;
         color: var(--text);
         background: var(--row);
@@ -13252,8 +13639,8 @@
     }
 
     @keyframes ttv2-pulse {
-        0% { box-shadow: 0 0 0 0 rgba(153, 204, 0, 0.7); }
-        100% { box-shadow: 0 0 0 8px rgba(153, 204, 0, 0); }
+        0% { box-shadow: 0 0 0 0 rgba(111, 220, 127, 0.7); }
+        100% { box-shadow: 0 0 0 8px rgba(111, 220, 127, 0); }
     }
 
     .ttv2-sweep {
@@ -13509,12 +13896,12 @@
         padding: 8px 10px;
         border: 1px solid var(--profit);
         border-radius: 6px;
-        background: rgba(153, 204, 0, 0.08);
+        background: rgba(111, 220, 127, 0.08);
     }
 
     .ttv2-buybox {
-        border-color: #4dabf7;
-        background: rgba(77, 171, 247, 0.08);
+        border-color: #5aa7ff;
+        background: rgba(90, 167, 255, 0.08);
     }
 
     .ttv2-buybox .ttv2-sub, .ttv2-buybox .ttv2-tb-ok, .ttv2-buybox .ttv2-tb-warn {
@@ -13523,7 +13910,7 @@
 
     /* Grey on the blue-tinted box: lighter than --muted, to read (5.7:1, not 4.2:1). */
     .ttv2-buybox .ttv2-sub {
-        color: #b3b3b3;
+        color: #cdd2db;
     }
 
     .ttv2-buynext {
@@ -13587,13 +13974,13 @@
         padding: 0;
         border: 0;
         background: none;
-        color: #b3b3b3;
+        color: #cdd2db;
         font-size: 12px;
         text-decoration: underline;
         cursor: pointer;
     }
 
-    .ttv2-panel button.ttv2-linkbtn:hover { color: var(--text, #ddd); }
+    .ttv2-panel button.ttv2-linkbtn:hover { color: var(--text, #e5e8ee); }
 
     .ttv2-tb-ok {
         color: var(--profit);
@@ -13730,7 +14117,7 @@
     .ttv2-panel button.ttv2-chip[aria-pressed="true"] {
         color: var(--text);
         border-color: var(--profit);
-        background: rgba(153, 204, 0, 0.12);
+        background: rgba(111, 220, 127, 0.12);
     }
 
     .ttv2-panel button.ttv2-chip-set {
@@ -13768,10 +14155,10 @@
     }
 
     /* A value the box could not read: red, and the reason under the chips.
-       #ff8a80, not --bad: a red that reads on the panel (5.9:1), as Torn Bids' .sp-inerr. */
+       #ff7b6e, not --bad: a red that reads on the panel (5.9:1), as Torn Bids' .sp-inerr. */
     .ttv2-panel input.ttv2-chip-input.ttv2-bad {
-        border-color: #ff8a80;
-        box-shadow: 0 0 0 1px #ff8a80;
+        border-color: #ff7b6e;
+        box-shadow: 0 0 0 1px #ff7b6e;
     }
 
     .ttv2-panel input.ttv2-chip-input.ttv2-bad:focus-visible {
@@ -13807,7 +14194,7 @@
     }
 
     .ttv2-chip-note[data-level="bad"] {
-        color: #ff8a80;
+        color: #ff7b6e;
     }
 
     .ttv2-chips.ttv2-chips-noted {
@@ -14050,7 +14437,7 @@
     }
 
     .ttv2-panel button.ttv2-bzrow[aria-pressed="true"] .ttv2-money {
-        color: #a8dd1c;
+        color: #6fdc7f;
         font-weight: bold;
     }
 
@@ -14081,7 +14468,7 @@
         font-size: 20px;
         font-weight: bold;
         line-height: 1.2;
-        color: #a8dd1c;
+        color: #6fdc7f;
         font-variant-numeric: tabular-nums;
     }
 
@@ -14093,16 +14480,16 @@
         display: block;
         width: 100%;
         height: auto;
-        background: #262626;
+        background: #24272e;
         border: 1px solid var(--line);
         border-radius: 8px;
         cursor: crosshair;
     }
 
-    .ttv2-graph-grid { stroke: #3a3a3a; stroke-width: 1; }
-    .ttv2-graph-label { fill: #999; font: 11px Arial, Helvetica, sans-serif; font-variant-numeric: tabular-nums; }
-    .ttv2-graph-empty { fill: #999; font: 12px Arial, Helvetica, sans-serif; }
-    .ttv2-graph-cursor { stroke: #777; stroke-width: 1; }
+    .ttv2-graph-grid { stroke: #383a40; stroke-width: 1; }
+    .ttv2-graph-label { fill: #949bab; font: 11px "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif; font-variant-numeric: tabular-nums; }
+    .ttv2-graph-empty { fill: #949bab; font: 12px "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif; }
+    .ttv2-graph-cursor { stroke: #6a7180; stroke-width: 1; }
 
     .ttv2-graph-tip {
         position: absolute;
@@ -14120,7 +14507,7 @@
 
     .ttv2-graph-tip[hidden] { display: none; }
     .ttv2-tip-when { color: var(--muted); }
-    .ttv2-tip-mv { color: #a8dd1c; font-weight: bold; }
+    .ttv2-tip-mv { color: #6fdc7f; font-weight: bold; }
     .ttv2-tip-im { color: var(--offer); }
 
     .ttv2-graph-keys {
@@ -14132,9 +14519,9 @@
 
     .ttv2-graph-keys span { display: inline-flex; align-items: center; gap: 4px; }
     .ttv2-graph-keys i { display: inline-block; width: 16px; height: 0; border-top: 2px solid; }
-    .ttv2-graph-keys .ttv2-key-mv i { border-color: #a8dd1c; }
+    .ttv2-graph-keys .ttv2-key-mv i { border-color: #6fdc7f; }
     .ttv2-graph-keys .ttv2-key-im i { border-color: var(--offer); border-top-width: 1px; }
-    .ttv2-graph-keys .ttv2-key-mark i { border-color: #f0a020; border-top-style: dashed; }
+    .ttv2-graph-keys .ttv2-key-mark i { border-color: #f6b74a; border-top-style: dashed; }
 
     .ttv2-bzrow .ttv2-bzlow { color: var(--offer); }
 
@@ -14147,17 +14534,17 @@
         border-radius: 6px;
         background: var(--row);
     }
-    .ttv2-fillnow-done { border-color: #99cc00; }
+    .ttv2-fillnow-done { border-color: #6fdc7f; }
     .ttv2-fillprice {
         font-size: 20px;
         font-weight: bold;
         line-height: 1.2;
-        color: #f0a020;
+        color: #f6b74a;
         font-variant-numeric: tabular-nums;
     }
-    .ttv2-fillnow-done .ttv2-fillprice { color: #a8dd1c; }
-    .ttv2-verdict[data-level="good"] { color: #a8dd1c; }
-    .ttv2-verdict[data-level="warn"] { color: #f0a020; }
+    .ttv2-fillnow-done .ttv2-fillprice { color: #6fdc7f; }
+    .ttv2-verdict[data-level="good"] { color: #6fdc7f; }
+    .ttv2-verdict[data-level="warn"] { color: #f6b74a; }
     .ttv2-panel button.ttv2-fillgo { align-self: flex-start; margin-top: 4px; }
 
     .ttv2-lows {
@@ -14312,6 +14699,434 @@
         color: var(--muted);
         font-weight: normal;
     }
+
+    /*
+     * 3.20 Graphite (mockups/T-graphite-everything.html, picked by the owner):
+     * the panel's look, over the rules above - the same parts and sizes the
+     * fitting in panel.js measures, a softer surface, system fonts, a serif
+     * title, one colour per meaning. The narrow steps above still win where
+     * they set a size (they are more specific).
+     */
+    .ttv2-panel {
+        background: var(--surface);
+        border: 1px solid var(--line2);
+        border-radius: 14px;
+        box-shadow: var(--shadow);
+        font: 13px/1.5 var(--sans);
+        -webkit-font-smoothing: antialiased;
+    }
+
+    .ttv2-panel b,
+    .ttv2-panel strong {
+        font-weight: 600;
+    }
+
+    .ttv2-panel a:hover { text-underline-offset: 3px; }
+
+    .ttv2-panel button {
+        font: 600 12px/1 var(--sans);
+        border-radius: 7px;
+        background: var(--raised);
+        border: 1px solid var(--line2);
+        color: var(--text2);
+        transition: background-color 0.15s var(--ease);
+    }
+
+    .ttv2-panel button:hover:not(:disabled) {
+        background: var(--hover);
+        border-color: var(--line2);
+    }
+
+    .ttv2-panel button.ttv2-primary {
+        color: var(--on-profit);
+        background: var(--profit);
+        border-color: transparent;
+        font-weight: 650;
+    }
+
+    .ttv2-panel button.ttv2-primary:hover:not(:disabled) {
+        background: #86e594;
+        border-color: transparent;
+    }
+
+    .ttv2-panel button.ttv2-link,
+    .ttv2-panel button.ttv2-link:hover:not(:disabled) {
+        background: none;
+        border: 0;
+        color: var(--offer);
+        font-weight: 500;
+    }
+
+    .ttv2-panel input[type="text"] {
+        font: 13px/1.4 var(--sans);
+        background: var(--input);
+        border: 1px solid var(--line2);
+        border-radius: 8px;
+    }
+
+    .ttv2-panel input[type="text"]:focus {
+        border-color: var(--brand);
+        outline: none;
+    }
+
+    .ttv2-label {
+        font: 650 11px/1.3 var(--sans);
+        letter-spacing: 0.08em;
+        color: var(--faint);
+    }
+
+    /* Lists scroll inside: a quiet dark scrollbar, not the browser's white one. */
+    .ttv2-panel * {
+        scrollbar-width: thin;
+        scrollbar-color: #3a3d45 transparent;
+    }
+
+    .ttv2-head {
+        height: 40px;
+        gap: 6px;
+        padding: 0 8px 0 14px;
+        background: var(--rail);
+    }
+
+    .ttv2-title {
+        font: 400 15px/1.2 var(--serif);
+        letter-spacing: 0;
+        color: var(--text);
+        text-shadow: none;
+    }
+
+    .ttv2-mini {
+        font: 600 12px var(--sans);
+    }
+
+    .ttv2-panel button.ttv2-icon {
+        height: 26px;
+        border-radius: 7px;
+        color: var(--text2);
+    }
+
+    .ttv2-panel button.ttv2-icon:hover:not(:disabled) {
+        background: var(--hover);
+    }
+
+    .ttv2-panel button.ttv2-scan {
+        height: 26px;
+        padding: 0 10px;
+        color: var(--on-profit);
+        background: var(--profit);
+        border-color: transparent;
+        font-weight: 650;
+    }
+
+    .ttv2-panel button.ttv2-scan:hover:not(:disabled) {
+        background: #86e594;
+        border-color: transparent;
+    }
+
+    .ttv2-panel button.ttv2-sell {
+        height: 26px;
+        padding: 0 10px;
+        background: transparent;
+        border-color: rgba(143, 155, 255, 0.45);
+        color: var(--brand);
+    }
+
+    @keyframes ttv2-pulse {
+        0% { box-shadow: 0 0 0 0 rgba(111, 220, 127, 0.6); }
+        100% { box-shadow: 0 0 0 8px rgba(111, 220, 127, 0); }
+    }
+
+    .ttv2-bar {
+        padding: 10px 14px;
+    }
+
+    .ttv2-dot {
+        width: 7px;
+        height: 7px;
+    }
+
+    .ttv2-seller {
+        padding: 8px 14px;
+    }
+
+    .ttv2-chips {
+        gap: 6px;
+        padding: 10px 14px;
+    }
+
+    .ttv2-panel button.ttv2-chip {
+        height: 26px;
+        padding: 0 10px;
+        border-radius: 999px;
+        font-weight: 500;
+        background: transparent;
+        border-color: var(--line2);
+        color: var(--text2);
+    }
+
+    .ttv2-panel button.ttv2-chip[aria-pressed="true"] {
+        color: var(--profit);
+        border-color: var(--profit-line);
+        background: var(--profit-bg);
+    }
+
+    .ttv2-panel button.ttv2-chip-set {
+        color: var(--text);
+        border-color: var(--line2);
+        background: var(--raised);
+    }
+
+    .ttv2-panel input.ttv2-chip-input {
+        height: 26px;
+        border-radius: 999px;
+        border-color: var(--brand);
+    }
+
+    .ttv2-panel button.ttv2-chip-any {
+        color: var(--text);
+        background: var(--raised);
+    }
+
+    .ttv2-chip-note {
+        padding: 0 14px 8px;
+    }
+
+    .ttv2-tabs {
+        gap: 4px;
+        padding: 0 14px;
+    }
+
+    .ttv2-panel button.ttv2-tab {
+        height: 34px;
+        padding: 0 10px;
+        margin-bottom: -1px;
+        border: 0;
+        border-bottom: 2px solid transparent;
+        border-radius: 0;
+        background: transparent;
+        color: var(--muted);
+        font-weight: 500;
+    }
+
+    .ttv2-panel button.ttv2-tab:hover:not(:disabled) {
+        background: transparent;
+        color: var(--text);
+    }
+
+    .ttv2-panel button.ttv2-tab.ttv2-tab-on {
+        background: transparent;
+        color: var(--text);
+        font-weight: 600;
+        box-shadow: none;
+        border-bottom-color: var(--profit);
+    }
+
+    .ttv2-credit {
+        padding-bottom: 0;
+        font-size: 11px;
+        color: var(--faint);
+    }
+
+    .ttv2-list {
+        padding: 4px 8px 8px;
+    }
+
+    .ttv2-cols {
+        padding: 10px 14px 4px;
+    }
+
+    .ttv2-row {
+        padding: 10px;
+        margin-bottom: 4px;
+        background: rgba(255, 255, 255, 0.025);
+        border: 1px solid transparent;
+        border-radius: 10px;
+        transition: background-color 0.15s var(--ease);
+    }
+
+    .ttv2-row:hover {
+        background: var(--raised);
+    }
+
+    .ttv2-row.ttv2-onpage {
+        border-color: var(--profit-line);
+        background: rgba(111, 220, 127, 0.05);
+    }
+
+    .ttv2-row-name {
+        font-weight: 600;
+    }
+
+    .ttv2-row-profit {
+        font: 650 15px var(--sans);
+        font-variant-numeric: tabular-nums;
+    }
+
+    .ttv2-row-details b {
+        color: var(--text2);
+        font-weight: 500;
+    }
+
+    .ttv2-status::before {
+        width: 7px;
+        height: 7px;
+    }
+
+    .ttv2-panel button.ttv2-go {
+        height: 26px;
+        padding: 0 12px;
+        font-weight: 650;
+        color: var(--text);
+    }
+
+    .ttv2-empty-text {
+        color: var(--muted);
+    }
+
+    /* The trade being worked on Torn's trade page, and the buying run. */
+    .ttv2-tradebox {
+        padding: 12px;
+        border: 1px solid var(--line2);
+        border-radius: 12px;
+        background: var(--raised);
+    }
+
+    .ttv2-panel > .ttv2-tradebox {
+        margin: 10px;
+    }
+
+    .ttv2-buybox {
+        border-color: var(--buy-line);
+        background: var(--buy-bg);
+    }
+
+    .ttv2-buybox .ttv2-tb-head > b {
+        color: var(--buy);
+    }
+
+    .ttv2-buybox .ttv2-sub {
+        color: #cdd2db;
+    }
+
+    .ttv2-panel button.ttv2-buynext {
+        min-height: 32px;
+        border-radius: 10px;
+        background: var(--buy);
+        color: var(--on-buy);
+        border-color: transparent;
+    }
+
+    .ttv2-panel button.ttv2-buynext:hover:not(:disabled) {
+        background: #77b7ff;
+        border-color: transparent;
+    }
+
+    .ttv2-panel button.ttv2-linkbtn {
+        color: var(--muted);
+        text-decoration: none;
+        font-weight: 500;
+    }
+
+    .ttv2-panel button.ttv2-linkbtn:hover:not(:disabled) {
+        background: none;
+        color: var(--text);
+    }
+
+    .ttv2-tb-mark {
+        color: var(--profit);
+    }
+
+    .ttv2-tb-fillnote {
+        margin-top: 8px;
+        padding-top: 8px;
+        border-top: 1px solid var(--line);
+        font-size: 12px;
+        color: var(--warn);
+    }
+
+    .ttv2-tb-fillnote.ttv2-tb-fillnote-ok {
+        color: var(--text2);
+    }
+
+    /* My bazaar */
+    .ttv2-panel button.ttv2-bzrow {
+        border-radius: 8px;
+    }
+
+    .ttv2-panel button.ttv2-bzrow[aria-pressed="true"] {
+        background: var(--raised);
+        border-color: var(--line2);
+    }
+
+    .ttv2-bzhero h3 {
+        font: 400 16px/1.25 var(--serif);
+        color: var(--text);
+    }
+
+    .ttv2-bzavg {
+        font: 650 20px/1.2 var(--sans);
+    }
+
+    .ttv2-graph {
+        background: var(--rail);
+        border-radius: 10px;
+    }
+
+    .ttv2-graph-tip {
+        background: rgba(17, 18, 21, 0.94);
+        border-radius: 8px;
+    }
+
+    .ttv2-graph-marklabel {
+        font: 600 11px var(--sans);
+    }
+
+    .ttv2-graph-keys {
+        flex-wrap: wrap;
+        gap: 4px 14px;
+    }
+
+    .ttv2-fillnow {
+        padding: 12px;
+        border-radius: 10px;
+        background: var(--raised);
+        border-color: var(--line2);
+    }
+
+    .ttv2-fillnow-done {
+        border-color: var(--profit-line);
+    }
+
+    .ttv2-tos-box {
+        border-radius: 10px;
+        background: var(--raised);
+    }
+
+    /* The serif title reads small at the narrow steps' sans sizes: one step up (still measured to fit). */
+    .ttv2-panel.ttv2-narrow .ttv2-head .ttv2-title {
+        font-size: 13px;
+    }
+
+    .ttv2-panel.ttv2-tight .ttv2-head .ttv2-title {
+        font-size: 12px;
+    }
+
+    .ttv2-panel.ttv2-tighter .ttv2-tabs {
+        gap: 0;
+    }
+
+    .ttv2-panel.ttv2-tighter button.ttv2-tab {
+        padding: 0 3px;
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+        .ttv2-panel *,
+        .ttv2-panel *::before,
+        .ttv2-panel *::after {
+            animation: none !important;
+            transition: none !important;
+        }
+    }
     `;
 
     /** Inject the page (card marker) stylesheet once. */
@@ -14445,7 +15260,7 @@
         const width = opts.width || 400;
         const height = opts.height || 160;
         const pad = { l: 8, r: 64, t: 12, b: 20 };
-        const colors = { im: '#74c0fc', mv: '#a8dd1c', ...(opts.colors || {}) };
+        const colors = { im: '#8cc0ff', mv: '#6fdc7f', ...(opts.colors || {}) };
 
         const fig = htmlEl('div', 'ttv2-graph-box');
         const svg = svgEl('svg', {
@@ -14553,8 +15368,21 @@
         /* the price about to be listed */
         if (mark !== null) {
             const my = y(mark).toFixed(1);
-            svg.appendChild(svgEl('line', { x1: pad.l, x2: pad.l + plotW, y1: my, y2: my, class: 'ttv2-graph-mark', stroke: '#f0a020', 'stroke-width': 1.5, 'stroke-dasharray': '5 3' }));
-            const label = svgEl('text', { x: pad.l + 4, y: Number(my) - 4, class: 'ttv2-graph-marklabel', fill: '#f0a020' });
+            svg.appendChild(svgEl('line', { x1: pad.l, x2: pad.l + plotW, y1: my, y2: my, class: 'ttv2-graph-mark', stroke: '#f6b74a', 'stroke-width': 1.5, 'stroke-dasharray': '5 3' }));
+            // Its words at the right end, on the side of the line away from the
+            // other lines there (3.20: above it, they sat on the average line).
+            const yAt = (list, key) => {
+                const last = list.length ? list[list.length - 1] : null;
+                return last ? y(last[key]) : null;
+            };
+            const near = [yAt(mv, 'mv'), yAt(points, 'im')].filter((v) => v !== null);
+            const above = Number(my) - 5;
+            const below = Number(my) + 13;
+            const clashes = (ly) => near.some((v) => Math.abs(v - (ly - 4)) < 9);
+            const fitsBelow = below <= pad.t + plotH - 2;
+            const fitsAbove = above - 10 >= pad.t;
+            const ly = fitsBelow && (clashes(above) || !fitsAbove) && !clashes(below) ? below : fitsAbove ? above : below;
+            const label = svgEl('text', { x: pad.l + plotW - 4, y: ly, 'text-anchor': 'end', class: 'ttv2-graph-marklabel', fill: '#f6b74a' });
             label.textContent = 'Fill ' + formatMoneyShort(mark);
             svg.appendChild(label);
         }
@@ -14873,8 +15701,10 @@
 
     /** The panel's usual width. */
     const PANEL_WIDTH = 430;
-    /** It fits beside Torn's content when at least this much room is there. */
-    const FIT_MIN_WIDTH = 240;
+    /** It fits beside Torn's content when at least this much room is there (3.20: 240 before - 230px of room floated it, 430 wide, over Torn). */
+    const FIT_MIN_WIDTH = 200;
+    /** With less room than that, its smallest size: it covers as little of Torn as it can. */
+    const FIT_SMALLEST = 240;
     /** Space kept between it and Torn's content, and the window edge. */
     const FIT_GAP = 8;
     /** Narrower than this, the header takes two rows instead of cutting anything. */
@@ -15644,10 +16474,11 @@
             this.tradeSig = sig;
             box.textContent = '';
             box.style.display = show ? '' : 'none';
-            if (!show) return;
+            this.tradeShown = show;
+            if (!show) return this.renderFillNote();
             if (ctx.match === 'other') {
                 box.appendChild(el('div', { class: 'ttv2-tb-warn', text: 'This trade is with ' + ctx.partner + '. The trade you accepted is with ' + (ctx.wanted || []).join(', ') + '.' }));
-                return;
+                return this.renderFillNote();
             }
             for (const t of list) {
                 const need = ctx.need && list.length === 1 ? ctx.need : t.items.map((i) => ({ name: i.name, qty: i.units, inside: 0 }));
@@ -15684,6 +16515,40 @@
                 if (ctx.waiting && ctx.waiting.length && list.length === 1) block.appendChild(el('div', { class: 'ttv2-sub', text: 'Not bought yet: ' + ctx.waiting.join(', ') }));
                 box.appendChild(block);
             }
+            this.renderFillNote();
+        }
+
+        /**
+         * Fill's line on Torn's trade page - what it marked, or why nothing
+         * (3.20): at the foot of the trade box. It was a line added after Torn's
+         * ADD TO TRADE, and Torn's pages get nothing that takes room.
+         *
+         * @param {{text: string, ok?: boolean}|null} n
+         */
+        setFillNote(n) {
+            const key = n ? JSON.stringify([n.text, Boolean(n.ok)]) : '';
+            if (key === this.fillNoteKey) return;
+            this.fillNoteKey = key;
+            this.fillNote = n || null;
+            this.renderFillNote();
+        }
+
+        renderFillNote() {
+            const box = this.tradeBoxEl;
+            if (!box) return;
+            let line = box.querySelector(':scope > .ttv2-tb-fillnote');
+            const n = this.fillNote;
+            if (!n) {
+                if (line) line.remove();
+                if (!this.tradeShown) box.style.display = 'none';
+                return;
+            }
+            if (!line) line = el('div', { class: 'ttv2-tb-fillnote' });
+            if (line !== box.lastElementChild) box.appendChild(line);
+            const cls = 'ttv2-tb-fillnote' + (n.ok ? ' ttv2-tb-fillnote-ok' : '');
+            if (line.className !== cls) line.className = cls;
+            if (line.textContent !== n.text) line.textContent = n.text;
+            box.style.display = '';
         }
 
         /**
@@ -15760,7 +16625,7 @@
             }
             // "Not here" only when it is not: a listing further down a long bazaar is still here.
             const notHere = v.here && !v.here.listed && !['below', 'searching', 'away'].includes(v.here.where);
-            const label = v.here && (!v.next || v.last) ? 'Done - go to the trade' : notHere ? 'Not here - next' : v.here && v.same ? 'Next item here' : v.here ? 'Next bazaar' : 'Open the next bazaar' + (v.next ? ': ' + v.next.seller : '');
+            const label = v.here && (!v.next || v.last) ? 'Done - go to the trade' : notHere ? 'Not here - next' : v.here && v.same ? 'Next item here' : v.here ? 'Next bazaar' : 'Open the next bazaar' + (v.next && v.next.seller ? ': ' + v.next.seller : '');
             this.buyNextBtn = el('button', { type: 'button', class: 'ttv2-primary ttv2-buynext', title: this.buyHereActive ? 'Key: N' : null, onclick: () => this.handlers.onBuyNext && this.handlers.onBuyNext() }, [label, this.buyHereActive ? el('span', { class: 'ttv2-kbd', text: 'N' }) : null]);
             box.appendChild(this.buyNextBtn);
             box.appendChild(this.cancelTradePart(v, () => this.setBuying(v)));
@@ -15984,7 +16849,9 @@
          * page itself is never touched. Where that space is narrower than usual,
          * the header, the filter chips and the tabs stay one row each, in smaller
          * steps of type and spacing - nothing is cut short. With less than
-         * FIT_MIN_WIDTH of room (a very narrow window), it floats as it always did.
+         * FIT_MIN_WIDTH of room (a very narrow window) there is nowhere it would
+         * not cover Torn: it takes its smallest size at the window's edge, so it
+         * covers as little as it can (3.20; it floated at its full 430px).
          */
         fit() {
             if (!this.root) return;
@@ -16002,6 +16869,8 @@
             if (rects.length && free >= FIT_MIN_WIDTH) {
                 width = Math.min(PANEL_WIDTH, free);
                 this.minLeft = Math.ceil(contentRight + FIT_GAP);
+            } else if (rects.length) {
+                width = FIT_SMALLEST;
             }
             this.root.style.setProperty('--fit-width', width + 'px');
 
@@ -16891,12 +17760,12 @@
     /*
      * Each use keeps its colour whatever its rank (a colour follows the use, never
      * its place): seven hues per service, validated for the dark card (the
-     * data-viz reference palette's dark steps, all checks passing on #1f1f1f); the
+     * data-viz reference palette's dark steps, all checks passing on #1c1e23); the
      * rest share one grey "Everything else" in the chart and are listed one by one
      * in the table below it.
      */
-    const UV_HUES = ['#3987e5', '#d95926', '#199e70', '#c98500', '#d55181', '#008300', '#9085e9'];
-    const UV_OTHER_HUE = '#6b6b6b';
+    const UV_HUES = ['#3987e5', '#d95926', '#199e70', '#d99a2b', '#d55181', '#008300', '#9085e9'];
+    const UV_OTHER_HUE = '#6a7180';
     const USAGE_COLOURS = {
         t: ['t.feed', 't.status', 't.networth', 't.ledger', 't.inventory', 't.sellers', 't.owner'],
         w: ['w.flips', 'w.buyers', 'w.lists', 'w.sweep', 'w.summary', 'w.desk', 'w.feed'],
@@ -17206,46 +18075,45 @@
     const USAGE_CSS = `
     .uv { display: flex; flex-direction: column; gap: 14px; }
     .uv-meters { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
-    .uv-meter { display: flex; flex-direction: column; gap: 6px; padding: 12px; text-align: left; background: var(--card2); border: 1px solid var(--cline2); border-radius: 10px; color: var(--text); cursor: pointer; }
-    .uv-meter:hover { border-color: var(--muted); }
-    .uv-meter.uv-on { border-color: var(--hot-line); box-shadow: inset 0 0 0 1px var(--hot-line); }
+    .uv-meter { display: flex; flex-direction: column; gap: 6px; padding: 14px; text-align: left; background: var(--raised); border: 1px solid var(--line); border-radius: 12px; color: var(--text); cursor: pointer; font: inherit; transition: border-color 0.15s var(--ease); }
+    .uv-meter:hover { border-color: var(--line2); }
+    .uv-meter.uv-on { border-color: var(--brand); box-shadow: inset 0 0 0 1px var(--brand); }
     .uv-mname { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
     .uv-mnum { color: var(--muted); }
-    .uv-mnum b { color: var(--text); font-size: 20px; font-variant-numeric: tabular-nums; }
+    .uv-mnum b { color: var(--text); font: 650 20px var(--sans); font-variant-numeric: tabular-nums; }
     .uv-meter small { color: var(--muted); font-size: 12px; }
-    .uv-bar { display: block; height: 8px; border-radius: 4px; background: #333; overflow: hidden; }
-    .uv-fill { display: block; height: 100%; border-radius: 4px; background: #3987e5; }
-    .uv-fill.uv-warn { background: #c98500; }
-    .uv-fill.uv-bad { background: #e66767; }
-    .uv-state { font-size: 12px; font-weight: bold; }
+    .uv-bar { display: block; height: 6px; border-radius: 999px; background: var(--input); overflow: hidden; }
+    .uv-fill { display: block; height: 100%; border-radius: 999px; background: var(--brand); }
+    .uv-fill.uv-warn { background: var(--warn); }
+    .uv-fill.uv-bad { background: var(--bad); }
+    .uv-state { font-size: 12px; font-weight: 600; }
     .uv-state.uv-ok { color: var(--muted); }
-    .uv-state.uv-warn { color: #e0a530; }
-    .uv-state.uv-bad { color: #ff8a80; }
+    .uv-state.uv-warn { color: var(--warn); }
+    .uv-state.uv-bad { color: var(--bad); }
     .uv-controls { display: flex; flex-wrap: wrap; gap: 10px; justify-content: space-between; }
-    .uv-seg { display: inline-flex; border: 1px solid var(--cline2); border-radius: 8px; overflow: hidden; }
-    .uv-seg button { padding: 6px 12px; border: 0; background: none; color: var(--muted); cursor: pointer; }
-    .uv-seg button + button { border-left: 1px solid var(--cline2); }
-    .uv-seg button.uv-on { background: var(--green-bg); color: var(--text); font-weight: bold; }
+    .uv-seg { display: inline-flex; gap: 2px; padding: 3px; border: 1px solid var(--line); border-radius: 11px; background: var(--input); overflow: hidden; }
+    .uv-seg button { height: 28px; padding: 0 12px; border: 0; border-radius: 8px; background: none; color: var(--muted); font-weight: 500; cursor: pointer; }
+    .uv-seg button.uv-on { background: var(--raised); color: var(--text); box-shadow: 0 1px 2px rgba(0, 0, 0, 0.3); }
     .uv-summary { margin: 0; color: var(--muted); }
     .uv-right { display: inline-flex; flex-wrap: wrap; gap: 8px; }
-    .uv-btn { padding: 6px 12px; border: 1px solid var(--cline2); border-radius: 8px; background: var(--card2); color: var(--text); cursor: pointer; }
-    .uv-btn:hover { border-color: var(--muted); }
+    .uv-btn { height: 30px; padding: 0 12px; border: 1px solid var(--line2); border-radius: 8px; background: var(--raised); color: var(--text); font-weight: 500; cursor: pointer; transition: background-color 0.15s var(--ease); }
+    .uv-btn:hover { background: var(--hover); }
 
     .uv-plot { position: relative; }
     .uv-svg { display: block; width: 100%; height: auto; }
-    .uv-grid { stroke: #2f2f2f; stroke-width: 1; }
-    .uv-cap { stroke: #ff8a80; stroke-width: 1; stroke-dasharray: 4 4; }
-    .uv-axis { fill: var(--muted); font-size: 11px; font-family: Arial, Helvetica, sans-serif; }
+    .uv-grid { stroke: var(--line); stroke-width: 1; }
+    .uv-cap { stroke: var(--bad); stroke-width: 1; stroke-dasharray: 4 4; }
+    .uv-axis { fill: var(--muted); font-size: 11px; font-family: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif; }
     .uv-hit { fill: transparent; cursor: default; }
     .uv-hit:hover, .uv-hit:focus { fill: rgba(255, 255, 255, 0.05); outline: none; }
-    .uv-tip { position: absolute; top: 0; min-width: 200px; max-width: 280px; padding: 8px 10px; background: #111; border: 1px solid var(--cline2); border-radius: 8px; box-shadow: 0 6px 18px rgba(0, 0, 0, 0.5); pointer-events: none; font-size: 12px; }
+    .uv-tip { position: absolute; top: 0; min-width: 200px; max-width: 280px; padding: 8px 10px; background: var(--page); border: 1px solid var(--line2); border-radius: 10px; box-shadow: var(--shadow); pointer-events: none; font-size: 12px; }
     .uv-tip > b { display: block; margin-bottom: 4px; }
     .uv-trow { display: grid; grid-template-columns: 10px 1fr auto; gap: 6px; align-items: center; }
     .uv-sw { display: inline-block; width: 10px; height: 10px; margin-right: 6px; border-radius: 2px; vertical-align: -1px; }
     .uv-trow .uv-sw { margin: 0; }
     .uv-table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
-    .uv-table th { text-align: left; font-size: 11px; letter-spacing: 0.4px; text-transform: uppercase; color: var(--muted); padding: 6px 8px; border-bottom: 1px solid var(--cline2); }
-    .uv-table td { padding: 6px 8px; border-bottom: 1px solid var(--cline); }
+    .uv-table th { text-align: left; font: 650 10.5px/1.3 var(--sans); letter-spacing: 0.08em; text-transform: uppercase; color: var(--faint); padding: 8px 10px; border-bottom: 1px solid var(--line); }
+    .uv-table td { padding: 8px 10px; border-bottom: 1px solid var(--line); color: var(--text2); }
     .uv-r { text-align: right; }
     .uv-lane { color: var(--muted); font-size: 12px; }
     .uv-lane-high { color: var(--price); }
@@ -17456,21 +18324,21 @@
     const REPORT_CSS = `
     .rv { display: flex; flex-direction: column; gap: 14px; }
     .rv-label { display: flex; flex-direction: column; gap: 6px; }
-    .rv-text { width: 100%; padding: 8px 10px; border: 1px solid var(--cline2); border-radius: 8px; background: var(--card2); color: var(--text); font: inherit; resize: vertical; }
-    .rv-text:focus { outline: 2px solid var(--hot-line); outline-offset: 0; }
+    .rv-text { width: 100%; padding: 10px 12px; border: 1px solid var(--line2); border-radius: 10px; background: var(--input); color: var(--text); font: inherit; resize: vertical; }
+    .rv-text:focus { outline: none; border-color: var(--brand); }
     .rv-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
     .rv-row small { color: var(--muted); }
-    .rv-btn { padding: 7px 14px; border: 1px solid var(--cline2); border-radius: 8px; background: var(--card2); color: var(--text); cursor: pointer; }
-    .rv-btn:hover { border-color: var(--muted); }
-    .rv-btn.rv-primary { background: var(--price); border-color: var(--price); color: #111; font-weight: bold; }
-    .rv-link { padding: 0; border: 0; background: none; color: var(--offer); text-decoration: underline; cursor: pointer; align-self: flex-start; }
+    .rv-btn { height: 32px; padding: 0 14px; border: 1px solid var(--line2); border-radius: 10px; background: var(--raised); color: var(--text); font-weight: 500; cursor: pointer; transition: background-color 0.15s var(--ease); }
+    .rv-btn:hover { background: var(--hover); }
+    .rv-btn.rv-primary { background: var(--profit); border-color: transparent; color: var(--on-profit); font-weight: 600; }
+    .rv-link { padding: 0; border: 0; background: none; color: var(--offer); cursor: pointer; align-self: flex-start; }
     .rv-shots { display: flex; flex-wrap: wrap; gap: 8px; }
     .rv-shot { position: relative; }
-    .rv-shot img { display: block; height: 72px; border-radius: 6px; border: 1px solid var(--cline2); }
+    .rv-shot img { display: block; height: 72px; border-radius: 8px; border: 1px solid var(--line2); }
     .rv-x { position: absolute; top: 2px; right: 2px; width: 20px; height: 20px; padding: 0; border: 0; border-radius: 10px; background: rgba(0, 0, 0, 0.7); color: #fff; cursor: pointer; }
     .rv-includes { margin: 0; padding-left: 18px; color: var(--muted); }
     .rv-includes li::marker { content: '✓  '; color: var(--price); }
-    .rv-log { margin: 0; padding: 8px 10px; border: 1px solid var(--cline2); border-radius: 8px; background: #111; font: 11px/1.5 Consolas, monospace; white-space: pre-wrap; }
+    .rv-log { margin: 0; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--input); color: var(--text2); font: 11px/1.5 Consolas, monospace; white-space: pre-wrap; }
     .rv-status { margin: 0; color: var(--muted); }
     `;
 
@@ -17958,8 +18826,8 @@
             const totals = shown.reduce((a, p) => ({ trades: a.trades + p.trades, received: a.received + p.received, profit: a.profit + p.profit }), { trades: 0, received: 0, profit: 0 });
             const card = lvEl('section', { class: 'lg-card' });
             card.appendChild(lvEl('div', { class: 'lg-cardh' }, [
-                lvEl('h3', { text: 'Traders · most trades first' }),
-                partners.length ? lvEl('span', { class: 'lg-muted' }, [lvCount(shown.length) + ' traders · ', lvEl('b', { text: lvCount(totals.trades) }), ' trades · paid to you ', lvEl('b', { text: formatMoney(Math.round(totals.received)) }), ' · profit ', lvEl('b', { class: totals.profit >= 0 ? 'lg-good' : 'lg-loss', text: lvSigned(totals.profit) })]) : null,
+                lvEl('h3', { text: 'Traders · favourites first, then most trades' }),
+                partners.length ? lvEl('span', { class: 'lg-muted' }, [lvCount(shown.length) + (shown.length === 1 ? ' trader · ' : ' traders · '), lvEl('b', { text: lvCount(totals.trades) }), ' trades · paid to you ', lvEl('b', { text: formatMoney(Math.round(totals.received)) }), ' · profit ', lvEl('b', { class: totals.profit >= 0 ? 'lg-good' : 'lg-loss', text: lvSigned(totals.profit) })]) : null,
             ]));
             if (!partners.length && !black.length) {
                 card.appendChild(lvEl('p', { class: 'lg-muted', text: L.busy ? 'Reading your trades…' : 'No finished trades read yet.' }));
@@ -17984,7 +18852,9 @@
                 });
                 return a;
             };
-            for (const p of shown) {
+            // Favourites first (3.20), each group in its own order: most trades first.
+            const favFirst = [...shown.filter((p) => isFavourite(p, edits)), ...shown.filter((p) => !isFavourite(p, edits))];
+            for (const p of favFirst) {
                 const fav = isFavourite(p, edits);
                 const removed = (edits.removed || []).map(String).includes(p.who);
                 const added = (edits.added || []).map(String).includes(p.who);
@@ -17992,9 +18862,9 @@
                 const pl = p.list || { checked: 0, paid: 0, short: [] };
                 const lastShort = pl.short.length ? pl.short[0] : null;
                 const b = { id: p.who, name: p.whoName || 'Player ' + p.who };
-                table.appendChild(lvEl('tr', {}, [
+                table.appendChild(lvEl('tr', { class: fav ? 'lg-favrow' : '' }, [
                     lvEl('td', {}, [lvEl('div', { class: 'lg-who' }, [
-                        lvEl('span', { class: 'lg-who1' }, [fav ? lvEl('span', { class: 'lg-star', text: '★' }) : null, name(p.who, p.whoName), trust(p.who)]),
+                        lvEl('span', { class: 'lg-who1' }, [fav ? lvEl('span', { class: 'lg-star', text: '★' }) : null, name(p.who, p.whoName), trust(p.who), fav ? lvEl('span', { class: 'sp-favtag', text: 'Favourite' }) : null]),
                         favNote ? lvEl('small', { text: favNote }) : null,
                     ])]),
                     lvEl('td', { class: 'lg-num', text: lvCount(p.trades) }),
@@ -18251,66 +19121,71 @@
     }
 
     const LEDGER_CSS = `
-    .lg { display: flex; flex-direction: column; gap: 16px; padding: 16px 24px 64px; }
-    .lg-card { background: var(--card); border: 1px solid var(--cline); border-radius: 12px; padding: 16px; min-width: 0; }
-    .lg-card h3 { margin: 0 0 10px; font-size: 11px; letter-spacing: 0.6px; text-transform: uppercase; color: var(--muted); }
-    .lg-empty h2 { margin: 0 0 8px; font-size: 20px; color: #fff; }
+    .lg { display: flex; flex-direction: column; gap: 16px; padding: 24px 24px 64px; }
+    .lg-card { background: var(--surface); border: 1px solid var(--line); border-radius: 16px; padding: 16px; min-width: 0; }
+    .lg-card h3 { margin: 0 0 12px; font: 650 11px/1 var(--sans); letter-spacing: 0.09em; text-transform: uppercase; color: var(--text2); display: flex; align-items: center; gap: 8px; }
+    .lg-card h3::before { content: ""; width: 3px; height: 12px; border-radius: 2px; background: var(--brand); flex: 0 0 auto; }
+    .lg-empty h2 { margin: 0 0 8px; font: 400 20px/1.2 var(--serif); color: var(--text); }
     .lg-empty p { margin: 0 0 10px; max-width: 720px; }
     .lg-muted { color: var(--muted); font-size: 12px; }
     .lg-bad { color: var(--bad); font-size: 12px; }
     .lg-status { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; font-size: 12px; color: var(--muted); }
-    .lg-filters { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 12px 16px; padding: 12px 16px; background: var(--rail); border: 1px solid var(--cline); border-radius: 12px; }
+    .lg-filters { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 12px 16px; padding: 12px 16px; background: var(--rail); border: 1px solid var(--line); border-radius: 16px; }
     .lg-chips { display: flex; gap: 6px; flex-wrap: wrap; }
+    .lg-chips { padding: 3px; gap: 2px; border-radius: 11px; background: var(--input); border: 1px solid var(--line); }
     .lg-chips .sp-chip-f { flex: 0 0 auto; padding: 0 12px; }
     .lg-chips-s .sp-chip-f { height: 26px; font-size: 12px; }
-    .lg-f { display: flex; flex-direction: column; gap: 4px; font-size: 11px; letter-spacing: 0.6px; text-transform: uppercase; color: var(--muted); }
-    .lg-in { height: 32px; min-width: 150px; padding: 0 10px; border-radius: 9px; border: 1px solid #444; background: #0f0f0f; color: var(--text); font: 13px Arial, Helvetica, sans-serif; text-transform: none; letter-spacing: 0; }
+    .lg-f { display: flex; flex-direction: column; gap: 6px; font: 650 11px/1 var(--sans); letter-spacing: 0.08em; text-transform: uppercase; color: var(--faint); }
+    .lg-in { height: 34px; min-width: 150px; padding: 0 10px; border-radius: 10px; border: 1px solid var(--line2); background: var(--input); color: var(--text); font: 400 13px "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif; text-transform: none; letter-spacing: 0; }
     .lg-head { display: flex; align-items: baseline; gap: 12px; }
-    .lg-head h2 { margin: 0; font-size: 20px; color: #fff; }
+    .lg-head h2 { margin: 0; font: 400 20px/1.2 var(--serif); color: var(--text); }
     .lg-tiles { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
-    .lg-tile { display: flex; flex-direction: column; gap: 2px; padding: 12px 14px; background: var(--card); border: 1px solid var(--cline); border-radius: 12px; }
-    .lg-tile b { font-size: 22px; font-variant-numeric: tabular-nums; color: #fff; }
+    .lg-tile { display: flex; flex-direction: column; gap: 4px; padding: 16px; background: var(--surface); border: 1px solid var(--line); border-radius: 16px; }
+    .lg-tile b { font: 650 24px/1.15 var(--sans); font-variant-numeric: tabular-nums; color: var(--text); }
     .lg-tile small { color: var(--muted); font-size: 12px; }
-    .lg-tl { font-size: 11px; letter-spacing: 0.6px; text-transform: uppercase; color: var(--muted); }
-    .lg-tile.lg-good { background: var(--hot); border-color: var(--hot-line); }
+    .lg-tl { font: 650 11px/1 var(--sans); letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+    .lg-tile.lg-good { background: var(--profit-bg); border-color: var(--profit-line); }
     .lg-tile.lg-good b, .lg-good { color: var(--price); }
-    .lg-tile.lg-loss b, .lg-loss { color: #ff8a80; }
+    .lg-tile.lg-loss b, .lg-loss { color: var(--bad); }
     .lg-note { margin: 0; font-size: 12px; color: var(--warn); }
-    .lg-tabs { display: flex; gap: 6px; }
+    .lg-tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--line); }
     .lg-receipts { display: grid; grid-template-columns: repeat(auto-fill, minmax(420px, 1fr)); gap: 12px; }
     .lg-rcpt .lg-cardh b { font-size: 15px; font-variant-numeric: tabular-nums; }
     .lg-rcpt-foot { margin: 8px 0 0; font-size: 12px; }
-    .lg-tab { height: 34px; padding: 0 16px; border-radius: 9px; border: 1px solid var(--cline2); background: none; color: var(--muted); font: bold 13px Arial, Helvetica, sans-serif; cursor: pointer; }
-    .lg-tab[aria-pressed="true"] { color: #fff; border-color: var(--profit); background: var(--green-bg); }
+    .lg-tab { height: 38px; padding: 0 14px; margin-bottom: -1px; border: 0; border-bottom: 2px solid transparent; border-radius: 0; background: none; color: var(--muted); font: 500 13px "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif; cursor: pointer; }
+    .lg-tab:hover { color: var(--text); }
+    .lg-tab[aria-pressed="true"] { color: var(--text); border-bottom-color: var(--brand); }
     .lg-in.lg-date { min-width: 140px; color-scheme: dark; }
     .lg-in.lg-min { min-width: 110px; width: 120px; }
     .lg-mugline { margin: 0; font-size: 13px; color: var(--muted); display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px; }
-    .lg-tile.lg-lossbox { border-color: #6b2b27; background: #2a1917; }
-    .lg-tile.lg-lossbox b { color: #ff8a80; }
+    .lg-tile.lg-lossbox { border-color: var(--bad-line); background: var(--bad-bg); }
+    .lg-tile.lg-lossbox b { color: var(--bad); }
     .lg-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; align-items: start; }
     .lg-cardh { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
     .lg-cardh h3 { margin: 0; }
     .lg-chart { width: 100%; height: auto; max-height: 260px; display: block; }
-    .lg-axis { stroke: #555; stroke-width: 1; }
-    .lg-lab { fill: var(--muted); font: 11px Arial, Helvetica, sans-serif; }
+    .lg-axis { stroke: #454852; stroke-width: 1; }
+    .lg-lab { fill: var(--muted); font: 11px "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif; }
     .lg-bar-g { fill: var(--price); background: var(--price); }
-    .lg-bar-r { fill: #e05a4f; background: #e05a4f; }
+    .lg-bar-r { fill: var(--bad); background: var(--bad); }
     .lg-ibars { display: flex; flex-direction: column; gap: 4px; }
-    .lg-ibar { display: grid; grid-template-columns: minmax(0, 160px) minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 4px 6px; border: 0; border-radius: 8px; background: none; color: var(--text); text-align: left; cursor: pointer; font: 13px Arial, Helvetica, sans-serif; }
-    .lg-ibar:hover { background: #242424; }
+    .lg-ibar { display: grid; grid-template-columns: minmax(0, 160px) minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 4px 6px; border: 0; border-radius: 8px; background: none; color: var(--text); text-align: left; cursor: pointer; font: 13px "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif; }
+    .lg-ibar:hover { background: var(--hover); }
     .lg-iname { overflow-wrap: anywhere; }
-    .lg-itrack { height: 10px; border-radius: 5px; background: #262626; overflow: hidden; }
+    .lg-itrack { height: 8px; border-radius: 999px; background: var(--raised); overflow: hidden; }
     .lg-itrack i { display: block; height: 100%; border-radius: 5px; }
     .lg-ibar b { font-variant-numeric: tabular-nums; white-space: nowrap; }
-    .lg-table { width: 100%; border-collapse: collapse; font-size: 13px; }
-    .lg-table th { text-align: left; font-size: 11px; letter-spacing: 0.6px; text-transform: uppercase; color: var(--muted); font-weight: normal; padding: 6px 8px; border-bottom: 1px solid var(--cline); }
-    .lg-table td { padding: 7px 8px; border-bottom: 1px solid #262626; vertical-align: top; }
+    .lg-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+    .lg-table th { text-align: left; font: 650 10.5px/1.3 var(--sans); letter-spacing: 0.08em; text-transform: uppercase; color: var(--faint); padding: 8px 10px; border-bottom: 1px solid var(--line); }
+    .lg-table td { padding: 9px 10px; border-bottom: 1px solid var(--line); vertical-align: top; color: var(--text2); }
+    .lg-table tr:hover td { background: rgba(255, 255, 255, 0.02); }
+    .lg-table tr.lg-favrow td:first-child { box-shadow: inset 3px 0 0 var(--fav); }
     .lg-num { text-align: right !important; font-variant-numeric: tabular-nums; white-space: nowrap; }
     .lg-click { cursor: pointer; }
-    .lg-click:hover { background: #222; }
-    .lg-side { font-size: 11px; font-weight: bold; padding: 2px 6px; border-radius: 8px; background: #262626; color: var(--muted); }
+    .lg-click:hover { background: var(--rail); }
+    .lg-side { font-size: 11px; font-weight: 650; padding: 2px 7px; border-radius: 999px; background: var(--raised); color: var(--muted); }
     .lg-sell .lg-side { color: var(--price); background: var(--green-bg); }
-    .lg-buy .lg-side { color: var(--offer); background: rgba(116, 192, 252, 0.10); }
+    .lg-buy .lg-side { color: var(--buy); background: var(--buy-bg); }
     .lg-from { display: block; font-size: 12px; color: var(--muted); }
     .lg-rows td:nth-child(3) { min-width: 160px; }
     @media (max-width: 1100px) { .lg-grid { grid-template-columns: minmax(0, 1fr); } }
@@ -18321,26 +19196,26 @@
         .lg-f { flex: 1 1 140px; }
     }
     .lg-qtym { display: none; color: var(--muted); }
-    .lg-short { color: var(--warn); font-weight: bold; }
+    .lg-short { color: var(--warn); font-weight: 600; }
     .lg-who { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
     .lg-who1 { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 8px; }
     .lg-who small { color: var(--muted); font-size: 12px; }
-    .lg-tname { color: #fff; font-weight: bold; text-decoration: none; }
+    .lg-tname { color: var(--text); font-weight: 600; text-decoration: none; }
     .lg-tname:hover { text-decoration: underline; }
-    .lg-star { color: #f2c94c; }
+    .lg-star { color: var(--fav); }
     .lg-paid { display: flex; flex-direction: column; gap: 2px; }
-    .lg-paid span { white-space: nowrap; font-weight: bold; }
+    .lg-paid span { white-space: nowrap; font-weight: 600; }
     .lg-paid small { font-size: 12px; }
     .lg-ctl { text-align: right; white-space: nowrap; }
     .lg-ctl .sp-fav + .sp-blk { margin-left: 6px; }
     .lg-bl td { opacity: 0.55; }
     .lg-bl td.lg-ctl { opacity: 1; }
-    .lg-bltag { font-size: 10px; font-weight: bold; letter-spacing: 0.4px; text-transform: uppercase; color: #ff8a80; border: 1px solid #6b2b27; border-radius: 9px; padding: 1px 6px; white-space: nowrap; }
+    .lg-bltag { font: 700 10px/16px var(--sans); letter-spacing: 0.05em; text-transform: uppercase; color: var(--bad); background: var(--bad-bg); border-radius: 999px; padding: 0 7px; white-space: nowrap; }
     /* A phone: every buy and sell is a small card of three lines, nothing cut. */
     @media (max-width: 700px) {
         .lg-rows, .lg-rows tbody, .lg-rows tr, .lg-rows td { display: block; }
         .lg-rows tr:first-child { display: none; }
-        .lg-rows tr { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 12px; padding: 8px 0; border-bottom: 1px solid #262626; }
+        .lg-rows tr { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 12px; padding: 8px 0; border-bottom: 1px solid var(--line); }
         .lg-rows td { padding: 0; border: 0; min-width: 0 !important; }
         .lg-rows td:nth-child(3) { grid-column: 1; grid-row: 1; }
         .lg-rows td:nth-child(9) { grid-column: 2; grid-row: 1; }
@@ -18393,6 +19268,7 @@
 
 
 
+
     const SELLING_PAGE_TITLE = 'Torn Bids';
 
     const SELLING_PAGE_DEFAULTS = {
@@ -18424,7 +19300,25 @@
          * whatever this says (every copy is its own).
          */
         neverFlip: ['Clothing', 'Other'],
+        /*
+         * Settings › Bazaar prices (3.20): how often each group's bazaars are read
+         * again, in whole minutes from 1 to 10 (core/desk.js freshnessMs).
+         */
+        freshDeskMin: FRESH_DEFAULTS.desk,
+        freshTopMin: FRESH_DEFAULTS.top,
+        freshOtherMin: FRESH_DEFAULTS.other,
     };
+
+    /* A flip card's "seen" dot: green under this many minutes, amber under the next, grey after. */
+    const SEEN_FRESH_MIN = 5;
+    const SEEN_OLD_MIN = 15;
+
+    /** Minutes since TornW3B saw the oldest listing of a flip's plan, or null when none says. */
+    function seenMinutes(steps) {
+        const at = (steps || []).map((st) => Number(st.dataAt || st.seenAt) || 0).filter((t) => t > 0);
+        if (!at.length) return null;
+        return Math.max(0, Math.floor((Date.now() - Math.min(...at)) / 60000));
+    }
 
     /* Your traders: this many cards before "Show all". */
     const SCAN_SHOWN = 5;
@@ -18921,15 +19815,16 @@
             this.deskEl = spEl('section', { class: 'sp-ws', 'aria-label': 'The item picked' });
 
             this.listEl = spEl('main', { class: 'sp-main' }, [
+                // Your traders on top, Best flips under them (3.20, the owner's order).
                 spEl('div', { class: 'sp-wrap' }, [
-                    spEl('div', { class: 'sp-sec' }, [
+                    this.scanEl,
+                    spEl('div', { class: 'sp-sec sp-sec-flips' }, [
                         spEl('h2', { text: 'Best flips · each within your cash' }),
                         spEl('span', { class: 'sp-sp' }),
                         this.onlineBtn,
                         this.trustedBtn,
                     ]),
                     this.stripEl,
-                    this.scanEl,
                     this.catLineEl,
                     spEl('div', { class: 'sp-desk' }, [
                         spEl('div', { class: 'sp-col-list' }, [
@@ -19294,6 +20189,26 @@
                 ]),
             ]);
 
+            /*
+             * Bazaar prices (3.20, the owner: "make it live in settings where they
+             * can change up to 10 mins"): how often each group is read again, and
+             * whether TornW3B's reads a minute can keep up with that.
+             */
+            this.freshSelects = {};
+            const freshSelect = (key, label) => {
+                const sel = spEl('select', { class: 'sp-cat sp-fresh', 'aria-label': label, 'data-focus': 'set:' + key });
+                for (let m = FRESH_MIN; m <= FRESH_MAX; m += 1) sel.appendChild(spEl('option', { value: String(m), text: m === 1 ? 'Every minute' : 'Every ' + m + ' minutes' }));
+                sel.addEventListener('change', () => this.h.onPrefsChange && this.h.onPrefsChange({ [key]: Number(sel.value) }));
+                this.freshSelects[key] = sel;
+                return sel;
+            };
+            this.keepUpEl = spEl('div', { class: 'sp-keepup', role: 'status' });
+            section('fresh', 'Bazaar prices', 'How often each item\'s bazaars are read again from TornW3B. Faster is fresher; TornW3B itself sees a bazaar every few minutes.', [
+                field('Desk and trade items', 'The item on the desk, and the items of the trade you are working on', [freshSelect('freshDeskMin', 'Desk and trade items: read every')]),
+                field('Top ' + FRESH_TOP + ' flips', 'The best possible flips', [freshSelect('freshTopMin', 'Top ' + FRESH_TOP + ' flips: read every')]),
+                field('Other possible flips', 'Every other item a trader pays more for than a bazaar asks', [freshSelect('freshOtherMin', 'Other possible flips: read every'), this.keepUpEl]),
+            ]);
+
             /* the Torn Ledger's Full key: masked, never shown again, its own terms */
             // A text box masked by CSS, never a password box (ui/mask.js): a
             // browser would offer to save a Full key into its synced passwords.
@@ -19392,6 +20307,32 @@
             this.snavPick('keys');
         }
 
+        /** Settings › Bazaar prices: the saved minutes, and whether they keep up. */
+        renderFresh(p) {
+            if (!this.keepUpEl) return;
+            const minutes = {
+                desk: freshMinutes(p.freshDeskMin, FRESH_DEFAULTS.desk),
+                top: freshMinutes(p.freshTopMin, FRESH_DEFAULTS.top),
+                other: freshMinutes(p.freshOtherMin, FRESH_DEFAULTS.other),
+            };
+            for (const [key, m] of [['freshDeskMin', minutes.desk], ['freshTopMin', minutes.top], ['freshOtherMin', minutes.other]]) {
+                const sel = this.freshSelects[key];
+                if (sel && sel.value !== String(m)) sel.value = String(m);
+            }
+            const info = this.state.info || {};
+            // Before the flips are known: as many as a page usually has.
+            const counts = info.freshCounts && info.flipsWanted ? info.freshCounts : { desk: 1, top: FRESH_TOP, other: 130 };
+            const k = keepsUp(minutes, counts, info.w3bPerMin || 60);
+            const text = k.ok
+                ? 'Keeps up: every group is read on time, with room left for traders\' price lists.'
+                : k.otherEvery
+                    ? 'Can\'t keep up: the other possible flips would be read about every ' + k.otherEvery + ' minutes instead. The desk and the top ' + FRESH_TOP + ' still come first.'
+                    : 'Too fast to keep up: the other possible flips would hardly be read. The desk and the top ' + FRESH_TOP + ' still come first.';
+            const cls = 'sp-keepup ' + (k.ok ? 'sp-keepup-ok' : 'sp-keepup-behind');
+            if (this.keepUpEl.textContent !== text) this.keepUpEl.textContent = text;
+            if (this.keepUpEl.className !== cls) this.keepUpEl.className = cls;
+        }
+
         /** Light one part in the settings menu. */
         snavPick(id) {
             this.snavOn = id;
@@ -19408,6 +20349,7 @@
                 te: info.teBadKey ? ['bad', 'key refused'] : !info.hasTeKey ? ['unknown', 'no key'] : info.teAt ? ['online', formatAge(now - info.teAt)] : ['idle', 'loading'],
                 w3b: (info.w3bRead || 0) < (info.w3bKnown || 0) ? ['idle', (info.w3bRead || 0) + '/' + info.w3bKnown] : ['online', count(info.w3bTraders || 0) + ' lists'],
                 flips: p.cash > 0 ? ['online', formatMoney(p.cash) + ' · ' + (p.networthPct || 10) + '%'] : ['idle', 'no cash limit'],
+                fresh: ['online', freshMinutes(p.freshDeskMin, FRESH_DEFAULTS.desk) + ' · ' + freshMinutes(p.freshTopMin, FRESH_DEFAULTS.top) + ' · ' + freshMinutes(p.freshOtherMin, FRESH_DEFAULTS.other) + ' min'],
                 links: ['online', p.linksNewTab !== false ? 'new tab' : 'this tab'],
                 report: (() => {
                     const log = this.problemLog || [];
@@ -19526,6 +20468,7 @@
             this.cashInput.classList.toggle('sp-dim', !hasCash);
             this.renderKeepList(p);
             this.renderNeverFlip(p);
+            this.renderFresh(p);
             this.renderBlackList();
 
             this.renderCategory();
@@ -19782,7 +20725,7 @@
             const refocus = this.focusKeyIn(box);
             queueMicrotask(() => this.focusBack(box, refocus));
             const sig = JSON.stringify([sc.open, sc.favourites, sc.trusted, this.scanAll, s.desk && s.desk.itemId, s.desk && s.desk.trade && s.desk.trade.chosen && s.desk.trade.chosen.key,
-                sc.list.map((x) => [x.id, x.name, x.profit, x.items, x.stops, x.reading, x.lastPaid, x.mainId, x.mainUnits, x.favourite, x.traded, x.trust && x.trust.level + x.trust.score])]);
+                sc.list.map((x) => [x.id, x.name, x.profit, x.items, x.stops, x.reading, x.lastPaid, x.mainId, x.mainUnits, x.favourite, x.hiddenBy, x.hiddenBy && s.statuses && JSON.stringify(s.statuses.get(String(x.id)) || null), x.traded, x.trust && x.trust.level + x.trust.score])]);
             if (sig === this.scanSig) return;
             this.scanSig = sig;
             box.textContent = '';
@@ -19798,10 +20741,14 @@
             ]));
             if (!sc.open || !total) return;
             const onDesk = s.desk && s.desk.trade && s.desk.trade.chosen ? s.desk.trade.chosen.key : null;
-            const shown = this.scanAll ? sc.list : sc.list.slice(0, SCAN_SHOWN);
-            const grid = spEl('div', { class: 'sp-scangrid' });
-            for (const x of shown) {
-                const ready = x.items > 0 && x.profit > 0;
+            // Favourites get a row of their own (3.20), every one of them, always
+            // shown; the Trusted row after it, the top few until Show all. The same
+            // sums for both: a favourite is never ranked up, only kept in view.
+            const favs = sc.list.filter((x) => x.favourite);
+            const rest = sc.list.filter((x) => !x.favourite);
+            const restShown = this.scanAll ? rest : rest.slice(0, SCAN_SHOWN);
+            const card = (x) => {
+                const ready = x.items > 0 && x.profit > 0 && !x.hiddenBy;
                 const sel = ready && onDesk === x.key && s.desk && s.desk.itemId === x.mainId;
                 const head = spEl('span', { class: 'sp-fc-top' }, [
                     x.favourite ? spEl('span', { class: 'sp-star', title: 'Favourite', text: '★' }) : null,
@@ -19809,17 +20756,23 @@
                     this.trustBadge(x),
                     x.lastPaid ? spEl('span', { class: 'sp-lastpaid', title: 'No public list: the prices they accepted from you last time. Check before buying.', text: 'Last paid' }) : null,
                 ]);
-                const card = spEl('div', { class: 'sp-fc sp-tc' + (ready ? ' sp-tc-ready' : ' sp-tc-none') + (sel ? ' sp-sel' : '') }, [head]);
-                if (ready) {
-                    card.append(
+                const el = spEl('div', { class: 'sp-fc sp-tc' + (ready ? ' sp-tc-ready' : ' sp-tc-none') + (x.favourite ? ' sp-tc-fav' : '') + (x.hiddenBy ? ' sp-tc-hidden' : '') + (sel ? ' sp-sel' : '') }, [head]);
+                if (x.hiddenBy) {
+                    const st = this.status({ id: x.id, name: x.name });
+                    el.append(
+                        spEl('small', { class: 'sp-tc-why' }, [st, st.childNodes.length ? ' · ' : '', 'hidden by ', spEl('b', { text: x.hiddenBy === 'offline' ? 'Buyers online only' : 'Trusted buyers only' })]),
+                        spEl('small', { text: 'Their trade is not counted while the filter is on.' }),
+                    );
+                } else if (ready) {
+                    el.append(
                         spEl('span', { class: 'sp-fc-p' + (x.lastPaid || x.estimated ? ' sp-est' : ''), title: x.lastPaid ? 'About: from what they paid you last time' : x.estimated ? 'About: some bazaars are still being read' : null, text: (x.lastPaid || x.estimated ? '≈ ' : '') + 'Trade ' + signed(x.profit) }),
                         spEl('small', {}, [spEl('b', { text: count(x.items) + (x.items === 1 ? ' item' : ' items') }), ' · ' + count(x.stops) + (x.stops === 1 ? ' bazaar' : ' bazaars') + (x.mainName ? ' · ' + x.mainName + ' ×' + count(x.mainUnits) + (x.items > 1 ? ' + ' + count(x.items - 1) + (x.items === 2 ? ' extra' : ' extras') : '') : '')]),
                     );
                 } else {
-                    card.appendChild(spEl('small', { text: x.reading ? 'Reading their list…' : 'No trade now: nothing in bazaars under their prices' }));
+                    el.appendChild(spEl('small', { text: x.reading ? 'Reading their list…' : 'No trade now: nothing in bazaars under their prices' }));
                 }
-                if (x.traded) card.appendChild(spEl('small', { class: 'sp-traded', text: x.traded }));
-                card.appendChild(spEl('button', {
+                if (x.traded) el.appendChild(spEl('small', { class: 'sp-traded', text: x.traded }));
+                el.appendChild(spEl('button', {
                     type: 'button',
                     class: 'sp-btn sp-go' + (sel ? ' sp-go-on' : ''),
                     'data-focus': 'scan:' + x.id,
@@ -19832,10 +20785,18 @@
                         this.deskEl.scrollIntoView({ block: 'start', behavior: 'smooth' });
                     },
                 }));
-                grid.appendChild(card);
-            }
-            box.appendChild(grid);
-            if (sc.list.length > SCAN_SHOWN) {
+                return el;
+            };
+            const group = (cls, title, sub, cards, empty) => spEl('div', { class: 'sp-tgroup ' + cls }, [
+                spEl('div', { class: 'sp-tlabel' }, [spEl('b', { text: title }), sub ? spEl('small', { text: sub }) : null]),
+                cards.length ? spEl('div', { class: 'sp-scangrid' }, cards.map(card)) : empty,
+            ]);
+            const groups = spEl('div', { class: 'sp-tgroups' });
+            groups.appendChild(group('sp-tg-fav', '★ Favourites', 'Yours, always here. Same sums as everyone.', favs,
+                spEl('div', { class: 'sp-empty sp-tg-empty' }, [spEl('b', { text: 'No favourites yet' }), spEl('span', { text: 'Press ☆ next to any trader to keep them here. Traders you have traded with 5 or more times in 30 days join by themselves.' })])));
+            if (rest.length) groups.appendChild(group('sp-tg-trust', 'Trusted', 'Best trade first.', restShown, null));
+            box.appendChild(groups);
+            if (rest.length > SCAN_SHOWN) {
                 box.appendChild(spEl('button', {
                     type: 'button',
                     class: 'sp-link sp-showall',
@@ -19866,7 +20827,7 @@
             const pinnedIds = new Set((s.pinned || []).map((p) => p.itemId));
             const sig = JSON.stringify([
                 [...pinnedIds],
-                strip.map((f) => [f.itemId, f.name, f.plan.profit, f.plan.units, f.plan.steps.map((st) => st.sellerName), f.buyer.name, f.buyer.price, f.buyer.trust && f.buyer.trust.level]),
+                strip.map((f) => [f.itemId, f.name, f.plan.profit, f.plan.units, f.plan.steps.map((st) => st.sellerName), f.buyer.name, f.buyer.price, f.buyer.trust && f.buyer.trust.level, seenMinutes(f.plan.steps)]),
                 s.desk && s.desk.itemId,
                 info.flipsChecked,
                 info.flipsWanted,
@@ -19915,7 +20876,7 @@
                             if (this.h.onLeftoversClear) this.h.onLeftoversClear();
                         } }) : null,
                     ]),
-                    spEl('span', { class: 'sp-fc-p', text: priced.length ? signed(priced.reduce((a, l) => a + l.gain, 0)) : '–' }),
+                    spEl('span', { class: 'sp-fc-p' + (priced.length ? '' : ' sp-fc-none'), text: priced.length ? signed(priced.reduce((a, l) => a + l.gain, 0)) : '–' }),
                     spEl('small', { text: (priced.length ? 'If sold to traders now' : 'No trader buys them now') + ' · paid ' + formatMoney(paid) + ' in all' }),
                     spEl('small', { class: 'sp-fc-sell', text: open ? 'Hide them ▴' : 'Show them ▾' }),
                 ]);
@@ -19941,7 +20902,7 @@
                         spEl('span', { class: 'sp-pic sp-pic-s' }, [this.image('left', l.itemId)]),
                         spEl('b', { class: 'sp-iname', text: count(l.qty) + ' ' + l.name }),
                     ]),
-                    spEl('span', { class: 'sp-fc-p', text: l.gain !== null ? signed(l.gain) : '–' }),
+                    spEl('span', { class: 'sp-fc-p' + (l.gain !== null ? '' : ' sp-fc-none'), text: l.gain !== null ? signed(l.gain) : '–' }),
                     spEl('small', { text: 'Left over · paid ' + formatMoney(l.each) + ' each' }),
                     spEl('small', { class: 'sp-fc-sell' }, l.best ? ['Sell to ', spEl('b', { text: l.best.name }), ' at ' + formatMoney(l.best.price)] : ['No trader buys it now']),
                 ]);
@@ -19989,6 +20950,7 @@
                     // What the bazaars sell it for (cheapest to dearest bought), and to whom.
                     spEl('small', {}, ['Buy ', spEl('b', { text: count(f.plan.units) }), ' at ', spEl('b', { text: priceRange(f.plan.steps) }), ' from ' + [...new Set(f.plan.steps.map((st) => st.sellerName || 'a bazaar'))].join(', ')]),
                     spEl('small', { class: 'sp-fc-sell' }, ['Sell to ', spEl('b', { text: f.buyer.name }), ' at ' + formatMoney(f.buyer.price), this.trustBadge(f.buyer)]),
+                    this.seenLine(f.plan.steps),
                 ]);
                 card.addEventListener('click', () => this.select(f.itemId));
                 card.addEventListener('keydown', (event) => {
@@ -19998,6 +20960,18 @@
                 });
                 box.appendChild(card);
             }
+        }
+
+        /**
+         * How old a flip's prices are (3.20): when TornW3B last saw the oldest of
+         * the listings it buys - "seen 3m ago", its dot green while that is a few
+         * minutes, amber after, grey when older than a read would ever be.
+         */
+        seenLine(steps) {
+            const m = seenMinutes(steps);
+            if (m === null) return null;
+            const level = m < SEEN_FRESH_MIN ? 'online' : m < SEEN_OLD_MIN ? 'idle' : 'offline';
+            return spEl('small', { class: 'sp-seen', title: 'When TornW3B last saw these listings' }, [spEl('span', { class: 'sp-dot', 'data-level': level }), m < 1 ? 'seen just now' : 'seen ' + formatAge(m * 60000)]);
         }
 
         /* ------------------------------------------------------------- list */
@@ -20287,9 +21261,9 @@
             rows.forEach((b) => {
                 const planning = Boolean(T && ((T.chosen && T.chosen.key === b.tradeKey) || (T.accepted && T.accepted.key === b.tradeKey)));
                 const until = declined[b.tradeKey];
-                card.appendChild(spEl('div', { class: 'sp-tr' + (b === topRow ? ' sp-top' : '') + (b.troll ? ' sp-troll' : '') + (planning ? ' sp-planning' : '') + (until ? ' sp-declined' : '') }, [
+                card.appendChild(spEl('div', { class: 'sp-tr' + (b === topRow ? ' sp-top' : '') + (b.troll ? ' sp-troll' : '') + (planning ? ' sp-planning' : '') + (until ? ' sp-declined' : '') + (b.favourite ? ' sp-favrow' : '') }, [
                     spEl('span', { class: 'sp-tr-l' }, [
-                        spEl('span', { class: 'sp-trader-l' }, [this.favButton(b), this.playerName(b.name, b.id, 'buyer:' + (b.id || b.name)), this.trustBadge(b)]),
+                        spEl('span', { class: 'sp-trader-l' }, [this.favButton(b), this.playerName(b.name, b.id, 'buyer:' + (b.id || b.name)), this.trustBadge(b), b.favourite ? spEl('span', { class: 'sp-favtag', text: 'Favourite' }) : null]),
                         this.status(b),
                         this.networthLine(b),
                         // Your own history with them (the Ledger): "Traded 7× · last 3d ago".
@@ -20429,14 +21403,11 @@
             });
         }
 
-        /** Trade, TE list and W3B list, in fixed slots so they line up row to row; ⊘ (blacklist) at the end on the desk. */
+        /** TE list and W3B list, the ones that exist, from the left (3.20: an empty slot left W3B list adrift); ⊘ (blacklist) at the end on the desk. */
         traderLinks(b, { blacklist = false } = {}) {
             const links = spEl('span', { class: 'sp-links' });
             const slot = (text, url, title) => {
-                if (!url) {
-                    links.appendChild(spEl('span', { class: 'sp-chip sp-chip-none', 'aria-hidden': 'true' }));
-                    return;
-                }
+                if (!url) return;
                 links.appendChild(this.link(text, url, { title, focus: 'link:' + (b.id || b.name) + ':' + text }));
             };
             slot('TE list', b.te ? tePriceListUrl(b.teName || b.name) : null, 'TornExchange price list: ' + formatMoney(b.te || 0));
@@ -20935,7 +21906,7 @@
                 card.appendChild(spEl('div', { class: 'sp-tpick sp-acc-foot sp-cancelask' }, [
                     spEl('span', { class: 'sp-warnnote', text: 'Cancel the trade with ' + b.name + '? This flip plan goes (they are not marked declined); what you already bought stays yours to sell.' }),
                     spEl('span', { class: 'sp-tpick-b' }, [
-                        spEl('button', { type: 'button', class: 'sp-btn', 'data-focus': 'acc:cancel-yes', text: 'Yes, cancel it', onclick: () => {
+                        spEl('button', { type: 'button', class: 'sp-btn sp-btn-bad', 'data-focus': 'acc:cancel-yes', text: 'Yes, cancel it', onclick: () => {
                             this.cancelAsk = null;
                             if (this.h.onTradeCancel) this.h.onTradeCancel(A.key);
                         } }),
@@ -20952,7 +21923,7 @@
             card.appendChild(spEl('div', { class: 'sp-tpick sp-acc-foot' }, [
                 spEl('span', { class: 'sp-tpick-b' }, [
                     spEl('button', { type: 'button', class: 'sp-link', 'data-focus': 'acc:back', title: 'Unfreeze: back to the live plan (nothing is kept)', text: '← Back to the live plan', onclick: () => this.h.onTradeClose && this.h.onTradeClose(A.key, false) }),
-                    spEl('button', { type: 'button', class: 'sp-link', 'data-focus': 'acc:cancel', title: 'They accepted, then the trade was called off: this flip plan goes (not marked declined)', text: 'Cancel trade', onclick: () => {
+                    spEl('button', { type: 'button', class: 'sp-link sp-cancel', 'data-focus': 'acc:cancel', title: 'They accepted, then the trade was called off: this flip plan goes (not marked declined)', text: 'Cancel trade', onclick: () => {
                         this.cancelAsk = A.key;
                         this.deskSig = null;
                         this.renderDesk();
@@ -21155,277 +22126,330 @@
     const SELLING_PAGE_CSS = LEDGER_CSS + USAGE_CSS + REPORT_CSS + `
     :host { all: initial; }
     * { box-sizing: border-box; }
+    /*
+     * 3.20 Graphite (mockups/T-graphite-everything.html, picked by the owner):
+     * four surface steps so areas separate (page, rail, card, raised), one
+     * colour per meaning, system fonts, Georgia for titles, figures in columns.
+     */
     .sp-page {
     ${TOKENS_CSS}
-        --page: #131313; --rail: #171717; --card: #1f1f1f; --card2: #252525;
-        --cline: #2b2b2b; --cline2: #393939; --price: #a8dd1c; --green-bg: rgba(153, 204, 0, 0.10);
-        --hot: #1f2616; --hot-line: #4a5d20; --orange: #e07b39; --head-h: 60px;
+        --card: var(--surface); --card2: var(--raised);
+        --cline: var(--line); --cline2: var(--line2); --price: var(--profit); --green-bg: var(--profit-bg);
+        --hot: var(--surface); --hot-line: var(--profit-line); --orange: #ff9b5a; --head-h: 60px;
         position: absolute; inset: 0; display: flex; flex-direction: column;
         background: var(--page); color: var(--text);
-        font: 13px/1.45 Arial, Helvetica, sans-serif;
+        font: 400 13px/1.5 var(--sans);
+        -webkit-font-smoothing: antialiased;
     }
-    button, input { font: inherit; color: inherit; }
+    button, input, select { font: inherit; color: inherit; }
     a { color: var(--offer); text-decoration: none; }
-    a:hover { text-decoration: underline; }
-    b { font-weight: bold; }
+    a:hover { text-decoration: underline; text-underline-offset: 3px; }
+    b { font-weight: 600; }
     [hidden] { display: none !important; }
     .sp-bad { color: var(--bad); }
     .sp-note { margin: 0; font-size: 12px; color: var(--muted); }
-    button:focus-visible, input:focus-visible, summary:focus-visible, a:focus-visible,
+    .sp-muted { color: var(--muted); font-size: 12px; }
+    button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-visible, a:focus-visible,
     [role="button"]:focus-visible { outline: 2px solid var(--profit); outline-offset: 2px; }
+    @keyframes sp-rise { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: none; } }
+    @keyframes sp-pop { 0% { transform: scale(1); } 50% { transform: scale(1.25); } 100% { transform: scale(1); } }
+    @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
 
     /* ---------------------------------------------------------------- header */
     .sp-head {
-        flex: 0 0 auto; height: var(--head-h); display: flex; align-items: center; gap: 16px; padding: 0 24px;
-        background: linear-gradient(180deg, #1d1d1d, #181818); border-bottom: 1px solid var(--cline);
+        flex: 0 0 auto; height: var(--head-h); display: flex; align-items: center; gap: 12px; padding: 0 24px;
+        background: var(--rail); border-bottom: 1px solid var(--line);
     }
-    .sp-brand { display: flex; align-items: center; gap: 10px; white-space: nowrap; }
-    .sp-mark { width: 32px; height: 32px; border-radius: 9px; background: var(--profit); color: #131313; display: grid; place-items: center; font-weight: 900; font-size: 17px; }
-    .sp-brand h1 { margin: 0; font-size: 20px; color: #fff; letter-spacing: 0.3px; }
-    .sp-tagline { color: var(--muted); font-size: 13px; }
-    .sp-search { flex: 1; min-width: 0; max-width: 420px; height: 36px; padding: 0 16px; border-radius: 18px; border: 1px solid var(--cline2); background: #0f0f0f; color: var(--text); }
-    .sp-search::placeholder { color: var(--muted); }
-    .sp-cat { flex: 0 0 auto; height: 36px; padding: 0 12px; border-radius: 18px; border: 1px solid var(--cline2); background: #0f0f0f; color: var(--text); font: inherit; font-weight: bold; cursor: pointer; }
-    .sp-cat.sp-cat-on { border-color: var(--profit); background: #1a2210; color: #fff; }
+    .sp-brand { display: flex; align-items: center; gap: 12px; white-space: nowrap; }
+    .sp-mark { width: 30px; height: 30px; border-radius: 9px; background: linear-gradient(145deg, #a3adff, #7381ff); color: #0b0e24; display: grid; place-items: center; font: 800 16px var(--sans); }
+    .sp-brand h1 { margin: 0; font: 400 21px/1 var(--serif); color: var(--text); letter-spacing: -0.01em; }
+    .sp-tagline { color: var(--muted); font-size: 12px; }
+    .sp-search { flex: 1; min-width: 0; max-width: 420px; height: 34px; padding: 0 12px; border-radius: 10px; border: 1px solid var(--line2); background: var(--input); color: var(--text); transition: border-color 0.15s var(--ease); }
+    .sp-search:focus { border-color: var(--brand); outline: none; }
+    .sp-search::placeholder { color: var(--faint); }
+    .sp-cat { flex: 0 0 auto; height: 34px; padding: 0 10px; border-radius: 10px; border: 1px solid var(--line2); background: var(--surface); color: var(--text); font: inherit; font-weight: 500; cursor: pointer; }
+    .sp-cat.sp-cat-on { border-color: var(--profit-line); background: var(--profit-bg); color: var(--text); }
     .sp-catline { display: flex; align-items: center; gap: 8px; margin: -12px 0 16px; font-size: 12px; color: var(--muted); }
-    .sp-catline b { color: #fff; }
+    .sp-catline b { color: var(--text); }
     .sp-catline .sp-link { font-size: 12px; }
     .sp-pills { margin-left: auto; display: flex; gap: 6px; }
-    .sp-pill { display: inline-flex; align-items: center; gap: 7px; height: 28px; padding: 0 11px; border-radius: 14px; background: var(--card); border: 1px solid var(--cline); font-size: 12px; color: var(--muted); white-space: nowrap; cursor: default; }
-    .sp-pill b { color: var(--text); }
+    .sp-pill { display: inline-flex; align-items: center; gap: 7px; height: 30px; padding: 0 11px; border-radius: 999px; background: var(--surface); border: 1px solid var(--line); font-size: 12px; color: var(--muted); white-space: nowrap; cursor: default; font-variant-numeric: tabular-nums; }
+    .sp-pill b { color: var(--text); font-weight: 600; }
     .sp-pill-btn { cursor: pointer; }
-    .sp-pill-btn:hover { border-color: var(--muted); color: var(--text); }
-    .sp-icon { width: 34px; height: 34px; flex: 0 0 auto; border-radius: 9px; border: 1px solid var(--cline2); background: none; cursor: pointer; font-size: 15px; color: var(--text); }
-    .sp-icon:hover { background: #242424; }
-    .sp-icon[aria-pressed="true"] { color: var(--profit); border-color: var(--profit); }
-    .sp-hbtn { height: 34px; padding: 0 12px; flex: 0 0 auto; border-radius: 9px; border: 1px solid var(--cline2); background: none; cursor: pointer; font-weight: bold; color: var(--text); white-space: nowrap; }
-    .sp-hbtn:hover { background: #242424; }
-    .sp-hbtn[aria-pressed="true"] { color: var(--profit); border-color: var(--profit); }
-    .sp-link.sp-danger { color: #ff8a80; }
+    .sp-pill-btn:hover { border-color: var(--line2); color: var(--text); background: var(--raised); }
+    .sp-icon { width: 34px; height: 34px; flex: 0 0 auto; border-radius: 10px; border: 1px solid var(--line2); background: var(--raised); cursor: pointer; font-size: 15px; color: var(--text); transition: background-color 0.15s var(--ease); }
+    .sp-icon:hover { background: var(--hover); }
+    .sp-icon[aria-pressed="true"] { color: var(--profit); border-color: var(--profit-line); }
+    .sp-hbtn { height: 34px; padding: 0 12px; flex: 0 0 auto; border-radius: 10px; border: 1px solid var(--line2); background: var(--raised); cursor: pointer; font-weight: 500; color: var(--text); white-space: nowrap; transition: background-color 0.15s var(--ease); }
+    .sp-hbtn:hover { background: var(--hover); }
+    .sp-hbtn[aria-pressed="true"] { color: var(--profit); border-color: var(--profit-line); }
+    .sp-link.sp-danger { color: var(--bad); }
 
     .sp-banner {
         display: none; align-items: center; gap: 12px; flex: 0 0 auto;
-        margin: 12px 24px 0; padding: 10px 14px;
-        background: var(--card); border: 1px solid var(--cline); border-left: 4px solid var(--offer); border-radius: 10px;
+        margin: 16px 24px 0; padding: 12px 16px; color: var(--text2);
+        background: var(--buy-bg); border: 1px solid var(--buy-line); border-radius: 12px;
     }
     .sp-banner > span { flex: 1; }
-    .sp-banner-on { display: flex; }
-    .sp-banner-warn { border-left-color: var(--warn); }
-    .sp-banner-bad { border-left-color: var(--bad); }
+    .sp-banner-on { display: flex; animation: sp-rise 0.2s var(--ease); }
+    .sp-banner-warn { background: var(--warn-bg); border-color: var(--warn-line); }
+    .sp-banner-bad { background: var(--bad-bg); border-color: var(--bad-line); }
 
     /* ------------------------------------------------------------ buttons */
     a.sp-btn { display: inline-flex; align-items: center; text-decoration: none; }
     .sp-btn {
-        height: 32px; padding: 0 14px; font-size: 13px; font-weight: bold; color: var(--text);
-        background: #333; border: 1px solid #444; border-radius: 9px; cursor: pointer; white-space: nowrap;
+        height: 32px; padding: 0 12px; font-size: 13px; font-weight: 500; color: var(--text);
+        background: var(--raised); border: 1px solid var(--line2); border-radius: 10px; cursor: pointer; white-space: nowrap;
+        transition: background-color 0.15s var(--ease);
     }
-    .sp-btn:hover { border-color: var(--muted); }
-    .sp-btn.sp-primary { color: var(--on-profit); background: var(--profit); border-color: var(--profit); }
+    .sp-btn:hover { background: var(--hover); }
+    .sp-btn:disabled { opacity: 0.45; cursor: default; }
+    .sp-btn:disabled:hover { background: var(--raised); }
+    .sp-btn.sp-primary { color: var(--on-profit); background: var(--profit); border-color: transparent; font-weight: 600; }
+    .sp-btn.sp-primary:hover { background: #86e594; }
     .sp-link { background: none; border: 0; padding: 0; color: var(--offer); font-size: 12px; cursor: pointer; text-align: left; }
-    .sp-link:hover { text-decoration: underline; }
-    .sp-toggle { display: inline-flex; align-items: center; gap: 8px; height: 32px; padding: 0 12px; border-radius: 9px; border: 1px solid var(--cline2); background: none; color: var(--muted); font-weight: bold; cursor: pointer; white-space: nowrap; }
-    .sp-toggle:hover { color: var(--text); }
-    .sp-toggle[aria-pressed="true"] { color: #fff; border-color: var(--profit); background: var(--green-bg); }
+    .sp-link:hover { text-decoration: underline; text-underline-offset: 3px; }
+    .sp-toggle { display: inline-flex; align-items: center; gap: 8px; height: 30px; padding: 0 12px; border-radius: 999px; border: 1px solid var(--line2); background: var(--surface); color: var(--text2); font-size: 12px; font-weight: 500; cursor: pointer; white-space: nowrap; transition: background-color 0.15s var(--ease); }
+    .sp-toggle:hover { color: var(--text); background: var(--raised); }
+    .sp-toggle[aria-pressed="true"] { color: var(--text); border-color: var(--profit-line); background: var(--profit-bg); }
 
     /* ----------------------------------------------------- one scroll, full width */
     .sp-main { flex: 1; min-height: 0; overflow-y: auto; }
-    .sp-wrap { padding: 16px 24px 64px; }
-    .sp-sec { display: flex; align-items: center; gap: 8px; margin: 0 0 10px; }
-    .sp-sec h2 { margin: 0; font-size: 11px; letter-spacing: 0.6px; text-transform: uppercase; color: var(--muted); white-space: nowrap; }
+    .sp-wrap { padding: 24px 24px 64px; }
+    .sp-sec { display: flex; align-items: center; gap: 12px; margin: 0 0 12px; }
+    .sp-sec h2 { margin: 0; font: 650 11px/1 var(--sans); letter-spacing: 0.09em; text-transform: uppercase; color: var(--text2); white-space: nowrap; display: flex; align-items: center; gap: 8px; }
+    .sp-sec h2::before { content: ""; width: 3px; height: 12px; border-radius: 2px; background: var(--c, var(--faint)); flex: 0 0 auto; }
+    .sp-sec-flips { --c: var(--profit); }
+    .sp-scan { --c: var(--fav); }
     .sp-sp { flex: 1; }
-    .sp-empty { padding: 24px 16px; text-align: center; color: var(--muted); background: var(--card); border: 1px dashed var(--cline2); border-radius: 12px; }
+    .sp-empty { padding: 28px 16px; text-align: center; color: var(--muted); background: transparent; border: 1px dashed var(--line2); border-radius: 16px; }
     .sp-more { display: block; margin: 12px auto 0; }
 
     /* the strip: the best flips, whatever item they are */
     .sp-strip { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 24px; }
     .sp-strip-empty { grid-column: 1 / -1; }
-    .sp-fc { display: flex; flex-direction: column; align-items: stretch; gap: 6px; padding: 12px 14px; text-align: left; background: var(--hot); border: 1px solid var(--hot-line); border-radius: 12px; cursor: pointer; }
-    .sp-fc:hover { background: #232d18; }
-    .sp-fc.sp-sel { box-shadow: 0 0 0 2px var(--profit); }
+    .sp-fc { display: flex; flex-direction: column; align-items: stretch; gap: 8px; padding: 16px; text-align: left; background: var(--surface); border: 1px solid var(--line); border-radius: 16px; cursor: pointer; transition: background-color 0.15s var(--ease), border-color 0.15s var(--ease); }
+    .sp-fc:hover { background: var(--raised); }
+    .sp-fc.sp-sel { border-color: var(--profit-line); box-shadow: inset 0 0 0 1px var(--profit-line); }
     .sp-fc-top { display: flex; align-items: center; gap: 10px; }
-    .sp-fc .sp-iname { font-size: 14px; }
-    .sp-fc-p { font-size: 21px; font-weight: bold; color: var(--price); font-variant-numeric: tabular-nums; }
-    .sp-fc small { font-size: 12px; color: var(--muted); }
-    .sp-fc small b { color: var(--text); }
+    .sp-fc .sp-iname { font: 600 14px/1.3 var(--sans); }
+    .sp-fc-p { font: 650 20px/1.15 var(--sans); color: var(--profit); font-variant-numeric: tabular-nums; letter-spacing: -0.01em; }
+    .sp-fc small { font-size: 12px; color: var(--muted); line-height: 1.55; }
+    .sp-fc small b { color: var(--text2); }
     .sp-fc-sell { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
     .sp-fc-sell .sp-trust { margin-left: 2px; }
+    .sp-seen { display: flex; align-items: center; gap: 6px; margin-top: auto; color: var(--faint) !important; font-variant-numeric: tabular-nums; }
+    .sp-seen .sp-dot { width: 6px; height: 6px; }
+
+    /* Your traders (3.20): a gold row of favourites, then Trusted */
+    .sp-tgroups { display: grid; gap: 12px; }
+    .sp-tgroup { display: grid; grid-template-columns: 150px minmax(0, 1fr); gap: 12px; align-items: stretch; }
+    .sp-tlabel { display: flex; flex-direction: column; justify-content: center; gap: 6px; padding: 16px; border-radius: 16px; background: var(--surface); border: 1px solid var(--line); }
+    .sp-tlabel b { font: 400 16px/1.2 var(--serif); }
+    .sp-tlabel small { color: var(--muted); font-size: 12px; }
+    .sp-tg-fav .sp-tlabel { background: linear-gradient(160deg, rgba(255, 204, 77, 0.14), rgba(255, 204, 77, 0.03)); border-color: var(--fav-line); }
+    .sp-tg-fav .sp-tlabel b { color: var(--fav); }
+    .sp-tg-trust .sp-tlabel b { color: var(--trust); }
+    .sp-tg-empty { display: grid; place-items: center; gap: 6px; padding: 20px 16px; }
+    .sp-tg-empty b { color: var(--text2); }
+    .sp-fc.sp-tc-fav { border-color: var(--fav-line); background: linear-gradient(180deg, rgba(255, 204, 77, 0.06), var(--surface) 55%); }
+    .sp-fc.sp-tc-fav:hover { background: linear-gradient(180deg, rgba(255, 204, 77, 0.09), var(--raised) 55%); }
+    .sp-fc.sp-tc-hidden { opacity: 0.62; }
+    .sp-tc-why { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
+    .sp-tc-why b { color: var(--text2); }
 
     /* the desk: every item on the left, the one picked on the right */
-    .sp-desk { display: grid; grid-template-columns: 340px minmax(0, 1fr); gap: 24px; align-items: start; }
-    .sp-col-list { min-width: 0; }
-    .sp-chips { display: flex; gap: 6px; margin-bottom: 10px; }
-    .sp-chip-f { flex: 1; height: 32px; border-radius: 16px; border: 1px solid var(--cline2); background: none; color: var(--muted); font-weight: bold; cursor: pointer; white-space: nowrap; }
-    .sp-chip-f small { font-weight: normal; font-size: 12px; margin-left: 4px; }
+    .sp-desk { display: grid; grid-template-columns: 340px minmax(0, 1fr); gap: 16px; align-items: start; }
+    .sp-col-list { min-width: 0; display: flex; flex-direction: column; gap: 6px; }
+    .sp-chips { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 2px; padding: 3px; margin-bottom: 4px; border-radius: 11px; background: var(--input); border: 1px solid var(--line); }
+    .sp-chip-f { height: 28px; border-radius: 8px; border: 0; background: none; color: var(--muted); font-weight: 500; cursor: pointer; white-space: nowrap; transition: background-color 0.15s var(--ease); }
+    .sp-chip-f small { font-weight: 400; font-size: 12px; margin-left: 5px; color: var(--faint); font-variant-numeric: tabular-nums; }
     .sp-chip-f:hover { color: var(--text); }
-    .sp-chip-f[aria-pressed="true"] { color: #fff; border-color: var(--profit); background: var(--green-bg); }
-    .sp-it { display: grid; grid-template-columns: 44px minmax(0, 1fr) auto; gap: 2px 10px; align-items: center; padding: 8px 10px; margin-bottom: 4px; border-radius: 10px; border: 1px solid transparent; cursor: pointer; }
-    .sp-it:hover { background: var(--card); }
-    .sp-it.sp-sel { background: #232a17; border-color: var(--profit); }
+    .sp-chip-f[aria-pressed="true"] { color: var(--text); background: var(--raised); box-shadow: 0 1px 2px rgba(0, 0, 0, 0.3); }
+    .sp-it { display: grid; grid-template-columns: 44px minmax(0, 1fr) auto; gap: 2px 12px; align-items: center; padding: 10px 12px; margin-bottom: 0; border-radius: 12px; border: 1px solid transparent; cursor: pointer; transition: background-color 0.15s var(--ease); }
+    .sp-it:hover { background: var(--surface); }
+    .sp-it.sp-sel { background: var(--surface); border-color: var(--profit-line); }
     .sp-it .sp-pic { grid-row: span 2; }
-    .sp-it small { grid-column: 2 / 4; font-size: 12px; color: var(--muted); }
+    .sp-it .sp-iname { font-weight: 600; }
+    .sp-it small { grid-column: 2 / 4; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
     .sp-it small:empty { display: none; }
-    .sp-badge { font-size: 12px; font-weight: bold; padding: 3px 8px; border-radius: 10px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+    .sp-badge { font: 650 12px/22px var(--sans); height: 22px; padding: 0 8px; border-radius: 7px; white-space: nowrap; font-variant-numeric: tabular-nums; }
     .sp-badge:empty { display: none; }
-    .sp-badge-flip { color: var(--price); background: var(--green-bg); }
-    .sp-badge-list { color: var(--offer); background: rgba(116, 192, 252, 0.10); }
-    .sp-badge-sell { color: var(--muted); background: #262626; }
+    .sp-badge-flip { color: var(--profit); background: var(--profit-bg); }
+    .sp-badge-list { color: var(--offer); background: var(--buy-bg); }
+    .sp-badge-sell { color: var(--text2); background: rgba(255, 255, 255, 0.07); }
 
-    .sp-ws { position: sticky; top: 16px; min-width: 0; background: var(--rail); border: 1px solid var(--cline); border-radius: 14px; padding: 16px; }
-    .sp-wsh { display: flex; align-items: center; gap: 14px; margin-bottom: 14px; }
-    .sp-wst { display: flex; flex-direction: column; min-width: 0; }
-    .sp-wsname { font-size: 20px; font-weight: bold; color: #fff; }
-    .sp-wst small { color: var(--muted); font-size: 12px; }
-    .sp-quad { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; align-items: start; }
-    .sp-q { min-width: 0; background: var(--card); border: 1px solid var(--cline); border-radius: 12px; padding: 12px 14px; }
-    .sp-q h3 { margin: 0 0 8px; font-size: 11px; letter-spacing: 0.6px; text-transform: uppercase; color: var(--muted); }
-    .sp-q.sp-hot { background: var(--hot); border-color: var(--hot-line); }
+    .sp-ws { position: sticky; top: 16px; min-width: 0; background: var(--rail); border: 1px solid var(--line); border-radius: 20px; padding: 24px; }
+    .sp-wsh { display: flex; align-items: center; gap: 16px; margin-bottom: 20px; }
+    .sp-wst { display: flex; flex-direction: column; min-width: 0; gap: 2px; }
+    .sp-wsname { font: 400 24px/1.15 var(--serif); color: var(--text); }
+    .sp-wst small { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+    .sp-quad { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.08fr); gap: 16px; align-items: start; }
+    .sp-q { min-width: 0; background: var(--surface); border: 1px solid var(--line); border-radius: 16px; padding: 16px; }
+    .sp-q h3 { margin: 0 0 12px; font: 650 11px/1 var(--sans); letter-spacing: 0.09em; text-transform: uppercase; color: var(--text2); display: flex; align-items: center; gap: 8px; }
+    .sp-q h3::before { content: ""; width: 3px; height: 12px; border-radius: 2px; background: var(--c, var(--faint)); flex: 0 0 auto; }
+    .sp-q.sp-hot { background: var(--surface); border-color: var(--profit-line); --c: var(--profit); }
     .sp-q.sp-wide { grid-column: 1 / -1; }
-    .sp-col { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
-    .sp-kind { margin-left: 6px; font-size: 11px; font-weight: bold; }
-    .sp-kind-fast { color: var(--price); }
+    .sp-col { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+    .sp-kind { margin-left: 6px; font-size: 10px; font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase; }
+    .sp-kind-fast { color: var(--profit); }
     .sp-kind-slow { color: var(--warn); }
-    .sp-left { display: block; margin-top: 2px; }
-    .sp-left .sp-qty { width: 56px; }
-    .sp-acc-foot { margin-top: 10px; }
+    .sp-left { display: block; margin-top: 4px; }
+    .sp-left .sp-qty { width: 96px; margin-right: 6px; }
+    .sp-acc-foot { margin-top: 12px; display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; }
+    .sp-acc-foot .sp-tpick-b { gap: 8px 20px; }
+    .sp-link.sp-cancel { color: var(--bad); }
+    .sp-btn.sp-btn-bad { color: var(--bad); background: var(--bad-bg); border-color: transparent; }
+    .sp-btn.sp-btn-bad:hover { background: rgba(255, 123, 110, 0.2); }
     .sp-cancelask { justify-content: flex-start; }
     .sp-cancelask > .sp-warnnote { flex: 1 1 100%; color: var(--warn); font-size: 13px; }
     .sp-tpick-b { align-items: center; }
-    .sp-fc.sp-lo { border-style: dashed; }
+    .sp-fc.sp-lo { border-style: dashed; border-color: var(--line2); background: transparent; }
+    .sp-fc.sp-lo:hover { background: var(--surface); }
     /* The pin sits in the card's corner, out of the flow: the card's contents
        are where they always were, pinned or not (the owner: "you moved the contents"). */
     .sp-fc { position: relative; }
-    .sp-fc .sp-fc-top { padding-right: 28px; }
-    .sp-pin { display: grid; place-items: center; width: 24px; height: 24px; padding: 0; border-radius: 7px; border: 1px solid var(--cline2); background: #161616; color: var(--muted); cursor: pointer; }
-    .sp-fc .sp-pin { position: absolute; top: 8px; right: 8px; }
-    .sp-pin:hover { color: #fff; border-color: #555; }
+    .sp-fc .sp-fc-top { padding-right: 30px; }
+    .sp-pin { display: grid; place-items: center; width: 26px; height: 26px; padding: 0; border-radius: 7px; border: 1px solid var(--line); background: transparent; color: var(--faint); cursor: pointer; transition: background-color 0.15s var(--ease); }
+    .sp-fc .sp-pin { position: absolute; top: 12px; right: 12px; }
+    .sp-pin:hover { color: var(--text); border-color: var(--line2); background: var(--raised); }
     .sp-pin:focus-visible { outline: 2px solid var(--offer); outline-offset: 1px; }
-    .sp-pin.sp-pin-on { color: var(--offer); border-color: #2f4466; background: #1b2230; }
+    .sp-pin.sp-pin-on { color: var(--buy); border-color: var(--buy-line); background: var(--buy-bg); }
     .sp-it.sp-it-pin { position: relative; }
     .sp-it.sp-it-pin small { padding-right: 30px; }
-    .sp-it .sp-pin-row { position: absolute; right: 10px; bottom: 6px; width: 22px; height: 22px; }
-    .sp-it.sp-pinrow { background: #1b2230; border-color: #2f4466; }
-    .sp-it.sp-pinrow.sp-sel { border-color: var(--offer); }
+    .sp-it .sp-pin-row { position: absolute; right: 12px; bottom: 8px; width: 22px; height: 22px; }
+    .sp-it.sp-pinrow { background: var(--buy-bg); border-color: var(--buy-line); }
+    .sp-it.sp-pinrow.sp-sel { border-color: var(--buy); }
     .sp-pinrow-r { display: inline-flex; align-items: center; gap: 6px; }
-    .sp-pinsep { border-top: 1px dashed var(--cline2); margin: 4px 0 8px; }
-    .sp-badge-bad { color: var(--bad); }
-    .sp-heldtag { margin-left: 8px; font-size: 11px; font-weight: bold; text-transform: uppercase; letter-spacing: 0.4px; color: var(--offer); }
-    .sp-mainnote { margin: 4px 0 6px; color: var(--text); }
-    .sp-add { padding: 2px 10px; }
-    .sp-fc .sp-lo-x { margin-left: auto; padding: 4px 8px; color: var(--offer); font-weight: bold; }
+    .sp-pinsep { border-top: 1px dashed var(--line2); margin: 4px 8px 8px; }
+    .sp-badge-bad { color: var(--bad); background: var(--bad-bg); }
+    .sp-heldtag { margin-left: 8px; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: var(--buy); }
+    .sp-mainnote { margin: 4px 0 8px; color: var(--text2); }
+    /* A left-out row: Add takes the tick's place and its own width (3.20: it ran over the picture). */
+    .sp-ti.sp-leftrow { grid-template-columns: auto 44px minmax(0, 1fr) auto; }
+    .sp-add { height: 26px; padding: 0 10px; font-size: 12px; border-radius: 8px; }
+    .sp-fc .sp-lo-x { margin-left: auto; padding: 4px 8px; color: var(--offer); font-weight: 500; }
     .sp-chat { min-width: 64px; justify-content: center; gap: 6px; }
-    .sp-q > .sp-note + .sp-note { margin-top: 6px; }
-    .sp-tr { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 10px; align-items: center; padding: 8px 6px; border-top: 1px solid var(--cline); }
+    .sp-q > .sp-note + .sp-note { margin-top: 8px; }
+    .sp-tr { position: relative; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px 16px; align-items: center; padding: 12px; border-top: 1px solid var(--line); }
     .sp-q h3 + .sp-tr, .sp-q .sp-note + .sp-tr { border-top: 0; }
-    .sp-tr.sp-top { background: var(--green-bg); border-radius: 9px; border-top-color: transparent; }
+    .sp-tr.sp-top { background: var(--profit-bg); border-radius: 12px; border-top-color: transparent; }
     .sp-tr.sp-top + .sp-tr { border-top-color: transparent; }
-    .sp-tr.sp-stale .sp-tprice, .sp-tr.sp-stale b, .sp-tr.sp-stale small { color: #8c8c8c; }
-    .sp-tr-l { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+    .sp-tr.sp-stale .sp-tprice, .sp-tr.sp-stale b, .sp-tr.sp-stale small { color: var(--faint); }
+    .sp-tr.sp-favrow::after { content: ""; position: absolute; left: 0; top: 10px; bottom: 10px; width: 3px; border-radius: 2px; background: var(--fav); pointer-events: none; }
+    .sp-favtag { display: inline-flex; align-items: center; height: 18px; padding: 0 7px; border-radius: 999px; font: 700 10px/1 var(--sans); letter-spacing: 0.05em; text-transform: uppercase; color: var(--fav); background: var(--fav-bg); white-space: nowrap; }
+    .sp-tr-l { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
     .sp-tr-l small { font-size: 12px; color: var(--muted); }
     .sp-tr-l small.sp-differ { color: var(--warn); }
     .sp-note.sp-warnnote { color: var(--warn); }
     .sp-trader-l { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 8px; min-width: 0; }
-    .sp-pname { color: #fff; font-weight: bold; }
-    .sp-tprice { font-weight: bold; text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
-    .sp-top .sp-tprice { color: var(--price); }
+    .sp-pname { color: var(--text); font-weight: 600; }
+    .sp-tprice { font: 650 15px var(--sans); text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .sp-top .sp-tprice { color: var(--profit); }
     .sp-links { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 6px; }
-    .sp-tr .sp-links { display: grid; grid-template-columns: 64px 64px 76px minmax(0, 1fr); align-items: center; }
-    .sp-tr .sp-links .sp-blk { grid-column: -2 / -1; justify-self: end; }
-    .sp-fav, .sp-blk { width: 24px; height: 24px; padding: 0; border-radius: 7px; border: 1px solid var(--cline2); background: #161616; color: #8a8a8a; font: 13px/22px Arial, Helvetica, sans-serif; cursor: pointer; }
-    .sp-fav:hover, .sp-blk:hover { color: var(--text); border-color: #555; }
-    .sp-fav.sp-fav-on { color: #f2c94c; border-color: #6b5a22; background: #262110; }
-    .sp-blk:hover { color: #ff6b6b; }
+    .sp-tr .sp-links { display: flex; align-items: center; gap: 6px; }
+    .sp-tr .sp-links .sp-blk { margin-left: auto; }
+    .sp-fav, .sp-blk { width: 24px; height: 24px; padding: 0; border-radius: 7px; border: 1px solid var(--line); background: transparent; color: var(--faint); font: 13px/22px var(--sans); cursor: pointer; transition: background-color 0.15s var(--ease); }
+    .sp-fav:hover, .sp-blk:hover { color: var(--text); border-color: var(--line2); background: var(--raised); }
+    .sp-fav.sp-fav-on { color: var(--fav); border-color: var(--fav-line); background: var(--fav-bg); animation: sp-pop 0.3s var(--ease); }
+    .sp-blk:hover { color: var(--bad); }
     .sp-tr-l small.sp-traded { color: var(--muted); }
     .sp-blnote { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
     .sp-tr .sp-links.sp-links-one { display: flex; }
     .sp-chip {
-        display: inline-flex; align-items: center; justify-content: center; height: 30px; padding: 0 10px; font-size: 12px; white-space: nowrap;
-        color: var(--offer); border: 1px solid #3d4f5c; border-radius: 8px;
+        display: inline-flex; align-items: center; justify-content: center; height: 26px; padding: 0 9px; font-size: 12px; font-weight: 500; white-space: nowrap;
+        color: var(--offer); background: var(--buy-bg); border: 1px solid transparent; border-radius: 7px;
+        transition: background-color 0.15s var(--ease);
     }
-    .sp-chip:hover { text-decoration: none; background: rgba(116, 192, 252, 0.12); }
+    .sp-chip:hover { text-decoration: none; background: rgba(90, 167, 255, 0.2); }
     .sp-chip-none { visibility: hidden; }
-    .sp-showall { margin-top: 8px; }
-    .sp-tsec { margin: 12px 0 4px; font-size: 11px; letter-spacing: 0.6px; text-transform: uppercase; color: var(--muted); }
-    .sp-th { display: flex; align-items: flex-start; gap: 16px; flex-wrap: wrap; margin-top: 4px; }
+    .sp-showall { margin-top: 12px; }
+    .sp-tsec { margin: 16px 0 6px; font: 650 11px/1 var(--sans); letter-spacing: 0.09em; text-transform: uppercase; color: var(--text2); }
+    .sp-th { display: flex; align-items: flex-start; gap: 16px; flex-wrap: wrap; margin-top: 4px; padding: 12px 16px; border-radius: 12px; background: var(--raised); }
     .sp-th-l { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
     .sp-th-r { margin-left: auto; text-align: right; }
     .sp-th-r small { display: block; color: var(--muted); font-size: 12px; }
-    .sp-ti { display: grid; grid-template-columns: 18px 44px minmax(0, 1fr) auto; gap: 4px 10px; align-items: center; padding: 8px 0; border-top: 1px solid #2f3a1c; }
-    .sp-ti.sp-off b, .sp-ti.sp-off small, .sp-ti.sp-off .sp-ti-p { color: #8c8c8c; }
-    .sp-tick { width: 16px; height: 16px; margin: 0; accent-color: var(--price); }
-    .sp-ti-l { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+    .sp-ti { display: grid; grid-template-columns: 18px 44px minmax(0, 1fr) auto; gap: 4px 12px; align-items: center; padding: 12px 0; border-top: 1px solid var(--line); }
+    .sp-ti.sp-off b, .sp-ti.sp-off small, .sp-ti.sp-off .sp-ti-p { color: var(--faint); }
+    .sp-tick { width: 16px; height: 16px; margin: 0; accent-color: var(--profit); }
+    .sp-ti-l { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
     .sp-ti-l small { color: var(--muted); font-size: 12px; }
-    .sp-tiname { color: #fff; font-weight: bold; text-decoration: none; }
-    .sp-tiname:hover { text-decoration: underline; }
-    .sp-here { margin-left: 6px; font-size: 11px; font-weight: bold; color: var(--price); }
-    .sp-ti-p { text-align: right; font-weight: bold; font-variant-numeric: tabular-nums; white-space: nowrap; }
-    .sp-ti-p.sp-good { color: var(--price); }
-    .sp-ti-p small { display: block; font-weight: normal; color: var(--muted); font-size: 12px; }
-    .sp-buys { grid-column: 3 / 5; display: flex; flex-direction: column; gap: 4px; }
-    .sp-buy { display: flex; align-items: center; gap: 10px; font-size: 12px; color: var(--muted); }
+    .sp-tiname { color: var(--text); font-weight: 600; text-decoration: none; }
+    .sp-tiname:hover { text-decoration: underline; text-underline-offset: 3px; }
+    .sp-here { margin-left: 6px; font-size: 10px; font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase; color: var(--profit); }
+    .sp-ti-p { text-align: right; font-weight: 650; font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .sp-ti-p.sp-good { color: var(--profit); }
+    .sp-ti-p small { display: block; font-weight: 400; color: var(--muted); font-size: 12px; }
+    .sp-buys { grid-column: 3 / 5; display: flex; flex-direction: column; gap: 6px; }
+    .sp-buy { display: flex; align-items: center; gap: 10px; font-size: 12px; color: var(--muted); line-height: 1.6; }
     .sp-buy .sp-chip { margin-left: auto; }
-    .sp-qty { width: 72px; height: 26px; padding: 0 6px; border-radius: 6px; border: 1px solid var(--cline2); background: #0f0f0f; color: var(--text); text-align: right; font-variant-numeric: tabular-nums; }
-    .sp-in-bad, .sp-key.sp-in-bad { border-color: #e05a4f !important; box-shadow: 0 0 0 1px #e05a4f; }
-    .sp-trade-links { display: flex; justify-content: flex-end; margin-top: 10px; }
+    .sp-qty { width: 72px; height: 28px; padding: 0 8px; border-radius: 8px; border: 1px solid var(--line2); background: var(--input); color: var(--text); text-align: right; font-variant-numeric: tabular-nums; }
+    .sp-qty:focus { border-color: var(--brand); outline: none; }
+    .sp-in-bad, .sp-key.sp-in-bad { border-color: var(--bad) !important; box-shadow: 0 0 0 3px var(--bad-bg); }
+    .sp-trade-links { display: flex; justify-content: flex-end; margin-top: 12px; }
     .sp-tradeline { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 4px; }
-    .sp-tradeline small { color: var(--muted); font-size: 12px; }
-    .sp-plan { height: 26px; padding: 0 10px; font-size: 12px; }
-    .sp-plan-on { display: inline-flex; align-items: center; border-radius: 13px; border: 1px solid var(--hot-line); color: var(--price); font-weight: bold; background: var(--green-bg); }
-    .sp-tr.sp-planning { box-shadow: inset 3px 0 0 var(--price); }
+    .sp-tradeline small { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+    .sp-plan { height: 26px; padding: 0 10px; font-size: 12px; border-radius: 8px; }
+    .sp-plan-on { display: inline-flex; align-items: center; border-radius: 8px; border: 0; color: var(--on-profit); font-weight: 650; background: var(--profit); }
+    .sp-tr.sp-planning { box-shadow: inset 3px 0 0 var(--profit); }
     /* Dimmed by colour, not see-through: its words stay readable (review M10). */
-    .sp-tr.sp-declined .sp-tprice, .sp-tr.sp-declined .sp-trader-l, .sp-tr.sp-declined small, .sp-tr.sp-hidden .sp-tprice, .sp-tr.sp-hidden .sp-trader-l, .sp-tr.sp-hidden small { color: #8c8c8c; }
+    .sp-tr.sp-declined .sp-tprice, .sp-tr.sp-declined .sp-trader-l, .sp-tr.sp-declined small, .sp-tr.sp-hidden .sp-tprice, .sp-tr.sp-hidden .sp-trader-l, .sp-tr.sp-hidden small { color: var(--faint); }
     .sp-tr.sp-troll .sp-tprice { color: var(--muted); text-decoration: line-through; }
-    .sp-scan { display: flex; flex-direction: column; gap: 8px; margin: 0 0 16px; }
+    .sp-scan { display: flex; flex-direction: column; gap: 12px; margin: 0 0 32px; }
     .sp-scanh { margin: 0; }
     .sp-fold { display: inline-flex; align-items: center; gap: 8px; padding: 0; border: 0; background: none; color: inherit; cursor: pointer; font: inherit; }
     .sp-fold h2 { margin: 0; }
-    .sp-fold:hover h2 { color: #fff; }
+    .sp-fold:hover h2 { color: var(--text); }
     .sp-chev { width: 12px; color: var(--muted); font-size: 12px; }
-    .sp-scangrid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; }
+    .sp-scangrid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
     @media (max-width: 1400px) { .sp-scangrid { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
     .sp-tc { cursor: default; }
-    .sp-tc.sp-tc-none { background: var(--card); border-color: var(--cline2); }
-    .sp-inerr { color: #ff8a80; font-size: 12px; font-weight: bold; }
-    .sp-tc .sp-go { margin-top: auto; }
-    .sp-tc .sp-go.sp-go-on { border-color: var(--offer); color: var(--offer); }
-    .sp-star { color: #f2c94c; }
-    .sp-lastpaid { display: inline-flex; align-items: center; height: 18px; padding: 0 6px; font-size: 10px; font-weight: bold; text-transform: uppercase; letter-spacing: 0.4px; border-radius: 9px; border: 1px solid #7a5210; color: var(--warn); white-space: nowrap; }
-    .sp-fc-p.sp-est { color: #c3ea6f; }
+    .sp-tc:hover { background: var(--surface); }
+    .sp-tc.sp-tc-none { background: var(--surface); border-color: var(--line); }
+    .sp-tc.sp-tc-fav.sp-tc-none { border-color: var(--fav-line); background: linear-gradient(180deg, rgba(255, 204, 77, 0.06), var(--surface) 55%); }
+    .sp-inerr { color: var(--bad); font-size: 12px; font-weight: 600; }
+    .sp-tc .sp-go { margin-top: auto; height: 28px; border-radius: 8px; font-size: 12px; }
+    .sp-tc .sp-go.sp-go-on { color: var(--on-profit); background: var(--profit); border-color: transparent; font-weight: 600; }
+    .sp-star { color: var(--fav); }
+    .sp-lastpaid { display: inline-flex; align-items: center; height: 18px; padding: 0 7px; font: 700 10px/1 var(--sans); text-transform: uppercase; letter-spacing: 0.05em; border-radius: 999px; color: var(--known); background: rgba(184, 164, 255, 0.12); white-space: nowrap; }
+    .sp-fc-p.sp-est { color: var(--profit); }
+    .sp-fc-p.sp-fc-none { color: var(--muted); }
     .sp-tc small.sp-traded { color: var(--muted); }
-    .sp-tpick { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; margin: 2px 0 6px; }
-    .sp-itemnote { margin: 6px 0; }
-    .sp-tpick-b { display: flex; gap: 6px; flex-wrap: wrap; }
+    .sp-tpick { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin: 4px 0 8px; }
+    .sp-itemnote { margin: 8px 0; }
+    .sp-tpick-b { display: flex; gap: 8px; flex-wrap: wrap; }
     .sp-buy .sp-tick { flex: 0 0 auto; }
-    .sp-check-ok .sp-checkword { color: var(--price); }
-    .sp-check-price .sp-checkword, .sp-check-short .sp-checkword { color: var(--warn); font-weight: bold; }
-    .sp-check-gone .sp-checkword { color: var(--bad); font-weight: bold; }
+    .sp-check-ok .sp-checkword { color: var(--profit); font-weight: 600; }
+    .sp-check-price .sp-checkword, .sp-check-short .sp-checkword { color: var(--warn); font-weight: 600; }
+    .sp-check-gone .sp-checkword { color: var(--bad); font-weight: 600; }
     .sp-check-bought { opacity: 0.6; }
-    .sp-gone { opacity: 0.8; }
-    .sp-gone-mark { width: 16px; height: 16px; border-radius: 50%; background: var(--warn); color: #131313; font-weight: bold; font-size: 11px; display: inline-flex; align-items: center; justify-content: center; }
+    .sp-gone { background: var(--bad-bg); border-radius: 10px; padding: 12px; border-top: 0; margin: 4px 0; }
+    .sp-gone-mark { width: 16px; height: 16px; border-radius: 50%; background: var(--bad); color: var(--page); font-weight: 700; font-size: 11px; display: inline-flex; align-items: center; justify-content: center; }
     .sp-gone small { color: var(--warn); }
-    .sp-buy .sp-bad { color: var(--bad); font-weight: bold; }
-    .sp-repl { color: var(--text); }
+    .sp-buy .sp-bad { color: var(--bad); font-weight: 600; }
+    .sp-repl { color: var(--text2); }
     .sp-repl .sp-link { font-size: 12px; }
-    .sp-drop { display: block; margin: 4px 0 0 auto; height: 24px; padding: 0 8px; font-size: 12px; }
-    .sp-neverlist { display: flex; flex-wrap: wrap; gap: 6px 14px; }
+    .sp-drop { display: block; margin: 4px 0 0 auto; height: 26px; padding: 0 10px; font-size: 12px; border-radius: 8px; }
+    .sp-neverlist { display: flex; flex-wrap: wrap; gap: 8px 16px; }
     .sp-never { font-size: 12px; }
-    .sp-keeplist { display: flex; flex-direction: column; gap: 6px; }
-    .sp-keeprow { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
-    .sp-big { font-size: 22px; font-weight: bold; color: var(--price); font-variant-numeric: tabular-nums; }
-    .sp-step { display: grid; grid-template-columns: 22px minmax(0, 1fr) auto; gap: 4px 10px; align-items: center; padding: 8px 0; border-top: 1px solid #2f3a1c; }
-    .sp-q .sp-note + .sp-step { margin-top: 6px; }
-    .sp-n { width: 22px; height: 22px; border-radius: 50%; background: var(--profit); color: #131313; font-weight: bold; font-size: 12px; display: grid; place-items: center; }
+    .sp-keeplist { display: flex; flex-direction: column; gap: 8px; }
+    .sp-keeprow { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+    .sp-big { font: 650 22px var(--sans); color: var(--profit); font-variant-numeric: tabular-nums; }
+    .sp-step { display: grid; grid-template-columns: 22px minmax(0, 1fr) auto; gap: 4px 12px; align-items: center; padding: 12px 0; border-top: 1px solid var(--line); }
+    .sp-q .sp-note + .sp-step { margin-top: 8px; }
+    .sp-n { width: 22px; height: 22px; border-radius: 50%; background: var(--profit); color: var(--on-profit); font-weight: 700; font-size: 12px; display: grid; place-items: center; }
     .sp-step .sp-trust { margin-left: 2px; }
     .sp-step-links { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
-    .sp-opt { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 12px; align-items: center; padding: 8px 10px; margin-bottom: 6px; border-radius: 9px; border: 1px solid var(--cline); color: var(--text); }
-    a.sp-opt:hover { text-decoration: none; border-color: #3d4f5c; background: rgba(116, 192, 252, 0.06); }
+    .sp-opt { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 12px; align-items: center; padding: 12px 14px; margin-bottom: 8px; border-radius: 12px; border: 1px solid var(--line); color: var(--text); transition: background-color 0.15s var(--ease); }
+    a.sp-opt:hover { text-decoration: none; border-color: var(--buy-line); background: var(--buy-bg); }
     .sp-opt-l { display: flex; flex-direction: column; min-width: 0; }
-    .sp-opt-l small, .sp-opt-p small { font-size: 12px; color: var(--muted); font-weight: normal; }
-    .sp-opt-p { display: flex; flex-direction: column; align-items: flex-end; font-size: 15px; font-weight: bold; font-variant-numeric: tabular-nums; white-space: nowrap; }
-    .sp-opt.sp-win { border-color: var(--hot-line); background: var(--green-bg); }
-    .sp-opt.sp-win .sp-opt-p { color: var(--price); }
+    .sp-opt-l small, .sp-opt-p small { font-size: 12px; color: var(--muted); font-weight: 400; }
+    .sp-opt-p { display: flex; flex-direction: column; align-items: flex-end; font-size: 15px; font-weight: 650; font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .sp-opt.sp-win { border-color: var(--profit-line); background: var(--profit-bg); }
+    .sp-opt.sp-win .sp-opt-p { color: var(--profit); }
     .sp-opt-none { color: var(--muted); }
-    .sp-verdict { margin: 4px 0 0; font-weight: bold; }
-    .sp-verdict.sp-win { color: var(--price); }
+    .sp-verdict { margin: 4px 0 0; font-weight: 600; }
+    .sp-verdict.sp-win { color: var(--profit); }
 
     /* shared pieces */
     .sp-pic { display: inline-flex; align-items: center; justify-content: center; width: 60px; height: 30px; flex: 0 0 auto; }
@@ -21433,51 +22457,57 @@
     .sp-pic-l { width: 80px; height: 40px; }
     .sp-img { width: 100%; height: 100%; object-fit: contain; }
     .sp-img-none { visibility: hidden; }
-    .sp-iname { color: #fff; }
+    .sp-iname { color: var(--text); }
     .sp-status { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); white-space: nowrap; }
     .sp-status:empty { display: none; }
-    .sp-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #666; flex: 0 0 auto; }
+    .sp-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--faint); flex: 0 0 auto; }
     .sp-dot[data-level="online"] { background: var(--profit); }
     .sp-dot[data-level="idle"] { background: var(--warn); }
-    .sp-dot[data-level="offline"] { background: #666; }
+    .sp-dot[data-level="offline"] { background: var(--faint); }
     /* Online, but in hospital, in jail or flying: may not trade right now. */
     .sp-dot[data-level="busy"] { background: var(--orange); }
     .sp-dot[data-level="bad"] { background: var(--bad); }
-    .sp-dot[data-level="unknown"] { background: transparent; border: 1px solid #777; }
+    .sp-dot[data-level="unknown"] { background: transparent; border: 1px solid var(--faint); }
     .sp-trust {
-        display: inline-flex; align-items: center; height: 18px; padding: 0 6px; flex: 0 0 auto;
-        font-size: 10px; font-weight: bold; text-transform: uppercase; letter-spacing: 0.4px;
-        border-radius: 9px; border: 1px solid #555; color: var(--muted); cursor: help;
+        display: inline-flex; align-items: center; height: 18px; padding: 0 7px; flex: 0 0 auto;
+        font: 700 10px/1 var(--sans); text-transform: uppercase; letter-spacing: 0.05em;
+        border-radius: 999px; border: 0; color: var(--muted); background: rgba(255, 255, 255, 0.06); cursor: help; white-space: nowrap;
     }
-    .sp-trust[data-level="trusted"] { color: #c3ea6f; border-color: #5c7a1e; background: rgba(153, 204, 0, 0.12); }
-    .sp-trust[data-level="known"] { color: #a7d4ff; border-color: #3d5a74; }
-    .sp-trust[data-level="caution"] { color: #f0a020; border-color: #7a5210; }
+    .sp-trust[data-level="trusted"] { color: var(--trust); background: var(--trust-bg); }
+    .sp-trust[data-level="known"] { color: var(--known); background: rgba(184, 164, 255, 0.12); }
+    .sp-trust[data-level="caution"] { color: var(--warn); background: var(--warn-bg); }
 
     /* ------------------------------------------------------------ settings */
-    .sp-settings { display: grid; grid-template-columns: 260px minmax(0, 1fr); gap: 24px; align-items: start; padding: 20px 24px 64px; }
-    .sp-snav { position: sticky; top: 20px; display: flex; flex-direction: column; gap: 4px; }
-    .sp-snav-g { margin: 12px 12px 4px; font-size: 11px; letter-spacing: 0.6px; text-transform: uppercase; color: var(--muted); }
+    .sp-settings { display: grid; grid-template-columns: 250px minmax(0, 1fr); gap: 24px; align-items: start; padding: 24px 24px 64px; }
+    .sp-snav { position: sticky; top: 24px; display: flex; flex-direction: column; gap: 2px; }
+    .sp-snav-g { margin: 14px 10px 6px; font: 650 10.5px/1 var(--sans); letter-spacing: 0.09em; text-transform: uppercase; color: var(--faint); }
     .sp-snav-g:first-child { margin-top: 0; }
-    .sp-snav-a { display: flex; align-items: center; gap: 10px; height: 40px; padding: 0 12px; border: 0; border-radius: 9px; background: none; color: var(--muted); font-weight: bold; text-align: left; cursor: pointer; }
-    .sp-snav-a:hover { background: var(--card); color: var(--text); }
-    .sp-snav-a[aria-current="true"] { background: var(--green-bg); color: #fff; box-shadow: inset 0 0 0 1px var(--hot-line); }
-    .sp-snav-a small { margin-left: auto; font-weight: normal; font-size: 12px; white-space: nowrap; }
+    .sp-snav-a { display: flex; align-items: center; gap: 8px; height: 36px; padding: 0 10px; border: 0; border-radius: 9px; background: none; color: var(--text2); font-weight: 500; text-align: left; cursor: pointer; transition: background-color 0.15s var(--ease); }
+    .sp-snav-a:hover { background: var(--surface); color: var(--text); }
+    .sp-snav-a[aria-current="true"] { background: var(--surface); color: var(--text); box-shadow: inset 2px 0 0 var(--brand); }
+    .sp-snav-a small { margin-left: auto; font-weight: 400; font-size: 12px; color: var(--faint); white-space: nowrap; }
     .sp-sbody { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
-    .sp-card { display: flex; flex-direction: column; padding: 20px; background: var(--card); border: 1px solid var(--cline); border-radius: 12px; scroll-margin-top: 20px; }
-    .sp-card h2 { margin: 0 0 4px; font-size: 15px; color: #fff; }
-    .sp-lead { margin: 0 0 14px; font-size: 12px; color: var(--muted); }
-    .sp-field { display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 8px 24px; align-items: start; padding: 12px 0; border-top: 1px solid var(--cline); }
-    .sp-flabel { display: flex; flex-direction: column; padding-top: 8px; }
+    .sp-card { display: flex; flex-direction: column; padding: 20px 22px; background: var(--surface); border: 1px solid var(--line); border-radius: 16px; scroll-margin-top: 24px; }
+    .sp-card h2 { margin: 0 0 4px; font: 400 17px/1.3 var(--serif); color: var(--text); }
+    .sp-lead { margin: 0 0 14px; font-size: 13px; color: var(--muted); }
+    .sp-field { display: grid; grid-template-columns: 240px minmax(0, 1fr); gap: 8px 24px; align-items: start; padding: 14px 0; border-top: 1px solid var(--line); }
+    .sp-flabel { display: flex; flex-direction: column; gap: 2px; padding-top: 7px; }
+    .sp-flabel b { font-weight: 600; }
     .sp-flabel small { font-size: 12px; color: var(--muted); }
-    .sp-fctl { display: flex; flex-direction: column; gap: 6px; min-width: 0; max-width: 640px; }
+    .sp-fctl { display: flex; flex-direction: column; gap: 8px; min-width: 0; max-width: 640px; }
     .sp-fctl > .sp-keystate:only-child { padding-top: 8px; }
     .sp-fctl > .sp-check { padding-top: 8px; }
+    .sp-fctl > .sp-fresh { align-self: flex-start; min-width: 200px; }
+    .sp-keepup { padding: 12px; border-radius: 12px; font-size: 12px; }
+    .sp-keepup-ok { background: var(--profit-bg); color: var(--text2); }
+    .sp-keepup-behind { background: var(--warn-bg); color: var(--warn); }
     .sp-inline { display: flex; gap: 8px; align-items: center; }
     .sp-inline input { flex: 1; min-width: 0; }
     .sp-inline.sp-pct input.sp-pctin { flex: 0 0 80px; text-align: right; }
     .sp-inline.sp-actions { gap: 16px; }
-    input.sp-key { height: 34px; padding: 0 12px; background: #0f0f0f; border: 1px solid #444; border-radius: 9px; color: var(--text); }
-    input.sp-key::placeholder { color: var(--muted); }
+    input.sp-key { height: 34px; padding: 0 12px; background: var(--input); border: 1px solid var(--line2); border-radius: 10px; color: var(--text); transition: border-color 0.15s var(--ease); }
+    input.sp-key:focus { border-color: var(--brand); outline: none; }
+    input.sp-key::placeholder { color: var(--faint); }
     .sp-masked { -webkit-text-security: disc; }
     .sp-keystate { font-size: 12px; color: var(--muted); }
     .sp-keystate.sp-ok { color: var(--profit); }
@@ -21489,9 +22519,9 @@
     .sp-keystate.sp-bad { color: var(--bad); }
     .sp-check { display: flex; gap: 8px; align-items: flex-start; cursor: pointer; }
     input[type="checkbox"] { accent-color: var(--profit); margin: 3px 0 0; }
-    .sp-tos { width: 100%; max-width: 900px; border-collapse: collapse; font-size: 12px; }
-    .sp-tos th, .sp-tos td { text-align: left; vertical-align: top; padding: 8px 4px; border-top: 1px solid var(--cline); }
-    .sp-tos th { width: 220px; color: var(--muted); font-weight: normal; }
+    .sp-tos { width: 100%; max-width: 900px; border-collapse: collapse; font-size: 12.5px; }
+    .sp-tos th, .sp-tos td { text-align: left; vertical-align: top; padding: 9px 4px; border-top: 1px solid var(--line); color: var(--text2); }
+    .sp-tos th { width: 220px; color: var(--muted); font-weight: 400; }
 
     /* ---------------------------------------------------------- narrower */
     /* With the Category dropdown the header needs room: under 1500px the two
@@ -21499,6 +22529,10 @@
        phone the pills get a row of their own and all come back. */
     @media (max-width: 1500px) and (min-width: 1001px) {
         .sp-pill[data-src="TornW3B"], .sp-pill[data-src="Online"] { display: none; }
+    }
+    @media (max-width: 1400px) {
+        .sp-tgroup { grid-template-columns: 128px minmax(0, 1fr); }
+        .sp-tlabel { padding: 14px 12px; }
     }
     @media (max-width: 1300px) {
         .sp-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -21521,6 +22555,7 @@
         /* A desktop window at half a screen (3.14.3 review): two cards a row, and the list before the desk. */
         .sp-strip, .sp-scangrid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
         .sp-desk { grid-template-columns: minmax(0, 1fr); }
+        .sp-tgroup { grid-template-columns: minmax(0, 1fr); }
         .sp-ws { position: static; }
         .sp-settings { grid-template-columns: minmax(0, 1fr); gap: 12px; padding: 12px 12px 48px; }
         .sp-snav { position: static; flex-direction: row; flex-wrap: wrap; }
@@ -22196,6 +23231,7 @@
      *   - the selling page tab (index.php?ttv2=traders): its own keys, its own
      *     settings, its own requests. See bootSellingPage().
      */
+
 
 
 
@@ -24215,7 +25251,7 @@
                 box.classList.add(BZ_FILL_CELL_CLASS);
                 tag.parentNode.appendChild(box);
             } else if (tag && tag.parentNode) tag.parentNode.insertBefore(box, tag.nextSibling);
-            else row.el.appendChild(box);
+            else rowFloat(row.el, document).appendChild(box);
         }
         // The cell it sits in keeps room for it (Torn may have drawn the cell again).
         if (box.classList.contains(BZ_FILL_CELL_CLASS) && box.parentNode && box.parentNode.classList && !box.parentNode.classList.contains(BZ_CELL_CLASS)) box.parentNode.classList.add(BZ_CELL_CLASS);
@@ -24228,12 +25264,16 @@
     /** The Item Market's price tag: before the price box (its rows have no name slot we can follow). */
     function ensureMarketTag(row, page) {
         let tag = row.el.querySelector('.' + OWN_BAZAAR_TAG_CLASS);
+        if (tag && !tag.parentElement.classList.contains(ROW_FLOAT_CLASS)) {
+            // One an older version put in the row's line goes: the tag floats now.
+            tag.remove();
+            tag = null;
+        }
         if (!tag) {
             tag = document.createElement('span');
             tag.className = OWN_BAZAAR_TAG_CLASS + ' ttv2-bztag-market';
-            const at = fillAnchor(page, row);
-            if (at && at.parent) at.parent.insertBefore(tag, at.before);
-            else row.el.appendChild(tag);
+            // In the row's floating group (3.20), never a line of its own above the price box.
+            rowFloat(row.el, document).appendChild(tag);
         }
         if (tag.dataset.itemId !== String(row.itemId)) tag.dataset.itemId = String(row.itemId);
         return tag;
@@ -24322,9 +25362,15 @@
     }
 
     function removeFillControls(root = document) {
-        for (const n of root.querySelectorAll('.ttv2-fillbox, .ttv2-fillset, .ttv2-bzchips')) n.remove();
-        // Torn's value cells are as they were: no room kept for a tick that is gone.
+        for (const n of root.querySelectorAll('.ttv2-fillset')) {
+            const bar = n.parentElement;
+            n.remove();
+            releaseMarks(bar);
+        }
+        for (const n of root.querySelectorAll('.ttv2-fillbox, .ttv2-bzchips')) n.remove();
+        // Torn's value cells are as they were.
         for (const c of root.querySelectorAll('.' + BZ_CELL_CLASS)) releaseBazaarCell(c);
+        removeRowFloats(root);
     }
 
     /** One of Torn's value cells, given back as it was. */
@@ -24339,7 +25385,7 @@
     /* Our marks on your bazaar's add page: Torn's value cell, and the Fill tick held at its right edge. */
     const BZ_CELL_CLASS = 'ttv2-bzcell';
     const BZ_FILL_CELL_CLASS = 'ttv2-fillcell';
-    /* Clear space between the cell's own line and the Fill tick. */
+    /* Clear space between Torn's words in the cell and our chips. */
     const BZ_FILL_GAP_PX = 8;
 
     /**
@@ -24347,19 +25393,24 @@
      * (3.16.3, the friend: "Fill button UI doesn't seem to be consistent?
      * Sometimes it's pushed far sometimes you don't see it").
      *
-     * The chips and the tick used to follow Torn's price in the cell's one line.
-     * With a quantity in the row another script writes "$29,782 | 2x = $59,564"
-     * there, the line no longer fitted, and the cell (Torn clips it with "…")
-     * dropped our whole group - all but the tick's square, left hanging at the
-     * far edge. Now the tick is held at the cell's right edge and the cell keeps
-     * that much room for it; when the rest still does not fit, IMA goes first
-     * (it is the same number Torn prints in that cell), then BP - whole chips,
-     * never a cut one. Both stay in My bazaar's list beside the page.
+     * The tick is held at the right edge of Torn's value cell and the chips just
+     * before it, all floating (3.20: the cell used to keep room for the tick with
+     * padding of its own - it keeps its own size now). Where the chips would
+     * cover Torn's words in the cell (another script writes "$29,782 | 2x =
+     * $59,564" there), IMA goes first (it is the same number Torn prints in that
+     * cell), then BP - whole chips, never a cut one. Both stay in My bazaar's
+     * list beside the page.
      *
      * Measured, not guessed: all reads, then all writes, so a page of 200 rows
      * costs a few layouts, and only rows whose words or width changed are done.
+     * Your bazaar's manage page and the Item Market's rows: their floating
+     * groups are placed by fitRowFloats.
      */
     function fitBazaarCells() {
+        if (app.ownBazaar && app.ownBazaar !== 'add') {
+            fitRowFloats(app.bzRows);
+            return;
+        }
         if (app.ownBazaar !== 'add') return;
         const todo = [];
         for (const row of app.bzRows) {
@@ -24373,13 +25424,22 @@
             todo.push({ cell, chips, key, room });
         }
         if (!todo.length) return;
+        // Where Torn's own words in the cell end: everything before our marks.
+        const wordsEnd = (t) => {
+            const range = document.createRange();
+            range.setStart(t.cell, 0);
+            range.setEndBefore(t.chips);
+            const r = range.getBoundingClientRect();
+            return r.width ? r.right : t.cell.getBoundingClientRect().left;
+        };
+        for (const t of todo) t.end = wordsEnd(t);
         for (const t of todo) {
-            t.cell.style.setProperty('--ttv2-fillw', t.room + BZ_FILL_GAP_PX + 'px');
+            t.cell.style.setProperty('--ttv2-fillw', t.room + 'px');
             if (t.chips.dataset.tight) delete t.chips.dataset.tight;
         }
         // '1': without IMA; '2': without both chips.
         for (const level of ['1', '2']) {
-            const over = todo.filter((t) => t.cell.scrollWidth > t.cell.clientWidth);
+            const over = todo.filter((t) => !t.chips.dataset.tight || t.chips.dataset.tight !== '2').filter((t) => t.chips.getBoundingClientRect().left < t.end + BZ_FILL_GAP_PX);
             if (!over.length) break;
             for (const t of over) t.chips.dataset.tight = level;
         }
@@ -24393,17 +25453,44 @@
      */
     function ensureFillSettingsLink() {
         const bar = linksBar(document);
-        if (!bar || bar.querySelector('.ttv2-fillset')) return;
-        const a = document.createElement('a');
-        a.href = '#';
-        a.className = 'ttv2-fillset';
-        a.setAttribute('role', 'button');
-        a.title = 'Which listing Fill undercuts, and by how much';
-        a.textContent = 'Fill settings';
-        // Torn's own link look, copied from the first link in the bar.
-        const like = bar.querySelector('a[class*="linkContainer___"]');
-        if (like) a.className = like.className.replace(/\biconActive___\S*/g, '') + ' ttv2-fillset';
-        bar.insertBefore(a, bar.firstChild);
+        if (!bar) return;
+        let a = bar.querySelector(':scope > .ttv2-fillset');
+        if (!a) {
+            // One an older version put first among Torn's links goes.
+            for (const old of bar.querySelectorAll('.ttv2-fillset')) old.remove();
+            a = document.createElement('a');
+            a.href = '#';
+            a.className = 'ttv2-fillset';
+            a.setAttribute('role', 'button');
+            a.title = 'Which listing Fill undercuts, and by how much';
+            a.textContent = 'Fill settings';
+            bar.appendChild(a);
+        }
+        placeFillSettings(a, bar);
+    }
+
+    /**
+     * "Fill settings" floats in Torn's links bar (3.20), not as one of its links
+     * (it was put first among them, glued to Manage items): beside Torn's links,
+     * on whichever side has room - before the first when they sit on the right,
+     * after the last when they sit on the left. Writes only what changed.
+     */
+    function placeFillSettings(a, bar) {
+        holdMarks(bar);
+        const links = [...bar.children].filter((n) => n !== a && !/(^|\s)ttv2-/.test(String(n.className || '')) && n.getBoundingClientRect().width > 0);
+        const box = bar.getBoundingClientRect();
+        const first = links.length ? links[0].getBoundingClientRect() : null;
+        const last = links.length ? links[links.length - 1].getBoundingClientRect() : null;
+        const w = a.offsetWidth;
+        let left;
+        if (first && first.left - box.left >= w + 16) left = first.left - box.left - w - 12;
+        else if (last) left = last.right - box.left + 12;
+        else left = 0;
+        const mid = first ? first.top + first.height / 2 : box.top + box.height / 2;
+        const top = Math.round(mid - box.top - bar.clientTop - a.offsetHeight / 2) + 'px';
+        const l = Math.round(left - bar.clientLeft) + 'px';
+        if (a.style.left !== l) a.style.left = l;
+        if (a.style.top !== top) a.style.top = top;
     }
 
     function openFillSettings() {
@@ -24509,9 +25596,12 @@
 
             app.fill.done.set(key, { itemId: String(itemId), kind, price: r.price, priceText: text, prev, inputs, qtyWritten, words: parts.join(' · '), level, at: Date.now() });
             app.bzSelected = String(itemId);
+            // What it typed, beside the page for a moment (3.20): no line is added to Torn's row.
+            showToast(rowEl, parts.join(' · '), level === 'warn' ? 'warn' : '');
         } catch (error) {
             const msg = redactKey(String((error && error.message) || error), getStoredKey());
             app.fill.last.set(String(itemId), { error: 'Fill: ' + msg, rowEl, at: Date.now() });
+            showToast(rowEl, 'Fill: ' + msg, 'bad');
         } finally {
             app.fill.busy.delete(rowEl);
             repaintFills();
@@ -24711,7 +25801,8 @@
             (found === 1 ? ' listing' : ' listings') +
             ' · ' +
             deals +
-            (deals === 1 ? ' deal' : ' deals') +
+            // The panel's list holds deals from every bazaar; this counts the page's (3.20).
+            (deals === 1 ? ' deal on this page' : ' deals on this page') +
             (locked ? ' · ' + locked + ' locked' : '')
         );
     }
@@ -25291,7 +26382,10 @@
         }
         const t = here ? here.trade : pending[0];
         const steps = t.items.flatMap((i) => i.steps || []);
-        const done = steps.filter(stepDone).length;
+        // Counted in bazaars, as the Checkout window counts them (3.20: "1 of 3 done"
+        // beside "1 of 1 bazaar left" was steps against bazaars).
+        const cart = checkoutList(t);
+        const done = cart.bazaars - cart.bazaarsLeft;
         const bought = here && buyRun.firstSeen !== null ? boughtFromStock(buyRun.firstSeen, buyRun.nowSeen, here.step.qty) : 0;
         const next = nextStep(t);
         app.panel.setBuying({
@@ -25300,7 +26394,7 @@
             // Minutes since they said yes (the box turns amber after ten).
             age: Math.floor((Date.now() - Number(t.at || Date.now())) / 60000) * 60000,
             done,
-            total: steps.length,
+            total: cart.bazaars,
             here: here
                 ? {
                     name: here.item.name,
@@ -25321,7 +26415,7 @@
                 : null,
             // Nothing seen to count from: Next asks instead of guessing.
             ask: Boolean(here && app.buyAsk === buyRun.stepKey),
-            next: next ? { name: next.name, seller: next.step.sellerName || 'the next bazaar' } : null,
+            next: next ? { name: next.name, seller: next.step.sellerName || null } : null,
             last: Boolean(here && next && steps.filter((st) => !stepDone(st)).length === 1),
             // Next stays on this bazaar: another item of the trade is here too.
             same: Boolean(here && here.trade.items.some((i) => (i.steps || []).some((st) => st !== here.step && !stepDone(st) && String(st.sellerId) === String(here.step.sellerId)))),
@@ -25588,6 +26682,8 @@
                 chip.className = TRADE_FILL_CLASS;
                 cell.appendChild(chip);
             }
+            // Beside the name, out of its line (3.20): the cell keeps its size and its wrapping.
+            placeFloat(chip);
             marked.add(chip);
             let text;
             let fill = null;
@@ -25681,9 +26777,9 @@
             btn.setAttribute('role', 'button');
             btn.tabIndex = 0;
         }
-        // Before Fill's line, after Torn's own.
-        const noteTag = bar.parentElement.querySelector('.' + TRADE_NOTE_CLASS);
-        if (btn.parentElement !== bar.parentElement || (noteTag && btn.nextSibling !== noteTag)) bar.parentElement.insertBefore(btn, noteTag);
+        // After Torn's own bar, floating (3.20): the bar keeps its size and its line.
+        if (btn.parentElement !== bar.parentElement) bar.parentElement.appendChild(btn);
+        placeFloat(btn);
         const todo = chips.filter((c) => c.getAttribute('aria-pressed') !== 'true').length;
         const text = todo ? '☐ Fill all ' + todo + (todo === 1 ? ' item' : ' items') + ' for ' + trader : (chips.length === 1 ? '☑ 1 item' : '☑ All ' + chips.length + ' items') + ' filled for ' + trader;
         const title = todo ? 'Type each marked row\'s quantity into its Qty box. You press ADD TO TRADE.' : 'Untick to put back what was in the boxes';
@@ -25713,27 +26809,23 @@
         return app.tradeBar;
     }
 
+    /*
+     * Fill's line (what it marked, or why nothing) goes in the panel's trade box
+     * (3.20): on Torn's page it was a line added after ADD TO TRADE. One an
+     * older version left there goes.
+     */
     function showFillNote(n) {
-        const bar = tradeAddBar();
-        let tag = document.querySelector('.' + TRADE_NOTE_CLASS);
-        if (!bar || !bar.parentElement) {
-            if (tag) tag.remove();
-            return;
-        }
-        if (!tag) {
-            tag = document.createElement('span');
-            tag.className = TRADE_NOTE_CLASS;
-            bar.parentElement.appendChild(tag);
-        }
-        if (tag.textContent !== n.text) tag.textContent = n.text;
-        const cls = TRADE_NOTE_CLASS + (n.ok ? ' ttv2-fillnote-ok' : '');
-        if (tag.className !== cls) tag.className = cls;
+        for (const tag of document.querySelectorAll('.' + TRADE_NOTE_CLASS)) tag.remove();
+        app.panel.setFillNote(n && n.text ? n : null);
     }
 
     /** The trade page's marks (rows to send, Fill), gone before they are drawn again. */
     function clearSendMarks() {
         for (const n of document.querySelectorAll('.' + TRADE_FILL_CLASS + ', .' + TRADE_FILLALL_CLASS)) n.remove();
-        if (!isTradePage(location.href)) for (const n of document.querySelectorAll('.' + TRADE_NOTE_CLASS)) n.remove();
+        if (!isTradePage(location.href)) {
+            for (const n of document.querySelectorAll('.' + TRADE_NOTE_CLASS)) n.remove();
+            app.panel.setFillNote(null);
+        }
         for (const n of document.querySelectorAll('.' + TRADE_SEND_CLASS)) n.classList.remove(TRADE_SEND_CLASS);
     }
 
@@ -26011,7 +27103,7 @@
 
     /** A change to, or inside, one of the helper's own price tags is not the page changing. */
     function isOwnTagMutation(m) {
-        const ours = '.' + OWN_BAZAAR_TAG_CLASS + ', .' + FILL_TAG_CLASS + ', .ttv2-fillbox, .ttv2-bzchips, .ttv2-fillset, .' + TRADE_BUYBAR_CLASS;
+        const ours = '.' + OWN_BAZAAR_TAG_CLASS + ', .' + FILL_TAG_CLASS + ', .ttv2-fillbox, .ttv2-bzchips, .ttv2-fillset, .' + TRADE_BUYBAR_CLASS + ', .' + ROW_FLOAT_CLASS + ', .ttv2-float';
         const isTag = (n) => n && n.nodeType === 1 && n.matches && n.matches(ours);
         const inTag = (n) => {
             const el = n && n.nodeType === 1 ? n : n && n.parentElement;
@@ -26816,7 +27908,7 @@
             out.push({ id: st.who, name: st.whoName || null });
         }
         // Added by hand before any trade: favourites too.
-        for (const id of edits.added || []) if (!out.some((f) => f.id === String(id)) && !black.has('id:' + id)) out.push({ id: String(id), name: null });
+        for (const id of edits.added || []) if (!out.some((f) => f.id === String(id)) && !black.has('id:' + id)) out.push({ id: String(id), name: (edits.names && edits.names[String(id)]) || null });
         return out;
     }
 
@@ -27116,8 +28208,7 @@
     const W3B_NEAR_MAX = 40;
     /* A sweep read keeps this many of the cheapest listings (the rest are never the flip). */
     const W3B_SWEEP_ROWS = 10;
-    /* The item picked: its bazaars read again after this. */
-    const W3B_SELECTED_MS = 2 * 60 * 1000;
+    /* The item picked, the trade and the flips: read again as Settings › Bazaar prices says (core/desk.js freshnessMs). */
     /* One trade reads at most this many of its items' bazaars (the chosen trader's first). */
     const TRADE_READ_MAX = 30;
     /* Traders on the desk who get a whole-trade value (the rest get one when planned). */
@@ -27364,7 +28455,7 @@
         else delete next[key];
         gmSet(STORE_SELL_DECLINED, next);
     }
-    /* A possible flip: its bazaars read again after this. */
+    /* A possible flip's read counts as current for twice this (the re-read itself follows Settings › Bazaar prices). */
     const W3B_CANDIDATE_MS = 10 * 60 * 1000;
     /* A TornW3B request that failed is not asked again before this. */
     const W3B_FAILED_RETRY_MS = 60 * 1000;
@@ -27471,6 +28562,8 @@
         // work on it (core/desk.js): until then the flips are checked first.
         const pinnedIds = [...new Set(Object.values(sellPinned(now)).flatMap((t) => t.lines.map((l) => l.itemId)))];
         const candIds = sell.candidates.map((c) => c.itemId);
+        const fresh = freshnessMs(sellPrefs());
+        const topIds = new Set(candIds.slice(0, FRESH_TOP).map(String));
         const read = nextW3bRead({
             summaryDue: now - sell.summaryAt >= W3B_SUMMARY_MS && now - sell.summaryTriedAt >= W3B_FAILED_RETRY_MS,
             picked: sell.selected,
@@ -27488,7 +28581,8 @@
             list: hidden && !backgroundListSlot(sell.w3bHiddenLists, now) ? null : nextW3bTrader(sell.db, heldIds(), now),
             turn: sell.w3bTurn,
             hidden,
-            due: (id, how) => bazaarsDue(id, how === 'desk' ? W3B_SELECTED_MS : how === 'sweep' ? W3B_SWEEP_MS : W3B_CANDIDATE_MS, now),
+            // Settings › Bazaar prices (3.20): the desk and the trade, the top flips, the others.
+            due: (id, how) => bazaarsDue(id, how === 'desk' ? fresh.desk : how === 'sweep' ? W3B_SWEEP_MS : topIds.has(String(id)) ? fresh.top : fresh.other, now),
         });
         if (!read) return null;
         if (read.kind === 'summary') return loadBazaarSummary;
@@ -28298,6 +29392,15 @@
             sell.selected = null;
             sell.pickedByYou = false;
         }
+        // A search you typed (3.20): when the item on the desk is not among what it
+        // finds, the desk moves to what it finds - once, as you type, never after.
+        if (q !== (sell.deskQuery || '')) {
+            sell.deskQuery = q;
+            if (q && sell.selected && !rows.some((r) => r.itemId === sell.selected)) {
+                sell.selected = null;
+                sell.pickedByYou = false;
+            }
+        }
         sell.selected = deskItem({ pickedByYou: sell.pickedByYou, selected: sell.selected, filter: sell.filter, strip, listed });
 
         /*
@@ -28624,7 +29727,16 @@
             for (const rows of ownByItem.values()) for (const r of rows) if (r.lastPaid) lastPaidIds.add(String(r.id));
             const teBad = Boolean(teState().badKey);
             const who = new Map();
-            for (const f of favs) who.set(f.id, { id: f.id, name: f.name || (statOf({ id: f.id }) || {}).whoName || 'Player ' + f.id, favourite: true });
+            // A favourite's name: theirs from the Ledger or when you starred them, else from any list they buy on.
+            let namesById = null;
+            const nameFromLists = (id) => {
+                if (!namesById) {
+                    namesById = new Map();
+                    for (const itemId of allIds) for (const b of buyersAll(itemId)) if (b && b.id && b.name && !namesById.has(String(b.id))) namesById.set(String(b.id), b.name);
+                }
+                return namesById.get(String(id)) || null;
+            };
+            for (const f of favs) who.set(f.id, { id: f.id, name: f.name || (statOf({ id: f.id }) || {}).whoName || nameFromLists(f.id) || 'Player ' + f.id, favourite: true });
             for (const [id, x] of trustedSeen) {
                 if (blacklist.has('id:' + id)) continue;
                 if (who.has(id)) who.get(id).name = x.name;
@@ -28646,12 +29758,16 @@
                     const reading = w.favourite && getTeKey() && !teBad && !ownLists[w.id];
                     const t = tradeWith({ id: w.id, name: w.name, trust }, null);
                     const main = t && t.main ? t.flips.find((r) => r.itemId === String(t.main)) : null;
+                    // A favourite that Buyers online only / Trusted buyers only leaves out stays in its row,
+                    // faded, saying why (3.20): its trade is not counted while the filter is on.
+                    const hid = w.favourite ? hiddenBuyers([{ id: w.id, name: w.name, trust }], { prefs, levelOf, votesMissing })[0] : null;
                     scan.list.push({
                         key: 'id:' + w.id,
                         id: w.id,
                         name: w.name,
                         trust,
                         favourite: w.favourite,
+                        hiddenBy: hid ? hid.hiddenBy : null,
                         traded: tradedLine(statOf({ id: w.id }), now),
                         reading: Boolean(reading) && !(t && t.items),
                         lastPaid: lastPaidIds.has(w.id),
@@ -28816,6 +29932,13 @@
                 bazaarsError: sell.summaryError,
                 flipsChecked,
                 flipsWanted: sell.candidates.length,
+                // Settings › Bazaar prices: how many items each group holds now, and the reads a minute.
+                freshCounts: {
+                    desk: new Set([sell.selected, ...(sell.tradeActive ? sell.tradeLive : [])].filter(Boolean).map(String)).size || 1,
+                    top: Math.min(FRESH_TOP, sell.candidates.length),
+                    other: Math.max(0, sell.candidates.length - FRESH_TOP),
+                },
+                w3bPerMin: SELL_W3B_PER_MIN,
                 sweepChecked,
                 sweepTotal: withBid.length,
                 statusesKnown,
@@ -29571,7 +30694,11 @@
             // Favourite (the star) and Blacklist (⊘) on a trader row; the Ledger's Traders tab too.
             onFavourite: (b, on) => {
                 if (!b || !b.id) return;
-                gmSet(STORE_SELL_FAVOURITES, editFavourite(sellFavourites(), b.id, on));
+                // The name is kept with it: a favourite added by hand, never traded with, is named (not "Player 12").
+                const edits = sellFavourites();
+                const names = { ...(edits.names || {}) };
+                if (on && b.name && !/^Player \d+$/.test(b.name)) names[String(b.id)] = String(b.name);
+                gmSet(STORE_SELL_FAVOURITES, { ...editFavourite(edits, b.id, on), names });
                 renderSellingNow();
             },
             onBlacklist: (b, on) => {

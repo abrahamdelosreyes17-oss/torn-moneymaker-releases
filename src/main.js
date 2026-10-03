@@ -60,7 +60,7 @@ import { coverAfter, coverRowsRead, coverListings, coverListingsRead, coverVerdi
 import { readBazaarList, BAZAAR_LIST_SELECTOR } from './sources/dom/bazaar-list.js';
 import { planTrade, keepAfter } from './core/trade.js';
 import { holdTrade, holdKey, resolveEstimated, priceHeld, livePins, editHeld, HOLD_MS } from './core/held.js';
-import { deskItem, nextW3bRead, backgroundSlot, backgroundListSlot, flipsStale, W3B_HIDDEN_PER_MIN, HIDDEN_RENDER_MS, declineKey, declinedOn } from './core/desk.js';
+import { deskItem, nextW3bRead, backgroundSlot, backgroundListSlot, flipsStale, W3B_HIDDEN_PER_MIN, HIDDEN_RENDER_MS, declineKey, declinedOn, freshnessMs, FRESH_TOP } from './core/desk.js';
 import { liquidityKind, unitsMoved, addMovement, stopsMinutes, EXTRA_CAP } from './core/liquidity.js';
 import { usageAdd, usageMerge, usageSeries, USAGE_SERVICES, USAGE_RANGES, USAGE_LABELS } from './core/usage.js';
 import { addLogEntries, logText } from './core/errlog.js';
@@ -176,7 +176,6 @@ import {
     priceText,
     scanMarketRows,
     ownIdFromPage,
-    fillAnchor,
     rowItemIdNow,
     savedPrice,
     linksBar,
@@ -195,6 +194,7 @@ import {
     presenceText,
     presenceWord,
 } from './sources/dom/owner.js';
+import { placeFloat, holdMarks, releaseMarks, rowFloat, fitRowFloats, removeRowFloats, showToast, ROW_FLOAT_CLASS } from './sources/dom/float.js';
 import { injectStyles } from './ui/styles.js';
 import { Panel, TORN_API_KEY_URL } from './ui/panel.js';
 import { SellingPage, SELLING_PAGE_DEFAULTS, ALL_ITEMS_PAGE, tradeUrl } from './ui/selling-page.js';
@@ -2178,7 +2178,7 @@ function ensureFillControls(row, page, tag) {
             box.classList.add(BZ_FILL_CELL_CLASS);
             tag.parentNode.appendChild(box);
         } else if (tag && tag.parentNode) tag.parentNode.insertBefore(box, tag.nextSibling);
-        else row.el.appendChild(box);
+        else rowFloat(row.el, document).appendChild(box);
     }
     // The cell it sits in keeps room for it (Torn may have drawn the cell again).
     if (box.classList.contains(BZ_FILL_CELL_CLASS) && box.parentNode && box.parentNode.classList && !box.parentNode.classList.contains(BZ_CELL_CLASS)) box.parentNode.classList.add(BZ_CELL_CLASS);
@@ -2191,12 +2191,16 @@ function ensureFillControls(row, page, tag) {
 /** The Item Market's price tag: before the price box (its rows have no name slot we can follow). */
 function ensureMarketTag(row, page) {
     let tag = row.el.querySelector('.' + OWN_BAZAAR_TAG_CLASS);
+    if (tag && !tag.parentElement.classList.contains(ROW_FLOAT_CLASS)) {
+        // One an older version put in the row's line goes: the tag floats now.
+        tag.remove();
+        tag = null;
+    }
     if (!tag) {
         tag = document.createElement('span');
         tag.className = OWN_BAZAAR_TAG_CLASS + ' ttv2-bztag-market';
-        const at = fillAnchor(page, row);
-        if (at && at.parent) at.parent.insertBefore(tag, at.before);
-        else row.el.appendChild(tag);
+        // In the row's floating group (3.20), never a line of its own above the price box.
+        rowFloat(row.el, document).appendChild(tag);
     }
     if (tag.dataset.itemId !== String(row.itemId)) tag.dataset.itemId = String(row.itemId);
     return tag;
@@ -2285,9 +2289,15 @@ function repaintFills() {
 }
 
 function removeFillControls(root = document) {
-    for (const n of root.querySelectorAll('.ttv2-fillbox, .ttv2-fillset, .ttv2-bzchips')) n.remove();
-    // Torn's value cells are as they were: no room kept for a tick that is gone.
+    for (const n of root.querySelectorAll('.ttv2-fillset')) {
+        const bar = n.parentElement;
+        n.remove();
+        releaseMarks(bar);
+    }
+    for (const n of root.querySelectorAll('.ttv2-fillbox, .ttv2-bzchips')) n.remove();
+    // Torn's value cells are as they were.
     for (const c of root.querySelectorAll('.' + BZ_CELL_CLASS)) releaseBazaarCell(c);
+    removeRowFloats(root);
 }
 
 /** One of Torn's value cells, given back as it was. */
@@ -2302,7 +2312,7 @@ function releaseBazaarCell(cell) {
 /* Our marks on your bazaar's add page: Torn's value cell, and the Fill tick held at its right edge. */
 const BZ_CELL_CLASS = 'ttv2-bzcell';
 const BZ_FILL_CELL_CLASS = 'ttv2-fillcell';
-/* Clear space between the cell's own line and the Fill tick. */
+/* Clear space between Torn's words in the cell and our chips. */
 const BZ_FILL_GAP_PX = 8;
 
 /**
@@ -2310,19 +2320,24 @@ const BZ_FILL_GAP_PX = 8;
  * (3.16.3, the friend: "Fill button UI doesn't seem to be consistent?
  * Sometimes it's pushed far sometimes you don't see it").
  *
- * The chips and the tick used to follow Torn's price in the cell's one line.
- * With a quantity in the row another script writes "$29,782 | 2x = $59,564"
- * there, the line no longer fitted, and the cell (Torn clips it with "…")
- * dropped our whole group - all but the tick's square, left hanging at the
- * far edge. Now the tick is held at the cell's right edge and the cell keeps
- * that much room for it; when the rest still does not fit, IMA goes first
- * (it is the same number Torn prints in that cell), then BP - whole chips,
- * never a cut one. Both stay in My bazaar's list beside the page.
+ * The tick is held at the right edge of Torn's value cell and the chips just
+ * before it, all floating (3.20: the cell used to keep room for the tick with
+ * padding of its own - it keeps its own size now). Where the chips would
+ * cover Torn's words in the cell (another script writes "$29,782 | 2x =
+ * $59,564" there), IMA goes first (it is the same number Torn prints in that
+ * cell), then BP - whole chips, never a cut one. Both stay in My bazaar's
+ * list beside the page.
  *
  * Measured, not guessed: all reads, then all writes, so a page of 200 rows
  * costs a few layouts, and only rows whose words or width changed are done.
+ * Your bazaar's manage page and the Item Market's rows: their floating
+ * groups are placed by fitRowFloats.
  */
 function fitBazaarCells() {
+    if (app.ownBazaar && app.ownBazaar !== 'add') {
+        fitRowFloats(app.bzRows);
+        return;
+    }
     if (app.ownBazaar !== 'add') return;
     const todo = [];
     for (const row of app.bzRows) {
@@ -2336,13 +2351,22 @@ function fitBazaarCells() {
         todo.push({ cell, chips, key, room });
     }
     if (!todo.length) return;
+    // Where Torn's own words in the cell end: everything before our marks.
+    const wordsEnd = (t) => {
+        const range = document.createRange();
+        range.setStart(t.cell, 0);
+        range.setEndBefore(t.chips);
+        const r = range.getBoundingClientRect();
+        return r.width ? r.right : t.cell.getBoundingClientRect().left;
+    };
+    for (const t of todo) t.end = wordsEnd(t);
     for (const t of todo) {
-        t.cell.style.setProperty('--ttv2-fillw', t.room + BZ_FILL_GAP_PX + 'px');
+        t.cell.style.setProperty('--ttv2-fillw', t.room + 'px');
         if (t.chips.dataset.tight) delete t.chips.dataset.tight;
     }
     // '1': without IMA; '2': without both chips.
     for (const level of ['1', '2']) {
-        const over = todo.filter((t) => t.cell.scrollWidth > t.cell.clientWidth);
+        const over = todo.filter((t) => !t.chips.dataset.tight || t.chips.dataset.tight !== '2').filter((t) => t.chips.getBoundingClientRect().left < t.end + BZ_FILL_GAP_PX);
         if (!over.length) break;
         for (const t of over) t.chips.dataset.tight = level;
     }
@@ -2356,17 +2380,44 @@ function fitBazaarCells() {
  */
 function ensureFillSettingsLink() {
     const bar = linksBar(document);
-    if (!bar || bar.querySelector('.ttv2-fillset')) return;
-    const a = document.createElement('a');
-    a.href = '#';
-    a.className = 'ttv2-fillset';
-    a.setAttribute('role', 'button');
-    a.title = 'Which listing Fill undercuts, and by how much';
-    a.textContent = 'Fill settings';
-    // Torn's own link look, copied from the first link in the bar.
-    const like = bar.querySelector('a[class*="linkContainer___"]');
-    if (like) a.className = like.className.replace(/\biconActive___\S*/g, '') + ' ttv2-fillset';
-    bar.insertBefore(a, bar.firstChild);
+    if (!bar) return;
+    let a = bar.querySelector(':scope > .ttv2-fillset');
+    if (!a) {
+        // One an older version put first among Torn's links goes.
+        for (const old of bar.querySelectorAll('.ttv2-fillset')) old.remove();
+        a = document.createElement('a');
+        a.href = '#';
+        a.className = 'ttv2-fillset';
+        a.setAttribute('role', 'button');
+        a.title = 'Which listing Fill undercuts, and by how much';
+        a.textContent = 'Fill settings';
+        bar.appendChild(a);
+    }
+    placeFillSettings(a, bar);
+}
+
+/**
+ * "Fill settings" floats in Torn's links bar (3.20), not as one of its links
+ * (it was put first among them, glued to Manage items): beside Torn's links,
+ * on whichever side has room - before the first when they sit on the right,
+ * after the last when they sit on the left. Writes only what changed.
+ */
+function placeFillSettings(a, bar) {
+    holdMarks(bar);
+    const links = [...bar.children].filter((n) => n !== a && !/(^|\s)ttv2-/.test(String(n.className || '')) && n.getBoundingClientRect().width > 0);
+    const box = bar.getBoundingClientRect();
+    const first = links.length ? links[0].getBoundingClientRect() : null;
+    const last = links.length ? links[links.length - 1].getBoundingClientRect() : null;
+    const w = a.offsetWidth;
+    let left;
+    if (first && first.left - box.left >= w + 16) left = first.left - box.left - w - 12;
+    else if (last) left = last.right - box.left + 12;
+    else left = 0;
+    const mid = first ? first.top + first.height / 2 : box.top + box.height / 2;
+    const top = Math.round(mid - box.top - bar.clientTop - a.offsetHeight / 2) + 'px';
+    const l = Math.round(left - bar.clientLeft) + 'px';
+    if (a.style.left !== l) a.style.left = l;
+    if (a.style.top !== top) a.style.top = top;
 }
 
 function openFillSettings() {
@@ -2472,9 +2523,12 @@ async function fillRow(rowEl, itemId, { base = null } = {}) {
 
         app.fill.done.set(key, { itemId: String(itemId), kind, price: r.price, priceText: text, prev, inputs, qtyWritten, words: parts.join(' · '), level, at: Date.now() });
         app.bzSelected = String(itemId);
+        // What it typed, beside the page for a moment (3.20): no line is added to Torn's row.
+        showToast(rowEl, parts.join(' · '), level === 'warn' ? 'warn' : '');
     } catch (error) {
         const msg = redactKey(String((error && error.message) || error), getStoredKey());
         app.fill.last.set(String(itemId), { error: 'Fill: ' + msg, rowEl, at: Date.now() });
+        showToast(rowEl, 'Fill: ' + msg, 'bad');
     } finally {
         app.fill.busy.delete(rowEl);
         repaintFills();
@@ -2674,7 +2728,8 @@ function scanSummary() {
         (found === 1 ? ' listing' : ' listings') +
         ' · ' +
         deals +
-        (deals === 1 ? ' deal' : ' deals') +
+        // The panel's list holds deals from every bazaar; this counts the page's (3.20).
+        (deals === 1 ? ' deal on this page' : ' deals on this page') +
         (locked ? ' · ' + locked + ' locked' : '')
     );
 }
@@ -3254,7 +3309,10 @@ function trackTradeBuying(listings) {
     }
     const t = here ? here.trade : pending[0];
     const steps = t.items.flatMap((i) => i.steps || []);
-    const done = steps.filter(stepDone).length;
+    // Counted in bazaars, as the Checkout window counts them (3.20: "1 of 3 done"
+    // beside "1 of 1 bazaar left" was steps against bazaars).
+    const cart = checkoutList(t);
+    const done = cart.bazaars - cart.bazaarsLeft;
     const bought = here && buyRun.firstSeen !== null ? boughtFromStock(buyRun.firstSeen, buyRun.nowSeen, here.step.qty) : 0;
     const next = nextStep(t);
     app.panel.setBuying({
@@ -3263,7 +3321,7 @@ function trackTradeBuying(listings) {
         // Minutes since they said yes (the box turns amber after ten).
         age: Math.floor((Date.now() - Number(t.at || Date.now())) / 60000) * 60000,
         done,
-        total: steps.length,
+        total: cart.bazaars,
         here: here
             ? {
                 name: here.item.name,
@@ -3284,7 +3342,7 @@ function trackTradeBuying(listings) {
             : null,
         // Nothing seen to count from: Next asks instead of guessing.
         ask: Boolean(here && app.buyAsk === buyRun.stepKey),
-        next: next ? { name: next.name, seller: next.step.sellerName || 'the next bazaar' } : null,
+        next: next ? { name: next.name, seller: next.step.sellerName || null } : null,
         last: Boolean(here && next && steps.filter((st) => !stepDone(st)).length === 1),
         // Next stays on this bazaar: another item of the trade is here too.
         same: Boolean(here && here.trade.items.some((i) => (i.steps || []).some((st) => st !== here.step && !stepDone(st) && String(st.sellerId) === String(here.step.sellerId)))),
@@ -3551,6 +3609,8 @@ function scanTradePageNow() {
             chip.className = TRADE_FILL_CLASS;
             cell.appendChild(chip);
         }
+        // Beside the name, out of its line (3.20): the cell keeps its size and its wrapping.
+        placeFloat(chip);
         marked.add(chip);
         let text;
         let fill = null;
@@ -3644,9 +3704,9 @@ function showFillAll(trader) {
         btn.setAttribute('role', 'button');
         btn.tabIndex = 0;
     }
-    // Before Fill's line, after Torn's own.
-    const noteTag = bar.parentElement.querySelector('.' + TRADE_NOTE_CLASS);
-    if (btn.parentElement !== bar.parentElement || (noteTag && btn.nextSibling !== noteTag)) bar.parentElement.insertBefore(btn, noteTag);
+    // After Torn's own bar, floating (3.20): the bar keeps its size and its line.
+    if (btn.parentElement !== bar.parentElement) bar.parentElement.appendChild(btn);
+    placeFloat(btn);
     const todo = chips.filter((c) => c.getAttribute('aria-pressed') !== 'true').length;
     const text = todo ? '☐ Fill all ' + todo + (todo === 1 ? ' item' : ' items') + ' for ' + trader : (chips.length === 1 ? '☑ 1 item' : '☑ All ' + chips.length + ' items') + ' filled for ' + trader;
     const title = todo ? 'Type each marked row\'s quantity into its Qty box. You press ADD TO TRADE.' : 'Untick to put back what was in the boxes';
@@ -3676,27 +3736,23 @@ function tradeAddBar() {
     return app.tradeBar;
 }
 
+/*
+ * Fill's line (what it marked, or why nothing) goes in the panel's trade box
+ * (3.20): on Torn's page it was a line added after ADD TO TRADE. One an
+ * older version left there goes.
+ */
 function showFillNote(n) {
-    const bar = tradeAddBar();
-    let tag = document.querySelector('.' + TRADE_NOTE_CLASS);
-    if (!bar || !bar.parentElement) {
-        if (tag) tag.remove();
-        return;
-    }
-    if (!tag) {
-        tag = document.createElement('span');
-        tag.className = TRADE_NOTE_CLASS;
-        bar.parentElement.appendChild(tag);
-    }
-    if (tag.textContent !== n.text) tag.textContent = n.text;
-    const cls = TRADE_NOTE_CLASS + (n.ok ? ' ttv2-fillnote-ok' : '');
-    if (tag.className !== cls) tag.className = cls;
+    for (const tag of document.querySelectorAll('.' + TRADE_NOTE_CLASS)) tag.remove();
+    app.panel.setFillNote(n && n.text ? n : null);
 }
 
 /** The trade page's marks (rows to send, Fill), gone before they are drawn again. */
 function clearSendMarks() {
     for (const n of document.querySelectorAll('.' + TRADE_FILL_CLASS + ', .' + TRADE_FILLALL_CLASS)) n.remove();
-    if (!isTradePage(location.href)) for (const n of document.querySelectorAll('.' + TRADE_NOTE_CLASS)) n.remove();
+    if (!isTradePage(location.href)) {
+        for (const n of document.querySelectorAll('.' + TRADE_NOTE_CLASS)) n.remove();
+        app.panel.setFillNote(null);
+    }
     for (const n of document.querySelectorAll('.' + TRADE_SEND_CLASS)) n.classList.remove(TRADE_SEND_CLASS);
 }
 
@@ -3974,7 +4030,7 @@ function onMutations(mutations) {
 
 /** A change to, or inside, one of the helper's own price tags is not the page changing. */
 function isOwnTagMutation(m) {
-    const ours = '.' + OWN_BAZAAR_TAG_CLASS + ', .' + FILL_TAG_CLASS + ', .ttv2-fillbox, .ttv2-bzchips, .ttv2-fillset, .' + TRADE_BUYBAR_CLASS;
+    const ours = '.' + OWN_BAZAAR_TAG_CLASS + ', .' + FILL_TAG_CLASS + ', .ttv2-fillbox, .ttv2-bzchips, .ttv2-fillset, .' + TRADE_BUYBAR_CLASS + ', .' + ROW_FLOAT_CLASS + ', .ttv2-float';
     const isTag = (n) => n && n.nodeType === 1 && n.matches && n.matches(ours);
     const inTag = (n) => {
         const el = n && n.nodeType === 1 ? n : n && n.parentElement;
@@ -4779,7 +4835,7 @@ function favouriteTraders(now = Date.now()) {
         out.push({ id: st.who, name: st.whoName || null });
     }
     // Added by hand before any trade: favourites too.
-    for (const id of edits.added || []) if (!out.some((f) => f.id === String(id)) && !black.has('id:' + id)) out.push({ id: String(id), name: null });
+    for (const id of edits.added || []) if (!out.some((f) => f.id === String(id)) && !black.has('id:' + id)) out.push({ id: String(id), name: (edits.names && edits.names[String(id)]) || null });
     return out;
 }
 
@@ -5079,8 +5135,7 @@ const W3B_NEAR_PCT = 5;
 const W3B_NEAR_MAX = 40;
 /* A sweep read keeps this many of the cheapest listings (the rest are never the flip). */
 const W3B_SWEEP_ROWS = 10;
-/* The item picked: its bazaars read again after this. */
-const W3B_SELECTED_MS = 2 * 60 * 1000;
+/* The item picked, the trade and the flips: read again as Settings › Bazaar prices says (core/desk.js freshnessMs). */
 /* One trade reads at most this many of its items' bazaars (the chosen trader's first). */
 const TRADE_READ_MAX = 30;
 /* Traders on the desk who get a whole-trade value (the rest get one when planned). */
@@ -5327,7 +5382,7 @@ function setSellDeclined(key, until) {
     else delete next[key];
     gmSet(STORE_SELL_DECLINED, next);
 }
-/* A possible flip: its bazaars read again after this. */
+/* A possible flip's read counts as current for twice this (the re-read itself follows Settings › Bazaar prices). */
 const W3B_CANDIDATE_MS = 10 * 60 * 1000;
 /* A TornW3B request that failed is not asked again before this. */
 const W3B_FAILED_RETRY_MS = 60 * 1000;
@@ -5434,6 +5489,8 @@ function nextW3bJob(now, hidden = false) {
     // work on it (core/desk.js): until then the flips are checked first.
     const pinnedIds = [...new Set(Object.values(sellPinned(now)).flatMap((t) => t.lines.map((l) => l.itemId)))];
     const candIds = sell.candidates.map((c) => c.itemId);
+    const fresh = freshnessMs(sellPrefs());
+    const topIds = new Set(candIds.slice(0, FRESH_TOP).map(String));
     const read = nextW3bRead({
         summaryDue: now - sell.summaryAt >= W3B_SUMMARY_MS && now - sell.summaryTriedAt >= W3B_FAILED_RETRY_MS,
         picked: sell.selected,
@@ -5451,7 +5508,8 @@ function nextW3bJob(now, hidden = false) {
         list: hidden && !backgroundListSlot(sell.w3bHiddenLists, now) ? null : nextW3bTrader(sell.db, heldIds(), now),
         turn: sell.w3bTurn,
         hidden,
-        due: (id, how) => bazaarsDue(id, how === 'desk' ? W3B_SELECTED_MS : how === 'sweep' ? W3B_SWEEP_MS : W3B_CANDIDATE_MS, now),
+        // Settings › Bazaar prices (3.20): the desk and the trade, the top flips, the others.
+        due: (id, how) => bazaarsDue(id, how === 'desk' ? fresh.desk : how === 'sweep' ? W3B_SWEEP_MS : topIds.has(String(id)) ? fresh.top : fresh.other, now),
     });
     if (!read) return null;
     if (read.kind === 'summary') return loadBazaarSummary;
@@ -6261,6 +6319,15 @@ function renderSellingWork(src = null) {
         sell.selected = null;
         sell.pickedByYou = false;
     }
+    // A search you typed (3.20): when the item on the desk is not among what it
+    // finds, the desk moves to what it finds - once, as you type, never after.
+    if (q !== (sell.deskQuery || '')) {
+        sell.deskQuery = q;
+        if (q && sell.selected && !rows.some((r) => r.itemId === sell.selected)) {
+            sell.selected = null;
+            sell.pickedByYou = false;
+        }
+    }
     sell.selected = deskItem({ pickedByYou: sell.pickedByYou, selected: sell.selected, filter: sell.filter, strip, listed });
 
     /*
@@ -6587,7 +6654,16 @@ function renderSellingWork(src = null) {
         for (const rows of ownByItem.values()) for (const r of rows) if (r.lastPaid) lastPaidIds.add(String(r.id));
         const teBad = Boolean(teState().badKey);
         const who = new Map();
-        for (const f of favs) who.set(f.id, { id: f.id, name: f.name || (statOf({ id: f.id }) || {}).whoName || 'Player ' + f.id, favourite: true });
+        // A favourite's name: theirs from the Ledger or when you starred them, else from any list they buy on.
+        let namesById = null;
+        const nameFromLists = (id) => {
+            if (!namesById) {
+                namesById = new Map();
+                for (const itemId of allIds) for (const b of buyersAll(itemId)) if (b && b.id && b.name && !namesById.has(String(b.id))) namesById.set(String(b.id), b.name);
+            }
+            return namesById.get(String(id)) || null;
+        };
+        for (const f of favs) who.set(f.id, { id: f.id, name: f.name || (statOf({ id: f.id }) || {}).whoName || nameFromLists(f.id) || 'Player ' + f.id, favourite: true });
         for (const [id, x] of trustedSeen) {
             if (blacklist.has('id:' + id)) continue;
             if (who.has(id)) who.get(id).name = x.name;
@@ -6609,12 +6685,16 @@ function renderSellingWork(src = null) {
                 const reading = w.favourite && getTeKey() && !teBad && !ownLists[w.id];
                 const t = tradeWith({ id: w.id, name: w.name, trust }, null);
                 const main = t && t.main ? t.flips.find((r) => r.itemId === String(t.main)) : null;
+                // A favourite that Buyers online only / Trusted buyers only leaves out stays in its row,
+                // faded, saying why (3.20): its trade is not counted while the filter is on.
+                const hid = w.favourite ? hiddenBuyers([{ id: w.id, name: w.name, trust }], { prefs, levelOf, votesMissing })[0] : null;
                 scan.list.push({
                     key: 'id:' + w.id,
                     id: w.id,
                     name: w.name,
                     trust,
                     favourite: w.favourite,
+                    hiddenBy: hid ? hid.hiddenBy : null,
                     traded: tradedLine(statOf({ id: w.id }), now),
                     reading: Boolean(reading) && !(t && t.items),
                     lastPaid: lastPaidIds.has(w.id),
@@ -6779,6 +6859,13 @@ function renderSellingWork(src = null) {
             bazaarsError: sell.summaryError,
             flipsChecked,
             flipsWanted: sell.candidates.length,
+            // Settings › Bazaar prices: how many items each group holds now, and the reads a minute.
+            freshCounts: {
+                desk: new Set([sell.selected, ...(sell.tradeActive ? sell.tradeLive : [])].filter(Boolean).map(String)).size || 1,
+                top: Math.min(FRESH_TOP, sell.candidates.length),
+                other: Math.max(0, sell.candidates.length - FRESH_TOP),
+            },
+            w3bPerMin: SELL_W3B_PER_MIN,
             sweepChecked,
             sweepTotal: withBid.length,
             statusesKnown,
@@ -7534,7 +7621,11 @@ function bootSellingPage() {
         // Favourite (the star) and Blacklist (⊘) on a trader row; the Ledger's Traders tab too.
         onFavourite: (b, on) => {
             if (!b || !b.id) return;
-            gmSet(STORE_SELL_FAVOURITES, editFavourite(sellFavourites(), b.id, on));
+            // The name is kept with it: a favourite added by hand, never traded with, is named (not "Player 12").
+            const edits = sellFavourites();
+            const names = { ...(edits.names || {}) };
+            if (on && b.name && !/^Player \d+$/.test(b.name)) names[String(b.id)] = String(b.name);
+            gmSet(STORE_SELL_FAVOURITES, { ...editFavourite(edits, b.id, on), names });
             renderSellingNow();
         },
         onBlacklist: (b, on) => {

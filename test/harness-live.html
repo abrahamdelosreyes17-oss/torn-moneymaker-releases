@@ -99,6 +99,15 @@ if (/[?&]ownbazaar=1/.test(location.search)) {
             d.querySelector('ul.items-cont').classList.add('all-items');
             d.insertAdjacentHTML('beforeend', '<style>#fake-own .info-wrap{display:none}</style><ul class="items-cont drugs-items" style="display:none">' + row(206, 'Xanax', 15, 830000) + '</ul>');
         }
+        // #/manage (3.20): your listings as rows of a flex list, as Torn's React
+        // page lays them out - name on the left, quantity and price boxes on the right.
+        if (/manage/.test(location.hash)) {
+            const mrow = (id, name, qty, price) => '<div data-testid="sortable-item" class="row___m1"><div class="item___m2"><img src="https://www.torn.com/images/items/' + id + '/small.png" alt="' + name + '"><div class="desc___m3">' + name + '</div></div>' +
+                '<div class="amount___m4">' + qty + '</div><div class="price___m5"><div class="input-money-group"><input class="input-money" type="text" value="' + price + '"><input class="input-money" type="hidden" value="' + price + '"></div></div><button type="button" class="remove___m6">Remove</button></div>';
+            d.querySelector('ul.items-cont').style.display = 'none';
+            d.insertAdjacentHTML('beforeend', '<style>#fake-manage{width:784px;background:#2e2e2e;font:12px Arial;color:#ddd}#fake-manage .row___m1{display:flex;align-items:center;gap:10px;height:44px;padding:0 10px;border-bottom:1px solid #444;overflow:hidden}#fake-manage .item___m2{display:flex;align-items:center;gap:10px;flex:1;min-width:0}#fake-manage .item___m2 img{height:30px}#fake-manage .desc___m3{font-weight:bold}#fake-manage .amount___m4{width:50px;text-align:right}#fake-manage .price___m5 input[type=text]{width:100px}</style>' +
+                '<div id="fake-manage">' + mrow(180, 'Bottle of Beer', 12, 60) + mrow(206, 'Xanax', 2, 845000) + mrow(1, 'Hammer', 1, 125) + '</div>');
+        }
         // Torn's form keeps what was typed; the harness logs each input event so a check can see Fill's.
         window.__typed = [];
         d.addEventListener('input', (e) => window.__typed.push([e.target.closest('li') ? e.target.closest('li').querySelector('.t-overflow').textContent : '?', e.target.className, e.target.value]));
@@ -116,7 +125,9 @@ if (_ownMarket) {
             (_ownMarket === 'add' ? '<div class="amountInputWrapper___x6"><div class="input-money-group"><input class="input-money" type="text"><input class="input-money" type="hidden"></div></div>' : '') +
             '<div class="priceInputWrapper___x7"><div class="input-money-group"><span class="input-money-symbol">$</span><input class="input-money" type="text" value="' + (price || '') + '"><input class="input-money" type="hidden" value="' + (price || '') + '"></div></div>' +
             '</div></div>';
+        // As Torn's Item Market lays its rows out (3.20): a flex row, the name on the left, the boxes on the right.
         d.innerHTML = '<input type="hidden" id="torn-user" value=\'{"id":999,"playername":"Me"}\'>' +
+            '<style>#item-market-root{width:784px;background:#2e2e2e;font:12px Arial;color:#ddd}#item-market-root [class*=itemRow___]{display:flex;align-items:center;gap:10px;height:48px;padding:0 10px;border-bottom:1px solid #444;overflow:hidden}#item-market-root [class*=info___]{display:flex;align-items:center;gap:8px;flex:1;min-width:0}#item-market-root [class*=info___] img{height:24px}#item-market-root [class*=amountInputWrapper___] input[type=text]{width:60px}#item-market-root [class*=priceInputWrapper___] input[type=text]{width:110px}</style>' +
             (_ownMarket === 'add' ? row(206, 'Xanax', 15) + row(180, 'Bottle of Beer', 12) : row(206, 'Xanax', 0, 845000));
         document.body.prepend(d);
         window.__typed = [];
@@ -210,7 +221,9 @@ if (_bzWindow) {
         for (let i = 0; i < _bzWindow; i++) data.push(i === want ? { id: 206, name: 'Xanax', price: 840000, stock: 5 } : { id: 3000 + i, name: 'Thing ' + (i + 1), price: 500 + i, stock: 3 });
         const d = document.createElement('div');
         d.id = 'fake-bazaar';
-        d.innerHTML = '<div style="height:120px;padding:8px;color:#ddd;font:12px Arial">BigSeller\'s bazaar <div class="searchBar___x"><input type="text" placeholder="search..." aria-label="Search bazaar" style="width:160px"></div></div>' +
+        // The owner banner as captured live (2026-09-24, sources/dom/owner.js): its status badge floats at its end (3.20).
+        const _seller = new URLSearchParams(location.search).get('userId') || '902';
+        d.innerHTML = '<div style="height:120px;padding:8px;color:#ddd;font:12px Arial"><div class="msg right-round messageContent___cdSrs" style="padding:6px 10px;background:#333;border-radius:5px;width:560px"><a href="profiles.php?XID=' + _seller + '" style="color:#9cf">BigSeller\'s</a> bazaar, favorited by <b>3</b> citizens, is currently <span class="bold">open.</span></div> <div class="searchBar___x"><input type="text" placeholder="search..." aria-label="Search bazaar" style="width:160px"></div></div>' +
             '<div class="itemsContainner___x" style="width:700px"><div><div data-testid="bazaar-items" style="position: relative; width: 100%; height: 0px;"></div></div></div>';
         document.body.prepend(d);
         const list = d.querySelector('[data-testid="bazaar-items"]');

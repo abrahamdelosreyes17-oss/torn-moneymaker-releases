@@ -34,6 +34,7 @@ import { extrasPerTrade, EXTRA_ITEMS_MAX } from '../core/trade.js';
 import { itemMarketUrl } from '../sources/route.js';
 import { LedgerView, LEDGER_CSS } from './ledger-view.js';
 import { keyInputAttrs, keyMask } from './mask.js';
+import { FRESH_DEFAULTS, FRESH_MIN, FRESH_MAX, FRESH_TOP, freshMinutes, keepsUp } from '../core/desk.js';
 
 export const SELLING_PAGE_TITLE = 'Torn Bids';
 
@@ -66,7 +67,25 @@ export const SELLING_PAGE_DEFAULTS = {
      * whatever this says (every copy is its own).
      */
     neverFlip: ['Clothing', 'Other'],
+    /*
+     * Settings › Bazaar prices (3.20): how often each group's bazaars are read
+     * again, in whole minutes from 1 to 10 (core/desk.js freshnessMs).
+     */
+    freshDeskMin: FRESH_DEFAULTS.desk,
+    freshTopMin: FRESH_DEFAULTS.top,
+    freshOtherMin: FRESH_DEFAULTS.other,
 };
+
+/* A flip card's "seen" dot: green under this many minutes, amber under the next, grey after. */
+const SEEN_FRESH_MIN = 5;
+const SEEN_OLD_MIN = 15;
+
+/** Minutes since TornW3B saw the oldest listing of a flip's plan, or null when none says. */
+function seenMinutes(steps) {
+    const at = (steps || []).map((st) => Number(st.dataAt || st.seenAt) || 0).filter((t) => t > 0);
+    if (!at.length) return null;
+    return Math.max(0, Math.floor((Date.now() - Math.min(...at)) / 60000));
+}
 
 /* Your traders: this many cards before "Show all". */
 const SCAN_SHOWN = 5;
@@ -563,15 +582,16 @@ export class SellingPage {
         this.deskEl = spEl('section', { class: 'sp-ws', 'aria-label': 'The item picked' });
 
         this.listEl = spEl('main', { class: 'sp-main' }, [
+            // Your traders on top, Best flips under them (3.20, the owner's order).
             spEl('div', { class: 'sp-wrap' }, [
-                spEl('div', { class: 'sp-sec' }, [
+                this.scanEl,
+                spEl('div', { class: 'sp-sec sp-sec-flips' }, [
                     spEl('h2', { text: 'Best flips · each within your cash' }),
                     spEl('span', { class: 'sp-sp' }),
                     this.onlineBtn,
                     this.trustedBtn,
                 ]),
                 this.stripEl,
-                this.scanEl,
                 this.catLineEl,
                 spEl('div', { class: 'sp-desk' }, [
                     spEl('div', { class: 'sp-col-list' }, [
@@ -936,6 +956,26 @@ export class SellingPage {
             ]),
         ]);
 
+        /*
+         * Bazaar prices (3.20, the owner: "make it live in settings where they
+         * can change up to 10 mins"): how often each group is read again, and
+         * whether TornW3B's reads a minute can keep up with that.
+         */
+        this.freshSelects = {};
+        const freshSelect = (key, label) => {
+            const sel = spEl('select', { class: 'sp-cat sp-fresh', 'aria-label': label, 'data-focus': 'set:' + key });
+            for (let m = FRESH_MIN; m <= FRESH_MAX; m += 1) sel.appendChild(spEl('option', { value: String(m), text: m === 1 ? 'Every minute' : 'Every ' + m + ' minutes' }));
+            sel.addEventListener('change', () => this.h.onPrefsChange && this.h.onPrefsChange({ [key]: Number(sel.value) }));
+            this.freshSelects[key] = sel;
+            return sel;
+        };
+        this.keepUpEl = spEl('div', { class: 'sp-keepup', role: 'status' });
+        section('fresh', 'Bazaar prices', 'How often each item\'s bazaars are read again from TornW3B. Faster is fresher; TornW3B itself sees a bazaar every few minutes.', [
+            field('Desk and trade items', 'The item on the desk, and the items of the trade you are working on', [freshSelect('freshDeskMin', 'Desk and trade items: read every')]),
+            field('Top ' + FRESH_TOP + ' flips', 'The best possible flips', [freshSelect('freshTopMin', 'Top ' + FRESH_TOP + ' flips: read every')]),
+            field('Other possible flips', 'Every other item a trader pays more for than a bazaar asks', [freshSelect('freshOtherMin', 'Other possible flips: read every'), this.keepUpEl]),
+        ]);
+
         /* the Torn Ledger's Full key: masked, never shown again, its own terms */
         // A text box masked by CSS, never a password box (ui/mask.js): a
         // browser would offer to save a Full key into its synced passwords.
@@ -1034,6 +1074,32 @@ export class SellingPage {
         this.snavPick('keys');
     }
 
+    /** Settings › Bazaar prices: the saved minutes, and whether they keep up. */
+    renderFresh(p) {
+        if (!this.keepUpEl) return;
+        const minutes = {
+            desk: freshMinutes(p.freshDeskMin, FRESH_DEFAULTS.desk),
+            top: freshMinutes(p.freshTopMin, FRESH_DEFAULTS.top),
+            other: freshMinutes(p.freshOtherMin, FRESH_DEFAULTS.other),
+        };
+        for (const [key, m] of [['freshDeskMin', minutes.desk], ['freshTopMin', minutes.top], ['freshOtherMin', minutes.other]]) {
+            const sel = this.freshSelects[key];
+            if (sel && sel.value !== String(m)) sel.value = String(m);
+        }
+        const info = this.state.info || {};
+        // Before the flips are known: as many as a page usually has.
+        const counts = info.freshCounts && info.flipsWanted ? info.freshCounts : { desk: 1, top: FRESH_TOP, other: 130 };
+        const k = keepsUp(minutes, counts, info.w3bPerMin || 60);
+        const text = k.ok
+            ? 'Keeps up: every group is read on time, with room left for traders\' price lists.'
+            : k.otherEvery
+                ? 'Can\'t keep up: the other possible flips would be read about every ' + k.otherEvery + ' minutes instead. The desk and the top ' + FRESH_TOP + ' still come first.'
+                : 'Too fast to keep up: the other possible flips would hardly be read. The desk and the top ' + FRESH_TOP + ' still come first.';
+        const cls = 'sp-keepup ' + (k.ok ? 'sp-keepup-ok' : 'sp-keepup-behind');
+        if (this.keepUpEl.textContent !== text) this.keepUpEl.textContent = text;
+        if (this.keepUpEl.className !== cls) this.keepUpEl.className = cls;
+    }
+
     /** Light one part in the settings menu. */
     snavPick(id) {
         this.snavOn = id;
@@ -1050,6 +1116,7 @@ export class SellingPage {
             te: info.teBadKey ? ['bad', 'key refused'] : !info.hasTeKey ? ['unknown', 'no key'] : info.teAt ? ['online', formatAge(now - info.teAt)] : ['idle', 'loading'],
             w3b: (info.w3bRead || 0) < (info.w3bKnown || 0) ? ['idle', (info.w3bRead || 0) + '/' + info.w3bKnown] : ['online', count(info.w3bTraders || 0) + ' lists'],
             flips: p.cash > 0 ? ['online', formatMoney(p.cash) + ' · ' + (p.networthPct || 10) + '%'] : ['idle', 'no cash limit'],
+            fresh: ['online', freshMinutes(p.freshDeskMin, FRESH_DEFAULTS.desk) + ' · ' + freshMinutes(p.freshTopMin, FRESH_DEFAULTS.top) + ' · ' + freshMinutes(p.freshOtherMin, FRESH_DEFAULTS.other) + ' min'],
             links: ['online', p.linksNewTab !== false ? 'new tab' : 'this tab'],
             report: (() => {
                 const log = this.problemLog || [];
@@ -1168,6 +1235,7 @@ export class SellingPage {
         this.cashInput.classList.toggle('sp-dim', !hasCash);
         this.renderKeepList(p);
         this.renderNeverFlip(p);
+        this.renderFresh(p);
         this.renderBlackList();
 
         this.renderCategory();
@@ -1424,7 +1492,7 @@ export class SellingPage {
         const refocus = this.focusKeyIn(box);
         queueMicrotask(() => this.focusBack(box, refocus));
         const sig = JSON.stringify([sc.open, sc.favourites, sc.trusted, this.scanAll, s.desk && s.desk.itemId, s.desk && s.desk.trade && s.desk.trade.chosen && s.desk.trade.chosen.key,
-            sc.list.map((x) => [x.id, x.name, x.profit, x.items, x.stops, x.reading, x.lastPaid, x.mainId, x.mainUnits, x.favourite, x.traded, x.trust && x.trust.level + x.trust.score])]);
+            sc.list.map((x) => [x.id, x.name, x.profit, x.items, x.stops, x.reading, x.lastPaid, x.mainId, x.mainUnits, x.favourite, x.hiddenBy, x.hiddenBy && s.statuses && JSON.stringify(s.statuses.get(String(x.id)) || null), x.traded, x.trust && x.trust.level + x.trust.score])]);
         if (sig === this.scanSig) return;
         this.scanSig = sig;
         box.textContent = '';
@@ -1440,10 +1508,14 @@ export class SellingPage {
         ]));
         if (!sc.open || !total) return;
         const onDesk = s.desk && s.desk.trade && s.desk.trade.chosen ? s.desk.trade.chosen.key : null;
-        const shown = this.scanAll ? sc.list : sc.list.slice(0, SCAN_SHOWN);
-        const grid = spEl('div', { class: 'sp-scangrid' });
-        for (const x of shown) {
-            const ready = x.items > 0 && x.profit > 0;
+        // Favourites get a row of their own (3.20), every one of them, always
+        // shown; the Trusted row after it, the top few until Show all. The same
+        // sums for both: a favourite is never ranked up, only kept in view.
+        const favs = sc.list.filter((x) => x.favourite);
+        const rest = sc.list.filter((x) => !x.favourite);
+        const restShown = this.scanAll ? rest : rest.slice(0, SCAN_SHOWN);
+        const card = (x) => {
+            const ready = x.items > 0 && x.profit > 0 && !x.hiddenBy;
             const sel = ready && onDesk === x.key && s.desk && s.desk.itemId === x.mainId;
             const head = spEl('span', { class: 'sp-fc-top' }, [
                 x.favourite ? spEl('span', { class: 'sp-star', title: 'Favourite', text: '★' }) : null,
@@ -1451,17 +1523,23 @@ export class SellingPage {
                 this.trustBadge(x),
                 x.lastPaid ? spEl('span', { class: 'sp-lastpaid', title: 'No public list: the prices they accepted from you last time. Check before buying.', text: 'Last paid' }) : null,
             ]);
-            const card = spEl('div', { class: 'sp-fc sp-tc' + (ready ? ' sp-tc-ready' : ' sp-tc-none') + (sel ? ' sp-sel' : '') }, [head]);
-            if (ready) {
-                card.append(
+            const el = spEl('div', { class: 'sp-fc sp-tc' + (ready ? ' sp-tc-ready' : ' sp-tc-none') + (x.favourite ? ' sp-tc-fav' : '') + (x.hiddenBy ? ' sp-tc-hidden' : '') + (sel ? ' sp-sel' : '') }, [head]);
+            if (x.hiddenBy) {
+                const st = this.status({ id: x.id, name: x.name });
+                el.append(
+                    spEl('small', { class: 'sp-tc-why' }, [st, st.childNodes.length ? ' · ' : '', 'hidden by ', spEl('b', { text: x.hiddenBy === 'offline' ? 'Buyers online only' : 'Trusted buyers only' })]),
+                    spEl('small', { text: 'Their trade is not counted while the filter is on.' }),
+                );
+            } else if (ready) {
+                el.append(
                     spEl('span', { class: 'sp-fc-p' + (x.lastPaid || x.estimated ? ' sp-est' : ''), title: x.lastPaid ? 'About: from what they paid you last time' : x.estimated ? 'About: some bazaars are still being read' : null, text: (x.lastPaid || x.estimated ? '≈ ' : '') + 'Trade ' + signed(x.profit) }),
                     spEl('small', {}, [spEl('b', { text: count(x.items) + (x.items === 1 ? ' item' : ' items') }), ' · ' + count(x.stops) + (x.stops === 1 ? ' bazaar' : ' bazaars') + (x.mainName ? ' · ' + x.mainName + ' ×' + count(x.mainUnits) + (x.items > 1 ? ' + ' + count(x.items - 1) + (x.items === 2 ? ' extra' : ' extras') : '') : '')]),
                 );
             } else {
-                card.appendChild(spEl('small', { text: x.reading ? 'Reading their list…' : 'No trade now: nothing in bazaars under their prices' }));
+                el.appendChild(spEl('small', { text: x.reading ? 'Reading their list…' : 'No trade now: nothing in bazaars under their prices' }));
             }
-            if (x.traded) card.appendChild(spEl('small', { class: 'sp-traded', text: x.traded }));
-            card.appendChild(spEl('button', {
+            if (x.traded) el.appendChild(spEl('small', { class: 'sp-traded', text: x.traded }));
+            el.appendChild(spEl('button', {
                 type: 'button',
                 class: 'sp-btn sp-go' + (sel ? ' sp-go-on' : ''),
                 'data-focus': 'scan:' + x.id,
@@ -1474,10 +1552,18 @@ export class SellingPage {
                     this.deskEl.scrollIntoView({ block: 'start', behavior: 'smooth' });
                 },
             }));
-            grid.appendChild(card);
-        }
-        box.appendChild(grid);
-        if (sc.list.length > SCAN_SHOWN) {
+            return el;
+        };
+        const group = (cls, title, sub, cards, empty) => spEl('div', { class: 'sp-tgroup ' + cls }, [
+            spEl('div', { class: 'sp-tlabel' }, [spEl('b', { text: title }), sub ? spEl('small', { text: sub }) : null]),
+            cards.length ? spEl('div', { class: 'sp-scangrid' }, cards.map(card)) : empty,
+        ]);
+        const groups = spEl('div', { class: 'sp-tgroups' });
+        groups.appendChild(group('sp-tg-fav', '★ Favourites', 'Yours, always here. Same sums as everyone.', favs,
+            spEl('div', { class: 'sp-empty sp-tg-empty' }, [spEl('b', { text: 'No favourites yet' }), spEl('span', { text: 'Press ☆ next to any trader to keep them here. Traders you have traded with 5 or more times in 30 days join by themselves.' })])));
+        if (rest.length) groups.appendChild(group('sp-tg-trust', 'Trusted', 'Best trade first.', restShown, null));
+        box.appendChild(groups);
+        if (rest.length > SCAN_SHOWN) {
             box.appendChild(spEl('button', {
                 type: 'button',
                 class: 'sp-link sp-showall',
@@ -1508,7 +1594,7 @@ export class SellingPage {
         const pinnedIds = new Set((s.pinned || []).map((p) => p.itemId));
         const sig = JSON.stringify([
             [...pinnedIds],
-            strip.map((f) => [f.itemId, f.name, f.plan.profit, f.plan.units, f.plan.steps.map((st) => st.sellerName), f.buyer.name, f.buyer.price, f.buyer.trust && f.buyer.trust.level]),
+            strip.map((f) => [f.itemId, f.name, f.plan.profit, f.plan.units, f.plan.steps.map((st) => st.sellerName), f.buyer.name, f.buyer.price, f.buyer.trust && f.buyer.trust.level, seenMinutes(f.plan.steps)]),
             s.desk && s.desk.itemId,
             info.flipsChecked,
             info.flipsWanted,
@@ -1557,7 +1643,7 @@ export class SellingPage {
                         if (this.h.onLeftoversClear) this.h.onLeftoversClear();
                     } }) : null,
                 ]),
-                spEl('span', { class: 'sp-fc-p', text: priced.length ? signed(priced.reduce((a, l) => a + l.gain, 0)) : '–' }),
+                spEl('span', { class: 'sp-fc-p' + (priced.length ? '' : ' sp-fc-none'), text: priced.length ? signed(priced.reduce((a, l) => a + l.gain, 0)) : '–' }),
                 spEl('small', { text: (priced.length ? 'If sold to traders now' : 'No trader buys them now') + ' · paid ' + formatMoney(paid) + ' in all' }),
                 spEl('small', { class: 'sp-fc-sell', text: open ? 'Hide them ▴' : 'Show them ▾' }),
             ]);
@@ -1583,7 +1669,7 @@ export class SellingPage {
                     spEl('span', { class: 'sp-pic sp-pic-s' }, [this.image('left', l.itemId)]),
                     spEl('b', { class: 'sp-iname', text: count(l.qty) + ' ' + l.name }),
                 ]),
-                spEl('span', { class: 'sp-fc-p', text: l.gain !== null ? signed(l.gain) : '–' }),
+                spEl('span', { class: 'sp-fc-p' + (l.gain !== null ? '' : ' sp-fc-none'), text: l.gain !== null ? signed(l.gain) : '–' }),
                 spEl('small', { text: 'Left over · paid ' + formatMoney(l.each) + ' each' }),
                 spEl('small', { class: 'sp-fc-sell' }, l.best ? ['Sell to ', spEl('b', { text: l.best.name }), ' at ' + formatMoney(l.best.price)] : ['No trader buys it now']),
             ]);
@@ -1631,6 +1717,7 @@ export class SellingPage {
                 // What the bazaars sell it for (cheapest to dearest bought), and to whom.
                 spEl('small', {}, ['Buy ', spEl('b', { text: count(f.plan.units) }), ' at ', spEl('b', { text: priceRange(f.plan.steps) }), ' from ' + [...new Set(f.plan.steps.map((st) => st.sellerName || 'a bazaar'))].join(', ')]),
                 spEl('small', { class: 'sp-fc-sell' }, ['Sell to ', spEl('b', { text: f.buyer.name }), ' at ' + formatMoney(f.buyer.price), this.trustBadge(f.buyer)]),
+                this.seenLine(f.plan.steps),
             ]);
             card.addEventListener('click', () => this.select(f.itemId));
             card.addEventListener('keydown', (event) => {
@@ -1640,6 +1727,18 @@ export class SellingPage {
             });
             box.appendChild(card);
         }
+    }
+
+    /**
+     * How old a flip's prices are (3.20): when TornW3B last saw the oldest of
+     * the listings it buys - "seen 3m ago", its dot green while that is a few
+     * minutes, amber after, grey when older than a read would ever be.
+     */
+    seenLine(steps) {
+        const m = seenMinutes(steps);
+        if (m === null) return null;
+        const level = m < SEEN_FRESH_MIN ? 'online' : m < SEEN_OLD_MIN ? 'idle' : 'offline';
+        return spEl('small', { class: 'sp-seen', title: 'When TornW3B last saw these listings' }, [spEl('span', { class: 'sp-dot', 'data-level': level }), m < 1 ? 'seen just now' : 'seen ' + formatAge(m * 60000)]);
     }
 
     /* ------------------------------------------------------------- list */
@@ -1929,9 +2028,9 @@ export class SellingPage {
         rows.forEach((b) => {
             const planning = Boolean(T && ((T.chosen && T.chosen.key === b.tradeKey) || (T.accepted && T.accepted.key === b.tradeKey)));
             const until = declined[b.tradeKey];
-            card.appendChild(spEl('div', { class: 'sp-tr' + (b === topRow ? ' sp-top' : '') + (b.troll ? ' sp-troll' : '') + (planning ? ' sp-planning' : '') + (until ? ' sp-declined' : '') }, [
+            card.appendChild(spEl('div', { class: 'sp-tr' + (b === topRow ? ' sp-top' : '') + (b.troll ? ' sp-troll' : '') + (planning ? ' sp-planning' : '') + (until ? ' sp-declined' : '') + (b.favourite ? ' sp-favrow' : '') }, [
                 spEl('span', { class: 'sp-tr-l' }, [
-                    spEl('span', { class: 'sp-trader-l' }, [this.favButton(b), this.playerName(b.name, b.id, 'buyer:' + (b.id || b.name)), this.trustBadge(b)]),
+                    spEl('span', { class: 'sp-trader-l' }, [this.favButton(b), this.playerName(b.name, b.id, 'buyer:' + (b.id || b.name)), this.trustBadge(b), b.favourite ? spEl('span', { class: 'sp-favtag', text: 'Favourite' }) : null]),
                     this.status(b),
                     this.networthLine(b),
                     // Your own history with them (the Ledger): "Traded 7× · last 3d ago".
@@ -2071,14 +2170,11 @@ export class SellingPage {
         });
     }
 
-    /** Trade, TE list and W3B list, in fixed slots so they line up row to row; ⊘ (blacklist) at the end on the desk. */
+    /** TE list and W3B list, the ones that exist, from the left (3.20: an empty slot left W3B list adrift); ⊘ (blacklist) at the end on the desk. */
     traderLinks(b, { blacklist = false } = {}) {
         const links = spEl('span', { class: 'sp-links' });
         const slot = (text, url, title) => {
-            if (!url) {
-                links.appendChild(spEl('span', { class: 'sp-chip sp-chip-none', 'aria-hidden': 'true' }));
-                return;
-            }
+            if (!url) return;
             links.appendChild(this.link(text, url, { title, focus: 'link:' + (b.id || b.name) + ':' + text }));
         };
         slot('TE list', b.te ? tePriceListUrl(b.teName || b.name) : null, 'TornExchange price list: ' + formatMoney(b.te || 0));
@@ -2577,7 +2673,7 @@ export class SellingPage {
             card.appendChild(spEl('div', { class: 'sp-tpick sp-acc-foot sp-cancelask' }, [
                 spEl('span', { class: 'sp-warnnote', text: 'Cancel the trade with ' + b.name + '? This flip plan goes (they are not marked declined); what you already bought stays yours to sell.' }),
                 spEl('span', { class: 'sp-tpick-b' }, [
-                    spEl('button', { type: 'button', class: 'sp-btn', 'data-focus': 'acc:cancel-yes', text: 'Yes, cancel it', onclick: () => {
+                    spEl('button', { type: 'button', class: 'sp-btn sp-btn-bad', 'data-focus': 'acc:cancel-yes', text: 'Yes, cancel it', onclick: () => {
                         this.cancelAsk = null;
                         if (this.h.onTradeCancel) this.h.onTradeCancel(A.key);
                     } }),
@@ -2594,7 +2690,7 @@ export class SellingPage {
         card.appendChild(spEl('div', { class: 'sp-tpick sp-acc-foot' }, [
             spEl('span', { class: 'sp-tpick-b' }, [
                 spEl('button', { type: 'button', class: 'sp-link', 'data-focus': 'acc:back', title: 'Unfreeze: back to the live plan (nothing is kept)', text: '← Back to the live plan', onclick: () => this.h.onTradeClose && this.h.onTradeClose(A.key, false) }),
-                spEl('button', { type: 'button', class: 'sp-link', 'data-focus': 'acc:cancel', title: 'They accepted, then the trade was called off: this flip plan goes (not marked declined)', text: 'Cancel trade', onclick: () => {
+                spEl('button', { type: 'button', class: 'sp-link sp-cancel', 'data-focus': 'acc:cancel', title: 'They accepted, then the trade was called off: this flip plan goes (not marked declined)', text: 'Cancel trade', onclick: () => {
                     this.cancelAsk = A.key;
                     this.deskSig = null;
                     this.renderDesk();
@@ -2797,277 +2893,330 @@ export class SellingPage {
 export const SELLING_PAGE_CSS = LEDGER_CSS + USAGE_CSS + REPORT_CSS + `
 :host { all: initial; }
 * { box-sizing: border-box; }
+/*
+ * 3.20 Graphite (mockups/T-graphite-everything.html, picked by the owner):
+ * four surface steps so areas separate (page, rail, card, raised), one
+ * colour per meaning, system fonts, Georgia for titles, figures in columns.
+ */
 .sp-page {
 ${TOKENS_CSS}
-    --page: #131313; --rail: #171717; --card: #1f1f1f; --card2: #252525;
-    --cline: #2b2b2b; --cline2: #393939; --price: #a8dd1c; --green-bg: rgba(153, 204, 0, 0.10);
-    --hot: #1f2616; --hot-line: #4a5d20; --orange: #e07b39; --head-h: 60px;
+    --card: var(--surface); --card2: var(--raised);
+    --cline: var(--line); --cline2: var(--line2); --price: var(--profit); --green-bg: var(--profit-bg);
+    --hot: var(--surface); --hot-line: var(--profit-line); --orange: #ff9b5a; --head-h: 60px;
     position: absolute; inset: 0; display: flex; flex-direction: column;
     background: var(--page); color: var(--text);
-    font: 13px/1.45 Arial, Helvetica, sans-serif;
+    font: 400 13px/1.5 var(--sans);
+    -webkit-font-smoothing: antialiased;
 }
-button, input { font: inherit; color: inherit; }
+button, input, select { font: inherit; color: inherit; }
 a { color: var(--offer); text-decoration: none; }
-a:hover { text-decoration: underline; }
-b { font-weight: bold; }
+a:hover { text-decoration: underline; text-underline-offset: 3px; }
+b { font-weight: 600; }
 [hidden] { display: none !important; }
 .sp-bad { color: var(--bad); }
 .sp-note { margin: 0; font-size: 12px; color: var(--muted); }
-button:focus-visible, input:focus-visible, summary:focus-visible, a:focus-visible,
+.sp-muted { color: var(--muted); font-size: 12px; }
+button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-visible, a:focus-visible,
 [role="button"]:focus-visible { outline: 2px solid var(--profit); outline-offset: 2px; }
+@keyframes sp-rise { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: none; } }
+@keyframes sp-pop { 0% { transform: scale(1); } 50% { transform: scale(1.25); } 100% { transform: scale(1); } }
+@media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
 
 /* ---------------------------------------------------------------- header */
 .sp-head {
-    flex: 0 0 auto; height: var(--head-h); display: flex; align-items: center; gap: 16px; padding: 0 24px;
-    background: linear-gradient(180deg, #1d1d1d, #181818); border-bottom: 1px solid var(--cline);
+    flex: 0 0 auto; height: var(--head-h); display: flex; align-items: center; gap: 12px; padding: 0 24px;
+    background: var(--rail); border-bottom: 1px solid var(--line);
 }
-.sp-brand { display: flex; align-items: center; gap: 10px; white-space: nowrap; }
-.sp-mark { width: 32px; height: 32px; border-radius: 9px; background: var(--profit); color: #131313; display: grid; place-items: center; font-weight: 900; font-size: 17px; }
-.sp-brand h1 { margin: 0; font-size: 20px; color: #fff; letter-spacing: 0.3px; }
-.sp-tagline { color: var(--muted); font-size: 13px; }
-.sp-search { flex: 1; min-width: 0; max-width: 420px; height: 36px; padding: 0 16px; border-radius: 18px; border: 1px solid var(--cline2); background: #0f0f0f; color: var(--text); }
-.sp-search::placeholder { color: var(--muted); }
-.sp-cat { flex: 0 0 auto; height: 36px; padding: 0 12px; border-radius: 18px; border: 1px solid var(--cline2); background: #0f0f0f; color: var(--text); font: inherit; font-weight: bold; cursor: pointer; }
-.sp-cat.sp-cat-on { border-color: var(--profit); background: #1a2210; color: #fff; }
+.sp-brand { display: flex; align-items: center; gap: 12px; white-space: nowrap; }
+.sp-mark { width: 30px; height: 30px; border-radius: 9px; background: linear-gradient(145deg, #a3adff, #7381ff); color: #0b0e24; display: grid; place-items: center; font: 800 16px var(--sans); }
+.sp-brand h1 { margin: 0; font: 400 21px/1 var(--serif); color: var(--text); letter-spacing: -0.01em; }
+.sp-tagline { color: var(--muted); font-size: 12px; }
+.sp-search { flex: 1; min-width: 0; max-width: 420px; height: 34px; padding: 0 12px; border-radius: 10px; border: 1px solid var(--line2); background: var(--input); color: var(--text); transition: border-color 0.15s var(--ease); }
+.sp-search:focus { border-color: var(--brand); outline: none; }
+.sp-search::placeholder { color: var(--faint); }
+.sp-cat { flex: 0 0 auto; height: 34px; padding: 0 10px; border-radius: 10px; border: 1px solid var(--line2); background: var(--surface); color: var(--text); font: inherit; font-weight: 500; cursor: pointer; }
+.sp-cat.sp-cat-on { border-color: var(--profit-line); background: var(--profit-bg); color: var(--text); }
 .sp-catline { display: flex; align-items: center; gap: 8px; margin: -12px 0 16px; font-size: 12px; color: var(--muted); }
-.sp-catline b { color: #fff; }
+.sp-catline b { color: var(--text); }
 .sp-catline .sp-link { font-size: 12px; }
 .sp-pills { margin-left: auto; display: flex; gap: 6px; }
-.sp-pill { display: inline-flex; align-items: center; gap: 7px; height: 28px; padding: 0 11px; border-radius: 14px; background: var(--card); border: 1px solid var(--cline); font-size: 12px; color: var(--muted); white-space: nowrap; cursor: default; }
-.sp-pill b { color: var(--text); }
+.sp-pill { display: inline-flex; align-items: center; gap: 7px; height: 30px; padding: 0 11px; border-radius: 999px; background: var(--surface); border: 1px solid var(--line); font-size: 12px; color: var(--muted); white-space: nowrap; cursor: default; font-variant-numeric: tabular-nums; }
+.sp-pill b { color: var(--text); font-weight: 600; }
 .sp-pill-btn { cursor: pointer; }
-.sp-pill-btn:hover { border-color: var(--muted); color: var(--text); }
-.sp-icon { width: 34px; height: 34px; flex: 0 0 auto; border-radius: 9px; border: 1px solid var(--cline2); background: none; cursor: pointer; font-size: 15px; color: var(--text); }
-.sp-icon:hover { background: #242424; }
-.sp-icon[aria-pressed="true"] { color: var(--profit); border-color: var(--profit); }
-.sp-hbtn { height: 34px; padding: 0 12px; flex: 0 0 auto; border-radius: 9px; border: 1px solid var(--cline2); background: none; cursor: pointer; font-weight: bold; color: var(--text); white-space: nowrap; }
-.sp-hbtn:hover { background: #242424; }
-.sp-hbtn[aria-pressed="true"] { color: var(--profit); border-color: var(--profit); }
-.sp-link.sp-danger { color: #ff8a80; }
+.sp-pill-btn:hover { border-color: var(--line2); color: var(--text); background: var(--raised); }
+.sp-icon { width: 34px; height: 34px; flex: 0 0 auto; border-radius: 10px; border: 1px solid var(--line2); background: var(--raised); cursor: pointer; font-size: 15px; color: var(--text); transition: background-color 0.15s var(--ease); }
+.sp-icon:hover { background: var(--hover); }
+.sp-icon[aria-pressed="true"] { color: var(--profit); border-color: var(--profit-line); }
+.sp-hbtn { height: 34px; padding: 0 12px; flex: 0 0 auto; border-radius: 10px; border: 1px solid var(--line2); background: var(--raised); cursor: pointer; font-weight: 500; color: var(--text); white-space: nowrap; transition: background-color 0.15s var(--ease); }
+.sp-hbtn:hover { background: var(--hover); }
+.sp-hbtn[aria-pressed="true"] { color: var(--profit); border-color: var(--profit-line); }
+.sp-link.sp-danger { color: var(--bad); }
 
 .sp-banner {
     display: none; align-items: center; gap: 12px; flex: 0 0 auto;
-    margin: 12px 24px 0; padding: 10px 14px;
-    background: var(--card); border: 1px solid var(--cline); border-left: 4px solid var(--offer); border-radius: 10px;
+    margin: 16px 24px 0; padding: 12px 16px; color: var(--text2);
+    background: var(--buy-bg); border: 1px solid var(--buy-line); border-radius: 12px;
 }
 .sp-banner > span { flex: 1; }
-.sp-banner-on { display: flex; }
-.sp-banner-warn { border-left-color: var(--warn); }
-.sp-banner-bad { border-left-color: var(--bad); }
+.sp-banner-on { display: flex; animation: sp-rise 0.2s var(--ease); }
+.sp-banner-warn { background: var(--warn-bg); border-color: var(--warn-line); }
+.sp-banner-bad { background: var(--bad-bg); border-color: var(--bad-line); }
 
 /* ------------------------------------------------------------ buttons */
 a.sp-btn { display: inline-flex; align-items: center; text-decoration: none; }
 .sp-btn {
-    height: 32px; padding: 0 14px; font-size: 13px; font-weight: bold; color: var(--text);
-    background: #333; border: 1px solid #444; border-radius: 9px; cursor: pointer; white-space: nowrap;
+    height: 32px; padding: 0 12px; font-size: 13px; font-weight: 500; color: var(--text);
+    background: var(--raised); border: 1px solid var(--line2); border-radius: 10px; cursor: pointer; white-space: nowrap;
+    transition: background-color 0.15s var(--ease);
 }
-.sp-btn:hover { border-color: var(--muted); }
-.sp-btn.sp-primary { color: var(--on-profit); background: var(--profit); border-color: var(--profit); }
+.sp-btn:hover { background: var(--hover); }
+.sp-btn:disabled { opacity: 0.45; cursor: default; }
+.sp-btn:disabled:hover { background: var(--raised); }
+.sp-btn.sp-primary { color: var(--on-profit); background: var(--profit); border-color: transparent; font-weight: 600; }
+.sp-btn.sp-primary:hover { background: #86e594; }
 .sp-link { background: none; border: 0; padding: 0; color: var(--offer); font-size: 12px; cursor: pointer; text-align: left; }
-.sp-link:hover { text-decoration: underline; }
-.sp-toggle { display: inline-flex; align-items: center; gap: 8px; height: 32px; padding: 0 12px; border-radius: 9px; border: 1px solid var(--cline2); background: none; color: var(--muted); font-weight: bold; cursor: pointer; white-space: nowrap; }
-.sp-toggle:hover { color: var(--text); }
-.sp-toggle[aria-pressed="true"] { color: #fff; border-color: var(--profit); background: var(--green-bg); }
+.sp-link:hover { text-decoration: underline; text-underline-offset: 3px; }
+.sp-toggle { display: inline-flex; align-items: center; gap: 8px; height: 30px; padding: 0 12px; border-radius: 999px; border: 1px solid var(--line2); background: var(--surface); color: var(--text2); font-size: 12px; font-weight: 500; cursor: pointer; white-space: nowrap; transition: background-color 0.15s var(--ease); }
+.sp-toggle:hover { color: var(--text); background: var(--raised); }
+.sp-toggle[aria-pressed="true"] { color: var(--text); border-color: var(--profit-line); background: var(--profit-bg); }
 
 /* ----------------------------------------------------- one scroll, full width */
 .sp-main { flex: 1; min-height: 0; overflow-y: auto; }
-.sp-wrap { padding: 16px 24px 64px; }
-.sp-sec { display: flex; align-items: center; gap: 8px; margin: 0 0 10px; }
-.sp-sec h2 { margin: 0; font-size: 11px; letter-spacing: 0.6px; text-transform: uppercase; color: var(--muted); white-space: nowrap; }
+.sp-wrap { padding: 24px 24px 64px; }
+.sp-sec { display: flex; align-items: center; gap: 12px; margin: 0 0 12px; }
+.sp-sec h2 { margin: 0; font: 650 11px/1 var(--sans); letter-spacing: 0.09em; text-transform: uppercase; color: var(--text2); white-space: nowrap; display: flex; align-items: center; gap: 8px; }
+.sp-sec h2::before { content: ""; width: 3px; height: 12px; border-radius: 2px; background: var(--c, var(--faint)); flex: 0 0 auto; }
+.sp-sec-flips { --c: var(--profit); }
+.sp-scan { --c: var(--fav); }
 .sp-sp { flex: 1; }
-.sp-empty { padding: 24px 16px; text-align: center; color: var(--muted); background: var(--card); border: 1px dashed var(--cline2); border-radius: 12px; }
+.sp-empty { padding: 28px 16px; text-align: center; color: var(--muted); background: transparent; border: 1px dashed var(--line2); border-radius: 16px; }
 .sp-more { display: block; margin: 12px auto 0; }
 
 /* the strip: the best flips, whatever item they are */
 .sp-strip { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 24px; }
 .sp-strip-empty { grid-column: 1 / -1; }
-.sp-fc { display: flex; flex-direction: column; align-items: stretch; gap: 6px; padding: 12px 14px; text-align: left; background: var(--hot); border: 1px solid var(--hot-line); border-radius: 12px; cursor: pointer; }
-.sp-fc:hover { background: #232d18; }
-.sp-fc.sp-sel { box-shadow: 0 0 0 2px var(--profit); }
+.sp-fc { display: flex; flex-direction: column; align-items: stretch; gap: 8px; padding: 16px; text-align: left; background: var(--surface); border: 1px solid var(--line); border-radius: 16px; cursor: pointer; transition: background-color 0.15s var(--ease), border-color 0.15s var(--ease); }
+.sp-fc:hover { background: var(--raised); }
+.sp-fc.sp-sel { border-color: var(--profit-line); box-shadow: inset 0 0 0 1px var(--profit-line); }
 .sp-fc-top { display: flex; align-items: center; gap: 10px; }
-.sp-fc .sp-iname { font-size: 14px; }
-.sp-fc-p { font-size: 21px; font-weight: bold; color: var(--price); font-variant-numeric: tabular-nums; }
-.sp-fc small { font-size: 12px; color: var(--muted); }
-.sp-fc small b { color: var(--text); }
+.sp-fc .sp-iname { font: 600 14px/1.3 var(--sans); }
+.sp-fc-p { font: 650 20px/1.15 var(--sans); color: var(--profit); font-variant-numeric: tabular-nums; letter-spacing: -0.01em; }
+.sp-fc small { font-size: 12px; color: var(--muted); line-height: 1.55; }
+.sp-fc small b { color: var(--text2); }
 .sp-fc-sell { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
 .sp-fc-sell .sp-trust { margin-left: 2px; }
+.sp-seen { display: flex; align-items: center; gap: 6px; margin-top: auto; color: var(--faint) !important; font-variant-numeric: tabular-nums; }
+.sp-seen .sp-dot { width: 6px; height: 6px; }
+
+/* Your traders (3.20): a gold row of favourites, then Trusted */
+.sp-tgroups { display: grid; gap: 12px; }
+.sp-tgroup { display: grid; grid-template-columns: 150px minmax(0, 1fr); gap: 12px; align-items: stretch; }
+.sp-tlabel { display: flex; flex-direction: column; justify-content: center; gap: 6px; padding: 16px; border-radius: 16px; background: var(--surface); border: 1px solid var(--line); }
+.sp-tlabel b { font: 400 16px/1.2 var(--serif); }
+.sp-tlabel small { color: var(--muted); font-size: 12px; }
+.sp-tg-fav .sp-tlabel { background: linear-gradient(160deg, rgba(255, 204, 77, 0.14), rgba(255, 204, 77, 0.03)); border-color: var(--fav-line); }
+.sp-tg-fav .sp-tlabel b { color: var(--fav); }
+.sp-tg-trust .sp-tlabel b { color: var(--trust); }
+.sp-tg-empty { display: grid; place-items: center; gap: 6px; padding: 20px 16px; }
+.sp-tg-empty b { color: var(--text2); }
+.sp-fc.sp-tc-fav { border-color: var(--fav-line); background: linear-gradient(180deg, rgba(255, 204, 77, 0.06), var(--surface) 55%); }
+.sp-fc.sp-tc-fav:hover { background: linear-gradient(180deg, rgba(255, 204, 77, 0.09), var(--raised) 55%); }
+.sp-fc.sp-tc-hidden { opacity: 0.62; }
+.sp-tc-why { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
+.sp-tc-why b { color: var(--text2); }
 
 /* the desk: every item on the left, the one picked on the right */
-.sp-desk { display: grid; grid-template-columns: 340px minmax(0, 1fr); gap: 24px; align-items: start; }
-.sp-col-list { min-width: 0; }
-.sp-chips { display: flex; gap: 6px; margin-bottom: 10px; }
-.sp-chip-f { flex: 1; height: 32px; border-radius: 16px; border: 1px solid var(--cline2); background: none; color: var(--muted); font-weight: bold; cursor: pointer; white-space: nowrap; }
-.sp-chip-f small { font-weight: normal; font-size: 12px; margin-left: 4px; }
+.sp-desk { display: grid; grid-template-columns: 340px minmax(0, 1fr); gap: 16px; align-items: start; }
+.sp-col-list { min-width: 0; display: flex; flex-direction: column; gap: 6px; }
+.sp-chips { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 2px; padding: 3px; margin-bottom: 4px; border-radius: 11px; background: var(--input); border: 1px solid var(--line); }
+.sp-chip-f { height: 28px; border-radius: 8px; border: 0; background: none; color: var(--muted); font-weight: 500; cursor: pointer; white-space: nowrap; transition: background-color 0.15s var(--ease); }
+.sp-chip-f small { font-weight: 400; font-size: 12px; margin-left: 5px; color: var(--faint); font-variant-numeric: tabular-nums; }
 .sp-chip-f:hover { color: var(--text); }
-.sp-chip-f[aria-pressed="true"] { color: #fff; border-color: var(--profit); background: var(--green-bg); }
-.sp-it { display: grid; grid-template-columns: 44px minmax(0, 1fr) auto; gap: 2px 10px; align-items: center; padding: 8px 10px; margin-bottom: 4px; border-radius: 10px; border: 1px solid transparent; cursor: pointer; }
-.sp-it:hover { background: var(--card); }
-.sp-it.sp-sel { background: #232a17; border-color: var(--profit); }
+.sp-chip-f[aria-pressed="true"] { color: var(--text); background: var(--raised); box-shadow: 0 1px 2px rgba(0, 0, 0, 0.3); }
+.sp-it { display: grid; grid-template-columns: 44px minmax(0, 1fr) auto; gap: 2px 12px; align-items: center; padding: 10px 12px; margin-bottom: 0; border-radius: 12px; border: 1px solid transparent; cursor: pointer; transition: background-color 0.15s var(--ease); }
+.sp-it:hover { background: var(--surface); }
+.sp-it.sp-sel { background: var(--surface); border-color: var(--profit-line); }
 .sp-it .sp-pic { grid-row: span 2; }
-.sp-it small { grid-column: 2 / 4; font-size: 12px; color: var(--muted); }
+.sp-it .sp-iname { font-weight: 600; }
+.sp-it small { grid-column: 2 / 4; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
 .sp-it small:empty { display: none; }
-.sp-badge { font-size: 12px; font-weight: bold; padding: 3px 8px; border-radius: 10px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.sp-badge { font: 650 12px/22px var(--sans); height: 22px; padding: 0 8px; border-radius: 7px; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .sp-badge:empty { display: none; }
-.sp-badge-flip { color: var(--price); background: var(--green-bg); }
-.sp-badge-list { color: var(--offer); background: rgba(116, 192, 252, 0.10); }
-.sp-badge-sell { color: var(--muted); background: #262626; }
+.sp-badge-flip { color: var(--profit); background: var(--profit-bg); }
+.sp-badge-list { color: var(--offer); background: var(--buy-bg); }
+.sp-badge-sell { color: var(--text2); background: rgba(255, 255, 255, 0.07); }
 
-.sp-ws { position: sticky; top: 16px; min-width: 0; background: var(--rail); border: 1px solid var(--cline); border-radius: 14px; padding: 16px; }
-.sp-wsh { display: flex; align-items: center; gap: 14px; margin-bottom: 14px; }
-.sp-wst { display: flex; flex-direction: column; min-width: 0; }
-.sp-wsname { font-size: 20px; font-weight: bold; color: #fff; }
-.sp-wst small { color: var(--muted); font-size: 12px; }
-.sp-quad { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; align-items: start; }
-.sp-q { min-width: 0; background: var(--card); border: 1px solid var(--cline); border-radius: 12px; padding: 12px 14px; }
-.sp-q h3 { margin: 0 0 8px; font-size: 11px; letter-spacing: 0.6px; text-transform: uppercase; color: var(--muted); }
-.sp-q.sp-hot { background: var(--hot); border-color: var(--hot-line); }
+.sp-ws { position: sticky; top: 16px; min-width: 0; background: var(--rail); border: 1px solid var(--line); border-radius: 20px; padding: 24px; }
+.sp-wsh { display: flex; align-items: center; gap: 16px; margin-bottom: 20px; }
+.sp-wst { display: flex; flex-direction: column; min-width: 0; gap: 2px; }
+.sp-wsname { font: 400 24px/1.15 var(--serif); color: var(--text); }
+.sp-wst small { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.sp-quad { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.08fr); gap: 16px; align-items: start; }
+.sp-q { min-width: 0; background: var(--surface); border: 1px solid var(--line); border-radius: 16px; padding: 16px; }
+.sp-q h3 { margin: 0 0 12px; font: 650 11px/1 var(--sans); letter-spacing: 0.09em; text-transform: uppercase; color: var(--text2); display: flex; align-items: center; gap: 8px; }
+.sp-q h3::before { content: ""; width: 3px; height: 12px; border-radius: 2px; background: var(--c, var(--faint)); flex: 0 0 auto; }
+.sp-q.sp-hot { background: var(--surface); border-color: var(--profit-line); --c: var(--profit); }
 .sp-q.sp-wide { grid-column: 1 / -1; }
-.sp-col { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
-.sp-kind { margin-left: 6px; font-size: 11px; font-weight: bold; }
-.sp-kind-fast { color: var(--price); }
+.sp-col { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
+.sp-kind { margin-left: 6px; font-size: 10px; font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase; }
+.sp-kind-fast { color: var(--profit); }
 .sp-kind-slow { color: var(--warn); }
-.sp-left { display: block; margin-top: 2px; }
-.sp-left .sp-qty { width: 56px; }
-.sp-acc-foot { margin-top: 10px; }
+.sp-left { display: block; margin-top: 4px; }
+.sp-left .sp-qty { width: 96px; margin-right: 6px; }
+.sp-acc-foot { margin-top: 12px; display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; }
+.sp-acc-foot .sp-tpick-b { gap: 8px 20px; }
+.sp-link.sp-cancel { color: var(--bad); }
+.sp-btn.sp-btn-bad { color: var(--bad); background: var(--bad-bg); border-color: transparent; }
+.sp-btn.sp-btn-bad:hover { background: rgba(255, 123, 110, 0.2); }
 .sp-cancelask { justify-content: flex-start; }
 .sp-cancelask > .sp-warnnote { flex: 1 1 100%; color: var(--warn); font-size: 13px; }
 .sp-tpick-b { align-items: center; }
-.sp-fc.sp-lo { border-style: dashed; }
+.sp-fc.sp-lo { border-style: dashed; border-color: var(--line2); background: transparent; }
+.sp-fc.sp-lo:hover { background: var(--surface); }
 /* The pin sits in the card's corner, out of the flow: the card's contents
    are where they always were, pinned or not (the owner: "you moved the contents"). */
 .sp-fc { position: relative; }
-.sp-fc .sp-fc-top { padding-right: 28px; }
-.sp-pin { display: grid; place-items: center; width: 24px; height: 24px; padding: 0; border-radius: 7px; border: 1px solid var(--cline2); background: #161616; color: var(--muted); cursor: pointer; }
-.sp-fc .sp-pin { position: absolute; top: 8px; right: 8px; }
-.sp-pin:hover { color: #fff; border-color: #555; }
+.sp-fc .sp-fc-top { padding-right: 30px; }
+.sp-pin { display: grid; place-items: center; width: 26px; height: 26px; padding: 0; border-radius: 7px; border: 1px solid var(--line); background: transparent; color: var(--faint); cursor: pointer; transition: background-color 0.15s var(--ease); }
+.sp-fc .sp-pin { position: absolute; top: 12px; right: 12px; }
+.sp-pin:hover { color: var(--text); border-color: var(--line2); background: var(--raised); }
 .sp-pin:focus-visible { outline: 2px solid var(--offer); outline-offset: 1px; }
-.sp-pin.sp-pin-on { color: var(--offer); border-color: #2f4466; background: #1b2230; }
+.sp-pin.sp-pin-on { color: var(--buy); border-color: var(--buy-line); background: var(--buy-bg); }
 .sp-it.sp-it-pin { position: relative; }
 .sp-it.sp-it-pin small { padding-right: 30px; }
-.sp-it .sp-pin-row { position: absolute; right: 10px; bottom: 6px; width: 22px; height: 22px; }
-.sp-it.sp-pinrow { background: #1b2230; border-color: #2f4466; }
-.sp-it.sp-pinrow.sp-sel { border-color: var(--offer); }
+.sp-it .sp-pin-row { position: absolute; right: 12px; bottom: 8px; width: 22px; height: 22px; }
+.sp-it.sp-pinrow { background: var(--buy-bg); border-color: var(--buy-line); }
+.sp-it.sp-pinrow.sp-sel { border-color: var(--buy); }
 .sp-pinrow-r { display: inline-flex; align-items: center; gap: 6px; }
-.sp-pinsep { border-top: 1px dashed var(--cline2); margin: 4px 0 8px; }
-.sp-badge-bad { color: var(--bad); }
-.sp-heldtag { margin-left: 8px; font-size: 11px; font-weight: bold; text-transform: uppercase; letter-spacing: 0.4px; color: var(--offer); }
-.sp-mainnote { margin: 4px 0 6px; color: var(--text); }
-.sp-add { padding: 2px 10px; }
-.sp-fc .sp-lo-x { margin-left: auto; padding: 4px 8px; color: var(--offer); font-weight: bold; }
+.sp-pinsep { border-top: 1px dashed var(--line2); margin: 4px 8px 8px; }
+.sp-badge-bad { color: var(--bad); background: var(--bad-bg); }
+.sp-heldtag { margin-left: 8px; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: var(--buy); }
+.sp-mainnote { margin: 4px 0 8px; color: var(--text2); }
+/* A left-out row: Add takes the tick's place and its own width (3.20: it ran over the picture). */
+.sp-ti.sp-leftrow { grid-template-columns: auto 44px minmax(0, 1fr) auto; }
+.sp-add { height: 26px; padding: 0 10px; font-size: 12px; border-radius: 8px; }
+.sp-fc .sp-lo-x { margin-left: auto; padding: 4px 8px; color: var(--offer); font-weight: 500; }
 .sp-chat { min-width: 64px; justify-content: center; gap: 6px; }
-.sp-q > .sp-note + .sp-note { margin-top: 6px; }
-.sp-tr { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 10px; align-items: center; padding: 8px 6px; border-top: 1px solid var(--cline); }
+.sp-q > .sp-note + .sp-note { margin-top: 8px; }
+.sp-tr { position: relative; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px 16px; align-items: center; padding: 12px; border-top: 1px solid var(--line); }
 .sp-q h3 + .sp-tr, .sp-q .sp-note + .sp-tr { border-top: 0; }
-.sp-tr.sp-top { background: var(--green-bg); border-radius: 9px; border-top-color: transparent; }
+.sp-tr.sp-top { background: var(--profit-bg); border-radius: 12px; border-top-color: transparent; }
 .sp-tr.sp-top + .sp-tr { border-top-color: transparent; }
-.sp-tr.sp-stale .sp-tprice, .sp-tr.sp-stale b, .sp-tr.sp-stale small { color: #8c8c8c; }
-.sp-tr-l { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.sp-tr.sp-stale .sp-tprice, .sp-tr.sp-stale b, .sp-tr.sp-stale small { color: var(--faint); }
+.sp-tr.sp-favrow::after { content: ""; position: absolute; left: 0; top: 10px; bottom: 10px; width: 3px; border-radius: 2px; background: var(--fav); pointer-events: none; }
+.sp-favtag { display: inline-flex; align-items: center; height: 18px; padding: 0 7px; border-radius: 999px; font: 700 10px/1 var(--sans); letter-spacing: 0.05em; text-transform: uppercase; color: var(--fav); background: var(--fav-bg); white-space: nowrap; }
+.sp-tr-l { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
 .sp-tr-l small { font-size: 12px; color: var(--muted); }
 .sp-tr-l small.sp-differ { color: var(--warn); }
 .sp-note.sp-warnnote { color: var(--warn); }
 .sp-trader-l { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 8px; min-width: 0; }
-.sp-pname { color: #fff; font-weight: bold; }
-.sp-tprice { font-weight: bold; text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
-.sp-top .sp-tprice { color: var(--price); }
+.sp-pname { color: var(--text); font-weight: 600; }
+.sp-tprice { font: 650 15px var(--sans); text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.sp-top .sp-tprice { color: var(--profit); }
 .sp-links { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 6px; }
-.sp-tr .sp-links { display: grid; grid-template-columns: 64px 64px 76px minmax(0, 1fr); align-items: center; }
-.sp-tr .sp-links .sp-blk { grid-column: -2 / -1; justify-self: end; }
-.sp-fav, .sp-blk { width: 24px; height: 24px; padding: 0; border-radius: 7px; border: 1px solid var(--cline2); background: #161616; color: #8a8a8a; font: 13px/22px Arial, Helvetica, sans-serif; cursor: pointer; }
-.sp-fav:hover, .sp-blk:hover { color: var(--text); border-color: #555; }
-.sp-fav.sp-fav-on { color: #f2c94c; border-color: #6b5a22; background: #262110; }
-.sp-blk:hover { color: #ff6b6b; }
+.sp-tr .sp-links { display: flex; align-items: center; gap: 6px; }
+.sp-tr .sp-links .sp-blk { margin-left: auto; }
+.sp-fav, .sp-blk { width: 24px; height: 24px; padding: 0; border-radius: 7px; border: 1px solid var(--line); background: transparent; color: var(--faint); font: 13px/22px var(--sans); cursor: pointer; transition: background-color 0.15s var(--ease); }
+.sp-fav:hover, .sp-blk:hover { color: var(--text); border-color: var(--line2); background: var(--raised); }
+.sp-fav.sp-fav-on { color: var(--fav); border-color: var(--fav-line); background: var(--fav-bg); animation: sp-pop 0.3s var(--ease); }
+.sp-blk:hover { color: var(--bad); }
 .sp-tr-l small.sp-traded { color: var(--muted); }
 .sp-blnote { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .sp-tr .sp-links.sp-links-one { display: flex; }
 .sp-chip {
-    display: inline-flex; align-items: center; justify-content: center; height: 30px; padding: 0 10px; font-size: 12px; white-space: nowrap;
-    color: var(--offer); border: 1px solid #3d4f5c; border-radius: 8px;
+    display: inline-flex; align-items: center; justify-content: center; height: 26px; padding: 0 9px; font-size: 12px; font-weight: 500; white-space: nowrap;
+    color: var(--offer); background: var(--buy-bg); border: 1px solid transparent; border-radius: 7px;
+    transition: background-color 0.15s var(--ease);
 }
-.sp-chip:hover { text-decoration: none; background: rgba(116, 192, 252, 0.12); }
+.sp-chip:hover { text-decoration: none; background: rgba(90, 167, 255, 0.2); }
 .sp-chip-none { visibility: hidden; }
-.sp-showall { margin-top: 8px; }
-.sp-tsec { margin: 12px 0 4px; font-size: 11px; letter-spacing: 0.6px; text-transform: uppercase; color: var(--muted); }
-.sp-th { display: flex; align-items: flex-start; gap: 16px; flex-wrap: wrap; margin-top: 4px; }
+.sp-showall { margin-top: 12px; }
+.sp-tsec { margin: 16px 0 6px; font: 650 11px/1 var(--sans); letter-spacing: 0.09em; text-transform: uppercase; color: var(--text2); }
+.sp-th { display: flex; align-items: flex-start; gap: 16px; flex-wrap: wrap; margin-top: 4px; padding: 12px 16px; border-radius: 12px; background: var(--raised); }
 .sp-th-l { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .sp-th-r { margin-left: auto; text-align: right; }
 .sp-th-r small { display: block; color: var(--muted); font-size: 12px; }
-.sp-ti { display: grid; grid-template-columns: 18px 44px minmax(0, 1fr) auto; gap: 4px 10px; align-items: center; padding: 8px 0; border-top: 1px solid #2f3a1c; }
-.sp-ti.sp-off b, .sp-ti.sp-off small, .sp-ti.sp-off .sp-ti-p { color: #8c8c8c; }
-.sp-tick { width: 16px; height: 16px; margin: 0; accent-color: var(--price); }
-.sp-ti-l { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.sp-ti { display: grid; grid-template-columns: 18px 44px minmax(0, 1fr) auto; gap: 4px 12px; align-items: center; padding: 12px 0; border-top: 1px solid var(--line); }
+.sp-ti.sp-off b, .sp-ti.sp-off small, .sp-ti.sp-off .sp-ti-p { color: var(--faint); }
+.sp-tick { width: 16px; height: 16px; margin: 0; accent-color: var(--profit); }
+.sp-ti-l { min-width: 0; display: flex; flex-direction: column; gap: 3px; }
 .sp-ti-l small { color: var(--muted); font-size: 12px; }
-.sp-tiname { color: #fff; font-weight: bold; text-decoration: none; }
-.sp-tiname:hover { text-decoration: underline; }
-.sp-here { margin-left: 6px; font-size: 11px; font-weight: bold; color: var(--price); }
-.sp-ti-p { text-align: right; font-weight: bold; font-variant-numeric: tabular-nums; white-space: nowrap; }
-.sp-ti-p.sp-good { color: var(--price); }
-.sp-ti-p small { display: block; font-weight: normal; color: var(--muted); font-size: 12px; }
-.sp-buys { grid-column: 3 / 5; display: flex; flex-direction: column; gap: 4px; }
-.sp-buy { display: flex; align-items: center; gap: 10px; font-size: 12px; color: var(--muted); }
+.sp-tiname { color: var(--text); font-weight: 600; text-decoration: none; }
+.sp-tiname:hover { text-decoration: underline; text-underline-offset: 3px; }
+.sp-here { margin-left: 6px; font-size: 10px; font-weight: 700; letter-spacing: 0.05em; text-transform: uppercase; color: var(--profit); }
+.sp-ti-p { text-align: right; font-weight: 650; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.sp-ti-p.sp-good { color: var(--profit); }
+.sp-ti-p small { display: block; font-weight: 400; color: var(--muted); font-size: 12px; }
+.sp-buys { grid-column: 3 / 5; display: flex; flex-direction: column; gap: 6px; }
+.sp-buy { display: flex; align-items: center; gap: 10px; font-size: 12px; color: var(--muted); line-height: 1.6; }
 .sp-buy .sp-chip { margin-left: auto; }
-.sp-qty { width: 72px; height: 26px; padding: 0 6px; border-radius: 6px; border: 1px solid var(--cline2); background: #0f0f0f; color: var(--text); text-align: right; font-variant-numeric: tabular-nums; }
-.sp-in-bad, .sp-key.sp-in-bad { border-color: #e05a4f !important; box-shadow: 0 0 0 1px #e05a4f; }
-.sp-trade-links { display: flex; justify-content: flex-end; margin-top: 10px; }
+.sp-qty { width: 72px; height: 28px; padding: 0 8px; border-radius: 8px; border: 1px solid var(--line2); background: var(--input); color: var(--text); text-align: right; font-variant-numeric: tabular-nums; }
+.sp-qty:focus { border-color: var(--brand); outline: none; }
+.sp-in-bad, .sp-key.sp-in-bad { border-color: var(--bad) !important; box-shadow: 0 0 0 3px var(--bad-bg); }
+.sp-trade-links { display: flex; justify-content: flex-end; margin-top: 12px; }
 .sp-tradeline { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 4px; }
-.sp-tradeline small { color: var(--muted); font-size: 12px; }
-.sp-plan { height: 26px; padding: 0 10px; font-size: 12px; }
-.sp-plan-on { display: inline-flex; align-items: center; border-radius: 13px; border: 1px solid var(--hot-line); color: var(--price); font-weight: bold; background: var(--green-bg); }
-.sp-tr.sp-planning { box-shadow: inset 3px 0 0 var(--price); }
+.sp-tradeline small { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.sp-plan { height: 26px; padding: 0 10px; font-size: 12px; border-radius: 8px; }
+.sp-plan-on { display: inline-flex; align-items: center; border-radius: 8px; border: 0; color: var(--on-profit); font-weight: 650; background: var(--profit); }
+.sp-tr.sp-planning { box-shadow: inset 3px 0 0 var(--profit); }
 /* Dimmed by colour, not see-through: its words stay readable (review M10). */
-.sp-tr.sp-declined .sp-tprice, .sp-tr.sp-declined .sp-trader-l, .sp-tr.sp-declined small, .sp-tr.sp-hidden .sp-tprice, .sp-tr.sp-hidden .sp-trader-l, .sp-tr.sp-hidden small { color: #8c8c8c; }
+.sp-tr.sp-declined .sp-tprice, .sp-tr.sp-declined .sp-trader-l, .sp-tr.sp-declined small, .sp-tr.sp-hidden .sp-tprice, .sp-tr.sp-hidden .sp-trader-l, .sp-tr.sp-hidden small { color: var(--faint); }
 .sp-tr.sp-troll .sp-tprice { color: var(--muted); text-decoration: line-through; }
-.sp-scan { display: flex; flex-direction: column; gap: 8px; margin: 0 0 16px; }
+.sp-scan { display: flex; flex-direction: column; gap: 12px; margin: 0 0 32px; }
 .sp-scanh { margin: 0; }
 .sp-fold { display: inline-flex; align-items: center; gap: 8px; padding: 0; border: 0; background: none; color: inherit; cursor: pointer; font: inherit; }
 .sp-fold h2 { margin: 0; }
-.sp-fold:hover h2 { color: #fff; }
+.sp-fold:hover h2 { color: var(--text); }
 .sp-chev { width: 12px; color: var(--muted); font-size: 12px; }
-.sp-scangrid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; }
+.sp-scangrid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
 @media (max-width: 1400px) { .sp-scangrid { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
 .sp-tc { cursor: default; }
-.sp-tc.sp-tc-none { background: var(--card); border-color: var(--cline2); }
-.sp-inerr { color: #ff8a80; font-size: 12px; font-weight: bold; }
-.sp-tc .sp-go { margin-top: auto; }
-.sp-tc .sp-go.sp-go-on { border-color: var(--offer); color: var(--offer); }
-.sp-star { color: #f2c94c; }
-.sp-lastpaid { display: inline-flex; align-items: center; height: 18px; padding: 0 6px; font-size: 10px; font-weight: bold; text-transform: uppercase; letter-spacing: 0.4px; border-radius: 9px; border: 1px solid #7a5210; color: var(--warn); white-space: nowrap; }
-.sp-fc-p.sp-est { color: #c3ea6f; }
+.sp-tc:hover { background: var(--surface); }
+.sp-tc.sp-tc-none { background: var(--surface); border-color: var(--line); }
+.sp-tc.sp-tc-fav.sp-tc-none { border-color: var(--fav-line); background: linear-gradient(180deg, rgba(255, 204, 77, 0.06), var(--surface) 55%); }
+.sp-inerr { color: var(--bad); font-size: 12px; font-weight: 600; }
+.sp-tc .sp-go { margin-top: auto; height: 28px; border-radius: 8px; font-size: 12px; }
+.sp-tc .sp-go.sp-go-on { color: var(--on-profit); background: var(--profit); border-color: transparent; font-weight: 600; }
+.sp-star { color: var(--fav); }
+.sp-lastpaid { display: inline-flex; align-items: center; height: 18px; padding: 0 7px; font: 700 10px/1 var(--sans); text-transform: uppercase; letter-spacing: 0.05em; border-radius: 999px; color: var(--known); background: rgba(184, 164, 255, 0.12); white-space: nowrap; }
+.sp-fc-p.sp-est { color: var(--profit); }
+.sp-fc-p.sp-fc-none { color: var(--muted); }
 .sp-tc small.sp-traded { color: var(--muted); }
-.sp-tpick { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; margin: 2px 0 6px; }
-.sp-itemnote { margin: 6px 0; }
-.sp-tpick-b { display: flex; gap: 6px; flex-wrap: wrap; }
+.sp-tpick { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin: 4px 0 8px; }
+.sp-itemnote { margin: 8px 0; }
+.sp-tpick-b { display: flex; gap: 8px; flex-wrap: wrap; }
 .sp-buy .sp-tick { flex: 0 0 auto; }
-.sp-check-ok .sp-checkword { color: var(--price); }
-.sp-check-price .sp-checkword, .sp-check-short .sp-checkword { color: var(--warn); font-weight: bold; }
-.sp-check-gone .sp-checkword { color: var(--bad); font-weight: bold; }
+.sp-check-ok .sp-checkword { color: var(--profit); font-weight: 600; }
+.sp-check-price .sp-checkword, .sp-check-short .sp-checkword { color: var(--warn); font-weight: 600; }
+.sp-check-gone .sp-checkword { color: var(--bad); font-weight: 600; }
 .sp-check-bought { opacity: 0.6; }
-.sp-gone { opacity: 0.8; }
-.sp-gone-mark { width: 16px; height: 16px; border-radius: 50%; background: var(--warn); color: #131313; font-weight: bold; font-size: 11px; display: inline-flex; align-items: center; justify-content: center; }
+.sp-gone { background: var(--bad-bg); border-radius: 10px; padding: 12px; border-top: 0; margin: 4px 0; }
+.sp-gone-mark { width: 16px; height: 16px; border-radius: 50%; background: var(--bad); color: var(--page); font-weight: 700; font-size: 11px; display: inline-flex; align-items: center; justify-content: center; }
 .sp-gone small { color: var(--warn); }
-.sp-buy .sp-bad { color: var(--bad); font-weight: bold; }
-.sp-repl { color: var(--text); }
+.sp-buy .sp-bad { color: var(--bad); font-weight: 600; }
+.sp-repl { color: var(--text2); }
 .sp-repl .sp-link { font-size: 12px; }
-.sp-drop { display: block; margin: 4px 0 0 auto; height: 24px; padding: 0 8px; font-size: 12px; }
-.sp-neverlist { display: flex; flex-wrap: wrap; gap: 6px 14px; }
+.sp-drop { display: block; margin: 4px 0 0 auto; height: 26px; padding: 0 10px; font-size: 12px; border-radius: 8px; }
+.sp-neverlist { display: flex; flex-wrap: wrap; gap: 8px 16px; }
 .sp-never { font-size: 12px; }
-.sp-keeplist { display: flex; flex-direction: column; gap: 6px; }
-.sp-keeprow { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
-.sp-big { font-size: 22px; font-weight: bold; color: var(--price); font-variant-numeric: tabular-nums; }
-.sp-step { display: grid; grid-template-columns: 22px minmax(0, 1fr) auto; gap: 4px 10px; align-items: center; padding: 8px 0; border-top: 1px solid #2f3a1c; }
-.sp-q .sp-note + .sp-step { margin-top: 6px; }
-.sp-n { width: 22px; height: 22px; border-radius: 50%; background: var(--profit); color: #131313; font-weight: bold; font-size: 12px; display: grid; place-items: center; }
+.sp-keeplist { display: flex; flex-direction: column; gap: 8px; }
+.sp-keeprow { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.sp-big { font: 650 22px var(--sans); color: var(--profit); font-variant-numeric: tabular-nums; }
+.sp-step { display: grid; grid-template-columns: 22px minmax(0, 1fr) auto; gap: 4px 12px; align-items: center; padding: 12px 0; border-top: 1px solid var(--line); }
+.sp-q .sp-note + .sp-step { margin-top: 8px; }
+.sp-n { width: 22px; height: 22px; border-radius: 50%; background: var(--profit); color: var(--on-profit); font-weight: 700; font-size: 12px; display: grid; place-items: center; }
 .sp-step .sp-trust { margin-left: 2px; }
 .sp-step-links { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }
-.sp-opt { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 12px; align-items: center; padding: 8px 10px; margin-bottom: 6px; border-radius: 9px; border: 1px solid var(--cline); color: var(--text); }
-a.sp-opt:hover { text-decoration: none; border-color: #3d4f5c; background: rgba(116, 192, 252, 0.06); }
+.sp-opt { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 12px; align-items: center; padding: 12px 14px; margin-bottom: 8px; border-radius: 12px; border: 1px solid var(--line); color: var(--text); transition: background-color 0.15s var(--ease); }
+a.sp-opt:hover { text-decoration: none; border-color: var(--buy-line); background: var(--buy-bg); }
 .sp-opt-l { display: flex; flex-direction: column; min-width: 0; }
-.sp-opt-l small, .sp-opt-p small { font-size: 12px; color: var(--muted); font-weight: normal; }
-.sp-opt-p { display: flex; flex-direction: column; align-items: flex-end; font-size: 15px; font-weight: bold; font-variant-numeric: tabular-nums; white-space: nowrap; }
-.sp-opt.sp-win { border-color: var(--hot-line); background: var(--green-bg); }
-.sp-opt.sp-win .sp-opt-p { color: var(--price); }
+.sp-opt-l small, .sp-opt-p small { font-size: 12px; color: var(--muted); font-weight: 400; }
+.sp-opt-p { display: flex; flex-direction: column; align-items: flex-end; font-size: 15px; font-weight: 650; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.sp-opt.sp-win { border-color: var(--profit-line); background: var(--profit-bg); }
+.sp-opt.sp-win .sp-opt-p { color: var(--profit); }
 .sp-opt-none { color: var(--muted); }
-.sp-verdict { margin: 4px 0 0; font-weight: bold; }
-.sp-verdict.sp-win { color: var(--price); }
+.sp-verdict { margin: 4px 0 0; font-weight: 600; }
+.sp-verdict.sp-win { color: var(--profit); }
 
 /* shared pieces */
 .sp-pic { display: inline-flex; align-items: center; justify-content: center; width: 60px; height: 30px; flex: 0 0 auto; }
@@ -3075,51 +3224,57 @@ a.sp-opt:hover { text-decoration: none; border-color: #3d4f5c; background: rgba(
 .sp-pic-l { width: 80px; height: 40px; }
 .sp-img { width: 100%; height: 100%; object-fit: contain; }
 .sp-img-none { visibility: hidden; }
-.sp-iname { color: #fff; }
+.sp-iname { color: var(--text); }
 .sp-status { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); white-space: nowrap; }
 .sp-status:empty { display: none; }
-.sp-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #666; flex: 0 0 auto; }
+.sp-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--faint); flex: 0 0 auto; }
 .sp-dot[data-level="online"] { background: var(--profit); }
 .sp-dot[data-level="idle"] { background: var(--warn); }
-.sp-dot[data-level="offline"] { background: #666; }
+.sp-dot[data-level="offline"] { background: var(--faint); }
 /* Online, but in hospital, in jail or flying: may not trade right now. */
 .sp-dot[data-level="busy"] { background: var(--orange); }
 .sp-dot[data-level="bad"] { background: var(--bad); }
-.sp-dot[data-level="unknown"] { background: transparent; border: 1px solid #777; }
+.sp-dot[data-level="unknown"] { background: transparent; border: 1px solid var(--faint); }
 .sp-trust {
-    display: inline-flex; align-items: center; height: 18px; padding: 0 6px; flex: 0 0 auto;
-    font-size: 10px; font-weight: bold; text-transform: uppercase; letter-spacing: 0.4px;
-    border-radius: 9px; border: 1px solid #555; color: var(--muted); cursor: help;
+    display: inline-flex; align-items: center; height: 18px; padding: 0 7px; flex: 0 0 auto;
+    font: 700 10px/1 var(--sans); text-transform: uppercase; letter-spacing: 0.05em;
+    border-radius: 999px; border: 0; color: var(--muted); background: rgba(255, 255, 255, 0.06); cursor: help; white-space: nowrap;
 }
-.sp-trust[data-level="trusted"] { color: #c3ea6f; border-color: #5c7a1e; background: rgba(153, 204, 0, 0.12); }
-.sp-trust[data-level="known"] { color: #a7d4ff; border-color: #3d5a74; }
-.sp-trust[data-level="caution"] { color: #f0a020; border-color: #7a5210; }
+.sp-trust[data-level="trusted"] { color: var(--trust); background: var(--trust-bg); }
+.sp-trust[data-level="known"] { color: var(--known); background: rgba(184, 164, 255, 0.12); }
+.sp-trust[data-level="caution"] { color: var(--warn); background: var(--warn-bg); }
 
 /* ------------------------------------------------------------ settings */
-.sp-settings { display: grid; grid-template-columns: 260px minmax(0, 1fr); gap: 24px; align-items: start; padding: 20px 24px 64px; }
-.sp-snav { position: sticky; top: 20px; display: flex; flex-direction: column; gap: 4px; }
-.sp-snav-g { margin: 12px 12px 4px; font-size: 11px; letter-spacing: 0.6px; text-transform: uppercase; color: var(--muted); }
+.sp-settings { display: grid; grid-template-columns: 250px minmax(0, 1fr); gap: 24px; align-items: start; padding: 24px 24px 64px; }
+.sp-snav { position: sticky; top: 24px; display: flex; flex-direction: column; gap: 2px; }
+.sp-snav-g { margin: 14px 10px 6px; font: 650 10.5px/1 var(--sans); letter-spacing: 0.09em; text-transform: uppercase; color: var(--faint); }
 .sp-snav-g:first-child { margin-top: 0; }
-.sp-snav-a { display: flex; align-items: center; gap: 10px; height: 40px; padding: 0 12px; border: 0; border-radius: 9px; background: none; color: var(--muted); font-weight: bold; text-align: left; cursor: pointer; }
-.sp-snav-a:hover { background: var(--card); color: var(--text); }
-.sp-snav-a[aria-current="true"] { background: var(--green-bg); color: #fff; box-shadow: inset 0 0 0 1px var(--hot-line); }
-.sp-snav-a small { margin-left: auto; font-weight: normal; font-size: 12px; white-space: nowrap; }
+.sp-snav-a { display: flex; align-items: center; gap: 8px; height: 36px; padding: 0 10px; border: 0; border-radius: 9px; background: none; color: var(--text2); font-weight: 500; text-align: left; cursor: pointer; transition: background-color 0.15s var(--ease); }
+.sp-snav-a:hover { background: var(--surface); color: var(--text); }
+.sp-snav-a[aria-current="true"] { background: var(--surface); color: var(--text); box-shadow: inset 2px 0 0 var(--brand); }
+.sp-snav-a small { margin-left: auto; font-weight: 400; font-size: 12px; color: var(--faint); white-space: nowrap; }
 .sp-sbody { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
-.sp-card { display: flex; flex-direction: column; padding: 20px; background: var(--card); border: 1px solid var(--cline); border-radius: 12px; scroll-margin-top: 20px; }
-.sp-card h2 { margin: 0 0 4px; font-size: 15px; color: #fff; }
-.sp-lead { margin: 0 0 14px; font-size: 12px; color: var(--muted); }
-.sp-field { display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 8px 24px; align-items: start; padding: 12px 0; border-top: 1px solid var(--cline); }
-.sp-flabel { display: flex; flex-direction: column; padding-top: 8px; }
+.sp-card { display: flex; flex-direction: column; padding: 20px 22px; background: var(--surface); border: 1px solid var(--line); border-radius: 16px; scroll-margin-top: 24px; }
+.sp-card h2 { margin: 0 0 4px; font: 400 17px/1.3 var(--serif); color: var(--text); }
+.sp-lead { margin: 0 0 14px; font-size: 13px; color: var(--muted); }
+.sp-field { display: grid; grid-template-columns: 240px minmax(0, 1fr); gap: 8px 24px; align-items: start; padding: 14px 0; border-top: 1px solid var(--line); }
+.sp-flabel { display: flex; flex-direction: column; gap: 2px; padding-top: 7px; }
+.sp-flabel b { font-weight: 600; }
 .sp-flabel small { font-size: 12px; color: var(--muted); }
-.sp-fctl { display: flex; flex-direction: column; gap: 6px; min-width: 0; max-width: 640px; }
+.sp-fctl { display: flex; flex-direction: column; gap: 8px; min-width: 0; max-width: 640px; }
 .sp-fctl > .sp-keystate:only-child { padding-top: 8px; }
 .sp-fctl > .sp-check { padding-top: 8px; }
+.sp-fctl > .sp-fresh { align-self: flex-start; min-width: 200px; }
+.sp-keepup { padding: 12px; border-radius: 12px; font-size: 12px; }
+.sp-keepup-ok { background: var(--profit-bg); color: var(--text2); }
+.sp-keepup-behind { background: var(--warn-bg); color: var(--warn); }
 .sp-inline { display: flex; gap: 8px; align-items: center; }
 .sp-inline input { flex: 1; min-width: 0; }
 .sp-inline.sp-pct input.sp-pctin { flex: 0 0 80px; text-align: right; }
 .sp-inline.sp-actions { gap: 16px; }
-input.sp-key { height: 34px; padding: 0 12px; background: #0f0f0f; border: 1px solid #444; border-radius: 9px; color: var(--text); }
-input.sp-key::placeholder { color: var(--muted); }
+input.sp-key { height: 34px; padding: 0 12px; background: var(--input); border: 1px solid var(--line2); border-radius: 10px; color: var(--text); transition: border-color 0.15s var(--ease); }
+input.sp-key:focus { border-color: var(--brand); outline: none; }
+input.sp-key::placeholder { color: var(--faint); }
 .sp-masked { -webkit-text-security: disc; }
 .sp-keystate { font-size: 12px; color: var(--muted); }
 .sp-keystate.sp-ok { color: var(--profit); }
@@ -3131,9 +3286,9 @@ input.sp-key::placeholder { color: var(--muted); }
 .sp-keystate.sp-bad { color: var(--bad); }
 .sp-check { display: flex; gap: 8px; align-items: flex-start; cursor: pointer; }
 input[type="checkbox"] { accent-color: var(--profit); margin: 3px 0 0; }
-.sp-tos { width: 100%; max-width: 900px; border-collapse: collapse; font-size: 12px; }
-.sp-tos th, .sp-tos td { text-align: left; vertical-align: top; padding: 8px 4px; border-top: 1px solid var(--cline); }
-.sp-tos th { width: 220px; color: var(--muted); font-weight: normal; }
+.sp-tos { width: 100%; max-width: 900px; border-collapse: collapse; font-size: 12.5px; }
+.sp-tos th, .sp-tos td { text-align: left; vertical-align: top; padding: 9px 4px; border-top: 1px solid var(--line); color: var(--text2); }
+.sp-tos th { width: 220px; color: var(--muted); font-weight: 400; }
 
 /* ---------------------------------------------------------- narrower */
 /* With the Category dropdown the header needs room: under 1500px the two
@@ -3141,6 +3296,10 @@ input[type="checkbox"] { accent-color: var(--profit); margin: 3px 0 0; }
    phone the pills get a row of their own and all come back. */
 @media (max-width: 1500px) and (min-width: 1001px) {
     .sp-pill[data-src="TornW3B"], .sp-pill[data-src="Online"] { display: none; }
+}
+@media (max-width: 1400px) {
+    .sp-tgroup { grid-template-columns: 128px minmax(0, 1fr); }
+    .sp-tlabel { padding: 14px 12px; }
 }
 @media (max-width: 1300px) {
     .sp-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -3163,6 +3322,7 @@ input[type="checkbox"] { accent-color: var(--profit); margin: 3px 0 0; }
     /* A desktop window at half a screen (3.14.3 review): two cards a row, and the list before the desk. */
     .sp-strip, .sp-scangrid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .sp-desk { grid-template-columns: minmax(0, 1fr); }
+    .sp-tgroup { grid-template-columns: minmax(0, 1fr); }
     .sp-ws { position: static; }
     .sp-settings { grid-template-columns: minmax(0, 1fr); gap: 12px; padding: 12px 12px 48px; }
     .sp-snav { position: static; flex-direction: row; flex-wrap: wrap; }

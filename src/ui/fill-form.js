@@ -242,26 +242,26 @@ export function buildFillForm({ get, set }) {
 /** The form's look, for the panel's and Torn Bids' stylesheets alike (their tokens). */
 export const FILL_FORM_CSS = `
 .tf-form { display: flex; flex-direction: column; gap: 12px; }
-.tf-block { display: flex; flex-direction: column; gap: 8px; padding: 12px; border: 1px solid var(--line, #444); border-radius: 8px; background: rgba(0, 0, 0, 0.18); }
-.tf-title { font-weight: bold; color: #fff; font-size: 13px; }
+.tf-block { display: flex; flex-direction: column; gap: 10px; padding: 12px; border: 1px solid var(--line, #2c2f36); border-radius: 12px; background: var(--raised, #24272e); }
+.tf-title { font: 400 15px/1.3 var(--serif, Georgia, serif); color: var(--text, #f2f4f8); }
 .tf-grid { display: grid; grid-template-columns: 72px minmax(0, 1fr); gap: 8px 10px; align-items: center; }
-.tf-label { font-size: 12px; color: var(--muted, #999); }
-.tf-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 13px; color: var(--text, #ddd); }
-.tf-select, .tf-num { height: 30px; padding: 0 8px; border-radius: 6px; border: 1px solid #555; background: #1b1b1b; color: var(--text, #ddd); font: inherit; font-size: 13px; }
+.tf-label { font-size: 12px; font-weight: 600; color: var(--text2, #cdd2db); }
+.tf-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 13px; color: var(--text, #e5e8ee); }
+.tf-select, .tf-num { height: 28px; padding: 0 8px; border-radius: 8px; border: 1px solid var(--line2, #3a3d45); background: var(--input, #0e0f12); color: var(--text, #f2f4f8); font: inherit; font-size: 13px; }
 .tf-form .tf-row input.tf-num { width: 84px; flex: 0 0 84px; text-align: right; font-variant-numeric: tabular-nums; }
-.tf-form .tf-row input.tf-num.tf-bad { border-color: #ff8a80; box-shadow: 0 0 0 1px #ff8a80; }
+.tf-form .tf-row input.tf-num.tf-bad { border-color: #ff7b6e; box-shadow: 0 0 0 1px #ff7b6e; }
 .tf-form .tf-row input.tf-num.tf-bad:focus-visible { outline: 0; }
-.tf-seg { display: inline-flex; border: 1px solid #555; border-radius: 6px; overflow: hidden; }
-.tf-seg button { height: 28px; padding: 0 10px; border: 0; border-radius: 0; background: none; color: var(--muted, #999); font: inherit; font-size: 13px; font-weight: bold; cursor: pointer; }
-.tf-seg button[aria-pressed="true"] { background: rgba(153, 204, 0, 0.14); color: #fff; box-shadow: inset 0 0 0 1px var(--profit, #99cc00); }
+.tf-seg { display: inline-flex; gap: 2px; padding: 3px; border: 1px solid var(--line, #2c2f36); border-radius: 10px; background: var(--input, #0e0f12); overflow: hidden; }
+.tf-seg button { height: 24px; padding: 0 10px; border: 0; border-radius: 7px; background: none; color: var(--muted, #949bab); font: inherit; font-size: 12px; font-weight: 500; cursor: pointer; }
+.tf-seg button[aria-pressed="true"] { background: var(--raised, #24272e); color: var(--text, #f2f4f8); box-shadow: 0 1px 2px rgba(0, 0, 0, 0.3); }
 .tf-check { cursor: pointer; }
-.tf-check input { accent-color: var(--profit, #99cc00); margin: 0; }
-.tf-example { font-size: 12px; color: var(--muted, #999); font-variant-numeric: tabular-nums; }
-/* Under the By box, in the grid's second column: Saved ✓ / why not (#ff8a80: red that reads) / a note. */
-.tf-state { grid-column: 2; margin-top: -4px; font-size: 12px; color: var(--muted, #999); overflow-wrap: anywhere; }
+.tf-check input { accent-color: var(--profit, #6fdc7f); margin: 0; }
+.tf-example { font-size: 12px; color: var(--muted, #949bab); font-variant-numeric: tabular-nums; }
+/* Under the By box, in the grid's second column: Saved ✓ / why not (#ff7b6e: red that reads) / a note. */
+.tf-state { grid-column: 2; margin-top: -4px; font-size: 12px; color: var(--muted, #949bab); overflow-wrap: anywhere; }
 .tf-state:empty { display: none; }
-.tf-state[data-level="ok"] { color: var(--profit, #99cc00); }
-.tf-state[data-level="bad"] { color: #ff8a80; }
-.tf-note { font-size: 12px; color: var(--muted, #999); }
+.tf-state[data-level="ok"] { color: var(--profit, #6fdc7f); }
+.tf-state[data-level="bad"] { color: #ff7b6e; }
+.tf-note { font-size: 12px; color: var(--muted, #949bab); }
 `;
 

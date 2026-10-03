@@ -141,3 +141,52 @@ export function nextW3bRead({ summaryDue = false, picked = null, active = false,
     if (sw) return { kind: 'bazaars', id: sw };
     return null;
 }
+
+/*
+ * Bazaar prices (3.20, the owner: "make it live in settings where they can
+ * change up to 10 mins"): how often each group's bazaars are read again, in
+ * whole minutes, 1 to 10 - the item on the desk and the trade you work on,
+ * the top flips, the other possible flips. Everything else (price lists,
+ * every-buyer lists, near misses, the sweep) has what is left.
+ */
+export const FRESH_MIN = 1;
+export const FRESH_MAX = 10;
+export const FRESH_TOP = 20;
+export const FRESH_DEFAULTS = { desk: 1, top: 2, other: 10 };
+/* Reads a minute kept for the rest: price lists, buyers, the summary. */
+export const FRESH_REST_PER_MIN = 15;
+
+/** A minutes setting as a whole number from 1 to 10, else its default. */
+export function freshMinutes(value, fallback) {
+    const n = Math.round(Number(value));
+    return Number.isFinite(n) && n >= FRESH_MIN && n <= FRESH_MAX ? n : fallback;
+}
+
+/** The three groups' re-read times in ms, from Torn Bids' prefs. */
+export function freshnessMs(prefs = {}) {
+    const m = 60 * 1000;
+    return {
+        desk: freshMinutes(prefs.freshDeskMin, FRESH_DEFAULTS.desk) * m,
+        top: freshMinutes(prefs.freshTopMin, FRESH_DEFAULTS.top) * m,
+        other: freshMinutes(prefs.freshOtherMin, FRESH_DEFAULTS.other) * m,
+    };
+}
+
+/**
+ * Can these settings keep up? Reads a minute each group wants, against the
+ * budget less what the rest keeps. When they cannot, the desk and the top
+ * flips still come first (nextW3bRead's order), so the other flips wait:
+ * `otherEvery` is how often they would be read instead, in minutes (null
+ * when there is no room for them at all).
+ *
+ * @param {{desk: number, top: number, other: number}} minutes
+ * @param {{desk: number, top: number, other: number}} counts - items in each group
+ * @param {number} budget - reads a minute in view
+ */
+export function keepsUp(minutes, counts, budget = 60) {
+    const want = counts.desk / minutes.desk + counts.top / minutes.top + counts.other / minutes.other;
+    const room = budget - FRESH_REST_PER_MIN;
+    if (want <= room) return { ok: true, want, otherEvery: minutes.other };
+    const left = room - counts.desk / minutes.desk - counts.top / minutes.top;
+    return { ok: false, want, otherEvery: left >= 1 && counts.other > 0 ? Math.ceil(counts.other / left) : null };
+}

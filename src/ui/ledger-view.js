@@ -481,8 +481,8 @@ export class LedgerView {
         const totals = shown.reduce((a, p) => ({ trades: a.trades + p.trades, received: a.received + p.received, profit: a.profit + p.profit }), { trades: 0, received: 0, profit: 0 });
         const card = lvEl('section', { class: 'lg-card' });
         card.appendChild(lvEl('div', { class: 'lg-cardh' }, [
-            lvEl('h3', { text: 'Traders · most trades first' }),
-            partners.length ? lvEl('span', { class: 'lg-muted' }, [lvCount(shown.length) + ' traders · ', lvEl('b', { text: lvCount(totals.trades) }), ' trades · paid to you ', lvEl('b', { text: formatMoney(Math.round(totals.received)) }), ' · profit ', lvEl('b', { class: totals.profit >= 0 ? 'lg-good' : 'lg-loss', text: lvSigned(totals.profit) })]) : null,
+            lvEl('h3', { text: 'Traders · favourites first, then most trades' }),
+            partners.length ? lvEl('span', { class: 'lg-muted' }, [lvCount(shown.length) + (shown.length === 1 ? ' trader · ' : ' traders · '), lvEl('b', { text: lvCount(totals.trades) }), ' trades · paid to you ', lvEl('b', { text: formatMoney(Math.round(totals.received)) }), ' · profit ', lvEl('b', { class: totals.profit >= 0 ? 'lg-good' : 'lg-loss', text: lvSigned(totals.profit) })]) : null,
         ]));
         if (!partners.length && !black.length) {
             card.appendChild(lvEl('p', { class: 'lg-muted', text: L.busy ? 'Reading your trades…' : 'No finished trades read yet.' }));
@@ -507,7 +507,9 @@ export class LedgerView {
             });
             return a;
         };
-        for (const p of shown) {
+        // Favourites first (3.20), each group in its own order: most trades first.
+        const favFirst = [...shown.filter((p) => isFavourite(p, edits)), ...shown.filter((p) => !isFavourite(p, edits))];
+        for (const p of favFirst) {
             const fav = isFavourite(p, edits);
             const removed = (edits.removed || []).map(String).includes(p.who);
             const added = (edits.added || []).map(String).includes(p.who);
@@ -515,9 +517,9 @@ export class LedgerView {
             const pl = p.list || { checked: 0, paid: 0, short: [] };
             const lastShort = pl.short.length ? pl.short[0] : null;
             const b = { id: p.who, name: p.whoName || 'Player ' + p.who };
-            table.appendChild(lvEl('tr', {}, [
+            table.appendChild(lvEl('tr', { class: fav ? 'lg-favrow' : '' }, [
                 lvEl('td', {}, [lvEl('div', { class: 'lg-who' }, [
-                    lvEl('span', { class: 'lg-who1' }, [fav ? lvEl('span', { class: 'lg-star', text: '★' }) : null, name(p.who, p.whoName), trust(p.who)]),
+                    lvEl('span', { class: 'lg-who1' }, [fav ? lvEl('span', { class: 'lg-star', text: '★' }) : null, name(p.who, p.whoName), trust(p.who), fav ? lvEl('span', { class: 'sp-favtag', text: 'Favourite' }) : null]),
                     favNote ? lvEl('small', { text: favNote }) : null,
                 ])]),
                 lvEl('td', { class: 'lg-num', text: lvCount(p.trades) }),
@@ -774,66 +776,71 @@ export class LedgerView {
 }
 
 export const LEDGER_CSS = `
-.lg { display: flex; flex-direction: column; gap: 16px; padding: 16px 24px 64px; }
-.lg-card { background: var(--card); border: 1px solid var(--cline); border-radius: 12px; padding: 16px; min-width: 0; }
-.lg-card h3 { margin: 0 0 10px; font-size: 11px; letter-spacing: 0.6px; text-transform: uppercase; color: var(--muted); }
-.lg-empty h2 { margin: 0 0 8px; font-size: 20px; color: #fff; }
+.lg { display: flex; flex-direction: column; gap: 16px; padding: 24px 24px 64px; }
+.lg-card { background: var(--surface); border: 1px solid var(--line); border-radius: 16px; padding: 16px; min-width: 0; }
+.lg-card h3 { margin: 0 0 12px; font: 650 11px/1 var(--sans); letter-spacing: 0.09em; text-transform: uppercase; color: var(--text2); display: flex; align-items: center; gap: 8px; }
+.lg-card h3::before { content: ""; width: 3px; height: 12px; border-radius: 2px; background: var(--brand); flex: 0 0 auto; }
+.lg-empty h2 { margin: 0 0 8px; font: 400 20px/1.2 var(--serif); color: var(--text); }
 .lg-empty p { margin: 0 0 10px; max-width: 720px; }
 .lg-muted { color: var(--muted); font-size: 12px; }
 .lg-bad { color: var(--bad); font-size: 12px; }
 .lg-status { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; font-size: 12px; color: var(--muted); }
-.lg-filters { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 12px 16px; padding: 12px 16px; background: var(--rail); border: 1px solid var(--cline); border-radius: 12px; }
+.lg-filters { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 12px 16px; padding: 12px 16px; background: var(--rail); border: 1px solid var(--line); border-radius: 16px; }
 .lg-chips { display: flex; gap: 6px; flex-wrap: wrap; }
+.lg-chips { padding: 3px; gap: 2px; border-radius: 11px; background: var(--input); border: 1px solid var(--line); }
 .lg-chips .sp-chip-f { flex: 0 0 auto; padding: 0 12px; }
 .lg-chips-s .sp-chip-f { height: 26px; font-size: 12px; }
-.lg-f { display: flex; flex-direction: column; gap: 4px; font-size: 11px; letter-spacing: 0.6px; text-transform: uppercase; color: var(--muted); }
-.lg-in { height: 32px; min-width: 150px; padding: 0 10px; border-radius: 9px; border: 1px solid #444; background: #0f0f0f; color: var(--text); font: 13px Arial, Helvetica, sans-serif; text-transform: none; letter-spacing: 0; }
+.lg-f { display: flex; flex-direction: column; gap: 6px; font: 650 11px/1 var(--sans); letter-spacing: 0.08em; text-transform: uppercase; color: var(--faint); }
+.lg-in { height: 34px; min-width: 150px; padding: 0 10px; border-radius: 10px; border: 1px solid var(--line2); background: var(--input); color: var(--text); font: 400 13px "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif; text-transform: none; letter-spacing: 0; }
 .lg-head { display: flex; align-items: baseline; gap: 12px; }
-.lg-head h2 { margin: 0; font-size: 20px; color: #fff; }
+.lg-head h2 { margin: 0; font: 400 20px/1.2 var(--serif); color: var(--text); }
 .lg-tiles { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
-.lg-tile { display: flex; flex-direction: column; gap: 2px; padding: 12px 14px; background: var(--card); border: 1px solid var(--cline); border-radius: 12px; }
-.lg-tile b { font-size: 22px; font-variant-numeric: tabular-nums; color: #fff; }
+.lg-tile { display: flex; flex-direction: column; gap: 4px; padding: 16px; background: var(--surface); border: 1px solid var(--line); border-radius: 16px; }
+.lg-tile b { font: 650 24px/1.15 var(--sans); font-variant-numeric: tabular-nums; color: var(--text); }
 .lg-tile small { color: var(--muted); font-size: 12px; }
-.lg-tl { font-size: 11px; letter-spacing: 0.6px; text-transform: uppercase; color: var(--muted); }
-.lg-tile.lg-good { background: var(--hot); border-color: var(--hot-line); }
+.lg-tl { font: 650 11px/1 var(--sans); letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+.lg-tile.lg-good { background: var(--profit-bg); border-color: var(--profit-line); }
 .lg-tile.lg-good b, .lg-good { color: var(--price); }
-.lg-tile.lg-loss b, .lg-loss { color: #ff8a80; }
+.lg-tile.lg-loss b, .lg-loss { color: var(--bad); }
 .lg-note { margin: 0; font-size: 12px; color: var(--warn); }
-.lg-tabs { display: flex; gap: 6px; }
+.lg-tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--line); }
 .lg-receipts { display: grid; grid-template-columns: repeat(auto-fill, minmax(420px, 1fr)); gap: 12px; }
 .lg-rcpt .lg-cardh b { font-size: 15px; font-variant-numeric: tabular-nums; }
 .lg-rcpt-foot { margin: 8px 0 0; font-size: 12px; }
-.lg-tab { height: 34px; padding: 0 16px; border-radius: 9px; border: 1px solid var(--cline2); background: none; color: var(--muted); font: bold 13px Arial, Helvetica, sans-serif; cursor: pointer; }
-.lg-tab[aria-pressed="true"] { color: #fff; border-color: var(--profit); background: var(--green-bg); }
+.lg-tab { height: 38px; padding: 0 14px; margin-bottom: -1px; border: 0; border-bottom: 2px solid transparent; border-radius: 0; background: none; color: var(--muted); font: 500 13px "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif; cursor: pointer; }
+.lg-tab:hover { color: var(--text); }
+.lg-tab[aria-pressed="true"] { color: var(--text); border-bottom-color: var(--brand); }
 .lg-in.lg-date { min-width: 140px; color-scheme: dark; }
 .lg-in.lg-min { min-width: 110px; width: 120px; }
 .lg-mugline { margin: 0; font-size: 13px; color: var(--muted); display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px; }
-.lg-tile.lg-lossbox { border-color: #6b2b27; background: #2a1917; }
-.lg-tile.lg-lossbox b { color: #ff8a80; }
+.lg-tile.lg-lossbox { border-color: var(--bad-line); background: var(--bad-bg); }
+.lg-tile.lg-lossbox b { color: var(--bad); }
 .lg-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; align-items: start; }
 .lg-cardh { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
 .lg-cardh h3 { margin: 0; }
 .lg-chart { width: 100%; height: auto; max-height: 260px; display: block; }
-.lg-axis { stroke: #555; stroke-width: 1; }
-.lg-lab { fill: var(--muted); font: 11px Arial, Helvetica, sans-serif; }
+.lg-axis { stroke: #454852; stroke-width: 1; }
+.lg-lab { fill: var(--muted); font: 11px "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif; }
 .lg-bar-g { fill: var(--price); background: var(--price); }
-.lg-bar-r { fill: #e05a4f; background: #e05a4f; }
+.lg-bar-r { fill: var(--bad); background: var(--bad); }
 .lg-ibars { display: flex; flex-direction: column; gap: 4px; }
-.lg-ibar { display: grid; grid-template-columns: minmax(0, 160px) minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 4px 6px; border: 0; border-radius: 8px; background: none; color: var(--text); text-align: left; cursor: pointer; font: 13px Arial, Helvetica, sans-serif; }
-.lg-ibar:hover { background: #242424; }
+.lg-ibar { display: grid; grid-template-columns: minmax(0, 160px) minmax(0, 1fr) auto; gap: 10px; align-items: center; padding: 4px 6px; border: 0; border-radius: 8px; background: none; color: var(--text); text-align: left; cursor: pointer; font: 13px "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif; }
+.lg-ibar:hover { background: var(--hover); }
 .lg-iname { overflow-wrap: anywhere; }
-.lg-itrack { height: 10px; border-radius: 5px; background: #262626; overflow: hidden; }
+.lg-itrack { height: 8px; border-radius: 999px; background: var(--raised); overflow: hidden; }
 .lg-itrack i { display: block; height: 100%; border-radius: 5px; }
 .lg-ibar b { font-variant-numeric: tabular-nums; white-space: nowrap; }
-.lg-table { width: 100%; border-collapse: collapse; font-size: 13px; }
-.lg-table th { text-align: left; font-size: 11px; letter-spacing: 0.6px; text-transform: uppercase; color: var(--muted); font-weight: normal; padding: 6px 8px; border-bottom: 1px solid var(--cline); }
-.lg-table td { padding: 7px 8px; border-bottom: 1px solid #262626; vertical-align: top; }
+.lg-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.lg-table th { text-align: left; font: 650 10.5px/1.3 var(--sans); letter-spacing: 0.08em; text-transform: uppercase; color: var(--faint); padding: 8px 10px; border-bottom: 1px solid var(--line); }
+.lg-table td { padding: 9px 10px; border-bottom: 1px solid var(--line); vertical-align: top; color: var(--text2); }
+.lg-table tr:hover td { background: rgba(255, 255, 255, 0.02); }
+.lg-table tr.lg-favrow td:first-child { box-shadow: inset 3px 0 0 var(--fav); }
 .lg-num { text-align: right !important; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .lg-click { cursor: pointer; }
-.lg-click:hover { background: #222; }
-.lg-side { font-size: 11px; font-weight: bold; padding: 2px 6px; border-radius: 8px; background: #262626; color: var(--muted); }
+.lg-click:hover { background: var(--rail); }
+.lg-side { font-size: 11px; font-weight: 650; padding: 2px 7px; border-radius: 999px; background: var(--raised); color: var(--muted); }
 .lg-sell .lg-side { color: var(--price); background: var(--green-bg); }
-.lg-buy .lg-side { color: var(--offer); background: rgba(116, 192, 252, 0.10); }
+.lg-buy .lg-side { color: var(--buy); background: var(--buy-bg); }
 .lg-from { display: block; font-size: 12px; color: var(--muted); }
 .lg-rows td:nth-child(3) { min-width: 160px; }
 @media (max-width: 1100px) { .lg-grid { grid-template-columns: minmax(0, 1fr); } }
@@ -844,26 +851,26 @@ export const LEDGER_CSS = `
     .lg-f { flex: 1 1 140px; }
 }
 .lg-qtym { display: none; color: var(--muted); }
-.lg-short { color: var(--warn); font-weight: bold; }
+.lg-short { color: var(--warn); font-weight: 600; }
 .lg-who { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .lg-who1 { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 8px; }
 .lg-who small { color: var(--muted); font-size: 12px; }
-.lg-tname { color: #fff; font-weight: bold; text-decoration: none; }
+.lg-tname { color: var(--text); font-weight: 600; text-decoration: none; }
 .lg-tname:hover { text-decoration: underline; }
-.lg-star { color: #f2c94c; }
+.lg-star { color: var(--fav); }
 .lg-paid { display: flex; flex-direction: column; gap: 2px; }
-.lg-paid span { white-space: nowrap; font-weight: bold; }
+.lg-paid span { white-space: nowrap; font-weight: 600; }
 .lg-paid small { font-size: 12px; }
 .lg-ctl { text-align: right; white-space: nowrap; }
 .lg-ctl .sp-fav + .sp-blk { margin-left: 6px; }
 .lg-bl td { opacity: 0.55; }
 .lg-bl td.lg-ctl { opacity: 1; }
-.lg-bltag { font-size: 10px; font-weight: bold; letter-spacing: 0.4px; text-transform: uppercase; color: #ff8a80; border: 1px solid #6b2b27; border-radius: 9px; padding: 1px 6px; white-space: nowrap; }
+.lg-bltag { font: 700 10px/16px var(--sans); letter-spacing: 0.05em; text-transform: uppercase; color: var(--bad); background: var(--bad-bg); border-radius: 999px; padding: 0 7px; white-space: nowrap; }
 /* A phone: every buy and sell is a small card of three lines, nothing cut. */
 @media (max-width: 700px) {
     .lg-rows, .lg-rows tbody, .lg-rows tr, .lg-rows td { display: block; }
     .lg-rows tr:first-child { display: none; }
-    .lg-rows tr { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 12px; padding: 8px 0; border-bottom: 1px solid #262626; }
+    .lg-rows tr { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 12px; padding: 8px 0; border-bottom: 1px solid var(--line); }
     .lg-rows td { padding: 0; border: 0; min-width: 0 !important; }
     .lg-rows td:nth-child(3) { grid-column: 1; grid-row: 1; }
     .lg-rows td:nth-child(9) { grid-column: 2; grid-row: 1; }

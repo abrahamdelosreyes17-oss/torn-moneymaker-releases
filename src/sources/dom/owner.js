@@ -9,9 +9,12 @@
  * The same profile link also sits in a (usually hidden) dropdown menu, in a
  * listItem___ wrapper - that one is skipped.
  *
- * Paint-only: a badge is added after the name. Nothing is clicked or read
- * beyond this banner.
+ * Paint-only: a badge floats at the end of the banner's line (3.20: it was
+ * put after the name and pushed the words after it along). Nothing is
+ * clicked or read beyond this banner.
  */
+
+import { placeFloat } from './float.js';
 
 export const OWNER_BADGE_CLASS = 'ttv2-owner';
 
@@ -118,12 +121,18 @@ export function renderOwnerBadge(root, ownerId, presence, now = Date.now()) {
     const link = findOwnerLink(root, ownerId);
     if (!link) return false;
 
-    let badge = link.nextElementSibling;
-    if (!badge || !badge.classList.contains(OWNER_BADGE_CLASS)) {
+    // At the end of the banner, out of its line: the banner keeps its size and its words their places.
+    const banner = link.closest('[class*="messageContent"], .msg') || link.parentElement;
+    let badge = banner.querySelector(':scope > .' + OWNER_BADGE_CLASS);
+    if (!badge) {
+        // One left after the name by an older version goes.
+        const old = link.nextElementSibling;
+        if (old && old.classList.contains(OWNER_BADGE_CLASS)) old.remove();
         badge = link.ownerDocument.createElement('span');
         badge.className = OWNER_BADGE_CLASS;
-        link.insertAdjacentElement('afterend', badge);
+        banner.appendChild(badge);
     }
+    placeFloat(badge);
 
     const { level, text } = presenceText(presence, now);
     if (badge.dataset.level !== level) badge.dataset.level = level;
