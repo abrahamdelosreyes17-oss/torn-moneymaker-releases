@@ -468,6 +468,9 @@ export class SellingPage {
         });
         this.titleEl = spEl('h1', { text: SELLING_PAGE_TITLE });
         this.taglineEl = spEl('span', { class: 'sp-tagline', text: 'Every item, both sides' });
+        // Where you are, after the name (3.20.3): "Torn Bids › Settings". The logo and
+        // the name never move; pressing them, Esc, or Ledger / ⚙ again goes home.
+        this.crumbEl = spEl('span', { class: 'sp-crumb', hidden: '' });
         this.searchEl = spEl('input', {
             type: 'search',
             class: 'sp-search',
@@ -510,9 +513,18 @@ export class SellingPage {
             text: '⚙',
             onclick: () => this.showView(this.view === 'settings' ? 'list' : 'settings'),
         });
+        this.brandEl = spEl('div', { class: 'sp-brand', role: 'button', tabindex: '0', title: 'Torn Bids: home', 'aria-label': 'Torn Bids: home' }, [spEl('span', { class: 'sp-mark', 'aria-hidden': 'true', text: '$' }), this.titleEl, this.crumbEl, this.taglineEl]);
+        this.brandEl.addEventListener('click', () => {
+            if (this.view !== 'list') this.showView('list');
+        });
+        this.brandEl.addEventListener('keydown', (event) => {
+            if (event.key !== 'Enter' && event.key !== ' ') return;
+            event.preventDefault();
+            if (this.view !== 'list') this.showView('list');
+        });
         this.headEl = spEl('header', { class: 'sp-head' }, [
             this.backBtn,
-            spEl('div', { class: 'sp-brand' }, [spEl('span', { class: 'sp-mark', 'aria-hidden': 'true', text: '$' }), this.titleEl, this.taglineEl]),
+            this.brandEl,
             this.searchEl,
             this.catEl,
             this.pillsEl,
@@ -1183,13 +1195,18 @@ export class SellingPage {
         this.settingsEl.hidden = !settings;
         this.ledgerEl.hidden = !ledger;
         this.listEl.hidden = !list;
-        this.backBtn.hidden = list;
+        // The back arrow stays hidden (3.20.3): it pushed the logo along. The logo is the way home.
+        this.backBtn.hidden = true;
         this.refreshBtn.hidden = !list;
         this.searchEl.hidden = !list;
         this.catEl.hidden = !list;
         this.settingsBtn.setAttribute('aria-pressed', String(settings));
         this.ledgerBtn.setAttribute('aria-pressed', String(ledger));
-        this.titleEl.textContent = settings ? 'Settings' : ledger ? 'Torn Ledger' : SELLING_PAGE_TITLE;
+        this.titleEl.textContent = SELLING_PAGE_TITLE;
+        this.crumbEl.textContent = settings ? '› Settings' : ledger ? '› Torn Ledger' : '';
+        this.crumbEl.hidden = list;
+        this.brandEl.title = list ? 'Torn Bids' : 'Back to Torn Bids (Esc)';
+        this.brandEl.classList.toggle('sp-brand-back', !list);
         this.taglineEl.hidden = !list;
         this.renderBanner();
         if (ledger) this.ledgerView.render(this.ledgerArgs());
@@ -2955,6 +2972,10 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .sp-brand { display: flex; align-items: center; gap: 12px; white-space: nowrap; }
 .sp-mark { width: 30px; height: 30px; border-radius: 9px; background: linear-gradient(145deg, #a3adff, #7381ff); color: #0b0e24; display: grid; place-items: center; font: 800 16px var(--sans); }
 .sp-brand h1 { margin: 0; font: 400 21px/1 var(--serif); color: var(--text); letter-spacing: -0.01em; }
+.sp-brand { border-radius: 10px; outline-offset: 4px; }
+.sp-brand.sp-brand-back { cursor: pointer; }
+.sp-brand.sp-brand-back:hover h1 { color: var(--brand); }
+.sp-crumb { font: 400 21px/1 var(--serif); color: var(--muted); letter-spacing: -0.01em; }
 .sp-tagline { color: var(--muted); font-size: 12px; }
 .sp-search { flex: 1; min-width: 0; max-width: 420px; height: 34px; padding: 0 12px; border-radius: 10px; border: 1px solid var(--line2); background: var(--input); color: var(--text); transition: border-color 0.15s var(--ease); }
 .sp-search:focus { border-color: var(--brand); outline: none; }

@@ -1166,7 +1166,10 @@ does is as it was.
   whole page. **3.20.1:** Favourites and Trusted are one row each, as many
   cards as fit across; the rest under *Show all*. **3.20.2:** a plan you
   started with *Plan trade* comes off the desk when you press *Planning*
-  again (until they accept; not marked declined, a pin stays).
+  again (until they accept; not marked declined, a pin stays). **3.20.3:**
+  the logo and the name never move - Settings and the Ledger read "Torn Bids
+  › Settings" after them, and the logo, Esc, or Ledger / ⚙ pressed again goes
+  home (the ← button pushed the header along).
 - **Favourites have a place of their own:** a gold Favourites row above
   Trusted in Your traders, every favourite always shown; a gold edge and a
   Favourite tag on the desk's trader rows and in the Ledger's Traders tab,
