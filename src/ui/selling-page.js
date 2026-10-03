@@ -23,6 +23,7 @@
  */
 
 import { formatMoney, formatAge, parseMoneyInput, readWholeNumber } from '../core/parse.js';
+import { TO_SELL_WHY } from '../core/to-sell.js';
 import { UsageView, USAGE_CSS } from './usage-view.js';
 import { ReportView, REPORT_CSS } from './report-view.js';
 import { TOKENS_CSS } from './styles.js';
@@ -95,7 +96,7 @@ export const ALL_ITEMS_PAGE = 50;
 export const DESK_ROWS = 5;
 
 /** The item list's filters. */
-export const SELL_FILTERS = ['all', 'mine', 'flips'];
+export const SELL_FILTERS = ['all', 'mine', 'flips', 'sell'];
 
 /** Your own bazaar's add page, where you list what you hold. */
 export const MY_BAZAAR_ADD_URL = 'https://www.torn.com/bazaar.php#/add';
@@ -609,7 +610,7 @@ export class SellingPage {
                 this.catLineEl,
                 spEl('div', { class: 'sp-desk' }, [
                     spEl('div', { class: 'sp-col-list' }, [
-                        spEl('div', { class: 'sp-chips', role: 'group', 'aria-label': 'Show items' }, [chip('all', 'All'), chip('mine', 'Mine'), chip('flips', 'Flips')]),
+                        spEl('div', { class: 'sp-chips', role: 'group', 'aria-label': 'Show items' }, [chip('all', 'All'), chip('mine', 'Mine'), chip('flips', 'Flips'), chip('sell', 'To sell')]),
                         this.listBox,
                         this.moreBtn,
                     ]),
@@ -1704,14 +1705,14 @@ export class SellingPage {
                 tabindex: '0',
                 'data-focus': 'left:' + l.itemId,
                 'aria-pressed': String(on),
-                title: 'Left over from the trade with ' + (l.from || 'a trader') + ': show where to sell it',
+                title: (l.why === 'extra' ? 'An extra buy' : 'Left over from the trade with ' + (l.from || 'a trader')) + ': show where to sell it',
             }, [
                 spEl('span', { class: 'sp-fc-top' }, [
                     spEl('span', { class: 'sp-pic sp-pic-s' }, [this.image('left', l.itemId)]),
                     spEl('b', { class: 'sp-iname', text: count(l.qty) + ' ' + l.name }),
                 ]),
                 spEl('span', { class: 'sp-fc-p' + (l.gain !== null ? '' : ' sp-fc-none'), text: l.gain !== null ? signed(l.gain) : '–' }),
-                spEl('small', { text: 'Left over · paid ' + formatMoney(l.each) + ' each' }),
+                spEl('small', { text: (l.why === 'extra' ? 'Extra buy' : 'Left over') + ' · paid ' + formatMoney(l.each) + ' each' }),
                 spEl('small', { class: 'sp-fc-sell' }, l.best ? ['Sell to ', spEl('b', { text: l.best.name }), ' at ' + formatMoney(l.best.price)] : ['No trader buys it now']),
             ]);
             card.addEventListener('click', () => this.select(String(l.itemId)));
@@ -1784,9 +1785,180 @@ export class SellingPage {
 
     /* ------------------------------------------------------------- list */
 
+    /** The tabs over the list: which one is on, and how many each holds. */
+    syncChips() {
+        const s = this.state;
+        for (const key of SELL_FILTERS) {
+            this.chipBtns[key].setAttribute('aria-pressed', String(s.filter === key));
+            this.chipCounts[key].textContent = count((s.counts && s.counts[key]) || 0);
+        }
+        // To sell with something in it: its number in the buying colour (mockup U).
+        this.chipBtns.sell.classList.toggle('sp-chip-has', Boolean(s.counts && s.counts.sell));
+    }
+
+    /** Why a To sell item is in the list: a small tag. */
+    whyTag(why, long = false) {
+        const text = why === 'cancel' && long ? 'Cancelled trade' : TO_SELL_WHY[why] || TO_SELL_WHY.left;
+        return spEl('span', { class: 'sp-why', 'data-why': why, text });
+    }
+
+    /**
+     * The To sell tab's rows (3.21.0, mockup U): what you bought to resell and
+     * still hold - why it is here, what you paid, who pays most now, and
+     * "Sell +$X" or "Waiting". The best profit first.
+     */
+    renderSellList() {
+        const s = this.state;
+        const T = s.toSell || { rows: [], open: false };
+        const rows = T.rows || [];
+        const sig = JSON.stringify(['sell', s.counts, T.open, s.desk && s.desk.itemId, s.prefs.onlineOnly, s.prefs.trustedOnly,
+            rows.map((r) => [r.itemId, r.name, r.qty, r.each, r.why, r.best && [r.best.name, r.best.price], r.gain, r.ready])]);
+        if (sig === this.listSig) return;
+        this.listSig = sig;
+        const shadow = this.root.getRootNode();
+        const active = shadow && shadow.activeElement;
+        const focusKey = active && this.listBox.contains(active) && active.dataset ? active.dataset.focus : null;
+        this.syncChips();
+        this.listBox.textContent = '';
+        this.moreBtn.hidden = true;
+        if (!rows.length) this.listBox.appendChild(spEl('div', { class: 'sp-empty', text: 'Nothing to sell. What you bought for a trade that was cancelled, what a trader did not take, and extra buys wait here.' }));
+        for (const r of rows) {
+            // With the board beside it no row is "the one on the desk".
+            const on = !T.open && Boolean(s.desk && s.desk.itemId === r.itemId);
+            const line = 'Paid ' + formatMoney(r.each) + ' · ' + (r.best ? r.best.name + ' pays ' + formatMoney(r.best.price) : this.noTraderText(null).toLowerCase());
+            this.listBox.appendChild(spEl('div', {
+                class: 'sp-it sp-ts' + (on ? ' sp-sel' : '') + (r.ready ? '' : ' sp-ts-wait'),
+                role: 'button',
+                tabindex: '0',
+                'aria-pressed': String(on),
+                'data-focus': 'sell:' + r.itemId,
+                title: r.ready ? 'Show it on the desk' : 'Waiting for a trader who pays more than you paid: show it on the desk',
+                onclick: () => this.select(r.itemId),
+                onkeydown: (event) => {
+                    if (event.target !== event.currentTarget || (event.key !== 'Enter' && event.key !== ' ')) return;
+                    event.preventDefault();
+                    this.select(r.itemId);
+                },
+            }, [
+                spEl('span', { class: 'sp-pic sp-pic-s' }, [this.image('sell', r.itemId)]),
+                spEl('span', { class: 'sp-ts-top' }, [spEl('b', { class: 'sp-iname', text: count(r.qty) + ' ' + r.name }), this.whyTag(r.why)]),
+                r.ready ? spEl('span', { class: 'sp-badge sp-badge-tosell', text: 'Sell ' + signed(r.gain) }) : spEl('span', { class: 'sp-badge sp-badge-wait', text: 'Waiting' }),
+                spEl('small', { text: line }),
+            ]));
+        }
+        if (focusKey) {
+            const again = [...this.listBox.querySelectorAll('[data-focus]')].find((n) => n.dataset.focus === focusKey);
+            if (again) again.focus({ preventScroll: true });
+        }
+    }
+
+    /**
+     * The To sell board (3.21.0, mockup U, B): beside the list while its tab is
+     * on - everything to sell under the trader who pays most for it now, one
+     * Plan trade per trader (their trade, with these as its "yours" lines), and
+     * what has no profit yet waiting at the bottom.
+     */
+    renderBoard() {
+        const s = this.state;
+        const T = s.toSell;
+        const box = this.deskEl;
+        const statusOf = (b) => {
+            const st = b && b.id && s.statuses ? s.statuses.get(String(b.id)) : null;
+            return st ? st.level + st.text : '';
+        };
+        const rowSig = (r) => [r.itemId, r.name, r.qty, r.each, r.why, r.best && [r.best.name, r.best.price], r.gain, r.short];
+        const sig = JSON.stringify(['board', T.groups.map((g) => [g.key, g.trader.name, statusOf(g.trader), g.trader.trust ? g.trader.trust.level + g.trader.trust.score : '', g.gain, g.rows.map(rowSig)]), T.waiting.map(rowSig), s.prefs.onlineOnly, s.prefs.trustedOnly]);
+        if (sig === this.deskSig) return;
+        const shadow = this.root.getRootNode();
+        const active = shadow && shadow.activeElement;
+        const keep = active && box.contains(active) && active.dataset ? active.dataset.focus : null;
+        this.deskSig = sig;
+        box.textContent = '';
+        const total = T.rows.length;
+        box.appendChild(spEl('div', { class: 'sp-wsh sp-bd-top' }, [
+            spEl('span', { class: 'sp-wst' }, [
+                spEl('span', { class: 'sp-wsname', text: 'To sell' }),
+                spEl('small', { text: total ? count(total) + (total === 1 ? ' item' : ' items') + ' you bought to resell and still hold' : 'What you bought to resell and still hold' }),
+            ]),
+        ]));
+        if (!total) {
+            box.appendChild(spEl('p', { class: 'sp-note', text: 'Nothing to sell. What you bought for a trade that was cancelled, what a trader did not take, and extra buys wait here until a trader pays more than you paid.' }));
+            return;
+        }
+        const itemRow = (r, right) => {
+            const el = spEl('div', { class: 'sp-bd-r', role: 'button', tabindex: '0', 'data-focus': 'board:' + r.itemId, title: 'Show it on the desk', onclick: () => this.select(r.itemId) }, [
+                spEl('span', { class: 'sp-pic sp-pic-s' }, [this.image('board', r.itemId)]),
+                spEl('b', { class: 'sp-iname', text: count(r.qty) + ' ' + r.name }),
+                this.whyTag(r.why, true),
+                spEl('span', { class: 'sp-sp' }),
+                ...right,
+            ]);
+            el.addEventListener('keydown', (event) => {
+                if (event.target !== el || (event.key !== 'Enter' && event.key !== ' ')) return;
+                event.preventDefault();
+                this.select(r.itemId);
+            });
+            return el;
+        };
+        for (const g of T.groups) {
+            const b = g.trader;
+            const group = spEl('div', { class: 'sp-bd-g sp-bd-ready' }, [
+                spEl('div', { class: 'sp-bd-h' }, [
+                    spEl('b', { class: 'sp-bd-who', text: b.name }),
+                    this.trustBadge(b),
+                    this.status(b),
+                    spEl('small', { text: count(g.rows.length) + (g.rows.length === 1 ? ' item' : ' items') }),
+                    spEl('span', { class: 'sp-sp' }),
+                    spEl('span', { class: 'sp-bd-gain', text: signed(g.gain) }),
+                    spEl('button', {
+                        type: 'button',
+                        class: 'sp-btn sp-primary',
+                        'data-focus': 'board:plan:' + g.key,
+                        title: 'Put the trade with ' + b.name + ' on the desk: these items go in as yours',
+                        text: 'Plan trade',
+                        onclick: () => this.h.onTradePick && this.h.onTradePick(g.rows[0].itemId, g.key),
+                    }),
+                ]),
+            ]);
+            for (const r of g.rows) {
+                group.appendChild(itemRow(r, [
+                    spEl('small', {}, ['Paid ', spEl('b', { text: formatMoney(r.each) }), ' each · they pay ', spEl('b', { text: formatMoney(r.best.price) })]),
+                    spEl('span', { class: 'sp-bd-gain', text: signed(r.gain) }),
+                ]));
+            }
+            box.appendChild(group);
+        }
+        if (T.waiting.length) {
+            const group = spEl('div', { class: 'sp-bd-g sp-bd-wait' }, [
+                spEl('div', { class: 'sp-bd-h' }, [
+                    spEl('b', { class: 'sp-bd-who', text: 'Waiting for a price' }),
+                    spEl('small', { text: count(T.waiting.length) + (T.waiting.length === 1 ? ' item' : ' items') }),
+                ]),
+            ]);
+            for (const r of T.waiting) {
+                group.appendChild(itemRow(r, [
+                    r.best
+                        ? spEl('small', {}, ['Paid ', spEl('b', { text: formatMoney(r.each) }), ' each · best now ', spEl('b', { text: formatMoney(r.best.price) }), ' (' + r.best.name + ')'])
+                        : spEl('small', {}, ['Paid ', spEl('b', { text: formatMoney(r.each) }), ' each · ' + this.noTraderText(null).toLowerCase()]),
+                    spEl('span', { class: 'sp-bd-short', text: r.best && r.short > 0 ? formatMoney(r.short) + ' short each' : 'Waiting' }),
+                ]));
+            }
+            box.appendChild(group);
+        }
+        box.appendChild(spEl('p', { class: 'sp-note', text: 'A row leaves by itself when your Ledger shows it sold or you no longer hold it.' }));
+        if (keep) {
+            const again = [...box.querySelectorAll('[data-focus]')].find((n) => n.dataset.focus === keep);
+            if (again) again.focus({ preventScroll: true });
+        }
+    }
+
     renderList() {
         const s = this.state;
         const info = s.info || {};
+        if (s.filter === 'sell') {
+            this.renderSellList();
+            return;
+        }
         // A pinned item is listed once: its row moves to the top, pinned (the
         // owner: "it created something doubled, instead of just pinning it").
         const pinnedItems = new Set((s.pinned || []).map((p) => p.itemId));
@@ -1813,10 +1985,7 @@ export class SellingPage {
         const active = shadow && shadow.activeElement;
         const focusKey = active && this.listBox.contains(active) && active.dataset ? active.dataset.focus : null;
 
-        for (const key of SELL_FILTERS) {
-            this.chipBtns[key].setAttribute('aria-pressed', String(s.filter === key));
-            this.chipCounts[key].textContent = count(s.counts[key] || 0);
-        }
+        this.syncChips();
 
         this.listBox.textContent = '';
         // Pinned trades first, whatever the filter: the main flip, the trader, the profit now.
@@ -1964,8 +2133,15 @@ export class SellingPage {
      *   where: {options, best, gain}|null, market: {state, lowest}}
      */
     renderDesk() {
+        // The To sell tab: its board, until a row is picked or a trade planned.
+        if (this.state.toSell && this.state.toSell.open) {
+            this.renderBoard();
+            return;
+        }
         const d = this.state.desk;
         const box = this.deskEl;
+        // On the To sell tab the desk has a way back to the board.
+        const fromSell = this.state.filter === 'sell';
         if (d && this.showAll.item !== d.itemId) this.showAll = { item: d.itemId, buyers: false, sellers: false, hidden: false };
         const statusOf = (b) => {
             const st = b.id && this.state.statuses ? this.state.statuses.get(String(b.id)) : null;
@@ -1984,9 +2160,9 @@ export class SellingPage {
                 d.sellers.state, d.sellers.error,
                 d.sellers.rows.map((r) => [r.sellerId, r.sellerName, r.price, r.qty, r.stale, Math.floor((now - (r.dataAt || 0)) / 60000)]),
                 d.plan, d.where, d.market, d.trade,
-                this.showAll, p.onlineOnly, p.trustedOnly, p.cash, Boolean(info.knownTraders), info.tradersLoading,
+                this.showAll, p.onlineOnly, p.trustedOnly, p.cash, Boolean(info.knownTraders), info.tradersLoading, fromSell,
             ])
-            : JSON.stringify([info.hasKey, info.loading, Boolean(info.bazaarsAt), info.tradersLoading, this.state.counts]);
+            : JSON.stringify([info.hasKey, info.loading, Boolean(info.bazaarsAt), info.tradersLoading, this.state.counts, fromSell]);
         if (sig === this.deskSig) return;
 
         const shadow = this.root.getRootNode();
@@ -1999,6 +2175,9 @@ export class SellingPage {
         const keep = active && box.contains(active) && active.dataset ? active.dataset.focus : null;
 
         box.textContent = '';
+        if (fromSell) {
+            box.appendChild(spEl('button', { type: 'button', class: 'sp-link sp-bd-back', 'data-focus': 'board:back', title: 'Back to everything to sell, by trader', text: '← To sell', onclick: () => this.h.onFilter && this.h.onFilter('sell') }));
+        }
         if (!d) {
             const none = !(this.state.counts && this.state.counts.all);
             box.appendChild(spEl('p', { class: 'sp-note', text: none ? (info.tradersLoading ? 'Looking for traders…' : 'Nothing to show yet.') : 'Pick an item.' }));
@@ -2535,7 +2714,8 @@ export class SellingPage {
         }
 
         // Yours: what they pay most for, minus what you keep.
-        if (c.held.length) card.appendChild(spEl('div', { class: 'sp-tsec', text: 'Yours · ' + b.name + ' pays the most' }));
+        // Since 3.21.0 only what you bought to resell (the To sell tab), where this trader pays more than you paid.
+        if (c.held.length) card.appendChild(spEl('div', { class: 'sp-tsec', text: 'Yours to sell · ' + b.name + ' pays more than you paid' }));
         for (const r of c.held) {
             const give = (n) => this.h.onTradeHeld && this.h.onTradeHeld(r.itemId, r.held, n, c.key);
             const on = r.units > 0;
@@ -3078,11 +3258,38 @@ a.sp-btn { display: inline-flex; align-items: center; text-decoration: none; }
 /* the desk: every item on the left, the one picked on the right */
 .sp-desk { display: grid; grid-template-columns: 340px minmax(0, 1fr); gap: 16px; align-items: start; }
 .sp-col-list { min-width: 0; display: flex; flex-direction: column; gap: 6px; }
-.sp-chips { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 2px; padding: 3px; margin-bottom: 4px; border-radius: 11px; background: var(--input); border: 1px solid var(--line); }
+.sp-chips { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 2px; padding: 3px; margin-bottom: 4px; border-radius: 11px; background: var(--input); border: 1px solid var(--line); }
 .sp-chip-f { height: 28px; border-radius: 8px; border: 0; background: none; color: var(--muted); font-weight: 500; cursor: pointer; white-space: nowrap; transition: background-color 0.15s var(--ease); }
 .sp-chip-f small { font-weight: 400; font-size: 12px; margin-left: 5px; color: var(--faint); font-variant-numeric: tabular-nums; }
 .sp-chip-f:hover { color: var(--text); }
 .sp-chip-f[aria-pressed="true"] { color: var(--text); background: var(--raised); box-shadow: 0 1px 2px rgba(0, 0, 0, 0.3); }
+/* To sell (3.21.0, mockup U): the tab, its rows, its board */
+.sp-chip-f.sp-chip-has small { color: var(--buy); font-weight: 600; }
+.sp-why { font: 600 11px/18px var(--sans); height: 18px; padding: 0 7px; border-radius: 999px; white-space: nowrap; color: var(--muted); background: rgba(255, 255, 255, 0.07); flex: 0 0 auto; }
+.sp-why[data-why="cancel"] { color: var(--warn); background: var(--warn-bg); }
+.sp-why[data-why="extra"] { color: var(--buy); background: var(--buy-bg); }
+.sp-it.sp-ts { grid-template-columns: 44px minmax(0, 1fr) auto; }
+.sp-ts-top { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 6px; min-width: 0; }
+.sp-it.sp-ts.sp-sel { border-color: var(--buy-line); background: var(--buy-bg); }
+.sp-ts-wait .sp-iname { color: var(--text2); }
+.sp-badge-tosell { color: var(--buy); background: var(--buy-bg); align-self: start; }
+.sp-badge-wait { color: var(--warn); background: var(--warn-bg); font-weight: 600; align-self: start; }
+.sp-bd-top { margin-bottom: 16px; }
+.sp-bd-g { border: 1px solid var(--line); border-radius: 14px; padding: 10px; margin-bottom: 10px; background: var(--surface); }
+.sp-bd-g.sp-bd-ready { border-color: var(--buy-line); }
+.sp-bd-g.sp-bd-wait { background: transparent; }
+.sp-bd-h { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; padding: 2px 2px 10px; }
+.sp-bd-who { font-size: 14px; }
+.sp-bd-wait .sp-bd-who { color: var(--muted); font-weight: 600; }
+.sp-bd-h small, .sp-bd-r small { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.sp-bd-r small b { color: var(--text); font-weight: 600; }
+.sp-bd-gain { font: 650 14px/1.2 var(--sans); color: var(--profit); font-variant-numeric: tabular-nums; white-space: nowrap; }
+.sp-bd-short { font: 600 13px/1.2 var(--sans); color: var(--warn); white-space: nowrap; }
+.sp-bd-r { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; padding: 9px 10px; margin-bottom: 4px; border-radius: 10px; background: var(--rail); border: 1px solid transparent; cursor: pointer; }
+.sp-bd-r:last-child { margin-bottom: 0; }
+.sp-bd-r:hover { border-color: var(--line); }
+.sp-bd-r .sp-iname { font-weight: 600; }
+.sp-bd-back { display: inline-block; margin: -8px 0 12px; font-size: 13px; }
 .sp-it { display: grid; grid-template-columns: 44px minmax(0, 1fr) auto; gap: 2px 12px; align-items: center; padding: 10px 12px; margin-bottom: 0; border-radius: 12px; border: 1px solid transparent; cursor: pointer; transition: background-color 0.15s var(--ease); }
 .sp-it:hover { background: var(--surface); }
 .sp-it.sp-sel { background: var(--surface); border-color: var(--profit-line); }

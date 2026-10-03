@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      3.20.6
+// @version      3.21.0
 // @description  Finds Bazaar and Item Market listings below NPC / market value - on the page you are viewing, and live from the Torn API and TornW3B - ranked by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -42,7 +42,7 @@
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '3.20.6';
+    const TTV2_BUILD_VERSION = '3.21.0';
 
     /* ===== src/platform/gm.js ===== */
     /*
@@ -1414,7 +1414,10 @@
         }
         for (const r of chosen.held || []) {
             if (!(r.units > 0)) continue;
-            items.push({ line: 'yours:' + r.itemId, itemId: String(r.itemId), name: r.name, units: r.units, bid: r.bid, kind: 'yours', sent: false, steps: [] });
+            const line = { line: 'yours:' + r.itemId, itemId: String(r.itemId), name: r.name, units: r.units, bid: r.bid, kind: 'yours', sent: false, steps: [] };
+            // A To sell item (3.21.0): what you paid for it, so the trade's profit counts it.
+            if (Number.isFinite(Number(r.each)) && r.each !== null && r.each !== undefined) line.each = Number(r.each);
+            items.push(line);
         }
         return {
             key: chosen.key,
@@ -1424,8 +1427,13 @@
             items,
             cost: items.reduce((a, i) => a + i.steps.reduce((b, st) => b + st.qty * st.price, 0), 0),
             pays: items.reduce((a, i) => a + i.units * i.bid, 0),
-            profit: items.reduce((a, i) => a + (i.kind === 'flip' ? i.steps.reduce((b, st) => b + st.qty * (i.bid - st.price), 0) : 0), 0),
+            profit: items.reduce((a, i) => a + (i.kind === 'flip' ? i.steps.reduce((b, st) => b + st.qty * (i.bid - st.price), 0) : yoursProfit(i, i.units)), 0),
         };
+    }
+
+    /** What a "yours" line makes: only when it says what you paid (a To sell item); your other items make nothing to count. */
+    function yoursProfit(line, units) {
+        return line && line.kind === 'yours' && Number.isFinite(line.each) ? units * (line.bid - line.each) : 0;
     }
 
     /** Stored accepted trades still worth keeping: {key: trade}, newest kept first. */
@@ -1876,7 +1884,7 @@
         for (const i of (trade && trade.items) || []) {
             const n = Math.min(sendUnits(i), Math.max(0, Math.floor(Number(i.left) || 0)));
             if (i.kind !== 'flip' || !(n > 0)) continue;
-            out.push({ itemId: String(i.itemId), name: i.name, qty: n, each: Math.round(costEach(i)), from: trade.trader ? trade.trader.name : null, at: now });
+            out.push({ itemId: String(i.itemId), name: i.name, qty: n, each: Math.round(costEach(i)), from: trade.trader ? trade.trader.name : null, at: now, why: 'left' });
         }
         return out;
     }
@@ -1895,10 +1903,10 @@
         for (const i of (trade && trade.items) || []) {
             if (i.kind !== 'flip' || !(i.steps || []).some(stepDone)) continue;
             const n = sendUnits(i);
-            if (n > 0) out.push({ itemId: String(i.itemId), name: i.name, qty: n, each: Math.round(costEach(i)), from, at: now, ...stamp });
+            if (n > 0) out.push({ itemId: String(i.itemId), name: i.name, qty: n, each: Math.round(costEach(i)), from, at: now, why: 'cancel', ...stamp });
         }
         for (const x of (trade && trade.extra) || []) {
-            if (extraForTrade(x)) out.push({ itemId: String(x.itemId), name: x.name, qty: Number(x.qty), each: Math.round(Number(x.price) || 0), from, at: now, ...stamp });
+            if (extraForTrade(x)) out.push({ itemId: String(x.itemId), name: x.name, qty: Number(x.qty), each: Math.round(Number(x.price) || 0), from, at: now, why: 'cancel', ...stamp });
         }
         return addLeftovers([], out);
     }
@@ -1917,6 +1925,8 @@
                 same.qty = qty;
                 same.at = Math.max(Number(same.at) || 0, Number(a.at) || 0);
                 same.from = a.from || same.from;
+                // Why it is To sell (3.21.0): the newer one's word.
+                if (a.why) same.why = a.why;
                 if (since) same.since = since;
             } else {
                 out.push({ ...a });
@@ -1941,7 +1951,10 @@
                 if (st.skipped && !st.bought) continue;
                 cost += (st.boughtQty > 0 ? st.boughtQty : st.qty) * st.price;
             }
-            if (i.kind !== 'flip') continue;
+            if (i.kind !== 'flip') {
+                profit += yoursProfit(i, taken);
+                continue;
+            }
             // Not bought yet: planned prices; bought: what it cost.
             const started = (i.steps || []).some(stepDone);
             const each = started ? costEach(i) : (i.steps || []).reduce((a, st) => a + st.qty * st.price, 0) / Math.max(1, (i.steps || []).reduce((a, st) => a + st.qty, 0));
@@ -2296,7 +2309,7 @@
         const out = [];
         for (const b of bought.values()) {
             const left = b.qty - Math.min(b.qty, given.get(b.itemId) || 0);
-            if (left > 0) out.push({ itemId: b.itemId, name: b.name, qty: left, each: Math.round(b.cost / b.qty), from, at: now, ...stamp });
+            if (left > 0) out.push({ itemId: b.itemId, name: b.name, qty: left, each: Math.round(b.cost / b.qty), from, at: now, why: 'left', ...stamp });
         }
         return out;
     }
@@ -5602,11 +5615,16 @@
             const refused = Math.max(0, Math.floor(Number(h.refused) || 0));
             const spare = kept === 'all' ? 0 : Math.max(0, have - kept - refused);
             const e = edits['held:' + id] || {};
-            const want = e.qty > 0 ? Math.min(spare, Math.floor(e.qty)) : Math.min(spare, capOf(id));
+            // `all` (3.21.0, a To sell item): every one you hold, not the "normal amount" of its kind.
+            const want = e.qty > 0 ? Math.min(spare, Math.floor(e.qty)) : h.all ? spare : Math.min(spare, capOf(id));
             const units = Math.max(0, Math.min(want, Math.floor(payLeftRef.left / bid)));
             if (units < want) capped = true;
             payLeftRef.left -= units * bid;
-            rows.push({ itemId: id, bid, held: have, units, kept, spare, kind: kindName(id) });
+            const row = { itemId: id, bid, held: have, units, kept, spare, kind: kindName(id) };
+            // What you paid for it, when known (a To sell item): the line's profit is counted from it.
+            if (Number(h.each) >= 0 && h.each !== undefined && h.each !== null) row.each = Number(h.each);
+            if (h.all) row.all = true;
+            rows.push(row);
         }
         return { rows, capped };
     }
@@ -10456,6 +10474,147 @@
             out.set(String(id), { at, triedAt: at, rows, error: null, loading: false, sweep: Boolean(b.sweep), kept: true });
         }
         return out;
+    }
+
+    /* ===== src/core/to-sell.js ===== */
+    /*
+     * To sell (3.21.0; the owner, 2026-10-03: "can we have a tab (clean one, lets
+     * not crowd what we have) that awaits a profitable sell? ... so it sees what
+     * the failed trade holds and we can still sell on profit"; mockup U, B).
+     *
+     * What you bought to resell and still hold - a cancelled trade's items, what
+     * a trader did not take, a blue-tagged buy made outside any trade - is one
+     * list (the leftovers, core/accepted.js), each with why it is there. This is
+     * that list as the tab shows it, the board that groups it by who pays most,
+     * and the lines it puts into a trade. Pure - no DOM, no network.
+     */
+
+    /** Why an item is in the list, in the page's words. A row kept before 3.21 does not say: "Not taken". */
+    const TO_SELL_WHY = { cancel: 'Cancelled', left: 'Not taken', extra: 'Extra buy' };
+
+    function toSellWhy(why) {
+        return Object.prototype.hasOwnProperty.call(TO_SELL_WHY, why) ? why : 'left';
+    }
+
+    function sameTrader(name, from) {
+        return Boolean(name && from) && String(name).toLowerCase() === String(from).toLowerCase();
+    }
+
+    /**
+     * The To sell rows, the ones with a profit first (most first), then the ones
+     * waiting (the nearest to a profit first), then the ones nobody buys.
+     *
+     * The buyer is the one who pays most now, never the trader who did not take
+     * it (`from`). `ready`: they pay enough over what you paid (the same margin
+     * rule as a flip - `enough(each profit, what you paid)`).
+     *
+     * @param {Array<{itemId, name, qty, each, from, why}>} leftovers
+     * @param {object} o
+     * @param {function} o.buyersOf - (itemId) => buyers, best first ({id, name, price, trust})
+     * @param {function} [o.keyOf] - (buyer) => the trade key of a trader
+     * @param {function} [o.enough] - (profitEach, paidEach) => boolean
+     */
+    function toSellRows(leftovers, { buyersOf, keyOf = (b) => (b.id ? 'id:' + b.id : 'name:' + String(b.name).toLowerCase()), enough = (profit) => profit > 0 } = {}) {
+        const rows = [];
+        for (const l of leftovers || []) {
+            if (!l || !l.itemId || !(Number(l.qty) > 0)) continue;
+            const each = Number(l.each) || 0;
+            const top = (buyersOf(String(l.itemId)) || []).find((b) => b && Number(b.price) > 0 && !sameTrader(b.name, l.from)) || null;
+            const per = top ? Number(top.price) - each : null;
+            const ready = top !== null && per > 0 && Boolean(enough(per, each));
+            rows.push({
+                itemId: String(l.itemId),
+                name: l.name || 'Item ' + l.itemId,
+                qty: Number(l.qty),
+                each,
+                why: toSellWhy(l.why),
+                from: l.from || null,
+                best: top ? { key: keyOf(top), id: top.id ? String(top.id) : null, name: top.name, price: Number(top.price), trust: top.trust || null } : null,
+                gain: top ? per * Number(l.qty) : null,
+                ready,
+                // Waiting: how far their price is from a profit, each (0 or less: over what you paid, but under the margin).
+                short: top && !ready ? each - Number(top.price) : null,
+            });
+        }
+        const rank = (r) => (r.ready ? 0 : r.best ? 1 : 2);
+        return rows.sort((a, b) => rank(a) - rank(b) || (a.ready ? b.gain - a.gain : (a.short ?? 0) - (b.short ?? 0)) || String(a.name).localeCompare(String(b.name)));
+    }
+
+    /**
+     * The board: the rows with a profit under the trader who pays most for each
+     * (the biggest total first), and the ones waiting.
+     *
+     * @returns {{groups: Array<{key, trader, rows, gain}>, waiting: Array}}
+     */
+    function toSellBoard(rows) {
+        const byKey = new Map();
+        const waiting = [];
+        for (const r of rows || []) {
+            if (!r.ready || !r.best) {
+                waiting.push(r);
+                continue;
+            }
+            let g = byKey.get(r.best.key);
+            if (!g) byKey.set(r.best.key, (g = { key: r.best.key, trader: r.best, rows: [], gain: 0 }));
+            g.rows.push(r);
+            g.gain += r.gain;
+        }
+        const groups = [...byKey.values()].sort((a, b) => b.gain - a.gain || String(a.trader.name).localeCompare(String(b.trader.name)));
+        return { groups, waiting };
+    }
+
+    /**
+     * What goes into a trade with each trader as "yours": every To sell item they
+     * pay enough for, all of it (`all`: not the "normal amount" an extra is cut
+     * to) - never offered back to the trader who did not take it. Your other
+     * items stay out of every trade (the owner, 2026-09-28: "my own items as
+     * cover, omit it"; 2026-10-03: back on "for resell items only").
+     *
+     * @returns {Map<string, Array<{itemId, bid, held, each, all: true}>>} trade key -> lines
+     */
+    function toSellHeld(leftovers, { buyersOf, keyOf = (b) => (b.id ? 'id:' + b.id : 'name:' + String(b.name).toLowerCase()), enough = (profit) => profit > 0 } = {}) {
+        const out = new Map();
+        for (const l of leftovers || []) {
+            if (!l || !l.itemId || !(Number(l.qty) > 0)) continue;
+            const each = Number(l.each) || 0;
+            for (const b of buyersOf(String(l.itemId)) || []) {
+                if (!b || !(Number(b.price) > 0) || sameTrader(b.name, l.from)) continue;
+                const per = Number(b.price) - each;
+                if (!(per > 0) || !enough(per, each)) continue;
+                const key = keyOf(b);
+                if (!out.has(key)) out.set(key, []);
+                // One line per item per trader (a trader listed twice for it: their first, the better, price).
+                if (out.get(key).some((x) => x.itemId === String(l.itemId))) continue;
+                out.get(key).push({ itemId: String(l.itemId), bid: Number(b.price), held: Number(l.qty), each, all: true });
+            }
+        }
+        return out;
+    }
+
+    /**
+     * A trade with "yours" lines went through: what they took of each comes off
+     * the list. What stays counts from now - the trade that took the rest is not
+     * held against it again when the Ledger reads it (leftoversAfterSales).
+     * The list itself when the trade had none of yours.
+     */
+    function afterYoursSent(leftovers, trade, now = Date.now()) {
+        const out = (Array.isArray(leftovers) ? leftovers : []).map((l) => ({ ...l }));
+        let changed = false;
+        for (const i of (trade && trade.items) || []) {
+            if (!i || i.kind !== 'yours') continue;
+            const taken = Math.max(0, (Number(i.units) || 0) - Math.max(0, Math.floor(Number(i.left) || 0)));
+            const row = out.find((l) => String(l.itemId) === String(i.itemId));
+            if (!row || !(taken > 0)) continue;
+            row.qty = Math.max(0, row.qty - taken);
+            row.since = now;
+            changed = true;
+        }
+        return changed ? out.filter((l) => l.qty > 0) : leftovers;
+    }
+
+    /** What a trade's "yours" lines make over what you paid: units x (their price - yours). */
+    function heldGain(rows) {
+        return (rows || []).reduce((a, r) => a + (Number(r.units) > 0 && Number(r.each) >= 0 ? r.units * (Number(r.bid) - (Number(r.each) || 0)) : 0), 0);
     }
 
     /* ===== src/core/status.js ===== */
@@ -19556,6 +19715,7 @@
 
 
 
+
     const SELLING_PAGE_TITLE = 'Torn Bids';
 
     const SELLING_PAGE_DEFAULTS = {
@@ -19615,7 +19775,7 @@
     const DESK_ROWS = 5;
 
     /** The item list's filters. */
-    const SELL_FILTERS = ['all', 'mine', 'flips'];
+    const SELL_FILTERS = ['all', 'mine', 'flips', 'sell'];
 
     /** Your own bazaar's add page, where you list what you hold. */
     const MY_BAZAAR_ADD_URL = 'https://www.torn.com/bazaar.php#/add';
@@ -20129,7 +20289,7 @@
                     this.catLineEl,
                     spEl('div', { class: 'sp-desk' }, [
                         spEl('div', { class: 'sp-col-list' }, [
-                            spEl('div', { class: 'sp-chips', role: 'group', 'aria-label': 'Show items' }, [chip('all', 'All'), chip('mine', 'Mine'), chip('flips', 'Flips')]),
+                            spEl('div', { class: 'sp-chips', role: 'group', 'aria-label': 'Show items' }, [chip('all', 'All'), chip('mine', 'Mine'), chip('flips', 'Flips'), chip('sell', 'To sell')]),
                             this.listBox,
                             this.moreBtn,
                         ]),
@@ -21224,14 +21384,14 @@
                     tabindex: '0',
                     'data-focus': 'left:' + l.itemId,
                     'aria-pressed': String(on),
-                    title: 'Left over from the trade with ' + (l.from || 'a trader') + ': show where to sell it',
+                    title: (l.why === 'extra' ? 'An extra buy' : 'Left over from the trade with ' + (l.from || 'a trader')) + ': show where to sell it',
                 }, [
                     spEl('span', { class: 'sp-fc-top' }, [
                         spEl('span', { class: 'sp-pic sp-pic-s' }, [this.image('left', l.itemId)]),
                         spEl('b', { class: 'sp-iname', text: count(l.qty) + ' ' + l.name }),
                     ]),
                     spEl('span', { class: 'sp-fc-p' + (l.gain !== null ? '' : ' sp-fc-none'), text: l.gain !== null ? signed(l.gain) : '–' }),
-                    spEl('small', { text: 'Left over · paid ' + formatMoney(l.each) + ' each' }),
+                    spEl('small', { text: (l.why === 'extra' ? 'Extra buy' : 'Left over') + ' · paid ' + formatMoney(l.each) + ' each' }),
                     spEl('small', { class: 'sp-fc-sell' }, l.best ? ['Sell to ', spEl('b', { text: l.best.name }), ' at ' + formatMoney(l.best.price)] : ['No trader buys it now']),
                 ]);
                 card.addEventListener('click', () => this.select(String(l.itemId)));
@@ -21304,9 +21464,180 @@
 
         /* ------------------------------------------------------------- list */
 
+        /** The tabs over the list: which one is on, and how many each holds. */
+        syncChips() {
+            const s = this.state;
+            for (const key of SELL_FILTERS) {
+                this.chipBtns[key].setAttribute('aria-pressed', String(s.filter === key));
+                this.chipCounts[key].textContent = count((s.counts && s.counts[key]) || 0);
+            }
+            // To sell with something in it: its number in the buying colour (mockup U).
+            this.chipBtns.sell.classList.toggle('sp-chip-has', Boolean(s.counts && s.counts.sell));
+        }
+
+        /** Why a To sell item is in the list: a small tag. */
+        whyTag(why, long = false) {
+            const text = why === 'cancel' && long ? 'Cancelled trade' : TO_SELL_WHY[why] || TO_SELL_WHY.left;
+            return spEl('span', { class: 'sp-why', 'data-why': why, text });
+        }
+
+        /**
+         * The To sell tab's rows (3.21.0, mockup U): what you bought to resell and
+         * still hold - why it is here, what you paid, who pays most now, and
+         * "Sell +$X" or "Waiting". The best profit first.
+         */
+        renderSellList() {
+            const s = this.state;
+            const T = s.toSell || { rows: [], open: false };
+            const rows = T.rows || [];
+            const sig = JSON.stringify(['sell', s.counts, T.open, s.desk && s.desk.itemId, s.prefs.onlineOnly, s.prefs.trustedOnly,
+                rows.map((r) => [r.itemId, r.name, r.qty, r.each, r.why, r.best && [r.best.name, r.best.price], r.gain, r.ready])]);
+            if (sig === this.listSig) return;
+            this.listSig = sig;
+            const shadow = this.root.getRootNode();
+            const active = shadow && shadow.activeElement;
+            const focusKey = active && this.listBox.contains(active) && active.dataset ? active.dataset.focus : null;
+            this.syncChips();
+            this.listBox.textContent = '';
+            this.moreBtn.hidden = true;
+            if (!rows.length) this.listBox.appendChild(spEl('div', { class: 'sp-empty', text: 'Nothing to sell. What you bought for a trade that was cancelled, what a trader did not take, and extra buys wait here.' }));
+            for (const r of rows) {
+                // With the board beside it no row is "the one on the desk".
+                const on = !T.open && Boolean(s.desk && s.desk.itemId === r.itemId);
+                const line = 'Paid ' + formatMoney(r.each) + ' · ' + (r.best ? r.best.name + ' pays ' + formatMoney(r.best.price) : this.noTraderText(null).toLowerCase());
+                this.listBox.appendChild(spEl('div', {
+                    class: 'sp-it sp-ts' + (on ? ' sp-sel' : '') + (r.ready ? '' : ' sp-ts-wait'),
+                    role: 'button',
+                    tabindex: '0',
+                    'aria-pressed': String(on),
+                    'data-focus': 'sell:' + r.itemId,
+                    title: r.ready ? 'Show it on the desk' : 'Waiting for a trader who pays more than you paid: show it on the desk',
+                    onclick: () => this.select(r.itemId),
+                    onkeydown: (event) => {
+                        if (event.target !== event.currentTarget || (event.key !== 'Enter' && event.key !== ' ')) return;
+                        event.preventDefault();
+                        this.select(r.itemId);
+                    },
+                }, [
+                    spEl('span', { class: 'sp-pic sp-pic-s' }, [this.image('sell', r.itemId)]),
+                    spEl('span', { class: 'sp-ts-top' }, [spEl('b', { class: 'sp-iname', text: count(r.qty) + ' ' + r.name }), this.whyTag(r.why)]),
+                    r.ready ? spEl('span', { class: 'sp-badge sp-badge-tosell', text: 'Sell ' + signed(r.gain) }) : spEl('span', { class: 'sp-badge sp-badge-wait', text: 'Waiting' }),
+                    spEl('small', { text: line }),
+                ]));
+            }
+            if (focusKey) {
+                const again = [...this.listBox.querySelectorAll('[data-focus]')].find((n) => n.dataset.focus === focusKey);
+                if (again) again.focus({ preventScroll: true });
+            }
+        }
+
+        /**
+         * The To sell board (3.21.0, mockup U, B): beside the list while its tab is
+         * on - everything to sell under the trader who pays most for it now, one
+         * Plan trade per trader (their trade, with these as its "yours" lines), and
+         * what has no profit yet waiting at the bottom.
+         */
+        renderBoard() {
+            const s = this.state;
+            const T = s.toSell;
+            const box = this.deskEl;
+            const statusOf = (b) => {
+                const st = b && b.id && s.statuses ? s.statuses.get(String(b.id)) : null;
+                return st ? st.level + st.text : '';
+            };
+            const rowSig = (r) => [r.itemId, r.name, r.qty, r.each, r.why, r.best && [r.best.name, r.best.price], r.gain, r.short];
+            const sig = JSON.stringify(['board', T.groups.map((g) => [g.key, g.trader.name, statusOf(g.trader), g.trader.trust ? g.trader.trust.level + g.trader.trust.score : '', g.gain, g.rows.map(rowSig)]), T.waiting.map(rowSig), s.prefs.onlineOnly, s.prefs.trustedOnly]);
+            if (sig === this.deskSig) return;
+            const shadow = this.root.getRootNode();
+            const active = shadow && shadow.activeElement;
+            const keep = active && box.contains(active) && active.dataset ? active.dataset.focus : null;
+            this.deskSig = sig;
+            box.textContent = '';
+            const total = T.rows.length;
+            box.appendChild(spEl('div', { class: 'sp-wsh sp-bd-top' }, [
+                spEl('span', { class: 'sp-wst' }, [
+                    spEl('span', { class: 'sp-wsname', text: 'To sell' }),
+                    spEl('small', { text: total ? count(total) + (total === 1 ? ' item' : ' items') + ' you bought to resell and still hold' : 'What you bought to resell and still hold' }),
+                ]),
+            ]));
+            if (!total) {
+                box.appendChild(spEl('p', { class: 'sp-note', text: 'Nothing to sell. What you bought for a trade that was cancelled, what a trader did not take, and extra buys wait here until a trader pays more than you paid.' }));
+                return;
+            }
+            const itemRow = (r, right) => {
+                const el = spEl('div', { class: 'sp-bd-r', role: 'button', tabindex: '0', 'data-focus': 'board:' + r.itemId, title: 'Show it on the desk', onclick: () => this.select(r.itemId) }, [
+                    spEl('span', { class: 'sp-pic sp-pic-s' }, [this.image('board', r.itemId)]),
+                    spEl('b', { class: 'sp-iname', text: count(r.qty) + ' ' + r.name }),
+                    this.whyTag(r.why, true),
+                    spEl('span', { class: 'sp-sp' }),
+                    ...right,
+                ]);
+                el.addEventListener('keydown', (event) => {
+                    if (event.target !== el || (event.key !== 'Enter' && event.key !== ' ')) return;
+                    event.preventDefault();
+                    this.select(r.itemId);
+                });
+                return el;
+            };
+            for (const g of T.groups) {
+                const b = g.trader;
+                const group = spEl('div', { class: 'sp-bd-g sp-bd-ready' }, [
+                    spEl('div', { class: 'sp-bd-h' }, [
+                        spEl('b', { class: 'sp-bd-who', text: b.name }),
+                        this.trustBadge(b),
+                        this.status(b),
+                        spEl('small', { text: count(g.rows.length) + (g.rows.length === 1 ? ' item' : ' items') }),
+                        spEl('span', { class: 'sp-sp' }),
+                        spEl('span', { class: 'sp-bd-gain', text: signed(g.gain) }),
+                        spEl('button', {
+                            type: 'button',
+                            class: 'sp-btn sp-primary',
+                            'data-focus': 'board:plan:' + g.key,
+                            title: 'Put the trade with ' + b.name + ' on the desk: these items go in as yours',
+                            text: 'Plan trade',
+                            onclick: () => this.h.onTradePick && this.h.onTradePick(g.rows[0].itemId, g.key),
+                        }),
+                    ]),
+                ]);
+                for (const r of g.rows) {
+                    group.appendChild(itemRow(r, [
+                        spEl('small', {}, ['Paid ', spEl('b', { text: formatMoney(r.each) }), ' each · they pay ', spEl('b', { text: formatMoney(r.best.price) })]),
+                        spEl('span', { class: 'sp-bd-gain', text: signed(r.gain) }),
+                    ]));
+                }
+                box.appendChild(group);
+            }
+            if (T.waiting.length) {
+                const group = spEl('div', { class: 'sp-bd-g sp-bd-wait' }, [
+                    spEl('div', { class: 'sp-bd-h' }, [
+                        spEl('b', { class: 'sp-bd-who', text: 'Waiting for a price' }),
+                        spEl('small', { text: count(T.waiting.length) + (T.waiting.length === 1 ? ' item' : ' items') }),
+                    ]),
+                ]);
+                for (const r of T.waiting) {
+                    group.appendChild(itemRow(r, [
+                        r.best
+                            ? spEl('small', {}, ['Paid ', spEl('b', { text: formatMoney(r.each) }), ' each · best now ', spEl('b', { text: formatMoney(r.best.price) }), ' (' + r.best.name + ')'])
+                            : spEl('small', {}, ['Paid ', spEl('b', { text: formatMoney(r.each) }), ' each · ' + this.noTraderText(null).toLowerCase()]),
+                        spEl('span', { class: 'sp-bd-short', text: r.best && r.short > 0 ? formatMoney(r.short) + ' short each' : 'Waiting' }),
+                    ]));
+                }
+                box.appendChild(group);
+            }
+            box.appendChild(spEl('p', { class: 'sp-note', text: 'A row leaves by itself when your Ledger shows it sold or you no longer hold it.' }));
+            if (keep) {
+                const again = [...box.querySelectorAll('[data-focus]')].find((n) => n.dataset.focus === keep);
+                if (again) again.focus({ preventScroll: true });
+            }
+        }
+
         renderList() {
             const s = this.state;
             const info = s.info || {};
+            if (s.filter === 'sell') {
+                this.renderSellList();
+                return;
+            }
             // A pinned item is listed once: its row moves to the top, pinned (the
             // owner: "it created something doubled, instead of just pinning it").
             const pinnedItems = new Set((s.pinned || []).map((p) => p.itemId));
@@ -21333,10 +21664,7 @@
             const active = shadow && shadow.activeElement;
             const focusKey = active && this.listBox.contains(active) && active.dataset ? active.dataset.focus : null;
 
-            for (const key of SELL_FILTERS) {
-                this.chipBtns[key].setAttribute('aria-pressed', String(s.filter === key));
-                this.chipCounts[key].textContent = count(s.counts[key] || 0);
-            }
+            this.syncChips();
 
             this.listBox.textContent = '';
             // Pinned trades first, whatever the filter: the main flip, the trader, the profit now.
@@ -21484,8 +21812,15 @@
          *   where: {options, best, gain}|null, market: {state, lowest}}
          */
         renderDesk() {
+            // The To sell tab: its board, until a row is picked or a trade planned.
+            if (this.state.toSell && this.state.toSell.open) {
+                this.renderBoard();
+                return;
+            }
             const d = this.state.desk;
             const box = this.deskEl;
+            // On the To sell tab the desk has a way back to the board.
+            const fromSell = this.state.filter === 'sell';
             if (d && this.showAll.item !== d.itemId) this.showAll = { item: d.itemId, buyers: false, sellers: false, hidden: false };
             const statusOf = (b) => {
                 const st = b.id && this.state.statuses ? this.state.statuses.get(String(b.id)) : null;
@@ -21504,9 +21839,9 @@
                     d.sellers.state, d.sellers.error,
                     d.sellers.rows.map((r) => [r.sellerId, r.sellerName, r.price, r.qty, r.stale, Math.floor((now - (r.dataAt || 0)) / 60000)]),
                     d.plan, d.where, d.market, d.trade,
-                    this.showAll, p.onlineOnly, p.trustedOnly, p.cash, Boolean(info.knownTraders), info.tradersLoading,
+                    this.showAll, p.onlineOnly, p.trustedOnly, p.cash, Boolean(info.knownTraders), info.tradersLoading, fromSell,
                 ])
-                : JSON.stringify([info.hasKey, info.loading, Boolean(info.bazaarsAt), info.tradersLoading, this.state.counts]);
+                : JSON.stringify([info.hasKey, info.loading, Boolean(info.bazaarsAt), info.tradersLoading, this.state.counts, fromSell]);
             if (sig === this.deskSig) return;
 
             const shadow = this.root.getRootNode();
@@ -21519,6 +21854,9 @@
             const keep = active && box.contains(active) && active.dataset ? active.dataset.focus : null;
 
             box.textContent = '';
+            if (fromSell) {
+                box.appendChild(spEl('button', { type: 'button', class: 'sp-link sp-bd-back', 'data-focus': 'board:back', title: 'Back to everything to sell, by trader', text: '← To sell', onclick: () => this.h.onFilter && this.h.onFilter('sell') }));
+            }
             if (!d) {
                 const none = !(this.state.counts && this.state.counts.all);
                 box.appendChild(spEl('p', { class: 'sp-note', text: none ? (info.tradersLoading ? 'Looking for traders…' : 'Nothing to show yet.') : 'Pick an item.' }));
@@ -22055,7 +22393,8 @@
             }
 
             // Yours: what they pay most for, minus what you keep.
-            if (c.held.length) card.appendChild(spEl('div', { class: 'sp-tsec', text: 'Yours · ' + b.name + ' pays the most' }));
+            // Since 3.21.0 only what you bought to resell (the To sell tab), where this trader pays more than you paid.
+            if (c.held.length) card.appendChild(spEl('div', { class: 'sp-tsec', text: 'Yours to sell · ' + b.name + ' pays more than you paid' }));
             for (const r of c.held) {
                 const give = (n) => this.h.onTradeHeld && this.h.onTradeHeld(r.itemId, r.held, n, c.key);
                 const on = r.units > 0;
@@ -22598,11 +22937,38 @@
     /* the desk: every item on the left, the one picked on the right */
     .sp-desk { display: grid; grid-template-columns: 340px minmax(0, 1fr); gap: 16px; align-items: start; }
     .sp-col-list { min-width: 0; display: flex; flex-direction: column; gap: 6px; }
-    .sp-chips { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 2px; padding: 3px; margin-bottom: 4px; border-radius: 11px; background: var(--input); border: 1px solid var(--line); }
+    .sp-chips { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 2px; padding: 3px; margin-bottom: 4px; border-radius: 11px; background: var(--input); border: 1px solid var(--line); }
     .sp-chip-f { height: 28px; border-radius: 8px; border: 0; background: none; color: var(--muted); font-weight: 500; cursor: pointer; white-space: nowrap; transition: background-color 0.15s var(--ease); }
     .sp-chip-f small { font-weight: 400; font-size: 12px; margin-left: 5px; color: var(--faint); font-variant-numeric: tabular-nums; }
     .sp-chip-f:hover { color: var(--text); }
     .sp-chip-f[aria-pressed="true"] { color: var(--text); background: var(--raised); box-shadow: 0 1px 2px rgba(0, 0, 0, 0.3); }
+    /* To sell (3.21.0, mockup U): the tab, its rows, its board */
+    .sp-chip-f.sp-chip-has small { color: var(--buy); font-weight: 600; }
+    .sp-why { font: 600 11px/18px var(--sans); height: 18px; padding: 0 7px; border-radius: 999px; white-space: nowrap; color: var(--muted); background: rgba(255, 255, 255, 0.07); flex: 0 0 auto; }
+    .sp-why[data-why="cancel"] { color: var(--warn); background: var(--warn-bg); }
+    .sp-why[data-why="extra"] { color: var(--buy); background: var(--buy-bg); }
+    .sp-it.sp-ts { grid-template-columns: 44px minmax(0, 1fr) auto; }
+    .sp-ts-top { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 6px; min-width: 0; }
+    .sp-it.sp-ts.sp-sel { border-color: var(--buy-line); background: var(--buy-bg); }
+    .sp-ts-wait .sp-iname { color: var(--text2); }
+    .sp-badge-tosell { color: var(--buy); background: var(--buy-bg); align-self: start; }
+    .sp-badge-wait { color: var(--warn); background: var(--warn-bg); font-weight: 600; align-self: start; }
+    .sp-bd-top { margin-bottom: 16px; }
+    .sp-bd-g { border: 1px solid var(--line); border-radius: 14px; padding: 10px; margin-bottom: 10px; background: var(--surface); }
+    .sp-bd-g.sp-bd-ready { border-color: var(--buy-line); }
+    .sp-bd-g.sp-bd-wait { background: transparent; }
+    .sp-bd-h { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; padding: 2px 2px 10px; }
+    .sp-bd-who { font-size: 14px; }
+    .sp-bd-wait .sp-bd-who { color: var(--muted); font-weight: 600; }
+    .sp-bd-h small, .sp-bd-r small { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+    .sp-bd-r small b { color: var(--text); font-weight: 600; }
+    .sp-bd-gain { font: 650 14px/1.2 var(--sans); color: var(--profit); font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .sp-bd-short { font: 600 13px/1.2 var(--sans); color: var(--warn); white-space: nowrap; }
+    .sp-bd-r { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 12px; padding: 9px 10px; margin-bottom: 4px; border-radius: 10px; background: var(--rail); border: 1px solid transparent; cursor: pointer; }
+    .sp-bd-r:last-child { margin-bottom: 0; }
+    .sp-bd-r:hover { border-color: var(--line); }
+    .sp-bd-r .sp-iname { font-weight: 600; }
+    .sp-bd-back { display: inline-block; margin: -8px 0 12px; font-size: 13px; }
     .sp-it { display: grid; grid-template-columns: 44px minmax(0, 1fr) auto; gap: 2px 12px; align-items: center; padding: 10px 12px; margin-bottom: 0; border-radius: 12px; border: 1px solid transparent; cursor: pointer; transition: background-color 0.15s var(--ease); }
     .sp-it:hover { background: var(--surface); }
     .sp-it.sp-sel { background: var(--surface); border-color: var(--profit-line); }
@@ -23571,6 +23937,7 @@
      *   - the selling page tab (index.php?ttv2=traders): its own keys, its own
      *     settings, its own requests. See bootSellingPage().
      */
+
 
 
 
@@ -26539,6 +26906,8 @@
                 if (row) Object.assign(e, { row: row.index, rowIds: [...row.ids], rowTotal: read.rowsTotal, rowSearch: read.searching });
             }
         }
+        // An extra buy (3.21.0): bought with no trade to put it in, where a Trusted trader pays more - To sell.
+        noteExtraBuys(seller, dropped, now);
         for (const b of dropped) {
             const mine = here.filter((x) => x.itemId === String(b.itemId));
             const qty = mine.reduce((a, x) => a + x.qty, 0);
@@ -26566,6 +26935,8 @@
             if (gone) {
                 if (!app.goneNoted.has(goneKey(seller, w.itemId))) logProblem('note', 'A listing is no longer in this bazaar (item ' + w.itemId + ', ' + w.qty + ' when last seen) - left out of the plans in Torn Bids');
                 noteGoneListing(seller, w.itemId);
+                // Bought out by you (you had just pressed on it): all of it is an extra buy.
+                if (pressedAt && now - pressedAt < STOCK_PRESS_MS) noteExtraBuys(seller, [{ itemId: w.itemId, name: w.name, price: w.price, qty: w.qty }], now);
             } else kept[key] = w;
         }
         store[seller] = { at: now, cards: { ...kept, ...seen } };
@@ -26575,6 +26946,33 @@
         } catch {
             /* this read only */
         }
+    }
+
+    /**
+     * Extra buys (3.21.0; the owner, 2026-10-03: "we buy that blue ... this is
+     * like an extra buy?"): what you took from a card a Trusted trader pays more
+     * for - the blue tag - when no accepted trade takes it. It joins To sell (the
+     * leftovers list, why: 'extra') at what you paid, to trade on at a profit.
+     *
+     * A buy an accepted trade counts is left to that trade: one of its planned
+     * steps at this bazaar (the buying run counts it), or an item its trader pays
+     * for ("Not planned", trackExtraBuys) - it comes back as a leftover if they
+     * do not take it. Read only: nothing is pressed, nothing is sent.
+     */
+    function noteExtraBuys(seller, bought, now = Date.now()) {
+        if (!seller || !bought || !bought.length) return;
+        const trades = Object.values(sellAccepted());
+        const claimed = (itemId) => trades.some((t) => (t.items || []).some((i) => String(i.itemId) === String(itemId) && (i.steps || []).some((st) => String(st.sellerId) === String(seller))) || traderBidOf(t, itemId) > 0);
+        const add = [];
+        for (const b of bought) {
+            if (!b || !(Number(b.qty) > 0) || !(Number(b.price) > 0) || claimed(b.itemId)) continue;
+            const buyer = trustedBuyerOf(b.itemId);
+            // Only where the blue tag was: a Trusted trader pays more than this listing asked.
+            if (!traderTagLabel(buyer, Number(b.price))) continue;
+            add.push({ itemId: String(b.itemId), name: b.name || 'Item ' + b.itemId, qty: Number(b.qty), each: Number(b.price), from: null, at: now, since: now, why: 'extra' });
+            logProblem('note', 'An extra buy kept for To sell (item ' + b.itemId + '): ' + b.qty + ' at $' + b.price);
+        }
+        if (add.length) saveSellLeftovers(addLeftovers(sellLeftovers(now), add));
     }
 
     /**
@@ -28045,6 +28443,8 @@
         activityDirty: false,
         /* Something you pressed: the next statuses asked are the traders in front of you, first in line (3.20.5). */
         statusPressed: false,
+        /* The To sell tab (3.21.0): its board is beside the list until you pick a row or plan a trade. */
+        boardOpen: false,
         /* Near-misses and every other item anyone buys (3.15): read after the possible flips. */
         nearIds: [],
         sweepIds: [],
@@ -28779,7 +29179,10 @@
         const all = sellAccepted();
         if (done && all[key]) {
             const rest = left || leftoversOf(all[key]);
-            if (rest.length) saveSellLeftovers(addLeftovers(sellLeftovers(), rest));
+            // Your To sell items that went in come off the list (3.21.0); what they did not take of the rest joins it.
+            const before = sellLeftovers();
+            const mine = afterYoursSent(before, all[key]);
+            if (rest.length || mine !== before) saveSellLeftovers(addLeftovers(mine, rest));
         }
         const itemId = all[key] ? String(all[key].itemId) : null;
         forgetLogBuysOf(key, all);
@@ -29538,6 +29941,12 @@
             const l = leftovers.find((x) => String(x.itemId) === id);
             if (!heldNames.has(id) && l && l.name) heldNames.set(id, l.name);
         }
+        // To sell (3.21.0, core/to-sell.js): what you bought to resell and still hold - its tab's rows, and
+        // the "yours" lines a trade with each trader gets. Only these: your other items stay out of every trade.
+        const sellEnough = (per, each) => enoughProfit(per, each, 'TRADER', prefs.minProfitPct);
+        const toSell = toSellRows(leftovers, { buyersOf, enough: sellEnough });
+        const toSellLines = toSellHeld(leftovers, { buyersOf, enough: sellEnough });
+        const toSellIds = new Set(toSell.map((r) => r.itemId));
         // The overlay's summary copy (every 30 s while a Torn tab is open), when newer (3.15).
         const sharedSummary = gmGet(STORE_W3B_SUMMARY, null);
         if (sell.summary && sharedSummary && Number(sharedSummary.fetchedAt) > sell.summaryAt && sharedSummary.lowest) {
@@ -29772,8 +30181,10 @@
             all: rows.length,
             mine: rows.filter((r) => r.held).length,
             flips: rows.filter((r) => r.badge && r.badge.kind === 'flip').length,
+            // To sell: all of it, whatever the search or the category shows.
+            sell: toSell.length,
         };
-        const pass = (r) => (sell.filter === 'mine' ? r.held > 0 : sell.filter === 'flips' ? Boolean(r.badge && r.badge.kind === 'flip') : true);
+        const pass = (r) => (sell.filter === 'mine' ? r.held > 0 : sell.filter === 'flips' ? Boolean(r.badge && r.badge.kind === 'flip') : sell.filter === 'sell' ? toSellIds.has(r.itemId) : true);
         // Money to be made first, then what you hold, then the best price.
         const listed = rows
             .filter(pass)
@@ -29848,9 +30259,10 @@
                     flips.push({ itemId: id, bid: fb.price, sellers: [{ sellerId: null, sellerName: null, price: low, qty: 1, stale: false }] });
                 }
             }
-            // Your own items are not offered in a trade (the owner, 2026-09-28:
-            // "my own items as cover, omit it"): the trade is what you buy to flip.
-            const held = [];
+            // Your own items are not offered in a trade (the owner, 2026-09-28: "my own
+            // items as cover, omit it") - except what you bought to resell (2026-10-03:
+            // "turn it on for resell items only"): the To sell items this trader pays enough for.
+            const held = toSellLines.get(key) || [];
             const nw = buyer.id ? networthOf(buyer.id) : null;
             const payCap = nw !== null && nw >= 0 && prefs.networthPct > 0 ? (nw * prefs.networthPct) / 100 : Infinity;
             const t = planTrade({
@@ -29868,7 +30280,8 @@
                 kindOf,
                 extraItems: prefs.extraItems,
             });
-            return { ...t, key, buyer, estimated };
+            // A To sell line makes what they pay over what you paid: part of what the trade makes.
+            return { ...t, profit: t.profit + heldGain(t.held), flipProfit: t.profit, key, buyer, estimated };
         };
         /*
          * The trader the desk's plan is with (the owner, 2026-09-27: "a button on
@@ -30014,8 +30427,12 @@
                 const held = resolveEstimated(hold.held, chosen.flips.map(named), pickOwn);
                 if (held !== hold.held) saveHeldTrade(pickId, key, held, hold.pinned);
                 const priced = priceHeld(held, { rowsOf: sellersOf, bidOf, lowestOf });
+                // Yours to sell: live, as in the plan now (they need no bazaar, so nothing of them is held still).
+                const yoursNow = chosen.held.map(named);
+                const yoursOn = yoursNow.filter((r) => r.units > 0);
+                const yoursGain = heldGain(yoursNow);
                 sell.tradeLive = priced.lines.map((l) => l.itemId).filter((id) => id !== String(pickId));
-                perTrader[key] = { ...(perTrader[key] || {}), profit: priced.profit, items: priced.items, stops: priced.stops, minutes: stopsMinutes(priced.stops), hasItem: true };
+                perTrader[key] = { ...(perTrader[key] || {}), profit: priced.profit + yoursGain, items: priced.items + yoursOn.length, stops: priced.stops, minutes: stopsMinutes(priced.stops), hasItem: true };
                 const inHeld = new Set([...priced.lines.map((l) => l.itemId), ...(held.off || []).map((o) => o.itemId)]);
                 const left = (chosen.left || []).filter((r) => !inHeld.has(r.itemId)).map((r) => ({ ...r, name: nameOf(r.itemId) }));
                 return {
@@ -30026,11 +30443,11 @@
                         main: held.main,
                         flips: priced.lines.map((l) => ({ ...l, name: l.name || nameOf(l.itemId) })),
                         off: (held.off || []).map((o) => ({ itemId: o.itemId, bid: o.bid, name: o.name || nameOf(o.itemId) })),
-                        held: [],
-                        items: priced.items,
-                        profit: priced.profit,
+                        held: yoursNow,
+                        items: priced.items + yoursOn.length,
+                        profit: priced.profit + yoursGain,
                         cost: priced.cost,
-                        pays: priced.pays,
+                        pays: priced.pays + yoursOn.reduce((a, r) => a + r.units * r.bid, 0),
                         payCapped: false,
                         estimated: priced.lines.filter((l) => l.estimated).length,
                         stops: priced.stops,
@@ -30167,7 +30584,8 @@
                     // Not "reading" when TornExchange refused the key: it never will (review L8).
                     const reading = w.favourite && getTeKey() && !teBad && !ownLists[w.id];
                     const t = tradeWith({ id: w.id, name: w.name, trust }, null);
-                    const main = t && t.main ? t.flips.find((r) => r.itemId === String(t.main)) : null;
+                    // The main flip; a trade of your To sell items only is named by the first of them.
+                    const main = (t && t.main ? t.flips.find((r) => r.itemId === String(t.main)) : null) || (t ? t.held.find((r) => r.units > 0) : null) || null;
                     // A favourite that Buyers online only / Trusted buyers only leaves out stays in its row,
                     // faded, saying why (3.20): its trade is not counted while the filter is on.
                     const hid = w.favourite ? hiddenBuyers([{ id: w.id, name: w.name, trust }], { prefs, levelOf, votesMissing })[0] : null;
@@ -30298,6 +30716,8 @@
             strip,
             pinned,
             leftovers: leftShown,
+            // The To sell tab: its rows, and its board (beside the list until a row is picked or a trade planned).
+            toSell: { rows: toSell, ...toSellBoard(toSell), open: sell.filter === 'sell' && sell.boardOpen },
             ledger: ledgerView(),
             scan,
             blacklist: sellBlacklist(),
@@ -30929,6 +31349,7 @@
         sell.selected = String(itemId);
         sell.pickedByYou = true;
         sell.statusPressed = true;
+        sell.boardOpen = false;
         loadTeItemList(sell.selected);
         renderSellingNow();
         stepW3b();
@@ -30936,7 +31357,8 @@
 
     /** All, Mine or Flips: the desk moves to the first item there. */
     function onSellFilter(key) {
-        sell.filter = key === 'mine' || key === 'flips' ? key : 'all';
+        sell.filter = key === 'mine' || key === 'flips' || key === 'sell' ? key : 'all';
+        sell.boardOpen = sell.filter === 'sell';
         sell.selected = null;
         sell.pickedByYou = false;
         sell.allShown = ALL_ITEMS_PAGE;
@@ -31056,6 +31478,7 @@
                 sell.pickedByYou = true;
                 // The trader you are about to deal with: their status now, not within 90 s.
                 sell.statusPressed = true;
+                sell.boardOpen = false;
                 // Planning a trader you declined means you are trying them again.
                 if (sellDeclined().has(declineKey(itemId, key))) setSellDeclined(declineKey(itemId, key), null);
                 renderSellingNow();

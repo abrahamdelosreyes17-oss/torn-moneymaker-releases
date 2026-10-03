@@ -447,6 +447,19 @@ if (/[?&]ownbuys=1/.test(location.search)) {
     _store[NS + 'sellStock'] = JSON.stringify({ '6002|870': { qty: 5, price: 812000, at: now - 30000 } });
 }
 /*
+ * &tosell=1 (3.21.0, with &manybuyers=1): the To sell tab - Stick of Dynamite
+ * from a cancelled trade and an extra buy of Xanax (both with a trader who
+ * pays more), and Bottles of Beer a trader did not take, waiting for a price.
+ */
+if (/[?&]tosell=1/.test(location.search)) {
+    const now = Date.now();
+    _store[NS + 'sellLeftovers'] = JSON.stringify([
+        { itemId: '335', name: 'Stick of Dynamite', qty: 53, each: 17500, from: 'KayMalta', at: now - 5 * 60000, since: now - 6 * 60000, why: 'cancel' },
+        { itemId: '206', name: 'Xanax', qty: 4, each: 840000, from: null, at: now - 4 * 60000, since: now - 4 * 60000, why: 'extra' },
+        { itemId: '180', name: 'Bottle of Beer', qty: 30, each: 900, from: 'Bob', at: now - 3 * 60000, since: now - 3 * 60000 },
+    ]);
+}
+/*
  * &leftmany=1 (3.16.4, with &bigflip=1): the friend's Torn Bids, 2026-10-02 -
  * sixteen things left over. One card for all of them, opened to see each;
  * no Sold ✓ anywhere.

@@ -125,7 +125,7 @@ test('what they did not take: out of the totals, kept at its cost for Traded - d
     assert.equal(tot.pays, 30 * 18000 + 3 * 110);
     assert.equal(tot.cost, 50 * 17500, 'you still bought 50');
     assert.equal(tot.profit, 30 * 500, 'profit on what they took; the 20 are still yours');
-    assert.deepEqual(leftoversOf(t, 5000), [{ itemId: '335', name: 'Stick of Dynamite', qty: 20, each: 17500, from: 'Bob', at: 5000 }]);
+    assert.deepEqual(leftoversOf(t, 5000), [{ itemId: '335', name: 'Stick of Dynamite', qty: 20, each: 17500, from: 'Bob', at: 5000, why: 'left' }]);
     assert.equal(markLeft(t, 'flip:335', 999).items[0].left, 50, 'never more than you send');
     // Two trades leave the same item: one row, the cost averaged.
     const both = addLeftovers([{ itemId: '335', name: 'x', qty: 20, each: 17500, at: 1 }], [{ itemId: '335', name: 'x', qty: 20, each: 17700, at: 2 }]);

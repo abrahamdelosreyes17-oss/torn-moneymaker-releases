@@ -115,11 +115,16 @@ function heldRowsOf(held, keep, edits, capOf, payLeftRef, kindName) {
         const refused = Math.max(0, Math.floor(Number(h.refused) || 0));
         const spare = kept === 'all' ? 0 : Math.max(0, have - kept - refused);
         const e = edits['held:' + id] || {};
-        const want = e.qty > 0 ? Math.min(spare, Math.floor(e.qty)) : Math.min(spare, capOf(id));
+        // `all` (3.21.0, a To sell item): every one you hold, not the "normal amount" of its kind.
+        const want = e.qty > 0 ? Math.min(spare, Math.floor(e.qty)) : h.all ? spare : Math.min(spare, capOf(id));
         const units = Math.max(0, Math.min(want, Math.floor(payLeftRef.left / bid)));
         if (units < want) capped = true;
         payLeftRef.left -= units * bid;
-        rows.push({ itemId: id, bid, held: have, units, kept, spare, kind: kindName(id) });
+        const row = { itemId: id, bid, held: have, units, kept, spare, kind: kindName(id) };
+        // What you paid for it, when known (a To sell item): the line's profit is counted from it.
+        if (Number(h.each) >= 0 && h.each !== undefined && h.each !== null) row.each = Number(h.each);
+        if (h.all) row.all = true;
+        rows.push(row);
     }
     return { rows, capped };
 }

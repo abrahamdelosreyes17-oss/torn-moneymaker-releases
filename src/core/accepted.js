@@ -42,7 +42,10 @@ export function acceptTrade(chosen, itemId, now = Date.now()) {
     }
     for (const r of chosen.held || []) {
         if (!(r.units > 0)) continue;
-        items.push({ line: 'yours:' + r.itemId, itemId: String(r.itemId), name: r.name, units: r.units, bid: r.bid, kind: 'yours', sent: false, steps: [] });
+        const line = { line: 'yours:' + r.itemId, itemId: String(r.itemId), name: r.name, units: r.units, bid: r.bid, kind: 'yours', sent: false, steps: [] };
+        // A To sell item (3.21.0): what you paid for it, so the trade's profit counts it.
+        if (Number.isFinite(Number(r.each)) && r.each !== null && r.each !== undefined) line.each = Number(r.each);
+        items.push(line);
     }
     return {
         key: chosen.key,
@@ -52,8 +55,13 @@ export function acceptTrade(chosen, itemId, now = Date.now()) {
         items,
         cost: items.reduce((a, i) => a + i.steps.reduce((b, st) => b + st.qty * st.price, 0), 0),
         pays: items.reduce((a, i) => a + i.units * i.bid, 0),
-        profit: items.reduce((a, i) => a + (i.kind === 'flip' ? i.steps.reduce((b, st) => b + st.qty * (i.bid - st.price), 0) : 0), 0),
+        profit: items.reduce((a, i) => a + (i.kind === 'flip' ? i.steps.reduce((b, st) => b + st.qty * (i.bid - st.price), 0) : yoursProfit(i, i.units)), 0),
     };
+}
+
+/** What a "yours" line makes: only when it says what you paid (a To sell item); your other items make nothing to count. */
+function yoursProfit(line, units) {
+    return line && line.kind === 'yours' && Number.isFinite(line.each) ? units * (line.bid - line.each) : 0;
 }
 
 /** Stored accepted trades still worth keeping: {key: trade}, newest kept first. */
@@ -504,7 +512,7 @@ export function leftoversOf(trade, now = Date.now()) {
     for (const i of (trade && trade.items) || []) {
         const n = Math.min(sendUnits(i), Math.max(0, Math.floor(Number(i.left) || 0)));
         if (i.kind !== 'flip' || !(n > 0)) continue;
-        out.push({ itemId: String(i.itemId), name: i.name, qty: n, each: Math.round(costEach(i)), from: trade.trader ? trade.trader.name : null, at: now });
+        out.push({ itemId: String(i.itemId), name: i.name, qty: n, each: Math.round(costEach(i)), from: trade.trader ? trade.trader.name : null, at: now, why: 'left' });
     }
     return out;
 }
@@ -523,10 +531,10 @@ export function cancelledLeftovers(trade, now = Date.now()) {
     for (const i of (trade && trade.items) || []) {
         if (i.kind !== 'flip' || !(i.steps || []).some(stepDone)) continue;
         const n = sendUnits(i);
-        if (n > 0) out.push({ itemId: String(i.itemId), name: i.name, qty: n, each: Math.round(costEach(i)), from, at: now, ...stamp });
+        if (n > 0) out.push({ itemId: String(i.itemId), name: i.name, qty: n, each: Math.round(costEach(i)), from, at: now, why: 'cancel', ...stamp });
     }
     for (const x of (trade && trade.extra) || []) {
-        if (extraForTrade(x)) out.push({ itemId: String(x.itemId), name: x.name, qty: Number(x.qty), each: Math.round(Number(x.price) || 0), from, at: now, ...stamp });
+        if (extraForTrade(x)) out.push({ itemId: String(x.itemId), name: x.name, qty: Number(x.qty), each: Math.round(Number(x.price) || 0), from, at: now, why: 'cancel', ...stamp });
     }
     return addLeftovers([], out);
 }
@@ -545,6 +553,8 @@ export function addLeftovers(list, add) {
             same.qty = qty;
             same.at = Math.max(Number(same.at) || 0, Number(a.at) || 0);
             same.from = a.from || same.from;
+            // Why it is To sell (3.21.0): the newer one's word.
+            if (a.why) same.why = a.why;
             if (since) same.since = since;
         } else {
             out.push({ ...a });
@@ -569,7 +579,10 @@ export function acceptedTotals(trade) {
             if (st.skipped && !st.bought) continue;
             cost += (st.boughtQty > 0 ? st.boughtQty : st.qty) * st.price;
         }
-        if (i.kind !== 'flip') continue;
+        if (i.kind !== 'flip') {
+            profit += yoursProfit(i, taken);
+            continue;
+        }
         // Not bought yet: planned prices; bought: what it cost.
         const started = (i.steps || []).some(stepDone);
         const each = started ? costEach(i) : (i.steps || []).reduce((a, st) => a + st.qty * st.price, 0) / Math.max(1, (i.steps || []).reduce((a, st) => a + st.qty, 0));
@@ -924,7 +937,7 @@ export function tradedLeftovers(trade, gave, now = Date.now(), finishedAt = null
     const out = [];
     for (const b of bought.values()) {
         const left = b.qty - Math.min(b.qty, given.get(b.itemId) || 0);
-        if (left > 0) out.push({ itemId: b.itemId, name: b.name, qty: left, each: Math.round(b.cost / b.qty), from, at: now, ...stamp });
+        if (left > 0) out.push({ itemId: b.itemId, name: b.name, qty: left, each: Math.round(b.cost / b.qty), from, at: now, why: 'left', ...stamp });
     }
     return out;
 }

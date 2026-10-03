@@ -123,6 +123,7 @@ import {
 } from './core/traders.js';
 import { makeBuyersKeeper } from './core/kept-buyers.js';
 import { redrawWait, warmSlice, packBazaarReads, unpackBazaarReads, WARM_SLICE_MS } from './core/start-up.js';
+import { toSellRows, toSellBoard, toSellHeld, heldGain, afterYoursSent } from './core/to-sell.js';
 import { statusWatch, statusAsks, flipCards, traderCards, packActivity, unpackActivity, STATUS_EVERY_MS } from './core/status.js';
 import {
     mergeInventory,
@@ -3126,6 +3127,8 @@ function trackSeenStock(listings) {
             if (row) Object.assign(e, { row: row.index, rowIds: [...row.ids], rowTotal: read.rowsTotal, rowSearch: read.searching });
         }
     }
+    // An extra buy (3.21.0): bought with no trade to put it in, where a Trusted trader pays more - To sell.
+    noteExtraBuys(seller, dropped, now);
     for (const b of dropped) {
         const mine = here.filter((x) => x.itemId === String(b.itemId));
         const qty = mine.reduce((a, x) => a + x.qty, 0);
@@ -3153,6 +3156,8 @@ function trackSeenStock(listings) {
         if (gone) {
             if (!app.goneNoted.has(goneKey(seller, w.itemId))) logProblem('note', 'A listing is no longer in this bazaar (item ' + w.itemId + ', ' + w.qty + ' when last seen) - left out of the plans in Torn Bids');
             noteGoneListing(seller, w.itemId);
+            // Bought out by you (you had just pressed on it): all of it is an extra buy.
+            if (pressedAt && now - pressedAt < STOCK_PRESS_MS) noteExtraBuys(seller, [{ itemId: w.itemId, name: w.name, price: w.price, qty: w.qty }], now);
         } else kept[key] = w;
     }
     store[seller] = { at: now, cards: { ...kept, ...seen } };
@@ -3162,6 +3167,33 @@ function trackSeenStock(listings) {
     } catch {
         /* this read only */
     }
+}
+
+/**
+ * Extra buys (3.21.0; the owner, 2026-10-03: "we buy that blue ... this is
+ * like an extra buy?"): what you took from a card a Trusted trader pays more
+ * for - the blue tag - when no accepted trade takes it. It joins To sell (the
+ * leftovers list, why: 'extra') at what you paid, to trade on at a profit.
+ *
+ * A buy an accepted trade counts is left to that trade: one of its planned
+ * steps at this bazaar (the buying run counts it), or an item its trader pays
+ * for ("Not planned", trackExtraBuys) - it comes back as a leftover if they
+ * do not take it. Read only: nothing is pressed, nothing is sent.
+ */
+function noteExtraBuys(seller, bought, now = Date.now()) {
+    if (!seller || !bought || !bought.length) return;
+    const trades = Object.values(sellAccepted());
+    const claimed = (itemId) => trades.some((t) => (t.items || []).some((i) => String(i.itemId) === String(itemId) && (i.steps || []).some((st) => String(st.sellerId) === String(seller))) || traderBidOf(t, itemId) > 0);
+    const add = [];
+    for (const b of bought) {
+        if (!b || !(Number(b.qty) > 0) || !(Number(b.price) > 0) || claimed(b.itemId)) continue;
+        const buyer = trustedBuyerOf(b.itemId);
+        // Only where the blue tag was: a Trusted trader pays more than this listing asked.
+        if (!traderTagLabel(buyer, Number(b.price))) continue;
+        add.push({ itemId: String(b.itemId), name: b.name || 'Item ' + b.itemId, qty: Number(b.qty), each: Number(b.price), from: null, at: now, since: now, why: 'extra' });
+        logProblem('note', 'An extra buy kept for To sell (item ' + b.itemId + '): ' + b.qty + ' at $' + b.price);
+    }
+    if (add.length) saveSellLeftovers(addLeftovers(sellLeftovers(now), add));
 }
 
 /**
@@ -4632,6 +4664,8 @@ const sell = {
     activityDirty: false,
     /* Something you pressed: the next statuses asked are the traders in front of you, first in line (3.20.5). */
     statusPressed: false,
+    /* The To sell tab (3.21.0): its board is beside the list until you pick a row or plan a trade. */
+    boardOpen: false,
     /* Near-misses and every other item anyone buys (3.15): read after the possible flips. */
     nearIds: [],
     sweepIds: [],
@@ -5366,7 +5400,10 @@ function closeSellAccepted(key, { done = false, left = null } = {}) {
     const all = sellAccepted();
     if (done && all[key]) {
         const rest = left || leftoversOf(all[key]);
-        if (rest.length) saveSellLeftovers(addLeftovers(sellLeftovers(), rest));
+        // Your To sell items that went in come off the list (3.21.0); what they did not take of the rest joins it.
+        const before = sellLeftovers();
+        const mine = afterYoursSent(before, all[key]);
+        if (rest.length || mine !== before) saveSellLeftovers(addLeftovers(mine, rest));
     }
     const itemId = all[key] ? String(all[key].itemId) : null;
     forgetLogBuysOf(key, all);
@@ -6125,6 +6162,12 @@ function renderSellingWork(src = null) {
         const l = leftovers.find((x) => String(x.itemId) === id);
         if (!heldNames.has(id) && l && l.name) heldNames.set(id, l.name);
     }
+    // To sell (3.21.0, core/to-sell.js): what you bought to resell and still hold - its tab's rows, and
+    // the "yours" lines a trade with each trader gets. Only these: your other items stay out of every trade.
+    const sellEnough = (per, each) => enoughProfit(per, each, 'TRADER', prefs.minProfitPct);
+    const toSell = toSellRows(leftovers, { buyersOf, enough: sellEnough });
+    const toSellLines = toSellHeld(leftovers, { buyersOf, enough: sellEnough });
+    const toSellIds = new Set(toSell.map((r) => r.itemId));
     // The overlay's summary copy (every 30 s while a Torn tab is open), when newer (3.15).
     const sharedSummary = gmGet(STORE_W3B_SUMMARY, null);
     if (sell.summary && sharedSummary && Number(sharedSummary.fetchedAt) > sell.summaryAt && sharedSummary.lowest) {
@@ -6359,8 +6402,10 @@ function renderSellingWork(src = null) {
         all: rows.length,
         mine: rows.filter((r) => r.held).length,
         flips: rows.filter((r) => r.badge && r.badge.kind === 'flip').length,
+        // To sell: all of it, whatever the search or the category shows.
+        sell: toSell.length,
     };
-    const pass = (r) => (sell.filter === 'mine' ? r.held > 0 : sell.filter === 'flips' ? Boolean(r.badge && r.badge.kind === 'flip') : true);
+    const pass = (r) => (sell.filter === 'mine' ? r.held > 0 : sell.filter === 'flips' ? Boolean(r.badge && r.badge.kind === 'flip') : sell.filter === 'sell' ? toSellIds.has(r.itemId) : true);
     // Money to be made first, then what you hold, then the best price.
     const listed = rows
         .filter(pass)
@@ -6435,9 +6480,10 @@ function renderSellingWork(src = null) {
                 flips.push({ itemId: id, bid: fb.price, sellers: [{ sellerId: null, sellerName: null, price: low, qty: 1, stale: false }] });
             }
         }
-        // Your own items are not offered in a trade (the owner, 2026-09-28:
-        // "my own items as cover, omit it"): the trade is what you buy to flip.
-        const held = [];
+        // Your own items are not offered in a trade (the owner, 2026-09-28: "my own
+        // items as cover, omit it") - except what you bought to resell (2026-10-03:
+        // "turn it on for resell items only"): the To sell items this trader pays enough for.
+        const held = toSellLines.get(key) || [];
         const nw = buyer.id ? networthOf(buyer.id) : null;
         const payCap = nw !== null && nw >= 0 && prefs.networthPct > 0 ? (nw * prefs.networthPct) / 100 : Infinity;
         const t = planTrade({
@@ -6455,7 +6501,8 @@ function renderSellingWork(src = null) {
             kindOf,
             extraItems: prefs.extraItems,
         });
-        return { ...t, key, buyer, estimated };
+        // A To sell line makes what they pay over what you paid: part of what the trade makes.
+        return { ...t, profit: t.profit + heldGain(t.held), flipProfit: t.profit, key, buyer, estimated };
     };
     /*
      * The trader the desk's plan is with (the owner, 2026-09-27: "a button on
@@ -6601,8 +6648,12 @@ function renderSellingWork(src = null) {
             const held = resolveEstimated(hold.held, chosen.flips.map(named), pickOwn);
             if (held !== hold.held) saveHeldTrade(pickId, key, held, hold.pinned);
             const priced = priceHeld(held, { rowsOf: sellersOf, bidOf, lowestOf });
+            // Yours to sell: live, as in the plan now (they need no bazaar, so nothing of them is held still).
+            const yoursNow = chosen.held.map(named);
+            const yoursOn = yoursNow.filter((r) => r.units > 0);
+            const yoursGain = heldGain(yoursNow);
             sell.tradeLive = priced.lines.map((l) => l.itemId).filter((id) => id !== String(pickId));
-            perTrader[key] = { ...(perTrader[key] || {}), profit: priced.profit, items: priced.items, stops: priced.stops, minutes: stopsMinutes(priced.stops), hasItem: true };
+            perTrader[key] = { ...(perTrader[key] || {}), profit: priced.profit + yoursGain, items: priced.items + yoursOn.length, stops: priced.stops, minutes: stopsMinutes(priced.stops), hasItem: true };
             const inHeld = new Set([...priced.lines.map((l) => l.itemId), ...(held.off || []).map((o) => o.itemId)]);
             const left = (chosen.left || []).filter((r) => !inHeld.has(r.itemId)).map((r) => ({ ...r, name: nameOf(r.itemId) }));
             return {
@@ -6613,11 +6664,11 @@ function renderSellingWork(src = null) {
                     main: held.main,
                     flips: priced.lines.map((l) => ({ ...l, name: l.name || nameOf(l.itemId) })),
                     off: (held.off || []).map((o) => ({ itemId: o.itemId, bid: o.bid, name: o.name || nameOf(o.itemId) })),
-                    held: [],
-                    items: priced.items,
-                    profit: priced.profit,
+                    held: yoursNow,
+                    items: priced.items + yoursOn.length,
+                    profit: priced.profit + yoursGain,
                     cost: priced.cost,
-                    pays: priced.pays,
+                    pays: priced.pays + yoursOn.reduce((a, r) => a + r.units * r.bid, 0),
                     payCapped: false,
                     estimated: priced.lines.filter((l) => l.estimated).length,
                     stops: priced.stops,
@@ -6754,7 +6805,8 @@ function renderSellingWork(src = null) {
                 // Not "reading" when TornExchange refused the key: it never will (review L8).
                 const reading = w.favourite && getTeKey() && !teBad && !ownLists[w.id];
                 const t = tradeWith({ id: w.id, name: w.name, trust }, null);
-                const main = t && t.main ? t.flips.find((r) => r.itemId === String(t.main)) : null;
+                // The main flip; a trade of your To sell items only is named by the first of them.
+                const main = (t && t.main ? t.flips.find((r) => r.itemId === String(t.main)) : null) || (t ? t.held.find((r) => r.units > 0) : null) || null;
                 // A favourite that Buyers online only / Trusted buyers only leaves out stays in its row,
                 // faded, saying why (3.20): its trade is not counted while the filter is on.
                 const hid = w.favourite ? hiddenBuyers([{ id: w.id, name: w.name, trust }], { prefs, levelOf, votesMissing })[0] : null;
@@ -6885,6 +6937,8 @@ function renderSellingWork(src = null) {
         strip,
         pinned,
         leftovers: leftShown,
+        // The To sell tab: its rows, and its board (beside the list until a row is picked or a trade planned).
+        toSell: { rows: toSell, ...toSellBoard(toSell), open: sell.filter === 'sell' && sell.boardOpen },
         ledger: ledgerView(),
         scan,
         blacklist: sellBlacklist(),
@@ -7516,6 +7570,7 @@ function onSellSelect(itemId) {
     sell.selected = String(itemId);
     sell.pickedByYou = true;
     sell.statusPressed = true;
+    sell.boardOpen = false;
     loadTeItemList(sell.selected);
     renderSellingNow();
     stepW3b();
@@ -7523,7 +7578,8 @@ function onSellSelect(itemId) {
 
 /** All, Mine or Flips: the desk moves to the first item there. */
 function onSellFilter(key) {
-    sell.filter = key === 'mine' || key === 'flips' ? key : 'all';
+    sell.filter = key === 'mine' || key === 'flips' || key === 'sell' ? key : 'all';
+    sell.boardOpen = sell.filter === 'sell';
     sell.selected = null;
     sell.pickedByYou = false;
     sell.allShown = ALL_ITEMS_PAGE;
@@ -7643,6 +7699,7 @@ function bootSellingPage() {
             sell.pickedByYou = true;
             // The trader you are about to deal with: their status now, not within 90 s.
             sell.statusPressed = true;
+            sell.boardOpen = false;
             // Planning a trader you declined means you are trying them again.
             if (sellDeclined().has(declineKey(itemId, key))) setSellDeclined(declineKey(itemId, key), null);
             renderSellingNow();

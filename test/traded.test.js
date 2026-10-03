@@ -92,8 +92,8 @@ test('what they did not take stays yours: bought minus given, at what it cost', 
     const t = trade();
     const left = tradedLeftovers(t, new Map([['203', 60]]), AT + 1);
     assert.deepEqual(left, [
-        { itemId: '203', name: 'Shrooms', qty: 11, each: 1937, from: 'KOMBAJN1', at: AT + 1 },
-        { itemId: '9', name: 'Compass', qty: 3, each: 16372, from: 'KOMBAJN1', at: AT + 1 },
+        { itemId: '203', name: 'Shrooms', qty: 11, each: 1937, from: 'KOMBAJN1', at: AT + 1, why: 'left' },
+        { itemId: '9', name: 'Compass', qty: 3, each: 16372, from: 'KOMBAJN1', at: AT + 1, why: 'left' },
     ]);
     // 3.16.4: told when the trade finished, each says so - from then on what leaves your stock counts against it.
     assert.deepEqual(tradedLeftovers(t, new Map([['203', 60]]), AT + 1, AT - 5000).map((l) => l.since), [AT - 5000, AT - 5000]);

@@ -1314,6 +1314,56 @@ would have kept them out.
 
 ---
 
+### To sell: what you bought to resell, in a tab of its own (3.21.0)
+
+The owner, 2026-10-03: "we buy that blue, it highlights in our item list and
+says hey trade it here ... this is like an extra buy?"; then, after the
+friend bought for a trade the trader cancelled (his zip: 126 leftovers, $143m
+at cost): "can we have a tab (clean one, lets not crowd what we have) that
+awaits a profitable sell? ... so it sees what the failed trade holds and we
+can still sell on profit". Picked: `mockups/U-to-sell-tab.html`, variant B.
+
+- **A fourth tab, "To sell (N)", beside All / Mine / Flips.** Its rows are
+  what you bought to resell and still hold, the best profit first: how many,
+  why it is there (Cancelled / Not taken / Extra buy), what you paid, who
+  pays most now, and "Sell +$X" - or "Waiting" while nobody pays enough over
+  what you paid (the same margin rule as a flip). Never the trader who did
+  not take it. `src/core/to-sell.js`: `toSellRows`.
+- **The board.** With the tab on, the workspace beside the list shows the
+  same items grouped under the trader who pays most for each (the biggest
+  total first), one **Plan trade** per trader, and "Waiting for a price" at
+  the bottom (`toSellBoard`). Picking a row or Plan trade shows the desk as
+  always, with "← To sell" to come back.
+- **Your own items in a trade again - only these.** The owner turned own
+  items off on 2026-09-28 ("my own items as cover, omit it"), and on
+  2026-10-03 back on "for resell items only". A trade with a trader now
+  carries the To sell items that trader pays enough for as its "Yours to
+  sell" lines (`toSellHeld`; all you hold of each, not the "normal amount"
+  an extra is cut to; a tick and a number on each, as before). They go
+  through "accepted", the Checkout and Fill as any yours line does. What
+  they make - what the trader pays over what you paid - is part of the
+  trade's profit everywhere it is shown (Your traders, the desk, the
+  accepted card). Your other items stay out of every trade.
+- **Sold: it leaves by itself.** Traded - done takes what they took of your
+  lines off the list at once (`afterYoursSent`); as before, the Ledger and
+  your inventory take off what left any other way. A leftover is kept a week
+  at most.
+- **Extra buys are remembered.** On a bazaar page, what you take from a card
+  with the blue tag (a Trusted trader pays more than the listing) when no
+  accepted trade takes it - not a planned step there, not an item that
+  trade's trader pays for - joins To sell at what you paid (`noteExtraBuys`
+  in main.js; from the card's stock dropping in front of you, or the card
+  going right after you pressed on it). Read only, as all of it.
+- A leftover now says why it is there (`why`: cancel / left / extra); one
+  kept before 3.21 reads "Not taken".
+
+Not built, for the owner to decide: the "Left over" card still stands first
+in Best flips (the same items); no To sell tab in the overlay; a To sell row
+cannot be dismissed by hand (an item you decide to keep stays until you no
+longer hold it, or a week).
+
+---
+
 ## Architecture
 
 ```
