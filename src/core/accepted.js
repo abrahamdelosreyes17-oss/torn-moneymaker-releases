@@ -845,11 +845,17 @@ export function applyLogBuys(trade, buys, { readFrom = 0, readTo = 0, bidOf = ()
  * @param {object} trade
  * @param {function} buyersOf - itemId -> buyers, best first ({id, name, price})
  * @returns {Array<{itemId, name, qty, each, best: {name, price}|null, gain: number|null}>}
+ *
+ * The same answer for the same trade, whenever it is asked (3.22.0): it carried
+ * "now" (the time a leftover would be kept at), so the Checkout window - which
+ * is drawn again only when what it shows changes - was taken down and built
+ * again on every tick of every Torn page while a trade was accepted, each time
+ * with a layout of the page.
  */
 export function sellElsewhere(trade, buyersOf) {
     const id = trade && trade.trader && trade.trader.id ? String(trade.trader.id) : null;
     const name = trade && trade.trader ? String(trade.trader.name || '').toLowerCase() : '';
-    return cancelledLeftovers(trade).map((l) => {
+    return cancelledLeftovers(trade).map(({ at, ...l }) => {
         const top = ((buyersOf && buyersOf(l.itemId)) || []).find((b) => b && !(id && b.id && String(b.id) === id) && String(b.name || '').toLowerCase() !== name) || null;
         return { ...l, best: top ? { name: top.name, price: top.price } : null, gain: top ? (top.price - l.each) * l.qty : null };
     });

@@ -34,6 +34,20 @@ function cleanText(node) {
     return ((node && node.textContent) || '').replace(/\s+/g, ' ').trim();
 }
 
+/*
+ * A row read once is remembered (3.22.0; the owner: "i press fill in the add
+ * bazaar, very laggy ... again it was VERY laggy"). The page is read every
+ * few seconds and after every change in its rows - each Fill is one - and
+ * every read looked up every row's picture and name again and worked out its
+ * item: on a page of 1,500 rows, twelve milliseconds a read for this alone,
+ * and far more for what was then done with each row. A row whose picture is
+ * the same element with the same address is the same item: its record comes
+ * back as it was (the same object, so what the caller keeps on it stays).
+ * Torn redrawing a row, or using its element for another item (#/manage is a
+ * virtualised list), changes the picture - that row is read again.
+ */
+const rowCache = new WeakMap();
+
 /**
  * Read every row on the page.
  *
@@ -50,8 +64,17 @@ export function scanOwnBazaar(which, root, index) {
     const seen = new Set();
     for (const el of root.querySelectorAll(OWN_BAZAAR_ROW_SELECTORS[which])) {
         // The manage selectors can both match the same row.
-        if (seen.has(el) || (el.closest && el.closest('#ttv2-host'))) continue;
+        if (seen.has(el)) continue;
         seen.add(el);
+        const known = rowCache.get(el);
+        if (known && known.which === which && known.index === index && known.img.isConnected && known.img.getAttribute('src') === known.src && el.contains(known.img)) {
+            diagnostics.rows += 1;
+            diagnostics.withImage += 1;
+            diagnostics.identified += 1;
+            rows.push(known.row);
+            continue;
+        }
+        if (el.closest && el.closest('#ttv2-host')) continue;
         diagnostics.rows += 1;
 
         const img = el.querySelector(ITEM_IMAGE_SELECTOR) || el.querySelector('img');
@@ -74,7 +97,11 @@ export function scanOwnBazaar(which, root, index) {
         }
 
         diagnostics.identified += 1;
-        rows.push({ el, nameEl: nameEl || el, itemId: item.id, name: item.name, item });
+        const row = { el, nameEl: nameEl || el, itemId: item.id, name: item.name, item };
+        rows.push(row);
+        // Remembered only when its picture says which item it is (a row named by its words is read each time).
+        if (id && img) rowCache.set(el, { which, index, img, src: img.getAttribute('src'), row });
+        else rowCache.delete(el);
     }
 
     return { rows, diagnostics };

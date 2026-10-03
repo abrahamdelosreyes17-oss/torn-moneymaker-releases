@@ -23,7 +23,7 @@ import {
 import { perfStart, perfNow, perfDone, perfTimed, perfForeign, perfStartup, perfRecord, perfMachine, SPEED_STORE_KEY } from './platform/perf.js';
 import { speedFiles } from './core/speed.js';
 import { tradesFiles } from './core/trades-export.js';
-import { tidyAccepted, tidyPins, tidyGone, tidyStock, tidyBought, tidyDeclined, tidyCancelUndo, tidyLeftovers, tidyTeLists } from './core/tidy.js';
+import { tidyAccepted, tidyPins, tidyGone, tidyStock, tidyBought, tidyDeclined, tidyAsked, tidyEnded, tidyCancelUndo, tidyLeftovers, tidyTeLists, tidyWasToSell, tidyHeld } from './core/tidy.js';
 import {
     buildItemIndex,
     makeItemsCacheEntry,
@@ -65,12 +65,12 @@ import { liquidityKind, unitsMoved, addMovement, stopsMinutes, EXTRA_CAP } from 
 import { usageAdd, usageMerge, usageSeries, USAGE_SERVICES, USAGE_RANGES, USAGE_LABELS } from './core/usage.js';
 import { addLogEntries, logText } from './core/errlog.js';
 import { checkoutList, boughtSince, stockBuys, addExtraBuy, applyLogBuys, bazaarBuyRows, addLogBuys, splitLogBuys, sellElsewhere, LOG_BUY_SLACK_MS, acceptTrade, liveAccepted, stepState, tickAccepted, stepDone, nextStep, boughtFromStock, recordBuy, recordLateBuy, sendUnits, acceptedTotals, replacementFor, replaceStep, dropLine, markLeft, leftoversOf, cancelledLeftovers, addLeftovers, sendList, fillNote, finishedTradeFor, tradedLeftovers, removeLeftovers, itemsGiven, tradePartnerId, tradeFinishedAt, TRADE_DONE_SLACK_MS, leftoversAfterSales, leftoverFrom } from './core/accepted.js';
-import { readTradeView, readTradeAddRows } from './sources/dom/trade.js';
+import { readTradeView, readTradeAddRows, readTradeAddRow } from './sources/dom/trade.js';
 import { BoughtWindow } from './ui/bought-window.js';
 import { makeTabId, LEADER_HEARTBEAT_MS } from './core/leader.js';
 import { tabWindow } from './platform/tab-window.js';
 import { idbGet, idbSet, idbDel } from './platform/idb.js';
-import { formatMoneyShort, formatAge } from './core/parse.js';
+import { formatMoneyShort, formatAge, parseMoneyInput } from './core/parse.js';
 import { rankOpportunities, summarize, hiddenCounts, belowMinRows } from './core/ranker.js';
 import { TornApiClient, redactKey, KEY_DEAD_CODES } from './api/client.js';
 import { W3bClient, fetchW3bSummary, fetchW3bListings, fetchW3bPriceList, fetchW3bItemTraders, overlayPerMinute } from './api/w3b.js';
@@ -119,11 +119,14 @@ import {
     rememberedVotes,
     ratingsInText,
     trustedOnly,
+    freshOnly,
     liveW3bPrices,
 } from './core/traders.js';
+import { liveAsked, addAsked, liveEnded, addEnded, endedOf, tradesBoard } from './core/trades-board.js';
 import { makeBuyersKeeper } from './core/kept-buyers.js';
 import { redrawWait, warmSlice, packBazaarReads, unpackBazaarReads, WARM_SLICE_MS } from './core/start-up.js';
-import { toSellRows, toSellBoard, toSellHeld, heldGain, afterYoursSent } from './core/to-sell.js';
+import { toSellRows, toSellBoard, toSellHeld, heldGain, afterYoursSent, whereAbovePaid, liveWasToSell, noteToSell, toSellWhy, TO_SELL_WHY } from './core/to-sell.js';
+import { BOUGHT_WINDOW_MS, boughtRecord, liveBoughtItems, sameBoughtItems, bazaarSellList, underPaid } from './core/bazaar-sell.js';
 import { statusWatch, statusAsks, flipCards, traderCards, packActivity, unpackActivity, STATUS_EVERY_MS } from './core/status.js';
 import {
     mergeInventory,
@@ -287,6 +290,10 @@ const STORE_SELL_ACCEPTED = 'sellAccepted';
 const STORE_SELL_CANCELLED = 'sellCancelled';
 /* Trades you pinned (core/held.js): 'item|trader key' -> held trade. Only prices move in them. */
 const STORE_SELL_PINNED = 'sellPinned';
+/* Trades you asked a trader about (3.22.0, core/trades-board.js): 'item|trader key' -> {itemId, key, id, name, items, profit, at}. An hour. */
+const STORE_SELL_ASKED = 'sellAsked';
+/* Trades that ended - traded, cancelled, never made - for the Trades board: a list, a day. */
+const STORE_SELL_ENDED = 'sellEnded';
 /* The Bought window (3.14.3): {pos: {x, y}|null, folded}. Where you dragged it, kept. */
 const STORE_BOUGHT_WINDOW = 'boughtWindow';
 /* What traders agreed to pay, per accepted trade (core/ledger.js): the Ledger splits a trade's money by it. */
@@ -339,6 +346,16 @@ const STORE_SELL_GONE = 'sellGone';
  */
 const STORE_SELL_STOCK = 'sellStock';
 const STORE_SELL_BOUGHT = 'sellBought';
+/*
+ * Your bazaar's sell list (3.22.0, core/bazaar-sell.js): what you bought in the last 24 hours and still
+ * hold, as Torn Bids last worked it out from your log. Your bazaar's add page marks those rows.
+ * {at, items: [{itemId, qty, each, at}]}
+ */
+const STORE_SELL_HELD = 'sellHeld24';
+/* It is written again with nothing changed only this often (its "as of" time). */
+const SELL_HELD_REWRITE_MS = 10 * 60 * 1000;
+/* What joined the To sell list, a month of notes (core/to-sell.js noteToSell): the Ledger's Sold tab marks the sales that took it. */
+const STORE_SELL_WAS = 'sellWasToSell';
 const SELL_LEFTOVERS_KEEP_MS = 7 * 24 * 60 * 60 * 1000;
 /*
  * Stored data nobody uses is deleted (3.17.0): which one-off clean-up has run
@@ -567,6 +584,10 @@ const app = {
     /* Your own bazaar's add / manage page, while you are on it. */
     ownBazaar: null,
     bzRows: [],
+    /* Your bazaar's add page (3.22.0): what you bought and have not sold (bzSell), the items Fill all passed over, and whether it is at work. */
+    bzSell: null,
+    bzSkip: new Map(),
+    bzSellBusy: false,
     bzDiagnostics: null,
     /* itemId -> { im: {price, at}|null, bz: {price, at}|null, imAt, bzAt, pending } */
     bzPrices: new Map(),
@@ -983,6 +1004,8 @@ function rescanNow() {
             removeFillControls(document);
             // What Fill typed on the page you left: its rows (and boxes) are gone.
             app.fill.done.clear();
+            app.bzSell = null;
+            app.bzSkip.clear();
         }
         app.ownBazaar = own;
         app.bzRows = [];
@@ -1559,6 +1582,8 @@ function scanOwnBazaarPage(which) {
     const now = Date.now();
     const hist = loadHistory();
     let changed = false;
+    // What you bought and have not sold (3.22.0): its rows are marked, on the add page only.
+    const sellList = which === 'add' ? bzSell(now) : null;
 
     for (const row of rows) {
         // Price history is kept for the item you look at (IMA / BP / its row
@@ -1577,7 +1602,9 @@ function scanOwnBazaarPage(which) {
         paintRowTag(tag, row.itemId);
         if (!tag.classList.contains('ttv2-bzchips') && tag.title !== 'Show its graph') tag.title = 'Show its graph';
         if (ensureFillControls(row, which, tag)) app.bzDiagnostics.fills += 1;
+        if (sellList) paintSellRow(row, tag, sellList.byItem.get(row.itemId) || null);
     }
+    paintSellBar(sellList);
     fitBazaarCells();
     bindRowTagPress();
     ensureFillSettingsLink();
@@ -1631,8 +1658,8 @@ function bindRowTagPress() {
         if (app.panel.collapsed) app.panel.setCollapsed(false, { save: true });
         if (app.panel.page !== 'mybazaar') app.panel.showPage('mybazaar');
         repaintOwnBazaar();
-        // IMA: to the graph; BP: to the cheapest bazaar listings.
-        if (tag.dataset.kind) app.panel.showBazaarPart(tag.dataset.kind === 'bp' ? 'lows' : 'graph');
+        // IMA: to the graph; BP: to the cheapest bazaar listings; Paid: to what you bought and have not sold.
+        if (tag.dataset.kind) app.panel.showBazaarPart(tag.dataset.kind === 'bp' ? 'lows' : tag.dataset.kind === 'paid' ? 'sell' : 'graph');
     };
 
     const swallow = (event) => {
@@ -1673,6 +1700,8 @@ function itemAverage(itemId) {
 function rowTagFor(row, page) {
     if (page === 'market-add' || page === 'market-view') return ensureMarketTag(row, page);
     if (page === 'add') {
+        // The row's chips as found last time, while they are still in it (3.22.0: not looked up on every read).
+        if (row.chips && row.chips.isConnected && row.el.contains(row.chips)) return row.chips;
         const cell = row.el.querySelector('.info-wrap');
         if (cell) {
             let chips = cell.querySelector('.ttv2-bzchips');
@@ -1693,6 +1722,7 @@ function rowTagFor(row, page) {
                 cell.appendChild(chips);
             }
             if (chips.dataset.itemId !== String(row.itemId)) chips.dataset.itemId = String(row.itemId);
+            row.chips = chips;
             return chips;
         }
     }
@@ -1703,6 +1733,10 @@ function paintRowTag(tag, itemId) {
     if (tag.classList.contains('ttv2-bzchips')) {
         const avg = itemAverage(itemId);
         const low = lowestBazaarPrice(itemId);
+        // The same numbers as when it was last painted: nothing to format, nothing to look up (3.22.0).
+        const sig = itemId + '|' + avg + '|' + low + '|' + (low ? '' : bpMissing(itemId).text) + '|' + (itemId === app.bzSelected);
+        if (tag.ttv2Sig === sig) return;
+        tag.ttv2Sig = sig;
         const ima = tag.querySelector('.ttv2-bzchip-ima b');
         const bp = tag.querySelector('.ttv2-bzchip-bp b');
         const a = avg ? formatMoney(avg) : '…';
@@ -1826,12 +1860,15 @@ function fetchOwnBazaarPrices() {
 
 function repaintOwnBazaar() {
     if (!app.ownBazaar) return;
+    const sellList = app.ownBazaar === 'add' ? bzSell() : null;
     for (const row of app.bzRows) {
         if (!document.contains(row.el)) continue;
         const tag = rowTagFor(row, app.ownBazaar);
         paintRowTag(tag, row.itemId);
         ensureFillControls(row, app.ownBazaar, tag);
+        if (sellList) paintSellRow(row, tag, sellList.byItem.get(row.itemId) || null);
     }
+    paintSellBar(sellList);
     fitBazaarCells();
     renderMyBazaar();
 }
@@ -1861,6 +1898,8 @@ function renderMyBazaar() {
         title: app.ownBazaar && app.ownBazaar.startsWith('market') ? 'My Item Market' : 'My bazaar',
         lowLabel: app.ownBazaar && app.ownBazaar.startsWith('market') ? 'Lowest IM' : 'Lowest bazaar',
         fill,
+        // What you bought and have not sold, with one Fill all (3.22.0; the add page only).
+        sell: bzSellPanel(),
         // The graph marks the price about to be listed: what Fill typed, else what it would type.
         mark: fill ? (fill.filled ? fill.filled.price : fill.preview ? fill.preview.price : null) : null,
     });
@@ -2147,15 +2186,19 @@ function fillRowOf(btn) {
  * tag. Returns true when the row has a price box to fill.
  */
 function ensureFillControls(row, page, tag) {
-    const kind = fillPageKind(page);
-    const inputs = rowInputs(kind, row.el);
-    let box = row.el.querySelector('.ttv2-fillbox');
+    // The row's price box and our tick as found last time, while they are still in the page (3.22.0:
+    // three look-ups a row, on every read of the page, for boxes that do not move).
+    if (!(row.priceEl && row.priceEl.isConnected)) row.priceEl = rowInputs(fillPageKind(page), row.el).price[0] || null;
+    const inputs = { price: row.priceEl ? [row.priceEl] : [] };
+    let box = row.fillBox && row.fillBox.isConnected ? row.fillBox : row.el.querySelector('.ttv2-fillbox');
+    row.fillBox = box;
     if (!inputs.price.length) {
         if (box) {
             const cell = box.parentNode;
             box.remove();
             // No tick: its cell keeps no room for one.
             if (cell && cell.classList && cell.classList.contains(BZ_CELL_CLASS)) releaseBazaarCell(cell);
+            row.fillBox = null;
         }
         return false;
     }
@@ -2183,11 +2226,16 @@ function ensureFillControls(row, page, tag) {
             tag.parentNode.appendChild(box);
         } else if (tag && tag.parentNode) tag.parentNode.insertBefore(box, tag.nextSibling);
         else rowFloat(row.el, document).appendChild(box);
+        row.fillBox = box;
     }
     // The cell it sits in keeps room for it (Torn may have drawn the cell again).
     if (box.classList.contains(BZ_FILL_CELL_CLASS) && box.parentNode && box.parentNode.classList && !box.parentNode.classList.contains(BZ_CELL_CLASS)) box.parentNode.classList.add(BZ_CELL_CLASS);
-    const btn = box.querySelector('.' + FILL_BUTTON_CLASS);
-    if (btn.dataset.itemId !== String(row.itemId)) btn.dataset.itemId = String(row.itemId);
+    if (box.ttv2Item !== row.itemId) {
+        const btn = box.querySelector('.' + FILL_BUTTON_CLASS);
+        if (btn.dataset.itemId !== String(row.itemId)) btn.dataset.itemId = String(row.itemId);
+        box.ttv2Item = row.itemId;
+        box.ttv2Plain = false;
+    }
     paintFill(box, row.el, row.itemId);
     return true;
 }
@@ -2219,13 +2267,23 @@ function ensureMarketTag(row, page) {
  */
 function fillKeyOf(rowEl, itemId) {
     const id = String(itemId);
-    let n = 0;
-    for (const r of app.bzRows || []) {
-        if (r.itemId !== id) continue;
-        if (r.el === rowEl) return id + ':' + n;
-        n += 1;
+    // Every row's key, worked out once per scan (3.22.0; the owner: "i press fill in the add bazaar, very
+    // laggy, it gets laggier the more you use it"). This walked every row of the page for each row it was
+    // asked about, several times a press: measured on a page of 1,500 rows, one Fill took half a second.
+    const rows = app.bzRows || [];
+    if (app.bzKeyRows !== rows) {
+        const seen = new Map();
+        const keys = new Map();
+        for (const r of rows) {
+            const n = seen.get(r.itemId) || 0;
+            if (!keys.has(r.el)) keys.set(r.el, r.itemId + ':' + n);
+            seen.set(r.itemId, n + 1);
+        }
+        app.bzKeys = keys;
+        app.bzKeyRows = rows;
     }
-    return id + ':0';
+    const key = app.bzKeys.get(rowEl);
+    return key && key.startsWith(id + ':') ? key : id + ':0';
 }
 
 /** This row's price boxes now: from the row as Torn draws it now, else the boxes Fill typed into. */
@@ -2250,10 +2308,15 @@ function stillFilled(done, rowEl) {
 
 /** The button's words and the line after it, from what this row has had filled. */
 function paintFill(box, rowEl, itemId) {
+    const key = fillKeyOf(rowEl, itemId);
+    // Not filled, not filling, nothing to say, and painted that way already: nothing to do (3.22.0 - a page
+    // of 1,500 rows had every tick looked up and compared again on every read).
+    const plain = !app.fill.done.has(key) && !app.fill.busy.has(rowEl) && !app.fill.last.has(String(itemId));
+    if (plain && box.ttv2Plain) return;
+    box.ttv2Plain = false;
     const btn = box.querySelector('.' + FILL_BUTTON_CLASS);
     const line = box.querySelector('.' + FILL_TAG_CLASS);
     if (!btn || !line) return;
-    const key = fillKeyOf(rowEl, itemId);
     const done = app.fill.done.get(key);
     const current = done && done.itemId === String(itemId) && stillFilled(done, rowEl) ? done : null;
     if (done && !current) app.fill.done.delete(key);
@@ -2281,15 +2344,16 @@ function paintFill(box, rowEl, itemId) {
     if (line.textContent !== words) line.textContent = words;
     if ((line.dataset.level || '') !== level) line.dataset.level = level;
     if (line.hidden !== !words) line.hidden = !words;
+    box.ttv2Plain = plain;
 }
 
-function repaintFills() {
+function repaintFills({ fit = true } = {}) {
     if (!app.ownBazaar) return;
     for (const row of app.bzRows) {
         const box = row.el.querySelector('.ttv2-fillbox');
         if (box) paintFill(box, row.el, row.itemId);
     }
-    fitBazaarCells();
+    if (fit) fitBazaarCells();
 }
 
 function removeFillControls(root = document) {
@@ -2298,7 +2362,9 @@ function removeFillControls(root = document) {
         n.remove();
         releaseMarks(bar);
     }
-    for (const n of root.querySelectorAll('.ttv2-fillbox, .ttv2-bzchips')) n.remove();
+    for (const n of root.querySelectorAll('.ttv2-fillbox, .ttv2-bzchips, .' + BZ_SELLBAR_CLASS)) n.remove();
+    for (const n of root.querySelectorAll('.' + BZ_SELL_CLASS)) n.classList.remove(BZ_SELL_CLASS);
+    for (const n of root.querySelectorAll('.' + BZ_UNDER_CLASS)) clearUnderPaid(n);
     // Torn's value cells are as they were.
     for (const c of root.querySelectorAll('.' + BZ_CELL_CLASS)) releaseBazaarCell(c);
     removeRowFloats(root);
@@ -2311,6 +2377,22 @@ function releaseBazaarCell(cell) {
     delete cell.dataset.ttv2Fit;
     const chips = cell.querySelector('.ttv2-bzchips');
     if (chips && chips.dataset.tight) delete chips.dataset.tight;
+}
+
+/**
+ * How wide each chip of a row is. A chip that has given way is still laid out
+ * (styles.js), so its width is read like the others'. Null when one cannot be
+ * read (a width of 0: the row is not drawn) - that row is measured the old way.
+ */
+function chipWidths(chips) {
+    const w = { ima: 0, bp: 0, paid: 0 };
+    for (const chip of chips.children) {
+        const kind = chip.dataset ? chip.dataset.kind : null;
+        if (kind !== 'ima' && kind !== 'bp' && kind !== 'paid') continue;
+        w[kind] = chip.offsetWidth;
+        if (!(w[kind] > 0)) return null;
+    }
+    return w;
 }
 
 /* Our marks on your bazaar's add page: Torn's value cell, and the Fill tick held at its right edge. */
@@ -2336,41 +2418,116 @@ const BZ_FILL_GAP_PX = 8;
  * costs a few layouts, and only rows whose words or width changed are done.
  * Your bazaar's manage page and the Item Market's rows: their floating
  * groups are placed by fitRowFloats.
+ *
+ * 3.22.0 (the owner: "i press fill in the add bazaar, very laggy, it gets
+ * laggier the more you use it"). Asking a row for its width makes the browser
+ * lay the whole page out again when anything has changed since, and this
+ * asked every row, at every Fill press twice and at every scan: on a page of
+ * 1,500 rows one press cost about 430 ms, five such layouts in it. A row whose
+ * words are the same as when it was last fitted is now passed over without
+ * being measured; all of them are measured again when the window is resized
+ * or the first row's cell changes size (Torn's column changed width with no
+ * word changing), and once a minute.
  */
+const BZ_FIT_FULL_MS = 60 * 1000;
 function fitBazaarCells() {
     if (app.ownBazaar && app.ownBazaar !== 'add') {
         fitRowFloats(app.bzRows);
         return;
     }
     if (app.ownBazaar !== 'add') return;
+    if (!app.bzFitBound) {
+        app.bzFitBound = true;
+        window.addEventListener('resize', () => {
+            app.bzFitFullAt = 0;
+        }, { passive: true });
+    }
+    // The first row's cell is watched: when its size changes, every row is measured again at the next read.
+    const firstBox = app.bzRows.length && app.bzRows[0].fillBox && app.bzRows[0].fillBox.isConnected ? app.bzRows[0].fillBox : null;
+    const firstCell = firstBox && firstBox.classList.contains(BZ_FILL_CELL_CLASS) ? firstBox.parentNode : null;
+    if (firstCell && firstCell !== app.bzFitWatched && typeof ResizeObserver === 'function') {
+        if (!app.bzFitWatch) {
+            app.bzFitWatch = new ResizeObserver(() => {
+                // Its first call only says the cell is now watched.
+                if (app.bzFitWatchArmed) app.bzFitFullAt = 0;
+                app.bzFitWatchArmed = true;
+            });
+        }
+        app.bzFitWatch.disconnect();
+        app.bzFitWatchArmed = false;
+        app.bzFitWatch.observe(firstCell);
+        app.bzFitWatched = firstCell;
+    }
+    const now = Date.now();
+    const full = now - (app.bzFitFullAt || 0) >= BZ_FIT_FULL_MS;
+    if (full) app.bzFitFullAt = now;
     const todo = [];
     for (const row of app.bzRows) {
-        const box = row.el.querySelector('.' + BZ_FILL_CELL_CLASS);
+        const kept = row.fillBox && row.fillBox.isConnected && row.fillBox.classList.contains(BZ_FILL_CELL_CLASS) ? row.fillBox : null;
+        const box = kept || row.el.querySelector('.' + BZ_FILL_CELL_CLASS);
         const cell = box ? box.parentNode : null;
-        const chips = cell && cell.querySelector ? cell.querySelector('.ttv2-bzchips') : null;
+        const chips = cell && row.chips && row.chips.parentNode === cell ? row.chips : cell && cell.querySelector ? cell.querySelector('.ttv2-bzchips') : null;
         if (!cell || !chips) continue;
-        const room = box.offsetWidth;
-        const key = cell.clientWidth + '|' + room + '|' + cell.textContent;
-        if (cell.dataset.ttv2Fit === key) continue;
-        todo.push({ cell, chips, key, room });
+        // The words, read without a layout: the same as when it was fitted - nothing to measure.
+        const words = cell.textContent;
+        const was = cell.dataset.ttv2Fit;
+        if (!full && was && was.slice(was.indexOf('|', was.indexOf('|') + 1) + 1) === words) continue;
+        todo.push({ cell, chips, box, words });
     }
+    // Only the rows that may have changed are measured (all of them on a full pass).
+    for (const t of todo) {
+        t.room = t.box.offsetWidth;
+        t.key = t.cell.clientWidth + '|' + t.room + '|' + t.words;
+    }
+    for (let i = todo.length - 1; i >= 0; i--) if (todo[i].cell.dataset.ttv2Fit === todo[i].key) todo.splice(i, 1);
     if (!todo.length) return;
-    // Where Torn's own words in the cell end: everything before our marks.
-    const wordsEnd = (t) => {
+    // Everything is read now, off one layout: where the chips' right edge will sit once the tick's room is
+    // set, where Torn's words end, and how wide each chip is. Which chips give way is then worked out by
+    // sum - each look at the page after a write is another layout of all of it (3.22.0: a row whose chips
+    // did not fit cost up to three more).
+    const wordsEnd = (t, c) => {
+        // Where Torn's own words in the cell end: everything before our marks.
         const range = document.createRange();
         range.setStart(t.cell, 0);
         range.setEndBefore(t.chips);
         const r = range.getBoundingClientRect();
-        return r.width ? r.right : t.cell.getBoundingClientRect().left;
+        return r.width ? r.right : c.left;
     };
-    for (const t of todo) t.end = wordsEnd(t);
     for (const t of todo) {
-        t.cell.style.setProperty('--ttv2-fillw', t.room + 'px');
-        if (t.chips.dataset.tight) delete t.chips.dataset.tight;
+        t.wasTight = Boolean(t.chips.dataset.tight);
+        const c = t.cell.getBoundingClientRect();
+        // The cell's inner right edge (its border taken off), less the tick's room and the 8px between them.
+        t.right = c.right - (c.width - t.cell.clientWidth - t.cell.clientLeft) - t.room - 8;
+        t.end = wordsEnd(t, c);
+        t.widths = chipWidths(t.chips);
     }
-    // '1': without IMA; '2': without both chips.
-    for (const level of ['1', '2']) {
-        const over = todo.filter((t) => !t.chips.dataset.tight || t.chips.dataset.tight !== '2').filter((t) => t.chips.getBoundingClientRect().left < t.end + BZ_FILL_GAP_PX);
+    // '1': without IMA; '2': without IMA and BP (what you paid stays, 3.22.0); '3': none of them.
+    const BZ_CHIP_GAP_PX = 4;
+    const sum = (list) => list.filter((w) => w > 0).reduce((a, w, i) => a + w + (i ? BZ_CHIP_GAP_PX : 0), 0);
+    const levelOf = (t) => {
+        const w = t.widths;
+        const fits = (width) => t.right - width >= t.end + BZ_FILL_GAP_PX + 1;
+        if (fits(sum([w.paid, w.ima, w.bp]))) return '';
+        if (fits(sum([w.paid, w.bp]))) return '1';
+        if (!w.paid || fits(w.paid)) return '2';
+        return '3';
+    };
+    for (const t of todo) {
+        if (t.cell.style.getPropertyValue('--ttv2-fillw') !== t.room + 'px') t.cell.style.setProperty('--ttv2-fillw', t.room + 'px');
+        const level = t.widths ? levelOf(t) : '';
+        if ((t.chips.dataset.tight || '') === level) continue;
+        if (level) t.chips.dataset.tight = level;
+        else delete t.chips.dataset.tight;
+    }
+    // A row whose chips' widths could not be read: measured, as before (the first chip still in the line).
+    const tightMaybe = todo.filter((t) => !t.widths);
+    const firstShown = (t) => {
+        const level = t.chips.dataset.tight || '';
+        const chip = [...t.chips.children].find((c) => !(level === '3' || (c.dataset.kind === 'ima' && level) || (c.dataset.kind === 'bp' && level === '2')));
+        return chip ? chip.getBoundingClientRect().left : Infinity;
+    };
+    for (const level of ['1', '2', '3']) {
+        const over = tightMaybe.filter((t) => t.chips.dataset.tight !== '3').filter((t) => firstShown(t) < t.end + BZ_FILL_GAP_PX);
         if (!over.length) break;
         for (const t of over) t.chips.dataset.tight = level;
     }
@@ -2397,6 +2554,13 @@ function ensureFillSettingsLink() {
         a.textContent = 'Fill settings';
         bar.appendChild(a);
     }
+    // Placing it measures Torn's links - a layout of the page when anything has changed since. Done when the
+    // bar's links change or the window is resized, and every 15 s; not on every read of the page (3.22.0).
+    const now = Date.now();
+    const sig = bar.children.length + '|' + window.innerWidth;
+    if (a.ttv2Placed === sig && now - (a.ttv2PlacedAt || 0) < BZ_FIT_FULL_MS) return;
+    a.ttv2Placed = sig;
+    a.ttv2PlacedAt = now;
     placeFillSettings(a, bar);
 }
 
@@ -2441,19 +2605,31 @@ function onFillPress(btn) {
         rescan();
         return;
     }
-    const key = fillKeyOf(rowEl, itemId);
-    const done = app.fill.done.get(key);
-    if (done && done.itemId === itemId && stillFilled(done, rowEl)) {
-        // Into the boxes as Torn draws them now (it may have redrawn the row).
-        const cur = fillInputsNow(done, rowEl);
-        writeInputs(cur.price, done.prev.price);
-        if (done.qtyWritten) writeInputs(cur.qty, done.prev.qty);
-        app.fill.done.delete(key);
+    if (fillUndo(rowEl, itemId)) {
         repaintFills();
+        paintSellBar();
         renderMyBazaar();
         return;
     }
     fillRow(rowEl, itemId).catch(() => {});
+}
+
+/** This row's Fill, when its boxes still hold what it typed. */
+function fillDoneOf(rowEl, itemId) {
+    const done = app.fill.done.get(fillKeyOf(rowEl, itemId));
+    return done && done.itemId === String(itemId) && stillFilled(done, rowEl) ? done : null;
+}
+
+/** What was in a filled row's boxes before goes back. True when it was filled. */
+function fillUndo(rowEl, itemId) {
+    const done = fillDoneOf(rowEl, itemId);
+    if (!done) return false;
+    // Into the boxes as Torn draws them now (it may have redrawn the row).
+    const cur = fillInputsNow(done, rowEl);
+    writeInputs(cur.price, done.prev.price);
+    if (done.qtyWritten) writeInputs(cur.qty, done.prev.qty);
+    app.fill.done.delete(fillKeyOf(rowEl, itemId));
+    return true;
 }
 
 /**
@@ -2465,77 +2641,461 @@ function onFillPress(btn) {
 async function fillRow(rowEl, itemId, { base = null } = {}) {
     const page = app.ownBazaar;
     if (!page || app.fill.busy.has(rowEl)) return;
-    const kind = fillPageKind(page);
     const market = page.startsWith('market') ? 'market' : 'bazaar';
-    const settings = fillSettings()[market];
-    const item = app.index ? app.index.byId.get(String(itemId)) : null;
     app.fill.last.delete(String(itemId));
+    app.bzSkip.delete(String(itemId));
     app.fill.busy.add(rowEl);
-    repaintFills();
+    // "Filling…" for a moment: painted, not fitted (the row is measured once, when the price is in).
+    repaintFills({ fit: false });
+    // What it typed (or why not), said once the row is painted and fitted: its place is read off the same layout.
+    let toast = null;
     try {
         const [got] = await Promise.all([
             base ? Promise.resolve({ rows: [], note: null, fromMarket: false }) : fillListings(market, itemId),
             market === 'bazaar' ? ensureSelfId() : Promise.resolve(null),
         ]);
-        if (app.ownBazaar !== page || !document.contains(rowEl)) throw new Error('The page changed; press Fill again.');
-        const avg = itemAverage(itemId);
-        const ctx = { npc: item && item.sellPrice > 0 ? item.sellPrice : null, avg, selfId: app.fill.selfId, checkFresh: market === 'bazaar' && !got.fromMarket };
-        // A listing picked in the panel is undercut under the same rules as any other.
-        const r = base ? fillPrice([base], { ...settings, index: 1 }, ctx) : fillPrice(got.rows, settings, ctx);
-        if (!(r.price > 0)) throw new Error(base && r.why && /No listing/.test(r.why) ? 'That listing is not one Fill undercuts (yours, $1, stale or far under the average).' : r.why || 'No listing to undercut.');
-
-        // Torn's #/manage reuses row elements: the row must still show this item.
-        const nowId = rowItemIdNow(kind, rowEl);
-        if (nowId && nowId !== String(itemId)) throw new Error('The row changed while prices loaded; tick again.');
-        const inputs = rowInputs(kind, rowEl);
-        if (!inputs.price.length) throw new Error('Torn\'s price box was not found in this row.');
-        // Filled already (a price picked in the panel after a tick): Undo still puts back the first values.
-        const key = fillKeyOf(rowEl, itemId);
-        const before = app.fill.done.get(key);
-        const again = before && before.itemId === String(itemId) && stillFilled(before, rowEl) ? before : null;
-        const prev = again ? again.prev : { price: readInputs(inputs.price), qty: readInputs(inputs.qty) };
-        const text = priceText(kind, r.price);
-        writeInputs(inputs.price, text);
-
-        // Quantity: all you have (or all but one), unless you typed one already.
-        let qtyWritten = again ? again.qtyWritten : false;
-        let qtyNote = '';
-        if (inputs.qty.length && !again) {
-            const typed = prev.qty.some((v) => String(v).trim() && String(v).trim() !== '0');
-            const q = fillQuantity(inputs.have, settings.qty);
-            if (!typed && q) {
-                writeInputs(inputs.qty, String(q));
-                qtyWritten = true;
-            } else if (!typed && !q) {
-                qtyNote = inputs.have === 1 && settings.qty === 'allbut1' ? 'you have 1: quantity left empty' : 'type the quantity';
-            }
-        }
-
-        const v = fillVerdict(r.price, avg);
-        const stats = isStatItem(item);
-        const parts = [(base ? 'Under the one you picked: ' : 'Filled ') + formatMoney(r.price)];
-        if (kind.startsWith('market')) parts.push('you get ' + formatMoney(Math.floor(r.price * (1 - VENUE_FEES.ITEM_MARKET))) + ' after the fee');
-        if (v.text) parts.push(v.text);
-        if (r.floor === 'npc') parts.push('held at the NPC price');
-        if (r.floor === 'avg') parts.push('held at the average');
-        if (!base && r.used < r.index) parts.push(r.count === 1 ? 'only 1 listing, so that one' : 'only ' + r.count + ' listings, so the highest of them');
-        if (stats) parts.push('each one has its own stats: check the price');
-        if (inputs.single) parts.push('tick Torn\'s box for this one');
-        if (qtyNote) parts.push(qtyNote);
-        if (got.note) parts.push(got.note);
-        const level = stats || v.level === 'warn' ? 'warn' : v.level === 'good' ? 'good' : '';
-
-        app.fill.done.set(key, { itemId: String(itemId), kind, price: r.price, priceText: text, prev, inputs, qtyWritten, words: parts.join(' · '), level, at: Date.now() });
+        const res = fillApply(rowEl, itemId, got, { base, page });
         app.bzSelected = String(itemId);
         // What it typed, beside the page for a moment (3.20): no line is added to Torn's row.
-        showToast(rowEl, parts.join(' · '), level === 'warn' ? 'warn' : '');
+        toast = [res.words, res.level === 'warn' ? 'warn' : ''];
     } catch (error) {
         const msg = redactKey(String((error && error.message) || error), getStoredKey());
         app.fill.last.set(String(itemId), { error: 'Fill: ' + msg, rowEl, at: Date.now() });
-        showToast(rowEl, 'Fill: ' + msg, 'bad');
+        toast = ['Fill: ' + msg, 'bad'];
     } finally {
         app.fill.busy.delete(rowEl);
-        repaintFills();
+        // Painted; then everything is read off ONE layout of the page (the row's place for the note, and the
+        // fit's measures); then only written. A press cost five layouts of the whole page (3.22.0).
+        repaintFills({ fit: false });
+        paintSellBar();
+        const at = toast && document.contains(rowEl) ? rowEl.getBoundingClientRect() : null;
+        fitBazaarCells();
+        if (toast) showToast(rowEl, toast[0], toast[1], document, at);
+        renderMyBazaar();
+    }
+}
+
+/**
+ * The price worked out from listings already read, and typed into one row's
+ * boxes (with the quantity). Nothing is awaited here: Fill all does every row
+ * in one go, then paints once.
+ *
+ * On your bazaar's add page a row of something you bought and have not sold
+ * (bzSell) gets how many you bought, not all you have. `skipUnder` (Fill all):
+ * a price under what you paid is not typed - {skip, price, paid} comes back.
+ *
+ * @returns {{words: string, level: string}|{skip: true, price: number, paid: number}} - throws why it could not
+ */
+function fillApply(rowEl, itemId, got, { base = null, page = app.ownBazaar, skipUnder = false } = {}) {
+    const kind = fillPageKind(page);
+    const market = page.startsWith('market') ? 'market' : 'bazaar';
+    const settings = fillSettings()[market];
+    const item = app.index ? app.index.byId.get(String(itemId)) : null;
+    if (app.ownBazaar !== page || !document.contains(rowEl)) throw new Error('The page changed; press Fill again.');
+    const avg = itemAverage(itemId);
+    const ctx = { npc: item && item.sellPrice > 0 ? item.sellPrice : null, avg, selfId: app.fill.selfId, checkFresh: market === 'bazaar' && !got.fromMarket };
+    // A listing picked in the panel is undercut under the same rules as any other.
+    const r = base ? fillPrice([base], { ...settings, index: 1 }, ctx) : fillPrice(got.rows, settings, ctx);
+    if (!(r.price > 0)) throw new Error(base && r.why && /No listing/.test(r.why) ? 'That listing is not one Fill undercuts (yours, $1, stale or far under the average).' : r.why || 'No listing to undercut.');
+    // Something you bought and still hold (the add page): never typed under what you paid by Fill all.
+    const bought = page === 'add' ? bzSell().byItem.get(String(itemId)) || null : null;
+    const under = Boolean(bought) && underPaid(r.price, bought.paid);
+    if (under && skipUnder) return { skip: true, price: r.price, paid: bought.paid };
+
+    // Torn's #/manage reuses row elements: the row must still show this item.
+    const nowId = rowItemIdNow(kind, rowEl);
+    if (nowId && nowId !== String(itemId)) throw new Error('The row changed while prices loaded; tick again.');
+    const inputs = rowInputs(kind, rowEl);
+    if (!inputs.price.length) throw new Error('Torn\'s price box was not found in this row.');
+    // Filled already (a price picked in the panel after a tick): Undo still puts back the first values.
+    const key = fillKeyOf(rowEl, itemId);
+    const before = app.fill.done.get(key);
+    const again = before && before.itemId === String(itemId) && stillFilled(before, rowEl) ? before : null;
+    const prev = again ? again.prev : { price: readInputs(inputs.price), qty: readInputs(inputs.qty) };
+    const text = priceText(kind, r.price);
+    writeInputs(inputs.price, text);
+
+    // Quantity: all you have (or all but one), unless you typed one already.
+    let qtyWritten = again ? again.qtyWritten : false;
+    let qtyNote = '';
+    let boughtQty = 0;
+    if (inputs.qty.length && !again) {
+        const typed = prev.qty.some((v) => String(v).trim() && String(v).trim() !== '0');
+        // What you bought to resell: how many you bought and have not sold, never more than you have.
+        boughtQty = bought && !typed ? Math.min(bought.qty, inputs.have || bought.qty) : 0;
+        const q = boughtQty || fillQuantity(inputs.have, settings.qty);
+        if (!typed && q) {
+            writeInputs(inputs.qty, String(q));
+            qtyWritten = true;
+        } else if (!typed && !q) {
+            qtyNote = inputs.have === 1 && settings.qty === 'allbut1' ? 'you have 1: quantity left empty' : 'type the quantity';
+        }
+    }
+
+    const v = fillVerdict(r.price, avg);
+    const stats = isStatItem(item);
+    const parts = [(base ? 'Under the one you picked: ' : 'Filled ') + formatMoney(r.price)];
+    if (kind.startsWith('market')) parts.push('you get ' + formatMoney(Math.floor(r.price * (1 - VENUE_FEES.ITEM_MARKET))) + ' after the fee');
+    if (v.text) parts.push(v.text);
+    if (r.floor === 'npc') parts.push('held at the NPC price');
+    if (r.floor === 'avg') parts.push('held at the average');
+    if (!base && r.used < r.index) parts.push(r.count === 1 ? 'only 1 listing, so that one' : 'only ' + r.count + ' listings, so the highest of them');
+    if (stats) parts.push('each one has its own stats: check the price');
+    if (inputs.single) parts.push('tick Torn\'s box for this one');
+    if (qtyNote) parts.push(qtyNote);
+    if (boughtQty && qtyWritten) parts.push('the ' + boughtQty.toLocaleString('en-US') + ' you bought');
+    if (under) parts.push('UNDER the ' + formatMoney(bought.paid) + ' you paid: a loss of ' + formatMoney(bought.paid - r.price) + ' each');
+    else if (bought && bought.paid > 0) parts.push('you paid ' + formatMoney(bought.paid) + ': +' + formatMoney(r.price - bought.paid) + ' each');
+    if (got.note) parts.push(got.note);
+    const level = under || stats || v.level === 'warn' ? 'warn' : v.level === 'good' ? 'good' : '';
+
+    app.fill.done.set(key, { itemId: String(itemId), kind, price: r.price, priceText: text, prev, inputs, qtyWritten, words: parts.join(' · '), level, at: Date.now() });
+    return { words: parts.join(' · '), level };
+}
+
+/* ------------------------------------------------------------------ *
+ * Your bazaar's add page: what you bought and have not sold (3.22.0)
+ * ------------------------------------------------------------------ */
+
+/*
+ * The owner, 2026-10-03: "when were selling in bazaar, items bought within
+ * the last 24 hours, some kind of overlay, that calculates okay what havent
+ * we traded or sold in bazaar, same as the checklist, fills all and it
+ * actually highlights that row ... everything bought in last 24 hours,
+ * prioritise sell list ... only unsold units that ive bought ... skip rows
+ * that would sell under what i paid. i need to see how much i paid for that
+ * item as well, and a pulsating red on the price that i input if its below
+ * what i [paid] ... for the fill all button ... lets add that on the top
+ * the add to bazaar page (just after where you would click the type of item)
+ * AND on the overlay".
+ *
+ * On your bazaar's add page only:
+ *   - the rows of what you bought and still hold (core/bazaar-sell.js: the To
+ *     sell list first, then the last day's other buys as Torn Bids read them
+ *     from your log) are marked, each with what you paid;
+ *   - one Fill all - a bar above Torn's list, under its item-type tabs, and
+ *     the same button in the panel - types each of those rows' price (your
+ *     Fill settings: $1 under the lowest bazaar unless you changed them) and
+ *     how many you bought; a row whose price would be under what you paid is
+ *     passed over, and said;
+ *   - a price box holding less than you paid pulses red, whoever typed it.
+ *
+ * It only types into boxes, only in those rows, only the ones in the page -
+ * it never scrolls Torn's list, ticks a box or presses Torn's button. (Rule 1
+ * had "no Fill all on your own listing pages": it would have typed into every
+ * item you own. This one types only into what you bought to resell.)
+ */
+const BZ_SELL_CLASS = 'ttv2-bzsell';
+const BZ_SELLBAR_CLASS = 'ttv2-bzsellbar';
+const BZ_UNDER_CLASS = 'ttv2-underpaid';
+/* The list is read from storage again after this, and at once when another tab changes it. */
+const BZ_SELL_READ_MS = 5000;
+/* A row Fill all passed over is offered again after this (the prices it went by are read again by then). */
+const BZ_SKIP_MS = 2 * 60 * 1000;
+const BZ_SELL_NONE = { readAt: 0, list: [], byItem: new Map(), logAt: 0 };
+
+/** What you bought and have not sold: {list, byItem, logAt (when Torn Bids last read your log; 0: no Ledger key)}. */
+function bzSell(now = Date.now()) {
+    if (app.ownBazaar !== 'add') return BZ_SELL_NONE;
+    if (app.bzSell && now - app.bzSell.readAt < BZ_SELL_READ_MS) return app.bzSell;
+    let out = { ...BZ_SELL_NONE, readAt: now };
+    try {
+        // What you bought for a trade that is still going is the trader's: not in the list.
+        const reserved = new Map();
+        for (const t of Object.values(sellAccepted(now))) {
+            for (const l of cancelledLeftovers(t, now)) reserved.set(String(l.itemId), (reserved.get(String(l.itemId)) || 0) + l.qty);
+        }
+        const stored = getLedgerKey() ? gmGet(STORE_SELL_HELD, null) : null;
+        const list = bazaarSellList({
+            leftovers: sellLeftovers(now),
+            bought: liveBoughtItems(stored, now),
+            reserved,
+            nameOf: (id) => {
+                const item = app.index ? app.index.byId.get(String(id)) : null;
+                return item ? item.name : null;
+            },
+        });
+        out = { readAt: now, list, byItem: new Map(list.map((r) => [r.itemId, r])), logAt: stored ? Number(stored.at) || 0 : 0 };
+    } catch (error) {
+        logProblem('note', 'The list of what you bought and have not sold could not be made: ' + String((error && error.message) || error));
+    }
+    app.bzSell = out;
+    return out;
+}
+
+/** Another tab changed the To sell list, an accepted trade, or what your log says you hold: the marks follow. */
+function onSellListChanged() {
+    app.bzSell = null;
+    if (app.ownBazaar === 'add') repaintOwnBazaar();
+}
+
+/** One row of the add page: marked (and what you paid said) when it is something you bought and still hold. */
+function paintSellRow(row, tag, entry) {
+    const on = Boolean(entry);
+    const was = row.el.classList.contains(BZ_SELL_CLASS);
+    if (!on && !was) return;
+    if (on !== was) row.el.classList.toggle(BZ_SELL_CLASS, on);
+    if (tag && tag.classList.contains('ttv2-bzchips')) {
+        let chip = tag.querySelector('.ttv2-bzchip-paid');
+        if (!on || !(entry.paid > 0)) {
+            if (chip) chip.remove();
+        } else {
+            if (!chip) {
+                chip = document.createElement('span');
+                chip.className = 'ttv2-bzchip ttv2-bzchip-paid';
+                chip.dataset.kind = 'paid';
+                chip.append('Paid ', document.createElement('b'));
+                tag.insertBefore(chip, tag.firstChild);
+            }
+            const b = chip.querySelector('b');
+            const text = formatMoney(entry.paid);
+            if (b.textContent !== text) b.textContent = text;
+            const why = entry.source === 'tosell' ? 'On your To sell list (' + TO_SELL_WHY[toSellWhy(entry.why)] + (entry.from ? ', ' + entry.from : '') + ')' : 'Bought in the last 24 hours';
+            const title = why + ': ' + entry.qty.toLocaleString('en-US') + ' not sold yet, at ' + text + ' each. Press for the list.';
+            if (chip.title !== title) chip.title = title;
+        }
+    }
+    paintUnderPaid(row.el, entry);
+}
+
+/** A row's price box pulses red while it holds less than you paid for the item. */
+function paintUnderPaid(rowEl, entry) {
+    for (const input of rowEl.querySelectorAll('.price input')) {
+        if (input.type === 'hidden') continue;
+        const typed = parseMoneyInput(input.value);
+        const under = Boolean(entry) && underPaid(typed, entry.paid);
+        if (!under) {
+            if (input.classList.contains(BZ_UNDER_CLASS)) clearUnderPaid(input);
+            continue;
+        }
+        if (!input.classList.contains(BZ_UNDER_CLASS)) input.classList.add(BZ_UNDER_CLASS);
+        const title = 'Under the ' + formatMoney(entry.paid) + ' you paid for it';
+        if (input.title !== title) input.title = title;
+    }
+}
+
+function clearUnderPaid(input) {
+    input.classList.remove(BZ_UNDER_CLASS);
+    if (/^Under the \$/.test(input.title || '')) input.removeAttribute('title');
+}
+
+/** A price typed (by you, or by Fill) on the add page: its box is checked against what you paid at once. */
+function bindUnderPaidWatch() {
+    if (app.bzUnderBound) return;
+    app.bzUnderBound = true;
+    const check = (event) => {
+        if (app.ownBazaar !== 'add' || !app.bzSell || !app.bzSell.list.length) return;
+        const t = event.target;
+        if (!t || t.tagName !== 'INPUT' || !t.closest || !t.closest('.price')) return;
+        const li = t.closest('li');
+        const row = li ? app.bzRows.find((r) => r.el === li) : null;
+        if (row) paintUnderPaid(row.el, bzSell().byItem.get(row.itemId) || null);
+    };
+    for (const type of ['input', 'keyup', 'change']) window.addEventListener(type, check, true);
+}
+
+/**
+ * The list as the bar and the panel show it: each item with what you paid,
+ * and where it stands on this page - filled, passed over (the price would be
+ * under what you paid), ready, or not in the list Torn has drawn.
+ * Null when there is nothing bought and unsold (or not on the add page).
+ */
+function bzSellView(sell = bzSell()) {
+    if (app.ownBazaar !== 'add' || !sell.list.length) return null;
+    const rowsOf = new Map();
+    for (const r of app.bzRows) {
+        if (!sell.byItem.has(r.itemId)) continue;
+        if (!rowsOf.has(r.itemId)) rowsOf.set(r.itemId, []);
+        rowsOf.get(r.itemId).push(r);
+    }
+    const out = { rows: [], total: sell.list.length, here: 0, filled: 0, skipped: 0, todo: 0, busy: app.bzSellBusy, logAt: sell.logAt };
+    for (const e of sell.list) {
+        const here = (rowsOf.get(e.itemId) || []).filter((r) => r.el.querySelector('.ttv2-fillbox'));
+        let done = null;
+        for (const r of here) {
+            done = fillDoneOf(r.el, r.itemId);
+            if (done) break;
+        }
+        const skipped = done ? null : app.bzSkip.get(e.itemId) || null;
+        const skip = skipped && Date.now() - skipped.at < BZ_SKIP_MS ? skipped : null;
+        const state = !here.length ? 'norow' : done ? 'filled' : skip ? 'skipped' : 'ready';
+        if (state !== 'norow') out.here += 1;
+        if (state === 'filled') out.filled += 1;
+        if (state === 'skipped') out.skipped += 1;
+        if (state === 'ready') out.todo += 1;
+        out.rows.push({ itemId: e.itemId, name: e.name, qty: e.qty, paid: e.paid, source: e.source, why: e.why ? TO_SELL_WHY[toSellWhy(e.why)] : null, state, price: done ? done.price : skip ? skip.price : null, low: lowestBazaarPrice(e.itemId) });
+    }
+    return out;
+}
+
+/**
+ * The bar above Torn's list on the add page (under its item-type tabs): Fill
+ * all, and where the list stands. Ours, in the page's flow before the first
+ * list - Torn's rows are not touched. Gone when there is nothing to sell.
+ */
+function paintSellBar(sell = app.ownBazaar === 'add' ? bzSell() : null) {
+    let bar = document.querySelector('.' + BZ_SELLBAR_CLASS);
+    const view = sell ? bzSellView(sell) : null;
+    const first = view ? document.querySelector('ul.items-cont') : null;
+    if (!first || !first.parentElement) {
+        if (bar) bar.remove();
+        return;
+    }
+    if (!bar) {
+        bar = document.createElement('div');
+        bar.className = BZ_SELLBAR_CLASS;
+        // A span with a button's role, as Fill all on the trade page: Torn's own button styles never reach it.
+        const btn = document.createElement('span');
+        btn.className = 'ttv2-bzsellall';
+        btn.setAttribute('role', 'button');
+        btn.tabIndex = 0;
+        const press = (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            fillAllBought();
+        };
+        btn.addEventListener('click', press);
+        btn.addEventListener('keydown', (event) => {
+            if (event.key === 'Enter' || event.key === ' ') press(event);
+        });
+        const note = document.createElement('span');
+        note.className = 'ttv2-bzsellnote';
+        bar.append(btn, note);
+        bindUnderPaidWatch();
+    }
+    // Before Torn's first list, in the same parent; moved only when it is not there (never fought over).
+    if (bar.parentElement !== first.parentElement || !(bar.compareDocumentPosition(first) & 4)) first.parentElement.insertBefore(bar, first);
+    const words = bzSellWords(view);
+    const btn = bar.firstChild;
+    const note = bar.lastChild;
+    if (btn.textContent !== words.button) btn.textContent = words.button;
+    if (btn.title !== words.title) btn.title = words.title;
+    if (btn.getAttribute('aria-pressed') !== String(words.pressed)) btn.setAttribute('aria-pressed', String(words.pressed));
+    if (btn.getAttribute('aria-disabled') !== String(words.disabled)) btn.setAttribute('aria-disabled', String(words.disabled));
+    if (note.textContent !== words.note) note.textContent = words.note;
+}
+
+/** The panel's part: the list, and Fill all's words. */
+function bzSellPanel() {
+    const view = bzSellView();
+    return view ? { rows: view.rows, words: bzSellWords(view), logAt: view.logAt } : null;
+}
+
+/** Fill all's words, the same on the bar and in the panel. */
+function bzSellWords(view) {
+    const n = (k, one, many) => k.toLocaleString('en-US') + ' ' + (k === 1 ? one : many);
+    const parts = [n(view.total, 'item', 'items') + ' bought and not sold'];
+    if (view.filled) parts.push(view.filled + ' filled');
+    if (view.skipped) parts.push(view.skipped + ' passed over: the price would be under what you paid');
+    if (view.here < view.total) parts.push(n(view.total - view.here, 'is', 'are') + ' not in this list (scroll it down or open the item\'s tab; or already listed)');
+    // Nothing left to type: with rows filled, the press puts them back; with none (all passed over, or none in the list) there is nothing to press.
+    const allDone = !view.todo && view.filled > 0;
+    const nothing = !view.todo && !view.filled;
+    return {
+        button: view.busy ? 'Filling…' : allDone ? '☑ ' + n(view.filled, 'item', 'items') + ' filled' : nothing ? 'Nothing to fill' : '☐ Fill all ' + n(view.todo, 'item', 'items') + ' you bought',
+        title: allDone ? 'Press to put back what was in the boxes' : 'Type the price (your Fill settings) and how many you bought into each marked row. A price under what you paid is not typed. You press Torn\'s button.',
+        pressed: allDone,
+        disabled: view.busy || nothing,
+        note: parts.join(' · '),
+    };
+}
+
+/** The rows one Fill all types into: each item's row in the list you are looking at (a weapon or armour: one row per unit bought). */
+function bzSellTargets(sell) {
+    const out = [];
+    const rowsOf = new Map();
+    for (const r of app.bzRows) {
+        if (!sell.byItem.has(r.itemId)) continue;
+        if (!rowsOf.has(r.itemId)) rowsOf.set(r.itemId, []);
+        rowsOf.get(r.itemId).push(r);
+    }
+    for (const e of sell.list) {
+        // Torn may list an item on several tabs: only the list that shows.
+        const here = (rowsOf.get(e.itemId) || []).filter((r) => document.contains(r.el) && r.el.querySelector('.ttv2-fillbox') && r.el.offsetParent !== null);
+        if (!here.length) continue;
+        const single = rowInputs('bazaar-add', here[0].el).single;
+        for (const r of single ? here.slice(0, Math.max(1, e.qty)) : here.slice(0, 1)) out.push({ entry: e, row: r });
+    }
+    return out;
+}
+
+/**
+ * Fill all's press. Every marked row not yet filled gets its price and
+ * quantity typed; with all of them filled, each is put back as it was.
+ * The prices are read first (all at once, each reused for a minute), then
+ * every row is typed in one go and the page is painted and measured once -
+ * not once per row.
+ */
+async function fillAllBought() {
+    if (app.ownBazaar !== 'add' || app.bzSellBusy) return;
+    const page = app.ownBazaar;
+    const targets = bzSellTargets(bzSell());
+    if (!targets.length) {
+        paintSellBar();
+        return;
+    }
+    // A row passed over a moment ago is not asked again until its prices are read again.
+    const passed = (id) => {
+        const s = app.bzSkip.get(id);
+        return Boolean(s && Date.now() - s.at < BZ_SKIP_MS);
+    };
+    const open = targets.filter((t) => !fillDoneOf(t.row.el, t.row.itemId));
+    const todo = open.filter((t) => !passed(t.row.itemId));
+    if (!todo.length && open.length === targets.length) {
+        paintSellBar();
+        return;
+    }
+    if (!todo.length) {
+        for (const t of targets) fillUndo(t.row.el, t.row.itemId);
+        logAction('Fill all on your bazaar\'s add page: ' + targets.length + ' rows put back');
+        repaintFills({ fit: false });
+        paintSellBar();
+        fitBazaarCells();
+        renderMyBazaar();
+        return;
+    }
+    app.bzSellBusy = true;
+    for (const t of todo) {
+        app.fill.busy.add(t.row.el);
+        app.fill.last.delete(t.row.itemId);
+        app.bzSkip.delete(t.row.itemId);
+    }
+    repaintFills({ fit: false });
+    paintSellBar();
+    let typed = 0;
+    let skipped = 0;
+    let failed = 0;
+    try {
+        const ids = [...new Set(todo.map((t) => t.row.itemId))];
+        const [got] = await Promise.all([
+            Promise.all(ids.map((id) => fillListings('bazaar', id).then((g) => [id, g, null], (error) => [id, null, error]))),
+            ensureSelfId(),
+        ]);
+        const byId = new Map(got.map(([id, g, error]) => [id, { g, error }]));
+        for (const t of todo) {
+            const id = t.row.itemId;
+            try {
+                const r = byId.get(id);
+                if (!r || r.error) throw r ? r.error : new Error('No prices read.');
+                const res = fillApply(t.row.el, id, r.g, { page, skipUnder: true });
+                if (res.skip) {
+                    app.bzSkip.set(id, { price: res.price, paid: res.paid, at: Date.now() });
+                    skipped += 1;
+                } else typed += 1;
+            } catch (error) {
+                const msg = redactKey(String((error && error.message) || error), getStoredKey());
+                app.fill.last.set(String(id), { error: 'Fill: ' + msg, rowEl: t.row.el, at: Date.now() });
+                failed += 1;
+            }
+        }
+    } finally {
+        for (const t of todo) app.fill.busy.delete(t.row.el);
+        app.bzSellBusy = false;
+        logAction('Fill all on your bazaar\'s add page: ' + typed + ' rows typed, ' + skipped + ' passed over (under what you paid), ' + failed + ' failed');
+        // Painted, then measured once, then written (as one Fill).
+        repaintFills({ fit: false });
+        paintSellBar();
+        fitBazaarCells();
         renderMyBazaar();
     }
 }
@@ -3685,7 +4245,8 @@ function scanTradePageNow() {
         return;
     }
     const marked = new Set();
-    for (const row of readTradeAddRows(document)) {
+    // Only the rows of what this trade sends are read (3.22.0): Torn's list can hold over a thousand.
+    for (const row of readTradeAddRows(document, (id) => need.has(id))) {
         const n = need.get(row.itemId);
         if (!n) continue;
         // After the name: Torn hides this page's .info-wrap, so a mark there is never seen.
@@ -4014,7 +4575,7 @@ function bindTradeFillPress() {
         }
         // This chip's own row (the item is in the All list and its category's list).
         const li = chip.closest('li');
-        const row = readTradeAddRows(document).find((r) => r.el === li);
+        const row = readTradeAddRow(li);
         if (!row || !row.qty) return;
         const want = chip.dataset.fill;
         if (tradeFill.has(row.el) && row.qty.value === want) {
@@ -4034,8 +4595,7 @@ function bindTradeFillPress() {
  * Torn's button, never ticks a box, never scrolls.
  */
 function fillAllTradeRows() {
-    const rows = readTradeAddRows(document);
-    const pairs = fillAllChips().map((chip) => ({ chip, row: rows.find((r) => r.el === chip.closest('li')) })).filter((p) => p.row && p.row.qty);
+    const pairs = fillAllChips().map((chip) => ({ chip, row: readTradeAddRow(chip.closest('li')) })).filter((p) => p.row && p.row.qty);
     const todo = pairs.filter((p) => !(tradeFill.has(p.row.el) && p.row.qty.value === p.chip.dataset.fill));
     if (todo.length) {
         for (const p of todo) {
@@ -4344,7 +4904,7 @@ function usageState() {
         keys: { torn: Boolean(getSellKey()), tornExchange: Boolean(getTeKey()), ledger: Boolean(getLedgerKey()), overlay: Boolean(gmGet(STORE_KEY, '')) },
         tornBids: {
             cash: p.cash || null, mostPerFlip: p.maxPerFlip || null, extrasPerTrade: p.extraItems || null, minProfitPct: p.minProfitPct ?? null,
-            traderCanPayPct: p.networthPct ?? null, onlineOnly: Boolean(p.onlineOnly), trustedOnly: Boolean(p.trustedOnly),
+            traderCanPayPct: p.networthPct ?? null, onlineOnly: Boolean(p.onlineOnly), trustedOnly: Boolean(p.trustedOnly), freshOnly: Boolean(p.freshOnly),
             favourites: favouriteTraders().length, blacklisted: sellBlacklist().length,
         },
         overlay: { liveFeed: overlay.liveFeed !== false, saveCalls: Boolean(overlay.saveCalls), useW3b: overlay.useW3b !== false },
@@ -4525,14 +5085,16 @@ function tidyStored(now = Date.now()) {
     // Only the tab in view: a hidden tab is slowed by the browser and may hold an older
     // copy of a value another tab just wrote - writing that back would undo the newer one.
     if (document.visibilityState !== 'visible') return;
+    // Before an old accepted trade is tidied away: what was bought for it goes to To sell.
+    expireSellAccepted(now);
     const c = gmGet(STORE_CLEANED, null) || {};
     if (now - (Number(c.tidyAt) || 0) < TIDY_EVERY_MS) return;
     gmSet(STORE_CLEANED, { ...c, tidyAt: now });
     perfTimed('hourly tidy-up of stored values', () => {
         const rules = [
             [STORE_SELL_ACCEPTED, tidyAccepted], [STORE_SELL_PINNED, tidyPins], [STORE_SELL_GONE, tidyGone], [STORE_SELL_STOCK, tidyStock], [STORE_SELL_BOUGHT, tidyBought],
-            [STORE_SELL_DECLINED, tidyDeclined], [STORE_SELL_CANCEL_UNDO, (s, t) => tidyCancelUndo(s, t, CANCEL_UNDO_KEEP_MS)], [STORE_SELL_LEFTOVERS, (s, t) => tidyLeftovers(s, t, SELL_LEFTOVERS_KEEP_MS)],
-            [STORE_TE_LISTS, tidyTeLists],
+            [STORE_SELL_DECLINED, tidyDeclined], [STORE_SELL_ASKED, tidyAsked], [STORE_SELL_ENDED, tidyEnded], [STORE_SELL_CANCEL_UNDO, (s, t) => tidyCancelUndo(s, t, CANCEL_UNDO_KEEP_MS)], [STORE_SELL_LEFTOVERS, (s, t) => tidyLeftovers(s, t, SELL_LEFTOVERS_KEEP_MS)],
+            [STORE_TE_LISTS, tidyTeLists], [STORE_SELL_WAS, tidyWasToSell], [STORE_SELL_HELD, tidyHeld],
         ];
         for (const [key, rule] of rules) {
             if (!gmSize(key)) continue;
@@ -4556,8 +5118,8 @@ function storageSizes() {
     ];
     // The values the first list missed (3.17.0: the speed log's "everything stored"), and this tab's own request windows.
     keys.push(
-        STORE_W3B_COOLDOWN, STORE_IM_WATCH, STORE_BIDS_SEEN, STORE_SELL_DECLINED, STORE_SELL_CANCELLED, STORE_BOUGHT_WINDOW, STORE_SELL_PRICE_RECORDS, STORE_SELL_BLACKLIST,
-        STORE_SELL_FAVOURITES, STORE_SELL_TE_OWN, STORE_CHAT_WANTED, STORE_SELL_MOVES, STORE_LEDGER_REV, STORE_SELL_PRESENCE,
+        STORE_W3B_COOLDOWN, STORE_IM_WATCH, STORE_BIDS_SEEN, STORE_SELL_DECLINED, STORE_SELL_ASKED, STORE_SELL_ENDED, STORE_SELL_CANCELLED, STORE_BOUGHT_WINDOW, STORE_SELL_PRICE_RECORDS, STORE_SELL_BLACKLIST,
+        STORE_SELL_FAVOURITES, STORE_SELL_TE_OWN, STORE_CHAT_WANTED, STORE_SELL_MOVES, STORE_LEDGER_REV, STORE_SELL_PRESENCE, STORE_SELL_HELD, STORE_SELL_WAS,
         FEED_LEADER_KEY, FEED_RECHECK_KEY, FEED_REFRESH_KEY, SPEED_STORE_KEY, STORE_CLEANED,
         STORE_API_WINDOW + '.' + app.tabId, STORE_W3B_WINDOW + '.' + app.tabId,
     );
@@ -4692,7 +5254,7 @@ function registerMenu() {
  * ------------------------------------------------------------------ */
 
 /* The Torn Ledger's state on Torn Bids (the key itself stays in storage). */
-const led = { client: null, data: null, busy: false, checking: false, error: null, keyError: null, saveMsg: null, nextAt: 0, buysClient: null, buysBusy: false, buysNextAt: 0 };
+const led = { client: null, data: null, busy: false, checking: false, error: null, keyError: null, saveMsg: null, nextAt: 0, buysClient: null, buysBusy: false, buysNextAt: 0, was: null, wasAt: 0 };
 
 const sell = {
     /* Each item's buyers, kept between redraws (core/kept-buyers.js). */
@@ -4725,6 +5287,9 @@ const sell = {
     statusPressed: false,
     /* The To sell tab (3.21.0): its board is beside the list until you pick a row or plan a trade. */
     boardOpen: false,
+    /* When each trader last changed their TornW3B price list: id -> ms (3.22.0, "Fresh prices only"). */
+    listAt: new Map(),
+    listAtDirty: false,
     /* Near-misses and every other item anyone buys (3.15): read after the possible flips. */
     nearIds: [],
     sweepIds: [],
@@ -5269,8 +5834,58 @@ function sellDeclined(now = Date.now()) {
  * buys your Torn log shows applied (3.16): what the log says you bought
  * ticks the plan off, whatever the page showed or was pressed.
  */
+/**
+ * An accepted trade with no trade made in a day (3.22.0; the owner: "depending
+ * on that, it automatically sorts it to to sell?"). It was let go silently -
+ * every reader passes over it, the hourly tidy deletes it - and what you had
+ * bought for it was written down nowhere. Now, as it goes, what was bought
+ * for it joins To sell ("No trade made") and the Trades board says so. Only
+ * the tab in view does it (a hidden tab may hold an older copy), and one
+ * trade once (the ended list knows it by trader and when they said yes).
+ */
+function expireSellAccepted(now = Date.now()) {
+    const raw = gmGet(STORE_SELL_ACCEPTED, null);
+    // The trades still kept come back, so the caller does not read and parse the stored value a second time.
+    const live = liveAccepted(raw, now);
+    if (!raw || typeof raw !== 'object' || document.visibilityState !== 'visible') return live;
+    const gone = Object.values(raw).filter((t) => t && t.key && Array.isArray(t.items) && live[t.key] !== t);
+    if (!gone.length) return live;
+    gmSet(STORE_SELL_ACCEPTED, live);
+    let ended = liveEnded(gmGet(STORE_SELL_ENDED, null), now);
+    let left = [];
+    for (const t of gone) {
+        if (ended.some((e) => e.key === String(t.key) && e.yesAt === (Number(t.at) || 0))) continue;
+        const mine = cancelledLeftovers(t, now).map((l) => ({ ...l, why: 'old' }));
+        left = addLeftovers(left, mine);
+        ended = addEnded(ended, endedOf(t, 'old', mine, now), now);
+        logProblem('note', 'An accepted trade with no trade made in a day was let go (' + (t.trader ? t.trader.name : t.key) + '): ' + mine.length + (mine.length === 1 ? ' item' : ' items') + ' bought for it went to To sell');
+    }
+    if (left.length) saveSellLeftovers(addLeftovers(sellLeftovers(now), left));
+    gmSet(STORE_SELL_ENDED, ended);
+    return live;
+}
+
+/** A trade ended (traded, cancelled): written down for the Trades board, with what went to To sell. */
+function noteSellEnded(trade, how, moved, now = Date.now()) {
+    if (!trade || !trade.key) return;
+    gmSet(STORE_SELL_ENDED, addEnded(gmGet(STORE_SELL_ENDED, null), endedOf(trade, how, moved, now), now));
+}
+
+/** Trades you asked a trader about, still waiting for a yes (an hour). */
+function sellAsked(now = Date.now()) {
+    return liveAsked(gmGet(STORE_SELL_ASKED, null), now);
+}
+
+function dropSellAsked(itemId, key) {
+    const all = sellAsked();
+    const k = holdKey(itemId, key);
+    if (!all[k]) return;
+    delete all[k];
+    gmSet(STORE_SELL_ASKED, all);
+}
+
 function sellAccepted(now = Date.now()) {
-    const all = liveAccepted(gmGet(STORE_SELL_ACCEPTED, null), now);
+    const all = expireSellAccepted(now);
     const log = gmGet(STORE_SELL_LOG_BUYS, null);
     if (!log || !Array.isArray(log.buys) || !Object.keys(all).length) return all;
     // Only trades the stored log reaches back to share its buys (an older one keeps what it saved).
@@ -5409,6 +6024,14 @@ function sellLeftovers(now = Date.now()) {
 }
 
 function saveSellLeftovers(list) {
+    // What joins the list is noted (3.22.0): the Ledger's Sold tab marks the sales that took it.
+    try {
+        const was = gmGet(STORE_SELL_WAS, null);
+        const next = noteToSell(was, gmGet(STORE_SELL_LEFTOVERS, []), list, Date.now(), leftoverFrom);
+        if (next !== was) gmSet(STORE_SELL_WAS, next);
+    } catch {
+        /* a note not kept changes nothing else */
+    }
     gmSet(STORE_SELL_LEFTOVERS, list);
     // This tab is not told of its own write (3.16.4): its log is read soon, to see what of them you still hold.
     if (led.client) ledgerSoon();
@@ -5427,6 +6050,7 @@ function cancelSellAccepted(key, now = Date.now()) {
     if (!t) return;
     const left = cancelledLeftovers(t, now);
     if (left.length) saveSellLeftovers(addLeftovers(sellLeftovers(now), left));
+    noteSellEnded(t, 'cancel', left, now);
     const recs = gmGet(STORE_SELL_PRICE_RECORDS, []) || [];
     const id = t.trader && t.trader.id ? String(t.trader.id) : null;
     const kept = recs.filter((r) => !(r && id && String(r.traderId) === id && Number(r.at) === Number(t.at)));
@@ -5463,6 +6087,7 @@ function closeSellAccepted(key, { done = false, left = null } = {}) {
         const before = sellLeftovers();
         const mine = afterYoursSent(before, all[key]);
         if (rest.length || mine !== before) saveSellLeftovers(addLeftovers(mine, rest));
+        noteSellEnded(all[key], 'traded', rest);
     }
     const itemId = all[key] ? String(all[key].itemId) : null;
     forgetLogBuysOf(key, all);
@@ -5604,6 +6229,39 @@ function saveActivity() {
     }
 }
 
+/*
+ * When each trader last changed their TornW3B price list, kept in the page's
+ * own storage like the statuses (3.22.0): a page just opened would show the
+ * old lists' prices until each item's buyers were read again.
+ */
+const LIST_AT_KEY = 'ttv2.bids.listat';
+const LIST_AT_MAX = 3000;
+
+function saveListAt() {
+    if (!sell.listAtDirty) return;
+    sell.listAtDirty = false;
+    try {
+        const rows = [...sell.listAt].sort((a, b) => b[1] - a[1]).slice(0, LIST_AT_MAX).map(([id, at]) => [id, Math.round(at / 1000)]);
+        localStorage.setItem(LIST_AT_KEY, JSON.stringify(rows));
+    } catch {
+        /* no page storage: learned again from the reads */
+    }
+}
+
+function restoreListAt() {
+    let stored = null;
+    try {
+        stored = JSON.parse(localStorage.getItem(LIST_AT_KEY) || 'null');
+    } catch {
+        stored = null;
+    }
+    for (const row of Array.isArray(stored) ? stored : []) {
+        const id = Array.isArray(row) ? String(row[0]) : '';
+        const at = Array.isArray(row) ? Number(row[1]) * 1000 : 0;
+        if (id && at > 0 && !sell.listAt.has(id)) sell.listAt.set(id, at);
+    }
+}
+
 /** Torn Bids is in view: said for every tab, so the overlay's reads make room (written at most every 10 s). */
 function markBidsSeen() {
     if (document.visibilityState !== 'visible') return;
@@ -5701,6 +6359,11 @@ function loadItemTraders(itemId) {
             sell.itemTraders.set(id, { at, triedAt: at, total, traders, loading: false, error: null });
             const found = [];
             for (const t of traders) {
+                // When they last changed their price list (Fresh prices only).
+                if (t.listAt && sell.listAt.get(t.id) !== t.listAt) {
+                    sell.listAt.set(t.id, t.listAt);
+                    sell.listAtDirty = true;
+                }
                 if (t.lastAction) {
                     const was = sell.activity.get(t.id);
                     if (!was || was.at <= t.lastAction) {
@@ -5717,6 +6380,26 @@ function loadItemTraders(itemId) {
             sell.itemTraders.set(id, { ...(prev || { at: 0, traders: [], total: 0 }), loading: false, triedAt: Date.now(), error: true });
             if (error && error.blocked) sell.w3bPauseUntil = Date.now() + 60000;
         });
+}
+
+/*
+ * Plan trade reads that trader's price list again at once (3.22.0; the owner,
+ * 2026-10-03: "price list of one trader was different, i sold it on a huge
+ * loss because his prices were stale and old ... the new price lowered down
+ * drastically"). A list is read again every 10 minutes for the items you
+ * hold and every hour for the rest, so the plan you were about to offer could
+ * stand on a price up to an hour old. One read, of the trader you picked;
+ * not more often than once a minute for the same trader.
+ */
+const PLAN_REREAD_MS = 60 * 1000;
+const planReread = new Map();
+
+function rereadTraderList(key, now = Date.now()) {
+    const id = String(key || '').startsWith('id:') ? String(key).slice(3) : null;
+    if (!id || !sell.w3b || !sell.db || !sell.db.traders || !sell.db.traders[id]) return;
+    if (now - (planReread.get(id) || 0) < PLAN_REREAD_MS) return;
+    planReread.set(id, now);
+    loadW3bList(id).then(() => renderSelling());
 }
 
 /** One trader's TornW3B price list. */
@@ -6168,6 +6851,7 @@ function renderSellingWork(src = null) {
         return st ? isFavourite(st, favEdits, now) : Boolean(b && b.id && favAdded.has(String(b.id)));
     };
     const blacklist = blacklistKeys(sellBlacklist());
+    const listAtOf = (id) => sell.listAt.get(String(id)) || 0;
     // Every buyer lookup that is not the shown list (a pinned or picked trade, its bids) skips them too.
     const buyersAllowed = (id) => withoutBlacklisted(buyersAll(id), blacklist);
     // Every trader with a Trusted badge seen on any item (Your traders scans them).
@@ -6187,6 +6871,8 @@ function renderSellingWork(src = null) {
             b = favouritesFirstOnTie(withoutBlacklisted(all, blacklist), favOf);
             if (prefs.onlineOnly) b = onlineOnly(b, levelOf);
             if (prefs.trustedOnly) b = trustedOnly(b, { min: 'Known', keepUnrated: votesMissing });
+            // Fresh prices only (3.22.0): a TornW3B price from a list not changed in two days is not shown.
+            if (prefs.freshOnly) b = freshOnly(b, listAtOf, now);
             shownCache.set(key, b);
         }
         return b;
@@ -6224,7 +6910,8 @@ function renderSellingWork(src = null) {
     // To sell (3.21.0, core/to-sell.js): what you bought to resell and still hold - its tab's rows, and
     // the "yours" lines a trade with each trader gets. Only these: your other items stay out of every trade.
     const sellEnough = (per, each) => enoughProfit(per, each, 'TRADER', prefs.minProfitPct);
-    const toSell = toSellRows(leftovers, { buyersOf, enough: sellEnough });
+    // (Your own bazaar as a way out is added once the bazaars are looked up, further down.)
+    let toSell = toSellRows(leftovers, { buyersOf, enough: sellEnough });
     const toSellLines = toSellHeld(leftovers, { buyersOf, enough: sellEnough });
     const toSellIds = new Set(toSell.map((r) => r.itemId));
     // The overlay's summary copy (every 30 s while a Torn tab is open), when newer (3.15).
@@ -6321,6 +7008,8 @@ function renderSellingWork(src = null) {
         const s = summary.get(String(id));
         return s ? s.lowestPrice : null;
     };
+    // To sell, now that the bazaars are known: your own bazaar where it is over what you paid (never a loss).
+    toSell = toSellRows(leftovers, { buyersOf, enough: sellEnough, bazaarOf: lowestOf });
     // A flip sells to a believable buyer only (see flipBuyer), and never
     // buys more than your Most per flip.
     // ...and never asks a trader to pay more than your share of their networth.
@@ -6852,7 +7541,7 @@ function renderSellingWork(src = null) {
         // Buyers online only (3.20.5): a status read since is a reason too - a trader found
         // offline kept "Trade +$X" here until the next working-out.
         const whoStatus = prefs.onlineOnly ? [...who.keys()].map((id) => levelOf(id) + (holdFlips && unreadStatus(id) ? '?' : '')) : null;
-        const scanSig = JSON.stringify([prefs.cash, prefs.maxPerFlip, prefs.extraItems, prefs.minProfitPct, prefs.networthPct, prefs.onlineOnly, prefs.trustedOnly, favEdits, [...blacklist], [...who.keys()], sell.summaryAt, whoStatus]);
+        const scanSig = JSON.stringify([prefs.cash, prefs.maxPerFlip, prefs.extraItems, prefs.minProfitPct, prefs.networthPct, prefs.onlineOnly, prefs.trustedOnly, prefs.freshOnly, favEdits, [...blacklist], [...who.keys()], sell.summaryAt, whoStatus]);
         const fresh = sell.scanSig === scanSig && now - (sell.scanAt || 0) < SCAN_EVERY_MS;
         if (!scan.open) sell.scanWatch = [];
         if (scan.open && fresh) scan.list = sell.scanList || [];
@@ -6904,11 +7593,17 @@ function renderSellingWork(src = null) {
         // Each trader row carries its key: Plan trade and Declined act on it.
         const pickAvg = itemOf(pick) ? Number(itemOf(pick).marketValue) || null : null;
         // A bid over 3x the Item Market Average is shown, marked, and never counted (troll bids).
-        const buyers = buyersOf(pick).map((x) => ({ ...x, tradeKey: traderKey(x), troll: pickAvg > 0 && !believableBid(x.price, pickAvg), traded: tradedLine(statOf(x), now), favourite: favOf(x) }));
+        let buyers = buyersOf(pick).map((x) => ({ ...x, tradeKey: traderKey(x), troll: pickAvg > 0 && !believableBid(x.price, pickAvg), traded: tradedLine(statOf(x), now), favourite: favOf(x) }));
+        // A To sell item (3.22.0, the owner: "never suggest selling on a loss ... only show traders who we can sell on
+        // a profit"): a trader who pays no more than you paid is taken off the list - counted and named below, never planned.
+        const paidRow = leftovers.find((l) => String(l.itemId) === pick) || null;
+        const paid = paidRow && Number(paidRow.each) > 0 ? Number(paidRow.each) : 0;
+        const lossBuyers = paid ? buyers.filter((x) => !(x.price > paid)).map((x) => ({ ...x, hiddenBy: 'loss', paid })) : [];
+        if (lossBuyers.length) buyers = buyers.filter((x) => x.price > paid);
         const realBid = pickAvg > 0 ? listBid(buyers, pickAvg) || null : buyers[0] ? buyers[0].price : null;
         // Traders Online only / Trusted only leave out here: counted and named, never just gone.
-        const shownKeys = new Set(buyers.map((x) => x.tradeKey));
-        const hidden = hiddenBuyers(withoutBlacklisted(buyersAll(pick), blacklist).filter((x) => !shownKeys.has(traderKey(x))), { prefs, levelOf, votesMissing })
+        const shownKeys = new Set([...buyers, ...lossBuyers].map((x) => x.tradeKey));
+        const hidden = hiddenBuyers(withoutBlacklisted(buyersAll(pick), blacklist).filter((x) => !shownKeys.has(traderKey(x))), { prefs, levelOf, votesMissing, listAtOf, now })
             .map((x) => ({ ...x, tradeKey: traderKey(x), traded: tradedLine(statOf(x), now), favourite: favOf(x) }));
         const b = sell.bazaars.get(pick);
         const held = heldQty.get(pick) || 0;
@@ -6927,8 +7622,10 @@ function renderSellingWork(src = null) {
             buyersTotal: buyers.length,
             buyersLoading: Boolean(load.loading),
             buyersListNote: !load.loading && load.error && now < (load.retryAt || 0) ? load.error : null,
-            hidden,
-            pending: !buyers.length && !hidden.length && (pendingFor(pick) || statusPending),
+            hidden: [...lossBuyers, ...hidden],
+            // What you paid for it, when it is a To sell item: nothing under it is suggested.
+            paid: paid || null,
+            pending: !buyers.length && !hidden.length && !lossBuyers.length && (pendingFor(pick) || statusPending),
             sellers: {
                 state: b && b.at ? 'ok' : b && b.error ? 'error' : 'loading',
                 rows: sellersOf(pick) || [],
@@ -6938,7 +7635,7 @@ function renderSellingWork(src = null) {
             planWhy: b && b.at ? null : 'loading',
             // Weapons and armour: every copy has its own stats, so no flip (say why).
             statItem: isStatItem(item),
-            where: held ? whereToSell({ held, bid: realBid, bazaarLowest: lowestOf(pick), marketLowest: m ? m.lowest : null, bazaarDepth: bazaarDepthOf(pick), marketDepth: m ? m.depth : null }) : null,
+            where: held ? whereAbovePaid(whereToSell({ held, bid: realBid, bazaarLowest: lowestOf(pick), marketLowest: m ? m.lowest : null, bazaarDepth: bazaarDepthOf(pick), marketDepth: m ? m.depth : null }), paid) : null,
             market: { state: m && m.at ? 'ok' : m && m.error ? 'error' : 'loading', lowest: m ? m.lowest : null },
         };
         desk.trade = tradeDesk(pick, buyers);
@@ -6963,8 +7660,27 @@ function renderSellingWork(src = null) {
         const p = priceHeld(t, { rowsOf: sellersOf, bidOf, lowestOf });
         const main = t.lines.find((l) => l.itemId === t.main) || t.lines[0] || null;
         const mainId = main ? main.itemId : t.itemId;
-        return { key: k, itemId: t.itemId, mainId, name: nameOf(t.itemId), mainName: nameOf(mainId), trader: t.trader.name, items: p.items, stops: p.stops, profit: p.profit, on: Boolean(desk && desk.itemId === t.itemId && deskKey === t.key) };
+        return { key: k, itemId: t.itemId, mainId, name: nameOf(t.itemId), mainName: nameOf(mainId), trader: t.trader.name, traderKey: t.key, traderId: t.trader.id || null, at: t.at, items: p.items, stops: p.stops, profit: p.profit, on: Boolean(desk && desk.itemId === t.itemId && deskKey === t.key) };
     });
+
+    // Trades (3.22.0, core/trades-board.js): every trade going - asked, accepted, ready - and what ended today.
+    // A trade you asked about that is on the desk now: its numbers follow the desk.
+    const askedNow = sellAsked(now);
+    const deskChosen = desk && desk.trade && !desk.trade.accepted ? desk.trade.chosen : null;
+    const askedOnDesk = deskChosen ? askedNow[holdKey(desk.itemId, deskChosen.key)] : null;
+    if (askedOnDesk && (askedOnDesk.items !== deskChosen.items || askedOnDesk.profit !== Math.round(deskChosen.profit))) {
+        askedOnDesk.items = deskChosen.items;
+        askedOnDesk.profit = Math.round(deskChosen.profit);
+        gmSet(STORE_SELL_ASKED, askedNow);
+    }
+    const tradesView = tradesBoard({
+        asked: Object.values(askedNow).filter((a) => !blacklist.has(a.key)),
+        pins: pinned.map((x) => ({ k: x.key, itemId: x.itemId, key: x.traderKey, id: x.traderId, name: x.trader, items: x.items, profit: Math.round(x.profit), at: x.at })),
+        accepted: Object.values(sellAccepted(now)),
+        ended: liveEnded(gmGet(STORE_SELL_ENDED, null), now),
+        declined: (itemId, key) => declinedAll.has(declineKey(itemId, key)),
+    });
+    counts.trades = tradesView.going;
 
     const watch = sellWatch({ desk, strip, waiting: stripWaiting, traders: sell.scanWatch || [], listed, held: [...heldQty.keys()], buyersAll });
     updateSellPresence(watch, now);
@@ -6999,6 +7715,8 @@ function renderSellingWork(src = null) {
         leftovers: leftShown,
         // The To sell tab: its rows, and its board (beside the list until a row is picked or a trade planned).
         toSell: { rows: toSell, ...toSellBoard(toSell), open: sell.filter === 'sell' && sell.boardOpen },
+        // The Trades tab: its rows by stage, and its board (beside the list until a trade is opened).
+        trades: { ...tradesView, open: sell.filter === 'trades' && sell.boardOpen },
         ledger: ledgerView(),
         scan,
         blacklist: sellBlacklist(),
@@ -7621,6 +8339,37 @@ function onSellRefresh() {
     renderSelling(true);
 }
 
+/** "X accepted": the trade on the desk is frozen (core/accepted.js acceptTrade), from the desk or the Trades board. */
+function acceptDeskTrade(itemId) {
+    logAction('Pressed accepted (item ' + itemId + ')');
+    const t = sell.lastTrade && sell.lastTrade.chosen;
+    if (!t) return;
+    const all = sellAccepted();
+    const acc = acceptTrade(t, itemId);
+    // A trade with this trader is already under way (accepted from
+    // another item's desk): show that one, never overwrite its ticks.
+    const open = all[acc.key];
+    if (open && String(open.itemId) !== String(itemId)) {
+        sell.selected = String(open.itemId);
+        sell.pickedByYou = true;
+        sell.tradePick.set(String(open.itemId), open.key);
+        renderSellingNow();
+        return;
+    }
+    all[acc.key] = acc;
+    saveSellAccepted(all);
+    // Kept after the trade: the Ledger splits what they paid by these prices.
+    const rec = priceRecordOf(acc);
+    if (rec) gmSet(STORE_SELL_PRICE_RECORDS, addPriceRecord(gmGet(STORE_SELL_PRICE_RECORDS, []), rec));
+    // Accepted takes over from the held plan, and from waiting for their yes.
+    sell.tradeHold.delete(holdKey(itemId, acc.key));
+    dropSellAsked(itemId, acc.key);
+    sell.selected = String(itemId);
+    sell.pickedByYou = true;
+    sell.tradePick.set(String(itemId), acc.key);
+    renderSellingNow();
+}
+
 /**
  * Put an item on the desk: its full TornExchange buyer list and its bazaars
  * are asked for straight away (each through its own paced queue).
@@ -7638,8 +8387,8 @@ function onSellSelect(itemId) {
 
 /** All, Mine or Flips: the desk moves to the first item there. */
 function onSellFilter(key) {
-    sell.filter = key === 'mine' || key === 'flips' || key === 'sell' ? key : 'all';
-    sell.boardOpen = sell.filter === 'sell';
+    sell.filter = key === 'mine' || key === 'flips' || key === 'sell' || key === 'trades' ? key : 'all';
+    sell.boardOpen = sell.filter === 'sell' || sell.filter === 'trades';
     sell.selected = null;
     sell.pickedByYou = false;
     sell.allShown = ALL_ITEMS_PAGE;
@@ -7699,6 +8448,7 @@ function bootSellingPage() {
     // The reads of last time are here from the start (3.19.0): what is due is read again, in the usual turns.
     restoreBazaarReads();
     restoreActivity();
+    restoreListAt();
     markBidsSeen();
     sell.keyDead = Boolean(gmGet(STORE_SELL_KEY_DEAD, false));
     if (sell.keyDead) sell.keyError = 'Torn rejected this key. Paste a new Limited key.';
@@ -7762,6 +8512,7 @@ function bootSellingPage() {
             sell.boardOpen = false;
             // Planning a trader you declined means you are trying them again.
             if (sellDeclined().has(declineKey(itemId, key))) setSellDeclined(declineKey(itemId, key), null);
+            rereadTraderList(key);
             renderSellingNow();
         },
         // Planning pressed again (3.20.2, the owner): the plan with them comes off
@@ -7826,33 +8577,40 @@ function bootSellingPage() {
             gmSet(STORE_SELL_BLACKLIST, editBlacklist(sellBlacklist(), b, on));
             renderSellingNow();
         },
-        onTradeAccept: (itemId) => {
-            logAction('Pressed accepted (item ' + itemId + ')');
+        onTradeAccept: (itemId) => acceptDeskTrade(itemId),
+        // Chat or Trade pressed on a planned trade (3.22.0): you asked them - it waits for their yes on the Trades board.
+        onTradeAsked: (itemId, key) => {
             const t = sell.lastTrade && sell.lastTrade.chosen;
-            if (!t) return;
-            const all = sellAccepted();
-            const acc = acceptTrade(t, itemId);
-            // A trade with this trader is already under way (accepted from
-            // another item's desk): show that one, never overwrite its ticks.
-            const open = all[acc.key];
-            if (open && String(open.itemId) !== String(itemId)) {
-                sell.selected = String(open.itemId);
-                sell.pickedByYou = true;
-                sell.tradePick.set(String(open.itemId), open.key);
-                renderSellingNow();
-                return;
-            }
-            all[acc.key] = acc;
-            saveSellAccepted(all);
-            // Kept after the trade: the Ledger splits what they paid by these prices.
-            const rec = priceRecordOf(acc);
-            if (rec) gmSet(STORE_SELL_PRICE_RECORDS, addPriceRecord(gmGet(STORE_SELL_PRICE_RECORDS, []), rec));
-            // Accepted takes over from the held plan.
-            sell.tradeHold.delete(holdKey(itemId, acc.key));
-            sell.selected = String(itemId);
-            sell.pickedByYou = true;
-            sell.tradePick.set(String(itemId), acc.key);
+            if (!t || t.key !== key || String(sell.selected) !== String(itemId)) return;
+            const was = sellAsked()[holdKey(itemId, key)];
+            if (!was) logAction('Asked a trader (item ' + itemId + ')');
+            gmSet(STORE_SELL_ASKED, addAsked(gmGet(STORE_SELL_ASKED, null), { itemId, key, id: t.buyer.id || null, name: t.buyer.name, items: t.items, profit: Math.round(t.profit) }));
+        },
+        // The Trades board: a waiting trade on the desk, as it was planned.
+        onTradesOpen: (itemId, key) => {
+            sell.tradePick.set(String(itemId), key);
+            onSellSelect(itemId);
+        },
+        // "X accepted" on the board: the trade goes on the desk and is frozen as the desk has it - the same press as there.
+        onTradesYes: (itemId, key) => {
+            sell.tradePick.set(String(itemId), key);
+            onSellSelect(itemId);
+            const t = sell.lastTrade && sell.lastTrade.chosen;
+            if (t && t.key === key && String(sell.selected) === String(itemId)) acceptDeskTrade(String(itemId));
+        },
+        // "Declined" on the board: passed over for an hour, as on the desk (a pin stays stored).
+        onTradesNo: (itemId, key) => {
+            logAction('Declined on the Trades board (item ' + itemId + ')');
+            setSellDeclined(declineKey(itemId, key), Date.now() + TRADE_DECLINE_MS);
+            dropSellAsked(itemId, key);
+            sell.tradeHold.delete(holdKey(itemId, key));
+            if (sell.tradePick.get(String(itemId)) === key) sell.tradePick.delete(String(itemId));
             renderSellingNow();
+        },
+        // An accepted trade from the board: on the desk, its accepted card.
+        onTradesShow: (itemId, key) => {
+            sell.tradePick.set(String(itemId), key);
+            onSellSelect(itemId);
         },
         onTradeReplace: (key, line, index, repl) => {
             const all = sellAccepted();
@@ -7917,6 +8675,7 @@ function bootSellingPage() {
             const item = sell.selected;
             if (!item) return;
             setSellDeclined(declineKey(item, key), Date.now() + TRADE_DECLINE_MS);
+            dropSellAsked(item, key);
             // The held plan with them goes (a pin stays until you unpin it).
             sell.tradeHold.delete(holdKey(item, key));
             sell.tradePick.delete(String(item));
@@ -8062,6 +8821,7 @@ function bootSellingPage() {
     // The rows come from IndexedDB (async); the first run waits for them.
     loadLedgerStore().then(() => {
         renderSelling();
+        shareBought();
         runLedger();
     });
     setInterval(() => runLedger(), 15000);
@@ -8099,6 +8859,7 @@ function bootSellingPage() {
         saveTraderDb();
         saveBazaarReads();
         saveActivity();
+        saveListAt();
         markBidsSeen();
         renderSelling();
     }, 15000);
@@ -8116,12 +8877,14 @@ function bootSellingPage() {
             saveTraderDb(true);
             saveBazaarReads(BAZAAR_READS_AWAY_MS);
             saveActivity();
+            saveListAt();
         }
     });
     window.addEventListener('pagehide', () => {
         saveTraderDb(true);
         saveBazaarReads(0);
         saveActivity();
+        saveListAt();
     });
 }
 
@@ -8272,6 +9035,7 @@ async function onLedgerSaveKey(key) {
 /** Forget the key AND everything the Ledger stored. */
 function onLedgerForget() {
     gmDel(STORE_LEDGER_KEY);
+    gmDel(STORE_SELL_HELD);
     gmDel(STORE_LEDGER_KEY_DEAD);
     gmDel(STORE_LEDGER_SELF);
     clearLedgerStore();
@@ -8408,6 +9172,7 @@ async function runLedger({ now = Date.now() } = {}) {
         }
         data.readAt = Date.now();
         if (same()) saveLedger();
+        if (same()) shareBought();
         // The buys no accepted trade was watching (3.16.4): off TornW3B's numbers as well.
         if (same()) noteOwnBuys(bazaarBuyRows(data.rows.filter((r) => r && Date.now() - Number(r.t) < OWN_KEEP_MS)));
         led.nextAt = Date.now() + (data.backfilled && !data.gap ? ledgerEveryMs() : LEDGER_BACKFILL_GAP_MS);
@@ -8431,6 +9196,22 @@ async function runLedger({ now = Date.now() } = {}) {
 
 /** A run noticed its key was forgotten or replaced. */
 class LedgerKeyChanged extends Error {}
+
+/**
+ * What you bought in the last 24 hours and still hold (3.22.0, core/bazaar-sell.js), left for Torn's
+ * pages: your bazaar's add page marks those rows. Worked out from the whole log (a sale uses up the
+ * oldest units first), only once it is read through the whole day with no stretch still open - half
+ * the story would call things unsold that were sold.
+ */
+function shareBought(now = Date.now()) {
+    if (!getLedgerKey() || !led.loaded || led.data === null) return;
+    if (!ledgerReaches(now - BOUGHT_WINDOW_MS)) return;
+    const data = ledgerData();
+    const next = boughtRecord(data.rows, { now, readAt: Number(data.readAt) || now });
+    const was = gmGet(STORE_SELL_HELD, null);
+    if (was && sameBoughtItems(was, next) && Math.abs(next.at - (Number(was.at) || 0)) < SELL_HELD_REWRITE_MS) return;
+    gmSet(STORE_SELL_HELD, next);
+}
 
 /*
  * Leftover cards go by themselves, and soon (3.16.4; the owner: "it shouldn't
@@ -8733,7 +9514,18 @@ function ledgerView() {
         favourites: sellFavourites(),
         blacklist: sellBlacklist(),
         trustOf: (id) => sell.trustById.get(String(id)) || null,
+        // What was on your To sell list: the Sold tab marks the sales that took it.
+        wasToSell: data ? wasToSellNow() : [],
     };
+}
+
+/** The To sell notes, read from storage at most every few seconds (the Ledger's page is redrawn often). */
+function wasToSellNow(now = Date.now()) {
+    if (!led.was || now - led.wasAt > 5000) {
+        led.was = liveWasToSell(gmGet(STORE_SELL_WAS, null), now);
+        led.wasAt = now;
+    }
+    return led.was;
 }
 
 /* ------------------------------------------------------------------ *
@@ -8821,6 +9613,8 @@ export function boot() {
         else trackTradeBuying([]);
     };
     gmOnChange(STORE_SELL_ACCEPTED, onAcceptedElsewhere);
+    // What you bought and have not sold (3.22.0): your bazaar's add page follows the list as it changes.
+    for (const key of [STORE_SELL_LEFTOVERS, STORE_SELL_HELD, STORE_SELL_ACCEPTED]) gmOnChange(key, onSellListChanged);
     // Torn Bids read your log: what it says you bought ticks the plan (3.16).
     gmOnChange(STORE_SELL_LOG_BUYS, onAcceptedElsewhere);
     gmOnChange(STORE_KEY_DEAD, onRemoteKey);
@@ -8869,6 +9663,7 @@ export function boot() {
             scanTradePage();
         },
         onFillListing: (market, index) => onFillFromListing(market, index),
+        onFillAllBought: () => fillAllBought(),
         onFillSelected: () => {
             const itemId = app.bzSelected;
             const row = app.bzRows.find((r) => r.itemId === itemId && document.contains(r.el) && r.el.querySelector('.ttv2-fillbox'));

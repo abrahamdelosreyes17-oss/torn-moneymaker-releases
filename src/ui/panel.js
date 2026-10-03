@@ -391,7 +391,10 @@ export class Panel {
 
         this.bzListEl = el('div', { class: 'ttv2-bzlist' });
         this.bzDetailEl = el('div', { class: 'ttv2-bzdetail' });
-        this.bazaarPage = el('div', { class: 'ttv2-page ttv2-page-bazaar' }, [this.bzListEl, this.bzDetailEl]);
+        // What you bought and have not sold (3.22.0): above the items, shown only when there is something.
+        this.bzSellEl = el('div', { class: 'ttv2-bzsellp' });
+        this.bzSellEl.style.display = 'none';
+        this.bazaarPage = el('div', { class: 'ttv2-page ttv2-page-bazaar' }, [this.bzSellEl, this.bzListEl, this.bzDetailEl]);
         this.bazaarPage.style.display = 'none';
 
         /* ---- settings page ---- */
@@ -1136,7 +1139,7 @@ export class Panel {
 
     /** My bazaar, scrolled to one part: 'graph' (IMA was pressed) or 'lows' (BP). */
     showBazaarPart(part) {
-        const target = part === 'lows' ? this.bzDetailEl.querySelector('.ttv2-lows') : this.bzDetailEl.querySelector('.ttv2-windows');
+        const target = part === 'sell' ? this.bzSellEl : part === 'lows' ? this.bzDetailEl.querySelector('.ttv2-lows') : this.bzDetailEl.querySelector('.ttv2-windows');
         if (target && target.scrollIntoView) target.scrollIntoView({ block: 'start' });
     }
 
@@ -1938,21 +1941,83 @@ export class Panel {
 
         if (!view) {
             this.bzSig = null;
+            this.bzIds = null;
+            this.renderBazaarSell(null);
             if (this.page === 'mybazaar') this.showPage('list');
             return;
         }
+        this.renderBazaarSell(view.sell || null);
         if (this.page === 'list') this.showPage('mybazaar');
         if (this.page === 'mybazaar' && this.titleTextEl.textContent !== (view.title || 'My bazaar')) this.titleTextEl.textContent = view.title || 'My bazaar';
 
         const updated = view.avgAt ? 'What it sold for, on average · updated ' + formatAge(Date.now() - view.avgAt) + '.' : 'What it sold for, on average.';
 
-        // Redrawn only when what it shows changes: the helper repaints every
-        // few seconds, and a redraw would drop the graph's hover readout.
+        /*
+         * The list of items: built once for the items on the page, then kept -
+         * a price that changes is written into its own row, and picking an
+         * item moves the highlight (3.22.0). It was built again, every row of
+         * it, whenever anything on this page changed - each Fill, each price
+         * read: on a page of 1,500 items that is 1,500 buttons a time, a
+         * stall of a tenth of a second and more.
+         */
+        const list = this.bzListEl;
+        const ids = (view.lowLabel || '') + '|' + view.items.map((i) => i.itemId).join(',');
+        if (ids !== this.bzIds || !this.bzRowEls) {
+            this.bzIds = ids;
+            this.bzRowEls = new Map();
+            this.bzPicked = null;
+            list.textContent = '';
+            if (!view.items.length) {
+                list.appendChild(el('div', { class: 'ttv2-note', text: 'No items found on this page yet.' }));
+            } else {
+                list.appendChild(el('div', { class: 'ttv2-bzrow ttv2-bzhead' }, [
+                    el('span', { class: 'ttv2-label', text: 'Item' }),
+                    el('span', { class: 'ttv2-label ttv2-money', text: 'IM average' }),
+                    el('span', { class: 'ttv2-label ttv2-money', text: view.lowLabel || 'Lowest' }),
+                ]));
+                for (const it of view.items) {
+                    const avgEl = el('span', { class: 'ttv2-money' });
+                    const lowEl = el('span', { class: 'ttv2-money ttv2-bzlow' });
+                    const btn = el('button', {
+                        type: 'button',
+                        class: 'ttv2-bzrow',
+                        'aria-pressed': 'false',
+                        title: 'Show its prices and graph',
+                        onclick: () => this.handlers.onSelectBazaarItem && this.handlers.onSelectBazaarItem(it.itemId),
+                    }, [el('span', { class: 'ttv2-name', text: it.name }), avgEl, lowEl]);
+                    this.bzRowEls.set(it.itemId, { btn, avgEl, lowEl, avg: undefined, low: undefined });
+                    list.appendChild(btn);
+                }
+            }
+        }
+        for (const it of view.items) {
+            const rec = this.bzRowEls.get(it.itemId);
+            if (!rec) continue;
+            if (rec.avg !== it.avg) {
+                rec.avg = it.avg;
+                rec.avgEl.textContent = it.avg ? formatMoney(it.avg) : '…';
+            }
+            if (rec.low !== it.low) {
+                rec.low = it.low;
+                rec.lowEl.textContent = it.low ? formatMoney(it.low) : '…';
+            }
+        }
+        if (this.bzPicked !== view.selected) {
+            const was = this.bzRowEls.get(this.bzPicked);
+            const now = this.bzRowEls.get(view.selected);
+            if (was) was.btn.setAttribute('aria-pressed', 'false');
+            if (now) now.btn.setAttribute('aria-pressed', 'true');
+            this.bzPicked = view.selected;
+        }
+
+        // The item picked: redrawn only when what it shows changes - the helper repaints
+        // every few seconds, and a redraw would drop the graph's hover readout.
         const s = view.series;
         const f = view.fill;
+        const sel = view.items.find((i) => i.itemId === view.selected);
         const sig = JSON.stringify([
-            view.items,
-            view.selected,
+            sel || null,
+            view.items.length,
             view.windowKey,
             view.mark,
             f ? [f.lists, f.preview, f.filled, f.canFill] : null,
@@ -1964,35 +2029,8 @@ export class Panel {
         }
         this.bzSig = sig;
 
-        const list = this.bzListEl;
-        list.textContent = '';
-
-        if (!view.items.length) {
-            list.appendChild(el('div', { class: 'ttv2-note', text: 'No items found on this page yet.' }));
-        } else {
-            list.appendChild(el('div', { class: 'ttv2-bzrow ttv2-bzhead' }, [
-                el('span', { class: 'ttv2-label', text: 'Item' }),
-                el('span', { class: 'ttv2-label ttv2-money', text: 'IM average' }),
-                el('span', { class: 'ttv2-label ttv2-money', text: view.lowLabel || 'Lowest' }),
-            ]));
-            for (const it of view.items) {
-                list.appendChild(el('button', {
-                    type: 'button',
-                    class: 'ttv2-bzrow',
-                    'aria-pressed': String(it.itemId === view.selected),
-                    title: 'Show its prices and graph',
-                    onclick: () => this.handlers.onSelectBazaarItem && this.handlers.onSelectBazaarItem(it.itemId),
-                }, [
-                    el('span', { class: 'ttv2-name', text: it.name }),
-                    el('span', { class: 'ttv2-money', text: it.avg ? formatMoney(it.avg) : '…' }),
-                    el('span', { class: 'ttv2-money ttv2-bzlow', text: it.low ? formatMoney(it.low) : '…' }),
-                ]));
-            }
-        }
-
         const detail = this.bzDetailEl;
         detail.textContent = '';
-        const sel = view.items.find((i) => i.itemId === view.selected);
         if (!sel) return;
 
         /* the answer first: one big number, what it is, how fresh */
@@ -2076,6 +2114,65 @@ export class Panel {
             el('span', { class: 'ttv2-key-im' }, [el('i'), 'Lowest listing we saw']),
             view.mark ? el('span', { class: 'ttv2-key-mark' }, [el('i'), 'Price to list']) : null,
         ]));
+    }
+
+    /**
+     * My bazaar › what you bought and have not sold (3.22.0; the add page):
+     * each item with how many and what you paid, where it stands - filled,
+     * passed over (the price would be under what you paid), ready, or not in
+     * the list Torn has drawn - and one Fill all, the same as the bar on the
+     * page. Redrawn only when it changes.
+     *
+     * @param {object|null} s - {rows: [{itemId, name, qty, paid, source, why, state, price, low}], words: {button, title, pressed, disabled, note}, logAt}
+     */
+    renderBazaarSell(s) {
+        const box = this.bzSellEl;
+        if (!box) return;
+        const sig = s ? JSON.stringify([s.rows, s.words, s.logAt ? Math.floor((Date.now() - s.logAt) / 60000) : null]) : '';
+        if (sig === this.bzSellSig) return;
+        this.bzSellSig = sig;
+        box.textContent = '';
+        box.style.display = s ? '' : 'none';
+        if (!s) return;
+        box.appendChild(el('div', { class: 'ttv2-bzsellh' }, [
+            el('span', { class: 'ttv2-label', text: 'Bought, not sold' }),
+            el('button', {
+                type: 'button',
+                class: 'ttv2-primary ttv2-bzsellgo',
+                'aria-pressed': String(Boolean(s.words.pressed)),
+                disabled: s.words.disabled ? '' : null,
+                title: s.words.title,
+                text: s.words.button,
+                onclick: () => this.handlers.onFillAllBought && this.handlers.onFillAllBought(),
+            }),
+        ]));
+        for (const r of s.rows) {
+            const gain = r.price && r.paid ? r.price - r.paid : null;
+            const wouldLose = r.state === 'ready' && r.low && r.paid && r.low - 1 < r.paid;
+            const status = r.state === 'filled'
+                ? '✓ ' + formatMoney(r.price) + (gain !== null ? ' (' + (gain >= 0 ? '+' : '−') + formatMoney(Math.abs(gain)) + ')' : '')
+                : r.state === 'skipped'
+                    ? 'passed over: ' + formatMoney(r.price) + ' is under'
+                    : r.state === 'norow'
+                        ? 'not in this list'
+                        : r.low
+                            ? 'lowest ' + formatMoney(r.low) + (wouldLose ? ' · under' : '')
+                            : 'ready';
+            box.appendChild(el('button', {
+                type: 'button',
+                class: 'ttv2-bzsellrow',
+                title: 'Show its prices and graph',
+                onclick: () => this.handlers.onSelectBazaarItem && this.handlers.onSelectBazaarItem(r.itemId),
+            }, [
+                el('span', { class: 'ttv2-name', text: r.name + ' ×' + Number(r.qty).toLocaleString('en-US') }),
+                el('span', { class: 'ttv2-bzsellst', 'data-state': wouldLose || (r.state === 'filled' && gain !== null && gain < 0) ? 'loss' : r.state, text: status }),
+                el('small', { text: (r.paid ? 'paid ' + formatMoney(r.paid) + ' each' : 'cost not known') + ' · ' + (r.source === 'tosell' ? 'To sell' + (r.why ? ' (' + r.why + ')' : '') : 'bought in the last 24 h') }),
+            ]));
+        }
+        const from = s.logAt
+            ? 'Your To sell list, and your log as Torn Bids read it ' + formatAge(Date.now() - s.logAt) + '.'
+            : 'Your To sell list only. With the Ledger\'s Full key in Torn Bids, every buy of the last 24 hours is here.';
+        box.appendChild(el('div', { class: 'ttv2-note', text: s.words.note + '. ' + from }));
     }
 
     destroy() {

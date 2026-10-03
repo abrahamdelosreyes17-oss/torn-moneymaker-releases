@@ -1411,6 +1411,221 @@ cart so i didnt sell".
 Not counted still: an Item Market buy (only bazaar pages are read), and a buy
 made while the overlay is off.
 
+### Trades, fresh prices, never a loss - and what you bought, on your bazaar (3.22.0)
+
+The owner, 2026-10-03. Parts 1 to 5 came first; 5's second half and 6 to 9 the same evening.
+
+**1. "cant we have a tab with active trades going? i cant figure out which
+trades havent been accepted, and depending on that, it automatically sorts it
+to to sell?"** Mockup `mockups/V-trades-tab.html`, variant A.
+
+- **A fifth tab, "Trades (N)"**, beside To sell: one row per trade you have
+  going, with where it stands. With the tab on, a board beside the list
+  (`src/core/trades-board.js`: `tradesBoard`), in the order a trade happens:
+  - **Waiting for their yes** - you asked, nothing is bought yet. "X
+    accepted" (the trade goes on the desk and is frozen as it is there - the
+    same press as the desk's), "Declined" (passed over for an hour), "Open".
+  - **Accepted · still buying** - "2 of 5 bazaars bought", "Next bazaar".
+  - **Accepted · ready to trade** - "Trade", "Traded - done".
+  - **Ended today** - traded, cancelled, or no trade in a day, with what went
+    to To sell.
+- **"Asked" is new.** Pressing **Chat** or the **Trade** link on a planned
+  trade writes it down (`sellAsked`, an hour; the first press is "asked 12m
+  ago"). A pinned trade waits there too. Before this a trade you asked about
+  was recorded nowhere unless pinned, and an accepted one showed only when
+  its item was picked again.
+- **An accepted trade with no trade made in a day goes to To sell.** It was
+  let go silently (every reader passes over a trade a day old, the hourly
+  tidy deletes it) and what you had bought for it was forgotten. As it goes
+  now, what was bought for it joins To sell as "No trade made"
+  (`expireSellAccepted` in main.js) and Ended today says so. Cancel trade
+  and what a trader did not take already did.
+- Not built from the mockup: "3 of 4 items in Torn's trade" on a ready row -
+  Torn Bids does not see Torn's trade page.
+
+**2. "if the prices are too stale ... do not show them in tornbids, it means
+they are not updating"; "2 days update is fine".**
+
+- **A third switch, "Fresh prices only"**, beside Buyers online only and
+  Trusted buyers only, on from the start. TornW3B says when each trader last
+  changed their price list (`pricelist_updated`, with every buyer of an
+  item). A TornW3B price from a list not changed in two days is not shown
+  (`stalePrice` / `freshOnly` in core/traders.js) - on the desk it is counted
+  and named ("Price list last changed 5d ago: hidden by Fresh prices only"),
+  as the other two switches do.
+- Measured that day on six items, the top 100 buyers of each: 35 to 42 had
+  changed their list within a day, about half within three, and of the ten
+  highest prices two to seven came from lists weeks old.
+- What it cannot judge: a price that is also on TornExchange (it gives no
+  date) is left alone, and a trader whose list date was never read is not
+  called old. The dates are kept in the page's own storage between visits.
+
+**3. "price list of one trader was different, i sold it on a huge loss because
+his prices were stale and old ... the new price lowered down drastically."**
+
+- **Plan trade reads that trader's TornW3B list again at once**
+  (`rereadTraderList`): a list was read every 10 minutes for the items you
+  hold and every hour for the rest, so the plan you were about to offer could
+  stand on a price up to an hour old. Fresh prices only is the other half.
+  What the trader really puts in is still checked on Torn's trade page ("X
+  short"), as before.
+
+**4. "in the to sell. never suggest selling on a loss, so we can sell on our
+bazaar still on profit, and only show traders who we can sell on a profit".**
+
+- **A To sell row never names a trader who pays no more than you paid** (it
+  read "best now $52,400 (Kay)" under a $53,000 cost). With no such trader,
+  **your own bazaar** is offered when $1 under the cheapest listing is over
+  what you paid - "Bazaar +$570 · your bazaar at $59" - else the row only
+  waits (`toSellRows`, `bazaarAbove`).
+- **On the desk of a To sell item** the traders who pay no more than you paid
+  come off the list, counted and named ("3 traders pay no more than the
+  $851,000 you paid: never suggested"), and in Where to sell a venue that
+  gives no more than you paid says so, is no link, and is never the best
+  (`whereAbovePaid`); with none over it: "Nothing pays more than the $X you
+  paid now: it waits in To sell".
+- The rule goes by the item: when you also hold older ones of it, they are
+  held to the same price.
+
+**5. "i press fill in the add bazaar, very laggy, it gets laggier the more you
+use it".** Torn adds the add page's rows as you scroll, and a Fill press cost
+more with every row in the page: measured in the harness, the page stuck for
+660 ms a press with 1,500 rows (3.21.0), 46 ms now.
+
+- A press asked the browser to lay the whole page out again five times: twice
+  to see which of Torn's boxes is the visible one (`writeInputs`), twice in
+  `fitBazaarCells` (it measured every row, before and after), once for the
+  result note. Now everything is read off one layout: the box you see is
+  known from its type, a row whose words did not change is not measured (all
+  are again on a window resize and every 15 s), the chips are measured a
+  second time only where the sum says they may not fit, and the note is
+  placed from the row's place without asking its own size.
+- `fillKeyOf` walked every row for each row it was asked about; the keys are
+  worked out once per scan.
+- The same fit decisions as before on the test page (rows with another
+  script's words in the cell, filled, unticked).
+
+That was half of it ("again it was VERY laggy"; "in the fill all everywhere,
+is it no longer laggy as well?"). Measured again on a list where every row is
+another item (`&distinct=1500`), the page was stuck far more often than at a
+press - and for other reasons:
+
+- **The page was read in full every 2.5 seconds, and again after every
+  Fill.** Each read looked up every row's picture, name, boxes, chips and
+  tick again and formatted both of its prices: about 125 ms a read at 1,500
+  rows, whether or not anything had changed. A row is now read once and
+  remembered (`rowCache` in sources/dom/ownbazaar.js: the same picture
+  element with the same address is the same item); its chips, its price box
+  and its tick are kept on the row; chips are written only when a number
+  changed and a plain tick is not painted again. About 15 ms a read.
+- **The panel's item list was built again, every row, whenever anything
+  changed** - a Fill, a price read, the item picked. It is built once per
+  page now; a price is written into its own row and the highlight moves.
+- **"Fill settings" was measured against Torn's links on every read** (a
+  layout when anything had changed). Now when the bar changes, on a resize,
+  and once a minute. The full re-measure of every row went from every 15 s to
+  once a minute, and at once when the first row's cell changes size.
+- **A chip that gives way is still laid out** (out of the line, not shown),
+  so its width can be read while it is away: which chips fit is worked out by
+  sum from one look at the page. A row whose chips did not fit cost up to
+  three more layouts at every press.
+- **The trade page read every row of Torn's list at every read** - picture,
+  boxes, name - for a trade that sends three of them. Only the rows of what
+  the trade sends are read (`readTradeAddRows`' `wanted`), and which item a
+  row shows is kept per row.
+- **The Checkout window was taken down and built again on every tick of every
+  Torn page while a trade was accepted** - each time with a layout of the
+  page. It is drawn again only when what it shows changes, and one of the
+  things it shows (`sellElsewhere`) carried the time of asking. Since 3.16.
+- Measured in the harness, 1,500 rows, the page stuck for (3.21.0 → now):
+  your bazaar's add page, idle - about 230 ms every 2.5 s → nothing most
+  ticks; one Fill press - about 1.7 s in all → about 0.09 s; the trade page,
+  idle - about 230 ms every 2.5 s → about 35 ms; its Fill all - about 0.5 s
+  → about 0.12 s. What is left of a press is one layout of the page, which
+  the browser needs to show the price at all.
+
+**6. "when were selling in bazaar, items bought within the last 24 hours, some
+kind of overlay, that calculates okay what havent we traded or sold in bazaar,
+same as the checklist, fills all and it actually highlights that row ...
+everything bought in last 24 hours, prioritise sell list ... only unsold units
+that ive bought ... skip rows that would sell under what i paid. i need to see
+how much i paid for that item as well, and a pulsating red on the price that i
+input if its below what i [paid] ... lets add that on the top the add to
+bazaar page (just after where you would click the type of item) AND on the
+overlay."** On your bazaar's add page (`src/core/bazaar-sell.js`; main.js
+"what you bought and have not sold"):
+
+- **What is on the list.** The To sell list first (a cancelled trade's items,
+  what a trader did not take, a bazaar buy no trade took). Then every other
+  buy of the last 24 hours - bazaar, Item Market, trade, shop - that your log
+  does not show sold, traded or given since: a sale uses up the oldest units
+  first, as the Ledger counts it (`unsoldBought`). Torn Bids works that out
+  when it reads your log and leaves the short answer for Torn's pages
+  (`sellHeld24`), so it needs the Ledger's Full key and is as fresh as Torn
+  Bids' last read (the panel says when); without the key the list is your To
+  sell list alone. What you bought for a trade that is still going is not on
+  it - that is the trader's.
+- **The rows are marked**, like the rows to send on the trade page, each with
+  a **Paid $X** chip before IMA and BP (it stays when those two give way).
+- **Fill all**, in a bar above Torn's list - under its item-type tabs - and
+  the same button in the panel's My bazaar, over the list of what you bought
+  (name, how many, what you paid, where it stands). One press types each
+  marked row's price (your Fill settings: $1 under the lowest bazaar unless
+  you changed them) and **how many you bought and have not sold** - never
+  more than you have. **A row whose price would be under what you paid is
+  passed over**, and said ("1 passed over: the price would be under what you
+  paid"). Pressed again with everything filled, it puts back what was in the
+  boxes. The prices are read first, every row is typed in one go, and the
+  page is painted and measured once - not once a row.
+- A row's own Fill tick still fills that row whatever the price - it is your
+  press - with the quantity you bought, and says "UNDER the $851,000 you
+  paid: a loss of $11,001 each".
+- **A price box holding less than you paid pulses red**, whoever typed it
+  (you, or Fill), until it holds the cost or more.
+- It only types into boxes, only in those rows, only the ones Torn has drawn:
+  it never scrolls the list, ticks a weapon's box or presses Torn's button
+  (rule 1, reworded below: "no Fill all on your own listing pages" was about
+  typing into every item you own).
+- Not seen on the real page: the bar goes before the first `ul.items-cont`,
+  which is where the tabs end in the markup this was written against.
+
+**7. "can we have in ledger, a tab that filters sold in item market, bazaar,
+and ledger profits? wether on a loss or profit?"** Mockup
+`mockups/W-ledger-sold-tab.html`.
+
+- **Ledger › Sold**: every sale, wherever it was made - when, what, how
+  many, where, to whom, the price, what you got (after the Item Market's
+  fee), what its units cost (first in, first out), what it made or lost, and
+  where those units were bought. **Sold in** (Everywhere, Bazaar, Item
+  Market, Trades, NPC shop) and **Show** (All, Profit, Loss, Cost not known)
+  as chips, with the period, item, category and who boxes; a tile per place
+  with its profit - press one to see only its sales. Nothing new is read:
+  these are the Trading tab's rows (`soldRows`, `soldByVenue` in
+  core/ledger.js).
+- **"To sell" on a sale**: each time something joins the To sell list a short
+  note is kept for a month (`noteToSell`: the item, how many, why, whose
+  trade), and the sales that took those units say so - "To sell · Cancelled ·
+  Bob", "Extra buy". Only for what joins the list from this version on.
+- **"so its not accurate when it says ive gained or lost on that item?"** A
+  trade pays one sum for everything in it. The trade's total is always the
+  real money against the real cost. With several items sold in one trade,
+  each item's share is by the prices the trader accepted in Torn Bids when
+  that was pressed, else by market value - and that second one is an
+  estimate. The Sold tab says which on the row ("estimate: its share of the
+  trade, by market value"); the receipt already said "split by their prices"
+  or "split by market value". A bazaar, Item Market or NPC sale, and a trade
+  of one item, are exact.
+
+**8. "in the to sell, the names are not clickable."** In To sell (the list
+and the board) and on the Trades board a trader's name opens their Torn
+profile and an item's name the Item Market; the rest of the row acts as
+before.
+
+**9. "in this area, its in the very bottom and unnoticeable in the to sell."**
+On the desk of a To sell item, **Where to sell your N** comes first, across
+the desk - it was the last card, under the list of bazaars - with what you
+paid in its title and, under it, what the best one makes over what you paid.
+
 ---
 
 ## Architecture
@@ -1485,8 +1700,10 @@ them.
    or scrolls. A user click never triggers a chain of game actions. **Fill types
    one row's price (and quantity) only on your click, into your own listing
    form, and never presses Torn's buttons** - you confirm. Nothing is filled
-   before you click. On your own listing pages a press fills one row (no
-   Fill all there: it would type a quantity into every item you own). The
+   before you click. On your own listing pages a press fills one row - and,
+   on your bazaar's add page (3.22.0), **Fill all** fills the rows of what
+   you bought to resell and have not sold, and no other (never every item
+   you own: that is why there was none before). The
    same holds for the trade page's Fill (one row's quantity) - and its
    **Fill all** (3.16.4): one press types the quantities of the rows marked
    for the trade you accepted, and nothing else. Typing into a page's boxes

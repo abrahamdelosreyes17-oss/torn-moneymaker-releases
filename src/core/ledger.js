@@ -496,3 +496,79 @@ export function tradeReceipts(rows, fifo) {
     }
     return [...by.values()].sort((a, b) => b.t - a.t);
 }
+
+/* ------------------------------------------------------------ the Sold tab (3.22.0) */
+
+/*
+ * The owner, 2026-10-03: "can we have in ledger, a tab that filters sold in
+ * item market, bazaar, and ledger profits? wether on a loss or profit?"
+ * (mockup W). Sales only, each with what it made against what its units cost.
+ */
+
+/** The places a sale is made, in the tab's order. */
+export const SOLD_VENUES = ['bazaar', 'market', 'trade', 'npc'];
+
+/** A sale's outcome from its FIFO match: 'profit', 'loss', or 'unknown' (no buy on record for any unit). */
+export function soldOutcome(match) {
+    if (!match || match.profit === null || match.profit === undefined) return 'unknown';
+    return match.profit < 0 ? 'loss' : 'profit';
+}
+
+/** The sales among rows that `show` keeps: 'all' | 'profit' | 'loss' | 'unknown'. */
+export function soldRows(rows, fifo, show = 'all') {
+    return (rows || []).filter((r) => r && r.side === 'sell' && (show === 'all' || soldOutcome(fifo.get(r.id)) === show));
+}
+
+/**
+ * What the sales came to, everywhere and per place.
+ * @returns {{all: object, bazaar: object, market: object, trade: object, npc: object}} each {profit, got, cost, fees, sales, losses, unknown}
+ */
+export function soldByVenue(sales, fifo) {
+    const blank = () => ({ profit: 0, got: 0, cost: 0, fees: 0, sales: 0, losses: 0, unknown: 0 });
+    const out = { all: blank() };
+    for (const v of SOLD_VENUES) out[v] = blank();
+    for (const r of sales || []) {
+        const m = fifo.get(r.id);
+        for (const b of [out.all, out[r.venue]]) {
+            if (!b) continue;
+            b.sales += 1;
+            b.got += m ? m.net : r.each * r.qty - (r.fee || 0);
+            b.fees += r.fee || 0;
+            if (m && m.profit !== null) {
+                b.profit += m.profit;
+                b.cost += m.cost || 0;
+                if (m.profit < 0) b.losses += 1;
+            } else b.unknown += 1;
+        }
+    }
+    for (const b of Object.values(out)) {
+        b.profit = Math.round(b.profit);
+        b.got = Math.round(b.got);
+        b.cost = Math.round(b.cost);
+    }
+    return out;
+}
+
+/** Where a sale's units were bought, in a few words: "Bob (Bazaar)", "3 bazaars", "Item Market", "no buy on record". */
+export function boughtFromText(match) {
+    const from = match && Array.isArray(match.from) ? match.from : [];
+    if (!from.length) return 'no buy on record';
+    const keys = new Map();
+    for (const f of from) {
+        const k = (f.who || f.whoName || '') + '|' + f.venue;
+        if (!keys.has(k)) keys.set(k, f);
+    }
+    const venues = new Set(from.map((f) => f.venue));
+    if (keys.size === 1) {
+        const f = from[0];
+        const who = f.whoName || (f.who ? 'Player ' + f.who : null);
+        const place = VENUE_NAMES[f.venue] || 'somewhere';
+        return who ? who + ' (' + place + ')' : place;
+    }
+    if (venues.size === 1) {
+        const v = [...venues][0];
+        const word = v === 'bazaar' ? 'bazaars' : v === 'market' ? 'Item Market buys' : v === 'trade' ? 'trades' : v === 'shop' ? 'city shop buys' : v === 'abroad' ? 'buys abroad' : 'buys';
+        return keys.size + ' ' + word;
+    }
+    return keys.size + ' buys (' + [...venues].map((v) => VENUE_NAMES[v] || v).join(', ') + ')';
+}

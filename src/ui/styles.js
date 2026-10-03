@@ -590,8 +590,87 @@ export const PAGE_CSS = `
 
 .ttv2-fillcell .ttv2-filltag { display: none; }
 .ttv2-fillcell .ttv2-fillbtn { height: 20px; font-size: 11px; }
-.ttv2-bzchips[data-tight="1"] .ttv2-bzchip-ima { display: none; }
-.ttv2-bzchips.ttv2-bzchips[data-tight="2"] { display: none; }
+/*
+ * A chip that gives way is taken out of the line and not shown - but still
+ * laid out (3.22.0), so its width can be read while it is away: the row is
+ * fitted again from one look at the page, never by showing it to measure.
+ */
+.ttv2-bzchips[data-tight="1"] .ttv2-bzchip-ima,
+.ttv2-bzchips[data-tight="2"] .ttv2-bzchip-ima,
+.ttv2-bzchips[data-tight="2"] .ttv2-bzchip-bp,
+.ttv2-bzchips[data-tight="3"] .ttv2-bzchip {
+    position: absolute;
+    top: 0;
+    right: 0;
+    visibility: hidden;
+    pointer-events: none;
+}
+
+/*
+ * Your bazaar's add page (3.22.0): the rows of what you bought and have not
+ * sold - marked like the rows to send on the trade page, with what you paid
+ * as a chip (it stays when IMA and BP give way) - and the bar above Torn's
+ * list with Fill all. A price box holding less than you paid pulses red.
+ */
+.ttv2-bzsell {
+    box-shadow: inset 3px 0 0 #5aa7ff, inset 0 0 0 9999px rgba(90, 167, 255, 0.08) !important;
+}
+
+.ttv2-bzchip-paid { border-color: rgba(246, 183, 74, 0.5); }
+.ttv2-bzchip-paid b { color: #f6b74a; }
+
+.ttv2-bzsellbar {
+    display: flex !important;
+    flex: 0 0 100%;
+    align-items: center;
+    gap: 10px;
+    box-sizing: border-box;
+    width: 100%;
+    min-height: 36px;
+    margin: 0 0 4px;
+    padding: 5px 10px;
+    border: 1px solid rgba(90, 167, 255, 0.35);
+    border-radius: 8px;
+    background: #121820;
+    color: #cdd2db;
+    font: 12px/1.4 "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+    clear: both;
+}
+
+.ttv2-bzsellall {
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    height: 26px;
+    padding: 0 10px;
+    border: 1px solid rgba(90, 167, 255, 0.45);
+    border-radius: 8px;
+    background: #10233b;
+    color: #cfe5ff;
+    font: 600 12px/24px "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+    box-shadow: 0 3px 10px rgba(0, 0, 0, 0.5);
+    white-space: nowrap;
+    cursor: pointer;
+    user-select: none;
+}
+
+.ttv2-bzsellall:hover { background: #163152; }
+.ttv2-bzsellall:focus-visible { outline: 2px solid #5aa7ff; outline-offset: 1px; }
+.ttv2-bzsellall[aria-pressed="true"] { background: #5aa7ff; color: #06121f; border-color: transparent; }
+.ttv2-bzsellall[aria-disabled="true"] { opacity: 0.55; cursor: default; }
+.ttv2-bzsellnote { min-width: 0; }
+
+input.ttv2-underpaid {
+    outline: 2px solid #ff5a4d !important;
+    outline-offset: 1px;
+    color: #ff8a80 !important;
+    animation: ttv2-underpulse 1.1s ease-in-out infinite;
+}
+
+@keyframes ttv2-underpulse {
+    0%, 100% { box-shadow: 0 0 0 0 rgba(255, 90, 77, 0.85); }
+    50% { box-shadow: 0 0 0 7px rgba(255, 90, 77, 0); }
+}
 .ttv2-fillbtn[data-level="good"] .ttv2-filllabel { color: #6fdc7f; }
 .ttv2-fillbtn[data-level="warn"] .ttv2-filllabel { color: #f6b74a; }
 .ttv2-fillbtn[data-level="bad"] { border-color: #ff7b6e; }
@@ -715,7 +794,7 @@ a.ttv2-fillset:hover { border-color: rgba(255, 255, 255, 0.3); }
 }
 
 @media (prefers-reduced-motion: reduce) {
-    .ttv2-toast, .ttv2-chatmark { animation: none !important; }
+    .ttv2-toast, .ttv2-chatmark, input.ttv2-underpaid { animation: none !important; }
     .ttv2-hit { transition: none !important; }
 }
 `;
@@ -1819,6 +1898,40 @@ ${TOKENS_CSS}
 .ttv2-graph-keys .ttv2-key-mark i { border-color: #f6b74a; border-top-style: dashed; }
 
 .ttv2-bzrow .ttv2-bzlow { color: var(--offer); }
+
+/* My bazaar › what you bought and have not sold (3.22.0): the rows the add page marks, and Fill all. */
+.ttv2-bzsellp {
+    flex: 0 0 auto;
+    max-height: 38%;
+    overflow-y: auto;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--line);
+}
+.ttv2-bzsellh { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 6px; }
+.ttv2-panel button.ttv2-bzsellgo { flex: 0 0 auto; height: 26px; padding: 0 10px; font-size: 12px; }
+.ttv2-panel button.ttv2-bzsellgo[aria-pressed="true"] { background: #5aa7ff; border-color: #5aa7ff; color: #06121f; }
+.ttv2-panel button.ttv2-bzsellrow {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 0 12px;
+    align-items: baseline;
+    width: 100%;
+    height: auto;
+    padding: 4px 8px;
+    margin-bottom: 2px;
+    text-align: left;
+    font-weight: normal;
+    font-size: 13px;
+    background: transparent;
+    border-color: transparent;
+}
+.ttv2-panel button.ttv2-bzsellrow:hover { background: var(--row); }
+.ttv2-bzsellrow .ttv2-name { min-width: 0; overflow-wrap: anywhere; color: var(--text); }
+.ttv2-bzsellrow small { grid-column: 1 / -1; color: var(--muted); font-size: 12px; }
+.ttv2-bzsellst { font-variant-numeric: tabular-nums; white-space: nowrap; color: var(--muted); }
+.ttv2-bzsellst[data-state="filled"] { color: #6fdc7f; font-weight: bold; }
+.ttv2-bzsellst[data-state="skipped"], .ttv2-bzsellst[data-state="loss"] { color: #ff7b6e; }
+.ttv2-bzsellp .ttv2-note { margin-top: 4px; }
 
 .ttv2-fillnow {
     display: flex;

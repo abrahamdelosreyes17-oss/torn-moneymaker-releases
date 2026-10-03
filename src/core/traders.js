@@ -606,13 +606,48 @@ export function onlineOnly(buyers, levelOf) {
  * @param {Array} buyers - the allowed buyers (blacklist already out)
  * @param {{prefs: {onlineOnly?: boolean, trustedOnly?: boolean}, levelOf: Function, votesMissing?: boolean}} opts
  */
-export function hiddenBuyers(buyers, { prefs = {}, levelOf = () => 'unknown', votesMissing = false } = {}) {
+export function hiddenBuyers(buyers, { prefs = {}, levelOf = () => 'unknown', votesMissing = false, listAtOf = () => 0, now = Date.now() } = {}) {
     const out = [];
     for (const b of buyers || []) {
         if (prefs.onlineOnly && b.id && levelOf(b.id) === 'offline') out.push({ ...b, hiddenBy: 'offline' });
         else if (prefs.trustedOnly && !(b.trust ? b.trust.level === 'Trusted' || b.trust.level === 'Known' : votesMissing)) out.push({ ...b, hiddenBy: 'trust' });
+        else if (prefs.freshOnly && stalePrice(b, listAtOf, now)) out.push({ ...b, hiddenBy: 'stale', listAt: Number(listAtOf(b.id)) || 0 });
     }
     return out;
+}
+
+/*
+ * "Fresh prices only" (3.22.0; the owner, 2026-10-03: "if the prices are too
+ * stale lets say over a day, do not show them in tornbids, it means they are
+ * not updating"; then: "2 days update is fine").
+ *
+ * TornW3B says when each trader last changed their price list
+ * (`pricelist_updated`, with every buyer of an item). Measured that day on
+ * six items, the top 100 buyers of each: 35 to 42 had changed theirs within a
+ * day, about half within three days, and of the ten highest prices two to
+ * seven came from lists weeks old - the prices nobody honours.
+ *
+ * A price is stale when it is that trader's TornW3B price, their list was
+ * last changed over two days ago, and TornExchange has no price of theirs for
+ * the item (TornExchange gives no date: a price also listed there is left
+ * alone). A trader whose list date was never read is not stale - not known
+ * is not old.
+ */
+export const PRICES_STALE_MS = 2 * 24 * 60 * 60 * 1000;
+
+/**
+ * @param {{id, w3b, te}} b - a buyer row (buyersForItem)
+ * @param {function} listAtOf - (trader id) => when their TornW3B list last changed (ms), 0 when not known
+ */
+export function stalePrice(b, listAtOf, now = Date.now()) {
+    if (!b || !b.id || !(b.w3b > 0) || b.te > 0) return false;
+    const at = Number(listAtOf(b.id)) || 0;
+    return at > 0 && now - at > PRICES_STALE_MS;
+}
+
+/** "Fresh prices only", order unchanged. */
+export function freshOnly(buyers, listAtOf, now = Date.now()) {
+    return buyers.filter((b) => !stalePrice(b, listAtOf, now));
 }
 
 /**

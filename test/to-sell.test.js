@@ -7,7 +7,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { toSellRows, toSellBoard, toSellHeld, heldGain, afterYoursSent, toSellWhy, TO_SELL_WHY } from '../src/core/to-sell.js';
+import { toSellRows, toSellBoard, toSellHeld, heldGain, afterYoursSent, toSellWhy, TO_SELL_WHY, bazaarAbove, whereAbovePaid } from '../src/core/to-sell.js';
+import { whereToSell } from '../src/core/flips.js';
 import { planTrade } from '../src/core/trade.js';
 import { acceptTrade, acceptedTotals, markLeft, leftoversOf, cancelledLeftovers, addLeftovers, recordBuy } from '../src/core/accepted.js';
 import { EXTRA_CAP } from '../src/core/liquidity.js';
@@ -38,10 +39,11 @@ test('the To sell rows: who pays most now, what it makes, the best profit first,
         ['Xanax', 'Bob', 4 * 10000, true],
         // Kay did not take the Monkey Plushies: never offered back to her - Lumei is next.
         ['Monkey Plushie', 'Lumei', 12 * 10, true],
-        ['Peony', 'Kay', 50 * -600, false],
+        // Kay pays $600 less than the Peonies cost: never named (3.22.0 - it read "best now $52,400 (Kay)").
+        ['Peony', null, null, false],
         ['Red Fox Plushie', null, null, false],
     ]);
-    assert.equal(rows[3].short, 600, 'waiting: $600 short each');
+    assert.equal(rows[3].short, null);
     assert.equal(rows[4].short, null);
     assert.deepEqual(rows.map((r) => r.why), ['cancel', 'extra', 'left', 'cancel', 'left'], 'a row kept before 3.21 does not say why: Not taken');
     assert.equal(rows[0].best.key, 'id:7');
@@ -58,7 +60,7 @@ test('the To sell rows: who pays most now, what it makes, the best profit first,
     assert.equal(toSellWhy('cancel'), 'cancel');
     assert.equal(toSellWhy(undefined), 'left');
     assert.equal(toSellWhy('constructor'), 'left');
-    assert.deepEqual(Object.keys(TO_SELL_WHY), ['cancel', 'left', 'extra']);
+    assert.deepEqual(Object.keys(TO_SELL_WHY), ['cancel', 'left', 'extra', 'old']);
 });
 
 test('the board: one group per trader who pays most, the biggest first; the rest wait', () => {
@@ -136,4 +138,45 @@ test('a leftover says why it is To sell: not taken, a cancelled trade - and the 
     assert.equal(both[0].qty, 25);
     // One that does not say (kept before 3.21) changes nothing of the other's word.
     assert.equal(addLeftovers([{ itemId: '335', name: 'x', qty: 20, each: 17500, at: 1, why: 'cancel' }], [{ itemId: '335', name: 'x', qty: 5, each: 17000, at: 2 }])[0].why, 'cancel');
+});
+
+test('To sell never suggests a loss (3.22.0): no trader under what you paid, your own bazaar when that is a profit, no venue under it is the best', () => {
+    // Peony cost $53,000: Kay pays $52,400 (a loss - never named); the cheapest bazaar is $55,000, so yours at $54,999 is a profit.
+    const bazaarOf = (id) => ({ 276: 55000, 268: 30000, 258: 20000 }[id] || null);
+    const rows = toSellRows(LEFT, { buyersOf, bazaarOf });
+    const peony = rows.find((r) => r.name === 'Peony');
+    assert.equal(peony.best, null);
+    assert.equal(peony.ready, false);
+    assert.deepEqual(peony.bazaar, { price: 54999, gain: 50 * 1999 });
+    // Red Fox cost $30,300 and the cheapest bazaar is $30,000: a loss there too - it only waits.
+    const fox = rows.find((r) => r.name === 'Red Fox Plushie');
+    assert.deepEqual([fox.best, fox.bazaar], [null, null]);
+    // With a trader over the margin the row is ready; the bazaar is still said (it may pay more).
+    const jaguar = rows.find((r) => r.name === 'Jaguar Plushie');
+    assert.equal(jaguar.ready, true);
+    assert.deepEqual(jaguar.bazaar, { price: 19999, gain: 89 * 6999 });
+    // Ready first, then a profit in your bazaar, then what only waits.
+    assert.deepEqual(rows.map((r) => r.name), ['Jaguar Plushie', 'Xanax', 'Monkey Plushie', 'Peony', 'Red Fox Plushie']);
+    assert.equal(bazaarAbove(101, 100, 3), null, '$1 under the cheapest is what you paid: no profit');
+    assert.deepEqual(bazaarAbove(102, 100, 3), { price: 101, gain: 3 });
+    assert.equal(bazaarAbove(null, 100, 3), null);
+    // No trade line is made for a trader who pays less than you paid (toSellHeld already asked for a profit).
+    assert.equal([...toSellHeld(LEFT, { buyersOf }).values()].flat().some((l) => l.itemId === '276'), false);
+
+    // Where to sell: paid $53,000 each for 50.
+    // The trader pays less, the Item Market nets less, your bazaar more: the bazaar is the best, the others are losses.
+    const w = whereAbovePaid(whereToSell({ held: 50, bid: 52400, bazaarLowest: 55000, marketLowest: 55000 }), 53000);
+    assert.deepEqual(w.options.map((o) => [o.venue, o.loss]), [['trader', true], ['bazaar', false], ['market', true]]);
+    assert.deepEqual([w.best, w.paid], ['bazaar', 53000]);
+    // Everything under what you paid: no best at all - it waits.
+    const none = whereAbovePaid(whereToSell({ held: 50, bid: 52400, bazaarLowest: 53000, marketLowest: 53000 }), 53000);
+    assert.equal(none.best, null);
+    assert.deepEqual(none.options.map((o) => o.loss), [true, true, true]);
+    // The trader over what you paid, as worked out: unchanged best and gain.
+    const base = whereToSell({ held: 50, bid: 54000, bazaarLowest: 54100 });
+    const kept = whereAbovePaid(base, 53000);
+    assert.deepEqual([kept.best, kept.gain], [base.best, base.gain]);
+    // Not a To sell item (nothing paid is known): the same object back.
+    assert.equal(whereAbovePaid(base, 0), base);
+    assert.equal(whereAbovePaid(null, 53000), null);
 });

@@ -68,23 +68,53 @@ export function readTradeView(doc = document) {
     return { partner, you: side(box.querySelector('.user.left')), them: side(right) };
 }
 
+/*
+ * Which item a row shows, kept per row (3.22.0; the owner: "in the fill all
+ * everywhere, is it no longer laggy as well?"). Torn's list can hold over a
+ * thousand rows, and each read of the page looked up every row's picture,
+ * boxes and name again - for a trade that sends three of them. The picture is
+ * looked up once per row (again when Torn redraws it), and only the rows the
+ * trade wants are read further.
+ */
+const tradeRowItems = new WeakMap();
+
+function tradeRowItemId(li) {
+    const known = tradeRowItems.get(li);
+    if (known && known.img.isConnected && known.img.getAttribute('src') === known.src && li.contains(known.img)) return known.itemId;
+    const img = li.querySelector(ITEM_IMAGE_SELECTOR) || li.querySelector('img[src*="/items/"]');
+    const itemId = img ? itemIdFromImage(img) : null;
+    if (itemId) tradeRowItems.set(li, { img, src: img.getAttribute('src'), itemId: String(itemId) });
+    else tradeRowItems.delete(li);
+    return itemId ? String(itemId) : null;
+}
+
+/** One row of the add step, or null when it cannot be added (disabled, or no item read). */
+export function readTradeAddRow(li) {
+    if (!li || !li.classList || li.classList.contains('disabled')) return null;
+    const itemId = tradeRowItemId(li);
+    if (!itemId) return null;
+    const inputs = rowInputs('bazaar-add', li);
+    const known = tradeRowItems.get(li);
+    const name = tradeText(li.querySelector('.name-wrap .t-overflow')) || (known && known.img.getAttribute('alt')) || '';
+    return { el: li, itemId, name, have: inputs.have, qty: inputs.qty[0] || null, single: inputs.single };
+}
+
 /**
  * The add step's rows you can add: item id, name, how many you have, and
  * the Qty box (or null for a tick-box row - one-of-a-kind items).
  *
+ * @param {function|null} [wanted] - (itemId) => boolean: only these items' rows are read (all of them without it)
  * @returns {Array<{el: Element, itemId: string, name: string, have: number|null, qty: HTMLInputElement|null, single: boolean}>}
  */
-export function readTradeAddRows(doc = document) {
+export function readTradeAddRows(doc = document, wanted = null) {
     const out = [];
     // Every category tab's list: the one you switch to is marked too.
     for (const li of doc.querySelectorAll('ul.items-cont li.clearfix')) {
         if (li.classList.contains('disabled')) continue;
-        const img = li.querySelector(ITEM_IMAGE_SELECTOR) || li.querySelector('img[src*="/items/"]');
-        const itemId = img ? itemIdFromImage(img) : null;
-        if (!itemId) continue;
-        const inputs = rowInputs('bazaar-add', li);
-        const name = tradeText(li.querySelector('.name-wrap .t-overflow')) || (img && img.getAttribute('alt')) || '';
-        out.push({ el: li, itemId: String(itemId), name, have: inputs.have, qty: inputs.qty[0] || null, single: inputs.single });
+        const itemId = tradeRowItemId(li);
+        if (!itemId || (wanted && !wanted(itemId))) continue;
+        const row = readTradeAddRow(li);
+        if (row) out.push(row);
     }
     return out;
 }

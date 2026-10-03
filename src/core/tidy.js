@@ -20,6 +20,9 @@ import { liveAccepted } from './accepted.js';
 import { livePins } from './held.js';
 import { liveGone, liveStock, liveBought } from './flips.js';
 import { TE_ITEM_TTL_MS } from './selling.js';
+import { liveAsked, liveEnded } from './trades-board.js';
+import { liveWasToSell } from './to-sell.js';
+import { liveBoughtItems } from './bazaar-sell.js';
 
 /** `stored` with only the keys a reader still returns; `stored` itself when all are kept. */
 function tidyKeep(stored, live) {
@@ -65,6 +68,32 @@ export function tidyDeclined(stored, now = Date.now()) {
     const live = {};
     for (const [k, until] of Object.entries(stored)) if (Number(until) > now) live[k] = until;
     return tidyKeep(stored, live);
+}
+
+/** Trades asked about (core/trades-board.js liveAsked): an hour. */
+export function tidyAsked(stored, now = Date.now()) {
+    return tidyKeep(stored, liveAsked(stored, now));
+}
+
+/** Ended trades (core/trades-board.js liveEnded): a day - a list. */
+export function tidyEnded(stored, now = Date.now()) {
+    if (!Array.isArray(stored)) return stored;
+    const live = liveEnded(stored, now);
+    return live.length === stored.length ? stored : live;
+}
+
+/** What joined the To sell list (core/to-sell.js liveWasToSell): a month - a list. */
+export function tidyWasToSell(stored, now = Date.now()) {
+    if (!Array.isArray(stored)) return stored;
+    const live = liveWasToSell(stored, now);
+    return live.length === stored.length ? stored : live;
+}
+
+/** What you bought in the last 24 hours and still hold (core/bazaar-sell.js liveBoughtItems): {at, items}. */
+export function tidyHeld(stored, now = Date.now()) {
+    if (!stored || typeof stored !== 'object' || !Array.isArray(stored.items)) return stored;
+    const live = liveBoughtItems(stored, now);
+    return live.length === stored.items.length ? stored : { ...stored, items: live };
 }
 
 /** Cancelled trades kept to be put right: {key: {trade, at}} for `keepMs`. */

@@ -151,24 +151,41 @@ export function removeRowFloats(root = document) {
 const TOAST_CLASS = 'ttv2-toast';
 const TOAST_MS = 4500;
 
-export function showToast(rowEl, text, level = '', doc = document) {
+/* The toast's widest (styles.js): with this much free beside the row it goes there. */
+const TOAST_MAX_W = 400;
+
+/**
+ * @param {Element} rowEl
+ * @param {string} text
+ * @param {string} [level]
+ * @param {Document} [doc]
+ * @param {{right: number, top: number}} [at] - the row's place, when the caller has just read it
+ *
+ * Placed from the row's place alone, by the edge it hangs from (3.22.0): its
+ * own size is never asked for - on a long page each such question made the
+ * browser lay the whole page out again.
+ */
+export function showToast(rowEl, text, level = '', doc = document, at = null) {
     const view = viewOf(rowEl) || (doc && doc.defaultView);
     if (!view || !text) return null;
     for (const old of doc.querySelectorAll('.' + TOAST_CLASS)) old.remove();
+    const r = at || (rowEl && rowEl.getBoundingClientRect ? rowEl.getBoundingClientRect() : { left: 16, right: 16, top: 16, bottom: 16 });
     const toast = doc.createElement('div');
     toast.className = TOAST_CLASS;
     toast.setAttribute('role', 'status');
     if (level) toast.dataset.level = level;
     toast.textContent = text;
-    doc.body.appendChild(toast);
-    const r = rowEl && rowEl.getBoundingClientRect ? rowEl.getBoundingClientRect() : { left: 16, right: 16, top: 16, bottom: 16 };
-    const w = toast.offsetWidth;
-    const h = toast.offsetHeight;
     const room = view.innerWidth - r.right - 16;
-    const left = room >= w ? r.right + 12 : Math.max(8, Math.min(view.innerWidth - w - 8, r.right - w));
-    const top = room >= w ? Math.max(8, Math.min(view.innerHeight - h - 8, r.top)) : Math.max(8, r.top - h - 6);
-    toast.style.left = Math.round(left) + 'px';
-    toast.style.top = Math.round(top) + 'px';
+    if (room >= TOAST_MAX_W) {
+        // Free space right of the row: beside it, from the row's top down.
+        toast.style.left = Math.round(r.right + 12) + 'px';
+        toast.style.top = Math.round(Math.max(8, Math.min(view.innerHeight - 96, r.top))) + 'px';
+    } else {
+        // Else just above the row, its right edge on the row's.
+        toast.style.right = Math.round(Math.max(8, view.innerWidth - r.right)) + 'px';
+        toast.style.bottom = Math.round(Math.max(8, Math.min(view.innerHeight - 40, view.innerHeight - r.top + 6))) + 'px';
+    }
+    doc.body.appendChild(toast);
     view.setTimeout(() => toast.remove(), TOAST_MS);
     return toast;
 }

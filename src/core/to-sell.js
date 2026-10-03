@@ -11,7 +11,7 @@
  */
 
 /** Why an item is in the list, in the page's words. A row kept before 3.21 does not say: "Not taken". */
-export const TO_SELL_WHY = { cancel: 'Cancelled', left: 'Not taken', extra: 'Extra buy' };
+export const TO_SELL_WHY = { cancel: 'Cancelled', left: 'Not taken', extra: 'Extra buy', old: 'No trade made' };
 
 export function toSellWhy(why) {
     return Object.prototype.hasOwnProperty.call(TO_SELL_WHY, why) ? why : 'left';
@@ -35,25 +35,32 @@ function sameTrader(name, from) {
  * waiting (the nearest to a profit first), then the ones nobody buys.
  *
  * The buyer is the one who pays most now, never the trader who did not take
- * it (`from`). `ready`: they pay enough over what you paid (the same margin
- * rule as a flip - `enough(each profit, what you paid)`).
+ * it (`from`) - and never one who pays no more than you paid (3.22.0; the
+ * owner: "never suggest selling on a loss, so we can sell on our bazaar still
+ * on profit, and only show traders who we can sell on a profit"). `ready`:
+ * they pay enough over what you paid (the same margin rule as a flip -
+ * `enough(each profit, what you paid)`). `bazaar`: your own bazaar, $1 under
+ * the cheapest listing, when that is over what you paid.
  *
  * @param {Array<{itemId, name, qty, each, from, why}>} leftovers
  * @param {object} o
  * @param {function} o.buyersOf - (itemId) => buyers, best first ({id, name, price, trust})
  * @param {function} [o.keyOf] - (buyer) => the trade key of a trader
  * @param {function} [o.enough] - (profitEach, paidEach) => boolean
+ * @param {function} [o.bazaarOf] - (itemId) => the cheapest bazaar listing of it that is not yours, or null
  */
-export function toSellRows(leftovers, { buyersOf, keyOf = (b) => (b.id ? 'id:' + b.id : 'name:' + String(b.name).toLowerCase()), enough = (profit) => profit > 0, extraWaiting = TO_SELL_EXTRA_WAITING } = {}) {
+export function toSellRows(leftovers, { buyersOf, keyOf = (b) => (b.id ? 'id:' + b.id : 'name:' + String(b.name).toLowerCase()), enough = (profit) => profit > 0, extraWaiting = TO_SELL_EXTRA_WAITING, bazaarOf = () => null } = {}) {
     const rows = [];
     // Extra buys still waiting for a price: the newest few only.
     const waitingExtras = [];
     for (const l of leftovers || []) {
         if (!l || !l.itemId || !(Number(l.qty) > 0)) continue;
         const each = Number(l.each) || 0;
-        const top = (buyersOf(String(l.itemId)) || []).find((b) => b && Number(b.price) > 0 && !sameTrader(b.name, l.from)) || null;
+        // Only a trader who pays more than you paid: one who pays less is never named.
+        const top = (buyersOf(String(l.itemId)) || []).find((b) => b && Number(b.price) > each && !sameTrader(b.name, l.from)) || null;
         const per = top ? Number(top.price) - each : null;
         const ready = top !== null && per > 0 && Boolean(enough(per, each));
+        const bazaar = bazaarAbove(bazaarOf(String(l.itemId)), each, Number(l.qty));
         if (!ready && toSellWhy(l.why) === 'extra') waitingExtras.push({ itemId: String(l.itemId), at: Number(l.at) || 0 });
         rows.push({
             itemId: String(l.itemId),
@@ -65,13 +72,43 @@ export function toSellRows(leftovers, { buyersOf, keyOf = (b) => (b.id ? 'id:' +
             best: top ? { key: keyOf(top), id: top.id ? String(top.id) : null, name: top.name, price: Number(top.price), trust: top.trust || null } : null,
             gain: top ? per * Number(l.qty) : null,
             ready,
-            // Waiting: how far their price is from a profit, each (0 or less: over what you paid, but under the margin).
+            // Waiting, with a trader over what you paid but under the margin: by how much, each (below 0).
             short: top && !ready ? each - Number(top.price) : null,
+            bazaar,
         });
     }
     const old = new Set(waitingExtras.sort((a, b) => b.at - a.at).slice(Math.max(0, extraWaiting)).map((x) => x.itemId));
-    const rank = (r) => (r.ready ? 0 : r.best ? 1 : 2);
-    return rows.filter((r) => !old.has(r.itemId)).sort((a, b) => rank(a) - rank(b) || (a.ready ? b.gain - a.gain : (a.short ?? 0) - (b.short ?? 0)) || String(a.name).localeCompare(String(b.name)));
+    // A profit with a trader, then one in your own bazaar, then a trader under the margin, then nothing yet.
+    const rank = (r) => (r.ready ? 0 : r.bazaar ? 1 : r.best ? 2 : 3);
+    const worth = (r) => (r.ready ? r.gain : r.bazaar ? r.bazaar.gain : r.best ? r.gain : 0);
+    return rows.filter((r) => !old.has(r.itemId)).sort((a, b) => rank(a) - rank(b) || worth(b) - worth(a) || String(a.name).localeCompare(String(b.name)));
+}
+
+/** Your own bazaar at $1 under the cheapest listing, when that is over what you paid: {price, gain}; else null. */
+export function bazaarAbove(lowest, paidEach, qty) {
+    const price = Number(lowest) > 1 ? Number(lowest) - 1 : 0;
+    return price > Number(paidEach) ? { price, gain: (price - Number(paidEach)) * Number(qty) } : null;
+}
+
+/**
+ * Where to sell a To sell item (core/flips.js whereToSell), never at a loss:
+ * a venue that gives no more than you paid is marked (`loss`) and is never
+ * the best; with none over what you paid there is no best - it waits.
+ *
+ * @param {{options: Array<{venue, each, units, total}>, best: string|null, gain: number}} where
+ * @param {number} paidEach
+ */
+export function whereAbovePaid(where, paidEach) {
+    const paid = Number(paidEach) || 0;
+    if (!where || !(paid > 0)) return where;
+    const options = where.options.map((o) => ({ ...o, loss: o.each !== null && o.each <= paid }));
+    const ok = options.filter((o) => o.each !== null && !o.loss);
+    const was = ok.find((o) => o.venue === where.best) || null;
+    // The best as worked out, when it is over what you paid; else the one that pays most each.
+    const best = was || ok.slice().sort((a, b) => b.each - a.each)[0] || null;
+    const trader = options.find((o) => o.venue === 'trader');
+    const overTrader = best && best.venue !== 'trader' && trader && trader.each !== null && !trader.loss;
+    return { options, best: best ? best.venue : null, gain: was ? where.gain : overTrader ? best.total - trader.total : 0, paid };
 }
 
 /**
@@ -149,4 +186,80 @@ export function afterYoursSent(leftovers, trade, now = Date.now()) {
 /** What a trade's "yours" lines make over what you paid: units x (their price - yours). */
 export function heldGain(rows) {
     return (rows || []).reduce((a, r) => a + (Number(r.units) > 0 && Number(r.each) >= 0 ? r.units * (Number(r.bid) - (Number(r.each) || 0)) : 0), 0);
+}
+
+/* ------------------------------------------- what was To sell, for the Ledger's Sold tab (3.22.0) */
+
+/*
+ * The owner, 2026-10-03: "see if i traded and sold something in the bazaar on
+ * the items i bought, maybe a trader didnt get it, maybe its in to sell".
+ * The To sell list forgets an item once it is sold, so each time something
+ * joins it a short note is kept - the item, how many, why, whose trade - and
+ * the Ledger's Sold tab marks the sales that took those units.
+ */
+export const WAS_TO_SELL_KEEP_MS = 30 * 24 * 60 * 60 * 1000;
+export const WAS_TO_SELL_MAX = 300;
+/* A sale this long after the item joined the list is no longer taken for it (the list keeps a week). */
+export const WAS_TO_SELL_MATCH_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** The stored notes still kept: [{itemId, qty, why, who, at, since}], oldest first. */
+export function liveWasToSell(stored, now = Date.now()) {
+    return (Array.isArray(stored) ? stored : [])
+        .filter((r) => r && r.itemId && Number(r.qty) > 0 && Number(r.at) > 0 && now - Number(r.at) < WAS_TO_SELL_KEEP_MS)
+        .sort((a, b) => a.at - b.at)
+        .slice(-WAS_TO_SELL_MAX);
+}
+
+/**
+ * The notes after the To sell list changed from `prev` to `next`: one more for
+ * each item that is new on it or has more units than before. The same list
+ * (`stored` itself) when nothing joined.
+ *
+ * @param {function} [sinceOf] - (leftover) => from when what leaves your stock counts against it (ms)
+ */
+export function noteToSell(stored, prev, next, now = Date.now(), sinceOf = (l) => Number(l && l.since) || Number(l && l.at) || now) {
+    const before = new Map();
+    for (const l of Array.isArray(prev) ? prev : []) if (l && l.itemId) before.set(String(l.itemId), (before.get(String(l.itemId)) || 0) + (Number(l.qty) || 0));
+    const add = [];
+    for (const l of Array.isArray(next) ? next : []) {
+        if (!l || !l.itemId) continue;
+        const more = (Number(l.qty) || 0) - (before.get(String(l.itemId)) || 0);
+        if (more > 0) add.push({ itemId: String(l.itemId), qty: more, why: toSellWhy(l.why), who: l.from || null, at: now, since: Number(sinceOf(l)) || now });
+    }
+    return add.length ? liveWasToSell([...(Array.isArray(stored) ? stored : []), ...add], now) : stored;
+}
+
+/**
+ * Which sales took units that were on the To sell list: each note's units are
+ * used up by the sales of that item made after it joined, oldest first.
+ *
+ * @param {Array} notes - liveWasToSell
+ * @param {Array<{id, t, itemId, qty, side}>} rows - Ledger rows
+ * @returns {Map<string, {why, who}>} sale row id -> why it was To sell
+ */
+export function toSellTags(notes, rows) {
+    const out = new Map();
+    const list = (Array.isArray(notes) ? notes : []).filter((n) => n && n.itemId && Number(n.qty) > 0);
+    if (!list.length) return out;
+    const items = new Set(list.map((n) => String(n.itemId)));
+    const sales = new Map();
+    for (const r of rows || []) {
+        if (!r || r.side !== 'sell' || !items.has(String(r.itemId)) || !(Number(r.qty) > 0)) continue;
+        if (!sales.has(String(r.itemId))) sales.set(String(r.itemId), []);
+        sales.get(String(r.itemId)).push({ id: r.id, t: Number(r.t), free: Number(r.qty) });
+    }
+    for (const s of sales.values()) s.sort((a, b) => a.t - b.t);
+    for (const n of list.slice().sort((a, b) => a.at - b.at)) {
+        let left = Number(n.qty);
+        const from = Number(n.since) || Number(n.at);
+        for (const s of sales.get(String(n.itemId)) || []) {
+            if (!(left > 0)) break;
+            if (!(s.t > from) || s.t - from > WAS_TO_SELL_MATCH_MS || !(s.free > 0)) continue;
+            const took = Math.min(left, s.free);
+            s.free -= took;
+            left -= took;
+            if (!out.has(s.id)) out.set(s.id, { why: toSellWhy(n.why), who: n.who || null });
+        }
+    }
+    return out;
 }

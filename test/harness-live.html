@@ -117,6 +117,19 @@ if (/[?&]ownbazaar=1/.test(location.search)) {
             for (let i = 0; i < 40; i++) all.insertAdjacentHTML('beforeend', row(4000 + i, 'Other thing ' + (i + 1), 3, 10));
             window.__loadRows = () => { for (const li of mine) all.appendChild(li); };
         }
+        // &addrows=N (3.22.0, the speed of Fill on a long add page): N more rows, Beer and Xanax in turn.
+        const _addRows = Number(new URLSearchParams(location.search).get('addrows')) || 0;
+        if (_addRows) {
+            let html = '';
+            for (let i = 0; i < _addRows; i++) html += i % 2 ? row(206, 'Xanax', 15, 830000) : row(180, 'Bottle of Beer', 12, 55);
+            d.querySelector('ul.items-cont').insertAdjacentHTML('beforeend', html);
+        }
+        const _moreRows = Number(new URLSearchParams(location.search).get('distinct')) || 0;
+        if (_moreRows) {
+            let html = '';
+            for (let i = 0; i < _moreRows; i++) html += row(5000 + i, 'Thing ' + (i + 1), 3, 100 + i);
+            d.querySelector('ul.items-cont').insertAdjacentHTML('afterbegin', html);
+        }
         // Torn's form keeps what was typed; the harness logs each input event so a check can see Fill's.
         window.__typed = [];
         d.addEventListener('input', (e) => window.__typed.push([e.target.closest('li') ? e.target.closest('li').querySelector('.t-overflow').textContent : '?', e.target.className, e.target.value]));
@@ -462,13 +475,65 @@ if (/[?&]ownbuys=1/.test(location.search)) {
  * from a cancelled trade and an extra buy of Xanax (both with a trader who
  * pays more), and Bottles of Beer a trader did not take, waiting for a price.
  */
-if (/[?&]tosell=1/.test(location.search)) {
+if (/[?&]tosell=[12]/.test(location.search)) {
+    // &tosell=2 (3.22.0, never a loss): the Xanax cost $851,000 (Bob pays $852,000; Carol and Alice less - never named),
+    // and the Beer cost $40 (no trader buys it; your bazaar at $59 is a profit).
+    const two = /[?&]tosell=2/.test(location.search);
     const now = Date.now();
     _store[NS + 'sellLeftovers'] = JSON.stringify([
         { itemId: '335', name: 'Stick of Dynamite', qty: 53, each: 17500, from: 'KayMalta', at: now - 5 * 60000, since: now - 6 * 60000, why: 'cancel' },
-        { itemId: '206', name: 'Xanax', qty: 4, each: 840000, from: null, at: now - 4 * 60000, since: now - 4 * 60000, why: 'extra' },
-        { itemId: '180', name: 'Bottle of Beer', qty: 30, each: 900, from: 'Bob', at: now - 3 * 60000, since: now - 3 * 60000 },
+        { itemId: '206', name: 'Xanax', qty: 4, each: two ? 851000 : 840000, from: null, at: now - 4 * 60000, since: now - 4 * 60000, why: 'extra' },
+        { itemId: '180', name: 'Bottle of Beer', qty: 30, each: two ? 40 : 900, from: 'Bob', at: now - 3 * 60000, since: now - 3 * 60000 },
     ]);
+}
+/*
+ * &bzsell=1 (3.22.0, with ?ownbazaar=1&page=bazaar#/add): what you bought and
+ * have not sold, on your bazaar's add page. To sell: 4 Xanax that cost
+ * $851,000 (the lowest bazaar is $840,000 - Fill all passes it over). Your
+ * log, as Torn Bids left it: 5 Bottles of Beer at $40 (Fill types $59 and 5),
+ * 2 Hammers at $30 (one row a unit; you tick Torn's box) and 3 Sticks of
+ * Dynamite (not in the page's list).
+ */
+if (/[?&]bzsell=1/.test(location.search)) {
+    const now = Date.now();
+    _store[NS + 'ledgerKey'] = JSON.stringify(FULLKEY);
+    _store[NS + 'sellLeftovers'] = JSON.stringify([
+        { itemId: '206', name: 'Xanax', qty: 4, each: 851000, from: 'Bob', at: now - 4 * 60000, since: now - 4 * 60000, why: 'cancel' },
+    ]);
+    _store[NS + 'sellHeld24'] = JSON.stringify({ at: now - 3 * 60000, items: [
+        { itemId: '180', qty: 5, each: 40, at: now - 2 * 3600000 },
+        { itemId: '1', qty: 2, each: 30, at: now - 3 * 3600000 },
+        { itemId: '335', qty: 3, each: 17500, at: now - 5 * 3600000 },
+    ] });
+}
+/*
+ * &tradesgoing=1 (3.22.0, with &manybuyers=1): the Trades tab - Carol asked
+ * about Dynamite 12 minutes ago, Bob accepted and one of his two bazaars is
+ * bought, Alice accepted and all is bought, KayMalta traded two hours ago, and
+ * a trade trader 77 accepted 25 hours ago was never made (its 3 bought Xanax
+ * go to To sell as the page opens).
+ */
+if (/[?&]tradesgoing=1/.test(location.search)) {
+    const now = Date.now();
+    const acc = (id, name, at, steps, itemId = '206', item = 'Xanax', bid = 850000) => ({ key: 'id:' + id, trader: { id: String(id), name }, itemId, at, cost: 0, pays: 0, profit: 0, items: [{ line: 'flip:' + itemId, itemId, name: item, units: steps.reduce((a, st) => a + st.qty, 0), bid, kind: 'flip', sent: false, steps }] });
+    _store[NS + 'sellAsked'] = JSON.stringify({ '335|id:44': { itemId: '335', key: 'id:44', id: '44', name: 'Carol', items: 1, profit: 47700, at: now - 12 * 60000 } });
+    _store[NS + 'sellAccepted'] = JSON.stringify({
+        'id:11': acc(11, 'Bob', now - 6 * 60000, [{ sellerId: '888', sellerName: 'XanSeller', qty: 2, price: 840000, bought: true, boughtQty: 2, boughtAt: now - 4 * 60000 }, { sellerId: '4242', sellerName: 'Other', qty: 1, price: 841000, bought: false }]),
+        'id:12': acc(12, 'Alice', now - 22 * 60000, [{ sellerId: '777', sellerName: 'CheapSeller', qty: 4, price: 50, bought: true, boughtQty: 4, boughtAt: now - 20 * 60000 }], '1', 'Hammer', 115),
+        'id:77': acc(77, 'OnlyW3B', now - 25 * 60 * 60000, [{ sellerId: '888', sellerName: 'XanSeller', qty: 3, price: 840000, bought: true, boughtQty: 3, boughtAt: now - 24.5 * 60 * 60000 }]),
+    });
+    _store[NS + 'sellEnded'] = JSON.stringify([{ key: 'id:5001', name: 'KayMalta', how: 'traded', at: now - 2 * 60 * 60000, yesAt: now - 3 * 60 * 60000, profit: 48000, moved: [] }]);
+}
+/*
+ * &stalelist=<trader id> (3.22.0): that trader last changed their TornW3B
+ * price list five days ago (as Torn Bids kept it from an earlier visit) -
+ * Fresh prices only leaves their TornW3B prices out. Without it, no list date
+ * is kept.
+ */
+{
+    const stale = new URLSearchParams(location.search).get('stalelist');
+    if (stale) localStorage.setItem('ttv2.bids.listat', JSON.stringify([[stale, Math.round(Date.now() / 1000) - 5 * 24 * 3600]]));
+    else localStorage.removeItem('ttv2.bids.listat');
 }
 /*
  * &leftmany=1 (3.16.4, with &bigflip=1): the friend's Torn Bids, 2026-10-02 -
@@ -482,6 +547,9 @@ if (/[?&]leftmany=1/.test(location.search)) {
     _store[NS + 'sellLeftovers'] = JSON.stringify(left.map(([itemId, name, qty, each], i) => ({ itemId: String(itemId), name, qty, each, from: 'Picex', at: now - (i + 1) * 60000, since: now - 3 * 3600000 })));
 }
 
+// &distinct=N (3.22.0, the speed of a long list): N more items, each with a row of its own on your
+// bazaar's add page and the trade page's add step - as a real inventory is, every row another item.
+const _distinct = Number(new URLSearchParams(location.search).get('distinct')) || 0;
 const ITEMS = {
     1: { name: 'Hammer', type: 'Melee', sell_price: 100, market_value: 120 },
     206: { name: 'Xanax', type: 'Drug', sell_price: 600, market_value: 830000 },
@@ -491,6 +559,8 @@ const ITEMS = {
     // "Sell: N/A" too: only a foreign shop, whose "sell" is 75% filler.
     335: { name: 'Stick of Dynamite', type: 'Temporary', sell_price: null, foreign: true, market_value: 9172 },
 };
+
+for (let i = 0; i < _distinct; i++) ITEMS[5000 + i] = { name: 'Thing ' + (i + 1), type: 'Other', sell_price: 10, market_value: 100 + i };
 
 /*
  * &bigflip=1 (3.14): the owner's 2026-09-28 page. KayMalta, a TornExchange

@@ -14,11 +14,17 @@
  */
 
 import { formatMoney, formatAge, parseMoneyInput } from '../core/parse.js';
-import { matchFifo, filterLedgerRows, ledgerTotals, ledgerByItem, ledgerByPeriod, periodStart, mugTotals, tradeReceipts, VENUE_NAMES } from '../core/ledger.js';
+import { matchFifo, filterLedgerRows, ledgerTotals, ledgerByItem, ledgerByPeriod, periodStart, mugTotals, tradeReceipts, VENUE_NAMES, SOLD_VENUES, soldRows, soldByVenue, soldOutcome, boughtFromText } from '../core/ledger.js';
+import { toSellTags, TO_SELL_WHY } from '../core/to-sell.js';
 import { isFavourite, FAVOURITE_TRADES } from '../core/partners.js';
 
 /* At most this many receipts drawn at once (narrow the period or who for older ones). */
 const RECEIPTS_SHOWN = 40;
+/* At most this many sales drawn at once on the Sold tab. */
+const SOLD_SHOWN = 200;
+/* The Sold tab's places, and what it can show. */
+const SOLD_IN = [['all', 'Everywhere'], ['bazaar', 'Bazaar'], ['market', 'Item Market'], ['trade', 'Trades'], ['npc', 'NPC shop']];
+const SOLD_SHOW = [['all', 'All'], ['profit', 'Profit'], ['loss', 'Loss'], ['unknown', 'Cost not known']];
 
 const DAY = 24 * 60 * 60 * 1000;
 
@@ -85,9 +91,9 @@ export class LedgerView {
      */
     constructor(h = {}) {
         this.h = h;
-        this.f = { period: '30d', itemId: '', category: '', venue: 'all', who: '', fromDay: '', toDay: '', mugger: 'all', mugMin: '', trader: '' };
+        this.f = { period: '30d', itemId: '', category: '', venue: 'all', who: '', fromDay: '', toDay: '', mugger: 'all', mugMin: '', trader: '', sold: 'all' };
         this.group = 'day';
-        /* 'trade' (buys and sells), 'receipts' (one per finished trade), 'traders' (who you traded with) or 'mugs' (what muggings took) */
+        /* 'trade' (buys and sells), 'sold' (every sale, a profit or a loss, per place), 'receipts' (one per finished trade), 'traders' (who you traded with) or 'mugs' (what muggings took) */
         this.tab = 'trade';
         this.fifoSig = null;
         this.fifo = new Map();
@@ -126,7 +132,7 @@ export class LedgerView {
         const L = v.ledger || {};
         const rows = L.rows || [];
         const mugs = L.mugs || [];
-        const sig = JSON.stringify([rows.length, rows.length ? rows[rows.length - 1].id : null, mugs.length, L.hasKey, L.busy, L.error, L.keyError, L.backfilled, Math.floor((Date.now() - (L.readAt || 0)) / 60000), this.f, this.group, this.tab, L.favourites || null, (L.blacklist || []).map((x) => x.key), (L.partners || []).length]);
+        const sig = JSON.stringify([rows.length, rows.length ? rows[rows.length - 1].id : null, mugs.length, L.hasKey, L.busy, L.error, L.keyError, L.backfilled, Math.floor((Date.now() - (L.readAt || 0)) / 60000), this.f, this.group, this.tab, L.favourites || null, (L.blacklist || []).map((x) => x.key), (L.partners || []).length, (L.wasToSell || []).length]);
         if (sig === this.sig) return;
         const box = this.el;
         // A date being typed part by part is never redrawn under you (3.14.3:
@@ -181,7 +187,7 @@ export class LedgerView {
 
         /* Trading | Mugged */
         const tabs = lvEl('div', { class: 'lg-tabs', role: 'group', 'aria-label': 'Ledger' });
-        for (const [k, label] of [['trade', 'Trading'], ['receipts', 'Receipts'], ['traders', 'Traders'], ['mugs', 'Mugged' + (mugs.length ? ' · ' + lvCount(mugs.length) : '')]]) {
+        for (const [k, label] of [['trade', 'Trading'], ['sold', 'Sold'], ['receipts', 'Receipts'], ['traders', 'Traders'], ['mugs', 'Mugged' + (mugs.length ? ' · ' + lvCount(mugs.length) : '')]]) {
             tabs.appendChild(lvEl('button', { type: 'button', class: 'lg-tab', 'aria-pressed': String(this.tab === k), 'data-lg-focus': 'tab:' + k, text: label, onclick: () => {
                 this.tab = k;
                 this.sig = null;
@@ -286,6 +292,13 @@ export class LedgerView {
         minInput.addEventListener('input', () => this.set({ mugMin: minInput.value }));
         const mugsTab = this.tab === 'mugs';
         const receiptsTab = this.tab === 'receipts';
+        const soldTab = this.tab === 'sold';
+        // Sold: where, and a profit or a loss, as chips (mockup W).
+        const soldVenue = SOLD_VENUES.includes(this.f.venue) ? this.f.venue : 'all';
+        const soldInChips = lvEl('div', { class: 'lg-chips', role: 'group', 'aria-label': 'Sold in' });
+        for (const [k, label] of SOLD_IN) soldInChips.appendChild(lvEl('button', { type: 'button', class: 'sp-chip-f', 'aria-pressed': String(soldVenue === k), 'data-lg-focus': 'soldin:' + k, text: label, onclick: () => this.set({ venue: k }) }));
+        const soldShowChips = lvEl('div', { class: 'lg-chips', role: 'group', 'aria-label': 'Show' });
+        for (const [k, label] of SOLD_SHOW) soldShowChips.appendChild(lvEl('button', { type: 'button', class: 'sp-chip-f', 'aria-pressed': String(this.f.sold === k), 'data-lg-focus': 'soldshow:' + k, text: label, onclick: () => this.set({ sold: k }) }));
         // Receipts: pick a trader (the ones on your receipts, most trades first; a star for favourites).
         const partners = L.partners || [];
         const traderSel = lvEl('select', { class: 'lg-in', 'aria-label': 'Trader', 'data-lg-focus': 'trader' }, [
@@ -298,19 +311,23 @@ export class LedgerView {
             ? this.f.who || this.f.mugger !== 'all' || this.f.mugMin
             : receiptsTab
                 ? this.f.itemId || this.f.category || this.f.trader
-                : this.f.itemId || this.f.category || this.f.venue !== 'all' || this.f.who;
+                : soldTab
+                    ? this.f.itemId || this.f.category || soldVenue !== 'all' || this.f.who || this.f.sold !== 'all'
+                    : this.f.itemId || this.f.category || this.f.venue !== 'all' || this.f.who;
         box.appendChild(lvEl('div', { class: 'lg-filters' }, [
             periodChips,
             ...dates,
             mugsTab ? null : lvEl('label', { class: 'lg-f' }, [lvEl('span', { text: 'Item' }), itemInput, datalist]),
             mugsTab ? null : lvEl('label', { class: 'lg-f' }, [lvEl('span', { text: 'Category' }), catSel]),
-            mugsTab || receiptsTab ? null : lvEl('label', { class: 'lg-f' }, [lvEl('span', { text: 'Where' }), venueSel]),
+            mugsTab || receiptsTab || soldTab ? null : lvEl('label', { class: 'lg-f' }, [lvEl('span', { text: 'Where' }), venueSel]),
             receiptsTab ? lvEl('label', { class: 'lg-f' }, [lvEl('span', { text: 'Trader' }), traderSel]) : lvEl('label', { class: 'lg-f' }, [lvEl('span', { text: mugsTab ? 'Mugged by' : 'Who' }), whoInput]),
             mugsTab ? lvEl('label', { class: 'lg-f' }, [lvEl('span', { text: 'Mugger' }), muggerSel]) : null,
             mugsTab ? lvEl('label', { class: 'lg-f' }, [lvEl('span', { text: 'At least' }), minInput]) : null,
+            soldTab ? lvEl('div', { class: 'lg-f' }, [lvEl('span', { text: 'Sold in' }), soldInChips]) : null,
+            soldTab ? lvEl('div', { class: 'lg-f' }, [lvEl('span', { text: 'Show' }), soldShowChips]) : null,
             any ? lvEl('button', { type: 'button', class: 'sp-link', text: 'Clear filters', onclick: () => {
                 this.itemText = '';
-                this.set(mugsTab ? { who: '', mugger: 'all', mugMin: '' } : receiptsTab ? { itemId: '', category: '', trader: '' } : { itemId: '', category: '', venue: 'all', who: '' });
+                this.set(mugsTab ? { who: '', mugger: 'all', mugMin: '' } : receiptsTab ? { itemId: '', category: '', trader: '' } : soldTab ? { itemId: '', category: '', venue: 'all', who: '', sold: 'all' } : { itemId: '', category: '', venue: 'all', who: '' });
             } }) : null,
         ]));
 
@@ -325,11 +342,16 @@ export class LedgerView {
             this.restoreFocus(focusKey, caret);
             return;
         }
-        const shown = filterLedgerRows(rows, { ...this.f, from, to }, typeOf);
-        const t = ledgerTotals(shown, this.fifo);
         const periodLabel = this.f.period === 'dates'
             ? (from ? dateText(from) : 'the start') + ' to ' + (to ? dateText(to) : 'today')
             : (PERIODS.find(([k]) => k === this.f.period) || [0, ''])[1].toLowerCase();
+        if (soldTab) {
+            this.renderSold(box, filterLedgerRows(rows, { ...this.f, venue: 'all', from, to }, typeOf), soldVenue, nameOf, L, rows, this.f.period === 'all' ? 'everything read' : periodLabel);
+            this.restoreFocus(focusKey, caret);
+            return;
+        }
+        const shown = filterLedgerRows(rows, { ...this.f, from, to }, typeOf);
+        const t = ledgerTotals(shown, this.fifo);
         const title = this.f.itemId ? 'Profit on ' + nameOf(this.f.itemId) : 'Profit';
 
         /* the answer */
@@ -402,6 +424,117 @@ export class LedgerView {
             this.rowsTable(shown, nameOf),
         ]));
         this.restoreFocus(focusKey, caret);
+    }
+
+    /**
+     * Ledger › Sold (3.22.0, mockup W; the owner: "a tab that filters sold in
+     * item market, bazaar, and ledger profits? wether on a loss or profit?"):
+     * every sale, wherever it was made - what you got (after the Item Market's
+     * fee), what its units cost (first in, first out), what it made or lost,
+     * and where those units were bought. A tile per place; press one to see
+     * only its sales. Nothing new is read: these are the Trading tab's rows.
+     *
+     * @param {Array} inPeriod - the rows the period, item, category and who filters keep (every place)
+     * @param {string} venue - 'all' or the place picked
+     * @param {Array} allRows - every Ledger row (the To sell tags are worked out over all of them)
+     */
+    renderSold(box, inPeriod, venue, nameOf, L, allRows, periodText) {
+        const sales = soldRows(inPeriod, this.fifo, this.f.sold);
+        const by = soldByVenue(sales, this.fifo);
+        const shown = venue === 'all' ? sales : sales.filter((r) => r.venue === venue);
+        box.appendChild(lvEl('div', { class: 'lg-head' }, [
+            lvEl('h2', { text: this.f.itemId ? 'Sold: ' + nameOf(this.f.itemId) : 'Sold' }),
+            lvEl('span', { class: 'lg-muted', text: periodText + ' · press a place to see only its sales' }),
+        ]));
+        const tiles = lvEl('div', { class: 'lg-tiles lg-tiles5', role: 'group', 'aria-label': 'Sold in' });
+        for (const [k, label] of SOLD_IN) {
+            const b = by[k];
+            const sub = [lvCount(b.sales) + (b.sales === 1 ? ' sale' : ' sales')];
+            if (b.losses) sub.push(lvCount(b.losses) + ' at a loss');
+            if (b.fees) sub.push('fees ' + formatMoney(b.fees));
+            if (b.unknown) sub.push(lvCount(b.unknown) + ' cost not known');
+            tiles.appendChild(lvEl('button', { type: 'button', class: 'lg-tile lg-tilebtn ' + (!b.sales ? '' : b.profit >= 0 ? 'lg-good' : 'lg-loss'), 'aria-pressed': String(venue === k), 'data-lg-focus': 'soldtile:' + k, title: k === 'all' ? 'Every place' : 'Only what you sold here', onclick: () => this.set({ venue: k }) }, [
+                lvEl('span', { class: 'lg-tl', text: label }),
+                lvEl('b', { text: b.sales ? lvSigned(b.profit) : '–' }),
+                lvEl('small', { text: sub.join(' · ') }),
+            ]));
+        }
+        box.appendChild(tiles);
+        const b = by[venue] || by.all;
+        if (b.unknown) box.appendChild(lvEl('p', { class: 'lg-note', text: lvCount(b.unknown) + (b.unknown === 1 ? ' sale' : ' sales') + ' with no buy on record (bought before the Ledger\'s first entry): the cost is not known, so they are not in the profit.' }));
+        if (!shown.length) {
+            box.appendChild(lvEl('p', { class: 'lg-card lg-muted', text: L.busy && !allRows.length ? 'Reading your log…' : allRows.length ? 'No sales match these filters.' : 'No sales read yet.' }));
+            return;
+        }
+        // Sales of what was on your To sell list (a cancelled trade's items, what a trader did not take, an extra buy).
+        const tags = toSellTags(L.wasToSell || [], allRows);
+        // A trade pays one sum for everything in it (the owner: "so its not accurate when it says ive gained
+        // or lost on that item?"). With several items sold in one trade, each item's share is worked out: by
+        // the prices the trader accepted in Torn Bids when there is such a record, else by market value - an
+        // estimate, and said on the row. The trade's own total is always the real money.
+        const soldInTrade = new Map();
+        for (const r of allRows) {
+            if (r.venue !== 'trade' || r.side !== 'sell') continue;
+            const m = String(r.id).match(/^trade:(.+):out:\d+$/);
+            if (m) soldInTrade.set(m[1], (soldInTrade.get(m[1]) || 0) + 1);
+        }
+        const shareNote = (r) => {
+            if (r.venue !== 'trade') return null;
+            const m = String(r.id).match(/^trade:(.+):out:\d+$/);
+            if (!m || !(soldInTrade.get(m[1]) > 1)) return null;
+            return r.split === 'price' ? 'its share of the trade, by their accepted prices' : 'estimate: its share of the trade, by market value';
+        };
+        const table = lvEl('table', { class: 'lg-table lg-soldt' });
+        table.appendChild(lvEl('tr', {}, ['When', 'Item', 'Qty', 'Sold in', 'To', 'Each', 'You got', 'It cost', 'Profit', 'Bought from'].map((h, i) => lvEl('th', { class: i === 2 || (i >= 5 && i <= 8) ? 'lg-num' : '', scope: 'col', text: h }))));
+        const list = shown.slice().reverse().slice(0, SOLD_SHOWN);
+        for (const r of list) {
+            const m = this.fifo.get(r.id) || null;
+            const outcome = soldOutcome(m);
+            const tag = tags.get(r.id) || null;
+            const tagWords = tag ? (TO_SELL_WHY[tag.why] || 'To sell') + (tag.who ? ' · ' + tag.who : '') : '';
+            table.appendChild(lvEl('tr', {}, [
+                lvEl('td', { text: dateText(r.t, true) }),
+                lvEl('td', {}, [lvEl('b', { class: 'lg-sname', text: nameOf(r.itemId) })]),
+                lvEl('td', { class: 'lg-num', text: lvCount(r.qty) }),
+                lvEl('td', { text: VENUE_NAMES[r.venue] || r.venue }),
+                lvEl('td', {}, [this.whoEl(r.who, r.whoName, r.venue)]),
+                lvEl('td', { class: 'lg-num', text: formatMoney(Math.round(r.each)) }),
+                lvEl('td', { class: 'lg-num' }, [formatMoney(Math.round(m ? m.net : r.each * r.qty - (r.fee || 0))), r.fee ? lvEl('small', { class: 'lg-from', text: 'after the ' + formatMoney(r.fee) + ' fee' }) : null]),
+                lvEl('td', { class: 'lg-num', text: m && m.cost !== null ? formatMoney(Math.round(m.cost)) : '–' }),
+                lvEl('td', { class: 'lg-num ' + (outcome === 'profit' ? 'lg-good' : outcome === 'loss' ? 'lg-loss' : 'lg-muted') }, [
+                    outcome === 'unknown' ? 'cost not known' : lvEl('b', { text: lvSigned(m.profit) }),
+                    outcome !== 'unknown' && m.unknownQty ? lvEl('small', { class: 'lg-from', text: lvCount(m.unknownQty) + ' with no buy on record' }) : null,
+                    shareNote(r) ? lvEl('small', { class: 'lg-from' + (r.split === 'price' ? '' : ' lg-est'), text: shareNote(r) }) : null,
+                ]),
+                lvEl('td', {}, [
+                    lvEl('span', { class: 'lg-muted', text: boughtFromText(m) }),
+                    tag ? lvEl('span', { class: 'lg-tstag', title: 'These were on your To sell list: ' + tagWords, text: tag.why === 'extra' ? 'Extra buy' : 'To sell' }) : null,
+                    tag && tag.why !== 'extra' ? lvEl('small', { class: 'lg-from', text: tagWords }) : null,
+                ]),
+            ]));
+        }
+        if (shown.length > list.length) table.appendChild(lvEl('tr', {}, [lvEl('td', { colspan: '10', class: 'lg-muted', text: 'The newest ' + list.length + ' of ' + lvCount(shown.length) + ' sales. Narrow the filters to see others.' })]));
+        box.appendChild(lvEl('section', { class: 'lg-card' }, [
+            lvEl('h3', { text: 'Sales · newest first' }),
+            lvEl('div', { class: 'lg-scroll' }, [table]),
+        ]));
+    }
+
+    /** Who a buy or a sale was with: their profile link; a shop's name; "anonymous". */
+    whoEl(id, name, venue) {
+        // Shops have no player: the NPC shop, a city shop, abroad.
+        if (!id && !name && (venue === 'npc' || venue === 'shop' || venue === 'abroad')) return lvEl('span', { class: 'lg-muted', text: VENUE_NAMES[venue] });
+        if (!id && !name) return lvEl('span', { class: 'lg-muted', text: 'anonymous' });
+        const label = name || 'Player ' + id;
+        if (!id) return lvEl('span', { text: label });
+        const url = 'https://www.torn.com/profiles.php?XID=' + encodeURIComponent(id);
+        const a = lvEl('a', { href: url, target: '_blank', rel: 'noopener noreferrer', text: label });
+        a.addEventListener('click', (e) => {
+            if (e.button !== 0 || e.ctrlKey || e.metaKey || e.shiftKey) return;
+            e.preventDefault();
+            if (this.h.onOpenUrl) this.h.onOpenUrl(url);
+        });
+        return a;
     }
 
     /**
@@ -736,21 +869,7 @@ export class LedgerView {
     rowsTable(shown, nameOf) {
         const table = lvEl('table', { class: 'lg-table lg-rows' });
         table.appendChild(lvEl('tr', {}, ['When', '', 'Item', 'Qty', 'Each', 'Total', 'Where', 'Who', 'Profit'].map((h, i) => lvEl('th', { class: i >= 3 && i <= 5 || i === 8 ? 'lg-num' : '', text: h }))));
-        const who = (id, name, venue) => {
-            // Shops have no player: the NPC shop, a city shop, abroad.
-            if (!id && !name && (venue === 'npc' || venue === 'shop' || venue === 'abroad')) return lvEl('span', { class: 'lg-muted', text: VENUE_NAMES[venue] });
-            if (!id && !name) return lvEl('span', { class: 'lg-muted', text: 'anonymous' });
-            const label = name || 'Player ' + id;
-            if (!id) return lvEl('span', { text: label });
-            const url = 'https://www.torn.com/profiles.php?XID=' + encodeURIComponent(id);
-            const a = lvEl('a', { href: url, target: '_blank', rel: 'noopener noreferrer', text: label });
-            a.addEventListener('click', (e) => {
-                if (e.button !== 0 || e.ctrlKey || e.metaKey || e.shiftKey) return;
-                e.preventDefault();
-                if (this.h.onOpenUrl) this.h.onOpenUrl(url);
-            });
-            return a;
-        };
+        const who = (id, name, venue) => this.whoEl(id, name, venue);
         const rows = shown.slice().reverse().slice(0, 200);
         for (const r of rows) {
             const m = r.side === 'sell' ? this.fifo.get(r.id) : null;
@@ -802,6 +921,18 @@ export const LEDGER_CSS = `
 .lg-tile.lg-good { background: var(--profit-bg); border-color: var(--profit-line); }
 .lg-tile.lg-good b, .lg-good { color: var(--price); }
 .lg-tile.lg-loss b, .lg-loss { color: var(--bad); }
+.lg-tiles5 { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+.lg-tilebtn { text-align: left; cursor: pointer; font: inherit; color: inherit; }
+.lg-tilebtn b { font-size: 20px; }
+.lg-tilebtn:hover { border-color: var(--line2); }
+.lg-tilebtn[aria-pressed="true"] { border-color: var(--brand); box-shadow: inset 0 0 0 1px var(--brand); }
+.lg-tilebtn:focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; }
+.lg-scroll { overflow-x: auto; }
+.lg-soldt td { white-space: nowrap; }
+.lg-soldt td:last-child { white-space: normal; min-width: 150px; }
+.lg-sname { font-weight: 600; color: var(--text); }
+.lg-est { color: var(--warn); }
+.lg-tstag { display: inline-block; margin-left: 6px; font: 650 10.5px/16px var(--sans); padding: 0 7px; border-radius: 999px; background: var(--buy-bg); color: var(--buy); white-space: nowrap; }
 .lg-note { margin: 0; font-size: 12px; color: var(--warn); }
 .lg-tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--line); }
 .lg-receipts { display: grid; grid-template-columns: repeat(auto-fill, minmax(420px, 1fr)); gap: 12px; }
@@ -846,7 +977,7 @@ export const LEDGER_CSS = `
 @media (max-width: 1100px) { .lg-grid { grid-template-columns: minmax(0, 1fr); } }
 @media (max-width: 1000px) {
     .lg { padding: 12px 12px 48px; }
-    .lg-tiles { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+    .lg-tiles, .lg-tiles5 { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
     .lg-in { min-width: 0; width: 100%; }
     .lg-f { flex: 1 1 140px; }
 }

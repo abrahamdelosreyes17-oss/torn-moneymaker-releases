@@ -193,7 +193,9 @@ export function writeInputs(inputs, value) {
         else input.value = String(v);
     });
     // One set of events, from the box you can see (Torn mirrors it into the hidden one).
-    const target = list.find(visible) || list[0];
+    // The one box that is not a hidden twin is the one you see (asking the page costs a layout of all of it, 3.22.0).
+    const shown = list.filter((i) => i && i.type !== 'hidden');
+    const target = (shown.length === 1 ? shown[0] : shown.find(visible)) || list[0];
     if (!target) return;
     for (const type of ['input', 'change']) target.dispatchEvent(new Event(type, { bubbles: true }));
     target.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
