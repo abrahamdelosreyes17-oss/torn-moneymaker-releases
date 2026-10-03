@@ -1161,7 +1161,10 @@ does is as it was.
   figures in columns, radii of 8/12/16 px, spacing in 4/8/12/16/24 px. Only
   cheap motion (opacity, transform, background), and none under the
   system's reduced-motion setting.
-- **Your traders on top, Best flips under it** (the owner's order).
+- **Your traders on top, Best flips under it** (the owner's order), with
+  Buyers online only and Trusted buyers only in its header - they filter the
+  whole page. **3.20.1:** Favourites and Trusted are one row each, as many
+  cards as fit across; the rest under *Show all*.
 - **Favourites have a place of their own:** a gold Favourites row above
   Trusted in Your traders, every favourite always shown; a gold edge and a
   Favourite tag on the desk's trader rows and in the Ledger's Traders tab,

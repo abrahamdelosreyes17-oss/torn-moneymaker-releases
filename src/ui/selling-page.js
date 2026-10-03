@@ -87,8 +87,6 @@ function seenMinutes(steps) {
     return Math.max(0, Math.floor((Date.now() - Math.min(...at)) / 60000));
 }
 
-/* Your traders: this many cards before "Show all". */
-const SCAN_SHOWN = 5;
 
 /** The item list shows this many at a time. */
 export const ALL_ITEMS_PAGE = 50;
@@ -367,7 +365,10 @@ export class SellingPage {
             }
         };
         document.addEventListener('keydown', this.keyHandler);
-        this.resizeHandler = () => this.fitDesk();
+        this.resizeHandler = () => {
+            this.fitDesk();
+            this.fitScan();
+        };
         window.addEventListener('resize', this.resizeHandler);
         this.ticker = setInterval(() => {
             this.renderPills();
@@ -1505,6 +1506,9 @@ export class SellingPage {
             ]),
             spEl('span', { class: 'sp-sp' }),
             spEl('small', { class: 'sp-muted', text: total ? count(sc.favourites) + (sc.favourites === 1 ? ' favourite' : ' favourites') + ' · ' + count(sc.trusted) + ' trusted' : 'No favourites or trusted traders yet' }),
+            // They filter the whole page, Your traders too: at its top (3.20.1, the owner).
+            this.onlineBtn,
+            this.trustedBtn,
         ]));
         if (!sc.open || !total) return;
         const onDesk = s.desk && s.desk.trade && s.desk.trade.chosen ? s.desk.trade.chosen.key : null;
@@ -1513,7 +1517,8 @@ export class SellingPage {
         // sums for both: a favourite is never ranked up, only kept in view.
         const favs = sc.list.filter((x) => x.favourite);
         const rest = sc.list.filter((x) => !x.favourite);
-        const restShown = this.scanAll ? rest : rest.slice(0, SCAN_SHOWN);
+        // One row each (3.20.1, the owner: "one row for favorites, and one row for
+        // trusted"): as many cards as fit across; the rest under Show all.
         const card = (x) => {
             const ready = x.items > 0 && x.profit > 0 && !x.hiddenBy;
             const sel = ready && onDesk === x.key && s.desk && s.desk.itemId === x.mainId;
@@ -1556,25 +1561,41 @@ export class SellingPage {
         };
         const group = (cls, title, sub, cards, empty) => spEl('div', { class: 'sp-tgroup ' + cls }, [
             spEl('div', { class: 'sp-tlabel' }, [spEl('b', { text: title }), sub ? spEl('small', { text: sub }) : null]),
-            cards.length ? spEl('div', { class: 'sp-scangrid' }, cards.map(card)) : empty,
+            cards.length ? spEl('div', { class: 'sp-scangrid' + (this.scanAll ? '' : ' sp-onerow') }, cards.map(card)) : empty,
         ]);
         const groups = spEl('div', { class: 'sp-tgroups' });
         groups.appendChild(group('sp-tg-fav', '★ Favourites', 'Yours, always here. Same sums as everyone.', favs,
             spEl('div', { class: 'sp-empty sp-tg-empty' }, [spEl('b', { text: 'No favourites yet' }), spEl('span', { text: 'Press ☆ next to any trader to keep them here. Traders you have traded with 5 or more times in 30 days join by themselves.' })])));
-        if (rest.length) groups.appendChild(group('sp-tg-trust', 'Trusted', 'Best trade first.', restShown, null));
+        if (rest.length) groups.appendChild(group('sp-tg-trust', 'Trusted', 'Best trade first.', rest, null));
         box.appendChild(groups);
-        if (rest.length > SCAN_SHOWN) {
-            box.appendChild(spEl('button', {
-                type: 'button',
-                class: 'sp-link sp-showall',
-                'data-focus': 'scan:all',
-                text: this.scanAll ? 'Show the top ' + SCAN_SHOWN : 'Show all ' + count(sc.list.length) + ' traders',
-                onclick: () => {
-                    this.scanAll = !this.scanAll;
-                    this.renderScan();
-                },
-            }));
+        this.scanAllBtn = spEl('button', {
+            type: 'button',
+            class: 'sp-link sp-showall',
+            'data-focus': 'scan:all',
+            hidden: '',
+            text: this.scanAll ? 'Show one row each' : 'Show all ' + count(sc.list.length) + ' traders',
+            onclick: () => {
+                this.scanAll = !this.scanAll;
+                this.scanSig = null;
+                this.renderScan();
+            },
+        });
+        box.appendChild(this.scanAllBtn);
+        this.fitScan();
+    }
+
+    /** Show all only when a row has cards past its end (how many fit depends on the width). */
+    fitScan() {
+        const btn = this.scanAllBtn;
+        if (!btn || !btn.isConnected) return;
+        let hidden = this.scanAll;
+        if (!hidden) {
+            for (const grid of this.scanEl.querySelectorAll('.sp-scangrid.sp-onerow')) {
+                const first = grid.firstElementChild;
+                if (first && [...grid.children].some((c) => c.offsetTop > first.offsetTop)) hidden = true;
+            }
         }
+        btn.hidden = !hidden;
     }
 
     renderStrip() {
@@ -3169,6 +3190,8 @@ a.sp-btn { display: inline-flex; align-items: center; text-decoration: none; }
 .sp-fold:hover h2 { color: var(--text); }
 .sp-chev { width: 12px; color: var(--muted); font-size: 12px; }
 .sp-scangrid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+/* One row: cards past the row's end take no height and are clipped (Show all brings them). */
+.sp-scangrid.sp-onerow { grid-template-rows: auto; grid-auto-rows: 0; row-gap: 0; overflow: hidden; }
 @media (max-width: 1400px) { .sp-scangrid { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
 .sp-tc { cursor: default; }
 .sp-tc:hover { background: var(--surface); }
