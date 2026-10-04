@@ -2014,7 +2014,7 @@ export class SellingPage {
                 tabindex: '0',
                 'aria-pressed': String(on),
                 'data-focus': 'sell:' + r.itemId,
-                title: r.ready ? 'Show it on the desk' : r.bazaar ? 'No trader pays enough over what you paid; your own bazaar would, $1 under the cheapest: show it on the desk' : 'Waiting for a trader who pays more than you paid: show it on the desk',
+                title: r.ready ? 'Show it on the desk' : r.bazaar ? 'No trader pays more than you paid; your own bazaar would, $1 under the cheapest: show it on the desk' : 'Waiting for a trader who pays more than you paid: show it on the desk',
                 onclick: () => this.select(r.itemId),
                 onkeydown: (event) => {
                     if (event.target !== event.currentTarget || (event.key !== 'Enter' && event.key !== ' ')) return;

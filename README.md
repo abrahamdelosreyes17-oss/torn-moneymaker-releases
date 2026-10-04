@@ -1671,6 +1671,39 @@ Still to do, and waiting for the real pages to be read: on Manage items, what
 you paid, and the tag that covers Torn's RRP column; on the add page, the
 Fill tick over the value of a weapon row.
 
+### More than the plan asked, and what you hold at any profit (3.22.2)
+
+The friend, 2026-10-04 (3.22.0), with 508 Kitten Plushies in his items and
+the trade page offering "Fill 28 for MrReeko": "Sometimes it misses some
+stuff that I add along the line for the trader that are still profitable but
+not in the flip plan ... Include them also on Fill all." And, the same day:
+"2 errors today", expected none.
+
+- **What you take over the plan's number goes with the trade at once.** A
+  step never counts more than it planned, so the rest of a listing you bought
+  out waited for the next read of your Torn log - a minute, longer with Torn
+  Bids in a background tab - while Checkout and Fill said the plan's number.
+  Now, when Next (or Cancel trade) counts the step, what left that listing
+  over the step's number is an unplanned buy of the trade, at the listing's
+  price and what the trader pays for the item. Counted from the stock this
+  load of the page first showed; a listing that left the page counts only
+  when you had just pressed on it. Your log still has the last word: its next
+  read replaces the page's count, never adds to it.
+- **What you hold goes to any trader who pays more than you paid** (the
+  owner, 2026-10-03: "so as long as he pays higher than what we bought it
+  for"). To sell used the least-profit margin, which is for deciding what to
+  buy; it kept held items out of the plan, Checkout and Fill all when the
+  trader paid over your cost but under that margin.
+- **TornExchange's slow list is not an error.** Its list of active traders is
+  waited 90 s for and asked again later, and the list last read is used
+  meanwhile. A late answer with a list still held is a note in the problem
+  log ("TornExchange slow"), not one of "errors today"; with no list held it
+  is still an error.
+
+Not seen on real Torn: both rules were built from the friend's zips and
+tested in node. His next zip shows it: "Bought more than the plan asked at
+this bazaar" in the problem log.
+
 ---
 
 ## Architecture

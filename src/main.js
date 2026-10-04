@@ -63,8 +63,8 @@ import { holdTrade, holdKey, resolveEstimated, priceHeld, livePins, editHeld, HO
 import { deskItem, nextW3bRead, backgroundSlot, backgroundListSlot, flipsStale, W3B_HIDDEN_PER_MIN, HIDDEN_RENDER_MS, declineKey, declinedOn, freshnessMs, FRESH_TOP } from './core/desk.js';
 import { liquidityKind, unitsMoved, addMovement, stopsMinutes, EXTRA_CAP } from './core/liquidity.js';
 import { usageAdd, usageMerge, usageSeries, USAGE_SERVICES, USAGE_RANGES, USAGE_LABELS } from './core/usage.js';
-import { addLogEntries, logText } from './core/errlog.js';
-import { checkoutList, boughtSince, stockBuys, addExtraBuy, applyLogBuys, bazaarBuyRows, addLogBuys, splitLogBuys, sellElsewhere, LOG_BUY_SLACK_MS, acceptTrade, liveAccepted, stepState, tickAccepted, stepDone, nextStep, boughtFromStock, recordBuy, recordLateBuy, sendUnits, acceptedTotals, replacementFor, replaceStep, dropLine, markLeft, leftoversOf, cancelledLeftovers, addLeftovers, sendList, fillNote, finishedTradeFor, tradedLeftovers, removeLeftovers, itemsGiven, tradePartnerId, tradeFinishedAt, TRADE_DONE_SLACK_MS, leftoversAfterSales, leftoverFrom } from './core/accepted.js';
+import { addLogEntries, logText, lateButHeld } from './core/errlog.js';
+import { checkoutList, boughtSince, stockBuys, addExtraBuy, applyLogBuys, bazaarBuyRows, addLogBuys, splitLogBuys, sellElsewhere, LOG_BUY_SLACK_MS, acceptTrade, liveAccepted, stepState, tickAccepted, stepDone, nextStep, boughtFromStock, boughtOverStock, recordBuy, recordLateBuy, sendUnits, acceptedTotals, replacementFor, replaceStep, dropLine, markLeft, leftoversOf, cancelledLeftovers, addLeftovers, sendList, fillNote, finishedTradeFor, tradedLeftovers, removeLeftovers, itemsGiven, tradePartnerId, tradeFinishedAt, TRADE_DONE_SLACK_MS, leftoversAfterSales, leftoverFrom } from './core/accepted.js';
 import { readTradeView, readTradeAddRows, readTradeAddRow } from './sources/dom/trade.js';
 import { BoughtWindow } from './ui/bought-window.js';
 import { makeTabId, LEADER_HEARTBEAT_MS } from './core/leader.js';
@@ -3747,11 +3747,16 @@ function onSettingsChange(partial) {
  * listing's stock on the page (the page you are viewing - read only). One
  * click, one page: never several at once.
  */
-const buyRun = { stepKey: null, firstSeen: null, nowSeen: null, seenGone: false, seenThisLoad: false, row: null, rowIds: null, rowTotal: null, rowSearch: null, lastStock: null, revealed: false };
+/*
+ * loadSeen / changedAt / price / goneByYou (3.22.2): the listing's stock when this load of the page first
+ * showed it, when it last changed, its price, and whether it left the page after you pressed on it - for
+ * what you took over the step's number (buyOverHere).
+ */
+const buyRun = { stepKey: null, firstSeen: null, nowSeen: null, seenGone: false, seenThisLoad: false, row: null, rowIds: null, rowTotal: null, rowSearch: null, lastStock: null, revealed: false, loadSeen: null, changedAt: null, price: null, goneByYou: false };
 
 /** A step's count starts again: nothing seen of it on this page yet. */
 function startBuyRun(key) {
-    Object.assign(buyRun, { stepKey: key, firstSeen: key ? loadBuyRunSeen(key) : null, nowSeen: null, seenGone: false, seenThisLoad: false, row: null, rowIds: null, rowTotal: null, rowSearch: null, lastStock: null, revealed: false });
+    Object.assign(buyRun, { stepKey: key, firstSeen: key ? loadBuyRunSeen(key) : null, nowSeen: null, seenGone: false, seenThisLoad: false, row: null, rowIds: null, rowTotal: null, rowSearch: null, lastStock: null, revealed: false, loadSeen: null, changedAt: null, price: null, goneByYou: false });
 }
 
 /*
@@ -4227,10 +4232,20 @@ function trackTradeBuying(listings) {
         const readable = scanned && (Boolean(here.listing) || listings.length > 0 || buyRun.seenThisLoad);
         if (readable && buyRun.firstSeen !== null) {
             if (here.listing) {
+                if (buyRun.loadSeen === null) buyRun.loadSeen = stock;
+                else if (stock !== buyRun.lastStock) buyRun.changedAt = Date.now();
+                buyRun.price = here.listing.listingPrice;
+                buyRun.goneByYou = false;
                 buyRun.nowSeen = stock;
                 buyRun.lastStock = stock;
                 buyRun.seenGone = false;
             } else if (buyListingGone(here.item.itemId)) {
+                if (!buyRun.seenGone) {
+                    buyRun.changedAt = Date.now();
+                    // Bought out by you only if you had just pressed on it (the rule every other card goes by).
+                    const pressedAt = app.stockPressed && buyRun.price ? app.stockPressed.get(String(here.item.itemId) + '|' + Number(buyRun.price)) : null;
+                    buyRun.goneByYou = Boolean(pressedAt && Date.now() - pressedAt < STOCK_PRESS_MS);
+                }
                 buyRun.nowSeen = null;
                 buyRun.seenGone = true;
             } else {
@@ -4300,6 +4315,24 @@ function trackTradeBuying(listings) {
     updateBoughtWindow();
 }
 
+/**
+ * More than the step asked for, taken from its listing in front of you (3.22.2; the friend, 2026-10-04, with
+ * 508 Kitten Plushies bought and the trade page offering "Fill 28": "it misses some stuff that I add along
+ * the line for the trader that are still profitable but not in the flip plan ... include them also on Fill
+ * all"). The step itself never counts more than it planned, and what was over waited for the next read of
+ * your Torn log - up to a minute, longer with Torn Bids in a background tab - while Checkout and Fill said
+ * the plan's number. It is an unplanned buy of that trade from the moment the step is counted, at what the
+ * listing asked and what the trader pays for the item. Your log still has the last word (applyLogBuys).
+ */
+function buyOverHere(trade, here) {
+    const over = boughtOverStock(buyRun.loadSeen, buyRun.nowSeen, here.step.qty, buyRun.goneByYou);
+    if (!(over > 0) || !(here.item.bid > 0)) return trade;
+    const price = Number(buyRun.price) > 0 ? Number(buyRun.price) : here.step.price;
+    logProblem('note', 'Bought more than the plan asked at this bazaar (item ' + here.item.itemId + '): ' + over + ' over at $' + price + ' - sent with the trade');
+    // When the stock was seen to change, not when Next was pressed: your log takes over from that moment.
+    return addExtraBuy(trade, { itemId: here.item.itemId, name: here.item.name, qty: over, price, bid: here.item.bid, sellerId: here.step.sellerId, seller: here.step.sellerName || null }, buyRun.changedAt || Date.now());
+}
+
 /** One line of a trade changed on the desk (ticked, a number, Add). */
 function applyTradeEdit(key, itemId, edit) {
     const e = { ...(sell.tradeEdits.get(key) || {}) };
@@ -4325,7 +4358,7 @@ function onOverlayTradeCancel(key) {
     if (here && here.trade.key === key && buyRun.firstSeen !== null) {
         const took = boughtFromStock(buyRun.firstSeen, buyRun.nowSeen, here.step.qty);
         const all = sellAccepted();
-        if (took > 0 && all[key]) saveSellAccepted({ ...all, [key]: recordBuy(all[key], here.line, here.index, took) });
+        if (took > 0 && all[key]) saveSellAccepted({ ...all, [key]: buyOverHere(recordBuy(all[key], here.line, here.index, took), here) });
     }
     if (buyRun.stepKey) saveBuyRunSeen(buyRun.stepKey, null);
     cancelSellAccepted(key);
@@ -4379,6 +4412,7 @@ function onBuyNext(answer) {
         const step = item && item.steps ? item.steps[here.index] : null;
         if (step && String(step.sellerId) === String(here.step.sellerId) && !stepDone(step)) {
             t = recordBuy(t, here.line, here.index, took);
+            if (counted && took > 0) t = buyOverHere(t, here);
             all = { ...all, [t.key]: t };
             saveSellAccepted(all);
         }
@@ -5158,6 +5192,12 @@ function logFailed(service, x) {
     const name = (USAGE_SERVICES[service] || { name: service }).name;
     const tag = usageTagFor(service, null, x && x.path, x && x.tag);
     const why = (e && (e.message || e.said)) || String(e || 'failed');
+    // TornExchange's list of active traders is slow by nature (waited 90 s for) and asked again later; with the
+    // list last read still held nothing is lost: a note, not an error (the friend, 2026-10-04: "2 errors today").
+    if (service === 'e' && lateButHeld(path, e, Boolean(gmGet(STORE_TE_IDS, null)))) {
+        logProblem('note', name + ' slow: ' + (USAGE_LABELS[tag] || { name: tag }).name + ' (' + path + ')', e.reason + ' - the list last read is used; asked again later');
+        return;
+    }
     logProblem('error', name + ' failed: ' + (USAGE_LABELS[tag] || { name: tag }).name + ' (' + String((x && x.path) || '').replace(/\d{5,}/g, 'N') + ')', why + (e && e.http ? ' [HTTP ' + e.http + ']' : '') + (e && e.code ? ' [code ' + e.code + ']' : ''));
 }
 
@@ -7251,7 +7291,11 @@ function renderSellingWork(src = null) {
     }
     // To sell (3.21.0, core/to-sell.js): what you bought to resell and still hold - its tab's rows, and
     // the "yours" lines a trade with each trader gets. Only these: your other items stay out of every trade.
-    const sellEnough = (per, each) => enoughProfit(per, each, 'TRADER', prefs.minProfitPct);
+    // What you already hold goes to any trader who pays more than you paid (3.22.2; the owner, 2026-10-03:
+    // "can it also fill items that it saw was profitable? so as long as he pays higher than what we bought
+    // it for"). Least profit decides what is worth BUYING; it kept these out of the plan, Checkout and
+    // Fill all whenever the trader paid over your cost but under that margin.
+    const sellEnough = (per) => per > 0;
     // (Your own bazaar as a way out is added once the bazaars are looked up, further down.)
     let toSell = toSellRows(leftovers, { buyersOf, enough: sellEnough });
     const toSellLines = toSellHeld(leftovers, { buyersOf, enough: sellEnough });

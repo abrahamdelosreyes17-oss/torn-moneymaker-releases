@@ -38,8 +38,9 @@ function sameTrader(name, from) {
  * it (`from`) - and never one who pays no more than you paid (3.22.0; the
  * owner: "never suggest selling on a loss, so we can sell on our bazaar still
  * on profit, and only show traders who we can sell on a profit"). `ready`:
- * they pay enough over what you paid (the same margin rule as a flip -
- * `enough(each profit, what you paid)`). `bazaar`: your own bazaar, $1 under
+ * they pay enough over what you paid - `enough(each profit, what you paid)`;
+ * the page's rule since 3.22.2 is any profit at all (the owner: "so as long
+ * as he pays higher than what we bought it for"). `bazaar`: your own bazaar, $1 under
  * the cheapest listing, when that is over what you paid.
  *
  * @param {Array<{itemId, name, qty, each, from, why}>} leftovers

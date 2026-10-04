@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      3.22.1
+// @version      3.22.2
 // @description  Finds Bazaar and Item Market listings below NPC / market value - on the page you are viewing, and live from the Torn API and TornW3B - ranked by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -42,7 +42,7 @@
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '3.22.1';
+    const TTV2_BUILD_VERSION = '3.22.2';
 
     /* ===== src/platform/gm.js ===== */
     /*
@@ -1641,6 +1641,21 @@
         if (!(firstSeen > 0)) return 0;
         if (nowSeen === null || nowSeen === undefined) return Math.min(need, firstSeen);
         return Math.max(0, Math.min(need, firstSeen - nowSeen));
+    }
+
+    /**
+     * What you took from a step's listing over what the step needed (3.22.2):
+     * the step itself never counts more than it planned (boughtFromStock), and
+     * the rest was not counted anywhere until your Torn log was next read. From
+     * the stock this load of the page first showed - a drop since another visit
+     * is anyone's buy. A listing that left the page counts only when you had just
+     * pressed on it (`goneByYou`), as every other card does (stockBuys).
+     */
+    function boughtOverStock(loadSeen, nowSeen, need, goneByYou = false) {
+        if (!(loadSeen > 0)) return 0;
+        const n = Math.max(0, Math.floor(Number(need) || 0));
+        if (nowSeen === null || nowSeen === undefined) return goneByYou ? Math.max(0, loadSeen - n) : 0;
+        return Math.max(0, loadSeen - nowSeen - n);
     }
 
     /** A copy of the trade with one step's outcome: how many you bought (0 = skipped). */
@@ -4079,8 +4094,9 @@
      * it (`from`) - and never one who pays no more than you paid (3.22.0; the
      * owner: "never suggest selling on a loss, so we can sell on our bazaar still
      * on profit, and only show traders who we can sell on a profit"). `ready`:
-     * they pay enough over what you paid (the same margin rule as a flip -
-     * `enough(each profit, what you paid)`). `bazaar`: your own bazaar, $1 under
+     * they pay enough over what you paid - `enough(each profit, what you paid)`;
+     * the page's rule since 3.22.2 is any profit at all (the owner: "so as long
+     * as he pays higher than what we bought it for"). `bazaar`: your own bazaar, $1 under
      * the cheapest listing, when that is over what you paid.
      *
      * @param {Array<{itemId, name, qty, each, from, why}>} leftovers
@@ -7020,6 +7036,17 @@
             }
         }
         return out.slice(-LOG_MAX);
+    }
+
+    /**
+     * A request that got no answer in time, for something still held from an
+     * earlier read (3.22.2): TornExchange's list of active traders is waited 90 s
+     * for, asked again later, and the list last read is used meanwhile. The
+     * friend's report, 2026-10-04, was "2 errors today" - both this, with nothing
+     * lost. A note in the log, not an error. Without a list held it is an error.
+     */
+    function lateButHeld(path, error, held) {
+        return Boolean(held) && /^active_traders$/.test(String(path || '')) && /^no answer/.test(String((error && error.reason) || ''));
     }
 
     /** A line of text, never a key: anything key-like is masked (16 letters and digits). */
@@ -22815,7 +22842,7 @@
                     tabindex: '0',
                     'aria-pressed': String(on),
                     'data-focus': 'sell:' + r.itemId,
-                    title: r.ready ? 'Show it on the desk' : r.bazaar ? 'No trader pays enough over what you paid; your own bazaar would, $1 under the cheapest: show it on the desk' : 'Waiting for a trader who pays more than you paid: show it on the desk',
+                    title: r.ready ? 'Show it on the desk' : r.bazaar ? 'No trader pays more than you paid; your own bazaar would, $1 under the cheapest: show it on the desk' : 'Waiting for a trader who pays more than you paid: show it on the desk',
                     onclick: () => this.select(r.itemId),
                     onkeydown: (event) => {
                         if (event.target !== event.currentTarget || (event.key !== 'Enter' && event.key !== ' ')) return;
@@ -28898,11 +28925,16 @@
      * listing's stock on the page (the page you are viewing - read only). One
      * click, one page: never several at once.
      */
-    const buyRun = { stepKey: null, firstSeen: null, nowSeen: null, seenGone: false, seenThisLoad: false, row: null, rowIds: null, rowTotal: null, rowSearch: null, lastStock: null, revealed: false };
+    /*
+     * loadSeen / changedAt / price / goneByYou (3.22.2): the listing's stock when this load of the page first
+     * showed it, when it last changed, its price, and whether it left the page after you pressed on it - for
+     * what you took over the step's number (buyOverHere).
+     */
+    const buyRun = { stepKey: null, firstSeen: null, nowSeen: null, seenGone: false, seenThisLoad: false, row: null, rowIds: null, rowTotal: null, rowSearch: null, lastStock: null, revealed: false, loadSeen: null, changedAt: null, price: null, goneByYou: false };
 
     /** A step's count starts again: nothing seen of it on this page yet. */
     function startBuyRun(key) {
-        Object.assign(buyRun, { stepKey: key, firstSeen: key ? loadBuyRunSeen(key) : null, nowSeen: null, seenGone: false, seenThisLoad: false, row: null, rowIds: null, rowTotal: null, rowSearch: null, lastStock: null, revealed: false });
+        Object.assign(buyRun, { stepKey: key, firstSeen: key ? loadBuyRunSeen(key) : null, nowSeen: null, seenGone: false, seenThisLoad: false, row: null, rowIds: null, rowTotal: null, rowSearch: null, lastStock: null, revealed: false, loadSeen: null, changedAt: null, price: null, goneByYou: false });
     }
 
     /*
@@ -29378,10 +29410,20 @@
             const readable = scanned && (Boolean(here.listing) || listings.length > 0 || buyRun.seenThisLoad);
             if (readable && buyRun.firstSeen !== null) {
                 if (here.listing) {
+                    if (buyRun.loadSeen === null) buyRun.loadSeen = stock;
+                    else if (stock !== buyRun.lastStock) buyRun.changedAt = Date.now();
+                    buyRun.price = here.listing.listingPrice;
+                    buyRun.goneByYou = false;
                     buyRun.nowSeen = stock;
                     buyRun.lastStock = stock;
                     buyRun.seenGone = false;
                 } else if (buyListingGone(here.item.itemId)) {
+                    if (!buyRun.seenGone) {
+                        buyRun.changedAt = Date.now();
+                        // Bought out by you only if you had just pressed on it (the rule every other card goes by).
+                        const pressedAt = app.stockPressed && buyRun.price ? app.stockPressed.get(String(here.item.itemId) + '|' + Number(buyRun.price)) : null;
+                        buyRun.goneByYou = Boolean(pressedAt && Date.now() - pressedAt < STOCK_PRESS_MS);
+                    }
                     buyRun.nowSeen = null;
                     buyRun.seenGone = true;
                 } else {
@@ -29451,6 +29493,24 @@
         updateBoughtWindow();
     }
 
+    /**
+     * More than the step asked for, taken from its listing in front of you (3.22.2; the friend, 2026-10-04, with
+     * 508 Kitten Plushies bought and the trade page offering "Fill 28": "it misses some stuff that I add along
+     * the line for the trader that are still profitable but not in the flip plan ... include them also on Fill
+     * all"). The step itself never counts more than it planned, and what was over waited for the next read of
+     * your Torn log - up to a minute, longer with Torn Bids in a background tab - while Checkout and Fill said
+     * the plan's number. It is an unplanned buy of that trade from the moment the step is counted, at what the
+     * listing asked and what the trader pays for the item. Your log still has the last word (applyLogBuys).
+     */
+    function buyOverHere(trade, here) {
+        const over = boughtOverStock(buyRun.loadSeen, buyRun.nowSeen, here.step.qty, buyRun.goneByYou);
+        if (!(over > 0) || !(here.item.bid > 0)) return trade;
+        const price = Number(buyRun.price) > 0 ? Number(buyRun.price) : here.step.price;
+        logProblem('note', 'Bought more than the plan asked at this bazaar (item ' + here.item.itemId + '): ' + over + ' over at $' + price + ' - sent with the trade');
+        // When the stock was seen to change, not when Next was pressed: your log takes over from that moment.
+        return addExtraBuy(trade, { itemId: here.item.itemId, name: here.item.name, qty: over, price, bid: here.item.bid, sellerId: here.step.sellerId, seller: here.step.sellerName || null }, buyRun.changedAt || Date.now());
+    }
+
     /** One line of a trade changed on the desk (ticked, a number, Add). */
     function applyTradeEdit(key, itemId, edit) {
         const e = { ...(sell.tradeEdits.get(key) || {}) };
@@ -29476,7 +29536,7 @@
         if (here && here.trade.key === key && buyRun.firstSeen !== null) {
             const took = boughtFromStock(buyRun.firstSeen, buyRun.nowSeen, here.step.qty);
             const all = sellAccepted();
-            if (took > 0 && all[key]) saveSellAccepted({ ...all, [key]: recordBuy(all[key], here.line, here.index, took) });
+            if (took > 0 && all[key]) saveSellAccepted({ ...all, [key]: buyOverHere(recordBuy(all[key], here.line, here.index, took), here) });
         }
         if (buyRun.stepKey) saveBuyRunSeen(buyRun.stepKey, null);
         cancelSellAccepted(key);
@@ -29530,6 +29590,7 @@
             const step = item && item.steps ? item.steps[here.index] : null;
             if (step && String(step.sellerId) === String(here.step.sellerId) && !stepDone(step)) {
                 t = recordBuy(t, here.line, here.index, took);
+                if (counted && took > 0) t = buyOverHere(t, here);
                 all = { ...all, [t.key]: t };
                 saveSellAccepted(all);
             }
@@ -30309,6 +30370,12 @@
         const name = (USAGE_SERVICES[service] || { name: service }).name;
         const tag = usageTagFor(service, null, x && x.path, x && x.tag);
         const why = (e && (e.message || e.said)) || String(e || 'failed');
+        // TornExchange's list of active traders is slow by nature (waited 90 s for) and asked again later; with the
+        // list last read still held nothing is lost: a note, not an error (the friend, 2026-10-04: "2 errors today").
+        if (service === 'e' && lateButHeld(path, e, Boolean(gmGet(STORE_TE_IDS, null)))) {
+            logProblem('note', name + ' slow: ' + (USAGE_LABELS[tag] || { name: tag }).name + ' (' + path + ')', e.reason + ' - the list last read is used; asked again later');
+            return;
+        }
         logProblem('error', name + ' failed: ' + (USAGE_LABELS[tag] || { name: tag }).name + ' (' + String((x && x.path) || '').replace(/\d{5,}/g, 'N') + ')', why + (e && e.http ? ' [HTTP ' + e.http + ']' : '') + (e && e.code ? ' [code ' + e.code + ']' : ''));
     }
 
@@ -32402,7 +32469,11 @@
         }
         // To sell (3.21.0, core/to-sell.js): what you bought to resell and still hold - its tab's rows, and
         // the "yours" lines a trade with each trader gets. Only these: your other items stay out of every trade.
-        const sellEnough = (per, each) => enoughProfit(per, each, 'TRADER', prefs.minProfitPct);
+        // What you already hold goes to any trader who pays more than you paid (3.22.2; the owner, 2026-10-03:
+        // "can it also fill items that it saw was profitable? so as long as he pays higher than what we bought
+        // it for"). Least profit decides what is worth BUYING; it kept these out of the plan, Checkout and
+        // Fill all whenever the trader paid over your cost but under that margin.
+        const sellEnough = (per) => per > 0;
         // (Your own bazaar as a way out is added once the bazaars are looked up, further down.)
         let toSell = toSellRows(leftovers, { buyersOf, enough: sellEnough });
         const toSellLines = toSellHeld(leftovers, { buyersOf, enough: sellEnough });

@@ -32,6 +32,17 @@ export function addLogEntries(stored, entries, now = Date.now()) {
     return out.slice(-LOG_MAX);
 }
 
+/**
+ * A request that got no answer in time, for something still held from an
+ * earlier read (3.22.2): TornExchange's list of active traders is waited 90 s
+ * for, asked again later, and the list last read is used meanwhile. The
+ * friend's report, 2026-10-04, was "2 errors today" - both this, with nothing
+ * lost. A note in the log, not an error. Without a list held it is an error.
+ */
+export function lateButHeld(path, error, held) {
+    return Boolean(held) && /^active_traders$/.test(String(path || '')) && /^no answer/.test(String((error && error.reason) || ''));
+}
+
 /** A line of text, never a key: anything key-like is masked (16 letters and digits). */
 export function logText(text, max = 300) {
     return String(text === null || text === undefined ? '' : text)

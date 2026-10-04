@@ -195,6 +195,21 @@ export function boughtFromStock(firstSeen, nowSeen, need) {
     return Math.max(0, Math.min(need, firstSeen - nowSeen));
 }
 
+/**
+ * What you took from a step's listing over what the step needed (3.22.2):
+ * the step itself never counts more than it planned (boughtFromStock), and
+ * the rest was not counted anywhere until your Torn log was next read. From
+ * the stock this load of the page first showed - a drop since another visit
+ * is anyone's buy. A listing that left the page counts only when you had just
+ * pressed on it (`goneByYou`), as every other card does (stockBuys).
+ */
+export function boughtOverStock(loadSeen, nowSeen, need, goneByYou = false) {
+    if (!(loadSeen > 0)) return 0;
+    const n = Math.max(0, Math.floor(Number(need) || 0));
+    if (nowSeen === null || nowSeen === undefined) return goneByYou ? Math.max(0, loadSeen - n) : 0;
+    return Math.max(0, loadSeen - nowSeen - n);
+}
+
 /** A copy of the trade with one step's outcome: how many you bought (0 = skipped). */
 export function recordBuy(trade, line, index, boughtQty, now = Date.now()) {
     const n = Math.max(0, Math.floor(Number(boughtQty) || 0));
