@@ -486,3 +486,38 @@ export async function fetchInventory(client, { limit = 250, categories = TORN_IN
     }
     return out;
 }
+
+/**
+ * The points market (3.24.0): GET /v2/market/pointsmarket. Public data, one call for every listing.
+ * The answer is handed back as Torn gives it; core/points.js (parsePointsMarket) reads it, so a shape Torn
+ * changes is one place to follow.
+ */
+export async function fetchPointsMarket(client, { tag = 't.sets', priority = 'low' } = {}) {
+    return client.get('v2/market/pointsmarket', {}, { tag, priority });
+}
+
+/**
+ * Your points, cash on hand and vault (3.24.0): GET /v2/user/money, Limited key.
+ * @returns {{points: number|null, onHand: number|null, vault: number|null}} null = Torn did not say
+ */
+export function parseUserMoney(data) {
+    const m = (data && (data.money || data)) || {};
+    const pick = (...keys) => {
+        for (const k of keys) {
+            const v = m[k];
+            if (v !== undefined && v !== null && Number.isFinite(Number(v))) return Number(v);
+        }
+        return null;
+    };
+    // The names Torn sent ride along (names only), so an answer Torn Bids cannot read can be said in the problem log.
+    return { points: pick('points'), onHand: pick('wallet', 'money_onhand', 'cash'), vault: pick('vault', 'vault_amount'), keys: Object.keys(m).slice(0, 20) };
+}
+
+export async function fetchMoney(client, { tag = 't.sets', priority = 'low' } = {}) {
+    return parseUserMoney(await client.get('v2/user/money', {}, { tag, priority }));
+}
+
+/** Torn's list of log types (3.24.0): v1 torn/?selections=logtypes -> { logtypes: { id: title } }. Asked once a week. */
+export async function fetchLogTypes(client, { tag = 't.sets', priority = 'low' } = {}) {
+    return client.get('torn', { selections: 'logtypes' }, { tag, priority });
+}

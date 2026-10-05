@@ -7,6 +7,8 @@ import {
     mergeTraderDbs,
     addTraders,
     parseW3bPriceList,
+    parseW3bSetPrices,
+    bestSetBuyer,
     recordW3bList,
     liveW3bPrices,
     nextW3bTrader,
@@ -648,4 +650,20 @@ test('TornExchange lists read in turn (3.15): a trader 4th on TornExchange is a 
     // As a buyer: the same way a favourite's own list counts (teOwn).
     const out = buyersForItem('206', { teOwn: idx.get('206') });
     assert.deepEqual(out.map((b) => [b.name, b.price]), [['Carol', 846000]]);
+});
+
+test('3.24.0: the set prices of a list (ids under zero) are kept apart from its items', () => {
+    const body = [{ itemId: 206, buyPrice: 850000 }, { itemId: -2, buyPrice: 309440 }, { itemId: -1, buyPrice: 308000 }, { itemId: -3, buyPrice: 5 }, { itemId: -2, buyPrice: 0 }];
+    assert.deepEqual(parseW3bPriceList(body), { 206: 850000 });
+    assert.deepEqual(parseW3bSetPrices(body), { '-2': 309440, '-1': 308000 });
+    assert.deepEqual(parseW3bSetPrices(null), {});
+    const db = { traders: {} };
+    recordW3bList(db, 3459156, { prices: parseW3bPriceList(body), sets: parseW3bSetPrices(body) }, 1000);
+    recordW3bList(db, 12, { prices: {}, sets: { '-2': 301000 } }, 1000);
+    recordW3bList(db, 13, { prices: { 206: 1 } }, 1000);
+    assert.equal(db.traders['3459156'].w3b.sets['-2'], 309440);
+    assert.equal(db.traders['13'].w3b.sets, undefined);
+    assert.deepEqual(bestSetBuyer(db, -2), { id: '3459156', name: 'Trader 3459156', price: 309440 });
+    assert.equal(bestSetBuyer(db, -1).price, 308000);
+    assert.equal(bestSetBuyer({ traders: {} }, -1), null);
 });

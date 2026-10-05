@@ -178,3 +178,24 @@ export function gmOnChange(key, handler) {
 
     return true;
 }
+
+/**
+ * Put text on the clipboard (3.24.0, Sets: a trade message, a forum title). Only ever on a press of yours.
+ * @returns {boolean} false when the host has no way to do it
+ */
+export function gmCopy(text) {
+    const value = String(text ?? '');
+    try {
+        if (typeof GM_setClipboard === 'function') {
+            GM_setClipboard(value, 'text');
+            return true;
+        }
+        if (typeof navigator !== 'undefined' && navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+            navigator.clipboard.writeText(value).catch(() => {});
+            return true;
+        }
+    } catch {
+        // No clipboard: the caller says so.
+    }
+    return false;
+}

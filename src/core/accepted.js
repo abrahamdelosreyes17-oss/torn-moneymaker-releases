@@ -1360,6 +1360,16 @@ export const LEFTOVER_SALE_MARGIN_MS = 5 * 60 * 1000;
  * Still one sale once (`seenTo`), still what you bought again sold first
  * (`spare`). What you held of the item before is not told apart from the
  * leftover: selling that counts too, as it always did.
+ *
+ * After 3.23.0 (the friend's zip, 2026-10-05: 2,352 Monkey Plushies sold by hand
+ * after Cancel trade, and To sell kept 796). `spare` was carried on the row
+ * and never dropped when the row's start moved forward. An older row counted
+ * a new trade's buys as bought again; Cancel trade then put those units INTO
+ * the row (addLeftovers) and moved its start past them - still "spare" too.
+ * The sale was taken from that first, took nothing off the row, and was
+ * marked seen. What was bought again is now worked out each time from the
+ * Ledger's rows between the row's start and `seenTo`; the `spare` written on
+ * the row is for the zip only, never read back.
  */
 
 /** From when the Ledger's rows count against a leftover (ms): its `since`, else five minutes after it was kept. */
@@ -1381,10 +1391,17 @@ export function leftoversAfterSales(leftovers, rows) {
         byItem.get(id).push(r);
     }
     return (leftovers || []).map((l) => {
-        const from = Math.max(leftoverFrom(l), Number(l.seenTo) || 0);
-        const mine = (byItem.get(String(l.itemId)) || []).filter((r) => Number(r.t) > from).sort((a, b) => a.t - b.t);
+        const start = leftoverFrom(l);
+        const from = Math.max(start, Number(l.seenTo) || 0);
+        const all = (byItem.get(String(l.itemId)) || []).filter((r) => Number(r.t) > start).sort((a, b) => a.t - b.t);
+        const mine = all.filter((r) => Number(r.t) > from);
         if (!mine.length) return l;
-        let spare = Math.max(0, Number(l.spare) || 0);
+        // What was bought again and is still held, from the rows already seen - not the count kept on the row.
+        let spare = 0;
+        for (const r of all) {
+            if (Number(r.t) > from) break;
+            spare = r.side === 'buy' ? spare + Number(r.qty) : spare - Math.min(spare, Number(r.qty));
+        }
         let gone = 0;
         for (const r of mine) {
             const n = Number(r.qty);

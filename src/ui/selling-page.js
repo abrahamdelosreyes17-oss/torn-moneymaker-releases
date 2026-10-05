@@ -36,6 +36,8 @@ import { bazaarUrl } from '../core/feed.js';
 import { extrasPerTrade, EXTRA_ITEMS_MAX } from '../core/trade.js';
 import { itemMarketUrl } from '../sources/route.js';
 import { LedgerView, LEDGER_CSS } from './ledger-view.js';
+import { SetsView, SETS_CSS } from './sets-view.js';
+import { SetsSettings } from './sets-settings.js';
 import { keyInputAttrs, keyMask } from './mask.js';
 import { FRESH_DEFAULTS, FRESH_MIN, FRESH_MAX, FRESH_TOP, freshMinutes, keepsUp } from '../core/desk.js';
 
@@ -527,6 +529,16 @@ export class SellingPage {
             text: 'Ledger',
             onclick: () => this.showView(this.view === 'ledger' ? 'list' : 'ledger'),
         });
+        // Sets (3.24.0): a page of its own, opened like the Ledger. Only there while Settings › Sets and points is on.
+        this.setsBtn = spEl('button', {
+            type: 'button',
+            class: 'sp-hbtn',
+            title: 'Sets: plushies and flowers for the museum, and the points they make',
+            'aria-pressed': 'false',
+            hidden: '',
+            text: 'Sets',
+            onclick: () => this.showView(this.view === 'sets' ? 'list' : 'sets'),
+        });
         this.settingsBtn = spEl('button', {
             type: 'button',
             class: 'sp-icon',
@@ -552,6 +564,7 @@ export class SellingPage {
             this.catEl,
             this.pillsEl,
             this.refreshBtn,
+            this.setsBtn,
             this.ledgerBtn,
             this.settingsBtn,
         ]);
@@ -668,11 +681,36 @@ export class SellingPage {
         });
         this.ledgerEl = spEl('main', { class: 'sp-main', hidden: '' }, [this.ledgerView.el]);
 
+        /* Sets */
+        const openSetsSettings = () => {
+            this.showView('settings');
+            const sec = this.snavSections && this.snavSections.find((x) => x.id === 'sets');
+            if (sec) {
+                this.snavPick('sets');
+                sec.sec.scrollIntoView({ block: 'start' });
+            }
+        };
+        this.setsView = new SetsView({
+            onChange: (partial) => this.h.onSetsChange && this.h.onSetsChange(partial),
+            onRead: () => this.h.onSetsRead && this.h.onSetsRead(),
+            onOpenUrl: (url) => url && this.h.onOpenUrl && this.h.onOpenUrl(url),
+            onCopy: (text) => (this.h.onCopy ? this.h.onCopy(text) : false),
+            onOpenSettings: openSetsSettings,
+            bazaarUrl: (id) => bazaarUrl(id),
+            marketUrl: (id) => itemMarketUrl(id, this.state.itemNameOf ? this.state.itemNameOf(id) : ''),
+            museumUrl: (hash) => (this.h.setsMuseumUrl ? this.h.setsMuseumUrl(hash) : ''),
+            pointsUrl: () => (this.h.setsPointsUrl ? this.h.setsPointsUrl() : ''),
+            onNoteOpen: (note) => this.h.onSetsNoteOpen && this.h.onSetsNoteOpen(note),
+            onNoteDismiss: (note) => this.h.onSetsNoteDismiss && this.h.onSetsNoteDismiss(note),
+        });
+        this.setsEl = spEl('main', { class: 'sp-main', hidden: '' }, [this.setsView.el]);
+        this.setsSettings = new SetsSettings((partial) => this.h.onSetsChange && this.h.onSetsChange(partial));
+
         /* settings */
         this.settingsEl = spEl('main', { class: 'sp-main', hidden: '' });
         this.buildSettings();
 
-        this.root = spEl('div', { class: 'sp-page' }, [this.headEl, this.bannerEl, this.listEl, this.ledgerEl, this.settingsEl]);
+        this.root = spEl('div', { class: 'sp-page' }, [this.headEl, this.bannerEl, this.listEl, this.setsEl, this.ledgerEl, this.settingsEl]);
     }
 
     /**
@@ -1080,7 +1118,7 @@ export class SellingPage {
             ['Data sharing', 'Nobody. Your trades go into a zip only when you download one yourself (Report a problem, Export API usage): it names the traders you traded with, and you choose who gets it.'],
             ['Purpose of use', 'Personal: profit tracking'],
             ['Key storage & sharing', 'Stored locally / Not shared'],
-            ['Key access level', 'Full, used only for your log (bazaar, Item Market and NPC shop buys and sells, and muggings), your trades, and key info'],
+            ['Key access level', 'Full, used only for your log (bazaar, Item Market and NPC shop buys and sells, and muggings; with Sets on: museum exchanges, points sold and points used), your trades (with Sets on: the trades open with you), and key info'],
             ['Other services', 'None: never sent to TornExchange or TornW3B'],
         ]) {
             ledgerTos.appendChild(spEl('tr', {}, [spEl('th', { text: k }), spEl('td', { text: v })]));
@@ -1095,6 +1133,11 @@ export class SellingPage {
             field('Key use', 'Torn API terms, Full key', [ledgerTos]),
         ]);
 
+        /* Sets (3.24.0, mockup Z5) */
+        group('Sets');
+        section('sets', 'Sets and points', 'Plushies and flowers kept for museum sets, swapped for points. One switch: off, they are ordinary items again.', [this.setsSettings.mainEl]);
+        section('setspages', 'Sets on Torn\'s pages', 'What Torn Bids shows and types on the museum, the points market, a trade and your forum thread. It never presses Torn\'s buttons.', [this.setsSettings.pagesEl]);
+
         /* preferences */
         group('Other');
         this.linksInput = spEl('input', { type: 'checkbox' });
@@ -1107,9 +1150,9 @@ export class SellingPage {
         for (const [k, v] of [
             ['Data storage', 'Only locally, in this browser'],
             ['Data sharing', 'Nobody'],
-            ['Purpose of use', 'Personal gain: who pays most for your items, and flips'],
+            ['Purpose of use', 'Personal gain: who pays most for your items, flips, and (with Sets on) your museum sets and points'],
             ['Key storage & sharing', 'Stored locally / Not shared'],
-            ['Key access level', 'Limited (your inventory and your own id; item names; Item Market prices; traders\' public status and networth)'],
+            ['Key access level', 'Limited (your inventory and your own id; item names; Item Market prices; traders\' public status and networth; with Sets on: the points market, your money and points, and Torn\'s list of log types)'],
             ['Other services', 'TornExchange, only with the key you log in there with'],
         ]) {
             tos.appendChild(spEl('tr', {}, [spEl('th', { text: k }), spEl('td', { text: v })]));
@@ -1180,6 +1223,12 @@ export class SellingPage {
                 if (!L.hasKey) return ['unknown', 'no key'];
                 return L.backfilled ? ['online', count((L.rows || []).length) + ' rows'] : ['idle', 'reading'];
             })(),
+            sets: (() => {
+                const S = this.state.sets;
+                if (!S || !S.settings.on) return ['unknown', 'off'];
+                return ['online', (S.settings.open ? 'open' : 'closed') + ' · ' + S.settings.pct + '%'];
+            })(),
+            setspages: [null, ''],
             terms: [null, ''],
         };
         for (const n of this.snav) {
@@ -1212,7 +1261,8 @@ export class SellingPage {
     }
 
     showView(view) {
-        this.view = view === 'settings' || view === 'ledger' ? view : 'list';
+        const setsOn = Boolean(this.state.sets && this.state.sets.settings.on);
+        this.view = view === 'settings' || view === 'ledger' || (view === 'sets' && setsOn) ? view : 'list';
         if (!this.root) return;
         const settings = this.view === 'settings';
         if (settings && !this.usageTimer) {
@@ -1223,9 +1273,12 @@ export class SellingPage {
             this.usageTimer = null;
         }
         const ledger = this.view === 'ledger';
+        const sets = this.view === 'sets';
         const list = this.view === 'list';
         this.settingsEl.hidden = !settings;
         this.ledgerEl.hidden = !ledger;
+        this.setsEl.hidden = !sets;
+        this.setsBtn.setAttribute('aria-pressed', String(sets));
         this.listEl.hidden = !list;
         // The back arrow stays hidden (3.20.3): it pushed the logo along. The logo is the way home.
         this.backBtn.hidden = true;
@@ -1235,14 +1288,29 @@ export class SellingPage {
         this.settingsBtn.setAttribute('aria-pressed', String(settings));
         this.ledgerBtn.setAttribute('aria-pressed', String(ledger));
         this.titleEl.textContent = SELLING_PAGE_TITLE;
-        this.crumbEl.textContent = settings ? '› Settings' : ledger ? '› Torn Ledger' : '';
+        this.crumbEl.textContent = settings ? '› Settings' : ledger ? '› Torn Ledger' : sets ? '› Torn Sets' : '';
         this.crumbEl.hidden = list;
         this.brandEl.title = list ? 'Torn Bids' : 'Back to Torn Bids (Esc)';
         this.brandEl.classList.toggle('sp-brand-back', !list);
         this.taglineEl.hidden = !list;
         this.renderBanner();
         if (ledger) this.ledgerView.render(this.ledgerArgs());
+        if (sets) this.renderSets();
         if (list) this.fitDesk();
+    }
+
+    /** The Sets page and its settings, from what main.js worked out (view.sets: { snap, settings, note, autoText }). */
+    renderSets() {
+        const S = this.state.sets;
+        if (!S) return;
+        this.setsBtn.hidden = !S.settings.on;
+        // Switched off while its page is open: back to the list.
+        if (!S.settings.on && this.view === 'sets') {
+            this.showView('list');
+            return;
+        }
+        this.setsSettings.sync(S.settings, { autoText: S.autoText || '' });
+        if (this.view === 'sets' && S.snap) this.setsView.render({ snap: S.snap, settings: S.settings, note: S.note || null, now: Date.now() });
     }
 
     ledgerArgs() {
@@ -1293,6 +1361,7 @@ export class SellingPage {
         this.renderCategory();
         this.renderLedgerKey();
         if (this.view === 'ledger') this.ledgerView.render(this.ledgerArgs());
+        this.renderSets();
         this.renderKeyStates();
         this.renderSettingsNav();
         this.renderPills();
@@ -1489,6 +1558,10 @@ export class SellingPage {
             say(info.teError || 'TornExchange did not accept this key.', 'bad', 'Try again', () => this.h.onRetryTe && this.h.onRetryTe());
         } else if (info.teWaitUntil && info.teWaitUntil > Date.now()) {
             say('TornExchange asked us to wait ' + formatAge(info.teWaitUntil - Date.now()).replace(' ago', '') + '.', 'warn');
+        } else if (this.state.sets && this.state.sets.note && this.view !== 'sets') {
+            // Sets (3.24.0): a trade is open with you. On the Sets page the note is in the page itself.
+            const n = this.state.sets.note;
+            say(n.title + ' ' + n.text, null, 'Open the trade', () => this.h.onSetsNoteOpen && this.h.onSetsNoteOpen(n), 'Not now', () => this.h.onSetsNoteDismiss && this.h.onSetsNoteDismiss(n));
         }
     }
 
@@ -3426,7 +3499,7 @@ export class SellingPage {
     }
 }
 
-export const SELLING_PAGE_CSS = LEDGER_CSS + USAGE_CSS + REPORT_CSS + `
+export const SELLING_PAGE_CSS = LEDGER_CSS + SETS_CSS + USAGE_CSS + REPORT_CSS + `
 :host { all: initial; }
 * { box-sizing: border-box; }
 /*

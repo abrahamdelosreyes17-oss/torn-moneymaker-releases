@@ -381,6 +381,67 @@ export const PAGE_CSS = `
     white-space: nowrap !important;
 }
 
+/*
+ * Sets (3.24.0, mockups Z6-Z10): a mark on a museum piece, a bazaar card, an item in a trade or your forum
+ * thread's title. Absolutely placed in Torn's element, so it takes no room; it catches no click.
+ */
+.ttv2-setmark {
+    top: -9px;
+    left: 4px;
+    height: 18px;
+    padding: 0 7px;
+    border: 1px solid rgba(90, 167, 255, 0.55);
+    border-radius: 9px;
+    background: #10233b;
+    color: #cfe5ff;
+    font: 600 11px/16px "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: 0;
+    text-transform: none;
+    pointer-events: none;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.45);
+}
+.ttv2-setmark[data-where="right"] { top: 50%; left: auto; right: 8px; transform: translateY(-50%); }
+.ttv2-setmark[data-where="under"] { top: calc(100% - 4px); left: 4px; }
+.ttv2-setmark[data-where="tile"] { top: auto; bottom: 2px; left: 2px; }
+.ttv2-setmark[data-state="top"] { border-color: #5aa7ff; background: #173a63; color: #fff; box-shadow: 0 0 0 1px #5aa7ff, 0 0 10px rgba(90, 167, 255, 0.5); }
+.ttv2-setmark[data-state="ok"] { border-color: rgba(160, 168, 184, 0.45); background: #1c2029; color: #c3c9d4; }
+.ttv2-setmark[data-state="ahead"], .ttv2-setmark[data-state="over"] { border-color: rgba(246, 183, 74, 0.6); background: #33260c; color: #ffd98a; }
+.ttv2-setmark[data-state="bad"] { border-color: rgba(255, 120, 120, 0.6); background: #3a1414; color: #ffc9c9; }
+.ttv2-setmark[data-state="good"] { border-color: rgba(111, 220, 127, 0.55); background: #12301a; color: #b9f3c2; }
+
+/* Fill beside Torn's own box on the museum and the points market: it types, you press Torn's button. */
+.ttv2-setfill {
+    top: 50%;
+    left: calc(100% + 8px);
+    transform: translateY(-50%);
+    height: 24px;
+    padding: 0 10px;
+    border: 1px solid rgba(90, 167, 255, 0.55);
+    border-radius: 7px;
+    background: #10233b;
+    color: #cfe5ff;
+    font: 600 11px/22px "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+    font-variant-numeric: tabular-nums;
+    cursor: pointer;
+}
+.ttv2-setfill:hover { background: #173a63; color: #fff; }
+.ttv2-setfill[data-done="1"] { border-color: rgba(111, 220, 127, 0.55); background: #12301a; color: #b9f3c2; }
+
+/* Why a price box on your bazaar's add page is red or amber, and a piece kept for sets (no Fill). */
+.ttv2-tonetag, .ttv2-keptnote {
+    height: 16px;
+    padding: 0 6px;
+    border-radius: 8px;
+    font: 600 10px/16px "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+    pointer-events: none;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.45);
+}
+.ttv2-tonetag { top: calc(100% - 6px); right: 2px; background: #33260c; color: #ffd98a; border: 1px solid rgba(246, 183, 74, 0.6); }
+.ttv2-tonetag[data-tone="under"] { background: #3a1414; color: #ffc9c9; border-color: rgba(255, 120, 120, 0.6); }
+.ttv2-keptnote.ttv2-fillcell { margin-left: 0; white-space: nowrap; }
+.ttv2-keptnote { margin-left: 8px; background: #1c2029; color: #c3c9d4; border: 1px solid rgba(160, 168, 184, 0.45); }
+
 .ttv2-sendrow .name-wrap {
     overflow: visible !important;
 }
@@ -602,7 +663,7 @@ export const PAGE_CSS = `
 .ttv2-bzchip:hover,
 .ttv2-bzchips[data-selected="true"] .ttv2-bzchip { border-color: rgba(111, 220, 127, 0.55); }
 
-.ttv2-fillbox.ttv2-fillcell {
+.ttv2-fillbox.ttv2-fillcell, .ttv2-keptnote.ttv2-fillcell {
     position: absolute;
     right: 2px;
     top: 50%;
@@ -2462,6 +2523,25 @@ ${TOKENS_CSS}
     border-color: var(--buy-line);
     background: var(--buy-bg);
 }
+
+/* Sets (3.24.0): what this page means for your sets. Never cut: a long line goes on to a second one. */
+.ttv2-setsbox { border-color: var(--buy-line); background: var(--buy-bg); }
+.ttv2-setsbox[data-tone="warn"] { border-color: var(--warn-line); background: var(--warn-bg); }
+.ttv2-setsbox .ttv2-tb-head > b { color: var(--buy); }
+.ttv2-setsbox[data-tone="warn"] .ttv2-tb-head > b { color: var(--warn); }
+.ttv2-sets-line { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; padding: 3px 0; font-size: 12px; line-height: 16px; color: var(--text2); overflow-wrap: anywhere; }
+.ttv2-sets-line > b { flex: none; white-space: nowrap; font-weight: 650; font-variant-numeric: tabular-nums; color: var(--text); }
+.ttv2-sets-ok, .ttv2-sets-ok > b { color: var(--profit); }
+.ttv2-sets-warn, .ttv2-sets-warn > b { color: var(--warn); }
+.ttv2-sets-bad, .ttv2-sets-bad > b { color: var(--bad); }
+.ttv2-sets-need > span:first-child { color: var(--buy); }
+.ttv2-sets-muted, .ttv2-sets-muted > b { color: var(--muted); }
+.ttv2-sets-sep { margin-top: 6px; padding-top: 8px; border-top: 1px solid var(--line); }
+.ttv2-sets-msg { display: block; padding: 8px 10px; background: var(--input); border: 1px solid var(--line); border-radius: 8px; color: var(--text2); user-select: text; }
+.ttv2-sets-btns { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.ttv2-sets-note { margin: 0 0 10px; padding: 0 0 10px; border-bottom: 1px solid var(--line); font-size: 12px; line-height: 16px; color: var(--text2); overflow-wrap: anywhere; }
+.ttv2-sets-note:last-child { margin: 0; padding: 0; border-bottom: 0; }
+.ttv2-sets-note b { color: var(--text); }
 
 .ttv2-buybox .ttv2-tb-head > b {
     color: var(--buy);

@@ -289,3 +289,76 @@ test('two trades leave the same item: one row, counted from the later start', ()
     // Two old ones: nothing said, as before.
     assert.equal('since' in addLeftovers([old], [{ ...old, at: AT + 1 }])[0], false);
 });
+
+/*
+ * The friend's zip of 2026-10-05 23:04 (3.23.0). He cancelled a trade with
+ * Grease_Monkey in Torn Bids, then sold the same bundle to Khawun by hand
+ * (Torn receipt 7540751, 15:00:42 UTC: 2,352 Monkey Plushie, 513 Tribulus
+ * Omanense). The Ledger had the sale; To sell kept Monkey Plushie 796 and
+ * Tribulus 437, with `seenTo` at that sale and `spare` 0, also after Refresh.
+ *
+ * A row carried `spare` - what he bought again since it began counting - and
+ * kept it when its start moved forward: an older row for the item counted
+ * the new trade's buys as bought again, Cancel trade then put those same
+ * units INTO the row (addLeftovers), and they stayed "spare" as well. A sale
+ * was taken from that first, so it took nothing off the row and was marked
+ * as seen. What was bought again is now worked out from the Ledger's rows
+ * since the row's own start, each time.
+ */
+const ZIP_SINCE = 1791210045000; // 14:20:45 UTC, his last buy for the Grease_Monkey trade
+const ZIP_CANCEL = 1791211869891; // 14:51:09
+const ZIP_SALE = 1791212442000; // 15:00:42, receipt 7540751
+const zipRows = () => [
+    { t: 1791210034000, itemId: '269', qty: 52, side: 'buy', venue: 'bazaar' },
+    { t: 1791210040000, itemId: '269', qty: 26, side: 'buy', venue: 'bazaar' },
+    { t: ZIP_SINCE, itemId: '269', qty: 36, side: 'buy', venue: 'bazaar' },
+    { t: ZIP_SALE, itemId: '269', qty: 2352, side: 'sell', venue: 'trade' },
+    { t: ZIP_SALE, itemId: '385', qty: 513, side: 'sell', venue: 'trade' },
+];
+
+test('sold by hand after Cancel trade: the rows go, whatever "bought again" they carried (the zip of 2026-10-05)', () => {
+    // The two rows as his leftovers.json has them, with the only carried count that leaves them as it does.
+    const rows = [
+        { itemId: '269', name: 'Monkey Plushie', qty: 796, each: 32090, from: 'Grease_Monkey', at: ZIP_CANCEL, why: 'cancel', since: ZIP_SINCE, spare: 2352, seenTo: ZIP_SINCE },
+        { itemId: '385', name: 'Tribulus Omanense', qty: 437, each: 59993, from: 'Grease_Monkey', at: ZIP_CANCEL, why: 'cancel', since: ZIP_SINCE, spare: 513, seenTo: 1791210027000 },
+    ];
+    // Nothing was bought after the rows' start, so all of the sale is theirs: he holds none.
+    assert.deepEqual(leftoversAfterSales(rows, zipRows()), []);
+    // Not sold yet: the rows stay, the same objects (nothing to save).
+    const held = leftoversAfterSales(rows, zipRows().slice(0, 3));
+    assert.equal(held[0], rows[0]);
+    assert.equal(held[1], rows[1]);
+});
+
+test('a new trade\'s buys, counted as bought again by an older row, then put into it by Cancel trade', () => {
+    // An earlier cancelled trade left 722 Monkey Plushies (40 + 223 + 459, his log).
+    const old = [{ itemId: '269', name: 'Monkey Plushie', qty: 722, each: 32246, from: 'Zer0CooL', at: 1791209628000, why: 'cancel', since: 1791208460000 }];
+    // The Ledger reads the next trade's three buys: bought again, as far as the old row can tell.
+    const seen = leftoversAfterSales(old, zipRows().slice(0, 3));
+    assert.deepEqual([seen[0].qty, seen[0].spare, seen[0].seenTo], [722, 114, ZIP_SINCE]);
+    // Cancel trade: those 114 join the row, which now counts from the last of those buys.
+    const both = addLeftovers(seen, [{ itemId: '269', name: 'Monkey Plushie', qty: 114, each: 32047, from: 'Grease_Monkey', at: ZIP_CANCEL, why: 'cancel', since: ZIP_SINCE }]);
+    assert.deepEqual([both[0].qty, both[0].since], [836, ZIP_SINCE]);
+    // 150 sold on his bazaar: all 150 come off - the 114 are in the row, not beside it.
+    const sale = { t: ZIP_SINCE + 10 * MIN, itemId: '269', qty: 150, side: 'sell', venue: 'bazaar' };
+    const after = leftoversAfterSales(both, [...zipRows().slice(0, 3), sale]);
+    assert.deepEqual([after[0].qty, after[0].spare, after[0].seenTo], [686, 0, sale.t]);
+    // Read again: the sale counts once.
+    assert.deepEqual(leftoversAfterSales(after, [...zipRows().slice(0, 3), sale]), after);
+});
+
+test('bought again, read in two goes: the same as read in one', () => {
+    const cards = tradedLeftovers(accepted(), new Map([['203', 60], ['9', 3]]), TRADED + MIN, TRADED);
+    const buy = { t: TRADED + 20 * MIN, itemId: '203', qty: 50, side: 'buy' };
+    const sells = [{ t: TRADED + 30 * MIN, itemId: '203', qty: 30, side: 'sell' }, { t: TRADED + 40 * MIN, itemId: '203', qty: 29, side: 'sell' }];
+    const first = leftoversAfterSales(cards, [buy, sells[0]]);
+    assert.deepEqual([first[0].qty, first[0].spare], [11, 20]);
+    // 29 more go: 20 of them bought again, 9 the leftover's.
+    const second = leftoversAfterSales(first, [buy, ...sells]);
+    assert.deepEqual([second[0].qty, second[0].spare], [2, 0]);
+    assert.deepEqual(leftoversAfterSales(cards, [buy, ...sells]).map((l) => [l.qty, l.spare]), [[2, 0]]);
+    // The row's start moves past the buy (a trade took some of it, core/to-sell.js afterYoursSent): what he held
+    // before the start is not told apart from the row, bought again or not - the count kept from before is dropped.
+    const moved = { ...first[0], since: TRADED + 35 * MIN };
+    assert.deepEqual(leftoversAfterSales([moved], [buy, ...sells]), []);
+});

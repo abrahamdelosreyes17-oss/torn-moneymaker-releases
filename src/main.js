@@ -19,6 +19,7 @@ import {
     gmOpenTab,
     gmOnChange,
     gmSize,
+    gmCopy,
 } from './platform/gm.js';
 import { perfStart, perfNow, perfDone, perfTimed, perfForeign, perfStartup, perfRecord, perfMachine, SPEED_STORE_KEY } from './platform/perf.js';
 import { speedFiles } from './core/speed.js';
@@ -74,7 +75,7 @@ import { formatMoneyShort, formatAge, parseMoneyInput } from './core/parse.js';
 import { rankOpportunities, summarize, hiddenCounts, belowMinRows } from './core/ranker.js';
 import { TornApiClient, redactKey, KEY_DEAD_CODES } from './api/client.js';
 import { W3bClient, fetchW3bSummary, fetchW3bListings, fetchW3bPriceList, fetchW3bItemTraders, overlayPerMinute } from './api/w3b.js';
-import { LedgerClient, fetchLedgerKeyInfo, isFullKey, fetchLogPage, fetchTradesPage, fetchTrade } from './api/ledger.js';
+import { LedgerClient, fetchLedgerKeyInfo, isFullKey, fetchLogPage, fetchTradesPage, fetchTradesOpen, fetchTrade } from './api/ledger.js';
 import { LOG_BAZAAR_BUY, readLedger, emptyLedger, rowsFromLog, rowsFromTrade, addLedgerRows, logSpan, mugFromLog, addMugs, priceRecordOf, addPriceRecord, acceptedPricesFor, matchFifo, tradeReceipts } from './core/ledger.js';
 import { partnerStats, isFavourite, editFavourite, editBlacklist, withoutBlacklisted, favouritesFirstOnTie, tradedLine, partnerKey, scanOrder, blacklistKeys } from './core/partners.js';
 import {
@@ -100,6 +101,8 @@ import {
     mergeTraderDbs,
     addTraders,
     parseW3bPriceList,
+    parseW3bSetPrices,
+    bestSetBuyer,
     recordW3bList,
     nextW3bTrader,
     traderDbStats,
@@ -164,7 +167,13 @@ import {
     TORN_ERROR_ACCESS_LEVEL,
     keyTooLowForInventory,
     isCategoryError,
+    fetchPointsMarket,
+    fetchMoney,
+    fetchLogTypes,
 } from './api/torn.js';
+import { SETS, setsOn, keptForSets, isSetItem, setOfItem, tradeOffer, tradeMessage, threadCheck, isBuyingTitle } from './core/sets.js';
+import { parsePointsMarket, listPrice, goneLots, recordPrice, bookAdd, bookSettle, pointsLogTypes, entryFromLog } from './core/points.js';
+import { setsSettings, setsSnapshot, snapPiece, snapTradeCtx, bazaarForSets, heldLots, pressedOff, snapForTabs, snapReady, tradeNote } from './core/sets-desk.js';
 import {
     detectPage,
     itemMarketUrl,
@@ -176,11 +185,18 @@ import {
     isTradersPageUrl,
     isOldTradersPageUrl,
     isTradePage,
+    isMuseumPage,
+    isPointsMarketPage,
+    isForumPage,
+    MUSEUM_URL,
+    POINTS_MARKET_URL,
+    tradeViewUrl,
     profileIdOf,
     PAGE_NONE,
     PAGE_BAZAAR,
 } from './sources/route.js';
 import { scanDom } from './sources/dom/scan.js';
+import { setMark, clearSetMarks, museumExchanges, pieceTiles, pointsListing, tradeTheirRows, forumThread, boxTwins } from './sources/dom/sets-pages.js';
 import { scanOwnBazaar, ensureRowTag, removeRowTags, OWN_BAZAAR_TAG_CLASS } from './sources/dom/ownbazaar.js';
 import {
     rowInputs,
@@ -1066,6 +1082,8 @@ function rescanNow() {
     const now = Date.now();
     const sellerId =
         app.pageType === PAGE_BAZAAR ? bazaarOwnerId(location.href) : null;
+    // Sets (3.24.0): the cards of someone's bazaar, for "need N · worth $X" on each piece.
+    setsTab.cards = app.pageType === PAGE_BAZAAR ? listings : [];
 
     for (const l of listings) {
         l.seenAt = stampSeen(l, now);
@@ -2369,7 +2387,9 @@ function ensureFillControls(row, page, tag) {
     const inputs = { price: row.priceEl ? [row.priceEl] : [] };
     let box = row.fillBox && row.fillBox.isConnected ? row.fillBox : row.el.querySelector('.ttv2-fillbox');
     row.fillBox = box;
-    if (!inputs.price.length) {
+    // Sets (3.24.0): while it is on, a plushie or flower of a chosen set is kept for the museum - no tick to price it for sale.
+    const kept = setsKeptHere(row.itemId);
+    if (!inputs.price.length || kept) {
         if (box) {
             const cell = box.parentNode;
             box.remove();
@@ -2377,8 +2397,11 @@ function ensureFillControls(row, page, tag) {
             if (cell && cell.classList && cell.classList.contains(BZ_CELL_CLASS)) releaseBazaarCell(cell);
             row.fillBox = null;
         }
+        // "kept for sets" in the tick's own place, so the row's chips stay where they are in every other row.
+        paintKeptNote(row, tag, kept && inputs.price.length > 0);
         return false;
     }
+    paintKeptNote(row, tag, false);
     if (!box) {
         box = document.createElement('span');
         box.className = 'ttv2-fillbox';
@@ -2545,7 +2568,7 @@ function removeFillControls(root = document) {
         n.remove();
         releaseMarks(bar);
     }
-    for (const n of root.querySelectorAll('.ttv2-fillbox, .ttv2-bzchips, .' + BZ_SELLBAR_CLASS)) n.remove();
+    for (const n of root.querySelectorAll('.ttv2-fillbox, .ttv2-keptnote, .ttv2-bzchips, .' + BZ_SELLBAR_CLASS)) n.remove();
     for (const n of root.querySelectorAll('.' + BZ_SELL_CLASS)) n.classList.remove(BZ_SELL_CLASS);
     for (const n of root.querySelectorAll('.' + BZ_UNDER_CLASS + ', .' + BZ_OVER_CLASS + ', .' + BZ_OK_CLASS)) clearPriceTone(n);
     // Torn's value cells are as they were.
@@ -3201,12 +3224,15 @@ function paintPriceTone(row, entry) {
     if (tone === 'under') input.title = 'Under the ' + formatMoney(paid) + ' you paid for it';
     else if (far) input.title = farUnderWords(far);
     else if (tone === 'over') input.title = 'Over the lowest bazaar price, ' + formatMoney(lowest) + ': yours would not be the cheapest';
+    // The reason, where you can see it without hovering (3.24.0): a small tag on the box's lower edge.
+    paintToneTag(input, tone === 'ok' ? null : tone, tone === 'under' ? 'under the ' + formatMoney(paid) + ' you paid' : far ? far.pct + '% under ' + (far.of === 'bazaar' ? 'the lowest bazaar, ' : 'market value, ') + formatMoney(far.ref) : tone === 'over' ? 'over the lowest bazaar, ' + formatMoney(lowest) : '');
 }
 
 function clearPriceTone(input) {
     input.classList.remove(BZ_UNDER_CLASS, BZ_CHEAP_CLASS, BZ_OVER_CLASS, BZ_OK_CLASS);
     if (/^(Under the \$|Over the lowest bazaar price|Far under )/.test(input.title || '')) input.removeAttribute('title');
     input.ttv2Tone = '';
+    paintToneTag(input, null, '');
 }
 
 /** A price typed (by you, or by Fill) on the add page: its box is checked against what you paid and the lowest bazaar price at once. */
@@ -5059,7 +5085,7 @@ function onMutations(mutations) {
 
 /** A change to, or inside, one of the helper's own price tags is not the page changing. */
 function isOwnTagMutation(m) {
-    const ours = '.' + OWN_BAZAAR_TAG_CLASS + ', .' + FILL_TAG_CLASS + ', .ttv2-fillbox, .ttv2-bzchips, .ttv2-fillset, .' + TRADE_BUYBAR_CLASS + ', .' + ROW_FLOAT_CLASS + ', .ttv2-float';
+    const ours = '.' + OWN_BAZAAR_TAG_CLASS + ', .' + FILL_TAG_CLASS + ', .ttv2-fillbox, .ttv2-bzchips, .ttv2-fillset, .' + TRADE_BUYBAR_CLASS + ', .' + ROW_FLOAT_CLASS + ', .ttv2-float, .ttv2-setmark, .ttv2-tonetag, .ttv2-keptnote';
     const isTag = (n) => n && n.nodeType === 1 && n.matches && n.matches(ours);
     const inTag = (n) => {
         const el = n && n.nodeType === 1 ? n : n && n.parentElement;
@@ -5533,6 +5559,7 @@ function storageSizes() {
         STORE_W3B_COOLDOWN, STORE_IM_WATCH, STORE_BIDS_SEEN, STORE_LIST_AT, STORE_SELL_DECLINED, STORE_SELL_ASKED, STORE_SELL_ENDED, STORE_SELL_ENDED_FULL, STORE_SELL_CANCELLED, STORE_BOUGHT_WINDOW, STORE_SELL_PRICE_RECORDS, STORE_SELL_BLACKLIST,
         STORE_SELL_FAVOURITES, STORE_SELL_TE_OWN, STORE_CHAT_WANTED, STORE_SELL_MOVES, STORE_LEDGER_REV, STORE_SELL_PRESENCE, STORE_SELL_HELD, STORE_SELL_WAS,
         FEED_LEADER_KEY, FEED_RECHECK_KEY, FEED_REFRESH_KEY, SPEED_STORE_KEY, STORE_CLEANED,
+        STORE_SETS, STORE_SETS_STATE, STORE_SETS_BOOK, STORE_SETS_SNAP, STORE_SETS_PRESS, STORE_SETS_NOTE,
         STORE_API_WINDOW + '.' + app.tabId, STORE_W3B_WINDOW + '.' + app.tabId,
     );
     const rows = [];
@@ -6763,6 +6790,12 @@ function nextW3bJob(now, hidden = false) {
         // Settings › Bazaar prices (3.20): the desk and the trade, the top flips, the others.
         due: (id, how) => bazaarsDue(id, how === 'desk' ? fresh.desk : how === 'sweep' ? W3B_SWEEP_MS : topIds.has(String(id)) ? fresh.top : fresh.other, now),
     });
+    // Sets (3.24.0): a set piece whose bazaars are due takes the turn of a price list, a sweep read or an
+    // idle slot - never the summary's, the desk's, a trade's or a flip's. Only from the tab in view.
+    if (!hidden && (!read || read.kind === 'list')) {
+        const piece = setsPieceDue(now);
+        if (piece) return () => loadBazaars(piece, 'w.sets');
+    }
     if (!read) return null;
     if (read.kind === 'summary') return loadBazaarSummary;
     if (read.kind === 'list') return Object.assign(() => loadW3bList(read.id), { list: true });
@@ -6773,6 +6806,10 @@ function nextW3bJob(now, hidden = false) {
         : sell.tradeLive.includes(id) || sell.tradeWanted.includes(id) || pinnedIds.includes(id) ? 'w.trade'
         : candIds.includes(id) || sell.nearIds.includes(id) ? 'w.flips'
         : 'w.sweep';
+    if (!hidden && tag === 'w.sweep') {
+        const piece = setsPieceDue(now);
+        if (piece) return () => loadBazaars(piece, 'w.sets');
+    }
     return () => loadBazaars(read.id, tag);
 }
 
@@ -6879,7 +6916,7 @@ function rereadTraderList(key, now = Date.now()) {
 /** One trader's TornW3B price list. */
 function loadW3bList(id) {
     return fetchW3bPriceList(sell.w3b, id)
-        .then((body) => recordW3bList(sell.db, id, { prices: parseW3bPriceList(body) }, Date.now()))
+        .then((body) => recordW3bList(sell.db, id, { prices: parseW3bPriceList(body), sets: parseW3bSetPrices(body) }, Date.now()))
         .catch((error) => {
             recordW3bList(sell.db, id, { error: true }, Date.now());
             if (error && error.blocked) sell.w3bPauseUntil = Date.now() + 60000;
@@ -6903,7 +6940,7 @@ function loadBazaarSummary() {
             sell.summaryError = null;
             // Listings of items no longer picked or possible flips are let go.
             const pinned = Object.values(sellPinned()).flatMap((t) => t.lines.map((l) => l.itemId));
-            const keep = new Set([sell.selected, ...sell.candidates.map((c) => c.itemId), ...sell.nearIds, ...sell.tradeWanted, ...sell.tradeLive, ...pinned]);
+            const keep = new Set([sell.selected, ...sell.candidates.map((c) => c.itemId), ...sell.nearIds, ...sell.tradeWanted, ...sell.tradeLive, ...pinned, ...setsPieceIds()]);
             // The overlay reads it too (its own copy every 30 s while a Torn tab is open).
             const lowest = {};
             for (const r of rows) if (r.lowestPrice > 0) lowest[r.itemId] = r.lowestPrice;
@@ -7381,6 +7418,13 @@ function renderSellingWork(src = null) {
         const l = leftovers.find((x) => String(x.itemId) === id);
         if (!heldNames.has(id) && l && l.name) heldNames.set(id, l.name);
     }
+    // Sets (3.24.0; the owner: "no plushie/flower is in to sell if we have this setting on, if its off, then of
+    // course it can go"): while it is on, a piece of a chosen set is kept for sets - in no To sell row, no trade
+    // offer, no flip and under no "sell" badge. Counted as held above first; the stored list is not touched, so
+    // switching Sets off brings every row back.
+    const setsCfg = setsNow();
+    const keptPiece = setsCfg.on ? (id) => keptForSets(id, setsCfg) : () => false;
+    if (setsCfg.on) leftovers = leftovers.filter((l) => !keptPiece(l.itemId));
     // To sell (3.21.0, core/to-sell.js): what you bought to resell and still hold - its tab's rows, and
     // the "yours" lines a trade with each trader gets. Only these: your other items stay out of every trade.
     // What you already hold goes to any trader who pays more than you paid (3.22.2; the owner, 2026-10-03:
@@ -7513,7 +7557,8 @@ function renderSellingWork(src = null) {
         const key = String(id);
         if (!flipBuyersCache.has(key)) {
             const item = itemOf(id);
-            if (neverFlip.has(itemCategory(item))) {
+            // Never flip, and (Sets on) a piece kept for sets: it is bought for the museum, not for a trader.
+            if (neverFlip.has(itemCategory(item)) || keptPiece(key)) {
                 flipBuyersCache.set(key, []);
                 return [];
             }
@@ -7609,7 +7654,7 @@ function renderSellingWork(src = null) {
         if (plan && plan.units > 0) {
             badge = { kind: 'flip', amount: plan.profit };
             value = plan.profit;
-        } else if (held && realBid > 0) {
+        } else if (held && realBid > 0 && !keptPiece(id)) {
             const w = whereToSell({ held, bid: realBid, bazaarLowest: lowest, bazaarDepth: bazaarDepthOf(id) });
             if (w.best === 'bazaar') {
                 badge = { kind: 'list', amount: w.gain };
@@ -8239,9 +8284,11 @@ function renderSellingWork(src = null) {
         const top = buyersOf(l.itemId).find((b) => !l.from || String(b.name).toLowerCase() !== String(l.from).toLowerCase()) || null;
         return { ...l, best: top ? { name: top.name, price: top.price } : null, gain: top ? (top.price - l.each) * l.qty : null };
     });
+    const setsView = setsWork({ settings: setsCfg, heldQty, sellersOf, buyersOf, itemOf, prefs, now });
     const pageT0 = perfNow();
     sell.drew = true;
     sell.page.render({
+        sets: setsView,
         strip,
         pinned,
         leftovers: leftShown,
@@ -8962,6 +9009,506 @@ function openSellLink(url) {
     else location.assign(url);
 }
 
+/* ------------------------------------------------------------------
+ * Sets (3.24.0; the owner, 2026-10-05, mockups Z1-Z10): plushies and
+ * flowers kept for museum sets, and the points they make.
+ *
+ * Torn Bids is where it is worked out: it holds your inventory, your
+ * Ledger, the bazaars and the keys. Each redraw makes one snapshot
+ * (core/sets-desk.js) - drawn by the Sets page, and stored for the Torn
+ * tabs, whose marks on the museum, the points market, a trade, a bazaar
+ * and your forum thread read nothing else. Off (the default), none of
+ * this runs and plushies and flowers are ordinary items.
+ *
+ * Its reads, all from the tab in view and only while the switch is on:
+ *   - the points market and your money, every "Read prices for sets"
+ *     minutes and on Read now (Limited key);
+ *   - each piece's bazaars from TornW3B, in the turn of a price list, a
+ *     sweep read or an idle slot - never the desk's, a trade's or a flip's;
+ *   - the Item Market's cheapest listings of the pieces you need, one
+ *     piece every few seconds, each again after the same minutes;
+ *   - your log for museum exchanges and points sold or used, every five
+ *     minutes (Full key), and your open trades once a minute while a note
+ *     is asked for (Full key).
+ * No alert, no sound, no browser notification (rules.php; README, hard
+ * rule 6): a trade open with you is said on the pages you are looking at.
+ * Nothing is pressed, posted or sent: Fill types, Copy copies, you press.
+ * ------------------------------------------------------------------ */
+
+/* The Sets settings (core/sets-desk.js setsSettings): read by Torn Bids and by every Torn tab. */
+const STORE_SETS = 'sets';
+/* What the reads have learned: the points price by day, lots seen leaving, the last listings, log types, what a point cost. */
+const STORE_SETS_STATE = 'setsState';
+/* The points book's entries: written by Torn Bids (your log) and by the museum page (a press of EXCHANGE). */
+const STORE_SETS_BOOK = 'setsBook';
+/* The snapshot, for the Torn tabs. */
+const STORE_SETS_SNAP = 'setsSnap';
+/* Presses of EXCHANGE on the museum: the sets they took come off the stock until Torn's inventory is read again. */
+const STORE_SETS_PRESS = 'setsPress';
+/* A trade open with you, for the panel. */
+const STORE_SETS_NOTE = 'setsNote';
+
+const SETS_STEP_MS = 5000;
+const SETS_LOG_MS = 5 * 60 * 1000;
+const SETS_TYPES_MS = 7 * 24 * 60 * 60 * 1000;
+const SETS_TRADES_MS = 60 * 1000;
+const SETS_RETRY_MS = 60 * 1000;
+const SETS_SNAP_SAVE_MS = 5000;
+const SETS_GONE_KEEP_MS = 24 * 60 * 60 * 1000;
+const SETS_PRESS_KEEP_MS = 2 * 60 * 60 * 1000;
+const SETS_LOG_BACK_MS = 7 * 24 * 60 * 60 * 1000;
+const SETS_NOTE_LIVE_MS = 3 * 60 * 1000;
+/* Open trades read in full a minute, at most: the newest ones. */
+const SETS_TRADES_READ = 3;
+
+const setsEng = {
+    listings: null, pointsAt: 0, pointsTriedAt: 0, pointsBusy: false, pointsError: '',
+    money: {}, moneyTriedAt: 0, moneyBusy: false, moneyOff: false, moneyFails: 0,
+    market: new Map(), marketBusy: false,
+    logAt: 0, logBusy: false, logOff: false,
+    tradesAt: 0, tradesBusy: false, tradesOff: false, tradesFails: 0,
+    note: null, snap: null, snapSig: '', snapSavedAt: 0, said: new Set(),
+};
+
+function setsNow() {
+    return setsSettings(gmGet(STORE_SETS, null));
+}
+
+function setsState() {
+    const s = gmGet(STORE_SETS_STATE, null);
+    return s && typeof s === 'object' ? s : {};
+}
+
+function saveSetsState(patch) {
+    gmSet(STORE_SETS_STATE, { ...setsState(), ...patch });
+}
+
+function setsBook() {
+    const b = gmGet(STORE_SETS_BOOK, null);
+    return Array.isArray(b) ? b : [];
+}
+
+function setsPresses(now = Date.now()) {
+    const p = gmGet(STORE_SETS_PRESS, null);
+    return (Array.isArray(p) ? p : []).filter((x) => x && now - Number(x.t) < SETS_PRESS_KEEP_MS);
+}
+
+/** The pieces of the sets switched on, as item ids. */
+function setsPieceIds(settings = setsNow()) {
+    return setsOn(settings).flatMap((s) => s.pieces.map((p) => String(p.id)));
+}
+
+/** One line in the problem log per kind of trouble and visit: the next zip shows it, the log is not flooded. */
+function setsSay(kind, what, detail = null) {
+    if (setsEng.said.has(kind)) return;
+    setsEng.said.add(kind);
+    logProblem('note', what, detail);
+}
+
+function setsKeyFailed(error) {
+    if (!isKeyDeadError(error)) return;
+    sell.keyDead = true;
+    sell.keyError = sellKeyErrorText(error);
+    gmSet(STORE_SELL_KEY_DEAD, true);
+}
+
+/** The points market: the price to type, the day's line of the price record, and the lots that left since the last read. */
+function readSetsPoints(now = Date.now()) {
+    if (setsEng.pointsBusy) return;
+    setsEng.pointsBusy = true;
+    setsEng.pointsTriedAt = now;
+    fetchPointsMarket(sell.client)
+        .then((json) => {
+            const listings = parsePointsMarket(json);
+            const at = Date.now();
+            if (!listings.length) {
+                setsEng.pointsError = 'not read';
+                setsSay('points-empty', 'Sets: the points market came back with no listing Torn Bids could read', 'the answer has: ' + Object.keys(json || {}).slice(0, 8).join(', '));
+                return;
+            }
+            const st = setsState();
+            const prev = setsEng.listings || st.listings || null;
+            const gone = prev ? goneLots(prev, listings, at) : [];
+            const price = listPrice(listings, 'lowest');
+            saveSetsState({
+                days: recordPrice(st.days, at, price ? price.lowest : 0),
+                gone: [...(st.gone || []), ...gone].filter((g) => at - g.t < SETS_GONE_KEEP_MS).slice(-400),
+                // The cheapest of them, for the next visit: what is listed far over the market is not kept.
+                listings: listings.slice(0, 150),
+                listingsAt: at,
+            });
+            setsEng.listings = listings;
+            setsEng.pointsAt = at;
+            setsEng.pointsError = '';
+        })
+        .catch((error) => {
+            setsEng.pointsError = 'not read';
+            setsEng.pointsTriedAt = Date.now() - setsNow().readMin * 60000 + SETS_RETRY_MS;
+            setsKeyFailed(error);
+            setsSay('points-failed', 'Sets: the points market could not be read', String((error && error.message) || error));
+        })
+        .finally(() => {
+            setsEng.pointsBusy = false;
+            renderSelling();
+        });
+}
+
+/** Your points, cash on hand and vault (Limited key). An answer Torn Bids cannot read is said once, then not asked for again. */
+function readSetsMoney(now = Date.now()) {
+    if (setsEng.moneyBusy || setsEng.moneyOff) return;
+    setsEng.moneyBusy = true;
+    setsEng.moneyTriedAt = now;
+    fetchMoney(sell.client)
+        .then((m) => {
+            if (m.points == null && m.onHand == null && m.vault == null) {
+                setsEng.moneyOff = true;
+                setsSay('money-shape', "Sets: Torn's answer for your money has none of the names Torn Bids knows", 'it has: ' + (m.keys || []).join(', '));
+                return;
+            }
+            setsEng.money = { points: m.points, onHand: m.onHand, vault: m.vault };
+            setsEng.moneyFails = 0;
+        })
+        .catch((error) => {
+            setsEng.moneyFails += 1;
+            // Not this key's to read (or not there): not asked again this visit.
+            if (setsEng.moneyFails >= 2) setsEng.moneyOff = true;
+            setsKeyFailed(error);
+            setsSay('money-failed', 'Sets: your money and points could not be read', String((error && error.message) || error));
+        })
+        .finally(() => {
+            setsEng.moneyBusy = false;
+            renderSelling();
+        });
+}
+
+/** The Item Market's cheapest listings of one piece you need: the piece holding your sets back first. */
+function readSetsMarket(now, every) {
+    if (setsEng.marketBusy || !setsEng.snap) return;
+    const need = setsEng.snap.sets.flatMap((s) => s.pieces.filter((p) => p.need > 0)).sort((a, b) => a.rank - b.rank);
+    const due = need.find((p) => {
+        const m = setsEng.market.get(String(p.id));
+        return !m || now - (m.triedAt || 0) >= every;
+    });
+    if (!due) return;
+    const id = String(due.id);
+    const prev = setsEng.market.get(id) || { at: 0, listings: [] };
+    setsEng.marketBusy = true;
+    setsEng.market.set(id, { ...prev, triedAt: now });
+    fetchItemMarket(sell.client, id, { limit: 20, tag: 't.sets', priority: 'low' })
+        .then((r) => {
+            const at = Date.now();
+            setsEng.market.set(id, { at, triedAt: at, listings: r.listings.map((l) => ({ price: l.price, qty: l.amount })).filter((l) => l.price > 0 && l.qty > 0) });
+        })
+        .catch((error) => {
+            setsKeyFailed(error);
+            setsSay('market-failed', 'Sets: the Item Market could not be read for a piece', String((error && error.message) || error));
+        })
+        .finally(() => {
+            setsEng.marketBusy = false;
+            renderSelling();
+        });
+}
+
+/** A piece whose bazaars are due (TornW3B): the ones you need first. Null when none, or Sets is off. */
+function setsPieceDue(now) {
+    const settings = setsNow();
+    if (!settings.on) return null;
+    const every = settings.readMin * 60000;
+    const ids = setsEng.snap
+        ? setsEng.snap.sets.flatMap((s) => [...s.pieces].sort((a, b) => a.rank - b.rank)).map((p) => String(p.id))
+        : setsPieceIds(settings);
+    return ids.find((id) => bazaarsDue(id, every, now)) || null;
+}
+
+/** What one point of a set cost you, as last worked out while you held a full set of it. */
+function setsCostOfPoint(setKey) {
+    const last = setsState().lastCost || {};
+    if (setKey && last[setKey] > 0) return last[setKey];
+    const known = Object.values(last).filter((v) => v > 0);
+    return known.length ? Math.round(known.reduce((a, b) => a + b, 0) / known.length) : 0;
+}
+
+/**
+ * Your log, for the points book: sets swapped at the museum, points sold and points used. Which log types those
+ * are is read from Torn's own list of types by their titles (once a week) - no type id is written in the code -
+ * and a row Torn Bids cannot read is named in the problem log (its type and the names in its data), never guessed.
+ */
+async function readSetsLog(now = Date.now()) {
+    if (setsEng.logBusy || setsEng.logOff || !led.client || !getLedgerKey() || gmGet(STORE_LEDGER_KEY_DEAD, null)) return;
+    // Not before a row can be priced: what a set cost you (your stock read) and today's points price (the market
+    // read, unless it cannot be). A row booked without them would stay in the book as free, or as a loss.
+    const ready = setsEng.snap;
+    if (!ready || !snapReady(ready) || (!(ready.points.lowest > 0) && !setsEng.pointsError && !(setsEng.pointsAt > 0))) return;
+    setsEng.logBusy = true;
+    setsEng.logAt = now;
+    try {
+        let st = setsState();
+        if (!st.types || now - (st.typesAt || 0) > SETS_TYPES_MS) {
+            const types = pointsLogTypes(await fetchLogTypes(sell.client));
+            saveSetsState({ types, typesAt: now });
+            st = setsState();
+            const missing = ['made', 'sold', 'used'].filter((k) => !types[k].length);
+            if (missing.length) setsSay('types', "Sets: Torn's list of log types names none for: " + missing.join(', '), 'found: ' + JSON.stringify(types.titles).slice(0, 300));
+        }
+        const types = st.types;
+        const ids = [...types.made, ...types.sold, ...types.used];
+        if (!ids.length) {
+            setsEng.logOff = true;
+            return;
+        }
+        const from = st.logFrom || Math.floor((now - SETS_LOG_BACK_MS) / 1000);
+        const rows = await fetchLogPage(led.client, { from, types: ids, use: { tag: 't.setslog', priority: 'low' } });
+        if (rows.length >= 100) setsSay('log-full', 'Sets: a full page of points rows in your log; older ones in the same stretch were not read');
+        const before = setsBook();
+        let book = before;
+        let newest = 0;
+        let madeRead = Boolean(st.madeRead);
+        const priceNow = setsEng.snap ? setsEng.snap.points.lowest : 0;
+        for (const row of [...rows].reverse()) {
+            if (!row) continue;
+            newest = Math.max(newest, Number(row.timestamp) || 0);
+            const entry = entryFromLog(row.id, row, types, { costOf: (set) => setsCostOfPoint(set), priceNow });
+            if (!entry) {
+                const d = row.details || {};
+                setsSay('log-row-' + (d.id ?? row.log), 'Sets: a log row of type ' + (d.id ?? row.log) + ' ("' + String(d.title || row.title || '') + '") could not be read', 'its data has: ' + Object.keys(row.data || {}).slice(0, 12).join(', '));
+                continue;
+            }
+            if (entry.kind === 'made') madeRead = true;
+            book = bookAdd(book, entry);
+        }
+        // A press of EXCHANGE the log never showed comes off - only once the log has shown an exchange it could read.
+        book = bookSettle(book, madeRead ? now : 0);
+        if (book !== before) gmSet(STORE_SETS_BOOK, book.slice(-600));
+        saveSetsState({ logFrom: newest || Math.max(from, Math.floor((now - 2 * 24 * 60 * 60 * 1000) / 1000)), logReadAt: now, madeRead });
+    } catch (error) {
+        setsSay('log-failed', 'Sets: your log could not be read for the points book', String((error && error.message) || error));
+    } finally {
+        setsEng.logBusy = false;
+        renderSelling();
+    }
+}
+
+/** The note as shown (Torn Bids) and as stored for the panel. Written only when it changes. */
+function setSetsNote(note, settings = setsNow()) {
+    const was = setsEng.note;
+    setsEng.note = note;
+    const forPanel = note && settings.notePanel ? note : null;
+    const stored = gmGet(STORE_SETS_NOTE, null);
+    const same = (a, b) => (!a && !b) || (a && b && a.id === b.id && a.text === b.text);
+    if (!same(stored, forPanel)) gmSet(STORE_SETS_NOTE, forPanel);
+    // Kept alive while the trade is open: the panel does not show a note Torn Bids stopped vouching for.
+    else if (forPanel && Date.now() - (stored.at || 0) > SETS_NOTE_LIVE_MS / 3) gmSet(STORE_SETS_NOTE, forPanel);
+    if (!same(was, note)) renderSelling();
+}
+
+/**
+ * A trade open with you (the owner: "a trade is opened with me"): your open trades once a minute, the newest few
+ * read in full, and the first whose other side holds a plushie or flower is the note - who, how many kinds of
+ * items, what the ones you need come to. Torn's API does not say who opened it. Never a trade you accepted in
+ * Torn Bids (that one is yours to sell in). Nothing is opened or accepted.
+ */
+async function readSetsTrades(now = Date.now()) {
+    const settings = setsNow();
+    if (setsEng.tradesBusy || setsEng.tradesOff || !setsEng.snap) return;
+    if (!(settings.noteBids || settings.notePanel)) {
+        if (setsEng.note) setSetsNote(null, settings);
+        return;
+    }
+    if (!led.buysClient || !getLedgerKey() || gmGet(STORE_LEDGER_KEY_DEAD, null)) return;
+    const self = gmGet(STORE_LEDGER_SELF, null);
+    if (!self) return;
+    setsEng.tradesBusy = true;
+    setsEng.tradesAt = now;
+    const use = { tag: 't.setslog', priority: 'low' };
+    try {
+        const list = await fetchTradesOpen(led.buysClient, { use });
+        setsEng.tradesFails = 0;
+        const dismissed = new Set((setsState().dismissed || []).map(String));
+        const mine = new Set(Object.values(sellAccepted(now)).map((t) => t.trader && t.trader.id && String(t.trader.id)).filter(Boolean));
+        let note = null;
+        let reads = 0;
+        for (const x of list) {
+            if (!x || !x.id || dismissed.has(String(x.id))) continue;
+            const partner = [x.trader, x.user].find((p) => p && p.id && String(p.id) !== String(self)) || {};
+            if (partner.id && mine.has(String(partner.id))) continue;
+            if (reads >= SETS_TRADES_READ) break;
+            reads += 1;
+            const full = await fetchTrade(led.buysClient, x.id, use);
+            const items = [];
+            for (const it of (full && Array.isArray(full.items) ? full.items : [])) {
+                if (!it || String(it.user_id) === String(self) || it.type !== 'Item' || !it.details) continue;
+                const id = String(it.details.id || '');
+                const qty = Number(it.details.amount) || 0;
+                const item = sell.index && sell.index.byId ? sell.index.byId.get(id) : null;
+                if (id && qty > 0) items.push({ id, name: (item && item.name) || it.details.name || 'Item ' + id, qty });
+            }
+            // Only a trade with a piece of your sets in it is Sets' business.
+            if (!items.some((it) => keptForSets(it.id, settings))) continue;
+            note = { ...tradeNote({ id: x.id, who: partner.name || (partner.id ? 'Player ' + partner.id : ''), whoId: partner.id || null, items }, tradeOffer(items, snapTradeCtx(setsEng.snap, settings))), at: now };
+            break;
+        }
+        setSetsNote(note, settings);
+    } catch (error) {
+        // Torn's word for the trades open now ("ongoing") was never seen answered: refused twice, it is not asked again this visit.
+        setsEng.tradesFails += 1;
+        if (setsEng.tradesFails >= 2) setsEng.tradesOff = true;
+        setsSay('trades-failed', 'Sets: your open trades could not be read', String((error && error.message) || error));
+    } finally {
+        setsEng.tradesBusy = false;
+    }
+}
+
+/** Every few seconds, the tab in view, Sets on: whatever read is due. */
+function stepSets() {
+    const settings = setsNow();
+    if (!settings.on || document.visibilityState !== 'visible' || !getSellKey() || sell.keyDead) return;
+    const now = Date.now();
+    const every = settings.readMin * 60000;
+    if (now - setsEng.pointsTriedAt >= every) readSetsPoints(now);
+    if (now - setsEng.moneyTriedAt >= every) readSetsMoney(now);
+    readSetsMarket(now, every);
+    if (now - setsEng.logAt >= SETS_LOG_MS) readSetsLog(now);
+    if (now - setsEng.tradesAt >= SETS_TRADES_MS) readSetsTrades(now);
+}
+
+/** Read now (the Sets page), or Sets just switched on: everything is due. */
+function setsReadNow() {
+    setsEng.pointsTriedAt = 0;
+    setsEng.moneyTriedAt = 0;
+    setsEng.moneyOff = false;
+    setsEng.moneyFails = 0;
+    setsEng.logAt = 0;
+    setsEng.tradesAt = 0;
+    for (const m of setsEng.market.values()) m.triedAt = 0;
+    // Each piece's bazaars are read again in their turn (bazaarsDue reads `kept` as due).
+    for (const id of setsPieceIds()) {
+        const b = sell.bazaars.get(id);
+        if (b && !b.loading) b.kept = true;
+    }
+    stepSets();
+    stepW3b();
+}
+
+/** A piece's listings for the snapshot: its bazaars as the flips see them (your own buys and gone listings off), and the Item Market. */
+function setsOffers(id, sellersOf, now, every) {
+    const out = [];
+    for (const r of sellersOf(id) || []) {
+        // A listing TornW3B has not seen for a while is most likely gone: not advice to act on.
+        if (r.stale) continue;
+        out.push({ price: r.price, qty: r.qty, src: 'bazaar', who: r.sellerName || null, whoId: r.sellerId ?? null });
+        if (out.length >= 80) break;
+    }
+    const m = setsEng.market.get(String(id));
+    if (m && m.at && now - m.at < every * 2) for (const l of m.listings) out.push({ price: l.price, qty: l.qty, src: 'market' });
+    return out;
+}
+
+/** The snapshot, for the Torn tabs: written when its numbers change, not more often than every few seconds. */
+function shareSetsSnap(snap, now) {
+    if (!snap) {
+        if (setsEng.snapSig) {
+            setsEng.snapSig = '';
+            gmSet(STORE_SETS_SNAP, null);
+        }
+        return;
+    }
+    // Start-up: nothing shared before your stock and the items' values are read (the last visit's stays).
+    if (!snapReady(snap)) return;
+    if (now - setsEng.snapSavedAt < SETS_SNAP_SAVE_MS) return;
+    const slim = snapForTabs(snap);
+    const sig = JSON.stringify({ ...slim, at: 0 });
+    // Unchanged: written again only now and then, so a Torn tab can tell Torn Bids is still open.
+    if (sig === setsEng.snapSig && now - setsEng.snapSavedAt < 60000) return;
+    setsEng.snapSig = sig;
+    setsEng.snapSavedAt = now;
+    gmSet(STORE_SETS_SNAP, slim);
+}
+
+/**
+ * The Sets page's view, worked out with the redraw's own lookups (what you hold, each item's sellers and buyers).
+ * @returns {{settings, snap, note, autoText}}
+ */
+function setsWork({ settings, heldQty, sellersOf, buyersOf, itemOf, prefs, now }) {
+    if (!settings.on) {
+        setsEng.snap = null;
+        shareSetsSnap(null, now);
+        return { settings, snap: null, note: null, autoText: '' };
+    }
+    return perfTimed('Torn Bids: the Sets page worked out', () => {
+        // Sets swapped since Torn's inventory was read are no longer held.
+        const off = pressedOff(setsPresses(now), sell.inventoryAt || 0);
+        const held = (id) => Math.max(0, (heldQty.get(String(id)) || 0) - (off.get(String(id)) || 0));
+        const mv = (id) => {
+            const item = itemOf(id);
+            return item ? Number(item.marketValue) || 0 : 0;
+        };
+        const bought = new Map();
+        if (getLedgerKey() && led.loaded) {
+            for (const r of ledgerData().rows) {
+                if (r.side !== 'buy' || !isSetItem(r.itemId)) continue;
+                const key = String(r.itemId);
+                if (!bought.has(key)) bought.set(key, []);
+                bought.get(key).push(r);
+            }
+        }
+        const every = settings.readMin * 60000;
+        const st = setsState();
+        if (!setsEng.listings && Array.isArray(st.listings)) {
+            // The last visit's read, until this one's is in.
+            setsEng.listings = st.listings;
+            setsEng.pointsAt = Number(st.listingsAt) || 0;
+        }
+        const ids = setsPieceIds(settings);
+        const readAts = ids.map((id) => {
+            const b = sell.bazaars.get(id);
+            return b && b.at ? b.at : 0;
+        });
+        const snap = setsSnapshot({
+            settings, held, mv,
+            lots: (id) => heldLots(bought.get(String(id)), held(id)),
+            offers: (id) => setsOffers(id, sellersOf, now, every),
+            topBid: (id) => {
+                const b = buyersOf(id)[0];
+                return b ? { price: b.price, name: b.name } : null;
+            },
+            setBuyer: (set) => bestSetBuyer(sell.db, set.w3bId),
+            cash: prefs.cash > 0 ? prefs.cash : null,
+            leastProfitPct: prefs.minProfitPct,
+            listings: setsEng.listings || [],
+            pointsAt: setsEng.pointsAt,
+            pointsError: setsEng.pointsError,
+            days: st.days || [],
+            gone: st.gone || [],
+            book: setsBook(),
+            money: setsEng.money,
+            moneyFailed: setsEng.moneyOff,
+            // "Prices read": every piece, at least this lately (0 until each has been read once).
+            pricesAt: readAts.length && readAts.every((t) => t > 0) ? Math.min(...readAts) : 0,
+            stockAt: sell.inventoryAt || 0,
+            reading: setsEng.pointsBusy || ids.some((id) => (sell.bazaars.get(id) || {}).loading),
+            now,
+        });
+        setsEng.snap = snap;
+        // What a point costs, kept for a museum exchange read from the log after its pieces are gone.
+        const last = { ...(st.lastCost || {}) };
+        let moved = false;
+        for (const s of snap.sets) {
+            const each = s.full > 0 ? Math.round(s.cost.perSet / s.points) : 0;
+            if (each > 0 && last[s.key] !== each) {
+                last[s.key] = each;
+                moved = true;
+            }
+        }
+        if (moved) saveSetsState({ lastCost: last });
+        shareSetsSnap(snap, now);
+        return {
+            settings, snap,
+            note: settings.noteBids ? setsEng.note : null,
+            autoText: snap.sets.map((s) => Number(s.auto).toLocaleString('en-US') + ' ' + s.key).join(' · '),
+        };
+    });
+}
+
 function bootSellingPage() {
     sell.client = new TornApiClient({
         getKey: getSellKey,
@@ -9278,6 +9825,30 @@ function bootSellingPage() {
             sell.allShown += ALL_ITEMS_PAGE;
             renderSelling(true);
         },
+        // Sets (3.24.0): its settings, Read now, Copy (your press puts text on the clipboard; nothing is sent), and the note.
+        onSetsChange: (partial) => {
+            const before = setsNow();
+            gmSet(STORE_SETS, { ...before, ...partial });
+            const after = setsNow();
+            if (after.on !== before.on) logAction('Sets and points switched ' + (after.on ? 'on' : 'off'));
+            if (after.on && !before.on) setsReadNow();
+            if (!after.on && setsEng.note) setSetsNote(null, after);
+            renderSellingNow();
+        },
+        onSetsRead: () => {
+            logAction('Read now (Sets)');
+            setsReadNow();
+            renderSelling(true);
+        },
+        onCopy: (text) => gmCopy(text),
+        setsMuseumUrl: (hash) => MUSEUM_URL + (hash ? '#' + hash : ''),
+        setsPointsUrl: () => POINTS_MARKET_URL,
+        onSetsNoteOpen: (note) => openSellLink(tradeViewUrl(note.id)),
+        onSetsNoteDismiss: (note) => {
+            saveSetsState({ dismissed: [...(setsState().dismissed || []), String(note.id)].slice(-50) });
+            setSetsNote(null);
+            renderSellingNow();
+        },
         onOpenUrl: openSellLink,
         getUsage: usageNow,
         getExtras: exportExtras,
@@ -9306,6 +9877,10 @@ function bootSellingPage() {
         renderSellingNow();
     });
     gmOnChange(STORE_SELL_PINNED, () => renderSellingNow());
+    // Sets: a setting changed in another tab, a press of EXCHANGE on the museum, a line in the points book.
+    gmOnChange(STORE_SETS, () => renderSellingNow());
+    gmOnChange(STORE_SETS_PRESS, () => renderSellingNow());
+    gmOnChange(STORE_SETS_BOOK, () => renderSelling());
     // A bazaar page showed a listing is not there: the plans leave it out.
     gmOnChange(STORE_SELL_GONE, () => renderSelling());
     // ...or showed fewer of it after you bought (3.16.4): the plans count on what is left.
@@ -9354,6 +9929,7 @@ function bootSellingPage() {
     })();
 
     setInterval(stepW3b, W3B_LIST_STEP_MS);
+    setInterval(stepSets, SETS_STEP_MS);
     setInterval(stepTeOne, TE_ONE_STEP_MS);
     setInterval(stepTeOwn, TE_ONE_STEP_MS);
     setInterval(stepTeScan, TE_ONE_STEP_MS);
@@ -10145,6 +10721,444 @@ function bootW3bHarvest() {
  * Boot
  * ------------------------------------------------------------------ */
 
+/* ------------------------------------------------------------------
+ * Sets on Torn's own pages (3.24.0, mockups Z6-Z10).
+ *
+ * A Torn tab works nothing out: it reads the snapshot Torn Bids stored
+ * (core/sets-desk.js) and says what the page in front of you means for
+ * your sets - in one box of the panel, and in small marks that take no
+ * room (sources/dom/sets-pages.js). No request is made from here.
+ *
+ *   the museum          held / need on each piece; Fill types your full
+ *                       sets into Torn's box - you press EXCHANGE
+ *   the points market   the price and the lot; Fill types both - you
+ *                       press ADD LISTING
+ *   a trade             your price on each of their plushies and flowers,
+ *                       the total for what you need, a message to copy
+ *   someone's bazaar    need and worth on each piece, before you buy
+ *   your forum thread   whether its title still says what Torn Bids says
+ *
+ * Fill is a button in the panel (your press types into Torn's boxes and
+ * sends nothing). The museum's, the points market's and the forum's
+ * markup was never seen when this was written, so nothing is floated
+ * beside their controls: a button there could sit on Torn's own.
+ * ------------------------------------------------------------------ */
+
+/* Your buying thread on Torn's forum, once seen with the title Torn Bids wrote: its id. */
+const STORE_SETS_THREAD = 'setsThread';
+/* A snapshot older than this says so: Torn Bids is closed, or in a tab put away. */
+const SETS_SNAP_OLD_MS = 15 * 60 * 1000;
+const SETS_DONE_MS = 4000;
+
+const setsTab = { settings: null, snap: null, note: null, cards: [], exchanges: [], listing: null, trade: null, marked: false, bound: false, done: '', doneAt: 0, pressAt: 0 };
+
+function loadSetsTab() {
+    setsTab.settings = setsNow();
+    const snap = setsTab.settings.on ? gmGet(STORE_SETS_SNAP, null) : null;
+    setsTab.snap = snap && Array.isArray(snap.sets) && snap.points && snapReady(snap) ? snap : null;
+    const note = setsTab.settings.on && setsTab.settings.notePanel ? gmGet(STORE_SETS_NOTE, null) : null;
+    setsTab.note = note && note.id ? note : null;
+}
+
+/** Is this item kept for sets (Sets on)? Then Fill leaves it alone on your bazaar's pages and the Item Market's. */
+function setsKeptHere(itemId) {
+    if (!setsTab.settings) loadSetsTab();
+    return setsTab.settings.on && keptForSets(itemId, setsTab.settings);
+}
+
+const setsSigned = (n) => (n >= 0 ? '+' : '−') + formatMoney(Math.abs(Math.round(n)));
+const setsCount = (n) => Number(n || 0).toLocaleString('en-US');
+
+/** A set of the snapshot, less what you swapped at the museum since it was worked out. */
+function setsLessPressed(set, snapAt, now) {
+    const off = setsPresses(now).filter((p) => p.set === set.key && p.t > snapAt).reduce((a, p) => a + (Number(p.sets) || 0), 0);
+    if (!off) return set;
+    const pieces = set.pieces.map((p) => {
+        const held = Math.max(0, p.held - off);
+        const need = Math.max(0, set.target - held);
+        const ahead = Math.max(0, held - set.target);
+        return { ...p, held, need, ahead, state: need ? 'need' : ahead ? 'ahead' : 'ok' };
+    });
+    return { ...set, full: Math.max(0, set.full - off), pieces };
+}
+
+function setsPieceWords(p) {
+    return p.state === 'need' ? setsCount(p.held) + ' · need ' + setsCount(p.need) : p.state === 'ahead' ? setsCount(p.held) + ' · ' + setsCount(p.ahead) + ' ahead' : setsCount(p.held) + ' ✓';
+}
+
+function setsDone(key) {
+    return setsTab.done === key && Date.now() - setsTab.doneAt < SETS_DONE_MS;
+}
+
+/* ---- the museum (Z6) ---- */
+
+function setsOnMuseum(snap, settings, now) {
+    const found = museumExchanges(document, SETS, location.hash);
+    setsTab.exchanges = found;
+    const shown = found.map((f) => f.set);
+    const sets = snap.sets.filter((s) => !shown.length || shown.includes(s.key)).map((s) => setsLessPressed(s, snap.at, now));
+    const lines = [];
+    const buttons = [];
+    for (const s of sets) {
+        const ex = found.find((f) => f.set === s.key) || null;
+        for (const t of pieceTiles(ex && ex.root ? ex.root : document, s.pieces)) {
+            const p = s.pieces.find((x) => String(x.id) === String(t.id));
+            setMark(t.el, setsPieceWords(p), p.top ? 'top' : p.state === 'need' ? '' : p.state);
+        }
+        const first = lines.length === 0;
+        lines.push({ text: s.name + ': full sets you hold', right: setsCount(s.full), cls: first ? '' : 'sep' });
+        if (s.full) {
+            lines.push({ text: 'Points they make', right: setsCount(s.full * s.points) });
+            lines.push({ text: 'They cost you' + (s.cost.known ? '' : ' (part at market value: no buy on record)'), right: formatMoney(s.cost.perSet) + ' a set' });
+            if (snap.points.price) {
+                const gain = s.full * s.value - s.full * s.cost.perSet;
+                lines.push({ text: 'At today’s points price, ' + formatMoney(snap.points.price), right: setsSigned(gain), cls: gain >= 0 ? 'ok' : 'bad' });
+            }
+        }
+        const short = s.pieces.filter((p) => p.need > 0).sort((a, b) => a.held - b.held)[0];
+        if (short) lines.push({ text: short.name + ' holds your next sets back', right: 'need ' + setsCount(short.need), cls: 'need' });
+        if (s.full && settings.fillMuseum) {
+            const key = 'fill-museum:' + s.key;
+            if (ex && ex.box) {
+                if (setsDone(key)) lines.push({ text: 'Typed ' + setsCount(s.full) + ' into Torn’s box. Press EXCHANGE yourself.', cls: 'ok' });
+                buttons.push({ key, label: 'Fill ' + setsCount(s.full) + (sets.length > 1 ? ' ' + s.key : ''), primary: true, title: 'Types ' + s.full + ' into Torn’s box. You press EXCHANGE.' });
+            } else if (ex) {
+                lines.push({ text: 'Torn Bids did not find a number box beside EXCHANGE: one press there swaps what Torn says.', cls: 'muted' });
+            }
+        }
+    }
+    if (snap.points.cheap && sets.some((s) => s.full)) lines.push({ text: 'Points are cheap today: swap if you like, and let the points wait in your points book.', cls: 'warn sep' });
+    return { title: sets.length === 1 ? 'Museum · ' + sets[0].name : 'Museum · your sets', lines, buttons };
+}
+
+/** A press of Torn's EXCHANGE, by you: written in the points book with what the sets cost. Nothing is pressed for you. */
+function bindSetsExchange() {
+    if (setsTab.bound) return;
+    setsTab.bound = true;
+    document.addEventListener('click', (event) => {
+        if (!event.isTrusted || !setsTab.snap || !isMuseumPage(location.href)) return;
+        const ex = setsTab.exchanges.find((x) => x.button && x.button.isConnected && (x.button === event.target || x.button.contains(event.target)));
+        if (!ex) return;
+        const now = Date.now();
+        const set = setsTab.snap.sets.map((s) => setsLessPressed(s, setsTab.snap.at, now)).find((s) => s.key === ex.set);
+        if (!set) return;
+        const typed = ex.box ? Number(String(ex.box.value).replace(/[^\d]/g, '')) : 1;
+        // Nothing typed, or more than you hold: Torn refuses it, and nothing is written.
+        if (!(typed >= 1) || typed > set.full) return;
+        // One press, written once.
+        if (now - setsTab.pressAt < 3000) return;
+        setsTab.pressAt = now;
+        const each = Math.round(set.cost.perSet / set.points);
+        gmSet(STORE_SETS_PRESS, [...setsPresses(now), { t: now, set: set.key, sets: typed }].slice(-40));
+        gmSet(STORE_SETS_BOOK, bookAdd(setsBook(), { id: 'page:' + now, t: now, kind: 'made', points: typed * set.points, each, set: set.key, src: 'page' }).slice(-600));
+        logAction('EXCHANGE pressed on the museum: ' + typed + ' ' + set.key + ' sets');
+    }, true);
+    // A number typed into a bazaar card's box: its mark says at once when it is more than you need.
+    document.addEventListener('input', () => {
+        if (app.pageType === PAGE_BAZAAR && setsTab.snap && setsTab.marked) scanSetsPage();
+    }, true);
+}
+
+/* ---- the points market (Z7) ---- */
+
+function setsOnPoints(snap, settings) {
+    const listing = pointsListing(document);
+    setsTab.listing = listing;
+    const p = snap.points;
+    const sell = snap.sell;
+    const lines = [];
+    const buttons = [];
+    if (!p.price) return { title: 'Points market', lines: [{ text: 'The points price is not read yet. Torn Bids reads it: open it, on its Sets page.', cls: 'muted' }] };
+    lines.push({ text: 'Price to type · $1 under the ' + (p.rule === 'wall' ? 'first wall' : 'lowest'), right: formatMoney(p.price) });
+    lines.push({ text: 'Listed cheaper than that', right: setsCount(p.ahead) + ' points' });
+    const loss = sell.points > 0 && p.price < sell.least;
+    if (sell.points) {
+        const lot = sell.lot;
+        lines.push({ text: 'Points made from your sets, to sell', right: setsCount(sell.points), cls: 'sep' });
+        lines.push({ text: 'Least price, from your points book', right: formatMoney(sell.least) });
+        if (loss) lines.push({ text: 'Today’s price is under what these points cost you: a loss. Wait.', cls: 'bad' });
+        else {
+            lines.push({ text: 'Profit on these ' + setsCount(sell.points), right: setsSigned(sell.profit), cls: 'ok' });
+            lines.push({ text: 'Lot', right: lot.split ? setsCount(lot.lots.length) + ' lots of ' + setsCount(lot.size) : 'all ' + setsCount(sell.points) + ' in one' });
+            lines.push({ text: lot.seen ? 'Lots of ' + setsCount(lot.seen.lo) + ' to ' + setsCount(lot.seen.hi) + ' left the market near this price today.' : 'One lot unless small lots are what is selling; none seen leaving near this price yet.', cls: 'muted' });
+            lines.push({ text: 'If it sells, ' + formatMoney(sell.lands) + ' lands on hand, where it can be mugged: put it in the vault.', cls: 'warn' });
+        }
+    } else {
+        lines.push({ text: 'No points from your sets are waiting to be sold.' + (p.held ? ' Your ' + setsCount(p.held) + ' points were yours before: never offered.' : ''), cls: 'muted sep' });
+    }
+    if (p.cheap && p.level && p.level.lo) lines.push({ text: 'Hold: points are cheap today (the last month: ' + formatMoney(p.level.lo) + ' to ' + formatMoney(p.level.hi) + '). Selling is still your choice.', cls: 'warn sep' });
+    if (sell.points && !loss && settings.fillPoints) {
+        if (listing) {
+            const size = sell.lot.split ? sell.lot.size : sell.points;
+            if (setsDone('fill-points')) lines.push({ text: 'Typed ' + setsCount(size) + ' points at ' + formatMoney(p.price) + '. Press ADD LISTING yourself.', cls: 'ok' });
+            buttons.push({ key: 'fill-points', label: 'Fill ' + setsCount(size) + ' at ' + formatMoney(p.price), primary: true, title: 'Types the lot and the price into Torn’s boxes. You press ADD LISTING.' });
+        } else {
+            lines.push({ text: 'Torn Bids did not find Torn’s Points and Price boxes on this page: type them yourself.', cls: 'muted' });
+        }
+    }
+    return { title: 'Points market', tone: p.cheap || loss ? 'warn' : '', lines, buttons };
+}
+
+/* ---- a trade (Z8) ---- */
+
+function setsOnTrade(snap, settings) {
+    const rows = tradeTheirRows(document);
+    const byName = new Map(SETS.flatMap((s) => s.pieces.map((p) => [p.name.toLowerCase(), p.id])));
+    const items = rows.map((r) => ({ id: byName.get(r.name.toLowerCase()) ?? null, name: r.name, qty: r.qty }));
+    if (!items.some((it) => it.id !== null && keptForSets(it.id, settings))) {
+        setsTab.trade = null;
+        return null;
+    }
+    const offer = tradeOffer(items, snapTradeCtx(snap, settings));
+    setsTab.trade = { offer, open: snap.open };
+    const lines = [];
+    offer.rows.forEach((r, i) => {
+        const el = rows[i] && rows[i].el;
+        if (r.state === 'other' || !r.each) {
+            if (el) setMark(el, '');
+            return;
+        }
+        const word = r.state === 'need' ? (r.qty > r.need ? 'need ' + setsCount(r.need) + ' of these' : 'need ' + setsCount(r.need)) : r.state === 'ahead' ? setsCount(r.ahead) + ' ahead already' : 'enough for now';
+        if (el) setMark(el, formatMoney(r.each) + ' each · ' + word, r.state === 'need' ? (r.top ? 'top' : '') : 'ok', 'right');
+        lines.push({ text: setsCount(r.qty) + ' ' + r.name + ' · ' + formatMoney(r.each) + ' each · ' + word, right: formatMoney(r.total), cls: r.state === 'need' ? 'need' : 'muted' });
+    });
+    const others = offer.rows.filter((r) => r.state === 'other').length;
+    if (others) lines.push({ text: others + (others === 1 ? ' other kind of item: not a plushie or flower, no price.' : ' other kinds of items: not plushies or flowers, no price.'), cls: 'muted' });
+    lines.push({ text: 'For what you need (' + setsCount(offer.need.items) + ' items)', right: formatMoney(offer.need.total), cls: 'sep ok' });
+    if (offer.all.total !== offer.need.total) lines.push({ text: 'For every piece (' + setsCount(offer.all.items) + ' items)', right: formatMoney(offer.all.total) });
+    if (!snap.open) lines.push({ text: 'Your shop is Closed: the message says so first.', cls: 'warn' });
+    const m = snap.money || {};
+    if (m.onHand !== null && m.onHand !== undefined) {
+        lines.push({ text: 'On hand ' + formatMoney(m.onHand) + (m.vault !== null && m.vault !== undefined ? ' · vault ' + formatMoney(m.vault) : ''), cls: 'muted sep' });
+        if (m.onHand < offer.need.total) lines.push({ text: 'Take ' + formatMoney(offer.need.total - m.onHand) + ' out of the vault before you accept.', cls: 'warn' });
+    }
+    lines.push({ text: tradeMessage(offer, { open: snap.open }), cls: 'msg' });
+    const buttons = [{ key: 'copy-need', label: setsDone('copy-need') ? 'Copied ✓' : 'Copy the message', primary: true, title: 'Puts the message on your clipboard. You paste and send it.' }];
+    if (offer.all.total !== offer.need.total) buttons.push({ key: 'copy-all', label: setsDone('copy-all') ? 'Copied ✓' : 'Copy for every piece', title: 'The same, with every piece priced.' });
+    return { title: 'Their items · you buy at ' + snap.pct + '%', tone: snap.open ? '' : 'warn', lines, buttons };
+}
+
+/* ---- someone's bazaar (Z9) ---- */
+
+function setsCardTyped(card) {
+    const box = card.querySelector('input:not([type="hidden"]):not([type="checkbox"])');
+    return box ? Number(String(box.value).replace(/[^\d]/g, '')) || 0 : 0;
+}
+
+function setsOnBazaar(snap) {
+    const cards = setsTab.cards.filter((c) => c && c.el && c.el.isConnected);
+    let any = false;
+    for (const c of cards) {
+        const hit = snapPiece(snap, c.itemId);
+        if (!hit) {
+            setMark(c.el, '');
+            continue;
+        }
+        any = true;
+        const p = hit.piece;
+        const price = c.listingPrice;
+        const typed = setsCardTyped(c.el);
+        let text;
+        let state;
+        if (p.state !== 'need') {
+            text = p.state === 'ahead' ? setsCount(p.ahead) + ' ahead already' : 'enough for now';
+            state = typed > 0 ? 'over' : 'ok';
+        } else if (typed > p.need) {
+            text = 'typing ' + setsCount(typed) + ' · you need ' + setsCount(p.need);
+            state = 'over';
+        } else if (p.worth && price > 0 && price < p.worth) {
+            text = 'need ' + setsCount(p.need) + ' · worth ' + formatMoney(p.worth);
+            state = p.top ? 'top' : '';
+        } else if (p.worth) {
+            text = 'need ' + setsCount(p.need) + ' · over its worth, ' + formatMoney(p.worth);
+            state = 'over';
+        } else {
+            text = 'need ' + setsCount(p.need);
+            state = '';
+        }
+        setMark(c.el, text, state);
+    }
+    if (!any) return null;
+    const r = bazaarForSets(snap, cards.map((c) => ({ itemId: c.itemId, price: c.listingPrice, stock: c.qty })));
+    const lines = [];
+    if (!r.count) {
+        lines.push({ text: snap.points.price ? 'Nothing here is under its worth for the pieces you need.' : 'The points price is not read yet, so no piece has a worth: open Torn Bids.', cls: 'muted' });
+        return { title: 'This bazaar · your sets', lines };
+    }
+    for (const row of r.rows) lines.push({ text: row.name + ' · ' + setsCount(row.take) + (row.all ? ' (all here)' : ' of them') + ' at ' + formatMoney(row.price), right: setsSigned(row.gain), cls: 'need' });
+    lines.push({ text: setsCount(r.count) + ' pieces under their worth cost', right: formatMoney(r.cost), cls: 'sep' });
+    lines.push({ text: 'Under their worth by', right: setsSigned(r.gain), cls: 'ok' });
+    for (const s of snap.sets) if (r.fullAfter[s.key] > s.full) lines.push({ text: 'Full ' + s.key + ' sets after buying', right: setsCount(s.full) + ' → ' + setsCount(r.fullAfter[s.key]) });
+    return { title: 'This bazaar · your sets', lines };
+}
+
+/* ---- your forum thread (Z10) ---- */
+
+function setsOnForum(snap) {
+    const th = forumThread(document, location.href);
+    const exact = th.titles.find((t) => t.text === snap.forum.title) || null;
+    const mine = gmGet(STORE_SETS_THREAD, null);
+    // A thread with the very title Torn Bids wrote is yours: remembered, so it is still known once the title is out of date.
+    if (exact && th.id && String(mine) !== th.id) gmSet(STORE_SETS_THREAD, th.id);
+    if (!exact && !(th.id && String(mine) === th.id)) return null;
+    const title = exact || th.titles.find((t) => isBuyingTitle(t.text)) || null;
+    if (!title) return null;
+    const check = threadCheck(title.text, { open: snap.open, pct: snap.pct });
+    const ok = check.state === 'match';
+    // At the right end of the title's own row: nothing of Torn's under it is covered.
+    setMark(title.el, ok ? 'matches Torn Bids ✓' : 'does not match Torn Bids', ok ? 'good' : 'over', 'right');
+    if (ok) return { title: 'Your buying thread', lines: [{ text: 'Its title says what Torn Bids says: ' + (snap.open ? 'Open at ' + snap.pct + '%.' : 'Closed.'), cls: 'ok' }] };
+    const why = check.state === 'open' ? 'It says CLOSED; Torn Bids is Open at ' + snap.pct + '%.'
+        : check.state === 'closed' ? 'It says OPEN; Torn Bids is Closed.'
+        : 'It says ' + check.says.pct + '%; Torn Bids buys at ' + snap.pct + '%.';
+    return {
+        title: 'Your buying thread',
+        tone: 'warn',
+        lines: [
+            { text: why, cls: 'warn' },
+            { text: snap.forum.title, cls: 'msg' },
+            { text: 'Edit the thread on Torn and paste. Nothing is posted for you.', cls: 'muted' },
+        ],
+        buttons: [
+            { key: 'copy-title', label: setsDone('copy-title') ? 'Copied ✓' : 'Copy the title', primary: true },
+            { key: 'copy-post', label: setsDone('copy-post') ? 'Copied ✓' : 'Copy the post' },
+        ],
+    };
+}
+
+/** The page in front of you, for your sets: its marks and the panel's box. Runs with the page's own tick. */
+function scanSetsPage() {
+    if (!app.panel || !app.panel.setSets) return;
+    if (!setsTab.settings) loadSetsTab();
+    const settings = setsTab.settings;
+    const snap = setsTab.snap;
+    const href = location.href;
+    const now = Date.now();
+    const where = !settings.on ? ''
+        : isMuseumPage(href) ? 'museum'
+        : isPointsMarketPage(href) ? 'points'
+        : isTradePage(href) ? 'trade'
+        : isForumPage(href) ? 'forum'
+        : app.pageType === PAGE_BAZAAR && !ownBazaarPage(href) ? 'bazaar'
+        : '';
+    let view = null;
+    if (where && snap) {
+        if (where === 'museum') view = setsOnMuseum(snap, settings, now);
+        else if (where === 'points') view = setsOnPoints(snap, settings);
+        else if (where === 'trade') view = setsOnTrade(snap, settings);
+        else if (where === 'forum') view = setsOnForum(snap);
+        else view = setsOnBazaar(snap);
+        setsTab.marked = true;
+        if (view && now - snap.at > SETS_SNAP_OLD_MS) view.lines.push({ text: 'Worked out ' + formatAge(now - snap.at) + ': open Torn Bids for the numbers of now.', cls: 'warn sep' });
+    } else {
+        if (setsTab.marked) {
+            clearSetMarks(document);
+            setsTab.marked = false;
+        }
+        // On, on one of its pages, and Torn Bids has not worked anything out yet.
+        if (where === 'museum' || where === 'points') view = { title: 'Sets', lines: [{ text: 'Open Torn Bids once: your sets are worked out there, and shown here.', cls: 'muted' }] };
+    }
+    const note = setsTab.note && now - (Number(setsTab.note.at) || 0) < SETS_NOTE_LIVE_MS && where !== 'trade' ? setsTab.note : null;
+    app.panel.setSets(view, note ? { id: note.id, title: note.title, text: note.text } : null);
+}
+
+/** A button of the panel's Sets box: Fill types into Torn's boxes, Copy copies, the note opens one page. */
+function onSetsPanel(key, arg) {
+    const snap = setsTab.snap;
+    const done = (k) => {
+        setsTab.done = k;
+        setsTab.doneAt = Date.now();
+        setTimeout(scanSetsPage, SETS_DONE_MS + 50);
+    };
+    if (key === 'note-open' && arg) {
+        location.assign(tradeViewUrl(arg.id));
+        return;
+    }
+    if (key === 'note-no' && arg) {
+        saveSetsState({ dismissed: [...(setsState().dismissed || []), String(arg.id)].slice(-50) });
+        gmSet(STORE_SETS_NOTE, null);
+        setsTab.note = null;
+    } else if (!snap) {
+        return;
+    } else if (key.startsWith('fill-museum:')) {
+        const ex = setsTab.exchanges.find((x) => x.set === key.slice(12) && x.box && x.box.isConnected);
+        const set = snap.sets.map((s) => setsLessPressed(s, snap.at, Date.now())).find((s) => s.key === key.slice(12));
+        if (!ex || !set || !set.full) return;
+        writeInputs(boxTwins(ex.box), String(set.full));
+        logAction('Fill on the museum: ' + set.full + ' ' + set.key + ' sets');
+        done(key);
+    } else if (key === 'fill-points') {
+        const l = setsTab.listing;
+        const sell = snap.sell;
+        if (!l || !l.amount.isConnected || !l.price.isConnected || !sell.points || !snap.points.price || snap.points.price < sell.least) return;
+        const size = sell.lot.split ? sell.lot.size : sell.points;
+        writeInputs(boxTwins(l.amount), String(size));
+        writeInputs(boxTwins(l.price), String(snap.points.price));
+        logAction('Fill on the points market: ' + size + ' points');
+        done(key);
+    } else if (key === 'copy-need' || key === 'copy-all') {
+        if (!setsTab.trade) return;
+        if (gmCopy(tradeMessage(setsTab.trade.offer, { open: snap.open, everything: key === 'copy-all' }))) done(key);
+    } else if (key === 'copy-title' || key === 'copy-post') {
+        if (gmCopy(key === 'copy-title' ? snap.forum.title : snap.forum.post)) done(key);
+    }
+    scanSetsPage();
+}
+
+/** Why a price box on your bazaar's add page is red or amber, said beside it (it was only in the box's hover text). */
+function paintToneTag(input, tone, text) {
+    const host = input.closest('.price') || input.parentElement;
+    if (!host) return;
+    let tag = host.querySelector(':scope > .ttv2-tonetag');
+    if (!tone || !text) {
+        if (tag) tag.remove();
+        return;
+    }
+    if (!tag) {
+        tag = document.createElement('span');
+        tag.className = 'ttv2-float ttv2-tonetag';
+        host.appendChild(tag);
+        holdMarks(host);
+    }
+    if (tag.dataset.tone !== tone) tag.dataset.tone = tone;
+    if (tag.textContent !== text) tag.textContent = text;
+}
+
+/** "kept for sets" where Fill's tick would be, on a row of a piece Sets keeps. */
+function paintKeptNote(row, tag, on) {
+    let note = row.el.querySelector('.ttv2-keptnote');
+    if (!on) {
+        if (note) {
+            const cell = note.parentNode;
+            const held = note.classList.contains(BZ_FILL_CELL_CLASS);
+            note.remove();
+            if (held && cell && cell.classList && cell.classList.contains(BZ_CELL_CLASS)) releaseBazaarCell(cell);
+        }
+        return;
+    }
+    if (note) {
+        // Torn may have drawn the cell again: it keeps the note's place.
+        if (note.classList.contains(BZ_FILL_CELL_CLASS) && note.parentNode && note.parentNode.classList && !note.parentNode.classList.contains(BZ_CELL_CLASS)) note.parentNode.classList.add(BZ_CELL_CLASS);
+        return;
+    }
+    note = document.createElement('span');
+    note.textContent = 'kept for sets';
+    note.title = 'Sets is on: this piece is kept for the museum, so Fill leaves its price alone.';
+    if (tag && tag.classList.contains('ttv2-bzchips') && tag.parentNode) {
+        // Your bazaar's add page: where the Fill tick sits in the other rows, the chips just before it.
+        note.className = 'ttv2-keptnote ' + BZ_FILL_CELL_CLASS;
+        tag.parentNode.appendChild(note);
+        tag.parentNode.classList.add(BZ_CELL_CLASS);
+    } else if (tag && tag.parentNode) {
+        note.className = 'ttv2-float ttv2-keptnote';
+        tag.parentNode.insertBefore(note, tag.nextSibling);
+        placeFloat(note);
+    } else {
+        note.className = 'ttv2-keptnote';
+        rowFloat(row.el, document).appendChild(note);
+    }
+}
+
 export function boot() {
     // On TornW3B: only note the traders its pages link to.
     if (location.hostname === 'weav3r.dev') {
@@ -10210,6 +11224,8 @@ export function boot() {
         onForgetKey,
         onClearCache,
         onViewChange,
+        // Sets (3.24.0): Fill, Copy and the note's two buttons in the panel's Sets box.
+        onSets: onSetsPanel,
         /*
          * The key is put into the field only when the user asks to see it.
          * A value sitting in an <input> on torn.com is readable by every
@@ -10304,6 +11320,22 @@ export function boot() {
 
         rescan('timer');
     }, POLL_INTERVAL_MS);
+
+    // Sets (3.24.0): what Torn Bids worked out, shown on this page; followed as it changes.
+    loadSetsTab();
+    const setsChanged = () => {
+        const was = setsTab.settings && setsTab.settings.on;
+        loadSetsTab();
+        scanSetsPage();
+        // Switched on or off: Fill's ticks on your bazaar's pages follow.
+        if (was !== setsTab.settings.on && app.ownBazaar) rescan('sets');
+    };
+    for (const key of [STORE_SETS, STORE_SETS_SNAP, STORE_SETS_NOTE, STORE_SETS_PRESS]) gmOnChange(key, setsChanged);
+    bindSetsExchange();
+    setInterval(() => {
+        if (document.visibilityState === 'visible') scanSetsPage();
+    }, POLL_INTERVAL_MS);
+    scanSetsPage();
 
     startPageWatch();
     startLiveFeed();

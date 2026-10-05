@@ -9,7 +9,7 @@
  *
  *   /v2/key/info          - to check the key is Full, and whose it is
  *   /v2/user/log          - bazaar and Item Market buys and sells
- *   /v2/user/trades       - your finished trades
+ *   /v2/user/trades       - your finished trades, and (3.24.0, Sets) the ones open now
  *   /v2/user/{id}/trade   - one trade's items and money
  *
  * It shares the one request window (70 a minute across every tab) with the
@@ -110,6 +110,15 @@ export async function fetchTradesPage(client, { from = null, use = undefined } =
     const params = { cat: 'finished', limit: 100, sort: 'ASC' };
     if (from) params.from = from;
     const data = await client.get('v2/user/trades', params, use);
+    return Array.isArray(data && data.trades) ? data.trades : [];
+}
+
+/**
+ * Your trades that are open now (3.24.0, Sets: the note when a trade is opened with you), newest first.
+ * The same path and parameters as the finished ones; Torn's word for the category is "ongoing".
+ */
+export async function fetchTradesOpen(client, { use = undefined } = {}) {
+    const data = await client.get('v2/user/trades', { cat: 'ongoing', limit: 20, sort: 'DESC' }, use);
     return Array.isArray(data && data.trades) ? data.trades : [];
 }
 

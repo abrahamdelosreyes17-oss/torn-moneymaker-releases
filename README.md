@@ -1872,6 +1872,160 @@ The bench has a seventh scene, "Torn Bids, 400 items read in turn"
 
 ---
 
+### Sets and points: a page of its own, and Torn's pages marked for it (3.24.0)
+
+The owner, 2026-10-05: plushies and flowers are bought to swap for points at
+the museum, and "everytime we can buy something in bazaar thats profitable for
+our set lets go ... even if its higher than market price its fine, as long as
+its still profitable within our margins". He asked for it apart from To sell
+("i think it will be confusing"), with a switch ("enable if you want the
+points/plushie feature or not"), as "its own page" like the Ledger, and for an
+open/closed for the forum thread. Drawn first (mockups Z1 to Z10), then built
+whole and released once. The To sell fix at the end ships with it.
+
+**Off until you switch it on** (Settings › Sets and points). Off, Torn Bids
+and the overlay are 3.23.0: no Sets button, no read, no mark. PawnHub was read
+for ideas only; nothing is pulled from it. Outside data is still TornW3B and
+TornExchange.
+
+**1. The Sets page** (`SetsView`, src/ui/sets-view.js; the numbers:
+`setsSnapshot`, src/core/sets-desk.js, from src/core/sets.js and
+src/core/points.js - pure, tested). A button beside Ledger, a page of its own
+with four tabs:
+
+- **Stock:** full sets now, the points they make, what they cost you (the
+  Ledger's newest buys up to what you hold, `heldLots`; market value where no
+  buy is on record, and it says so), each piece as a tile ("12 · need 28",
+  "40 ✓", "46 · 6 ahead"), and the piece that holds your next sets back with
+  its cheapest bazaar.
+- **Buy:** every listing under a piece's worth to you, cheapest first, across
+  bazaars (TornW3B) and the Item Market, until you have enough of that piece.
+  A piece's worth is its share of a set at the points price less your least
+  profit (`pieceWorths`, by market value). Stale bazaar listings are left out.
+- **My prices:** "I buy at N% of market value" (`ratePrice`, `rateSet`): what
+  a set costs you at that rate, what it swaps for, how far you could go, and
+  one press to set a rate that pays. Open / Closed for your shop, and the
+  forum thread's title and post written for you to copy (`forumText`). How
+  much of your money is in pieces and points, against a limit you set
+  (`moneyShare`).
+- **Points:** the points book (`bookState`): points made from sets carry
+  their cost; points sold and used come off the oldest made first; points you
+  held before are never offered. The price to type (`listPrice`: $1 under the
+  first wall of the points market, or under the lowest), and how many points
+  are ahead of yours.
+
+How many sets to build: a number, or as many as your cash buys
+(`autoTarget`). Never a dollar cut-off written in the code.
+
+**2. A piece kept for sets is not for sale** (`keptForSets`). While Sets is
+on, a plushie or flower of a chosen set is not offered to your traders, is not
+a To sell leftover, gets no sell or list badge, and on your bazaar's add page
+has "kept for sets" where the Fill tick sits in other rows.
+
+**3. What is read, and when.** Only in a visible Torn Bids tab, only with Sets
+on, all through the one shared queue:
+
+- The points market and your money and points (Limited key, `t.sets`): every
+  5, 10 or 30 minutes as you choose, and on Read now.
+- Each piece's bazaars (TornW3B, `w.sets`): in turn, in the sweep's own slots
+  (`nextW3bJob`) - no request beyond the 60 a minute already allowed.
+- The Item Market for a piece you need: one every five seconds at most.
+- Your log for museum exchanges, points sold and points used (Full key,
+  `t.setslog`, every five minutes). Which log types those are is read from
+  Torn's own list by their titles (`pointsLogTypes`); no id is written in the
+  code. A row that cannot be read is named in the problem log, never guessed.
+  Not read before a row can be priced (your stock and the points price are
+  in): a row booked without them would stay as free, or as a loss.
+- The trades open with you, once a minute (`fetchTradesOpen`), and up to
+  three of them read.
+
+A read that fails says so once in the problem log and, where Torn refuses it,
+is not asked again that visit ("could not be read" on the page, not "not read
+yet"). The settings' key tables name the new reads.
+
+**4. On Torn's pages** (src/sources/dom/sets-pages.js; main.js
+`scanSetsPage`). Torn Bids works everything out and stores one small snapshot
+(`snapForTabs`, never before your stock and the items' values are read:
+`snapReady`); Torn tabs only read it. Every mark floats and takes no room. A
+box in the panel says the rest:
+
+- **The museum:** a mark on each piece's tile, and in the panel how many sets
+  you hold, what they make and leave you. **Fill N** types the number of full
+  sets into Torn's box; you press EXCHANGE. Your press is written in the
+  points book at once, and Torn's log confirms it.
+- **The points market:** what to list and at what price. **Fill** types the
+  amount and the price; you press ADD LISTING.
+- **A trade:** each of their plushies and flowers at your rate, "need 28 of
+  these", "6 ahead already"; the total for what you need (only the units you
+  need of a row that holds more) and for every piece; what to take out of the
+  vault first; and a message to copy (`tradeOffer`, `tradeMessage`). Closed:
+  the message says so first.
+- **Someone's bazaar:** "need 28 · worth $36,199" on a piece under its worth,
+  amber when it is over, or when you type more than you need
+  (`bazaarForSets`).
+- **Your buying thread:** "matches Torn Bids ✓" or not, with the title and
+  post to copy (`threadCheck`). A thread is yours only when its title is the
+  very one Torn Bids wrote; then it is remembered by its id.
+
+**5. A trade opened with you** shows as one line in Torn Bids and in the
+panel ("Open the trade", "Not now") - only for a trade that holds a piece you
+keep, never for the trader of a trade you accepted in Torn Bids.
+
+**6. Why a price box is red or amber,** on your listing pages, for everyone:
+a small tag on the box's lower edge ("under the $55 you paid", "63% under
+market value, $55", "over the lowest bazaar, $840,000"). The hover said it
+before; now it is seen.
+
+**Two things drawn and not built as drawn, and why:**
+
+- **No browser notification** for an opened trade (drawn in Z5). Hard rule 6:
+  no alerts, nothing that draws attention to another window. The note shows
+  only in Torn Bids and in the panel.
+- **Fill for the museum and the points market is a button in the panel,** not
+  beside Torn's own boxes. Their real markup has never been seen, and a float
+  placed by guess could cover Torn's button.
+
+**Nothing is pressed, posted or sent for you.** Fill types into boxes on your
+press; Copy puts text on your clipboard (`gmCopy`, the new `GM_setClipboard`
+grant); you press Torn's buttons and paste your own posts.
+
+**Found in the bug hunt and fixed before release:** a trade row holding more
+than you need was counted in full in "for what you need"; Torn Bids shared
+its first snapshot before your stock was read (every piece read "hold 0");
+points used were booked as a loss when the log was read before the points
+price; on the add page a kept piece's IMA and BP chips drifted off the row;
+the forum mark covered the first post; the far-under tag ran past the row.
+
+**To sell: sold by hand after Cancel trade** (the friend's zip, 2026-10-05:
+2,352 Monkey Plushies sold by hand, and To sell kept 796). What was "bought
+again" was a count carried on the row and never dropped when the row's start
+moved; the sale was taken from it, took nothing off the row, and was marked
+seen. It is now worked out each time from the Ledger's rows
+(`leftoversAfterSales`, src/core/accepted.js; three tests in
+test/own-buys.test.js).
+
+Tests: test/sets.test.js, test/points.test.js, test/sets-desk.test.js, one
+more in test/traders.test.js (TornW3B's set prices).
+
+Seen in the harness, not on real Torn: all of it. **Not checked, and to be
+read on the real pages first:** the markup of museum.php, pmarket.php and
+forums.php (the finders go by words - EXCHANGE, ADD LISTING, item pictures,
+headings - and mark nothing where they find nothing); the names in Torn's
+answer for your money (`v2/user/money`); `cat=ongoing` for open trades; the
+titles of the log types and the names in those rows; whether EXCHANGE asks to
+confirm; the points market's listing fee, if any; the clipboard on a real
+install. Your display case is not read.
+
+New harness switches: `&sets=1|off|none`, `&setsclosed=1`, `&setspct=<n>`,
+`&moneyshape=odd`, `&setsbook=1`, `&setskeep=1` (what Torn Bids works out is
+kept for a stand-in Torn page opened next), and the stand-ins `page=museum`,
+`page=pmarket`, `page=forum#/p=threads&f=10&t=<id>&thread=open101|closed|open99|other`,
+`page=trade&tradeview=<name>&theirs=<Name:qty,...>`,
+`page=bazaar&userId=7001&bazaarcards=1&setcards=1`. With `&sets` your
+bazaar's add page has a Panda Plushie row.
+
+---
+
 ## Architecture
 
 ```
@@ -1893,6 +2047,11 @@ src/
                  trader per item, highest first, which price list to read next
     history.js   the price history the script records (buckets, averages,
                  coverage)
+    sets.js      museum sets: what you hold, what a piece is worth to you,
+                 what to buy, a trade's offer, the forum text (3.24.0)
+    points.js    the points market's first wall, the price to type, the
+                 points book, Torn's log rows for it
+    sets-desk.js the Sets page's snapshot, and the slim copy Torn tabs read
   feed/
     controller.js  polls within budget in the leader tab; storage is the truth
   api/
@@ -1907,10 +2066,13 @@ src/
   sources/
     route.js     which Torn page are we on
     dom/         reading listings (and your own bazaar's rows) out of the
-                 page being viewed
+                 page being viewed; sets-pages.js finds the museum's, the
+                 points market's, a trade's and a forum thread's parts by
+                 their words
   ui/
     panel.js     the ranked list, My bazaar, settings
     selling-page.js  the traders page (its own tab)
+    sets-view.js     the Sets page; sets-settings.js its two settings cards
     graph.js     the add-page graph: scale, gaps, outliers, hover readout
     overlay.js   row marking
     styles.js    all CSS and the colour tokens
@@ -1963,7 +2125,11 @@ them.
    Next (and the N key, only on that bazaar) is the panel's Next: it counts
    what you took from the page and opens one page. Those two small buttons
    are the only elements the script puts inside a Torn card (the marked one
-   only; they act only on it).
+   only; they act only on it). Since 3.24.0, with Sets on, the panel's
+   **Fill** on the museum types the number of full sets, and on the points
+   market the amount and the price - into Torn's boxes, on your press, one
+   page; EXCHANGE and ADD LISTING are yours to press. Copy puts text on your
+   clipboard; nothing is ever posted or sent.
 2. **Never fetch a Torn page the user is not viewing.** There is no `fetch` of
    `torn.com` anywhere — only `api.torn.com` (from `src/api/client.js`),
    `weav3r.dev` (from `src/api/w3b.js`) and `www.tornexchange.com` (from
@@ -1980,6 +2146,10 @@ them.
    (3.16.3: the pages on torn.com use the Ledger's key for one question - did
    a trade you accepted go through - and only when no Torn Bids tab is open to
    ask it; the panel's own work still needs the Public key and nothing more.)
+   (3.24.0, only with Sets on: the Limited key also reads the points market,
+   your own money and points, and Torn's list of log types; the Full key also
+   reads your log's museum and points rows and the trades open with you. Both
+   tables in Settings say so.)
 4. **Rate-limit everything.** All Torn API calls pass through one queue capped at
    70/min, **shared by every open tab**, with dedup and backoff; the live feed
    spends at most 30/min of it; TornW3B gets at most 60/min of its 100/min. Torn's 100/min is per user across all tools. Do not
@@ -1989,7 +2159,9 @@ them.
    that works from unfocused pages to "generate alerts, or draw attention to itself
    or another window". The feed runs only in a visible tab (a hidden leader steps
    down), and results appear only in the panel: no notifications, sounds or title
-   flashing. Do not add them.
+   flashing. Do not add them. (3.24.0: a browser notification for a trade
+   opened with you was drawn, and left out for this rule. The note is a line
+   in Torn Bids and in the panel.)
 7. **Third parties are disclosed, and never get a key they do not already have.** TornW3B is on by
    default, which Torn's API ToS allows for an automatic integration when the
    tool's own terms cover it: Settings names it, says it receives item ids only,
@@ -2038,7 +2210,7 @@ The traders page's key (a separate table beside its own field):
 
 | Data storage | Data sharing | Purpose of use | Key storage & sharing | Key access level |
 |---|---|---|---|---|
-| Only locally | Nobody | Personal gain: who pays most for your items, and flips | Stored locally / Not shared | Limited (user: inventory - your own items; user: basic - your own id; torn: items - item names; market: itemmarket - the Item Market for the item on the desk; user: profile - traders' public online status; user: personalstats (networth) - traders' public networth) |
+| Only locally | Nobody | Personal gain: who pays most for your items, flips, and (with Sets on) your museum sets and points | Stored locally / Not shared | Limited (user: inventory - your own items; user: basic - your own id; torn: items - item names; market: itemmarket - the Item Market for the item on the desk; user: profile - traders' public online status; user: personalstats (networth) - traders' public networth; with Sets on: market: pointsmarket - the points market; user: money - your own money and points; torn: logtypes - the names of Torn's log types) |
 
 Plus: *TornExchange, only with the key you log in there with.*
 
@@ -2046,7 +2218,7 @@ The Torn Ledger's key (its own table beside its own field):
 
 | Data storage | Data sharing | Purpose of use | Key storage & sharing | Key access level |
 |---|---|---|---|---|
-| Only locally: time, item, quantity, price, where, who - never the log's own text | Nobody. Your trades go into a zip only when you download one yourself (Report a problem, Export API usage): it names the traders you traded with, and you choose who gets it | Personal: profit tracking, and checking what you bought for a trade you accepted | Stored locally / Not shared | Full, used only for your log (user: log - bazaar and Item Market buys and sells), your trades (user: trades, trade) and key: info |
+| Only locally: time, item, quantity, price, where, who - never the log's own text | Nobody. Your trades go into a zip only when you download one yourself (Report a problem, Export API usage): it names the traders you traded with, and you choose who gets it | Personal: profit tracking, and checking what you bought for a trade you accepted | Stored locally / Not shared | Full, used only for your log (user: log - bazaar and Item Market buys and sells; with Sets on: museum exchanges, points sold and points used), your trades (user: trades, trade; with Sets on: the trades open with you) and key: info |
 
 Plus: *Other services: none - never sent to TornExchange or TornW3B.*
 

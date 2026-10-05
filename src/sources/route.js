@@ -188,3 +188,30 @@ export function isTradersPageUrl(href) {
 export function isOldTradersPageUrl(href) {
     return queryOf(href).get(TRADERS_PAGE_PARAM) === TRADERS_PAGE_VALUE && isTornHost(href);
 }
+
+/* ------------------------------------------------------------- Sets (3.24.0) */
+
+/** Torn's museum, the points market, and a trade as you view it. Links only: one press, one page. */
+export const MUSEUM_URL = 'https://www.torn.com/museum.php';
+export const POINTS_MARKET_URL = 'https://www.torn.com/pmarket.php';
+export function tradeViewUrl(tradeId) {
+    return 'https://www.torn.com/trade.php#step=view&ID=' + encodeURIComponent(String(tradeId).replace(/\D/g, ''));
+}
+
+/** The museum (museum.php). `page=museum` is the test harness's stand-in. */
+export function isMuseumPage(href) {
+    const url = String(href || '').toLowerCase();
+    return url.includes('/museum.php') || /[?&]page=museum(?:[&#]|$)/.test(url);
+}
+
+/** The points market (pmarket.php). `page=pmarket` is the harness's stand-in. */
+export function isPointsMarketPage(href) {
+    const url = String(href || '').toLowerCase();
+    return url.includes('/pmarket.php') || /[?&]page=pmarket(?:[&#]|$)/.test(url);
+}
+
+/** Torn's forums (forums.php). `page=forum` is the harness's stand-in. */
+export function isForumPage(href) {
+    const url = String(href || '').toLowerCase();
+    return url.includes('/forums.php') || /[?&]page=forum(?:[&#]|$)/.test(url);
+}

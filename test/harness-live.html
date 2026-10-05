@@ -93,6 +93,8 @@ if (/[?&]ownbazaar=1/.test(location.search)) {
             row(180, 'Bottle of Beer', 12, 55) +
             row(206, 'Xanax', 15, 830000) +
             row(1, 'Hammer', 0, 120, true) +
+            // &sets (3.24.0): a piece of a set among your items - kept for the museum while Sets is on.
+            (/[?&]sets=/.test(location.search) ? row(274, 'Panda Plushie', 12, 35000) : '') +
             '</ul>';
         document.body.prepend(d);
         // On the trade page (page=trade), as read on the real one: the info
@@ -190,7 +192,9 @@ if (_tradeView) {
             '<li class="color2"><ul class="desc">' + (inside.length ? inside.map(([n, x]) => '<li><div class="name left">' + n + ' x' + x + '</div></li>').join('') : '<li class="last"><div class="name left inactive">No items in trade</div></li>') + '</ul></li>' +
             '<li class="color3 last"><ul class="desc"><li class="last"><div class="name left inactive">No properties in trade</div></li></ul></li></ul></div>' +
             '<div class="user right"><div class="title-black">' + _tradeView + '</div><ul class="cont">' +
-            '<li class="color1"><ul class="desc"><li class="last"><div class="name left">' + (offer ? '$' + offer.toLocaleString('en-US') : 'No money in trade') + '</div></li></ul></li></ul></div></div>';
+            '<li class="color1"><ul class="desc"><li class="last"><div class="name left">' + (offer ? '$' + offer.toLocaleString('en-US') : 'No money in trade') + '</div></li></ul></li>' +
+            ((q.get('theirs') || '') ? '<li class="color2"><ul class="desc">' + q.get('theirs').split(',').filter(Boolean).map((p) => p.split(':')).map(([n, x]) => '<li style="width:380px;height:22px"><div class="name left">' + n + ' x' + x + '</div></li>').join('') + '</ul></li>' : '') +
+            '</ul></div></div>';
         document.body.prepend(d);
     });
 }
@@ -363,7 +367,10 @@ const SLOW = /[?&]slow=1/.test(location.search);
 const TESLOW = /[?&]teslow=1/.test(location.search);
 
 function GM_getValue(k, d) { return k in _store ? _store[k] : d; }
-function GM_setValue(k, v) { _store[k] = v; }
+function GM_setValue(k, v) {
+    _store[k] = v;
+    if (/[?&]setskeep=1/.test(location.search) && k.startsWith(NS + 'sets')) try { localStorage.setItem('h.' + k, v); } catch (e) { /* no storage */ }
+}
 function GM_deleteValue(k) { delete _store[k]; }
 function GM_registerMenuCommand() {}
 function GM_addValueChangeListener() {}
@@ -706,9 +713,149 @@ if (_bigStore) {
     _store[NS + 'traderDb'] = JSON.stringify(db);
 }
 
+/*
+ * &sets=1 (3.24.0): Sets and points. The thirteen plushies and eleven flowers
+ * are items you hold (the mockups' numbers), each has bazaars on TornW3B and
+ * listings on the Item Market, the points market has a first wall at $30,900,
+ * Torn says your money and points, your log holds a museum exchange and a
+ * points sale (with &ledgerkey=1), and a trade is open with Marlowe.
+ *   &sets=1         the switch already on (40 sets at once); &sets=off: there, but off
+ *   &setsclosed=1   your shop is Closed          &setspct=<n>  your rate
+ *   &moneyshape=odd Torn's answer for your money has names Torn Bids does not know
+ *   &setsbook=1     120 points made from sets a minute ago (a press of EXCHANGE), waiting to be sold
+ *   &setskeep=1     what Torn Bids works out is kept (localStorage), so a stand-in Torn page opened next
+ *                   in the same browser reads it as a Torn tab reads Torn Bids'
+ * Torn's pages (stand-ins, drawn from their text as read on 2026-10-05 - not their real markup):
+ *   page=museum[#plushie|#flower]   page=pmarket   page=forum#/p=threads&f=10&t=16400001&thread=open101|closed|open99
+ *   tradeview=Marlowe&theirs=Panda Plushie:10,Kitten Plushie:4,Hammer:1
+ *   page=bazaar&userId=7001&bazaarcards=1&setcards=1
+ */
+const SETS_Q = new URLSearchParams(location.search);
+const SETS_H = SETS_Q.has('sets');
+const SETS_PLUSH = { 186: ['Sheep Plushie', 620, 41], 187: ['Teddy Bear Plushie', 680, 40], 215: ['Kitten Plushie', 550, 46], 258: ['Jaguar Plushie', 13200, 22], 261: ['Wolverine Plushie', 4150, 40], 266: ['Nessie Plushie', 61300, 18], 268: ['Red Fox Plushie', 11400, 31], 269: ['Monkey Plushie', 32000, 40], 273: ['Chamois Plushie', 14150, 38], 274: ['Panda Plushie', 35000, 12], 281: ['Lion Plushie', 50000, 40], 384: ['Camel Plushie', 70900, 35], 618: ['Stingray Plushie', 4800, 44] };
+const SETS_FLOWER = { 260: ['Dahlia', 2100, 25], 263: ['Crocus', 9800, 30], 264: ['Orchid', 28500, 30], 267: ['Heather', 31200, 21], 271: ['Ceibo Flower', 39500, 30], 272: ['Edelweiss', 24800, 30], 276: ['Peony', 41300, 33], 277: ['Cherry Blossom', 52900, 30], 282: ['African Violet', 47600, 30], 385: ['Tribulus Omanense', 44100, 9], 617: ['Banana Orchid', 6400, 30] };
+const SETS_PIECES = { ...SETS_PLUSH, ...SETS_FLOWER };
+if (SETS_H) {
+    for (const [id, [name, mv]] of Object.entries(SETS_PIECES)) ITEMS[id] = { name, type: SETS_PLUSH[id] ? 'Plushie' : 'Flower', sell_price: Math.round(mv / 20), market_value: mv };
+    if (SETS_Q.get('sets') !== 'none') {
+        _store[NS + 'sets'] = JSON.stringify({ on: SETS_Q.get('sets') !== 'off', targetMode: 'number', target: 40, open: !SETS_Q.has('setsclosed'), ...(SETS_Q.get('setspct') ? { pct: Number(SETS_Q.get('setspct')) } : {}) });
+    }
+    if (SETS_Q.has('ledgerkey')) _store[NS + 'ledgerSelf'] = JSON.stringify('999');
+    if (SETS_Q.has('setsbook')) _store[NS + 'setsBook'] = JSON.stringify([{ id: 'page:1', t: Date.now() - 60000, kind: 'made', points: 120, each: 29785, set: 'plushie', src: 'page' }]);
+    // A stand-in Torn page: what Torn Bids worked out the last time it was open with &setskeep=1.
+    if (!SETS_Q.has('ttv2')) try {
+        for (let i = 0; i < localStorage.length; i += 1) {
+            const k = localStorage.key(i);
+            if (k && k.startsWith('h.' + NS + 'sets') && k !== 'h.' + NS + 'sets') _store[k.slice(2)] = localStorage.getItem(k);
+        }
+    } catch (e) { /* no storage: the stand-in page shows "Open Torn Bids once" */ }
+}
+
+function setsRespond(u) {
+    if (u.hostname === 'api.torn.com') {
+        if (u.pathname === '/v2/market/pointsmarket') {
+            const rows = [[30850, 25], [30860, 50], [30870, 40], [30900, 2000], [30910, 500], [30920, 800], [30930, 100], [30940, 300], [30950, 900], [30960, 60]];
+            return { pointsmarket: Object.fromEntries(rows.map(([cost, quantity], i) => [9000 + i, { cost, quantity, total_cost: cost * quantity }])) };
+        }
+        if (u.pathname === '/v2/user/money') {
+            if (u.searchParams.get('key') !== LIMITED) return { error: { code: 16, error: 'Access level of this key is not high enough' } };
+            return SETS_Q.get('moneyshape') === 'odd'
+                ? { money: { pts: 950, pocket: 1500000, bank_vault: 420000000 } }
+                : { money: { points: 950, wallet: 1500000, vault: 420000000, company: 0, cayman_bank: 0 } };
+        }
+        if (u.pathname === '/torn/' && u.searchParams.get('selections') === 'logtypes') {
+            return { logtypes: { 1225: 'Bazaar buy', 1226: 'Bazaar sell', 7000: 'Museum exchange', 5011: 'Points market sell', 5010: 'Points market buy', 4900: 'Points use refill', 6001: 'Faction points use' } };
+        }
+        if (u.pathname === '/v2/user/log' && /(^|,)7000(,|$)/.test(u.searchParams.get('log') || '')) {
+            if (u.searchParams.get('key') !== FULLKEY) return { error: { code: 16, error: 'Access level of this key is not high enough' } };
+            const all = [
+                { id: 's1', timestamp: NOW_S - 2 * 86400, details: { id: 7000, title: 'Museum exchange', category: 'Museum' }, data: { points: 30, set: 'Plushie Set' } },
+                { id: 's2', timestamp: NOW_S - 86400, details: { id: 5011, title: 'Points market sell', category: 'Points market' }, data: { quantity: 20, cost_each: 30700, cost_total: 614000 } },
+                { id: 's3', timestamp: NOW_S - 3600, details: { id: 4900, title: 'Points use refill', category: 'Points' }, data: { points_used: 25 } },
+            ];
+            const from = Number(u.searchParams.get('from')) || 0;
+            return { log: all.filter((e) => e.timestamp >= from).sort((a, b) => b.timestamp - a.timestamp), _metadata: { links: {} } };
+        }
+        if (u.pathname === '/v2/user/trades' && u.searchParams.get('cat') === 'ongoing') {
+            return { trades: [{ id: 601, timestamp: NOW_S - 120, user: { id: 999, name: 'Me' }, trader: { id: 7001, name: 'Marlowe' } }], _metadata: { links: {} } };
+        }
+        if (u.pathname === '/v2/user/601/trade') {
+            return { trade: { id: 601, timestamp: NOW_S - 120, user: { id: 999, name: 'Me' }, trader: { id: 7001, name: 'Marlowe' }, items: [
+                { user_id: 7001, type: 'Item', details: { id: 274, uid: null, amount: 10 } },
+                { user_id: 7001, type: 'Item', details: { id: 215, uid: null, amount: 4 } },
+                { user_id: 7001, type: 'Item', details: { id: 1, uid: null, amount: 1 } },
+            ] } };
+        }
+        if (u.pathname === '/v2/user/inventory' && u.searchParams.get('key') === LIMITED && !Number(u.searchParams.get('offset') || 0)) {
+            return { inventory: { items: [
+                { id: 206, amount: 12, equipped: false, name: 'Xanax', faction_owned: false, uid: null },
+                ...Object.entries(SETS_PIECES).map(([id, [name, , held]]) => ({ id: +id, amount: held, equipped: false, name, faction_owned: false, uid: null })),
+            ], timestamp: NOW_S }, _metadata: { links: { next: null, prev: null }, total: 25 } };
+        }
+        const m = u.pathname.match(/^\/v2\/market\/(\d+)\/itemmarket$/);
+        if (m && SETS_PIECES[m[1]]) {
+            const mv = SETS_PIECES[m[1]][1];
+            return { itemmarket: { item: { id: +m[1], average_price: mv }, listings: [{ price: Math.round(mv * 1.01), amount: 6 }, { price: Math.round(mv * 1.05), amount: 40 }], cache_timestamp: NOW_S - 10, cache_delay: 30 }, _metadata: { total: 2 } };
+        }
+    }
+    if (u.hostname === 'weav3r.dev') {
+        const b = u.pathname.match(/^\/api\/marketplace\/(\d+)$/);
+        if (b && SETS_PIECES[b[1]]) {
+            const mv = SETS_PIECES[b[1]][1];
+            return { total_listings: 3, listings: [
+                { player_id: 7001, player_name: 'Marlowe', price: Math.round(mv * 0.99), quantity: 15, last_checked: NOW_S - 30 },
+                { player_id: 7002, player_name: 'Dear', price: Math.round(mv * 1.02), quantity: 12, last_checked: NOW_S - 40 },
+                { player_id: 7003, player_name: 'Stale', price: Math.round(mv * 0.5), quantity: 99, last_checked: NOW_S - 6 * 3600 },
+            ] };
+        }
+    }
+    return null;
+}
+
+if (SETS_H) {
+    document.addEventListener('DOMContentLoaded', () => {
+        const q = SETS_Q;
+        const page = q.get('page');
+        const box = (id, html) => {
+            const d = document.createElement('div');
+            d.id = id;
+            d.style.cssText = 'width:784px;margin:12px;padding:10px;background:#2e2e2e;color:#ddd;font:12px Arial';
+            d.innerHTML = html;
+            document.body.prepend(d);
+        };
+        if (page === 'museum') {
+            const pane = (word, pieces, shown) => '<div class="pane" style="display:' + (shown ? 'block' : 'none') + '"><p>To exchange ' + word + ' set for 10 points, you require the following:</p>' +
+                '<ul style="display:flex;flex-wrap:wrap;gap:6px;list-style:none;padding:0;margin:8px 0">' + Object.entries(pieces).map(([id, [name]]) => '<li style="width:100px;height:74px;background:#3a3a3a;text-align:center"><img src="https://www.torn.com/images/items/' + id + '/large.png" alt="" style="height:30px;width:60px;display:inline-block"><div>' + name + '</div></li>').join('') + '</ul>' +
+                '<div style="display:flex;gap:8px;align-items:center">Number of sets <input type="text" value="" style="width:50px"> <button type="button" class="torn-btn">EXCHANGE</button></div></div>';
+            const flower = /flower/i.test(location.hash);
+            box('fake-museum', '<h4>Museum</h4><div><a href="#plushie">Plushie Set</a> · <a href="#flower">Exotic Flower Set</a> · <a href="#coin">Medieval Coin Set</a></div>' + pane('a Plushie', SETS_PLUSH, !flower) + pane('an Exotic Flower', SETS_FLOWER, flower));
+            window.__exchanged = 0;
+            for (const b of document.querySelectorAll('#fake-museum button')) b.addEventListener('click', () => { window.__exchanged += 1; });
+        }
+        if (page === 'pmarket') {
+            box('fake-pmarket', '<h4>Points Market</h4><div class="add" style="padding:8px;background:#3a3a3a"><b>Add listing</b> &nbsp; Points: <input type="text" style="width:80px"> Price each: $ <input type="text" style="width:100px"> <button type="button" class="torn-btn">ADD LISTING</button></div>' +
+                '<ul style="list-style:none;padding:0"><li><b>Seller / Amount / Cost each / Total price</b></li><li>Someone / 25 / $30,850 / $771,250</li><li>Other / 2,000 / $30,900 / $61,800,000</li></ul>');
+        }
+        if (page === 'forum') {
+            const titles = { open101: '[OPEN] Buying Plushies & Flowers · 101% of market value', closed: '[CLOSED] Buying Plushies & Flowers · back soon', open99: '[OPEN] Buying Plushies & Flowers · 99% of market value', other: 'Selling my old armor' };
+            const thread = (location.hash.match(/thread=(\w+)/) || [])[1] || q.get('thread') || 'open101';
+            box('fake-forum', '<div>Forums › Trading</div><h4 class="title-black" style="background:#444;padding:8px;margin:8px 0">' + titles[thread].replace(/&/g, '&amp;') + '</h4><div style="padding:8px;background:#3a3a3a">Me [999]: Buying every plushie and flower, any amount.</div>');
+        }
+        if (q.has('setcards')) {
+            const host = document.getElementById('fake-bazaar');
+            const card = (id, name, price, stock) => '<div class="itemDescription___x" data-id="' + id + '" style="width:220px;height:110px;display:inline-block;margin:14px 4px 4px;padding:6px;background:#333;color:#ddd;font:12px Arial">' +
+                '<img src="https://www.torn.com/images/items/' + id + '/large.png" alt="' + name + '" style="height:30px"><div>' + name + '</div><div>$' + price.toLocaleString('en-US') + '</div><div class="stock">(' + stock + ' in stock)</div>' +
+                '<div style="margin-top:4px"><input class="buyAmountInput" type="text" placeholder="Qty" style="width:60px"> <button type="button">Buy</button></div></div>';
+            if (host) host.insertAdjacentHTML('beforeend', card(274, 'Panda Plushie', 34900, 40) + card(266, 'Nessie Plushie', 70000, 5) + card(215, 'Kitten Plushie', 500, 9) + card(385, 'Tribulus Omanense', 43000, 6));
+        }
+    });
+}
+
 window.__requests = [];
 function respond(url) {
     const u = new URL(url);
+    const setsAnswer = SETS_H ? setsRespond(u) : null;
+    if (setsAnswer) return setsAnswer;
     if (u.hostname === 'api.torn.com') {
         const sel = u.searchParams.get('selections');
         if (u.pathname === '/v2/torn/items') {
