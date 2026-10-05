@@ -1704,6 +1704,33 @@ Not seen on real Torn: both rules were built from the friend's zips and
 tested in node. His next zip shows it: "Bought more than the plan asked at
 this bazaar" in the problem log.
 
+### A price list getting old says so, in amber (3.22.3)
+
+The owner, 2026-10-05: "we do need a pulsating amber color to show that price
+list isnt updated over 24 hours to 2 days". Two days stays the line for Fresh
+prices only ("2 IS FINE"); he picked the look from three in
+`mockups/X-amber-old-list.html` (B).
+
+- **Over 24 hours, up to two days:** the trader is still shown and still
+  planned. Under their name on the desk's "Traders pay" card, an amber line
+  with a pulsing amber dot: "Price list last changed 1 day 6 hours ago". The
+  price itself is left as it is.
+- **Over two days:** hidden by Fresh prices only, as before. With the switch
+  off they show, with the same amber line and a dot that does not pulse.
+- **Which prices:** the ones Fresh prices only looks at, so the two never
+  disagree - that trader's TornW3B price, with no TornExchange price of theirs
+  for the item (TornExchange gives no date) and a list date that was read
+  (`oldList`, src/core/traders.js). The age is in words, never shortened
+  (`listAgeText`).
+- **What it costs:** the pulse is a ring behind the dot that grows and fades
+  (transform and opacity only: no layout, no repaint of the row), off under
+  "reduce motion". It keeps its beat when the desk is drawn again.
+
+Seen in the harness (`test/harness-live.html?ttv2=traders&sellkeys=1&awake=1&stalelist=11&listhours=30`,
+Stick of Dynamite, until TornExchange's own list for Bob arrives), not on real
+Torn. Not in this release: the same mark on the Your traders cards and in the
+overlay.
+
 ---
 
 ## Architecture

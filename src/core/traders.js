@@ -650,6 +650,50 @@ export function freshOnly(buyers, listAtOf, now = Date.now()) {
     return buyers.filter((b) => !stalePrice(b, listAtOf, now));
 }
 
+/*
+ * A list getting old (3.22.3; the owner, 2026-10-05: "we do need a pulsating
+ * amber color to show that price list isnt updated over 24 hours to 2 days").
+ *
+ * Two days stays the line for Fresh prices only ("2 IS FINE"). A price from a
+ * list last changed over 24 hours ago and not yet over two days is still
+ * shown, with a pulsing amber dot and how long ago ('aging'). Over two days
+ * ('stale') it is seen only with Fresh prices only off: the same amber line,
+ * its dot still.
+ *
+ * The same price as stalePrice looks at, so the two never disagree: that
+ * trader's TornW3B price, with no TornExchange price of theirs for the item
+ * and a list date that was read.
+ */
+export const PRICES_AGING_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * @param {{id, w3b, te}} b - a buyer row (buyersForItem)
+ * @param {function} listAtOf - (trader id) => when their TornW3B list last changed (ms), 0 when not known
+ * @returns {{at: number, level: 'aging'|'stale'}|null} null: nothing to say
+ */
+export function oldList(b, listAtOf, now = Date.now()) {
+    if (!b || !b.id || !(b.w3b > 0) || b.te > 0) return null;
+    const at = Number(listAtOf(b.id)) || 0;
+    if (!(at > 0) || !(now - at > PRICES_AGING_MS)) return null;
+    return { at, level: now - at > PRICES_STALE_MS ? 'stale' : 'aging' };
+}
+
+/**
+ * How long ago a list was changed, in words, never shortened: "1 day 6 hours
+ * ago", "2 days ago", "23 days ago". Hours are said for the first three days,
+ * where they matter; after that the days alone.
+ */
+export function listAgeText(ms) {
+    if (!Number.isFinite(ms) || ms < 0) return 'not known';
+    const hours = Math.floor(ms / (60 * 60 * 1000));
+    const days = Math.floor(hours / 24);
+    const h = hours % 24;
+    const dText = days + (days === 1 ? ' day' : ' days');
+    const hText = h + (h === 1 ? ' hour' : ' hours');
+    if (days < 1) return hours < 1 ? 'under an hour ago' : hText + ' ago';
+    return (days < 3 && h ? dText + ' ' + hText : dText) + ' ago';
+}
+
 /**
  * "Trusted buyers only", order unchanged. By default the Trusted badge only
  * (the bazaar-card tag in the overlay). Torn Bids (3.14, the owner: "we've

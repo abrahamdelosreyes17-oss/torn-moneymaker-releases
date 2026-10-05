@@ -528,11 +528,14 @@ if (/[?&]tradesgoing=1/.test(location.search)) {
  * &stalelist=<trader id> (3.22.0): that trader last changed their TornW3B
  * price list five days ago (as Torn Bids kept it from an earlier visit) -
  * Fresh prices only leaves their TornW3B prices out. Without it, no list date
- * is kept.
+ * is kept. &listhours=<n> (3.22.3): n hours ago, not five days - 30 is a list
+ * getting old (shown, with the amber dot).
  */
 {
-    const stale = new URLSearchParams(location.search).get('stalelist');
-    if (stale) localStorage.setItem('ttv2.bids.listat', JSON.stringify([[stale, Math.round(Date.now() / 1000) - 5 * 24 * 3600]]));
+    const q = new URLSearchParams(location.search);
+    const stale = q.get('stalelist');
+    const hours = Number(q.get('listhours')) > 0 ? Number(q.get('listhours')) : 5 * 24;
+    if (stale) localStorage.setItem('ttv2.bids.listat', JSON.stringify([[stale, Math.round(Date.now() / 1000 - hours * 3600)]]));
     else localStorage.removeItem('ttv2.bids.listat');
 }
 /*

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      3.22.2
+// @version      3.22.3
 // @description  Finds Bazaar and Item Market listings below NPC / market value - on the page you are viewing, and live from the Torn API and TornW3B - ranked by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -42,7 +42,7 @@
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '3.22.2';
+    const TTV2_BUILD_VERSION = '3.22.3';
 
     /* ===== src/platform/gm.js ===== */
     /*
@@ -10745,6 +10745,50 @@
         return buyers.filter((b) => !stalePrice(b, listAtOf, now));
     }
 
+    /*
+     * A list getting old (3.22.3; the owner, 2026-10-05: "we do need a pulsating
+     * amber color to show that price list isnt updated over 24 hours to 2 days").
+     *
+     * Two days stays the line for Fresh prices only ("2 IS FINE"). A price from a
+     * list last changed over 24 hours ago and not yet over two days is still
+     * shown, with a pulsing amber dot and how long ago ('aging'). Over two days
+     * ('stale') it is seen only with Fresh prices only off: the same amber line,
+     * its dot still.
+     *
+     * The same price as stalePrice looks at, so the two never disagree: that
+     * trader's TornW3B price, with no TornExchange price of theirs for the item
+     * and a list date that was read.
+     */
+    const PRICES_AGING_MS = 24 * 60 * 60 * 1000;
+
+    /**
+     * @param {{id, w3b, te}} b - a buyer row (buyersForItem)
+     * @param {function} listAtOf - (trader id) => when their TornW3B list last changed (ms), 0 when not known
+     * @returns {{at: number, level: 'aging'|'stale'}|null} null: nothing to say
+     */
+    function oldList(b, listAtOf, now = Date.now()) {
+        if (!b || !b.id || !(b.w3b > 0) || b.te > 0) return null;
+        const at = Number(listAtOf(b.id)) || 0;
+        if (!(at > 0) || !(now - at > PRICES_AGING_MS)) return null;
+        return { at, level: now - at > PRICES_STALE_MS ? 'stale' : 'aging' };
+    }
+
+    /**
+     * How long ago a list was changed, in words, never shortened: "1 day 6 hours
+     * ago", "2 days ago", "23 days ago". Hours are said for the first three days,
+     * where they matter; after that the days alone.
+     */
+    function listAgeText(ms) {
+        if (!Number.isFinite(ms) || ms < 0) return 'not known';
+        const hours = Math.floor(ms / (60 * 60 * 1000));
+        const days = Math.floor(hours / 24);
+        const h = hours % 24;
+        const dText = days + (days === 1 ? ' day' : ' days');
+        const hText = h + (h === 1 ? ' hour' : ' hours');
+        if (days < 1) return hours < 1 ? 'under an hour ago' : hText + ' ago';
+        return (days < 3 && h ? dText + ' ' + hText : dText) + ' ago';
+    }
+
     /**
      * "Trusted buyers only", order unchanged. By default the Trusted badge only
      * (the bazaar-card tag in the overlay). Torn Bids (3.14, the owner: "we've
@@ -20865,6 +20909,7 @@
 
 
 
+
     const SELLING_PAGE_TITLE = 'Torn Bids';
 
     const SELLING_PAGE_DEFAULTS = {
@@ -20924,6 +20969,8 @@
 
     /** Traders and bazaars shown per item before "Show all". */
     const DESK_ROWS = 5;
+    /* One pulse of the amber dot on an old price list (3.22.3); the CSS below says the same. */
+    const OLD_PULSE_MS = 1600;
 
     /** The item list's filters. */
     const SELL_FILTERS = ['all', 'mine', 'flips', 'sell', 'trades'];
@@ -23178,6 +23225,8 @@
                     d.buyers.map((b) => [b.id, b.name, b.price, b.te, b.teTop, b.teList, b.w3b, statusOf(b), b.trust ? b.trust.level + b.trust.score : '', this.state.networth && b.id ? this.state.networth.get(String(b.id)) : null, Boolean(b.favourite), b.traded || '', Boolean(b.troll), Boolean(b.lastPaidOnly)]),
                     this.justBlacklisted ? this.justBlacklisted.at : 0,
                     (d.hidden || []).map((b) => [b.tradeKey, b.price, b.hiddenBy, statusOf(b), b.trust ? b.trust.level + b.trust.score : '']),
+                    // How old a list is, in the words shown: drawn again when they change, not every second.
+                    Object.entries(d.oldLists || {}).map(([k, o]) => [k, o.level, listAgeText(now - o.at)]),
                     p.freshOnly,
                     p.networthPct,
                     d.sellers.state, d.sellers.error,
@@ -23288,6 +23337,7 @@
                         this.networthLine(b),
                         // Your own history with them (the Ledger): "Traded 7× · last 3d ago".
                         b.traded ? spEl('small', { class: 'sp-traded', text: b.traded }) : null,
+                        this.oldListLine(d, b),
                         // Their two lists disagree: the lower is counted, and said.
                         b.differ
                             ? spEl('small', { class: 'sp-differ', text: 'Lists differ: ' + this.listPrices(b, ' · ') + '. Counted at the lower; check before trading.' })
@@ -23316,6 +23366,21 @@
             }
             this.hiddenBuyersPart(card, d);
             return card;
+        }
+
+        /**
+         * A price from a TornW3B list its trader has not changed in over 24 hours
+         * (3.22.3; the owner picked mockup X-B): an amber dot and how long ago,
+         * under the trader - the price itself is left as it is. The dot pulses
+         * until two days; past that (Fresh prices only off) it is still.
+         */
+        oldListLine(d, b) {
+            const o = d.oldLists && b.tradeKey ? d.oldLists[b.tradeKey] : null;
+            if (!o) return null;
+            const dot = spEl('span', { class: 'sp-olddot' });
+            // The desk is drawn again often: the pulse goes on from where the clock is, never from its start.
+            if (o.level === 'aging') dot.style.animationDelay = -(Date.now() % OLD_PULSE_MS) + 'ms';
+            return spEl('small', { class: 'sp-oldlist' + (o.level === 'aging' ? ' sp-oldlist-pulse' : '') }, [dot, 'Price list last changed ' + listAgeText(Date.now() - o.at)]);
         }
 
         /**
@@ -24445,6 +24510,15 @@
     .sp-tr-l small { font-size: 12px; color: var(--muted); }
     .sp-tr-l small.sp-differ { color: var(--warn); }
     .sp-note.sp-warnnote { color: var(--warn); }
+    /*
+     * An old price list (3.22.3): amber, with a dot. The pulse is a ring behind
+     * the dot that grows and fades - transform and opacity only, so it costs no
+     * layout and no repaint of the row.
+     */
+    .sp-tr-l small.sp-oldlist { display: flex; align-items: flex-start; gap: 6px; color: var(--warn); }
+    .sp-olddot { position: relative; flex: 0 0 auto; width: 7px; height: 7px; margin-top: 5px; border-radius: 50%; background: var(--warn); }
+    .sp-oldlist-pulse .sp-olddot::after { content: ""; position: absolute; inset: 0; border-radius: 50%; background: var(--warn); pointer-events: none; animation: sp-oldpulse 1600ms ease-out infinite; animation-delay: inherit; }
+    @keyframes sp-oldpulse { 0% { transform: scale(1); opacity: 0.7; } 70%, 100% { transform: scale(3); opacity: 0; } }
     .sp-trader-l { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 8px; min-width: 0; }
     .sp-pname { color: var(--text); font-weight: 600; }
     .sp-tprice { font: 650 15px var(--sans); text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
@@ -33183,6 +33257,8 @@
                 avg: item ? Number(item.marketValue) || null : null,
                 bazaars: s ? s.totalBazaars : 0,
                 buyers,
+                // A shown price from a TornW3B list not changed in over 24 hours (3.22.3): said on its row, in amber.
+                oldLists: Object.fromEntries(buyers.map((x) => [x.tradeKey, oldList(x, listAtOf, now)]).filter((e) => e[1])),
                 buyersTotal: buyers.length,
                 buyersLoading: Boolean(load.loading),
                 buyersListNote: !load.loading && load.error && now < (load.retryAt || 0) ? load.error : null,

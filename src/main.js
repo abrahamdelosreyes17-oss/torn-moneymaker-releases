@@ -120,6 +120,7 @@ import {
     ratingsInText,
     trustedOnly,
     freshOnly,
+    oldList,
     liveW3bPrices,
 } from './core/traders.js';
 import { liveAsked, addAsked, liveEnded, addEnded, endedOf, tradesBoard } from './core/trades-board.js';
@@ -8005,6 +8006,8 @@ function renderSellingWork(src = null) {
             avg: item ? Number(item.marketValue) || null : null,
             bazaars: s ? s.totalBazaars : 0,
             buyers,
+            // A shown price from a TornW3B list not changed in over 24 hours (3.22.3): said on its row, in amber.
+            oldLists: Object.fromEntries(buyers.map((x) => [x.tradeKey, oldList(x, listAtOf, now)]).filter((e) => e[1])),
             buyersTotal: buyers.length,
             buyersLoading: Boolean(load.loading),
             buyersListNote: !load.loading && load.error && now < (load.retryAt || 0) ? load.error : null,

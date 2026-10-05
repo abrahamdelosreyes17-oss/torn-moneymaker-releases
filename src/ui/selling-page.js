@@ -24,6 +24,7 @@
 
 import { formatMoney, formatAge, parseMoneyInput, readWholeNumber } from '../core/parse.js';
 import { TO_SELL_WHY } from '../core/to-sell.js';
+import { listAgeText } from '../core/traders.js';
 import { UsageView, USAGE_CSS } from './usage-view.js';
 import { ReportView, REPORT_CSS } from './report-view.js';
 import { TOKENS_CSS } from './styles.js';
@@ -96,6 +97,8 @@ export const ALL_ITEMS_PAGE = 50;
 
 /** Traders and bazaars shown per item before "Show all". */
 export const DESK_ROWS = 5;
+/* One pulse of the amber dot on an old price list (3.22.3); the CSS below says the same. */
+const OLD_PULSE_MS = 1600;
 
 /** The item list's filters. */
 export const SELL_FILTERS = ['all', 'mine', 'flips', 'sell', 'trades'];
@@ -2350,6 +2353,8 @@ export class SellingPage {
                 d.buyers.map((b) => [b.id, b.name, b.price, b.te, b.teTop, b.teList, b.w3b, statusOf(b), b.trust ? b.trust.level + b.trust.score : '', this.state.networth && b.id ? this.state.networth.get(String(b.id)) : null, Boolean(b.favourite), b.traded || '', Boolean(b.troll), Boolean(b.lastPaidOnly)]),
                 this.justBlacklisted ? this.justBlacklisted.at : 0,
                 (d.hidden || []).map((b) => [b.tradeKey, b.price, b.hiddenBy, statusOf(b), b.trust ? b.trust.level + b.trust.score : '']),
+                // How old a list is, in the words shown: drawn again when they change, not every second.
+                Object.entries(d.oldLists || {}).map(([k, o]) => [k, o.level, listAgeText(now - o.at)]),
                 p.freshOnly,
                 p.networthPct,
                 d.sellers.state, d.sellers.error,
@@ -2460,6 +2465,7 @@ export class SellingPage {
                     this.networthLine(b),
                     // Your own history with them (the Ledger): "Traded 7× · last 3d ago".
                     b.traded ? spEl('small', { class: 'sp-traded', text: b.traded }) : null,
+                    this.oldListLine(d, b),
                     // Their two lists disagree: the lower is counted, and said.
                     b.differ
                         ? spEl('small', { class: 'sp-differ', text: 'Lists differ: ' + this.listPrices(b, ' · ') + '. Counted at the lower; check before trading.' })
@@ -2488,6 +2494,21 @@ export class SellingPage {
         }
         this.hiddenBuyersPart(card, d);
         return card;
+    }
+
+    /**
+     * A price from a TornW3B list its trader has not changed in over 24 hours
+     * (3.22.3; the owner picked mockup X-B): an amber dot and how long ago,
+     * under the trader - the price itself is left as it is. The dot pulses
+     * until two days; past that (Fresh prices only off) it is still.
+     */
+    oldListLine(d, b) {
+        const o = d.oldLists && b.tradeKey ? d.oldLists[b.tradeKey] : null;
+        if (!o) return null;
+        const dot = spEl('span', { class: 'sp-olddot' });
+        // The desk is drawn again often: the pulse goes on from where the clock is, never from its start.
+        if (o.level === 'aging') dot.style.animationDelay = -(Date.now() % OLD_PULSE_MS) + 'ms';
+        return spEl('small', { class: 'sp-oldlist' + (o.level === 'aging' ? ' sp-oldlist-pulse' : '') }, [dot, 'Price list last changed ' + listAgeText(Date.now() - o.at)]);
     }
 
     /**
@@ -3617,6 +3638,15 @@ a.sp-btn { display: inline-flex; align-items: center; text-decoration: none; }
 .sp-tr-l small { font-size: 12px; color: var(--muted); }
 .sp-tr-l small.sp-differ { color: var(--warn); }
 .sp-note.sp-warnnote { color: var(--warn); }
+/*
+ * An old price list (3.22.3): amber, with a dot. The pulse is a ring behind
+ * the dot that grows and fades - transform and opacity only, so it costs no
+ * layout and no repaint of the row.
+ */
+.sp-tr-l small.sp-oldlist { display: flex; align-items: flex-start; gap: 6px; color: var(--warn); }
+.sp-olddot { position: relative; flex: 0 0 auto; width: 7px; height: 7px; margin-top: 5px; border-radius: 50%; background: var(--warn); }
+.sp-oldlist-pulse .sp-olddot::after { content: ""; position: absolute; inset: 0; border-radius: 50%; background: var(--warn); pointer-events: none; animation: sp-oldpulse 1600ms ease-out infinite; animation-delay: inherit; }
+@keyframes sp-oldpulse { 0% { transform: scale(1); opacity: 0.7; } 70%, 100% { transform: scale(3); opacity: 0; } }
 .sp-trader-l { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 8px; min-width: 0; }
 .sp-pname { color: var(--text); font-weight: 600; }
 .sp-tprice { font: 650 15px var(--sans); text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }

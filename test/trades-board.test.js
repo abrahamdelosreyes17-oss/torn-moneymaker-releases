@@ -8,6 +8,10 @@
  * - "if the prices are too stale ... do not show them in tornbids, it means
  *   they are not updating"; "2 days update is fine" - core/traders.js
  *   stalePrice / freshOnly.
+ *
+ * 3.22.3 (the owner, 2026-10-05): "we do need a pulsating amber color to show
+ * that price list isnt updated over 24 hours to 2 days" - core/traders.js
+ * oldList / listAgeText.
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -15,7 +19,7 @@ import assert from 'node:assert/strict';
 import { liveAsked, addAsked, liveEnded, addEnded, endedOf, tradesBoard, ASKED_KEEP_MS, ENDED_KEEP_MS } from '../src/core/trades-board.js';
 import { acceptTrade, recordBuy, cancelledLeftovers } from '../src/core/accepted.js';
 import { tidyAsked, tidyEnded } from '../src/core/tidy.js';
-import { stalePrice, freshOnly, hiddenBuyers, PRICES_STALE_MS } from '../src/core/traders.js';
+import { stalePrice, freshOnly, hiddenBuyers, oldList, listAgeText, PRICES_STALE_MS, PRICES_AGING_MS } from '../src/core/traders.js';
 
 const NOW = 1_790_000_000_000;
 const MIN = 60 * 1000;
@@ -118,4 +122,55 @@ test('Fresh prices only: a TornW3B price from a list not changed in two days is 
     assert.deepEqual(hiddenBuyers(buyers, { prefs: { freshOnly: true }, listAtOf, now: NOW }).map((b) => [b.id, b.hiddenBy, b.listAt]), [['1', 'stale', NOW - 3 * DAY]]);
     assert.deepEqual(hiddenBuyers(buyers, { prefs: { freshOnly: true, onlineOnly: true }, levelOf, listAtOf, now: NOW }).map((b) => [b.id, b.hiddenBy]), [['1', 'offline']]);
     assert.deepEqual(hiddenBuyers(buyers, { prefs: {}, listAtOf, now: NOW }), []);
+});
+
+test('an old list (3.22.3): over 24 hours to two days is aging, over two days is stale - the same prices Fresh prices only looks at, and no others', () => {
+    const HOUR = 60 * 60 * 1000;
+    const DAY = 24 * HOUR;
+    assert.equal(PRICES_AGING_MS, DAY);
+    const listAt = new Map([['1', NOW - 3 * DAY], ['2', NOW - 30 * HOUR], ['3', NOW - 30 * HOUR], ['5', NOW - 30 * HOUR], ['6', NOW - 2 * HOUR], ['7', NOW + HOUR]]);
+    const listAtOf = (id) => listAt.get(String(id)) || 0;
+    const buyers = [
+        { id: '1', name: 'Over two days', price: 900, w3b: 900, te: null },
+        { id: '2', name: 'A day and six hours', price: 890, w3b: 890, te: null },
+        { id: '3', name: 'The same, on TornExchange too', price: 880, w3b: 885, te: 880 },
+        { id: '4', name: 'Date not known', price: 870, w3b: 870, te: null },
+        { id: '5', name: 'TornExchange only', price: 860, w3b: null, te: 860 },
+        { id: '6', name: 'Changed two hours ago', price: 855, w3b: 855, te: null },
+        { id: '7', name: 'A date ahead of this clock', price: 852, w3b: 852, te: null },
+        { id: null, name: 'By name only', price: 850, w3b: 850, te: null },
+    ];
+    assert.deepEqual(buyers.map((b) => oldList(b, listAtOf, NOW)), [
+        { at: NOW - 3 * DAY, level: 'stale' },
+        { at: NOW - 30 * HOUR, level: 'aging' },
+        null, null, null, null, null, null,
+    ]);
+    assert.equal(oldList(null, listAtOf, NOW), null);
+    // Exactly 24 hours is not over 24 hours; exactly two days is still aging, as it is still shown.
+    const at = (ms) => oldList({ id: '9', w3b: 5 }, () => NOW - ms, NOW);
+    assert.equal(at(PRICES_AGING_MS), null);
+    assert.deepEqual(at(PRICES_AGING_MS + 1), { at: NOW - PRICES_AGING_MS - 1, level: 'aging' });
+    assert.equal(at(PRICES_STALE_MS).level, 'aging');
+    assert.equal(at(PRICES_STALE_MS + 1).level, 'stale');
+    // Never at odds with Fresh prices only: what it hides is stale here, what it keeps is not.
+    for (const b of buyers) {
+        const o = oldList(b, listAtOf, NOW);
+        assert.equal(Boolean(o && o.level === 'stale'), stalePrice(b, listAtOf, NOW), b.name);
+    }
+    // With the switch on, the one old list left on the page is the aging one.
+    assert.deepEqual(freshOnly(buyers, listAtOf, NOW).map((b) => (oldList(b, listAtOf, NOW) || {}).level || null), ['aging', null, null, null, null, null, null]);
+    // A list date that is not a number is not known.
+    assert.equal(oldList({ id: '9', w3b: 5 }, () => 'soon', NOW), null);
+    assert.equal(oldList({ id: '9', w3b: 5 }, () => undefined, NOW), null);
+});
+
+test('how long ago a list was changed (3.22.3): in words, never shortened - hours for the first three days, then days', () => {
+    const HOUR = 60 * 60 * 1000;
+    const DAY = 24 * HOUR;
+    assert.deepEqual(
+        [30 * HOUR, DAY, DAY + HOUR, 25 * HOUR + 59 * 60 * 1000, 2 * DAY, 2 * DAY + 5 * HOUR, 3 * DAY - 1, 3 * DAY, 3 * DAY + 5 * HOUR, 23 * DAY].map(listAgeText),
+        ['1 day 6 hours ago', '1 day ago', '1 day 1 hour ago', '1 day 1 hour ago', '2 days ago', '2 days 5 hours ago', '2 days 23 hours ago', '3 days ago', '3 days ago', '23 days ago'],
+    );
+    assert.deepEqual([0, 59 * 60 * 1000, HOUR, 23 * HOUR].map(listAgeText), ['under an hour ago', 'under an hour ago', '1 hour ago', '23 hours ago']);
+    assert.deepEqual([NaN, -1, undefined, Infinity].map(listAgeText), ['not known', 'not known', 'not known', 'not known']);
 });
