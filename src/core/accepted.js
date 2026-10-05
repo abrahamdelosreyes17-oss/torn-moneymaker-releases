@@ -16,6 +16,17 @@ export const ACCEPTED_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 /** At most this many accepted trades are kept at once. */
 export const ACCEPTED_MAX = 10;
 
+/*
+ * The most items one trade takes (3.23.0; the owner, 2026-10-05: "the 10k
+ * limit is per trade"): a count of units - what the plan buys, what you buy
+ * outside it and your own To sell lines together. The plan, Add all and Fill
+ * all stop at it; what goes over waits in To sell under that trader, for a
+ * second trade with them ("yes can go to sell").
+ */
+export const TRADE_MAX_UNITS = 10000;
+/* From this share of it, the count says how much room is left. */
+const TRADE_NEAR = 0.9;
+
 /**
  * The frozen trade, from the plan on the desk at the moment of yes.
  *
@@ -261,6 +272,164 @@ export function recordLateBuy(trade, sellerId, itemId, qty, price, now = Date.no
     return { trade: changed ? { ...trade, items } : trade, rest };
 }
 
+/* ------------------------------ every buy the trader pays for (3.23.0) */
+
+/*
+ * The friend's zip, 2026-10-05: FAFFO had accepted Bottle of Champagne at
+ * $3,100; one bought at $2,899 at a bazaar other than the planned one was
+ * written down as "An extra buy kept for To sell", not as a buy of the trade.
+ * On a bazaar page a buy was the trade's only when its item was planned AT
+ * THAT bazaar, else by the lists that browser tab had, while the read of your
+ * Torn log went by the trade's line at any bazaar.
+ *
+ * One rule, for the bazaar page, Next and the log read: what the trader
+ * accepted for the item in this trade, wherever it was to be bought; else
+ * what their list says. And one place for each buy: the buying run (a step
+ * still to buy there), the trade, or To sell - never two of them.
+ */
+
+/**
+ * What a trade pays for one of an item: the price its trader accepted for it
+ * (a flip's line first, else one of your own lines), else what their list
+ * says. 0: they do not buy it.
+ *
+ * @param {function} [listBidOf] - (item id) => what this trade's trader lists for it
+ */
+export function tradeBidOf(trade, itemId, listBidOf = () => 0) {
+    const accepted = acceptedBidOf(trade, itemId);
+    if (accepted > 0) return accepted;
+    const listed = Number(listBidOf(String(itemId)));
+    return Number.isFinite(listed) && listed > 0 ? listed : 0;
+}
+
+/** The price a trade's trader accepted for an item (0: the item is not in the trade). */
+function acceptedBidOf(trade, itemId) {
+    const id = String(itemId);
+    const lines = ((trade && trade.items) || []).filter((i) => i && String(i.itemId) === id && Number(i.bid) > 0);
+    const line = lines.find((i) => i.kind === 'flip') || lines[0];
+    return line ? Number(line.bid) : 0;
+}
+
+/** A step of this item still to buy at this seller: the buying run counts what you take of it (Next). */
+export function pendingStepAt(trade, sellerId, itemId) {
+    return ((trade && trade.items) || []).some((i) => i && i.kind === 'flip' && String(i.itemId) === String(itemId) && (i.steps || []).some((st) => !stepDone(st) && String(st.sellerId) === String(sellerId)));
+}
+
+/**
+ * Which accepted trade a buy is for: the one that planned this item at this
+ * seller; else the one that accepted a price for the item; else the one whose
+ * trader's list pays for it - the newest such, each time. None: null (the buy
+ * is yours, To sell).
+ *
+ * @param {Array} trades - accepted trades
+ * @param {{sellerId, itemId}} buy
+ * @param {function} [listBidOf] - (trade, item id) => what that trade's trader lists for it
+ */
+export function tradeForBuy(trades, buy, listBidOf = () => 0) {
+    const list = [...(Array.isArray(trades) ? trades : Object.values(trades || {}))].filter((t) => t && t.key && Array.isArray(t.items)).sort((a, b) => b.at - a.at);
+    if (!buy || !list.length) return null;
+    const item = String(buy.itemId);
+    const seller = String(buy.sellerId || '');
+    return list.find((t) => t.items.some((i) => i.kind === 'flip' && String(i.itemId) === item && (i.steps || []).some((st) => String(st.sellerId) === seller)))
+        || list.find((t) => acceptedBidOf(t, item) > 0)
+        || list.find((t) => Number(listBidOf(t, item)) > 0)
+        || null;
+}
+
+/**
+ * Where one buy made on a bazaar page goes.
+ *
+ * - 'run': a step of it is still to buy at this bazaar - the buying run
+ *   counts it at Next (and what is over the step's number), never twice.
+ * - 'trade': it joins the trade that pays for it (`trade`: that trade with
+ *   the buy in it). A step you had been through at this bazaar - skipped, or
+ *   bought short - is filled first (`filled`); the rest is an unplanned buy
+ *   of the trade (`extra`) at `bid`, which is the price the trader accepted
+ *   (`by`: 'accepted') or their list's ('list').
+ * - 'tosell': no accepted trade's trader pays for it - it is yours.
+ * - 'none': not a buy.
+ *
+ * @param {Array|object} trades - the accepted trades
+ * @param {{sellerId, itemId, name, qty, price, seller?}} buy
+ * @param {function} [listBidOf] - (trade, item id) => what that trade's trader lists for it
+ * @param {boolean} [watched] - false: the buying run is counting ANOTHER card of this item here
+ *   (the same item listed twice, at two prices), so this card's buy is not its to count
+ */
+export function placeBuy(trades, buy, listBidOf = () => 0, now = Date.now(), watched = true) {
+    const none = { where: 'none', key: null, trade: null, filled: 0, extra: 0, bid: 0, by: null };
+    const qty = Math.max(0, Math.floor(Number(buy && buy.qty) || 0));
+    if (!buy || !buy.itemId || !qty) return none;
+    const list = (Array.isArray(trades) ? trades : Object.values(trades || {})).filter((t) => t && t.key && Array.isArray(t.items));
+    const run = watched ? list.find((t) => pendingStepAt(t, buy.sellerId, buy.itemId)) : null;
+    if (run) return { ...none, where: 'run', key: run.key };
+    const t = tradeForBuy(list, buy, listBidOf);
+    if (!t) return { ...none, where: 'tosell' };
+    const accepted = acceptedBidOf(t, buy.itemId);
+    const bid = tradeBidOf(t, buy.itemId, (id) => listBidOf(t, id));
+    const late = recordLateBuy(t, buy.sellerId, buy.itemId, qty, buy.price, now);
+    let next = late.trade;
+    if (late.rest > 0) {
+        let seller = buy.seller || null;
+        for (const i of t.items) for (const st of i.steps || []) if (!seller && String(st.sellerId) === String(buy.sellerId) && st.sellerName) seller = st.sellerName;
+        next = addExtraBuy(next, { itemId: buy.itemId, name: buy.name || 'Item ' + buy.itemId, qty: late.rest, price: Number(buy.price) || 0, bid, sellerId: buy.sellerId ? String(buy.sellerId) : null, seller }, now);
+    }
+    return { where: 'trade', key: t.key, trade: next, filled: qty - late.rest, extra: late.rest, bid, by: accepted > 0 ? 'accepted' : 'list' };
+}
+
+/**
+ * Where a buy read from your Torn log lands, for the problem log (3.23.0:
+ * the next report says why each buy is in a trade or left out of it).
+ *
+ * @returns {{where: 'step'|'trade'|'out'|'none', key: string|null, bid: number, by: 'accepted'|'list'|null}}
+ *   step: planned at that bazaar (it ticks the step; what is over it is not
+ *   planned); trade: not planned there, its trader pays for it; out: no
+ *   accepted trade's trader pays for it; none: bought before any trade's yes
+ */
+export function logBuyPlace(trades, buy, listBidOf = () => 0) {
+    const none = { where: 'none', key: null, bid: 0, by: null };
+    const open = [...(Array.isArray(trades) ? trades : Object.values(trades || {}))].filter((t) => t && t.key && Array.isArray(t.items) && buy && Number(buy.t) >= Number(t.at) - LOG_BUY_SLACK_MS).sort((a, b) => b.at - a.at);
+    if (!open.length) return none;
+    const t = tradeForBuy(open, buy, listBidOf);
+    if (!t) return { ...none, where: 'out', key: open[0].key };
+    const planned = t.items.some((i) => i.kind === 'flip' && String(i.itemId) === String(buy.itemId) && (i.steps || []).some((st) => String(st.sellerId) === String(buy.sellerId)));
+    return { where: planned ? 'step' : 'trade', key: t.key, bid: tradeBidOf(t, buy.itemId, (id) => listBidOf(t, id)), by: acceptedBidOf(t, buy.itemId) > 0 ? 'accepted' : 'list' };
+}
+
+/**
+ * A buy is never in To sell and in the trade both. The page keeps a buy no
+ * trade pays for as an "Extra buy" (with where it was bought: `buys`, seller
+ * id -> units); when your Torn log - read with every list Torn Bids has -
+ * then puts that buy in a trade, it comes off the To sell row. Each unit
+ * once: what was taken off is taken off `buys` too. The same list when
+ * nothing changes.
+ *
+ * @param {Array} leftovers - the To sell list
+ * @param {Array} trades - the accepted trades, your log applied (applyLogBuys)
+ */
+export function toSellLessTradeBuys(leftovers, trades) {
+    const list = Array.isArray(leftovers) ? leftovers : [];
+    if (!list.some((l) => l && l.buys)) return leftovers;
+    let out = null;
+    for (const t of Array.isArray(trades) ? trades : Object.values(trades || {})) {
+        const since = Number(t && t.at) - LOG_BUY_SLACK_MS;
+        for (const x of (t && t.extra) || []) {
+            if (!x || !x.fromLog || !(Number(x.bid) > 0) || !x.sellerId) continue;
+            const seller = String(x.sellerId);
+            const at = (out || list).findIndex((l) => l && String(l.itemId) === String(x.itemId) && l.why === 'extra' && l.buys && Number(l.buys[seller]) > 0 && Number(l.qty) > 0 && Number(l.at) >= since);
+            if (at < 0) continue;
+            const row = (out || list)[at];
+            const n = Math.min(Number(x.qty) || 0, Number(row.buys[seller]), Number(row.qty));
+            if (!(n > 0)) continue;
+            if (!out) out = list.map((l) => (l && l.buys ? { ...l, buys: { ...l.buys } } : l));
+            const mine = out[at];
+            mine.qty -= n;
+            mine.buys[seller] -= n;
+            if (!(mine.buys[seller] > 0)) delete mine.buys[seller];
+        }
+    }
+    return out ? out.filter((l) => !l || l.qty > 0) : leftovers;
+}
+
 /* ------------------------------------ Bought since you accepted (3.14.3) */
 
 /*
@@ -322,7 +491,7 @@ export function addExtraBuy(trade, buy, now = Date.now()) {
  * @param {Map<string, number>|null} [o.inside] - lowercase item name -> how many are in Torn's trade now (the trade page), or null elsewhere
  * @returns {{trader, at, rows: Array, extra: Array, toBuy: number, totals: {cost, pays, profit}, missing: Array<{name, qty}>, done: boolean}}
  */
-export function boughtSince(trade, { inside = null } = {}) {
+export function boughtSince(trade, { inside = null, max = TRADE_MAX_UNITS } = {}) {
     const rows = [];
     let cost = 0;
     let pays = 0;
@@ -360,6 +529,53 @@ export function boughtSince(trade, { inside = null } = {}) {
         extra.push({ ...x, each: x.price, sellers: x.seller ? [x.seller] : [], planned: false, tone: x.bid > x.price ? 'extra' : 'loss', send: x.qty, inTrade: null, profit: x.qty * (x.bid - x.price) });
     }
     const all = [...rows, ...extra].sort((a, b) => (a.at || 0) - (b.at || 0));
+    // 10,000 items a trade (3.23.0): in the order you bought, then your own lines. What is over is not
+    // sent, not expected money and not asked for by the checklist - it goes to To sell when the trade ends.
+    const most = Number(max) > 0 ? Math.floor(Number(max)) : 0;
+    let room = most;
+    const overBy = new Map();
+    for (const r of all) {
+        const fit = Math.min(r.send, room);
+        room -= fit;
+        if (fit < r.send) {
+            const cut = r.send - fit;
+            const o = overBy.get(r.itemId) || { itemId: r.itemId, name: r.name, qty: 0, cost: 0 };
+            o.qty += cut;
+            o.cost += cut * r.each;
+            overBy.set(r.itemId, o);
+            cost -= cut * r.each;
+            pays -= cut * r.bid;
+            r.over = cut;
+            r.send = fit;
+            r.profit = fit * (r.bid - r.each);
+        }
+    }
+    const yoursOver = {};
+    let yoursSent = 0;
+    for (const i of (trade && trade.items) || []) {
+        if (i.kind === 'flip') continue;
+        const want = takenUnits(i);
+        const fit = Math.min(want, room);
+        room -= fit;
+        yoursSent += fit;
+        if (fit < want) yoursOver[String(i.itemId)] = (yoursOver[String(i.itemId)] || 0) + (want - fit);
+    }
+    const overRows = [...overBy.values()].map((o) => ({ itemId: o.itemId, name: o.name, qty: o.qty, each: o.qty ? o.cost / o.qty : 0 }));
+    const units = most - room;
+    const count = {
+        max: most,
+        units,
+        room,
+        full: units >= most,
+        // Nearly full: from nine tenths of it, Checkout says how much room is left.
+        near: units < most && units >= most * TRADE_NEAR,
+        over: overRows.reduce((a, o) => a + o.qty, 0) + Object.values(yoursOver).reduce((a, n) => a + n, 0),
+        // Planned and not bought yet: not in the trade, and said apart.
+        toBuy: ((trade && trade.items) || []).reduce((a, i) => a + (i.kind === 'flip' ? (i.steps || []).reduce((b, st) => b + (stepDone(st) ? 0 : Number(st.qty) || 0), 0) : 0), 0),
+        overRows,
+        yoursOver,
+        yoursSent,
+    };
     // What is in the trade, shared out in the order you bought: one item bought
     // twice (planned, and again unplanned) is not ticked twice from one count.
     if (inside) {
@@ -379,7 +595,55 @@ export function boughtSince(trade, { inside = null } = {}) {
         totals: { cost, pays, profit: pays - cost },
         missing,
         done: Boolean(inside) && all.length > 0 && !missing.length,
+        count,
     };
+}
+
+/**
+ * The trade's items against the most one trade takes (TRADE_MAX_UNITS).
+ *
+ * @returns {{max, units, room, full, over, toBuy, overRows: Array<{itemId, name, qty, each}>, yoursOver: object, yoursSent: number}}
+ *   units: in the trade as it stands - bought (planned and not), and your own
+ *   lines; toBuy: planned, not bought yet; over: bought or yours, past the
+ *   limit (overRows: what you bought; yoursOver: item id -> units of yours)
+ */
+export function tradeCount(trade, max = TRADE_MAX_UNITS) {
+    return boughtSince(trade, { max }).count;
+}
+
+/**
+ * The count as Checkout and Torn Bids show it (3.23.0): how full, and the one
+ * line to say - nothing while there is room, the room left from nine tenths,
+ * and where the rest goes once it is full.
+ *
+ * @param {object|null} count - tradeCount / boughtSince's count
+ * @param {string|null} name - the trader
+ * @returns {{state: 'ok'|'near'|'full', units, max, pct, text, say}|null}
+ */
+export function countView(count, name) {
+    if (!count || !(count.max > 0)) return null;
+    const n = (x) => Number(x).toLocaleString('en-US');
+    const who = name || 'them';
+    const state = count.full ? 'full' : count.near ? 'near' : 'ok';
+    const say = count.over > 0
+        ? 'This trade is full. ' + n(count.over) + (count.over === 1 ? ' more goes' : ' more go') + ' to To sell under ' + who + ' when it is done, for a second trade.'
+        : count.full
+            ? 'This trade is full. Anything more you buy goes to To sell under ' + who + ', for a second trade.'
+            : count.near ? 'Room for ' + n(count.room) + ' more in this trade.' : '';
+    return {
+        state,
+        units: count.units,
+        max: count.max,
+        pct: Math.min(100, Math.round((count.units / count.max) * 1000) / 10),
+        text: n(count.units) + ' of ' + n(count.max),
+        say,
+    };
+}
+
+/** What a full trade leaves for a second one with the same trader: the To sell rows of what you bought past the limit. */
+export function overLeftovers(trade, now = Date.now(), max = TRADE_MAX_UNITS) {
+    const to = trade && trade.trader ? trade.trader.name : null;
+    return tradeCount(trade, max).overRows.map((o) => ({ itemId: String(o.itemId), name: o.name, qty: o.qty, each: Math.round(o.each), from: null, for: to, at: now, why: 'over' }));
 }
 
 /*
@@ -606,8 +870,18 @@ export function addLeftovers(list, add) {
             same.qty = qty;
             same.at = Math.max(Number(same.at) || 0, Number(a.at) || 0);
             same.from = a.from || same.from;
-            // Why it is To sell (3.21.0): the newer one's word.
-            if (a.why) same.why = a.why;
+            // Why it is To sell (3.21.0): the newer one's word - and whom it waits for (3.23.0, 'over').
+            if (a.why) {
+                same.why = a.why;
+                if (a.for) same.for = a.for;
+                else delete same.for;
+            }
+            // Where an extra buy was made (3.23.0, toSellLessTradeBuys): seller id -> units.
+            if (a.buys || same.buys) {
+                const buys = { ...(same.buys || {}) };
+                for (const [k, n] of Object.entries(a.buys || {})) buys[k] = (Number(buys[k]) || 0) + (Number(n) || 0);
+                same.buys = buys;
+            }
             if (since) same.since = since;
         } else {
             out.push({ ...a });
@@ -666,9 +940,10 @@ export function acceptedTotals(trade) {
  *   send: one row per item; pays: what they should put in for it; waiting: the
  *   names of the plan's lines not bought yet
  */
-export function sendList(trade) {
+export function sendList(trade, max = TRADE_MAX_UNITS) {
     const items = (trade && trade.items) || [];
     const send = new Map();
+    const over = new Map();
     let pays = 0;
     const add = (itemId, name, qty, bid) => {
         if (!(qty > 0)) return;
@@ -677,16 +952,40 @@ export function sendList(trade) {
         send.set(id, { itemId: id, name: was ? was.name : name, qty: (was ? was.qty : 0) + qty });
         pays += qty * (Number(bid) || 0);
     };
-    const bought = boughtSince(trade);
+    const wait = (itemId, name, qty) => {
+        if (!(qty > 0)) return;
+        const id = String(itemId);
+        const was = over.get(id);
+        over.set(id, { itemId: id, name: was ? was.name : name, qty: (was ? was.qty : 0) + qty });
+    };
+    const most = Number(max) > 0 ? Math.floor(Number(max)) : 0;
+    const bought = boughtSince(trade, { max: most });
     const running = bought.rows.length > 0 || items.some((i) => i.kind === 'flip' && (i.steps || []).some(stepDone));
     if (!running) {
-        for (const i of items) add(i.itemId, i.name, takenUnits(i), i.bid);
-        return { send: [...send.values()], pays, waiting: [] };
+        // The plan's own numbers, held to the limit all the same (a plan made before there was one).
+        let room = most;
+        for (const i of items) {
+            const want = takenUnits(i);
+            const fit = Math.min(want, room);
+            room -= fit;
+            add(i.itemId, i.name, fit, i.bid);
+            wait(i.itemId, i.name, want - fit);
+        }
+        return { send: [...send.values()], pays, waiting: [], over: [...over.values()], full: room <= 0 };
     }
-    for (const i of items) if (i.kind !== 'flip') add(i.itemId, i.name, takenUnits(i), i.bid);
-    for (const r of bought.rows) add(r.itemId, r.name, r.send, r.bid);
-    const waiting = items.filter((i) => i.kind === 'flip' && !send.has(String(i.itemId)) && (i.steps || []).some((st) => !stepDone(st))).map((i) => i.name);
-    return { send: [...send.values()], pays, waiting };
+    // 10,000 items a trade (3.23.0): what you bought first, in the order you bought it, then your own lines.
+    for (const i of items) {
+        if (i.kind === 'flip') continue;
+        const cut = Math.min(takenUnits(i), bought.count.yoursOver[String(i.itemId)] || 0);
+        add(i.itemId, i.name, takenUnits(i) - cut, i.bid);
+        wait(i.itemId, i.name, cut);
+    }
+    for (const r of bought.rows) {
+        add(r.itemId, r.name, r.send, r.bid);
+        wait(r.itemId, r.name, r.over || 0);
+    }
+    const waiting = items.filter((i) => i.kind === 'flip' && !send.has(String(i.itemId)) && !over.has(String(i.itemId)) && (i.steps || []).some((st) => !stepDone(st))).map((i) => i.name);
+    return { send: [...send.values()], pays, waiting, over: [...over.values()], full: bought.count.full };
 }
 
 /* ------------------------------------------ Fill on Torn's trade page (3.14.2) */
@@ -708,15 +1007,18 @@ export function sendList(trade) {
  * @param {number} p.marked - rows marked with Fill on this page
  * @param {number|null} [p.open] - items of it still to add (not all in the trade yet); null: not known
  * @param {string[]} [p.waiting] - the plan's lines not bought yet (sendList)
+ * @param {number} [p.over] - units past the most one trade takes (sendList's over): not offered to Fill
  * @returns {{ok: boolean, text: string}}
  */
-export function fillNote({ accepted = [], trader = null, partner = null, toSend = 0, marked = 0, missing = [], open = null, waiting = [] }) {
+export function fillNote({ accepted = [], trader = null, partner = null, toSend = 0, marked = 0, missing = [], open = null, waiting = [], over = 0 }) {
     if (!accepted.length) return { ok: false, text: 'Fill: no trade accepted in Torn Bids on this browser' };
     if (!trader && partner) return { ok: false, text: 'Fill: this trade is with ' + partner + '; you accepted ' + accepted.join(', ') };
     if (!trader) return { ok: false, text: 'Fill: which trade? You accepted ' + accepted.join(', ') + ' - open it from its first page' };
     if (!toSend) return { ok: false, text: 'Fill: nothing recorded as bought for ' + trader + ' - tick Bought in Torn Bids' };
     // A trade made mid flip (3.17.2): how many of the plan's items are not bought yet (Checkout names them).
-    const later = waiting.length ? ' · ' + waiting.length + ' not bought yet' : '';
+    // A full trade (3.23.0): Fill stops at 10,000; what is over goes to To sell under them when the trade is done.
+    const full = over > 0 ? ' · the trade is full at ' + TRADE_MAX_UNITS.toLocaleString('en-US') + ' items: ' + Number(over).toLocaleString('en-US') + ' more go to To sell under ' + trader + ', for a second trade' : '';
+    const later = (waiting.length ? ' · ' + waiting.length + ' not bought yet' : '') + full;
     // All of it is in already: said so (it read "none of X's items are in this list" - their rows had left the list).
     if (open === 0) return { ok: true, text: 'Fill: everything ' + (waiting.length ? 'you bought ' : '') + 'for ' + trader + ' is in the trade' + later };
     // Torn adds the list's rows as you scroll it (3.21.1: said, with the way to them - Fill never scrolls for you).
@@ -834,13 +1136,14 @@ export function applyLogBuys(trade, buys, { readFrom = 0, readTo = 0, bidOf = ()
     const fromLog = [];
     for (const p of pool.values()) {
         if (!(p.left > 0)) continue;
-        const line = trade.items.find((i) => i.kind === 'flip' && String(i.itemId) === p.itemId);
+        // One rule (3.23.0): the price they accepted for the item - a flip's line or one of yours - else their list.
+        const line = trade.items.find((i) => String(i.itemId) === p.itemId && i.name);
         fromLog.push({
             itemId: p.itemId,
-            name: names.get(p.itemId) || nameOf(p.itemId) || 'Item ' + p.itemId,
+            name: names.get(p.itemId) || (line && line.name) || nameOf(p.itemId) || 'Item ' + p.itemId,
             qty: p.left,
             price: p.qty ? p.cost / p.qty : 0,
-            bid: line ? line.bid : Math.max(0, Number(bidOf(p.itemId)) || 0),
+            bid: tradeBidOf(trade, p.itemId, bidOf),
             sellerId: p.sellerId,
             seller: sellerName.get(p.sellerId) || null,
             at: p.at,
@@ -879,19 +1182,21 @@ export function sellElsewhere(trade, buyersOf) {
 /**
  * Which accepted trade each log buy belongs to, so no buy counts twice: a
  * buy from a seller a trade planned for that item goes to that trade (the
- * newest such); anything else to the newest trade accepted before it.
+ * newest such); else to the trade that accepted a price for the item, or
+ * whose trader lists it; anything else to the newest trade accepted before it.
  *
  * @returns {Map<string, Array>} trade key -> its buys
  */
-export function splitLogBuys(trades, buys) {
+export function splitLogBuys(trades, buys, listBidOf = () => 0) {
     const list = [...(trades || [])].filter((t) => t && t.key).sort((a, b) => b.at - a.at);
     const out = new Map(list.map((t) => [t.key, []]));
     for (const b of buys || []) {
         if (!b) continue;
         const open = list.filter((t) => Number(b.t) >= Number(t.at) - LOG_BUY_SLACK_MS);
         if (!open.length) continue;
-        const planned = open.find((t) => (t.items || []).some((i) => i.kind === 'flip' && String(i.itemId) === String(b.itemId) && (i.steps || []).some((st) => String(st.sellerId) === String(b.sellerId))));
-        out.get((planned || open[0]).key).push(b);
+        // The trade that pays for it (tradeForBuy, 3.23.0: the newest trade took everything not planned at
+        // that seller, whether or not its trader buys it); one nobody pays for stays with the newest.
+        out.get((tradeForBuy(open, b, listBidOf) || open[0]).key).push(b);
     }
     return out;
 }
@@ -966,8 +1271,12 @@ export function finishedTradeFor(trade, finished, until = Infinity) {
  * (Torn's clock, ms) - from then on what leaves your stock counts against
  * these (leftoversAfterSales).
  */
-export function tradedLeftovers(trade, gave, now = Date.now(), finishedAt = null) {
+export function tradedLeftovers(trade, gave, now = Date.now(), finishedAt = null, max = TRADE_MAX_UNITS) {
     const from = trade && trade.trader ? trade.trader.name : null;
+    // A full trade (3.23.0): what you bought past the limit was never offered - it waits for a second trade
+    // with this trader, and is not "not taken" (which is never offered to them again).
+    const count = tradeCount(trade, max);
+    const overOf = new Map(count.overRows.map((o) => [String(o.itemId), o.qty]));
     const given = new Map();
     for (const [k, v] of gave || []) given.set(String(k), Number(v) || 0);
     const bought = new Map();
@@ -982,7 +1291,7 @@ export function tradedLeftovers(trade, gave, now = Date.now(), finishedAt = null
     for (const i of (trade && trade.items) || []) {
         const id = String(i.itemId);
         if (i.kind === 'yours') {
-            if (given.has(id)) given.set(id, Math.max(0, given.get(id) - (Number(i.units) || 0)));
+            if (given.has(id)) given.set(id, Math.max(0, given.get(id) - Math.max(0, (Number(i.units) || 0) - (count.yoursOver[id] || 0))));
             continue;
         }
         if (i.kind !== 'flip' || !(i.steps || []).some(stepDone)) continue;
@@ -997,7 +1306,9 @@ export function tradedLeftovers(trade, gave, now = Date.now(), finishedAt = null
     const out = [];
     for (const b of bought.values()) {
         const left = b.qty - Math.min(b.qty, given.get(b.itemId) || 0);
-        if (left > 0) out.push({ itemId: b.itemId, name: b.name, qty: left, each: Math.round(b.cost / b.qty), from, at: now, why: 'left', ...stamp });
+        if (!(left > 0)) continue;
+        const over = left <= (overOf.get(b.itemId) || 0);
+        out.push({ itemId: b.itemId, name: b.name, qty: left, each: Math.round(b.cost / b.qty), from: over ? null : from, ...(over ? { for: from } : {}), at: now, why: over ? 'over' : 'left', ...stamp });
     }
     return out;
 }

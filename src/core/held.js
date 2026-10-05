@@ -182,8 +182,10 @@ export function priceHeld(held, { rowsOf, bidOf, lowestOf = () => null }) {
  * @param {function} repick - (itemId, units) => steps [{sellerId, sellerName, qty, price}] or null
  * @param {object} [info] - {name, bid, kind, units} for an item not in the trade yet (one you add),
  *   units: how many when you tick back one that had none
+ * @param {number} [room] - the most this line may take (3.23.0: what the trade's
+ *   item limit leaves it); none: the trade is left as it is
  */
-export function editHeld(held, itemId, edit, repick, info = {}) {
+export function editHeld(held, itemId, edit, repick, info = {}, room = Infinity) {
     const id = String(itemId);
     const at = held.lines.findIndex((l) => l.itemId === id);
     const was = at >= 0 ? held.lines[at] : (held.off || []).find((o) => o.itemId === id) || null;
@@ -199,7 +201,10 @@ export function editHeld(held, itemId, edit, repick, info = {}) {
         lines.splice(Math.min(Number.isInteger(place) ? place : lines.length, lines.length), 0, line);
         return { ...held, lines, off };
     }
-    const n = edit && edit.qty > 0 ? Math.floor(edit.qty) : (was && was.units) || Math.floor(Number(info.units) || 0);
+    const asked = edit && edit.qty > 0 ? Math.floor(edit.qty) : (was && was.units) || Math.floor(Number(info.units) || 0);
+    const n = Math.max(0, Math.min(asked, Math.floor(Number(room))));
+    // No room left in the trade for one of it: nothing changes (the page says the trade is full).
+    if (asked > 0 && !(n > 0)) return held;
     const steps = n > 0 ? repick(id, n) : null;
     if (!steps || !steps.length) {
         // Added (Add, Add all) before its bazaars were read: in as an ≈ line at

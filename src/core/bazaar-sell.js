@@ -111,6 +111,10 @@ export function sameBoughtItems(a, b) {
  * the log's, never added to them) at the higher of the two costs, so a price
  * that clears it is never a loss.
  *
+ * A To sell row marked "Not for sale" (3.23.0, core/to-sell.js `keep`) is in
+ * the list as `kept`: what you paid for it is still known (a price under it
+ * still warns), and Fill all passes it by (fillAllList).
+ *
  * @param {object} o
  * @param {Array<{itemId, name, qty, each, why, from, at}>} o.leftovers - the To sell list
  * @param {Array<{itemId, qty, each, at}>} [o.bought] - liveBoughtItems
@@ -133,6 +137,7 @@ export function bazaarSellList({ leftovers = [], bought = [], reserved = null, n
             continue;
         }
         const row = { itemId: id, name: l.name || nameOf(id) || 'Item ' + id, qty: Math.floor(Number(l.qty)), paid: Number(l.each) || 0, source: 'tosell', why: l.why || 'left', from: l.from || null, at: Number(l.at) || 0 };
+        if (Number(l.keep) > 0) row.kept = true;
         byItem.set(id, row);
         out.push(row);
     }
@@ -154,6 +159,11 @@ export function bazaarSellList({ leftovers = [], bought = [], reserved = null, n
     }
     rest.sort((a, b) => b.at - a.at || String(a.name).localeCompare(String(b.name)));
     return [...out, ...rest];
+}
+
+/** The rows Fill all goes through: all but the ones marked "Not for sale" (3.23.0). */
+export function fillAllList(list) {
+    return (list || []).filter((r) => r && !r.kept);
 }
 
 /** Would listing at `price` give less than you paid for it? (Nothing known paid: never.) */

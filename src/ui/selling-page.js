@@ -23,6 +23,7 @@
  */
 
 import { formatMoney, formatAge, parseMoneyInput, readWholeNumber } from '../core/parse.js';
+import { TRADE_MAX_UNITS, countView } from '../core/accepted.js';
 import { TO_SELL_WHY } from '../core/to-sell.js';
 import { listAgeText } from '../core/traders.js';
 import { UsageView, USAGE_CSS } from './usage-view.js';
@@ -274,6 +275,22 @@ function keyField({ placeholder, onSave, onReveal, primary = false }) {
     });
     void primary;
     return { input, row: spEl('div', { class: 'sp-inline' }, [input, show]) };
+}
+
+/**
+ * The one line under a trade's left-out items (3.23.0): how many are not
+ * offered, and why - no cash, no pay or no room for even one of them.
+ * @param {string} name - the trader
+ * @param {number} shown - left-out items that still fit
+ * @param {number} hidden - left-out items that do not
+ */
+export function leftHiddenText(name, shown, hidden) {
+    if (!(hidden > 0)) return '';
+    const n = Number(hidden).toLocaleString('en-US');
+    const why = ': your Cash for flips, what ' + name + ' can pay or the ' + TRADE_MAX_UNITS.toLocaleString('en-US') + ' items of one trade leave no room for ' + (hidden === 1 ? 'it' : 'them') + '.';
+    return shown > 0
+        ? n + ' more ' + (hidden === 1 ? 'is' : 'are') + ' not shown' + why
+        : name + ' buys ' + n + (hidden === 1 ? ' more item' : ' more items') + ', not shown' + why;
 }
 
 export class SellingPage {
@@ -1541,7 +1558,7 @@ export class SellingPage {
         const refocus = this.focusKeyIn(box);
         queueMicrotask(() => this.focusBack(box, refocus));
         const sig = JSON.stringify([sc.open, sc.favourites, sc.trusted, this.scanAll, s.desk && s.desk.itemId, s.desk && s.desk.trade && s.desk.trade.chosen && s.desk.trade.chosen.key,
-            sc.list.map((x) => [x.id, x.name, x.profit, x.items, x.stops, x.reading, x.lastPaid, x.mainId, x.mainUnits, x.favourite, x.waiting, x.hiddenBy, x.hiddenBy && s.statuses && JSON.stringify(s.statuses.get(String(x.id)) || null), x.traded, x.trust && x.trust.level + x.trust.score])]);
+            sc.list.map((x) => [x.id, x.name, x.profit, x.items, x.stops, x.reading, x.lastPaid, x.mainId, x.mainUnits, x.favourite, x.waiting, x.hiddenBy, x.hiddenBy && s.statuses && JSON.stringify(s.statuses.get(String(x.id)) || null), x.traded, x.trust && x.trust.level + x.trust.score, x.listOld ? x.listOld.level + listAgeText(Date.now() - x.listOld.at) : ''])]);
         if (sig === this.scanSig) return;
         this.scanSig = sig;
         box.textContent = '';
@@ -1594,6 +1611,8 @@ export class SellingPage {
                 el.appendChild(spEl('small', { text: x.waiting ? 'Checking if they are online…' : x.reading ? 'Reading their list…' : 'No trade now: nothing in bazaars under their prices' }));
             }
             if (x.traded) el.appendChild(spEl('small', { class: 'sp-traded', text: x.traded }));
+            // A price this trade counts on is from a list getting old (3.23.0): the same line as on the desk.
+            if (ready && x.listOld) el.appendChild(this.oldListEl(x.listOld));
             el.appendChild(spEl('button', {
                 type: 'button',
                 class: 'sp-btn sp-go' + (sel ? ' sp-go-on' : ''),
@@ -1994,7 +2013,7 @@ export class SellingPage {
         const T = s.toSell || { rows: [], open: false };
         const rows = T.rows || [];
         const sig = JSON.stringify(['sell', s.counts, T.open, s.desk && s.desk.itemId, s.prefs.onlineOnly, s.prefs.trustedOnly,
-            rows.map((r) => [r.itemId, r.name, r.qty, r.each, r.why, r.best && [r.best.name, r.best.price], r.gain, r.ready, r.bazaar])]);
+            rows.map((r) => [r.itemId, r.name, r.qty, r.each, r.why, r.best && [r.best.name, r.best.price], r.gain, r.ready, r.bazaar, r.kept])]);
         if (sig === this.listSig) return;
         this.listSig = sig;
         const shadow = this.root.getRootNode();
@@ -2008,16 +2027,19 @@ export class SellingPage {
             // With the board beside it no row is "the one on the desk".
             const on = !T.open && Boolean(s.desk && s.desk.itemId === r.itemId);
             // Never a trader who pays less than you paid (3.22.0): your own bazaar when that is a profit, else it waits.
-            const line = r.best
-                ? ['Paid ' + formatMoney(r.each) + ' · ', this.playerName(r.best.name, r.best.id, 'sell:who:' + r.itemId), ' pays ' + formatMoney(r.best.price)]
-                : ['Paid ' + formatMoney(r.each) + ' · ' + (r.bazaar ? 'your bazaar at ' + formatMoney(r.bazaar.price) : 'no trader pays more yet')];
+            // Not for sale (3.23.0): yours to keep - in no trade until you put it back (on the board).
+            const line = r.kept
+                ? ['Paid ' + formatMoney(r.each) + ' · in no trade until you put it back']
+                : r.best
+                    ? ['Paid ' + formatMoney(r.each) + ' · ', this.playerName(r.best.name, r.best.id, 'sell:who:' + r.itemId), ' pays ' + formatMoney(r.best.price)]
+                    : ['Paid ' + formatMoney(r.each) + ' · ' + (r.bazaar ? 'your bazaar at ' + formatMoney(r.bazaar.price) : 'no trader pays more yet')];
             this.listBox.appendChild(spEl('div', {
-                class: 'sp-it sp-ts' + (on ? ' sp-sel' : '') + (r.ready ? '' : ' sp-ts-wait'),
+                class: 'sp-it sp-ts' + (on ? ' sp-sel' : '') + (r.ready ? '' : ' sp-ts-wait') + (r.kept ? ' sp-ts-kept' : ''),
                 role: 'button',
                 tabindex: '0',
                 'aria-pressed': String(on),
                 'data-focus': 'sell:' + r.itemId,
-                title: r.ready ? 'Show it on the desk' : r.bazaar ? 'No trader pays more than you paid; your own bazaar would, $1 under the cheapest: show it on the desk' : 'Waiting for a trader who pays more than you paid: show it on the desk',
+                title: r.kept ? 'Not for sale: it is in no trade. Show it on the desk' : r.ready ? 'Show it on the desk' : r.bazaar ? 'No trader pays more than you paid; your own bazaar would, $1 under the cheapest: show it on the desk' : 'Waiting for a trader who pays more than you paid: show it on the desk',
                 onclick: () => this.select(r.itemId),
                 onkeydown: (event) => {
                     if (event.target !== event.currentTarget || (event.key !== 'Enter' && event.key !== ' ')) return;
@@ -2027,7 +2049,8 @@ export class SellingPage {
             }, [
                 spEl('span', { class: 'sp-pic sp-pic-s' }, [this.image('sell', r.itemId)]),
                 spEl('span', { class: 'sp-ts-top' }, [this.itemName(r, 'sell:name:' + r.itemId), this.whyTag(r.why)]),
-                r.ready ? spEl('span', { class: 'sp-badge sp-badge-tosell', text: 'Sell ' + signed(r.gain) }) : r.bazaar ? spEl('span', { class: 'sp-badge sp-badge-list', text: 'Bazaar ' + signed(r.bazaar.gain) }) : spEl('span', { class: 'sp-badge sp-badge-wait', text: 'Waiting' }),
+                r.kept ? spEl('span', { class: 'sp-badge sp-badge-kept', text: 'Not for sale' })
+                    : r.ready ? spEl('span', { class: 'sp-badge sp-badge-tosell', text: 'Sell ' + signed(r.gain) }) : r.bazaar ? spEl('span', { class: 'sp-badge sp-badge-list', text: 'Bazaar ' + signed(r.bazaar.gain) }) : spEl('span', { class: 'sp-badge sp-badge-wait', text: 'Waiting' }),
                 spEl('small', {}, line),
             ]));
         }
@@ -2052,7 +2075,8 @@ export class SellingPage {
             return st ? st.level + st.text : '';
         };
         const rowSig = (r) => [r.itemId, r.name, r.qty, r.each, r.why, r.best && [r.best.name, r.best.price], r.gain, r.short, r.bazaar];
-        const sig = JSON.stringify(['board', T.groups.map((g) => [g.key, g.trader.name, statusOf(g.trader), g.trader.trust ? g.trader.trust.level + g.trader.trust.score : '', g.gain, g.rows.map(rowSig)]), T.waiting.map(rowSig), s.prefs.onlineOnly, s.prefs.trustedOnly]);
+        const keptRows = T.kept || [];
+        const sig = JSON.stringify(['board', T.groups.map((g) => [g.key, g.trader.name, statusOf(g.trader), g.trader.trust ? g.trader.trust.level + g.trader.trust.score : '', g.gain, g.rows.map(rowSig)]), T.waiting.map(rowSig), keptRows.map(rowSig), s.prefs.onlineOnly, s.prefs.trustedOnly]);
         if (sig === this.deskSig) return;
         const shadow = this.root.getRootNode();
         const active = shadow && shadow.activeElement;
@@ -2070,6 +2094,21 @@ export class SellingPage {
             box.appendChild(spEl('p', { class: 'sp-note', text: 'Nothing to sell. What you bought for a trade that was cancelled, what a trader did not take, and extra buys wait here until a trader pays more than you paid.' }));
             return;
         }
+        // "Not for sale" on a row (3.23.0), and the way back: the row is kept out of every trade, not removed.
+        const keepBtn = (r) => spEl('button', {
+            type: 'button',
+            class: 'sp-link sp-keep',
+            'data-focus': 'board:keep:' + r.itemId,
+            title: r.kept
+                ? 'Put ' + r.name + ' back: traders who pay more than you paid are named again, and it goes into their trades'
+                : 'Keep ' + r.name + ': it stays in this list, in no trade and off your bazaar\'s Fill all, until you put it back',
+            text: r.kept ? 'For sale again' : 'Not for sale',
+            onclick: (event) => {
+                // The row itself opens the desk: this press is not that.
+                event.stopPropagation();
+                if (this.h.onNotForSale) this.h.onNotForSale(r.itemId, !r.kept);
+            },
+        });
         const itemRow = (r, right) => {
             const el = spEl('div', { class: 'sp-bd-r', role: 'button', tabindex: '0', 'data-focus': 'board:' + r.itemId, title: 'Show it on the desk', onclick: () => this.select(r.itemId) }, [
                 spEl('span', { class: 'sp-pic sp-pic-s' }, [this.image('board', r.itemId)]),
@@ -2077,6 +2116,7 @@ export class SellingPage {
                 this.whyTag(r.why, true),
                 spEl('span', { class: 'sp-sp' }),
                 ...right,
+                keepBtn(r),
             ]);
             el.addEventListener('keydown', (event) => {
                 if (event.target !== el || (event.key !== 'Enter' && event.key !== ' ')) return;
@@ -2133,7 +2173,17 @@ export class SellingPage {
             }
             box.appendChild(group);
         }
-        box.appendChild(spEl('p', { class: 'sp-note', text: 'A row leaves by itself when your Ledger shows it sold or you no longer hold it.' }));
+        if (keptRows.length) {
+            const group = spEl('div', { class: 'sp-bd-g sp-bd-wait sp-bd-kept' }, [
+                spEl('div', { class: 'sp-bd-h' }, [
+                    spEl('b', { class: 'sp-bd-who', text: 'Not for sale' }),
+                    spEl('small', { text: count(keptRows.length) + (keptRows.length === 1 ? ' item' : ' items') + ' · in no trade, and off your bazaar\'s Fill all' }),
+                ]),
+            ]);
+            for (const r of keptRows) group.appendChild(itemRow(r, [spEl('small', {}, ['Paid ', spEl('b', { text: formatMoney(r.each) }), ' each'])]));
+            box.appendChild(group);
+        }
+        box.appendChild(spEl('p', { class: 'sp-note', text: 'A row leaves by itself when your Ledger shows it sold or you no longer hold it. "Not for sale" keeps one here, out of every trade, until you put it back.' }));
         if (keep) {
             const again = [...box.querySelectorAll('[data-focus]')].find((n) => n.dataset.focus === keep);
             if (again) again.focus({ preventScroll: true });
@@ -2504,7 +2554,11 @@ export class SellingPage {
      */
     oldListLine(d, b) {
         const o = d.oldLists && b.tradeKey ? d.oldLists[b.tradeKey] : null;
-        if (!o) return null;
+        return o ? this.oldListEl(o) : null;
+    }
+
+    /** The line itself, for a desk row or a Your traders card (3.23.0). @param {{at: number, level: 'aging'|'stale'}} o */
+    oldListEl(o) {
         const dot = spEl('span', { class: 'sp-olddot' });
         // The desk is drawn again often: the pulse goes on from where the clock is, never from its start.
         if (o.level === 'aging') dot.style.animationDelay = -(Date.now() % OLD_PULSE_MS) + 'ms';
@@ -2790,6 +2844,10 @@ export class SellingPage {
             const nw = b.id && this.state.networth ? this.state.networth.get(String(b.id)) : null;
             card.appendChild(spEl('p', { class: 'sp-note', text: b.name + ' can pay at most ' + (this.state.prefs.networthPct || 10) + '% of their networth' + (nw >= 0 ? ' (' + formatMoney(nw) + ')' : '') + ' for the whole trade: it stops there.' }));
         }
+        // One trade takes 10,000 items (3.23.0): the plan stops there, and says so.
+        if (c.unitsCapped) {
+            card.appendChild(spEl('p', { class: 'sp-note sp-units', text: count(c.units) + ' of ' + count(TRADE_MAX_UNITS) + ' items: one trade takes no more, so this one stops there. The rest is for a second trade with ' + b.name + '.' }));
+        }
 
         const tick = (checked, label, focus, onChange) => {
             const input = spEl('input', { type: 'checkbox', class: 'sp-tick', 'aria-label': label, 'data-focus': focus });
@@ -2913,7 +2971,13 @@ export class SellingPage {
         }
         // What else they buy, left out so the buying stays quick: listed on a
         // press, each with Add (the owner: "5 extra items, not max, but soft cap").
-        if (c.more > 0) {
+        // 3.23.0: the list is what still fits this trade - your Cash for flips, what
+        // they can pay and the 10,000 - best first; what does not fit is counted in one line.
+        const fits = (c.left || []).length;
+        const hidden = c.leftHidden || 0;
+        if (!fits && hidden) {
+            card.appendChild(spEl('p', { class: 'sp-note sp-leftline', text: leftHiddenText(b.name, 0, hidden) }));
+        } else if (c.more > 0) {
             const open = this.showLeft === c.key;
             card.appendChild(spEl('p', { class: 'sp-note sp-leftline' }, [
                 b.name + ' buys ' + count(c.more) + (c.more === 1 ? ' more item' : ' more items') + ', left out to keep it quick. ',
@@ -2937,6 +3001,7 @@ export class SellingPage {
                     ]));
                 }
             }
+            if (hidden) card.appendChild(spEl('p', { class: 'sp-note sp-lefthidden', text: leftHiddenText(b.name, fits, hidden) }));
         }
         // Was in this trade, is not now: said, never just gone (the friend lost
         // track of what to buy when rows vanished mid-trade).
@@ -2944,7 +3009,7 @@ export class SellingPage {
             card.appendChild(spEl('div', { class: 'sp-ti sp-off sp-gone' }, [
                 spEl('span', { class: 'sp-gone-mark', text: '!' }),
                 spEl('span', { class: 'sp-pic sp-pic-s' }, [this.image('trade-gone', r.itemId)]),
-                spEl('span', { class: 'sp-ti-l' }, [spEl('b', { text: r.name }), spEl('small', { text: 'no longer in the trade: no bazaar sells it under ' + b.name + '\'s price now (bought, or re-priced), or your Cash went to the others' })]),
+                spEl('span', { class: 'sp-ti-l' }, [spEl('b', { text: r.name }), spEl('small', { text: c.unitsCapped ? 'no longer in the trade: it is full at ' + count(TRADE_MAX_UNITS) + ' items' : 'no longer in the trade: no bazaar sells it under ' + b.name + '\'s price now (bought, or re-priced), or your Cash went to the others' })]),
                 spEl('span', { class: 'sp-ti-p', text: '–' }),
             ]));
         }
@@ -3014,6 +3079,9 @@ export class SellingPage {
                 spEl('small', { text: 'buy for ' + formatMoney(tot.cost) + ' · ' + b.name + ' pays ' + formatMoney(tot.pays) + ' · sent ' + sent + ' of ' + toSend.length }),
             ]),
         ]));
+        // Its items against the 10,000 one trade takes (3.23.0): said from nine tenths of it.
+        const cv = countView(A.count, b.name);
+        if (cv && cv.say) card.appendChild(spEl('p', { class: 'sp-note sp-units' + (cv.state === 'full' ? ' sp-units-full' : ''), text: cv.text + ' items. ' + cv.say }));
         // One thing to press next, always in the same place: buy, then trade.
         const next = left
             ? spEl('button', { type: 'button', class: 'sp-btn sp-primary', 'data-focus': 'acc:start', text: left === steps.length ? 'Start buying' : 'Continue buying', onclick: () => this.h.onTradeStartBuying && this.h.onTradeStartBuying(A.key) })
@@ -3537,6 +3605,10 @@ a.sp-btn { display: inline-flex; align-items: center; text-decoration: none; }
 .sp-ts-top { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 6px; min-width: 0; }
 .sp-it.sp-ts.sp-sel { border-color: var(--buy-line); background: var(--buy-bg); }
 .sp-ts-wait .sp-iname { color: var(--text2); }
+.sp-badge-kept { color: var(--muted); background: rgba(255, 255, 255, 0.07); font-weight: 600; align-self: start; }
+.sp-link.sp-keep { color: var(--muted); white-space: nowrap; padding: 4px 2px; }
+.sp-link.sp-keep:hover, .sp-link.sp-keep:focus-visible { color: var(--text); }
+.sp-bd-kept .sp-link.sp-keep { color: var(--offer); }
 .sp-badge-tosell { color: var(--buy); background: var(--buy-bg); align-self: start; }
 .sp-badge-wait { color: var(--warn); background: var(--warn-bg); font-weight: 600; align-self: start; }
 .sp-bd-top { margin-bottom: 16px; }
@@ -3638,13 +3710,18 @@ a.sp-btn { display: inline-flex; align-items: center; text-decoration: none; }
 .sp-tr-l small { font-size: 12px; color: var(--muted); }
 .sp-tr-l small.sp-differ { color: var(--warn); }
 .sp-note.sp-warnnote { color: var(--warn); }
+/* A trade against the 10,000 items one trade takes (3.23.0): amber near it, red when full. */
+.sp-note.sp-units { color: var(--warn); margin: 0 0 8px; }
+.sp-note.sp-units.sp-units-full { color: var(--bad); }
+.sp-note.sp-lefthidden { margin: 4px 0 0; }
 /*
  * An old price list (3.22.3): amber, with a dot. The pulse is a ring behind
  * the dot that grows and fades - transform and opacity only, so it costs no
  * layout and no repaint of the row.
  */
-.sp-tr-l small.sp-oldlist { display: flex; align-items: flex-start; gap: 6px; color: var(--warn); }
-.sp-olddot { position: relative; flex: 0 0 auto; width: 7px; height: 7px; margin-top: 5px; border-radius: 50%; background: var(--warn); }
+.sp-tr-l small.sp-oldlist, .sp-fc small.sp-oldlist { display: flex; align-items: flex-start; gap: 6px; color: var(--warn); }
+/* The dot sits in the middle of the first line, whatever that line's height (a desk row's, a card's). */
+.sp-olddot { position: relative; flex: 0 0 auto; width: 7px; height: 7px; margin-top: 5px; margin-top: calc((1lh - 7px) / 2); border-radius: 50%; background: var(--warn); }
 .sp-oldlist-pulse .sp-olddot::after { content: ""; position: absolute; inset: 0; border-radius: 50%; background: var(--warn); pointer-events: none; animation: sp-oldpulse 1600ms ease-out infinite; animation-delay: inherit; }
 @keyframes sp-oldpulse { 0% { transform: scale(1); opacity: 0.7; } 70%, 100% { transform: scale(3); opacity: 0; } }
 .sp-trader-l { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 8px; min-width: 0; }

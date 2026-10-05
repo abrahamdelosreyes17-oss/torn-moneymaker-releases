@@ -991,7 +991,7 @@ sent by the script: the player downloads the zip and sends it.
 **The bench** (`node test/bench.mjs`, or `npm run bench`): the harness in
 a real Chrome with the processor slowed four times, rows another extension
 keeps writing into (`&ttbusy=1`) and a 1.2 MB trader database
-(`&bigstore=2000`), six scenes, the script's own speed log printed for
+(`&bigstore=2000`), seven scenes (3.23.0: one more, 400 items read in turn), the script's own speed log printed for
 each and for all together. No dependencies (it speaks the DevTools protocol
 itself). It is how each step of Part 3 is measured before and after.
 `--compare <build>` runs every scene on that build and on this one, each
@@ -1729,7 +1729,146 @@ prices only ("2 IS FINE"); he picked the look from three in
 Seen in the harness (`test/harness-live.html?ttv2=traders&sellkeys=1&awake=1&stalelist=11&listhours=30`,
 Stick of Dynamite, until TornExchange's own list for Bob arrives), not on real
 Torn. Not in this release: the same mark on the Your traders cards and in the
-overlay.
+overlay (they came in 3.23.0).
+
+### Every buy in its trade, 10,000 items a trade, and eight more (3.23.0)
+
+Ten things agreed with the owner on 2026-10-05, built together and released
+once. Nothing here needs another script installed, and none of it reads what
+another script stores.
+
+**1. Every buy the trader pays for joins the trade.** One rule, for the
+bazaar page, Next and the read of your log (`tradeForBuy`, `placeBuy`,
+src/core/accepted.js): a buy belongs to the trade whose accepted price covers
+that item - at any bazaar, planned there or not - else to the trade whose
+trader lists it. Before, a buy at a bazaar the plan did not name went to To
+sell even when the trade's trader was paying for that very item (the
+Champagne case: the first failing test, test/all-buys.test.js).
+
+- A step already passed is filled first; what is over it is an "unplanned"
+  buy of the same trade, at the trade's price.
+- A listing you bought out is remembered for 90 seconds after the press, so
+  the card disappearing is still counted as your buy.
+- Never in To sell and in the trade both: when your log puts a buy in a
+  trade, it comes off the To sell row the page made for it
+  (`toSellLessTradeBuys`).
+
+**2. 10,000 items per trade** (the owner: "the 10k limit is per trade").
+A count of units - planned, unplanned and your To sell lines together
+(`TRADE_MAX_UNITS`, `tradeCount`).
+
+- The plan, Add all, "Show them" and Fill all stop at it. A plan that stops
+  there says so on its card: "10,000 of 10,000 items: one trade takes no
+  more, so this one stops there. The rest is for a second trade with …".
+- Checkout shows a running count under its title - "Items in this trade
+  6,420 of 10,000" with a bar: blue, amber from 9,000 ("Room for 520 more in
+  this trade."), red when full. Counter A of
+  `mockups/Y-ten-thousand-counter.html`; B and C are still there to pick.
+- What goes over waits in To sell under that trader, marked "Over 10,000",
+  for a second trade with them (the owner: "yes can go to sell"). In
+  Checkout such a row says "320 over: To sell"; on Torn's trade page the Fill
+  note says "the trade is full at 10,000 items: 320 more go to To sell under
+  Bob, for a second trade", and Fill types no more than the trade takes.
+
+**3. "Show them" and Add all follow Cash for flips.** The left-out list is
+walked best first against the cash left, what the trader can pay and the
+10,000 (`fitLeftOut`, src/core/trade.js). What does not fit is not shown; one
+line says how many: "KayMalta buys 10 more items, not shown: your Cash for
+flips, what KayMalta can pay or the 10,000 items of one trade leave no room
+for them."
+
+**4. The next zip answers "why was this buy left out" itself.**
+
+- `trades/accepted-trades.json`: every trade still open and the last three
+  that ended (a week at most) - its lines, each line's bazaars, the unplanned
+  buys, the units against the 10,000. It names the trader and the sellers,
+  as the plan on your screen does; no key, and nothing of yours but the trade.
+- A problem-log line when a buy joins a trade ("A buy joined the trade (item
+  206): 2 at $840000 - 2 not planned; they pay $850000 (the price accepted in
+  this trade)") and when one is left out of every trade, with why.
+- "A listing is no longer in this bazaar" is one line per bazaar, not one per
+  listing: "3 listings are no longer in this bazaar (when last seen: item 206
+  ×5, 3004 ×3, 3005 ×1) - left out of the plans in Torn Bids", with the time
+  of the last.
+
+**5. Our own count of requests, nobody else's.** It was "share the limits
+with another script"; that is dropped. Every TornW3B request of ours already
+passes through the one window our own tabs share (80 a minute; src/api/w3b.js,
+src/platform/tab-window.js). The friend's count peaked at 89: that can only
+happen when two tabs take the same last slot before either has heard of the
+other's request. **The fix is not in this release** - what pushed it is not
+known yet. What is in: a tab that finds the shared minute over the limit
+waits, as always, and writes one line (at most one every five minutes):
+"TornW3B: 89 requests in the last minute from our own tabs, over our own
+limit of 80 (3 tabs asking; 41 from this one, Torn Bids, in view)". His next
+zip says which tabs; the fix follows that.
+
+**6. Buyers who traded lately.** TornW3B's own API takes
+`tradedWithinHours` on an item's buyers. With **Fresh prices only** on, and
+only for an item with more buyers than one answer holds (100), every other
+read of that item's buyers asks for those who traded in the last 48 hours
+(`buyersAsk`, src/core/traders.js). The two answers are one list
+(`mergeItemBuyers`): nobody the full read named is lost, and the active
+traders the full read cut off are added. Nobody is hidden by it. It cannot be
+tried against the real service from here (its paths are never probed): if the
+option is ignored the result is what it was before, and the log says so
+("… last traded longer ago than that: TornW3B may not take the option").
+
+**7. Only listings under the trader's price (`maxPrice`): measured, and not
+sent.** On the bench (scene "Torn Bids, 400 items read in turn", the
+processor slowed four times, 20 s, two runs each): with each item's ten kept
+rows a redraw took 139 and 100 ms; with none, 105 and 96 ms. The part that
+works the rows out was about 40 ms against 28 - 12 ms saved, less than two
+runs of the same thing differ by. A read "in turn" already keeps only its ten
+cheapest rows; the redraw's time is the page being built. And an item with
+nothing under the trader's price would lose its lowest bazaar price. The
+option is not in the client's list of what may ride in a query, and a test
+holds it out (test/w3b-ask.test.js).
+
+**8. A typed bazaar price far under market value pulses red.** On your
+bazaar's add page, a price a quarter or more under the item's market value
+(`FAR_UNDER_SHARE`, `farUnder`, src/core/fill.js) gets the same red pulse as
+a price under what you paid; hovering says "Far under its market value,
+$830,000: 90% less. Check the price". It is a share, not a sum. Where every
+bazaar already sells the item under its value, the line is the lowest bazaar
+price instead - a dollar under the cheapest is a price, not a slip. No
+pop-up, and Torn's button is never blocked or pressed.
+
+**9. "Not for sale" on a To sell row.** On the To sell board every row has a
+quiet "Not for sale". Pressed, the row stays in the list (last, marked) and
+is in no trade, under no trader, off the Left over card and passed over by
+your bazaar's Fill all - until "For sale again". The tab's count is the rows
+for sale. More of the item joining the list does not take the lock off: only
+you do. On the bazaar add page the row still shows what you paid, so a price
+under it still warns. A trade you had already accepted with that item in it
+keeps its line. (`setNotForSale`, src/core/to-sell.js; test/not-for-sale.test.js.)
+
+**10. The amber mark for a price list getting old, everywhere.** 3.22.3 put
+it on the desk's "Traders pay" card. Now also:
+
+- **Your traders cards:** a pulsing amber dot and the age, when a line of
+  that trade is priced from the trader's TornW3B list not changed in over 24
+  hours (`tradeOldList`).
+- **The overlay's trader tag on a bazaar card:** an amber dot after the name
+  (`data-ttv2-trader-old`, a pseudo-element: it takes no room).
+- **Over two days, with Fresh prices only on:** the tag passes that trader
+  over and names the next (`tagBuyer`); none left, no tag.
+
+Torn pages learn the list dates from Torn Bids through one stored value
+(`listAt`); no request is made for them.
+
+Seen in the harness, not on real Torn: all of the above that shows. Tests
+only: the zip's new file. Not built: the fix for item 5 (it waits for the
+zip), and item 7 by decision.
+
+New harness switches: `&buyplan=4` (the plan's item is at another bazaar
+only), `&units=<n>` and `&sendunits=<n>` (a trade with n items bought),
+`&tenk=<n>` (with `&bigflip=1`: one flip that fills a trade),
+`&notforsale=<item id>`, `&w3bbuyers=<n>` (`&w3bignore=1`: the option is not
+honoured), `&w3btag=1`, `&hammer=<price>`, `&listshared=0`, `&teownoff=1`,
+`&sweepitems=<n>&sweeprows=<k>` (the bench), and `window.__ahead(minutes)`.
+The bench has a seventh scene, "Torn Bids, 400 items read in turn"
+(`--sweeprows <k>`).
 
 ---
 
@@ -1855,7 +1994,9 @@ them.
    default, which Torn's API ToS allows for an automatic integration when the
    tool's own terms cover it: Settings names it, says it receives item ids only,
    and links its terms, and the Bazaars list credits it. Unticking it stops every
-   request to it. Only item ids are sent; never a key.
+   request to it. Only item ids are sent; never a key. (3.23.0: and one
+   whole number, `tradedWithinHours`, on an item's buyers - the client drops
+   every other name and every value that is not a whole number from 1 to 168.)
    The traders page reads traders' public TornW3B price lists the same way: no
    key, only the trader's id in the path.
    **TornExchange** is used only by the traders page. Its API key *is* the Torn

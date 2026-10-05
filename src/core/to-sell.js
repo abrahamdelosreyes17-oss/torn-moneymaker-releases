@@ -10,8 +10,11 @@
  * and the lines it puts into a trade. Pure - no DOM, no network.
  */
 
+import { tradeCount } from './accepted.js';
+
 /** Why an item is in the list, in the page's words. A row kept before 3.21 does not say: "Not taken". */
-export const TO_SELL_WHY = { cancel: 'Cancelled', left: 'Not taken', extra: 'Extra buy', old: 'No trade made' };
+/* 'over' (3.23.0): bought for a trade that was full at 10,000 items - it waits for a second trade with that trader (`for`). */
+export const TO_SELL_WHY = { cancel: 'Cancelled', left: 'Not taken', extra: 'Extra buy', old: 'No trade made', over: 'Over 10,000' };
 
 export function toSellWhy(why) {
     return Object.prototype.hasOwnProperty.call(TO_SELL_WHY, why) ? why : 'left';
@@ -25,6 +28,40 @@ export function toSellWhy(why) {
  * back by themselves when a trader pays more than you paid.
  */
 export const TO_SELL_EXTRA_WAITING = 10;
+
+/*
+ * Not for sale (3.23.0; asked 2026-10-03: "A To sell row cannot be dismissed
+ * by hand: an item you decide to keep stays until you no longer hold it, or a
+ * week. A 'Not for sale' on a row?"). The lock only: the row stays on the tab,
+ * marked (`keep`: when you said so), and is in no trade, under no trader on
+ * the board and not on your bazaar's Fill all - until you put it back. More
+ * of the item joining the list does not take the lock off (addLeftovers keeps
+ * the row's own fields): only you do. It still leaves by itself when you no
+ * longer hold it, as every row does.
+ */
+export function notForSale(leftover) {
+    return Boolean(leftover && Number(leftover.keep) > 0);
+}
+
+/** The list with one item's row locked (`on`) or put back. The list itself when that changes nothing. */
+export function setNotForSale(leftovers, itemId, on, now = Date.now()) {
+    const list = Array.isArray(leftovers) ? leftovers : [];
+    const id = String(itemId);
+    const turns = (l) => Boolean(l) && String(l.itemId) === id && notForSale(l) !== Boolean(on);
+    if (!list.some(turns)) return leftovers;
+    return list.map((l) => {
+        if (!turns(l)) return l;
+        const next = { ...l };
+        delete next.keep;
+        if (on) next.keep = now;
+        return next;
+    });
+}
+
+/** How many of the tab's rows are for sale (its count: the locked ones are not). */
+export function forSaleCount(rows) {
+    return (rows || []).filter((r) => r && !r.kept).length;
+}
 
 function sameTrader(name, from) {
     return Boolean(name && from) && String(name).toLowerCase() === String(from).toLowerCase();
@@ -57,8 +94,15 @@ export function toSellRows(leftovers, { buyersOf, keyOf = (b) => (b.id ? 'id:' +
     for (const l of leftovers || []) {
         if (!l || !l.itemId || !(Number(l.qty) > 0)) continue;
         const each = Number(l.each) || 0;
+        // Not for sale (3.23.0): listed, last, with no trader and no price - and never one of the "newest few" waiting.
+        if (notForSale(l)) {
+            rows.push({ itemId: String(l.itemId), name: l.name || 'Item ' + l.itemId, qty: Number(l.qty), each, why: toSellWhy(l.why), from: l.from || null, best: null, gain: null, ready: false, short: null, bazaar: null, kept: true });
+            continue;
+        }
         // Only a trader who pays more than you paid: one who pays less is never named.
-        const top = (buyersOf(String(l.itemId)) || []).find((b) => b && Number(b.price) > each && !sameTrader(b.name, l.from)) || null;
+        const over = (buyersOf(String(l.itemId)) || []).filter((b) => b && Number(b.price) > each && !sameTrader(b.name, l.from));
+        // What a full trade left (3.23.0) waits for a second trade with that trader, while they pay more than you paid.
+        const top = (toSellWhy(l.why) === 'over' && l.for ? over.find((b) => sameTrader(b.name, l.for)) : null) || over[0] || null;
         const per = top ? Number(top.price) - each : null;
         const ready = top !== null && per > 0 && Boolean(enough(per, each));
         const bazaar = bazaarAbove(bazaarOf(String(l.itemId)), each, Number(l.qty));
@@ -79,8 +123,8 @@ export function toSellRows(leftovers, { buyersOf, keyOf = (b) => (b.id ? 'id:' +
         });
     }
     const old = new Set(waitingExtras.sort((a, b) => b.at - a.at).slice(Math.max(0, extraWaiting)).map((x) => x.itemId));
-    // A profit with a trader, then one in your own bazaar, then a trader under the margin, then nothing yet.
-    const rank = (r) => (r.ready ? 0 : r.bazaar ? 1 : r.best ? 2 : 3);
+    // A profit with a trader, then one in your own bazaar, then a trader under the margin, then nothing yet - and what is not for sale.
+    const rank = (r) => (r.kept ? 4 : r.ready ? 0 : r.bazaar ? 1 : r.best ? 2 : 3);
     const worth = (r) => (r.ready ? r.gain : r.bazaar ? r.bazaar.gain : r.best ? r.gain : 0);
     return rows.filter((r) => !old.has(r.itemId)).sort((a, b) => rank(a) - rank(b) || worth(b) - worth(a) || String(a.name).localeCompare(String(b.name)));
 }
@@ -114,14 +158,20 @@ export function whereAbovePaid(where, paidEach) {
 
 /**
  * The board: the rows with a profit under the trader who pays most for each
- * (the biggest total first), and the ones waiting.
+ * (the biggest total first), the ones waiting, and the ones you marked "Not
+ * for sale" (3.23.0).
  *
- * @returns {{groups: Array<{key, trader, rows, gain}>, waiting: Array}}
+ * @returns {{groups: Array<{key, trader, rows, gain}>, waiting: Array, kept: Array}}
  */
 export function toSellBoard(rows) {
     const byKey = new Map();
     const waiting = [];
+    const kept = [];
     for (const r of rows || []) {
+        if (r.kept) {
+            kept.push(r);
+            continue;
+        }
         if (!r.ready || !r.best) {
             waiting.push(r);
             continue;
@@ -132,7 +182,7 @@ export function toSellBoard(rows) {
         g.gain += r.gain;
     }
     const groups = [...byKey.values()].sort((a, b) => b.gain - a.gain || String(a.trader.name).localeCompare(String(b.trader.name)));
-    return { groups, waiting };
+    return { groups, waiting, kept };
 }
 
 /**
@@ -148,6 +198,8 @@ export function toSellHeld(leftovers, { buyersOf, keyOf = (b) => (b.id ? 'id:' +
     const out = new Map();
     for (const l of leftovers || []) {
         if (!l || !l.itemId || !(Number(l.qty) > 0)) continue;
+        // Not for sale (3.23.0): in no trade.
+        if (notForSale(l)) continue;
         const each = Number(l.each) || 0;
         for (const b of buyersOf(String(l.itemId)) || []) {
             if (!b || !(Number(b.price) > 0) || sameTrader(b.name, l.from)) continue;
@@ -172,9 +224,12 @@ export function toSellHeld(leftovers, { buyersOf, keyOf = (b) => (b.id ? 'id:' +
 export function afterYoursSent(leftovers, trade, now = Date.now()) {
     const out = (Array.isArray(leftovers) ? leftovers : []).map((l) => ({ ...l }));
     let changed = false;
+    let cut = null;
     for (const i of (trade && trade.items) || []) {
         if (!i || i.kind !== 'yours') continue;
-        const taken = Math.max(0, (Number(i.units) || 0) - Math.max(0, Math.floor(Number(i.left) || 0)));
+        // What the trade's item limit kept out (3.23.0) was never sent: it stays on the list.
+        if (!cut) cut = tradeCount(trade).yoursOver;
+        const taken = Math.max(0, (Number(i.units) || 0) - Math.max(0, Math.floor(Number(i.left) || 0)) - (cut[String(i.itemId)] || 0));
         const row = out.find((l) => String(l.itemId) === String(i.itemId));
         if (!row || !(taken > 0)) continue;
         row.qty = Math.max(0, row.qty - taken);

@@ -10,8 +10,10 @@
  * Non-negotiables, enforced here rather than by convention:
  *
  *   1. This client NEVER sees a Torn API key. It has no key parameter, no
- *      getKey, and the only query it ever sends is `comment`. The Torn client
- *      and this one share nothing.
+ *      getKey, and the only query it ever sends is `comment` and, since
+ *      3.23.0, the whole numbers of W3B_QUERY (one: a count of hours) - a
+ *      name not in that list, or a value that is not a whole number within
+ *      its range, is dropped. The Torn client and this one share nothing.
  *   2. weav3r.dev is the only destination - asserted on the resolved URL, not
  *      just implied by a constant, exactly as client.js does for api.torn.com.
  *   3. Its own sliding window, well under TornW3B's 100/min Cloudflare limit,
@@ -60,6 +62,29 @@ export function overlayPerMinute(bidsSeenAt, now = Date.now()) {
     return at > 0 && at <= now + 60000 && now - at < W3B_BIDS_IN_USE_MS ? W3B_BESIDE_BIDS_PER_MINUTE : W3B_MAX_PER_MINUTE;
 }
 
+/*
+ * What may ride in a query besides `comment` (3.23.0): an option of TornW3B's
+ * own API, a whole number within the range the service takes. Checked on the
+ * way out (buildUrl): nothing else can be put in, whoever calls.
+ *
+ *   tradedWithinHours  /marketplace/{id}/traders: only buyers who traded in
+ *                      the last N hours (1-168)
+ *
+ * `maxPrice` on /marketplace/{id} (only the listings at or under a price) was
+ * tried for 3.23.0 and is NOT sent. Measured on the bench (the scene "400
+ * items read in turn", with their dearer rows and without): about 12 ms of a
+ * 100-140 ms redraw with the processor slowed four times, less than two runs
+ * of the same thing differ by - a read "in turn" already keeps only its 10
+ * cheapest rows, and the redraw's time is the page, not the rows. And an item
+ * with nothing under the trader's price would lose its lowest bazaar price.
+ */
+const W3B_QUERY = { tradedWithinHours: [1, 168] };
+
+/** A whole number within [min, max], or null. */
+function w3bWhole(value, min, max) {
+    return typeof value === 'number' && Number.isInteger(value) && value >= min && value <= max ? value : null;
+}
+
 export class W3bError extends Error {
     constructor(message, { http = null, blocked = false } = {}) {
         super(message);
@@ -106,8 +131,15 @@ export class W3bClient {
         onSent = null,
         onFailed = null,
         perMinute = null,
+        onOver = null,
     } = {}) {
         this.perMinute = perMinute;
+        /**
+         * ({count, limit, own}) => void (3.23.0): the minute every tab shares was found OVER
+         * sharedPerMinute - tabs learn of each other's requests late, so two can take the same
+         * last slot. This tab waits, as always; the report is for the problem log.
+         */
+        this.onOver = onOver;
         /** ({path, tag}) => void, each request that leaves: the usage record (3.15). */
         this.onSent = onSent;
         /** ({path, tag, error}) => void, a request that failed: the problem log (3.15). */
@@ -191,6 +223,13 @@ export class W3bClient {
             const shared = this.readShared(t);
             const sharedFull = this.loadShared && shared.recent.length >= this.sharedPerMinute;
             const limit = this.limit();
+            if (this.onOver && this.loadShared && shared.recent.length > this.sharedPerMinute) {
+                try {
+                    this.onOver({ count: shared.recent.length, limit: this.sharedPerMinute, own: this.recent.length });
+                } catch {
+                    // The report is best-effort.
+                }
+            }
 
             if (this.recent.length < limit && !sharedFull) {
                 this.recent.push(t);
@@ -221,24 +260,28 @@ export class W3bClient {
         if (this.loadShared) this.writeShared({ ...this.readShared(t), cooldownUntil: this.cooldownUntil });
     }
 
-    /** Build and check a URL. Exposed for tests. */
-    buildUrl(path) {
+    /** Build and check a URL. Exposed for tests. `query`: W3B_QUERY's options only. */
+    buildUrl(path, query = null) {
         const url = new URL(String(path).replace(/^\/+/, ''), W3B_API_BASE);
 
         if (url.hostname !== W3B_HOST) {
             throw new W3bError('Refusing to contact ' + url.hostname + '.');
         }
 
-        // Nothing but an attribution comment ever goes in the query.
+        // Nothing but an attribution comment ever goes in the query - and the whole number of W3B_QUERY.
         url.search = '';
         url.searchParams.set('comment', 'TornTradingV2');
+        for (const [name, [min, max]] of Object.entries(W3B_QUERY)) {
+            const n = query && Object.prototype.hasOwnProperty.call(query, name) ? w3bWhole(query[name], min, max) : null;
+            if (n !== null) url.searchParams.set(name, String(n));
+        }
 
         return url;
     }
 
     /** GET one TornW3B path. Serialised, rate-limited, never keyed. `tag`: what it is for (the usage record). */
-    get(path, { tag = null } = {}) {
-        const run = () => this.execute(path, tag).catch((error) => {
+    get(path, { tag = null, query = null } = {}) {
+        const run = () => this.execute(path, tag, query).catch((error) => {
             if (this.onFailed) {
                 try {
                     this.onFailed({ path, tag, error });
@@ -253,14 +296,14 @@ export class W3bClient {
         return promise;
     }
 
-    async execute(path, tag = null) {
+    async execute(path, tag = null, query = null) {
         if (this.now() < this.blockedUntil()) {
             throw new W3bError('TornW3B is rate limiting us; paused briefly.', {
                 blocked: true,
             });
         }
 
-        const url = this.buildUrl(path);
+        const url = this.buildUrl(path, query);
         await this.waitForSlot();
         // Another tab may have been blocked while this one waited for a slot.
         if (this.now() < this.blockedUntil()) {
@@ -340,9 +383,8 @@ export async function fetchW3bSummary(client, { tag = 'w.summary' } = {}) {
  * Every bazaar listing TornW3B knows for one item.
  *
  * Retries once when the payload says there are listings but sends none - a
- * known mid-scan glitch. `maxPrice` and friends are deliberately NOT sent:
- * they are not in TornW3B's spec, TornTools filters client-side anyway, and
- * trusting an ignored filter is how a list fills with rows that are not deals.
+ * known mid-scan glitch. `maxPrice` is deliberately NOT sent (see W3B_QUERY:
+ * measured for 3.23.0, it did not help) - every listing is asked for.
  *
  * @returns {Promise<{listings: Array, total: number}>} raw listing objects
  */
@@ -372,14 +414,20 @@ export async function fetchW3bListings(client, itemId, { tag = null } = {}) {
  * with their rating and when they were last active - free, where a Torn
  * profile call per trader cost the shared 70/min.
  *
- * @returns {Promise<{total: number, traders: Array<{id, name, price, up, down, lastAction, lastTrade, listAt}>}>}
+ * `withinHours` (3.23.0): only those who traded in the last N hours are
+ * asked for (`tradedWithinHours`) - the 100 of the answer are then not spent
+ * on lists nobody trades on. `withinHours` in the answer says what was asked.
+ *
+ * @returns {Promise<{total: number, withinHours: number|null, traders: Array<{id, name, price, up, down, lastAction, lastTrade, listAt}>}>}
  */
-export async function fetchW3bItemTraders(client, itemId, { tag = 'w.buyers' } = {}) {
-    const data = await client.get('marketplace/' + encodeURIComponent(String(itemId)) + '/traders', { tag });
+export async function fetchW3bItemTraders(client, itemId, { tag = 'w.buyers', withinHours = null } = {}) {
+    const hours = w3bWhole(withinHours, ...W3B_QUERY.tradedWithinHours);
+    const data = await client.get('marketplace/' + encodeURIComponent(String(itemId)) + '/traders', { tag, query: hours ? { tradedWithinHours: hours } : null });
     const rows = data && Array.isArray(data.traders) ? data.traders : [];
     const sec = (x) => (Number(x) > 0 ? Number(x) * 1000 : null);
     return {
         total: Number(data && data.total_count) || rows.length,
+        withinHours: hours,
         traders: rows
             .filter((t) => t && Number(t.player_id) > 0 && Number(t.price) > 0)
             .map((t) => ({

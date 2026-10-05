@@ -645,6 +645,44 @@ export function stalePrice(b, listAtOf, now = Date.now()) {
     return at > 0 && now - at > PRICES_STALE_MS;
 }
 
+/*
+ * Who traded lately (3.23.0, the first step on "will this trader actually
+ * trade this item"). TornW3B's list of an item's buyers holds 100 at most,
+ * highest price first - Xanax had 412 - so the 100 we read were the dearest
+ * lists, traded on or not. It can be asked for only those who traded in the
+ * last N hours. With Fresh prices only on, an item with more buyers than one
+ * answer holds is read both ways in turn - everyone, then those who traded
+ * in the last two days (the same two days) - and the two answers are one
+ * list: nobody the full read named is lost, and nobody's list date goes
+ * unread. No trader is hidden by this; it only finds the ones the cut hid.
+ */
+export const FRESH_TRADED_HOURS = PRICES_STALE_MS / (60 * 60 * 1000);
+
+/**
+ * What the next read of an item's buyers asks for.
+ *
+ * @param {{at, total, answered?, traders, withinHours}|null} prev - the last read
+ * @returns {number|null} hours for "traded within", or null: everyone
+ */
+export function buyersAsk(prev, { fresh = false } = {}) {
+    if (!fresh || !prev || !(Number(prev.at) > 0) || prev.withinHours) return null;
+    const answered = Number.isFinite(Number(prev.answered)) ? Number(prev.answered) : (prev.traders || []).length;
+    return Number(prev.total) > answered && answered > 0 ? FRESH_TRADED_HOURS : null;
+}
+
+/** Two reads of an item's buyers as one list: the newer read of the same trader counts; highest price first. */
+export function mergeItemBuyers(older, newer) {
+    const byId = new Map();
+    for (const t of older || []) if (t && t.id) byId.set(String(t.id), t);
+    for (const t of newer || []) if (t && t.id) byId.set(String(t.id), t);
+    return [...byId.values()].sort((a, b) => b.price - a.price);
+}
+
+/** In an answer asked for "traded within N hours": how many last traded longer ago than that (known ones only). */
+export function notTradedLately(traders, hours, now = Date.now()) {
+    return (traders || []).filter((t) => t && Number(t.lastTrade) > 0 && now - Number(t.lastTrade) > hours * 60 * 60 * 1000).length;
+}
+
 /** "Fresh prices only", order unchanged. */
 export function freshOnly(buyers, listAtOf, now = Date.now()) {
     return buyers.filter((b) => !stalePrice(b, listAtOf, now));
@@ -676,6 +714,61 @@ export function oldList(b, listAtOf, now = Date.now()) {
     const at = Number(listAtOf(b.id)) || 0;
     if (!(at > 0) || !(now - at > PRICES_AGING_MS)) return null;
     return { at, level: now - at > PRICES_STALE_MS ? 'stale' : 'aging' };
+}
+
+/**
+ * A trade's old list (3.23.0, the Your traders cards): the first of its lines
+ * whose price is this trader's from a TornW3B list not changed in over 24
+ * hours. One list, one date: the first found says it for the trade.
+ *
+ * @param {Array<{itemId}>} lines - the trade's flips and your To sell lines, in order
+ * @param {function} rowOf - (item id) => that trader's buyer row for the item, or null
+ * @returns {{at: number, level: 'aging'|'stale'}|null}
+ */
+export function tradeOldList(lines, rowOf, listAtOf, now = Date.now()) {
+    for (const l of lines || []) {
+        const old = l ? oldList(rowOf(l.itemId), listAtOf, now) : null;
+        if (old) return old;
+    }
+    return null;
+}
+
+/**
+ * The trader a bazaar card's tag names (3.23.0; the owner, 2026-10-05: "yes
+ * the overlay tag should hide old traders too"): the best Trusted one - and,
+ * with Fresh prices only on, the best whose price is not from a list over two
+ * days old (stalePrice, Torn Bids' own rule). None left: no tag.
+ *
+ * @param {Array} buyers - highest first, the blacklist already out
+ * @param {{fresh?: boolean, listAtOf?: function, now?: number}} [o]
+ */
+export function tagBuyer(buyers, { fresh = false, listAtOf = () => 0, now = Date.now() } = {}) {
+    const trusted = trustedOnly(buyers || []);
+    return (fresh ? freshOnly(trusted, listAtOf, now) : trusted)[0] || null;
+}
+
+/*
+ * The list dates, for every page (3.23.0). Torn Bids keeps them in its own
+ * page's storage (its address is not Torn's), which a page on torn.com never
+ * sees - so they are also kept, as short as they go, with the script's own
+ * values: [[trader id, seconds]], the newest first.
+ */
+export const LIST_AT_MAX = 3000;
+
+/** @param {Map<string, number>} listAt - trader id -> ms */
+export function packListAt(listAt, max = LIST_AT_MAX) {
+    return [...listAt].sort((a, b) => b[1] - a[1]).slice(0, max).map(([id, at]) => [String(id), Math.round(at / 1000)]);
+}
+
+/** What was stored, as trader id -> ms. Anything that is not a date is left out. */
+export function readListAtRows(stored) {
+    const out = new Map();
+    for (const row of Array.isArray(stored) ? stored : []) {
+        const id = Array.isArray(row) && row[0] !== null && row[0] !== undefined ? String(row[0]) : '';
+        const at = Array.isArray(row) ? Number(row[1]) * 1000 : 0;
+        if (id && at > 0 && Number.isFinite(at) && !out.has(id)) out.set(id, at);
+    }
+    return out;
 }
 
 /**

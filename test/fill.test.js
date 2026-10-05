@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
+import * as fill from '../src/core/fill.js';
 import {
     fillPrice,
     fillQuantity,
@@ -167,4 +168,43 @@ test('listings read ahead: one being read is passed over, one that failed waits'
     state.b.errorAt = NOW - FILL_REUSE_MS - 1;
     assert.equal(nextWarmRead(['a', 'b', 'c'], (id) => state[id], { now: NOW }), 'b');
     assert.equal(nextWarmRead([], () => null, { now: NOW }), null);
+});
+
+/*
+ * 3.23.0, item 8: a typed bazaar price far under market value - a slipped
+ * digit (15,000 typed as 1,500) - pulses red in its box. By a share of the
+ * value, never a sum; no pop-up, and nothing of Torn's is blocked.
+ */
+test('a price far under market value: a quarter or more under it pulses red; a normal undercut does not', () => {
+    assert.equal(fill.FAR_UNDER_SHARE, 0.25);
+    // A slipped digit.
+    assert.equal(fill.priceTone(1500, { market: 15000 }), 'cheap');
+    assert.deepEqual(fill.farUnder(1500, { market: 15000 }), { ref: 15000, of: 'market', pct: 90 });
+    // A fifth under: an undercut, not a slip.
+    assert.equal(fill.priceTone(12000, { market: 15000 }), 'ok');
+    assert.equal(fill.farUnder(12000, { market: 15000 }), null);
+    // The line itself: a quarter under is still a price; a dollar less is not.
+    assert.equal(fill.priceTone(11250, { market: 15000 }), 'ok');
+    assert.equal(fill.priceTone(11249, { market: 15000 }), 'cheap');
+    // No market value known: nothing to hold it against, as before.
+    assert.equal(fill.priceTone(1500, {}), null);
+    assert.equal(fill.priceTone(1500, { market: 0 }), null);
+    assert.equal(fill.farUnder(0, { market: 15000 }), null);
+});
+
+test('far under: held against the lower of the market value and the lowest bazaar, so undercutting cheap bazaars is not a warning', () => {
+    // Every bazaar sells it at less than half its market value: a dollar under the cheapest is a normal price.
+    assert.equal(fill.priceTone(6999, { market: 15000, lowest: 7000 }), 'ok');
+    assert.equal(fill.farUnder(6999, { market: 15000, lowest: 7000 }), null);
+    // A slip against that too.
+    assert.equal(fill.priceTone(700, { market: 15000, lowest: 7000 }), 'cheap');
+    assert.deepEqual(fill.farUnder(700, { market: 15000, lowest: 7000 }), { ref: 7000, of: 'bazaar', pct: 90 });
+    // The lowest bazaar over the market value: the market value is the line.
+    assert.deepEqual(fill.farUnder(1000, { market: 15000, lowest: 16000 }), { ref: 15000, of: 'market', pct: 93 });
+    // Under what you paid is said first (it is the loss); over the lowest bazaar is unchanged.
+    assert.equal(fill.priceTone(90, { paid: 100, market: 15000 }), 'under');
+    assert.equal(fill.priceTone(16000, { market: 15000, lowest: 15500 }), 'over');
+    // In words, for the box's hover.
+    assert.equal(fill.farUnderWords({ ref: 15000, of: 'market', pct: 90 }), 'Far under its market value, $15,000: 90% less. Check the price');
+    assert.equal(fill.farUnderWords({ ref: 7000, of: 'bazaar', pct: 90 }), 'Far under the lowest bazaar price, $7,000: 90% less. Check the price');
 });

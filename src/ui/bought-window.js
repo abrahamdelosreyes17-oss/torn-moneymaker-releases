@@ -13,6 +13,8 @@
  * presses anything of Torn's. Names go in through textContent only.
  */
 
+import { countView } from '../core/accepted.js';
+
 const BW_HOST_ID = 'ttv2-bought-host';
 
 function bwEl(tag, props = {}, children = []) {
@@ -302,9 +304,15 @@ export class BoughtWindow {
         const cart = m.cart || null;
         const cartLines = cart ? cart.lines : [];
         const left = cart ? cart.bazaarsLeft : 0;
-        const mini = cart && cartLines.length
-            ? ' · ' + (cart.done ? 'all bought' : left + (left === 1 ? ' bazaar' : ' bazaars') + ' to go') + ' · ' + cart.unitsBought.toLocaleString('en-US') + ' of ' + cart.units.toLocaleString('en-US') + ' items' + (buys ? ' · ' + bwSigned(m.totals.profit) : '')
-            : ' · ' + buys + (buys === 1 ? ' buy' : ' buys') + ' · ' + bwSigned(m.totals.profit) + (m.toBuy ? ' · ' + m.toBuy + ' to buy' : '');
+        // The trade against the 10,000 items one trade takes (3.23.0, the owner's pick from
+        // mockups/Y-ten-thousand-counter.html): a bar under the title, always in view.
+        const cap = countView(m.count, m.trader);
+        // Folded: the plan's own count while there is room; the trade's, once that is what matters.
+        const mini = cap && cap.state !== 'ok'
+            ? ' · ' + cap.text + ' items' + (cap.state === 'full' ? ' · full' : '') + (buys ? ' · ' + bwSigned(m.totals.profit) : '')
+            : cart && cartLines.length
+                ? ' · ' + (cart.done ? 'all bought' : left + (left === 1 ? ' bazaar' : ' bazaars') + ' to go') + ' · ' + cart.unitsBought.toLocaleString('en-US') + ' of ' + cart.units.toLocaleString('en-US') + ' items' + (buys ? ' · ' + bwSigned(m.totals.profit) : '')
+                : ' · ' + buys + (buys === 1 ? ' buy' : ' buys') + ' · ' + bwSigned(m.totals.profit) + (m.toBuy ? ' · ' + m.toBuy + ' to buy' : '');
         const head = bwEl('div', { class: 'bw-hd', title: 'Drag to move it anywhere' }, [
             bwEl('span', { class: 'bw-ti' }, [
                 'Checkout · ' + (m.trader || 'the trade'),
@@ -317,6 +325,15 @@ export class BoughtWindow {
         if (this.folded) {
             this.place();
             return;
+        }
+        if (cap) {
+            const fill = bwEl('i');
+            fill.style.width = cap.pct + '%';
+            box.appendChild(bwEl('div', { class: 'bw-cap bw-cap-' + cap.state, role: 'status', 'aria-label': 'Items in this trade: ' + cap.text }, [
+                bwEl('div', { class: 'bw-cap-row' }, [bwEl('span', { text: 'Items in this trade' }), bwEl('span', {}, [bwEl('b', { text: cap.units.toLocaleString('en-US') }), ' of ' + cap.max.toLocaleString('en-US')])]),
+                bwEl('div', { class: 'bw-cap-bar' }, [fill]),
+                cap.say ? bwEl('div', { class: 'bw-cap-say', text: cap.say }) : null,
+            ]));
         }
 
         const body = bwEl('div', { class: 'bw-body' });
@@ -369,6 +386,8 @@ export class BoughtWindow {
                     bwEl('b', { text: r.name }),
                     ' ×' + r.qty.toLocaleString('en-US'),
                     r.planned ? null : bwEl('span', { class: 'bw-tag', text: r.tone === 'loss' ? 'not planned · loses' : 'not planned' }),
+                    // Past the 10,000 of one trade (3.23.0): not sent with this one.
+                    r.over > 0 ? bwEl('span', { class: 'bw-tag bw-over', text: r.over.toLocaleString('en-US') + ' over: To sell' }) : null,
                 ]),
                 bwEl('span', { class: 'bw-p' + (r.profit < 0 ? ' bw-neg' : '') }, [bwSigned(r.profit), check]),
                 bwEl('span', { class: 'bw-d', text: 'at ' + bwMoney(r.each) + (r.sellers && r.sellers.length ? ' · ' + r.sellers.join(', ') : r.seller ? ' · ' + r.seller : '') + (r.at ? ' · ' + bwTime(r.at) : '') + ' · ' + (m.trader || 'they') + ' pays ' + bwMoney(r.bid) }),
@@ -415,6 +434,15 @@ export const BOUGHT_CSS = `
 .bw-folded .bw-hd { border-bottom: 0; }
 .bw-ti { flex: 1; min-width: 0; font: 400 14px/1.3 var(--serif); color: var(--text); overflow-wrap: anywhere; }
 .bw-mini { font: 400 12px "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif; color: var(--muted); font-variant-numeric: tabular-nums; }
+.bw-cap { flex: 0 0 auto; padding: 8px 14px 9px; background: var(--rail); border-bottom: 1px solid var(--line); }
+.bw-cap-row { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.bw-cap-row b { color: var(--text); font-weight: 650; font-size: 13px; }
+.bw-cap-bar { height: 5px; margin-top: 5px; border-radius: 3px; background: var(--row); overflow: hidden; }
+.bw-cap-bar i { display: block; height: 100%; border-radius: 3px; background: var(--buy); }
+.bw-cap-near .bw-cap-bar i { background: var(--warn); } .bw-cap-near .bw-cap-row b { color: var(--warn); }
+.bw-cap-full .bw-cap-bar i { background: var(--red); } .bw-cap-full .bw-cap-row b { color: var(--red); }
+.bw-cap-say { margin-top: 5px; font-size: 12px; font-weight: 600; overflow-wrap: anywhere; }
+.bw-cap-near .bw-cap-say { color: var(--warn); } .bw-cap-full .bw-cap-say { color: var(--red); }
 .bw-ic { width: 26px; height: 26px; padding: 0; border: 1px solid transparent; border-radius: 7px; background: transparent; color: var(--text); font: 15px/22px "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif; cursor: pointer; }
 .bw-ic:hover { background: #2b2f37; }
 .bw-ic:focus-visible { outline: 2px solid var(--profit); outline-offset: 1px; }
@@ -442,6 +470,7 @@ export const BOUGHT_CSS = `
 .bw-n b { color: var(--text); font-weight: 600; }
 .bw-tag { margin-left: 6px; font-size: 11px; font-weight: bold; color: var(--orange); white-space: nowrap; }
 .bw-loss .bw-tag { color: var(--red); }
+.bw-tag.bw-over, .bw-loss .bw-tag.bw-over { color: var(--red); }
 .bw-p { text-align: right; font-weight: 650; color: var(--profit); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .bw-p.bw-neg, .bw-neg { color: var(--red); }
 .bw-d { grid-column: 1 / -1; font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }

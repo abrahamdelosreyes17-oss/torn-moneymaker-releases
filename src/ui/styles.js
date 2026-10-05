@@ -220,6 +220,30 @@ export const PAGE_CSS = `
 }
 
 /*
+ * That trader's price is from a TornW3B list not changed in over 24 hours
+ * (3.23.0): an amber dot inside the tag, at its start - drawn as the tag's
+ * own background, so nothing is added to Torn's card and the tag stays one
+ * line. Until two days the tag also glows amber, slowly (a filter: nothing
+ * of the page is laid out again); past two days the dot alone.
+ */
+.ttv2-trader.ttv2-trader.ttv2-trader[data-ttv2-trader-old]::after {
+    padding-left: 20px !important;
+    background-image: radial-gradient(circle closest-side, #f6b74a 0, #f6b74a 86%, rgba(246, 183, 74, 0) 100%) !important;
+    background-repeat: no-repeat !important;
+    background-size: 7px 7px !important;
+    background-position: 7px 50% !important;
+}
+
+.ttv2-trader.ttv2-trader.ttv2-trader[data-ttv2-trader-old="aging"]::after {
+    animation: ttv2-oldlist 1.6s ease-in-out infinite;
+}
+
+@keyframes ttv2-oldlist {
+    0%, 100% { filter: drop-shadow(0 0 0 rgba(246, 183, 74, 0)); }
+    50% { filter: drop-shadow(0 0 4px rgba(246, 183, 74, 0.95)); }
+}
+
+/*
  * A trade you accepted (3.12.8): the listing to buy on a bazaar, in blue with
  * its own words, apart from the NPC deals' green; on Torn's trade page the
  * rows to send, and Fill.
@@ -666,7 +690,9 @@ export const PAGE_CSS = `
 .ttv2-bzsellall[aria-disabled="true"] { opacity: 0.55; cursor: default; }
 .ttv2-bzsellnote { min-width: 0; }
 
-input.ttv2-underpaid {
+/* .ttv2-farunder (3.23.0): far under its market value - a slipped digit - pulses the same red. */
+input.ttv2-underpaid,
+input.ttv2-farunder {
     outline: 2px solid #ff5a4d !important;
     outline-offset: 1px;
     color: #ff8a80 !important;
@@ -822,7 +848,8 @@ a.ttv2-fillset:hover { border-color: rgba(255, 255, 255, 0.3); }
 }
 
 @media (prefers-reduced-motion: reduce) {
-    .ttv2-toast, .ttv2-chatmark, input.ttv2-underpaid { animation: none !important; }
+    .ttv2-toast, .ttv2-chatmark, input.ttv2-underpaid, input.ttv2-farunder { animation: none !important; }
+    .ttv2-trader.ttv2-trader.ttv2-trader[data-ttv2-trader-old]::after { animation: none !important; }
     .ttv2-hit { transition: none !important; }
 }
 `;

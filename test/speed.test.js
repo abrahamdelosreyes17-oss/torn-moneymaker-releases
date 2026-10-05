@@ -249,7 +249,7 @@ test('his trades: a receipt per trade with what it cost and made - and they do n
         nameOf: (id) => ({ 335: 'Stick of Dynamite', 1: 'Hammer' })[id] || null,
         now: NOW,
     });
-    assert.deepEqual(files.map((f) => f.name), ['README.txt', 'receipts.json', 'receipts.csv', 'accepted-prices.json', 'leftovers.json']);
+    assert.deepEqual(files.map((f) => f.name), ['README.txt', 'receipts.json', 'receipts.csv', 'accepted-prices.json', 'leftovers.json', 'accepted-trades.json']);
     const receipts = JSON.parse(files[1].text).receipts;
     assert.equal(receipts.length, 1, 'only trades: the Item Market sale is not one');
     assert.deepEqual([receipts[0].who, receipts[0].whoName, receipts[0].received, receipts[0].cost, receipts[0].profit], ['11', 'Bob', 540000, 525000, 15000]);

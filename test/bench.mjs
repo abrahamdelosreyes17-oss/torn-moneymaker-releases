@@ -76,6 +76,14 @@ const SCENES = [
         run: 'await wait(' + SECONDS * 1000 + ');',
     },
     {
+        // 3.23.0: a long list of items no trader's price reaches (each read "in turn", its cheapest rows kept).
+        // --sweeprows 0: as if only the listings under the trader's price had been asked for.
+        name: 'Torn Bids, 400 items read in turn',
+        url: 'test/harness-live.html?ttv2=traders&sellkeys=1&bigflip=1&awake=1&sweepitems=400&sweeprows=' + (Number(arg('sweeprows', 10)) || 0),
+        run: 'await wait(' + SECONDS * 1000 + ');',
+        timedOnly: true,
+    },
+    {
         // 3.19.0: what the page feels like while it loads - a real mouse and keyboard (the browser times only those).
         // What is pressed, and when, decides what is asked and drawn: timed, not compared.
         name: 'typing in the search box and picking flips while the traders page loads',

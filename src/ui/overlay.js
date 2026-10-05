@@ -104,10 +104,16 @@ export function revealRow(el) {
 export const TRADER_CLASS = 'ttv2-trader';
 export const TRADER_DATA_KEY = 'ttv2Trader';
 export const TRADER_DATA_ATTR = 'data-ttv2-trader';
+/*
+ * Their price is from a list getting old (3.23.0): 'aging' (over 24 hours,
+ * the tag's amber dot and glow) or 'stale' (over two days, the dot alone). A
+ * second data attribute on the same card: still nothing appended.
+ */
+export const TRADER_OLD_KEY = 'ttv2TraderOld';
 
 /**
  * Tag these cards, and untag every other one.
- * @param {Array<{el: Element, label: string}>} rows
+ * @param {Array<{el: Element, label: string, old?: 'aging'|'stale'|null}>} rows
  */
 export function markTraderTags(rows, root = document) {
     const keep = new Set();
@@ -116,11 +122,15 @@ export function markTraderTags(rows, root = document) {
         keep.add(row.el);
         row.el.classList.add(TRADER_CLASS);
         if (row.el.dataset[TRADER_DATA_KEY] !== row.label) row.el.dataset[TRADER_DATA_KEY] = row.label;
+        const old = row.old === 'aging' || row.old === 'stale' ? row.old : null;
+        if (!old) delete row.el.dataset[TRADER_OLD_KEY];
+        else if (row.el.dataset[TRADER_OLD_KEY] !== old) row.el.dataset[TRADER_OLD_KEY] = old;
     }
     for (const el of root.querySelectorAll('[' + TRADER_DATA_ATTR + ']')) {
         if (keep.has(el)) continue;
         el.classList.remove(TRADER_CLASS);
         delete el.dataset[TRADER_DATA_KEY];
+        delete el.dataset[TRADER_OLD_KEY];
     }
 }
 

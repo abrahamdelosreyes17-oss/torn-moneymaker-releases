@@ -21,6 +21,11 @@ const LIMITED = 'LIMITED123456789';
 const TEKEY = 'TEKEYabcdefgh123';
 _store[NS + 'apiKey'] = JSON.stringify(KEY);
 // Defaults only: TornW3B must be on without the user ticking anything.
+// window.__ahead(minutes) (3.23.0): the clock jumps forward, as if the page had been left open that long.
+let _ahead = 0;
+const _realNow = Date.now.bind(Date);
+Date.now = () => _realNow() + _ahead;
+window.__ahead = (minutes) => { _ahead += minutes * 60000; };
 // ?nofeed=1 turns the live feed and TornW3B off, so only the page's own Torn calls are made.
 _store[NS + 'settings'] = JSON.stringify(/[?&]nofeed=1/.test(location.search) ? { liveFeed: false, useW3b: false } : {});
 // ?sellkeys=1 boots the selling page with both of its keys already saved.
@@ -200,7 +205,8 @@ if (/[?&]bazaarcards=1/.test(location.search)) {
             '<div style="margin-top:4px"><input class="buyAmountInput" type="text" placeholder="Qty" style="width:60px"> <button type="button">Buy</button></div></div>';
         const d = document.createElement('div');
         d.id = 'fake-bazaar';
-        d.innerHTML = card(335, 'Stick of Dynamite', 17500, 60) + card(206, 'Xanax', 840000, 2);
+        // &w3btag=1 (3.23.0): a Hammer too, at $100 (&hammer=<price>: 90 is an NPC deal as well) - under what Trixie ($140, TornW3B only) and Bob ($110) pay.
+        d.innerHTML = card(335, 'Stick of Dynamite', 17500, 60) + card(206, 'Xanax', 840000, 2) + (/[?&]w3btag=1/.test(location.search) ? card(1, 'Hammer', Number(new URLSearchParams(location.search).get('hammer')) || 100, 4) : '');
         document.body.prepend(d);
         window.__buy = (id, n) => {
             const c = d.querySelector('[data-id="' + id + '"]');
@@ -219,6 +225,8 @@ if (/[?&]bazaarcards=1/.test(location.search)) {
 // (none without it). &buyplan=1: Bob accepted a trade a minute ago with a step
 // for 2 Xanax at this seller (and one more at another). &buyplan=3: that step
 // already skipped by Next (a buy made after going back must still count).
+// &buyplan=4: the plan's Xanax is at another bazaar only (a buy here is not
+// planned). &units=<n>: n of Thing 3 already bought for the trade.
 // window.__buy(id, n) takes n off a listing, as a purchase does.
 const _bzWindow = Number(new URLSearchParams(location.search).get('bazaarwindow')) || 0;
 const BZW_ITEMS = {};
@@ -227,14 +235,17 @@ if (_bzWindow) {
     const want = q.has('want') ? Number(q.get('want')) : -1;
     const seller = q.get('userId') || '777';
     for (let i = 0; i < _bzWindow; i++) BZW_ITEMS[3000 + i] = { name: 'Thing ' + (i + 1), type: 'Other', sell_price: 10, market_value: 400 };
-    if (/[?&]buyplan=[123]/.test(location.search)) {
+    if (/[?&]buyplan=[1234]/.test(location.search)) {
         const now = Date.now();
         _store[NS + 'sellAccepted'] = JSON.stringify({ 'id:11': { key: 'id:11', trader: { id: '11', name: 'Bob' }, itemId: '206', at: now - 60000, cost: 2521000, pays: 2550000, profit: 29000, items: [
             { line: 'flip:206', itemId: '206', name: 'Xanax', units: 3, bid: 850000, kind: 'flip', sent: false, steps: [
                 // &buyplan=3 (3.21.1): Next was pressed here with nothing bought - the step is skipped; you came back.
-                { sellerId: seller, sellerName: 'BigSeller', qty: 2, price: 840000, bought: false, ...(/[?&]buyplan=3/.test(location.search) ? { skipped: true, boughtQty: 0, boughtAt: null } : {}) },
+                // &buyplan=4 (3.23.0, the Champagne case): no step at this bazaar - Xanax bought here is not in the plan, and Bob pays for it.
+                ...(/[?&]buyplan=4/.test(location.search) ? [] : [{ sellerId: seller, sellerName: 'BigSeller', qty: 2, price: 840000, bought: false, ...(/[?&]buyplan=3/.test(location.search) ? { skipped: true, boughtQty: 0, boughtAt: null } : {}) }]),
                 { sellerId: '4242', sellerName: 'Other', qty: 1, price: 841000, bought: false },
             ] },
+            // &units=<n> (3.23.0): and n of Thing 3 already bought for him elsewhere - the trade against its 10,000 items.
+            ...(q.has('units') ? [{ line: 'flip:3002', itemId: '3002', name: 'Thing 3', units: Number(q.get('units')), bid: 600, kind: 'flip', sent: false, steps: [{ sellerId: '555', sellerName: 'Elsewhere', qty: Number(q.get('units')), price: 500, bought: true, boughtQty: Number(q.get('units')), boughtAt: now - 30000 }] }] : []),
             // &buyplan=2: and 2 of Thing 2 at this same seller, so Next stays on this page.
             ...(/[?&]buyplan=2/.test(location.search) ? [{ line: 'flip:3001', itemId: '3001', name: 'Thing 2', units: 2, bid: 600, kind: 'flip', sent: false, steps: [{ sellerId: seller, sellerName: 'BigSeller', qty: 2, price: 501, bought: false }] }] : []),
         ] } });
@@ -420,7 +431,8 @@ if (LEFTGONE) {
  * &sendplan=1 (3.16.4, with ?ownbazaar=1&page=trade#step=add&ID=5): Bob
  * accepted, and 10 Bottles of Beer, 2 Xanax and a Hammer were bought for him.
  * The add step marks the three rows; Fill all types 10 and 2 (the Hammer has
- * Torn's tick box - never ticked for you).
+ * Torn's tick box - never ticked for you). &sendunits=<n> (3.23.0): n Bottles
+ * of Beer were bought, not 10 - a trade past its 10,000 items.
  */
 if (/[?&]sendplan=(1|mid)/.test(location.search)) {
     const now = Date.now();
@@ -428,7 +440,7 @@ if (/[?&]sendplan=(1|mid)/.test(location.search)) {
     // &sendplan=mid (3.17.2, the friend's trade made mid flip): only the Beer was bought - the Xanax and the Hammer are not bought yet.
     const mid = /[?&]sendplan=mid/.test(location.search);
     const todo = (line) => (mid ? { ...line, steps: line.steps.map((st) => ({ sellerId: st.sellerId, qty: st.qty, price: st.price, bought: false })) } : line);
-    _store[NS + 'sellAccepted'] = JSON.stringify({ 'id:11': { key: 'id:11', trader: { id: '11', name: 'Bob' }, itemId: '206', at: now - 20 * 60000, items: [flip(180, 'Bottle of Beer', 10, 40, 60), todo(flip(206, 'Xanax', 2, 830000, 850000)), todo(flip(1, 'Hammer', 1, 100, 120))], cost: 1660500, pays: 1700720, profit: 40220 } });
+    _store[NS + 'sellAccepted'] = JSON.stringify({ 'id:11': { key: 'id:11', trader: { id: '11', name: 'Bob' }, itemId: '206', at: now - 20 * 60000, items: [flip(180, 'Bottle of Beer', Number(new URLSearchParams(location.search).get('sendunits')) || 10, 40, 60), todo(flip(206, 'Xanax', 2, 830000, 850000)), todo(flip(1, 'Hammer', 1, 100, 120))], cost: 1660500, pays: 1700720, profit: 40220 } });
     // &intrade=N: the trade view, seen earlier in this tab, had N Bottles of Beer in it (trade ID 5).
     const inTrade = (location.search.match(/[?&]intrade=(\d+)/) || [])[1];
     if (inTrade) sessionStorage.setItem('ttv2-tradeinside-5', JSON.stringify([{ name: 'Bottle of Beer', qty: Number(inTrade) }]));
@@ -507,6 +519,16 @@ if (/[?&]bzsell=1/.test(location.search)) {
     ] });
 }
 /*
+ * &notforsale=<item id> (3.23.0, with &tosell=1 or &bzsell=1): that To sell
+ * row is already marked "Not for sale".
+ */
+{
+    const id = new URLSearchParams(location.search).get('notforsale');
+    if (id && _store[NS + 'sellLeftovers']) {
+        _store[NS + 'sellLeftovers'] = JSON.stringify(JSON.parse(_store[NS + 'sellLeftovers']).map((l) => (String(l.itemId) === id ? { ...l, keep: Date.now() - 60000 } : l)));
+    }
+}
+/*
  * &tradesgoing=1 (3.22.0, with &manybuyers=1): the Trades tab - Carol asked
  * about Dynamite 12 minutes ago, Bob accepted and one of his two bazaars is
  * bought, Alice accepted and all is bought, KayMalta traded two hours ago, and
@@ -535,8 +557,25 @@ if (/[?&]tradesgoing=1/.test(location.search)) {
     const q = new URLSearchParams(location.search);
     const stale = q.get('stalelist');
     const hours = Number(q.get('listhours')) > 0 ? Number(q.get('listhours')) : 5 * 24;
-    if (stale) localStorage.setItem('ttv2.bids.listat', JSON.stringify([[stale, Math.round(Date.now() / 1000 - hours * 3600)]]));
+    const rows = stale ? [[stale, Math.round(Date.now() / 1000 - hours * 3600)]] : null;
+    if (rows) localStorage.setItem('ttv2.bids.listat', JSON.stringify(rows));
     else localStorage.removeItem('ttv2.bids.listat');
+    // 3.23.0: the copy every page reads (the overlay's tag on a bazaar card). &listshared=0 leaves it out,
+    // as on a Torn page before Torn Bids wrote it.
+    if (rows && q.get('listshared') !== '0') _store[NS + 'listAt'] = JSON.stringify(rows);
+}
+/*
+ * &w3btag=1 (3.23.0, with ?traders=1): Trixie (78), Trusted by her TornW3B
+ * rating, pays $140 for a Hammer on her TornW3B list alone - more than Bob's
+ * $110 - so a bazaar card's tag names her, and &stalelist=78 ages her list:
+ * &listhours=30 the amber dot, five days (the default) passed over for Bob
+ * with Fresh prices only on.
+ */
+if (/[?&]w3btag=1/.test(location.search)) {
+    const t = Date.now();
+    const db = _store[NS + 'traderDb'] ? JSON.parse(_store[NS + 'traderDb']) : { version: 1, traders: {} };
+    db.traders[78] = { name: 'Trixie', from: 'w3b', seenAt: t, w3b: { checkedAt: t, at: t, found: true, prices: { 1: 140 } }, rating: { up: 300, down: 2, at: t } };
+    _store[NS + 'traderDb'] = JSON.stringify(db);
 }
 /*
  * &leftmany=1 (3.16.4, with &bigflip=1): the friend's Torn Bids, 2026-10-02 -
@@ -599,6 +638,10 @@ const BIG_BAZAARS = {
     1007: [bigRow(6002, 'VirusB', 600, 20)],
 };
 for (let i = 0; i < 9; i++) BIG_BAZAARS[1010 + i] = [bigRow(6100 + i, 'Candy' + i, 300 + i, 30)];
+// &tenk=<n> (3.23.0, with &bigflip=1): VirusA lists n Dahlias, so one flip can fill the 10,000 items of a trade
+// (with &sellprefs={"maxPerFlip":10000}; press the Dahlia flip to plan it first).
+const _tenk = Number(new URLSearchParams(location.search).get('tenk')) || 0;
+if (_tenk) BIG_BAZAARS[1006][0].quantity = _tenk;
 BIG_BAZAARS[1030] = [bigRow(6001, 'VirusA', 3000, 40)];
 // What KayMalta buys (TornExchange's top buyers): the virus, and the cover.
 const BIG_TE = { 870: { item: 'Stealth Virus', traders: [{ trader: 'KayMalta', trader_id: 5001, price: 1157499, vote_score: 180 }] } };
@@ -612,6 +655,37 @@ if (BIG) {
         5003: { name: 'Mil-Soul', from: 'w3b', seenAt: t, w3b: null, rating: { up: 300, down: 2, at: t } },
         5002: { name: 'SweetTooth', from: 'w3b', seenAt: t, w3b: null, rating: { up: 150, down: 1, at: t } },
     } });
+}
+
+/*
+ * &sweepitems=<n> (3.23.0, the speed bench): n more items that a trader
+ * (Sweeper, on TornW3B) buys at $50 and bazaars sell from $100 - never a
+ * flip, so each is read "in turn" and only its cheapest rows are kept.
+ * Their reads are already there, as on a page opened again:
+ * &sweeprows=<k> rows each (10 is what a sweep keeps; 0 is what asking only
+ * for listings under the trader's price would leave - how `maxPrice` was
+ * measured for 3.23.0, and dropped).
+ */
+const _sweepItems = Number(new URLSearchParams(location.search).get('sweepitems')) || 0;
+const SWEEP_ITEMS = {};
+const sweepListings = (id) => Array.from({ length: 100 }, (_, k) => ({ player_id: 13000 + ((id * 7 + k) % 900), player_name: 'Stall' + ((id * 7 + k) % 900), price: 100 + k, quantity: 1 + (k % 5), last_checked: NOW_S - 30 }));
+if (_sweepItems) {
+    const t = Date.now();
+    const q = new URLSearchParams(location.search);
+    const keepRows = q.has('sweeprows') ? Number(q.get('sweeprows')) : 10;
+    const prices = {};
+    const reads = {};
+    for (let i = 0; i < _sweepItems; i++) {
+        const id = 12000 + i;
+        SWEEP_ITEMS[id] = { name: 'Bloom ' + (i + 1), type: 'Flower', sell_price: 10, market_value: 120 };
+        prices[id] = 50;
+        reads[id] = { at: t - 60000, sweep: true, rows: sweepListings(id).slice(0, keepRows).map((r) => [String(r.player_id), r.player_name, r.price, r.quantity, (NOW_S - 30) * 1000, null, false]) };
+    }
+    Object.assign(ITEMS, SWEEP_ITEMS);
+    const db = _store[NS + 'traderDb'] ? JSON.parse(_store[NS + 'traderDb']) : { version: 1, traders: {} };
+    db.traders[5900] = { name: 'Sweeper', from: 'w3b', seenAt: t, w3b: { checkedAt: t, at: t, found: true, prices }, rating: { up: 400, down: 1, at: t } };
+    _store[NS + 'traderDb'] = JSON.stringify(db);
+    localStorage.setItem('ttv2.bids.reads', JSON.stringify({ v: 1, at: t, items: reads }));
 }
 
 /*
@@ -775,6 +849,9 @@ function respond(url) {
         if (u.searchParams.get('key') !== TEKEY && !(SAME && u.searchParams.get('key') === LIMITED)) return { status: 'error', message: 'Invalid API key', __http: 401 };
         // 3.14.3: a trader's whole list (Your traders). Bob buys Hammers too - on no item's top three.
         const own = u.pathname.match(/^\/api\/prices\/(\w+)$/);
+        // &teownoff=1 (3.23.0): Bob's whole TornExchange list does not come, so his Dynamite price stays TornW3B's alone
+        // (the amber line of an old list stays on his Your traders card).
+        if (own && /[?&]teownoff=1/.test(location.search)) return { status: 'error', message: 'Trader not found', __http: 404 };
         if (own) return own[1] === '11' ? { status: 'success', data: { items: [{ item_id: 335, name: 'Stick of Dynamite', price: 18000 }, { item_id: 1, name: 'Hammer', price: 130 }] }, meta: { trader: 'Bob' } } : { status: 'error', message: 'Trader not found', __http: 404 };
         if (u.pathname === '/api/all_best_listings') {
             return { status: 'success', data: {
@@ -818,11 +895,25 @@ function respond(url) {
                 { item_id: 206, item_name: 'Xanax', lowest_price: 839000, market_price: 830000, total_bazaars: 2 },
                 { item_id: 180, item_name: 'Bottle of Beer', lowest_price: 60, market_price: 55, total_bazaars: 1 },
                 { item_id: 900, item_name: 'Companion Script : Test', lowest_price: 5, market_price: 10088888 },
+                ...Object.entries(SWEEP_ITEMS).map(([id, it]) => ({ item_id: +id, item_name: it.name, lowest_price: 100, market_price: 120, total_bazaars: 100 })),
                 { item_id: 335, item_name: 'Stick of Dynamite', lowest_price: 17500, market_price: 9172 },
                 ...(BIG ? Object.entries(BIG_BAZAARS).map(([id, rows]) => ({ item_id: +id, item_name: BIG_ITEMS[id].name, lowest_price: Math.min(...rows.map((r) => r.price)), market_price: BIG_ITEMS[id].market_value, total_bazaars: rows.length })) : []),
             ] };
         }
+        // &w3bbuyers=<n> (3.23.0): Xanax has n TornW3B buyers (W3bBuyer1..n, ids 8001..), highest price first, and
+        // one answer holds 100. Every fourth traded an hour ago, the others ten days ago; `tradedWithinHours` is
+        // honoured, as the service says it is - &w3bignore=1: it is not. Their lists changed a day and a half ago.
+        const trM = u.pathname.match(/^\/api\/marketplace\/(\d+)\/traders$/);
+        if (trM) {
+            const n = trM[1] === '206' ? Number(new URLSearchParams(location.search).get('w3bbuyers')) || 0 : 0;
+            let all = Array.from({ length: n }, (_, i) => ({ player_id: 8001 + i, player_name: 'W3bBuyer' + (i + 1), price: 849000 - i * 10, rating: { upvotes: 120, downvotes: 1 },
+                last_action: NOW_S - 600, last_trade: NOW_S - (i % 4 === 3 ? 3600 : 10 * 86400), pricelist_updated: NOW_S - 36 * 3600 }));
+            const within = Number(u.searchParams.get('tradedWithinHours')) || 0;
+            if (within && !/[?&]w3bignore=1/.test(location.search)) all = all.filter((t) => NOW_S - t.last_trade <= within * 3600);
+            return { total_count: all.length, traders: all.slice(0, 100) };
+        }
         const bigM = u.pathname.match(/^\/api\/marketplace\/(\d+)$/);
+        if (bigM && SWEEP_ITEMS[bigM[1]]) return { total_listings: 100, listings: sweepListings(+bigM[1]) };
         if (BIG && bigM && BIG_BAZAARS[bigM[1]]) {
             return { total_listings: BIG_BAZAARS[bigM[1]].length, listings: BIG_BAZAARS[bigM[1]] };
         }

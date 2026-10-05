@@ -60,7 +60,8 @@ test('the To sell rows: who pays most now, what it makes, the best profit first,
     assert.equal(toSellWhy('cancel'), 'cancel');
     assert.equal(toSellWhy(undefined), 'left');
     assert.equal(toSellWhy('constructor'), 'left');
-    assert.deepEqual(Object.keys(TO_SELL_WHY), ['cancel', 'left', 'extra', 'old']);
+    // 'over' (3.23.0): what a trade full at 10,000 items left for a second one.
+    assert.deepEqual(Object.keys(TO_SELL_WHY), ['cancel', 'left', 'extra', 'old', 'over']);
 });
 
 test('the board: one group per trader who pays most, the biggest first; the rest wait', () => {
@@ -70,7 +71,8 @@ test('the board: one group per trader who pays most, the biggest first; the rest
         ['Bob', ['Xanax'], 40000],
     ]);
     assert.deepEqual(board.waiting.map((r) => r.name), ['Peony', 'Red Fox Plushie']);
-    assert.deepEqual(toSellBoard([]), { groups: [], waiting: [] });
+    // `kept` (3.23.0): the rows marked "Not for sale" - test/not-for-sale.test.js.
+    assert.deepEqual(toSellBoard([]), { groups: [], waiting: [], kept: [] });
 });
 
 test('what goes into a trade as yours: every To sell item that trader pays enough for - all of it, and nothing else', () => {

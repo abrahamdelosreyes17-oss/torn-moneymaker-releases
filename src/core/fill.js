@@ -161,20 +161,57 @@ export function fillQuantity(have, mode = 'all') {
  * than what we paid, and amber if higher than the lowest bazaar price. green
  * still green").
  *
+ * 3.23.0: and far under its market value - a slipped digit, 15,000 typed as
+ * 1,500 - which pulses red too ('cheap').
+ *
  * @param {number} price - what the box holds
  * @param {object} [o]
  * @param {number|null} [o.paid] - what you paid for one; null when not known
  * @param {number|null} [o.lowest] - the lowest bazaar price now; null when not known
- * @returns {'under'|'over'|'ok'|null} under what you paid (a loss); over the
- *   lowest bazaar (yours would not be the cheapest); neither; null with no
- *   price, or nothing to hold it against
+ * @param {number|null} [o.market] - the item's market value; null when not known
+ * @returns {'under'|'cheap'|'over'|'ok'|null} under what you paid (a loss); far
+ *   under its value (farUnder); over the lowest bazaar (yours would not be the
+ *   cheapest); none of them; null with no price, or nothing to hold it against
  */
-export function priceTone(price, { paid = null, lowest = null } = {}) {
+export function priceTone(price, { paid = null, lowest = null, market = null } = {}) {
     const p = Number(price);
     if (!(p > 0)) return null;
     if (Number(paid) > 0 && p < Number(paid)) return 'under';
+    if (farUnder(p, { market, lowest })) return 'cheap';
     if (Number(lowest) > 0 && p > Number(lowest)) return 'over';
-    return Number(paid) > 0 || Number(lowest) > 0 ? 'ok' : null;
+    return Number(paid) > 0 || Number(lowest) > 0 || Number(market) > 0 ? 'ok' : null;
+}
+
+/*
+ * Far under market value (3.23.0; agreed 2026-10-05: "a warning when a typed
+ * bazaar price is far under market value: our own red pulse, by a percent -
+ * no pop-up, and Torn's button is never blocked"). A share of the value, not
+ * a sum: a quarter or more under it. Held against the LOWER of the market
+ * value and the lowest bazaar price: where every bazaar already sells an item
+ * far under its value, a dollar under the cheapest is a price, not a slip.
+ */
+export const FAR_UNDER_SHARE = 0.25;
+
+/**
+ * @returns {{ref: number, of: 'market'|'bazaar', pct: number}|null} what the
+ *   price is far under, and by how many percent (whole, rounded down); null
+ *   when it is not, or there is no market value to hold it against
+ */
+export function farUnder(price, { market = null, lowest = null } = {}) {
+    const p = Number(price);
+    const m = Number(market);
+    if (!(p > 0) || !(m > 0)) return null;
+    const low = Number(lowest);
+    const of = low > 0 && low < m ? 'bazaar' : 'market';
+    const ref = of === 'bazaar' ? low : m;
+    if (!(p < ref * (1 - FAR_UNDER_SHARE))) return null;
+    return { ref, of, pct: Math.floor((1 - p / ref) * 100) };
+}
+
+/** The same, in words (the price box's hover). */
+export function farUnderWords(far) {
+    if (!far) return '';
+    return 'Far under ' + (far.of === 'bazaar' ? 'the lowest bazaar price' : 'its market value') + ', $' + Math.round(far.ref).toLocaleString('en-US') + ': ' + far.pct + '% less. Check the price';
 }
 
 /**
