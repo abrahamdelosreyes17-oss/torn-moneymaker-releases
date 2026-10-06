@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      3.24.0
+// @version      3.24.1
 // @description  Finds Bazaar and Item Market listings below NPC / market value - on the page you are viewing, and live from the Torn API and TornW3B - ranked by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -15,7 +15,6 @@
 // @grant        GM_openInTab
 // @grant        GM_xmlhttpRequest
 // @grant        GM_addValueChangeListener
-// @grant        GM_setClipboard
 // @connect      api.torn.com
 // @connect      www.tornexchange.com
 // @connect      weav3r.dev
@@ -43,7 +42,7 @@
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '3.24.0';
+    const TTV2_BUILD_VERSION = '3.24.1';
 
     /* ===== src/platform/gm.js ===== */
     /*
@@ -225,27 +224,6 @@
         });
 
         return true;
-    }
-
-    /**
-     * Put text on the clipboard (3.24.0, Sets: a trade message, a forum title). Only ever on a press of yours.
-     * @returns {boolean} false when the host has no way to do it
-     */
-    function gmCopy(text) {
-        const value = String(text ?? '');
-        try {
-            if (typeof GM_setClipboard === 'function') {
-                GM_setClipboard(value, 'text');
-                return true;
-            }
-            if (typeof navigator !== 'undefined' && navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
-                navigator.clipboard.writeText(value).catch(() => {});
-                return true;
-            }
-        } catch {
-            // No clipboard: the caller says so.
-        }
-        return false;
     }
 
     /* ===== src/core/speed.js ===== */
@@ -7428,8 +7406,6 @@
         't.ledger': { name: 'Ledger', lane: 'low' },
         't.buys': { name: 'Buys for an accepted trade (your log)', lane: 'normal' },
         't.traded': { name: 'Did an accepted trade go through (your trades)', lane: 'normal' },
-        't.sets': { name: 'Sets: points market, your money, pieces on the Item Market', lane: 'low' },
-        't.setslog': { name: 'Sets: points in your log, trades open now', lane: 'low' },
         't.other': { name: 'Other', lane: 'high' },
         'w.summary': { name: 'Bazaar summary' },
         'w.feed': { name: 'Overlay bazaar deals' },
@@ -7437,7 +7413,6 @@
         'w.desk': { name: 'Item on the desk' },
         'w.flips': { name: 'Possible flips' },
         'w.sweep': { name: 'Every item, in turn' },
-        'w.sets': { name: 'Set pieces' },
         'w.trade': { name: 'Trade and pins' },
         'w.buyers': { name: 'Buyers per item' },
         'w.lists': { name: 'Trader price lists' },
@@ -9966,7 +9941,7 @@
      *
      *   /v2/key/info          - to check the key is Full, and whose it is
      *   /v2/user/log          - bazaar and Item Market buys and sells
-     *   /v2/user/trades       - your finished trades, and (3.24.0, Sets) the ones open now
+     *   /v2/user/trades       - your finished trades
      *   /v2/user/{id}/trade   - one trade's items and money
      *
      * It shares the one request window (70 a minute across every tab) with the
@@ -10067,15 +10042,6 @@
         const params = { cat: 'finished', limit: 100, sort: 'ASC' };
         if (from) params.from = from;
         const data = await client.get('v2/user/trades', params, use);
-        return Array.isArray(data && data.trades) ? data.trades : [];
-    }
-
-    /**
-     * Your trades that are open now (3.24.0, Sets: the note when a trade is opened with you), newest first.
-     * The same path and parameters as the finished ones; Torn's word for the category is "ongoing".
-     */
-    async function fetchTradesOpen(client, { use = undefined } = {}) {
-        const data = await client.get('v2/user/trades', { cat: 'ongoing', limit: 20, sort: 'DESC' }, use);
         return Array.isArray(data && data.trades) ? data.trades : [];
     }
 
@@ -10959,34 +10925,6 @@
         return prices;
     }
 
-    /**
-     * A list's set prices: TornW3B gives a whole museum set an id under zero (-1 Flower Set, -2 Plushie Set).
-     * parseW3bPriceList leaves them out, as no item has such an id; Sets (3.24.0) reads them here.
-     * @returns {object} {"-1": price, "-2": price}, only the ones listed
-     */
-    function parseW3bSetPrices(body) {
-        const sets = {};
-        if (!Array.isArray(body)) return sets;
-        for (const row of body) {
-            const itemId = Number(row && row.itemId);
-            const price = Number(row && row.buyPrice);
-            if (itemId !== -1 && itemId !== -2) continue;
-            if (!Number.isFinite(price) || price <= 0) continue;
-            sets[String(itemId)] = price;
-        }
-        return sets;
-    }
-
-    /** The trader paying the most for a whole set (w3bId -1 or -2), from the lists read: {id, name, price} or null. */
-    function bestSetBuyer(db, w3bId) {
-        let best = null;
-        for (const [id, t] of Object.entries((db && db.traders) || {})) {
-            const price = Number(t && t.w3b && t.w3b.sets && t.w3b.sets[String(w3bId)]) || 0;
-            if (price > 0 && (!best || price > best.price)) best = { id, name: t.name || 'Trader ' + id, price };
-        }
-        return best;
-    }
-
     /** Record the result of reading one trader's TornW3B list. */
     function recordW3bList(db, traderId, result, now = Date.now()) {
         const id = cleanId(traderId);
@@ -11002,7 +10940,6 @@
         t.w3b = Object.keys(prices).length
             ? { checkedAt: now, at: now, found: true, prices }
             : { checkedAt: now, found: false };
-        if (result.sets && Object.keys(result.sets).length) t.w3b.sets = result.sets;
     }
 
     /** Ask for a list again soon (Refresh), without hiding the prices we have. */
@@ -13278,1018 +13215,6 @@
         return out;
     }
 
-    /**
-     * The points market (3.24.0): GET /v2/market/pointsmarket. Public data, one call for every listing.
-     * The answer is handed back as Torn gives it; core/points.js (parsePointsMarket) reads it, so a shape Torn
-     * changes is one place to follow.
-     */
-    async function fetchPointsMarket(client, { tag = 't.sets', priority = 'low' } = {}) {
-        return client.get('v2/market/pointsmarket', {}, { tag, priority });
-    }
-
-    /**
-     * Your points, cash on hand and vault (3.24.0): GET /v2/user/money, Limited key.
-     * @returns {{points: number|null, onHand: number|null, vault: number|null}} null = Torn did not say
-     */
-    function parseUserMoney(data) {
-        const m = (data && (data.money || data)) || {};
-        const pick = (...keys) => {
-            for (const k of keys) {
-                const v = m[k];
-                if (v !== undefined && v !== null && Number.isFinite(Number(v))) return Number(v);
-            }
-            return null;
-        };
-        // The names Torn sent ride along (names only), so an answer Torn Bids cannot read can be said in the problem log.
-        return { points: pick('points'), onHand: pick('wallet', 'money_onhand', 'cash'), vault: pick('vault', 'vault_amount'), keys: Object.keys(m).slice(0, 20) };
-    }
-
-    async function fetchMoney(client, { tag = 't.sets', priority = 'low' } = {}) {
-        return parseUserMoney(await client.get('v2/user/money', {}, { tag, priority }));
-    }
-
-    /** Torn's list of log types (3.24.0): v1 torn/?selections=logtypes -> { logtypes: { id: title } }. Asked once a week. */
-    async function fetchLogTypes(client, { tag = 't.sets', priority = 'low' } = {}) {
-        return client.get('torn', { selections: 'logtypes' }, { tag, priority });
-    }
-
-    /* ===== src/core/sets.js ===== */
-    // Sets: plushies and flowers, swapped at the museum for points.
-    // Pure working-out, no page and no storage: what you hold of each piece, how many more a set needs, what a piece is
-    // worth to you at a points price, what you pay a seller at your rate, and the words for a trade and a forum thread.
-    // The points market and the points book are in points.js.
-
-    const setPiece = (id, name) => ({ id, name });
-
-    /** The two museum sets Torn Bids trades. Ids are Torn's item ids; names are matched too, in case one ever moves. */
-    const SETS = [
-        {
-            key: 'plushie', name: 'Plushie Set', short: 'plushie', museum: 'Plushie Set', hash: 'plushie', points: 10, w3bId: -2,
-            pieces: [
-                setPiece(186, 'Sheep Plushie'), setPiece(187, 'Teddy Bear Plushie'), setPiece(215, 'Kitten Plushie'), setPiece(258, 'Jaguar Plushie'),
-                setPiece(261, 'Wolverine Plushie'), setPiece(266, 'Nessie Plushie'), setPiece(268, 'Red Fox Plushie'), setPiece(269, 'Monkey Plushie'),
-                setPiece(273, 'Chamois Plushie'), setPiece(274, 'Panda Plushie'), setPiece(281, 'Lion Plushie'), setPiece(384, 'Camel Plushie'),
-                setPiece(618, 'Stingray Plushie'),
-            ],
-        },
-        {
-            key: 'flower', name: 'Flower Set', short: 'flower', museum: 'Exotic Flower Set', hash: 'flower', points: 10, w3bId: -1,
-            pieces: [
-                setPiece(260, 'Dahlia'), setPiece(263, 'Crocus'), setPiece(264, 'Orchid'), setPiece(267, 'Heather'), setPiece(271, 'Ceibo Flower'),
-                setPiece(272, 'Edelweiss'), setPiece(276, 'Peony'), setPiece(277, 'Cherry Blossom'), setPiece(282, 'African Violet'),
-                setPiece(385, 'Tribulus Omanense'), setPiece(617, 'Banana Orchid'),
-            ],
-        },
-    ];
-
-    const SET_BY_ITEM = new Map();
-    for (const set of SETS) for (const p of set.pieces) SET_BY_ITEM.set(String(p.id), set);
-
-    const setByKey = (key) => SETS.find((s) => s.key === key) || null;
-    /** The set an item is a piece of, or null. */
-    const setOfItem = (itemId) => SET_BY_ITEM.get(String(itemId)) || null;
-    const isSetItem = (itemId) => SET_BY_ITEM.has(String(itemId));
-    /** A piece's name without the set's word, for a tight tile: "Panda Plushie" -> "Panda". */
-    const shortName = (name) => String(name || '').replace(/\s+Plushie$/i, '');
-
-    const setNum = (v) => { const n = Number(v); return Number.isFinite(n) ? n : 0; };
-    const setWhole = (v) => Math.max(0, Math.floor(setNum(v)));
-
-    /** The sets switched on in the settings: `which` is { plushie: true, flower: true }. */
-    function setsOn(settings) {
-        if (!settings || !settings.on) return [];
-        const which = settings.which || {};
-        return SETS.filter((s) => which[s.key] !== false);
-    }
-
-    /** While Sets is on, a plushie or flower of a chosen set is kept for sets: never To sell, never offered, never filled. */
-    function keptForSets(itemId, settings) {
-        const set = setOfItem(itemId);
-        return !!set && setsOn(settings).includes(set);
-    }
-
-    /**
-     * What you hold of one set, against the number of sets you are building.
-     * @param held   itemId -> how many you hold (object or Map)
-     * @param target sets being built at once; a piece under it says "need", over it "ahead"
-     * `full` is how many whole sets you could swap now; `top` is the piece holding the next set back.
-     */
-    function setStock(set, held, target) {
-        const get = (id) => setWhole(held instanceof Map ? (held.get(String(id)) ?? held.get(Number(id))) : (held || {})[id]);
-        const counts = set.pieces.map((p) => get(p.id));
-        const full = counts.length ? Math.min(...counts) : 0;
-        const most = counts.length ? Math.max(...counts) : 0;
-        const aim = Math.max(setWhole(target), full);
-        const pieces = set.pieces.map((p, i) => {
-            const have = counts[i];
-            const need = Math.max(0, aim - have);
-            const ahead = Math.max(0, have - aim);
-            return { id: p.id, name: p.name, held: have, need, ahead, state: need ? 'need' : ahead ? 'ahead' : 'ok', top: false, rank: 0 };
-        });
-        // Rank by need: 1 is the piece you hold least of. It is "top" only while it holds a set back.
-        const order = [...pieces].sort((a, b) => a.held - b.held || a.name.localeCompare(b.name));
-        order.forEach((p, i) => { p.rank = i + 1; });
-        const short = order.length && order[0].need > 0 ? order[0] : null;
-        if (short) short.top = true;
-        return { key: set.key, name: set.name, points: set.points, full, most, target: aim, pieces, short };
-    }
-
-    /**
-     * How many sets to build at once when the owner types no number: what the cash pays for at his rate, and never
-     * fewer than the piece he already holds most of (those pieces are waiting for the others).
-     */
-    function autoTarget(set, held, cash, setCost) {
-        const most = setStock(set, held, 0).most;
-        const byCash = setCost > 0 && Number.isFinite(Number(cash)) ? Math.floor(setNum(cash) / setCost) : 0;
-        return Math.max(most, byCash);
-    }
-
-    /** A set's pieces at Torn's market value, summed. 0 when a piece has none yet. */
-    function setMarketValue(set, mv) {
-        let sum = 0;
-        for (const p of set.pieces) {
-            const v = setWhole(mv(p.id));
-            if (!v) return 0;
-            sum += v;
-        }
-        return sum;
-    }
-
-    /** What a set brings at a points price. */
-    const setValue = (set, pointsPrice) => set.points * setWhole(pointsPrice);
-
-    /**
-     * What one piece is worth to you: the set's value at the points price, shared over its pieces by market value.
-     * A piece listed under this is profit for the set. Returns itemId -> dollars (0 when it cannot be worked out).
-     */
-    function pieceWorths(set, mv, pointsPrice) {
-        const total = setMarketValue(set, mv);
-        const value = setValue(set, pointsPrice);
-        const out = new Map();
-        for (const p of set.pieces) out.set(String(p.id), total && value ? Math.floor(value * setWhole(mv(p.id)) / total) : 0);
-        return out;
-    }
-
-    /** What you pay a seller for one unit: your percentage of its market value. */
-    const ratePrice = (marketValue, pct) => Math.round(setWhole(marketValue) * setNum(pct) / 100);
-
-    /**
-     * Your rate, against the points price: what a set bought at it costs, what it leaves, and the highest rate that
-     * still keeps your least profit (a percentage of what you spend - the same setting flips use).
-     */
-    function rateSet(set, mv, pct, pointsPrice, leastProfitPct = 0) {
-        const market = setMarketValue(set, mv);
-        const value = setValue(set, pointsPrice);
-        let cost = 0;
-        for (const p of set.pieces) cost += ratePrice(mv(p.id), pct);
-        const profit = value - cost;
-        const kept = cost > 0 ? profit / cost * 100 : 0;
-        // cost <= value / (1 + least/100), and cost = market * pct / 100: rounded DOWN to a tenth, so the cap itself still pays.
-        const cap = market > 0 && value > 0 ? Math.floor(value / (1 + Math.max(0, setNum(leastProfitPct)) / 100) / market * 1000) / 10 : 0;
-        return { market, value, cost, profit, kept, cap, ok: value > 0 && market > 0 && setNum(pct) <= cap };
-    }
-
-    /**
-     * What the pieces of your full sets cost you, cheapest-paid units first.
-     * @param lots itemId -> [{ qty, each }] of what you paid for units you still hold (any order). Units with no
-     *             record are counted at `fallback(id)` (market value) and `known` turns false.
-     * @returns { sets, total, perSet, least, known } - `least` is the points price a point must sell OVER.
-     */
-    function setsCost(set, sets, lots, fallback) {
-        const n = setWhole(sets);
-        let total = 0;
-        let known = true;
-        for (const p of set.pieces) {
-            const mine = [...((lots && lots(p.id)) || [])].filter((l) => setWhole(l.qty) > 0 && setNum(l.each) > 0).sort((a, b) => a.each - b.each);
-            let left = n;
-            for (const l of mine) {
-                if (left <= 0) break;
-                const take = Math.min(left, setWhole(l.qty));
-                total += take * setNum(l.each);
-                left -= take;
-            }
-            if (left > 0) {
-                known = false;
-                total += left * setWhole(fallback ? fallback(p.id) : 0);
-            }
-        }
-        total = Math.round(total);
-        const perSet = n ? Math.round(total / n) : 0;
-        return { sets: n, total, perSet, least: n ? Math.floor(perSet / set.points) : 0, known };
-    }
-
-    /** The least price a point may be typed at and still be a profit: one dollar over what it cost. */
-    const leastPointPrice = (costPerPoint) => Math.floor(setNum(costPerPoint)) + 1;
-
-    /**
-     * Where to buy the pieces you need, now. A unit is worth buying while its price is UNDER the piece's worth.
-     * @param offers itemId -> [{ price, qty, src: 'bazaar' | 'market', who, whoId }]
-     * Each row has the cheapest bazaars and the cheapest Item Market listing side by side, the better one marked,
-     * and the units to buy (cheapest first, up to what you need).
-     */
-    function buyPlan(set, stock, worths, offers) {
-        const rows = [];
-        const sellers = new Set();
-        let count = 0;
-        let cost = 0;
-        let gain = 0;
-        let market = 0;
-        const after = new Map(stock.pieces.map((p) => [String(p.id), p.held]));
-        for (const p of stock.pieces) {
-            const worth = setWhole(worths.get(String(p.id)));
-            const all = [...((offers && offers(p.id)) || [])].filter((o) => setWhole(o.price) > 0 && setWhole(o.qty) > 0).sort((a, b) => a.price - b.price);
-            const bazaar = all.filter((o) => o.src !== 'market');
-            const im = all.filter((o) => o.src === 'market');
-            const row = {
-                id: p.id, name: p.name, held: p.held, need: p.need, ahead: p.ahead, state: p.state, top: p.top, rank: p.rank, worth,
-                bazaar: bazaar.slice(0, 2), market: im[0] || null, best: null, units: [], count: 0, cost: 0, gain: 0, over: false,
-            };
-            const b = bazaar[0];
-            const m = im[0];
-            if (b && m) row.best = m.price < b.price ? 'market' : 'bazaar';
-            else if (b || m) row.best = b ? 'bazaar' : 'market';
-            if (p.need > 0 && worth > 0) {
-                let left = p.need;
-                for (const o of all) {
-                    if (left <= 0 || o.price >= worth) break;
-                    const take = Math.min(left, setWhole(o.qty));
-                    row.units.push({ ...o, take });
-                    row.count += take;
-                    row.cost += take * o.price;
-                    row.gain += take * (worth - o.price);
-                    left -= take;
-                    if (o.src === 'market') market += take;
-                    else if (o.whoId != null || o.who) sellers.add(String(o.whoId ?? o.who));
-                }
-                // Needed, something is listed, and the cheapest of it is at or over its worth: wait.
-                row.over = !row.count && all.length > 0;
-            }
-            after.set(String(p.id), p.held + row.count);
-            count += row.count;
-            cost += row.cost;
-            gain += row.gain;
-            rows.push(row);
-        }
-        rows.sort((a, b) => (b.count > 0) - (a.count > 0) || (b.need > 0) - (a.need > 0) || a.rank - b.rank);
-        const fullAfter = after.size ? Math.min(...after.values()) : 0;
-        return { key: set.key, name: set.name, rows, count, cost, gain, bazaars: sellers.size, market, full: stock.full, fullAfter };
-    }
-
-    /**
-     * Whole sets bought fresh in one run: the k-th set takes the k-th cheapest unit of every piece. Sets are added
-     * while one still leaves the least profit and the cash lasts.
-     * @returns null when not even one set pays, else { sets, pieces, bazaars, cost, perSet, value, gain }
-     */
-    function setRun(set, offers, value, { cash = Infinity, leastProfitPct = 0, most = 500 } = {}) {
-        if (!(value > 0)) return null;
-        const ladders = set.pieces.map((p) => {
-            const units = [];
-            const all = [...((offers && offers(p.id)) || [])].filter((o) => setWhole(o.price) > 0 && setWhole(o.qty) > 0).sort((a, b) => a.price - b.price);
-            for (const o of all) {
-                for (let i = 0; i < setWhole(o.qty) && units.length < most; i++) units.push(o);
-                if (units.length >= most) break;
-            }
-            return units;
-        });
-        const depth = Math.min(...ladders.map((l) => l.length));
-        const sellers = new Set();
-        let sets = 0;
-        let cost = 0;
-        let market = 0;
-        for (let k = 0; k < depth; k++) {
-            const one = ladders.reduce((s, l) => s + l[k].price, 0);
-            if (value - one < one * Math.max(0, setNum(leastProfitPct)) / 100 || value <= one) break;
-            if (cost + one > cash) break;
-            cost += one;
-            sets++;
-            for (const l of ladders) {
-                if (l[k].src === 'market') market++;
-                else sellers.add(String(l[k].whoId ?? l[k].who));
-            }
-        }
-        if (!sets) return null;
-        return { key: set.key, name: set.name, sets, pieces: sets * set.pieces.length, bazaars: sellers.size, market, cost, perSet: Math.round(cost / sets), value, gain: sets * value - cost };
-    }
-
-    const setMoney = (n) => '$' + Math.round(setNum(n)).toLocaleString('en-US');
-
-    /**
-     * Someone's items in a trade, priced at your rate.
-     * @param items  [{ id, name, qty }] - their side of the trade
-     * @param ctx    { settings, stockOf(set) -> setStock result, mv(id), pct }
-     * Rows of a chosen set get a price and one word: need, ok ("enough for now") or ahead. Anything else gets none.
-     * Of a row that holds more than you need, `take` units are the ones you need and `extra` the rest: the total for
-     * what you need counts only the first.
-     */
-    function tradeOffer(items, ctx) {
-        const on = setsOn(ctx.settings);
-        const rows = [];
-        const need = { items: 0, total: 0 };
-        const all = { items: 0, total: 0 };
-        for (const it of items || []) {
-            const qty = setWhole(it.qty);
-            if (!qty) continue;
-            const set = setOfItem(it.id);
-            if (!set || !on.includes(set)) {
-                rows.push({ id: it.id, name: it.name, qty, each: 0, total: 0, state: 'other', need: 0, ahead: 0, take: 0, extra: 0, top: false });
-                continue;
-            }
-            const pc = ctx.stockOf(set).pieces.find((p) => String(p.id) === String(it.id));
-            const each = ratePrice(ctx.mv(it.id), ctx.pct);
-            const take = pc.state === 'need' ? Math.min(qty, pc.need) : 0;
-            const row = { id: it.id, name: it.name || pc.name, qty, each, total: each * qty, take, extra: qty - take, state: pc.state, need: pc.need, ahead: pc.ahead, held: pc.held, target: pc.held + pc.need - pc.ahead, top: pc.top };
-            rows.push(row);
-            if (!each) continue;
-            all.items += qty;
-            all.total += row.total;
-            need.items += take;
-            need.total += take * each;
-        }
-        return { rows, need, all };
-    }
-
-    const setListWords = (parts) => (parts.length <= 1 ? parts.join('') : parts.slice(0, -1).join(', ') + ' and ' + parts[parts.length - 1]);
-
-    /** The message to copy into Torn's trade chat. `everything` prices every piece, not only the ones you need. */
-    function tradeMessage(offer, { open = true, everything = false } = {}) {
-        const priced = offer.rows.filter((r) => r.each > 0);
-        const wanted = priced.filter((r) => r.take > 0);
-        const rest = priced.filter((r) => r.extra > 0);
-        const others = offer.rows.filter((r) => r.state === 'other');
-        const each = (r) => `${r.qty} ${r.name} (${setMoney(r.each)} each)`;
-        const needed = (r) => `${r.take} ${r.name} (${setMoney(r.each)} each)`;
-        const out = [];
-        if (!open) out.push('I am closed for buying right now.');
-        if (everything && priced.length) {
-            out.push(`I can pay ${setMoney(offer.all.total)} for ${setListWords(priced.map(each))}.`);
-        } else if (wanted.length) {
-            out.push(`I can pay ${setMoney(offer.need.total)} for ${setListWords(wanted.map(needed))}.`);
-            if (rest.length) out.push(`${setListWords(rest.map((r) => `${r.take > 0 ? r.extra + ' more ' : ''}${shortName(r.name)} (${setMoney(r.each)})`))} I have enough of for now; same price if you want them gone.`);
-        } else if (rest.length) {
-            out.push(`I have enough of these for now: ${setListWords(rest.map((r) => `${shortName(r.name)} (${setMoney(r.each)} each)`))}. Same price if you want them gone: ${setMoney(offer.all.total)} for all.`);
-        }
-        if (others.length) out.push(`${setListWords(others.map((r) => r.name))} I do not buy.`);
-        return out.join(' ');
-    }
-
-    const setPctText = (pct) => String(Math.round(setNum(pct) * 10) / 10);
-
-    /** The pieces to name in the thread: the ones holding sets back, a few of each set. */
-    function mostWanted(stocks, perSet = 3) {
-        return stocks.map((st) => st.pieces.filter((p) => p.need > 0).sort((a, b) => a.rank - b.rank).slice(0, perSet).map((p) => shortName(p.name)).join(', ')).filter(Boolean).join(' · ');
-    }
-
-    /** Title and post for your buying thread. Written for you to copy: Torn Bids never posts. */
-    function forumText({ open, pct, stocks = [], sets = SETS }) {
-        const what = sets.length === 1 ? (sets[0].key === 'plushie' ? 'Plushies' : 'Flowers') : 'Plushies & Flowers';
-        const every = sets.length === 1 ? (sets[0].key === 'plushie' ? 'plushie' : 'flower') : 'plushie and flower';
-        if (!open) {
-            return {
-                title: `[CLOSED] Buying ${what} · back soon`,
-                post: `Closed for now: not buying until this thread says OPEN again.\nWhen I am open I pay ${setPctText(pct)}% of market value for every ${every}.`,
-            };
-        }
-        const wanted = mostWanted(stocks);
-        return {
-            title: `[OPEN] Buying ${what} · ${setPctText(pct)}% of market value`,
-            post: [
-                `Buying every ${every}, any amount.`,
-                `I pay ${setPctText(pct)}% of market value, paid in the trade.`,
-                wanted ? `Most wanted now: ${wanted}.` : '',
-                'Start a trade with me and add your items. I answer with the total.',
-            ].filter(Boolean).join('\n'),
-        };
-    }
-
-    /** What a thread's title says: open or closed, and the rate, each null when the title does not say. */
-    function readThreadTitle(title) {
-        const t = String(title || '');
-        const open = /\bclosed\b/i.test(t) ? false : /\bopen\b/i.test(t) ? true : null;
-        const m = t.match(/(\d{2,3}(?:\.\d+)?)\s*%/);
-        return { open, pct: m ? Number(m[1]) : null };
-    }
-
-    /** A thread you started that reads like a buying thread for sets. */
-    const isBuyingTitle = (title) => /\b(open|closed)\b/i.test(String(title || '')) && /plush|flower/i.test(String(title || ''));
-
-    /**
-     * Does your thread still say what Torn Bids says?
-     * @returns { state: 'match' | 'open' | 'closed' | 'rate', says: { open, pct } }
-     *   'open' = Torn Bids is open and the title says closed; 'closed' = the other way; 'rate' = the rate moved.
-     */
-    function threadCheck(title, { open, pct }) {
-        const says = readThreadTitle(title);
-        let state = 'match';
-        if (says.open !== null && says.open !== !!open) state = open ? 'open' : 'closed';
-        else if (open && says.pct !== null && Math.abs(says.pct - setNum(pct)) > 0.049) state = 'rate';
-        return { state, says };
-    }
-
-    /**
-     * How much of your money sits in sets and points, as a share.
-     * @returns { inSets, total, share } - share is 0..100
-     */
-    function moneyShare({ pieces = 0, points = 0, cash = 0, vault = 0 }) {
-        const inSets = setWhole(pieces) + setWhole(points);
-        const total = inSets + setWhole(cash) + setWhole(vault);
-        return { inSets, total, share: total ? inSets / total * 100 : 0 };
-    }
-
-    /* ===== src/core/points.js ===== */
-    // Points: the points market's listings, the price to list at, the lot, what is usual, and the points book.
-    // Pure working-out. The sets that make the points are in sets.js.
-
-    const ptNum = (v) => { const n = Number(v); return Number.isFinite(n) ? n : 0; };
-    const ptWhole = (v) => Math.max(0, Math.floor(ptNum(v)));
-
-    /** Torn's own ceiling for a points listing ("Maximum price each is $100,000"); a parsed price over it is not a price. */
-    const POINT_PRICE_MAX = 100000;
-
-    /**
-     * Torn's /v2/market/pointsmarket (or v1 market/?selections=pointsmarket): { pointsmarket: { id: { cost, quantity } } }.
-     * @returns [{ id, cost, qty }] cheapest first
-     */
-    function parsePointsMarket(json) {
-        const raw = json && (json.pointsmarket || json.pointsMarket || json.listings);
-        if (!raw || typeof raw !== 'object') return [];
-        const rows = Array.isArray(raw) ? raw.map((r, i) => [r && (r.id ?? i), r]) : Object.entries(raw);
-        const out = [];
-        for (const [id, r] of rows) {
-            if (!r) continue;
-            const cost = ptWhole(r.cost ?? r.price ?? r.cost_each);
-            const qty = ptWhole(r.quantity ?? r.amount ?? r.points);
-            if (cost > 0 && cost <= POINT_PRICE_MAX && qty > 0) out.push({ id: String(id), cost, qty });
-        }
-        return out.sort((a, b) => a.cost - b.cost || (a.id < b.id ? -1 : 1));
-    }
-
-    /** Listings folded by price: [{ price, qty, lots }] cheapest first. */
-    function priceLevels(listings) {
-        const by = new Map();
-        for (const l of listings || []) {
-            const lv = by.get(l.cost) || { price: l.cost, qty: 0, lots: 0 };
-            lv.qty += l.qty;
-            lv.lots += 1;
-            by.set(l.cost, lv);
-        }
-        return [...by.values()].sort((a, b) => a.price - b.price);
-    }
-
-    /**
-     * The first wall: the price level just over the widest step up in price near the bottom of the book. A few cheap
-     * points sit under it; the bulk of the market starts there. Null when the book climbs evenly (no step stands out).
-     * No dollar figure in the rule: a step is "wide" against the other steps of the same book.
-     */
-    function firstWall(levels, { depth = 12 } = {}) {
-        const near = (levels || []).slice(0, depth);
-        if (near.length < 3) return null;
-        const steps = [];
-        for (let i = 1; i < near.length; i++) steps.push({ i, rel: near[i].price / near[i - 1].price - 1 });
-        const sorted = steps.map((s) => s.rel).sort((a, b) => a - b);
-        const median = sorted[Math.floor((sorted.length - 1) / 2)];
-        let best = null;
-        for (const s of steps) if (!best || s.rel > best.rel) best = s;
-        if (!best || best.rel <= 0 || best.rel < median * 3) return null;
-        let ahead = 0;
-        for (let i = 0; i < best.i; i++) ahead += near[i].qty;
-        return { price: near[best.i].price, ahead, index: best.i };
-    }
-
-    /**
-     * The price to type for your points.
-     * @param rule 'wall' = $1 under the first wall (the default); 'lowest' = $1 under the lowest listing
-     * @returns null with no listings, else { price, ahead, rule, lowest, wall }; `ahead` = points listed cheaper than you
-     */
-    function listPrice(listings, rule = 'wall') {
-        const levels = priceLevels(listings);
-        if (!levels.length) return null;
-        const lowest = levels[0].price;
-        const wall = firstWall(levels);
-        const useWall = rule !== 'lowest' && !!wall;
-        const price = Math.max(1, (useWall ? wall.price : lowest) - 1);
-        let ahead = 0;
-        for (const lv of levels) if (lv.price < price) ahead += lv.qty;
-        return { price, ahead, rule: useWall ? 'wall' : 'lowest', lowest, wall: wall ? wall.price : null };
-    }
-
-    /** Lots that were listed at the last read and are not now: sold or taken down, Torn does not say which. */
-    function goneLots(prev, next, now) {
-        const still = new Set((next || []).map((l) => l.id));
-        return (prev || []).filter((l) => !still.has(l.id)).map((l) => ({ cost: l.cost, qty: l.qty, t: now }));
-    }
-
-    const PT_DAY_MS = 86400000;
-
-    /**
-     * In what lots to list. One lot, unless small lots are what has been leaving the market near your price.
-     * @param gone lots seen leaving ({ cost, qty, t }), any age - only the last day near your price is counted
-     * @returns { lots: [n, ...], size, seen: { count, lo, hi } | null, split: boolean }
-     */
-    function lotAdvice(points, gone, price, now = Date.now()) {
-        const total = ptWhole(points);
-        const near = (gone || []).filter((g) => now - ptNum(g.t) < PT_DAY_MS && g.qty > 0 && g.cost <= price * 1.01);
-        const sizes = near.map((g) => g.qty).sort((a, b) => a - b);
-        const seen = sizes.length ? { count: sizes.length, lo: sizes[0], hi: sizes[sizes.length - 1] } : null;
-        const one = { lots: total ? [total] : [], size: total, seen, split: false };
-        if (sizes.length < 5 || !total) return one;
-        const median = sizes[Math.floor((sizes.length - 1) / 2)];
-        if (median * 2 > total) return one;
-        const lots = [];
-        for (let left = total; left > 0; left -= median) lots.push(Math.min(median, left));
-        return { lots, size: median, seen, split: true };
-    }
-
-    const ptDayOf = (t) => new Date(t).toISOString().slice(0, 10);
-
-    /** One read of the points price into the day's line. Kept: the last `keep` days. */
-    function recordPrice(days, now, price, keep = 40) {
-        const p = ptWhole(price);
-        if (!p) return days || [];
-        const day = ptDayOf(now);
-        const out = (days || []).filter((d) => d && d.day !== day);
-        const cur = (days || []).find((d) => d && d.day === day) || { day, n: 0, sum: 0, lo: p, hi: p };
-        out.push({ day, n: cur.n + 1, sum: cur.sum + p, lo: Math.min(cur.lo, p), hi: Math.max(cur.hi, p) });
-        return out.sort((a, b) => (a.day < b.day ? -1 : 1)).slice(-keep);
-    }
-
-    /** Days of its own it takes before Torn Bids says what a usual points price is. */
-    const USUAL_DAYS = 5;
-
-    /**
-     * The usual level of the points price: the range of the daily averages of the last month, today left out.
-     * @returns { lo, hi, days } or { days } while there are too few days to say
-     */
-    function usualLevel(days, now = Date.now(), window = 30) {
-        const today = ptDayOf(now);
-        const from = ptDayOf(now - window * PT_DAY_MS);
-        const avgs = (days || []).filter((d) => d && d.day < today && d.day >= from && d.n > 0).map((d) => Math.round(d.sum / d.n));
-        if (avgs.length < USUAL_DAYS) return { days: avgs.length };
-        return { lo: Math.min(...avgs), hi: Math.max(...avgs), days: avgs.length };
-    }
-
-    /** Cheap = under the whole usual range. A price against its own level, never a dollar cut-off. */
-    const pointsCheap = (price, level) => !!(level && level.lo && ptWhole(price) > 0 && ptWhole(price) < level.lo);
-
-    // ---- The points book ---------------------------------------------------------------------------------------------
-
-    const PT_MERGE_MS = 5 * 60000;
-
-    /**
-     * Add one entry: { id, t, kind: 'made' | 'sold' | 'used', points, each, set, src }.
-     *   made: `each` = what one point cost you (the set's cost / its points);  sold: the price a point went for;
-     *   used: what a point cost on the market that moment.
-     * The same id is never added twice. A 'made' entry read from Torn's log takes the place of the one Torn Bids wrote
-     * when you pressed EXCHANGE (same points, within five minutes), keeping the cost worked out at the press.
-     */
-    function bookAdd(entries, entry) {
-        const list = entries || [];
-        const points = ptWhole(entry && entry.points);
-        if (!entry || !points || !entry.id) return list;
-        if (list.some((e) => e.id === entry.id)) return list;
-        const e = { id: String(entry.id), t: ptNum(entry.t), kind: entry.kind, points, each: ptNum(entry.each), set: entry.set || null, src: entry.src || 'log' };
-        if (e.kind === 'made') {
-            const other = e.src === 'log' ? 'page' : 'log';
-            const twin = list.find((x) => x.kind === 'made' && x.src === other && x.points === points && Math.abs(x.t - e.t) < PT_MERGE_MS && !x.twin);
-            if (twin) {
-                // One exchange, seen twice: keep the log's id (so it is not added again) and the page's cost.
-                const page = e.src === 'page' ? e : twin;
-                const log = e.src === 'log' ? e : twin;
-                const merged = { ...log, each: page.each || log.each, set: page.set || log.set, twin: page.id };
-                return list.map((x) => (x === twin ? merged : x)).sort((a, b) => a.t - b.t);
-            }
-        }
-        return [...list, e].sort((a, b) => a.t - b.t);
-    }
-
-    /**
-     * The book, worked out: points made carry their cost; sold and used points come off the oldest made first.
-     * Points sold or used beyond what was made were yours before (no cost on record): they count for nothing here.
-     * @returns { rows, made, sold, used, left, cost, each, least, profitSold, saved, value }
-     */
-    function bookState(entries, priceNow = 0) {
-        const lots = [];
-        const rows = [];
-        let made = 0;
-        let madeCost = 0;
-        let sold = 0;
-        let used = 0;
-        let profitSold = 0;
-        let saved = 0;
-        for (const e of [...(entries || [])].sort((a, b) => a.t - b.t)) {
-            if (e.kind === 'made') {
-                lots.push({ left: e.points, each: e.each });
-                made += e.points;
-                madeCost += e.points * e.each;
-                rows.push({ ...e, mine: e.points, gain: 0 });
-                continue;
-            }
-            let left = e.points;
-            let cost = 0;
-            let mine = 0;
-            for (const lot of lots) {
-                if (left <= 0) break;
-                const take = Math.min(left, lot.left);
-                lot.left -= take;
-                left -= take;
-                mine += take;
-                cost += take * lot.each;
-            }
-            // Points used with no price on record (the market was not read): no saving is claimed, and no loss.
-            const gain = e.each > 0 ? Math.round(mine * e.each - cost) : 0;
-            if (e.kind === 'sold') { sold += mine; profitSold += gain; } else { used += mine; saved += gain; }
-            rows.push({ ...e, mine, gain });
-        }
-        const leftLots = lots.filter((l) => l.left > 0);
-        const left = leftLots.reduce((s, l) => s + l.left, 0);
-        const cost = Math.round(leftLots.reduce((s, l) => s + l.left * l.each, 0));
-        const each = left ? cost / left : 0;
-        return {
-            rows: rows.reverse(), made, madeCost: Math.round(madeCost), sold, used, left, cost, each,
-            least: left ? Math.floor(each) + 1 : 0, profitSold, saved, value: left * ptWhole(priceNow),
-        };
-    }
-
-    /**
-     * A 'made' entry written at a press of EXCHANGE that Torn's log never showed (the press did not go through, or
-     * the box was changed): it comes off once the log has been read past it. Only when the log can say - `until` is
-     * the time the log has been read up to, and 0 (the log is not read) keeps everything.
-     */
-    function bookSettle(entries, until, wait = PT_MERGE_MS) {
-        const list = entries || [];
-        if (!(until > 0)) return list;
-        const out = list.filter((e) => !(e.kind === 'made' && e.src === 'page' && !e.twin && e.t + wait < until));
-        return out.length === list.length ? list : out;
-    }
-
-    // ---- Torn's log --------------------------------------------------------------------------------------------------
-
-    /**
-     * Which of Torn's log types are a museum exchange, a points sale and points used. Read from Torn's own list of
-     * log types (torn/?selections=logtypes -> { logtypes: { id: title } }) by their titles, so no id is written here.
-     */
-    function pointsLogTypes(json) {
-        const raw = json && (json.logtypes || json);
-        const out = { made: [], sold: [], used: [], titles: {} };
-        if (!raw || typeof raw !== 'object') return out;
-        const rows = Array.isArray(raw) ? raw.map((r) => [r && r.id, r && r.title]) : Object.entries(raw);
-        for (const [id, t] of rows) {
-            const title = String((t && t.title) || t || '');
-            if (!title || id == null) continue;
-            let kind = null;
-            if (/museum/i.test(title)) kind = 'made';
-            else if (/points?\s*market/i.test(title) && /\b(sell|sold|sale)\b/i.test(title)) kind = 'sold';
-            else if (/\bpoints?\b/i.test(title) && /\b(refill|use|used|spend|spent)\b/i.test(title) && !/market|faction|company|job/i.test(title)) kind = 'used';
-            if (!kind) continue;
-            out[kind].push(Number(id));
-            out.titles[id] = title;
-        }
-        return out;
-    }
-
-    const ptPick = (data, keys) => {
-        for (const k of keys) {
-            const v = data && data[k];
-            if (v != null && Number.isFinite(Number(v)) && Number(v) > 0) return Number(v);
-        }
-        return 0;
-    };
-
-    /**
-     * One row of Torn's log as a points-book entry, or null when it cannot be read with certainty.
-     * @param row  Torn's v2 row { id, timestamp, details: { id, title }, data } (v1's { log, title, ... } is read too)
-     * @param types pointsLogTypes()
-     * @param ctx  { costOf(setKey, sets) -> cost of one point, priceNow }
-     */
-    function entryFromLog(id, row, types, ctx = {}) {
-        if (!row) return null;
-        const details = row.details && typeof row.details === 'object' ? row.details : {};
-        const type = Number(details.id ?? row.log);
-        const kind = types.made.includes(type) ? 'made' : types.sold.includes(type) ? 'sold' : types.used.includes(type) ? 'used' : null;
-        if (!kind) return null;
-        const data = row.data || {};
-        const t = ptNum(row.timestamp) * 1000;
-        const text = (String(details.title || row.title || '') + ' ' + JSON.stringify(data)).toLowerCase();
-        if (kind === 'made') {
-            const points = ptWhole(ptPick(data, ['points', 'points_gained', 'points_received', 'points_increased']));
-            if (!points) return null;
-            const set = /plush/.test(text) ? 'plushie' : /flower/.test(text) ? 'flower' : null;
-            return { id: 'log:' + id, t, kind, points, each: ctx.costOf ? ptNum(ctx.costOf(set, points)) : 0, set, src: 'log' };
-        }
-        if (kind === 'sold') {
-            const points = ptWhole(ptPick(data, ['quantity', 'points', 'amount']));
-            if (!points) return null;
-            let each = ptPick(data, ['cost_each', 'price_each', 'price', 'each']);
-            if (!each) {
-                const total = ptPick(data, ['cost_total', 'total_cost', 'total', 'money_gained', 'value', 'cost']);
-                each = total ? total / points : 0;
-            }
-            if (!(each > 0) || each > POINT_PRICE_MAX) return null;
-            return { id: 'log:' + id, t, kind, points, each: Math.round(each), set: null, src: 'log' };
-        }
-        const points = ptWhole(ptPick(data, ['points', 'points_used', 'points_spent']));
-        if (!points) return null;
-        return { id: 'log:' + id, t, kind, points, each: ptWhole(ctx.priceNow), set: null, src: 'log' };
-    }
-
-    /* ===== src/core/sets-desk.js ===== */
-    // Sets: everything the Sets page and the marks on Torn's pages show, worked out once from what Torn Bids holds.
-    // Pure: main.js hands in the settings, what you hold, prices and the points market; out comes one plain object
-    // (a snapshot) that is drawn by the Sets page and stored for the Torn tabs. No page, no storage, no clock of its own.
-
-
-
-
-    /** The Sets settings. Off until the owner turns it on: an update must not change what plushies and flowers do. */
-    const SETS_DEFAULTS = Object.freeze({
-        on: false,
-        which: Object.freeze({ plushie: true, flower: true }),
-        pct: 101,
-        targetMode: 'cash',
-        target: 40,
-        shareMax: 30,
-        readMin: 10,
-        fillMuseum: true,
-        fillPoints: true,
-        pointsRule: 'wall',
-        noteBids: true,
-        notePanel: true,
-        open: true,
-    });
-
-    const SETS_READ_CHOICES = [5, 10, 30];
-
-    const deskNum = (v) => { const n = Number(v); return Number.isFinite(n) ? n : 0; };
-    const deskWhole = (v) => Math.max(0, Math.floor(deskNum(v)));
-
-    /** Stored settings made safe: unknown keys dropped, numbers inside their range. */
-    function setsSettings(stored) {
-        const s = stored && typeof stored === 'object' ? stored : {};
-        const pct = deskNum(s.pct);
-        const which = s.which && typeof s.which === 'object' ? s.which : {};
-        return {
-            on: s.on === true,
-            which: { plushie: which.plushie !== false, flower: which.flower !== false },
-            pct: pct >= 50 && pct <= 200 ? Math.round(pct * 10) / 10 : SETS_DEFAULTS.pct,
-            targetMode: s.targetMode === 'number' ? 'number' : 'cash',
-            target: deskWhole(s.target) >= 1 ? deskWhole(s.target) : SETS_DEFAULTS.target,
-            shareMax: deskNum(s.shareMax) >= 1 && deskNum(s.shareMax) <= 100 ? Math.round(deskNum(s.shareMax)) : SETS_DEFAULTS.shareMax,
-            readMin: SETS_READ_CHOICES.includes(Number(s.readMin)) ? Number(s.readMin) : SETS_DEFAULTS.readMin,
-            fillMuseum: s.fillMuseum !== false,
-            fillPoints: s.fillPoints !== false,
-            pointsRule: s.pointsRule === 'lowest' ? 'lowest' : 'wall',
-            noteBids: s.noteBids !== false,
-            notePanel: s.notePanel !== false,
-            open: s.open !== false,
-        };
-    }
-
-    /**
-     * The snapshot.
-     * @param {object} i
-     *   settings        setsSettings()
-     *   held(id)        how many of an item you hold now
-     *   mv(id)          Torn's market value of an item
-     *   lots(id)        [{ qty, each }] what you paid for units you still hold (may be empty)
-     *   offers(id)      [{ price, qty, src, who, whoId }] bazaar and Item Market listings read for the piece
-     *   topBid(id)      { price, name } the best any other trader pays for the piece, or null
-     *   setBuyer(set)   { id, name, price } the trader paying most for a whole set, or null
-     *   cash            what flips may spend (null = no limit); leastProfitPct: the flips setting
-     *   listings        the points market, parsePointsMarket(); pointsAt: when it was read
-     *   days, gone      the points price record and the lots seen leaving (points.js)
-     *   book            the points book's entries
-     *   money           { points, onHand, vault } from Torn, each null when not read
-     *   moneyFailed     Torn's answer for your money could not be read, and is not asked for again this visit
-     *   pricesAt        when the pieces' listings were last read
-     */
-    function setsSnapshot(i) {
-        const now = i.now || Date.now();
-        const settings = i.settings;
-        const on = setsOn(settings);
-        const money = i.money || {};
-        const price = listPrice(i.listings || [], settings.pointsRule);
-        const pointsPrice = price ? price.price : 0;
-        const level = usualLevel(i.days || [], now);
-        // Cheap or not is said of the market's own lowest price - what the daily record keeps - not of the price you would type.
-        const cheap = pointsCheap(price ? price.lowest : 0, level);
-        const least = deskNum(i.leastProfitPct);
-
-        const sets = [];
-        const totals = { full: 0, points: 0, cost: 0, gain: 0, known: true };
-        const buyTotals = { count: 0, cost: 0, gain: 0, bazaars: 0, market: 0 };
-        // One bazaar may sell pieces of both sets: counted once.
-        const buySellers = new Set();
-        let piecesValue = 0;
-        for (const set of on) {
-            const heldMap = {};
-            for (const p of set.pieces) heldMap[p.id] = deskWhole(i.held(p.id));
-            const rate = rateSet(set, i.mv, settings.pct, pointsPrice, least);
-            const auto = autoTarget(set, heldMap, i.cash, rate.cost);
-            const target = settings.targetMode === 'number' ? settings.target : auto;
-            const stock = setStock(set, heldMap, target);
-            const worths = pieceWorths(set, i.mv, pointsPrice);
-            const value = setValue(set, pointsPrice);
-            const cost = setsCost(set, stock.full, i.lots, i.mv);
-            const buy = buyPlan(set, stock, worths, i.offers);
-            const run = value ? setRun(set, i.offers, value, { cash: i.cash > 0 ? i.cash : Infinity, leastProfitPct: least }) : null;
-            const trader = (i.setBuyer && i.setBuyer(set)) || null;
-            const pieces = stock.pieces.map((p) => {
-                const all = [...((i.offers && i.offers(p.id)) || [])].filter((o) => o.price > 0 && o.qty > 0).sort((a, b) => a.price - b.price);
-                const lowBazaar = all.find((o) => o.src !== 'market') || null;
-                const bid = (i.topBid && i.topBid(p.id)) || null;
-                piecesValue += p.held * deskWhole(i.mv(p.id));
-                return {
-                    ...p, short: shortName(p.name), mv: deskWhole(i.mv(p.id)), rate: ratePrice(i.mv(p.id), settings.pct), worth: worths.get(String(p.id)) || 0,
-                    low: all[0] ? { price: all[0].price, qty: all[0].qty, who: all[0].who || null, whoId: all[0].whoId ?? null, src: all[0].src } : null,
-                    lowBazaar: lowBazaar ? lowBazaar.price : 0,
-                    bid: bid && bid.price > 0 ? { price: bid.price, name: bid.name || '' } : null,
-                };
-            });
-            const short = pieces.find((p) => p.top) || null;
-            const gain = stock.full && value ? stock.full * value - cost.total : 0;
-            sets.push({
-                key: set.key, name: set.name, museum: set.museum, hash: set.hash, points: set.points, full: stock.full, target: stock.target, auto,
-                pieces, short: short ? { id: short.id, name: short.name, held: short.held, low: short.low } : null,
-                cost, value, gain, rate, buy: setsSlimBuy(buy), run, trader,
-                aheadList: pieces.filter((p) => p.ahead > 0).sort((a, b) => b.ahead - a.ahead).map((p) => ({ name: p.short, ahead: p.ahead })),
-            });
-            totals.full += stock.full;
-            totals.points += stock.full * set.points;
-            totals.cost += cost.total;
-            totals.gain += gain;
-            totals.known = totals.known && cost.known;
-            buyTotals.count += buy.count;
-            buyTotals.cost += buy.cost;
-            buyTotals.gain += buy.gain;
-            for (const r of buy.rows) for (const u of r.units) if (u.src !== 'market' && (u.whoId != null || u.who)) buySellers.add(String(u.whoId ?? u.who));
-            buyTotals.market += buy.market;
-        }
-        buyTotals.bazaars = buySellers.size;
-        totals.least = totals.points ? Math.floor(totals.cost / totals.points) : 0;
-
-        const book = bookState(i.book || [], pointsPrice);
-        const toSell = book.left;
-        const lot = lotAdvice(toSell, i.gone || [], pointsPrice, now);
-        const pointsHeld = money.points == null ? null : deskWhole(money.points);
-        const share = moneyShare({ pieces: piecesValue, points: (pointsHeld == null ? book.left : pointsHeld) * pointsPrice, cash: money.onHand, vault: money.vault });
-
-        return {
-            at: now,
-            on: !!settings.on,
-            open: !!settings.open,
-            pct: settings.pct,
-            least,
-            sets,
-            totals,
-            buyTotals,
-            points: {
-                price: pointsPrice, ahead: price ? price.ahead : 0, rule: price ? price.rule : settings.pointsRule, lowest: price ? price.lowest : 0,
-                wall: price ? price.wall : null, at: i.pointsAt || 0, error: i.pointsError || '', level, cheap, held: pointsHeld,
-            },
-            sell: {
-                points: toSell, price: pointsPrice, least: book.least, cost: book.cost, lot,
-                profit: toSell && pointsPrice ? toSell * pointsPrice - book.cost : 0,
-                lands: toSell * pointsPrice,
-                bigger: toSell + totals.points,
-            },
-            book: { ...book, rows: book.rows.slice(0, 200), before: pointsHeld == null ? null : Math.max(0, pointsHeld - book.left) },
-            share: { ...share, max: settings.shareMax, over: share.total > 0 && share.share > settings.shareMax, known: money.onHand != null || money.vault != null },
-            money: { onHand: money.onHand == null ? null : deskWhole(money.onHand), vault: money.vault == null ? null : deskWhole(money.vault), failed: !!i.moneyFailed },
-            forum: forumText({ open: settings.open, pct: settings.pct, stocks: sets.map((s) => ({ pieces: s.pieces })), sets: on }),
-            pricesAt: i.pricesAt || 0,
-            stockAt: i.stockAt || 0,
-            reading: !!i.reading,
-        };
-    }
-
-    /** A buy plan without the bulk: each row keeps where its units come from, not every listing read. */
-    function setsSlimBuy(buy) {
-        return {
-            ...buy,
-            rows: buy.rows.map((r) => ({
-                ...r,
-                units: r.units.map((u) => ({ price: u.price, take: u.take, src: u.src, who: u.who || null, whoId: u.whoId ?? null })),
-                bazaar: r.bazaar.map((o) => ({ price: o.price, qty: o.qty, who: o.who || null, whoId: o.whoId ?? null })),
-                market: r.market ? { price: r.market.price, qty: r.market.qty } : null,
-            })),
-        };
-    }
-
-    /** A piece's line in the snapshot, by item id: { set, piece } or null. What a mark on a Torn page reads. */
-    function snapPiece(snap, itemId) {
-        for (const set of (snap && snap.sets) || []) {
-            const piece = set.pieces.find((p) => String(p.id) === String(itemId));
-            if (piece) return { set, piece };
-        }
-        return null;
-    }
-
-    /** The snapshot as tradeOffer()'s context. */
-    function snapTradeCtx(snap, settings) {
-        return {
-            settings,
-            pct: snap.pct,
-            mv: (id) => { const hit = snapPiece(snap, id); return hit ? hit.piece.mv : 0; },
-            stockOf: (set) => { const s = snap.sets.find((x) => x.key === set.key); return { pieces: s ? s.pieces : [] }; },
-        };
-    }
-
-    /**
-     * The cheapest units of one bazaar that are worth buying for sets: what the marks on someone's bazaar add up to.
-     * @param cards [{ itemId, price, stock }] the bazaar's cards as read from the page
-     * @returns { rows: [{ itemId, name, price, take, worth, gain, need, top }], count, cost, gain, fullAfter: { key: n } }
-     */
-    function bazaarForSets(snap, cards) {
-        const rows = [];
-        const add = new Map();
-        for (const c of cards || []) {
-            const hit = snapPiece(snap, c.itemId);
-            if (!hit || !(hit.piece.need > 0) || !(hit.piece.worth > 0) || !(c.price > 0) || c.price >= hit.piece.worth) continue;
-            const had = add.get(String(c.itemId)) || 0;
-            const take = Math.min(deskWhole(c.stock), hit.piece.need - had);
-            if (take <= 0) continue;
-            add.set(String(c.itemId), had + take);
-            rows.push({ itemId: c.itemId, name: hit.piece.name, price: c.price, take, all: take >= deskWhole(c.stock), worth: hit.piece.worth, gain: take * (hit.piece.worth - c.price), need: hit.piece.need, top: hit.piece.top, set: hit.set.key });
-        }
-        rows.sort((a, b) => b.top - a.top || b.gain - a.gain);
-        const fullAfter = {};
-        for (const set of (snap && snap.sets) || []) {
-            fullAfter[set.key] = Math.min(...set.pieces.map((p) => p.held + (add.get(String(p.id)) || 0)));
-        }
-        return {
-            rows,
-            count: rows.reduce((s, r) => s + r.take, 0),
-            cost: rows.reduce((s, r) => s + r.take * r.price, 0),
-            gain: rows.reduce((s, r) => s + r.gain, 0),
-            fullAfter,
-        };
-    }
-
-    /**
-     * What you paid for the units of an item you still hold: your newest buys in the Ledger, up to the count held.
-     * (A museum exchange is not a sale in the Ledger, so "bought and not sold" would count pieces long swapped.)
-     * @param rows the Ledger's rows of ONE item ({ t, qty, each, side }), any order
-     */
-    function heldLots(rows, held) {
-        let left = deskWhole(held);
-        const out = [];
-        for (const r of [...(rows || [])].filter((x) => x && x.side === 'buy' && x.qty > 0 && x.each > 0).sort((a, b) => b.t - a.t)) {
-            if (left <= 0) break;
-            const qty = Math.min(left, deskWhole(r.qty));
-            out.push({ qty, each: deskNum(r.each) });
-            left -= qty;
-        }
-        return out;
-    }
-
-    /**
-     * Sets swapped at the museum since Torn's inventory was last read: their pieces are no longer held.
-     * @param presses [{ t, set, sets }] presses of EXCHANGE; @returns itemId -> units to take off what the inventory says
-     */
-    function pressedOff(presses, inventoryAt) {
-        const off = new Map();
-        for (const p of presses || []) {
-            if (!p || !(p.t > (inventoryAt || 0))) continue;
-            const set = SETS.find((s) => s.key === p.set);
-            if (!set) continue;
-            for (const pc of set.pieces) off.set(String(pc.id), (off.get(String(pc.id)) || 0) + deskWhole(p.sets));
-        }
-        return off;
-    }
-
-    /**
-     * Is the snapshot fit to show on Torn's pages? Not before Torn's inventory has been read and the items' market values
-     * are in: until then every piece would read "hold 0, worth $0". The last visit's snapshot stays in its place.
-     */
-    function snapReady(snap) {
-        return !!snap && snap.stockAt > 0 && snap.sets.some((s) => s.pieces.some((p) => p.mv > 0));
-    }
-
-    /** The snapshot as the Torn tabs get it: the page's long tables left out. */
-    function snapForTabs(snap) {
-        return {
-            ...snap,
-            sets: snap.sets.map((s) => ({ ...s, buy: { count: s.buy.count, cost: s.buy.cost, gain: s.buy.gain, fullAfter: s.buy.fullAfter }, run: null })),
-            book: { ...snap.book, rows: [] },
-        };
-    }
-
-    /**
-     * The note for a trade that is open with you: who, how many kinds of items, and what the ones you need come to.
-     * Torn's API does not say who opened it, so the words do not either.
-     * @param trade { id, who, whoId, items: [{ id, name, qty }] } - their side
-     */
-    function tradeNote(trade, offer) {
-        const kinds = offer.rows.length;
-        const needed = offer.rows.filter((r) => r.state === 'need' && r.each > 0).length;
-        const money = '$' + Math.round(offer.need.total).toLocaleString('en-US');
-        let text;
-        if (!kinds) text = 'nothing added yet.';
-        else if (needed) text = kinds + (kinds === 1 ? ' kind of item' : ' kinds of items') + ' · you need ' + needed + ' of them · about ' + money + ' for those.';
-        else if (offer.all.items) text = kinds + (kinds === 1 ? ' kind of item' : ' kinds of items') + ' · pieces you have enough of for now.';
-        else text = kinds + (kinds === 1 ? ' kind of item' : ' kinds of items') + ' · no plushie or flower among them.';
-        return { id: String(trade.id), who: trade.who || 'someone', whoId: trade.whoId ?? null, title: 'Trade open with ' + (trade.who || 'someone'), text: '· ' + text, kinds, needed, total: offer.need.total };
-    }
-
     /* ===== src/sources/route.js ===== */
     /*
      * Which Torn page are we on? Pure string work, so it is testable.
@@ -14480,33 +13405,6 @@
     /** The old address, on Torn's home page: forwarded to the new one. */
     function isOldTradersPageUrl(href) {
         return queryOf(href).get(TRADERS_PAGE_PARAM) === TRADERS_PAGE_VALUE && isTornHost(href);
-    }
-
-    /* ------------------------------------------------------------- Sets (3.24.0) */
-
-    /** Torn's museum, the points market, and a trade as you view it. Links only: one press, one page. */
-    const MUSEUM_URL = 'https://www.torn.com/museum.php';
-    const POINTS_MARKET_URL = 'https://www.torn.com/pmarket.php';
-    function tradeViewUrl(tradeId) {
-        return 'https://www.torn.com/trade.php#step=view&ID=' + encodeURIComponent(String(tradeId).replace(/\D/g, ''));
-    }
-
-    /** The museum (museum.php). `page=museum` is the test harness's stand-in. */
-    function isMuseumPage(href) {
-        const url = String(href || '').toLowerCase();
-        return url.includes('/museum.php') || /[?&]page=museum(?:[&#]|$)/.test(url);
-    }
-
-    /** The points market (pmarket.php). `page=pmarket` is the harness's stand-in. */
-    function isPointsMarketPage(href) {
-        const url = String(href || '').toLowerCase();
-        return url.includes('/pmarket.php') || /[?&]page=pmarket(?:[&#]|$)/.test(url);
-    }
-
-    /** Torn's forums (forums.php). `page=forum` is the harness's stand-in. */
-    function isForumPage(href) {
-        const url = String(href || '').toLowerCase();
-        return url.includes('/forums.php') || /[?&]page=forum(?:[&#]|$)/.test(url);
     }
 
     /* ===== src/sources/dom/scan.js ===== */
@@ -15066,203 +13964,6 @@
         doc.body.appendChild(toast);
         view.setTimeout(() => toast.remove(), TOAST_MS);
         return toast;
-    }
-
-    /* ===== src/sources/dom/sets-pages.js ===== */
-    /*
-     * Sets on Torn's own pages (3.24.0, mockups Z6-Z10): where things are on the
-     * museum, the points market, a trade and a forum thread, and the small marks
-     * Torn Bids floats there.
-     *
-     * The museum, the points market and the forum were never read as markup when
-     * this was written - only as text. So nothing here leans on a class name of
-     * theirs: a control is found by the words on it (EXCHANGE, ADD LISTING), a
-     * piece by its picture (/images/items/{id}/), a box by standing next to its
-     * button. Where the page is not what this expects, nothing is found and
-     * nothing is marked; the panel's box still says the numbers.
-     *
-     * It reads the page and adds marks of its own (absolutely placed, they take
-     * no room and catch no click). It never presses anything of Torn's.
-     */
-
-
-
-
-    const SET_MARK_CLASS = 'ttv2-setmark';
-    const SET_FILL_CLASS = 'ttv2-setfill';
-
-    const OURS = '#ttv2-host, .' + SET_MARK_CLASS + ', .' + SET_FILL_CLASS;
-
-    function setsShown(el) {
-        return Boolean(el && el.getClientRects && el.getClientRects().length);
-    }
-
-    function setsOurs(el) {
-        return Boolean(el && el.closest && el.closest(OURS));
-    }
-
-    function setsWords(el) {
-        if (!el) return '';
-        const raw = el.tagName === 'INPUT' ? el.value : el.textContent;
-        return String(raw || '').replace(/\s+/g, ' ').trim();
-    }
-
-    /**
-     * A float mark inside one of Torn's elements: made once, its words and state kept up, gone with no words.
-     * @param {string} where - '' (the element's top edge, left), 'right' (its right side, centred) or 'under'
-     */
-    function setMark(host, text, state = '', where = '') {
-        if (!host || !host.children) return null;
-        let mark = null;
-        for (const c of host.children) {
-            if (c.classList && c.classList.contains(SET_MARK_CLASS)) {
-                mark = c;
-                break;
-            }
-        }
-        if (!text) {
-            if (mark) {
-                mark.remove();
-                releaseMarks(host);
-            }
-            return null;
-        }
-        if (!mark) {
-            mark = host.ownerDocument.createElement('span');
-            mark.className = 'ttv2-float ' + SET_MARK_CLASS;
-            host.appendChild(mark);
-            holdMarks(host);
-        }
-        if (mark.textContent !== text) mark.textContent = text;
-        if (mark.dataset.state !== state) mark.dataset.state = state;
-        if ((mark.dataset.where || '') !== where) mark.dataset.where = where;
-        return mark;
-    }
-
-    /** Every Sets mark and Fill button off the page, and Torn's elements given back as they were. */
-    function clearSetMarks(doc = document) {
-        for (const m of doc.querySelectorAll('.' + SET_MARK_CLASS + ', .' + SET_FILL_CLASS)) {
-            const host = m.parentElement;
-            m.remove();
-            if (host && !host.querySelector(':scope > .ttv2-float')) releaseMarks(host);
-        }
-    }
-
-    /** Torn's controls with these words on them (the innermost one of each). */
-    function findByWords(doc, re) {
-        const found = [];
-        for (const el of doc.querySelectorAll('button, input[type="submit"], input[type="button"], a, [role="button"], span.btn, div.btn')) {
-            if (setsOurs(el) || !setsShown(el)) continue;
-            if (re.test(setsWords(el))) found.push(el);
-        }
-        return found.filter((el) => !found.some((o) => o !== el && el.contains(o)));
-    }
-
-    /** The text boxes you can see nearest a control: in its form, else in what holds it, a few steps up at most. */
-    function boxesNear(el, min = 1) {
-        let node = el.form || el.parentElement;
-        for (let up = 0; node && up < 6; up += 1, node = node.parentElement) {
-            const boxes = [...node.querySelectorAll('input')].filter((i) => /^(text|number|tel|)$/.test(i.getAttribute('type') || '') && setsShown(i) && !setsOurs(i));
-            if (boxes.length >= min) return { root: node, boxes };
-        }
-        return { root: null, boxes: [] };
-    }
-
-    /** A box and its hidden twin (Torn's money boxes keep the plain number in one), for writeInputs. */
-    function boxTwins(box) {
-        const group = box && box.closest && box.closest('.input-money-group');
-        return group ? [...group.querySelectorAll('input')] : box ? [box] : [];
-    }
-
-    /**
-     * The museum's EXCHANGE controls you can see, each with the set it swaps and its "number of sets" box (if any).
-     * The set is told by the words around the control ("To exchange a Plushie set for 10 points...").
-     * @param sets [{ key, museum }]
-     * @returns [{ set, button, box, root }]
-     */
-    function museumExchanges(doc, sets, hash = '') {
-        const out = [];
-        for (const button of findByWords(doc, /^exchange$/i)) {
-            let key = null;
-            let root = null;
-            let node = button.parentElement;
-            for (let up = 0; node && up < 8 && !key; up += 1, node = node.parentElement) {
-                const text = String(node.textContent || '');
-                // The whole page names every set: no telling from there.
-                if (text.length > 6000) break;
-                const hits = sets.filter((s) => new RegExp(s.museum.replace(/\s+set$/i, ''), 'i').test(text));
-                if (hits.length === 1) {
-                    key = hits[0].key;
-                    root = node;
-                } else if (hits.length > 1) break;
-            }
-            // Not told by the words: by the tab in the address (museum.php#plushie).
-            if (!key) {
-                const byHash = sets.find((s) => new RegExp('#/?' + s.hash + '\\b', 'i').test(hash || ''));
-                if (byHash) key = byHash.key;
-            }
-            if (!key) continue;
-            const near = boxesNear(button, 1);
-            out.push({ set: key, button, box: near.boxes[near.boxes.length - 1] || null, root: root || near.root || button.parentElement });
-        }
-        return out;
-    }
-
-    /**
-     * A set's pieces as the page shows them: the element around each piece's picture.
-     * @param pieces [{ id }]; @param root where to look (the set's own part of the page, else the page)
-     * @returns [{ id, el }]
-     */
-    function pieceTiles(root, pieces) {
-        const out = [];
-        for (const p of pieces) {
-            const img = [...root.querySelectorAll('img[src*="/images/items/' + p.id + '/"]')].find((i) => setsShown(i) && !setsOurs(i));
-            if (!img) continue;
-            out.push({ id: p.id, el: img.closest('li') || img.parentElement });
-        }
-        return out;
-    }
-
-    /** The points market's "Add listing": its button, the Points box and the Price each box. Null when not on the page. */
-    function pointsListing(doc) {
-        const button = findByWords(doc, /^add listing$/i)[0];
-        if (!button) return null;
-        const { root, boxes } = boxesNear(button, 2);
-        if (boxes.length < 2) return null;
-        const label = (i) => [i.name, i.id, i.placeholder, i.getAttribute('aria-label')].join(' ').toLowerCase();
-        let price = boxes.find((i) => /price|cost/.test(label(i))) || null;
-        let amount = boxes.find((i) => i !== price && /amount|point|quant/.test(label(i))) || null;
-        // No name to go by: Torn's order on the page, Points and then Price each.
-        if (!price || !amount) {
-            amount = boxes[0];
-            price = boxes[1];
-        }
-        return { button, amount, price, root };
-    }
-
-    /** The other side's item rows on the trade view: [{ el, name, qty }]. */
-    function tradeTheirRows(doc) {
-        const box = doc.querySelector('.trade-cont');
-        if (!box) return [];
-        const out = [];
-        for (const li of box.querySelectorAll('.user.right ul.cont > li.color2 ul.desc > li')) {
-            const n = li.querySelector('.name');
-            const it = n ? parseTradeItemLine(setsWords(n)) : null;
-            if (it && !/^no items in trade$/i.test(it.name)) out.push({ el: li, name: it.name, qty: it.qty });
-        }
-        return out;
-    }
-
-    /** A forum thread, as far as the page says: its id (from the address) and the headings that may be its title. */
-    function forumThread(doc, href) {
-        const m = String(href || '').match(/[#&?/]t=(\d+)/);
-        const titles = [];
-        for (const el of doc.querySelectorAll('h1, h2, h3, h4, .title-black, [class*="thread-name"], [class*="threadName"], [class*="thread-title"], [class*="threadTitle"], [class*="subject"]')) {
-            if (setsOurs(el) || !setsShown(el)) continue;
-            const text = setsWords(el);
-            if (text.length >= 5 && text.length <= 200) titles.push({ el, text });
-        }
-        return { id: m ? m[1] : null, titles, docTitle: String(doc.title || '') };
     }
 
     /* ===== src/sources/dom/ownbazaar.js ===== */
@@ -16464,67 +15165,6 @@
         white-space: nowrap !important;
     }
 
-    /*
-     * Sets (3.24.0, mockups Z6-Z10): a mark on a museum piece, a bazaar card, an item in a trade or your forum
-     * thread's title. Absolutely placed in Torn's element, so it takes no room; it catches no click.
-     */
-    .ttv2-setmark {
-        top: -9px;
-        left: 4px;
-        height: 18px;
-        padding: 0 7px;
-        border: 1px solid rgba(90, 167, 255, 0.55);
-        border-radius: 9px;
-        background: #10233b;
-        color: #cfe5ff;
-        font: 600 11px/16px "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
-        font-variant-numeric: tabular-nums;
-        letter-spacing: 0;
-        text-transform: none;
-        pointer-events: none;
-        box-shadow: 0 1px 4px rgba(0, 0, 0, 0.45);
-    }
-    .ttv2-setmark[data-where="right"] { top: 50%; left: auto; right: 8px; transform: translateY(-50%); }
-    .ttv2-setmark[data-where="under"] { top: calc(100% - 4px); left: 4px; }
-    .ttv2-setmark[data-where="tile"] { top: auto; bottom: 2px; left: 2px; }
-    .ttv2-setmark[data-state="top"] { border-color: #5aa7ff; background: #173a63; color: #fff; box-shadow: 0 0 0 1px #5aa7ff, 0 0 10px rgba(90, 167, 255, 0.5); }
-    .ttv2-setmark[data-state="ok"] { border-color: rgba(160, 168, 184, 0.45); background: #1c2029; color: #c3c9d4; }
-    .ttv2-setmark[data-state="ahead"], .ttv2-setmark[data-state="over"] { border-color: rgba(246, 183, 74, 0.6); background: #33260c; color: #ffd98a; }
-    .ttv2-setmark[data-state="bad"] { border-color: rgba(255, 120, 120, 0.6); background: #3a1414; color: #ffc9c9; }
-    .ttv2-setmark[data-state="good"] { border-color: rgba(111, 220, 127, 0.55); background: #12301a; color: #b9f3c2; }
-
-    /* Fill beside Torn's own box on the museum and the points market: it types, you press Torn's button. */
-    .ttv2-setfill {
-        top: 50%;
-        left: calc(100% + 8px);
-        transform: translateY(-50%);
-        height: 24px;
-        padding: 0 10px;
-        border: 1px solid rgba(90, 167, 255, 0.55);
-        border-radius: 7px;
-        background: #10233b;
-        color: #cfe5ff;
-        font: 600 11px/22px "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
-        font-variant-numeric: tabular-nums;
-        cursor: pointer;
-    }
-    .ttv2-setfill:hover { background: #173a63; color: #fff; }
-    .ttv2-setfill[data-done="1"] { border-color: rgba(111, 220, 127, 0.55); background: #12301a; color: #b9f3c2; }
-
-    /* Why a price box on your bazaar's add page is red or amber, and a piece kept for sets (no Fill). */
-    .ttv2-tonetag, .ttv2-keptnote {
-        height: 16px;
-        padding: 0 6px;
-        border-radius: 8px;
-        font: 600 10px/16px "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
-        pointer-events: none;
-        box-shadow: 0 1px 4px rgba(0, 0, 0, 0.45);
-    }
-    .ttv2-tonetag { top: calc(100% - 6px); right: 2px; background: #33260c; color: #ffd98a; border: 1px solid rgba(246, 183, 74, 0.6); }
-    .ttv2-tonetag[data-tone="under"] { background: #3a1414; color: #ffc9c9; border-color: rgba(255, 120, 120, 0.6); }
-    .ttv2-keptnote.ttv2-fillcell { margin-left: 0; white-space: nowrap; }
-    .ttv2-keptnote { margin-left: 8px; background: #1c2029; color: #c3c9d4; border: 1px solid rgba(160, 168, 184, 0.45); }
-
     .ttv2-sendrow .name-wrap {
         overflow: visible !important;
     }
@@ -16746,7 +15386,7 @@
     .ttv2-bzchip:hover,
     .ttv2-bzchips[data-selected="true"] .ttv2-bzchip { border-color: rgba(111, 220, 127, 0.55); }
 
-    .ttv2-fillbox.ttv2-fillcell, .ttv2-keptnote.ttv2-fillcell {
+    .ttv2-fillbox.ttv2-fillcell {
         position: absolute;
         right: 2px;
         top: 50%;
@@ -18607,25 +17247,6 @@
         background: var(--buy-bg);
     }
 
-    /* Sets (3.24.0): what this page means for your sets. Never cut: a long line goes on to a second one. */
-    .ttv2-setsbox { border-color: var(--buy-line); background: var(--buy-bg); }
-    .ttv2-setsbox[data-tone="warn"] { border-color: var(--warn-line); background: var(--warn-bg); }
-    .ttv2-setsbox .ttv2-tb-head > b { color: var(--buy); }
-    .ttv2-setsbox[data-tone="warn"] .ttv2-tb-head > b { color: var(--warn); }
-    .ttv2-sets-line { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; padding: 3px 0; font-size: 12px; line-height: 16px; color: var(--text2); overflow-wrap: anywhere; }
-    .ttv2-sets-line > b { flex: none; white-space: nowrap; font-weight: 650; font-variant-numeric: tabular-nums; color: var(--text); }
-    .ttv2-sets-ok, .ttv2-sets-ok > b { color: var(--profit); }
-    .ttv2-sets-warn, .ttv2-sets-warn > b { color: var(--warn); }
-    .ttv2-sets-bad, .ttv2-sets-bad > b { color: var(--bad); }
-    .ttv2-sets-need > span:first-child { color: var(--buy); }
-    .ttv2-sets-muted, .ttv2-sets-muted > b { color: var(--muted); }
-    .ttv2-sets-sep { margin-top: 6px; padding-top: 8px; border-top: 1px solid var(--line); }
-    .ttv2-sets-msg { display: block; padding: 8px 10px; background: var(--input); border: 1px solid var(--line); border-radius: 8px; color: var(--text2); user-select: text; }
-    .ttv2-sets-btns { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
-    .ttv2-sets-note { margin: 0 0 10px; padding: 0 0 10px; border-bottom: 1px solid var(--line); font-size: 12px; line-height: 16px; color: var(--text2); overflow-wrap: anywhere; }
-    .ttv2-sets-note:last-child { margin: 0; padding: 0; border-bottom: 0; }
-    .ttv2-sets-note b { color: var(--text); }
-
     .ttv2-buybox .ttv2-tb-head > b {
         color: var(--buy);
     }
@@ -19538,9 +18159,6 @@
             // The buying run after a trader said yes: Next bazaar (3.12.8).
             this.buyBoxEl = el('div', { class: 'ttv2-tradebox ttv2-buybox' });
             this.buyBoxEl.style.display = 'none';
-            // Sets (3.24.0): what the page you are on means for your sets, and a trade open with you.
-            this.setsBoxEl = el('div', { class: 'ttv2-tradebox ttv2-setsbox' });
-            this.setsBoxEl.style.display = 'none';
 
             this.listPage = el('div', { class: 'ttv2-page ttv2-page-list' }, [
                 this.tradeBoxEl,
@@ -19575,7 +18193,7 @@
 
             // The buying run's box sits under the header, outside the pages: Next
             // is there on every page, in Settings, and with the panel collapsed.
-            this.root = el('div', { class: 'ttv2-panel' }, [this.headEl, this.buyBoxEl, this.setsBoxEl, this.bodyEl]);
+            this.root = el('div', { class: 'ttv2-panel' }, [this.headEl, this.buyBoxEl, this.bodyEl]);
 
             // Esc closes an open chip editor, then Settings.
             this.root.addEventListener('keydown', (event) => {
@@ -20181,50 +18799,6 @@
             if (line.className !== cls) line.className = cls;
             if (line.textContent !== n.text) line.textContent = n.text;
             box.style.display = '';
-        }
-
-        /**
-         * Sets (3.24.0, mockups Z6-Z10): one box under the header. `view` is what the page you are on means for your
-         * sets - the museum, the points market, a trade, a bazaar, your forum thread - and `note` a trade open with
-         * you. Words and numbers only; its buttons type into a Torn box, copy text or open one page.
-         *
-         * @param {null|{title, status?, tone?, lines: Array<{text, right?, cls?}>, buttons?: Array<{key, label, primary?, title?}>}} view
-         * @param {null|{id, title, text}} note
-         */
-        setSets(view, note = null) {
-            const box = this.setsBoxEl;
-            if (!box) return;
-            const sig = view || note ? JSON.stringify([view, note]) : '';
-            if (sig === this.setsSig) return;
-            this.setsSig = sig;
-            box.textContent = '';
-            if (!view && !note) {
-                box.style.display = 'none';
-                return;
-            }
-            box.style.display = '';
-            box.dataset.tone = (view && view.tone) || '';
-            const press = (key, arg) => () => this.handlers.onSets && this.handlers.onSets(key, arg);
-            if (note) {
-                box.appendChild(el('div', { class: 'ttv2-sets-note' }, [
-                    el('div', {}, [el('b', { text: note.title }), ' ' + note.text]),
-                    el('div', { class: 'ttv2-sets-btns' }, [
-                        el('button', { type: 'button', class: 'ttv2-primary', text: 'Open the trade', onclick: press('note-open', note) }),
-                        el('button', { type: 'button', text: 'Not now', onclick: press('note-no', note) }),
-                    ]),
-                ]));
-            }
-            if (!view) return;
-            box.appendChild(el('div', { class: 'ttv2-tb-head' }, [el('b', { text: view.title }), view.status ? el('span', { class: 'ttv2-tb-status', text: view.status }) : null]));
-            for (const l of view.lines || []) {
-                box.appendChild(el('div', { class: 'ttv2-sets-line' + (l.cls ? ' ' + l.cls.split(' ').map((c) => 'ttv2-sets-' + c).join(' ') : '') }, [
-                    el('span', { text: l.text }),
-                    l.right !== undefined && l.right !== null ? el('b', { text: l.right }) : null,
-                ]));
-            }
-            if (view.buttons && view.buttons.length) {
-                box.appendChild(el('div', { class: 'ttv2-sets-btns' }, view.buttons.map((b) => el('button', { type: 'button', class: b.primary ? 'ttv2-primary' : '', title: b.title || null, text: b.label, onclick: press(b.key) }))));
-            }
         }
 
         /**
@@ -23133,723 +21707,6 @@
     }
     `;
 
-    /* ===== src/ui/sets-view.js ===== */
-    // The Sets page (3.24.0, mockups Z1-Z4): a page of its own inside Torn Bids, opened from the top bar the way the
-    // Ledger is. Four tabs: Stock, Buy, My prices, Points. It draws the snapshot from core/sets-desk.js and nothing else;
-    // every change goes out through a handler. Lives in SellingPage's shadow root and uses its tokens and buttons.
-
-
-
-
-    function stEl(tag, props = {}, children = []) {
-        const node = document.createElement(tag);
-        for (const [key, value] of Object.entries(props)) {
-            if (key === 'class') node.className = value;
-            else if (key === 'text') node.textContent = value;
-            else if (key.startsWith('on') && typeof value === 'function') node.addEventListener(key.slice(2).toLowerCase(), value);
-            else if (!key.startsWith('on') && value !== null && value !== undefined && value !== false) node.setAttribute(key, String(value));
-        }
-        for (const child of [].concat(children)) {
-            if (child === null || child === undefined || child === false) continue;
-            node.appendChild(typeof child === 'string' ? document.createTextNode(child) : child);
-        }
-        return node;
-    }
-
-    const stCount = (n) => Number(n || 0).toLocaleString('en-US');
-    const stSigned = (n) => (n >= 0 ? '+' : '−') + formatMoney(Math.abs(n));
-    const stPct = (n) => String(Math.round(Number(n) * 10) / 10);
-    const stAge = (at, now) => (at ? formatAge(now - at) : 'not read yet');
-    const stB = (text, cls) => stEl('b', { text, class: cls || null });
-
-    const SETS_TABS = [['stock', 'Stock'], ['buy', 'Buy'], ['prices', 'My prices'], ['points', 'Points']];
-
-    class SetsView {
-        /**
-         * @param {object} h - onChange(partial settings), onRead(), onOpenUrl(url), onCopy(text) -> boolean,
-         *   onOpenSettings(), bazaarUrl(playerId), marketUrl(itemId), museumUrl(hash), pointsUrl(),
-         *   onNoteOpen(note), onNoteDismiss(note)
-         */
-        constructor(h = {}) {
-            this.h = h;
-            this.tab = 'stock';
-            this.el = stEl('div', { class: 'st' });
-        }
-
-        show(tab) {
-            if (!SETS_TABS.some(([k]) => k === tab)) return;
-            this.tab = tab;
-            this.sig = null;
-            this.render(this.last);
-        }
-
-        /** @param {object} v - { snap, settings, note, now } */
-        render(v) {
-            if (!v || !v.snap) return;
-            this.last = v;
-            const now = v.now || Date.now();
-            const s = v.snap;
-            const sig = JSON.stringify([s, v.settings, v.note || null, this.tab, this.copied || null, Math.floor(now / 60000)]);
-            if (sig === this.sig) return;
-            const box = this.el;
-            const root = box.getRootNode && box.getRootNode();
-            const act = root && root.activeElement;
-            // Typing in a box of this page: leave the page alone until the box is left.
-            if (act && box.contains(act) && act.tagName === 'INPUT' && act.type === 'text' && !this.force) return;
-            this.force = false;
-            this.sig = sig;
-            const focusKey = act && box.contains(act) && act.dataset ? act.dataset.stFocus : null;
-            box.textContent = '';
-
-            if (v.note) box.appendChild(this.noteEl(v.note));
-            box.appendChild(this.statusEl(s, now));
-            const tabs = stEl('div', { class: 'lg-tabs', role: 'group', 'aria-label': 'Sets' });
-            for (const [k, label] of SETS_TABS) {
-                tabs.appendChild(stEl('button', { type: 'button', class: 'lg-tab', 'aria-pressed': String(this.tab === k), 'data-st-focus': 'tab:' + k, text: label, onclick: () => this.show(k) }));
-            }
-            box.appendChild(tabs);
-            if (!s.sets.length) {
-                box.appendChild(stEl('section', { class: 'lg-card lg-empty' }, [
-                    stEl('h2', { text: 'No set is chosen' }),
-                    stEl('p', { text: 'Tick Plushie or Flower under Settings › Sets and points.' }),
-                    stEl('button', { type: 'button', class: 'sp-btn sp-primary', text: 'Open the settings', onclick: () => this.h.onOpenSettings && this.h.onOpenSettings() }),
-                ]));
-            } else if (this.tab === 'buy') this.renderBuy(box, s, now);
-            else if (this.tab === 'prices') this.renderPrices(box, s, v.settings);
-            else if (this.tab === 'points') this.renderPoints(box, s, now);
-            else this.renderStock(box, s);
-
-            if (focusKey) {
-                const again = box.querySelector('[data-st-focus="' + focusKey + '"]');
-                if (again) again.focus({ preventScroll: true });
-            }
-        }
-
-        link(text, url, cls = 'sp-btn st-sm') {
-            return stEl('button', { type: 'button', class: cls, text, onclick: () => this.h.onOpenUrl && this.h.onOpenUrl(url) });
-        }
-
-        copyBtn(text, label, key, cls = 'sp-btn st-sm') {
-            const done = this.copied === key;
-            return stEl('button', {
-                type: 'button', class: cls + (done ? ' st-done' : ''), 'data-st-focus': 'copy:' + key, text: done ? 'Copied ✓' : label,
-                onclick: () => {
-                    const ok = this.h.onCopy ? this.h.onCopy(text) : false;
-                    if (ok === false) return;
-                    this.copied = key;
-                    clearTimeout(this.copiedTimer);
-                    this.copiedTimer = setTimeout(() => { this.copied = null; this.sig = null; this.force = true; this.render(this.last); }, 2000);
-                    this.sig = null;
-                    this.force = true;
-                    this.render(this.last);
-                },
-            });
-        }
-
-        noteEl(note) {
-            return stEl('div', { class: 'st-note', role: 'status' }, [
-                stEl('span', { class: 'sp-dot', 'data-level': 'busy' }),
-                stEl('span', {}, [stB(note.title), note.text ? ' ' + note.text : '']),
-                stEl('span', { class: 'sp-sp' }),
-                stEl('button', { type: 'button', class: 'sp-btn st-sm st-blue', text: 'Open the trade', onclick: () => this.h.onNoteOpen && this.h.onNoteOpen(note) }),
-                stEl('button', { type: 'button', class: 'sp-btn st-sm', text: 'Not now', onclick: () => this.h.onNoteDismiss && this.h.onNoteDismiss(note) }),
-            ]);
-        }
-
-        statusEl(s, now) {
-            const p = s.points;
-            return stEl('div', { class: 'st-status' }, [
-                stEl('button', {
-                    type: 'button', class: 'sp-pill sp-pill-btn st-open', 'data-open': String(s.open), 'data-st-focus': 'open',
-                    title: 'Press to switch between Open and Closed', onclick: () => this.h.onChange && this.h.onChange({ open: !s.open }),
-                }, [stEl('span', { class: 'sp-dot', 'data-level': s.open ? 'online' : 'offline' }), stB(s.open ? 'Open' : 'Closed'), s.open ? ' buying at ' + stPct(s.pct) + '% of market value' : ' not buying']),
-                stEl('span', { class: 'sp-pill', title: p.at ? 'Read ' + stAge(p.at, now) : null }, [stB('Points'), ' ' + (p.price ? formatMoney(p.price) : p.error || 'not read yet')]),
-                stEl('span', { class: 'sp-pill' }, [stEl('span', { class: 'sp-dot', 'data-level': s.pricesAt ? 'online' : 'idle' }), stB('Prices'), ' ' + (s.reading ? 'reading…' : stAge(s.pricesAt, now))]),
-                stEl('span', { class: 'sp-sp' }),
-                stEl('button', { type: 'button', class: 'sp-btn', text: 'Read now', 'data-st-focus': 'read', onclick: () => this.h.onRead && this.h.onRead() }),
-            ]);
-        }
-
-        tile(label, value, sub, cls = '') {
-            return stEl('div', { class: 'lg-tile ' + cls }, [stEl('span', { class: 'lg-tl', text: label }), stEl('b', { text: value }), sub ? stEl('small', { text: sub }) : null]);
-        }
-
-        levelText(level) {
-            if (level && level.lo) return 'the month: ' + formatMoney(level.lo) + ' to ' + formatMoney(level.hi);
-            return 'usual level: watched ' + ((level && level.days) || 0) + ' of ' + USUAL_DAYS + ' days';
-        }
-
-        // ---- Stock ---------------------------------------------------------------------------------------------------
-
-        renderStock(box, s) {
-            const t = s.totals;
-            const p = s.points;
-            box.appendChild(stEl('div', { class: 'lg-tiles lg-tiles5' }, [
-                this.tile('Full sets now', stCount(t.full), s.sets.map((x) => stCount(x.full) + ' ' + x.key).join(' · ')),
-                this.tile('Points they make', stCount(t.points), '10 points a set'),
-                this.tile('They cost you', t.full ? formatMoney(t.cost) : '-', t.full ? 'points must sell over ' + formatMoney(t.least) + (t.known ? '' : ' · part at market value') : 'no full set yet'),
-                this.tile("At today's points price", t.full && p.price ? stSigned(t.gain) : '-', p.price ? stCount(t.points) + ' points at ' + formatMoney(p.price) : 'points price not read', t.full && p.price ? (t.gain >= 0 ? 'lg-good' : 'lg-loss') : ''),
-                this.tile('Points today' + (p.cheap ? ' · cheap' : ''), p.price ? formatMoney(p.price) : '-', this.levelText(p.level), p.cheap ? 'st-hold' : ''),
-            ]));
-            for (const set of s.sets) box.appendChild(this.setPanel(set, s));
-            if (p.cheap && t.full) {
-                box.appendChild(stEl('section', { class: 'lg-card st-holdbox' }, [stEl('div', { class: 'st-ph' }, [
-                    stEl('span', { class: 'sp-dot', 'data-level': 'idle' }),
-                    stB('Points are cheap today', 'st-warn'),
-                    stEl('span', { class: 'lg-muted', text: 'Swap the ' + stCount(t.full) + ' sets at the museum; the ' + stCount(t.points) + ' points wait in your points book until the price is back at its usual level.' }),
-                    stEl('span', { class: 'sp-sp' }),
-                    stEl('button', { type: 'button', class: 'sp-btn st-sm', text: 'See Points', onclick: () => this.show('points') }),
-                ])]));
-            }
-        }
-
-        setPanel(set, s) {
-            const head = stEl('div', { class: 'st-ph' }, [
-                stEl('span', { class: 'st-who', text: set.name }),
-                stEl('span', { class: 'lg-muted' }, [stB(stCount(set.full)), ' full sets · building ', stB(stCount(set.target)), set.full ? ' · these ' + stCount(set.full) + ' cost ' : '', set.full ? stB(formatMoney(set.cost.perSet)) : null, set.full ? ' a set' : '']),
-                stEl('span', { class: 'sp-sp' }),
-                set.full && s.points.price ? stEl('span', { class: 'st-gain ' + (set.gain >= 0 ? 'st-ok' : 'st-bad'), text: stSigned(set.gain) }) : null,
-                this.link('Open the museum', this.h.museumUrl ? this.h.museumUrl(set.hash) : '', 'sp-btn st-sm st-go'),
-            ]);
-            const grid = stEl('div', { class: 'st-grid', 'data-n': String(set.pieces.length) });
-            const order = [...set.pieces].sort((a, c) => (c.need > 0) - (a.need > 0) || (a.ahead > 0) - (c.ahead > 0) || a.held - c.held || a.name.localeCompare(c.name));
-            for (const p of order) {
-                const words = p.state === 'need' ? stCount(p.held) + ' · need ' + stCount(p.need) : p.state === 'ahead' ? stCount(p.held) + ' · ' + stCount(p.ahead) + ' ahead' : stCount(p.held) + ' ✓';
-                grid.appendChild(stEl('div', { class: 'st-pc' + (p.top ? ' st-top' : p.state === 'need' ? ' st-need' : p.state === 'ahead' ? ' st-ahead' : ''), title: p.name }, [
-                    stB(p.short),
-                    stEl('span', { class: p.state === 'need' ? 'st-buy' : p.state === 'ahead' ? 'st-warn' : 'lg-muted', text: words }),
-                ]));
-            }
-            const kids = [head, grid];
-            if (set.short) {
-                const low = set.short.low;
-                kids.push(stEl('div', { class: 'st-row' }, [
-                    stEl('span', { class: 'sp-dot', 'data-level': 'busy' }),
-                    stEl('span', {}, [stB(set.short.name), ' holds your next sets back', low ? ' · cheapest now ' : ' · none read yet', low ? stB(formatMoney(low.price)) : null, low ? ' ×' + stCount(low.qty) + (low.who ? ' at ' + low.who : low.src === 'market' ? ' on the Item Market' : '') : '']),
-                    stEl('span', { class: 'sp-sp' }),
-                    low && low.src !== 'market' && low.whoId != null && this.h.bazaarUrl ? this.link('Open the bazaar', this.h.bazaarUrl(low.whoId), 'sp-link') : null,
-                    low && low.src === 'market' && this.h.marketUrl ? this.link('Open the Item Market', this.h.marketUrl(set.short.id), 'sp-link') : null,
-                    stEl('button', { type: 'button', class: 'sp-btn st-sm', text: 'See Buy', onclick: () => this.show('buy') }),
-                ]));
-            }
-            return stEl('section', { class: 'lg-card st-panel' }, kids);
-        }
-
-        // ---- Buy -----------------------------------------------------------------------------------------------------
-
-        renderBuy(box, s, now) {
-            const t = s.buyTotals;
-            const p = s.points;
-            if (!p.price) {
-                box.appendChild(stEl('section', { class: 'lg-card lg-empty' }, [stEl('h2', { text: 'The points price is not read yet' }), stEl('p', { text: 'A piece is worth buying while it is listed under its share of a set at the points price. Press Read now.' })]));
-                return;
-            }
-            const after = s.sets.map((x) => (x.buy.fullAfter > x.full ? 'from ' + stCount(x.full) + ' to ' + stCount(x.buy.fullAfter) + ' ' + x.key + ' sets' : null)).filter(Boolean).join(' · ');
-            box.appendChild(stEl('section', { class: 'lg-card st-banner' + (t.count ? ' st-banner-go' : '') }, [
-                t.count
-                    ? stEl('span', {}, [stB(stCount(t.count) + ' pieces'), ' are under their worth right now · ', stB(formatMoney(t.cost)), ' at ' + stCount(t.bazaars) + (t.bazaars === 1 ? ' bazaar' : ' bazaars') + (t.market ? ' and the Item Market' : ''), after ? ' · ' + after : '', ' · ', stB(stSigned(t.gain), 'st-ok')])
-                    : stEl('span', {}, [stB('Nothing you need is under its worth right now.'), ' Prices read ' + stAge(s.pricesAt, now) + '; the next read is in turn.']),
-            ]));
-            for (const set of s.sets) box.appendChild(this.buyTable(set));
-            const runs = s.sets.filter((x) => x.run || x.trader);
-            if (runs.length) {
-                box.appendChild(stEl('div', { class: 'lg-head' }, [stEl('h2', { text: 'Whole sets in one run' }), stEl('span', { class: 'lg-muted', text: 'Every piece bought fresh, cheapest first, while a set still pays' + (s.least ? ' your least profit of ' + stPct(s.least) + '%' : '') + '.' })]));
-                const cards = stEl('div', { class: 'st-runs' });
-                for (const set of runs) cards.appendChild(this.runCard(set));
-                box.appendChild(cards);
-            }
-            box.appendChild(stEl('p', { class: 'lg-muted st-foot', text: 'A piece’s worth: a set at the points price you would sell at (' + formatMoney(p.price) + ' a point), shared over its pieces by market value. Every dollar under it is profit. Pieces you are ahead on are left alone.' }));
-        }
-
-        buyTable(set) {
-            const table = stEl('table', { class: 'lg-table st-table' });
-            table.appendChild(stEl('tr', {}, ['Piece', 'You hold', 'Cheapest bazaar', 'Item Market', 'Worth to you', 'Buy now', ''].map((h, i) => stEl('th', { class: i && i < 6 ? 'lg-num' : '', text: h }))));
-            for (const r of set.buy.rows) {
-                const offer = (o, best) => (o ? stEl('span', { class: best ? 'st-best' : '' }, [stB(formatMoney(o.price)), ' ×' + stCount(o.qty), o.who ? ' ' + o.who : '']) : stEl('span', { class: 'lg-muted', text: '-' }));
-                const bz = stEl('td', { class: 'lg-num' }, r.bazaar.length ? r.bazaar.flatMap((o, i) => [i ? stEl('br') : null, offer(o, !i && r.best === 'bazaar')]) : [offer(null)]);
-                const hold = r.state === 'need' ? stCount(r.held) + ' · need ' + stCount(r.need) : r.state === 'ahead' ? stCount(r.held) + ' · ' + stCount(r.ahead) + ' ahead' : stCount(r.held) + ' ✓';
-                let buy;
-                if (r.count) buy = stEl('span', {}, [stB(stCount(r.count) + ' for ' + formatMoney(r.cost)), stEl('br'), stEl('span', { class: 'st-ok', text: stSigned(r.gain) })]);
-                else if (r.over) buy = stEl('span', { class: 'st-warn', text: 'over its worth: wait' });
-                else if (r.state !== 'need') buy = stEl('span', { class: 'lg-muted', text: r.state === 'ahead' ? 'ahead already' : 'enough for now' });
-                else buy = stEl('span', { class: 'lg-muted', text: 'none listed' });
-                const first = r.units[0];
-                let open = null;
-                if (first && first.src === 'market' && this.h.marketUrl) open = this.link('Open', this.h.marketUrl(r.id), 'sp-link');
-                else if (first && first.whoId != null && this.h.bazaarUrl) open = this.link('Open', this.h.bazaarUrl(first.whoId), 'sp-link');
-                table.appendChild(stEl('tr', { class: r.top ? 'st-toprow' : r.count ? '' : 'st-dim' }, [
-                    stEl('td', {}, [stB(r.name), r.top ? stEl('small', { class: 'st-buy', text: ' holds your sets back' }) : null]),
-                    stEl('td', { class: 'lg-num ' + (r.state === 'need' ? 'st-buy' : r.state === 'ahead' ? 'st-warn' : 'lg-muted'), text: hold }),
-                    bz,
-                    stEl('td', { class: 'lg-num' }, [offer(r.market, r.best === 'market')]),
-                    stEl('td', { class: 'lg-num', text: r.worth ? formatMoney(r.worth) : '-' }),
-                    stEl('td', { class: 'lg-num' }, [buy]),
-                    stEl('td', { class: 'st-act' }, [open]),
-                ]));
-            }
-            return stEl('section', { class: 'lg-card st-panel' }, [
-                stEl('div', { class: 'st-ph' }, [
-                    stEl('span', { class: 'st-who', text: set.name }),
-                    stEl('span', { class: 'lg-muted' }, [stB(stCount(set.full)), ' full sets · building ', stB(stCount(set.target)), set.buy.count ? ' · ' + stCount(set.buy.count) + ' pieces to buy now' : '']),
-                    stEl('span', { class: 'sp-sp' }),
-                    set.buy.count ? stEl('span', { class: 'st-gain st-ok', text: stSigned(set.buy.gain) }) : null,
-                ]),
-                stEl('div', { class: 'lg-scroll' }, [table]),
-            ]);
-        }
-
-        runCard(set) {
-            const run = set.run;
-            const kids = [stEl('div', { class: 'st-ph' }, [
-                stEl('span', { class: 'st-who', text: set.name + (run ? ' ×' + stCount(run.sets) : '') }),
-                stEl('span', { class: 'sp-sp' }),
-                run ? stEl('span', { class: 'st-gain st-ok', text: stSigned(run.gain) }) : stEl('span', { class: 'lg-muted', text: 'no whole set pays now' }),
-            ])];
-            if (run) {
-                kids.push(stEl('div', { class: 'st-kv' }, [stEl('span', { text: 'Pieces' }), stEl('span', {}, [stB(stCount(run.pieces)), ' from ' + stCount(run.bazaars) + (run.bazaars === 1 ? ' bazaar' : ' bazaars') + (run.market ? ' and the Item Market' : '')])]));
-                kids.push(stEl('div', { class: 'st-kv' }, [stEl('span', { text: 'A set costs' }), stEl('span', {}, [stB(formatMoney(run.perSet)), ' · swaps for ' + formatMoney(run.value)])]));
-                kids.push(stEl('div', { class: 'st-kv' }, [stEl('span', { text: 'This run needs' }), stB(formatMoney(run.cost))]));
-            }
-            if (set.trader) {
-                kids.push(stEl('div', { class: 'st-kv st-sep' }, [stEl('span', { text: 'A trader buying whole sets' }), stEl('span', {}, [stB(formatMoney(set.trader.price)), ' a set · ' + set.trader.name])]));
-                if (run) kids.push(stEl('p', { class: 'lg-muted', text: set.trader.price > run.value ? 'That is ' + formatMoney(set.trader.price - run.value) + ' a set more than the museum at today’s points price. Shown to compare: your pieces stay for sets.' : 'The museum pays more at today’s points price.' }));
-            }
-            return stEl('section', { class: 'lg-card st-panel' }, kids);
-        }
-
-        // ---- My prices -----------------------------------------------------------------------------------------------
-
-        renderPrices(box, s, settings) {
-            const p = s.points;
-            const input = stEl('input', { type: 'text', class: 'sp-key sp-pctin', 'aria-label': 'I buy at this percent of market value', autocomplete: 'off', spellcheck: 'false', inputmode: 'decimal', 'data-st-focus': 'pct', value: stPct(s.pct) });
-            const state = stEl('span', { class: 'sp-keystate', role: 'status' });
-            const commit = () => {
-                const n = Number(String(input.value).replace(/[%,\s]/g, ''));
-                if (!input.value.trim() || n === s.pct) { input.value = stPct(s.pct); state.textContent = ''; return true; }
-                if (!(n >= 50 && n <= 200)) { state.textContent = 'Type a percent from 50 to 200. Still ' + stPct(s.pct) + '.'; state.className = 'sp-keystate sp-bad'; return false; }
-                this.force = true;
-                if (this.h.onChange) this.h.onChange({ pct: Math.round(n * 10) / 10 });
-                return true;
-            };
-            input.addEventListener('focus', () => input.select());
-            input.addEventListener('blur', commit);
-            input.addEventListener('keydown', (event) => {
-                if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); input.value = stPct(s.pct); state.textContent = ''; input.blur(); return; }
-                if (event.key !== 'Enter') return;
-                event.preventDefault();
-                if (commit()) input.blur();
-                else input.select();
-            });
-            const sets = s.sets;
-            const lines = [];
-            for (const set of sets) {
-                const r = set.rate;
-                if (!r.value || !r.market) continue;
-                lines.push(stEl('div', { class: 'st-row ' + (r.profit <= 0 ? 'st-rowbad' : r.ok ? 'st-rowok' : 'st-rowwarn') }, [
-                    stEl('span', {}, [
-                        'At ' + stPct(s.pct) + '% a ' + set.key + ' set costs you ', stB(formatMoney(r.cost)), ' and swaps for ', stB(formatMoney(r.value)), ': ',
-                        r.profit > 0 ? stB(stSigned(r.profit) + ' a set, ' + stPct(r.kept) + '%', 'st-ok') : stB(stSigned(r.profit) + ' a set', 'st-bad'),
-                        r.profit > 0 && r.ok ? ' · you could go up to ' + stPct(r.cap) + '%' + (s.least ? ' and keep your least profit of ' + stPct(s.least) + '%' : '') : '',
-                        r.profit > 0 && !r.ok ? ' · under your least profit of ' + stPct(s.least) + '%: ' + stPct(r.cap) + '% or less keeps it' : '',
-                        r.profit <= 0 ? ' · ' + stPct(r.cap) + '% or less pays' : '',
-                    ]),
-                    stEl('span', { class: 'sp-sp' }),
-                    !r.ok && r.cap >= 50 ? stEl('button', { type: 'button', class: 'sp-btn st-sm', text: 'Set ' + stPct(r.cap) + '%', 'data-st-focus': 'cap:' + set.key, onclick: () => { this.force = true; if (this.h.onChange) this.h.onChange({ pct: r.cap }); } }) : null,
-                ]));
-            }
-            box.appendChild(stEl('section', { class: 'lg-card st-panel' }, [
-                stEl('div', { class: 'st-rate' }, [stEl('span', { class: 'st-who', text: 'I buy at' }), input, stEl('span', { class: 'st-who', text: '% of market value' }), stEl('span', { class: 'lg-muted', text: 'every plushie and flower' }), state]),
-                ...(lines.length ? lines : [stEl('p', { class: 'lg-muted', text: p.price ? 'Market values are not read yet.' : 'The points price is not read yet: what a set leaves you shows once it is.' })]),
-            ]));
-
-            const two = stEl('div', { class: 'st-two' });
-            const left = stEl('div', { class: 'st-col' });
-            for (const set of sets) {
-                const table = stEl('table', { class: 'lg-table st-table' });
-                table.appendChild(stEl('tr', {}, ['Piece', 'Market value', 'You pay', 'Lowest bazaar', 'Best other buyer'].map((h, i) => stEl('th', { class: i ? 'lg-num' : '', text: h }))));
-                for (const pc of [...set.pieces].sort((a, c) => c.mv - a.mv)) {
-                    const more = pc.bid && pc.bid.price > pc.rate;
-                    table.appendChild(stEl('tr', {}, [
-                        stEl('td', {}, [stB(pc.name)]),
-                        stEl('td', { class: 'lg-num', text: pc.mv ? formatMoney(pc.mv) : '-' }),
-                        stEl('td', { class: 'lg-num' }, [stB(pc.rate ? formatMoney(pc.rate) : '-')]),
-                        stEl('td', { class: 'lg-num ' + (pc.lowBazaar && pc.lowBazaar < pc.rate ? 'st-warn' : ''), text: pc.lowBazaar ? formatMoney(pc.lowBazaar) : '-', title: pc.lowBazaar && pc.lowBazaar < pc.rate ? formatMoney(pc.rate - pc.lowBazaar) + ' cheaper in a bazaar' : null }),
-                        stEl('td', { class: 'lg-num' }, pc.bid ? [formatMoney(pc.bid.price), more ? stEl('small', { class: 'st-warn', text: ' pays more than you' }) : null] : [stEl('span', { class: 'lg-muted', text: '-' })]),
-                    ]));
-                }
-                left.appendChild(stEl('section', { class: 'lg-card st-panel' }, [
-                    stEl('div', { class: 'st-ph' }, [stEl('span', { class: 'st-who', text: set.name }), stEl('span', { class: 'lg-muted' }, ['a set at your rate: ', stB(formatMoney(set.rate.cost))])]),
-                    stEl('div', { class: 'lg-scroll' }, [table]),
-                ]));
-            }
-            const f = s.forum;
-            const seg = (on, label, val) => stEl('button', { type: 'button', class: 'st-seg' + (on ? ' st-seg-on' : ''), 'aria-pressed': String(on), 'data-st-focus': 'shop:' + val, text: label, onclick: () => this.h.onChange && this.h.onChange({ open: val }) });
-            const right = stEl('div', { class: 'st-col' }, [
-                stEl('section', { class: 'lg-card st-panel' }, [
-                    stEl('h3', { text: 'Your shop' }),
-                    stEl('div', { class: 'st-ph' }, [
-                        stEl('span', {}, [stB(s.open ? 'Open' : 'Closed'), stEl('br'), stEl('span', { class: 'lg-muted', text: s.open ? 'The marks on a trade give your prices.' : 'The message for a trade says you are closed.' })]),
-                        stEl('span', { class: 'sp-sp' }),
-                        stEl('div', { class: 'st-segs', role: 'group', 'aria-label': 'Your shop' }, [seg(s.open, 'Open', true), seg(!s.open, 'Closed', false)]),
-                    ]),
-                ]),
-                stEl('section', { class: 'lg-card st-panel' }, [
-                    stEl('h3', { text: 'Your forum thread' }),
-                    stEl('div', { class: 'st-msg st-msgtitle', text: f.title }),
-                    stEl('div', { class: 'st-msg', text: f.post }),
-                    stEl('div', { class: 'st-btns' }, [this.copyBtn(f.title, 'Copy the title', 'title', 'sp-btn st-sm st-blue'), this.copyBtn(f.post, 'Copy the post', 'post')]),
-                    stEl('p', { class: 'lg-muted', text: 'Torn Bids writes it; you paste and save it on Torn. Nothing is ever posted for you.' }),
-                ]),
-                this.shareCard(s),
-            ]);
-            two.appendChild(left);
-            two.appendChild(right);
-            box.appendChild(two);
-        }
-
-        shareCard(s) {
-            const sh = s.share;
-            const kids = [stEl('h3', { text: 'Your money in sets and points' })];
-            if (!sh.known) {
-                kids.push(stEl('p', { class: 'lg-muted', text: 'Pieces and points: ' + formatMoney(sh.inSets) + '. Your cash and vault ' + (s.money && s.money.failed ? 'could not be read (Report a problem says why)' : 'are not read yet') + ', so the share cannot be worked out.' }));
-            } else {
-                kids.push(stEl('div', { class: 'st-ph' }, [
-                    stEl('span', { class: 'st-big ' + (sh.over ? 'st-warn' : ''), text: stPct(sh.share) + '%' }),
-                    stEl('span', { class: 'lg-muted', text: 'of ' + formatMoney(sh.total) + ' · your limit is ' + stCount(sh.max) + '%' }),
-                ]));
-                kids.push(stEl('div', { class: 'st-bar' }, [stEl('span', { class: sh.over ? 'st-barwarn' : '', style: 'width:' + Math.min(100, Math.round(sh.share)) + '%' }), stEl('i', { style: 'left:' + Math.min(100, sh.max) + '%' })]));
-                if (sh.over) kids.push(stEl('p', { class: 'st-warn', text: 'Over your limit: time to close, or to swap and sell.' }));
-            }
-            return stEl('section', { class: 'lg-card st-panel' }, kids);
-        }
-
-        // ---- Points --------------------------------------------------------------------------------------------------
-
-        renderPoints(box, s, now) {
-            const bk = s.book;
-            const p = s.points;
-            const sell = s.sell;
-            box.appendChild(stEl('div', { class: 'lg-tiles st-tiles4' }, [
-                this.tile('Made from sets, to sell', stCount(bk.left), bk.left ? 'cost you ' + formatMoney(Math.round(bk.each)) + ' each' : 'none waiting'),
-                this.tile('Held before', bk.before == null ? '-' : stCount(bk.before), bk.before == null ? (s.money && s.money.failed ? 'your points could not be read' : 'your points are not read yet') : 'yours already · never offered'),
-                this.tile('Made so far', stCount(bk.made), stCount(bk.made / 10) + ' sets · ' + formatMoney(bk.madeCost)),
-                this.tile('Profit so far', stSigned(bk.profitSold + bk.saved), 'sold ' + stSigned(bk.profitSold) + ' · saved by using ' + stSigned(bk.saved), bk.profitSold + bk.saved >= 0 ? 'lg-good' : 'lg-loss'),
-            ]));
-            const two = stEl('div', { class: 'st-two' });
-            const table = stEl('table', { class: 'lg-table st-table' });
-            table.appendChild(stEl('tr', {}, ['When', 'What', 'Points', 'Each', 'Profit'].map((h, i) => stEl('th', { class: i > 1 ? 'lg-num' : '', text: h }))));
-            for (const r of bk.rows) {
-                const what = r.kind === 'made' ? 'Made · ' + stCount(r.points / 10) + (r.set ? ' ' + r.set : '') + ' sets' : r.kind === 'sold' ? 'Sold' : 'Used';
-                table.appendChild(stEl('tr', {}, [
-                    stEl('td', { text: formatAge(now - r.t), title: new Date(r.t).toLocaleString() }),
-                    stEl('td', {}, [stEl('span', { class: 'st-kind st-kind-' + r.kind, text: what }), r.kind !== 'made' && r.mine < r.points ? stEl('small', { class: 'lg-muted', text: ' ' + stCount(r.points - r.mine) + ' of them yours from before' }) : null]),
-                    stEl('td', { class: 'lg-num', text: stCount(r.points) }),
-                    stEl('td', { class: 'lg-num', text: r.each ? formatMoney(r.each) : '-', title: r.kind === 'made' ? 'What one point cost you' : r.kind === 'sold' ? 'What a point sold for' : 'What a point cost on the market then' }),
-                    stEl('td', { class: 'lg-num ' + (r.kind === 'made' ? 'lg-muted' : r.gain >= 0 ? 'lg-good' : 'lg-loss'), text: r.kind === 'made' ? '' : stSigned(r.gain) }),
-                ]));
-            }
-            two.appendChild(stEl('section', { class: 'lg-card st-panel' }, [
-                stEl('h3', { text: 'Your points book' }),
-                bk.rows.length ? stEl('div', { class: 'lg-scroll' }, [table]) : stEl('p', { class: 'lg-muted', text: 'Nothing yet. A set swapped at the museum is written here with what its pieces cost you; points you sell or use come off the oldest first.' }),
-            ]));
-            const right = stEl('div', { class: 'st-col' });
-            if (p.cheap) {
-                right.appendChild(stEl('section', { class: 'lg-card st-panel st-holdbox' }, [
-                    stEl('h3', { class: 'st-warn', text: 'Hold: points are cheap today' }),
-                    stEl('p', { text: formatMoney(p.price) + ' is under the last month’s level, ' + formatMoney(p.level.lo) + ' to ' + formatMoney(p.level.hi) + '. You can still sell: it is your choice.' }),
-                ]));
-            }
-            const kv = (k, v, cls) => stEl('div', { class: 'st-kv' + (cls ? ' ' + cls : '') }, [stEl('span', { text: k }), v]);
-            const lot = sell.lot;
-            const cardKids = [stEl('h3', { text: 'If you sell now' })];
-            if (!p.price) cardKids.push(stEl('p', { class: 'lg-muted', text: 'The points price is not read yet.' }));
-            else {
-                cardKids.push(kv('Price to type', stEl('span', {}, [stB(formatMoney(p.price), 'st-ok'), ' · $1 under the ' + (p.rule === 'wall' ? 'first wall' : 'lowest')])));
-                cardKids.push(kv('Ahead of you', stEl('span', { text: stCount(p.ahead) + ' points' })));
-                if (sell.points) {
-                    cardKids.push(kv('Least price, from your book', stB(formatMoney(sell.least))));
-                    cardKids.push(kv('Profit on these ' + stCount(sell.points), stB(stSigned(sell.profit), sell.profit >= 0 ? 'st-ok' : 'st-bad')));
-                    cardKids.push(kv('Lot', stB(lot.split ? stCount(lot.lots.length) + ' lots of ' + stCount(lot.size) : 'all ' + stCount(sell.points) + ' in one lot'), 'st-sep'));
-                    cardKids.push(stEl('p', { class: 'lg-muted', text: lot.seen ? 'Lots of ' + stCount(lot.seen.lo) + ' to ' + stCount(lot.seen.hi) + ' left the market near this price today (' + stCount(lot.seen.count) + ' seen).' + (lot.split ? '' : ' Small lots only when small lots are what is selling.') : 'One lot unless small lots are what is selling. Torn Bids has not seen lots leave near this price yet.' }));
-                    if (sell.bigger > sell.points) cardKids.push(kv('Or wait for a bigger lot', stEl('span', {}, [stB(stCount(sell.bigger)), ' once your ' + stCount(s.totals.full) + ' full sets are swapped']), 'st-sep'));
-                    cardKids.push(kv('If it sells', stEl('span', {}, [stB(formatMoney(sell.lands)), ' lands on hand']), 'st-sep'));
-                    cardKids.push(stEl('p', { class: 'st-warn', text: 'Money on hand can be mugged. Put it in the vault when it lands.' }));
-                } else {
-                    cardKids.push(stEl('p', { class: 'lg-muted', text: s.totals.full ? 'No points from sets are waiting. Your ' + stCount(s.totals.full) + ' full sets would make ' + stCount(s.totals.points) + '.' : 'No points from sets are waiting.' }));
-                }
-                cardKids.push(stEl('div', { class: 'st-btns' }, [this.link('Open the points market', this.h.pointsUrl ? this.h.pointsUrl() : '', 'sp-btn st-sm st-go')]));
-            }
-            right.appendChild(stEl('section', { class: 'lg-card st-panel' }, cardKids));
-            two.appendChild(right);
-            box.appendChild(two);
-        }
-    }
-
-    const SETS_CSS = `
-    .st { display: flex; flex-direction: column; gap: 16px; padding: 24px 24px 64px; }
-    .st h3 { margin: 0 0 12px; font: 650 11px/1 var(--sans); letter-spacing: 0.09em; text-transform: uppercase; color: var(--text2); }
-    .st p { margin: 0; }
-    .ss { display: contents; }
-    .st-status { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-    .st-open[data-open="true"] { border-color: var(--profit-line); background: var(--profit-bg); }
-    .st-open[data-open="false"] { border-color: var(--line2); color: var(--muted); }
-    .st-note { display: flex; align-items: center; gap: 12px; padding: 12px 16px; background: var(--buy-bg); border: 1px solid var(--buy-line); border-radius: 12px; }
-    .st-panel { display: flex; flex-direction: column; gap: 12px; }
-    .st-panel h3 { margin: 0; }
-    .st-ph { display: flex; align-items: center; gap: 12px; min-width: 0; }
-    .st-who { font: 400 17px/1.2 var(--serif); color: var(--text); white-space: nowrap; }
-    .st-gain { font-weight: 650; font-variant-numeric: tabular-nums; white-space: nowrap; }
-    .st-ok { color: var(--profit); }
-    .st-bad { color: var(--bad); }
-    .st-warn { color: var(--warn); }
-    .st-buy { color: var(--buy); }
-    .st-big { font: 400 26px/1 var(--serif); }
-    .sp-btn.st-sm { height: 28px; padding: 0 10px; font-size: 12px; border-radius: 8px; }
-    .sp-btn.st-go { color: var(--offer); border-color: var(--buy-line); background: var(--buy-bg); }
-    .sp-btn.st-blue { color: var(--on-buy); background: var(--buy); border-color: transparent; font-weight: 600; }
-    .sp-btn.st-done { color: var(--profit); border-color: var(--profit-line); background: var(--profit-bg); }
-    .st-grid { display: grid; grid-template-columns: repeat(13, minmax(0, 1fr)); gap: 8px; }
-    .st-grid[data-n="11"] { grid-template-columns: repeat(11, minmax(0, 1fr)); }
-    .st-pc { display: flex; flex-direction: column; gap: 2px; padding: 8px 8px; background: var(--rail); border: 1px solid var(--line); border-radius: 10px; min-width: 0; font-size: 12px; white-space: nowrap; }
-    .st-pc b { font-weight: 600; color: var(--text); }
-    .st-pc.st-need { border-color: var(--buy-line); }
-    .st-pc.st-top { border-color: var(--buy); box-shadow: 0 0 0 1px var(--buy), 0 0 14px rgba(90, 167, 255, 0.35); }
-    .st-pc.st-ahead { border-color: var(--warn-line); }
-    .st-row { display: flex; align-items: center; gap: 10px; padding: 10px 12px; background: var(--rail); border: 1px solid var(--line); border-radius: 10px; }
-    .st-rowok { border-color: var(--profit-line); background: var(--profit-bg); }
-    .st-rowwarn { border-color: var(--warn-line); background: var(--warn-bg); }
-    .st-rowbad { border-color: var(--bad-line); background: var(--bad-bg); }
-    .lg-tile.st-hold { border-color: var(--warn-line); background: var(--warn-bg); }
-    .lg-tile.st-hold b { color: var(--warn); }
-    .st-holdbox { border-color: var(--warn-line); background: var(--warn-bg); }
-    .st-tiles4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
-    .st-banner { border-color: var(--line2); }
-    .st-banner-go { border-color: var(--buy-line); background: var(--buy-bg); }
-    .st-table td, .st-table th { white-space: nowrap; }
-    .st-table small { font-size: 11px; }
-    .st-toprow td:first-child { box-shadow: inset 3px 0 0 var(--buy); }
-    .st-dim td { color: var(--muted); }
-    .st-dim td b { color: var(--text2); font-weight: 500; }
-    .st-best b { color: var(--profit); }
-    .st-act { text-align: right; }
-    .st-runs { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
-    .st-kv { display: flex; justify-content: space-between; gap: 12px; color: var(--text2); }
-    .st-kv > span:first-child { color: var(--muted); }
-    .st-sep { padding-top: 10px; border-top: 1px solid var(--line); }
-    .st-foot { max-width: 110ch; }
-    .st-rate { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-    .st-rate input.sp-pctin { width: 84px; height: 36px; font-size: 17px; text-align: right; }
-    .st-two { display: grid; grid-template-columns: minmax(0, 1fr) 400px; gap: 16px; align-items: start; }
-    .st-col { display: flex; flex-direction: column; gap: 16px; min-width: 0; }
-    .st-segs { display: inline-flex; padding: 3px; gap: 3px; background: var(--input); border: 1px solid var(--line); border-radius: 10px; }
-    .st-seg { height: 28px; padding: 0 14px; font: 600 12px var(--sans); color: var(--muted); background: transparent; border: 0; border-radius: 8px; cursor: pointer; }
-    .st-seg-on { color: var(--on-profit); background: var(--profit); }
-    .st-msg { padding: 10px 12px; background: var(--input); border: 1px solid var(--line); border-radius: 10px; color: var(--text2); white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; }
-    .st-msgtitle { color: var(--text); font-weight: 600; }
-    .st-btns { display: flex; gap: 8px; }
-    .st-bar { position: relative; height: 8px; background: var(--input); border-radius: 4px; }
-    .st-bar span { position: absolute; left: 0; top: 0; bottom: 0; background: var(--buy); border-radius: 4px; }
-    .st-bar span.st-barwarn { background: var(--warn); }
-    .st-bar i { position: absolute; top: -3px; bottom: -3px; width: 2px; background: var(--text2); }
-    .st-kind { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; border: 1px solid var(--line2); }
-    .st-kind-made { color: var(--buy); border-color: var(--buy-line); }
-    .st-kind-sold { color: var(--profit); border-color: var(--profit-line); }
-    .st-kind-used { color: var(--known); }
-    @media (max-width: 1500px) {
-        .st-grid, .st-grid[data-n="11"] { grid-template-columns: repeat(7, minmax(0, 1fr)); }
-        .st-grid[data-n="11"] { grid-template-columns: repeat(6, minmax(0, 1fr)); }
-    }
-    @media (max-width: 1200px) {
-        .st-two { grid-template-columns: minmax(0, 1fr); }
-        .st-runs { grid-template-columns: minmax(0, 1fr); }
-    }
-    `;
-
-    /* ===== src/ui/sets-settings.js ===== */
-    // Settings › Sets and points (3.24.0, mockup Z5): the one switch, and the few settings under it.
-    // Two bodies for two cards of Torn Bids' settings page; they use that page's own field, radio and check classes.
-    // Nothing is saved by a button: a press, Enter, Tab or a click away saves; Esc puts back what was there.
-
-
-
-    function ssEl(tag, props = {}, children = []) {
-        const node = document.createElement(tag);
-        for (const [key, value] of Object.entries(props)) {
-            if (key === 'class') node.className = value;
-            else if (key === 'text') node.textContent = value;
-            else if (key.startsWith('on') && typeof value === 'function') node.addEventListener(key.slice(2).toLowerCase(), value);
-            else if (!key.startsWith('on') && value !== null && value !== undefined && value !== false) node.setAttribute(key, String(value));
-        }
-        for (const child of [].concat(children)) {
-            if (child === null || child === undefined || child === false) continue;
-            node.appendChild(typeof child === 'string' ? document.createTextNode(child) : child);
-        }
-        return node;
-    }
-
-    const ssField = (label, sub, control) =>
-        ssEl('div', { class: 'sp-field' }, [
-            ssEl('div', { class: 'sp-flabel' }, [ssEl('b', { text: label }), sub ? ssEl('small', { text: sub }) : null]),
-            ssEl('div', { class: 'sp-fctl' }, [].concat(control)),
-        ]);
-
-    class SetsSettings {
-        /** @param {function} onChange - onChange(partial settings) */
-        constructor(onChange) {
-            this.onChange = onChange;
-            this.mainEl = ssEl('div', { class: 'ss' });
-            this.pagesEl = ssEl('div', { class: 'ss' });
-        }
-
-        set(partial) {
-            this.force = true;
-            if (this.onChange) this.onChange(partial);
-        }
-
-        segs(label, focus, options, value, pick) {
-            const box = ssEl('div', { class: 'st-segs', role: 'group', 'aria-label': label });
-            for (const [val, text] of options) {
-                const on = val === value;
-                box.appendChild(ssEl('button', { type: 'button', class: 'st-seg' + (on ? ' st-seg-on' : ''), 'aria-pressed': String(on), 'data-ss-focus': focus + ':' + val, text, onclick: () => { if (!on) pick(val); } }));
-            }
-            return box;
-        }
-
-        check(focus, label, on, pick) {
-            const input = ssEl('input', { type: 'checkbox', 'data-ss-focus': focus });
-            input.checked = !!on;
-            input.addEventListener('change', () => pick(input.checked));
-            return ssEl('label', { class: 'sp-check' }, [input, ssEl('span', { text: label })]);
-        }
-
-        /** A number box: `read(text)` gives { patch } or { error }. */
-        box(focus, label, shown, read) {
-            const input = ssEl('input', { type: 'text', class: 'sp-key sp-pctin', 'aria-label': label, autocomplete: 'off', spellcheck: 'false', inputmode: 'decimal', 'data-ss-focus': focus, value: shown });
-            const state = ssEl('div', { class: 'sp-keystate', role: 'status' });
-            const commit = () => {
-                const text = input.value.trim();
-                if (!text || text === shown) { input.value = shown; input.classList.remove('sp-in-bad'); state.textContent = ''; return true; }
-                const r = read(text);
-                if (r.error) {
-                    input.classList.add('sp-in-bad');
-                    state.className = 'sp-keystate sp-bad';
-                    state.textContent = r.error + ' Still ' + shown + '.';
-                    return false;
-                }
-                this.set(r.patch);
-                return true;
-            };
-            input.addEventListener('focus', () => input.select());
-            input.addEventListener('blur', commit);
-            input.addEventListener('keydown', (event) => {
-                if (event.key === 'Escape') {
-                    event.preventDefault();
-                    event.stopPropagation();
-                    input.value = shown;
-                    input.classList.remove('sp-in-bad');
-                    state.textContent = '';
-                    input.blur();
-                    return;
-                }
-                if (event.key !== 'Enter') return;
-                event.preventDefault();
-                if (commit()) input.blur();
-                else input.select();
-            });
-            return { input, state };
-        }
-
-        /** @param s the settings; @param extra { autoText: string } what the cash allows, for the label ("40 plushie · 38 flower") */
-        sync(s, extra = {}) {
-            const sig = JSON.stringify([s, extra]);
-            if (sig === this.sig) return;
-            const root = this.mainEl.getRootNode && this.mainEl.getRootNode();
-            const act = root && root.activeElement;
-            const inside = act && (this.mainEl.contains(act) || this.pagesEl.contains(act));
-            // Typing in one of these boxes: nothing is redrawn under the caret.
-            if (inside && act.tagName === 'INPUT' && act.type === 'text' && !this.force) return;
-            const focusKey = inside && act.dataset ? act.dataset.ssFocus : null;
-            this.force = false;
-            this.sig = sig;
-
-            const main = this.mainEl;
-            main.textContent = '';
-            main.appendChild(ssField('Sets and points', s.on
-                ? 'On: the Sets page, the marks on Torn’s pages, and every plushie and flower kept for sets.'
-                : 'Off: plushies and flowers are ordinary items, as today. No Sets page, no marks for sets on Torn’s pages, no reads for sets.',
-            [this.segs('Sets and points', 'on', [[false, 'Off'], [true, 'On']], s.on, (on) => this.set({ on }))]));
-            const pages = this.pagesEl;
-            pages.textContent = '';
-            if (!s.on) {
-                pages.appendChild(ssEl('p', { class: 'sp-note', text: 'Shown once Sets and points is on. What you set is kept for when you switch it back on, and your points book keeps its entries.' }));
-                this.focusBack(focusKey);
-                return;
-            }
-
-            main.appendChild(ssField('Which sets', 'The other ten museum sets come later.', [ssEl('div', { class: 'sp-inline' }, [
-                this.check('which:plushie', 'Plushie', s.which.plushie, (on) => this.set({ which: { ...s.which, plushie: on } })),
-                this.check('which:flower', 'Flower', s.which.flower, (on) => this.set({ which: { ...s.which, flower: on } })),
-            ])]));
-
-            const pct = this.box('pct', 'I buy at this percent of market value', String(s.pct), (text) => {
-                const n = Number(String(text).replace(/[%,\s]/g, ''));
-                return n >= 50 && n <= 200 ? { patch: { pct: Math.round(n * 10) / 10 } } : { error: 'Type a percent from 50 to 200.' };
-            });
-            main.appendChild(ssField('I buy at', 'Of market value. The same number as on the My prices tab.', [ssEl('div', { class: 'sp-inline sp-pct' }, [pct.input, ' % of market value']), pct.state]));
-
-            const target = this.box('target', 'Sets to build at once', String(s.target), (text) => {
-                const n = Number(String(text).replace(/[,\s]/g, ''));
-                return Number.isInteger(n) && n >= 1 ? { patch: { target: n, targetMode: 'number' } } : { error: 'Type a whole number of sets, 1 or more.' };
-            });
-            const radio = (value, label, extraEl) => {
-                const input = ssEl('input', { type: 'radio', name: 'ss-target-mode', value, 'data-ss-focus': 'tmode:' + value });
-                input.checked = s.targetMode === value;
-                input.addEventListener('change', () => { if (input.checked) this.set({ targetMode: value }); });
-                return ssEl('label', { class: 'sp-radio-o' }, [input, ssEl('span', { text: label }), extraEl || null]);
-            };
-            main.appendChild(ssField('Sets to build at once', 'Under it a piece says “need”; over it, “ahead”.', [
-                ssEl('div', { class: 'sp-radio', role: 'radiogroup', 'aria-label': 'Sets to build at once' }, [
-                    radio('cash', 'What my cash allows' + (extra.autoText ? ' · ' + extra.autoText : '')),
-                    radio('number', 'A number', target.input),
-                ]),
-                target.state,
-                ssEl('p', { class: 'sp-note', text: 'Cash is the “Cash for flips” you set under Flips; with no limit there, it is the piece you hold most of.' }),
-            ]));
-
-            const share = this.box('share', 'Most of my money in sets and points', String(s.shareMax), (text) => {
-                const n = Number(String(text).replace(/[%,\s]/g, ''));
-                return n >= 1 && n <= 100 ? { patch: { shareMax: Math.round(n) } } : { error: 'Type a percent from 1 to 100.' };
-            });
-            main.appendChild(ssField('Most of my money in sets and points', 'A share of cash, vault, pieces and points together. Over it Torn Bids says “time to close”.', [ssEl('div', { class: 'sp-inline sp-pct' }, ['Up to ', share.input, ' %']), share.state]));
-
-            main.appendChild(ssField('Read prices for sets', 'Sets wait their turn behind an accepted trade and the item you are looking at.', [
-                this.segs('Read prices for sets', 'read', SETS_READ_CHOICES.map((m) => [m, 'Every ' + m + ' min']), s.readMin, (readMin) => this.set({ readMin })),
-            ]));
-
-            pages.appendChild(ssField('Fill on the museum', 'Types how many full sets you hold into Torn’s box. You press EXCHANGE.', [
-                this.segs('Fill on the museum', 'fillm', [[false, 'Off'], [true, 'On']], s.fillMuseum, (fillMuseum) => this.set({ fillMuseum })),
-            ]));
-            pages.appendChild(ssField('Fill on the points market', 'Types the price and the lot. You press ADD LISTING.', [
-                this.segs('Fill on the points market', 'fillp', [['off', 'Off'], ['lowest', '$1 under the lowest'], ['wall', '$1 under the first wall']], s.fillPoints ? s.pointsRule : 'off',
-                    (v) => this.set(v === 'off' ? { fillPoints: false } : { fillPoints: true, pointsRule: v })),
-            ]));
-            pages.appendChild(ssField('A trade is opened with me', 'Tell me in', [ssEl('div', { class: 'sp-inline' }, [
-                this.check('note:bids', 'Torn Bids', s.noteBids, (on) => this.set({ noteBids: on })),
-                this.check('note:panel', 'The panel', s.notePanel, (on) => this.set({ notePanel: on })),
-            ]), ssEl('p', { class: 'sp-note', text: 'It says who, how many kinds of items, and what the ones you need come to, on the page you are looking at. No sound and no browser notification: Torn’s rules forbid a script that draws attention to itself. Opening the trade is your choice; nothing is accepted for you.' })]));
-            pages.appendChild(ssField('My shop', 'The same switch as on the My prices tab.', [
-                this.segs('My shop', 'open', [[true, 'Open'], [false, 'Closed']], s.open, (open) => this.set({ open })),
-            ]));
-            this.focusBack(focusKey);
-        }
-
-        focusBack(key) {
-            if (!key) return;
-            const again = this.mainEl.querySelector('[data-ss-focus="' + key + '"]') || this.pagesEl.querySelector('[data-ss-focus="' + key + '"]');
-            if (again) again.focus({ preventScroll: true });
-        }
-    }
-
     /* ===== src/ui/selling-page.js ===== */
     /*
      * Torn Bids: every item, both sides - who pays most for it, who sells it
@@ -23874,8 +21731,6 @@
      * placeholder. Nothing is cut short with an ellipsis. Names from Torn,
      * TornExchange or TornW3B only ever go in via textContent.
      */
-
-
 
 
 
@@ -24382,16 +22237,6 @@
                 text: 'Ledger',
                 onclick: () => this.showView(this.view === 'ledger' ? 'list' : 'ledger'),
             });
-            // Sets (3.24.0): a page of its own, opened like the Ledger. Only there while Settings › Sets and points is on.
-            this.setsBtn = spEl('button', {
-                type: 'button',
-                class: 'sp-hbtn',
-                title: 'Sets: plushies and flowers for the museum, and the points they make',
-                'aria-pressed': 'false',
-                hidden: '',
-                text: 'Sets',
-                onclick: () => this.showView(this.view === 'sets' ? 'list' : 'sets'),
-            });
             this.settingsBtn = spEl('button', {
                 type: 'button',
                 class: 'sp-icon',
@@ -24417,7 +22262,6 @@
                 this.catEl,
                 this.pillsEl,
                 this.refreshBtn,
-                this.setsBtn,
                 this.ledgerBtn,
                 this.settingsBtn,
             ]);
@@ -24534,36 +22378,11 @@
             });
             this.ledgerEl = spEl('main', { class: 'sp-main', hidden: '' }, [this.ledgerView.el]);
 
-            /* Sets */
-            const openSetsSettings = () => {
-                this.showView('settings');
-                const sec = this.snavSections && this.snavSections.find((x) => x.id === 'sets');
-                if (sec) {
-                    this.snavPick('sets');
-                    sec.sec.scrollIntoView({ block: 'start' });
-                }
-            };
-            this.setsView = new SetsView({
-                onChange: (partial) => this.h.onSetsChange && this.h.onSetsChange(partial),
-                onRead: () => this.h.onSetsRead && this.h.onSetsRead(),
-                onOpenUrl: (url) => url && this.h.onOpenUrl && this.h.onOpenUrl(url),
-                onCopy: (text) => (this.h.onCopy ? this.h.onCopy(text) : false),
-                onOpenSettings: openSetsSettings,
-                bazaarUrl: (id) => bazaarUrl(id),
-                marketUrl: (id) => itemMarketUrl(id, this.state.itemNameOf ? this.state.itemNameOf(id) : ''),
-                museumUrl: (hash) => (this.h.setsMuseumUrl ? this.h.setsMuseumUrl(hash) : ''),
-                pointsUrl: () => (this.h.setsPointsUrl ? this.h.setsPointsUrl() : ''),
-                onNoteOpen: (note) => this.h.onSetsNoteOpen && this.h.onSetsNoteOpen(note),
-                onNoteDismiss: (note) => this.h.onSetsNoteDismiss && this.h.onSetsNoteDismiss(note),
-            });
-            this.setsEl = spEl('main', { class: 'sp-main', hidden: '' }, [this.setsView.el]);
-            this.setsSettings = new SetsSettings((partial) => this.h.onSetsChange && this.h.onSetsChange(partial));
-
             /* settings */
             this.settingsEl = spEl('main', { class: 'sp-main', hidden: '' });
             this.buildSettings();
 
-            this.root = spEl('div', { class: 'sp-page' }, [this.headEl, this.bannerEl, this.listEl, this.setsEl, this.ledgerEl, this.settingsEl]);
+            this.root = spEl('div', { class: 'sp-page' }, [this.headEl, this.bannerEl, this.listEl, this.ledgerEl, this.settingsEl]);
         }
 
         /**
@@ -24971,7 +22790,7 @@
                 ['Data sharing', 'Nobody. Your trades go into a zip only when you download one yourself (Report a problem, Export API usage): it names the traders you traded with, and you choose who gets it.'],
                 ['Purpose of use', 'Personal: profit tracking'],
                 ['Key storage & sharing', 'Stored locally / Not shared'],
-                ['Key access level', 'Full, used only for your log (bazaar, Item Market and NPC shop buys and sells, and muggings; with Sets on: museum exchanges, points sold and points used), your trades (with Sets on: the trades open with you), and key info'],
+                ['Key access level', 'Full, used only for your log (bazaar, Item Market and NPC shop buys and sells, and muggings), your trades, and key info'],
                 ['Other services', 'None: never sent to TornExchange or TornW3B'],
             ]) {
                 ledgerTos.appendChild(spEl('tr', {}, [spEl('th', { text: k }), spEl('td', { text: v })]));
@@ -24986,11 +22805,6 @@
                 field('Key use', 'Torn API terms, Full key', [ledgerTos]),
             ]);
 
-            /* Sets (3.24.0, mockup Z5) */
-            group('Sets');
-            section('sets', 'Sets and points', 'Plushies and flowers kept for museum sets, swapped for points. One switch: off, they are ordinary items again.', [this.setsSettings.mainEl]);
-            section('setspages', 'Sets on Torn\'s pages', 'What Torn Bids shows and types on the museum, the points market, a trade and your forum thread. It never presses Torn\'s buttons.', [this.setsSettings.pagesEl]);
-
             /* preferences */
             group('Other');
             this.linksInput = spEl('input', { type: 'checkbox' });
@@ -25003,9 +22817,9 @@
             for (const [k, v] of [
                 ['Data storage', 'Only locally, in this browser'],
                 ['Data sharing', 'Nobody'],
-                ['Purpose of use', 'Personal gain: who pays most for your items, flips, and (with Sets on) your museum sets and points'],
+                ['Purpose of use', 'Personal gain: who pays most for your items, and flips'],
                 ['Key storage & sharing', 'Stored locally / Not shared'],
-                ['Key access level', 'Limited (your inventory and your own id; item names; Item Market prices; traders\' public status and networth; with Sets on: the points market, your money and points, and Torn\'s list of log types)'],
+                ['Key access level', 'Limited (your inventory and your own id; item names; Item Market prices; traders\' public status and networth)'],
                 ['Other services', 'TornExchange, only with the key you log in there with'],
             ]) {
                 tos.appendChild(spEl('tr', {}, [spEl('th', { text: k }), spEl('td', { text: v })]));
@@ -25076,12 +22890,6 @@
                     if (!L.hasKey) return ['unknown', 'no key'];
                     return L.backfilled ? ['online', count((L.rows || []).length) + ' rows'] : ['idle', 'reading'];
                 })(),
-                sets: (() => {
-                    const S = this.state.sets;
-                    if (!S || !S.settings.on) return ['unknown', 'off'];
-                    return ['online', (S.settings.open ? 'open' : 'closed') + ' · ' + S.settings.pct + '%'];
-                })(),
-                setspages: [null, ''],
                 terms: [null, ''],
             };
             for (const n of this.snav) {
@@ -25114,8 +22922,7 @@
         }
 
         showView(view) {
-            const setsOn = Boolean(this.state.sets && this.state.sets.settings.on);
-            this.view = view === 'settings' || view === 'ledger' || (view === 'sets' && setsOn) ? view : 'list';
+            this.view = view === 'settings' || view === 'ledger' ? view : 'list';
             if (!this.root) return;
             const settings = this.view === 'settings';
             if (settings && !this.usageTimer) {
@@ -25126,12 +22933,9 @@
                 this.usageTimer = null;
             }
             const ledger = this.view === 'ledger';
-            const sets = this.view === 'sets';
             const list = this.view === 'list';
             this.settingsEl.hidden = !settings;
             this.ledgerEl.hidden = !ledger;
-            this.setsEl.hidden = !sets;
-            this.setsBtn.setAttribute('aria-pressed', String(sets));
             this.listEl.hidden = !list;
             // The back arrow stays hidden (3.20.3): it pushed the logo along. The logo is the way home.
             this.backBtn.hidden = true;
@@ -25141,29 +22945,14 @@
             this.settingsBtn.setAttribute('aria-pressed', String(settings));
             this.ledgerBtn.setAttribute('aria-pressed', String(ledger));
             this.titleEl.textContent = SELLING_PAGE_TITLE;
-            this.crumbEl.textContent = settings ? '› Settings' : ledger ? '› Torn Ledger' : sets ? '› Torn Sets' : '';
+            this.crumbEl.textContent = settings ? '› Settings' : ledger ? '› Torn Ledger' : '';
             this.crumbEl.hidden = list;
             this.brandEl.title = list ? 'Torn Bids' : 'Back to Torn Bids (Esc)';
             this.brandEl.classList.toggle('sp-brand-back', !list);
             this.taglineEl.hidden = !list;
             this.renderBanner();
             if (ledger) this.ledgerView.render(this.ledgerArgs());
-            if (sets) this.renderSets();
             if (list) this.fitDesk();
-        }
-
-        /** The Sets page and its settings, from what main.js worked out (view.sets: { snap, settings, note, autoText }). */
-        renderSets() {
-            const S = this.state.sets;
-            if (!S) return;
-            this.setsBtn.hidden = !S.settings.on;
-            // Switched off while its page is open: back to the list.
-            if (!S.settings.on && this.view === 'sets') {
-                this.showView('list');
-                return;
-            }
-            this.setsSettings.sync(S.settings, { autoText: S.autoText || '' });
-            if (this.view === 'sets' && S.snap) this.setsView.render({ snap: S.snap, settings: S.settings, note: S.note || null, now: Date.now() });
         }
 
         ledgerArgs() {
@@ -25214,7 +23003,6 @@
             this.renderCategory();
             this.renderLedgerKey();
             if (this.view === 'ledger') this.ledgerView.render(this.ledgerArgs());
-            this.renderSets();
             this.renderKeyStates();
             this.renderSettingsNav();
             this.renderPills();
@@ -25411,10 +23199,6 @@
                 say(info.teError || 'TornExchange did not accept this key.', 'bad', 'Try again', () => this.h.onRetryTe && this.h.onRetryTe());
             } else if (info.teWaitUntil && info.teWaitUntil > Date.now()) {
                 say('TornExchange asked us to wait ' + formatAge(info.teWaitUntil - Date.now()).replace(' ago', '') + '.', 'warn');
-            } else if (this.state.sets && this.state.sets.note && this.view !== 'sets') {
-                // Sets (3.24.0): a trade is open with you. On the Sets page the note is in the page itself.
-                const n = this.state.sets.note;
-                say(n.title + ' ' + n.text, null, 'Open the trade', () => this.h.onSetsNoteOpen && this.h.onSetsNoteOpen(n), 'Not now', () => this.h.onSetsNoteDismiss && this.h.onSetsNoteDismiss(n));
             }
         }
 
@@ -27352,7 +25136,7 @@
         }
     }
 
-    const SELLING_PAGE_CSS = LEDGER_CSS + SETS_CSS + USAGE_CSS + REPORT_CSS + `
+    const SELLING_PAGE_CSS = LEDGER_CSS + USAGE_CSS + REPORT_CSS + `
     :host { all: initial; }
     * { box-sizing: border-box; }
     /*
@@ -28614,10 +26398,6 @@
 
 
 
-
-
-
-
     const STORE_KEY = 'apiKey';
     const STORE_ITEMS = 'itemsCache';
     const STORE_NPC = 'npcCache';
@@ -29455,8 +27235,6 @@
         const now = Date.now();
         const sellerId =
             app.pageType === PAGE_BAZAAR ? bazaarOwnerId(location.href) : null;
-        // Sets (3.24.0): the cards of someone's bazaar, for "need N · worth $X" on each piece.
-        setsTab.cards = app.pageType === PAGE_BAZAAR ? listings : [];
 
         for (const l of listings) {
             l.seenAt = stampSeen(l, now);
@@ -30760,9 +28538,7 @@
         const inputs = { price: row.priceEl ? [row.priceEl] : [] };
         let box = row.fillBox && row.fillBox.isConnected ? row.fillBox : row.el.querySelector('.ttv2-fillbox');
         row.fillBox = box;
-        // Sets (3.24.0): while it is on, a plushie or flower of a chosen set is kept for the museum - no tick to price it for sale.
-        const kept = setsKeptHere(row.itemId);
-        if (!inputs.price.length || kept) {
+        if (!inputs.price.length) {
             if (box) {
                 const cell = box.parentNode;
                 box.remove();
@@ -30770,11 +28546,8 @@
                 if (cell && cell.classList && cell.classList.contains(BZ_CELL_CLASS)) releaseBazaarCell(cell);
                 row.fillBox = null;
             }
-            // "kept for sets" in the tick's own place, so the row's chips stay where they are in every other row.
-            paintKeptNote(row, tag, kept && inputs.price.length > 0);
             return false;
         }
-        paintKeptNote(row, tag, false);
         if (!box) {
             box = document.createElement('span');
             box.className = 'ttv2-fillbox';
@@ -30941,7 +28714,7 @@
             n.remove();
             releaseMarks(bar);
         }
-        for (const n of root.querySelectorAll('.ttv2-fillbox, .ttv2-keptnote, .ttv2-bzchips, .' + BZ_SELLBAR_CLASS)) n.remove();
+        for (const n of root.querySelectorAll('.ttv2-fillbox, .ttv2-bzchips, .' + BZ_SELLBAR_CLASS)) n.remove();
         for (const n of root.querySelectorAll('.' + BZ_SELL_CLASS)) n.classList.remove(BZ_SELL_CLASS);
         for (const n of root.querySelectorAll('.' + BZ_UNDER_CLASS + ', .' + BZ_OVER_CLASS + ', .' + BZ_OK_CLASS)) clearPriceTone(n);
         // Torn's value cells are as they were.
@@ -31597,15 +29370,12 @@
         if (tone === 'under') input.title = 'Under the ' + formatMoney(paid) + ' you paid for it';
         else if (far) input.title = farUnderWords(far);
         else if (tone === 'over') input.title = 'Over the lowest bazaar price, ' + formatMoney(lowest) + ': yours would not be the cheapest';
-        // The reason, where you can see it without hovering (3.24.0): a small tag on the box's lower edge.
-        paintToneTag(input, tone === 'ok' ? null : tone, tone === 'under' ? 'under the ' + formatMoney(paid) + ' you paid' : far ? far.pct + '% under ' + (far.of === 'bazaar' ? 'the lowest bazaar, ' : 'market value, ') + formatMoney(far.ref) : tone === 'over' ? 'over the lowest bazaar, ' + formatMoney(lowest) : '');
     }
 
     function clearPriceTone(input) {
         input.classList.remove(BZ_UNDER_CLASS, BZ_CHEAP_CLASS, BZ_OVER_CLASS, BZ_OK_CLASS);
         if (/^(Under the \$|Over the lowest bazaar price|Far under )/.test(input.title || '')) input.removeAttribute('title');
         input.ttv2Tone = '';
-        paintToneTag(input, null, '');
     }
 
     /** A price typed (by you, or by Fill) on the add page: its box is checked against what you paid and the lowest bazaar price at once. */
@@ -33458,7 +31228,7 @@
 
     /** A change to, or inside, one of the helper's own price tags is not the page changing. */
     function isOwnTagMutation(m) {
-        const ours = '.' + OWN_BAZAAR_TAG_CLASS + ', .' + FILL_TAG_CLASS + ', .ttv2-fillbox, .ttv2-bzchips, .ttv2-fillset, .' + TRADE_BUYBAR_CLASS + ', .' + ROW_FLOAT_CLASS + ', .ttv2-float, .ttv2-setmark, .ttv2-tonetag, .ttv2-keptnote';
+        const ours = '.' + OWN_BAZAAR_TAG_CLASS + ', .' + FILL_TAG_CLASS + ', .ttv2-fillbox, .ttv2-bzchips, .ttv2-fillset, .' + TRADE_BUYBAR_CLASS + ', .' + ROW_FLOAT_CLASS + ', .ttv2-float';
         const isTag = (n) => n && n.nodeType === 1 && n.matches && n.matches(ours);
         const inTag = (n) => {
             const el = n && n.nodeType === 1 ? n : n && n.parentElement;
@@ -33932,7 +31702,6 @@
             STORE_W3B_COOLDOWN, STORE_IM_WATCH, STORE_BIDS_SEEN, STORE_LIST_AT, STORE_SELL_DECLINED, STORE_SELL_ASKED, STORE_SELL_ENDED, STORE_SELL_ENDED_FULL, STORE_SELL_CANCELLED, STORE_BOUGHT_WINDOW, STORE_SELL_PRICE_RECORDS, STORE_SELL_BLACKLIST,
             STORE_SELL_FAVOURITES, STORE_SELL_TE_OWN, STORE_CHAT_WANTED, STORE_SELL_MOVES, STORE_LEDGER_REV, STORE_SELL_PRESENCE, STORE_SELL_HELD, STORE_SELL_WAS,
             FEED_LEADER_KEY, FEED_RECHECK_KEY, FEED_REFRESH_KEY, SPEED_STORE_KEY, STORE_CLEANED,
-            STORE_SETS, STORE_SETS_STATE, STORE_SETS_BOOK, STORE_SETS_SNAP, STORE_SETS_PRESS, STORE_SETS_NOTE,
             STORE_API_WINDOW + '.' + app.tabId, STORE_W3B_WINDOW + '.' + app.tabId,
         );
         const rows = [];
@@ -35163,12 +32932,6 @@
             // Settings › Bazaar prices (3.20): the desk and the trade, the top flips, the others.
             due: (id, how) => bazaarsDue(id, how === 'desk' ? fresh.desk : how === 'sweep' ? W3B_SWEEP_MS : topIds.has(String(id)) ? fresh.top : fresh.other, now),
         });
-        // Sets (3.24.0): a set piece whose bazaars are due takes the turn of a price list, a sweep read or an
-        // idle slot - never the summary's, the desk's, a trade's or a flip's. Only from the tab in view.
-        if (!hidden && (!read || read.kind === 'list')) {
-            const piece = setsPieceDue(now);
-            if (piece) return () => loadBazaars(piece, 'w.sets');
-        }
         if (!read) return null;
         if (read.kind === 'summary') return loadBazaarSummary;
         if (read.kind === 'list') return Object.assign(() => loadW3bList(read.id), { list: true });
@@ -35179,10 +32942,6 @@
             : sell.tradeLive.includes(id) || sell.tradeWanted.includes(id) || pinnedIds.includes(id) ? 'w.trade'
             : candIds.includes(id) || sell.nearIds.includes(id) ? 'w.flips'
             : 'w.sweep';
-        if (!hidden && tag === 'w.sweep') {
-            const piece = setsPieceDue(now);
-            if (piece) return () => loadBazaars(piece, 'w.sets');
-        }
         return () => loadBazaars(read.id, tag);
     }
 
@@ -35289,7 +33048,7 @@
     /** One trader's TornW3B price list. */
     function loadW3bList(id) {
         return fetchW3bPriceList(sell.w3b, id)
-            .then((body) => recordW3bList(sell.db, id, { prices: parseW3bPriceList(body), sets: parseW3bSetPrices(body) }, Date.now()))
+            .then((body) => recordW3bList(sell.db, id, { prices: parseW3bPriceList(body) }, Date.now()))
             .catch((error) => {
                 recordW3bList(sell.db, id, { error: true }, Date.now());
                 if (error && error.blocked) sell.w3bPauseUntil = Date.now() + 60000;
@@ -35313,7 +33072,7 @@
                 sell.summaryError = null;
                 // Listings of items no longer picked or possible flips are let go.
                 const pinned = Object.values(sellPinned()).flatMap((t) => t.lines.map((l) => l.itemId));
-                const keep = new Set([sell.selected, ...sell.candidates.map((c) => c.itemId), ...sell.nearIds, ...sell.tradeWanted, ...sell.tradeLive, ...pinned, ...setsPieceIds()]);
+                const keep = new Set([sell.selected, ...sell.candidates.map((c) => c.itemId), ...sell.nearIds, ...sell.tradeWanted, ...sell.tradeLive, ...pinned]);
                 // The overlay reads it too (its own copy every 30 s while a Torn tab is open).
                 const lowest = {};
                 for (const r of rows) if (r.lowestPrice > 0) lowest[r.itemId] = r.lowestPrice;
@@ -35791,13 +33550,6 @@
             const l = leftovers.find((x) => String(x.itemId) === id);
             if (!heldNames.has(id) && l && l.name) heldNames.set(id, l.name);
         }
-        // Sets (3.24.0; the owner: "no plushie/flower is in to sell if we have this setting on, if its off, then of
-        // course it can go"): while it is on, a piece of a chosen set is kept for sets - in no To sell row, no trade
-        // offer, no flip and under no "sell" badge. Counted as held above first; the stored list is not touched, so
-        // switching Sets off brings every row back.
-        const setsCfg = setsNow();
-        const keptPiece = setsCfg.on ? (id) => keptForSets(id, setsCfg) : () => false;
-        if (setsCfg.on) leftovers = leftovers.filter((l) => !keptPiece(l.itemId));
         // To sell (3.21.0, core/to-sell.js): what you bought to resell and still hold - its tab's rows, and
         // the "yours" lines a trade with each trader gets. Only these: your other items stay out of every trade.
         // What you already hold goes to any trader who pays more than you paid (3.22.2; the owner, 2026-10-03:
@@ -35930,8 +33682,7 @@
             const key = String(id);
             if (!flipBuyersCache.has(key)) {
                 const item = itemOf(id);
-                // Never flip, and (Sets on) a piece kept for sets: it is bought for the museum, not for a trader.
-                if (neverFlip.has(itemCategory(item)) || keptPiece(key)) {
+                if (neverFlip.has(itemCategory(item))) {
                     flipBuyersCache.set(key, []);
                     return [];
                 }
@@ -36027,7 +33778,7 @@
             if (plan && plan.units > 0) {
                 badge = { kind: 'flip', amount: plan.profit };
                 value = plan.profit;
-            } else if (held && realBid > 0 && !keptPiece(id)) {
+            } else if (held && realBid > 0) {
                 const w = whereToSell({ held, bid: realBid, bazaarLowest: lowest, bazaarDepth: bazaarDepthOf(id) });
                 if (w.best === 'bazaar') {
                     badge = { kind: 'list', amount: w.gain };
@@ -36657,11 +34408,9 @@
             const top = buyersOf(l.itemId).find((b) => !l.from || String(b.name).toLowerCase() !== String(l.from).toLowerCase()) || null;
             return { ...l, best: top ? { name: top.name, price: top.price } : null, gain: top ? (top.price - l.each) * l.qty : null };
         });
-        const setsView = setsWork({ settings: setsCfg, heldQty, sellersOf, buyersOf, itemOf, prefs, now });
         const pageT0 = perfNow();
         sell.drew = true;
         sell.page.render({
-            sets: setsView,
             strip,
             pinned,
             leftovers: leftShown,
@@ -37382,506 +35131,6 @@
         else location.assign(url);
     }
 
-    /* ------------------------------------------------------------------
-     * Sets (3.24.0; the owner, 2026-10-05, mockups Z1-Z10): plushies and
-     * flowers kept for museum sets, and the points they make.
-     *
-     * Torn Bids is where it is worked out: it holds your inventory, your
-     * Ledger, the bazaars and the keys. Each redraw makes one snapshot
-     * (core/sets-desk.js) - drawn by the Sets page, and stored for the Torn
-     * tabs, whose marks on the museum, the points market, a trade, a bazaar
-     * and your forum thread read nothing else. Off (the default), none of
-     * this runs and plushies and flowers are ordinary items.
-     *
-     * Its reads, all from the tab in view and only while the switch is on:
-     *   - the points market and your money, every "Read prices for sets"
-     *     minutes and on Read now (Limited key);
-     *   - each piece's bazaars from TornW3B, in the turn of a price list, a
-     *     sweep read or an idle slot - never the desk's, a trade's or a flip's;
-     *   - the Item Market's cheapest listings of the pieces you need, one
-     *     piece every few seconds, each again after the same minutes;
-     *   - your log for museum exchanges and points sold or used, every five
-     *     minutes (Full key), and your open trades once a minute while a note
-     *     is asked for (Full key).
-     * No alert, no sound, no browser notification (rules.php; README, hard
-     * rule 6): a trade open with you is said on the pages you are looking at.
-     * Nothing is pressed, posted or sent: Fill types, Copy copies, you press.
-     * ------------------------------------------------------------------ */
-
-    /* The Sets settings (core/sets-desk.js setsSettings): read by Torn Bids and by every Torn tab. */
-    const STORE_SETS = 'sets';
-    /* What the reads have learned: the points price by day, lots seen leaving, the last listings, log types, what a point cost. */
-    const STORE_SETS_STATE = 'setsState';
-    /* The points book's entries: written by Torn Bids (your log) and by the museum page (a press of EXCHANGE). */
-    const STORE_SETS_BOOK = 'setsBook';
-    /* The snapshot, for the Torn tabs. */
-    const STORE_SETS_SNAP = 'setsSnap';
-    /* Presses of EXCHANGE on the museum: the sets they took come off the stock until Torn's inventory is read again. */
-    const STORE_SETS_PRESS = 'setsPress';
-    /* A trade open with you, for the panel. */
-    const STORE_SETS_NOTE = 'setsNote';
-
-    const SETS_STEP_MS = 5000;
-    const SETS_LOG_MS = 5 * 60 * 1000;
-    const SETS_TYPES_MS = 7 * 24 * 60 * 60 * 1000;
-    const SETS_TRADES_MS = 60 * 1000;
-    const SETS_RETRY_MS = 60 * 1000;
-    const SETS_SNAP_SAVE_MS = 5000;
-    const SETS_GONE_KEEP_MS = 24 * 60 * 60 * 1000;
-    const SETS_PRESS_KEEP_MS = 2 * 60 * 60 * 1000;
-    const SETS_LOG_BACK_MS = 7 * 24 * 60 * 60 * 1000;
-    const SETS_NOTE_LIVE_MS = 3 * 60 * 1000;
-    /* Open trades read in full a minute, at most: the newest ones. */
-    const SETS_TRADES_READ = 3;
-
-    const setsEng = {
-        listings: null, pointsAt: 0, pointsTriedAt: 0, pointsBusy: false, pointsError: '',
-        money: {}, moneyTriedAt: 0, moneyBusy: false, moneyOff: false, moneyFails: 0,
-        market: new Map(), marketBusy: false,
-        logAt: 0, logBusy: false, logOff: false,
-        tradesAt: 0, tradesBusy: false, tradesOff: false, tradesFails: 0,
-        note: null, snap: null, snapSig: '', snapSavedAt: 0, said: new Set(),
-    };
-
-    function setsNow() {
-        return setsSettings(gmGet(STORE_SETS, null));
-    }
-
-    function setsState() {
-        const s = gmGet(STORE_SETS_STATE, null);
-        return s && typeof s === 'object' ? s : {};
-    }
-
-    function saveSetsState(patch) {
-        gmSet(STORE_SETS_STATE, { ...setsState(), ...patch });
-    }
-
-    function setsBook() {
-        const b = gmGet(STORE_SETS_BOOK, null);
-        return Array.isArray(b) ? b : [];
-    }
-
-    function setsPresses(now = Date.now()) {
-        const p = gmGet(STORE_SETS_PRESS, null);
-        return (Array.isArray(p) ? p : []).filter((x) => x && now - Number(x.t) < SETS_PRESS_KEEP_MS);
-    }
-
-    /** The pieces of the sets switched on, as item ids. */
-    function setsPieceIds(settings = setsNow()) {
-        return setsOn(settings).flatMap((s) => s.pieces.map((p) => String(p.id)));
-    }
-
-    /** One line in the problem log per kind of trouble and visit: the next zip shows it, the log is not flooded. */
-    function setsSay(kind, what, detail = null) {
-        if (setsEng.said.has(kind)) return;
-        setsEng.said.add(kind);
-        logProblem('note', what, detail);
-    }
-
-    function setsKeyFailed(error) {
-        if (!isKeyDeadError(error)) return;
-        sell.keyDead = true;
-        sell.keyError = sellKeyErrorText(error);
-        gmSet(STORE_SELL_KEY_DEAD, true);
-    }
-
-    /** The points market: the price to type, the day's line of the price record, and the lots that left since the last read. */
-    function readSetsPoints(now = Date.now()) {
-        if (setsEng.pointsBusy) return;
-        setsEng.pointsBusy = true;
-        setsEng.pointsTriedAt = now;
-        fetchPointsMarket(sell.client)
-            .then((json) => {
-                const listings = parsePointsMarket(json);
-                const at = Date.now();
-                if (!listings.length) {
-                    setsEng.pointsError = 'not read';
-                    setsSay('points-empty', 'Sets: the points market came back with no listing Torn Bids could read', 'the answer has: ' + Object.keys(json || {}).slice(0, 8).join(', '));
-                    return;
-                }
-                const st = setsState();
-                const prev = setsEng.listings || st.listings || null;
-                const gone = prev ? goneLots(prev, listings, at) : [];
-                const price = listPrice(listings, 'lowest');
-                saveSetsState({
-                    days: recordPrice(st.days, at, price ? price.lowest : 0),
-                    gone: [...(st.gone || []), ...gone].filter((g) => at - g.t < SETS_GONE_KEEP_MS).slice(-400),
-                    // The cheapest of them, for the next visit: what is listed far over the market is not kept.
-                    listings: listings.slice(0, 150),
-                    listingsAt: at,
-                });
-                setsEng.listings = listings;
-                setsEng.pointsAt = at;
-                setsEng.pointsError = '';
-            })
-            .catch((error) => {
-                setsEng.pointsError = 'not read';
-                setsEng.pointsTriedAt = Date.now() - setsNow().readMin * 60000 + SETS_RETRY_MS;
-                setsKeyFailed(error);
-                setsSay('points-failed', 'Sets: the points market could not be read', String((error && error.message) || error));
-            })
-            .finally(() => {
-                setsEng.pointsBusy = false;
-                renderSelling();
-            });
-    }
-
-    /** Your points, cash on hand and vault (Limited key). An answer Torn Bids cannot read is said once, then not asked for again. */
-    function readSetsMoney(now = Date.now()) {
-        if (setsEng.moneyBusy || setsEng.moneyOff) return;
-        setsEng.moneyBusy = true;
-        setsEng.moneyTriedAt = now;
-        fetchMoney(sell.client)
-            .then((m) => {
-                if (m.points == null && m.onHand == null && m.vault == null) {
-                    setsEng.moneyOff = true;
-                    setsSay('money-shape', "Sets: Torn's answer for your money has none of the names Torn Bids knows", 'it has: ' + (m.keys || []).join(', '));
-                    return;
-                }
-                setsEng.money = { points: m.points, onHand: m.onHand, vault: m.vault };
-                setsEng.moneyFails = 0;
-            })
-            .catch((error) => {
-                setsEng.moneyFails += 1;
-                // Not this key's to read (or not there): not asked again this visit.
-                if (setsEng.moneyFails >= 2) setsEng.moneyOff = true;
-                setsKeyFailed(error);
-                setsSay('money-failed', 'Sets: your money and points could not be read', String((error && error.message) || error));
-            })
-            .finally(() => {
-                setsEng.moneyBusy = false;
-                renderSelling();
-            });
-    }
-
-    /** The Item Market's cheapest listings of one piece you need: the piece holding your sets back first. */
-    function readSetsMarket(now, every) {
-        if (setsEng.marketBusy || !setsEng.snap) return;
-        const need = setsEng.snap.sets.flatMap((s) => s.pieces.filter((p) => p.need > 0)).sort((a, b) => a.rank - b.rank);
-        const due = need.find((p) => {
-            const m = setsEng.market.get(String(p.id));
-            return !m || now - (m.triedAt || 0) >= every;
-        });
-        if (!due) return;
-        const id = String(due.id);
-        const prev = setsEng.market.get(id) || { at: 0, listings: [] };
-        setsEng.marketBusy = true;
-        setsEng.market.set(id, { ...prev, triedAt: now });
-        fetchItemMarket(sell.client, id, { limit: 20, tag: 't.sets', priority: 'low' })
-            .then((r) => {
-                const at = Date.now();
-                setsEng.market.set(id, { at, triedAt: at, listings: r.listings.map((l) => ({ price: l.price, qty: l.amount })).filter((l) => l.price > 0 && l.qty > 0) });
-            })
-            .catch((error) => {
-                setsKeyFailed(error);
-                setsSay('market-failed', 'Sets: the Item Market could not be read for a piece', String((error && error.message) || error));
-            })
-            .finally(() => {
-                setsEng.marketBusy = false;
-                renderSelling();
-            });
-    }
-
-    /** A piece whose bazaars are due (TornW3B): the ones you need first. Null when none, or Sets is off. */
-    function setsPieceDue(now) {
-        const settings = setsNow();
-        if (!settings.on) return null;
-        const every = settings.readMin * 60000;
-        const ids = setsEng.snap
-            ? setsEng.snap.sets.flatMap((s) => [...s.pieces].sort((a, b) => a.rank - b.rank)).map((p) => String(p.id))
-            : setsPieceIds(settings);
-        return ids.find((id) => bazaarsDue(id, every, now)) || null;
-    }
-
-    /** What one point of a set cost you, as last worked out while you held a full set of it. */
-    function setsCostOfPoint(setKey) {
-        const last = setsState().lastCost || {};
-        if (setKey && last[setKey] > 0) return last[setKey];
-        const known = Object.values(last).filter((v) => v > 0);
-        return known.length ? Math.round(known.reduce((a, b) => a + b, 0) / known.length) : 0;
-    }
-
-    /**
-     * Your log, for the points book: sets swapped at the museum, points sold and points used. Which log types those
-     * are is read from Torn's own list of types by their titles (once a week) - no type id is written in the code -
-     * and a row Torn Bids cannot read is named in the problem log (its type and the names in its data), never guessed.
-     */
-    async function readSetsLog(now = Date.now()) {
-        if (setsEng.logBusy || setsEng.logOff || !led.client || !getLedgerKey() || gmGet(STORE_LEDGER_KEY_DEAD, null)) return;
-        // Not before a row can be priced: what a set cost you (your stock read) and today's points price (the market
-        // read, unless it cannot be). A row booked without them would stay in the book as free, or as a loss.
-        const ready = setsEng.snap;
-        if (!ready || !snapReady(ready) || (!(ready.points.lowest > 0) && !setsEng.pointsError && !(setsEng.pointsAt > 0))) return;
-        setsEng.logBusy = true;
-        setsEng.logAt = now;
-        try {
-            let st = setsState();
-            if (!st.types || now - (st.typesAt || 0) > SETS_TYPES_MS) {
-                const types = pointsLogTypes(await fetchLogTypes(sell.client));
-                saveSetsState({ types, typesAt: now });
-                st = setsState();
-                const missing = ['made', 'sold', 'used'].filter((k) => !types[k].length);
-                if (missing.length) setsSay('types', "Sets: Torn's list of log types names none for: " + missing.join(', '), 'found: ' + JSON.stringify(types.titles).slice(0, 300));
-            }
-            const types = st.types;
-            const ids = [...types.made, ...types.sold, ...types.used];
-            if (!ids.length) {
-                setsEng.logOff = true;
-                return;
-            }
-            const from = st.logFrom || Math.floor((now - SETS_LOG_BACK_MS) / 1000);
-            const rows = await fetchLogPage(led.client, { from, types: ids, use: { tag: 't.setslog', priority: 'low' } });
-            if (rows.length >= 100) setsSay('log-full', 'Sets: a full page of points rows in your log; older ones in the same stretch were not read');
-            const before = setsBook();
-            let book = before;
-            let newest = 0;
-            let madeRead = Boolean(st.madeRead);
-            const priceNow = setsEng.snap ? setsEng.snap.points.lowest : 0;
-            for (const row of [...rows].reverse()) {
-                if (!row) continue;
-                newest = Math.max(newest, Number(row.timestamp) || 0);
-                const entry = entryFromLog(row.id, row, types, { costOf: (set) => setsCostOfPoint(set), priceNow });
-                if (!entry) {
-                    const d = row.details || {};
-                    setsSay('log-row-' + (d.id ?? row.log), 'Sets: a log row of type ' + (d.id ?? row.log) + ' ("' + String(d.title || row.title || '') + '") could not be read', 'its data has: ' + Object.keys(row.data || {}).slice(0, 12).join(', '));
-                    continue;
-                }
-                if (entry.kind === 'made') madeRead = true;
-                book = bookAdd(book, entry);
-            }
-            // A press of EXCHANGE the log never showed comes off - only once the log has shown an exchange it could read.
-            book = bookSettle(book, madeRead ? now : 0);
-            if (book !== before) gmSet(STORE_SETS_BOOK, book.slice(-600));
-            saveSetsState({ logFrom: newest || Math.max(from, Math.floor((now - 2 * 24 * 60 * 60 * 1000) / 1000)), logReadAt: now, madeRead });
-        } catch (error) {
-            setsSay('log-failed', 'Sets: your log could not be read for the points book', String((error && error.message) || error));
-        } finally {
-            setsEng.logBusy = false;
-            renderSelling();
-        }
-    }
-
-    /** The note as shown (Torn Bids) and as stored for the panel. Written only when it changes. */
-    function setSetsNote(note, settings = setsNow()) {
-        const was = setsEng.note;
-        setsEng.note = note;
-        const forPanel = note && settings.notePanel ? note : null;
-        const stored = gmGet(STORE_SETS_NOTE, null);
-        const same = (a, b) => (!a && !b) || (a && b && a.id === b.id && a.text === b.text);
-        if (!same(stored, forPanel)) gmSet(STORE_SETS_NOTE, forPanel);
-        // Kept alive while the trade is open: the panel does not show a note Torn Bids stopped vouching for.
-        else if (forPanel && Date.now() - (stored.at || 0) > SETS_NOTE_LIVE_MS / 3) gmSet(STORE_SETS_NOTE, forPanel);
-        if (!same(was, note)) renderSelling();
-    }
-
-    /**
-     * A trade open with you (the owner: "a trade is opened with me"): your open trades once a minute, the newest few
-     * read in full, and the first whose other side holds a plushie or flower is the note - who, how many kinds of
-     * items, what the ones you need come to. Torn's API does not say who opened it. Never a trade you accepted in
-     * Torn Bids (that one is yours to sell in). Nothing is opened or accepted.
-     */
-    async function readSetsTrades(now = Date.now()) {
-        const settings = setsNow();
-        if (setsEng.tradesBusy || setsEng.tradesOff || !setsEng.snap) return;
-        if (!(settings.noteBids || settings.notePanel)) {
-            if (setsEng.note) setSetsNote(null, settings);
-            return;
-        }
-        if (!led.buysClient || !getLedgerKey() || gmGet(STORE_LEDGER_KEY_DEAD, null)) return;
-        const self = gmGet(STORE_LEDGER_SELF, null);
-        if (!self) return;
-        setsEng.tradesBusy = true;
-        setsEng.tradesAt = now;
-        const use = { tag: 't.setslog', priority: 'low' };
-        try {
-            const list = await fetchTradesOpen(led.buysClient, { use });
-            setsEng.tradesFails = 0;
-            const dismissed = new Set((setsState().dismissed || []).map(String));
-            const mine = new Set(Object.values(sellAccepted(now)).map((t) => t.trader && t.trader.id && String(t.trader.id)).filter(Boolean));
-            let note = null;
-            let reads = 0;
-            for (const x of list) {
-                if (!x || !x.id || dismissed.has(String(x.id))) continue;
-                const partner = [x.trader, x.user].find((p) => p && p.id && String(p.id) !== String(self)) || {};
-                if (partner.id && mine.has(String(partner.id))) continue;
-                if (reads >= SETS_TRADES_READ) break;
-                reads += 1;
-                const full = await fetchTrade(led.buysClient, x.id, use);
-                const items = [];
-                for (const it of (full && Array.isArray(full.items) ? full.items : [])) {
-                    if (!it || String(it.user_id) === String(self) || it.type !== 'Item' || !it.details) continue;
-                    const id = String(it.details.id || '');
-                    const qty = Number(it.details.amount) || 0;
-                    const item = sell.index && sell.index.byId ? sell.index.byId.get(id) : null;
-                    if (id && qty > 0) items.push({ id, name: (item && item.name) || it.details.name || 'Item ' + id, qty });
-                }
-                // Only a trade with a piece of your sets in it is Sets' business.
-                if (!items.some((it) => keptForSets(it.id, settings))) continue;
-                note = { ...tradeNote({ id: x.id, who: partner.name || (partner.id ? 'Player ' + partner.id : ''), whoId: partner.id || null, items }, tradeOffer(items, snapTradeCtx(setsEng.snap, settings))), at: now };
-                break;
-            }
-            setSetsNote(note, settings);
-        } catch (error) {
-            // Torn's word for the trades open now ("ongoing") was never seen answered: refused twice, it is not asked again this visit.
-            setsEng.tradesFails += 1;
-            if (setsEng.tradesFails >= 2) setsEng.tradesOff = true;
-            setsSay('trades-failed', 'Sets: your open trades could not be read', String((error && error.message) || error));
-        } finally {
-            setsEng.tradesBusy = false;
-        }
-    }
-
-    /** Every few seconds, the tab in view, Sets on: whatever read is due. */
-    function stepSets() {
-        const settings = setsNow();
-        if (!settings.on || document.visibilityState !== 'visible' || !getSellKey() || sell.keyDead) return;
-        const now = Date.now();
-        const every = settings.readMin * 60000;
-        if (now - setsEng.pointsTriedAt >= every) readSetsPoints(now);
-        if (now - setsEng.moneyTriedAt >= every) readSetsMoney(now);
-        readSetsMarket(now, every);
-        if (now - setsEng.logAt >= SETS_LOG_MS) readSetsLog(now);
-        if (now - setsEng.tradesAt >= SETS_TRADES_MS) readSetsTrades(now);
-    }
-
-    /** Read now (the Sets page), or Sets just switched on: everything is due. */
-    function setsReadNow() {
-        setsEng.pointsTriedAt = 0;
-        setsEng.moneyTriedAt = 0;
-        setsEng.moneyOff = false;
-        setsEng.moneyFails = 0;
-        setsEng.logAt = 0;
-        setsEng.tradesAt = 0;
-        for (const m of setsEng.market.values()) m.triedAt = 0;
-        // Each piece's bazaars are read again in their turn (bazaarsDue reads `kept` as due).
-        for (const id of setsPieceIds()) {
-            const b = sell.bazaars.get(id);
-            if (b && !b.loading) b.kept = true;
-        }
-        stepSets();
-        stepW3b();
-    }
-
-    /** A piece's listings for the snapshot: its bazaars as the flips see them (your own buys and gone listings off), and the Item Market. */
-    function setsOffers(id, sellersOf, now, every) {
-        const out = [];
-        for (const r of sellersOf(id) || []) {
-            // A listing TornW3B has not seen for a while is most likely gone: not advice to act on.
-            if (r.stale) continue;
-            out.push({ price: r.price, qty: r.qty, src: 'bazaar', who: r.sellerName || null, whoId: r.sellerId ?? null });
-            if (out.length >= 80) break;
-        }
-        const m = setsEng.market.get(String(id));
-        if (m && m.at && now - m.at < every * 2) for (const l of m.listings) out.push({ price: l.price, qty: l.qty, src: 'market' });
-        return out;
-    }
-
-    /** The snapshot, for the Torn tabs: written when its numbers change, not more often than every few seconds. */
-    function shareSetsSnap(snap, now) {
-        if (!snap) {
-            if (setsEng.snapSig) {
-                setsEng.snapSig = '';
-                gmSet(STORE_SETS_SNAP, null);
-            }
-            return;
-        }
-        // Start-up: nothing shared before your stock and the items' values are read (the last visit's stays).
-        if (!snapReady(snap)) return;
-        if (now - setsEng.snapSavedAt < SETS_SNAP_SAVE_MS) return;
-        const slim = snapForTabs(snap);
-        const sig = JSON.stringify({ ...slim, at: 0 });
-        // Unchanged: written again only now and then, so a Torn tab can tell Torn Bids is still open.
-        if (sig === setsEng.snapSig && now - setsEng.snapSavedAt < 60000) return;
-        setsEng.snapSig = sig;
-        setsEng.snapSavedAt = now;
-        gmSet(STORE_SETS_SNAP, slim);
-    }
-
-    /**
-     * The Sets page's view, worked out with the redraw's own lookups (what you hold, each item's sellers and buyers).
-     * @returns {{settings, snap, note, autoText}}
-     */
-    function setsWork({ settings, heldQty, sellersOf, buyersOf, itemOf, prefs, now }) {
-        if (!settings.on) {
-            setsEng.snap = null;
-            shareSetsSnap(null, now);
-            return { settings, snap: null, note: null, autoText: '' };
-        }
-        return perfTimed('Torn Bids: the Sets page worked out', () => {
-            // Sets swapped since Torn's inventory was read are no longer held.
-            const off = pressedOff(setsPresses(now), sell.inventoryAt || 0);
-            const held = (id) => Math.max(0, (heldQty.get(String(id)) || 0) - (off.get(String(id)) || 0));
-            const mv = (id) => {
-                const item = itemOf(id);
-                return item ? Number(item.marketValue) || 0 : 0;
-            };
-            const bought = new Map();
-            if (getLedgerKey() && led.loaded) {
-                for (const r of ledgerData().rows) {
-                    if (r.side !== 'buy' || !isSetItem(r.itemId)) continue;
-                    const key = String(r.itemId);
-                    if (!bought.has(key)) bought.set(key, []);
-                    bought.get(key).push(r);
-                }
-            }
-            const every = settings.readMin * 60000;
-            const st = setsState();
-            if (!setsEng.listings && Array.isArray(st.listings)) {
-                // The last visit's read, until this one's is in.
-                setsEng.listings = st.listings;
-                setsEng.pointsAt = Number(st.listingsAt) || 0;
-            }
-            const ids = setsPieceIds(settings);
-            const readAts = ids.map((id) => {
-                const b = sell.bazaars.get(id);
-                return b && b.at ? b.at : 0;
-            });
-            const snap = setsSnapshot({
-                settings, held, mv,
-                lots: (id) => heldLots(bought.get(String(id)), held(id)),
-                offers: (id) => setsOffers(id, sellersOf, now, every),
-                topBid: (id) => {
-                    const b = buyersOf(id)[0];
-                    return b ? { price: b.price, name: b.name } : null;
-                },
-                setBuyer: (set) => bestSetBuyer(sell.db, set.w3bId),
-                cash: prefs.cash > 0 ? prefs.cash : null,
-                leastProfitPct: prefs.minProfitPct,
-                listings: setsEng.listings || [],
-                pointsAt: setsEng.pointsAt,
-                pointsError: setsEng.pointsError,
-                days: st.days || [],
-                gone: st.gone || [],
-                book: setsBook(),
-                money: setsEng.money,
-                moneyFailed: setsEng.moneyOff,
-                // "Prices read": every piece, at least this lately (0 until each has been read once).
-                pricesAt: readAts.length && readAts.every((t) => t > 0) ? Math.min(...readAts) : 0,
-                stockAt: sell.inventoryAt || 0,
-                reading: setsEng.pointsBusy || ids.some((id) => (sell.bazaars.get(id) || {}).loading),
-                now,
-            });
-            setsEng.snap = snap;
-            // What a point costs, kept for a museum exchange read from the log after its pieces are gone.
-            const last = { ...(st.lastCost || {}) };
-            let moved = false;
-            for (const s of snap.sets) {
-                const each = s.full > 0 ? Math.round(s.cost.perSet / s.points) : 0;
-                if (each > 0 && last[s.key] !== each) {
-                    last[s.key] = each;
-                    moved = true;
-                }
-            }
-            if (moved) saveSetsState({ lastCost: last });
-            shareSetsSnap(snap, now);
-            return {
-                settings, snap,
-                note: settings.noteBids ? setsEng.note : null,
-                autoText: snap.sets.map((s) => Number(s.auto).toLocaleString('en-US') + ' ' + s.key).join(' · '),
-            };
-        });
-    }
-
     function bootSellingPage() {
         sell.client = new TornApiClient({
             getKey: getSellKey,
@@ -38198,30 +35447,6 @@
                 sell.allShown += ALL_ITEMS_PAGE;
                 renderSelling(true);
             },
-            // Sets (3.24.0): its settings, Read now, Copy (your press puts text on the clipboard; nothing is sent), and the note.
-            onSetsChange: (partial) => {
-                const before = setsNow();
-                gmSet(STORE_SETS, { ...before, ...partial });
-                const after = setsNow();
-                if (after.on !== before.on) logAction('Sets and points switched ' + (after.on ? 'on' : 'off'));
-                if (after.on && !before.on) setsReadNow();
-                if (!after.on && setsEng.note) setSetsNote(null, after);
-                renderSellingNow();
-            },
-            onSetsRead: () => {
-                logAction('Read now (Sets)');
-                setsReadNow();
-                renderSelling(true);
-            },
-            onCopy: (text) => gmCopy(text),
-            setsMuseumUrl: (hash) => MUSEUM_URL + (hash ? '#' + hash : ''),
-            setsPointsUrl: () => POINTS_MARKET_URL,
-            onSetsNoteOpen: (note) => openSellLink(tradeViewUrl(note.id)),
-            onSetsNoteDismiss: (note) => {
-                saveSetsState({ dismissed: [...(setsState().dismissed || []), String(note.id)].slice(-50) });
-                setSetsNote(null);
-                renderSellingNow();
-            },
             onOpenUrl: openSellLink,
             getUsage: usageNow,
             getExtras: exportExtras,
@@ -38250,10 +35475,6 @@
             renderSellingNow();
         });
         gmOnChange(STORE_SELL_PINNED, () => renderSellingNow());
-        // Sets: a setting changed in another tab, a press of EXCHANGE on the museum, a line in the points book.
-        gmOnChange(STORE_SETS, () => renderSellingNow());
-        gmOnChange(STORE_SETS_PRESS, () => renderSellingNow());
-        gmOnChange(STORE_SETS_BOOK, () => renderSelling());
         // A bazaar page showed a listing is not there: the plans leave it out.
         gmOnChange(STORE_SELL_GONE, () => renderSelling());
         // ...or showed fewer of it after you bought (3.16.4): the plans count on what is left.
@@ -38302,7 +35523,6 @@
         })();
 
         setInterval(stepW3b, W3B_LIST_STEP_MS);
-        setInterval(stepSets, SETS_STEP_MS);
         setInterval(stepTeOne, TE_ONE_STEP_MS);
         setInterval(stepTeOwn, TE_ONE_STEP_MS);
         setInterval(stepTeScan, TE_ONE_STEP_MS);
@@ -39094,444 +36314,6 @@
      * Boot
      * ------------------------------------------------------------------ */
 
-    /* ------------------------------------------------------------------
-     * Sets on Torn's own pages (3.24.0, mockups Z6-Z10).
-     *
-     * A Torn tab works nothing out: it reads the snapshot Torn Bids stored
-     * (core/sets-desk.js) and says what the page in front of you means for
-     * your sets - in one box of the panel, and in small marks that take no
-     * room (sources/dom/sets-pages.js). No request is made from here.
-     *
-     *   the museum          held / need on each piece; Fill types your full
-     *                       sets into Torn's box - you press EXCHANGE
-     *   the points market   the price and the lot; Fill types both - you
-     *                       press ADD LISTING
-     *   a trade             your price on each of their plushies and flowers,
-     *                       the total for what you need, a message to copy
-     *   someone's bazaar    need and worth on each piece, before you buy
-     *   your forum thread   whether its title still says what Torn Bids says
-     *
-     * Fill is a button in the panel (your press types into Torn's boxes and
-     * sends nothing). The museum's, the points market's and the forum's
-     * markup was never seen when this was written, so nothing is floated
-     * beside their controls: a button there could sit on Torn's own.
-     * ------------------------------------------------------------------ */
-
-    /* Your buying thread on Torn's forum, once seen with the title Torn Bids wrote: its id. */
-    const STORE_SETS_THREAD = 'setsThread';
-    /* A snapshot older than this says so: Torn Bids is closed, or in a tab put away. */
-    const SETS_SNAP_OLD_MS = 15 * 60 * 1000;
-    const SETS_DONE_MS = 4000;
-
-    const setsTab = { settings: null, snap: null, note: null, cards: [], exchanges: [], listing: null, trade: null, marked: false, bound: false, done: '', doneAt: 0, pressAt: 0 };
-
-    function loadSetsTab() {
-        setsTab.settings = setsNow();
-        const snap = setsTab.settings.on ? gmGet(STORE_SETS_SNAP, null) : null;
-        setsTab.snap = snap && Array.isArray(snap.sets) && snap.points && snapReady(snap) ? snap : null;
-        const note = setsTab.settings.on && setsTab.settings.notePanel ? gmGet(STORE_SETS_NOTE, null) : null;
-        setsTab.note = note && note.id ? note : null;
-    }
-
-    /** Is this item kept for sets (Sets on)? Then Fill leaves it alone on your bazaar's pages and the Item Market's. */
-    function setsKeptHere(itemId) {
-        if (!setsTab.settings) loadSetsTab();
-        return setsTab.settings.on && keptForSets(itemId, setsTab.settings);
-    }
-
-    const setsSigned = (n) => (n >= 0 ? '+' : '−') + formatMoney(Math.abs(Math.round(n)));
-    const setsCount = (n) => Number(n || 0).toLocaleString('en-US');
-
-    /** A set of the snapshot, less what you swapped at the museum since it was worked out. */
-    function setsLessPressed(set, snapAt, now) {
-        const off = setsPresses(now).filter((p) => p.set === set.key && p.t > snapAt).reduce((a, p) => a + (Number(p.sets) || 0), 0);
-        if (!off) return set;
-        const pieces = set.pieces.map((p) => {
-            const held = Math.max(0, p.held - off);
-            const need = Math.max(0, set.target - held);
-            const ahead = Math.max(0, held - set.target);
-            return { ...p, held, need, ahead, state: need ? 'need' : ahead ? 'ahead' : 'ok' };
-        });
-        return { ...set, full: Math.max(0, set.full - off), pieces };
-    }
-
-    function setsPieceWords(p) {
-        return p.state === 'need' ? setsCount(p.held) + ' · need ' + setsCount(p.need) : p.state === 'ahead' ? setsCount(p.held) + ' · ' + setsCount(p.ahead) + ' ahead' : setsCount(p.held) + ' ✓';
-    }
-
-    function setsDone(key) {
-        return setsTab.done === key && Date.now() - setsTab.doneAt < SETS_DONE_MS;
-    }
-
-    /* ---- the museum (Z6) ---- */
-
-    function setsOnMuseum(snap, settings, now) {
-        const found = museumExchanges(document, SETS, location.hash);
-        setsTab.exchanges = found;
-        const shown = found.map((f) => f.set);
-        const sets = snap.sets.filter((s) => !shown.length || shown.includes(s.key)).map((s) => setsLessPressed(s, snap.at, now));
-        const lines = [];
-        const buttons = [];
-        for (const s of sets) {
-            const ex = found.find((f) => f.set === s.key) || null;
-            for (const t of pieceTiles(ex && ex.root ? ex.root : document, s.pieces)) {
-                const p = s.pieces.find((x) => String(x.id) === String(t.id));
-                setMark(t.el, setsPieceWords(p), p.top ? 'top' : p.state === 'need' ? '' : p.state);
-            }
-            const first = lines.length === 0;
-            lines.push({ text: s.name + ': full sets you hold', right: setsCount(s.full), cls: first ? '' : 'sep' });
-            if (s.full) {
-                lines.push({ text: 'Points they make', right: setsCount(s.full * s.points) });
-                lines.push({ text: 'They cost you' + (s.cost.known ? '' : ' (part at market value: no buy on record)'), right: formatMoney(s.cost.perSet) + ' a set' });
-                if (snap.points.price) {
-                    const gain = s.full * s.value - s.full * s.cost.perSet;
-                    lines.push({ text: 'At today’s points price, ' + formatMoney(snap.points.price), right: setsSigned(gain), cls: gain >= 0 ? 'ok' : 'bad' });
-                }
-            }
-            const short = s.pieces.filter((p) => p.need > 0).sort((a, b) => a.held - b.held)[0];
-            if (short) lines.push({ text: short.name + ' holds your next sets back', right: 'need ' + setsCount(short.need), cls: 'need' });
-            if (s.full && settings.fillMuseum) {
-                const key = 'fill-museum:' + s.key;
-                if (ex && ex.box) {
-                    if (setsDone(key)) lines.push({ text: 'Typed ' + setsCount(s.full) + ' into Torn’s box. Press EXCHANGE yourself.', cls: 'ok' });
-                    buttons.push({ key, label: 'Fill ' + setsCount(s.full) + (sets.length > 1 ? ' ' + s.key : ''), primary: true, title: 'Types ' + s.full + ' into Torn’s box. You press EXCHANGE.' });
-                } else if (ex) {
-                    lines.push({ text: 'Torn Bids did not find a number box beside EXCHANGE: one press there swaps what Torn says.', cls: 'muted' });
-                }
-            }
-        }
-        if (snap.points.cheap && sets.some((s) => s.full)) lines.push({ text: 'Points are cheap today: swap if you like, and let the points wait in your points book.', cls: 'warn sep' });
-        return { title: sets.length === 1 ? 'Museum · ' + sets[0].name : 'Museum · your sets', lines, buttons };
-    }
-
-    /** A press of Torn's EXCHANGE, by you: written in the points book with what the sets cost. Nothing is pressed for you. */
-    function bindSetsExchange() {
-        if (setsTab.bound) return;
-        setsTab.bound = true;
-        document.addEventListener('click', (event) => {
-            if (!event.isTrusted || !setsTab.snap || !isMuseumPage(location.href)) return;
-            const ex = setsTab.exchanges.find((x) => x.button && x.button.isConnected && (x.button === event.target || x.button.contains(event.target)));
-            if (!ex) return;
-            const now = Date.now();
-            const set = setsTab.snap.sets.map((s) => setsLessPressed(s, setsTab.snap.at, now)).find((s) => s.key === ex.set);
-            if (!set) return;
-            const typed = ex.box ? Number(String(ex.box.value).replace(/[^\d]/g, '')) : 1;
-            // Nothing typed, or more than you hold: Torn refuses it, and nothing is written.
-            if (!(typed >= 1) || typed > set.full) return;
-            // One press, written once.
-            if (now - setsTab.pressAt < 3000) return;
-            setsTab.pressAt = now;
-            const each = Math.round(set.cost.perSet / set.points);
-            gmSet(STORE_SETS_PRESS, [...setsPresses(now), { t: now, set: set.key, sets: typed }].slice(-40));
-            gmSet(STORE_SETS_BOOK, bookAdd(setsBook(), { id: 'page:' + now, t: now, kind: 'made', points: typed * set.points, each, set: set.key, src: 'page' }).slice(-600));
-            logAction('EXCHANGE pressed on the museum: ' + typed + ' ' + set.key + ' sets');
-        }, true);
-        // A number typed into a bazaar card's box: its mark says at once when it is more than you need.
-        document.addEventListener('input', () => {
-            if (app.pageType === PAGE_BAZAAR && setsTab.snap && setsTab.marked) scanSetsPage();
-        }, true);
-    }
-
-    /* ---- the points market (Z7) ---- */
-
-    function setsOnPoints(snap, settings) {
-        const listing = pointsListing(document);
-        setsTab.listing = listing;
-        const p = snap.points;
-        const sell = snap.sell;
-        const lines = [];
-        const buttons = [];
-        if (!p.price) return { title: 'Points market', lines: [{ text: 'The points price is not read yet. Torn Bids reads it: open it, on its Sets page.', cls: 'muted' }] };
-        lines.push({ text: 'Price to type · $1 under the ' + (p.rule === 'wall' ? 'first wall' : 'lowest'), right: formatMoney(p.price) });
-        lines.push({ text: 'Listed cheaper than that', right: setsCount(p.ahead) + ' points' });
-        const loss = sell.points > 0 && p.price < sell.least;
-        if (sell.points) {
-            const lot = sell.lot;
-            lines.push({ text: 'Points made from your sets, to sell', right: setsCount(sell.points), cls: 'sep' });
-            lines.push({ text: 'Least price, from your points book', right: formatMoney(sell.least) });
-            if (loss) lines.push({ text: 'Today’s price is under what these points cost you: a loss. Wait.', cls: 'bad' });
-            else {
-                lines.push({ text: 'Profit on these ' + setsCount(sell.points), right: setsSigned(sell.profit), cls: 'ok' });
-                lines.push({ text: 'Lot', right: lot.split ? setsCount(lot.lots.length) + ' lots of ' + setsCount(lot.size) : 'all ' + setsCount(sell.points) + ' in one' });
-                lines.push({ text: lot.seen ? 'Lots of ' + setsCount(lot.seen.lo) + ' to ' + setsCount(lot.seen.hi) + ' left the market near this price today.' : 'One lot unless small lots are what is selling; none seen leaving near this price yet.', cls: 'muted' });
-                lines.push({ text: 'If it sells, ' + formatMoney(sell.lands) + ' lands on hand, where it can be mugged: put it in the vault.', cls: 'warn' });
-            }
-        } else {
-            lines.push({ text: 'No points from your sets are waiting to be sold.' + (p.held ? ' Your ' + setsCount(p.held) + ' points were yours before: never offered.' : ''), cls: 'muted sep' });
-        }
-        if (p.cheap && p.level && p.level.lo) lines.push({ text: 'Hold: points are cheap today (the last month: ' + formatMoney(p.level.lo) + ' to ' + formatMoney(p.level.hi) + '). Selling is still your choice.', cls: 'warn sep' });
-        if (sell.points && !loss && settings.fillPoints) {
-            if (listing) {
-                const size = sell.lot.split ? sell.lot.size : sell.points;
-                if (setsDone('fill-points')) lines.push({ text: 'Typed ' + setsCount(size) + ' points at ' + formatMoney(p.price) + '. Press ADD LISTING yourself.', cls: 'ok' });
-                buttons.push({ key: 'fill-points', label: 'Fill ' + setsCount(size) + ' at ' + formatMoney(p.price), primary: true, title: 'Types the lot and the price into Torn’s boxes. You press ADD LISTING.' });
-            } else {
-                lines.push({ text: 'Torn Bids did not find Torn’s Points and Price boxes on this page: type them yourself.', cls: 'muted' });
-            }
-        }
-        return { title: 'Points market', tone: p.cheap || loss ? 'warn' : '', lines, buttons };
-    }
-
-    /* ---- a trade (Z8) ---- */
-
-    function setsOnTrade(snap, settings) {
-        const rows = tradeTheirRows(document);
-        const byName = new Map(SETS.flatMap((s) => s.pieces.map((p) => [p.name.toLowerCase(), p.id])));
-        const items = rows.map((r) => ({ id: byName.get(r.name.toLowerCase()) ?? null, name: r.name, qty: r.qty }));
-        if (!items.some((it) => it.id !== null && keptForSets(it.id, settings))) {
-            setsTab.trade = null;
-            return null;
-        }
-        const offer = tradeOffer(items, snapTradeCtx(snap, settings));
-        setsTab.trade = { offer, open: snap.open };
-        const lines = [];
-        offer.rows.forEach((r, i) => {
-            const el = rows[i] && rows[i].el;
-            if (r.state === 'other' || !r.each) {
-                if (el) setMark(el, '');
-                return;
-            }
-            const word = r.state === 'need' ? (r.qty > r.need ? 'need ' + setsCount(r.need) + ' of these' : 'need ' + setsCount(r.need)) : r.state === 'ahead' ? setsCount(r.ahead) + ' ahead already' : 'enough for now';
-            if (el) setMark(el, formatMoney(r.each) + ' each · ' + word, r.state === 'need' ? (r.top ? 'top' : '') : 'ok', 'right');
-            lines.push({ text: setsCount(r.qty) + ' ' + r.name + ' · ' + formatMoney(r.each) + ' each · ' + word, right: formatMoney(r.total), cls: r.state === 'need' ? 'need' : 'muted' });
-        });
-        const others = offer.rows.filter((r) => r.state === 'other').length;
-        if (others) lines.push({ text: others + (others === 1 ? ' other kind of item: not a plushie or flower, no price.' : ' other kinds of items: not plushies or flowers, no price.'), cls: 'muted' });
-        lines.push({ text: 'For what you need (' + setsCount(offer.need.items) + ' items)', right: formatMoney(offer.need.total), cls: 'sep ok' });
-        if (offer.all.total !== offer.need.total) lines.push({ text: 'For every piece (' + setsCount(offer.all.items) + ' items)', right: formatMoney(offer.all.total) });
-        if (!snap.open) lines.push({ text: 'Your shop is Closed: the message says so first.', cls: 'warn' });
-        const m = snap.money || {};
-        if (m.onHand !== null && m.onHand !== undefined) {
-            lines.push({ text: 'On hand ' + formatMoney(m.onHand) + (m.vault !== null && m.vault !== undefined ? ' · vault ' + formatMoney(m.vault) : ''), cls: 'muted sep' });
-            if (m.onHand < offer.need.total) lines.push({ text: 'Take ' + formatMoney(offer.need.total - m.onHand) + ' out of the vault before you accept.', cls: 'warn' });
-        }
-        lines.push({ text: tradeMessage(offer, { open: snap.open }), cls: 'msg' });
-        const buttons = [{ key: 'copy-need', label: setsDone('copy-need') ? 'Copied ✓' : 'Copy the message', primary: true, title: 'Puts the message on your clipboard. You paste and send it.' }];
-        if (offer.all.total !== offer.need.total) buttons.push({ key: 'copy-all', label: setsDone('copy-all') ? 'Copied ✓' : 'Copy for every piece', title: 'The same, with every piece priced.' });
-        return { title: 'Their items · you buy at ' + snap.pct + '%', tone: snap.open ? '' : 'warn', lines, buttons };
-    }
-
-    /* ---- someone's bazaar (Z9) ---- */
-
-    function setsCardTyped(card) {
-        const box = card.querySelector('input:not([type="hidden"]):not([type="checkbox"])');
-        return box ? Number(String(box.value).replace(/[^\d]/g, '')) || 0 : 0;
-    }
-
-    function setsOnBazaar(snap) {
-        const cards = setsTab.cards.filter((c) => c && c.el && c.el.isConnected);
-        let any = false;
-        for (const c of cards) {
-            const hit = snapPiece(snap, c.itemId);
-            if (!hit) {
-                setMark(c.el, '');
-                continue;
-            }
-            any = true;
-            const p = hit.piece;
-            const price = c.listingPrice;
-            const typed = setsCardTyped(c.el);
-            let text;
-            let state;
-            if (p.state !== 'need') {
-                text = p.state === 'ahead' ? setsCount(p.ahead) + ' ahead already' : 'enough for now';
-                state = typed > 0 ? 'over' : 'ok';
-            } else if (typed > p.need) {
-                text = 'typing ' + setsCount(typed) + ' · you need ' + setsCount(p.need);
-                state = 'over';
-            } else if (p.worth && price > 0 && price < p.worth) {
-                text = 'need ' + setsCount(p.need) + ' · worth ' + formatMoney(p.worth);
-                state = p.top ? 'top' : '';
-            } else if (p.worth) {
-                text = 'need ' + setsCount(p.need) + ' · over its worth, ' + formatMoney(p.worth);
-                state = 'over';
-            } else {
-                text = 'need ' + setsCount(p.need);
-                state = '';
-            }
-            setMark(c.el, text, state);
-        }
-        if (!any) return null;
-        const r = bazaarForSets(snap, cards.map((c) => ({ itemId: c.itemId, price: c.listingPrice, stock: c.qty })));
-        const lines = [];
-        if (!r.count) {
-            lines.push({ text: snap.points.price ? 'Nothing here is under its worth for the pieces you need.' : 'The points price is not read yet, so no piece has a worth: open Torn Bids.', cls: 'muted' });
-            return { title: 'This bazaar · your sets', lines };
-        }
-        for (const row of r.rows) lines.push({ text: row.name + ' · ' + setsCount(row.take) + (row.all ? ' (all here)' : ' of them') + ' at ' + formatMoney(row.price), right: setsSigned(row.gain), cls: 'need' });
-        lines.push({ text: setsCount(r.count) + ' pieces under their worth cost', right: formatMoney(r.cost), cls: 'sep' });
-        lines.push({ text: 'Under their worth by', right: setsSigned(r.gain), cls: 'ok' });
-        for (const s of snap.sets) if (r.fullAfter[s.key] > s.full) lines.push({ text: 'Full ' + s.key + ' sets after buying', right: setsCount(s.full) + ' → ' + setsCount(r.fullAfter[s.key]) });
-        return { title: 'This bazaar · your sets', lines };
-    }
-
-    /* ---- your forum thread (Z10) ---- */
-
-    function setsOnForum(snap) {
-        const th = forumThread(document, location.href);
-        const exact = th.titles.find((t) => t.text === snap.forum.title) || null;
-        const mine = gmGet(STORE_SETS_THREAD, null);
-        // A thread with the very title Torn Bids wrote is yours: remembered, so it is still known once the title is out of date.
-        if (exact && th.id && String(mine) !== th.id) gmSet(STORE_SETS_THREAD, th.id);
-        if (!exact && !(th.id && String(mine) === th.id)) return null;
-        const title = exact || th.titles.find((t) => isBuyingTitle(t.text)) || null;
-        if (!title) return null;
-        const check = threadCheck(title.text, { open: snap.open, pct: snap.pct });
-        const ok = check.state === 'match';
-        // At the right end of the title's own row: nothing of Torn's under it is covered.
-        setMark(title.el, ok ? 'matches Torn Bids ✓' : 'does not match Torn Bids', ok ? 'good' : 'over', 'right');
-        if (ok) return { title: 'Your buying thread', lines: [{ text: 'Its title says what Torn Bids says: ' + (snap.open ? 'Open at ' + snap.pct + '%.' : 'Closed.'), cls: 'ok' }] };
-        const why = check.state === 'open' ? 'It says CLOSED; Torn Bids is Open at ' + snap.pct + '%.'
-            : check.state === 'closed' ? 'It says OPEN; Torn Bids is Closed.'
-            : 'It says ' + check.says.pct + '%; Torn Bids buys at ' + snap.pct + '%.';
-        return {
-            title: 'Your buying thread',
-            tone: 'warn',
-            lines: [
-                { text: why, cls: 'warn' },
-                { text: snap.forum.title, cls: 'msg' },
-                { text: 'Edit the thread on Torn and paste. Nothing is posted for you.', cls: 'muted' },
-            ],
-            buttons: [
-                { key: 'copy-title', label: setsDone('copy-title') ? 'Copied ✓' : 'Copy the title', primary: true },
-                { key: 'copy-post', label: setsDone('copy-post') ? 'Copied ✓' : 'Copy the post' },
-            ],
-        };
-    }
-
-    /** The page in front of you, for your sets: its marks and the panel's box. Runs with the page's own tick. */
-    function scanSetsPage() {
-        if (!app.panel || !app.panel.setSets) return;
-        if (!setsTab.settings) loadSetsTab();
-        const settings = setsTab.settings;
-        const snap = setsTab.snap;
-        const href = location.href;
-        const now = Date.now();
-        const where = !settings.on ? ''
-            : isMuseumPage(href) ? 'museum'
-            : isPointsMarketPage(href) ? 'points'
-            : isTradePage(href) ? 'trade'
-            : isForumPage(href) ? 'forum'
-            : app.pageType === PAGE_BAZAAR && !ownBazaarPage(href) ? 'bazaar'
-            : '';
-        let view = null;
-        if (where && snap) {
-            if (where === 'museum') view = setsOnMuseum(snap, settings, now);
-            else if (where === 'points') view = setsOnPoints(snap, settings);
-            else if (where === 'trade') view = setsOnTrade(snap, settings);
-            else if (where === 'forum') view = setsOnForum(snap);
-            else view = setsOnBazaar(snap);
-            setsTab.marked = true;
-            if (view && now - snap.at > SETS_SNAP_OLD_MS) view.lines.push({ text: 'Worked out ' + formatAge(now - snap.at) + ': open Torn Bids for the numbers of now.', cls: 'warn sep' });
-        } else {
-            if (setsTab.marked) {
-                clearSetMarks(document);
-                setsTab.marked = false;
-            }
-            // On, on one of its pages, and Torn Bids has not worked anything out yet.
-            if (where === 'museum' || where === 'points') view = { title: 'Sets', lines: [{ text: 'Open Torn Bids once: your sets are worked out there, and shown here.', cls: 'muted' }] };
-        }
-        const note = setsTab.note && now - (Number(setsTab.note.at) || 0) < SETS_NOTE_LIVE_MS && where !== 'trade' ? setsTab.note : null;
-        app.panel.setSets(view, note ? { id: note.id, title: note.title, text: note.text } : null);
-    }
-
-    /** A button of the panel's Sets box: Fill types into Torn's boxes, Copy copies, the note opens one page. */
-    function onSetsPanel(key, arg) {
-        const snap = setsTab.snap;
-        const done = (k) => {
-            setsTab.done = k;
-            setsTab.doneAt = Date.now();
-            setTimeout(scanSetsPage, SETS_DONE_MS + 50);
-        };
-        if (key === 'note-open' && arg) {
-            location.assign(tradeViewUrl(arg.id));
-            return;
-        }
-        if (key === 'note-no' && arg) {
-            saveSetsState({ dismissed: [...(setsState().dismissed || []), String(arg.id)].slice(-50) });
-            gmSet(STORE_SETS_NOTE, null);
-            setsTab.note = null;
-        } else if (!snap) {
-            return;
-        } else if (key.startsWith('fill-museum:')) {
-            const ex = setsTab.exchanges.find((x) => x.set === key.slice(12) && x.box && x.box.isConnected);
-            const set = snap.sets.map((s) => setsLessPressed(s, snap.at, Date.now())).find((s) => s.key === key.slice(12));
-            if (!ex || !set || !set.full) return;
-            writeInputs(boxTwins(ex.box), String(set.full));
-            logAction('Fill on the museum: ' + set.full + ' ' + set.key + ' sets');
-            done(key);
-        } else if (key === 'fill-points') {
-            const l = setsTab.listing;
-            const sell = snap.sell;
-            if (!l || !l.amount.isConnected || !l.price.isConnected || !sell.points || !snap.points.price || snap.points.price < sell.least) return;
-            const size = sell.lot.split ? sell.lot.size : sell.points;
-            writeInputs(boxTwins(l.amount), String(size));
-            writeInputs(boxTwins(l.price), String(snap.points.price));
-            logAction('Fill on the points market: ' + size + ' points');
-            done(key);
-        } else if (key === 'copy-need' || key === 'copy-all') {
-            if (!setsTab.trade) return;
-            if (gmCopy(tradeMessage(setsTab.trade.offer, { open: snap.open, everything: key === 'copy-all' }))) done(key);
-        } else if (key === 'copy-title' || key === 'copy-post') {
-            if (gmCopy(key === 'copy-title' ? snap.forum.title : snap.forum.post)) done(key);
-        }
-        scanSetsPage();
-    }
-
-    /** Why a price box on your bazaar's add page is red or amber, said beside it (it was only in the box's hover text). */
-    function paintToneTag(input, tone, text) {
-        const host = input.closest('.price') || input.parentElement;
-        if (!host) return;
-        let tag = host.querySelector(':scope > .ttv2-tonetag');
-        if (!tone || !text) {
-            if (tag) tag.remove();
-            return;
-        }
-        if (!tag) {
-            tag = document.createElement('span');
-            tag.className = 'ttv2-float ttv2-tonetag';
-            host.appendChild(tag);
-            holdMarks(host);
-        }
-        if (tag.dataset.tone !== tone) tag.dataset.tone = tone;
-        if (tag.textContent !== text) tag.textContent = text;
-    }
-
-    /** "kept for sets" where Fill's tick would be, on a row of a piece Sets keeps. */
-    function paintKeptNote(row, tag, on) {
-        let note = row.el.querySelector('.ttv2-keptnote');
-        if (!on) {
-            if (note) {
-                const cell = note.parentNode;
-                const held = note.classList.contains(BZ_FILL_CELL_CLASS);
-                note.remove();
-                if (held && cell && cell.classList && cell.classList.contains(BZ_CELL_CLASS)) releaseBazaarCell(cell);
-            }
-            return;
-        }
-        if (note) {
-            // Torn may have drawn the cell again: it keeps the note's place.
-            if (note.classList.contains(BZ_FILL_CELL_CLASS) && note.parentNode && note.parentNode.classList && !note.parentNode.classList.contains(BZ_CELL_CLASS)) note.parentNode.classList.add(BZ_CELL_CLASS);
-            return;
-        }
-        note = document.createElement('span');
-        note.textContent = 'kept for sets';
-        note.title = 'Sets is on: this piece is kept for the museum, so Fill leaves its price alone.';
-        if (tag && tag.classList.contains('ttv2-bzchips') && tag.parentNode) {
-            // Your bazaar's add page: where the Fill tick sits in the other rows, the chips just before it.
-            note.className = 'ttv2-keptnote ' + BZ_FILL_CELL_CLASS;
-            tag.parentNode.appendChild(note);
-            tag.parentNode.classList.add(BZ_CELL_CLASS);
-        } else if (tag && tag.parentNode) {
-            note.className = 'ttv2-float ttv2-keptnote';
-            tag.parentNode.insertBefore(note, tag.nextSibling);
-            placeFloat(note);
-        } else {
-            note.className = 'ttv2-keptnote';
-            rowFloat(row.el, document).appendChild(note);
-        }
-    }
-
     function boot() {
         // On TornW3B: only note the traders its pages link to.
         if (location.hostname === 'weav3r.dev') {
@@ -39597,8 +36379,6 @@
             onForgetKey,
             onClearCache,
             onViewChange,
-            // Sets (3.24.0): Fill, Copy and the note's two buttons in the panel's Sets box.
-            onSets: onSetsPanel,
             /*
              * The key is put into the field only when the user asks to see it.
              * A value sitting in an <input> on torn.com is readable by every
@@ -39693,22 +36473,6 @@
 
             rescan('timer');
         }, POLL_INTERVAL_MS);
-
-        // Sets (3.24.0): what Torn Bids worked out, shown on this page; followed as it changes.
-        loadSetsTab();
-        const setsChanged = () => {
-            const was = setsTab.settings && setsTab.settings.on;
-            loadSetsTab();
-            scanSetsPage();
-            // Switched on or off: Fill's ticks on your bazaar's pages follow.
-            if (was !== setsTab.settings.on && app.ownBazaar) rescan('sets');
-        };
-        for (const key of [STORE_SETS, STORE_SETS_SNAP, STORE_SETS_NOTE, STORE_SETS_PRESS]) gmOnChange(key, setsChanged);
-        bindSetsExchange();
-        setInterval(() => {
-            if (document.visibilityState === 'visible') scanSetsPage();
-        }, POLL_INTERVAL_MS);
-        scanSetsPage();
 
         startPageWatch();
         startLiveFeed();

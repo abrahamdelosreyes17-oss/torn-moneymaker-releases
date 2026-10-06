@@ -55,7 +55,6 @@ const HEADER = `// ==UserScript==
 // @grant        GM_openInTab
 // @grant        GM_xmlhttpRequest
 // @grant        GM_addValueChangeListener
-// @grant        GM_setClipboard
 // @connect      api.torn.com
 // @connect      www.tornexchange.com
 // @connect      weav3r.dev

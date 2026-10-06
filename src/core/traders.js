@@ -149,34 +149,6 @@ export function parseW3bPriceList(body) {
     return prices;
 }
 
-/**
- * A list's set prices: TornW3B gives a whole museum set an id under zero (-1 Flower Set, -2 Plushie Set).
- * parseW3bPriceList leaves them out, as no item has such an id; Sets (3.24.0) reads them here.
- * @returns {object} {"-1": price, "-2": price}, only the ones listed
- */
-export function parseW3bSetPrices(body) {
-    const sets = {};
-    if (!Array.isArray(body)) return sets;
-    for (const row of body) {
-        const itemId = Number(row && row.itemId);
-        const price = Number(row && row.buyPrice);
-        if (itemId !== -1 && itemId !== -2) continue;
-        if (!Number.isFinite(price) || price <= 0) continue;
-        sets[String(itemId)] = price;
-    }
-    return sets;
-}
-
-/** The trader paying the most for a whole set (w3bId -1 or -2), from the lists read: {id, name, price} or null. */
-export function bestSetBuyer(db, w3bId) {
-    let best = null;
-    for (const [id, t] of Object.entries((db && db.traders) || {})) {
-        const price = Number(t && t.w3b && t.w3b.sets && t.w3b.sets[String(w3bId)]) || 0;
-        if (price > 0 && (!best || price > best.price)) best = { id, name: t.name || 'Trader ' + id, price };
-    }
-    return best;
-}
-
 /** Record the result of reading one trader's TornW3B list. */
 export function recordW3bList(db, traderId, result, now = Date.now()) {
     const id = cleanId(traderId);
@@ -192,7 +164,6 @@ export function recordW3bList(db, traderId, result, now = Date.now()) {
     t.w3b = Object.keys(prices).length
         ? { checkedAt: now, at: now, found: true, prices }
         : { checkedAt: now, found: false };
-    if (result.sets && Object.keys(result.sets).length) t.w3b.sets = result.sets;
 }
 
 /** Ask for a list again soon (Refresh), without hiding the prices we have. */

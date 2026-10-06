@@ -377,9 +377,6 @@ export class Panel {
         // The buying run after a trader said yes: Next bazaar (3.12.8).
         this.buyBoxEl = el('div', { class: 'ttv2-tradebox ttv2-buybox' });
         this.buyBoxEl.style.display = 'none';
-        // Sets (3.24.0): what the page you are on means for your sets, and a trade open with you.
-        this.setsBoxEl = el('div', { class: 'ttv2-tradebox ttv2-setsbox' });
-        this.setsBoxEl.style.display = 'none';
 
         this.listPage = el('div', { class: 'ttv2-page ttv2-page-list' }, [
             this.tradeBoxEl,
@@ -414,7 +411,7 @@ export class Panel {
 
         // The buying run's box sits under the header, outside the pages: Next
         // is there on every page, in Settings, and with the panel collapsed.
-        this.root = el('div', { class: 'ttv2-panel' }, [this.headEl, this.buyBoxEl, this.setsBoxEl, this.bodyEl]);
+        this.root = el('div', { class: 'ttv2-panel' }, [this.headEl, this.buyBoxEl, this.bodyEl]);
 
         // Esc closes an open chip editor, then Settings.
         this.root.addEventListener('keydown', (event) => {
@@ -1020,50 +1017,6 @@ export class Panel {
         if (line.className !== cls) line.className = cls;
         if (line.textContent !== n.text) line.textContent = n.text;
         box.style.display = '';
-    }
-
-    /**
-     * Sets (3.24.0, mockups Z6-Z10): one box under the header. `view` is what the page you are on means for your
-     * sets - the museum, the points market, a trade, a bazaar, your forum thread - and `note` a trade open with
-     * you. Words and numbers only; its buttons type into a Torn box, copy text or open one page.
-     *
-     * @param {null|{title, status?, tone?, lines: Array<{text, right?, cls?}>, buttons?: Array<{key, label, primary?, title?}>}} view
-     * @param {null|{id, title, text}} note
-     */
-    setSets(view, note = null) {
-        const box = this.setsBoxEl;
-        if (!box) return;
-        const sig = view || note ? JSON.stringify([view, note]) : '';
-        if (sig === this.setsSig) return;
-        this.setsSig = sig;
-        box.textContent = '';
-        if (!view && !note) {
-            box.style.display = 'none';
-            return;
-        }
-        box.style.display = '';
-        box.dataset.tone = (view && view.tone) || '';
-        const press = (key, arg) => () => this.handlers.onSets && this.handlers.onSets(key, arg);
-        if (note) {
-            box.appendChild(el('div', { class: 'ttv2-sets-note' }, [
-                el('div', {}, [el('b', { text: note.title }), ' ' + note.text]),
-                el('div', { class: 'ttv2-sets-btns' }, [
-                    el('button', { type: 'button', class: 'ttv2-primary', text: 'Open the trade', onclick: press('note-open', note) }),
-                    el('button', { type: 'button', text: 'Not now', onclick: press('note-no', note) }),
-                ]),
-            ]));
-        }
-        if (!view) return;
-        box.appendChild(el('div', { class: 'ttv2-tb-head' }, [el('b', { text: view.title }), view.status ? el('span', { class: 'ttv2-tb-status', text: view.status }) : null]));
-        for (const l of view.lines || []) {
-            box.appendChild(el('div', { class: 'ttv2-sets-line' + (l.cls ? ' ' + l.cls.split(' ').map((c) => 'ttv2-sets-' + c).join(' ') : '') }, [
-                el('span', { text: l.text }),
-                l.right !== undefined && l.right !== null ? el('b', { text: l.right }) : null,
-            ]));
-        }
-        if (view.buttons && view.buttons.length) {
-            box.appendChild(el('div', { class: 'ttv2-sets-btns' }, view.buttons.map((b) => el('button', { type: 'button', class: b.primary ? 'ttv2-primary' : '', title: b.title || null, text: b.label, onclick: press(b.key) }))));
-        }
     }
 
     /**
