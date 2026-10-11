@@ -513,6 +513,9 @@ export const BIDS_CALM_CSS = `
 .badge.trust[data-level="caution"] { color: var(--warn); background: var(--warn-bg); }
 .pname { color: inherit; text-decoration: none; } .pname:hover { text-decoration: underline; text-underline-offset: 3px; }
 .pin.on { color: var(--text); background: var(--hover); } .who-t .pin { width: 26px; height: 26px; }
+/* 3.26.0: the trade's header is one family - TE list / W3B list are buttons, so ⊘ and the star take the same 26 px box (the pin's). */
+.who-t .quiet, .who-t .star { width: 26px; height: 26px; flex: none; display: grid; place-items: center; margin: 0; padding: 0; border: 1px solid var(--line2); border-radius: 8px; background: var(--raised); font-size: 14px; }
+.who-t .quiet:hover, .who-t .star:hover { background: var(--hover); border-color: rgba(255,255,255,.22); }
 
 /* ---------- the frame ---------- */
 .app { grid-template-rows: minmax(0, 1fr); } .main { grid-template-rows: 52px auto minmax(0, 1fr) 30px; min-height: 0; }
@@ -801,6 +804,10 @@ export const BIDS_FORM_CSS = `
 .lg-profitbox { display: grid; gap: 12px; } .lg-profitbox .lg-mugline { padding: 10px 16px; }
 .lg-chips { padding: 1px; } .lg-chips .sp-chip-f, .lg-chips-s .sp-chip-f { height: 28px; font-size: 12px; } .lg-in { height: 32px; }
 .lg-filters { align-items: flex-end; gap: 10px 16px; }
+/* 3.25.1: "where are my settings that I can click?" - the Only toggles are buttons and look it: an outline, filled when on. */
+.tog { padding: 0 10px; border: 1px solid var(--line2); border-radius: 999px; }
+.tog.on { background: var(--raised); }
+.tog:hover { border-color: var(--faint); }
 `;
 
 export const BIDS_CSS = BIDS_BASE_CSS + BIDS_CALM_CSS + BIDS_FORM_CSS;

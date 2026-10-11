@@ -1526,6 +1526,7 @@ export class Panel {
 
         // One row, always: in less room, smaller type and tighter spacing,
         // one step at a time, measured - never cut, never wrapped.
+        this.root.classList.remove('ttv2-head2');
         this.root.classList.toggle('ttv2-narrow', width < TWO_ROW_BELOW);
         this.root.classList.remove('ttv2-tight');
         this.root.style.removeProperty('--fit-right');
@@ -1536,6 +1537,9 @@ export class Panel {
         this.root.classList.remove('ttv2-tighter');
         if (this.root.classList.contains('ttv2-narrow') && overflows()) this.root.classList.add('ttv2-tight');
         if (this.root.classList.contains('ttv2-tight') && overflows()) this.root.classList.add('ttv2-tighter');
+        // The header alone still too wide at the smallest type (the switch names both sides): it takes
+        // two rows - the switch whole, the Scan / Open Torn Bids button under it. Never a side left out.
+        if (this.headEl && this.headEl.clientWidth && this.headEl.scrollWidth - this.headEl.clientWidth > 1) this.root.classList.add('ttv2-head2');
 
         // Still a few pixels short: borrow them from the window-edge margin
         // first, then from the gap - never more than the gap, so the panel

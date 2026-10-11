@@ -3,7 +3,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { SharedLink, SHARED_CONFIG_KEY, SHARED_STATE_KEY, SHARED_GRANT_KEY, SHARED_MARKS_KEY, SHARED_TICK_MS, SHARED_UNKNOWN_MS } from '../src/feed/shared-link.js';
+import { SharedLink, SHARED_CONFIG_KEY, SHARED_STATE_KEY, SHARED_GRANT_KEY, SHARED_MARKS_KEY, SHARED_TICK_MS, SHARED_UNKNOWN_MS, SHARED_UNKNOWN_STEPS_MS, sharedUnknownWait } from '../src/feed/shared-link.js';
 import { sharedOutgoingOk, sharedMayCall, withShared, sharedNowLine, sharedPanelLine, sharedKnown, sharedWord, sharedSaid, sharedSaidLine } from '../src/core/shared.js';
 import { serverFile } from './server-path.js';
 
@@ -227,16 +227,29 @@ test('a PC the server does not know: asked once, nothing kept, nothing shown, as
     assert.equal(wrong.world.requests.length, 0);
     // Anyone may install Torn Bids: a stranger's copy asks once, not every half minute.
     assert.equal(wrong.posts.length, 1);
-    await wrong.pass(30 * 60000);
+    await wrong.pass(3 * 60000);
     assert.equal(wrong.posts.length, 1);
+    assert.match(sharedSaidLine(tab.link.status(), 6), /asked again in 5 minutes, or at once/);
     // To that PC there is no server: no line in the panel, nothing to show in Torn Bids.
     const st = tab.link.status();
     assert.equal(sharedKnown(st), false);
     assert.equal(sharedPanelLine(st, st.now), null);
     assert.equal(sharedNowLine(st, st.now).level, 'off');
-    // Its owner may have let it in since: asked again after six hours.
-    await wrong.pass(SHARED_UNKNOWN_MS);
+    // Its owner may have let it in since: asked again after 5 minutes, then 15, then an hour (3.26.0: it was
+    // six hours from the first, so a key just added waited that long) - and from then every six hours.
+    assert.deepEqual(SHARED_UNKNOWN_STEPS_MS, [5 * 60000, 15 * 60000, 60 * 60000]);
+    assert.deepEqual([1, 2, 3, 4, 9, 0, undefined].map(sharedUnknownWait), [5 * 60000, 15 * 60000, 60 * 60000, SHARED_UNKNOWN_MS, SHARED_UNKNOWN_MS, 5 * 60000, 5 * 60000]);
+    await wrong.pass(2 * 60000);
     assert.equal(wrong.posts.length, 2);
+    await wrong.pass(16 * 60000);
+    assert.equal(wrong.posts.length, 3);
+    await wrong.pass(61 * 60000);
+    assert.equal(wrong.posts.length, 4);
+    assert.match(sharedSaidLine(tab.link.status(), 6), /asked again in 6 hours, or at once/);
+    await wrong.pass(SHARED_UNKNOWN_MS - 5 * 60000);
+    assert.equal(wrong.posts.length, 4);
+    await wrong.pass(10 * 60000);
+    assert.equal(wrong.posts.length, 5);
 
     let down = false;
     const s = setUp({ down: () => down });
@@ -611,4 +624,109 @@ test('a key the owner never added, and a key added as key-only: 404, said once i
     assert.equal(st.unknown, false);
     assert.equal(sharedSaid(st), 'ok');
     assert.ok(tab.link.reads().index.bySeller.has('11'));
+});
+
+/* 3.26.0: the server hands out TornW3B's work - which sellers lists are this PC's, and the trader lists another PC read. */
+test('TornW3B\'s work through the server: this PC reads only the sellers lists handed to it, and trader lists go both ways', async () => {
+    const { SHARED_W3B_ASK_KEY, SHARED_LISTS_OUT_KEY, SHARED_LISTS_IN_KEY } = await import('../src/feed/shared-link.js');
+    const { sharedMayRead, sharedList, sharedBody, sharedAskIn, sharedListsIn, SHARED_MAX_WANT, SHARED_MAX_LISTS, SHARED_ASK_FRESH_MS } = await import('../src/core/shared.js');
+
+    const s = setUp();
+    const want = { sellers: [11], worth: { 206: 850000 }, want: [206, 367, 180], w3b: [8, 900], lists: true };
+    const tab = s.addTab('sell', 't1', want);
+    const app = s.addTab('app', 't2', {});
+    // This PC read trader 77's list a moment ago: it waits in the stored value for the next exchange.
+    const readAt = s.world.t + SKEW - 5000;
+    s.gm.values.set(SHARED_LISTS_OUT_KEY, [[77, readAt, { 206: 849500, 180: 61 }]]);
+    // The other person's PC read item 367's sellers a moment ago, and trader 44's list.
+    const theirs = () => s.world.host.handle('vincent', 'POST', '/sync', { used: 1, dir: [[367, 2000]], lists: [[44, s.world.t - 3000, { 1: 118 }]], listsSince: 0 }).body;
+    theirs();
+    await s.pass(40000);
+
+    // What left this PC: the want, the room, the list - numbers only, in the agreed shape.
+    const sent = s.posts.find((p) => p.body.want);
+    assert.deepEqual(sent.body.want, [206, 367, 180]);
+    assert.deepEqual(sent.body.w3b, [8, 900]);
+    assert.deepEqual(sent.body.lists, [[77, readAt, { 206: 849500, 180: 61 }]]);
+    assert.equal(sent.body.listsSince, 0);
+    assert.ok(s.posts.every((p) => sharedOutgoingOk(p.body)));
+    // Sent once: the next exchange does not carry the same list again.
+    assert.equal(s.posts.filter((p) => p.body.lists).length, 1);
+
+    // The server left 367 to the PC that just read it: 206 and 180 are this PC's.
+    const handed = tab.link.w3bAsk();
+    assert.deepEqual(handed.want, [206, 367, 180]);
+    assert.deepEqual(handed.ask, [206, 180]);
+    const now = s.world.t + SKEW;
+    assert.equal(sharedMayRead(handed, 206, now), true);
+    assert.equal(sharedMayRead(handed, '367', now), false);
+    // An item the server was never told of is this PC's as before; so is everything once the server has been silent.
+    assert.equal(sharedMayRead(handed, 999, now), true);
+    assert.equal(sharedMayRead(handed, 367, handed.at + SHARED_ASK_FRESH_MS), true);
+    assert.equal(sharedMayRead(null, 367, now), true);
+    // The tab that does not lead goes by the same.
+    assert.deepEqual(app.link.w3bAsk(), handed);
+    assert.deepEqual(tab.link.status().w3bAsk, [2, 3]);
+
+    // The other PC's trader list is here for Torn Bids' page to take, and this PC's is with the other PC.
+    const box = s.gm.values.get(SHARED_LISTS_IN_KEY);
+    assert.equal(box.n, 1);
+    assert.deepEqual(box.lists.map((l) => [l[0], l[2]]), [[44, { 1: 118 }]]);
+    assert.equal(tab.link.status().listsIn, 1);
+    assert.equal(tab.link.status().listsOut, 1);
+    const got = theirs();
+    assert.deepEqual(got.lists.map((l) => [l[0], l[2]]), [[77, { 206: 849500, 180: 61 }]]);
+    // Nothing new: nothing is taken twice.
+    await s.pass(65000);
+    assert.equal(s.gm.values.get(SHARED_LISTS_IN_KEY).n, 1);
+
+    // With Torn Bids' page closed (only the panel's tab), no lists are asked for and no want is sent.
+    const o = setUp();
+    o.addTab('app', 't1', { sellers: [11], worth: { 206: 850000 } });
+    o.gm.values.set(SHARED_LISTS_OUT_KEY, [[77, o.world.t, { 206: 1 }]]);
+    await o.pass(40000);
+    assert.ok(o.posts.length > 0 && o.posts.every((p) => !('lists' in p.body) && !('listsSince' in p.body) && !('want' in p.body) && !('w3b' in p.body)));
+    assert.equal(o.gm.values.has(SHARED_W3B_ASK_KEY), false);
+
+    // The shapes, whatever is put in: numbers only, within the limits.
+    assert.equal(sharedList([77, 5, { 206: 1.6, x: 5, 180: -1, 9: 'a' }])[2][206], 2);
+    assert.deepEqual(sharedList([77, 5, { 206: 1.6, x: 5, 180: -1, 9: 'a' }]), [77, 5, { 206: 2 }]);
+    for (const bad of [null, [77, 5], [77, 5, {}], ['x', 5, { 1: 1 }], [77, 0, { 1: 1 }], [77, 5.5, { 1: 1 }], [77, 5, [1]], [77, 5, { 1: 0 }]]) assert.equal(sharedList(bad), null, JSON.stringify(bad));
+    const big = sharedBody({ wants: [{ want: Array.from({ length: 200 }, (_, i) => i + 1), w3b: [3, 4] }], lists: Array.from({ length: 9 }, (_, i) => [i + 1, 5, { 1: 1 }]), listsSince: 7 });
+    assert.equal(big.want.length, SHARED_MAX_WANT);
+    assert.equal(big.lists.length, SHARED_MAX_LISTS);
+    assert.equal(big.listsSince, 7);
+    assert.equal(sharedOutgoingOk(big), true);
+    // A want with no room said, or room with no want: neither is sent. A name can never ride along.
+    assert.equal('want' in sharedBody({ wants: [{ want: [1, 2] }] }), false);
+    assert.equal('w3b' in sharedBody({ wants: [{ w3b: [1, 2] }] }), false);
+    assert.equal(sharedOutgoingOk({ ...big, lists: [[1, 5, { 1: 'Bob' }]] }), false);
+    assert.equal(sharedOutgoingOk({ ...big, want: ['206'] }), false);
+    assert.equal(sharedOutgoingOk({ ...big, w3b: [1, 2, 3] }), false);
+    // The answer: only what was wanted, each once; a server that says nothing about it is no hand-out.
+    assert.deepEqual(sharedAskIn({ ask: [180, 5, 180, 'x', 206] }, [206, 180], 9).ask, [180, 206]);
+    assert.equal(sharedAskIn({}, [206], 9), null);
+    assert.equal(sharedAskIn({ ask: [206] }, [], 9), null);
+    assert.deepEqual(sharedListsIn({ lists: [[44, 5, { 1: 118 }], 'junk', [0, 5, { 1: 1 }]] }), [[44, 5, { 1: 118 }]]);
+});
+
+test('the same key saved again while the server does not know this PC: asked again at once, and the short waits start over', async () => {
+    const wrong = setUp({ pass: 'w'.repeat(32) });
+    const tab = wrong.addTab('sell', 't1', { sellers: [11], worth: { 206: 850000 } });
+    await wrong.pass(70000);
+    assert.equal(wrong.posts.length, 1);
+    assert.equal(tab.link.status().unknown, true);
+    // Nothing to ask again about while the wait is the only thing in the way... until the key is saved again.
+    await wrong.pass(60000);
+    assert.equal(wrong.posts.length, 1);
+    assert.equal(tab.link.knock(), true);
+    await wrong.pass(SHARED_TICK_MS * 2);
+    assert.equal(wrong.posts.length, 2);
+    // Still not known: the first short wait again (5 minutes), not the second.
+    assert.equal(tab.link.status().unknownWaitMs, SHARED_UNKNOWN_STEPS_MS[0]);
+    // A PC the server knows has nothing to knock about.
+    const s = setUp();
+    const ok = s.addTab('sell', 't1', { sellers: [11], worth: { 206: 850000 } });
+    await s.pass(40000);
+    assert.equal(ok.link.knock(), false);
 });

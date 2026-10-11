@@ -60,14 +60,14 @@ test('the overlay tag (item 10c): old is written beside the label, changed when 
     assert.equal('ttv2TraderOld' in a.dataset, false);
 });
 
-test('the overlay tag (item 10d): with Fresh prices only on, a trader whose list is over two days old is passed over for the next Trusted one', () => {
+test('the overlay tag (item 10d): with Fresh prices only on, a trader whose list is over a day old is passed over for the next Trusted one', () => {
     assert.equal(typeof traders.tagBuyer, 'function');
-    const listAt = new Map([['1', NOW - 20 * DAY], ['2', NOW - 30 * HOUR], ['3', NOW - 20 * DAY]]);
+    const listAt = new Map([['1', NOW - 20 * DAY], ['2', NOW - 18 * HOUR], ['3', NOW - 20 * DAY]]);
     const listAtOf = (id) => listAt.get(String(id)) || 0;
     const buyers = [
         { id: '9', name: 'Known, not Trusted', price: 950, w3b: 950, te: null, trust: KNOWN },
         { id: '1', name: 'Weeks old', price: 900, w3b: 900, te: null, trust: TRUSTED },
-        { id: '2', name: 'A day and six hours', price: 890, w3b: 890, te: null, trust: TRUSTED },
+        { id: '2', name: 'Eighteen hours', price: 890, w3b: 890, te: null, trust: TRUSTED },
         { id: '3', name: 'Weeks old too', price: 880, w3b: 880, te: null, trust: TRUSTED },
     ];
     // The stale trader passed over, the next one named.
@@ -108,7 +108,7 @@ test('the list dates for every page: Torn Bids packs them, a page on torn.com re
 
 test('a Your traders card (item 10b): its trade is old when the first of its lines priced from that trader\'s old TornW3B list is', () => {
     assert.equal(typeof traders.tradeOldList, 'function');
-    const listAt = new Map([['7', NOW - 30 * HOUR]]);
+    const listAt = new Map([['7', NOW - 18 * HOUR]]);
     const listAtOf = (id) => listAt.get(String(id)) || 0;
     const rows = new Map([
         ['206', { id: '7', price: 850000, w3b: 850000, te: 850000 }],
@@ -117,7 +117,7 @@ test('a Your traders card (item 10b): its trade is old when the first of its lin
     ]);
     const rowOf = (itemId) => rows.get(String(itemId)) || null;
     // The first line is on TornExchange too (no date to go by); the second is the old list's.
-    assert.deepEqual(traders.tradeOldList([{ itemId: '206' }, { itemId: '180' }], rowOf, listAtOf, NOW), { at: NOW - 30 * HOUR, level: 'aging' });
+    assert.deepEqual(traders.tradeOldList([{ itemId: '206' }, { itemId: '180' }], rowOf, listAtOf, NOW), { at: NOW - 18 * HOUR, level: 'aging' });
     // No line priced from the TornW3B list alone: nothing to say.
     assert.equal(traders.tradeOldList([{ itemId: '206' }, { itemId: '1' }], rowOf, listAtOf, NOW), null);
     // A line whose row is not known says nothing, and breaks nothing.
@@ -126,6 +126,6 @@ test('a Your traders card (item 10b): its trade is old when the first of its lin
     assert.equal(traders.tradeOldList(null, rowOf, listAtOf, NOW), null);
     // Changed within the day: nothing.
     assert.equal(traders.tradeOldList([{ itemId: '180' }], rowOf, () => NOW - HOUR, NOW), null);
-    // Over two days (seen only with Fresh prices only off): stale.
+    // Over a day (seen only with Fresh prices only off): stale.
     assert.equal(traders.tradeOldList([{ itemId: '180' }], rowOf, () => NOW - 3 * DAY, NOW).level, 'stale');
 });

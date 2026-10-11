@@ -220,3 +220,31 @@ test('Fill\'s line on a part-bought trade: says it is all in, and how many are n
     // Still to add, no row here.
     assert.match(fillNote({ ...base, toSend: 1, marked: 0, open: 1 }).text, /none of ELIZA_BITE's items are in this list/);
 });
+
+test('the card adds up: what you pay is of the very units they pay for (the friend\'s card, 2026-10-11)', () => {
+    const line = (steps, more = {}) => ({ kind: 'flip', itemId: '1', name: 'X', bid: 1000, units: steps.reduce((a, s) => a + s.qty, 0), steps, ...more });
+    const flips = (tot) => tot.pays - tot.own - tot.cost;
+    // Before any buy: the plan, whole.
+    const plan = acceptedTotals({ items: [line([{ sellerId: 'a', qty: 10000, price: 970 }, { sellerId: 'b', qty: 7000, price: 970 }, { sellerId: 'c', qty: 3000, price: 990 }])] });
+    assert.deepEqual([plan.pays, plan.cost, plan.profit, plan.toBuy.cost, plan.spent], [20000000, 19460000, 540000, 0, 0]);
+    // Two of three bazaars bought: it said "you pay 19.46M, they pay 17M, profit +510,000".
+    const mid = acceptedTotals({ items: [line([{ sellerId: 'a', qty: 10000, price: 970, bought: true }, { sellerId: 'b', qty: 7000, price: 970, bought: true }, { sellerId: 'c', qty: 3000, price: 990 }])] });
+    assert.deepEqual([mid.pays, mid.cost, mid.profit], [17000000, 16490000, 510000]);
+    assert.equal(flips(mid), mid.profit);
+    assert.deepEqual(mid.toBuy, { cost: 3000 * 990, pays: 3000 * 1000, steps: 1 }, 'the bazaar not been to yet: said apart');
+    assert.equal(mid.spent, 16490000);
+    assert.equal(mid.profit + mid.toBuy.pays - mid.toBuy.cost, plan.profit, 'with it, the trade still comes to what they said yes to');
+    // A bazaar skipped is not still to buy.
+    const skipped = acceptedTotals({ items: [line([{ sellerId: 'a', qty: 10000, price: 970, bought: true }, { sellerId: 'c', qty: 3000, price: 990, skipped: true }])] });
+    assert.deepEqual([skipped.toBuy.cost, flips(skipped)], [0, skipped.profit]);
+    // They took fewer: what stayed is yours to sell, not this trade's cost.
+    const fewer = acceptedTotals({ items: [line([{ sellerId: 'a', qty: 10000, price: 970, bought: true }, { sellerId: 'c', qty: 3000, price: 990, bought: true }], { left: 3000 })] });
+    assert.equal(Math.round(flips(fewer)), Math.round(fewer.profit));
+    assert.equal(fewer.left.units, 3000);
+    assert.equal(Math.round(fewer.cost + fewer.left.cost), fewer.spent, 'every dollar paid is in the trade or left with you');
+    // Your own items: they pay for them, no bazaar is paid.
+    const own = acceptedTotals({ items: [line([{ sellerId: 'a', qty: 10, price: 970, bought: true }]), { kind: 'yours', itemId: '2', name: 'Y', bid: 500, units: 1000, steps: [] }, { kind: 'yours', itemId: '3', name: 'Z', bid: 500, units: 10, each: 400, steps: [] }] });
+    assert.equal(own.own, 1010 * 500);
+    assert.equal(flips(own), 10 * 30);
+    assert.equal(own.profit, 10 * 30 + 10 * 100, 'and a To sell item adds what it makes');
+});

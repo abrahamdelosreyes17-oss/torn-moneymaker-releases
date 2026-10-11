@@ -96,6 +96,8 @@ export class LiveFeed {
      * @param {function} [deps.onKeyDead] - (error) => void
      * @param {function} [deps.now]
      * @param {function} [deps.onSummary] - (summary, now) => void, each TornW3B summary
+     * @param {function} [deps.serverKnows] - (itemId, lowestPrice) => boolean (3.26.0): the shared server read
+     *   a bazaar with the item at that price or under it lately - TornW3B's sellers list of it is not asked for
      */
     constructor(deps) {
         this.d = deps;
@@ -110,6 +112,8 @@ export class LiveFeed {
         this.tornSpent = [];
         this.lastError = null;
         this.lastCycleAt = null;
+        // Sellers lists not asked of TornW3B this session, the server's own read standing in (3.26.0).
+        this.serverStoodIn = 0;
         this.lastRefreshSeen = 0;
         this.cycleCount = 0;
         /** itemId -> when its "cheaper on the market too?" check last ran. */
@@ -165,6 +169,7 @@ export class LiveFeed {
             keyed: Boolean(this.d.hasUsableKey()),
             leading: this.leading,
             candidates: this.candidates.length,
+            serverStoodIn: this.serverStoodIn,
             nextRefreshAt: this.lastSummaryAt ? this.lastSummaryAt + SUMMARY_INTERVAL_MS : null,
             lastCycleAt: this.lastCycleAt,
             lastError: this.lastError,
@@ -293,10 +298,20 @@ export class LiveFeed {
         const feedNow = this.readFeed();
         const byId = new Map(this.candidates.map((c) => [c.itemId, c]));
 
+        // The server read this cheapest price from Torn itself: nothing TornW3B's sellers list could add.
+        const known = (c) => {
+            try {
+                return Boolean(this.d.serverKnows && this.d.serverKnows(c.itemId, c.lowestPrice));
+            } catch {
+                return false;
+            }
+        };
         const queue = [];
         for (const id of rechecks) if (byId.has(id)) queue.push(byId.get(id));
         for (const c of this.candidates) {
-            if (!queue.includes(c) && bazaarDue(feedNow, c, this.now())) queue.push(c);
+            if (queue.includes(c) || !bazaarDue(feedNow, c, this.now())) continue;
+            if (known(c)) this.serverStoodIn += 1;
+            else queue.push(c);
         }
 
         let fetched = 0;

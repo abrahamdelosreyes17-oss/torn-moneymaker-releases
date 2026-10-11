@@ -720,7 +720,19 @@ if (_bigStore) {
 }
 
 window.__requests = [];
+// TornW3B's light list (3.26.0): the ten cheapest of the same pretend listings, price and count, no seller.
+// &lightshape=odd answers in a shape the script does not read; &lightnew=1 adds a price no sellers list holds.
 function respond(url) {
+    const u = new URL(url);
+    const out = respondFull(url);
+    if (!(u.hostname === 'weav3r.dev' && /^\/api\/marketplace\/\d+$/.test(u.pathname) && u.searchParams.get('filler') === '1') || !out || !Array.isArray(out.listings)) return out;
+    window.__light = (window.__light || 0) + 1;
+    if (/[?&]lightshape=odd/.test(location.search)) return { ok: true, cheapest: 'see the website' };
+    const rows = out.listings.filter((l) => Number(l.player_id) > 0).sort((x, y) => x.price - y.price).slice(0, 10).map((l) => ({ price: l.price, quantity: l.quantity }));
+    if (/[?&]lightnew=1/.test(location.search) && rows.length) rows.unshift({ price: Math.max(2, rows[0].price - 1), quantity: 1 });
+    return { listings: rows.slice(0, 10) };
+}
+function respondFull(url) {
     const u = new URL(url);
     if (u.hostname === 'api.torn.com') {
         const sel = u.searchParams.get('selections');
@@ -916,9 +928,24 @@ function respond(url) {
         // &w3bbuyers=<n> (3.23.0): Xanax has n TornW3B buyers (W3bBuyer1..n, ids 8001..), highest price first, and
         // one answer holds 100. Every fourth traded an hour ago, the others ten days ago; `tradedWithinHours` is
         // honoured, as the service says it is - &w3bignore=1: it is not. Their lists changed a day and a half ago.
+        // 3.26.0: every trader whose pretend list (below) holds the item is named too, at that price, as
+        // the service does - their lists changed three hours ago (&listsold=<hours>: that many hours ago;
+        // &listsold=0: no date given), so a flip's price can be checked. &nobuyers=1: none of them, as before.
         const trM = u.pathname.match(/^\/api\/marketplace\/(\d+)\/traders$/);
         if (trM) {
             const n = trM[1] === '206' ? Number(new URLSearchParams(location.search).get('w3bbuyers')) || 0 : 0;
+            if (!n && !/[?&]nobuyers=1/.test(location.search)) {
+                const q = new URLSearchParams(location.search).get('listsold');
+                const hours = q === null ? 3 : Number(q) || 0;
+                const NAMES = { 11: 'Bob', 44: 'Carol', 77: 'OnlyW3B', 5003: 'Mil-Soul', 5002: 'SweetTooth' };
+                const named = Object.entries(w3bPretendLists())
+                    .map(([tid, rows]) => [tid, rows.find((r) => String(r.itemId) === trM[1] && r.buyPrice > 0)])
+                    .filter(([, row]) => row)
+                    .map(([tid, row]) => ({ player_id: +tid, player_name: NAMES[tid] || 'Trader ' + tid, price: row.buyPrice, rating: { upvotes: 120, downvotes: 1 },
+                        last_action: NOW_S - 600, last_trade: NOW_S - 3600, ...(hours ? { pricelist_updated: NOW_S - hours * 3600 } : {}) }))
+                    .sort((a, b) => b.price - a.price);
+                return { total_count: named.length, traders: named };
+            }
             let all = Array.from({ length: n }, (_, i) => ({ player_id: 8001 + i, player_name: 'W3bBuyer' + (i + 1), price: 849000 - i * 10, rating: { upvotes: 120, downvotes: 1 },
                 last_action: NOW_S - 600, last_trade: NOW_S - (i % 4 === 3 ? 3600 : 10 * 86400), pricelist_updated: NOW_S - 36 * 3600 }));
             const within = Number(u.searchParams.get('tradedWithinHours')) || 0;
@@ -958,7 +985,18 @@ function respond(url) {
         // TornW3B list; trader 77 is only on TornW3B.
         const pl = u.pathname.match(/^\/api\/pricelist\/(\d+)$/);
         if (pl) {
-            const lists = {
+            const lists = w3bPretendLists();
+            return lists[pl[1]] || { error: 'Pricelist not found for this user', __http: 404 };
+        }
+        return { total_listings: 0, listings: [] };
+    }
+    if (u.hostname.endsWith('.workers.dev') && u.pathname === '/sync') {
+        return w3bPretendSync();
+    }
+    throw new Error('Unexpected host ' + u.hostname);
+}
+function w3bPretendLists() {
+            return {
                 11: [{ itemId: 206, name: 'Xanax', buyPrice: 852000 }, { itemId: 1, name: 'Hammer', buyPrice: 0 }, { itemId: -1, name: 'Flower Set', buyPrice: 300000 }, { itemId: 335, name: 'Stick of Dynamite', buyPrice: 18000 }],
                 44: [{ itemId: 1, name: 'Hammer', buyPrice: 118 }],
                 77: [{ itemId: 206, name: 'Xanax', buyPrice: 849500 }, { itemId: 180, name: 'Bottle of Beer', buyPrice: 61 }, { itemId: 335, name: 'Stick of Dynamite', buyPrice: 9000 }],
@@ -967,11 +1005,9 @@ function respond(url) {
                     5002: [{ itemId: 1002, name: 'Bag of Bon Bons', buyPrice: 200 }, { itemId: 1003, name: 'Box of Sweet Hearts', buyPrice: 190 }],
                 } : {}),
             };
-            return lists[pl[1]] || { error: 'Pricelist not found for this user', __http: 404 };
-        }
-        return { total_listings: 0, listings: [] };
-    }
-    if (u.hostname.endsWith('.workers.dev') && u.pathname === '/sync') {
+}
+function w3bPretendSync() {
+    {
         window.__sharedPosts += 1;
         if (SHARED === 'refused') return { __http: 404 };
         if (SHARED !== 'on') throw new Error('The pretend shared server is down');
@@ -992,7 +1028,6 @@ function respond(url) {
                 } : undefined,
         };
     }
-    throw new Error('Unexpected host ' + u.hostname);
 }
 function GM_xmlhttpRequest(opts) {
     window.__requests.push(opts.url);

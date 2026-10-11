@@ -57,9 +57,9 @@ test('an item\'s buyers: asked for those who traded lately only when told to, an
 test('when to ask for those who traded lately: Fresh prices only on, and more buyers than one answer holds - every other read', () => {
     const t = (n) => Array.from({ length: n }, (_, i) => ({ id: String(i + 1), price: 1000 - i }));
     const full = { at: NOW, total: 412, traders: t(100), withinHours: null };
-    // Two days, as Fresh prices only.
-    assert.equal(traders.FRESH_TRADED_HOURS, 48);
-    assert.equal(traders.buyersAsk(full, { fresh: true }), 48);
+    // A day, as Fresh prices only (two days until 3.26.0).
+    assert.equal(traders.FRESH_TRADED_HOURS, 24);
+    assert.equal(traders.buyersAsk(full, { fresh: true }), 24);
     // The switch off: as before.
     assert.equal(traders.buyersAsk(full, { fresh: false }), null);
     // Never read: everyone first.

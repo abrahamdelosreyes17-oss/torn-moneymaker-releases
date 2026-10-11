@@ -23,7 +23,7 @@
  */
 
 import { formatMoney, formatAge, parseMoneyInput, readWholeNumber } from '../core/parse.js';
-import { sharedNowLine, sharedKeyLine, sharedSplit, sharedKnown } from '../core/shared.js';
+import { sharedNowLine, sharedKeyLine, sharedKeyBoxLine, sharedSplit, sharedKnown } from '../core/shared.js';
 import { TRADE_MAX_UNITS, countView } from '../core/accepted.js';
 import { enoughProfit } from '../core/profit.js';
 import { stillLine } from '../core/still.js';
@@ -371,6 +371,8 @@ export class SellingPage {
         this.orderAsked = '';
         /* "Show all" in the desk, for the item it was pressed on. */
         this.showAll = { item: null, buyers: false, sellers: false };
+        // Refresh pressed on a trader: trade key -> when (the row says "Reading…" until the answer is in).
+        this.checkPressed = new Map();
     }
 
     /**
@@ -1037,6 +1039,7 @@ export class SellingPage {
         if (!said.length) said.push(['', info.bazaarsAt ? 'Nothing new. Prices are read as they change.' : 'Loading bazaar prices…']);
         const right = [];
         if (info.flipsWanted) right.push(['possible flips checked', info.flipsChecked + ' of ' + info.flipsWanted]);
+        if (info.pricesWaiting) right.push(['flips waiting for a price check', count(info.pricesWaiting)]);
         if (info.w3bKnown) right.push(['price lists', count(info.w3bRead || 0) + ' of ' + count(info.w3bKnown)]);
         const sig = JSON.stringify([said, right]);
         if (sig === this.tapeSig) return;
@@ -1412,7 +1415,7 @@ export class SellingPage {
             ? JSON.stringify([
                 where,
                 d.itemId, d.name, d.held, d.avg, d.bazaars, d.buyersTotal, d.buyersLoading, d.buyersListNote, d.pending, d.planWhy, d.paid,
-                d.buyers.map((b) => [b.id, b.name, b.price, b.te, b.teTop, b.teList, b.w3b, statusOf(b), b.trust ? b.trust.level + b.trust.score : '', s.networth && b.id ? s.networth.get(String(b.id)) : null, Boolean(b.favourite), b.traded || '', Boolean(b.troll), Boolean(b.lastPaidOnly)]),
+                d.buyers.map((b) => [b.id, b.name, b.price, b.te, b.teTop, b.teList, b.w3b, statusOf(b), b.trust ? b.trust.level + b.trust.score : '', s.networth && b.id ? s.networth.get(String(b.id)) : null, Boolean(b.favourite), b.traded || '', Boolean(b.troll), Boolean(b.lastPaidOnly), this.checkSig(b, now)]),
                 this.justBlacklisted ? this.justBlacklisted.at : 0,
                 (d.hidden || []).map((b) => [b.tradeKey, b.price, b.hiddenBy, statusOf(b), b.trust ? b.trust.level + b.trust.score : '']),
                 // How old a list is, in the words shown: drawn again when they change, not every second.
@@ -1688,6 +1691,7 @@ export class SellingPage {
                 spEl('b', { text: b.name }),
                 until ? spEl('small', {}, ['said no · passed over for ' + formatAge(until - Date.now()).replace(' ago', '') + ' · ', this.wordBtn('Undo', 'plan:undo:' + b.tradeKey, 'Plan with ' + b.name + ' again', () => this.h.onTradeUndecline && this.h.onTradeUndecline(b.tradeKey))]) : null,
                 this.oldListLine(d, b),
+                this.checkLine(d, b),
                 // Their two lists disagree: the lower is counted, and said.
                 b.differ ? spEl('small', { title: 'Their two price lists do not agree: check before trading', text: 'Lists differ: ' + this.listPrices(b, ' · ') + ' · counted at the lower' }) : null,
                 b.troll ? spEl('small', { class: 't-warn', text: 'Over 3× Item Market Average: not counted' }) : null,
@@ -1726,6 +1730,9 @@ export class SellingPage {
             spEl('thead', {}, [spEl('tr', {}, [spEl('th', { text: 'Trader' }), spEl('th', { class: 'n', text: 'Pays' }), spEl('th', { class: 'n', title: 'What the whole trade with them makes: this item and their other items', text: 'The trade' })])]),
             body,
         ]));
+        // Why a price makes no flip: the rows say it in a few words, the reason itself is here once.
+        const note = this.checkNote(rows);
+        if (note) box.appendChild(spEl('p', { class: 'note', text: note }));
     }
 
     /**
@@ -1832,6 +1839,83 @@ export class SellingPage {
         return o ? this.oldListEl(o) : null;
     }
 
+    /**
+     * A price that makes no flip, and why (3.26.0; the owner, 2026-10-11: "everytime it shows a flip, its
+     * because the item list is checked ... a refresh button on traders so it takes the price list from
+     * there and we get fresh prices"): under the trader, with Refresh - their list is read at once, then
+     * the item's buyers. A checked price says nothing: its Refresh is beside the name. A price that is
+     * only what they last paid has its own line.
+     */
+    checkLine(d, b) {
+        const c = b.check;
+        if (!c || b.troll || b.lastPaidOnly) return null;
+        const now = Date.now();
+        const reading = this.checkReading(b, now);
+        const refresh = b.id && b.w3b > 0
+            ? this.wordBtn('Refresh', 'check:' + b.tradeKey, 'Reads ' + b.name + '\'s price list on TornW3B now, then who buys this item' + (c.at ? ' (price last checked ' + this.checkAge(now - c.at) + ')' : ''), () => {
+                this.checkPressed.set(b.tradeKey, Date.now());
+                this.deskSig = null;
+                if (this.h.onTraderCheck) this.h.onTraderCheck(d.itemId, b.tradeKey);
+                this.redrawDesk();
+            })
+            : null;
+        if (reading) return spEl('small', { text: 'Reading their price list…' });
+        const said = c.ok ? 'Price checked ' + this.checkAge(now - c.at) : this.checkWhy(b, now);
+        return spEl('small', {}, [said, refresh ? ' · ' : null, refresh]);
+    }
+
+    /** How long ago a price was checked: "just now" under five seconds (a Refresh just answered), else the age. */
+    checkAge(ms) {
+        return ms < 5000 ? 'just now' : formatAge(ms);
+    }
+
+    /**
+     * Why a price makes no flip: the row's few words. One line in the row (the Trader column is narrow
+     * at 1280); the whole reason is said once under the table (checkNote), not under every trader.
+     */
+    checkWhy(b, now = Date.now()) {
+        const c = b.check || {};
+        if (c.why === 'te-only' || c.why === 'no-id') return 'On TornExchange only: no flip';
+        // The amber line above says when their list last changed.
+        if (c.why === 'old-list') return 'Over a day old: no flip';
+        if (c.why === 'no-date') return 'No date on their list: no flip';
+        return c.at ? 'Last checked ' + this.checkAge(now - c.at) + ': no flip' : 'Not checked yet: no flip';
+    }
+
+    /**
+     * The reason behind "no flip", once under the Traders pay table: one sentence for each kind of
+     * reason among the rows on show, in the rows' order. '' when every shown price makes a flip.
+     */
+    checkNote(rows) {
+        const words = {
+            'te-only': 'A price only on TornExchange has no date, so it makes no flip.',
+            'old-list': 'A list not changed in over a day makes no flip until they change it.',
+            'no-date': 'A list whose last change is not known yet makes no flip.',
+            'unchecked': 'A price makes a flip only once checked with its trader; Refresh checks it now.',
+        };
+        const kinds = [];
+        for (const b of rows) {
+            const c = b.check;
+            if (!c || c.ok || b.troll || b.lastPaidOnly) continue;
+            const kind = c.why === 'no-id' ? 'te-only' : words[c.why] ? c.why : 'unchecked';
+            if (!kinds.includes(kind)) kinds.push(kind);
+        }
+        return kinds.map((k) => words[k]).join(' ');
+    }
+
+    /** Refresh was pressed on this trader in the last 15 seconds, and the answer is not in yet. */
+    checkReading(b, now = Date.now()) {
+        const at = this.checkPressed.get(b.tradeKey) || 0;
+        return at > 0 && now - at < 15000 && !(b.check && b.check.at >= at);
+    }
+
+    /** What of a check is on screen (the desk is drawn again when it changes, not every second). */
+    checkSig(b, now = Date.now()) {
+        const c = b.check;
+        if (!c) return '';
+        return c.why + (c.at ? this.checkAge(now - c.at) : '') + (this.checkReading(b, now) ? 'r' : '');
+    }
+
     /** The line itself. @param {{at: number, level: 'aging'|'stale'}} o */
     oldListEl(o) {
         return spEl('small', { class: 't-warn', title: 'Check their list before you buy' }, ['Price list last changed ' + listAgeText(Date.now() - o.at)]);
@@ -1856,8 +1940,8 @@ export class SellingPage {
     /** TE list and W3B list, the ones that exist; then ⊘ (blacklist: never a buyer). @returns {Node[]} */
     traderLinks(b, { blacklist = false } = {}) {
         const out = [];
-        if (b.te) out.push(this.link('TE list', tePriceListUrl(b.teName || b.name), { cls: 'quiet lk', title: b.name + '\'s TornExchange price list: ' + formatMoney(b.te), focus: 'step-te' }));
-        if (b.w3b && b.id) out.push(this.link('W3B list', w3bPriceListUrl(b.id), { cls: 'quiet lk', title: b.name + '\'s TornW3B price list: ' + formatMoney(b.w3b), focus: 'step-w3b' }));
+        if (b.te) out.push(this.link('TE list', tePriceListUrl(b.teName || b.name), { cls: 'btn sm lk', title: b.name + '\'s TornExchange price list: ' + formatMoney(b.te), focus: 'step-te' }));
+        if (b.w3b && b.id) out.push(this.link('W3B list', w3bPriceListUrl(b.id), { cls: 'btn sm lk', title: b.name + '\'s TornW3B price list: ' + formatMoney(b.w3b), focus: 'step-w3b' }));
         if (blacklist) {
             out.push(spEl('button', {
                 type: 'button',
@@ -2322,6 +2406,8 @@ export class SellingPage {
         const toSend = A.items.filter((i) => !skippedAll(i));
         const sent = toSend.filter((i) => i.sent).length;
         const tot = A.totals || { pays: A.pays, cost: A.cost, profit: A.profit };
+        const open = tot.toBuy || { cost: 0, pays: 0 };
+        const kept = tot.left || { cost: 0 };
         const steps = A.items.flatMap((i) => i.steps || []);
         const left0 = steps.filter((st) => !done(st)).length;
         // A buy skipped is not a buy done: each is counted as what it is.
@@ -2333,9 +2419,14 @@ export class SellingPage {
             spEl('div', { class: 'bigrow' }, [
                 // What the trade comes to now (planned prices until you buy, then what you took). A zero is never green.
                 spEl('div', {}, [spEl('span', { class: 'lbl', text: 'Profit' }), spEl('div', { class: 'big' + this.moneyTone(tot.profit), text: signed(tot.profit) })]),
+                // The two sums are of the same items, so they come to the profit beside them (3.26.0); what is
+                // not in them yet, or no longer, has a line of its own.
                 spEl('div', { class: 'eq' }, ['You pay the bazaars', spEl('b', { text: formatMoney(tot.cost) }), spEl('br'), b.name + ' pays you', spEl('b', { text: formatMoney(tot.pays) }),
+                    ...(tot.own > 0 ? [spEl('br'), 'of it for your own items', spEl('b', { text: formatMoney(tot.own) })] : []),
+                    ...(open.cost > 0 ? [spEl('br'), 'Still to buy', spEl('b', { title: 'Bazaars of this trade you have not been to yet: not paid, and not counted above until you buy', text: formatMoney(open.cost) + ' (' + signed(open.pays - open.cost) + ')' })] : []),
+                    ...(kept.cost > 0 ? [spEl('br'), 'Left with you', spEl('b', { title: 'Bought and not taken by ' + b.name + ': it goes to To sell, and is not a loss of this trade', text: formatMoney(kept.cost) })] : []),
                     // It no longer comes to what they said yes to (a buy skipped, dropped or re-priced): said once, here.
-                    ...(A.profit > 0 && Math.round(A.profit) !== Math.round(tot.profit) ? [spEl('br'), 'Planned at their yes', spEl('b', { text: signed(A.profit) })] : [])]),
+                    ...(A.profit > 0 && Math.round(A.profit) !== Math.round(tot.profit + open.pays - open.cost) ? [spEl('br'), 'Planned at their yes', spEl('b', { text: signed(A.profit) })] : [])]),
             ]),
             this.stepBar(left0 ? 2 : 3),
             spEl('p', { class: 'note', text: steps.length
@@ -2703,10 +2794,10 @@ export class SellingPage {
             const all = [...T.waiting, ...yes];
             const stand = [T.ready.length ? count(T.ready.length) + ' ready to trade' : null, T.buying.length ? count(T.buying.length) + ' buying' : null, T.waiting.length ? count(T.waiting.length) + ' waiting for a yes' : null].filter(Boolean);
             const paid = yes.reduce((a, r) => a + (r.paid || 0), 0);
-            const cost = yes.reduce((a, r) => a + (r.cost || 0), 0);
+            const toBuy = yes.reduce((a, r) => a + (r.toBuy || 0), 0);
             this.tilesInto(this.tradesTiles, 'trades', [
                 { label: 'Going', value: count(all.length), small: all.length === 1 ? 'trade' : 'trades', sub: [stand.length ? stand.join(' · ') : 'none now'] },
-                { label: 'Paid to bazaars so far', value: formatMoney(paid), sub: yes.length ? ['in the ' + this.plural(yes.length, 'trade') + ' they said yes to · ', b(formatMoney(Math.max(0, cost - paid))), ' still to buy'] : ['nothing is bought before a yes'] },
+                { label: 'Paid to bazaars so far', value: formatMoney(paid), sub: yes.length ? ['in the ' + this.plural(yes.length, 'trade') + ' they said yes to · ', b(formatMoney(toBuy)), ' still to buy'] : ['nothing is bought before a yes'] },
                 { label: 'They pay you', value: formatMoney(yes.reduce((a, r) => a + (r.pays || 0), 0)), sub: [yes.length ? 'when ' + (yes.length === 1 ? 'that one is' : 'those ' + count(yes.length) + ' are') + ' traded' : 'no trade said yes to yet'] },
                 { label: 'Profit in all of them', value: signed(all.reduce((a, r) => a + (r.profit || 0), 0)), good: all.reduce((a, r) => a + (r.profit || 0), 0) > 0, sub: yes.length ? [b(signed(yes.reduce((a, r) => a + (r.profit || 0), 0))), ' in the ' + this.plural(yes.length, 'trade') + ' said yes to'] : ['none said yes to yet'] },
             ]);
@@ -3069,11 +3160,27 @@ export class SellingPage {
         this.keyStateEl = spEl('div', { class: 'sp-keystate', text: 'No key saved.' });
         this.keyForgetBtn = spEl('button', { type: 'button', class: 'sp-link sp-quiet', text: 'Forget key', onclick: () => this.h.onForgetKey && this.h.onForgetKey() });
         torn.row.appendChild(this.keyForgetBtn);
-        section('keys', 'Torn API key', 'Used only on this page, sent to api.torn.com only.', [
-            field('Limited key', ['Make one at ', newTab('Torn › Settings › API Key', TORN_API_KEY_URL)], [
+        /* The Public key (3.26.0): the one NPC Arbitrage's panel saves - shown here too, saved from either. */
+        const pub = keyField({
+            placeholder: 'Public Only API key',
+            onSave: (key) => this.h.onSavePublicKey && this.h.onSavePublicKey(key),
+            onReveal: () => (this.h.onRevealPublicKey ? this.h.onRevealPublicKey() : ''),
+        });
+        this.pubStateEl = spEl('div', { class: 'sp-keystate', text: 'No key saved.' });
+        this.pubServerEl = spEl('div', { class: 'sp-keystate' });
+        this.pubServerEl.hidden = true;
+        this.pubForgetBtn = spEl('button', { type: 'button', class: 'sp-link sp-quiet', text: 'Forget key', onclick: () => this.h.onForgetPublicKey && this.h.onForgetPublicKey() });
+        pub.row.appendChild(this.pubForgetBtn);
+        section('keys', 'Torn API keys', ['Both are sent to api.torn.com only. Make them at ', newTab('Torn › Settings › API Key', TORN_API_KEY_URL), '.'], [
+            field('Limited key', 'Used only on this page.', [
                 torn.row,
                 this.keyStateEl,
                 note(['Reads your inventory, your own id, item names, the Item Market for the item on the desk, and traders\' online status.']),
+            ]),
+            field('Public key', 'The key NPC Arbitrage uses on Torn\'s pages. Save it here or in its panel: it is one key, both places.', [
+                pub.row,
+                this.pubStateEl,
+                this.pubServerEl,
             ]),
         ]);
 
@@ -3101,8 +3208,21 @@ export class SellingPage {
         ]);
 
         this.w3bStateEl = spEl('div', { class: 'sp-keystate' });
-        section('w3b', 'TornW3B', ['Bazaar prices and traders\' price lists, from ', newTab('weav3r.dev', 'https://weav3r.dev/'), '. No key needed; it only receives item and trader ids.'], [
+        /* The key registered on TornW3B (3.26.0): optional - with it TornW3B allows 25 sellers lists a minute, not 10. */
+        const w3k = keyField({
+            placeholder: 'Key you registered on TornW3B (optional)',
+            onSave: (key) => this.h.onSaveW3bKey && this.h.onSaveW3bKey(key),
+            onReveal: () => (this.h.onRevealW3bKey ? this.h.onRevealW3bKey() : ''),
+        });
+        this.w3bKeyStateEl = spEl('div', { class: 'sp-keystate', text: 'No key saved · an item\'s bazaars: 8 reads a minute.' });
+        this.w3bKeyForgetBtn = spEl('button', { type: 'button', class: 'sp-link sp-quiet', text: 'Forget key', onclick: () => this.h.onForgetW3bKey && this.h.onForgetW3bKey() });
+        w3k.row.append(this.w3bKeyForgetBtn);
+        section('w3b', 'TornW3B', ['Bazaar prices and traders\' price lists, from ', newTab('weav3r.dev', 'https://weav3r.dev/'), '. No key needed; without one it only receives item and trader ids.'], [
             field('State', null, [this.w3bStateEl]),
+            field('TornW3B key', ['Optional. The Torn key you registered on ', newTab('weav3r.dev', 'https://weav3r.dev/'), '. With it TornW3B lets this page read an item\'s bazaars 22 times a minute instead of 8. It goes to weav3r.dev only, and only with those reads. Your Limited key goes there only if you paste it in this box.'], [
+                w3k.row,
+                this.w3bKeyStateEl,
+            ]),
         ]);
 
         /*
@@ -3438,16 +3558,17 @@ export class SellingPage {
          */
         const tos = spEl('table', { class: 'sp-tos' });
         this.tosEl = tos;
-        tos.appendChild(spEl('tr', {}, [spEl('th'), spEl('th', { text: 'Limited key' }), spEl('th', { text: 'Full key (Torn Ledger)' }), spEl('th', { class: 'tos-sv', text: 'Public key on the shared server' })]));
-        for (const [k, limited, full, server] of [
-            ['Data storage', 'Only locally, in this browser', 'Only locally, in this browser: time, item, quantity, price, where, who. Never the log\'s own text.', 'On the server: the bazaar prices your key read. Nothing about your account.'],
-            ['Data sharing', 'Nobody', 'Nobody. Your trades go into a zip only when you download one yourself (Report a problem, Export API usage): it names the traders you traded with, and you choose who gets it.', 'The people on this server only.'],
-            ['Purpose of use', 'Personal gain: who pays most for your items, and flips', 'Personal: profit tracking', 'Reading bazaars for the group, while any of you is on.'],
-            ['Key storage & sharing', 'Stored locally / Not shared', 'Stored locally / Not shared', 'Kept on the server as a secret that cannot be read back. Shared with no one.'],
-            ['Key access level', 'Limited (your inventory and your own id; item names; Item Market prices; traders\' public status and networth)', 'Full, used only for your log (bazaar, Item Market and NPC shop buys and sells, and muggings), your trades, and key info', 'Public Only'],
-            ['Other services', 'TornExchange, only with the key you log in there with', 'None: never sent to TornExchange or TornW3B', 'None'],
+        tos.appendChild(spEl('tr', {}, [spEl('th'), spEl('th', { text: 'Limited key' }), spEl('th', { text: 'Public key (NPC Arbitrage)' }), spEl('th', { text: 'Full key (Torn Ledger)' }), spEl('th', { class: 'tos-sv', text: 'Public key on the shared server' })]));
+        // The Public key's column (3.26.0: it can be pasted on this page now) says what its panel on Torn's pages says.
+        for (const [k, limited, open, full, server] of [
+            ['Data storage', 'Only locally, in this browser', 'Only locally, in this browser', 'Only locally, in this browser: time, item, quantity, price, where, who. Never the log\'s own text.', 'On the server: the bazaar prices your key read. Nothing about your account.'],
+            ['Data sharing', 'Nobody', 'Nobody', 'Nobody. Your trades go into a zip only when you download one yourself (Report a problem, Export API usage): it names the traders you traded with, and you choose who gets it.', 'The people on this server only.'],
+            ['Purpose of use', 'Personal gain: who pays most for your items, and flips', 'Competitive advantage: finding Bazaar and Item Market listings below NPC or market value, and filling your own listing prices', 'Personal: profit tracking', 'Reading bazaars for the group, while any of you is on.'],
+            ['Key storage & sharing', 'Stored locally / Not shared', 'Stored locally / Not shared. A one-way code made from it, never the key, is sent to Torn Bids\' own server to ask whether this PC is one of its people.', 'Stored locally / Not shared', 'Kept on the server as a secret that cannot be read back. Shared with no one.'],
+            ['Key access level', 'Limited (your inventory and your own id; item names; Item Market prices; traders\' public status and networth)', 'Public (item names and shop prices; Item Market prices; key info; bazaar owners\' public status; your own id)', 'Full, used only for your log (bazaar, Item Market and NPC shop buys and sells, and muggings), your trades, and key info', 'Public Only'],
+            ['Other services', 'TornExchange, only with the key you log in there with. TornW3B, only if the key you paste in the TornW3B box is this one', 'None: TornW3B receives item ids only, never this key', 'None: never sent to TornExchange or TornW3B', 'None'],
         ]) {
-            tos.appendChild(spEl('tr', {}, [spEl('th', { text: k }), spEl('td', { text: limited }), spEl('td', { text: full }), spEl('td', { class: 'tos-sv', text: server })]));
+            tos.appendChild(spEl('tr', {}, [spEl('th', { text: k }), spEl('td', { text: limited }), spEl('td', { text: open }), spEl('td', { text: full }), spEl('td', { class: 'tos-sv', text: server })]));
         }
         section('terms', 'Key use', 'Torn\'s API terms: what each key is used for, and where it is kept.', [tos]);
 
@@ -3576,6 +3697,7 @@ export class SellingPage {
         parts.push(known ? count(read) + ' of ' + count(known) + ' price lists read' : 'No trader known yet');
         parts.push(info.bazaarsAt ? 'bazaar prices ' + formatAge(now - info.bazaarsAt) : 'bazaar prices loading');
         if (info.flipsWanted) parts.push('possible flips checked ' + info.flipsChecked + ' of ' + info.flipsWanted);
+        if (info.pricesWaiting) parts.push(count(info.pricesWaiting) + (info.pricesWaiting === 1 ? ' possible flip waits' : ' possible flips wait') + ' for a price check');
         this.w3bStateEl.textContent = parts.join(' · ') + '.';
         this.w3bStateEl.className = 'sp-keystate' + (info.bazaarsError && !info.bazaarsAt ? ' sp-bad' : info.bazaarsAt ? ' sp-ok' : '');
     }
@@ -3740,6 +3862,24 @@ export class SellingPage {
             this.keyStateEl.classList.add('sp-ok');
         }
 
+        // The Public key: NPC Arbitrage's, the same one its panel on Torn's pages shows.
+        const pk = info.publicKey || {};
+        this.pubForgetBtn.hidden = !pk.has;
+        this.pubStateEl.className = 'sp-keystate';
+        if (pk.error) {
+            this.pubStateEl.textContent = pk.error;
+            this.pubStateEl.classList.add('sp-bad');
+        } else if (!pk.has) {
+            this.pubStateEl.textContent = 'No key saved: NPC Arbitrage on Torn\'s pages is off.';
+        } else {
+            const access = pk.access ? String(pk.access).replace(/\s*access$/i, '') : '';
+            this.pubStateEl.textContent = 'Saved' + (access ? ' · ' + access + ' access' : '') + '.' + (pk.over ? ' A Public Only key is enough here.' : '');
+            this.pubStateEl.classList.add(pk.over ? 'sp-warn' : 'sp-ok');
+        }
+        const serverSays = pk.has ? sharedKeyBoxLine(info.shared || null) : '';
+        if (this.pubServerEl.textContent !== serverSays) this.pubServerEl.textContent = serverSays;
+        this.pubServerEl.hidden = !serverSays;
+
         this.teStateEl.className = 'sp-keystate';
         if (info.teKeyMsg) {
             this.teStateEl.textContent = info.teKeyMsg;
@@ -3757,6 +3897,25 @@ export class SellingPage {
             if (info.teError) this.teStateEl.classList.add('sp-bad');
         }
         this.teSameBtn.hidden = !info.hasKey;
+
+        // The key registered on TornW3B, and what is left of its sellers lists (their own minute and day).
+        // (The minute's count moves every few seconds: not on a settings page. The day's is said.)
+        const L = info.w3bListing || null;
+        const left = L ? ' · ' + count(L.day) + ' of 900 today' : '';
+        this.w3bKeyStateEl.className = 'sp-keystate';
+        if (info.w3bKeyMsg) {
+            this.w3bKeyStateEl.textContent = info.w3bKeyMsg;
+            this.w3bKeyStateEl.classList.add('sp-bad');
+        } else if (info.w3bKey === 'refused') {
+            this.w3bKeyStateEl.textContent = 'TornW3B does not know this key: it is not sent. An item\'s bazaars: 8 reads a minute' + left + '.';
+            this.w3bKeyStateEl.classList.add('sp-bad');
+        } else if (info.w3bKey === 'saved') {
+            this.w3bKeyStateEl.textContent = 'Saved · an item\'s bazaars: 22 reads a minute' + left + '.';
+            this.w3bKeyStateEl.classList.add('sp-ok');
+        } else {
+            this.w3bKeyStateEl.textContent = 'No key saved · an item\'s bazaars: 8 reads a minute' + left + '.';
+        }
+        this.w3bKeyForgetBtn.hidden = info.w3bKey === 'none' || !info.w3bKey;
     }
 
     /** Only what stops the page working: a key missing or refused, or a wait. */
@@ -3849,6 +4008,8 @@ export class SellingPage {
         if (info.teBadKey && !info.knownTraders) return 'No traders: TornExchange refused the key.';
         // Buyers online only (3.20.5): flips are found, their buyers' statuses are being read.
         if (info.flipsWaiting) return 'Checking who is online…';
+        // 3.26.0: a flip is shown only once TornW3B confirmed its buyer's price minutes ago.
+        if (info.pricesWaiting) return 'Checking the price of ' + count(info.pricesWaiting) + (info.pricesWaiting === 1 ? ' possible flip' : ' possible flips') + ' with its trader…';
         if (info.flipsChecked < info.flipsWanted) return 'No flips found yet. Checking ' + info.flipsChecked + ' of ' + info.flipsWanted + '.';
         // A trade under way holds the list as it was: empty then, empty now, and that is said - before
         // "Looking for traders", which a held list is not doing.

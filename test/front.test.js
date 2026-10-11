@@ -140,12 +140,12 @@ function rig({ burst = 12 } = {}) {
             const before = t;
             beat();
             // The overlay asks only from a tab in view (its client sends nothing from a hidden one).
-            if (inView === 'page' && frontMayAsk('page', sides, t) && !tabs.page.stats().coolingDown) await tabs.page.get('marketplace/1', { tag: 'w.feed' }).catch(() => {});
+            if (inView === 'page' && frontMayAsk('page', sides, t) && !tabs.page.stats().coolingDown) await tabs.page.get('pricelist/1', { tag: 'w.feed' }).catch(() => {});
             if (!tabs.bids.stats().coolingDown) {
-                if (frontMayAsk('bids', sides, t)) await tabs.bids.get('marketplace/2', { tag: 'w.flips' }).catch(() => {});
+                if (frontMayAsk('bids', sides, t)) await tabs.bids.get('pricelist/2', { tag: 'w.flips' }).catch(() => {});
                 else if (t - tradeReadAt >= 20000) {
                     tradeReadAt = t;
-                    await tabs.bids.get('marketplace/206', { tag: 'w.trade' }).catch(() => {});
+                    await tabs.bids.get('pricelist/206', { tag: 'w.trade' }).catch(() => {});
                 }
             }
             if (t === before) t += 1000;

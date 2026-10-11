@@ -137,6 +137,8 @@ export function tradesBoard({ asked = [], pins = [], accepted = [], ended = [], 
             cost: Math.round(tot.cost),
             pays: Math.round(tot.pays),
             paid: Math.round(steps.reduce((a, st) => a + (st.bought || st.boughtQty > 0 ? (st.boughtQty > 0 ? st.boughtQty : st.qty) * st.price : 0), 0)),
+            // Bazaars not been to yet, at the plan's prices (3.26.0: `cost` is of what `pays` counts, no longer of every step).
+            toBuy: Math.round(steps.reduce((a, st) => a + (stepDone(st) ? 0 : st.qty * st.price), 0)),
             // Lines in Torn's trade so far, and the bazaar to buy from next.
             sent: (t.items || []).filter((i) => i.sent).length,
             next: open ? open.sellerName || (open.sellerId ? 'Player ' + open.sellerId : null) : null,

@@ -1984,6 +1984,98 @@ Not seen on real Torn pages before release: the panel's switch, the "In this
 bazaar" list, the closed Torn Bids page, and the rebuilt pages - they were
 checked on the harness (1536, 2560 and 900 wide, first run), 639 tests.
 
+### A flip only on a price checked minutes ago, and TornW3B asked only what we cannot know (3.26.0)
+
+**Why.** 3.25.0 was slow and showed flips that were not there. Seven report zips
+gave the cause: every one of TornW3B's refusals was an item's sellers list
+(`GET /marketplace/{id}`), which TornW3B limits by itself - ten a minute and a
+thousand a day for an address - while Torn Bids wanted about 24 a minute. 3.25.0
+had read the refusals as "a burst is refused" and slowed *every* request, so the
+buyers and the price lists starved (0.4 buyers reads a minute where 8.5 were
+wanted) and a flip stood on a trader's price from hours before.
+
+**A flip is shown only on a checked price** (`src/core/checked.js`). A buyer
+makes a flip, and a line of a trade, only when all three hold:
+
+1. the price is the trader's TornW3B price - a price that is only on
+   TornExchange shows under "Traders pay" and makes no flip alone
+   (TornExchange gives no date for a price);
+2. TornW3B confirmed that trader at that price within the last 5 minutes: the
+   item's buyers read naming them at it, or their own list read by this PC;
+3. their list changed within the last 24 hours (a date not known counts as old).
+
+Under each "Traders pay" row one line says which: "Price checked 40s ago ·
+Refresh", or why it makes no flip. **Refresh** reads that trader's own list and
+the item's buyers at once. Items that would be a flip once checked are read
+first, and the footer counts them ("waiting for a price check"). A trader's list
+is kept 7 days and shown as old; lists of the trade on the desk are read every
+3 minutes, a flip's trader every 10, a list not changed in a day or of a trader
+Trusted hides every 6 hours, and among the hourly ones the most recently
+changed goes first. An item's buyers: the desk's every 2 minutes, a flip's
+every 3, the rest every 10 (it was 20 for all).
+
+**The sellers list has a limit of its own** (`src/api/w3b.js`): 8 a minute and
+900 a day, every tab together, and `Retry-After` is obeyed. A refusal stops the
+sellers lists only; buyers and price lists run at full pace again. Two of the
+minute and a hundred of the day are kept for the desk's item and a trade.
+
+**The key you registered on TornW3B** (optional; Settings > TornW3B). With it
+TornW3B allows 25 sellers lists a minute; Torn Bids uses 22. It is sent as the
+header `X-API-Key`, only with a sellers list, only to weav3r.dev, never in a web
+address. TornW3B answering 401 means it does not know the key: it is not sent
+again, and Settings says so. The Limited key is never sent there by itself, and
+the Ledger's Full key is refused in that box.
+
+**The light list** (`src/core/cheap.js`): `?filler=1`, the ten cheapest prices
+and counts with no seller, on a limit of its own (200 a minute). It stands in
+for a sellers list where the sellers are not the question: every item in turn
+(the sweep), and a possible flip whose sellers were read in full in the last
+half hour. There it either says what that read said - the read stands as of
+now, no sellers list spent - or it does not, and the sellers are read at once.
+It never changes a row. Its shape was known from TornW3B's spec only when this
+was written: an answer that cannot be read is logged by its field names and the
+light list is left alone for that visit; so it is when it hardly ever agrees
+with a sellers list.
+
+**Through the shared server** (`src/core/shared.js`, `src/feed/shared-link.js`):
+
+- NPC Arbitrage takes bazaar prices the server read from Torn itself: every
+  item an NPC buys is in what this PC says it wants, a deal row is shown from
+  the server's read alone (under 5 minutes old), and a sellers list is not
+  asked for when the server already knows the cheapest price.
+- The server hands out TornW3B's work: this PC says which sellers lists it
+  wants and what is left of its limit, and reads only those handed to it
+  (while the answer is under 45 seconds old). Each PC still asks from its own
+  address, under the script's own name, inside the published limit.
+- Trader lists go both ways: the newest five this PC read go up, and lists
+  another person's PC read come down. Such a list is shown, and checks no
+  price: a flip stands only on this PC's own read of TornW3B.
+- A PC the server does not know is asked about again after 5, 15 and 60
+  minutes, then every 6 hours (it was 6 hours from the first), and at once
+  when its key is saved again.
+
+**Torn Archive on the same PC** asks TornW3B for sellers lists too. Each app
+writes its count to the page's storage (`tornapps.w3b.trading`,
+`tornapps.w3b.archive`) and adds the other's, so the two stay under one limit.
+
+**The Public key can be saved in Torn Bids' Settings.** It is the one key NPC
+Arbitrage's panel saves: shown in both places, saved or forgotten from either.
+Torn is asked about it before it replaces the saved one. Under the box, while
+the server does not know this key, one line says so and when it is asked again.
+
+**Smaller things.** The accepted trade's card adds up what was paid and what
+is still to buy from the same lines it shows. "TE list" and "W3B list" are
+buttons. With Trusted on, the lists of traders it hides are read every 6 hours.
+The panel's header fits a 240 px panel (a 1920x1200 laptop).
+
+**In the overlay (NPC Arbitrage)** this changes: deal rows from the server's
+own reads, fewer sellers lists asked, the TornW3B key's header on its sellers
+lists too, and every NPC-sellable item in what it tells the server it wants.
+
+Not seen on real Torn pages or against the live server: all of the above. It
+was checked on the harness and by 674 tests, the shared parts against the
+server's real code. The light list's real answer has never been seen.
+
 ---
 
 ## Architecture
@@ -2154,7 +2246,14 @@ The traders page's key (a separate table beside its own field):
 |---|---|---|---|---|
 | Only locally | Nobody | Personal gain: who pays most for your items, and flips | Stored locally / Not shared | Limited (user: inventory - your own items; user: basic - your own id; torn: items - item names; market: itemmarket - the Item Market for the item on the desk; user: profile - traders' public online status; user: personalstats (networth) - traders' public networth) |
 
-Plus: *TornExchange, only with the key you log in there with.*
+Plus: *TornExchange, only with the key you log in there with. TornW3B, only when
+you paste the key you registered there into its own box (3.26.0): sent as a
+header with an item's sellers list, never in a web address.*
+
+Since 3.26.0 the panel's Public key can be pasted on the traders page too (the
+same stored key); the page's "Key use" table has a column for it with the
+panel's words, and says that the shared server is asked with a word made from
+the key, which cannot be turned back into it.
 
 The Torn Ledger's key (its own table beside its own field):
 

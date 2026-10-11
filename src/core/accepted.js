@@ -899,23 +899,45 @@ export function acceptedTotals(trade) {
     let pays = 0;
     let cost = 0;
     let profit = 0;
+    let own = 0;
+    let spent = 0;
+    const toBuy = { cost: 0, pays: 0, steps: 0 };
+    const left = { units: 0, cost: 0 };
     for (const i of (trade && trade.items) || []) {
         const taken = takenUnits(i);
         pays += taken * i.bid;
-        for (const st of i.steps || []) {
-            if (st.skipped && !st.bought) continue;
-            cost += (st.boughtQty > 0 ? st.boughtQty : st.qty) * st.price;
-        }
         if (i.kind !== 'flip') {
+            // Yours: they pay for it, no bazaar is paid - said apart, so the card's sum holds.
+            own += taken * i.bid;
             profit += yoursProfit(i, taken);
             continue;
         }
         // Not bought yet: planned prices; bought: what it cost.
         const started = (i.steps || []).some(stepDone);
         const each = started ? costEach(i) : (i.steps || []).reduce((a, st) => a + st.qty * st.price, 0) / Math.max(1, (i.steps || []).reduce((a, st) => a + st.qty, 0));
+        // The cost of the very units `pays` counts (3.26.0). Before, every step not skipped was added
+        // here, bought or not, while pays and profit counted only what was bought once a line was started:
+        // "You pay $20.16M, they pay $17.82M, profit +$550,736" (the friend's card, 2026-10-11).
+        cost += taken * each;
         profit += taken * (i.bid - each);
+        for (const st of i.steps || []) {
+            if (st.bought || st.boughtQty > 0) spent += (st.boughtQty > 0 ? st.boughtQty : st.qty) * st.price;
+            // Started on, and this bazaar still to visit: neither paid nor expected yet.
+            else if (started && !stepDone(st)) {
+                toBuy.cost += st.qty * st.price;
+                toBuy.pays += st.qty * i.bid;
+                toBuy.steps += 1;
+            }
+        }
+        // Bought, and they did not take it: its cost is not this trade's - it is yours to sell.
+        const kept = Math.max(0, sendUnits(i) - taken);
+        if (started && kept) {
+            left.units += kept;
+            left.cost += kept * each;
+        }
     }
-    return { pays, cost, profit };
+    // (pays - own) - cost is the flips' profit, always; `profit` adds what your own items make.
+    return { pays, cost, profit, own, spent, toBuy, left };
 }
 
 /* ---------------------------------- What goes into the trade now (3.17.2) */

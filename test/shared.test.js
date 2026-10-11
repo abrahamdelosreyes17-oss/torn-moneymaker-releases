@@ -488,3 +488,50 @@ test('nobody sets Shared up: the address is built in, and the word of the PC is 
     assert.equal(await sharedWord(null), null);
     assert.equal(await sharedWord('short'), null);
 });
+
+/* 3.26.0 (the owner, 2026-10-11): NPC Arbitrage takes bazaar prices from Torn's API through the shared server. */
+test('the server\'s own reads make a deal by themselves: listings under what the item sells for, read in the last five minutes', async () => {
+    const { sharedDealRows, sharedKnowsLowest, SHARED_DEAL_MAX_AGE_MS } = await import('../src/core/shared.js');
+    const T = 1_900_000_000_000;
+    assert.equal(SHARED_DEAL_MAX_AGE_MS, 5 * 60000);
+    // seller -> [changed at, seen at, gen, [[item, price, qty]]]
+    const index = sharedIndex([{
+        888: [T - 600000, T - 20000, 1, [[206, 835000, 3], [1, 40, 9]]],
+        4444: [T - 60000, T - 60000, 1, [[206, 836000, 1], [206, 1, 5], [206, 834000, 0]]],
+        555: [T - 4 * 3600000, T - 6 * 60000, 1, [[206, 700000, 2]]],
+    }]);
+    // Under $836,000: only 888's - 4444's is not under it, its $1 listing is locked, its empty one is none, 555 was read six minutes ago.
+    assert.deepEqual(sharedDealRows(index, 206, 836000, T), [
+        { sellerId: '888', sellerName: null, price: 835000, qty: 3, dataAt: T - 20000, changedAt: T - 600000, sponsored: false, shared: true },
+    ]);
+    assert.deepEqual(sharedDealRows(index, '206', 900000, T).map((r) => [r.sellerId, r.price]), [['888', 835000], ['4444', 836000]]);
+    assert.deepEqual(sharedDealRows(index, 206, 835000, T), []);
+    assert.deepEqual(sharedDealRows(index, 999, 1e9, T), []);
+    assert.deepEqual(sharedDealRows(null, 206, 1e9, T), []);
+
+    // TornW3B's summary says the cheapest is $835,000: the server read that very price - nothing to ask TornW3B.
+    assert.equal(sharedKnowsLowest(index, 206, 835000, T), true);
+    assert.equal(sharedKnowsLowest(index, 206, 840000, T), true);
+    // TornW3B sees a cheaper one than any the server read lately (555's read is too old): its sellers list is asked for.
+    assert.equal(sharedKnowsLowest(index, 206, 700000, T), false);
+    assert.equal(sharedKnowsLowest(index, 206, 834999, T), false);
+    // A locked $1 listing is never "known", whoever names it.
+    assert.equal(sharedKnowsLowest(index, 206, 1, T), false);
+    assert.equal(sharedKnowsLowest(index, 999, 50, T), false);
+    assert.equal(sharedKnowsLowest(null, 206, 835000, T), false);
+});
+
+test('under the Public key\'s box: what the server said of this key, only while the Shared part does not say it', async () => {
+    const { sharedKeyBoxLine } = await import('../src/core/shared.js');
+    // No key or no server address in this copy; or one of the server's own people (the Shared part says it).
+    assert.equal(sharedKeyBoxLine(null), '');
+    assert.equal(sharedKeyBoxLine({ on: false }), '');
+    assert.equal(sharedKeyBoxLine({ on: true, okAt: 5, key: 'working' }), '');
+    // The server does not know this key: said plainly, with when it is asked again.
+    assert.match(sharedKeyBoxLine({ on: true, unknown: true, unknownWaitMs: 5 * 60000 }), /does not know this key.*needs this same key from you.*every 5 minutes.*save the key here again/);
+    assert.match(sharedKeyBoxLine({ on: true, unknown: true, unknownWaitMs: 60 * 60000 }), /every 1 hour,/);
+    assert.match(sharedKeyBoxLine({ on: true, unknown: true, unknownWaitMs: 6 * 3600000 }), /every 6 hours,/);
+    // Not asked yet, or no answer.
+    assert.equal(sharedKeyBoxLine({ on: true }), 'Shared server: not asked yet.');
+    assert.equal(sharedKeyBoxLine({ on: true, error: 'no answer' }), 'Shared server: no answer yet.');
+});

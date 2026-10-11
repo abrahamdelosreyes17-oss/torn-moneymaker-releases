@@ -113,9 +113,11 @@ export function deskItem({ pickedByYou = false, selected = null, filter = 'all',
  * @param {function} [p.buyersDue] - (itemId) => boolean
  * @param {string[]} [p.near] - near-misses: a bazaar a little over the best bid (the summary lags), 3.15
  * @param {string[]} [p.sweep] - every other item anyone buys, oldest read first: what is left of the budget (3.15)
+ * @param {string[]} [p.check] - items with a flip shown or possible (3.26.0): their buyers are read before more
+ *   bazaars, since a flip is shown only on a price checked minutes ago (core/checked.js)
  * @returns {null|{kind: 'summary'}|{kind: 'bazaars', id: string}|{kind: 'buyers', id: string}|{kind: 'list', id: string}}
  */
-export function nextW3bRead({ summaryDue = false, picked = null, active = false, live = [], wanted = [], candidates = [], pinned = [], list = null, turn = 0, hidden = false, due, buyers = [], buyersDue = () => false, near = [], sweep = [] }) {
+export function nextW3bRead({ summaryDue = false, picked = null, active = false, live = [], wanted = [], candidates = [], pinned = [], list = null, turn = 0, hidden = false, due, buyers = [], buyersDue = () => false, near = [], sweep = [], check = [] }) {
     if (summaryDue) return { kind: 'summary' };
     if (picked && due(picked, 'desk')) return { kind: 'bazaars', id: picked };
     if (picked && buyers.includes(picked) && buyersDue(picked)) return { kind: 'buyers', id: picked };
@@ -125,6 +127,8 @@ export function nextW3bRead({ summaryDue = false, picked = null, active = false,
         const w = wanted.find((id) => due(id, 'slow'));
         if (w) return { kind: 'bazaars', id: w };
     }
+    const chk = check.find((id) => buyersDue(id));
+    if (chk) return { kind: 'buyers', id: chk };
     const cand = candidates.find((id) => due(id, 'slow'));
     const buy = buyers.find((id) => buyersDue(id));
     // Hidden, the flips first: the price lists can wait until you look.

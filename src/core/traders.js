@@ -20,14 +20,22 @@
 
 export const TRADER_DB_VERSION = 1;
 
-/** A TornW3B list is shown for this long after it was read, then dropped. */
-export const W3B_LIST_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+/**
+ * A TornW3B list is kept, and shown, for this long after it was read, then dropped. Seven days since
+ * 3.26.0 (the owner, 2026-10-11: "we keep a stale list we keep for 7 days"); it was six hours, so a
+ * Torn Bids opened in the morning knew no trader until 2,800 lists had been read again. A kept list
+ * says how old it is and never makes a flip by itself: a flip needs a check (core/checked.js).
+ */
+export const W3B_LIST_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
 /** Lists of traders who buy something you hold are re-read this often. */
 export const W3B_HELD_REFRESH_MS = 10 * 60 * 1000;
 
 /** Every other trader's list is re-read this often. */
 export const W3B_OTHER_REFRESH_MS = 60 * 60 * 1000;
+
+/** A list not changed in over a day (it makes no flip), or of a trader the Trusted switch hides: this often. */
+export const W3B_SLOW_REFRESH_MS = 6 * 60 * 60 * 1000;
 
 /** A trader with no TornW3B list is checked again after this. */
 export const W3B_MISSING_RECHECK_MS = 24 * 60 * 60 * 1000;
@@ -241,13 +249,21 @@ export function liveW3bPrices(trader, now = Date.now()) {
 
 /**
  * Which trader's TornW3B list to read next, or null if none is due. Never
- * read first, then the oldest list of a trader who buys something you hold,
- * then the oldest of everyone else; traders with no list are re-checked daily.
+ * read first, then one marked due (Refresh on a trader, or TornW3B says they
+ * changed their list since we read it), then the oldest list of a trader who
+ * buys something you hold or stands behind a flip, then everyone else - the
+ * list changed most recently first (3.26.0, the owner: "prioritize recent
+ * updates") - then the slow ones; traders with no list are re-checked daily.
  *
  * @param {object} db
  * @param {Set<string>} heldIds - item ids in your inventory
+ * @param {number} now
+ * @param {object} [o]
+ * @param {Set<string>} [o.hot] - traders behind a flip shown or possible: read as often as those who buy what you hold
+ * @param {function} [o.listAtOf] - (trader id) => when they last changed their list (ms), 0 when not known
+ * @param {function} [o.slow] - (trader id) => true: read only every W3B_SLOW_REFRESH_MS (hidden by the Trusted switch)
  */
-export function nextW3bTrader(db, heldIds = new Set(), now = Date.now()) {
+export function nextW3bTrader(db, heldIds = new Set(), now = Date.now(), { hot = null, listAtOf = null, slow = null } = {}) {
     let best = null;
     let bestRank = Infinity;
     for (const [id, t] of Object.entries(db.traders)) {
@@ -262,15 +278,21 @@ export function nextW3bTrader(db, heldIds = new Set(), now = Date.now()) {
             rank = 3e15 + w.checkedAt;
         } else {
             const age = now - (w.at || 0);
-            const buysHeld = heldIds.size > 0 && Object.keys(w.prices || {}).some((i) => heldIds.has(i));
+            const isHot = Boolean(hot && hot.has(id));
+            const buysHeld = isHot || (heldIds.size > 0 && Object.keys(w.prices || {}).some((i) => heldIds.has(i)));
+            const changed = listAtOf ? Number(listAtOf(id)) || 0 : 0;
             if (w.due) {
                 rank = 5e14 + (w.at || 0);
             } else if (buysHeld) {
                 if (age < W3B_HELD_REFRESH_MS) continue;
                 rank = 1e15 + (w.at || 0);
+            } else if ((changed > 0 && now - changed > PRICES_STALE_MS) || (slow && slow(id))) {
+                if (age < W3B_SLOW_REFRESH_MS) continue;
+                rank = 2.5e15 + (w.at || 0);
             } else {
                 if (age < W3B_OTHER_REFRESH_MS) continue;
-                rank = 2e15 + (w.at || 0);
+                // With the dates known: the list changed most recently first. Without: the oldest read first, as before.
+                rank = listAtOf ? 2e15 + (1e14 - Math.min(changed, 1e14 - 1)) : 2e15 + (w.at || 0);
             }
         }
         if (rank < bestRank) {
@@ -632,8 +654,13 @@ export function hiddenBuyers(buyers, { prefs = {}, levelOf = () => 'unknown', vo
  * the item (TornExchange gives no date: a price also listed there is left
  * alone). A trader whose list date was never read is not stale - not known
  * is not old.
+ *
+ * 3.26.0 (the owner, 2026-10-11: "price list has to be updated for at most 24
+ * hours ago"): the line is one day, not two, and the amber "getting old" mark
+ * (PRICES_AGING_MS) starts at twelve hours. A flip needs more than this - a
+ * check minutes old, whatever the Fresh prices switch says (core/checked.js).
  */
-export const PRICES_STALE_MS = 2 * 24 * 60 * 60 * 1000;
+export const PRICES_STALE_MS = 24 * 60 * 60 * 1000;
 
 /**
  * @param {{id, w3b, te}} b - a buyer row (buyersForItem)
@@ -702,7 +729,7 @@ export function freshOnly(buyers, listAtOf, now = Date.now()) {
  * trader's TornW3B price, with no TornExchange price of theirs for the item
  * and a list date that was read.
  */
-export const PRICES_AGING_MS = 24 * 60 * 60 * 1000;
+export const PRICES_AGING_MS = 12 * 60 * 60 * 1000;
 
 /**
  * @param {{id, w3b, te}} b - a buyer row (buyersForItem)

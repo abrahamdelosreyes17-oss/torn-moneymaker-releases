@@ -20,6 +20,23 @@
  *      and a hard cooldown on 429 or a non-JSON (Cloudflare challenge) body.
  *
  * Responses are cached server-side for 60s, so asking faster is pointless.
+ *
+ * 3.26.0 - each kind of request has its own limit, as TornW3B has (its spec,
+ * read 2026-10-10; per address, without a key):
+ *
+ *   GET /marketplace/{itemId}            the sellers of an item: 10 a minute, 1,000 a day
+ *   GET /marketplace/{itemId}?filler=1   its 10 cheapest prices and counts, no seller:
+ *                                        200 a minute, 10,000 a day, a counter of its own
+ *   every route together                 300 a minute; Cloudflare in front: 100 a minute
+ *   a 429 carries Retry-After
+ *
+ * Seven report zips (2026-09-30 to 2026-10-08) say the same: every one of 54
+ * refusals was a sellers list, the eleventh of its minute, from 2026-10-06 on -
+ * before that day 60 to 75 a minute passed for hours. 3.25.0 read it as "a
+ * burst is refused" and spaced every request; that was wrong. So the sellers
+ * list has a minute and a day of its own here (W3B_LISTING_*), every tab
+ * together; a refusal there stops the sellers lists only, for as long as
+ * TornW3B says, and neither the price lists nor the buyers wait for it.
  */
 
 import { gmFetch } from '../platform/gm.js';
@@ -39,8 +56,27 @@ export const W3B_MAX_PER_MINUTE = 60;
  */
 export const W3B_SHARED_PER_MINUTE = 80;
 
-/** After a 429 or a challenge page, stop asking for this long. */
+/** After a 429 with no Retry-After, or a challenge page, stop asking for this long. */
 export const W3B_COOLDOWN_MS = 60000;
+
+/** The sellers of an item (GET /marketplace/{itemId}): TornW3B allows 10 a minute and 1,000 a day; two and a hundred are left spare. */
+export const W3B_LISTING_PER_MINUTE = 8;
+export const W3B_LISTING_PER_DAY = 900;
+/**
+ * With the key you registered on TornW3B (3.26.0): 25 a minute allowed, three left spare; the day is the same
+ * thousand. The key is a Torn key of yours that TornW3B already has; it goes in the header X-API-Key of a
+ * sellers list and nowhere else - never in a web address, never to another host (buildUrl), never with
+ * another kind of request. TornW3B answering 401 means it does not know the key: it is not sent again.
+ */
+export const W3B_LISTING_KEYED_PER_MINUTE = 22;
+export const W3B_KEY_HEADER = 'X-API-Key';
+/** Its light list (filler=1): 10,000 a day allowed. Its minute is the one every request shares. */
+export const W3B_LIGHT_PER_DAY = 9000;
+/** A Retry-After is believed between these: never a wait of nothing, never one past a day. */
+export const W3B_RETRY_AFTER_MIN_MS = 1000;
+export const W3B_RETRY_AFTER_MAX_MS = 24 * 60 * 60 * 1000;
+const W3B_HOUR_MS = 60 * 60 * 1000;
+const W3B_DAY_HOURS = 24;
 
 /*
  * The pace (3.25.0; the friend's zip of 2026-10-06, 3.24.1). TornW3B refused us
@@ -105,8 +141,59 @@ export function overlayPerMinute(bidsSeenAt, now = Date.now()) {
  * of the same thing differ by - a read "in turn" already keeps only its 10
  * cheapest rows, and the redraw's time is the page, not the rows. And an item
  * with nothing under the trader's price would lose its lowest bazaar price.
+ *
+ *   filler             /marketplace/{id}: 1 = the light list (3.26.0) - the 10
+ *                      cheapest listings, price and count only
  */
-const W3B_QUERY = { tradedWithinHours: [1, 168] };
+const W3B_QUERY = { tradedWithinHours: [1, 168], filler: [1, 1] };
+
+/** Is this the sellers-of-an-item route (marketplace/{itemId})? Not the summary (marketplace), not marketplace/{id}/traders. */
+export function isW3bListingPath(path) {
+    return /^marketplace\/[^/?#]+\/?$/.test(String(path).replace(/^\/+/, ''));
+}
+
+/** Which limit a request draws on: 'listing' (an item's sellers), 'light' (its light list), or 'rest'. */
+export function w3bRoute(path, query = null) {
+    if (!isW3bListingPath(path)) return 'rest';
+    return query && query.filler === 1 ? 'light' : 'listing';
+}
+
+/**
+ * How long a Retry-After asks us to wait, in ms: a number of seconds, or an
+ * HTTP date. Null when there is none or it cannot be read (the caller then
+ * waits W3B_COOLDOWN_MS).
+ */
+export function w3bRetryAfterMs(value, now = Date.now()) {
+    const text = String(value ?? '').trim();
+    if (!text) return null;
+    let ms = null;
+    if (/^\d+(\.\d+)?$/.test(text)) {
+        ms = Number(text) * 1000;
+    } else if (/[A-Za-z]{3}/.test(text) && /\d{4}/.test(text)) {
+        // An HTTP date ("Wed, 21 Oct 2026 07:28:00 GMT"): nothing looser is taken for one.
+        const at = Date.parse(text);
+        if (Number.isFinite(at)) ms = at - now;
+    }
+    if (ms === null || !Number.isFinite(ms)) return null;
+    return Math.min(W3B_RETRY_AFTER_MAX_MS, Math.max(W3B_RETRY_AFTER_MIN_MS, Math.ceil(ms)));
+}
+
+/** One answer header: gmFetch's `header(name)`, or a fetch Response's `headers.get(name)`. */
+function w3bHeader(response, name) {
+    try {
+        if (response && typeof response.header === 'function') return response.header(name);
+        if (response && response.headers && typeof response.headers.get === 'function') return response.headers.get(name);
+    } catch {
+        // No header to read: the caller falls back.
+    }
+    return null;
+}
+
+function w3bSum(counts) {
+    let n = 0;
+    for (const v of Object.values(counts || {})) n += Number(v) || 0;
+    return n;
+}
 
 /** A whole number within [min, max], or null. */
 function w3bWhole(value, min, max) {
@@ -114,13 +201,22 @@ function w3bWhole(value, min, max) {
 }
 
 export class W3bError extends Error {
-    constructor(message, { http = null, blocked = false, paused = false } = {}) {
+    constructor(message, { http = null, blocked = false, paused = false, route = null, reason = null, retryAt = null, badKey = false } = {}) {
         super(message);
         this.name = 'W3bError';
         this.http = http;
+        // TornW3B answered 401 to the key registered there (3.26.0).
+        this.badKey = badKey;
+        // Everything is stopped (a refusal of a request with no limit of its own, or a challenge page).
         this.blocked = blocked;
-        // Not sent at all: we are inside the wait a refusal started. Nothing for the problem log.
+        // Not sent at all: we are inside the wait a refusal started, or a limit of our own is used up. Nothing for the problem log.
         this.paused = paused;
+        // 'listing' | 'light': only this kind of request is stopped (3.26.0); the rest go on.
+        this.route = route;
+        // Of a request not sent: 'cooldown' | 'listing-wait' | 'listing-minute' | 'listing-day' | 'light-wait' | 'light-day'.
+        this.reason = reason;
+        // When asking again can work (ms), where that is known.
+        this.retryAt = retryAt;
     }
 }
 
@@ -172,7 +268,44 @@ export class W3bClient {
         pace = false,
         onAnswered = null,
         onPace = null,
+        listingPerMinute = W3B_LISTING_PER_MINUTE,
+        listingPerDay = W3B_LISTING_PER_DAY,
+        lightPerDay = W3B_LIGHT_PER_DAY,
+        listingKeyedPerMinute = W3B_LISTING_KEYED_PER_MINUTE,
+        listingKey = null,
+        onKeyRefused = null,
+        loadListing = null,
+        addListing = null,
+        loadRoutes = null,
+        saveRoutes = null,
+        otherListing = null,
+        onRoute = null,
     } = {}) {
+        /*
+         * The sellers list's own minute and day, and the light list's day (3.26.0).
+         *   loadListing / addListing: every tab's sellers lists of the last minute (platform/tab-window.js)
+         *   loadRoutes / saveRoutes:  () => {listingDay: {[hour]: n}, lightDay: {[hour]: n}, listingUntil, lightUntil}
+         *                             stored for every tab; hour = floor(ms / 3,600,000)
+         *   otherListing:             () => {minute, day}: sellers lists another app of ours asked from this
+         *                             PC (Torn Archive) - TornW3B counts by address, so they are the same ten
+         *   onRoute:                  ({route, until, said}) => void: TornW3B refused this kind; for the log
+         *   listingKey:               () => the key registered on TornW3B, or '' (none, or one it refused)
+         *   onKeyRefused:             () => void: TornW3B answered 401 to that key - whoever stores it marks it
+         */
+        this.listingPerMinuteOwn = listingPerMinute;
+        this.listingKeyedPerMinute = listingKeyedPerMinute;
+        this.listingKey = listingKey;
+        this.onKeyRefused = onKeyRefused;
+        this.listingPerDay = listingPerDay;
+        this.lightPerDay = lightPerDay;
+        this.loadListing = loadListing;
+        this.addListing = addListing;
+        this.loadRoutes = loadRoutes;
+        this.saveRoutes = saveRoutes;
+        this.otherListing = otherListing;
+        this.onRoute = onRoute;
+        this.listingRecent = [];
+        this.routesOwn = { listingDay: {}, lightDay: {}, listingUntil: 0, lightUntil: 0 };
         this.pace = Boolean(pace);
         // This tab's own copy of the pace, for when nothing is shared; and what it has shortened the gap by since it last stored it.
         this.paceOwn = null;
@@ -204,6 +337,22 @@ export class W3bClient {
         this.recent = [];
         this.chain = Promise.resolve();
         this.cooldownUntil = 0;
+    }
+
+    /** The key for a sellers list, or '': only something shaped like a Torn key is ever put in a header. */
+    listingKeyNow() {
+        if (!this.listingKey) return '';
+        try {
+            const key = String(this.listingKey() || '').trim();
+            return /^[A-Za-z0-9]{16}$/.test(key) ? key : '';
+        } catch {
+            return '';
+        }
+    }
+
+    /** The sellers lists allowed in a minute: more with a key TornW3B knows. */
+    get listingPerMinute() {
+        return this.listingKeyNow() ? this.listingKeyedPerMinute : this.listingPerMinuteOwn;
     }
 
     /** What every tab has used, and any wait one of them was told to make. */
@@ -322,10 +471,175 @@ export class W3bClient {
         return Number.isFinite(n) ? Math.max(1, Math.min(this.maxPerMinute, Math.floor(n))) : this.maxPerMinute;
     }
 
+    /** The hour counts worth keeping (the last 24 whole hours and this one), as {[hour]: count}. */
+    dayCounts(source, t) {
+        const out = {};
+        if (!source || typeof source !== 'object') return out;
+        const hour = Math.floor(t / W3B_HOUR_MS);
+        for (const [h, n] of Object.entries(source)) {
+            const at = Number(h);
+            const count = Math.floor(Number(n));
+            if (Number.isInteger(at) && at <= hour && at >= hour - W3B_DAY_HOURS && count > 0) out[at] = count;
+        }
+        return out;
+    }
+
+    /** What is kept of the two kinds with a limit of their own: the larger of this tab's and what every tab stored. */
+    routes(t = this.now()) {
+        const own = this.routesOwn;
+        own.listingDay = this.dayCounts(own.listingDay, t);
+        own.lightDay = this.dayCounts(own.lightDay, t);
+        let stored = null;
+        if (this.loadRoutes) {
+            try {
+                stored = this.loadRoutes();
+            } catch {
+                stored = null;
+            }
+        }
+        const s = stored && typeof stored === 'object' ? stored : {};
+        const pickDay = (mine, theirs) => {
+            const kept = this.dayCounts(theirs, t);
+            return w3bSum(kept) > w3bSum(mine) ? kept : mine;
+        };
+        // A wait "from the future" past a day (the clock was changed) is not believed.
+        const until = (mine, theirs) => {
+            const n = Number(theirs);
+            return Math.max(mine || 0, Number.isFinite(n) && n <= t + W3B_RETRY_AFTER_MAX_MS ? n : 0);
+        };
+        return {
+            listingDay: pickDay(own.listingDay, s.listingDay),
+            lightDay: pickDay(own.lightDay, s.lightDay),
+            listingUntil: until(own.listingUntil, s.listingUntil),
+            lightUntil: until(own.lightUntil, s.lightUntil),
+        };
+    }
+
+    writeRoutes(next) {
+        this.routesOwn = { ...next };
+        if (!this.saveRoutes) return;
+        try {
+            this.saveRoutes(next);
+        } catch {
+            // Sharing is best-effort; this tab still counts its own.
+        }
+    }
+
+    /**
+     * The sellers list's two counts (every tab's, and another app's on this PC) and when each has room again.
+     * @returns {{minute: number, day: number, minuteFreeAt: number, dayFreeAt: number, until: number}} *FreeAt: 0 while there is room
+     */
+    listingUse(t = this.now()) {
+        this.listingRecent = this.listingRecent.filter((x) => t - x < 60000);
+        let recent = this.listingRecent;
+        if (this.loadListing) {
+            try {
+                const s = this.loadListing();
+                const all = Array.isArray(s) ? s.filter((x) => Number.isFinite(x) && t - x < 60000 && x <= t).sort((a, b) => a - b) : [];
+                if (all.length > recent.length) recent = all;
+            } catch {
+                // Sharing is best-effort; this tab still counts its own.
+            }
+        }
+        let other = { minute: 0, day: 0 };
+        if (this.otherListing) {
+            try {
+                const o = this.otherListing() || {};
+                const n = (v) => (Number.isFinite(Number(v)) && Number(v) > 0 ? Math.floor(Number(v)) : 0);
+                other = { minute: n(o.minute), day: n(o.day) };
+            } catch {
+                // Not known: only our own are counted.
+            }
+        }
+        const r = this.routes(t);
+        const perMinute = Math.max(1, Math.floor(Number(this.listingPerMinute)) || 1);
+        const perDay = Math.max(1, Math.floor(Number(this.listingPerDay)) || 1);
+        const minute = recent.length + other.minute;
+        const day = w3bSum(r.listingDay) + other.day;
+        const hours = Object.keys(r.listingDay).map(Number).sort((a, b) => a - b);
+        // Our own slot that brings the minute back under its limit, a minute after it was taken; the other app's are not ours to time.
+        const mineOver = recent.length - Math.max(0, perMinute - other.minute);
+        return {
+            minute,
+            day,
+            minuteFreeAt: minute >= perMinute ? (mineOver >= 0 && recent.length ? recent[Math.min(recent.length - 1, mineOver)] + 60000 : t + 15000) : 0,
+            // The oldest counted hour leaves the day when the hour after its 24 have passed begins.
+            dayFreeAt: day >= perDay ? (hours.length ? (hours[0] + W3B_DAY_HOURS + 1) * W3B_HOUR_MS : t + W3B_HOUR_MS) : 0,
+            until: r.listingUntil > t ? r.listingUntil : 0,
+        };
+    }
+
+    /** The light list's day, and a wait TornW3B asked for. */
+    lightUse(t = this.now()) {
+        const r = this.routes(t);
+        const perDay = Math.max(1, Math.floor(Number(this.lightPerDay)) || 1);
+        const day = w3bSum(r.lightDay);
+        const hours = Object.keys(r.lightDay).map(Number).sort((a, b) => a - b);
+        return {
+            day,
+            dayFreeAt: day >= perDay ? (hours.length ? (hours[0] + W3B_DAY_HOURS + 1) * W3B_HOUR_MS : t + W3B_HOUR_MS) : 0,
+            until: r.lightUntil > t ? r.lightUntil : 0,
+        };
+    }
+
+    /** Count one request of a kind with its own limit, as it is about to leave. */
+    noteRoute(route, t = this.now()) {
+        if (route === 'listing') {
+            this.listingRecent.push(t);
+            if (this.addListing) {
+                try {
+                    this.addListing(t);
+                } catch {
+                    // Best-effort; this tab still limits itself.
+                }
+            }
+        }
+        const r = this.routes(t);
+        const key = route === 'listing' ? 'listingDay' : 'lightDay';
+        const hour = Math.floor(t / W3B_HOUR_MS);
+        this.writeRoutes({ ...r, [key]: { ...r[key], [hour]: (r[key][hour] || 0) + 1 } });
+    }
+
+    /** TornW3B refused this kind: none of it is asked until `until` - this tab and, through storage, every other. */
+    coolRoute(route, ms, t = this.now()) {
+        const until = t + (Number(ms) > 0 ? Number(ms) : W3B_COOLDOWN_MS);
+        const r = this.routes(t);
+        this.writeRoutes({ ...r, [route === 'listing' ? 'listingUntil' : 'lightUntil']: until });
+        return until;
+    }
+
+    /** Why a request may not leave now (an error to throw; nothing was sent), or null. */
+    refusal(route, t = this.now()) {
+        const until = this.blockedUntil(t);
+        if (t < until) return new W3bError('TornW3B is rate limiting us; paused briefly.', { blocked: true, paused: true, reason: 'cooldown', retryAt: until });
+        if (route === 'listing') {
+            const use = this.listingUse(t);
+            if (use.until) return new W3bError('TornW3B asked us to wait before another sellers list.', { paused: true, route, reason: 'listing-wait', retryAt: use.until });
+            if (use.dayFreeAt) return new W3bError("TornW3B sellers lists: today's " + this.listingPerDay + ' are used.', { paused: true, route, reason: 'listing-day', retryAt: use.dayFreeAt });
+            if (use.minuteFreeAt) return new W3bError("TornW3B sellers lists: this minute's " + this.listingPerMinute + ' are used.', { paused: true, route, reason: 'listing-minute', retryAt: use.minuteFreeAt });
+        } else if (route === 'light') {
+            const use = this.lightUse(t);
+            if (use.until) return new W3bError('TornW3B asked us to wait before another light list.', { paused: true, route, reason: 'light-wait', retryAt: use.until });
+            if (use.dayFreeAt) return new W3bError("TornW3B light lists: today's " + this.lightPerDay + ' are used.', { paused: true, route, reason: 'light-day', retryAt: use.dayFreeAt });
+        }
+        return null;
+    }
+
     stats() {
         const t = this.now();
         const used = this.recent.filter((x) => t - x < 60000).length;
+        const listing = this.listingUse(t);
+        const light = this.lightUse(t);
         return {
+            // The sellers list's own minute and day (every tab's; and Torn Archive's on this PC), and the light list's day.
+            listingLastMinute: listing.minute,
+            listingToday: listing.day,
+            listingMinuteLeft: Math.max(0, this.listingPerMinute - listing.minute),
+            listingDayLeft: Math.max(0, this.listingPerDay - listing.day),
+            // When a sellers list can next be asked for: 0 = now.
+            listingFreeAt: Math.max(listing.until, listing.minuteFreeAt, listing.dayFreeAt),
+            lightToday: light.day,
+            lightFreeAt: Math.max(light.until, light.dayFreeAt),
             usedLastMinute: used,
             remaining: Math.max(0, this.limit() - used),
             coolingDown: t < this.blockedUntil(t),
@@ -387,11 +701,12 @@ export class W3bClient {
         }
     }
 
-    /** Stop asking - this tab and, through storage, every other. */
-    coolDown() {
+    /** Stop asking - this tab and, through storage, every other. `ms`: what a Retry-After asked for; else the usual minute. */
+    coolDown(ms = W3B_COOLDOWN_MS) {
         const t = this.now();
-        this.cooldownUntil = t + W3B_COOLDOWN_MS;
+        this.cooldownUntil = t + (Number(ms) > 0 ? Number(ms) : W3B_COOLDOWN_MS);
         if (this.loadShared) this.writeShared({ ...this.readShared(t), cooldownUntil: this.cooldownUntil });
+        return this.cooldownUntil;
     }
 
     /** Build and check a URL. Exposed for tests. `query`: W3B_QUERY's options only. */
@@ -432,23 +747,18 @@ export class W3bClient {
     }
 
     async execute(path, tag = null, query = null) {
-        // Paused: not sent, not kept for later - whoever asked asks again when it is due.
-        if (this.now() < this.blockedUntil()) {
-            throw new W3bError('TornW3B is rate limiting us; paused briefly.', {
-                blocked: true,
-                paused: true,
-            });
-        }
-
         const url = this.buildUrl(path, query);
+        // What really leaves decides the kind: a `filler` that was dropped on the way out is a sellers list.
+        const route = w3bRoute(path, { filler: url.searchParams.get('filler') === '1' ? 1 : null });
+        // Paused, or a limit of this kind used up: not sent, not kept for later - whoever asked asks again when it is due.
+        let refused = this.refusal(route);
+        if (refused) throw refused;
+
         const at = await this.waitForSlot();
-        // Another tab may have been blocked while this one waited for a slot.
-        if (this.now() < this.blockedUntil()) {
-            throw new W3bError('TornW3B is rate limiting us; paused briefly.', {
-                blocked: true,
-                paused: true,
-            });
-        }
+        // Another tab may have been blocked, or have taken the last room, while this one waited for a slot.
+        refused = this.refusal(route);
+        if (refused) throw refused;
+        if (route !== 'rest') this.noteRoute(route);
 
         if (this.onSent) {
             try {
@@ -458,9 +768,11 @@ export class W3bClient {
             }
         }
 
+        // The registered key: with a sellers list only, in a header only (the URL above never holds one).
+        const key = route === 'listing' ? this.listingKeyNow() : '';
         let response;
         try {
-            response = await this.fetchImpl(url.toString());
+            response = key ? await this.fetchImpl(url.toString(), { headers: { [W3B_KEY_HEADER]: key } }) : await this.fetchImpl(url.toString());
         } catch (error) {
             throw new W3bError(
                 'TornW3B network error: ' + ((error && error.message) || error),
@@ -468,13 +780,41 @@ export class W3bClient {
         }
 
         if (response.status === 429) {
-            this.coolDown();
-            this.paceRefused();
+            // TornW3B says how long to stay away (Retry-After); without it, the usual minute.
+            const said = w3bRetryAfterMs(w3bHeader(response, 'retry-after'), this.now());
             this.answered(path, tag, true);
+            if (route !== 'rest') {
+                // Only this kind is stopped: the summary, the price lists and the buyers go on, at the pace they had.
+                const until = this.coolRoute(route, said ?? W3B_COOLDOWN_MS);
+                if (this.onRoute) {
+                    try {
+                        const use = route === 'listing' ? this.listingUse() : this.lightUse();
+                        this.onRoute({ route, until, said, minute: use.minute ?? null, day: use.day });
+                    } catch {
+                        // The log is best-effort.
+                    }
+                }
+                throw new W3bError('TornW3B rate limit (429).', { http: 429, route, retryAt: until });
+            }
+            const until = this.coolDown(said ?? W3B_COOLDOWN_MS);
+            this.paceRefused();
             throw new W3bError('TornW3B rate limit (429).', {
                 http: 429,
                 blocked: true,
+                retryAt: until,
             });
+        }
+
+        if (key && response.status === 401) {
+            // TornW3B does not know this key: it is not sent again (the next sellers list goes without, at the slower limit).
+            if (this.onKeyRefused) {
+                try {
+                    this.onKeyRefused();
+                } catch {
+                    // Best-effort.
+                }
+            }
+            throw new W3bError('TornW3B does not know this key (401).', { http: 401, badKey: true });
         }
 
         if (!response.ok) {
@@ -550,6 +890,17 @@ export async function fetchW3bListings(client, itemId, { tag = null } = {}) {
         listings: data && Array.isArray(data.listings) ? data.listings : [],
         total: Number(data && data.total_listings) || 0,
     };
+}
+
+/**
+ * An item's light list (3.26.0): GET /marketplace/{id}?filler=1 - by TornW3B's
+ * spec the 10 cheapest listings with price and count, no seller, on a limit of
+ * its own (200 a minute, 10,000 a day). The answer as it came: what it holds
+ * is for core/cheap.js to say (parseW3bCheapest), since we know its shape from
+ * the spec only.
+ */
+export function fetchW3bCheapest(client, itemId, { tag = 'w.cheap' } = {}) {
+    return client.get('marketplace/' + encodeURIComponent(String(itemId)), { tag, query: { filler: 1 } });
 }
 
 /**

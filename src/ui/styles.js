@@ -2869,9 +2869,44 @@ ${TOKENS_CSS}
     font-size: 11.5px;
 }
 
-/* The tightest step: the header names only the side that is on; the switch itself is in Settings. */
-.ttv2-panel.ttv2-tighter .ttv2-head button.ttv2-jobb:not(.ttv2-jobb-on) {
-    display: none;
+/*
+ * A header that still does not fit at the smallest type (3.26.0; a 1920x1200 laptop: the panel is
+ * 240px there, and "NPC Arbitrage" was left out of the switch): two rows. The switch, whole, with
+ * Settings and Collapse; under it Scan / Open Torn Bids across the panel. Nothing left out or cut.
+ */
+.ttv2-panel.ttv2-head2 .ttv2-head {
+    flex-wrap: wrap;
+    height: auto;
+    min-height: 40px;
+    padding-top: 7px;
+    padding-bottom: 7px;
+    row-gap: 6px;
+}
+
+.ttv2-panel.ttv2-head2 .ttv2-head .ttv2-title {
+    flex: 1 1 0;
+    min-width: max-content;
+}
+
+.ttv2-panel.ttv2-head2 button.ttv2-sell,
+.ttv2-panel.ttv2-head2 button.ttv2-scan {
+    order: 5;
+    flex: 1 0 100%;
+    height: 24px;
+}
+
+.ttv2-panel.ttv2-head2 button.ttv2-jobb:first-child {
+    margin-left: -4px;
+}
+
+/* ...and the line under it: a long sentence takes the row, what stood at its right goes under it (it was squeezed to four short lines). */
+.ttv2-panel.ttv2-head2 .ttv2-bar {
+    flex-wrap: wrap;
+    gap: 2px 8px;
+}
+
+.ttv2-panel.ttv2-head2 .ttv2-bar-left {
+    flex: 1 1 auto;
 }
 
 .ttv2-panel.ttv2-tight button.ttv2-jobb.ttv2-jobb-on {

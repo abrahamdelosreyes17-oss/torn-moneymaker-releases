@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      3.25.0
+// @version      3.26.0
 // @description  Finds Bazaar and Item Market listings below NPC / market value - on the page you are viewing, and live from the Torn API and TornW3B - ranked by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -52,7 +52,7 @@
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '3.25.0';
+    const TTV2_BUILD_VERSION = '3.26.0';
     const TTV2_SHARED_HOME = 'https://torn-bids-shared.pumping-iron-worker.workers.dev';
 
     /* ===== src/platform/gm.js ===== */
@@ -164,6 +164,16 @@
         }
     }
 
+    /** One header out of GM_xmlhttpRequest's `responseHeaders` text ("name: value" a line), or null. */
+    function gmHeader(text, name) {
+        const want = String(name).toLowerCase();
+        for (const line of String(text || '').split(/\r?\n/)) {
+            const at = line.indexOf(':');
+            if (at > 0 && line.slice(0, at).trim().toLowerCase() === want) return line.slice(at + 1).trim();
+        }
+        return null;
+    }
+
     /**
      * HTTP GET through the userscript host's own transport.
      *
@@ -181,12 +191,14 @@
      * the tests).
      *
      * @param {string} url
-     * @param {{timeoutMs?: number}} [options] - how long to wait for the answer (30 s)
+     * @param {{timeoutMs?: number, headers?: object}} [options] - how long to wait for the answer (30 s);
+     *   request headers (3.26.0: only TornW3B's X-API-Key, from api/w3b.js - a key is never in a URL)
      * @returns {Promise<{ok: boolean, status: number, json: function}>}
      */
-    function gmFetch(url, { timeoutMs = 30000 } = {}) {
+    function gmFetch(url, { timeoutMs = 30000, headers = null } = {}) {
+        // Under node and where the host has no transport of its own: fetch's answer carries `headers.get(name)`.
         if (typeof GM_xmlhttpRequest !== 'function') {
-            if (typeof fetch === 'function') return fetch(url);
+            if (typeof fetch === 'function') return headers ? fetch(url, { headers }) : fetch(url);
             return Promise.reject(new Error('No HTTP transport available.'));
         }
 
@@ -194,12 +206,15 @@
             GM_xmlhttpRequest({
                 method: 'GET',
                 url,
+                ...(headers ? { headers } : {}),
                 timeout: timeoutMs,
                 onload(response) {
                     resolve({
                         ok: response.status >= 200 && response.status < 300,
                         status: response.status,
                         json: async () => JSON.parse(response.responseText),
+                        // One answer header by name (3.26.0: TornW3B's Retry-After), or null.
+                        header: (name) => gmHeader(response.responseHeaders, name),
                     });
                 },
                 onerror() {
@@ -366,7 +381,80 @@
     const SHARED_MAX_SELLERS = 3000;
     const SHARED_MAX_NEAR = 200;
     const SHARED_MAX_WORTH = 5000;
-    const SHARED_BODY_KEYS = ['app', 'ver', 'used', 'waiting', 'sellers', 'trades', 'looking', 'worth', 'since', 'seen', 'going', 'bought', 'dir'];
+    const SHARED_BODY_KEYS = ['app', 'ver', 'used', 'waiting', 'sellers', 'trades', 'looking', 'worth', 'since', 'seen', 'going', 'bought', 'dir', 'want', 'w3b', 'lists', 'listsSince'];
+    /*
+     * 3.26.0, the server handing out TornW3B's work (its /sync, deployed 2026-10-11):
+     *   want        the items whose sellers list this PC would ask TornW3B for next, most wanted first (60 at most)
+     *   w3b         [sellers lists left this minute, left today] of this PC's own limit
+     *   -> ask      the ones of `want` that are this PC's to read (another PC read the rest, or is better placed)
+     *   lists       trader price lists this PC read from TornW3B: [trader, read at (ms), {item: price}] (5 a sync)
+     *   listsSince  the answer's last `listsAt` (0 the first time)
+     *   -> lists    lists another person's PC read; -> listsAt
+     * TornW3B is still asked by each PC from its own address, under its own limit and name: the server only says
+     * which PC reads what, so two PCs do not ask for the same list.
+     */
+    const SHARED_MAX_WANT = 60;
+    const SHARED_MAX_LISTS = 5;
+    const SHARED_MAX_LIST_ITEMS = 2500;
+    /** What the server handed out is gone by for this long after it was said (an exchange is every 30 s). */
+    const SHARED_ASK_FRESH_MS = 45000;
+
+    /** One trader list as it may be sent or kept: [trader, readAt, {item: price}], or null. Numbers only. */
+    function sharedList(entry) {
+        if (!Array.isArray(entry) || entry.length !== 3) return null;
+        const trader = sharedId(entry[0]);
+        const at = entry[1];
+        const prices = entry[2];
+        if (trader === null || !Number.isInteger(at) || at <= 0 || at >= 1e13 || !prices || typeof prices !== 'object' || Array.isArray(prices)) return null;
+        const out = {};
+        let n = 0;
+        for (const [key, value] of Object.entries(prices)) {
+            const item = sharedId(key);
+            if (item === null || typeof value !== 'number' || !Number.isFinite(value) || value <= 0) continue;
+            if (n >= SHARED_MAX_LIST_ITEMS) break;
+            if (!(item in out)) n += 1;
+            out[item] = Math.round(value);
+        }
+        return n ? [trader, at, out] : null;
+    }
+
+    /** The answer's trader lists, checked: read by another person's PC, oldest first. */
+    function sharedListsIn(answer) {
+        const out = [];
+        for (const entry of answer && Array.isArray(answer.lists) ? answer.lists : []) {
+            const list = sharedList(entry);
+            if (list) out.push(list);
+            if (out.length >= SHARED_MAX_LISTS * 4) break;
+        }
+        return out;
+    }
+
+    /**
+     * What the server handed out, to keep: {at, want, ask} - `ask` only of what was wanted, in its order.
+     * Null when the server said nothing about it (an older server, or nothing was wanted).
+     */
+    function sharedAskIn(answer, want, now) {
+        if (!answer || !Array.isArray(answer.ask) || !Array.isArray(want) || !want.length) return null;
+        const wanted = new Set(want);
+        const ask = [];
+        for (const value of answer.ask) {
+            const id = sharedId(value);
+            if (id !== null && wanted.has(id) && !ask.includes(id)) ask.push(id);
+        }
+        return { at: now, want: [...wanted], ask };
+    }
+
+    /**
+     * May this PC ask TornW3B for an item's sellers list now, by what the server handed out? Not when it was
+     * wanted and the server left it to another PC; everything else as before - an item the server was not told
+     * of, a server that has been silent, a PC on its own.
+     */
+    function sharedMayRead(kept, itemId, now) {
+        if (!kept || !(now - kept.at < SHARED_ASK_FRESH_MS) || now < kept.at) return true;
+        const id = Number(itemId);
+        return !kept.want.includes(id) || kept.ask.includes(id);
+    }
+
     // The server is shared with our other apps: each says which it is, so one person's apps are added up
     // against the one Torn limit, and whoever runs the server can ask for a newer version.
     const SHARED_APP = 'torn-bids';
@@ -522,7 +610,7 @@
      * come out of here, whatever is put in.
      * `now`: this PC's clock; the marks leave as ages, since every PC has its own clock.
      */
-    function sharedBody({ used = 0, waiting = 0, wants = [], since = 0, seen = 0, sendWorth = true, now = 0, ver = null } = {}) {
+    function sharedBody({ used = 0, waiting = 0, wants = [], since = 0, seen = 0, sendWorth = true, now = 0, ver = null, lists = null, listsSince = null } = {}) {
         const count = (n) => (Number.isFinite(n) && n > 0 ? Math.min(1000, Math.floor(n)) : 0);
         const list = Array.isArray(wants) ? wants.filter((w) => w && typeof w === 'object') : [];
         const trades = sharedIds(list.map((w) => w.trades), SHARED_MAX_NEAR);
@@ -543,6 +631,16 @@
         body.bought = marks.bought.map(([seller, item, qty, price, at]) => [seller, item, qty, price, age(at)]);
         const dir = sharedDir(list);
         if (dir.length) body.dir = dir.map(([item, at]) => [item, age(at)]);
+        // TornW3B's work (3.26.0): what this PC would read next, and what is left of its own limit.
+        const want = sharedIds(list.map((w) => w.want), SHARED_MAX_WANT);
+        const room = list.map((w) => w.w3b).find((r) => Array.isArray(r) && r.length === 2 && r.every((n) => Number.isFinite(n) && n >= 0));
+        if (want.length && room) {
+            body.want = want;
+            body.w3b = room.map((n) => Math.min(100000, Math.floor(n)));
+        }
+        const out = (Array.isArray(lists) ? lists : []).map(sharedList).filter(Boolean).slice(0, SHARED_MAX_LISTS);
+        if (out.length) body.lists = out;
+        if (Number.isInteger(listsSince) && listsSince >= 0) body.listsSince = listsSince;
         if (sendWorth) {
             const worth = {};
             let n = 0;
@@ -587,6 +685,18 @@
             } else if (key === 'bought') {
                 // [bazaar, item, how many, price, age]
                 if (!Array.isArray(value) || !value.every((m) => Array.isArray(m) && m.length === 5 && m.every(whole) && m[0] > 0 && m[1] > 0 && m[2] > 0)) return false;
+            } else if (key === 'want') {
+                if (!Array.isArray(value) || value.length > SHARED_MAX_WANT || !value.every((id) => Number.isInteger(id) && id > 0 && id < 1e10)) return false;
+            } else if (key === 'w3b') {
+                if (!Array.isArray(value) || value.length !== 2 || !value.every(whole)) return false;
+            } else if (key === 'lists') {
+                // [trader, read at, {item: price}]
+                if (!Array.isArray(value) || value.length > SHARED_MAX_LISTS) return false;
+                for (const l of value) {
+                    if (!Array.isArray(l) || l.length !== 3 || !Number.isInteger(l[0]) || l[0] <= 0 || l[0] >= 1e10 || !whole(l[1]) || l[1] <= 0) return false;
+                    if (!l[2] || typeof l[2] !== 'object' || Array.isArray(l[2]) || Object.keys(l[2]).length > SHARED_MAX_LIST_ITEMS) return false;
+                    for (const [item, price] of Object.entries(l[2])) if (!/^\d{1,10}$/.test(item) || !Number.isInteger(price) || price <= 0) return false;
+                }
             } else if (key === 'worth') {
                 if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
                 for (const [item, price] of Object.entries(value)) {
@@ -699,6 +809,41 @@
             }
         }
         return { bySeller, byItem };
+    }
+
+    /**
+     * NPC Arbitrage from the server (3.26.0; the owner, 2026-10-11: bazaar prices from Torn's own API through
+     * our server, TornW3B asked only what we cannot know). A read this old or newer makes a deal by itself,
+     * and stands in for TornW3B's sellers list of the item.
+     */
+    const SHARED_DEAL_MAX_AGE_MS = 5 * 60000;
+
+    /**
+     * The listings of one item the server read from Torn lately, under a price, cheapest first - rows as
+     * TornW3B's are, with no seller name (the server gives none). A price of $1 or less is a locked listing.
+     * @param {{byItem: Map}} index - sharedIndex()
+     * @param {number} under - only listings cheaper than this (what the item sells for)
+     */
+    function sharedDealRows(index, itemId, under, now, maxAge = SHARED_DEAL_MAX_AGE_MS) {
+        const out = [];
+        for (const l of (index && index.byItem && index.byItem.get(String(itemId))) || []) {
+            if (!(l.price > 1) || !(l.qty > 0) || !(l.price < under) || !(now - l.seen <= maxAge)) continue;
+            out.push({ sellerId: l.sellerId, sellerName: null, price: l.price, qty: l.qty, dataAt: l.seen, changedAt: l.at, sponsored: false, shared: true });
+        }
+        return out.sort((a, b) => a.price - b.price);
+    }
+
+    /**
+     * Does the server already know the cheapest bazaar price TornW3B's summary names for an item - a listing
+     * at that price or under it, read from Torn lately? Then TornW3B's sellers list of the item would say
+     * nothing new, and is not asked for.
+     */
+    function sharedKnowsLowest(index, itemId, lowest, now, maxAge = SHARED_DEAL_MAX_AGE_MS) {
+        if (!(lowest > 1)) return false;
+        for (const l of (index && index.byItem && index.byItem.get(String(itemId))) || []) {
+            if (l.price > 1 && l.qty > 0 && l.price <= lowest && now - l.seen <= maxAge) return true;
+        }
+        return false;
     }
 
     /**
@@ -980,7 +1125,10 @@
     function sharedSaidLine(st, hours) {
         const word = sharedSaid(st);
         if (word === 'unknown') {
-            return 'Shared: the server answered 404 - the Public key of this PC is not on the server as "runs our app". Nothing is exchanged; it is asked again in ' + hours + ' hours, or at once when the key changes';
+            // 3.26.0: sooner at first (5, 15, 60 minutes), then every `hours`.
+            const ms = Number(st && st.unknownWaitMs) || 0;
+            const again = ms > 0 && ms < hours * 3600000 ? Math.round(ms / 60000) + ' minutes' : hours + ' hours';
+            return 'Shared: the server answered 404 - the Public key of this PC is not on the server as "runs our app". Nothing is exchanged; it is asked again in ' + again + ', or at once when the key changes';
         }
         if (word === 'ok') return 'Shared: the server knows this PC and answers';
         if (word === 'update') return 'Shared: the server knows this PC and wants a newer Torn Bids (' + String(st.update).slice(0, 40) + '): nothing is exchanged until this copy is updated';
@@ -1026,6 +1174,22 @@
         if (silent) return { lead: 'Shared is on', rest: 'no answer from the server, working alone' };
         if (st.reading === 'stopped' || st.reading === 'resting') return { lead: 'Shared is on', rest: 'the server is not reading now, working alone' };
         return { lead: 'Shared is on', rest: st.people ? st.people + (st.people === 1 ? ' person' : ' people') : 'connected' };
+    }
+
+    /**
+     * Under the Public key's box in Settings (3.26.0): what the server said of this key, while that is not said
+     * anywhere else on the page - to the server's own people the Shared part says it, so here: nothing.
+     * @param {object} st - SharedLink.status()
+     * @returns {string} '' = nothing to say
+     */
+    function sharedKeyBoxLine(st) {
+        if (!st || !st.on || sharedKnown(st)) return '';
+        if (st.unknown) {
+            const ms = Number(st.unknownWaitMs) || 0;
+            const again = ms >= 3600000 ? Math.round(ms / 3600000) + (ms < 5400000 ? ' hour' : ' hours') : Math.max(1, Math.round(ms / 60000)) + ' minutes';
+            return 'Shared server: it does not know this key, so Torn Bids works alone. Whoever runs your server needs this same key from you. Asked again every ' + again + ', and at once when you save the key here again.';
+        }
+        return st.error ? 'Shared server: no answer yet.' : 'Shared server: not asked yet.';
     }
 
     /** "Your Torn key on the server": {level, text}; what the server last said of it. */
@@ -1134,6 +1298,13 @@
     const SHARED_LEADER_KEY = 'sharedLeader';
     const SHARED_INTEREST_KEY = 'sharedInterest';
     const SHARED_ASK_KEY = 'sharedAsk';
+    /* 3.26.0 - TornW3B's work, handed out by the server (core/shared.js): what it said is this PC's to read ... */
+    const SHARED_W3B_ASK_KEY = 'sharedW3bAsk';
+    /* ... the trader lists this PC read, waiting to be sent (written by Torn Bids' page) ... */
+    const SHARED_LISTS_OUT_KEY = 'sharedListsOut';
+    /* ... and the ones another person's PC read, for Torn Bids' page to take: {at, n, lists}. */
+    const SHARED_LISTS_IN_KEY = 'sharedListsIn';
+    const SHARED_LISTS_IN_KEEP = 20;
     /* The other PCs' TornW3B reads and this PC's turn among them (core/shared.js, sharedDirIn). */
     const SHARED_DIR_KEY = 'sharedDir';
     const SHARED_WANT_PREFIX = 'sharedWant.';
@@ -1152,6 +1323,14 @@
     const SHARED_WORTH_EVERY_MS = 10 * 60000;
     // A PC the server does not know (anyone may install Torn Bids): asked again this often, in case its owner let it in.
     const SHARED_UNKNOWN_MS = 6 * 60 * 60000;
+    // 3.26.0: the first askings after a "not known" come sooner - a key its owner adds is let in within the hour,
+    // not six hours later - then every SHARED_UNKNOWN_MS as before: a stranger's copy still asks four times a day.
+    const SHARED_UNKNOWN_STEPS_MS = [5 * 60000, 15 * 60000, 60 * 60000];
+    /** The wait after the n-th "not known" in a row (1 = the first). */
+    function sharedUnknownWait(tries) {
+        const n = Number.isInteger(tries) && tries > 0 ? tries : 1;
+        return SHARED_UNKNOWN_STEPS_MS[n - 1] ?? SHARED_UNKNOWN_MS;
+    }
 
     class SharedLink {
         /**
@@ -1211,6 +1390,13 @@
             return sharedMarksNow(this.marksKept, (this.d.load(SHARED_STATE_KEY) || {}).okAt, now);
         }
 
+        /** What the server last handed out of TornW3B's sellers lists: {at, want, ask}, or null (core/shared.js sharedMayRead). */
+        w3bAsk() {
+            if (!this.config()) return null;
+            if (this.w3bAskKept === undefined) this.w3bAskKept = this.d.load(SHARED_W3B_ASK_KEY) || null;
+            return this.w3bAskKept;
+        }
+
         /** The other PCs' TornW3B reads and this PC's turn; alone (and with Shared off) every item is this PC's. */
         dir() {
             if (!this.config()) return { reads: {}, turn: { of: 1, me: 0 } };
@@ -1258,6 +1444,8 @@
                 this.grantKept = undefined;
             } else if (key === SHARED_DIR_KEY) {
                 this.dirKept = undefined;
+            } else if (key === SHARED_W3B_ASK_KEY) {
+                this.w3bAskKept = undefined;
             } else if (key === SHARED_MARKS_KEY) {
                 this.marksKept = undefined;
                 this.d.onReads();
@@ -1265,6 +1453,7 @@
                 this.grantKept = undefined;
                 this.marksKept = undefined;
                 this.dirKept = undefined;
+                this.w3bAskKept = undefined;
                 this.buckets = null;
                 this.kept = null;
                 this.d.onReads();
@@ -1303,11 +1492,14 @@
             const clean = sharedBody({ wants: [want] });
             const marks = sharedMarks([want], now);
             const dir = sharedDir([want]);
-            const json = JSON.stringify([clean.sellers, clean.trades, clean.looking, clean.worth, marks.going, marks.bought, dir]);
+            // TornW3B's work (3.26.0): what this part would read next, what is left of the limit, and whether it takes trader lists.
+            const w3b = clean.want ? { want: clean.want, w3b: clean.w3b } : {};
+            const takes = want.lists ? { lists: true } : {};
+            const json = JSON.stringify([clean.sellers, clean.trades, clean.looking, clean.worth, marks.going, marks.bought, dir, w3b, takes]);
             if (json === this.wantJson && now - this.wantAt < SHARED_WANT_EVERY_MS) return;
             this.wantJson = json;
             this.wantAt = now;
-            this.d.save(SHARED_WANT_PREFIX + this.d.world, { at: now, sellers: clean.sellers, trades: clean.trades, looking: clean.looking, worth: clean.worth, going: marks.going, bought: marks.bought, dir });
+            this.d.save(SHARED_WANT_PREFIX + this.d.world, { at: now, sellers: clean.sellers, trades: clean.trades, looking: clean.looking, worth: clean.worth, going: marks.going, bought: marks.bought, dir, ...w3b, ...takes });
         }
 
         /** Call every SHARED_TICK_MS. */
@@ -1326,7 +1518,7 @@
 
             const state = this.d.load(SHARED_STATE_KEY) || {};
             const since = now - (state.syncAt || 0);
-            if (state.unknown && since < SHARED_UNKNOWN_MS) return;
+            if (state.unknown && since < sharedUnknownWait(state.unknownTries)) return;
             const asked = this.asked().at;
             if (since < SHARED_SYNC_MS && !(asked >= (state.syncAt || 0) && asked > 0 && since >= SHARED_SOON_MS)) return;
 
@@ -1356,6 +1548,11 @@
             }
 
             const state = { ...before, syncAt: startedAt, error: null, unknown: false };
+            // Trader lists (3.26.0): only while Torn Bids' page is open - it reads them, and it takes the others'.
+            const takesLists = wants.some((w) => w.lists);
+            if (!this.listsSent) this.listsSent = new Map();
+            let listsAt = Number.isInteger(before.listsAt) && before.listsAt >= 0 ? before.listsAt : 0;
+            const listsGot = [];
             const touched = new Set();
             let marksChanged = false;
             let born = before.born ?? null;
@@ -1371,7 +1568,11 @@
                     const ver = this.d.version || null;
                     const worthJson = JSON.stringify(probe.worth);
                     const sendWorth = page === 0 && (worthJson !== this.worthJson || now - this.worthAt >= SHARED_WORTH_EVERY_MS || born === null);
-                    const body = sharedBody({ used: use.used, waiting: (Number(use.waiting) || 0) + others, wants, since: seq, seen, sendWorth, now, ver });
+                    // The lists read since the last exchange that took them, on the first page only.
+                    const listsOut = takesLists && page === 0
+                        ? (this.d.load(SHARED_LISTS_OUT_KEY) || []).map(sharedList).filter((l) => l && this.listsSent.get(l[0]) !== l[1])
+                        : [];
+                    const body = sharedBody({ used: use.used, waiting: (Number(use.waiting) || 0) + others, wants: page === 0 ? wants : wants.map(({ want, w3b, ...w }) => w), since: seq, seen, sendWorth, now, ver, lists: listsOut, listsSince: takesLists && page === 0 ? listsAt : null });
                     if (!sharedOutgoingOk(body)) throw new Error('Not sent: the message was not in the agreed shape.');
 
                     const response = await this.d.post(`${cfg.address}/sync`, {
@@ -1380,6 +1581,7 @@
                     });
                     if (response.status === 404) {
                         state.unknown = true;
+                        state.unknownTries = (Number.isInteger(before.unknownTries) ? before.unknownTries : 0) + 1;
                         throw new Error('The server does not know this PC.');
                     }
                     // Whoever runs the server asked for a newer Torn Bids. Our Torn use was still counted there, so
@@ -1446,9 +1648,27 @@
                         this.d.save(SHARED_DIR_KEY, dirNow);
                     }
                     state.turn = dirNow.turn;
+                    if (page === 0) {
+                        // TornW3B's work: which of the wanted sellers lists are this PC's, and the others' trader lists.
+                        for (const l of body.lists || []) this.listsSent.set(l[0], l[1]);
+                        if (this.listsSent.size > 500) this.listsSent = new Map([...this.listsSent].slice(-250));
+                        const handed = sharedAskIn(answer, body.want || [], got);
+                        if (JSON.stringify(handed) !== JSON.stringify(this.w3bAsk())) {
+                            this.w3bAskKept = handed;
+                            if (handed) this.d.save(SHARED_W3B_ASK_KEY, handed);
+                            else this.d.del(SHARED_W3B_ASK_KEY);
+                        }
+                        state.w3bAsk = handed ? [handed.ask.length, handed.want.length] : null;
+                        if (takesLists) {
+                            listsGot.push(...sharedListsIn(answer));
+                            if (Number.isInteger(answer.listsAt) && answer.listsAt >= 0) listsAt = answer.listsAt;
+                            state.listsOut = (Number.isInteger(before.listsOut) ? before.listsOut : 0) + (body.lists || []).length;
+                        }
+                    }
                     if (Number.isInteger(answer.seq)) seq = answer.seq;
                     if (Number.isFinite(answer.now)) seen = answer.now;
                     state.okAt = got;
+                    state.unknownTries = 0;
                     state.update = null;
                     state.reading = answer.state ?? null;
                     state.key = answer.key ?? null;
@@ -1471,6 +1691,14 @@
                 for (const b of sharedPrune(this.buckets, this.now())) touched.add(b);
             }
             for (const b of touched) this.d.save(SHARED_READS_PREFIX + b, this.buckets[b]);
+            if (listsGot.length) {
+                // For Torn Bids' page to take: the newest kept, numbered so each is taken once.
+                const had = this.d.load(SHARED_LISTS_IN_KEY) || {};
+                const n = (Number.isInteger(had.n) ? had.n : 0) + listsGot.length;
+                this.d.save(SHARED_LISTS_IN_KEY, { at: startedAt, n, lists: [...(Array.isArray(had.lists) ? had.lists : []), ...listsGot].slice(-SHARED_LISTS_IN_KEEP) });
+                state.listsIn = (Number.isInteger(before.listsIn) ? before.listsIn : 0) + listsGot.length;
+            }
+            state.listsAt = listsAt;
             state.seq = seq;
             state.seenAt = seen;
             state.born = born;
@@ -1483,10 +1711,25 @@
             if (touched.size || marksChanged) this.d.onReads();
         }
 
+        /**
+         * Ask again now (3.26.0): the same key was saved again while the server's last answer was "not known" - its
+         * owner may just have let this PC in (2026-10-11: a key added on the server waited out six silent hours,
+         * and saving it again changed nothing). The wait starts over; the tab that does the exchanging asks on its
+         * next tick. @returns {boolean} whether there was a "not known" to ask again about
+         */
+        knock() {
+            const state = this.d.load(SHARED_STATE_KEY) || {};
+            if (!this.config() || !state.unknown) return false;
+            this.d.save(SHARED_STATE_KEY, { ...state, syncAt: 0, unknownTries: 0 });
+            return true;
+        }
+
         /** The server's address or this PC's word changed, or there is none now: what was kept under the old one goes. */
         forget() {
             for (let i = 0; i < SHARED_BUCKETS; i += 1) this.d.del(SHARED_READS_PREFIX + i);
-            for (const key of [SHARED_STATE_KEY, SHARED_GRANT_KEY, SHARED_MARKS_KEY, SHARED_INTEREST_KEY, SHARED_ASK_KEY, SHARED_DIR_KEY]) this.d.del(key);
+            for (const key of [SHARED_STATE_KEY, SHARED_GRANT_KEY, SHARED_MARKS_KEY, SHARED_INTEREST_KEY, SHARED_ASK_KEY, SHARED_DIR_KEY, SHARED_W3B_ASK_KEY, SHARED_LISTS_OUT_KEY, SHARED_LISTS_IN_KEY]) this.d.del(key);
+            this.w3bAskKept = null;
+            this.listsSent = new Map();
             this.buckets = null;
             this.kept = null;
             this.interest = null;
@@ -1519,7 +1762,13 @@
                 people: Number.isInteger(state.people) ? state.people : null,
                 peopleOn: Array.isArray(state.on) ? state.on : [],
                 you: state.you || null,
+                // TornW3B's work (3.26.0): [handed to this PC, wanted] at the last exchange; trader lists sent and taken so far.
+                w3bAsk: Array.isArray(state.w3bAsk) ? state.w3bAsk : null,
+                listsOut: Number.isInteger(state.listsOut) ? state.listsOut : 0,
+                listsIn: Number.isInteger(state.listsIn) ? state.listsIn : 0,
                 unknown: Boolean(cfg && state.unknown),
+                // When a PC the server does not know asks again (ms from the last asking).
+                unknownWaitMs: cfg && state.unknown ? sharedUnknownWait(state.unknownTries) : null,
                 now,
             };
         }
@@ -3574,23 +3823,45 @@
         let pays = 0;
         let cost = 0;
         let profit = 0;
+        let own = 0;
+        let spent = 0;
+        const toBuy = { cost: 0, pays: 0, steps: 0 };
+        const left = { units: 0, cost: 0 };
         for (const i of (trade && trade.items) || []) {
             const taken = takenUnits(i);
             pays += taken * i.bid;
-            for (const st of i.steps || []) {
-                if (st.skipped && !st.bought) continue;
-                cost += (st.boughtQty > 0 ? st.boughtQty : st.qty) * st.price;
-            }
             if (i.kind !== 'flip') {
+                // Yours: they pay for it, no bazaar is paid - said apart, so the card's sum holds.
+                own += taken * i.bid;
                 profit += yoursProfit(i, taken);
                 continue;
             }
             // Not bought yet: planned prices; bought: what it cost.
             const started = (i.steps || []).some(stepDone);
             const each = started ? costEach(i) : (i.steps || []).reduce((a, st) => a + st.qty * st.price, 0) / Math.max(1, (i.steps || []).reduce((a, st) => a + st.qty, 0));
+            // The cost of the very units `pays` counts (3.26.0). Before, every step not skipped was added
+            // here, bought or not, while pays and profit counted only what was bought once a line was started:
+            // "You pay $20.16M, they pay $17.82M, profit +$550,736" (the friend's card, 2026-10-11).
+            cost += taken * each;
             profit += taken * (i.bid - each);
+            for (const st of i.steps || []) {
+                if (st.bought || st.boughtQty > 0) spent += (st.boughtQty > 0 ? st.boughtQty : st.qty) * st.price;
+                // Started on, and this bazaar still to visit: neither paid nor expected yet.
+                else if (started && !stepDone(st)) {
+                    toBuy.cost += st.qty * st.price;
+                    toBuy.pays += st.qty * i.bid;
+                    toBuy.steps += 1;
+                }
+            }
+            // Bought, and they did not take it: its cost is not this trade's - it is yours to sell.
+            const kept = Math.max(0, sendUnits(i) - taken);
+            if (started && kept) {
+                left.units += kept;
+                left.cost += kept * each;
+            }
         }
-        return { pays, cost, profit };
+        // (pays - own) - cost is the flips' profit, always; `profit` adds what your own items make.
+        return { pays, cost, profit, own, spent, toBuy, left };
     }
 
     /* ---------------------------------- What goes into the trade now (3.17.2) */
@@ -5801,6 +6072,8 @@
                 cost: Math.round(tot.cost),
                 pays: Math.round(tot.pays),
                 paid: Math.round(steps.reduce((a, st) => a + (st.bought || st.boughtQty > 0 ? (st.boughtQty > 0 ? st.boughtQty : st.qty) * st.price : 0), 0)),
+                // Bazaars not been to yet, at the plan's prices (3.26.0: `cost` is of what `pays` counts, no longer of every step).
+                toBuy: Math.round(steps.reduce((a, st) => a + (stepDone(st) ? 0 : st.qty * st.price), 0)),
                 // Lines in Torn's trade so far, and the bazaar to buy from next.
                 sent: (t.items || []).filter((i) => i.sent).length,
                 next: open ? open.sellerName || (open.sellerId ? 'Player ' + open.sellerId : null) : null,
@@ -8571,6 +8844,1089 @@
         return next;
     }
 
+    /* ===== src/core/traders.js ===== */
+    /*
+     * Our own trader database, and who pays most for each item. Pure: no DOM,
+     * no network.
+     *
+     * Traders publish buy prices in two places:
+     *   - TornExchange: every active trader (name + Torn id), the top three
+     *     buyers of every item, and an item's full buyer list on request.
+     *   - TornW3B: each trader's own price list at weav3r.dev/pricelist/{id}.
+     *     TornW3B has no list of traders, so ours is built from TornExchange's
+     *     active traders plus every /pricelist/{id} link seen on a TornW3B page
+     *     the user opened (its leaderboards, Search Deals).
+     *
+     * One row per trader per item: a trader on both sites shows once, with both
+     * links. When their two lists disagree, the LOWER price is the one counted
+     * (ranking, flips, where to sell), and the row is marked `differ`: in a trade
+     * the trader pays what they choose, and the owner's friend lost money trading
+     * on the higher of two lists (2026-09-26) - one list was stale or bait.
+     * Always highest (counted) price first.
+     */
+
+    const TRADER_DB_VERSION = 1;
+
+    /**
+     * A TornW3B list is kept, and shown, for this long after it was read, then dropped. Seven days since
+     * 3.26.0 (the owner, 2026-10-11: "we keep a stale list we keep for 7 days"); it was six hours, so a
+     * Torn Bids opened in the morning knew no trader until 2,800 lists had been read again. A kept list
+     * says how old it is and never makes a flip by itself: a flip needs a check (core/checked.js).
+     */
+    const W3B_LIST_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+
+    /** Lists of traders who buy something you hold are re-read this often. */
+    const W3B_HELD_REFRESH_MS = 10 * 60 * 1000;
+
+    /** Every other trader's list is re-read this often. */
+    const W3B_OTHER_REFRESH_MS = 60 * 60 * 1000;
+
+    /** A list not changed in over a day (it makes no flip), or of a trader the Trusted switch hides: this often. */
+    const W3B_SLOW_REFRESH_MS = 6 * 60 * 60 * 1000;
+
+    /** A trader with no TornW3B list is checked again after this. */
+    const W3B_MISSING_RECHECK_MS = 24 * 60 * 60 * 1000;
+
+    /** A failed read is not tried again before this. */
+    const W3B_ERROR_RETRY_MS = 5 * 60 * 1000;
+
+    /**
+     * A trader no source has named for this long, with no TornW3B list read in
+     * that time, is forgotten: the database used to only grow, and every Torn
+     * page loads it.
+     */
+    const TRADER_FORGET_MS = 30 * 24 * 60 * 60 * 1000;
+
+    /** `seenAt` is written back at most this often (it changes on every read of a source). */
+    const SEEN_RENEW_MS = 24 * 60 * 60 * 1000;
+
+    function emptyTraderDb() {
+        return { version: TRADER_DB_VERSION, traders: {} };
+    }
+
+    /** The stored database, or an empty one when absent or from another version. */
+    function readTraderDb(entry) {
+        if (!entry || entry.version !== TRADER_DB_VERSION || !entry.traders || typeof entry.traders !== 'object') {
+            return emptyTraderDb();
+        }
+        return entry;
+    }
+
+    function cleanId(id) {
+        const s = String(id === null || id === undefined ? '' : id).replace(/\D/g, '');
+        return s && s !== '0' ? s : '';
+    }
+
+    /**
+     * Fold `other` (what storage holds now) into `db` (what this tab holds), so
+     * neither loses what the other learned: every trader from both, and for each
+     * the more recently read TornW3B list. Returns true when `db` changed.
+     */
+    function mergeTraderDbs(db, other) {
+        const src = readTraderDb(other);
+        let changed = false;
+        for (const [id, t] of Object.entries(src.traders)) {
+            const mine = db.traders[id];
+            if (!mine) {
+                db.traders[id] = t;
+                changed = true;
+                continue;
+            }
+            // Only an answer counts: a failed read (errorAt) never replaces a
+            // list, and of two answers the later one wins.
+            const theirs = (t.w3b && t.w3b.checkedAt) || 0;
+            const ours = (mine.w3b && mine.w3b.checkedAt) || 0;
+            if (theirs > ours) {
+                mine.w3b = t.w3b;
+                changed = true;
+            }
+            if (t.name && mine.name.startsWith('Trader ') && !t.name.startsWith('Trader ')) {
+                mine.name = t.name;
+                changed = true;
+            }
+            if ((t.seenAt || 0) > (mine.seenAt || 0)) mine.seenAt = t.seenAt;
+        }
+        return changed;
+    }
+
+    /**
+     * Add traders we have just learned of (from TornExchange, Torn, or a TornW3B
+     * page). Returns true when anything changed. A known trader keeps what we
+     * know of their list. Names from TornExchange and Torn are authoritative; a
+     * name read off a TornW3B page only fills in a placeholder.
+     *
+     * @param {object} db
+     * @param {Iterable<{id, name, source}>} found
+     */
+    function addTraders(db, found, now = Date.now()) {
+        let changed = false;
+        for (const f of found || []) {
+            const id = cleanId(f && f.id);
+            if (!id) continue;
+            const name = f.name ? String(f.name).trim() : '';
+            let t = db.traders[id];
+            if (!t) {
+                t = db.traders[id] = { name: name || 'Trader ' + id, from: f.source || null, seenAt: now, w3b: null };
+                changed = true;
+            } else if (name && t.name !== name && ((f.source !== 'w3b' && f.source !== 'seed') || t.name.startsWith('Trader '))) {
+                t.name = name;
+                changed = true;
+            }
+            // Still named by a source: not one to forget (see pruneTraderDb).
+            if (!(now - (t.seenAt || 0) < SEEN_RENEW_MS)) {
+                t.seenAt = now;
+                changed = true;
+            }
+            // TornW3B's rating ("523↑ · 7↓"), when the page we read showed it.
+            const r = f.rating;
+            if (r && Number.isFinite(r.up) && Number.isFinite(r.down) && (!t.rating || t.rating.up !== r.up || t.rating.down !== r.down)) {
+                t.rating = { up: r.up, down: r.down, at: now };
+                changed = true;
+            }
+        }
+        return changed;
+    }
+
+    /**
+     * A TornW3B price list as {itemId: price}: buying prices only (0 means "not
+     * buying"), real items only (negative ids are TornW3B's own sets).
+     */
+    function parseW3bPriceList(body) {
+        const prices = {};
+        if (!Array.isArray(body)) return prices;
+        for (const row of body) {
+            const itemId = Number(row && row.itemId);
+            const price = Number(row && row.buyPrice);
+            if (!Number.isInteger(itemId) || itemId <= 0) continue;
+            if (!Number.isFinite(price) || price <= 0) continue;
+            prices[String(itemId)] = price;
+        }
+        return prices;
+    }
+
+    /** Record the result of reading one trader's TornW3B list. */
+    function recordW3bList(db, traderId, result, now = Date.now()) {
+        const id = cleanId(traderId);
+        if (!id) return;
+        if (!db.traders[id]) db.traders[id] = { name: 'Trader ' + id, from: 'w3b', seenAt: now, w3b: null };
+        const t = db.traders[id];
+        if (result.error) {
+            // Not an answer: keep whatever list we had, try again in a while.
+            t.w3b = { ...(t.w3b || {}), errorAt: now };
+            return;
+        }
+        const prices = result.prices || {};
+        t.w3b = Object.keys(prices).length
+            ? { checkedAt: now, at: now, found: true, prices }
+            : { checkedAt: now, found: false };
+    }
+
+    /** Ask for a list again soon (Refresh), without hiding the prices we have. */
+    function markW3bDue(db, traderId) {
+        const t = db.traders[cleanId(traderId)];
+        if (t && t.w3b && t.w3b.found) t.w3b.due = true;
+    }
+
+    /**
+     * Drop price lists too old to show, so storage does not grow forever. The
+     * trader and when their list was read stay, so it is read again in turn -
+     * unless no source has named them for TRADER_FORGET_MS and they had no list
+     * in that time: then the trader goes too.
+     */
+    function pruneTraderDb(db, now = Date.now()) {
+        for (const [id, t] of Object.entries(db.traders)) {
+            // Kept before 3.12.5 without a date: counted from now, not forgotten at once.
+            if (!t.seenAt) t.seenAt = now;
+            const listAt = (t.w3b && (t.w3b.at || t.w3b.checkedAt)) || 0;
+            const lastFound = t.w3b && t.w3b.found ? listAt : 0;
+            if (now - (t.seenAt || 0) > TRADER_FORGET_MS && now - lastFound > TRADER_FORGET_MS) {
+                delete db.traders[id];
+                continue;
+            }
+            const w = t.w3b;
+            if (w && w.found && w.prices && !(now - w.at <= W3B_LIST_MAX_AGE_MS)) {
+                t.w3b = { checkedAt: w.checkedAt, at: w.at, found: true, prices: null };
+            }
+            if (t.te && t.te.prices && !(now - t.te.at < TE_SCAN_MAX_AGE_MS)) t.te = { ...t.te, prices: null };
+        }
+        return db;
+    }
+
+    /*
+     * TornExchange, every active trader's whole list in turn (3.15): the top
+     * three per item missed everyone ranked 4th and lower. Kept with the trader,
+     * like their TornW3B list; used for TE_SCAN_MAX_AGE_MS.
+     */
+    const TE_SCAN_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+
+    /** One trader's TornExchange list read (`prices` [{itemId, price}]), or `{error: true}`. */
+    function recordTeScan(db, traderId, { prices = null, error = false } = {}, now = Date.now()) {
+        const id = cleanId(traderId);
+        if (!id) return;
+        const t = db.traders[id] || (db.traders[id] = { name: 'Trader ' + id, from: 'te', seenAt: now, w3b: null });
+        if (error) {
+            t.te = { ...(t.te || {}), triedAt: now, failed: ((t.te && t.te.failed) || 0) + 1 };
+            return;
+        }
+        const map = {};
+        for (const p of prices || []) if (p && p.price > 0) map[String(p.itemId)] = p.price;
+        t.te = { at: now, triedAt: now, prices: map, failed: 0 };
+    }
+
+    /** itemId -> [{id, name, price}] from every TornExchange list read within TE_SCAN_MAX_AGE_MS. */
+    function indexTeScanByItem(db, now = Date.now()) {
+        const out = new Map();
+        for (const [id, t] of Object.entries((db && db.traders) || {})) {
+            const te = t && t.te;
+            if (!te || !te.prices || !(now - te.at < TE_SCAN_MAX_AGE_MS)) continue;
+            for (const [itemId, price] of Object.entries(te.prices)) {
+                if (!out.has(itemId)) out.set(itemId, []);
+                out.get(itemId).push({ id, name: t.name && !String(t.name).startsWith('Trader ') ? t.name : null, price });
+            }
+        }
+        return out;
+    }
+
+    /** A trader's TornW3B prices, if read recently enough to show. */
+    function liveW3bPrices(trader, now = Date.now()) {
+        const w = trader && trader.w3b;
+        if (!w || !w.found || !w.prices || !(now - w.at <= W3B_LIST_MAX_AGE_MS)) return null;
+        return w.prices;
+    }
+
+    /**
+     * Which trader's TornW3B list to read next, or null if none is due. Never
+     * read first, then one marked due (Refresh on a trader, or TornW3B says they
+     * changed their list since we read it), then the oldest list of a trader who
+     * buys something you hold or stands behind a flip, then everyone else - the
+     * list changed most recently first (3.26.0, the owner: "prioritize recent
+     * updates") - then the slow ones; traders with no list are re-checked daily.
+     *
+     * @param {object} db
+     * @param {Set<string>} heldIds - item ids in your inventory
+     * @param {number} now
+     * @param {object} [o]
+     * @param {Set<string>} [o.hot] - traders behind a flip shown or possible: read as often as those who buy what you hold
+     * @param {function} [o.listAtOf] - (trader id) => when they last changed their list (ms), 0 when not known
+     * @param {function} [o.slow] - (trader id) => true: read only every W3B_SLOW_REFRESH_MS (hidden by the Trusted switch)
+     */
+    function nextW3bTrader(db, heldIds = new Set(), now = Date.now(), { hot = null, listAtOf = null, slow = null } = {}) {
+        let best = null;
+        let bestRank = Infinity;
+        for (const [id, t] of Object.entries(db.traders)) {
+            const w = t.w3b;
+            if (w && w.errorAt && now - w.errorAt < W3B_ERROR_RETRY_MS) continue;
+
+            let rank;
+            if (!w || !w.checkedAt) {
+                rank = 0;
+            } else if (!w.found) {
+                if (now - w.checkedAt < W3B_MISSING_RECHECK_MS) continue;
+                rank = 3e15 + w.checkedAt;
+            } else {
+                const age = now - (w.at || 0);
+                const isHot = Boolean(hot && hot.has(id));
+                const buysHeld = isHot || (heldIds.size > 0 && Object.keys(w.prices || {}).some((i) => heldIds.has(i)));
+                const changed = listAtOf ? Number(listAtOf(id)) || 0 : 0;
+                if (w.due) {
+                    rank = 5e14 + (w.at || 0);
+                } else if (buysHeld) {
+                    if (age < W3B_HELD_REFRESH_MS) continue;
+                    rank = 1e15 + (w.at || 0);
+                } else if ((changed > 0 && now - changed > PRICES_STALE_MS) || (slow && slow(id))) {
+                    if (age < W3B_SLOW_REFRESH_MS) continue;
+                    rank = 2.5e15 + (w.at || 0);
+                } else {
+                    if (age < W3B_OTHER_REFRESH_MS) continue;
+                    // With the dates known: the list changed most recently first. Without: the oldest read first, as before.
+                    rank = listAtOf ? 2e15 + (1e14 - Math.min(changed, 1e14 - 1)) : 2e15 + (w.at || 0);
+                }
+            }
+            if (rank < bestRank) {
+                bestRank = rank;
+                best = id;
+            }
+        }
+        return best;
+    }
+
+    /** Counts for the status line. */
+    function traderDbStats(db, now = Date.now()) {
+        let total = 0;
+        let withW3b = 0;
+        let unchecked = 0;
+        let newest = 0;
+        for (const t of Object.values(db.traders)) {
+            total += 1;
+            if (!t.w3b || !t.w3b.checkedAt) unchecked += 1;
+            if (liveW3bPrices(t, now)) {
+                withW3b += 1;
+                if (t.w3b.at > newest) newest = t.w3b.at;
+            }
+        }
+        return { total, withW3b, unchecked, newestW3bAt: newest || null };
+    }
+
+    /**
+     * Every trader buying one item, one row each, highest price first.
+     *
+     * @param {string} itemId
+     * @param {object} src
+     * @param {Array}  [src.teBest]     - TornExchange top three: {name, id, price, score}
+     * @param {Array|null} [src.teFull] - TornExchange full list: {name, price}
+     * @param {Map}    [src.idsByName]  - lowercase TornExchange name -> torn id
+     * @param {object} [src.db]         - the trader database (TornW3B lists)
+     * @param {Map}    [src.w3bByItem]  - itemId -> [{id, price}], from indexW3bByItem
+     * @param {Array}  [src.teOwn]      - your traders' own whole TornExchange lists (3.14.3):
+     *   {id, name, price, lastPaid} - lastPaid: no public list, what they paid you last
+     * @returns {Array<{id, name, price, te: number|null, w3b: number|null, teName: string|null}>}
+     */
+    function buyersForItem(itemId, { teBest = [], teFull = null, idsByName = new Map(), db = null, w3bByItem = null, dbIdsByName = null, votesById = null, teOwn = null, w3bItem = null } = {}) {
+        const key = String(itemId);
+        const rows = new Map();
+        const byName = new Map();
+
+        const row = (id, name) => {
+            const k = id ? 'id:' + id : 'name:' + String(name).toLowerCase();
+            let r = rows.get(k);
+            if (!r) {
+                r = { id: id || null, name: name || (id ? 'Trader ' + id : '?'), price: 0, te: null, teTop: null, teList: null, w3b: null, teName: null, votes: null };
+                rows.set(k, r);
+            }
+            if (name && r.name.startsWith('Trader ') && !String(name).startsWith('Trader ')) r.name = name;
+            return r;
+        };
+        // TornExchange's top three and an item's full list are read at different
+        // times: when they disagree for one trader, the lower counts (as between
+        // the two sites) - the higher may be a price they have since dropped.
+        const setTe = (r, name, price, which) => {
+            r.teName = name;
+            if (!(r[which] >= price)) r[which] = price;
+            r.te = r.teTop > 0 && r.teList > 0 ? Math.min(r.teTop, r.teList) : r.teTop || r.teList;
+            byName.set(String(name).toLowerCase(), r);
+        };
+
+        for (const t of teBest || []) {
+            if (!t || !(t.price > 0) || !t.name) continue;
+            const lower = String(t.name).toLowerCase();
+            const id = cleanId(t.id) || cleanId(idsByName.get(lower)) || cleanId(dbIdsByName && dbIdsByName.get(lower));
+            const r = row(id, t.name);
+            setTe(r, t.name, t.price, 'teTop');
+            // TornExchange's vote score comes with its top buyers.
+            if (Number.isFinite(t.score)) r.votes = t.score;
+        }
+        if (Array.isArray(teFull)) {
+            // The full list carries everyone ever listed; once the active traders
+            // are known, a name on neither that list nor the top three is an
+            // inactive trader and is left out.
+            const activeKnown = idsByName && idsByName.size > 0;
+            for (const t of teFull) {
+                if (!t || !(t.price > 0) || !t.name) continue;
+                const lower = String(t.name).toLowerCase();
+                const known = byName.get(lower);
+                if (!known && activeKnown && !idsByName.has(lower)) continue;
+                const id = (known && known.id) || cleanId(idsByName.get(lower)) || cleanId(dbIdsByName && dbIdsByName.get(lower));
+                setTe(known || row(id, t.name), t.name, t.price, 'teList');
+            }
+        }
+
+        // A trader's own whole list counts as their full list. Last-paid prices
+        // (no public list) are kept apart and count only when nothing else does.
+        for (const t of teOwn || []) {
+            if (!t || !(t.price > 0) || !(t.id || t.name)) continue;
+            const known = t.name ? byName.get(String(t.name).toLowerCase()) : null;
+            const r = rows.get('id:' + cleanId(t.id)) || known || row(cleanId(t.id), t.name);
+            if (t.lastPaid) {
+                if (!(r.lastPaid >= t.price)) r.lastPaid = t.price;
+                continue;
+            }
+            // Only a real name makes a TornExchange list link.
+            if (t.name) setTe(r, t.name, t.price, 'teList');
+            else if (!(r.teList >= t.price)) {
+                r.teList = t.price;
+                r.te = r.teTop > 0 ? Math.min(r.teTop, r.teList) : r.teList;
+            }
+        }
+
+        const w3b = w3bByItem ? w3bByItem.get(key) || [] : [];
+        for (const { id, price } of w3b) {
+            const t = db && db.traders[id];
+            // The same trader already here by name only (a TornExchange row with
+            // no id yet): one row, now with the id.
+            let r = rows.get('id:' + id);
+            // (No TornExchange row by name at all: nothing to look up - 3.17.1, the same result.)
+            if (!r && t && byName.size) {
+                const named = byName.get(String(t.name).toLowerCase());
+                if (named && !named.id) {
+                    rows.delete('name:' + String(named.name).toLowerCase());
+                    named.id = id;
+                    rows.set('id:' + id, named);
+                    r = named;
+                }
+            }
+            if (!r) r = row(id, t ? t.name : null);
+            if (!(r.w3b >= price)) r.w3b = price;
+        }
+
+        // Every TornW3B buyer of this item, read minutes ago (3.15, /traders): its
+        // price is the newest, and it names traders we had no list of yet.
+        for (const t of w3bItem || []) {
+            const id = cleanId(t && t.id);
+            if (!id || !(t.price > 0)) continue;
+            let r = rows.get('id:' + id);
+            if (!r && t.name && byName.size) {
+                const named = byName.get(String(t.name).toLowerCase());
+                if (named && !named.id) {
+                    rows.delete('name:' + String(named.name).toLowerCase());
+                    named.id = id;
+                    rows.set('id:' + id, named);
+                    r = named;
+                }
+            }
+            if (!r) r = row(id, t.name || null);
+            r.w3b = t.price;
+            if (Number.isFinite(t.up) && Number.isFinite(t.down)) r.itemRating = { up: t.up, down: t.down };
+        }
+
+        const out = [];
+        for (const r of rows.values()) {
+            const both = r.te > 0 && r.w3b > 0;
+            r.price = both ? Math.min(r.te, r.w3b) : Math.max(r.te || 0, r.w3b || 0);
+            // Only what they paid you last: marked, and never above a live price.
+            r.lastPaidOnly = !(r.price > 0) && r.lastPaid > 0;
+            if (r.lastPaidOnly) r.price = r.lastPaid;
+            r.differ = (both && r.te !== r.w3b) || (r.teTop > 0 && r.teList > 0 && r.teTop !== r.teList);
+            if (r.price <= 0) continue;
+            // What we know of how they trade: TornExchange votes (from any item's
+            // top three) and TornW3B's rating.
+            if (r.votes === null && r.id && votesById && votesById.has(r.id)) r.votes = votesById.get(r.id);
+            const t = r.id && db ? db.traders[r.id] : null;
+            r.rating = (t && t.rating) || r.itemRating || null;
+            r.trust = trustOf(r.votes, r.rating);
+            out.push(r);
+        }
+        out.sort((a, b) => b.price - a.price || TRADER_NAME_ORDER.compare(String(a.name), String(b.name)));
+        return out;
+    }
+
+    /*
+     * Names at the same price, in the order String.localeCompare gives them: it
+     * is this same collator (the default locale, no options) - made once here
+     * instead of once per comparison (3.17.1).
+     */
+    const TRADER_NAME_ORDER = new Intl.Collator();
+
+    /**
+     * A trader's trust, from the votes other players left after trading with
+     * them: TornExchange's vote score and TornW3B's rating (ups minus downs). The
+     * better of the two counts, so a trader known on one site only is not
+     * marked down for missing from the other.
+     *
+     *   Trusted  - 100 or more
+     *   Known    - 20 or more
+     *   New      - 0 to 19
+     *   Caution  - below 0
+     *   null     - nothing known
+     *
+     * @returns {{level: string, score: number, votes: number|null, up: number|null, down: number|null}|null}
+     */
+    function trustOf(votes, rating) {
+        const te = Number.isFinite(votes) ? votes : null;
+        const w3b = rating && Number.isFinite(rating.up) && Number.isFinite(rating.down) ? rating.up - rating.down : null;
+        if (te === null && w3b === null) return null;
+        const score = Math.max(te === null ? -Infinity : te, w3b === null ? -Infinity : w3b);
+        const level = score >= 100 ? 'Trusted' : score >= 20 ? 'Known' : score >= 0 ? 'New' : 'Caution';
+        return { level, score, votes: te, up: rating ? rating.up : null, down: rating ? rating.down : null };
+    }
+
+    /**
+     * TornExchange vote scores by trader id, from every item's top buyers and
+     * the keyless best-buyer answers: one pass, for every row.
+     * @param {Iterable<Array>} lists - arrays of {id, score}
+     */
+    function votesByTrader(lists) {
+        const out = new Map();
+        for (const list of lists) {
+            for (const t of list || []) {
+                const id = cleanId(t && t.id);
+                if (id && Number.isFinite(t.score) && !out.has(id)) out.set(id, t.score);
+            }
+        }
+        return out;
+    }
+
+    /* A trader's TornExchange votes are remembered this long after last seen. */
+    const VOTES_KEEP_MS = 7 * 24 * 60 * 60 * 1000;
+    /* At most this many traders' votes are remembered (the most recently seen). */
+    const VOTES_KEEP_MAX = 5000;
+
+    /**
+     * Votes only come with an item's top three, so a trader who drops out of
+     * every top three at a refresh lost their trust badge, and with "Trusted
+     * buyers only" vanished from the desk (the friend, 3.14.4: "the list of
+     * buyers suddenly disappears"). The last votes seen are kept for a week.
+     *
+     * @param {object|null} stored - {id: [score, at]}
+     * @param {Map<string, number>} current - votesByTrader of the newest answer
+     * @param {number} at - when that answer was read
+     * @returns {object} the new stored form
+     */
+    function rememberVotes(stored, current, at, now = Date.now()) {
+        const all = new Map();
+        for (const [id, v] of Object.entries(stored && typeof stored === 'object' ? stored : {})) {
+            if (Array.isArray(v) && Number.isFinite(v[0]) && now - Number(v[1]) <= VOTES_KEEP_MS) all.set(id, [v[0], Number(v[1])]);
+        }
+        for (const [id, score] of current || []) {
+            const old = all.get(id);
+            if (!old || !(old[1] > at)) all.set(id, [score, at]);
+        }
+        const keep = [...all.entries()].sort((a, b) => b[1][1] - a[1][1]).slice(0, VOTES_KEEP_MAX);
+        return Object.fromEntries(keep);
+    }
+
+    /** The remembered votes, as votesByTrader's map (too old ones left out). */
+    function rememberedVotes(stored, now = Date.now()) {
+        const out = new Map();
+        for (const [id, v] of Object.entries(stored && typeof stored === 'object' ? stored : {})) {
+            if (Array.isArray(v) && Number.isFinite(v[0]) && now - Number(v[1]) <= VOTES_KEEP_MS) out.set(id, v[0]);
+        }
+        return out;
+    }
+
+    /**
+     * Who pays the most for the most of your items. In Torn you trade with one
+     * person at a time, so the trader with the best price on many of your items
+     * is the one to message first.
+     *
+     * @param {Array<{itemId, buyers, best}>} rows - My items
+     * @param {number} [limit]
+     * @returns {Array<{trader, bestOn: string[], buys: number}>} most best-prices first
+     */
+    function bestTradersFor(rows, limit = 3) {
+        const byId = new Map();
+        for (const r of rows || []) {
+            for (const [i, b] of (r.buyers || []).entries()) {
+                const key = b.id || 'name:' + String(b.name).toLowerCase();
+                let e = byId.get(key);
+                if (!e) byId.set(key, (e = { trader: b, bestOn: [], buys: 0 }));
+                e.buys += 1;
+                if (i === 0) e.bestOn.push(r.itemId);
+            }
+        }
+        return [...byId.values()]
+            .filter((e) => e.bestOn.length > 0)
+            .sort((a, b) => b.bestOn.length - a.bestOn.length || b.buys - a.buys || String(a.trader.name).localeCompare(String(b.trader.name)))
+            .slice(0, limit);
+    }
+
+    /**
+     * TornW3B's ratings as its leaderboards print them: a name, then
+     * "523↑ · 7↓" on the next line.
+     * @returns {Map<string, {up: number, down: number}>} name -> rating
+     */
+    function ratingsInText(text) {
+        const out = new Map();
+        const re = /([A-Za-z0-9_-]{1,20})\s*\n\s*(\d+)\s*↑\s*·\s*(\d+)\s*↓/g;
+        let m;
+        while ((m = re.exec(String(text || '')))) out.set(m[1], { up: Number(m[2]), down: Number(m[3]) });
+        return out;
+    }
+
+    /** Lowercase name -> id for every trader we know by a real name. */
+    function traderIdsByName(db) {
+        const out = new Map();
+        for (const [id, t] of Object.entries(db.traders)) {
+            if (t.name && !t.name.startsWith('Trader ')) out.set(t.name.toLowerCase(), id);
+        }
+        return out;
+    }
+
+    /** itemId -> [{id, price}] across every live TornW3B list: one pass, not one per item. */
+    function indexW3bByItem(db, now = Date.now()) {
+        const out = new Map();
+        for (const [id, t] of Object.entries(db.traders)) {
+            const prices = liveW3bPrices(t, now);
+            if (!prices) continue;
+            for (const [itemId, price] of Object.entries(prices)) {
+                let list = out.get(itemId);
+                if (!list) out.set(itemId, (list = []));
+                list.push({ id, price });
+            }
+        }
+        return out;
+    }
+
+    /**
+     * "Buyers online only": drop traders known to be offline, order unchanged.
+     * Idle ones (logged in, away a few minutes), ones whose status is not read
+     * yet, and ones known by name only stay - it used to drop all of those, and
+     * with them most of the big TornExchange buyers (3.14).
+     */
+    function onlineOnly(buyers, levelOf) {
+        return buyers.filter((b) => !(b.id && levelOf(b.id) === 'offline'));
+    }
+
+    /**
+     * The buyers "Buyers online only" and "Trusted buyers only" leave out, each
+     * with why (`hiddenBy`: 'offline' or 'trust'), so the desk can say so: a
+     * list that empties with no reason reads as broken (the friend, 3.14.4).
+     * The same rules as onlineOnly and trustedOnly({min: 'Known'}).
+     *
+     * @param {Array} buyers - the allowed buyers (blacklist already out)
+     * @param {{prefs: {onlineOnly?: boolean, trustedOnly?: boolean}, levelOf: Function, votesMissing?: boolean}} opts
+     */
+    function hiddenBuyers(buyers, { prefs = {}, levelOf = () => 'unknown', votesMissing = false, listAtOf = () => 0, now = Date.now() } = {}) {
+        const out = [];
+        for (const b of buyers || []) {
+            if (prefs.onlineOnly && b.id && levelOf(b.id) === 'offline') out.push({ ...b, hiddenBy: 'offline' });
+            else if (prefs.trustedOnly && !(b.trust ? b.trust.level === 'Trusted' || b.trust.level === 'Known' : votesMissing)) out.push({ ...b, hiddenBy: 'trust' });
+            else if (prefs.freshOnly && stalePrice(b, listAtOf, now)) out.push({ ...b, hiddenBy: 'stale', listAt: Number(listAtOf(b.id)) || 0 });
+        }
+        return out;
+    }
+
+    /*
+     * "Fresh prices only" (3.22.0; the owner, 2026-10-03: "if the prices are too
+     * stale lets say over a day, do not show them in tornbids, it means they are
+     * not updating"; then: "2 days update is fine").
+     *
+     * TornW3B says when each trader last changed their price list
+     * (`pricelist_updated`, with every buyer of an item). Measured that day on
+     * six items, the top 100 buyers of each: 35 to 42 had changed theirs within a
+     * day, about half within three days, and of the ten highest prices two to
+     * seven came from lists weeks old - the prices nobody honours.
+     *
+     * A price is stale when it is that trader's TornW3B price, their list was
+     * last changed over two days ago, and TornExchange has no price of theirs for
+     * the item (TornExchange gives no date: a price also listed there is left
+     * alone). A trader whose list date was never read is not stale - not known
+     * is not old.
+     *
+     * 3.26.0 (the owner, 2026-10-11: "price list has to be updated for at most 24
+     * hours ago"): the line is one day, not two, and the amber "getting old" mark
+     * (PRICES_AGING_MS) starts at twelve hours. A flip needs more than this - a
+     * check minutes old, whatever the Fresh prices switch says (core/checked.js).
+     */
+    const PRICES_STALE_MS = 24 * 60 * 60 * 1000;
+
+    /**
+     * @param {{id, w3b, te}} b - a buyer row (buyersForItem)
+     * @param {function} listAtOf - (trader id) => when their TornW3B list last changed (ms), 0 when not known
+     */
+    function stalePrice(b, listAtOf, now = Date.now()) {
+        if (!b || !b.id || !(b.w3b > 0) || b.te > 0) return false;
+        const at = Number(listAtOf(b.id)) || 0;
+        return at > 0 && now - at > PRICES_STALE_MS;
+    }
+
+    /*
+     * Who traded lately (3.23.0, the first step on "will this trader actually
+     * trade this item"). TornW3B's list of an item's buyers holds 100 at most,
+     * highest price first - Xanax had 412 - so the 100 we read were the dearest
+     * lists, traded on or not. It can be asked for only those who traded in the
+     * last N hours. With Fresh prices only on, an item with more buyers than one
+     * answer holds is read both ways in turn - everyone, then those who traded
+     * in the last two days (the same two days) - and the two answers are one
+     * list: nobody the full read named is lost, and nobody's list date goes
+     * unread. No trader is hidden by this; it only finds the ones the cut hid.
+     */
+    const FRESH_TRADED_HOURS = PRICES_STALE_MS / (60 * 60 * 1000);
+
+    /**
+     * What the next read of an item's buyers asks for.
+     *
+     * @param {{at, total, answered?, traders, withinHours}|null} prev - the last read
+     * @returns {number|null} hours for "traded within", or null: everyone
+     */
+    function buyersAsk(prev, { fresh = false } = {}) {
+        if (!fresh || !prev || !(Number(prev.at) > 0) || prev.withinHours) return null;
+        const answered = Number.isFinite(Number(prev.answered)) ? Number(prev.answered) : (prev.traders || []).length;
+        return Number(prev.total) > answered && answered > 0 ? FRESH_TRADED_HOURS : null;
+    }
+
+    /** Two reads of an item's buyers as one list: the newer read of the same trader counts; highest price first. */
+    function mergeItemBuyers(older, newer) {
+        const byId = new Map();
+        for (const t of older || []) if (t && t.id) byId.set(String(t.id), t);
+        for (const t of newer || []) if (t && t.id) byId.set(String(t.id), t);
+        return [...byId.values()].sort((a, b) => b.price - a.price);
+    }
+
+    /** In an answer asked for "traded within N hours": how many last traded longer ago than that (known ones only). */
+    function notTradedLately(traders, hours, now = Date.now()) {
+        return (traders || []).filter((t) => t && Number(t.lastTrade) > 0 && now - Number(t.lastTrade) > hours * 60 * 60 * 1000).length;
+    }
+
+    /** "Fresh prices only", order unchanged. */
+    function freshOnly(buyers, listAtOf, now = Date.now()) {
+        return buyers.filter((b) => !stalePrice(b, listAtOf, now));
+    }
+
+    /*
+     * A list getting old (3.22.3; the owner, 2026-10-05: "we do need a pulsating
+     * amber color to show that price list isnt updated over 24 hours to 2 days").
+     *
+     * Two days stays the line for Fresh prices only ("2 IS FINE"). A price from a
+     * list last changed over 24 hours ago and not yet over two days is still
+     * shown, with a pulsing amber dot and how long ago ('aging'). Over two days
+     * ('stale') it is seen only with Fresh prices only off: the same amber line,
+     * its dot still.
+     *
+     * The same price as stalePrice looks at, so the two never disagree: that
+     * trader's TornW3B price, with no TornExchange price of theirs for the item
+     * and a list date that was read.
+     */
+    const PRICES_AGING_MS = 12 * 60 * 60 * 1000;
+
+    /**
+     * @param {{id, w3b, te}} b - a buyer row (buyersForItem)
+     * @param {function} listAtOf - (trader id) => when their TornW3B list last changed (ms), 0 when not known
+     * @returns {{at: number, level: 'aging'|'stale'}|null} null: nothing to say
+     */
+    function oldList(b, listAtOf, now = Date.now()) {
+        if (!b || !b.id || !(b.w3b > 0) || b.te > 0) return null;
+        const at = Number(listAtOf(b.id)) || 0;
+        if (!(at > 0) || !(now - at > PRICES_AGING_MS)) return null;
+        return { at, level: now - at > PRICES_STALE_MS ? 'stale' : 'aging' };
+    }
+
+    /**
+     * A trade's old list (3.23.0, the Your traders cards): the first of its lines
+     * whose price is this trader's from a TornW3B list not changed in over 24
+     * hours. One list, one date: the first found says it for the trade.
+     *
+     * @param {Array<{itemId}>} lines - the trade's flips and your To sell lines, in order
+     * @param {function} rowOf - (item id) => that trader's buyer row for the item, or null
+     * @returns {{at: number, level: 'aging'|'stale'}|null}
+     */
+    function tradeOldList(lines, rowOf, listAtOf, now = Date.now()) {
+        for (const l of lines || []) {
+            const old = l ? oldList(rowOf(l.itemId), listAtOf, now) : null;
+            if (old) return old;
+        }
+        return null;
+    }
+
+    /**
+     * The trader a bazaar card's tag names (3.23.0; the owner, 2026-10-05: "yes
+     * the overlay tag should hide old traders too"): the best Trusted one - and,
+     * with Fresh prices only on, the best whose price is not from a list over two
+     * days old (stalePrice, Torn Bids' own rule). None left: no tag.
+     *
+     * @param {Array} buyers - highest first, the blacklist already out
+     * @param {{fresh?: boolean, listAtOf?: function, now?: number}} [o]
+     */
+    function tagBuyer(buyers, { fresh = false, listAtOf = () => 0, now = Date.now() } = {}) {
+        const trusted = trustedOnly(buyers || []);
+        return (fresh ? freshOnly(trusted, listAtOf, now) : trusted)[0] || null;
+    }
+
+    /*
+     * The list dates, for every page (3.23.0). Torn Bids keeps them in its own
+     * page's storage (its address is not Torn's), which a page on torn.com never
+     * sees - so they are also kept, as short as they go, with the script's own
+     * values: [[trader id, seconds]], the newest first.
+     */
+    const LIST_AT_MAX = 3000;
+
+    /** @param {Map<string, number>} listAt - trader id -> ms */
+    function packListAt(listAt, max = LIST_AT_MAX) {
+        return [...listAt].sort((a, b) => b[1] - a[1]).slice(0, max).map(([id, at]) => [String(id), Math.round(at / 1000)]);
+    }
+
+    /** What was stored, as trader id -> ms. Anything that is not a date is left out. */
+    function readListAtRows(stored) {
+        const out = new Map();
+        for (const row of Array.isArray(stored) ? stored : []) {
+            const id = Array.isArray(row) && row[0] !== null && row[0] !== undefined ? String(row[0]) : '';
+            const at = Array.isArray(row) ? Number(row[1]) * 1000 : 0;
+            if (id && at > 0 && Number.isFinite(at) && !out.has(id)) out.set(id, at);
+        }
+        return out;
+    }
+
+    /**
+     * How long ago a list was changed, in words, never shortened: "1 day 6 hours
+     * ago", "2 days ago", "23 days ago". Hours are said for the first three days,
+     * where they matter; after that the days alone.
+     */
+    function listAgeText(ms) {
+        if (!Number.isFinite(ms) || ms < 0) return 'not known';
+        const hours = Math.floor(ms / (60 * 60 * 1000));
+        const days = Math.floor(hours / 24);
+        const h = hours % 24;
+        const dText = days + (days === 1 ? ' day' : ' days');
+        const hText = h + (h === 1 ? ' hour' : ' hours');
+        if (days < 1) return hours < 1 ? 'under an hour ago' : hText + ' ago';
+        return (days < 3 && h ? dText + ' ' + hText : dText) + ' ago';
+    }
+
+    /**
+     * "Trusted buyers only", order unchanged. By default the Trusted badge only
+     * (the bazaar-card tag in the overlay). Torn Bids (3.14, the owner: "we've
+     * made the trusted too strict") passes `min: 'Known'` - 20 votes and up - and
+     * `keepUnrated` while TornExchange's votes are not loaded: a trader is not
+     * untrusted because a list did not load.
+     *
+     * @param {Array} buyers
+     * @param {{min?: 'Trusted'|'Known', keepUnrated?: boolean}} [opts]
+     */
+    function trustedOnly(buyers, { min = 'Trusted', keepUnrated = false } = {}) {
+        const ok = min === 'Known' ? new Set(['Trusted', 'Known']) : new Set(['Trusted']);
+        return buyers.filter((b) => (b.trust ? ok.has(b.trust.level) : keepUnrated));
+    }
+
+    /** What each column sorts by first: prices and counts high to low, names A to Z. */
+    const SORT_FIRST_DIR = { name: 1, price: -1, buyer: 1, next: -1, traders: -1 };
+
+    /**
+     * Pressing a column's header: a new column sorts its natural way first, the
+     * same column again turns it around.
+     */
+    function nextSort(current, key) {
+        if (!Object.prototype.hasOwnProperty.call(SORT_FIRST_DIR, key)) return current;
+        if (current && current.key === key) return { key, dir: -current.dir };
+        return { key, dir: SORT_FIRST_DIR[key] };
+    }
+
+    /**
+     * Item rows in the order the Rows and Table views' headers ask for. Items
+     * nobody buys stay at the end whatever the order, by name; ties fall back to
+     * the best price, then the name, so the order never jumps between renders.
+     *
+     * @param {Array<{name, buyers, best}>} rows
+     * @param {{key: string, dir: 1|-1}} sort
+     */
+    function sortItemRows(rows, sort) {
+        const key = sort && SORT_FIRST_DIR[sort.key] !== undefined ? sort.key : 'price';
+        const dir = sort && sort.dir === 1 ? 1 : -1;
+        const text = (a, b) => String(a).localeCompare(String(b), 'en', { sensitivity: 'base' });
+        const num = (a, b) => (Number(a) || 0) - (Number(b) || 0);
+        const by = {
+            name: (a, b) => text(a.name, b.name),
+            price: (a, b) => num(a.best.price, b.best.price),
+            buyer: (a, b) => text(a.best.name, b.best.name),
+            next: (a, b) => num(a.buyers[1] ? a.buyers[1].price : 0, b.buyers[1] ? b.buyers[1].price : 0),
+            traders: (a, b) => a.buyers.length - b.buyers.length,
+        }[key];
+        return rows.slice().sort((a, b) => {
+            if (Boolean(a.best) !== Boolean(b.best)) return a.best ? -1 : 1;
+            if (!a.best) return text(a.name, b.name);
+            return dir * by(a, b) || b.best.price - a.best.price || text(a.name, b.name);
+        });
+    }
+
+    /**
+     * Item rows for a section: best buyer first in each, items with a buyer
+     * first (highest best price), the rest after by name.
+     *
+     * @param {Iterable<string>} itemIds
+     * @param {function} buyersOf - (itemId) => buyers, already filtered
+     * @param {function} nameOf   - (itemId) => display name
+     * @param {string} [query]    - case-insensitive name filter
+     */
+    function itemRows(itemIds, { buyersOf, nameOf, query = '' }) {
+        const q = String(query || '').trim().toLowerCase();
+        const rows = [];
+        for (const id of itemIds) {
+            const name = nameOf(id);
+            if (q && !String(name).toLowerCase().includes(q)) continue;
+            const buyers = buyersOf(id);
+            rows.push({ itemId: String(id), name, buyers, best: buyers[0] || null });
+        }
+        rows.sort((a, b) => {
+            if (Boolean(a.best) !== Boolean(b.best)) return a.best ? -1 : 1;
+            if (a.best && b.best && b.best.price !== a.best.price) return b.best.price - a.best.price;
+            return String(a.name).localeCompare(String(b.name));
+        });
+        return rows;
+    }
+
+    /**
+     * "Name [1234567]" pairs in page text, as TornW3B's Search Deals prints each
+     * trader. Only ids that also have a /pricelist/ link are kept by the caller.
+     * @returns {Map<string, string>} id -> name
+     */
+    function traderNamesInText(text) {
+        const out = new Map();
+        const re = /([A-Za-z0-9_-]{1,20}) \[(\d{1,8})\]/g;
+        let m;
+        while ((m = re.exec(String(text || '')))) out.set(m[2], m[1]);
+        return out;
+    }
+
+    /** Every /pricelist/{id} link in a page's anchors: [{id, name}]. */
+    function traderLinksIn(anchors) {
+        const out = new Map();
+        for (const a of anchors || []) {
+            const href = a && (a.getAttribute ? a.getAttribute('href') : a.href);
+            const m = String(href || '').match(/\/pricelist\/(\d+)(?:[/?#]|$)/);
+            if (!m) continue;
+            const text = String((a.textContent || '')).trim();
+            // A "List" button carries no name; a leaderboard link carries it.
+            // Only something shaped like a Torn name (letters, digits, _ and -, up
+            // to 20): never "List", "1 Clouds +516" or a sentence.
+            const name = /^[A-Za-z0-9_-]{1,20}$/.test(text) && !/^(list|pricelist|view|trade|bazaar)$/i.test(text) ? text : '';
+            const prev = out.get(m[1]);
+            if (!prev || (!prev.name && name)) out.set(m[1], { id: m[1], name, source: 'w3b' });
+        }
+        return [...out.values()];
+    }
+
+    /* ===== src/core/checked.js ===== */
+    /*
+     * A flip only on a price checked just now (3.26.0).
+     *
+     * The owner, 2026-10-11: "tornbids currently shows stale prices. shows a 100m
+     * flip. but trader already price changed ... when it calculates these flips.
+     * it has to look at the real price list first. and remember, price list has
+     * to be updated for at most 24 hours ago", then: "nothing stale, no fake
+     * flips. everytime it shows a flip, its because the item list is checked."
+     *
+     * Why it was stale (his zips): a trader's TornW3B list was re-read once an
+     * hour and used for six; the read that gives every buyer of one item ran at
+     * 0.4 a minute where 8.5 were due (the sellers lists went first, and were
+     * always due); and nothing looked at the buyer again before a flip was shown.
+     *
+     * The rule here: a buyer makes a flip only when
+     *   - the price is their TornW3B price (TornExchange gives no date for a
+     *     price: one that is only there is shown under "Traders pay", and makes
+     *     no flip alone);
+     *   - TornW3B was asked about it in the last FLIP_CHECK_MS - the item's
+     *     buyers (it names them at that price), or their own list (it holds the
+     *     item at that price);
+     *   - and their list was last changed within PRICES_STALE_MS (a day).
+     * Everything else is a possible flip: it waits, and its check goes first.
+     *
+     * Pure: no DOM, no storage, no clock.
+     */
+
+
+
+    /* How long a check stands. The buyers of a flip are read again well inside it (FLIP_RECHECK_MS). */
+    const FLIP_CHECK_MS = 5 * 60 * 1000;
+    /* A shown or possible flip's buyers are read again this often, so a flip never lapses by the clock alone. */
+    const FLIP_RECHECK_MS = 3 * 60 * 1000;
+    /* The item on the desk: its buyers, this often. */
+    const DESK_RECHECK_MS = 2 * 60 * 1000;
+    /* Every other item whose buyers are read (what you hold, the other possible flips). */
+    const OTHER_RECHECK_MS = 10 * 60 * 1000;
+
+    const checkedIdsOf = new WeakMap();
+
+    /** trader id -> price, from one read of an item's buyers (made once per read). */
+    function checkedNamedIn(traders) {
+        if (!Array.isArray(traders)) return null;
+        let m = checkedIdsOf.get(traders);
+        if (!m) {
+            m = new Map();
+            for (const t of traders) if (t && t.id) m.set(String(t.id), Number(t.price) || 0);
+            checkedIdsOf.set(traders, m);
+        }
+        return m;
+    }
+
+    /**
+     * When TornW3B last named this trader at this price in a read of the item's
+     * buyers (0: never). A read is kept in two parts when the item has more buyers
+     * than one answer holds - everyone (`full`, read at `fullAt`) and those who
+     * traded lately (`lately`, at `latelyAt`) - and each part checks only what it
+     * names, at its own time: `at` is the newer of the two, and is not the time
+     * of a trader only the older part names.
+     */
+    function checkedNamedAt(item, id, price) {
+        if (!item || !(item.at > 0)) return 0;
+        const parts = [[item.full, item.fullAt], [item.lately, item.latelyAt]].filter(([rows, readAt]) => Array.isArray(rows) && readAt > 0);
+        if (!parts.length) {
+            const m = checkedNamedIn(item.traders);
+            return m && m.get(id) === price ? item.at : 0;
+        }
+        let at = 0;
+        for (const [rows, readAt] of parts) if (readAt > at && checkedNamedIn(rows).get(id) === price) at = readAt;
+        return at;
+    }
+
+    /**
+     * Is this buyer's price for this item checked?
+     *
+     * @param {{id, price, w3b, te, lastPaidOnly}} b - a buyer row (buyersForItem)
+     * @param {object} o
+     * @param {string} o.itemId
+     * @param {{at: number, traders: Array, full?: Array, fullAt?: number, lately?: Array, latelyAt?: number}|null} o.item - the last read of the item's buyers, or null
+     * @param {{at: number, found: boolean, prices: object, shared?: boolean}|null} o.list - the last read of this trader's own list, or null
+     * @param {number} o.listAt - when they last changed their list (ms), 0: not known
+     * @returns {{ok: boolean, why: 'checked'|'no-id'|'te-only'|'not-checked'|'old-list'|'no-date', at: number}}
+     *   at: when TornW3B last confirmed this price (0: never)
+     */
+    function priceChecked(b, { itemId, item = null, list = null, listAt = 0, now = Date.now(), checkMs = FLIP_CHECK_MS, staleMs = PRICES_STALE_MS } = {}) {
+        if (!b || !b.id) return { ok: false, why: 'no-id', at: 0 };
+        if (!(b.w3b > 0) || b.lastPaidOnly) return { ok: false, why: 'te-only', at: 0 };
+        let at = checkedNamedAt(item, String(b.id), b.w3b);
+        // A list another PC read (it came through the shared server, by that PC's clock) is shown, and checks nothing.
+        if (list && list.found && !list.shared && list.prices && Number(list.prices[String(itemId)]) === b.w3b && list.at > at) at = list.at;
+        if (!(at > 0) || now - at > checkMs) return { ok: false, why: 'not-checked', at };
+        const changed = Number(listAt) || 0;
+        if (!(changed > 0)) return { ok: false, why: 'no-date', at };
+        if (now - changed > staleMs) return { ok: false, why: 'old-list', at };
+        return { ok: true, why: 'checked', at };
+    }
+
+    /**
+     * A trader's own list was read: every kept read of an item's buyers older
+     * than it now says what the list says - their new price, or no longer them.
+     * (The buyers read overrides a list's price for the hour it is kept; without
+     * this a trader's price read a moment ago lost to the buyers read before it.)
+     *
+     * @param {Map<string, object>} itemTraders - item id -> {at, traders, full, fullAt, lately, latelyAt, ...}; entries are replaced, never written into
+     * @param {string} traderId
+     * @param {object} prices - {itemId: price}, {} when they have no list
+     * @param {number} at - when the list was read
+     * @returns {string[]} the items whose buyers changed
+     */
+    function applyListToItemBuyers(itemTraders, traderId, prices, at) {
+        const id = String(traderId);
+        const changed = [];
+        const fix = (rows, price) => {
+            if (!Array.isArray(rows)) return rows;
+            const i = rows.findIndex((t) => t && String(t.id) === id);
+            if (i < 0 || Number(rows[i].price) === price) return rows;
+            const next = rows.slice();
+            if (price > 0) next[i] = { ...rows[i], price };
+            else next.splice(i, 1);
+            return price > 0 ? next.sort((a, b) => b.price - a.price) : next;
+        };
+        const names = (rows) => Array.isArray(rows) && rows.some((t) => t && String(t.id) === id);
+        for (const [itemId, rec] of itemTraders) {
+            if (!rec || !(rec.at > 0)) continue;
+            // Each part by its own time; the merged list by the newest part that names them.
+            const fullAt = rec.fullAt > 0 ? rec.fullAt : rec.at;
+            const latelyAt = rec.latelyAt > 0 ? rec.latelyAt : rec.at;
+            const namedAt = Math.max(names(rec.full) ? fullAt : 0, names(rec.lately) ? latelyAt : 0) || rec.at;
+            if (fullAt >= at && latelyAt >= at && namedAt >= at) continue;
+            const price = Number((prices || {})[String(itemId)]) || 0;
+            const traders = namedAt < at ? fix(rec.traders, price) : rec.traders;
+            const full = fullAt < at ? fix(rec.full, price) : rec.full;
+            const lately = latelyAt < at ? fix(rec.lately, price) : rec.lately;
+            if (traders === rec.traders && full === rec.full && lately === rec.lately) continue;
+            itemTraders.set(itemId, { ...rec, traders, full, lately });
+            changed.push(String(itemId));
+        }
+        return changed;
+    }
+
+    /**
+     * How often an item's buyers are read again, by what the item is to you.
+     *
+     * @param {string} itemId
+     * @param {{desk: string|null, flips: Set<string>}} o - the item on the desk; the items with a flip shown or possible
+     */
+    function buyersEveryMs(itemId, { desk = null, flips = null } = {}) {
+        const id = String(itemId);
+        if (desk && id === String(desk)) return DESK_RECHECK_MS;
+        if (flips && flips.has(id)) return FLIP_RECHECK_MS;
+        return OTHER_RECHECK_MS;
+    }
+
     /* ===== src/core/desk.js ===== */
     /*
      * Which item the desk shows, and which TornW3B read comes next (3.14).
@@ -8687,9 +10043,11 @@
      * @param {function} [p.buyersDue] - (itemId) => boolean
      * @param {string[]} [p.near] - near-misses: a bazaar a little over the best bid (the summary lags), 3.15
      * @param {string[]} [p.sweep] - every other item anyone buys, oldest read first: what is left of the budget (3.15)
+     * @param {string[]} [p.check] - items with a flip shown or possible (3.26.0): their buyers are read before more
+     *   bazaars, since a flip is shown only on a price checked minutes ago (core/checked.js)
      * @returns {null|{kind: 'summary'}|{kind: 'bazaars', id: string}|{kind: 'buyers', id: string}|{kind: 'list', id: string}}
      */
-    function nextW3bRead({ summaryDue = false, picked = null, active = false, live = [], wanted = [], candidates = [], pinned = [], list = null, turn = 0, hidden = false, due, buyers = [], buyersDue = () => false, near = [], sweep = [] }) {
+    function nextW3bRead({ summaryDue = false, picked = null, active = false, live = [], wanted = [], candidates = [], pinned = [], list = null, turn = 0, hidden = false, due, buyers = [], buyersDue = () => false, near = [], sweep = [], check = [] }) {
         if (summaryDue) return { kind: 'summary' };
         if (picked && due(picked, 'desk')) return { kind: 'bazaars', id: picked };
         if (picked && buyers.includes(picked) && buyersDue(picked)) return { kind: 'buyers', id: picked };
@@ -8699,6 +10057,8 @@
             const w = wanted.find((id) => due(id, 'slow'));
             if (w) return { kind: 'bazaars', id: w };
         }
+        const chk = check.find((id) => buyersDue(id));
+        if (chk) return { kind: 'buyers', id: chk };
         const cand = candidates.find((id) => due(id, 'slow'));
         const buy = buyers.find((id) => buyersDue(id));
         // Hidden, the flips first: the price lists can wait until you look.
@@ -11075,6 +12435,23 @@
      *      and a hard cooldown on 429 or a non-JSON (Cloudflare challenge) body.
      *
      * Responses are cached server-side for 60s, so asking faster is pointless.
+     *
+     * 3.26.0 - each kind of request has its own limit, as TornW3B has (its spec,
+     * read 2026-10-10; per address, without a key):
+     *
+     *   GET /marketplace/{itemId}            the sellers of an item: 10 a minute, 1,000 a day
+     *   GET /marketplace/{itemId}?filler=1   its 10 cheapest prices and counts, no seller:
+     *                                        200 a minute, 10,000 a day, a counter of its own
+     *   every route together                 300 a minute; Cloudflare in front: 100 a minute
+     *   a 429 carries Retry-After
+     *
+     * Seven report zips (2026-09-30 to 2026-10-08) say the same: every one of 54
+     * refusals was a sellers list, the eleventh of its minute, from 2026-10-06 on -
+     * before that day 60 to 75 a minute passed for hours. 3.25.0 read it as "a
+     * burst is refused" and spaced every request; that was wrong. So the sellers
+     * list has a minute and a day of its own here (W3B_LISTING_*), every tab
+     * together; a refusal there stops the sellers lists only, for as long as
+     * TornW3B says, and neither the price lists nor the buyers wait for it.
      */
 
 
@@ -11094,8 +12471,27 @@
      */
     const W3B_SHARED_PER_MINUTE = 80;
 
-    /** After a 429 or a challenge page, stop asking for this long. */
+    /** After a 429 with no Retry-After, or a challenge page, stop asking for this long. */
     const W3B_COOLDOWN_MS = 60000;
+
+    /** The sellers of an item (GET /marketplace/{itemId}): TornW3B allows 10 a minute and 1,000 a day; two and a hundred are left spare. */
+    const W3B_LISTING_PER_MINUTE = 8;
+    const W3B_LISTING_PER_DAY = 900;
+    /**
+     * With the key you registered on TornW3B (3.26.0): 25 a minute allowed, three left spare; the day is the same
+     * thousand. The key is a Torn key of yours that TornW3B already has; it goes in the header X-API-Key of a
+     * sellers list and nowhere else - never in a web address, never to another host (buildUrl), never with
+     * another kind of request. TornW3B answering 401 means it does not know the key: it is not sent again.
+     */
+    const W3B_LISTING_KEYED_PER_MINUTE = 22;
+    const W3B_KEY_HEADER = 'X-API-Key';
+    /** Its light list (filler=1): 10,000 a day allowed. Its minute is the one every request shares. */
+    const W3B_LIGHT_PER_DAY = 9000;
+    /** A Retry-After is believed between these: never a wait of nothing, never one past a day. */
+    const W3B_RETRY_AFTER_MIN_MS = 1000;
+    const W3B_RETRY_AFTER_MAX_MS = 24 * 60 * 60 * 1000;
+    const W3B_HOUR_MS = 60 * 60 * 1000;
+    const W3B_DAY_HOURS = 24;
 
     /*
      * The pace (3.25.0; the friend's zip of 2026-10-06, 3.24.1). TornW3B refused us
@@ -11160,8 +12556,59 @@
      * of the same thing differ by - a read "in turn" already keeps only its 10
      * cheapest rows, and the redraw's time is the page, not the rows. And an item
      * with nothing under the trader's price would lose its lowest bazaar price.
+     *
+     *   filler             /marketplace/{id}: 1 = the light list (3.26.0) - the 10
+     *                      cheapest listings, price and count only
      */
-    const W3B_QUERY = { tradedWithinHours: [1, 168] };
+    const W3B_QUERY = { tradedWithinHours: [1, 168], filler: [1, 1] };
+
+    /** Is this the sellers-of-an-item route (marketplace/{itemId})? Not the summary (marketplace), not marketplace/{id}/traders. */
+    function isW3bListingPath(path) {
+        return /^marketplace\/[^/?#]+\/?$/.test(String(path).replace(/^\/+/, ''));
+    }
+
+    /** Which limit a request draws on: 'listing' (an item's sellers), 'light' (its light list), or 'rest'. */
+    function w3bRoute(path, query = null) {
+        if (!isW3bListingPath(path)) return 'rest';
+        return query && query.filler === 1 ? 'light' : 'listing';
+    }
+
+    /**
+     * How long a Retry-After asks us to wait, in ms: a number of seconds, or an
+     * HTTP date. Null when there is none or it cannot be read (the caller then
+     * waits W3B_COOLDOWN_MS).
+     */
+    function w3bRetryAfterMs(value, now = Date.now()) {
+        const text = String(value ?? '').trim();
+        if (!text) return null;
+        let ms = null;
+        if (/^\d+(\.\d+)?$/.test(text)) {
+            ms = Number(text) * 1000;
+        } else if (/[A-Za-z]{3}/.test(text) && /\d{4}/.test(text)) {
+            // An HTTP date ("Wed, 21 Oct 2026 07:28:00 GMT"): nothing looser is taken for one.
+            const at = Date.parse(text);
+            if (Number.isFinite(at)) ms = at - now;
+        }
+        if (ms === null || !Number.isFinite(ms)) return null;
+        return Math.min(W3B_RETRY_AFTER_MAX_MS, Math.max(W3B_RETRY_AFTER_MIN_MS, Math.ceil(ms)));
+    }
+
+    /** One answer header: gmFetch's `header(name)`, or a fetch Response's `headers.get(name)`. */
+    function w3bHeader(response, name) {
+        try {
+            if (response && typeof response.header === 'function') return response.header(name);
+            if (response && response.headers && typeof response.headers.get === 'function') return response.headers.get(name);
+        } catch {
+            // No header to read: the caller falls back.
+        }
+        return null;
+    }
+
+    function w3bSum(counts) {
+        let n = 0;
+        for (const v of Object.values(counts || {})) n += Number(v) || 0;
+        return n;
+    }
 
     /** A whole number within [min, max], or null. */
     function w3bWhole(value, min, max) {
@@ -11169,13 +12616,22 @@
     }
 
     class W3bError extends Error {
-        constructor(message, { http = null, blocked = false, paused = false } = {}) {
+        constructor(message, { http = null, blocked = false, paused = false, route = null, reason = null, retryAt = null, badKey = false } = {}) {
             super(message);
             this.name = 'W3bError';
             this.http = http;
+            // TornW3B answered 401 to the key registered there (3.26.0).
+            this.badKey = badKey;
+            // Everything is stopped (a refusal of a request with no limit of its own, or a challenge page).
             this.blocked = blocked;
-            // Not sent at all: we are inside the wait a refusal started. Nothing for the problem log.
+            // Not sent at all: we are inside the wait a refusal started, or a limit of our own is used up. Nothing for the problem log.
             this.paused = paused;
+            // 'listing' | 'light': only this kind of request is stopped (3.26.0); the rest go on.
+            this.route = route;
+            // Of a request not sent: 'cooldown' | 'listing-wait' | 'listing-minute' | 'listing-day' | 'light-wait' | 'light-day'.
+            this.reason = reason;
+            // When asking again can work (ms), where that is known.
+            this.retryAt = retryAt;
         }
     }
 
@@ -11227,7 +12683,44 @@
             pace = false,
             onAnswered = null,
             onPace = null,
+            listingPerMinute = W3B_LISTING_PER_MINUTE,
+            listingPerDay = W3B_LISTING_PER_DAY,
+            lightPerDay = W3B_LIGHT_PER_DAY,
+            listingKeyedPerMinute = W3B_LISTING_KEYED_PER_MINUTE,
+            listingKey = null,
+            onKeyRefused = null,
+            loadListing = null,
+            addListing = null,
+            loadRoutes = null,
+            saveRoutes = null,
+            otherListing = null,
+            onRoute = null,
         } = {}) {
+            /*
+             * The sellers list's own minute and day, and the light list's day (3.26.0).
+             *   loadListing / addListing: every tab's sellers lists of the last minute (platform/tab-window.js)
+             *   loadRoutes / saveRoutes:  () => {listingDay: {[hour]: n}, lightDay: {[hour]: n}, listingUntil, lightUntil}
+             *                             stored for every tab; hour = floor(ms / 3,600,000)
+             *   otherListing:             () => {minute, day}: sellers lists another app of ours asked from this
+             *                             PC (Torn Archive) - TornW3B counts by address, so they are the same ten
+             *   onRoute:                  ({route, until, said}) => void: TornW3B refused this kind; for the log
+             *   listingKey:               () => the key registered on TornW3B, or '' (none, or one it refused)
+             *   onKeyRefused:             () => void: TornW3B answered 401 to that key - whoever stores it marks it
+             */
+            this.listingPerMinuteOwn = listingPerMinute;
+            this.listingKeyedPerMinute = listingKeyedPerMinute;
+            this.listingKey = listingKey;
+            this.onKeyRefused = onKeyRefused;
+            this.listingPerDay = listingPerDay;
+            this.lightPerDay = lightPerDay;
+            this.loadListing = loadListing;
+            this.addListing = addListing;
+            this.loadRoutes = loadRoutes;
+            this.saveRoutes = saveRoutes;
+            this.otherListing = otherListing;
+            this.onRoute = onRoute;
+            this.listingRecent = [];
+            this.routesOwn = { listingDay: {}, lightDay: {}, listingUntil: 0, lightUntil: 0 };
             this.pace = Boolean(pace);
             // This tab's own copy of the pace, for when nothing is shared; and what it has shortened the gap by since it last stored it.
             this.paceOwn = null;
@@ -11259,6 +12752,22 @@
             this.recent = [];
             this.chain = Promise.resolve();
             this.cooldownUntil = 0;
+        }
+
+        /** The key for a sellers list, or '': only something shaped like a Torn key is ever put in a header. */
+        listingKeyNow() {
+            if (!this.listingKey) return '';
+            try {
+                const key = String(this.listingKey() || '').trim();
+                return /^[A-Za-z0-9]{16}$/.test(key) ? key : '';
+            } catch {
+                return '';
+            }
+        }
+
+        /** The sellers lists allowed in a minute: more with a key TornW3B knows. */
+        get listingPerMinute() {
+            return this.listingKeyNow() ? this.listingKeyedPerMinute : this.listingPerMinuteOwn;
         }
 
         /** What every tab has used, and any wait one of them was told to make. */
@@ -11377,10 +12886,175 @@
             return Number.isFinite(n) ? Math.max(1, Math.min(this.maxPerMinute, Math.floor(n))) : this.maxPerMinute;
         }
 
+        /** The hour counts worth keeping (the last 24 whole hours and this one), as {[hour]: count}. */
+        dayCounts(source, t) {
+            const out = {};
+            if (!source || typeof source !== 'object') return out;
+            const hour = Math.floor(t / W3B_HOUR_MS);
+            for (const [h, n] of Object.entries(source)) {
+                const at = Number(h);
+                const count = Math.floor(Number(n));
+                if (Number.isInteger(at) && at <= hour && at >= hour - W3B_DAY_HOURS && count > 0) out[at] = count;
+            }
+            return out;
+        }
+
+        /** What is kept of the two kinds with a limit of their own: the larger of this tab's and what every tab stored. */
+        routes(t = this.now()) {
+            const own = this.routesOwn;
+            own.listingDay = this.dayCounts(own.listingDay, t);
+            own.lightDay = this.dayCounts(own.lightDay, t);
+            let stored = null;
+            if (this.loadRoutes) {
+                try {
+                    stored = this.loadRoutes();
+                } catch {
+                    stored = null;
+                }
+            }
+            const s = stored && typeof stored === 'object' ? stored : {};
+            const pickDay = (mine, theirs) => {
+                const kept = this.dayCounts(theirs, t);
+                return w3bSum(kept) > w3bSum(mine) ? kept : mine;
+            };
+            // A wait "from the future" past a day (the clock was changed) is not believed.
+            const until = (mine, theirs) => {
+                const n = Number(theirs);
+                return Math.max(mine || 0, Number.isFinite(n) && n <= t + W3B_RETRY_AFTER_MAX_MS ? n : 0);
+            };
+            return {
+                listingDay: pickDay(own.listingDay, s.listingDay),
+                lightDay: pickDay(own.lightDay, s.lightDay),
+                listingUntil: until(own.listingUntil, s.listingUntil),
+                lightUntil: until(own.lightUntil, s.lightUntil),
+            };
+        }
+
+        writeRoutes(next) {
+            this.routesOwn = { ...next };
+            if (!this.saveRoutes) return;
+            try {
+                this.saveRoutes(next);
+            } catch {
+                // Sharing is best-effort; this tab still counts its own.
+            }
+        }
+
+        /**
+         * The sellers list's two counts (every tab's, and another app's on this PC) and when each has room again.
+         * @returns {{minute: number, day: number, minuteFreeAt: number, dayFreeAt: number, until: number}} *FreeAt: 0 while there is room
+         */
+        listingUse(t = this.now()) {
+            this.listingRecent = this.listingRecent.filter((x) => t - x < 60000);
+            let recent = this.listingRecent;
+            if (this.loadListing) {
+                try {
+                    const s = this.loadListing();
+                    const all = Array.isArray(s) ? s.filter((x) => Number.isFinite(x) && t - x < 60000 && x <= t).sort((a, b) => a - b) : [];
+                    if (all.length > recent.length) recent = all;
+                } catch {
+                    // Sharing is best-effort; this tab still counts its own.
+                }
+            }
+            let other = { minute: 0, day: 0 };
+            if (this.otherListing) {
+                try {
+                    const o = this.otherListing() || {};
+                    const n = (v) => (Number.isFinite(Number(v)) && Number(v) > 0 ? Math.floor(Number(v)) : 0);
+                    other = { minute: n(o.minute), day: n(o.day) };
+                } catch {
+                    // Not known: only our own are counted.
+                }
+            }
+            const r = this.routes(t);
+            const perMinute = Math.max(1, Math.floor(Number(this.listingPerMinute)) || 1);
+            const perDay = Math.max(1, Math.floor(Number(this.listingPerDay)) || 1);
+            const minute = recent.length + other.minute;
+            const day = w3bSum(r.listingDay) + other.day;
+            const hours = Object.keys(r.listingDay).map(Number).sort((a, b) => a - b);
+            // Our own slot that brings the minute back under its limit, a minute after it was taken; the other app's are not ours to time.
+            const mineOver = recent.length - Math.max(0, perMinute - other.minute);
+            return {
+                minute,
+                day,
+                minuteFreeAt: minute >= perMinute ? (mineOver >= 0 && recent.length ? recent[Math.min(recent.length - 1, mineOver)] + 60000 : t + 15000) : 0,
+                // The oldest counted hour leaves the day when the hour after its 24 have passed begins.
+                dayFreeAt: day >= perDay ? (hours.length ? (hours[0] + W3B_DAY_HOURS + 1) * W3B_HOUR_MS : t + W3B_HOUR_MS) : 0,
+                until: r.listingUntil > t ? r.listingUntil : 0,
+            };
+        }
+
+        /** The light list's day, and a wait TornW3B asked for. */
+        lightUse(t = this.now()) {
+            const r = this.routes(t);
+            const perDay = Math.max(1, Math.floor(Number(this.lightPerDay)) || 1);
+            const day = w3bSum(r.lightDay);
+            const hours = Object.keys(r.lightDay).map(Number).sort((a, b) => a - b);
+            return {
+                day,
+                dayFreeAt: day >= perDay ? (hours.length ? (hours[0] + W3B_DAY_HOURS + 1) * W3B_HOUR_MS : t + W3B_HOUR_MS) : 0,
+                until: r.lightUntil > t ? r.lightUntil : 0,
+            };
+        }
+
+        /** Count one request of a kind with its own limit, as it is about to leave. */
+        noteRoute(route, t = this.now()) {
+            if (route === 'listing') {
+                this.listingRecent.push(t);
+                if (this.addListing) {
+                    try {
+                        this.addListing(t);
+                    } catch {
+                        // Best-effort; this tab still limits itself.
+                    }
+                }
+            }
+            const r = this.routes(t);
+            const key = route === 'listing' ? 'listingDay' : 'lightDay';
+            const hour = Math.floor(t / W3B_HOUR_MS);
+            this.writeRoutes({ ...r, [key]: { ...r[key], [hour]: (r[key][hour] || 0) + 1 } });
+        }
+
+        /** TornW3B refused this kind: none of it is asked until `until` - this tab and, through storage, every other. */
+        coolRoute(route, ms, t = this.now()) {
+            const until = t + (Number(ms) > 0 ? Number(ms) : W3B_COOLDOWN_MS);
+            const r = this.routes(t);
+            this.writeRoutes({ ...r, [route === 'listing' ? 'listingUntil' : 'lightUntil']: until });
+            return until;
+        }
+
+        /** Why a request may not leave now (an error to throw; nothing was sent), or null. */
+        refusal(route, t = this.now()) {
+            const until = this.blockedUntil(t);
+            if (t < until) return new W3bError('TornW3B is rate limiting us; paused briefly.', { blocked: true, paused: true, reason: 'cooldown', retryAt: until });
+            if (route === 'listing') {
+                const use = this.listingUse(t);
+                if (use.until) return new W3bError('TornW3B asked us to wait before another sellers list.', { paused: true, route, reason: 'listing-wait', retryAt: use.until });
+                if (use.dayFreeAt) return new W3bError("TornW3B sellers lists: today's " + this.listingPerDay + ' are used.', { paused: true, route, reason: 'listing-day', retryAt: use.dayFreeAt });
+                if (use.minuteFreeAt) return new W3bError("TornW3B sellers lists: this minute's " + this.listingPerMinute + ' are used.', { paused: true, route, reason: 'listing-minute', retryAt: use.minuteFreeAt });
+            } else if (route === 'light') {
+                const use = this.lightUse(t);
+                if (use.until) return new W3bError('TornW3B asked us to wait before another light list.', { paused: true, route, reason: 'light-wait', retryAt: use.until });
+                if (use.dayFreeAt) return new W3bError("TornW3B light lists: today's " + this.lightPerDay + ' are used.', { paused: true, route, reason: 'light-day', retryAt: use.dayFreeAt });
+            }
+            return null;
+        }
+
         stats() {
             const t = this.now();
             const used = this.recent.filter((x) => t - x < 60000).length;
+            const listing = this.listingUse(t);
+            const light = this.lightUse(t);
             return {
+                // The sellers list's own minute and day (every tab's; and Torn Archive's on this PC), and the light list's day.
+                listingLastMinute: listing.minute,
+                listingToday: listing.day,
+                listingMinuteLeft: Math.max(0, this.listingPerMinute - listing.minute),
+                listingDayLeft: Math.max(0, this.listingPerDay - listing.day),
+                // When a sellers list can next be asked for: 0 = now.
+                listingFreeAt: Math.max(listing.until, listing.minuteFreeAt, listing.dayFreeAt),
+                lightToday: light.day,
+                lightFreeAt: Math.max(light.until, light.dayFreeAt),
                 usedLastMinute: used,
                 remaining: Math.max(0, this.limit() - used),
                 coolingDown: t < this.blockedUntil(t),
@@ -11442,11 +13116,12 @@
             }
         }
 
-        /** Stop asking - this tab and, through storage, every other. */
-        coolDown() {
+        /** Stop asking - this tab and, through storage, every other. `ms`: what a Retry-After asked for; else the usual minute. */
+        coolDown(ms = W3B_COOLDOWN_MS) {
             const t = this.now();
-            this.cooldownUntil = t + W3B_COOLDOWN_MS;
+            this.cooldownUntil = t + (Number(ms) > 0 ? Number(ms) : W3B_COOLDOWN_MS);
             if (this.loadShared) this.writeShared({ ...this.readShared(t), cooldownUntil: this.cooldownUntil });
+            return this.cooldownUntil;
         }
 
         /** Build and check a URL. Exposed for tests. `query`: W3B_QUERY's options only. */
@@ -11487,23 +13162,18 @@
         }
 
         async execute(path, tag = null, query = null) {
-            // Paused: not sent, not kept for later - whoever asked asks again when it is due.
-            if (this.now() < this.blockedUntil()) {
-                throw new W3bError('TornW3B is rate limiting us; paused briefly.', {
-                    blocked: true,
-                    paused: true,
-                });
-            }
-
             const url = this.buildUrl(path, query);
+            // What really leaves decides the kind: a `filler` that was dropped on the way out is a sellers list.
+            const route = w3bRoute(path, { filler: url.searchParams.get('filler') === '1' ? 1 : null });
+            // Paused, or a limit of this kind used up: not sent, not kept for later - whoever asked asks again when it is due.
+            let refused = this.refusal(route);
+            if (refused) throw refused;
+
             const at = await this.waitForSlot();
-            // Another tab may have been blocked while this one waited for a slot.
-            if (this.now() < this.blockedUntil()) {
-                throw new W3bError('TornW3B is rate limiting us; paused briefly.', {
-                    blocked: true,
-                    paused: true,
-                });
-            }
+            // Another tab may have been blocked, or have taken the last room, while this one waited for a slot.
+            refused = this.refusal(route);
+            if (refused) throw refused;
+            if (route !== 'rest') this.noteRoute(route);
 
             if (this.onSent) {
                 try {
@@ -11513,9 +13183,11 @@
                 }
             }
 
+            // The registered key: with a sellers list only, in a header only (the URL above never holds one).
+            const key = route === 'listing' ? this.listingKeyNow() : '';
             let response;
             try {
-                response = await this.fetchImpl(url.toString());
+                response = key ? await this.fetchImpl(url.toString(), { headers: { [W3B_KEY_HEADER]: key } }) : await this.fetchImpl(url.toString());
             } catch (error) {
                 throw new W3bError(
                     'TornW3B network error: ' + ((error && error.message) || error),
@@ -11523,13 +13195,41 @@
             }
 
             if (response.status === 429) {
-                this.coolDown();
-                this.paceRefused();
+                // TornW3B says how long to stay away (Retry-After); without it, the usual minute.
+                const said = w3bRetryAfterMs(w3bHeader(response, 'retry-after'), this.now());
                 this.answered(path, tag, true);
+                if (route !== 'rest') {
+                    // Only this kind is stopped: the summary, the price lists and the buyers go on, at the pace they had.
+                    const until = this.coolRoute(route, said ?? W3B_COOLDOWN_MS);
+                    if (this.onRoute) {
+                        try {
+                            const use = route === 'listing' ? this.listingUse() : this.lightUse();
+                            this.onRoute({ route, until, said, minute: use.minute ?? null, day: use.day });
+                        } catch {
+                            // The log is best-effort.
+                        }
+                    }
+                    throw new W3bError('TornW3B rate limit (429).', { http: 429, route, retryAt: until });
+                }
+                const until = this.coolDown(said ?? W3B_COOLDOWN_MS);
+                this.paceRefused();
                 throw new W3bError('TornW3B rate limit (429).', {
                     http: 429,
                     blocked: true,
+                    retryAt: until,
                 });
+            }
+
+            if (key && response.status === 401) {
+                // TornW3B does not know this key: it is not sent again (the next sellers list goes without, at the slower limit).
+                if (this.onKeyRefused) {
+                    try {
+                        this.onKeyRefused();
+                    } catch {
+                        // Best-effort.
+                    }
+                }
+                throw new W3bError('TornW3B does not know this key (401).', { http: 401, badKey: true });
             }
 
             if (!response.ok) {
@@ -11608,6 +13308,17 @@
     }
 
     /**
+     * An item's light list (3.26.0): GET /marketplace/{id}?filler=1 - by TornW3B's
+     * spec the 10 cheapest listings with price and count, no seller, on a limit of
+     * its own (200 a minute, 10,000 a day). The answer as it came: what it holds
+     * is for core/cheap.js to say (parseW3bCheapest), since we know its shape from
+     * the spec only.
+     */
+    function fetchW3bCheapest(client, itemId, { tag = 'w.cheap' } = {}) {
+        return client.get('marketplace/' + encodeURIComponent(String(itemId)), { tag, query: { filler: 1 } });
+    }
+
+    /**
      * Every TornW3B buyer of one item (3.15): GET /api/marketplace/{id}/traders,
      * highest price first, at most 100 (`total_count` says how many there are:
      * 412 for Xanax on 2026-09-29, against ~290 lists we had read). Each comes
@@ -11670,6 +13381,138 @@
     function positiveOrNull(value) {
         const n = Number(value);
         return Number.isFinite(n) && n > 0 ? n : null;
+    }
+
+    /* ===== src/core/cheap.js ===== */
+    /*
+     * TornW3B's light list of an item (3.26.0): GET /marketplace/{id}?filler=1 - by
+     * its spec the ten cheapest listings with price and count and no seller, on a
+     * limit of its own (200 a minute, 10,000 a day) where an item's sellers list
+     * has ten a minute and a thousand a day.
+     *
+     * The owner, 2026-10-11: TornW3B is asked only what we cannot know. So the
+     * light list stands in for a sellers list wherever the sellers are not the
+     * question:
+     *
+     *   - every item in turn (the sweep), which only ever wanted the cheapest price;
+     *   - a possible flip whose sellers were read in full: the light list either
+     *     says what that read said - then nothing is new, and no sellers list is
+     *     spent - or it does not, and then the sellers list is read at once.
+     *
+     * It only ever confirms a full read or calls for one. It never changes a row:
+     * a listing is added, removed or counted down by a sellers list alone.
+     *
+     * Its shape is known from the spec only (it was never asked before this
+     * version), so the answer is read liberally, and an answer that cannot be read
+     * is said so (cheapKeys, for the log) and never guessed at.
+     */
+
+    /** How many listings the light list holds at most: with fewer, it is everything listed. */
+    const W3B_LIGHT_ROWS = 10;
+
+    const CHEAP_LISTS = ['listings', 'prices', 'cheapest', 'items', 'data', 'results'];
+    const CHEAP_PRICE = ['price', 'cost', 'value'];
+    const CHEAP_COUNT = ['quantity', 'amount', 'qty', 'count', 'available', 'stock'];
+
+    function cheapNumber(entry, names) {
+        for (const name of names) {
+            const n = Number(entry[name]);
+            if (entry[name] !== null && entry[name] !== undefined && entry[name] !== '' && Number.isFinite(n)) return n;
+        }
+        return null;
+    }
+
+    /**
+     * The light list as it came -> what it says, or null when it cannot be read.
+     * @returns {{rows: {price: number, qty: number}[], whole: boolean}|null} rows by price, one a price, the count
+     *   of every listing at it; `whole`: fewer than ten came, so it is everything listed. The $1 listings are left
+     *   out, as a sellers list leaves them out (core/feed.js normalizeW3bListings).
+     */
+    function parseW3bCheapest(data) {
+        let list = null;
+        if (Array.isArray(data)) list = data;
+        else if (data && typeof data === 'object') {
+            for (const name of CHEAP_LISTS) {
+                if (Array.isArray(data[name])) {
+                    list = data[name];
+                    break;
+                }
+            }
+        }
+        if (!list) return null;
+        const byPrice = new Map();
+        for (const entry of list) {
+            let price = null;
+            let qty = null;
+            if (Array.isArray(entry) && entry.length === 2) [price, qty] = entry.map(Number);
+            else if (entry && typeof entry === 'object') {
+                price = cheapNumber(entry, CHEAP_PRICE);
+                qty = cheapNumber(entry, CHEAP_COUNT);
+            }
+            // One entry that is not a price and a count: the shape is not the one this reads.
+            if (!Number.isFinite(price) || !Number.isFinite(qty) || !(price > 0) || !(qty > 0)) return null;
+            if (price <= 1) continue;
+            byPrice.set(price, (byPrice.get(price) || 0) + qty);
+        }
+        const rows = [...byPrice].map(([price, qty]) => ({ price, qty })).sort((a, b) => a.price - b.price);
+        return { rows, whole: list.length < W3B_LIGHT_ROWS };
+    }
+
+    /** For the log, when the light list cannot be read: the names of its fields, never what they hold. */
+    function cheapKeys(data) {
+        const names = (o) => Object.keys(o).slice(0, 8).map((k) => String(k).slice(0, 20));
+        if (Array.isArray(data)) return 'a list of ' + (data[0] && typeof data[0] === 'object' ? (Array.isArray(data[0]) ? 'lists' : '{' + names(data[0]).join(', ') + '}') : typeof data[0]);
+        if (!data || typeof data !== 'object') return typeof data;
+        const first = Object.keys(data).find((k) => Array.isArray(data[k]) && data[k][0] && typeof data[k][0] === 'object');
+        return '{' + names(data).join(', ') + '}' + (first ? ', ' + first + ' of {' + names(data[first][0]).join(', ') + '}' : '');
+    }
+
+    /** The cheapest price in a light list; null when nothing is listed. */
+    function cheapLowest(light) {
+        const rows = light && Array.isArray(light.rows) ? light.rows : [];
+        return rows.length ? rows[0].price : null;
+    }
+
+    /**
+     * Does the light list say what the sellers list said? Compared a price at a time, the count of every listing at
+     * it - below the price where either list may be cut short (the light list after ten listings; a kept sellers
+     * list after the rows that were kept).
+     *
+     * @param {Array<{price:number, qty:number}>} rows - the sellers list as read (its rows, every seller)
+     * @param {{rows: Array, whole: boolean}} light - parseW3bCheapest
+     * @param {object} [o]
+     * @param {boolean} [o.cut] - the sellers list was kept only in part (its cheapest rows)
+     * @returns {{same: boolean, why: string, prices: number}} why: 'same' | 'new-price' (a price no seller we know
+     *   has: an unknown seller, or a new price) | 'more' (more at a price than we know) | 'less' (fewer, or sold)
+     *   | 'nothing' (nothing to compare: neither list reaches under the other's cut); prices: how many were compared
+     */
+    function cheapSame(rows, light, { cut = false } = {}) {
+        const known = new Map();
+        let knownTop = 0;
+        for (const r of rows || []) {
+            const price = Number(r && r.price);
+            const qty = Number(r && (r.qty ?? r.quantity));
+            if (!(price > 1) || !(qty > 0)) continue;
+            known.set(price, (known.get(price) || 0) + qty);
+            if (price > knownTop) knownTop = price;
+        }
+        const lightRows = light && Array.isArray(light.rows) ? light.rows : [];
+        const lightTop = lightRows.length ? lightRows[lightRows.length - 1].price : 0;
+        // Under this price both lists hold every listing: the last price of a list cut short may be there in part.
+        const under = Math.min(light && light.whole ? Infinity : lightTop, cut ? knownTop : Infinity);
+        const said = new Map(lightRows.map((r) => [r.price, r.qty]));
+        let prices = 0;
+        for (const price of new Set([...known.keys(), ...said.keys()])) {
+            if (!(price < under)) continue;
+            prices += 1;
+            const had = known.get(price) || 0;
+            const now = said.get(price) || 0;
+            if (now === had) continue;
+            return { same: false, why: !had ? 'new-price' : now > had ? 'more' : 'less', prices };
+        }
+        // Both empty and whole: nobody sells it, as before. Otherwise nothing under the cut is nothing learned.
+        if (!prices && !(light && light.whole && !cut && !known.size)) return { same: false, why: 'nothing', prices: 0 };
+        return { same: true, why: 'same', prices };
     }
 
     /* ===== src/core/front.js ===== */
@@ -11805,6 +13648,56 @@
      * Pure: no storage, no DOM, no clock.
      */
 
+    /*
+     * 3.26.0: TornW3B counts an item's sellers list by address (ten a minute, a thousand a day), so the two apps
+     * on one PC draw on the same count. Each says its own in the site's page storage, and adds the other's:
+     *   tornapps.w3b.trading / tornapps.w3b.archive   { at, m: [ms of its sellers lists of the last minute],
+     *                                                   d: { hour: count } }   hour = floor(ms / 3,600,000),
+     *                                                   this hour and the 24 before
+     * (the same text as Torn Archive's core/turns.js readW3bMark / w3bMarkText). A mark that cannot be read
+     * counts as nothing.
+     */
+    const BESIDE_W3B_OWN_MARK = 'tornapps.w3b.trading';
+    const BESIDE_W3B_OTHER_MARK = 'tornapps.w3b.archive';
+    const BESIDE_W3B_HOURS = 24;
+    const BESIDE_W3B_MOST = 200;
+
+    /** A sellers-list mark read back: only what still counts at `now`. @returns {{m: number[], d: object}|null} */
+    function besideW3bMark(text, now) {
+        if (typeof text !== 'string' || !text || text.length > 20000) return null;
+        let mark = null;
+        try {
+            mark = JSON.parse(text);
+        } catch {
+            return null;
+        }
+        if (!mark || typeof mark !== 'object' || Array.isArray(mark)) return null;
+        const m = (Array.isArray(mark.m) ? mark.m : []).filter((x) => typeof x === 'number' && Number.isFinite(x) && x <= now && now - x < 60000).sort((a, b) => a - b).slice(-BESIDE_W3B_MOST);
+        const hour = Math.floor(now / 3600000);
+        const d = {};
+        for (const [h, n] of Object.entries(mark.d && typeof mark.d === 'object' && !Array.isArray(mark.d) ? mark.d : {})) {
+            const at = Number(h);
+            const count = Math.floor(Number(n));
+            if (Number.isInteger(at) && at <= hour && at >= hour - BESIDE_W3B_HOURS && count > 0) d[at] = Math.min(count, 100000);
+        }
+        return { m, d };
+    }
+
+    /** Our own mark, as text: the sellers lists of every tab of ours, the last minute's times and the day by hour. */
+    function besideW3bText(times, day, now) {
+        const got = besideW3bMark(JSON.stringify({ at: now, m: times, d: day }), now);
+        return JSON.stringify({ at: now, m: got ? got.m : [], d: got ? got.d : {} });
+    }
+
+    /** The other app's use, for the client (api/w3b.js `otherListing`): {at, minute, day}. */
+    function besideW3bOther(text, now) {
+        const got = besideW3bMark(text, now);
+        if (!got) return null;
+        let day = 0;
+        for (const n of Object.values(got.d)) day += n;
+        return { at: now, minute: got.m.length, day };
+    }
+
     const BESIDE_FRONT_MARK = 'tornapps.front';
     const BESIDE_ALIVE_MARK = 'tornapps.archive';
     const BESIDE_BEHIND_MARK = 'tornapps.behind';
@@ -11836,9 +13729,27 @@
         return Number.isFinite(at) && at > 0 ? { app: m.app, at } : null;
     }
 
-    /** Is Torn Archive the one in front, and open? A time from the future (the clock was changed) is not believed. */
-    function besideArchiveInFront(front, alive, now) {
+    /**
+     * When he last came to a page of ours - Torn Bids, or a Torn page with our panel on it (3.25.1). Torn Archive
+     * knows only of Torn Bids' own page, so a Torn Archive tab left open kept Torn Bids on the smaller share for
+     * as long as he worked on Torn's pages. `sides`: the two signs of life of core/front.js.
+     */
+    function besideOursCameAt(sides, now) {
+        let at = 0;
+        for (const side of [sides && sides.bids, sides && sides.page]) {
+            const t = Number(side && side.front);
+            if (Number.isFinite(t) && t > at && t <= now + 60000) at = t;
+        }
+        return at;
+    }
+
+    /**
+     * Is Torn Archive the one in front, and open? A time from the future (the clock was changed) is not believed.
+     * `oursCameAt`: he came to a page of ours after he last looked at Torn Archive - then it is not in front.
+     */
+    function besideArchiveInFront(front, alive, now, oursCameAt = 0) {
         if (!front || front.app !== 'archive' || front.at > now + 60000) return false;
+        if (oursCameAt > front.at) return false;
         const open = alive && alive.app === 'archive' && alive.at <= now + 60000 ? Math.max(front.at, alive.at) : front.at;
         return now - open < BESIDE_FRESH_MS;
     }
@@ -11850,9 +13761,9 @@
      *  at:     when this was worked out (a tab believes it only while fresh, see besideBehind()).
      * @param {object|null} prev - the stored answer
      */
-    function besideStep(prev, { front = null, alive = null, now }) {
+    function besideStep(prev, { front = null, alive = null, now, oursCameAt = 0 }) {
         const was = besideClean(prev);
-        if (besideArchiveInFront(front, alive, now)) return { behind: true, leftAt: 0, at: now };
+        if (besideArchiveInFront(front, alive, now, oursCameAt)) return { behind: true, leftAt: 0, at: now };
         if (!was.behind) return { behind: false, leftAt: 0, at: now };
         const leftAt = was.leftAt > 0 && was.leftAt <= now ? was.leftAt : now;
         return now - leftAt >= BESIDE_UP_MS ? { behind: false, leftAt: 0, at: now } : { behind: true, leftAt, at: now };
@@ -12925,908 +14836,6 @@
     async function fetchTeActiveTraderList(client) {
         const body = await client.get('active_traders', {}, { timeoutMs: TE_ACTIVE_TIMEOUT_MS });
         return { byName: parseTeActiveTraders(body), list: parseTeActiveTraderList(body) };
-    }
-
-    /* ===== src/core/traders.js ===== */
-    /*
-     * Our own trader database, and who pays most for each item. Pure: no DOM,
-     * no network.
-     *
-     * Traders publish buy prices in two places:
-     *   - TornExchange: every active trader (name + Torn id), the top three
-     *     buyers of every item, and an item's full buyer list on request.
-     *   - TornW3B: each trader's own price list at weav3r.dev/pricelist/{id}.
-     *     TornW3B has no list of traders, so ours is built from TornExchange's
-     *     active traders plus every /pricelist/{id} link seen on a TornW3B page
-     *     the user opened (its leaderboards, Search Deals).
-     *
-     * One row per trader per item: a trader on both sites shows once, with both
-     * links. When their two lists disagree, the LOWER price is the one counted
-     * (ranking, flips, where to sell), and the row is marked `differ`: in a trade
-     * the trader pays what they choose, and the owner's friend lost money trading
-     * on the higher of two lists (2026-09-26) - one list was stale or bait.
-     * Always highest (counted) price first.
-     */
-
-    const TRADER_DB_VERSION = 1;
-
-    /** A TornW3B list is shown for this long after it was read, then dropped. */
-    const W3B_LIST_MAX_AGE_MS = 6 * 60 * 60 * 1000;
-
-    /** Lists of traders who buy something you hold are re-read this often. */
-    const W3B_HELD_REFRESH_MS = 10 * 60 * 1000;
-
-    /** Every other trader's list is re-read this often. */
-    const W3B_OTHER_REFRESH_MS = 60 * 60 * 1000;
-
-    /** A trader with no TornW3B list is checked again after this. */
-    const W3B_MISSING_RECHECK_MS = 24 * 60 * 60 * 1000;
-
-    /** A failed read is not tried again before this. */
-    const W3B_ERROR_RETRY_MS = 5 * 60 * 1000;
-
-    /**
-     * A trader no source has named for this long, with no TornW3B list read in
-     * that time, is forgotten: the database used to only grow, and every Torn
-     * page loads it.
-     */
-    const TRADER_FORGET_MS = 30 * 24 * 60 * 60 * 1000;
-
-    /** `seenAt` is written back at most this often (it changes on every read of a source). */
-    const SEEN_RENEW_MS = 24 * 60 * 60 * 1000;
-
-    function emptyTraderDb() {
-        return { version: TRADER_DB_VERSION, traders: {} };
-    }
-
-    /** The stored database, or an empty one when absent or from another version. */
-    function readTraderDb(entry) {
-        if (!entry || entry.version !== TRADER_DB_VERSION || !entry.traders || typeof entry.traders !== 'object') {
-            return emptyTraderDb();
-        }
-        return entry;
-    }
-
-    function cleanId(id) {
-        const s = String(id === null || id === undefined ? '' : id).replace(/\D/g, '');
-        return s && s !== '0' ? s : '';
-    }
-
-    /**
-     * Fold `other` (what storage holds now) into `db` (what this tab holds), so
-     * neither loses what the other learned: every trader from both, and for each
-     * the more recently read TornW3B list. Returns true when `db` changed.
-     */
-    function mergeTraderDbs(db, other) {
-        const src = readTraderDb(other);
-        let changed = false;
-        for (const [id, t] of Object.entries(src.traders)) {
-            const mine = db.traders[id];
-            if (!mine) {
-                db.traders[id] = t;
-                changed = true;
-                continue;
-            }
-            // Only an answer counts: a failed read (errorAt) never replaces a
-            // list, and of two answers the later one wins.
-            const theirs = (t.w3b && t.w3b.checkedAt) || 0;
-            const ours = (mine.w3b && mine.w3b.checkedAt) || 0;
-            if (theirs > ours) {
-                mine.w3b = t.w3b;
-                changed = true;
-            }
-            if (t.name && mine.name.startsWith('Trader ') && !t.name.startsWith('Trader ')) {
-                mine.name = t.name;
-                changed = true;
-            }
-            if ((t.seenAt || 0) > (mine.seenAt || 0)) mine.seenAt = t.seenAt;
-        }
-        return changed;
-    }
-
-    /**
-     * Add traders we have just learned of (from TornExchange, Torn, or a TornW3B
-     * page). Returns true when anything changed. A known trader keeps what we
-     * know of their list. Names from TornExchange and Torn are authoritative; a
-     * name read off a TornW3B page only fills in a placeholder.
-     *
-     * @param {object} db
-     * @param {Iterable<{id, name, source}>} found
-     */
-    function addTraders(db, found, now = Date.now()) {
-        let changed = false;
-        for (const f of found || []) {
-            const id = cleanId(f && f.id);
-            if (!id) continue;
-            const name = f.name ? String(f.name).trim() : '';
-            let t = db.traders[id];
-            if (!t) {
-                t = db.traders[id] = { name: name || 'Trader ' + id, from: f.source || null, seenAt: now, w3b: null };
-                changed = true;
-            } else if (name && t.name !== name && ((f.source !== 'w3b' && f.source !== 'seed') || t.name.startsWith('Trader '))) {
-                t.name = name;
-                changed = true;
-            }
-            // Still named by a source: not one to forget (see pruneTraderDb).
-            if (!(now - (t.seenAt || 0) < SEEN_RENEW_MS)) {
-                t.seenAt = now;
-                changed = true;
-            }
-            // TornW3B's rating ("523↑ · 7↓"), when the page we read showed it.
-            const r = f.rating;
-            if (r && Number.isFinite(r.up) && Number.isFinite(r.down) && (!t.rating || t.rating.up !== r.up || t.rating.down !== r.down)) {
-                t.rating = { up: r.up, down: r.down, at: now };
-                changed = true;
-            }
-        }
-        return changed;
-    }
-
-    /**
-     * A TornW3B price list as {itemId: price}: buying prices only (0 means "not
-     * buying"), real items only (negative ids are TornW3B's own sets).
-     */
-    function parseW3bPriceList(body) {
-        const prices = {};
-        if (!Array.isArray(body)) return prices;
-        for (const row of body) {
-            const itemId = Number(row && row.itemId);
-            const price = Number(row && row.buyPrice);
-            if (!Number.isInteger(itemId) || itemId <= 0) continue;
-            if (!Number.isFinite(price) || price <= 0) continue;
-            prices[String(itemId)] = price;
-        }
-        return prices;
-    }
-
-    /** Record the result of reading one trader's TornW3B list. */
-    function recordW3bList(db, traderId, result, now = Date.now()) {
-        const id = cleanId(traderId);
-        if (!id) return;
-        if (!db.traders[id]) db.traders[id] = { name: 'Trader ' + id, from: 'w3b', seenAt: now, w3b: null };
-        const t = db.traders[id];
-        if (result.error) {
-            // Not an answer: keep whatever list we had, try again in a while.
-            t.w3b = { ...(t.w3b || {}), errorAt: now };
-            return;
-        }
-        const prices = result.prices || {};
-        t.w3b = Object.keys(prices).length
-            ? { checkedAt: now, at: now, found: true, prices }
-            : { checkedAt: now, found: false };
-    }
-
-    /** Ask for a list again soon (Refresh), without hiding the prices we have. */
-    function markW3bDue(db, traderId) {
-        const t = db.traders[cleanId(traderId)];
-        if (t && t.w3b && t.w3b.found) t.w3b.due = true;
-    }
-
-    /**
-     * Drop price lists too old to show, so storage does not grow forever. The
-     * trader and when their list was read stay, so it is read again in turn -
-     * unless no source has named them for TRADER_FORGET_MS and they had no list
-     * in that time: then the trader goes too.
-     */
-    function pruneTraderDb(db, now = Date.now()) {
-        for (const [id, t] of Object.entries(db.traders)) {
-            // Kept before 3.12.5 without a date: counted from now, not forgotten at once.
-            if (!t.seenAt) t.seenAt = now;
-            const listAt = (t.w3b && (t.w3b.at || t.w3b.checkedAt)) || 0;
-            const lastFound = t.w3b && t.w3b.found ? listAt : 0;
-            if (now - (t.seenAt || 0) > TRADER_FORGET_MS && now - lastFound > TRADER_FORGET_MS) {
-                delete db.traders[id];
-                continue;
-            }
-            const w = t.w3b;
-            if (w && w.found && w.prices && !(now - w.at <= W3B_LIST_MAX_AGE_MS)) {
-                t.w3b = { checkedAt: w.checkedAt, at: w.at, found: true, prices: null };
-            }
-            if (t.te && t.te.prices && !(now - t.te.at < TE_SCAN_MAX_AGE_MS)) t.te = { ...t.te, prices: null };
-        }
-        return db;
-    }
-
-    /*
-     * TornExchange, every active trader's whole list in turn (3.15): the top
-     * three per item missed everyone ranked 4th and lower. Kept with the trader,
-     * like their TornW3B list; used for TE_SCAN_MAX_AGE_MS.
-     */
-    const TE_SCAN_MAX_AGE_MS = 6 * 60 * 60 * 1000;
-
-    /** One trader's TornExchange list read (`prices` [{itemId, price}]), or `{error: true}`. */
-    function recordTeScan(db, traderId, { prices = null, error = false } = {}, now = Date.now()) {
-        const id = cleanId(traderId);
-        if (!id) return;
-        const t = db.traders[id] || (db.traders[id] = { name: 'Trader ' + id, from: 'te', seenAt: now, w3b: null });
-        if (error) {
-            t.te = { ...(t.te || {}), triedAt: now, failed: ((t.te && t.te.failed) || 0) + 1 };
-            return;
-        }
-        const map = {};
-        for (const p of prices || []) if (p && p.price > 0) map[String(p.itemId)] = p.price;
-        t.te = { at: now, triedAt: now, prices: map, failed: 0 };
-    }
-
-    /** itemId -> [{id, name, price}] from every TornExchange list read within TE_SCAN_MAX_AGE_MS. */
-    function indexTeScanByItem(db, now = Date.now()) {
-        const out = new Map();
-        for (const [id, t] of Object.entries((db && db.traders) || {})) {
-            const te = t && t.te;
-            if (!te || !te.prices || !(now - te.at < TE_SCAN_MAX_AGE_MS)) continue;
-            for (const [itemId, price] of Object.entries(te.prices)) {
-                if (!out.has(itemId)) out.set(itemId, []);
-                out.get(itemId).push({ id, name: t.name && !String(t.name).startsWith('Trader ') ? t.name : null, price });
-            }
-        }
-        return out;
-    }
-
-    /** A trader's TornW3B prices, if read recently enough to show. */
-    function liveW3bPrices(trader, now = Date.now()) {
-        const w = trader && trader.w3b;
-        if (!w || !w.found || !w.prices || !(now - w.at <= W3B_LIST_MAX_AGE_MS)) return null;
-        return w.prices;
-    }
-
-    /**
-     * Which trader's TornW3B list to read next, or null if none is due. Never
-     * read first, then the oldest list of a trader who buys something you hold,
-     * then the oldest of everyone else; traders with no list are re-checked daily.
-     *
-     * @param {object} db
-     * @param {Set<string>} heldIds - item ids in your inventory
-     */
-    function nextW3bTrader(db, heldIds = new Set(), now = Date.now()) {
-        let best = null;
-        let bestRank = Infinity;
-        for (const [id, t] of Object.entries(db.traders)) {
-            const w = t.w3b;
-            if (w && w.errorAt && now - w.errorAt < W3B_ERROR_RETRY_MS) continue;
-
-            let rank;
-            if (!w || !w.checkedAt) {
-                rank = 0;
-            } else if (!w.found) {
-                if (now - w.checkedAt < W3B_MISSING_RECHECK_MS) continue;
-                rank = 3e15 + w.checkedAt;
-            } else {
-                const age = now - (w.at || 0);
-                const buysHeld = heldIds.size > 0 && Object.keys(w.prices || {}).some((i) => heldIds.has(i));
-                if (w.due) {
-                    rank = 5e14 + (w.at || 0);
-                } else if (buysHeld) {
-                    if (age < W3B_HELD_REFRESH_MS) continue;
-                    rank = 1e15 + (w.at || 0);
-                } else {
-                    if (age < W3B_OTHER_REFRESH_MS) continue;
-                    rank = 2e15 + (w.at || 0);
-                }
-            }
-            if (rank < bestRank) {
-                bestRank = rank;
-                best = id;
-            }
-        }
-        return best;
-    }
-
-    /** Counts for the status line. */
-    function traderDbStats(db, now = Date.now()) {
-        let total = 0;
-        let withW3b = 0;
-        let unchecked = 0;
-        let newest = 0;
-        for (const t of Object.values(db.traders)) {
-            total += 1;
-            if (!t.w3b || !t.w3b.checkedAt) unchecked += 1;
-            if (liveW3bPrices(t, now)) {
-                withW3b += 1;
-                if (t.w3b.at > newest) newest = t.w3b.at;
-            }
-        }
-        return { total, withW3b, unchecked, newestW3bAt: newest || null };
-    }
-
-    /**
-     * Every trader buying one item, one row each, highest price first.
-     *
-     * @param {string} itemId
-     * @param {object} src
-     * @param {Array}  [src.teBest]     - TornExchange top three: {name, id, price, score}
-     * @param {Array|null} [src.teFull] - TornExchange full list: {name, price}
-     * @param {Map}    [src.idsByName]  - lowercase TornExchange name -> torn id
-     * @param {object} [src.db]         - the trader database (TornW3B lists)
-     * @param {Map}    [src.w3bByItem]  - itemId -> [{id, price}], from indexW3bByItem
-     * @param {Array}  [src.teOwn]      - your traders' own whole TornExchange lists (3.14.3):
-     *   {id, name, price, lastPaid} - lastPaid: no public list, what they paid you last
-     * @returns {Array<{id, name, price, te: number|null, w3b: number|null, teName: string|null}>}
-     */
-    function buyersForItem(itemId, { teBest = [], teFull = null, idsByName = new Map(), db = null, w3bByItem = null, dbIdsByName = null, votesById = null, teOwn = null, w3bItem = null } = {}) {
-        const key = String(itemId);
-        const rows = new Map();
-        const byName = new Map();
-
-        const row = (id, name) => {
-            const k = id ? 'id:' + id : 'name:' + String(name).toLowerCase();
-            let r = rows.get(k);
-            if (!r) {
-                r = { id: id || null, name: name || (id ? 'Trader ' + id : '?'), price: 0, te: null, teTop: null, teList: null, w3b: null, teName: null, votes: null };
-                rows.set(k, r);
-            }
-            if (name && r.name.startsWith('Trader ') && !String(name).startsWith('Trader ')) r.name = name;
-            return r;
-        };
-        // TornExchange's top three and an item's full list are read at different
-        // times: when they disagree for one trader, the lower counts (as between
-        // the two sites) - the higher may be a price they have since dropped.
-        const setTe = (r, name, price, which) => {
-            r.teName = name;
-            if (!(r[which] >= price)) r[which] = price;
-            r.te = r.teTop > 0 && r.teList > 0 ? Math.min(r.teTop, r.teList) : r.teTop || r.teList;
-            byName.set(String(name).toLowerCase(), r);
-        };
-
-        for (const t of teBest || []) {
-            if (!t || !(t.price > 0) || !t.name) continue;
-            const lower = String(t.name).toLowerCase();
-            const id = cleanId(t.id) || cleanId(idsByName.get(lower)) || cleanId(dbIdsByName && dbIdsByName.get(lower));
-            const r = row(id, t.name);
-            setTe(r, t.name, t.price, 'teTop');
-            // TornExchange's vote score comes with its top buyers.
-            if (Number.isFinite(t.score)) r.votes = t.score;
-        }
-        if (Array.isArray(teFull)) {
-            // The full list carries everyone ever listed; once the active traders
-            // are known, a name on neither that list nor the top three is an
-            // inactive trader and is left out.
-            const activeKnown = idsByName && idsByName.size > 0;
-            for (const t of teFull) {
-                if (!t || !(t.price > 0) || !t.name) continue;
-                const lower = String(t.name).toLowerCase();
-                const known = byName.get(lower);
-                if (!known && activeKnown && !idsByName.has(lower)) continue;
-                const id = (known && known.id) || cleanId(idsByName.get(lower)) || cleanId(dbIdsByName && dbIdsByName.get(lower));
-                setTe(known || row(id, t.name), t.name, t.price, 'teList');
-            }
-        }
-
-        // A trader's own whole list counts as their full list. Last-paid prices
-        // (no public list) are kept apart and count only when nothing else does.
-        for (const t of teOwn || []) {
-            if (!t || !(t.price > 0) || !(t.id || t.name)) continue;
-            const known = t.name ? byName.get(String(t.name).toLowerCase()) : null;
-            const r = rows.get('id:' + cleanId(t.id)) || known || row(cleanId(t.id), t.name);
-            if (t.lastPaid) {
-                if (!(r.lastPaid >= t.price)) r.lastPaid = t.price;
-                continue;
-            }
-            // Only a real name makes a TornExchange list link.
-            if (t.name) setTe(r, t.name, t.price, 'teList');
-            else if (!(r.teList >= t.price)) {
-                r.teList = t.price;
-                r.te = r.teTop > 0 ? Math.min(r.teTop, r.teList) : r.teList;
-            }
-        }
-
-        const w3b = w3bByItem ? w3bByItem.get(key) || [] : [];
-        for (const { id, price } of w3b) {
-            const t = db && db.traders[id];
-            // The same trader already here by name only (a TornExchange row with
-            // no id yet): one row, now with the id.
-            let r = rows.get('id:' + id);
-            // (No TornExchange row by name at all: nothing to look up - 3.17.1, the same result.)
-            if (!r && t && byName.size) {
-                const named = byName.get(String(t.name).toLowerCase());
-                if (named && !named.id) {
-                    rows.delete('name:' + String(named.name).toLowerCase());
-                    named.id = id;
-                    rows.set('id:' + id, named);
-                    r = named;
-                }
-            }
-            if (!r) r = row(id, t ? t.name : null);
-            if (!(r.w3b >= price)) r.w3b = price;
-        }
-
-        // Every TornW3B buyer of this item, read minutes ago (3.15, /traders): its
-        // price is the newest, and it names traders we had no list of yet.
-        for (const t of w3bItem || []) {
-            const id = cleanId(t && t.id);
-            if (!id || !(t.price > 0)) continue;
-            let r = rows.get('id:' + id);
-            if (!r && t.name && byName.size) {
-                const named = byName.get(String(t.name).toLowerCase());
-                if (named && !named.id) {
-                    rows.delete('name:' + String(named.name).toLowerCase());
-                    named.id = id;
-                    rows.set('id:' + id, named);
-                    r = named;
-                }
-            }
-            if (!r) r = row(id, t.name || null);
-            r.w3b = t.price;
-            if (Number.isFinite(t.up) && Number.isFinite(t.down)) r.itemRating = { up: t.up, down: t.down };
-        }
-
-        const out = [];
-        for (const r of rows.values()) {
-            const both = r.te > 0 && r.w3b > 0;
-            r.price = both ? Math.min(r.te, r.w3b) : Math.max(r.te || 0, r.w3b || 0);
-            // Only what they paid you last: marked, and never above a live price.
-            r.lastPaidOnly = !(r.price > 0) && r.lastPaid > 0;
-            if (r.lastPaidOnly) r.price = r.lastPaid;
-            r.differ = (both && r.te !== r.w3b) || (r.teTop > 0 && r.teList > 0 && r.teTop !== r.teList);
-            if (r.price <= 0) continue;
-            // What we know of how they trade: TornExchange votes (from any item's
-            // top three) and TornW3B's rating.
-            if (r.votes === null && r.id && votesById && votesById.has(r.id)) r.votes = votesById.get(r.id);
-            const t = r.id && db ? db.traders[r.id] : null;
-            r.rating = (t && t.rating) || r.itemRating || null;
-            r.trust = trustOf(r.votes, r.rating);
-            out.push(r);
-        }
-        out.sort((a, b) => b.price - a.price || TRADER_NAME_ORDER.compare(String(a.name), String(b.name)));
-        return out;
-    }
-
-    /*
-     * Names at the same price, in the order String.localeCompare gives them: it
-     * is this same collator (the default locale, no options) - made once here
-     * instead of once per comparison (3.17.1).
-     */
-    const TRADER_NAME_ORDER = new Intl.Collator();
-
-    /**
-     * A trader's trust, from the votes other players left after trading with
-     * them: TornExchange's vote score and TornW3B's rating (ups minus downs). The
-     * better of the two counts, so a trader known on one site only is not
-     * marked down for missing from the other.
-     *
-     *   Trusted  - 100 or more
-     *   Known    - 20 or more
-     *   New      - 0 to 19
-     *   Caution  - below 0
-     *   null     - nothing known
-     *
-     * @returns {{level: string, score: number, votes: number|null, up: number|null, down: number|null}|null}
-     */
-    function trustOf(votes, rating) {
-        const te = Number.isFinite(votes) ? votes : null;
-        const w3b = rating && Number.isFinite(rating.up) && Number.isFinite(rating.down) ? rating.up - rating.down : null;
-        if (te === null && w3b === null) return null;
-        const score = Math.max(te === null ? -Infinity : te, w3b === null ? -Infinity : w3b);
-        const level = score >= 100 ? 'Trusted' : score >= 20 ? 'Known' : score >= 0 ? 'New' : 'Caution';
-        return { level, score, votes: te, up: rating ? rating.up : null, down: rating ? rating.down : null };
-    }
-
-    /**
-     * TornExchange vote scores by trader id, from every item's top buyers and
-     * the keyless best-buyer answers: one pass, for every row.
-     * @param {Iterable<Array>} lists - arrays of {id, score}
-     */
-    function votesByTrader(lists) {
-        const out = new Map();
-        for (const list of lists) {
-            for (const t of list || []) {
-                const id = cleanId(t && t.id);
-                if (id && Number.isFinite(t.score) && !out.has(id)) out.set(id, t.score);
-            }
-        }
-        return out;
-    }
-
-    /* A trader's TornExchange votes are remembered this long after last seen. */
-    const VOTES_KEEP_MS = 7 * 24 * 60 * 60 * 1000;
-    /* At most this many traders' votes are remembered (the most recently seen). */
-    const VOTES_KEEP_MAX = 5000;
-
-    /**
-     * Votes only come with an item's top three, so a trader who drops out of
-     * every top three at a refresh lost their trust badge, and with "Trusted
-     * buyers only" vanished from the desk (the friend, 3.14.4: "the list of
-     * buyers suddenly disappears"). The last votes seen are kept for a week.
-     *
-     * @param {object|null} stored - {id: [score, at]}
-     * @param {Map<string, number>} current - votesByTrader of the newest answer
-     * @param {number} at - when that answer was read
-     * @returns {object} the new stored form
-     */
-    function rememberVotes(stored, current, at, now = Date.now()) {
-        const all = new Map();
-        for (const [id, v] of Object.entries(stored && typeof stored === 'object' ? stored : {})) {
-            if (Array.isArray(v) && Number.isFinite(v[0]) && now - Number(v[1]) <= VOTES_KEEP_MS) all.set(id, [v[0], Number(v[1])]);
-        }
-        for (const [id, score] of current || []) {
-            const old = all.get(id);
-            if (!old || !(old[1] > at)) all.set(id, [score, at]);
-        }
-        const keep = [...all.entries()].sort((a, b) => b[1][1] - a[1][1]).slice(0, VOTES_KEEP_MAX);
-        return Object.fromEntries(keep);
-    }
-
-    /** The remembered votes, as votesByTrader's map (too old ones left out). */
-    function rememberedVotes(stored, now = Date.now()) {
-        const out = new Map();
-        for (const [id, v] of Object.entries(stored && typeof stored === 'object' ? stored : {})) {
-            if (Array.isArray(v) && Number.isFinite(v[0]) && now - Number(v[1]) <= VOTES_KEEP_MS) out.set(id, v[0]);
-        }
-        return out;
-    }
-
-    /**
-     * Who pays the most for the most of your items. In Torn you trade with one
-     * person at a time, so the trader with the best price on many of your items
-     * is the one to message first.
-     *
-     * @param {Array<{itemId, buyers, best}>} rows - My items
-     * @param {number} [limit]
-     * @returns {Array<{trader, bestOn: string[], buys: number}>} most best-prices first
-     */
-    function bestTradersFor(rows, limit = 3) {
-        const byId = new Map();
-        for (const r of rows || []) {
-            for (const [i, b] of (r.buyers || []).entries()) {
-                const key = b.id || 'name:' + String(b.name).toLowerCase();
-                let e = byId.get(key);
-                if (!e) byId.set(key, (e = { trader: b, bestOn: [], buys: 0 }));
-                e.buys += 1;
-                if (i === 0) e.bestOn.push(r.itemId);
-            }
-        }
-        return [...byId.values()]
-            .filter((e) => e.bestOn.length > 0)
-            .sort((a, b) => b.bestOn.length - a.bestOn.length || b.buys - a.buys || String(a.trader.name).localeCompare(String(b.trader.name)))
-            .slice(0, limit);
-    }
-
-    /**
-     * TornW3B's ratings as its leaderboards print them: a name, then
-     * "523↑ · 7↓" on the next line.
-     * @returns {Map<string, {up: number, down: number}>} name -> rating
-     */
-    function ratingsInText(text) {
-        const out = new Map();
-        const re = /([A-Za-z0-9_-]{1,20})\s*\n\s*(\d+)\s*↑\s*·\s*(\d+)\s*↓/g;
-        let m;
-        while ((m = re.exec(String(text || '')))) out.set(m[1], { up: Number(m[2]), down: Number(m[3]) });
-        return out;
-    }
-
-    /** Lowercase name -> id for every trader we know by a real name. */
-    function traderIdsByName(db) {
-        const out = new Map();
-        for (const [id, t] of Object.entries(db.traders)) {
-            if (t.name && !t.name.startsWith('Trader ')) out.set(t.name.toLowerCase(), id);
-        }
-        return out;
-    }
-
-    /** itemId -> [{id, price}] across every live TornW3B list: one pass, not one per item. */
-    function indexW3bByItem(db, now = Date.now()) {
-        const out = new Map();
-        for (const [id, t] of Object.entries(db.traders)) {
-            const prices = liveW3bPrices(t, now);
-            if (!prices) continue;
-            for (const [itemId, price] of Object.entries(prices)) {
-                let list = out.get(itemId);
-                if (!list) out.set(itemId, (list = []));
-                list.push({ id, price });
-            }
-        }
-        return out;
-    }
-
-    /**
-     * "Buyers online only": drop traders known to be offline, order unchanged.
-     * Idle ones (logged in, away a few minutes), ones whose status is not read
-     * yet, and ones known by name only stay - it used to drop all of those, and
-     * with them most of the big TornExchange buyers (3.14).
-     */
-    function onlineOnly(buyers, levelOf) {
-        return buyers.filter((b) => !(b.id && levelOf(b.id) === 'offline'));
-    }
-
-    /**
-     * The buyers "Buyers online only" and "Trusted buyers only" leave out, each
-     * with why (`hiddenBy`: 'offline' or 'trust'), so the desk can say so: a
-     * list that empties with no reason reads as broken (the friend, 3.14.4).
-     * The same rules as onlineOnly and trustedOnly({min: 'Known'}).
-     *
-     * @param {Array} buyers - the allowed buyers (blacklist already out)
-     * @param {{prefs: {onlineOnly?: boolean, trustedOnly?: boolean}, levelOf: Function, votesMissing?: boolean}} opts
-     */
-    function hiddenBuyers(buyers, { prefs = {}, levelOf = () => 'unknown', votesMissing = false, listAtOf = () => 0, now = Date.now() } = {}) {
-        const out = [];
-        for (const b of buyers || []) {
-            if (prefs.onlineOnly && b.id && levelOf(b.id) === 'offline') out.push({ ...b, hiddenBy: 'offline' });
-            else if (prefs.trustedOnly && !(b.trust ? b.trust.level === 'Trusted' || b.trust.level === 'Known' : votesMissing)) out.push({ ...b, hiddenBy: 'trust' });
-            else if (prefs.freshOnly && stalePrice(b, listAtOf, now)) out.push({ ...b, hiddenBy: 'stale', listAt: Number(listAtOf(b.id)) || 0 });
-        }
-        return out;
-    }
-
-    /*
-     * "Fresh prices only" (3.22.0; the owner, 2026-10-03: "if the prices are too
-     * stale lets say over a day, do not show them in tornbids, it means they are
-     * not updating"; then: "2 days update is fine").
-     *
-     * TornW3B says when each trader last changed their price list
-     * (`pricelist_updated`, with every buyer of an item). Measured that day on
-     * six items, the top 100 buyers of each: 35 to 42 had changed theirs within a
-     * day, about half within three days, and of the ten highest prices two to
-     * seven came from lists weeks old - the prices nobody honours.
-     *
-     * A price is stale when it is that trader's TornW3B price, their list was
-     * last changed over two days ago, and TornExchange has no price of theirs for
-     * the item (TornExchange gives no date: a price also listed there is left
-     * alone). A trader whose list date was never read is not stale - not known
-     * is not old.
-     */
-    const PRICES_STALE_MS = 2 * 24 * 60 * 60 * 1000;
-
-    /**
-     * @param {{id, w3b, te}} b - a buyer row (buyersForItem)
-     * @param {function} listAtOf - (trader id) => when their TornW3B list last changed (ms), 0 when not known
-     */
-    function stalePrice(b, listAtOf, now = Date.now()) {
-        if (!b || !b.id || !(b.w3b > 0) || b.te > 0) return false;
-        const at = Number(listAtOf(b.id)) || 0;
-        return at > 0 && now - at > PRICES_STALE_MS;
-    }
-
-    /*
-     * Who traded lately (3.23.0, the first step on "will this trader actually
-     * trade this item"). TornW3B's list of an item's buyers holds 100 at most,
-     * highest price first - Xanax had 412 - so the 100 we read were the dearest
-     * lists, traded on or not. It can be asked for only those who traded in the
-     * last N hours. With Fresh prices only on, an item with more buyers than one
-     * answer holds is read both ways in turn - everyone, then those who traded
-     * in the last two days (the same two days) - and the two answers are one
-     * list: nobody the full read named is lost, and nobody's list date goes
-     * unread. No trader is hidden by this; it only finds the ones the cut hid.
-     */
-    const FRESH_TRADED_HOURS = PRICES_STALE_MS / (60 * 60 * 1000);
-
-    /**
-     * What the next read of an item's buyers asks for.
-     *
-     * @param {{at, total, answered?, traders, withinHours}|null} prev - the last read
-     * @returns {number|null} hours for "traded within", or null: everyone
-     */
-    function buyersAsk(prev, { fresh = false } = {}) {
-        if (!fresh || !prev || !(Number(prev.at) > 0) || prev.withinHours) return null;
-        const answered = Number.isFinite(Number(prev.answered)) ? Number(prev.answered) : (prev.traders || []).length;
-        return Number(prev.total) > answered && answered > 0 ? FRESH_TRADED_HOURS : null;
-    }
-
-    /** Two reads of an item's buyers as one list: the newer read of the same trader counts; highest price first. */
-    function mergeItemBuyers(older, newer) {
-        const byId = new Map();
-        for (const t of older || []) if (t && t.id) byId.set(String(t.id), t);
-        for (const t of newer || []) if (t && t.id) byId.set(String(t.id), t);
-        return [...byId.values()].sort((a, b) => b.price - a.price);
-    }
-
-    /** In an answer asked for "traded within N hours": how many last traded longer ago than that (known ones only). */
-    function notTradedLately(traders, hours, now = Date.now()) {
-        return (traders || []).filter((t) => t && Number(t.lastTrade) > 0 && now - Number(t.lastTrade) > hours * 60 * 60 * 1000).length;
-    }
-
-    /** "Fresh prices only", order unchanged. */
-    function freshOnly(buyers, listAtOf, now = Date.now()) {
-        return buyers.filter((b) => !stalePrice(b, listAtOf, now));
-    }
-
-    /*
-     * A list getting old (3.22.3; the owner, 2026-10-05: "we do need a pulsating
-     * amber color to show that price list isnt updated over 24 hours to 2 days").
-     *
-     * Two days stays the line for Fresh prices only ("2 IS FINE"). A price from a
-     * list last changed over 24 hours ago and not yet over two days is still
-     * shown, with a pulsing amber dot and how long ago ('aging'). Over two days
-     * ('stale') it is seen only with Fresh prices only off: the same amber line,
-     * its dot still.
-     *
-     * The same price as stalePrice looks at, so the two never disagree: that
-     * trader's TornW3B price, with no TornExchange price of theirs for the item
-     * and a list date that was read.
-     */
-    const PRICES_AGING_MS = 24 * 60 * 60 * 1000;
-
-    /**
-     * @param {{id, w3b, te}} b - a buyer row (buyersForItem)
-     * @param {function} listAtOf - (trader id) => when their TornW3B list last changed (ms), 0 when not known
-     * @returns {{at: number, level: 'aging'|'stale'}|null} null: nothing to say
-     */
-    function oldList(b, listAtOf, now = Date.now()) {
-        if (!b || !b.id || !(b.w3b > 0) || b.te > 0) return null;
-        const at = Number(listAtOf(b.id)) || 0;
-        if (!(at > 0) || !(now - at > PRICES_AGING_MS)) return null;
-        return { at, level: now - at > PRICES_STALE_MS ? 'stale' : 'aging' };
-    }
-
-    /**
-     * A trade's old list (3.23.0, the Your traders cards): the first of its lines
-     * whose price is this trader's from a TornW3B list not changed in over 24
-     * hours. One list, one date: the first found says it for the trade.
-     *
-     * @param {Array<{itemId}>} lines - the trade's flips and your To sell lines, in order
-     * @param {function} rowOf - (item id) => that trader's buyer row for the item, or null
-     * @returns {{at: number, level: 'aging'|'stale'}|null}
-     */
-    function tradeOldList(lines, rowOf, listAtOf, now = Date.now()) {
-        for (const l of lines || []) {
-            const old = l ? oldList(rowOf(l.itemId), listAtOf, now) : null;
-            if (old) return old;
-        }
-        return null;
-    }
-
-    /**
-     * The trader a bazaar card's tag names (3.23.0; the owner, 2026-10-05: "yes
-     * the overlay tag should hide old traders too"): the best Trusted one - and,
-     * with Fresh prices only on, the best whose price is not from a list over two
-     * days old (stalePrice, Torn Bids' own rule). None left: no tag.
-     *
-     * @param {Array} buyers - highest first, the blacklist already out
-     * @param {{fresh?: boolean, listAtOf?: function, now?: number}} [o]
-     */
-    function tagBuyer(buyers, { fresh = false, listAtOf = () => 0, now = Date.now() } = {}) {
-        const trusted = trustedOnly(buyers || []);
-        return (fresh ? freshOnly(trusted, listAtOf, now) : trusted)[0] || null;
-    }
-
-    /*
-     * The list dates, for every page (3.23.0). Torn Bids keeps them in its own
-     * page's storage (its address is not Torn's), which a page on torn.com never
-     * sees - so they are also kept, as short as they go, with the script's own
-     * values: [[trader id, seconds]], the newest first.
-     */
-    const LIST_AT_MAX = 3000;
-
-    /** @param {Map<string, number>} listAt - trader id -> ms */
-    function packListAt(listAt, max = LIST_AT_MAX) {
-        return [...listAt].sort((a, b) => b[1] - a[1]).slice(0, max).map(([id, at]) => [String(id), Math.round(at / 1000)]);
-    }
-
-    /** What was stored, as trader id -> ms. Anything that is not a date is left out. */
-    function readListAtRows(stored) {
-        const out = new Map();
-        for (const row of Array.isArray(stored) ? stored : []) {
-            const id = Array.isArray(row) && row[0] !== null && row[0] !== undefined ? String(row[0]) : '';
-            const at = Array.isArray(row) ? Number(row[1]) * 1000 : 0;
-            if (id && at > 0 && Number.isFinite(at) && !out.has(id)) out.set(id, at);
-        }
-        return out;
-    }
-
-    /**
-     * How long ago a list was changed, in words, never shortened: "1 day 6 hours
-     * ago", "2 days ago", "23 days ago". Hours are said for the first three days,
-     * where they matter; after that the days alone.
-     */
-    function listAgeText(ms) {
-        if (!Number.isFinite(ms) || ms < 0) return 'not known';
-        const hours = Math.floor(ms / (60 * 60 * 1000));
-        const days = Math.floor(hours / 24);
-        const h = hours % 24;
-        const dText = days + (days === 1 ? ' day' : ' days');
-        const hText = h + (h === 1 ? ' hour' : ' hours');
-        if (days < 1) return hours < 1 ? 'under an hour ago' : hText + ' ago';
-        return (days < 3 && h ? dText + ' ' + hText : dText) + ' ago';
-    }
-
-    /**
-     * "Trusted buyers only", order unchanged. By default the Trusted badge only
-     * (the bazaar-card tag in the overlay). Torn Bids (3.14, the owner: "we've
-     * made the trusted too strict") passes `min: 'Known'` - 20 votes and up - and
-     * `keepUnrated` while TornExchange's votes are not loaded: a trader is not
-     * untrusted because a list did not load.
-     *
-     * @param {Array} buyers
-     * @param {{min?: 'Trusted'|'Known', keepUnrated?: boolean}} [opts]
-     */
-    function trustedOnly(buyers, { min = 'Trusted', keepUnrated = false } = {}) {
-        const ok = min === 'Known' ? new Set(['Trusted', 'Known']) : new Set(['Trusted']);
-        return buyers.filter((b) => (b.trust ? ok.has(b.trust.level) : keepUnrated));
-    }
-
-    /** What each column sorts by first: prices and counts high to low, names A to Z. */
-    const SORT_FIRST_DIR = { name: 1, price: -1, buyer: 1, next: -1, traders: -1 };
-
-    /**
-     * Pressing a column's header: a new column sorts its natural way first, the
-     * same column again turns it around.
-     */
-    function nextSort(current, key) {
-        if (!Object.prototype.hasOwnProperty.call(SORT_FIRST_DIR, key)) return current;
-        if (current && current.key === key) return { key, dir: -current.dir };
-        return { key, dir: SORT_FIRST_DIR[key] };
-    }
-
-    /**
-     * Item rows in the order the Rows and Table views' headers ask for. Items
-     * nobody buys stay at the end whatever the order, by name; ties fall back to
-     * the best price, then the name, so the order never jumps between renders.
-     *
-     * @param {Array<{name, buyers, best}>} rows
-     * @param {{key: string, dir: 1|-1}} sort
-     */
-    function sortItemRows(rows, sort) {
-        const key = sort && SORT_FIRST_DIR[sort.key] !== undefined ? sort.key : 'price';
-        const dir = sort && sort.dir === 1 ? 1 : -1;
-        const text = (a, b) => String(a).localeCompare(String(b), 'en', { sensitivity: 'base' });
-        const num = (a, b) => (Number(a) || 0) - (Number(b) || 0);
-        const by = {
-            name: (a, b) => text(a.name, b.name),
-            price: (a, b) => num(a.best.price, b.best.price),
-            buyer: (a, b) => text(a.best.name, b.best.name),
-            next: (a, b) => num(a.buyers[1] ? a.buyers[1].price : 0, b.buyers[1] ? b.buyers[1].price : 0),
-            traders: (a, b) => a.buyers.length - b.buyers.length,
-        }[key];
-        return rows.slice().sort((a, b) => {
-            if (Boolean(a.best) !== Boolean(b.best)) return a.best ? -1 : 1;
-            if (!a.best) return text(a.name, b.name);
-            return dir * by(a, b) || b.best.price - a.best.price || text(a.name, b.name);
-        });
-    }
-
-    /**
-     * Item rows for a section: best buyer first in each, items with a buyer
-     * first (highest best price), the rest after by name.
-     *
-     * @param {Iterable<string>} itemIds
-     * @param {function} buyersOf - (itemId) => buyers, already filtered
-     * @param {function} nameOf   - (itemId) => display name
-     * @param {string} [query]    - case-insensitive name filter
-     */
-    function itemRows(itemIds, { buyersOf, nameOf, query = '' }) {
-        const q = String(query || '').trim().toLowerCase();
-        const rows = [];
-        for (const id of itemIds) {
-            const name = nameOf(id);
-            if (q && !String(name).toLowerCase().includes(q)) continue;
-            const buyers = buyersOf(id);
-            rows.push({ itemId: String(id), name, buyers, best: buyers[0] || null });
-        }
-        rows.sort((a, b) => {
-            if (Boolean(a.best) !== Boolean(b.best)) return a.best ? -1 : 1;
-            if (a.best && b.best && b.best.price !== a.best.price) return b.best.price - a.best.price;
-            return String(a.name).localeCompare(String(b.name));
-        });
-        return rows;
-    }
-
-    /**
-     * "Name [1234567]" pairs in page text, as TornW3B's Search Deals prints each
-     * trader. Only ids that also have a /pricelist/ link are kept by the caller.
-     * @returns {Map<string, string>} id -> name
-     */
-    function traderNamesInText(text) {
-        const out = new Map();
-        const re = /([A-Za-z0-9_-]{1,20}) \[(\d{1,8})\]/g;
-        let m;
-        while ((m = re.exec(String(text || '')))) out.set(m[2], m[1]);
-        return out;
-    }
-
-    /** Every /pricelist/{id} link in a page's anchors: [{id, name}]. */
-    function traderLinksIn(anchors) {
-        const out = new Map();
-        for (const a of anchors || []) {
-            const href = a && (a.getAttribute ? a.getAttribute('href') : a.href);
-            const m = String(href || '').match(/\/pricelist\/(\d+)(?:[/?#]|$)/);
-            if (!m) continue;
-            const text = String((a.textContent || '')).trim();
-            // A "List" button carries no name; a leaderboard link carries it.
-            // Only something shaped like a Torn name (letters, digits, _ and -, up
-            // to 20): never "List", "1 Clouds +516" or a sentence.
-            const name = /^[A-Za-z0-9_-]{1,20}$/.test(text) && !/^(list|pricelist|view|trade|bazaar)$/i.test(text) ? text : '';
-            const prev = out.get(m[1]);
-            if (!prev || (!prev.name && name)) out.set(m[1], { id: m[1], name, source: 'w3b' });
-        }
-        return [...out.values()];
     }
 
     /* ===== src/core/kept-buyers.js ===== */
@@ -15339,20 +16348,16 @@
      *
      * @returns {{level: number|null, name: string|null}}
      */
+    /** What Torn's key info says of a key's access: {level, name}; nulls when it does not say. */
+    function keyAccessOf(data) {
+        const level = Number(data && data.access_level);
+        const name = (data && data.access_type) || ACCESS_LEVEL_NAMES[level] || null;
+        return { level: Number.isFinite(level) ? level : null, name };
+    }
+
     async function fetchKeyAccess(client) {
         try {
-            const data = await client.get('key', { selections: 'info' });
-
-            const level = Number(data && data.access_level);
-            const name =
-                (data && data.access_type) ||
-                ACCESS_LEVEL_NAMES[level] ||
-                null;
-
-            return {
-                level: Number.isFinite(level) ? level : null,
-                name,
-            };
+            return keyAccessOf(await client.get('key', { selections: 'info' }));
         } catch {
             // The check is advisory. If it fails, say nothing rather than
             // blocking a key that is probably fine.
@@ -20024,9 +21029,44 @@
         font-size: 11.5px;
     }
 
-    /* The tightest step: the header names only the side that is on; the switch itself is in Settings. */
-    .ttv2-panel.ttv2-tighter .ttv2-head button.ttv2-jobb:not(.ttv2-jobb-on) {
-        display: none;
+    /*
+     * A header that still does not fit at the smallest type (3.26.0; a 1920x1200 laptop: the panel is
+     * 240px there, and "NPC Arbitrage" was left out of the switch): two rows. The switch, whole, with
+     * Settings and Collapse; under it Scan / Open Torn Bids across the panel. Nothing left out or cut.
+     */
+    .ttv2-panel.ttv2-head2 .ttv2-head {
+        flex-wrap: wrap;
+        height: auto;
+        min-height: 40px;
+        padding-top: 7px;
+        padding-bottom: 7px;
+        row-gap: 6px;
+    }
+
+    .ttv2-panel.ttv2-head2 .ttv2-head .ttv2-title {
+        flex: 1 1 0;
+        min-width: max-content;
+    }
+
+    .ttv2-panel.ttv2-head2 button.ttv2-sell,
+    .ttv2-panel.ttv2-head2 button.ttv2-scan {
+        order: 5;
+        flex: 1 0 100%;
+        height: 24px;
+    }
+
+    .ttv2-panel.ttv2-head2 button.ttv2-jobb:first-child {
+        margin-left: -4px;
+    }
+
+    /* ...and the line under it: a long sentence takes the row, what stood at its right goes under it (it was squeezed to four short lines). */
+    .ttv2-panel.ttv2-head2 .ttv2-bar {
+        flex-wrap: wrap;
+        gap: 2px 8px;
+    }
+
+    .ttv2-panel.ttv2-head2 .ttv2-bar-left {
+        flex: 1 1 auto;
     }
 
     .ttv2-panel.ttv2-tight button.ttv2-jobb.ttv2-jobb-on {
@@ -21975,6 +23015,7 @@
 
             // One row, always: in less room, smaller type and tighter spacing,
             // one step at a time, measured - never cut, never wrapped.
+            this.root.classList.remove('ttv2-head2');
             this.root.classList.toggle('ttv2-narrow', width < TWO_ROW_BELOW);
             this.root.classList.remove('ttv2-tight');
             this.root.style.removeProperty('--fit-right');
@@ -21985,6 +23026,9 @@
             this.root.classList.remove('ttv2-tighter');
             if (this.root.classList.contains('ttv2-narrow') && overflows()) this.root.classList.add('ttv2-tight');
             if (this.root.classList.contains('ttv2-tight') && overflows()) this.root.classList.add('ttv2-tighter');
+            // The header alone still too wide at the smallest type (the switch names both sides): it takes
+            // two rows - the switch whole, the Scan / Open Torn Bids button under it. Never a side left out.
+            if (this.headEl && this.headEl.clientWidth && this.headEl.scrollWidth - this.headEl.clientWidth > 1) this.root.classList.add('ttv2-head2');
 
             // Still a few pixels short: borrow them from the window-edge margin
             // first, then from the gap - never more than the gap, so the panel
@@ -25093,6 +26137,9 @@
     .badge.trust[data-level="caution"] { color: var(--warn); background: var(--warn-bg); }
     .pname { color: inherit; text-decoration: none; } .pname:hover { text-decoration: underline; text-underline-offset: 3px; }
     .pin.on { color: var(--text); background: var(--hover); } .who-t .pin { width: 26px; height: 26px; }
+    /* 3.26.0: the trade's header is one family - TE list / W3B list are buttons, so ⊘ and the star take the same 26 px box (the pin's). */
+    .who-t .quiet, .who-t .star { width: 26px; height: 26px; flex: none; display: grid; place-items: center; margin: 0; padding: 0; border: 1px solid var(--line2); border-radius: 8px; background: var(--raised); font-size: 14px; }
+    .who-t .quiet:hover, .who-t .star:hover { background: var(--hover); border-color: rgba(255,255,255,.22); }
 
     /* ---------- the frame ---------- */
     .app { grid-template-rows: minmax(0, 1fr); } .main { grid-template-rows: 52px auto minmax(0, 1fr) 30px; min-height: 0; }
@@ -25381,6 +26428,10 @@
     .lg-profitbox { display: grid; gap: 12px; } .lg-profitbox .lg-mugline { padding: 10px 16px; }
     .lg-chips { padding: 1px; } .lg-chips .sp-chip-f, .lg-chips-s .sp-chip-f { height: 28px; font-size: 12px; } .lg-in { height: 32px; }
     .lg-filters { align-items: flex-end; gap: 10px 16px; }
+    /* 3.25.1: "where are my settings that I can click?" - the Only toggles are buttons and look it: an outline, filled when on. */
+    .tog { padding: 0 10px; border: 1px solid var(--line2); border-radius: 999px; }
+    .tog.on { background: var(--raised); }
+    .tog:hover { border-color: var(--faint); }
     `;
 
     const BIDS_CSS = BIDS_BASE_CSS + BIDS_CALM_CSS + BIDS_FORM_CSS;
@@ -26036,6 +27087,8 @@
             this.orderAsked = '';
             /* "Show all" in the desk, for the item it was pressed on. */
             this.showAll = { item: null, buyers: false, sellers: false };
+            // Refresh pressed on a trader: trade key -> when (the row says "Reading…" until the answer is in).
+            this.checkPressed = new Map();
         }
 
         /**
@@ -26702,6 +27755,7 @@
             if (!said.length) said.push(['', info.bazaarsAt ? 'Nothing new. Prices are read as they change.' : 'Loading bazaar prices…']);
             const right = [];
             if (info.flipsWanted) right.push(['possible flips checked', info.flipsChecked + ' of ' + info.flipsWanted]);
+            if (info.pricesWaiting) right.push(['flips waiting for a price check', count(info.pricesWaiting)]);
             if (info.w3bKnown) right.push(['price lists', count(info.w3bRead || 0) + ' of ' + count(info.w3bKnown)]);
             const sig = JSON.stringify([said, right]);
             if (sig === this.tapeSig) return;
@@ -27077,7 +28131,7 @@
                 ? JSON.stringify([
                     where,
                     d.itemId, d.name, d.held, d.avg, d.bazaars, d.buyersTotal, d.buyersLoading, d.buyersListNote, d.pending, d.planWhy, d.paid,
-                    d.buyers.map((b) => [b.id, b.name, b.price, b.te, b.teTop, b.teList, b.w3b, statusOf(b), b.trust ? b.trust.level + b.trust.score : '', s.networth && b.id ? s.networth.get(String(b.id)) : null, Boolean(b.favourite), b.traded || '', Boolean(b.troll), Boolean(b.lastPaidOnly)]),
+                    d.buyers.map((b) => [b.id, b.name, b.price, b.te, b.teTop, b.teList, b.w3b, statusOf(b), b.trust ? b.trust.level + b.trust.score : '', s.networth && b.id ? s.networth.get(String(b.id)) : null, Boolean(b.favourite), b.traded || '', Boolean(b.troll), Boolean(b.lastPaidOnly), this.checkSig(b, now)]),
                     this.justBlacklisted ? this.justBlacklisted.at : 0,
                     (d.hidden || []).map((b) => [b.tradeKey, b.price, b.hiddenBy, statusOf(b), b.trust ? b.trust.level + b.trust.score : '']),
                     // How old a list is, in the words shown: drawn again when they change, not every second.
@@ -27353,6 +28407,7 @@
                     spEl('b', { text: b.name }),
                     until ? spEl('small', {}, ['said no · passed over for ' + formatAge(until - Date.now()).replace(' ago', '') + ' · ', this.wordBtn('Undo', 'plan:undo:' + b.tradeKey, 'Plan with ' + b.name + ' again', () => this.h.onTradeUndecline && this.h.onTradeUndecline(b.tradeKey))]) : null,
                     this.oldListLine(d, b),
+                    this.checkLine(d, b),
                     // Their two lists disagree: the lower is counted, and said.
                     b.differ ? spEl('small', { title: 'Their two price lists do not agree: check before trading', text: 'Lists differ: ' + this.listPrices(b, ' · ') + ' · counted at the lower' }) : null,
                     b.troll ? spEl('small', { class: 't-warn', text: 'Over 3× Item Market Average: not counted' }) : null,
@@ -27391,6 +28446,9 @@
                 spEl('thead', {}, [spEl('tr', {}, [spEl('th', { text: 'Trader' }), spEl('th', { class: 'n', text: 'Pays' }), spEl('th', { class: 'n', title: 'What the whole trade with them makes: this item and their other items', text: 'The trade' })])]),
                 body,
             ]));
+            // Why a price makes no flip: the rows say it in a few words, the reason itself is here once.
+            const note = this.checkNote(rows);
+            if (note) box.appendChild(spEl('p', { class: 'note', text: note }));
         }
 
         /**
@@ -27497,6 +28555,83 @@
             return o ? this.oldListEl(o) : null;
         }
 
+        /**
+         * A price that makes no flip, and why (3.26.0; the owner, 2026-10-11: "everytime it shows a flip, its
+         * because the item list is checked ... a refresh button on traders so it takes the price list from
+         * there and we get fresh prices"): under the trader, with Refresh - their list is read at once, then
+         * the item's buyers. A checked price says nothing: its Refresh is beside the name. A price that is
+         * only what they last paid has its own line.
+         */
+        checkLine(d, b) {
+            const c = b.check;
+            if (!c || b.troll || b.lastPaidOnly) return null;
+            const now = Date.now();
+            const reading = this.checkReading(b, now);
+            const refresh = b.id && b.w3b > 0
+                ? this.wordBtn('Refresh', 'check:' + b.tradeKey, 'Reads ' + b.name + '\'s price list on TornW3B now, then who buys this item' + (c.at ? ' (price last checked ' + this.checkAge(now - c.at) + ')' : ''), () => {
+                    this.checkPressed.set(b.tradeKey, Date.now());
+                    this.deskSig = null;
+                    if (this.h.onTraderCheck) this.h.onTraderCheck(d.itemId, b.tradeKey);
+                    this.redrawDesk();
+                })
+                : null;
+            if (reading) return spEl('small', { text: 'Reading their price list…' });
+            const said = c.ok ? 'Price checked ' + this.checkAge(now - c.at) : this.checkWhy(b, now);
+            return spEl('small', {}, [said, refresh ? ' · ' : null, refresh]);
+        }
+
+        /** How long ago a price was checked: "just now" under five seconds (a Refresh just answered), else the age. */
+        checkAge(ms) {
+            return ms < 5000 ? 'just now' : formatAge(ms);
+        }
+
+        /**
+         * Why a price makes no flip: the row's few words. One line in the row (the Trader column is narrow
+         * at 1280); the whole reason is said once under the table (checkNote), not under every trader.
+         */
+        checkWhy(b, now = Date.now()) {
+            const c = b.check || {};
+            if (c.why === 'te-only' || c.why === 'no-id') return 'On TornExchange only: no flip';
+            // The amber line above says when their list last changed.
+            if (c.why === 'old-list') return 'Over a day old: no flip';
+            if (c.why === 'no-date') return 'No date on their list: no flip';
+            return c.at ? 'Last checked ' + this.checkAge(now - c.at) + ': no flip' : 'Not checked yet: no flip';
+        }
+
+        /**
+         * The reason behind "no flip", once under the Traders pay table: one sentence for each kind of
+         * reason among the rows on show, in the rows' order. '' when every shown price makes a flip.
+         */
+        checkNote(rows) {
+            const words = {
+                'te-only': 'A price only on TornExchange has no date, so it makes no flip.',
+                'old-list': 'A list not changed in over a day makes no flip until they change it.',
+                'no-date': 'A list whose last change is not known yet makes no flip.',
+                'unchecked': 'A price makes a flip only once checked with its trader; Refresh checks it now.',
+            };
+            const kinds = [];
+            for (const b of rows) {
+                const c = b.check;
+                if (!c || c.ok || b.troll || b.lastPaidOnly) continue;
+                const kind = c.why === 'no-id' ? 'te-only' : words[c.why] ? c.why : 'unchecked';
+                if (!kinds.includes(kind)) kinds.push(kind);
+            }
+            return kinds.map((k) => words[k]).join(' ');
+        }
+
+        /** Refresh was pressed on this trader in the last 15 seconds, and the answer is not in yet. */
+        checkReading(b, now = Date.now()) {
+            const at = this.checkPressed.get(b.tradeKey) || 0;
+            return at > 0 && now - at < 15000 && !(b.check && b.check.at >= at);
+        }
+
+        /** What of a check is on screen (the desk is drawn again when it changes, not every second). */
+        checkSig(b, now = Date.now()) {
+            const c = b.check;
+            if (!c) return '';
+            return c.why + (c.at ? this.checkAge(now - c.at) : '') + (this.checkReading(b, now) ? 'r' : '');
+        }
+
         /** The line itself. @param {{at: number, level: 'aging'|'stale'}} o */
         oldListEl(o) {
             return spEl('small', { class: 't-warn', title: 'Check their list before you buy' }, ['Price list last changed ' + listAgeText(Date.now() - o.at)]);
@@ -27521,8 +28656,8 @@
         /** TE list and W3B list, the ones that exist; then ⊘ (blacklist: never a buyer). @returns {Node[]} */
         traderLinks(b, { blacklist = false } = {}) {
             const out = [];
-            if (b.te) out.push(this.link('TE list', tePriceListUrl(b.teName || b.name), { cls: 'quiet lk', title: b.name + '\'s TornExchange price list: ' + formatMoney(b.te), focus: 'step-te' }));
-            if (b.w3b && b.id) out.push(this.link('W3B list', w3bPriceListUrl(b.id), { cls: 'quiet lk', title: b.name + '\'s TornW3B price list: ' + formatMoney(b.w3b), focus: 'step-w3b' }));
+            if (b.te) out.push(this.link('TE list', tePriceListUrl(b.teName || b.name), { cls: 'btn sm lk', title: b.name + '\'s TornExchange price list: ' + formatMoney(b.te), focus: 'step-te' }));
+            if (b.w3b && b.id) out.push(this.link('W3B list', w3bPriceListUrl(b.id), { cls: 'btn sm lk', title: b.name + '\'s TornW3B price list: ' + formatMoney(b.w3b), focus: 'step-w3b' }));
             if (blacklist) {
                 out.push(spEl('button', {
                     type: 'button',
@@ -27987,6 +29122,8 @@
             const toSend = A.items.filter((i) => !skippedAll(i));
             const sent = toSend.filter((i) => i.sent).length;
             const tot = A.totals || { pays: A.pays, cost: A.cost, profit: A.profit };
+            const open = tot.toBuy || { cost: 0, pays: 0 };
+            const kept = tot.left || { cost: 0 };
             const steps = A.items.flatMap((i) => i.steps || []);
             const left0 = steps.filter((st) => !done(st)).length;
             // A buy skipped is not a buy done: each is counted as what it is.
@@ -27998,9 +29135,14 @@
                 spEl('div', { class: 'bigrow' }, [
                     // What the trade comes to now (planned prices until you buy, then what you took). A zero is never green.
                     spEl('div', {}, [spEl('span', { class: 'lbl', text: 'Profit' }), spEl('div', { class: 'big' + this.moneyTone(tot.profit), text: signed(tot.profit) })]),
+                    // The two sums are of the same items, so they come to the profit beside them (3.26.0); what is
+                    // not in them yet, or no longer, has a line of its own.
                     spEl('div', { class: 'eq' }, ['You pay the bazaars', spEl('b', { text: formatMoney(tot.cost) }), spEl('br'), b.name + ' pays you', spEl('b', { text: formatMoney(tot.pays) }),
+                        ...(tot.own > 0 ? [spEl('br'), 'of it for your own items', spEl('b', { text: formatMoney(tot.own) })] : []),
+                        ...(open.cost > 0 ? [spEl('br'), 'Still to buy', spEl('b', { title: 'Bazaars of this trade you have not been to yet: not paid, and not counted above until you buy', text: formatMoney(open.cost) + ' (' + signed(open.pays - open.cost) + ')' })] : []),
+                        ...(kept.cost > 0 ? [spEl('br'), 'Left with you', spEl('b', { title: 'Bought and not taken by ' + b.name + ': it goes to To sell, and is not a loss of this trade', text: formatMoney(kept.cost) })] : []),
                         // It no longer comes to what they said yes to (a buy skipped, dropped or re-priced): said once, here.
-                        ...(A.profit > 0 && Math.round(A.profit) !== Math.round(tot.profit) ? [spEl('br'), 'Planned at their yes', spEl('b', { text: signed(A.profit) })] : [])]),
+                        ...(A.profit > 0 && Math.round(A.profit) !== Math.round(tot.profit + open.pays - open.cost) ? [spEl('br'), 'Planned at their yes', spEl('b', { text: signed(A.profit) })] : [])]),
                 ]),
                 this.stepBar(left0 ? 2 : 3),
                 spEl('p', { class: 'note', text: steps.length
@@ -28368,10 +29510,10 @@
                 const all = [...T.waiting, ...yes];
                 const stand = [T.ready.length ? count(T.ready.length) + ' ready to trade' : null, T.buying.length ? count(T.buying.length) + ' buying' : null, T.waiting.length ? count(T.waiting.length) + ' waiting for a yes' : null].filter(Boolean);
                 const paid = yes.reduce((a, r) => a + (r.paid || 0), 0);
-                const cost = yes.reduce((a, r) => a + (r.cost || 0), 0);
+                const toBuy = yes.reduce((a, r) => a + (r.toBuy || 0), 0);
                 this.tilesInto(this.tradesTiles, 'trades', [
                     { label: 'Going', value: count(all.length), small: all.length === 1 ? 'trade' : 'trades', sub: [stand.length ? stand.join(' · ') : 'none now'] },
-                    { label: 'Paid to bazaars so far', value: formatMoney(paid), sub: yes.length ? ['in the ' + this.plural(yes.length, 'trade') + ' they said yes to · ', b(formatMoney(Math.max(0, cost - paid))), ' still to buy'] : ['nothing is bought before a yes'] },
+                    { label: 'Paid to bazaars so far', value: formatMoney(paid), sub: yes.length ? ['in the ' + this.plural(yes.length, 'trade') + ' they said yes to · ', b(formatMoney(toBuy)), ' still to buy'] : ['nothing is bought before a yes'] },
                     { label: 'They pay you', value: formatMoney(yes.reduce((a, r) => a + (r.pays || 0), 0)), sub: [yes.length ? 'when ' + (yes.length === 1 ? 'that one is' : 'those ' + count(yes.length) + ' are') + ' traded' : 'no trade said yes to yet'] },
                     { label: 'Profit in all of them', value: signed(all.reduce((a, r) => a + (r.profit || 0), 0)), good: all.reduce((a, r) => a + (r.profit || 0), 0) > 0, sub: yes.length ? [b(signed(yes.reduce((a, r) => a + (r.profit || 0), 0))), ' in the ' + this.plural(yes.length, 'trade') + ' said yes to'] : ['none said yes to yet'] },
                 ]);
@@ -28734,11 +29876,27 @@
             this.keyStateEl = spEl('div', { class: 'sp-keystate', text: 'No key saved.' });
             this.keyForgetBtn = spEl('button', { type: 'button', class: 'sp-link sp-quiet', text: 'Forget key', onclick: () => this.h.onForgetKey && this.h.onForgetKey() });
             torn.row.appendChild(this.keyForgetBtn);
-            section('keys', 'Torn API key', 'Used only on this page, sent to api.torn.com only.', [
-                field('Limited key', ['Make one at ', newTab('Torn › Settings › API Key', TORN_API_KEY_URL)], [
+            /* The Public key (3.26.0): the one NPC Arbitrage's panel saves - shown here too, saved from either. */
+            const pub = keyField({
+                placeholder: 'Public Only API key',
+                onSave: (key) => this.h.onSavePublicKey && this.h.onSavePublicKey(key),
+                onReveal: () => (this.h.onRevealPublicKey ? this.h.onRevealPublicKey() : ''),
+            });
+            this.pubStateEl = spEl('div', { class: 'sp-keystate', text: 'No key saved.' });
+            this.pubServerEl = spEl('div', { class: 'sp-keystate' });
+            this.pubServerEl.hidden = true;
+            this.pubForgetBtn = spEl('button', { type: 'button', class: 'sp-link sp-quiet', text: 'Forget key', onclick: () => this.h.onForgetPublicKey && this.h.onForgetPublicKey() });
+            pub.row.appendChild(this.pubForgetBtn);
+            section('keys', 'Torn API keys', ['Both are sent to api.torn.com only. Make them at ', newTab('Torn › Settings › API Key', TORN_API_KEY_URL), '.'], [
+                field('Limited key', 'Used only on this page.', [
                     torn.row,
                     this.keyStateEl,
                     note(['Reads your inventory, your own id, item names, the Item Market for the item on the desk, and traders\' online status.']),
+                ]),
+                field('Public key', 'The key NPC Arbitrage uses on Torn\'s pages. Save it here or in its panel: it is one key, both places.', [
+                    pub.row,
+                    this.pubStateEl,
+                    this.pubServerEl,
                 ]),
             ]);
 
@@ -28766,8 +29924,21 @@
             ]);
 
             this.w3bStateEl = spEl('div', { class: 'sp-keystate' });
-            section('w3b', 'TornW3B', ['Bazaar prices and traders\' price lists, from ', newTab('weav3r.dev', 'https://weav3r.dev/'), '. No key needed; it only receives item and trader ids.'], [
+            /* The key registered on TornW3B (3.26.0): optional - with it TornW3B allows 25 sellers lists a minute, not 10. */
+            const w3k = keyField({
+                placeholder: 'Key you registered on TornW3B (optional)',
+                onSave: (key) => this.h.onSaveW3bKey && this.h.onSaveW3bKey(key),
+                onReveal: () => (this.h.onRevealW3bKey ? this.h.onRevealW3bKey() : ''),
+            });
+            this.w3bKeyStateEl = spEl('div', { class: 'sp-keystate', text: 'No key saved · an item\'s bazaars: 8 reads a minute.' });
+            this.w3bKeyForgetBtn = spEl('button', { type: 'button', class: 'sp-link sp-quiet', text: 'Forget key', onclick: () => this.h.onForgetW3bKey && this.h.onForgetW3bKey() });
+            w3k.row.append(this.w3bKeyForgetBtn);
+            section('w3b', 'TornW3B', ['Bazaar prices and traders\' price lists, from ', newTab('weav3r.dev', 'https://weav3r.dev/'), '. No key needed; without one it only receives item and trader ids.'], [
                 field('State', null, [this.w3bStateEl]),
+                field('TornW3B key', ['Optional. The Torn key you registered on ', newTab('weav3r.dev', 'https://weav3r.dev/'), '. With it TornW3B lets this page read an item\'s bazaars 22 times a minute instead of 8. It goes to weav3r.dev only, and only with those reads. Your Limited key goes there only if you paste it in this box.'], [
+                    w3k.row,
+                    this.w3bKeyStateEl,
+                ]),
             ]);
 
             /*
@@ -29103,16 +30274,17 @@
              */
             const tos = spEl('table', { class: 'sp-tos' });
             this.tosEl = tos;
-            tos.appendChild(spEl('tr', {}, [spEl('th'), spEl('th', { text: 'Limited key' }), spEl('th', { text: 'Full key (Torn Ledger)' }), spEl('th', { class: 'tos-sv', text: 'Public key on the shared server' })]));
-            for (const [k, limited, full, server] of [
-                ['Data storage', 'Only locally, in this browser', 'Only locally, in this browser: time, item, quantity, price, where, who. Never the log\'s own text.', 'On the server: the bazaar prices your key read. Nothing about your account.'],
-                ['Data sharing', 'Nobody', 'Nobody. Your trades go into a zip only when you download one yourself (Report a problem, Export API usage): it names the traders you traded with, and you choose who gets it.', 'The people on this server only.'],
-                ['Purpose of use', 'Personal gain: who pays most for your items, and flips', 'Personal: profit tracking', 'Reading bazaars for the group, while any of you is on.'],
-                ['Key storage & sharing', 'Stored locally / Not shared', 'Stored locally / Not shared', 'Kept on the server as a secret that cannot be read back. Shared with no one.'],
-                ['Key access level', 'Limited (your inventory and your own id; item names; Item Market prices; traders\' public status and networth)', 'Full, used only for your log (bazaar, Item Market and NPC shop buys and sells, and muggings), your trades, and key info', 'Public Only'],
-                ['Other services', 'TornExchange, only with the key you log in there with', 'None: never sent to TornExchange or TornW3B', 'None'],
+            tos.appendChild(spEl('tr', {}, [spEl('th'), spEl('th', { text: 'Limited key' }), spEl('th', { text: 'Public key (NPC Arbitrage)' }), spEl('th', { text: 'Full key (Torn Ledger)' }), spEl('th', { class: 'tos-sv', text: 'Public key on the shared server' })]));
+            // The Public key's column (3.26.0: it can be pasted on this page now) says what its panel on Torn's pages says.
+            for (const [k, limited, open, full, server] of [
+                ['Data storage', 'Only locally, in this browser', 'Only locally, in this browser', 'Only locally, in this browser: time, item, quantity, price, where, who. Never the log\'s own text.', 'On the server: the bazaar prices your key read. Nothing about your account.'],
+                ['Data sharing', 'Nobody', 'Nobody', 'Nobody. Your trades go into a zip only when you download one yourself (Report a problem, Export API usage): it names the traders you traded with, and you choose who gets it.', 'The people on this server only.'],
+                ['Purpose of use', 'Personal gain: who pays most for your items, and flips', 'Competitive advantage: finding Bazaar and Item Market listings below NPC or market value, and filling your own listing prices', 'Personal: profit tracking', 'Reading bazaars for the group, while any of you is on.'],
+                ['Key storage & sharing', 'Stored locally / Not shared', 'Stored locally / Not shared. A one-way code made from it, never the key, is sent to Torn Bids\' own server to ask whether this PC is one of its people.', 'Stored locally / Not shared', 'Kept on the server as a secret that cannot be read back. Shared with no one.'],
+                ['Key access level', 'Limited (your inventory and your own id; item names; Item Market prices; traders\' public status and networth)', 'Public (item names and shop prices; Item Market prices; key info; bazaar owners\' public status; your own id)', 'Full, used only for your log (bazaar, Item Market and NPC shop buys and sells, and muggings), your trades, and key info', 'Public Only'],
+                ['Other services', 'TornExchange, only with the key you log in there with. TornW3B, only if the key you paste in the TornW3B box is this one', 'None: TornW3B receives item ids only, never this key', 'None: never sent to TornExchange or TornW3B', 'None'],
             ]) {
-                tos.appendChild(spEl('tr', {}, [spEl('th', { text: k }), spEl('td', { text: limited }), spEl('td', { text: full }), spEl('td', { class: 'tos-sv', text: server })]));
+                tos.appendChild(spEl('tr', {}, [spEl('th', { text: k }), spEl('td', { text: limited }), spEl('td', { text: open }), spEl('td', { text: full }), spEl('td', { class: 'tos-sv', text: server })]));
             }
             section('terms', 'Key use', 'Torn\'s API terms: what each key is used for, and where it is kept.', [tos]);
 
@@ -29241,6 +30413,7 @@
             parts.push(known ? count(read) + ' of ' + count(known) + ' price lists read' : 'No trader known yet');
             parts.push(info.bazaarsAt ? 'bazaar prices ' + formatAge(now - info.bazaarsAt) : 'bazaar prices loading');
             if (info.flipsWanted) parts.push('possible flips checked ' + info.flipsChecked + ' of ' + info.flipsWanted);
+            if (info.pricesWaiting) parts.push(count(info.pricesWaiting) + (info.pricesWaiting === 1 ? ' possible flip waits' : ' possible flips wait') + ' for a price check');
             this.w3bStateEl.textContent = parts.join(' · ') + '.';
             this.w3bStateEl.className = 'sp-keystate' + (info.bazaarsError && !info.bazaarsAt ? ' sp-bad' : info.bazaarsAt ? ' sp-ok' : '');
         }
@@ -29405,6 +30578,24 @@
                 this.keyStateEl.classList.add('sp-ok');
             }
 
+            // The Public key: NPC Arbitrage's, the same one its panel on Torn's pages shows.
+            const pk = info.publicKey || {};
+            this.pubForgetBtn.hidden = !pk.has;
+            this.pubStateEl.className = 'sp-keystate';
+            if (pk.error) {
+                this.pubStateEl.textContent = pk.error;
+                this.pubStateEl.classList.add('sp-bad');
+            } else if (!pk.has) {
+                this.pubStateEl.textContent = 'No key saved: NPC Arbitrage on Torn\'s pages is off.';
+            } else {
+                const access = pk.access ? String(pk.access).replace(/\s*access$/i, '') : '';
+                this.pubStateEl.textContent = 'Saved' + (access ? ' · ' + access + ' access' : '') + '.' + (pk.over ? ' A Public Only key is enough here.' : '');
+                this.pubStateEl.classList.add(pk.over ? 'sp-warn' : 'sp-ok');
+            }
+            const serverSays = pk.has ? sharedKeyBoxLine(info.shared || null) : '';
+            if (this.pubServerEl.textContent !== serverSays) this.pubServerEl.textContent = serverSays;
+            this.pubServerEl.hidden = !serverSays;
+
             this.teStateEl.className = 'sp-keystate';
             if (info.teKeyMsg) {
                 this.teStateEl.textContent = info.teKeyMsg;
@@ -29422,6 +30613,25 @@
                 if (info.teError) this.teStateEl.classList.add('sp-bad');
             }
             this.teSameBtn.hidden = !info.hasKey;
+
+            // The key registered on TornW3B, and what is left of its sellers lists (their own minute and day).
+            // (The minute's count moves every few seconds: not on a settings page. The day's is said.)
+            const L = info.w3bListing || null;
+            const left = L ? ' · ' + count(L.day) + ' of 900 today' : '';
+            this.w3bKeyStateEl.className = 'sp-keystate';
+            if (info.w3bKeyMsg) {
+                this.w3bKeyStateEl.textContent = info.w3bKeyMsg;
+                this.w3bKeyStateEl.classList.add('sp-bad');
+            } else if (info.w3bKey === 'refused') {
+                this.w3bKeyStateEl.textContent = 'TornW3B does not know this key: it is not sent. An item\'s bazaars: 8 reads a minute' + left + '.';
+                this.w3bKeyStateEl.classList.add('sp-bad');
+            } else if (info.w3bKey === 'saved') {
+                this.w3bKeyStateEl.textContent = 'Saved · an item\'s bazaars: 22 reads a minute' + left + '.';
+                this.w3bKeyStateEl.classList.add('sp-ok');
+            } else {
+                this.w3bKeyStateEl.textContent = 'No key saved · an item\'s bazaars: 8 reads a minute' + left + '.';
+            }
+            this.w3bKeyForgetBtn.hidden = info.w3bKey === 'none' || !info.w3bKey;
         }
 
         /** Only what stops the page working: a key missing or refused, or a wait. */
@@ -29514,6 +30724,8 @@
             if (info.teBadKey && !info.knownTraders) return 'No traders: TornExchange refused the key.';
             // Buyers online only (3.20.5): flips are found, their buyers' statuses are being read.
             if (info.flipsWaiting) return 'Checking who is online…';
+            // 3.26.0: a flip is shown only once TornW3B confirmed its buyer's price minutes ago.
+            if (info.pricesWaiting) return 'Checking the price of ' + count(info.pricesWaiting) + (info.pricesWaiting === 1 ? ' possible flip' : ' possible flips') + ' with its trader…';
             if (info.flipsChecked < info.flipsWanted) return 'No flips found yet. Checking ' + info.flipsChecked + ' of ' + info.flipsWanted + '.';
             // A trade under way holds the list as it was: empty then, empty now, and that is said - before
             // "Looking for traders", which a held list is not doing.
@@ -30470,6 +31682,8 @@
          * @param {function} [deps.onKeyDead] - (error) => void
          * @param {function} [deps.now]
          * @param {function} [deps.onSummary] - (summary, now) => void, each TornW3B summary
+         * @param {function} [deps.serverKnows] - (itemId, lowestPrice) => boolean (3.26.0): the shared server read
+         *   a bazaar with the item at that price or under it lately - TornW3B's sellers list of it is not asked for
          */
         constructor(deps) {
             this.d = deps;
@@ -30484,6 +31698,8 @@
             this.tornSpent = [];
             this.lastError = null;
             this.lastCycleAt = null;
+            // Sellers lists not asked of TornW3B this session, the server's own read standing in (3.26.0).
+            this.serverStoodIn = 0;
             this.lastRefreshSeen = 0;
             this.cycleCount = 0;
             /** itemId -> when its "cheaper on the market too?" check last ran. */
@@ -30539,6 +31755,7 @@
                 keyed: Boolean(this.d.hasUsableKey()),
                 leading: this.leading,
                 candidates: this.candidates.length,
+                serverStoodIn: this.serverStoodIn,
                 nextRefreshAt: this.lastSummaryAt ? this.lastSummaryAt + SUMMARY_INTERVAL_MS : null,
                 lastCycleAt: this.lastCycleAt,
                 lastError: this.lastError,
@@ -30667,10 +31884,20 @@
             const feedNow = this.readFeed();
             const byId = new Map(this.candidates.map((c) => [c.itemId, c]));
 
+            // The server read this cheapest price from Torn itself: nothing TornW3B's sellers list could add.
+            const known = (c) => {
+                try {
+                    return Boolean(this.d.serverKnows && this.d.serverKnows(c.itemId, c.lowestPrice));
+                } catch {
+                    return false;
+                }
+            };
             const queue = [];
             for (const id of rechecks) if (byId.has(id)) queue.push(byId.get(id));
             for (const c of this.candidates) {
-                if (!queue.includes(c) && bazaarDue(feedNow, c, this.now())) queue.push(c);
+                if (queue.includes(c) || !bazaarDue(feedNow, c, this.now())) continue;
+                if (known(c)) this.serverStoodIn += 1;
+                else queue.push(c);
             }
 
             let fetched = 0;
@@ -30922,6 +32149,8 @@
 
 
 
+
+
     const STORE_KEY = 'apiKey';
     const STORE_ITEMS = 'itemsCache';
     const STORE_NPC = 'npcCache';
@@ -30935,7 +32164,15 @@
     const STORE_W3B_WINDOW = 'w3bWindow';
     const STORE_W3B_COOLDOWN = 'w3bCooldown';
     /* The gap every tab keeps between two TornW3B requests, as it has found it (3.25.0, api/w3b.js): {gap, floor, floorUntil}. */
-    const STORE_W3B_PACE = 'w3bPace';
+    /* 3.26.0: under a new name - the pace 3.25.0 found was found on the sellers list, which now has a limit of its own. */
+    const STORE_W3B_PACE = 'w3bPace2';
+    /* The sellers list's own minute, per tab (platform/tab-window.js), and both limited kinds' day and waits: {listingDay, lightDay, listingUntil, lightUntil}. */
+    const STORE_W3B_LISTING = 'w3bListing';
+    const STORE_W3B_ROUTES = 'w3bRoutes';
+    /* Sellers lists Torn Archive asked from this PC (the same address, so the same ten a minute): {at, minute, day}, kept by the Torn Bids page. */
+    const STORE_W3B_OTHER = 'w3bOther';
+    /* The key its owner registered on TornW3B (Settings; optional): sent to TornW3B only, as a header. {key, dead} */
+    const STORE_W3B_KEY = 'w3bKey';
     const STORE_KEY_DEAD = 'keyDead';
     const STORE_OPENED = 'opened';
 
@@ -31626,7 +32863,7 @@
         gmDel(STORE_KEY_ACCESS);
         gmDel(STORE_KEY_DEAD);
         app.keyDead = false;
-        sharedSetUp();
+        sharedSetUp({ knock: true });
         // Saved: the box no longer holds it (Show fetches it again).
         if (app.panel.keyMask) app.panel.keyMask.hide();
         if (app.panel.keyInput) app.panel.keyInput.value = '';
@@ -32273,6 +33510,25 @@
             for (const [id, snap] of feed.bazaar) {
                 const rows = withShared(snap.rows, id, sharedReads.index, sharedReads.joined);
                 if (rows !== snap.rows) feed.bazaar.set(id, { ...snap, rows });
+            }
+            // 3.26.0: a bazaar the server read from Torn in the last five minutes makes a deal by itself - TornW3B
+            // need not know the bazaar (core/shared.js sharedDealRows). Only listings under what the item sells for.
+            if (app.index && app.index.byId) {
+                let fromServer = 0;
+                for (const id of sharedReads.index.byItem.keys()) {
+                    const had = feed.bazaar.get(id);
+                    if (had && had.rows.length) continue;
+                    const best = Math.max(0, ...Object.values(exitsFor(app.index.byId.get(id), app.settings)));
+                    if (!(best > 0)) continue;
+                    const rows = sharedDealRows(sharedReads.index, id, best, now);
+                    if (!rows.length) continue;
+                    feed.bazaar.set(id, { rows, fetchedAt: Math.max(...rows.map((r) => r.dataAt)), summaryLowest: null });
+                    fromServer += rows.length;
+                }
+                if (fromServer !== app.serverDealRows && (!fromServer || !app.serverDealRows)) {
+                    logProblem('note', fromServer ? 'NPC Arbitrage: ' + fromServer + ' cheap listings come from the shared server\'s own reads of Torn, with no TornW3B sellers list' : 'NPC Arbitrage: no cheap listing from the shared server\'s reads now', '');
+                }
+                app.serverDealRows = fromServer;
             }
         }
         const feedRows = app.index
@@ -36361,8 +37617,12 @@
             listHeld: sell.still ? { seconds: Math.round((Date.now() - sell.still.at) / 1000), waiting: sell.still.waiting || 0, rows: sell.still.place.size, cards: sell.still.cards.length } : null,
             coverage: {
                 tradersKnown: info.w3bKnown ?? null, tradersRead: info.w3bRead ?? null,
-                flipsChecked: info.flipsChecked ?? null, flipsWanted: info.flipsWanted ?? null,
+                flipsChecked: info.flipsChecked ?? null, flipsWanted: info.flipsWanted ?? null, flipsWaiting: info.flipsWaiting ?? null, pricesWaiting: info.pricesWaiting ?? null,
                 everyItemChecked: info.sweepChecked ?? null, everyItem: info.sweepTotal ?? null,
+                // 3.26.0: the light list (read, could not be read, agreed with the sellers list, did not and why; off: why),
+                // sellers lists another PC read for this one, and sellers lists the server's prices stood in for.
+                lightList: sell.lightStats ? { ...sell.lightStats, off: sell.lightOff || null } : null,
+                sellersListsLeftToOthers: sell.w3bLeftToOthers || 0,
                 statusesKnown: info.statusesKnown ?? null, statusesWanted: info.statusesWanted ?? null,
                 teScanned: Object.values((sell.db && sell.db.traders) || {}).filter((t) => t && t.te && t.te.prices).length,
             },
@@ -36387,6 +37647,10 @@
         return {
             on: s.on, leading: Boolean(s.leading), answeredSecondsAgo: s.okAt ? Math.round((Date.now() - s.okAt) / 1000) : null, error: s.error ? String(s.error).slice(0, 120) : null,
             people: s.people, need: s.need, serverShare: s.serverShare, serverUsed: s.serverUsed, sellers: s.sellers,
+            // 3.26.0: the server does not know this PC (and when it is asked again); TornW3B's sellers lists handed to
+            // this PC of those it wanted; trader lists sent up and come down.
+            unknown: Boolean(s.unknown), askedAgainAfterMinutes: s.unknownWaitMs ? Math.round(s.unknownWaitMs / 60000) : null,
+            sellersListsHanded: s.w3bAsk || null, listsUp: s.listsOut ?? null, listsDown: s.listsIn ?? null,
         };
     }
 
@@ -36488,8 +37752,15 @@
             getWant,
             onReads,
         });
-        for (const key of [SHARED_CONFIG_KEY, SHARED_STATE_KEY, SHARED_GRANT_KEY]) gmOnChange(key, () => sharedLink.onStored(key));
-        gmOnChange(STORE_KEY, sharedSetUp);
+        for (const key of [SHARED_CONFIG_KEY, SHARED_STATE_KEY, SHARED_GRANT_KEY, SHARED_W3B_ASK_KEY]) gmOnChange(key, () => sharedLink.onStored(key));
+        // Trader lists another person's PC read (3.26.0): Torn Bids' page takes them as they come.
+        if (world === 'sell') {
+            gmOnChange(SHARED_LISTS_IN_KEY, () => takeSharedLists());
+            takeSharedLists();
+        }
+        gmOnChange(STORE_KEY, () => sharedSetUp());
+        // The Public key's box in Torn Bids' Settings shows what the panel on Torn's pages saved or forgot.
+        if (world === 'sell') for (const key of [STORE_KEY, STORE_KEY_ACCESS, STORE_KEY_DEAD]) gmOnChange(key, () => renderSelling(true));
         sharedSetUp();
         // What the server said goes to the log once per change, from the tab that does the exchanging: it knows
         // this PC, it does not (404), it wants a newer copy, or there was no exchange.
@@ -36557,7 +37828,32 @@
         // Which TornW3B lists this PC read in the last two minutes (item numbers and times): the others then leave those to it.
         const dir = [];
         for (const [id, b] of sell.bazaars) if (b && b.at && !b.kept && !b.error && !b.loading && now - b.at < SHARED_DIR_TELL_MS) dir.push([Number(id), b.at]);
-        sell.sharedWant = { trades, looking, sellers, worth: sell.sharedWorth || {}, going, bought, dir };
+        // 3.26.0 - TornW3B's work, handed out by the server: the sellers lists this PC would ask for in the next
+        // half minute that are not its own alone (the possible flips, the near ones, the sweep - in that order),
+        // and what is left of its limit. The desk's item and a trade's are never asked about: they are read anyway.
+        const mine = new Set([sell.selected, ...sell.tradeLive, ...sell.tradeWanted].filter(Boolean).map(String));
+        const fresh = freshnessMs(sellPrefs());
+        const top = new Set(sell.candidates.slice(0, FRESH_TOP).map((c) => String(c.itemId)));
+        const want = [];
+        const soon = now + 30000;
+        // Where the light list stands in (core/cheap.js), no sellers list is wanted: nothing to hand out.
+        const lightOn = lightUsable(now);
+        const wantFrom = (ids, every, how) => {
+            for (const raw of ids || []) {
+                if (want.length >= SHARED_MAX_WANT) return;
+                const id = String(raw);
+                if (mine.has(id) || want.includes(Number(id))) continue;
+                if (lightOn && lightStandsIn(id, how, now)) continue;
+                const b = sell.bazaars.get(id);
+                if (b && (b.loading || (!b.kept && !b.error && !(b.lightMiss > b.at) && soon - b.at < every(id)))) continue;
+                want.push(Number(id));
+            }
+        };
+        wantFrom(sell.candidates.map((c) => c.itemId), (id) => (top.has(id) ? fresh.top : fresh.other), 'slow');
+        wantFrom(sell.nearIds, () => fresh.other, 'slow');
+        wantFrom(sell.sweepIds, () => W3B_SWEEP_MS, 'sweep');
+        const st = sell.w3b ? sell.w3b.stats() : null;
+        sell.sharedWant = { trades, looking, sellers, worth: sell.sharedWorth || {}, going, bought, dir, want, w3b: st ? [st.listingMinuteLeft, st.listingDayLeft] : null, lists: true };
         sell.sharedWantAt = now;
         return sell.sharedWant;
     }
@@ -36567,7 +37863,7 @@
      * to it is made from the Public key it already holds (core/shared.js, sharedWord) - the key itself is
      * sent nowhere. Run at start-up and whenever the key changes; what was kept under an old word goes.
      */
-    async function sharedSetUp() {
+    async function sharedSetUp(o) {
         if (!sharedLink) return;
         let next = null;
         try {
@@ -36578,7 +37874,14 @@
             logProblem('note', 'Shared: the word of this PC could not be made (' + String(error && error.message ? error.message : error).slice(0, 80) + ')', '');
         }
         const had = gmGet(SHARED_CONFIG_KEY, null);
-        if (JSON.stringify(had || null) === JSON.stringify(next)) return;
+        if (JSON.stringify(had || null) === JSON.stringify(next)) {
+            // The same key, saved again by hand (3.26.0): a server that did not know this PC is asked at once.
+            if (o && o.knock === true && next && sharedLink.knock()) {
+                logProblem('note', 'Shared: the same Public key was saved again - the server is asked again at once', 'its last answer was that it does not know this PC');
+                sharedLink.tick().catch(() => {});
+            }
+            return;
+        }
         sharedLink.forget();
         if (next) gmSet(SHARED_CONFIG_KEY, next);
         else gmDel(SHARED_CONFIG_KEY);
@@ -36609,10 +37912,17 @@
         const worth = {};
         // The deals' bazaars are NPC Arbitrage's ask; with Torn Bids on, this tab asks only for a trade's bazaars and the one it is on.
         const feed = npcOn() ? readFeedCacheEntry(gmGet(FEED_STORE_KEY, null), now) : { bazaar: new Map() };
+        // 3.26.0: every item with a way out you ticked (an NPC shop buys it; its value, with the resale chips) is
+        // watched by the server, at what it sells for - its reads of Torn's own bazaars come back for all of
+        // them, so a deal no longer needs TornW3B to have seen the bazaar.
+        if (npcOn() && app.index && app.index.byId) {
+            for (const [id, item] of app.index.byId) {
+                const best = Math.max(0, ...Object.values(exitsFor(item, app.settings)));
+                if (best > 0) worth[id] = best;
+            }
+        }
         for (const [id, snap] of feed.bazaar) {
-            const item = app.index && app.index.byId ? app.index.byId.get(id) : null;
-            const best = Math.max(0, ...Object.values(exitsFor(item, app.settings)));
-            worth[id] = best > 0 ? best : 1;
+            if (!(id in worth)) worth[id] = 1;
             for (const r of snap.rows) if (r.sellerId) sellers.push(r.sellerId);
         }
         // The two marks, with Torn Bids closed too: a buying run stays marked, and what your log shows bought is passed on.
@@ -36660,7 +37970,30 @@
             addShared: (at) => sharedTabWindow(STORE_W3B_WINDOW).add(at),
             isVisible: () => background || document.visibilityState === 'visible',
             onOver: (x) => noteW3bOver(x, who),
+            // 3.26.0: the sellers list has TornW3B's own limit (ten a minute, a thousand a day, by address) - counted
+            // by every tab together, and with what Torn Archive asked from this PC.
+            loadListing: () => sharedTabWindow(STORE_W3B_LISTING).load(),
+            addListing: (at) => sharedTabWindow(STORE_W3B_LISTING).add(at),
+            loadRoutes: () => gmGet(STORE_W3B_ROUTES, null),
+            saveRoutes: (r) => gmSet(STORE_W3B_ROUTES, r),
+            otherListing: () => w3bOtherUse(gmGet(STORE_W3B_OTHER, null), Date.now()),
+            // The key registered on TornW3B, when you gave one (Settings › TornW3B): 22 sellers lists a minute, not 8.
+            listingKey: getW3bKey,
+            onKeyRefused: () => {
+                const v = gmGet(STORE_W3B_KEY, null);
+                if (v && v.key && !v.bad) gmSet(STORE_W3B_KEY, { ...v, bad: true, badAt: Date.now() });
+                logProblem('error', 'TornW3B does not know the key in its box (401)', 'it is not sent again; sellers lists go on without it, eight a minute. Register the key on weav3r.dev, or paste the one registered there');
+            },
+            onRoute: (x) => logProblem('note', 'TornW3B refused ' + (x.route === 'listing' ? 'a sellers list' : 'a light list') + ': none asked for ' + Math.round((x.until - Date.now()) / 1000) + ' s'
+                + (x.said ? ' (the wait it sent)' : ' (it sent no wait: the usual minute)'), (x.minute === null ? '' : x.minute + ' in the last minute, ') + x.day + ' in the last day, by our count; price lists and buyers go on'),
         });
+    }
+
+    /** What another app of ours asked from this PC, while its mark is young: {minute, day}. */
+    function w3bOtherUse(mark, now) {
+        const age = mark && typeof mark === 'object' ? now - Number(mark.at) : NaN;
+        // Its minute counts while the mark is a minute or two old; its day until a day has passed since it was last told.
+        return { minute: age < 2 * 60 * 1000 ? Number(mark.minute) || 0 : 0, day: age < 24 * 60 * 60 * 1000 ? Number(mark.day) || 0 : 0 };
     }
 
     /*
@@ -36723,6 +38056,11 @@
             onKeyDead: markKeyDead,
             onSummary: onW3bSummary,
             wantsItemMarket: itemMarketWatched,
+            // 3.26.0: the server already read this cheapest price from Torn - TornW3B's sellers list is not asked for.
+            serverKnows: (itemId, lowest) => {
+                const reads = sharedLink ? sharedLink.reads() : null;
+                return Boolean(reads && sharedKnowsLowest(reads.index, itemId, lowest, Date.now()));
+            },
         });
 
         // Follower tabs re-render the moment the leader stores something new.
@@ -37390,6 +38728,21 @@
         return gmGet(STORE_TE_KEY, '') || '';
     }
 
+    /*
+     * The key registered on TornW3B (3.26.0, optional): {key, at, bad?, badAt?}. A Torn key of yours that TornW3B
+     * already has. It leaves this browser only as the header X-API-Key of a sellers list to weav3r.dev (api/w3b.js);
+     * your Limited key is never sent there by itself. `bad`: TornW3B answered 401 to it - kept, shown, not sent.
+     */
+    function w3bKeyRecord() {
+        const v = gmGet(STORE_W3B_KEY, null);
+        return v && typeof v === 'object' && typeof v.key === 'string' && v.key ? v : null;
+    }
+
+    function getW3bKey() {
+        const v = w3bKeyRecord();
+        return v && !v.bad ? v.key : '';
+    }
+
     function sellPrefs() {
         const stored = gmGet(STORE_SELL_PREFS, {}) || {};
         const out = { ...SELLING_PAGE_DEFAULTS };
@@ -38035,6 +39388,39 @@
      * the marks in the site's own page storage can be read. Which of the two was looked at last is worked out, kept
      * for every tab of ours, and while Torn Bids keeps to the smaller share that is said for Torn Archive to read.
      */
+    /*
+     * TornW3B's sellers lists, counted with Torn Archive's (3.26.0; core/beside.js): what it asked from this PC is
+     * read from its mark and kept for every tab of ours (the client adds it to our own, api/w3b.js), and our own
+     * count is said for it to add to its. Written when it changed, and every half minute.
+     */
+    let besideW3bSaid = '';
+    let besideW3bSaidAt = 0;
+    let besideW3bHeard = '';
+    function besideW3bLook(now) {
+        try {
+            const other = besideW3bOther(window.localStorage.getItem(BESIDE_W3B_OTHER_MARK), now);
+            const heard = other ? other.minute + '|' + other.day : '';
+            const had = gmGet(STORE_W3B_OTHER, null);
+            // Renewed while it counts something, so its minute is believed only while Torn Archive is still saying it.
+            if (other && (heard !== besideW3bHeard || (other.minute + other.day > 0 && now - Number(had && had.at) > BESIDE_RENEW_MS))) gmSet(STORE_W3B_OTHER, other);
+            else if (!other && had) gmDel(STORE_W3B_OTHER);
+            if (heard !== besideW3bHeard && other && !besideW3bHeard) logProblem('note', 'Torn Archive asks TornW3B for sellers lists from this PC too: its count is added to ours (' + other.minute + ' in the last minute, ' + other.day + ' today)', 'TornW3B counts by address: the two apps keep under one limit together');
+            besideW3bHeard = heard;
+
+            const routes = gmGet(STORE_W3B_ROUTES, null);
+            const times = sharedTabWindow(STORE_W3B_LISTING).load();
+            const day = routes && routes.listingDay && typeof routes.listingDay === 'object' ? routes.listingDay : {};
+            const said = JSON.stringify([times, day]);
+            if (said !== besideW3bSaid || now - besideW3bSaidAt > BESIDE_RENEW_MS) {
+                window.localStorage.setItem(BESIDE_W3B_OWN_MARK, besideW3bText(times, day, now));
+                besideW3bSaid = said;
+                besideW3bSaidAt = now;
+            }
+        } catch {
+            // No page storage: each app counts only its own, and both still keep two under TornW3B's ten.
+        }
+    }
+
     function besideLook() {
         let front = null;
         let alive = null;
@@ -38045,17 +39431,21 @@
             // No page storage: Torn Archive is never heard, and Torn Bids keeps its whole limit.
         }
         const now = Date.now();
+        besideW3bLook(now);
         const prev = gmGet(STORE_BESIDE, null);
-        const next = besideStep(prev, { front, alive, now });
+        // He came to Torn Bids, or to a Torn page with our panel, after he last looked at Torn Archive: not behind.
+        const next = besideStep(prev, { front, alive, now, oursCameAt: besideOursCameAt(frontSides(), now) });
         if (!besideDue(prev, next, now)) return;
         const was = Boolean(prev && prev.behind);
         gmSet(STORE_BESIDE, next);
-        if (next.behind) {
-            try {
-                window.localStorage.setItem(BESIDE_BEHIND_MARK, besideBehindText(now));
-            } catch {
-                // Not said: Torn Archive then stays on its smaller share, and the two are still under the limit.
-            }
+        try {
+            // Said while behind. On the way back up it is taken away at once (3.25.1): Torn Archive may not know he
+            // came to a page of ours (a Torn page is not on its site), and goes back to its smaller share the moment
+            // the mark is gone - a minute before Torn Bids takes its whole limit again.
+            if (next.behind && !next.leftAt) window.localStorage.setItem(BESIDE_BEHIND_MARK, besideBehindText(now));
+            else if (was) window.localStorage.removeItem(BESIDE_BEHIND_MARK);
+        } catch {
+            // Not said: Torn Archive then stays on its smaller share, and the two are still under the limit.
         }
         if (was !== next.behind) {
             logProblem('note', next.behind
@@ -38071,6 +39461,9 @@
             if (!e || e.key === null || e.key === BESIDE_FRONT_MARK || e.key === BESIDE_ALIVE_MARK) besideLook();
         });
         setInterval(besideLook, BESIDE_LOOK_EVERY_MS);
+        // He came to a page of ours (this one, or a Torn page in another tab): heard at once, not at the next look.
+        gmOnChange(STORE_FRONT_BIDS, besideLook);
+        gmOnChange(STORE_FRONT_PAGE, besideLook);
     }
 
     /** Torn Bids is in view: said for every tab, so the overlay's reads make room (written at most every 10 s). */
@@ -38092,17 +39485,104 @@
     }
 
     /** Are an item's bazaar listings due to be read? */
-    function bazaarsDue(itemId, every, now, background = false) {
+    function bazaarsDue(itemId, every, now, background = false, how = '') {
         const b = sell.bazaars.get(String(itemId));
         if (!b) return true;
         if (b.loading) return false;
         if (b.error) return now - b.triedAt >= W3B_FAILED_RETRY_MS;
         // Brought back from the last visit (3.19.0): read again in its turn, as on a page just opened.
         if (b.kept) return true;
+        // 3.26.0: the light list said something the sellers list read before it does not - the sellers are read at
+        // once. Not for the sweep, which wants the cheapest price only and has it from the light list.
+        if (how !== 'sweep' && b.lightMiss > b.at) return true;
+        if (how !== 'desk' && b.lightErrAt && now - b.lightErrAt < W3B_FAILED_RETRY_MS) return false;
+        const at = how === 'sweep' ? bazaarSeenAt(b) : b.at;
         // A background read with Shared on (3.25.0): a list a friend's PC just read is not read again here,
         // and each item has one PC that goes first (core/shared.js). The desk and a trade never wait on anyone.
-        if (background && sharedLink && sharedLink.config()) return sharedDirDue(b.at, every, now, itemId, sharedLink.dir());
-        return now - b.at >= every;
+        if (background && sharedLink && sharedLink.config()) return sharedDirDue(at, every, now, itemId, sharedLink.dir());
+        return now - at >= every;
+    }
+
+    /** When TornW3B was last asked about an item's bazaars, either way: its sellers list, or its light list. */
+    function bazaarSeenAt(b) {
+        return b ? Math.max(Number(b.at) || 0, Number(b.lightAt) || 0) : 0;
+    }
+
+    /*
+     * The light list (3.26.0, core/cheap.js): ten cheapest prices and counts, no seller, on a limit of its own.
+     * It stands in for a sellers list for every item in turn (the sweep), and for a possible flip whose sellers
+     * were read in full in the last half hour: there it confirms that read, or calls for a new one. Never for the
+     * desk's item or a trade's. Off for this visit when its answers cannot be read, or hardly ever agree with a
+     * sellers list (then it tells us nothing, and only costs).
+     */
+    const W3B_LIGHT_FULL_MS = 30 * 60 * 1000;
+    const W3B_LIGHT_BAD_MAX = 2;
+    const W3B_LIGHT_JUDGE_AFTER = 30;
+    const W3B_LIGHT_SAME_LEAST = 0.2;
+    function lightUsable(now) {
+        if (sell.lightOff || !sell.w3b) return false;
+        const st = sell.w3b.stats();
+        return !(st.lightFreeAt > now);
+    }
+
+    /** Would the next read of this item be its light list? `how`: 'sweep', or 'slow' (a possible flip, a near one). */
+    function lightStandsIn(itemId, how, now) {
+        if (how === 'sweep') return true;
+        if (how !== 'slow') return false;
+        const b = sell.bazaars.get(String(itemId));
+        return Boolean(b && b.at && !b.kept && !b.error && !b.sweep && !(b.lightMiss > b.at) && now - (b.fullAt || b.at) < W3B_LIGHT_FULL_MS);
+    }
+
+    function loadCheapest(itemId, tag) {
+        const id = String(itemId);
+        const prev = sell.bazaars.get(id) || { at: 0, rows: [], error: null };
+        sell.bazaars.set(id, { ...prev, loading: true, triedAt: Date.now() });
+        const stats = sell.lightStats || (sell.lightStats = { read: 0, bad: 0, same: 0, miss: 0, why: {} });
+        return fetchW3bCheapest(sell.w3b, id)
+            .then((data) => {
+                const at = Date.now();
+                const light = parseW3bCheapest(data);
+                if (!light) {
+                    // Not the shape this version reads: said once, with the names of its fields, and not asked for again.
+                    stats.bad += 1;
+                    sell.bazaars.set(id, { ...prev, lightErrAt: at, loading: false });
+                    if (stats.bad === 1) logProblem('note', 'TornW3B\'s light list came in a shape this version does not read: ' + cheapKeys(data), 'sellers lists are read as before; nothing was guessed from it');
+                    if (stats.bad >= W3B_LIGHT_BAD_MAX && !stats.read) {
+                        sell.lightOff = 'shape';
+                        logProblem('note', 'TornW3B\'s light list is not used on this visit (its shape is not known)', 'every item is read by its sellers list, as in 3.25');
+                    }
+                    return;
+                }
+                stats.read += 1;
+                if (stats.read === 1) logProblem('note', 'TornW3B\'s light list is read (ten cheapest prices, no seller; a limit of its own)', 'it stands in for a sellers list for every item in turn, and confirms the sellers of a possible flip; a sellers list is asked only where it says something new');
+                // A read kept from the last visit is compared as well: the same, and it stands as of now; not, and its sellers are read.
+                const full = prev.at > 0;
+                const said = full ? cheapSame(prev.rows, light, { cut: Boolean(prev.sweep) }) : { same: false, why: 'no-sellers-list' };
+                if (full) {
+                    stats[said.same ? 'same' : 'miss'] += 1;
+                    stats.why[said.why] = (stats.why[said.why] || 0) + 1;
+                }
+                // The same as the sellers list said: that read stands as of now, and its own time is kept (fullAt).
+                if (said.same) sell.bazaars.set(id, { ...prev, at, triedAt: at, fullAt: prev.fullAt || prev.at, lightAt: at, lightRows: light, lightMiss: 0, error: null, loading: false, kept: false });
+                else sell.bazaars.set(id, { ...prev, triedAt: at, lightAt: at, lightRows: light, lightMiss: at, error: null, loading: false, kept: false });
+                sell.bazaarsDirty = true;
+                // It hardly ever agrees with a sellers list read minutes before: it is not telling us what we took it to.
+                const judged = stats.same + stats.miss;
+                if (tag !== 'w.sweep' && judged >= W3B_LIGHT_JUDGE_AFTER && stats.same < judged * W3B_LIGHT_SAME_LEAST && !sell.lightOff) {
+                    sell.lightOff = 'never-agrees';
+                    logProblem('note', 'TornW3B\'s light list is not used on this visit: it agreed with the sellers list ' + stats.same + ' times of ' + judged, 'why not: ' + Object.entries(stats.why).map(([k, n]) => k + ' ' + n).join(', ') + '; every item is read by its sellers list again');
+                }
+            })
+            .catch((error) => {
+                // Its own day is used, or TornW3B asked to wait: nothing failed, and the sellers lists go on (lightUsable).
+                if (error && error.paused && error.route) {
+                    sell.bazaars.set(id, { ...prev, loading: false });
+                    return;
+                }
+                // No answer: asked again in a minute, as a sellers list is - not on the very next turn.
+                sell.bazaars.set(id, { ...prev, triedAt: Date.now(), lightErrAt: Date.now(), loading: false });
+                if (error && error.blocked && !error.paused) sell.w3bPauseUntil = Date.now() + 60000;
+            });
     }
 
     /**
@@ -38121,6 +39601,29 @@
         return [...ids];
     }
 
+    /*
+     * Room for a sellers list (3.26.0). TornW3B allows ten a minute and a thousand a day by address; the
+     * client keeps to 8 and 900 (api/w3b.js). `now`: one may leave. `back`: one may leave for a possible
+     * flip or the sweep - they leave two of the minute and a hundred of the day to the desk and a trade,
+     * which would otherwise wait out a minute the flips had used up.
+     */
+    const W3B_LISTING_KEEP_MINUTE = 2;
+    const W3B_LISTING_KEEP_DAY = 100;
+    let w3bRoomNoted = '';
+    function w3bListingRoom(now) {
+        const st = sell.w3b ? sell.w3b.stats() : null;
+        if (!st) return { now: true, back: true };
+        const free = !(st.listingFreeAt > now);
+        // For the log, once each time it changes: why no sellers list is asked for.
+        const why = st.listingDayLeft <= 0 ? 'day' : st.listingDayLeft <= W3B_LISTING_KEEP_DAY ? 'day-low' : '';
+        if (why !== w3bRoomNoted) {
+            w3bRoomNoted = why;
+            if (why === 'day') logProblem('note', 'TornW3B sellers lists: all ' + st.listingToday + ' of today are used (our own limit, under the 1,000 TornW3B allows)', 'none is asked until ' + new Date(st.listingFreeAt).toLocaleTimeString() + '; prices of bazaars the shared server reads go on');
+            else if (why === 'day-low') logProblem('note', 'TornW3B sellers lists: ' + st.listingDayLeft + ' left today', 'kept for the item on the desk and the items of a trade; possible flips wait for the light list and the shared server');
+        }
+        return { now: free, back: free && st.listingMinuteLeft > W3B_LISTING_KEEP_MINUTE && st.listingDayLeft > W3B_LISTING_KEEP_DAY };
+    }
+
     function nextW3bJob(now, hidden = false) {
         // A Torn page is in front, or nothing of ours is in view (3.25.0, core/front.js): Torn Bids asks
         // only for what an accepted or held trade needs - the one read longest ago first. Its flips,
@@ -38128,14 +39631,18 @@
         if (!bidsMayAsk(now)) {
             const every = freshnessMs(sellPrefs()).desk;
             const readAt = (id) => Number((sell.bazaars.get(String(id)) || {}).at) || 0;
-            const due = tradeNeedIds(now).filter((id) => bazaarsDue(id, every, now)).sort((a, b) => readAt(a) - readAt(b));
+            const due = w3bListingRoom(now).now ? tradeNeedIds(now).filter((id) => bazaarsDue(id, every, now)).sort((a, b) => readAt(a) - readAt(b)) : [];
             return due.length ? () => loadBazaars(due[0], 'w.trade') : null;
         }
         sell.w3bTurn ^= 1;
         // Refresh was pressed: what you were looking at, before everything but the one-call summary of every price.
         const summaryFirst = now - sell.summaryAt >= W3B_SUMMARY_MS && now - sell.summaryTriedAt >= W3B_FAILED_RETRY_MS;
+        const room = w3bListingRoom(now);
         while (!summaryFirst && sell.refreshQueue && sell.refreshQueue.length) {
-            const first = sell.refreshQueue.shift();
+            // A sellers list waits for room in its own minute (3.26.0); the buyers of what you look at do not wait for it.
+            const at = sell.refreshQueue.findIndex((q) => q.kind === 'buyers' || room.now);
+            if (at < 0) break;
+            const [first] = sell.refreshQueue.splice(at, 1);
             // Read already since the press (its usual turn got there first): not read twice.
             const had = first.kind === 'buyers' ? sell.itemTraders.get(String(first.id)) : sell.bazaars.get(String(first.id));
             if (had && Number(had.at) >= sell.refreshAt) continue;
@@ -38149,11 +39656,30 @@
         const topIds = new Set(candIds.slice(0, FRESH_TOP).map(String));
         // Yours alone, whoever else is on: the desk's item and everything a trade of yours holds.
         const ownIds = new Set([sell.selected, ...sell.tradeLive, ...sell.tradeWanted, ...pinnedIds].filter(Boolean).map(String));
+        // 3.26.0: the traders of the trade on the desk - their own lists, well inside the check, so the whole
+        // trade stands on prices read minutes ago (a list is not TornW3B's limited kind).
+        if (!hidden) {
+            const dueList = [...(sell.deskTraders || [])].find((id) => {
+                const w = sell.db && sell.db.traders && sell.db.traders[id] ? sell.db.traders[id].w3b : null;
+                return w && w.found && now - (w.at || 0) >= FLIP_RECHECK_MS && !(w.errorAt && now - w.errorAt < W3B_FAILED_RETRY_MS * 5);
+            });
+            if (dueList) return Object.assign(() => loadW3bList(dueList), { list: true });
+        }
         const turnOf = sharedLink && sharedLink.config() ? sharedLink.dir().turn.of : 1;
         if (turnOf !== sell.sharedTurnOf) {
             logProblem('note', turnOf > 1 ? 'Shared: TornW3B lists are split between ' + turnOf + ' PCs now' : 'Shared: no other PC is on, every TornW3B list is this PC\'s again');
             sell.sharedTurnOf = turnOf;
         }
+        // What the server last handed out of the sellers lists this PC said it wants (null: nothing said, or it is old).
+        const handed = sharedLink && sharedLink.config() ? sharedLink.w3bAsk() : null;
+        const handedSig = handed ? handed.ask.length + '/' + handed.want.length : '';
+        if (handedSig !== sell.w3bHandedSig && (!handedSig || !sell.w3bHandedSig)) {
+            logProblem('note', handed
+                ? 'Shared: the server hands out TornW3B\'s sellers lists now - ' + handed.ask.length + ' of the ' + handed.want.length + ' this PC wanted are its own to read, the rest another PC reads'
+                : 'Shared: the server no longer says which sellers lists are this PC\'s - every one it wants is its own again', '');
+        }
+        sell.w3bHandedSig = handedSig;
+        const lightOn = lightUsable(now);
         const read = nextW3bRead({
             summaryDue: now - sell.summaryAt >= W3B_SUMMARY_MS && now - sell.summaryTriedAt >= W3B_FAILED_RETRY_MS,
             picked: sell.selected,
@@ -38165,14 +39691,34 @@
             // Every buyer: the desk's item, what you hold, then the possible flips.
             buyers: [...new Set([sell.selected, ...[...heldIds()].slice(0, 20), ...candIds].filter(Boolean).map(String))],
             buyersDue: (id) => itemTradersDue(id, now),
+            // The items with a flip shown or possible: their buyers before more bazaars (a flip needs its check).
+            check: sell.flipCheckIds || [],
             near: sell.nearIds,
             sweep: sell.sweepIds,
             // Hidden, the lists have a few reads a minute of their own at most.
-            list: hidden && !backgroundListSlot(sell.w3bHiddenLists, now) ? null : nextW3bTrader(sell.db, heldIds(), now),
+            list: hidden && !backgroundListSlot(sell.w3bHiddenLists, now) ? null : nextW3bTrader(sell.db, heldIds(), now, {
+                hot: sell.flipTraders || null,
+                listAtOf: (id) => sell.listAt.get(String(id)) || 0,
+                // Trusted on: a trader the switch hides has their list read every six hours, not every hour.
+                slow: sell.trustSlow ? (id) => { const tr = sell.trustById.get(String(id)); return !(tr && (tr.level === 'Trusted' || tr.level === 'Known')); } : null,
+            }),
             turn: sell.w3bTurn,
             hidden,
             // Settings › Bazaar prices (3.20): the desk and the trade, the top flips, the others.
-            due: (id, how) => bazaarsDue(id, how === 'desk' ? fresh.desk : how === 'sweep' ? W3B_SWEEP_MS : topIds.has(String(id)) ? fresh.top : fresh.other, now, how !== 'desk' && !ownIds.has(String(id))),
+            // 3.26.0: and only while the sellers list's own minute and day have room - the desk and a trade may use all of
+            // it, everything else leaves them a share (w3bListingRoom).
+            due: (id, how) => {
+                const own = how === 'desk' || ownIds.has(String(id));
+                // The light list needs no room in the sellers lists' minute or day: it has a limit of its own.
+                if (!(own ? room.now : room.back) && !(!own && lightOn && lightStandsIn(id, how, now))) return false;
+                // The server handed this one to another PC (it read it, or has more of its limit left): its
+                // bazaars come back through the server's own reads of Torn.
+                if (!own && handed && !sharedMayRead(handed, id, now)) {
+                    sell.w3bLeftToOthers = (sell.w3bLeftToOthers || 0) + 1;
+                    return false;
+                }
+                return bazaarsDue(id, how === 'desk' ? fresh.desk : how === 'sweep' ? W3B_SWEEP_MS : topIds.has(String(id)) ? fresh.top : fresh.other, now, !own, how);
+            },
         });
         if (!read) return null;
         if (read.kind === 'summary') return loadBazaarSummary;
@@ -38184,6 +39730,8 @@
             : sell.tradeLive.includes(id) || sell.tradeWanted.includes(id) || pinnedIds.includes(id) ? 'w.trade'
             : candIds.includes(id) || sell.nearIds.includes(id) ? 'w.flips'
             : 'w.sweep';
+        // The light list where the sellers are not the question (core/cheap.js): the sweep, and a possible flip read in full before.
+        if (lightOn && (tag === 'w.sweep' || tag === 'w.flips') && !ownIds.has(id) && lightStandsIn(id, tag === 'w.sweep' ? 'sweep' : 'slow', now)) return () => loadCheapest(read.id, tag);
         return () => loadBazaars(read.id, tag);
     }
 
@@ -38193,7 +39741,9 @@
         if (!t) return true;
         if (t.loading) return false;
         if (t.error) return now - t.triedAt >= W3B_FAILED_RETRY_MS * 5;
-        return now - t.at >= W3B_BUYERS_MS;
+        // 3.26.0: by what the item is to you - the desk's every 2 minutes, a flip's (shown or possible) every 3, so its
+        // check never lapses by the clock alone, the rest every 10 (core/checked.js). It was 20 minutes for all.
+        return now - t.at >= Math.min(W3B_BUYERS_MS, buyersEveryMs(itemId, { desk: sell.selected, flips: sell.flipCheck }));
     }
 
     /**
@@ -38231,6 +39781,9 @@
                     if (t.listAt && sell.listAt.get(t.id) !== t.listAt) {
                         sell.listAt.set(t.id, t.listAt);
                         sell.listAtDirty = true;
+                        // 3.26.0: they changed their list after we last read it - their other prices moved too: it is read next.
+                        const own = sell.db && sell.db.traders ? sell.db.traders[t.id] : null;
+                        if (own && own.w3b && own.w3b.found && own.w3b.at < t.listAt) markW3bDue(sell.db, t.id);
                     }
                     if (t.lastAction) {
                         const was = sell.activity.get(t.id);
@@ -38279,18 +39832,104 @@
     const PLAN_REREAD_MS = 60 * 1000;
     const planReread = new Map();
 
-    function rereadTraderList(key, now = Date.now()) {
+    function rereadTraderList(key, now = Date.now(), every = PLAN_REREAD_MS) {
         const id = String(key || '').startsWith('id:') ? String(key).slice(3) : null;
-        if (!id || !sell.w3b || !sell.db || !sell.db.traders || !sell.db.traders[id]) return;
-        if (now - (planReread.get(id) || 0) < PLAN_REREAD_MS) return;
+        if (!id || !sell.w3b || !sell.db || !sell.db.traders || !sell.db.traders[id]) return false;
+        if (now - (planReread.get(id) || 0) < every) return false;
         planReread.set(id, now);
         loadW3bList(id).then(() => renderSelling());
+        return true;
+    }
+
+    /*
+     * "Check now" on a trader (3.26.0; the owner, 2026-10-11: "a refresh button on traders so it takes the
+     * price list from there and we get fresh prices"): their own list at once, and the item's buyers after
+     * it. Neither is TornW3B's limited kind. Not more often than every 15 seconds for one trader.
+     */
+    const TRADER_CHECK_MS = 15 * 1000;
+    function checkTraderNow(itemId, key) {
+        const asked = rereadTraderList(key, Date.now(), TRADER_CHECK_MS);
+        const id = String(itemId || '');
+        const it = id ? sell.itemTraders.get(id) : null;
+        if (id && !(it && it.loading)) {
+            sell.refreshQueue = [{ kind: 'buyers', id }, ...(sell.refreshQueue || []).filter((q) => !(q.kind === 'buyers' && String(q.id) === id))];
+            sell.refreshAt = Date.now();
+        }
+        logProblem('note', 'Check now: the price list of trader ' + String(key).replace(/^id:/, '') + (asked ? ' is read again' : ' was read under 15 s ago') + (id ? ', then the buyers of item ' + id : ''));
+        stepW3b();
+    }
+
+    /* For the log, the first few of a session: a list read again that changed what a buyers read had said. */
+    let listMovedNotes = 0;
+
+    /*
+     * Trader lists through the shared server (3.26.0; the friend's idea, 2026-10-11: one PC's read serves the
+     * others). A list this PC read waits in a stored value for the next exchange (the newest five); a list another
+     * person's PC read is taken into the trader database when it is newer than ours by a minute or more. It is
+     * marked `shared`: shown, and its trader's list is not read again here before its turn - but it checks no
+     * price (core/checked.js): its time is by the other PC's clock, and a flip stands only on this PC's own read.
+     */
+    function shareOwnList(id, prices, at) {
+        if (!sharedLink || !sharedLink.config()) return;
+        const cut = Object.fromEntries(Object.entries(prices || {}).slice(0, SHARED_MAX_LIST_ITEMS));
+        const mine = sharedList([Number(id), at, cut]);
+        if (!mine) return;
+        const had = (gmGet(SHARED_LISTS_OUT_KEY, null) || []).filter((l) => Array.isArray(l) && l[0] !== mine[0]);
+        gmSet(SHARED_LISTS_OUT_KEY, [...had, mine].slice(-SHARED_MAX_LISTS));
+    }
+
+    let sharedListsTaken = null;
+    let sharedListsNoted = 0;
+    function takeSharedLists() {
+        if (!sell.db || !sell.db.traders) return;
+        const box = gmGet(SHARED_LISTS_IN_KEY, null);
+        if (!box || !Number.isInteger(box.n) || !Array.isArray(box.lists)) return;
+        // Each list once: the box is numbered, and holds the newest. On a page just opened, all it holds.
+        const fresh = sharedListsTaken === null ? box.lists.length : Math.min(box.lists.length, box.n - sharedListsTaken);
+        sharedListsTaken = box.n;
+        if (!(fresh > 0)) return;
+        const now = Date.now();
+        let taken = 0;
+        for (const entry of box.lists.slice(-fresh)) {
+            const l = sharedList(entry);
+            if (!l) continue;
+            const [trader, readAt, prices] = l;
+            const id = String(trader);
+            // Never from the future, by this PC's clock; never over a week old.
+            const at = Math.min(readAt, now);
+            if (now - at > W3B_LIST_MAX_AGE_MS) continue;
+            const own = sell.db.traders[id] ? sell.db.traders[id].w3b : null;
+            if (own && own.checkedAt && own.checkedAt >= at - 60000) continue;
+            if (!sell.db.traders[id]) sell.db.traders[id] = { name: 'Trader ' + id, from: 'w3b', seenAt: now, w3b: null };
+            sell.db.traders[id].w3b = { checkedAt: at, at, found: true, prices: Object.fromEntries(Object.entries(prices).map(([k, v]) => [String(k), v])), shared: true };
+            taken += 1;
+        }
+        if (!taken) return;
+        sell.dbDirty = true;
+        sell.w3bIndex = null;
+        saveTraderDb();
+        if (sharedListsNoted < 10) {
+            sharedListsNoted += 1;
+            logProblem('note', 'Shared: ' + taken + (taken === 1 ? ' trader list' : ' trader lists') + ' another PC read came through the server', 'shown as read then; a price in it makes a flip only once this PC\'s own TornW3B read confirms it');
+        }
+        renderSelling();
     }
 
     /** One trader's TornW3B price list. */
     function loadW3bList(id) {
         return fetchW3bPriceList(sell.w3b, id)
-            .then((body) => recordW3bList(sell.db, id, { prices: parseW3bPriceList(body) }, Date.now()))
+            .then((body) => {
+                const at = Date.now();
+                const prices = parseW3bPriceList(body);
+                recordW3bList(sell.db, id, { prices }, at);
+                shareOwnList(id, prices, at);
+                // 3.26.0: what the list says now stands over an older read of an item's buyers (core/checked.js).
+                const moved = applyListToItemBuyers(sell.itemTraders, id, prices, at);
+                if (moved.length && listMovedNotes < 20) {
+                    listMovedNotes += 1;
+                    logProblem('note', 'The price list of trader ' + id + ', read again, differs from the buyers read before it on ' + moved.length + (moved.length === 1 ? ' item' : ' items') + ' (' + moved.slice(0, 6).join(', ') + (moved.length > 6 ? ', …' : '') + ')', 'the list stands: a price they changed or took off no longer makes a flip');
+                }
+            })
             .catch((error) => {
                 recordW3bList(sell.db, id, { error: true }, Date.now());
                 if (error && error.blocked && !error.paused) sell.w3bPauseUntil = Date.now() + 60000;
@@ -38344,11 +39983,18 @@
                 if (sweep) rows = [...rows].sort((a, b) => a.price - b.price).slice(0, W3B_SWEEP_ROWS);
                 // How fast it sells: what left the bazaars since the last read.
                 const suspect = rows.length === 0 && (prev.rows || []).length > 0;
-                if (!sweep && !prev.sweep && prev.at && at - prev.at <= SELL_MOVES_GAP_MS && !suspect) noteMovement(id, unitsMoved(prev.rows, rows, (listings || []).length >= 100), at - prev.at, at);
-                sell.bazaars.set(id, { at, triedAt: at, rows, error: null, loading: false, sweep });
+                // Since the sellers were last read (fullAt): a light list that confirmed them in between moved nothing.
+                const prevAt = prev.fullAt || prev.at;
+                if (!sweep && !prev.sweep && prevAt && at - prevAt <= SELL_MOVES_GAP_MS && !suspect) noteMovement(id, unitsMoved(prev.rows, rows, (listings || []).length >= 100), at - prevAt, at);
+                sell.bazaars.set(id, { at, fullAt: at, triedAt: at, rows, error: null, loading: false, sweep });
                 sell.bazaarsDirty = true;
             })
             .catch((error) => {
+                // Kept back by the sellers list's own limit (3.26.0): nothing was asked, so nothing failed - as it was, read in its turn.
+                if (error && error.paused && error.route) {
+                    sell.bazaars.set(id, { ...prev, loading: false });
+                    return;
+                }
                 sell.bazaars.set(id, { ...prev, triedAt: Date.now(), error: 'TornW3B did not answer. Trying again soon.', loading: false });
                 if (error && error.blocked && !error.paused) sell.w3bPauseUntil = Date.now() + 60000;
             });
@@ -39004,7 +40650,38 @@
             }
             return flipBuyersCache.get(key);
         };
-        // The plan that makes the most among the believable buyers (each capped
+        /*
+         * 3.26.0 (core/checked.js; the owner, 2026-10-11: "everytime it shows a flip, its because the item list is
+         * checked"): a flip, and a line of a trade, only with a buyer whose price TornW3B confirmed minutes ago and
+         * whose list changed within a day. The believable buyers above still say which bazaars are worth reading
+         * and what an item is worth; what they would make unchecked is a possible flip, checked first.
+         */
+        const checkCache = new Map();
+        const checkOf = (id, b) => {
+            const k = String(id) + '|' + (b.id || b.name);
+            let c = checkCache.get(k);
+            if (!c) {
+                const it = sell.itemTraders.get(String(id));
+                const own = b.id && sell.db.traders[b.id] ? sell.db.traders[b.id].w3b : null;
+                c = priceChecked(b, { itemId: String(id), item: it && it.at ? it : null, list: own || null, listAt: b.id ? listAtOf(b.id) : 0, now });
+                checkCache.set(k, c);
+            }
+            return c;
+        };
+        const flipCheckedCache = new Map();
+        const flipCheckedOf = (id) => {
+            const key = String(id);
+            let list = flipCheckedCache.get(key);
+            if (!list) {
+                const all = flipBuyersOf(key);
+                list = all.filter((b) => checkOf(key, b).ok);
+                // All of them: the very list (a kept plan looks its buyer up in it by place).
+                if (list.length === all.length) list = all;
+                flipCheckedCache.set(key, list);
+            }
+            return list;
+        };
+        // The plan that makes the most among the checked buyers (each capped
         // by what they can pay); a tie goes to the higher bid.
         const declinedAll = sellDeclined(now);
         const declinedBy = (id, b) => declinedAll.size > 0 && declinedAll.has(declineKey(id, b.id ? 'id:' + b.id : 'name:' + String(b.name).toLowerCase()));
@@ -39014,7 +40691,7 @@
         const planOf = (id) => {
             const rows = sellersOf(id);
             if (!rows) return null;
-            const fbs = flipBuyersOf(id);
+            const fbs = flipCheckedOf(id);
             const k = keepers.plans.get(String(id), keptPlanSig(rows, prefs, fbs, (b) => declinedBy(id, b)), () => {
                 const best = planFrom(id, rows);
                 if (!best) return null;
@@ -39026,7 +40703,7 @@
         const planFrom = (id, rows) => {
             if (!rows) return null;
             let best = null;
-            for (const b of flipBuyersOf(id)) {
+            for (const b of flipCheckedOf(id)) {
                 // A trade you declined is not a flip (the same trader's other items still are).
                 if (declinedAll.size && declinedAll.has(declineKey(id, b.id ? 'id:' + b.id : 'name:' + String(b.name).toLowerCase()))) continue;
                 const most = Math.min(prefs.maxPerFlip || 100, b.maxUnits ? b.maxUnits : Infinity);
@@ -39035,6 +40712,21 @@
                 if (!best || plan.profit > best.profit || (plan.profit === best.profit && plan.units > 0 && !best.units)) best = { ...plan, buyer: b };
             }
             return best;
+        };
+        // A possible flip: what the item would make with its highest buyer not checked yet, when a check can
+        // still make it one (never a price only on TornExchange, never a list a day old). One plan an item, at most.
+        const possibleOf = (id, rows) => {
+            const all = flipBuyersOf(id);
+            if (!rows || flipCheckedOf(id) === all) return null;
+            for (const b of all) {
+                const c = checkOf(id, b);
+                if (c.ok) return null;
+                if ((c.why !== 'not-checked' && c.why !== 'no-date') || declinedBy(id, b)) continue;
+                const most = Math.min(prefs.maxPerFlip || 100, b.maxUnits ? b.maxUnits : Infinity);
+                const plan = flipPlan(rows, b.price, { cash: prefs.cash, maxUnits: most, minPct: prefs.minProfitPct });
+                return plan && plan.units > 0 ? { profit: plan.profit, buyer: b } : null;
+            }
+            return null;
         };
 
         // Shared, for a card and the desk: who of the others is going for this item, and what a friend's buy took from its plan.
@@ -39072,6 +40764,14 @@
         const effective = new Map();
         for (const [id, row] of summary) {
             const b = sell.bazaars.get(String(id));
+            // 3.26.0: the light list said something the sellers list does not (core/cheap.js) - its cheapest price is
+            // the newest word on the item until the sellers are read, unless the summary is newer and cheaper still.
+            if (b && b.lightMiss > b.at && now - b.lightAt < W3B_CANDIDATE_MS * 2) {
+                const said = cheapLowest(b.lightRows);
+                const lowest = sell.summaryAt > b.lightAt && row.lowestPrice > 0 && !(said > 0 && said <= row.lowestPrice) ? row.lowestPrice : said;
+                effective.set(id, lowest === row.lowestPrice ? row : { ...row, lowestPrice: lowest });
+                continue;
+            }
             const read = b && b.at && now - b.at < W3B_CANDIDATE_MS * 2 ? lowestOf(id) : null;
             const lowest = read > 0 && !(sell.summaryAt > b.at && row.lowestPrice > 0 && row.lowestPrice < read) ? read : b && b.at && !(read > 0) && !(sell.summaryAt > b.at) ? null : row.lowestPrice;
             effective.set(id, lowest === row.lowestPrice ? row : { ...row, lowestPrice: lowest });
@@ -39103,10 +40803,8 @@
         };
         sell.nearIds = sell.summary ? nearMisses(summary, bestBidOf, { pct: W3B_NEAR_PCT, limit: W3B_NEAR_MAX, exclude: candSet }) : [];
         const nearSet = new Set(sell.nearIds);
-        const readAt = (id) => {
-            const b = sell.bazaars.get(id);
-            return b ? b.at || 0 : 0;
-        };
+        // Every item in turn: asked either way counts (its sellers list, or its light list).
+        const readAt = (id) => bazaarSeenAt(sell.bazaars.get(id));
         sell.sweepIds = withBid.filter((id) => !candSet.has(id) && !nearSet.has(id)).sort((a, b) => readAt(a) - readAt(b));
         // Shared: what each item is worth to a trader, for the server's order of reading; every item read is in it.
         if (sharedReads) {
@@ -39138,12 +40836,18 @@
         const allIds = new Set([...heldQty.keys(), ...teMap.keys(), ...w3bByItem.keys(), ...oneIds]);
         const q = String(sell.query || '').trim().toLowerCase();
         let rows = [];
+        // Possible flips waiting for their buyer's price to be checked, and the flips shown (their check is kept up).
+        const waiting = [];
+        const shownFlips = [];
         for (const id of allIds) {
             const name = nameOf(id);
             if (q && !String(name).toLowerCase().includes(q)) continue;
             const best = buyersOf(id)[0] || null;
             const held = heldQty.get(id) || 0;
             const plan = planOf(id);
+            const maybe = possibleOf(id, sellersOf(id));
+            if (maybe && !(plan && plan.units > 0 && plan.profit >= maybe.profit)) waiting.push({ itemId: String(id), profit: maybe.profit, traderId: maybe.buyer.id || null });
+            if (plan && plan.units > 0) shownFlips.push({ itemId: String(id), profit: plan.profit, traderId: plan.buyer && plan.buyer.id ? plan.buyer.id : null });
             const lowest = lowestOf(id);
             // The best believable bid (a troll one - $99b for a Parcel - never counts):
             // it sorts the list and says where to sell. No average: the top bid, as before.
@@ -39165,6 +40869,23 @@
             }
             rows.push({ itemId: id, name, held, lowest, badge, value, bid: avg > 0 ? realBid : 0, pending: !best && pendingFor(id), plan, best, category: itemCategory(itemOf(id)) });
         }
+        // What the next reads go to (nextW3bJob): a possible flip's buyers first, the biggest first, then the
+        // shown flips' - and their traders' own lists as often as those who buy what you hold. A search
+        // shows only part of the items: the whole list of the last full look stays.
+        if (!q) {
+            waiting.sort((a, b) => b.profit - a.profit);
+            shownFlips.sort((a, b) => b.profit - a.profit);
+            sell.flipCheckIds = [...waiting, ...shownFlips].map((f) => f.itemId);
+            sell.flipCheck = new Set(sell.flipCheckIds);
+            sell.flipTraders = new Set([...waiting, ...shownFlips].map((f) => f.traderId).filter(Boolean).map(String));
+            if (waiting.length !== (sell.pricesWaiting || 0) && (!waiting.length || !sell.pricesWaiting)) {
+                logProblem('note', waiting.length
+                    ? 'Possible flips waiting for a price check: ' + waiting.length + ' (' + shownFlips.length + ' flips shown) - a flip is shown only once TornW3B confirmed the price of its buyer in the last 5 minutes'
+                    : 'Every possible flip has its price checked: ' + shownFlips.length + ' shown');
+            }
+            sell.pricesWaiting = waiting.length;
+        }
+        sell.trustSlow = Boolean(prefs.trustedOnly) && !votesMissing;
         // The category filters the flips, the list and its counts together; its
         // own counts follow the search only.
         const categories = categoryCounts(rows.map((r) => r.category), sell.category);
@@ -39304,7 +41025,9 @@
             if (!tradeIndex) {
                 tradeIndex = new Map();
                 for (const id of allIds) {
-                    for (const fb of flipBuyersOf(id)) {
+                    // 3.26.0: only prices checked minutes ago go into a trade (their own list, read again while
+                    // the trade is on the desk, checks every item of theirs at once).
+                    for (const fb of flipCheckedOf(id)) {
                         const k = traderKey(fb);
                         if (!tradeIndex.has(k)) tradeIndex.set(k, []);
                         tradeIndex.get(k).push({ id, fb });
@@ -39393,10 +41116,13 @@
          * trader you picked or pinned is used even when a Show toggle hides them
          * (a pin must come back as it was pinned).
          */
+        const deskTraderIds = new Set();
         const chooseTrade = (pickId, buyers, keptKey = null) => {
             const declined = declinedOn(declinedAll, pickId);
             const plans = new Map();
             for (const b of buyers.slice(0, TRADE_TRADERS_MAX)) plans.set(traderKey(b), tradeWith(b, pickId));
+            // The traders of the item on the desk: their lists are read again every few minutes (nextW3bJob).
+            if (String(pickId) === String(sell.selected)) for (const b of buyers.slice(0, TRADE_TRADERS_MAX)) if (b.id && b.w3b > 0) deskTraderIds.add(String(b.id));
             // A pinned trade on this item comes back with its trader (after a reload too).
             const pinFor = Object.values(sellPinned(now)).find((t) => t.itemId === String(pickId) && !declined.has(t.key) && !blacklist.has(t.key));
             const pickedKey = sell.tradePick.get(String(pickId)) || (pinFor ? pinFor.key : null);
@@ -39788,7 +41514,7 @@
             // Each trader row carries its key: Plan trade and Declined act on it.
             const pickAvg = itemOf(pick) ? Number(itemOf(pick).marketValue) || null : null;
             // A bid over 3x the Item Market Average is shown, marked, and never counted (troll bids).
-            let buyers = buyersOf(pick).map((x) => ({ ...x, tradeKey: traderKey(x), troll: pickAvg > 0 && !believableBid(x.price, pickAvg), traded: tradedLine(statOf(x), now), favourite: favOf(x) }));
+            let buyers = buyersOf(pick).map((x) => ({ ...x, tradeKey: traderKey(x), troll: pickAvg > 0 && !believableBid(x.price, pickAvg), traded: tradedLine(statOf(x), now), favourite: favOf(x), check: checkOf(pick, x) }));
             // A To sell item (3.22.0, the owner: "never suggest selling on a loss ... only show traders who we can sell on
             // a profit"): a trader who pays no more than you paid is taken off the list - counted and named below, never planned.
             const paidRow = leftovers.find((l) => String(l.itemId) === pick) || null;
@@ -39838,6 +41564,7 @@
                 market: { state: m && m.at ? 'ok' : m && m.error ? 'error' : 'loading', lowest: m ? m.lowest : null },
             };
             desk.trade = tradeDesk(pick, buyers);
+            sell.deskTraders = deskTraderIds;
             // Flips > By trader: everything the trader of the trade on show buys, beside the cheapest bazaar.
             const shownTrade = desk.trade && (desk.trade.chosen || desk.trade.accepted);
             if (shownTrade && shownTrade.buyer && sell.bdPage === 'flips' && sell.bdTab === 1) {
@@ -39994,6 +41721,10 @@
                 teSameAsLimited: Boolean(teKey) && teKey === getSellKey(),
                 teError: st.error || null,
                 teKeyMsg: sell.teKeyMsg || null,
+                // Settings › TornW3B: the key registered there - 'none' | 'saved' | 'refused', and the sellers lists left.
+                w3bKey: w3bKeyRecord() ? (w3bKeyRecord().bad ? 'refused' : 'saved') : 'none',
+                w3bKeyMsg: sell.w3bKeyMsg || null,
+                w3bListing: sell.w3b ? (({ listingLastMinute, listingToday, listingMinuteLeft, listingDayLeft, listingFreeAt }) => ({ minute: listingLastMinute, day: listingToday, minuteLeft: listingMinuteLeft, dayLeft: listingDayLeft, freeAt: listingFreeAt }))(sell.w3b.stats()) : null,
                 teBadKey: Boolean(st.badKey),
                 teWaitUntil: st.blockedUntil > now ? st.blockedUntil : null,
                 teAt: sell.traders ? sell.traders.fetchedAt : null,
@@ -40012,12 +41743,15 @@
                 w3bRead: stats.total - stats.unchecked,
                 // Settings › Shared.
                 shared: sharedLink ? sharedLink.status(now) : null,
+                publicKey: publicKeyInfo(now),
                 // Beside Torn Archive while it is in front: said once, in the sidebar.
                 beside: besideLine(gmGet(STORE_BESIDE, null), now),
                 bazaarsAt: sell.summaryAt || null,
                 bazaarsError: sell.summaryError,
                 flipsChecked,
                 flipsWanted: sell.candidates.length,
+                // Possible flips not shown until TornW3B confirms their buyer's price (3.26.0).
+                pricesWaiting: sell.pricesWaiting || 0,
                 // Settings › Bazaar prices: how many items each group holds now, and the reads a minute.
                 freshCounts: {
                     desk: new Set([sell.selected, ...(sell.tradeActive ? sell.tradeLive : [])].filter(Boolean).map(String)).size || 1,
@@ -40137,6 +41871,16 @@
             sell.inventory = cached.items;
             sell.inventoryAt = cached.fetchedAt;
             return;
+        }
+
+        // What was kept from before shows at once, whatever its age (3.25.1: "Loading your inventory..." stood
+        // there for as long as the reads took); the fresh read then takes its place.
+        if (!sell.inventory) {
+            const kept = readInventoryCacheEntry(gmGet(STORE_INVENTORY, null), Date.now(), Infinity);
+            if (kept) {
+                sell.inventory = kept.items;
+                sell.inventoryAt = kept.fetchedAt;
+            }
         }
 
         sell.loading = true;
@@ -40538,6 +42282,69 @@
         renderSelling(true);
     }
 
+    /*
+     * The Public key, in Torn Bids' own Settings (3.26.0; the owner, 2026-10-11: "the only part it can be set is
+     * in the npc arbitradge. can you tell tornbids to add that in settings?"). ONE key - the one NPC Arbitrage's
+     * panel saves (STORE_KEY) - shown in both places and saved from either. Its word (never the key) is what the
+     * shared server knows this PC by, so a save here asks the server at once.
+     */
+    function publicKeyInfo(now) {
+        const has = Boolean(getStoredKey());
+        const access = has ? gmGet(STORE_KEY_ACCESS, null) : null;
+        return {
+            has,
+            access: access && access.name,
+            over: Boolean(access && access.level !== null && access.level > ACCESS_PUBLIC),
+            error: sell.publicKeyError || (has && keyDeadWords(gmGet(STORE_KEY_DEAD, null), 'Public', now)) || null,
+        };
+    }
+
+    function onSellSavePublicKey(raw) {
+        const key = String(raw || '').trim();
+        const no = (msg) => {
+            sell.publicKeyError = msg;
+            renderSelling(true);
+        };
+        if (!key) return no('Paste a key first.');
+        // The Ledger's Full key stays with the Ledger.
+        if (key === getLedgerKey()) return no('That is your Full (Ledger) key. Paste a Public Only key here.');
+        if (!looksLikeTornKey(key)) return no('A Torn key is 16 letters and digits. Your saved key is unchanged.');
+        const probe = new TornApiClient({ getKey: () => key, ...tornSharing(), maxRetries: 0 });
+        const seq = (sell.publicKeyProbeSeq = (sell.publicKeyProbeSeq || 0) + 1);
+        const use = (access) => {
+            // The access first: the panel's tabs read it when the key changes under them.
+            gmDel(STORE_KEY_DEAD);
+            if (access && access.level !== null) gmSet(STORE_KEY_ACCESS, access);
+            else gmDel(STORE_KEY_ACCESS);
+            gmSet(STORE_KEY, key);
+            sell.publicKeyError = null;
+            logProblem('note', 'Public key saved in Torn Bids\' Settings' + (access && access.name ? ' (' + access.name + ')' : ''), 'the one key NPC Arbitrage uses on Torn\'s pages; the shared server is asked with its word');
+            sharedSetUp({ knock: true });
+            renderSelling(true);
+        };
+        probe.get('key', { selections: 'info' }).then(
+            (info) => {
+                if (seq === sell.publicKeyProbeSeq) use(keyAccessOf(info));
+            },
+            (error) => {
+                if (seq !== sell.publicKeyProbeSeq) return;
+                // Torn said no: the key you had stays. Anything else (no answer): saved, as the panel does.
+                if (isKeyDeadError(error)) no('Torn does not accept that key. Your saved key is unchanged.');
+                else use(null);
+            },
+        );
+    }
+
+    function onSellForgetPublicKey() {
+        gmDel(STORE_KEY);
+        gmDel(STORE_KEY_ACCESS);
+        gmDel(STORE_KEY_DEAD);
+        sell.publicKeyError = null;
+        logProblem('note', 'Public key forgotten in Torn Bids\' Settings', 'NPC Arbitrage on Torn\'s pages has no key now, and the shared server is not asked');
+        sharedSetUp();
+        renderSelling(true);
+    }
+
     /** A new key may be another player: whose listings are "yours" is asked again. */
     function forgetSelf() {
         gmDel(STORE_SELL_SELF);
@@ -40586,6 +42393,30 @@
     function onSellRetryTe() {
         setTeState({ badKey: false, error: null, lastAttemptAt: 0, idsAttemptAt: 0 });
         refreshSellTraders({ force: true });
+        renderSelling(true);
+    }
+
+    /** Settings › TornW3B: the key registered there. A typo, or a Full key, never replaces the one saved. */
+    function onSellSaveW3bKey(raw) {
+        const key = String(raw || '').trim();
+        if (!key) return;
+        const access = gmGet(STORE_SELL_KEY_ACCESS, null);
+        if (key === getLedgerKey() || (key === getSellKey() && isFullKey(access))) {
+            sell.w3bKeyMsg = 'That key has Full access. TornW3B never gets it from here: paste the key you registered on weav3r.dev. Nothing was saved.';
+        } else if (!looksLikeTornKey(key)) {
+            sell.w3bKeyMsg = 'A Torn key is 16 letters and digits. Nothing was saved.';
+        } else {
+            sell.w3bKeyMsg = null;
+            gmSet(STORE_W3B_KEY, { key, at: Date.now() });
+            logProblem('note', 'A key for TornW3B was saved', 'sent only as the header X-API-Key of a sellers list, to weav3r.dev; up to 22 sellers lists a minute with it, 8 without');
+        }
+        renderSelling(true);
+    }
+
+    function onSellForgetW3bKey() {
+        gmDel(STORE_W3B_KEY);
+        sell.w3bKeyMsg = null;
+        logProblem('note', 'The key for TornW3B was forgotten', 'sellers lists go on without it, eight a minute');
         renderSelling(true);
     }
 
@@ -40849,6 +42680,12 @@
             onRevealKey: () => getSellKey(),
             onSaveTeKey: onSellSaveTeKey,
             onForgetTeKey: onSellForgetTeKey,
+            onSavePublicKey: onSellSavePublicKey,
+            onForgetPublicKey: onSellForgetPublicKey,
+            onRevealPublicKey: () => getStoredKey(),
+            onSaveW3bKey: onSellSaveW3bKey,
+            onForgetW3bKey: onSellForgetW3bKey,
+            onRevealW3bKey: () => (w3bKeyRecord() ? w3bKeyRecord().key : ''),
             onLedgerSaveKey,
             onLedgerForget,
             onLedgerRead: () => {
@@ -40859,6 +42696,10 @@
             onRetryTe: onSellRetryTe,
             onRevealTeKey: () => getTeKey(),
             onRefresh: onSellRefresh,
+            onTraderCheck: (itemId, key) => {
+                logAction('Check now (item ' + itemId + ', trader ' + String(key).replace(/^id:/, '') + ')');
+                checkTraderNow(itemId, key);
+            },
             onPrefsChange: (partial) => {
                 // Onto what is stored, not just the known keys: trustedOn311 (the
                 // one-time Trusted switch) must survive, or Trusted comes back on

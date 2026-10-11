@@ -99,9 +99,9 @@ test('ended: traded, cancelled and never made are kept a day, each trade once, w
     assert.equal(tidyEnded('junk', NOW), 'junk');
 });
 
-test('Fresh prices only: a TornW3B price from a list not changed in two days is stale - never one with a TornExchange price, never one whose date is not known', () => {
+test('Fresh prices only: a TornW3B price from a list not changed in a day is stale (two days until 3.26.0) - never one with a TornExchange price, never one whose date is not known', () => {
     const DAY = 24 * 60 * 60 * 1000;
-    assert.equal(PRICES_STALE_MS, 2 * DAY);
+    assert.equal(PRICES_STALE_MS, DAY);
     const listAt = new Map([['1', NOW - 3 * DAY], ['2', NOW - DAY], ['3', NOW - 30 * DAY], ['5', NOW - 30 * DAY]]);
     const listAtOf = (id) => listAt.get(String(id)) || 0;
     const buyers = [
@@ -114,7 +114,7 @@ test('Fresh prices only: a TornW3B price from a list not changed in two days is 
     ];
     assert.deepEqual(buyers.map((b) => stalePrice(b, listAtOf, NOW)), [true, false, false, false, false, false]);
     assert.deepEqual(freshOnly(buyers, listAtOf, NOW).map((b) => b.id), ['2', '3', '4', '5', null]);
-    // Exactly two days is not over two days.
+    // Exactly a day is not over a day.
     assert.equal(stalePrice({ id: '9', w3b: 5 }, () => NOW - PRICES_STALE_MS, NOW), false);
     assert.equal(stalePrice({ id: '9', w3b: 5 }, () => NOW - PRICES_STALE_MS - 1, NOW), true);
     // Said on the desk, with why - only while the switch is on, and after the other two reasons.
@@ -124,15 +124,15 @@ test('Fresh prices only: a TornW3B price from a list not changed in two days is 
     assert.deepEqual(hiddenBuyers(buyers, { prefs: {}, listAtOf, now: NOW }), []);
 });
 
-test('an old list (3.22.3): over 24 hours to two days is aging, over two days is stale - the same prices Fresh prices only looks at, and no others', () => {
+test('an old list (3.22.3; 3.26.0: twelve hours and a day): over 12 hours to a day is aging, over a day is stale - the same prices Fresh prices only looks at, and no others', () => {
     const HOUR = 60 * 60 * 1000;
     const DAY = 24 * HOUR;
-    assert.equal(PRICES_AGING_MS, DAY);
-    const listAt = new Map([['1', NOW - 3 * DAY], ['2', NOW - 30 * HOUR], ['3', NOW - 30 * HOUR], ['5', NOW - 30 * HOUR], ['6', NOW - 2 * HOUR], ['7', NOW + HOUR]]);
+    assert.equal(PRICES_AGING_MS, 12 * HOUR);
+    const listAt = new Map([['1', NOW - 3 * DAY], ['2', NOW - 18 * HOUR], ['3', NOW - 18 * HOUR], ['5', NOW - 18 * HOUR], ['6', NOW - 2 * HOUR], ['7', NOW + HOUR]]);
     const listAtOf = (id) => listAt.get(String(id)) || 0;
     const buyers = [
-        { id: '1', name: 'Over two days', price: 900, w3b: 900, te: null },
-        { id: '2', name: 'A day and six hours', price: 890, w3b: 890, te: null },
+        { id: '1', name: 'Over a day', price: 900, w3b: 900, te: null },
+        { id: '2', name: 'Eighteen hours', price: 890, w3b: 890, te: null },
         { id: '3', name: 'The same, on TornExchange too', price: 880, w3b: 885, te: 880 },
         { id: '4', name: 'Date not known', price: 870, w3b: 870, te: null },
         { id: '5', name: 'TornExchange only', price: 860, w3b: null, te: 860 },
@@ -142,11 +142,11 @@ test('an old list (3.22.3): over 24 hours to two days is aging, over two days is
     ];
     assert.deepEqual(buyers.map((b) => oldList(b, listAtOf, NOW)), [
         { at: NOW - 3 * DAY, level: 'stale' },
-        { at: NOW - 30 * HOUR, level: 'aging' },
+        { at: NOW - 18 * HOUR, level: 'aging' },
         null, null, null, null, null, null,
     ]);
     assert.equal(oldList(null, listAtOf, NOW), null);
-    // Exactly 24 hours is not over 24 hours; exactly two days is still aging, as it is still shown.
+    // Exactly 12 hours is not over 12 hours; exactly a day is still aging, as it is still shown.
     const at = (ms) => oldList({ id: '9', w3b: 5 }, () => NOW - ms, NOW);
     assert.equal(at(PRICES_AGING_MS), null);
     assert.deepEqual(at(PRICES_AGING_MS + 1), { at: NOW - PRICES_AGING_MS - 1, level: 'aging' });

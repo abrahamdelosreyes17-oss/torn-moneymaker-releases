@@ -7,7 +7,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
-    besideMark, besideStep, besideBehind, besideRoom, besideBehindText, besideDue, besideLine, besideArchiveInFront,
+    besideMark, besideStep, besideOursCameAt, besideBehind, besideRoom, besideBehindText, besideDue, besideLine, besideArchiveInFront,
     BESIDE_FRONT_MARK, BESIDE_BEHIND_MARK, BESIDE_TORN_PER_MINUTE, BESIDE_W3B_PER_MINUTE, BESIDE_FRESH_MS, BESIDE_UP_MS, BESIDE_RENEW_MS, BESIDE_LOOK_EVERY_MS,
 } from '../src/core/beside.js';
 import { W3bClient } from '../src/api/w3b.js';
@@ -219,4 +219,71 @@ test('Torn Bids and Torn Archive, each by its own rules: never over one limit to
     assert.equal(peak.archiveTorn, turns.SHARES.front.torn, 'Torn Archive never got the larger share while it was looked at');
     assert.equal(peak.bidsTorn, BIDS.torn, 'Torn Bids never got its whole limit back');
     assert.equal(peak.bidsBehindTorn, BESIDE_TORN_PER_MINUTE);
+});
+
+// 3.25.1, the owner on the released 3.25.0: "its very slow ... i dont even have torn archive on". A Torn Archive
+// tab was open, last looked at before he went to work on Torn's pages and Torn Bids - and Torn Bids kept to 15 a minute.
+test('he came to a page of ours after he last looked at Torn Archive: not behind, with its tab still open', () => {
+    const T = 1700000000000;
+    const front = { app: 'archive', at: T };
+    const alive = (now) => ({ app: 'archive', at: now - 20000 });
+    // Torn Archive looked at, nothing of ours come to since: behind, and it stays so while its tab is open.
+    let st = besideStep(null, { front, alive: alive(T + 5000), now: T + 5000, oursCameAt: besideOursCameAt({ bids: { seen: T - 60000, front: T - 60000 }, page: null }, T + 5000) });
+    assert.equal(st.behind, true);
+    st = besideStep(st, { front, alive: alive(T + 600000), now: T + 600000, oursCameAt: T - 60000 });
+    assert.equal(st.behind, true);
+    // He comes to a Torn page with our panel: Torn Archive is no longer in front, and a minute later the limit is whole.
+    const sides = { bids: { seen: T - 60000, front: T - 60000 }, page: { seen: T + 610000, front: T + 610000 } };
+    const came = besideOursCameAt(sides, T + 610000);
+    assert.equal(came, T + 610000);
+    assert.equal(besideArchiveInFront(front, alive(T + 610000), T + 610000, came), false);
+    st = besideStep(st, { front, alive: alive(T + 610000), now: T + 610000, oursCameAt: came });
+    assert.deepEqual([st.behind, st.leftAt], [true, T + 610000]);
+    st = besideStep(st, { front, alive: alive(T + 671000), now: T + 671000, oursCameAt: came });
+    assert.equal(st.behind, false);
+    // It stays whole for as long as he does not look at Torn Archive again, whatever its open tab says.
+    st = besideStep(st, { front, alive: alive(T + 3600000), now: T + 3600000, oursCameAt: came });
+    assert.equal(st.behind, false);
+    // He looks at Torn Archive again: behind at once.
+    st = besideStep(st, { front: { app: 'archive', at: T + 3700000 }, alive: alive(T + 3700000), now: T + 3700000, oursCameAt: came });
+    assert.equal(st.behind, true);
+    // A time from the future is not believed, and no sign of ours means "never".
+    assert.equal(besideOursCameAt({ bids: { front: T + 999999999 }, page: null }, T), 0);
+    assert.equal(besideOursCameAt(null, T), 0);
+});
+
+/* 3.26.0: TornW3B counts an item's sellers list by address - Torn Bids and Torn Archive on one PC say their own count to each other. */
+test('the sellers-list marks: our own count as text, the other app\'s read back, only what still counts', async () => {
+    const { besideW3bMark, besideW3bText, besideW3bOther, BESIDE_W3B_OWN_MARK, BESIDE_W3B_OTHER_MARK } = await import('../src/core/beside.js');
+    const NOW = 1_900_000_000_000;
+    const hour = Math.floor(NOW / 3600000);
+    assert.deepEqual([BESIDE_W3B_OWN_MARK, BESIDE_W3B_OTHER_MARK], ['tornapps.w3b.trading', 'tornapps.w3b.archive']);
+
+    // Ours: the last minute's times (older ones and ones from the future left out), the day by hour (hours over a day old left out).
+    const text = besideW3bText([NOW - 70000, NOW - 5000, NOW - 30000, NOW + 5], { [hour]: 4, [hour - 24]: 10, [hour - 25]: 99, [hour + 1]: 7, junk: 3 }, NOW);
+    assert.deepEqual(JSON.parse(text), { at: NOW, m: [NOW - 30000, NOW - 5000], d: { [hour - 24]: 10, [hour]: 4 } });
+
+    // The other's, as the client wants it.
+    assert.deepEqual(besideW3bOther(text, NOW), { at: NOW, minute: 2, day: 14 });
+    // A minute later its minute has left; its day has not.
+    assert.deepEqual(besideW3bOther(text, NOW + 61000), { at: NOW + 61000, minute: 0, day: 14 });
+    // A mark that cannot be read counts as nothing.
+    for (const bad of [null, '', 'x', '[]', '"a"', 'null']) assert.equal(besideW3bOther(bad, NOW), null, String(bad));
+    assert.deepEqual(besideW3bMark('{}', NOW), { m: [], d: {} });
+    assert.deepEqual(besideW3bMark(JSON.stringify({ m: 'no', d: [1, 2] }), NOW), { m: [], d: {} });
+    assert.deepEqual(besideW3bMark(JSON.stringify({ m: [NOW - 1, 'x', null], d: { [hour]: -2, [hour - 1]: 2.9 } }), NOW), { m: [NOW - 1], d: { [hour - 1]: 2 } });
+});
+
+test('the sellers-list marks read the same on both sides', { skip: turnsFile ? false : 'Torn Archive\'s folder is not beside this one' }, async () => {
+    const turns = await import(turnsFile);
+    const { besideW3bMark, besideW3bText } = await import('../src/core/beside.js');
+    if (typeof turns.readW3bMark !== 'function' || typeof turns.w3bMarkText !== 'function') return;
+    const NOW = 1_900_000_000_000;
+    const hour = Math.floor(NOW / 3600000);
+    const times = [NOW - 59000, NOW - 61000, NOW - 10];
+    const day = { [hour]: 3, [hour - 3]: 8, [hour - 30]: 5 };
+    // What Torn Archive writes, Torn Bids reads as Torn Archive itself would - and the other way round.
+    assert.deepEqual(besideW3bMark(turns.w3bMarkText(times, day, NOW), NOW), turns.readW3bMark(turns.w3bMarkText(times, day, NOW), NOW));
+    assert.deepEqual(turns.readW3bMark(besideW3bText(times, day, NOW), NOW), besideW3bMark(besideW3bText(times, day, NOW), NOW));
+    assert.equal(besideW3bText(times, day, NOW), turns.w3bMarkText(times, day, NOW));
 });

@@ -106,6 +106,16 @@ export function gmMenu(label, handler) {
     }
 }
 
+/** One header out of GM_xmlhttpRequest's `responseHeaders` text ("name: value" a line), or null. */
+export function gmHeader(text, name) {
+    const want = String(name).toLowerCase();
+    for (const line of String(text || '').split(/\r?\n/)) {
+        const at = line.indexOf(':');
+        if (at > 0 && line.slice(0, at).trim().toLowerCase() === want) return line.slice(at + 1).trim();
+    }
+    return null;
+}
+
 /**
  * HTTP GET through the userscript host's own transport.
  *
@@ -123,12 +133,14 @@ export function gmMenu(label, handler) {
  * the tests).
  *
  * @param {string} url
- * @param {{timeoutMs?: number}} [options] - how long to wait for the answer (30 s)
+ * @param {{timeoutMs?: number, headers?: object}} [options] - how long to wait for the answer (30 s);
+ *   request headers (3.26.0: only TornW3B's X-API-Key, from api/w3b.js - a key is never in a URL)
  * @returns {Promise<{ok: boolean, status: number, json: function}>}
  */
-export function gmFetch(url, { timeoutMs = 30000 } = {}) {
+export function gmFetch(url, { timeoutMs = 30000, headers = null } = {}) {
+    // Under node and where the host has no transport of its own: fetch's answer carries `headers.get(name)`.
     if (typeof GM_xmlhttpRequest !== 'function') {
-        if (typeof fetch === 'function') return fetch(url);
+        if (typeof fetch === 'function') return headers ? fetch(url, { headers }) : fetch(url);
         return Promise.reject(new Error('No HTTP transport available.'));
     }
 
@@ -136,12 +148,15 @@ export function gmFetch(url, { timeoutMs = 30000 } = {}) {
         GM_xmlhttpRequest({
             method: 'GET',
             url,
+            ...(headers ? { headers } : {}),
             timeout: timeoutMs,
             onload(response) {
                 resolve({
                     ok: response.status >= 200 && response.status < 300,
                     status: response.status,
                     json: async () => JSON.parse(response.responseText),
+                    // One answer header by name (3.26.0: TornW3B's Retry-After), or null.
+                    header: (name) => gmHeader(response.responseHeaders, name),
                 });
             },
             onerror() {

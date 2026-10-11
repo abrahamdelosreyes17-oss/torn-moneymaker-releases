@@ -6,6 +6,9 @@
  * A pretend TornW3B that refuses more than N requests in any 10 seconds, two tabs that both want to
  * read all the time (as the overlay and Torn Bids do), and a clock that moves only when someone
  * sleeps. Without the pace the tabs are refused every minute, for ever; with it they settle.
+ *
+ * 3.26.0: that reading was wrong for the sellers list (it has a limit of its own, test/w3b-routes.test.js).
+ * The pace stays for every other request, so these ask for a price list - a request with no limit of its own.
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -66,7 +69,7 @@ function world({ tabs = 2, burst = 8, pace = true, down = null } = {}) {
                 if (c.stats().coolingDown) continue;
                 asked = true;
                 try {
-                    await c.get('marketplace/206', { tag: 'w.flips' });
+                    await c.get('pricelist/206', { tag: 'w.flips' });
                 } catch {
                     // The app goes on to its next tick.
                 }
@@ -126,14 +129,14 @@ test('after a pause the first request goes alone, and slowly from there - what w
     // During the pause: asked anyway (a caller that did not look) - nothing is sent, nothing is queued, and the log stays quiet.
     const before = w.sent.length;
     const logged = w.failed.length;
-    for (let i = 0; i < 20; i++) await assert.rejects(w.clients[i % 2].get('marketplace/206'), (e) => e.blocked === true && e.paused === true);
+    for (let i = 0; i < 20; i++) await assert.rejects(w.clients[i % 2].get('pricelist/206'), (e) => e.blocked === true && e.paused === true);
     assert.equal(w.sent.length, before);
     assert.equal(w.failed.length, logged, 'a paused request went to the problem log');
     // The one real 429 did.
     assert.equal(w.failed.filter((f) => f.error && f.error.http === 429).length, w.refused.length);
     // The pause over: both tabs ask at once, as they do.
     w.clock.t = refusedAt + W3B_COOLDOWN_MS + 10;
-    await Promise.all([w.clients[0].get('marketplace/1'), w.clients[1].get('marketplace/2'), w.clients[0].get('marketplace/3')]);
+    await Promise.all([w.clients[0].get('pricelist/1'), w.clients[1].get('pricelist/2'), w.clients[0].get('pricelist/3')]);
     const after = w.sent.slice(before).map((s) => s.at);
     assert.equal(after.length, 3);
     // Slower than before the refusal, not the same dozen again.
@@ -180,7 +183,7 @@ test('each answer is counted as taken or refused, the request that was never sen
     assert.equal(w.answers.length, w.sent.length);
     assert.deepEqual(Object.keys(w.answers[0]).sort(), ['at', 'path', 'refused', 'tab', 'tag']);
     const n = w.answers.length;
-    await assert.rejects(w.clients[0].get('marketplace/206'), (e) => e.paused === true);
+    await assert.rejects(w.clients[0].get('pricelist/206'), (e) => e.paused === true);
     assert.equal(w.answers.length, n);
 });
 

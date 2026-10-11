@@ -22,7 +22,80 @@ export const SHARED_BUCKETS = 16;
 const SHARED_MAX_SELLERS = 3000;
 const SHARED_MAX_NEAR = 200;
 const SHARED_MAX_WORTH = 5000;
-const SHARED_BODY_KEYS = ['app', 'ver', 'used', 'waiting', 'sellers', 'trades', 'looking', 'worth', 'since', 'seen', 'going', 'bought', 'dir'];
+const SHARED_BODY_KEYS = ['app', 'ver', 'used', 'waiting', 'sellers', 'trades', 'looking', 'worth', 'since', 'seen', 'going', 'bought', 'dir', 'want', 'w3b', 'lists', 'listsSince'];
+/*
+ * 3.26.0, the server handing out TornW3B's work (its /sync, deployed 2026-10-11):
+ *   want        the items whose sellers list this PC would ask TornW3B for next, most wanted first (60 at most)
+ *   w3b         [sellers lists left this minute, left today] of this PC's own limit
+ *   -> ask      the ones of `want` that are this PC's to read (another PC read the rest, or is better placed)
+ *   lists       trader price lists this PC read from TornW3B: [trader, read at (ms), {item: price}] (5 a sync)
+ *   listsSince  the answer's last `listsAt` (0 the first time)
+ *   -> lists    lists another person's PC read; -> listsAt
+ * TornW3B is still asked by each PC from its own address, under its own limit and name: the server only says
+ * which PC reads what, so two PCs do not ask for the same list.
+ */
+export const SHARED_MAX_WANT = 60;
+export const SHARED_MAX_LISTS = 5;
+export const SHARED_MAX_LIST_ITEMS = 2500;
+/** What the server handed out is gone by for this long after it was said (an exchange is every 30 s). */
+export const SHARED_ASK_FRESH_MS = 45000;
+
+/** One trader list as it may be sent or kept: [trader, readAt, {item: price}], or null. Numbers only. */
+export function sharedList(entry) {
+    if (!Array.isArray(entry) || entry.length !== 3) return null;
+    const trader = sharedId(entry[0]);
+    const at = entry[1];
+    const prices = entry[2];
+    if (trader === null || !Number.isInteger(at) || at <= 0 || at >= 1e13 || !prices || typeof prices !== 'object' || Array.isArray(prices)) return null;
+    const out = {};
+    let n = 0;
+    for (const [key, value] of Object.entries(prices)) {
+        const item = sharedId(key);
+        if (item === null || typeof value !== 'number' || !Number.isFinite(value) || value <= 0) continue;
+        if (n >= SHARED_MAX_LIST_ITEMS) break;
+        if (!(item in out)) n += 1;
+        out[item] = Math.round(value);
+    }
+    return n ? [trader, at, out] : null;
+}
+
+/** The answer's trader lists, checked: read by another person's PC, oldest first. */
+export function sharedListsIn(answer) {
+    const out = [];
+    for (const entry of answer && Array.isArray(answer.lists) ? answer.lists : []) {
+        const list = sharedList(entry);
+        if (list) out.push(list);
+        if (out.length >= SHARED_MAX_LISTS * 4) break;
+    }
+    return out;
+}
+
+/**
+ * What the server handed out, to keep: {at, want, ask} - `ask` only of what was wanted, in its order.
+ * Null when the server said nothing about it (an older server, or nothing was wanted).
+ */
+export function sharedAskIn(answer, want, now) {
+    if (!answer || !Array.isArray(answer.ask) || !Array.isArray(want) || !want.length) return null;
+    const wanted = new Set(want);
+    const ask = [];
+    for (const value of answer.ask) {
+        const id = sharedId(value);
+        if (id !== null && wanted.has(id) && !ask.includes(id)) ask.push(id);
+    }
+    return { at: now, want: [...wanted], ask };
+}
+
+/**
+ * May this PC ask TornW3B for an item's sellers list now, by what the server handed out? Not when it was
+ * wanted and the server left it to another PC; everything else as before - an item the server was not told
+ * of, a server that has been silent, a PC on its own.
+ */
+export function sharedMayRead(kept, itemId, now) {
+    if (!kept || !(now - kept.at < SHARED_ASK_FRESH_MS) || now < kept.at) return true;
+    const id = Number(itemId);
+    return !kept.want.includes(id) || kept.ask.includes(id);
+}
+
 // The server is shared with our other apps: each says which it is, so one person's apps are added up
 // against the one Torn limit, and whoever runs the server can ask for a newer version.
 export const SHARED_APP = 'torn-bids';
@@ -178,7 +251,7 @@ export function sharedMarks(wants, now) {
  * come out of here, whatever is put in.
  * `now`: this PC's clock; the marks leave as ages, since every PC has its own clock.
  */
-export function sharedBody({ used = 0, waiting = 0, wants = [], since = 0, seen = 0, sendWorth = true, now = 0, ver = null } = {}) {
+export function sharedBody({ used = 0, waiting = 0, wants = [], since = 0, seen = 0, sendWorth = true, now = 0, ver = null, lists = null, listsSince = null } = {}) {
     const count = (n) => (Number.isFinite(n) && n > 0 ? Math.min(1000, Math.floor(n)) : 0);
     const list = Array.isArray(wants) ? wants.filter((w) => w && typeof w === 'object') : [];
     const trades = sharedIds(list.map((w) => w.trades), SHARED_MAX_NEAR);
@@ -199,6 +272,16 @@ export function sharedBody({ used = 0, waiting = 0, wants = [], since = 0, seen 
     body.bought = marks.bought.map(([seller, item, qty, price, at]) => [seller, item, qty, price, age(at)]);
     const dir = sharedDir(list);
     if (dir.length) body.dir = dir.map(([item, at]) => [item, age(at)]);
+    // TornW3B's work (3.26.0): what this PC would read next, and what is left of its own limit.
+    const want = sharedIds(list.map((w) => w.want), SHARED_MAX_WANT);
+    const room = list.map((w) => w.w3b).find((r) => Array.isArray(r) && r.length === 2 && r.every((n) => Number.isFinite(n) && n >= 0));
+    if (want.length && room) {
+        body.want = want;
+        body.w3b = room.map((n) => Math.min(100000, Math.floor(n)));
+    }
+    const out = (Array.isArray(lists) ? lists : []).map(sharedList).filter(Boolean).slice(0, SHARED_MAX_LISTS);
+    if (out.length) body.lists = out;
+    if (Number.isInteger(listsSince) && listsSince >= 0) body.listsSince = listsSince;
     if (sendWorth) {
         const worth = {};
         let n = 0;
@@ -243,6 +326,18 @@ export function sharedOutgoingOk(body) {
         } else if (key === 'bought') {
             // [bazaar, item, how many, price, age]
             if (!Array.isArray(value) || !value.every((m) => Array.isArray(m) && m.length === 5 && m.every(whole) && m[0] > 0 && m[1] > 0 && m[2] > 0)) return false;
+        } else if (key === 'want') {
+            if (!Array.isArray(value) || value.length > SHARED_MAX_WANT || !value.every((id) => Number.isInteger(id) && id > 0 && id < 1e10)) return false;
+        } else if (key === 'w3b') {
+            if (!Array.isArray(value) || value.length !== 2 || !value.every(whole)) return false;
+        } else if (key === 'lists') {
+            // [trader, read at, {item: price}]
+            if (!Array.isArray(value) || value.length > SHARED_MAX_LISTS) return false;
+            for (const l of value) {
+                if (!Array.isArray(l) || l.length !== 3 || !Number.isInteger(l[0]) || l[0] <= 0 || l[0] >= 1e10 || !whole(l[1]) || l[1] <= 0) return false;
+                if (!l[2] || typeof l[2] !== 'object' || Array.isArray(l[2]) || Object.keys(l[2]).length > SHARED_MAX_LIST_ITEMS) return false;
+                for (const [item, price] of Object.entries(l[2])) if (!/^\d{1,10}$/.test(item) || !Number.isInteger(price) || price <= 0) return false;
+            }
         } else if (key === 'worth') {
             if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
             for (const [item, price] of Object.entries(value)) {
@@ -355,6 +450,41 @@ export function sharedIndex(buckets) {
         }
     }
     return { bySeller, byItem };
+}
+
+/**
+ * NPC Arbitrage from the server (3.26.0; the owner, 2026-10-11: bazaar prices from Torn's own API through
+ * our server, TornW3B asked only what we cannot know). A read this old or newer makes a deal by itself,
+ * and stands in for TornW3B's sellers list of the item.
+ */
+export const SHARED_DEAL_MAX_AGE_MS = 5 * 60000;
+
+/**
+ * The listings of one item the server read from Torn lately, under a price, cheapest first - rows as
+ * TornW3B's are, with no seller name (the server gives none). A price of $1 or less is a locked listing.
+ * @param {{byItem: Map}} index - sharedIndex()
+ * @param {number} under - only listings cheaper than this (what the item sells for)
+ */
+export function sharedDealRows(index, itemId, under, now, maxAge = SHARED_DEAL_MAX_AGE_MS) {
+    const out = [];
+    for (const l of (index && index.byItem && index.byItem.get(String(itemId))) || []) {
+        if (!(l.price > 1) || !(l.qty > 0) || !(l.price < under) || !(now - l.seen <= maxAge)) continue;
+        out.push({ sellerId: l.sellerId, sellerName: null, price: l.price, qty: l.qty, dataAt: l.seen, changedAt: l.at, sponsored: false, shared: true });
+    }
+    return out.sort((a, b) => a.price - b.price);
+}
+
+/**
+ * Does the server already know the cheapest bazaar price TornW3B's summary names for an item - a listing
+ * at that price or under it, read from Torn lately? Then TornW3B's sellers list of the item would say
+ * nothing new, and is not asked for.
+ */
+export function sharedKnowsLowest(index, itemId, lowest, now, maxAge = SHARED_DEAL_MAX_AGE_MS) {
+    if (!(lowest > 1)) return false;
+    for (const l of (index && index.byItem && index.byItem.get(String(itemId))) || []) {
+        if (l.price > 1 && l.qty > 0 && l.price <= lowest && now - l.seen <= maxAge) return true;
+    }
+    return false;
 }
 
 /**
@@ -636,7 +766,10 @@ export function sharedSaid(st) {
 export function sharedSaidLine(st, hours) {
     const word = sharedSaid(st);
     if (word === 'unknown') {
-        return 'Shared: the server answered 404 - the Public key of this PC is not on the server as "runs our app". Nothing is exchanged; it is asked again in ' + hours + ' hours, or at once when the key changes';
+        // 3.26.0: sooner at first (5, 15, 60 minutes), then every `hours`.
+        const ms = Number(st && st.unknownWaitMs) || 0;
+        const again = ms > 0 && ms < hours * 3600000 ? Math.round(ms / 60000) + ' minutes' : hours + ' hours';
+        return 'Shared: the server answered 404 - the Public key of this PC is not on the server as "runs our app". Nothing is exchanged; it is asked again in ' + again + ', or at once when the key changes';
     }
     if (word === 'ok') return 'Shared: the server knows this PC and answers';
     if (word === 'update') return 'Shared: the server knows this PC and wants a newer Torn Bids (' + String(st.update).slice(0, 40) + '): nothing is exchanged until this copy is updated';
@@ -682,6 +815,22 @@ export function sharedPanelLine(st, now) {
     if (silent) return { lead: 'Shared is on', rest: 'no answer from the server, working alone' };
     if (st.reading === 'stopped' || st.reading === 'resting') return { lead: 'Shared is on', rest: 'the server is not reading now, working alone' };
     return { lead: 'Shared is on', rest: st.people ? st.people + (st.people === 1 ? ' person' : ' people') : 'connected' };
+}
+
+/**
+ * Under the Public key's box in Settings (3.26.0): what the server said of this key, while that is not said
+ * anywhere else on the page - to the server's own people the Shared part says it, so here: nothing.
+ * @param {object} st - SharedLink.status()
+ * @returns {string} '' = nothing to say
+ */
+export function sharedKeyBoxLine(st) {
+    if (!st || !st.on || sharedKnown(st)) return '';
+    if (st.unknown) {
+        const ms = Number(st.unknownWaitMs) || 0;
+        const again = ms >= 3600000 ? Math.round(ms / 3600000) + (ms < 5400000 ? ' hour' : ' hours') : Math.max(1, Math.round(ms / 60000)) + ' minutes';
+        return 'Shared server: it does not know this key, so Torn Bids works alone. Whoever runs your server needs this same key from you. Asked again every ' + again + ', and at once when you save the key here again.';
+    }
+    return st.error ? 'Shared server: no answer yet.' : 'Shared server: not asked yet.';
 }
 
 /** "Your Torn key on the server": {level, text}; what the server last said of it. */

@@ -240,20 +240,16 @@ export async function fetchShops(client) {
  *
  * @returns {{level: number|null, name: string|null}}
  */
+/** What Torn's key info says of a key's access: {level, name}; nulls when it does not say. */
+export function keyAccessOf(data) {
+    const level = Number(data && data.access_level);
+    const name = (data && data.access_type) || ACCESS_LEVEL_NAMES[level] || null;
+    return { level: Number.isFinite(level) ? level : null, name };
+}
+
 export async function fetchKeyAccess(client) {
     try {
-        const data = await client.get('key', { selections: 'info' });
-
-        const level = Number(data && data.access_level);
-        const name =
-            (data && data.access_type) ||
-            ACCESS_LEVEL_NAMES[level] ||
-            null;
-
-        return {
-            level: Number.isFinite(level) ? level : null,
-            name,
-        };
+        return keyAccessOf(await client.get('key', { selections: 'info' }));
     } catch {
         // The check is advisory. If it fails, say nothing rather than
         // blocking a key that is probably fine.

@@ -976,3 +976,37 @@ test('paused means silent: while TornW3B has us wait, the feed asks nothing - an
     await a.tick();
     assert.ok(calls.length >= 2, 'did not ask again after the wait');
 });
+
+/* 3.26.0 (the owner, 2026-10-11): NPC Arbitrage takes bazaar prices from Torn's API through the shared server. */
+test('a sellers list is not asked of TornW3B when the shared server already read that cheapest price from Torn', async () => {
+    const store = memoryStore();
+    let t = 1_000_000;
+    const fetchImpl = w3bServer();
+    const asked = [];
+    let knows = true;
+    const feed = makeFeed({ store, w3bFetch: fetchImpl, now: () => t });
+    feed.d.serverKnows = (itemId, lowest) => (asked.push([itemId, lowest]), knows);
+
+    await feed.tick();
+    t += 5000;
+    await feed.tick();
+    const paths = () => fetchImpl.calls.map((c) => new URL(c).pathname);
+    assert.deepEqual(paths(), ['/api/marketplace'], 'the summary, and no sellers list');
+    assert.deepEqual(asked, [['1', 50]]);
+    assert.equal(feed.status().serverStoodIn, 1);
+
+    // The server no longer knows it (TornW3B sees a cheaper bazaar than any the server read): asked as before.
+    knows = false;
+    t += 5000;
+    await feed.tick();
+    assert.deepEqual(paths(), ['/api/marketplace', '/api/marketplace/1']);
+    // A check that throws is "not known": the list is asked for.
+    const store2 = memoryStore();
+    const fetch2 = w3bServer();
+    const feed2 = makeFeed({ store: store2, w3bFetch: fetch2, now: () => t });
+    feed2.d.serverKnows = () => { throw new Error('no reads'); };
+    await feed2.tick();
+    t += 5000;
+    await feed2.tick();
+    assert.ok(fetch2.calls.some((c) => new URL(c).pathname === '/api/marketplace/1'));
+});

@@ -22,6 +22,7 @@ import {
     SHARED_SYNC_MS, SHARED_BUCKETS, sharedAddress, sharedPassOk, sharedBody, sharedOutgoingOk, sharedVersion, sharedTake, sharedPrune,
     sharedReadBucket, sharedIndex, sharedInterest, sharedPerson, sharedMarks, sharedMarksIn, sharedMarksNow,
     sharedDir, sharedDirIn,
+    sharedList, sharedListsIn, sharedAskIn,
 } from '../core/shared.js';
 
 export const SHARED_CONFIG_KEY = 'sharedConfig';
@@ -31,6 +32,13 @@ export const SHARED_MARKS_KEY = 'sharedMarks';
 const SHARED_LEADER_KEY = 'sharedLeader';
 const SHARED_INTEREST_KEY = 'sharedInterest';
 const SHARED_ASK_KEY = 'sharedAsk';
+/* 3.26.0 - TornW3B's work, handed out by the server (core/shared.js): what it said is this PC's to read ... */
+export const SHARED_W3B_ASK_KEY = 'sharedW3bAsk';
+/* ... the trader lists this PC read, waiting to be sent (written by Torn Bids' page) ... */
+export const SHARED_LISTS_OUT_KEY = 'sharedListsOut';
+/* ... and the ones another person's PC read, for Torn Bids' page to take: {at, n, lists}. */
+export const SHARED_LISTS_IN_KEY = 'sharedListsIn';
+const SHARED_LISTS_IN_KEEP = 20;
 /* The other PCs' TornW3B reads and this PC's turn among them (core/shared.js, sharedDirIn). */
 export const SHARED_DIR_KEY = 'sharedDir';
 const SHARED_WANT_PREFIX = 'sharedWant.';
@@ -49,6 +57,14 @@ const SHARED_PRUNE_EVERY_MS = 10 * 60000;
 const SHARED_WORTH_EVERY_MS = 10 * 60000;
 // A PC the server does not know (anyone may install Torn Bids): asked again this often, in case its owner let it in.
 export const SHARED_UNKNOWN_MS = 6 * 60 * 60000;
+// 3.26.0: the first askings after a "not known" come sooner - a key its owner adds is let in within the hour,
+// not six hours later - then every SHARED_UNKNOWN_MS as before: a stranger's copy still asks four times a day.
+export const SHARED_UNKNOWN_STEPS_MS = [5 * 60000, 15 * 60000, 60 * 60000];
+/** The wait after the n-th "not known" in a row (1 = the first). */
+export function sharedUnknownWait(tries) {
+    const n = Number.isInteger(tries) && tries > 0 ? tries : 1;
+    return SHARED_UNKNOWN_STEPS_MS[n - 1] ?? SHARED_UNKNOWN_MS;
+}
 
 export class SharedLink {
     /**
@@ -108,6 +124,13 @@ export class SharedLink {
         return sharedMarksNow(this.marksKept, (this.d.load(SHARED_STATE_KEY) || {}).okAt, now);
     }
 
+    /** What the server last handed out of TornW3B's sellers lists: {at, want, ask}, or null (core/shared.js sharedMayRead). */
+    w3bAsk() {
+        if (!this.config()) return null;
+        if (this.w3bAskKept === undefined) this.w3bAskKept = this.d.load(SHARED_W3B_ASK_KEY) || null;
+        return this.w3bAskKept;
+    }
+
     /** The other PCs' TornW3B reads and this PC's turn; alone (and with Shared off) every item is this PC's. */
     dir() {
         if (!this.config()) return { reads: {}, turn: { of: 1, me: 0 } };
@@ -155,6 +178,8 @@ export class SharedLink {
             this.grantKept = undefined;
         } else if (key === SHARED_DIR_KEY) {
             this.dirKept = undefined;
+        } else if (key === SHARED_W3B_ASK_KEY) {
+            this.w3bAskKept = undefined;
         } else if (key === SHARED_MARKS_KEY) {
             this.marksKept = undefined;
             this.d.onReads();
@@ -162,6 +187,7 @@ export class SharedLink {
             this.grantKept = undefined;
             this.marksKept = undefined;
             this.dirKept = undefined;
+            this.w3bAskKept = undefined;
             this.buckets = null;
             this.kept = null;
             this.d.onReads();
@@ -200,11 +226,14 @@ export class SharedLink {
         const clean = sharedBody({ wants: [want] });
         const marks = sharedMarks([want], now);
         const dir = sharedDir([want]);
-        const json = JSON.stringify([clean.sellers, clean.trades, clean.looking, clean.worth, marks.going, marks.bought, dir]);
+        // TornW3B's work (3.26.0): what this part would read next, what is left of the limit, and whether it takes trader lists.
+        const w3b = clean.want ? { want: clean.want, w3b: clean.w3b } : {};
+        const takes = want.lists ? { lists: true } : {};
+        const json = JSON.stringify([clean.sellers, clean.trades, clean.looking, clean.worth, marks.going, marks.bought, dir, w3b, takes]);
         if (json === this.wantJson && now - this.wantAt < SHARED_WANT_EVERY_MS) return;
         this.wantJson = json;
         this.wantAt = now;
-        this.d.save(SHARED_WANT_PREFIX + this.d.world, { at: now, sellers: clean.sellers, trades: clean.trades, looking: clean.looking, worth: clean.worth, going: marks.going, bought: marks.bought, dir });
+        this.d.save(SHARED_WANT_PREFIX + this.d.world, { at: now, sellers: clean.sellers, trades: clean.trades, looking: clean.looking, worth: clean.worth, going: marks.going, bought: marks.bought, dir, ...w3b, ...takes });
     }
 
     /** Call every SHARED_TICK_MS. */
@@ -223,7 +252,7 @@ export class SharedLink {
 
         const state = this.d.load(SHARED_STATE_KEY) || {};
         const since = now - (state.syncAt || 0);
-        if (state.unknown && since < SHARED_UNKNOWN_MS) return;
+        if (state.unknown && since < sharedUnknownWait(state.unknownTries)) return;
         const asked = this.asked().at;
         if (since < SHARED_SYNC_MS && !(asked >= (state.syncAt || 0) && asked > 0 && since >= SHARED_SOON_MS)) return;
 
@@ -253,6 +282,11 @@ export class SharedLink {
         }
 
         const state = { ...before, syncAt: startedAt, error: null, unknown: false };
+        // Trader lists (3.26.0): only while Torn Bids' page is open - it reads them, and it takes the others'.
+        const takesLists = wants.some((w) => w.lists);
+        if (!this.listsSent) this.listsSent = new Map();
+        let listsAt = Number.isInteger(before.listsAt) && before.listsAt >= 0 ? before.listsAt : 0;
+        const listsGot = [];
         const touched = new Set();
         let marksChanged = false;
         let born = before.born ?? null;
@@ -268,7 +302,11 @@ export class SharedLink {
                 const ver = this.d.version || null;
                 const worthJson = JSON.stringify(probe.worth);
                 const sendWorth = page === 0 && (worthJson !== this.worthJson || now - this.worthAt >= SHARED_WORTH_EVERY_MS || born === null);
-                const body = sharedBody({ used: use.used, waiting: (Number(use.waiting) || 0) + others, wants, since: seq, seen, sendWorth, now, ver });
+                // The lists read since the last exchange that took them, on the first page only.
+                const listsOut = takesLists && page === 0
+                    ? (this.d.load(SHARED_LISTS_OUT_KEY) || []).map(sharedList).filter((l) => l && this.listsSent.get(l[0]) !== l[1])
+                    : [];
+                const body = sharedBody({ used: use.used, waiting: (Number(use.waiting) || 0) + others, wants: page === 0 ? wants : wants.map(({ want, w3b, ...w }) => w), since: seq, seen, sendWorth, now, ver, lists: listsOut, listsSince: takesLists && page === 0 ? listsAt : null });
                 if (!sharedOutgoingOk(body)) throw new Error('Not sent: the message was not in the agreed shape.');
 
                 const response = await this.d.post(`${cfg.address}/sync`, {
@@ -277,6 +315,7 @@ export class SharedLink {
                 });
                 if (response.status === 404) {
                     state.unknown = true;
+                    state.unknownTries = (Number.isInteger(before.unknownTries) ? before.unknownTries : 0) + 1;
                     throw new Error('The server does not know this PC.');
                 }
                 // Whoever runs the server asked for a newer Torn Bids. Our Torn use was still counted there, so
@@ -343,9 +382,27 @@ export class SharedLink {
                     this.d.save(SHARED_DIR_KEY, dirNow);
                 }
                 state.turn = dirNow.turn;
+                if (page === 0) {
+                    // TornW3B's work: which of the wanted sellers lists are this PC's, and the others' trader lists.
+                    for (const l of body.lists || []) this.listsSent.set(l[0], l[1]);
+                    if (this.listsSent.size > 500) this.listsSent = new Map([...this.listsSent].slice(-250));
+                    const handed = sharedAskIn(answer, body.want || [], got);
+                    if (JSON.stringify(handed) !== JSON.stringify(this.w3bAsk())) {
+                        this.w3bAskKept = handed;
+                        if (handed) this.d.save(SHARED_W3B_ASK_KEY, handed);
+                        else this.d.del(SHARED_W3B_ASK_KEY);
+                    }
+                    state.w3bAsk = handed ? [handed.ask.length, handed.want.length] : null;
+                    if (takesLists) {
+                        listsGot.push(...sharedListsIn(answer));
+                        if (Number.isInteger(answer.listsAt) && answer.listsAt >= 0) listsAt = answer.listsAt;
+                        state.listsOut = (Number.isInteger(before.listsOut) ? before.listsOut : 0) + (body.lists || []).length;
+                    }
+                }
                 if (Number.isInteger(answer.seq)) seq = answer.seq;
                 if (Number.isFinite(answer.now)) seen = answer.now;
                 state.okAt = got;
+                state.unknownTries = 0;
                 state.update = null;
                 state.reading = answer.state ?? null;
                 state.key = answer.key ?? null;
@@ -368,6 +425,14 @@ export class SharedLink {
             for (const b of sharedPrune(this.buckets, this.now())) touched.add(b);
         }
         for (const b of touched) this.d.save(SHARED_READS_PREFIX + b, this.buckets[b]);
+        if (listsGot.length) {
+            // For Torn Bids' page to take: the newest kept, numbered so each is taken once.
+            const had = this.d.load(SHARED_LISTS_IN_KEY) || {};
+            const n = (Number.isInteger(had.n) ? had.n : 0) + listsGot.length;
+            this.d.save(SHARED_LISTS_IN_KEY, { at: startedAt, n, lists: [...(Array.isArray(had.lists) ? had.lists : []), ...listsGot].slice(-SHARED_LISTS_IN_KEEP) });
+            state.listsIn = (Number.isInteger(before.listsIn) ? before.listsIn : 0) + listsGot.length;
+        }
+        state.listsAt = listsAt;
         state.seq = seq;
         state.seenAt = seen;
         state.born = born;
@@ -380,10 +445,25 @@ export class SharedLink {
         if (touched.size || marksChanged) this.d.onReads();
     }
 
+    /**
+     * Ask again now (3.26.0): the same key was saved again while the server's last answer was "not known" - its
+     * owner may just have let this PC in (2026-10-11: a key added on the server waited out six silent hours,
+     * and saving it again changed nothing). The wait starts over; the tab that does the exchanging asks on its
+     * next tick. @returns {boolean} whether there was a "not known" to ask again about
+     */
+    knock() {
+        const state = this.d.load(SHARED_STATE_KEY) || {};
+        if (!this.config() || !state.unknown) return false;
+        this.d.save(SHARED_STATE_KEY, { ...state, syncAt: 0, unknownTries: 0 });
+        return true;
+    }
+
     /** The server's address or this PC's word changed, or there is none now: what was kept under the old one goes. */
     forget() {
         for (let i = 0; i < SHARED_BUCKETS; i += 1) this.d.del(SHARED_READS_PREFIX + i);
-        for (const key of [SHARED_STATE_KEY, SHARED_GRANT_KEY, SHARED_MARKS_KEY, SHARED_INTEREST_KEY, SHARED_ASK_KEY, SHARED_DIR_KEY]) this.d.del(key);
+        for (const key of [SHARED_STATE_KEY, SHARED_GRANT_KEY, SHARED_MARKS_KEY, SHARED_INTEREST_KEY, SHARED_ASK_KEY, SHARED_DIR_KEY, SHARED_W3B_ASK_KEY, SHARED_LISTS_OUT_KEY, SHARED_LISTS_IN_KEY]) this.d.del(key);
+        this.w3bAskKept = null;
+        this.listsSent = new Map();
         this.buckets = null;
         this.kept = null;
         this.interest = null;
@@ -416,7 +496,13 @@ export class SharedLink {
             people: Number.isInteger(state.people) ? state.people : null,
             peopleOn: Array.isArray(state.on) ? state.on : [],
             you: state.you || null,
+            // TornW3B's work (3.26.0): [handed to this PC, wanted] at the last exchange; trader lists sent and taken so far.
+            w3bAsk: Array.isArray(state.w3bAsk) ? state.w3bAsk : null,
+            listsOut: Number.isInteger(state.listsOut) ? state.listsOut : 0,
+            listsIn: Number.isInteger(state.listsIn) ? state.listsIn : 0,
             unknown: Boolean(cfg && state.unknown),
+            // When a PC the server does not know asks again (ms from the last asking).
+            unknownWaitMs: cfg && state.unknown ? sharedUnknownWait(state.unknownTries) : null,
             now,
         };
     }
