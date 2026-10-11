@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      3.27.0
+// @version      3.28.0
 // @description  Finds Bazaar and Item Market listings below NPC / market value - on the page you are viewing, and live from the Torn API and TornW3B - ranked by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -52,7 +52,7 @@
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '3.27.0';
+    const TTV2_BUILD_VERSION = '3.28.0';
     const TTV2_SHARED_HOME = 'https://torn-bids-shared.pumping-iron-worker.workers.dev';
 
     /* ===== src/platform/gm.js ===== */
@@ -645,7 +645,7 @@
     const SHARED_MAX_SELLERS = 3000;
     const SHARED_MAX_NEAR = 200;
     const SHARED_MAX_WORTH = 5000;
-    const SHARED_BODY_KEYS = ['app', 'ver', 'used', 'waiting', 'sellers', 'trades', 'looking', 'worth', 'since', 'seen', 'going', 'bought', 'dir', 'want', 'w3b', 'lists', 'listsSince', 'calls'];
+    const SHARED_BODY_KEYS = ['app', 'ver', 'used', 'waiting', 'sellers', 'trades', 'looking', 'worth', 'since', 'seen', 'going', 'bought', 'dir', 'want', 'w3b', 'lists', 'listsSince', 'calls', 'moves'];
     /*
      * 3.26.0, the server handing out TornW3B's work (its /sync, deployed 2026-10-11):
      *   want        the items whose sellers list this PC would ask TornW3B for next, most wanted first (60 at most)
@@ -662,6 +662,32 @@
     const SHARED_MAX_LIST_ITEMS = 2500;
     /** What the server handed out is gone by for this long after it was said (an exchange is every 30 s). */
     const SHARED_ASK_FRESH_MS = 45000;
+
+    /*
+     * 3.28.0 - how fast items leave the bazaars, as the server counted it from its own reads of Torn:
+     *   moves       the time of the table this PC holds (the server's clock; 0 for none)
+     *   -> moves    {at, rows: [[item, units an hour]]} when the server has a newer one
+     * Nothing new leaves this PC for it: one number.
+     */
+    const SHARED_MAX_MOVES = 3000;
+    /** The answer's table, checked: {at, rows: {item: units an hour}}, or null when the server sent none. */
+    function sharedMovesIn(answer) {
+        const m = answer && answer.moves;
+        if (!m || typeof m !== 'object' || !Number.isInteger(m.at) || m.at <= 0 || m.at >= 1e13 || !Array.isArray(m.rows)) return null;
+        const rows = {};
+        let n = 0;
+        for (const r of m.rows) {
+            if (!Array.isArray(r) || r.length !== 2) continue;
+            const item = sharedId(r[0]);
+            if (item === null || typeof r[1] !== 'number' || !Number.isFinite(r[1]) || r[1] < 0 || r[1] > 1e7) continue;
+            if (!(item in rows)) {
+                if (n >= SHARED_MAX_MOVES) continue;
+                n += 1;
+            }
+            rows[item] = r[1];
+        }
+        return { at: m.at, rows };
+    }
 
     /** One trader list as it may be sent or kept: [trader, readAt, {item: price}], or null. Numbers only. */
     function sharedList(entry) {
@@ -891,7 +917,7 @@
      * come out of here, whatever is put in.
      * `now`: this PC's clock; the marks leave as ages, since every PC has its own clock.
      */
-    function sharedBody({ used = 0, waiting = 0, wants = [], since = 0, seen = 0, sendWorth = true, now = 0, ver = null, lists = null, listsSince = null, calls = null } = {}) {
+    function sharedBody({ used = 0, waiting = 0, wants = [], since = 0, seen = 0, sendWorth = true, now = 0, ver = null, lists = null, listsSince = null, calls = null, moves = null } = {}) {
         const count = (n) => (Number.isFinite(n) && n > 0 ? Math.min(1000, Math.floor(n)) : 0);
         const list = Array.isArray(wants) ? wants.filter((w) => w && typeof w === 'object') : [];
         const trades = sharedIds(list.map((w) => w.trades), SHARED_MAX_NEAR);
@@ -922,6 +948,8 @@
         const out = (Array.isArray(lists) ? lists : []).map(sharedList).filter(Boolean).slice(0, SHARED_MAX_LISTS);
         if (out.length) body.lists = out;
         if (Number.isInteger(listsSince) && listsSince >= 0) body.listsSince = listsSince;
+        // 3.28.0 - the table of item speeds this PC holds (its time on the server's clock): a newer one is sent back.
+        if (Number.isInteger(moves) && moves >= 0 && moves < 1e13) body.moves = moves;
         // 3.26.2 - this PC's own request counts since the last answered exchange (core/usage.js): {} = none were made.
         if (calls && typeof calls === 'object' && !Array.isArray(calls)) {
             body.calls = {};
@@ -1615,6 +1643,8 @@
     /* ... and the ones another person's PC read, for Torn Bids' page to take: {at, n, lists}. */
     const SHARED_LISTS_IN_KEY = 'sharedListsIn';
     const SHARED_LISTS_IN_KEEP = 20;
+    /* 3.28.0 - how fast items leave the bazaars, as the server counted it: {at (the server's clock), got (this PC's), rows: {item: units an hour}}. */
+    const SHARED_MOVES_KEY = 'sharedMoves';
     /* The other PCs' TornW3B reads and this PC's turn among them (core/shared.js, sharedDirIn). */
     const SHARED_DIR_KEY = 'sharedDir';
     // 3.26.2 - this PC's request counts waiting to be sent, every tab's in one sum (core/usage.js usageCallsAdd).
@@ -1889,6 +1919,7 @@
             const listsGot = [];
             const touched = new Set();
             let marksChanged = false;
+            let movesChanged = false;
             let born = before.born ?? null;
             let seen = Number.isFinite(before.seenAt) ? before.seenAt : 0;
             try {
@@ -1908,7 +1939,10 @@
                         : [];
                     // This PC's own request counts since the last answered exchange, on the first page only ({} = none made).
                     const callsOut = page === 0 ? usageCallsOut(this.d.load(SHARED_CALLS_KEY), now) : null;
-                    const body = sharedBody({ used: use.used, waiting: (Number(use.waiting) || 0) + others, wants: page === 0 ? wants : wants.map(({ want, w3b, ...w }) => w), since: seq, seen, sendWorth, now, ver, lists: listsOut, listsSince: takesLists && page === 0 ? listsAt : null, calls: callsOut });
+                    // The item speeds (3.28.0): asked for only while Torn Bids' page is open - it plans by them.
+                    const movesHeld = takesLists && page === 0 ? this.d.load(SHARED_MOVES_KEY) : null;
+                    const movesAt = takesLists && page === 0 ? (movesHeld && Number.isInteger(movesHeld.at) && movesHeld.at > 0 ? movesHeld.at : 0) : null;
+                    const body = sharedBody({ used: use.used, waiting: (Number(use.waiting) || 0) + others, wants: page === 0 ? wants : wants.map(({ want, w3b, ...w }) => w), since: seq, seen, sendWorth, now, ver, lists: listsOut, listsSince: takesLists && page === 0 ? listsAt : null, calls: callsOut, moves: movesAt });
                     if (!sharedOutgoingOk(body)) throw new Error('Not sent: the message was not in the agreed shape.');
 
                     const response = await this.d.post(`${cfg.address}/sync`, {
@@ -2011,6 +2045,13 @@
                             if (Number.isInteger(answer.listsAt) && answer.listsAt >= 0) listsAt = answer.listsAt;
                             state.listsOut = (Number.isInteger(before.listsOut) ? before.listsOut : 0) + (body.lists || []).length;
                         }
+                        // A newer table of item speeds: kept whole (it replaces the one before).
+                        const moved = movesAt === null ? null : sharedMovesIn(answer);
+                        if (moved) {
+                            this.d.save(SHARED_MOVES_KEY, { at: moved.at, got, rows: moved.rows });
+                            state.moves = Object.keys(moved.rows).length;
+                            movesChanged = true;
+                        }
                     }
                     if (Number.isInteger(answer.seq)) seq = answer.seq;
                     if (Number.isFinite(answer.now)) seen = answer.now;
@@ -2055,7 +2096,8 @@
             this.rev = state.rev;
             this.d.save(SHARED_STATE_KEY, state);
             if (touched.size) this.kept = null;
-            if (touched.size || marksChanged) this.d.onReads();
+            // (This tab hears no change of what it stored itself: the page is told here.)
+            if (touched.size || marksChanged || movesChanged) this.d.onReads();
         }
 
         /**
@@ -2074,7 +2116,7 @@
         /** The server's address or this PC's word changed, or there is none now: what was kept under the old one goes. */
         forget() {
             for (let i = 0; i < SHARED_BUCKETS; i += 1) this.d.del(SHARED_READS_PREFIX + i);
-            for (const key of [SHARED_STATE_KEY, SHARED_GRANT_KEY, SHARED_MARKS_KEY, SHARED_INTEREST_KEY, SHARED_ASK_KEY, SHARED_DIR_KEY, SHARED_W3B_ASK_KEY, SHARED_LISTS_OUT_KEY, SHARED_LISTS_IN_KEY, SHARED_CALLS_KEY]) this.d.del(key);
+            for (const key of [SHARED_STATE_KEY, SHARED_GRANT_KEY, SHARED_MARKS_KEY, SHARED_INTEREST_KEY, SHARED_ASK_KEY, SHARED_DIR_KEY, SHARED_W3B_ASK_KEY, SHARED_LISTS_OUT_KEY, SHARED_LISTS_IN_KEY, SHARED_CALLS_KEY, SHARED_MOVES_KEY]) this.d.del(key);
             this.w3bAskKept = null;
             this.listsSent = new Map();
             this.buckets = null;
@@ -2116,6 +2158,8 @@
                 // 3.26.2: this PC's request counts told to the server so far, and in how many exchanges.
                 callsOut: Number.isInteger(state.callsOut) ? state.callsOut : 0,
                 callsSyncs: Number.isInteger(state.callsSyncs) ? state.callsSyncs : 0,
+                // 3.28.0: how many items the server's last table of speeds named (null: none came yet).
+                moves: Number.isInteger(state.moves) ? state.moves : null,
                 unknown: Boolean(cfg && state.unknown),
                 // When a PC the server does not know asks again (ms from the last asking).
                 unknownWaitMs: cfg && state.unknown ? sharedUnknownWait(state.unknownTries) : null,
@@ -4557,6 +4601,58 @@
         const ours = (gave) => !gave || Object.entries(gave).some(([k, v]) => planned.has(String(k)) && Number(v) > 0);
         const hits = (finished || []).filter((f) => f && f.partnerId && String(f.partnerId) === id && Number(f.t) >= from && Number(f.t) <= until && ours(f.gave));
         return hits.sort((a, b) => a.t - b.t)[0] || null;
+    }
+
+    /* ------------------------------------------- the trade was called off on Torn (3.27.1) */
+
+    /*
+     * The friend (3.26.2, 2026-10-12): "Trader declined the trade and the trades
+     * in torn bids doesn't disappear I have to manually remove them myself". Only
+     * a trade that went through closed by itself; one the trader declined (or
+     * that ran out) stayed "under way" until Cancel trade was pressed.
+     *
+     * Torn lists the trades you have open (/v2/user/trades, cat ongoing). One
+     * with the trader of an accepted trade is remembered; when it is no longer
+     * open, did not go through, and no other trade with them is open, the trade
+     * was called off. Counted on TRADE_GONE_CHECKS reads in a row (a minute
+     * apart), so a trade that finished between two requests is first seen in
+     * your finished trades.
+     */
+    const TRADE_GONE_CHECKS = 2;
+
+    /**
+     * @param {object|null} going - what was kept: trade key -> {yesAt, ids: string[], misses}
+     * @param {Array} open - the accepted trades (with a trader id)
+     * @param {Array<{id, partnerId}>} ongoing - your open trades on Torn, read now
+     * @param {object} [o]
+     * @param {function} [o.finished] - (Torn trade id) => null (not among your finished trades), 'empty' (listed, nothing changed hands), else truthy
+     * @returns {{going: object, gone: string[]}} what to keep, and the keys of the trades called off
+     */
+    function tradesCalledOff(going, open, ongoing, { finished = () => null, checks = TRADE_GONE_CHECKS } = {}) {
+        const next = {};
+        const gone = [];
+        for (const t of open || []) {
+            const partner = t && t.trader && t.trader.id ? String(t.trader.id) : null;
+            if (!partner || !t.key) continue;
+            const was = going && going[t.key] && Number(going[t.key].yesAt) === Number(t.at) ? going[t.key] : null;
+            const here = (ongoing || []).filter((x) => x && x.id && String(x.partnerId) === partner).map((x) => String(x.id));
+            if (here.length) {
+                next[t.key] = { yesAt: Number(t.at), ids: [...new Set([...(was ? was.ids : []), ...here])].slice(-10), misses: 0 };
+                continue;
+            }
+            // Never seen open on Torn: nothing to go by.
+            if (!was || !was.ids.length) continue;
+            // One that finished with something in it is not this (finishedTradeFor closes that), nor a calling off.
+            const ids = was.ids.filter((id) => {
+                const f = finished(id);
+                return !f || f === 'empty';
+            });
+            if (!ids.length) continue;
+            const misses = (Number(was.misses) || 0) + 1;
+            if (misses >= checks) gone.push(t.key);
+            else next[t.key] = { yesAt: Number(t.at), ids, misses };
+        }
+        return { going: next, gone };
     }
 
     /**
@@ -8133,7 +8229,7 @@
         const searching = Boolean(read.searching);
         const same = Boolean(prev && prev.key === key && prev.total === read.rowsTotal && Boolean(prev.searching) === searching);
         const perRow = Math.max(Number(read.perRow) || 0, same ? Number(prev.perRow) || 0 : 0);
-        const whole = (read.rows || []).filter((r) => r && Number.isInteger(r.index) && r.index >= 0 && r.index < read.rowsTotal && r.ids.length >= 1 && (r.index === read.rowsTotal - 1 || r.ids.length >= perRow));
+        const whole = (read.rows || []).filter((r) => r && Number.isInteger(r.index) && r.index >= 0 && r.index < read.rowsTotal && r.ids.length >= 1 && !r.open && (r.index === read.rowsTotal - 1 || r.ids.length >= perRow));
         const sigs = whole.map((r) => [String(r.index), r.ids.map(String).join(',')]);
         const moved = same && sigs.some(([i, s]) => i in prev.rows && prev.rows[i] !== s);
         const rows = same && !moved ? { ...prev.rows } : {};
@@ -8213,6 +8309,8 @@
             if (!hadList) return true;
             return Boolean(rest && !rest.length && last.rowTotal === 1);
         }
+        // A buy form is open on a listing that could not be named (3.27.1): it may be this one.
+        if ((read.rows || []).some((r) => r && r.open)) return false;
         if (absent) return true;
         if (!rest || last.row === null || last.row === undefined || Boolean(read.searching) !== Boolean(last.rowSearch)) return false;
         if (read.rows.some((r) => r.ids.map(String).includes(id))) return false;
@@ -8482,6 +8580,68 @@
         };
     }
 
+    /* ===== src/sources/dom/buy-form.js ===== */
+    /*
+     * Torn's buy form on a bazaar listing, read only (3.27.1).
+     *
+     * Read on the owner's own bazaar page, 2026-10-11: a listing's tile is
+     * div.item___. Closed, it holds the card (div.itemDescription___: the
+     * picture, two buttons - "Show info: <name>" and "Buy: <name>" - the name,
+     * the price, the stock). OPEN, the card is NOT in the page: the tile holds
+     * only div.buyMenu___ - the name, the price, "(890 in stock)", Close, the
+     * number box and Buy ("Buy: <name>"). No picture anywhere in the tile.
+     *
+     * The cards and the rows of a bazaar are found by their pictures (detect.js,
+     * bazaar-list.js), so a listing whose form is open was not found at all - and
+     * "not found just after you pressed on it" was taken for "you bought all of
+     * it" (the owner, 2026-10-11: a Naval Cutlass at $41,000,000 in To sell that
+     * he never bought). This finds the forms, so their listings still count as
+     * there. Nothing here presses or types anything.
+     */
+
+    const BUY_FORM_SELECTOR = '[class*="buyMenu"]';
+
+    const bfNumber = (s) => Number(String(s == null ? '' : s).replace(/[^\d]/g, '')) || 0;
+
+    /**
+     * The buy forms open under `root`: [{el, name, price, qty}] in page order.
+     * `price` and `qty` are 0 when the form does not say them; a form with no
+     * name is left out (it names no listing).
+     */
+    function openBuyForms(root) {
+        const out = [];
+        if (!root || !root.querySelectorAll) return out;
+        let nodes;
+        try {
+            nodes = root.querySelectorAll(BUY_FORM_SELECTOR);
+        } catch {
+            return out;
+        }
+        for (const el of nodes) {
+            // The outermost element of a form only (its parts carry the word in their class names too).
+            if (el.parentElement && el.parentElement.closest && el.parentElement.closest(BUY_FORM_SELECTOR)) continue;
+            const text = String(el.textContent || '').replace(/\s+/g, ' ');
+            const named = typeof el.querySelector === 'function' ? el.querySelector('[class*="name"]') : null;
+            const name = String(named ? named.textContent : text.split('$')[0]).replace(/\s+/g, ' ').trim();
+            if (!name) continue;
+            out.push({ el, name, price: bfNumber((text.match(/\$\s?[\d,]+/) || [])[0]), qty: bfNumber((text.match(/([\d,]+)\s+in stock/i) || [])[1]) });
+        }
+        return out;
+    }
+
+    /**
+     * The open buy form whose own Buy was pressed (`target`: what was pressed),
+     * or null - Close, the number box and anything outside a form are not it.
+     */
+    function buyFormBought(target) {
+        if (!target || !target.closest) return null;
+        const form = target.closest(BUY_FORM_SELECTOR);
+        const button = target.closest('button, input[type="submit"], input[type="button"], [role="button"]');
+        if (!form || !button || !form.contains(button)) return null;
+        const label = String(button.getAttribute('aria-label') || button.textContent || button.value || '').trim();
+        return /^buy\b/i.test(label) ? form : null;
+    }
+
     /* ===== src/sources/dom/bazaar-list.js ===== */
     /*
      * How much of a player's bazaar is in the page, read only.
@@ -8502,6 +8662,7 @@
      * Anything not laid out this way reads as null, and the caller carries on as
      * it did before it knew any of this.
      */
+
 
 
 
@@ -8542,10 +8703,16 @@
     /**
      * What the page shows of the bazaar's list now.
      *
+     * A listing whose buy form is open has no picture (buy-form.js): it is named
+     * by its form - `idOfForm({name, price, qty})` gives its item id - and keeps
+     * its place in its row. One that cannot be named marks the row `open`: a
+     * listing is in it that the ids do not show, so nothing is judged from it.
+     *
      * @param {Document|Element} root
-     * @returns {null|{rowsTotal: number, perRow: number, rows: Array<{index: number, ids: string[], el: Element}>, searching: boolean}}
+     * @param {function} [idOfForm]
+     * @returns {null|{rowsTotal: number, perRow: number, rows: Array<{index: number, ids: string[], el: Element, open?: boolean}>, searching: boolean}}
      */
-    function readBazaarList(root) {
+    function readBazaarList(root, idOfForm = () => null) {
         const list = root && root.querySelector ? root.querySelector(BAZAAR_LIST_SELECTOR) : null;
         if (!list) return null;
         const els = [...list.querySelectorAll(BAZAAR_ROW_SELECTOR)];
@@ -8558,8 +8725,22 @@
             const y = styleNumber(el, OFFSET_RE);
             // A row not placed by its offset: not the list read above.
             if (y === null || y < 0) return null;
-            const ids = [...el.querySelectorAll(ITEM_IMAGE_SELECTOR)].map(itemIdFromImage).filter(Boolean).map(String);
-            rows.push({ index: Math.round(y / rowHeight), ids, el });
+            const forms = openBuyForms(el);
+            const ids = [];
+            let open = false;
+            // In page order: each listing by its picture, or by its open form.
+            for (const node of el.querySelectorAll(ITEM_IMAGE_SELECTOR + ', ' + BUY_FORM_SELECTOR)) {
+                const form = forms.find((x) => x.el === node);
+                if (form) {
+                    const id = idOfForm(form);
+                    if (id) ids.push(String(id));
+                    else open = true;
+                } else if (!forms.some((x) => x.el.contains(node))) {
+                    const id = itemIdFromImage(node);
+                    if (id) ids.push(String(id));
+                }
+            }
+            rows.push(open ? { index: Math.round(y / rowHeight), ids, el, open } : { index: Math.round(y / rowHeight), ids, el });
         }
         const rowsTotal = Math.round(listHeight / rowHeight);
         if (!(rowsTotal > 0)) return null;
@@ -8687,6 +8868,65 @@
         return (rec.units / rec.ms) * 3600000;
     }
 
+    /*
+     * 3.28.0 - amounts by how fast an item really moves (the owner, 2026-10-11: "tornbids wants to look for the
+     * fastest flippable items ... thimle x10 or cans x100. sometimes traders dont buy that ... they would only buy
+     * high liquid items on that amount").
+     *
+     * Until now only a trade's EXTRA items had a limit by kind (fast: Most per flip, normal 10, slow 3), the kind was
+     * mostly Torn's item type, and the main flip had none. Now the shared server counts what leaves the bazaars it
+     * reads from Torn (server/src/moves.js) and sends units an hour per item; no more of an item goes in one trade
+     * than moves in about AMOUNT_HOURS, the main flip and the extras alike.
+     *
+     * Three rules keep this from costing a flip (the owner, 2026-10-12: "im just scared we find 0 deals now"):
+     *   - it changes how many and the order, never whether: an amount is never under 1, and the least profit is a
+     *     share of each item's price, so fewer of an item cannot fail it;
+     *   - an item nobody measured is planned exactly as before (measuredRate null -> the old limits);
+     *   - what a trader took from you before is believed over the count: never fewer than that.
+     */
+
+    /** No more of an item in one trade than leaves the bazaars in this many hours. Ours, not the owner's number. */
+    const AMOUNT_HOURS = 1;
+    /** Measured under this many an hour: a slow seller, whatever its type. */
+    const SLOW_PER_HOUR = 1;
+
+    /**
+     * Units an hour that really move, or null when the shared server has not measured the item. This PC's own count
+     * (TornW3B's lists read twice) can only raise it: each sees a part of the market, so the higher is the nearer.
+     * Without the server's word there is no rate at all - a PC on its own plans as it always did.
+     *
+     * @param {number|null|undefined} serverRate - units an hour, from the shared server's table
+     * @param {{units, ms}|null} [move] - this PC's own movement record (addMovement)
+     */
+    function measuredRate(serverRate, move = null) {
+        if (typeof serverRate !== 'number' || !Number.isFinite(serverRate) || serverRate < 0) return null;
+        const own = perHour(move);
+        return own !== null && own > serverRate ? own : serverRate;
+    }
+
+    /**
+     * The most of one item a trade takes.
+     *
+     * @param {object} p
+     * @param {number} p.most - Most per flip
+     * @param {string} [p.kind] - 'fast' | 'normal' | 'slow'
+     * @param {number|null} [p.rate] - measuredRate(); null: not measured
+     * @param {boolean} [p.extra] - an extra item of a trade (cover), not its main flip
+     * @param {number} [p.took] - the most of it this trader took from you in one trade before (0: never)
+     */
+    function amountCap({ most = Infinity, kind = 'normal', rate = null, extra = false, took = 0 } = {}) {
+        const top = most > 0 ? Math.floor(most) : Infinity;
+        // Not measured: as it always was - the main flip up to Most per flip, an extra by its kind.
+        let n = extra ? Math.min(top, EXTRA_CAP[kind] ?? EXTRA_CAP.normal) : top;
+        if (typeof rate === 'number' && Number.isFinite(rate) && rate >= 0) {
+            n = Math.max(1, Math.ceil(rate * AMOUNT_HOURS));
+            // One of a kind (a weapon, armour): as cover, still only a few.
+            if (extra && kind === 'slow') n = Math.min(n, EXTRA_CAP.slow);
+        }
+        if (took > 0) n = Math.max(n, Math.floor(took));
+        return Math.max(1, Math.min(top, n));
+    }
+
     /**
      * The kind of an item: 'fast', 'normal' or 'slow'.
      *
@@ -8695,9 +8935,11 @@
      * @param {boolean} [p.statItem] - one of a kind (weapons, armour, cars)
      * @param {Array|null} [p.sellers] - its bazaar listings, when read
      * @param {{units, ms}|null} [p.move] - its movement record (addMovement)
+     * @param {number|null} [p.rate] - measuredRate(): when the item was measured, that decides - not its type
      */
-    function liquidityKind({ type = null, statItem = false, sellers = null, move = null } = {}) {
+    function liquidityKind({ type = null, statItem = false, sellers = null, move = null, rate: measured = null } = {}) {
         if (statItem) return 'slow';
+        if (typeof measured === 'number' && Number.isFinite(measured)) return measured >= FAST_PER_HOUR ? 'fast' : measured < SLOW_PER_HOUR ? 'slow' : 'normal';
         const rate = perHour(move);
         if (rate !== null && rate >= FAST_PER_HOUR) return 'fast';
         // Watched for hours and nothing moved: whatever its type, nobody is buying.
@@ -8804,6 +9046,9 @@
      * @param {string|null} [p.traderId] - the trader: their own bazaar is never bought from
      * @param {function|null} [p.kindOf] - itemId -> 'fast' | 'normal' | 'slow': the main flip and its
      *   extras (see above); null plans every item up to Most, the item on the desk first
+     * @param {function|null} [p.capOf] - (itemId, extra) => the most of the item this trade takes (3.28.0,
+     *   core/liquidity.js amountCap: by how fast it really moves); null = Most per flip for the main flip and
+     *   EXTRA_CAP[kind] for an extra, as before. A number you typed is yours and is not cut by it.
      * @param {number} [p.extraItems] - Extras per trade (Settings); unset = EXTRA_ITEMS
      * @param {number} [p.maxUnits] - the most items one trade takes (TRADE_MAX_UNITS)
      * @param {boolean} [p.everything] - every flip with this trader (3.25.0; the owner: "we sometimes
@@ -8916,7 +9161,7 @@
     }
 
     /** The main flip and a few extras (the app's plan). */
-    function planMainAndExtras({ first = null, flips = [], held = [], cash = null, maxPerItem = FLIP_MAX_UNITS, payCap = Infinity, minPct = MIN_PROFIT_PCT, edits = {}, keep = {}, traderId = null, kindOf, extraItems = EXTRA_ITEMS, maxUnits = TRADE_MAX_UNITS }) {
+    function planMainAndExtras({ first = null, flips = [], held = [], cash = null, maxPerItem = FLIP_MAX_UNITS, payCap = Infinity, minPct = MIN_PROFIT_PCT, edits = {}, keep = {}, traderId = null, kindOf, capOf = null, extraItems = EXTRA_ITEMS, maxUnits = TRADE_MAX_UNITS }) {
         const extrasWanted = extrasPerTrade(extraItems);
         let cashLeft = cash > 0 ? cash : Infinity;
         // The items one trade takes (3.23.0): every line counts, bought or yours.
@@ -8932,7 +9177,11 @@
             if (!kinds.has(id)) kinds.set(id, KIND_RANK[kindOf(id)] !== undefined ? kindOf(id) : 'normal');
             return kinds.get(id);
         };
-        const kindCap = (id) => Math.min(most, EXTRA_CAP[kind(id)]);
+        const measured = (id, extra) => {
+            const n = typeof capOf === 'function' ? Number(capOf(id, extra)) : NaN;
+            return n >= 1 ? Math.floor(n) : null;
+        };
+        const kindCap = (id) => Math.min(most, measured(id, true) ?? EXTRA_CAP[kind(id)]);
 
         const { items, off } = usable(flips, trader, minPct, edits);
         const plan = new Map();
@@ -8971,10 +9220,10 @@
         // 1. The main flip: the item that makes the most, from at most 5 bazaars.
         // Items are weighed best-first by what they could make at most, and the
         // weighing stops once no item left could beat the best found.
-        const capOfMain = (it) => (it.typed ? Math.min(it.typed, most) : most);
+        const capOfMain = (it) => (it.typed ? Math.min(it.typed, most) : Math.min(most, measured(it.id, false) ?? most));
         // Your own lines keep their place in the trade's item limit: they are bought already. (What they
         // would take is tried on a copy of their pay; they are put in after the main flip, as before.)
-        const yoursWant = heldRowsOf(held, keep, edits, (id) => Math.min(most, EXTRA_CAP[kind(id)]), { left: pay.left }, kind).rows.reduce((a, r) => a + r.units, 0);
+        const yoursWant = heldRowsOf(held, keep, edits, kindCap, { left: pay.left }, kind).rows.reduce((a, r) => a + r.units, 0);
         const mainRoom = Math.max(0, room.left - yoursWant);
         // The most an item could make: its five best sellers' profit, and no more
         // than Most per flip (or the cash, or their pay) at its cheapest margin.
@@ -14324,6 +14573,16 @@
         return Array.isArray(data && data.trades) ? data.trades : [];
     }
 
+    /**
+     * The trades you have open on Torn now (3.27.1). The same path as the
+     * finished ones; Torn's word for the category is "ongoing", and it takes no
+     * limit, sort or from (Torn's spec). null: the answer was not a list.
+     */
+    async function fetchOngoingTrades(client, use = undefined) {
+        const data = await client.get('v2/user/trades', { cat: 'ongoing' }, use);
+        return Array.isArray(data && data.trades) ? data.trades : null;
+    }
+
     /** One trade: both sides' items and money. */
     async function fetchTrade(client, tradeId, use = undefined) {
         const id = String(tradeId).replace(/\D/g, '');
@@ -15264,6 +15523,29 @@
         return pastTrades(at >= 0 ? list.map((r, k) => (k === at ? next : r)) : [next, ...list]);
     }
 
+    /**
+     * The most of each item each trader took from you in one trade that went through: 'traderKey|itemId' -> units
+     * (3.28.0: what a trader took before is believed over a count of the market - core/liquidity.js amountCap).
+     * What stayed with you (To sell) is not counted as taken.
+     * @returns {Map<string, number>}
+     */
+    function pastTook(stored) {
+        const out = new Map();
+        for (const rec of pastTrades(stored)) {
+            if (!rec.end || rec.end.how !== 'traded') continue;
+            const per = new Map();
+            for (const row of rec.end.bought || []) {
+                const n = (Number(row.got) || 0) - (Number(row.kept) || 0);
+                if (n > 0) per.set(String(row.itemId), (per.get(String(row.itemId)) || 0) + n);
+            }
+            for (const [id, n] of per) {
+                const k = rec.key + '|' + id;
+                if (n > (out.get(k) || 0)) out.set(k, n);
+            }
+        }
+        return out;
+    }
+
     /** 'going' while it has not ended, else how it ended. */
     function pastState(rec) {
         return rec && rec.end ? rec.end.how : 'going';
@@ -15810,10 +16092,11 @@
      * @param {{maxPerFlip, cash, minProfitPct}} prefs
      * @param {object[]} buyers - flipBuyers()
      * @param {function} declined - (buyer) => boolean
+     * @param {function|null} [capOf] - (buyer) => the most of the item a trade with them takes (3.28.0, amountCap)
      */
-    function keptPlanSig(rows, prefs, buyers, declined) {
+    function keptPlanSig(rows, prefs, buyers, declined, capOf = null) {
         const sig = [rows, prefs.maxPerFlip, prefs.cash, prefs.minProfitPct, buyers.length];
-        for (const b of buyers) sig.push(b.id, b.name, b.price, b.maxUnits, Boolean(declined(b)));
+        for (const b of buyers) sig.push(b.id, b.name, b.price, b.maxUnits, Boolean(declined(b)), capOf ? capOf(b) : 0);
         return sig;
     }
 
@@ -21545,9 +21828,27 @@
         margin-top: 6px;
     }
 
+    /* One row when it fits. In a narrow panel the price line goes under the name
+       and the name keeps its words whole (3.27.1: the name's column was what was
+       left beside the price line - nothing - and it broke after every letter). */
+    .ttv2-here-r {
+        display: flex;
+        flex-wrap: wrap;
+    }
+
     .ttv2-here-n {
+        flex: 1 1 auto;
         min-width: 0;
-        overflow-wrap: anywhere;
+        overflow-wrap: break-word;
+    }
+
+    .ttv2-here-r .ttv2-here-l {
+        min-width: 0;
+        white-space: normal;
+    }
+
+    .ttv2-here-r .ttv2-link {
+        margin-left: auto;
     }
 
     .ttv2-here-n b,
@@ -25255,7 +25556,7 @@
             this.tab = 'trade';
             this.fifoSig = null;
             this.fifo = new Map();
-            this.el = lvEl('div', { class: 'lg' });
+            this.el = lvEl('div', { class: 'lg-page' });
         }
 
         /** From / to (ms) for the period picked. */
@@ -26059,7 +26360,7 @@
     }
 
     const LEDGER_CSS = `
-    .lg { display: flex; flex-direction: column; gap: 16px; padding: 24px 24px 64px; }
+    .lg-page { display: flex; flex-direction: column; gap: 16px; padding: 24px 24px 64px; }
     .lg-card { background: var(--surface); border: 1px solid var(--line); border-radius: 16px; padding: 16px; min-width: 0; }
     .lg-card h3 { margin: 0 0 12px; font: 650 11px/1 var(--sans); letter-spacing: 0.09em; text-transform: uppercase; color: var(--text2); display: flex; align-items: center; gap: 8px; }
     .lg-card h3::before { content: ""; width: 3px; height: 12px; border-radius: 2px; background: var(--brand); flex: 0 0 auto; }
@@ -26142,7 +26443,7 @@
     .lg-rows td:nth-child(3) { min-width: 160px; }
     @media (max-width: 1100px) { .lg-grid { grid-template-columns: minmax(0, 1fr); } }
     @media (max-width: 1000px) {
-        .lg { padding: 12px 12px 48px; }
+        .lg-page { padding: 12px 12px 48px; }
         .lg-tiles, .lg-tiles5 { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
         .lg-in { min-width: 0; width: 100%; }
         .lg-f { flex: 1 1 140px; }
@@ -26289,10 +26590,9 @@
     .sp { flex: 1; }
     .pill { height: 30px; display: inline-flex; align-items: center; gap: 7px; padding: 0 10px; border-radius: 9px; background: var(--panel); border: 1px solid var(--line); color: var(--muted); font-size: 12px; }
     .pill b { color: var(--text); font-size: 13px; }
-    .pill .dn { color: var(--warn); } .pill.flash { animation: flash 1s var(--ease); }
     @container (max-width: 1130px) { .pill.opt { display: none; } }
-    @container (max-width: 1240px) { .page.stackable { grid-template-columns: minmax(0, 1fr); } .page.stackable .minc { min-height: 260px !important; } }
-    @container (max-width: 1420px) { .page.stackable.wide { grid-template-columns: minmax(0, 1fr); } .page.stackable.wide .minc { min-height: 260px !important; } }
+    @container (max-width: 1240px) { .page.stackable { grid-template-columns: minmax(0, 1fr); } }
+    @container (max-width: 1420px) { .page.stackable.wide { grid-template-columns: minmax(0, 1fr); } }
     .btn { height: 30px; padding: 0 12px; border-radius: 9px; border: 1px solid var(--line2); background: var(--raised); color: var(--text); font-weight: 550; font-size: 13px; display: inline-flex; align-items: center; justify-content: center; gap: 6px; white-space: nowrap; transition: background .16s, transform .16s var(--ease), border-color .16s; }
     .btn:hover { background: var(--hover); border-color: rgba(255,255,255,.22); }
     .btn:active { transform: scale(.97); }
@@ -26334,7 +26634,6 @@
     .legend span { display: inline-flex; align-items: center; gap: 6px; }
     .key { width: 14px; height: 2px; border-radius: 2px; background: var(--c); flex: none; }
     .key.box { height: 10px; width: 10px; border-radius: 3px; }
-    .key.band { height: 10px; background: rgba(255,255,255,.1); }
     .key.dash { background: repeating-linear-gradient(90deg, var(--muted) 0 4px, transparent 4px 7px); }
     .seg { display: inline-flex; background: var(--input); border: 1px solid var(--line); border-radius: 9px; padding: 2px; }
     .seg button { height: 24px; padding: 0 10px; border: 0; border-radius: 7px; background: none; color: var(--muted); font-size: 12px; font-weight: 600; transition: background .16s, color .16s; }
@@ -26343,13 +26642,7 @@
     .tip.on { opacity: 1; }
     .tip h4 { margin: 0 0 4px; font: 600 12px var(--sans); color: var(--muted); }
     .tip div { display: flex; align-items: center; gap: 7px; color: var(--text2); } .tip div b { margin-left: auto; padding-left: 14px; color: var(--text); }
-    svg .g { stroke: var(--grid); stroke-width: 1; } svg .ax { fill: var(--muted); font: 12px var(--sans); }
-    svg .lb { fill: var(--text2); font: 600 12px var(--sans); } svg .rl { fill: var(--muted); font: 12px var(--sans); }
-    svg .ln { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
-    svg .ln.draw { stroke-dasharray: 1; stroke-dashoffset: 1; animation: draw 1.1s var(--ease) .1s forwards; }
-    svg .fade { animation: fade .9s ease .35s both; }
-    svg .bar.growy { transform-box: fill-box; transform-origin: bottom; animation: growy .55s var(--ease) both; }
-    svg .bar.neg.growy { transform-origin: top; }
+    svg .g { stroke: var(--grid); stroke-width: 1; }
     svg .cross { stroke: var(--line2); stroke-width: 1; }
 
     /* ---------- dashboard ---------- */
@@ -26359,7 +26652,6 @@
     .k-v { font: 650 clamp(18px, 1.72cqw, 23px)/1.25 var(--disp); letter-spacing: -.015em; white-space: nowrap; }
     .k-v.good { color: var(--good); }
     .k-s { color: var(--muted); font-size: 12px; line-height: 1.4; } .k-s b { color: var(--text2); }
-    .k-x { position: absolute; right: 12px; top: 9px; opacity: .95; }
     .meter { position: relative; height: 6px; border-radius: 4px; background: rgba(255,255,255,.07); margin: 7px 0 6px; }
     .meter i { position: absolute; inset: 0 auto 0 0; border-radius: 4px; background: var(--brand); width: var(--w); animation: growx .8s var(--ease) .2s both; transform-origin: left; }
     .meter u { position: absolute; top: -3px; bottom: -3px; width: 2px; background: var(--text2); left: var(--at); border-radius: 2px; }
@@ -26386,25 +26678,18 @@
     .sw { width: 8px; height: 8px; border-radius: 3px; display: inline-block; margin-right: 8px; background: var(--c); }
     .badge { display: inline-flex; align-items: center; gap: 5px; height: 20px; padding: 0 8px; border-radius: 999px; font: 600 12px/1 var(--sans); white-space: nowrap; color: var(--muted); background: rgba(255,255,255,.06); }
     .badge.need { color: #8fc1ff; background: var(--need-bg); } .badge.ahead { color: var(--warn); background: var(--warn-bg); } .badge.ok { color: var(--good); background: var(--good-bg); } .badge.bad { color: #ff8a87; background: var(--bad-bg); } .badge.best { color: #c9bfff; background: var(--brand-bg); }
-    .t-good { color: var(--good); } .t-bad { color: #ff8a87; } .t-warn { color: var(--warn); } .t-need { color: #8fc1ff; } .t-muted { color: var(--muted); }
+    .t-good { color: var(--good); } .t-bad { color: #ff8a87; } .t-warn { color: var(--warn); } .t-muted { color: var(--muted); }
     .tiles { display: grid; grid-template-columns: repeat(var(--n, 4), minmax(0, 1fr)); gap: 12px; }
     .tile { padding: 11px 14px 12px; }
-    .pgrid { display: grid; gap: 8px; height: 100%; grid-auto-rows: minmax(70px, 1fr); }
     .pc { border-radius: 10px; background: var(--raised); border: 1px solid var(--line); min-width: 0; transition: transform .2s var(--ease), border-color .2s; }
     .pc:hover { transform: translateY(-2px); border-color: var(--line2); }
-    .pc.need .pc-bar i { background: var(--need); } .pc.ahead .pc-bar i { background: var(--warn); }
     .pc.first { border-color: rgba(76,157,255,.5); box-shadow: 0 0 0 3px rgba(76,157,255,.08); }
     .pc.act { background: var(--brand-bg); border-color: var(--brand-line); color: var(--text2); font-size: 12px; }
     .flow { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 0; }
-    .fl .k-l { white-space: normal; } .fl { padding: 2px 10px 2px 14px; border-left: 1px solid var(--line); position: relative; } .fl:first-child { border-left: 0; padding-left: 0; }
-    .fl:not(:first-child)::before { content: "›"; position: absolute; left: -6px; top: 16px; color: var(--faint); background: var(--panel); font-size: 16px; line-height: 1; }
     .rows { display: flex; flex-direction: column; }
     .row { display: flex; align-items: center; gap: 10px; padding: 7px 0; border-top: 1px solid var(--line); white-space: nowrap; } .row:first-child { border-top: 0; }
-    .row .grow1 { flex: 1; min-width: 0; white-space: normal; color: var(--text2); } .row .grow1 b { color: var(--text); }
     .li { display: flex; align-items: center; gap: 10px; padding: 8px 14px; border-top: 1px solid var(--line); transition: background .14s; } .li:hover { background: rgba(255,255,255,.028); }
     .li.sel { background: var(--brand-bg); box-shadow: inset 2px 0 0 var(--brand); }
-    .li-m { flex: 1; min-width: 0; } .li-m b { display: block; } .li-m span { color: var(--muted); font-size: 12px; }
-    .av { width: 30px; height: 30px; border-radius: 50%; background: var(--raised); border: 1px solid var(--line2); display: grid; place-items: center; font: 650 12px var(--sans); color: var(--text2); flex: none; }
     .msg { padding: 7px 12px; border-radius: 10px; background: var(--input); border: 1px solid var(--line); color: var(--text2); line-height: 1.5; }
     .hero { font: 650 36px/1 var(--disp); letter-spacing: -.02em; } .hero small { font-size: 16px; color: var(--muted); font-weight: 500; letter-spacing: 0; margin-left: 6px; }
     .toggle { display: inline-flex; align-items: center; gap: 8px; }
@@ -26420,25 +26705,16 @@
     .it img { width: 38px; height: 19px; object-fit: contain; display: block; }
     .it.lg { width: 60px; height: 30px; } .it.lg img { width: 60px; height: 30px; }
     .tk .it { margin-right: 6px; }
-    .t-brand { color: #c9bfff; }
-    .top.tight .pill.opt { display: none; } .top.tighter .pill .dn { display: none; }
-    .nx-p { width: 38px; flex: none; display: grid; place-items: center; } .nx-p .it { margin: 0; }
+    .top.tight .pill.opt { display: none; }
     /* stock tiles: what is in a tile grows with the tile, so a tall screen leaves no empty box */
     .pc { container: pc / size; display: block; padding: 0; cursor: pointer; }
-    .pc.act { cursor: default; } .pc.act .pc-in { justify-content: center; align-items: flex-start; gap: 7px; }
-    @container pc (min-height: 118px) { .pc-in { padding: 10px 12px 11px; gap: 3px; } .pc .it, .pc .it img { width: 60px; height: 30px; } .pc-n { font-size: 14px; margin-top: 2px; } .pc-q b, .pc-big { font-size: 21px; } .pc-bar { height: 6px; } .pc.act { font-size: 13px; } }
-    @container pc (min-height: 158px) and (min-width: 136px) { .pc-x { display: grid; gap: 3px; margin-top: 5px; padding-top: 6px; border-top: 1px solid var(--line); } }
-    @container pc (min-height: 192px) { .pc-k:nth-child(3) { display: flex; } }
-    @container pc (min-width: 176px) { .pc-k .w { display: inline; } .pc-k .n { display: none; } }
-    @container pc (min-height: 250px) and (max-width: 135.9px) { .pc-x { display: grid; gap: 3px; margin-top: 7px; padding-top: 8px; border-top: 1px solid var(--line); } .pc-k { flex-direction: column; } }
-    @container pc (min-height: 236px) and (min-width: 170px) { .pc-in { padding: 12px 14px 13px; gap: 4px; } .pc .it, .pc .it img { width: 100px; height: 50px; } .pc-n { font-size: 15px; } .pc-q b, .pc-big { font-size: 26px; } .pc-x { gap: 5px; } }
+    .pc.act { cursor: default; }
+    @container pc (min-height: 118px) { .pc .it, .pc .it img { width: 60px; height: 30px; } .pc.act { font-size: 13px; } }
+    @container pc (min-height: 236px) and (min-width: 170px) { .pc .it, .pc .it img { width: 100px; height: 50px; } }
     /* the buying run */
     .stop.cur { background: var(--brand-bg); box-shadow: inset 3px 0 0 var(--brand); }
     .stop.done .stop-n { background: var(--good-bg); border-color: transparent; color: var(--good); } .stop.skip .stop-n { color: var(--faint); }
     .stop.done .chips, .stop.skip .chips { opacity: .55; }
-    .stop-st { font-size: 12px; color: var(--muted); } .stop.done .stop-st { color: var(--good); } .stop.cur .stop-st { color: #c9bfff; }
-    .kbd { display: inline-grid; place-items: center; min-width: 18px; height: 18px; margin-left: 8px; padding: 0 4px; border-radius: 5px; background: rgba(255,255,255,.22); font: 650 12px/1 var(--sans); }
-    .runbar { display: flex; align-items: center; gap: 8px 10px; flex-wrap: wrap; padding-bottom: 9px; color: var(--text2); } .runbar > span { flex: 1 1 220px; min-width: 0; } .runbar b { color: var(--text); }
     /* a name or a button that opens the real page on Torn */
     .lk { color: inherit; cursor: pointer; text-decoration: none; } .lk::after { content: "\\2197"; margin-left: 4px; font-size: 12px; font-weight: 400; color: var(--faint); transition: color .14s; } .lk:hover, .lk:hover::after { color: #c9bfff; }
     .btn.out::after { content: "\\2197"; margin-left: 6px; opacity: .75; }
@@ -26446,37 +26722,24 @@
     .main { position: relative; }
     .kpis { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; } .kpis .kpi { grid-column: auto; }
     /* is it worth opening */
-    .verdict { display: flex; align-items: center; gap: 10px; padding-bottom: 9px; white-space: nowrap; } .verdict b { font: 650 16px var(--disp); } .verdict .sp { flex: 1; } .verdict .lamp { margin: 0 4px; }
+    .verdict { display: flex; align-items: center; gap: 10px; padding-bottom: 9px; white-space: nowrap; } .verdict b { font: 650 16px var(--disp); } .verdict .sp { flex: 1; }
     .chk { display: flex; align-items: baseline; gap: 10px; padding: 6px 0; border-top: 1px solid var(--line); color: var(--text2); line-height: 1.45; } .chk b { color: var(--text); }
     .chk::before { content: "\\2713"; flex: none; width: 16px; color: var(--good); font-weight: 700; } .chk.no::before { content: "\\2715"; color: var(--warn); }
     /* open trades */
     .li[data-tr] { cursor: pointer; } .li .amt { text-align: right; white-space: nowrap; } .li .amt span { display: block; }
     .st { font-size: 12px; white-space: nowrap; color: var(--muted); } .st.you { color: var(--warn); } .st.new { color: #c9bfff; }
-    .av.new { border-color: var(--brand); box-shadow: 0 0 0 3px var(--brand-bg); }
     /* the notice of a new trade */
     .toast { position: absolute; top: 62px; right: 16px; z-index: 60; display: flex; align-items: center; gap: 12px; padding: 10px 10px 10px 12px; border-radius: 12px; background: var(--panel); border: 1px solid var(--brand-line); box-shadow: 0 16px 40px rgba(0,0,0,.55); white-space: nowrap; opacity: 0; transform: translateY(-8px); pointer-events: none; transition: opacity .26s var(--ease), transform .26s var(--ease); }
     .toast.on { opacity: 1; transform: none; pointer-events: auto; } .toast b { display: block; } .toast .s { color: var(--muted); font-size: 12px; }
     .toast .x { width: 22px; height: 22px; padding: 0; border: 0; border-radius: 6px; background: none; color: var(--faint); font-size: 16px; line-height: 1; } .toast .x:hover { color: var(--text); background: rgba(255,255,255,.08); }
     .shows { display: grid; gap: 18px; align-content: start; } .shows h4 { margin: 0 0 7px; font: 600 12px var(--sans); color: var(--muted); } .shows p { margin: 0; color: var(--text2); }
-    .field { flex-wrap: wrap; row-gap: 6px; } .field .f-l { flex: 1 1 150px; } .field > .seg, .field > .inp { margin-left: auto; }
-    .osn { width: 100%; display: flex; align-items: center; gap: 12px; padding: 12px 14px; border-radius: 10px; background: #2b2d33; border: 1px solid rgba(255,255,255,.1); color: #f1f1f1; font: 13px/1.4 "Segoe UI", system-ui, sans-serif; box-shadow: 0 10px 30px rgba(0,0,0,.5); } .osn b { display: block; } .osn span.s { color: #b9bcc4; font-size: 12px; }
-    .tabt { display: inline-flex; align-items: center; gap: 8px; padding: 7px 14px; border-radius: 9px 9px 0 0; background: var(--raised); border: 1px solid var(--line2); border-bottom: 0; color: var(--text2); } .tabt .mark, .osn .mark { width: 20px; height: 20px; border-radius: 6px; } .osn .mark { width: 30px; height: 30px; border-radius: 9px; } .tabt .mark svg { width: 12px; height: 12px; }
-    .ta-ok { color: var(--good); font-size: 12px; } .ta-warn { color: var(--warn); font-size: 12px; } .mk.fill[data-take] { cursor: pointer; }
+    .field { flex-wrap: wrap; row-gap: 6px; } .field .f-l { flex: 1 1 150px; } .field > .seg, .field > .inp { margin-left: auto; } .mk.fill[data-take] { cursor: pointer; }
 
     /* ---------- buy: every place that sells a piece, and the shopping list ---------- */
-    .p-buy { grid-template-columns: minmax(0, 1fr); } .p-buy > .pane { height: 100%; } .gbuy { grid-template-columns: minmax(0, 7fr) minmax(0, 5fr); }
-    @container (max-width: 1240px) { .pane.stk { grid-template-columns: minmax(0, 1fr); } .pane.stk .minc { min-height: 260px !important; } }
     .t tr.pick { cursor: pointer; } .t tbody tr.sel, .t tbody tr.sel:hover { background: var(--brand-bg); box-shadow: inset 2px 0 0 var(--brand); }
-    .rec { display: flex; align-items: center; gap: 10px 18px; flex-wrap: wrap; } .rec .hero { white-space: nowrap; } .rec-t { flex: 1; min-width: 240px; color: var(--text2); line-height: 1.5; } .rec-t b { color: var(--text); } .rec-b { display: flex; gap: 8px; }
-    .wl { display: grid; grid-template-columns: minmax(0, 1fr) 44px 72px 76px 104px; align-items: center; gap: 8px; padding: 6px 14px; border-top: 1px solid var(--line); white-space: nowrap; color: var(--text2); transition: background .14s; }
-    .wl:hover { background: rgba(255,255,255,.028); } .wl b { color: var(--text); } .wl .n { text-align: right; }
-    .wl.h { color: var(--faint); font: 650 12px var(--sans); } .wl.h:hover { background: none; }
-    .wl.cheap b.num { color: #c9bfff; } .wl.on { background: var(--brand-bg); box-shadow: inset 2px 0 0 var(--brand); }
-    .wl-a { display: flex; gap: 6px; justify-content: flex-end; }
-    .wl-s { padding: 4px 14px 9px; color: var(--text2); font-size: 12px; line-height: 1.5; } .wl-s b { color: var(--text); } .wl-s.foot { padding-top: 9px; border-top: 1px solid var(--line); color: var(--muted); }
+    .rec { display: flex; align-items: center; gap: 10px 18px; flex-wrap: wrap; } .rec .hero { white-space: nowrap; }
     .stop { display: flex; gap: 10px; padding: 9px 14px; border-top: 1px solid var(--line); } .stop:first-child { border-top: 0; }
     .stop-n { width: 22px; height: 22px; flex: none; border-radius: 50%; display: grid; place-items: center; background: var(--raised); border: 1px solid var(--line2); font: 650 12px var(--sans); color: var(--text2); }
-    .stop-m { flex: 1; min-width: 0; } .stop-h { display: flex; align-items: center; gap: 10px; white-space: nowrap; flex-wrap: wrap; }
     .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 7px; }
     .chip { display: inline-flex; align-items: center; gap: 7px; height: 28px; padding: 0 4px 0 6px; border-radius: 8px; background: var(--raised); border: 1px solid var(--line); white-space: nowrap; font-size: 12px; color: var(--text2); }
     .chip .it { margin: 0; } .chip b { color: var(--text); }
@@ -26484,30 +26747,15 @@
 
     /* ---------- is it safe to be open, lot sizes ---------- */
     .safe { display: flex; gap: 14px; align-items: flex-start; color: var(--text2); line-height: 1.5; } .safe b { color: var(--text); } .safe p { margin: 0 0 6px; } .safe p:last-child { margin: 0; }
-    .lamp { width: 12px; height: 12px; margin-top: 4px; border-radius: 50%; flex: none; background: var(--good); box-shadow: 0 0 0 4px var(--good-bg); } .lamp.warn { background: var(--warn); box-shadow: 0 0 0 4px var(--warn-bg); }
 
     /* ---------- Torn's own pages: a grey stand-in, our marks on top ---------- */
-    .mk-ring { box-shadow: inset 0 0 0 2px var(--need); } .mk-ring.top { box-shadow: inset 0 0 0 2px var(--need), 0 0 14px rgba(76,157,255,.45); } .mk-ring.ahead { box-shadow: inset 0 0 0 1px var(--warn); }
     .mk { display: inline-flex; align-items: center; gap: 5px; height: 20px; padding: 0 8px; border-radius: 999px; font: 600 12px/1 var(--sans); white-space: nowrap; background: #10233b; color: #cfe5ff; border: 1px solid rgba(76,157,255,.5); box-shadow: 0 2px 8px rgba(0,0,0,.5); }
     .mk b { color: #fff; } .mk.c { position: absolute; top: -11px; right: 6px; z-index: 2; } .mk.b { position: absolute; bottom: -11px; right: 6px; z-index: 2; }
     .mk.ahead { background: #2a2110; color: var(--warn); border-color: rgba(245,165,36,.45); } .mk.grey { background: #23262c; color: #cfd4dc; border-color: rgba(255,255,255,.14); } .mk.good { background: #10261a; color: var(--good); border-color: rgba(63,207,107,.45); }
     .mk.fill { background: var(--brand); color: #fff; border-color: transparent; }
-    .ta { position: sticky; top: 0; display: flex; flex-direction: column; border-radius: 12px; background: var(--panel); border: 1px solid var(--line2); box-shadow: 0 16px 40px rgba(0,0,0,.5); color: var(--text); font: 13px/1.45 var(--sans); overflow: hidden; }
-    .ta-h { display: flex; align-items: center; gap: 8px; height: 40px; padding: 0 8px 0 10px; border-bottom: 1px solid var(--line); background: var(--rail-bg); white-space: nowrap; }
-    .ta-h .mark { width: 24px; height: 24px; border-radius: 7px; } .ta-h .mark svg { width: 15px; height: 15px; } .ta-h b { font: 650 13px var(--disp); margin-right: auto; } .ta-h span.w { color: var(--muted); font-size: 12px; }
-    .ta-b { display: grid; gap: 8px; padding: 10px 12px 12px; }
-    .ta-b h4 { margin: 0; display: flex; align-items: baseline; gap: 8px; font: 650 13px var(--sans); white-space: nowrap; } .ta-b h4 span { margin-left: auto; color: var(--muted); font-weight: 400; font-size: 12px; }
-    .ta-l { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 2px 8px; padding: 6px 8px; border-radius: 9px; background: var(--raised); border: 1px solid var(--line); }
-    .ta-l .it { margin: 0; } .ta-l b { font-weight: 600; } .ta-l .s { grid-column: 1 / -1; color: var(--muted); font-size: 12px; } .ta-l.dim b { color: var(--muted); font-weight: 500; }
-    .ta-kv { display: flex; align-items: baseline; gap: 10px; font-size: 12px; color: var(--muted); } .ta-kv > :last-child { margin-left: auto; color: var(--text); text-align: right; } .ta-kv.sep { padding-top: 8px; border-top: 1px solid var(--line); }
-    .ta-n { color: var(--muted); font-size: 12px; line-height: 1.5; } .ta-n b { color: var(--text2); }
-    .ta-hold { padding: 8px 10px; border-radius: 9px; background: var(--warn-bg); border: 1px solid rgba(245,165,36,.4); color: var(--text2); font-size: 12px; line-height: 1.5; } .ta-hold b { color: var(--warn); }
-    .ta .msg { font-size: 12px; padding: 7px 10px; } .ta-btns { display: flex; gap: 6px; flex-wrap: wrap; }
 
     /* page grids */
-    .g2 { grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); } .g2r { grid-template-columns: minmax(0, 1fr) minmax(0, 2fr); } .g57 { grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); } .g11 { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); } .g1 { grid-template-columns: minmax(0, 1fr); }
-    .p-tabs { grid-template-columns: minmax(0, 1fr); } .p-tabs > .pane { height: 100%; }
-    .minc { min-height: 180px; }
+    .g2 { grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); } .g57 { grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); } .g11 { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); } .g1 { grid-template-columns: minmax(0, 1fr); }
 
     @keyframes rise { from { opacity: 0; transform: translateY(8px); } }
     @keyframes draw { to { stroke-dashoffset: 0; } }
@@ -26517,7 +26765,7 @@
     @keyframes ping { 0% { transform: scale(.6); opacity: .9; } 70%, 100% { transform: scale(1.5); opacity: 0; } }
     @keyframes flash { 0% { background: rgba(245,165,36,.28); border-color: rgba(245,165,36,.6); } }
     @keyframes tape { to { transform: translateX(-50%); } }
-    @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } svg .ln.draw { stroke-dashoffset: 0; } }
+    @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }
 
     /* ---------- Mockup AD only: Torn Archive's shell, in Torn Bids' own graphite and green ---------- */
 
@@ -26542,7 +26790,7 @@
     .t tbody tr.dim td, .t tbody tr.dim td b { color: var(--faint); font-weight: 400; }
     .t tbody tr.g td { padding-top: 13px; color: var(--muted); font-size: 12px; background: none !important; } .t tbody tr.g td b { color: var(--text); font-size: 13px; }
     .t td .it { margin-right: 9px; }
-    .t td.t-good { color: var(--good); } .t td.t-bad { color: var(--bad); } .t td.t-warn { color: var(--warn); } .t td.t-need { color: var(--need); } .t td.t-muted { color: var(--muted); } .t-bad { color: var(--bad); }
+    .t td.t-good { color: var(--good); } .t td.t-bad { color: var(--bad); } .t td.t-warn { color: var(--warn); } .t td.t-muted { color: var(--muted); } .t-bad { color: var(--bad); }
     .t tr.pick td { padding-top: 8px; padding-bottom: 8px; } .t tr.pick .cell b { font-size: 14px; }
     .t td.n b.t-good, .t td.n b.amt { font: 650 15px var(--disp); }
     .cell { display: flex; align-items: center; gap: 10px; min-width: 0; } .cell .it { margin: 0; } .cell > div { min-width: 0; }
@@ -26553,13 +26801,11 @@
     /* a page fills the window; a box ends where its rows end, and a long list scrolls inside its own box */
     .page.fit, .page.fit > .pane { height: 100%; }
     .pb.scroll, .fit .pb.flush, .snug .pb.flush { overflow: auto; scrollbar-width: thin; scrollbar-color: #3a3f4a transparent; }
-    .snug { align-items: start; } .snug > .panel, .snug > .col { max-height: 100%; }
-    .col > .panel.sh { flex: 0 1 auto; } .col > .panel.fx { flex: none; }
+    .snug { align-items: start; } .snug > .panel, .snug > .col { max-height: 100%; } .col > .panel.fx { flex: none; }
     .c3 { grid-template-columns: minmax(0, 10fr) minmax(0, 11fr) minmax(0, 10fr); grid-template-rows: minmax(0, 1fr); }
     .c3t { grid-template-columns: minmax(0, 8fr) minmax(0, 13fr) minmax(0, 10fr); }
     @container (max-width: 1240px) { .page.fit:has(.c3), .page.fit > .pane.c3 { height: auto; } .c3 { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); grid-template-rows: auto; } .c3 > .panel.tint { grid-column: 1 / -1; } }
     .c75 { grid-template-columns: minmax(0, 7fr) minmax(0, 5fr); }
-    .c11 { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); }
     .pgrows { grid-template-columns: minmax(0, 1fr); align-content: start; }
     /* the list's own search and filters */
     .find { display: flex; gap: 6px; align-items: center; padding: 10px 14px 4px; white-space: nowrap; }
@@ -26633,19 +26879,9 @@
     .prog { height: 6px; border-radius: 3px; background: rgba(255,255,255,.07); overflow: hidden; } .prog i { display: block; height: 100%; width: var(--w); border-radius: 3px; background: var(--c, var(--good)); animation: growx .7s var(--ease) both; transform-origin: left; }
     .det { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); } .det > div { min-width: 0; } .det > div + div { border-left: 1px solid var(--line); }
     @container (max-width: 1100px) { .det { grid-template-columns: minmax(0, 1fr); } .det > div + div { border-left: 0; border-top: 1px solid var(--line); } .board { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
-    /* ledger and settings */
-    .lgp { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); align-content: start; }
-    .lgf { display: flex; gap: 8px; align-items: center; white-space: nowrap; } .lgf .inp { height: 28px; color: var(--faint); font-size: 12px; }
-    .lg1 { grid-template-columns: minmax(0, 7fr) minmax(0, 5fr); grid-template-rows: auto 264px auto auto; align-content: start; } .lg1 > .tiles, .lg1 > .wide { grid-column: 1 / -1; }
-    .lg2 { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
-    .lg3 { grid-template-columns: minmax(0, 7fr) minmax(0, 5fr); align-items: start; }
-    .lims { display: grid; grid-auto-rows: 44px; }
-    .lim { display: grid; grid-template-columns: 150px minmax(0, 1fr) 150px; align-items: center; gap: 14px; white-space: nowrap; border-top: 1px solid var(--line); } .lim:first-child { border-top: 0; }
-    .lim b { color: var(--text); } .lim .r { text-align: right; color: var(--muted); } .lim .meter { margin: 0; height: 8px; } .meter i.warn { background: var(--warn); } .meter i.blue { background: var(--need); }
+    /* ledger and settings */ .meter i.warn { background: var(--warn); } .meter i.blue { background: var(--need); }
     .field .inp.key { letter-spacing: .2em; flex: 0 0 150px; } .field .inp.txt { flex: 1; min-width: 0; color: var(--text2); letter-spacing: 0; }
-    .area { display: block; width: 100%; padding: 8px 10px; border-radius: 8px; background: var(--input); border: 1px solid var(--line2); color: var(--faint); }
     /* Torn's pages keep the panel's own look */
-    .thost { display: block; }
     .hide { display: none !important; }
     /* small things */
     .qty { display: inline-block; min-width: 30px; padding: 0 6px; border-radius: 5px; background: var(--input); border: 1px solid var(--line2); color: var(--text); text-align: center; font-weight: 600; cursor: text; }
@@ -26678,7 +26914,6 @@
     .badge.trust { color: var(--text2); background: rgba(255,255,255,.07); }
     .badge.best { color: var(--good); background: var(--good-bg); }
     .blue { background: rgba(255,255,255,.06); color: var(--text2); } .dot.need { background: var(--muted); }
-    .t-need, .t td.t-need { color: var(--text2); }
     .star { color: var(--text2); }
     .t tr.mk td { background: rgba(255,255,255,.035); box-shadow: inset 0 1px 0 var(--line2); } .t tr.mk td b { color: var(--text); }
     .stepbar .done { border-color: var(--line2); } .stepbar .done i { color: var(--text2); }
@@ -26745,7 +26980,6 @@
     .t tr.pick:focus-visible { outline: 2px solid var(--text2); outline-offset: -2px; }
     .t td .tag { display: inline-block; margin-left: 8px; padding: 0 7px; border-radius: 999px; background: rgba(255,255,255,.07); color: var(--text2); font: 600 12px/18px var(--sans); vertical-align: 1px; }
     .t td .tag.warn { color: var(--warn); background: var(--warn-bg); }
-    .t td .chg { margin-left: 5px; font-size: 12px; color: var(--muted); }
     .t td.act { width: 1%; padding-left: 0; } .t td.wrap, .t td.wrap small { white-space: normal; }
     .t tr.gone td b { color: var(--faint); font-weight: 400; text-decoration: line-through; }
     .t tr.pinrow td { background: rgba(255,255,255,.025); }
@@ -26900,7 +27134,7 @@
     .facts b { font-size: 16px; }
 
     /* the Ledger: the same headings and plain totals as every other page */
-    .lg { padding: 0 0 48px; gap: 16px; }
+    .lg-page { padding: 0 0 48px; gap: 16px; }
     .lg-card, .lg-tile, .lg-tile.lg-good, .lg-tile.lg-lossbox { border: 0; border-radius: 12px; background: var(--panel); }
     .lg-card { padding: 14px 16px; } .lg-tile { padding: 14px 16px; }
     .lg-card h3 { margin: 0 0 10px; font: 600 14px/1.3 var(--sans); letter-spacing: 0; text-transform: none; color: var(--text); } .lg-card h3::before { display: none; }
@@ -26965,7 +27199,7 @@
     :where(.bd) .lg-table th { font: 600 12px/1.3 var(--sans); letter-spacing: 0; text-transform: none; color: var(--faint); }
     :where(.bd) .lg-bltag { padding: 0; background: none; font: 600 11px/16px var(--sans); letter-spacing: 0; text-transform: none; }
     /* One green button a screen: while the bar on top asks for a key, a page's own main button is plain. */
-    .bd:has(.sp-banner-on .sp-primary) .lg .sp-btn.sp-primary { color: var(--text); background: var(--raised); border-color: var(--line2); font-weight: 500; }
+    .bd:has(.sp-banner-on .sp-primary) .lg-page .sp-btn.sp-primary { color: var(--text); background: var(--raised); border-color: var(--line2); font-weight: 500; }
     /* Trusted is the one coloured word; Known reads plain, Caution amber. */
     .badge.trust[data-level="known"], :where(.bd) .sp-trust[data-level="known"] { color: var(--text2); }
 
@@ -26993,6 +27227,21 @@
     .tog { padding: 0 10px; border: 1px solid var(--line2); border-radius: 999px; }
     .tog.on { background: var(--raised); }
     .tog:hover { border-color: var(--faint); }
+
+    /* A list never scrolls sideways (3.27.1; the friend, 1536 wide: "it needs to scroll to see full item width
+       wise"). Every cell was on one line, so a long item name pushed the figures out of the panel. Now the cell
+       that holds the name (its picture, name and the line under it) gives way: it wraps between words, and only
+       when the row does not fit - a row with room is as it was. Figures and a trader's name stay on one line.
+       A heading may wrap in a table whose rows are not pressed (What <trader> pays: "<a long name> pays"); in
+       the pressed lists the first column takes all the room there is, so their headings keep their one line. */
+    .t td:has(> .cell) { white-space: normal; overflow-wrap: break-word; }
+    .t td .cell > span:not(.it) { min-width: 0; }
+    .t td:has(> .cell) .mk, .t td:has(> .cell) .badge, .t td:has(> .cell) .btn, .t td:has(> .cell) .tag { white-space: nowrap; }
+    .t:not(:has(tr.pick)) th { white-space: normal; vertical-align: bottom; }
+    /* Drawn for a window about 1700 wide. On a narrower one the whole of Torn Bids is drawn at nine tenths, so the
+       same columns have the room they were drawn with (the friend had set his browser to 90% himself to get there:
+       his zip, window 1707 on a 1536 screen). The big-screen rule above does the opposite from 2200. */
+    @media (max-width: 1699px) { .app { zoom: .9; } }
     `;
 
     /* Trades > History (3.27.0, mockup AH): the last 30 trades on the left, the one picked on the right. */
@@ -28089,6 +28338,11 @@
             else this.render({});
         }
 
+        /** The page and tab in view, and the list they show: {page, tab, filter} - null before the page is built. */
+        shownNow() {
+            return this.bd ? { page: this.bd.page, tab: this.bd.tab, filter: bdFilterOf(this.bd.page, this.bd.tab) } : null;
+        }
+
         /** The older names for the three views: the list (Flips), the Ledger, Settings. */
         showView(view) {
             if (view === 'settings') this.go('settings');
@@ -28527,7 +28781,7 @@
             const now = Date.now();
             const sig = JSON.stringify([
                 'items', kind, s.counts, s.listTotal, s.desk && s.desk.itemId, info.hasKey, info.loading, info.inventoryAt ? 1 : 0, info.tradersLoading, Boolean(info.bazaarsAt), this.query, s.category,
-                list.map((r) => [r.itemId, r.name, r.held, r.lowest, r.badge && [r.badge.kind, r.badge.amount], r.pending, r.units, r.stops, r.bid, r.mark && r.mark.text, r.still && [r.still.move, r.still.gone, r.still.was],
+                list.map((r) => [r.itemId, r.name, r.held, r.lowest, r.badge && [r.badge.kind, r.badge.amount], r.pending, r.units, r.stops, r.pace, r.bid, r.mark && r.mark.text, r.still && [r.still.move, r.still.gone, r.still.was],
                     r.to && [r.to.name, this.dotSig(r.to), r.to.old ? listAgeText(now - r.to.old.at) : ''], r.top && [r.top.name, r.top.price, this.dotSig(r.top)], paidOf.has(r.itemId) ? paidOf.get(r.itemId).each : 0]),
                 s.pinned || [],
             ]);
@@ -28570,7 +28824,10 @@
                     gone ? spEl('span', { class: 'tag', title: 'It was a flip when the list was held. It keeps its place until your trade ends.', text: 'No flip now' }) : null,
                 ];
                 let sub;
-                if (kind === 'flips') sub = flip && r.units ? '× ' + count(r.units) + ' · ' + count(r.stops) + (r.stops === 1 ? ' bazaar' : ' bazaars') + (r.buy && r.sell ? ' · buy ' + formatMoney(r.buy) + ' · sell ' + formatMoney(r.sell) : '') : gone ? 'held in its place' : '';
+                // 3.28.0: the amount is what moves in about an hour, where that is less than there is to buy - said, so "× 3" is no riddle.
+                const paced = kind === 'flips' && flip && r.units && typeof r.pace === 'number';
+                const paceWords = paced ? ' · ' + (r.pace >= 1 ? 'about ' + count(Math.round(r.pace)) + ' an hour sell' : 'under one an hour sells') : '';
+                if (kind === 'flips') sub = flip && r.units ? '× ' + count(r.units) + ' · ' + count(r.stops) + (r.stops === 1 ? ' bazaar' : ' bazaars') + (r.buy && r.sell ? ' · buy ' + formatMoney(r.buy) + ' · sell ' + formatMoney(r.sell) : '') + paceWords : gone ? 'held in its place' : '';
                 else if (kind === 'all') sub = flip ? null : r.badge && r.badge.kind === 'list' ? 'your bazaar pays ' + signed(r.badge.amount) + ' more than a trader' : r.pending ? 'Checking…' : r.lowest ? 'no flip now · from ' + formatMoney(r.lowest) : 'no flip now';
                 else {
                     const paid = paidOf.get(r.itemId);
@@ -28579,7 +28836,7 @@
                 const first = spEl('td', {}, [spEl('div', { class: 'cell' }, [this.pic('list', r.itemId), spEl('div', {}, [
                     spEl('b', { text: r.name }),
                     ...tags,
-                    kind === 'all' && flip ? spEl('small', { class: 't-good', text: 'flip ' + signed(r.badge.amount) }) : sub ? spEl('small', { text: sub }) : null,
+                    kind === 'all' && flip ? spEl('small', { class: 't-good', text: 'flip ' + signed(r.badge.amount) }) : sub ? spEl('small', paced ? { text: sub, title: 'No more of an item in one trade than about an hour of what leaves the bazaars - a trader takes what they can sell on. Counted by the shared server from Torn\'s own bazaars; Most per flip still caps it.' } : { text: sub }) : null,
                 ])])]);
                 const cells = [first];
                 if (kind === 'flips') {
@@ -29346,7 +29603,7 @@
             return spEl('div', { class: 'stepbar' }, ['Ask', 'Yes', 'Buy', 'Trade'].map((word, i) => spEl('span', { class: i < at ? 'done' : i === at ? 'now' : '' }, [spEl('i', { text: i < at ? '✓' : String(i + 1) }), word])));
         }
 
-        /** "sells fast" / "slow seller" beside an extra item: why it is in, and in that amount. */
+        /** "sells fast" / "slow seller" beside an extra item: why it is in, and in that amount. Measured where the shared server counted it (3.28.0), else by its type. */
         kindTag(kind) {
             if (kind === 'fast') return spEl('span', { class: 'kind', text: 'sells fast' });
             if (kind === 'slow') return spEl('span', { class: 'kind', text: 'slow seller' });
@@ -29720,7 +29977,7 @@
                 this.chatLink(b, 'btn go big out'),
                 spEl('button', { type: 'button', class: 'btn big', 'data-focus': 'trade:accept:' + c.key, title: b.name + ' said yes: the trade is frozen as it is now, so nothing in it moves while you buy and send. It moves to Trades.', text: b.name + ' said yes', onclick: () => this.h.onTradeAccept && this.h.onTradeAccept(d.itemId) }),
                 // Nothing to buy: the trade itself can be opened now.
-                !c.stops && b.id ? this.link('Open the trade', tradeUrl(b.id), { cls: 'btn lg out', title: 'Start a trade with ' + b.name + ' on Torn', focus: 'step-trade' }) : null,
+                !c.stops && b.id ? this.link('Open the trade', tradeUrl(b.id), { cls: 'btn big out', title: 'Start a trade with ' + b.name + ' on Torn', focus: 'step-trade' }) : null,
                 spEl('span', { class: 'sp' }),
                 this.wordBtn(b.name + ' said no', 'trade:decline:' + c.key, b.name + ' said no to this trade: on to the next (this trade is passed over for an hour; their other trades stay). Undo shows on their row.', () => this.h.onTradeDecline && this.h.onTradeDecline(c.key), 'quiet'),
             ]);
@@ -29998,7 +30255,7 @@
                     kids.push(spEl('p', { class: 'note', text: b.name + ' can pay for at most ' + count(b.maxUnits) + ': ' + (this.state.prefs.networthPct || 10) + '% of their networth' + (nw >= 0 && nw !== null ? ' (' + formatMoney(nw) + ')' : '') + '.' }));
                 }
                 if (b.differ) kids.push(spEl('div', { class: 'amber' }, [spEl('span', {}, [spEl('b', { text: b.name + '\'s lists differ' }), ' (' + this.listPrices(b, ', ') + '): planned at the lower. Check their list before trading.'])]));
-                kids.push(spEl('div', { class: 'acts' }, [this.chatLink(b, 'btn go big out'), b.id ? this.link('Open the trade', tradeUrl(b.id), { cls: 'btn lg out', title: 'Start a trade with ' + b.name + ' on Torn', focus: 'step-trade' }) : null]));
+                kids.push(spEl('div', { class: 'acts' }, [this.chatLink(b, 'btn go big out'), b.id ? this.link('Open the trade', tradeUrl(b.id), { cls: 'btn big out', title: 'Start a trade with ' + b.name + ' on Torn', focus: 'step-trade' }) : null]));
                 return spEl('div', { class: 'plan' }, kids);
             }
             let text;
@@ -30352,7 +30609,7 @@
             // Refused by the browser (it copies only from a page you are on): said on the button, never silent.
             const failed = this.pastCopyFailed === idOf(rec);
             const copy = spEl('button', { type: 'button', class: 'btn sm' + (copied ? ' done' : ''), 'data-focus': 'past:copy', title: 'Copies this trade as plain text, in Torn\'s time, to paste to ' + who, text: copied ? 'Copied' : failed ? 'Could not copy: press again' : 'Copy for ' + who, onclick: () => this.copyPast(rec, idOf(rec)) });
-            const BY = { seen: 'seen in your Torn trades', hand: 'Traded - done pressed in Torn Bids', bids: 'Cancel trade pressed in Torn Bids', torn: 'Cancel trade pressed on a Torn page' };
+            const BY = { seen: 'seen in your Torn trades', hand: 'Traded - done pressed in Torn Bids', bids: 'Cancel trade pressed in Torn Bids', torn: 'Cancel trade pressed on a Torn page', gone: 'it left your open trades on Torn without going through' };
             const later = end ? pastSpan(end.at - rec.at) + ' later' : '';
             const story = ['Said yes ' + pastWhen(rec.at, now)];
             if (state === 'traded') story.push(spEl('b', { text: 'traded ' + pastWhen(end.at, now) }), later, BY[end.by] || null);
@@ -33025,6 +33282,7 @@
 
 
 
+
     const STORE_KEY = 'apiKey';
     const STORE_ITEMS = 'itemsCache';
     const STORE_NPC = 'npcCache';
@@ -33380,6 +33638,8 @@
         buyWhere: null,
         /* Listings noted as not there, once per page load: 'seller|item'. */
         goneNoted: new Set(),
+        // The listing this page was opened for, once marked not here (notePointedGone).
+        pointedGone: null,
         tradeFillBound: false,
         // The buying run's "did you buy it?" (the step key it asks about).
         buyAsk: null,
@@ -34179,7 +34439,7 @@
         markFriendRows(friendsHere.size ? listings.filter((l) => l.el && friendsHere.has(String(l.itemId))).map((l) => ({ el: l.el, label: sharedOnThis(friendsHere.get(String(l.itemId)), now).replace(/ · [^·]*$/, '') })) : []);
         showBazaarTarget(listings);
         // How much of this bazaar is in the page, and how much of it has been read (3.16.3).
-        app.bzRead = app.pageType === PAGE_BAZAAR && sellerId ? readBazaarList(document) : null;
+        app.bzRead = app.pageType === PAGE_BAZAAR && sellerId ? readBazaarList(document, buyFormItemId) : null;
         if (app.bzRead) {
             app.bzHadList = true;
             for (const r of app.bzRead.rows) for (const id of r.ids) app.bzEver.add(id);
@@ -34187,6 +34447,7 @@
         app.bzCover = coverAfter(app.bzCover, location.href, app.bzRead);
         // How soon after this page showed its list was first read (see BUY_EARLY_READ_MS).
         if (app.bzCover && app.bzReadAfter === null) app.bzReadAfter = pageShownAt === null ? Infinity : Math.max(0, performance.now() - pageShownAt);
+        notePointedGone(listings);
         trackTradeBuying(app.pageType === PAGE_BAZAAR ? listings : []);
 
         app.lastScanAt = now;
@@ -34293,6 +34554,40 @@
                 'warn',
             );
         }
+    }
+
+    /**
+     * Sent here from Torn Bids for one listing, and this bazaar holds none of that
+     * item (3.27.1). The owner, 2026-10-11: "even when i go to a bazaar from
+     * tornbids, and i see ... item no longer there ... it doesnt update in
+     * tornbids and it still sees it". A listing was marked gone only when this
+     * page had SEEN it and it then left, or when it was a step of an accepted
+     * trade; one already gone when you arrived was never seen, so nothing was
+     * said - showBazaarTarget just had nothing to point at.
+     *
+     * The link names the item (bazaarTarget). Once every row of the bazaar has
+     * been read and the item is in none (coverVerdict 'absent' - never on rows
+     * not read yet, never under the bazaar's search box, never while a buy form
+     * that could not be named is open), it is marked gone as any other: out of
+     * every plan in Torn Bids until TornW3B has seen that bazaar change since.
+     */
+    function notePointedGone(listings) {
+        if (!bidsOn() || app.pageType !== PAGE_BAZAAR || !Array.isArray(listings)) return;
+        const target = bazaarTarget(location.href);
+        const seller = bazaarOwnerId(location.href);
+        if (!target || !seller) return;
+        const k = goneKey(seller, target.itemId);
+        if (listings.some((l) => String(l.itemId) === target.itemId)) {
+            if (app.pointedGone === k) app.pointedGone = null;
+            forgetGoneListing(seller, target.itemId);
+            return;
+        }
+        if (coverVerdict(app.bzCover, target.itemId) !== 'absent') return;
+        if (app.pointedGone === k) return;
+        app.pointedGone = k;
+        if (!app.goneNoted.has(k)) logProblem('note', 'The listing Torn Bids sent you for is not in this bazaar (item ' + target.itemId + ') - left out of the plans in Torn Bids');
+        noteGoneListing(seller, target.itemId);
+        app.panel.setStatus('That listing is not in this bazaar any more. Torn Bids leaves it out now.', 'warn');
     }
 
     /** Shared: what the others are going for in this bazaar - Map of item (as text) -> {who, at, sellers}. Empty with Shared off. */
@@ -37148,9 +37443,34 @@
             // ...and when: a card that is bought out leaves the page a moment later - after a confirm, and a
             // read or two of the page in between (3.23.0: one memory of a press, kept STOCK_PRESS_MS).
             for (const c of app.stockCards || []) {
-                if (c.el && c.el.contains(target)) (app.stockPressed = app.stockPressed || new Map()).set(String(c.itemId) + '|' + Number(c.listingPrice), Date.now());
+                if (c.el && c.el.contains(target)) pressedOnListing(String(c.itemId) + '|' + Number(c.listingPrice));
+            }
+            // Torn's own Buy, in the form that stands where the card was (3.27.1): the press that buys.
+            if (buyFormBought(target)) {
+                const form = openBuyForms(document).find((x) => x.el.contains(target));
+                const id = form ? buyFormItemId(form) : null;
+                if (id && form.price) pressedOnListing(id + '|' + form.price);
             }
         }, true);
+        // Enter in the form's number box buys as its Buy does.
+        document.addEventListener('keydown', (event) => {
+            if (event.key !== 'Enter' || !event.target || !event.target.closest) return;
+            const form = openBuyForms(document).find((x) => x.el.contains(event.target));
+            const id = form ? buyFormItemId(form) : null;
+            if (id && form.price) pressedOnListing(id + '|' + form.price);
+        }, true);
+    }
+
+    /** You pressed on this listing ('itemId|price'): when, for a listing that then leaves, and that you did, for stock that then falls. */
+    function pressedOnListing(key) {
+        (app.stockPressed = app.stockPressed || new Map()).set(key, Date.now());
+        (app.stockTouched = app.stockTouched || new Set()).add(key);
+    }
+
+    /** The item a buy form is for, by the name it shows (it has no picture): its id, or null. */
+    function buyFormItemId(form) {
+        const item = form && form.name && app.index ? findItemByName(app.index, form.name) : null;
+        return item ? String(item.id) : null;
     }
 
     /**
@@ -37199,11 +37519,32 @@
         }
         const was = store[seller] && store[seller].cards && typeof store[seller].cards === 'object' ? store[seller].cards : {};
         const now = Date.now();
-        const { bought: dropped, seen } = stockBuys(was, listings);
+        const { bought: fell, seen } = stockBuys(was, listings);
+        // A listing whose buy form is open (3.27.1, sources/dom/buy-form.js): its card is not in the page, and it
+        // is still there - not gone, and no stock of it fell (two listings of one item at one price count as one).
+        const forms = openBuyForms(document).map((x) => ({ ...x, itemId: buyFormItemId(x) }));
+        const formOpen = (itemId, price) => forms.some((x) => x.itemId === String(itemId) && (!x.price || x.price === Number(price)));
+        app.stockFormSeen = app.stockFormSeen || new Set();
+        for (const [key, w] of Object.entries(was)) {
+            if (!w || !formOpen(w.itemId, w.price)) {
+                app.stockFormSeen.delete(seller + '|' + key);
+                continue;
+            }
+            if (seen[key] && seen[key].qty < w.qty) seen[key].qty = w.qty;
+            // The press that opened the form bought nothing: from here only the form's own Buy counts as "you pressed".
+            if (!app.stockFormSeen.has(seller + '|' + key)) {
+                app.stockFormSeen.add(seller + '|' + key);
+                if (app.stockPressed) app.stockPressed.delete(key);
+            }
+        }
+        // A form that names no item we know: it may stand for any listing here, so none is judged gone.
+        const formUnknown = forms.some((x) => !x.itemId);
+        const dropped = fell.filter((b) => !formUnknown && !formOpen(b.itemId, b.price));
         // Cards read on this load of the page: only their rows are evidence (the list may be sorted another way after a reload).
         app.stockSeenLoad = app.stockSeenLoad || new Set();
-        // Stock that dropped since another visit is anyone's buy; only a drop in front of you is yours (3.21.1).
-        const tookHere = dropped.filter((b) => app.stockSeenLoad.has(seller + '|' + b.itemId + '|' + b.price));
+        // Stock that dropped since another visit is anyone's buy; only a drop in front of you is yours (3.21.1) -
+        // and only on a listing you pressed in on this visit (3.27.1): a drop on one you never touched is someone else's.
+        const tookHere = dropped.filter((b) => app.stockSeenLoad.has(seller + '|' + b.itemId + '|' + b.price) && app.stockTouched && app.stockTouched.has(b.itemId + '|' + b.price));
         for (const key of Object.keys(seen)) app.stockSeenLoad.add(seller + '|' + key);
         const here = Object.values(seen);
         // Each card's row of the list, as it is now: says later whether a card left the page or was bought out.
@@ -37229,6 +37570,11 @@
         const kept = {};
         for (const [key, w] of Object.entries(was)) {
             if (!w || seen[key]) continue;
+            // Its buy form is open in its place: still there, as it was.
+            if (formOpen(w.itemId, w.price)) {
+                kept[key] = w;
+                continue;
+            }
             // The item is here at another price: re-priced, counted from its new card.
             if (here.some((x) => x.itemId === w.itemId)) continue;
             const pressedAt = app.stockPressed ? app.stockPressed.get(key) : null;
@@ -37238,9 +37584,9 @@
             const rowNow = read && Number.isInteger(w.row) ? read.rows.find((r) => r.index === w.row) : null;
             const byRow = Boolean(read) && app.stockSeenLoad.has(seller + '|' + key) && !read.searching && !w.rowSearch
                 && (!rowNow || rowNow.ids.length >= read.perRow || rowNow.index === read.rowsTotal - 1);
-            const gone = read
+            const gone = !formUnknown && (read
                 ? absent || (byRow && listingBoughtOut(w.itemId, w, read, { hadList: true, absent: false }))
-                : !app.bzHadList && Boolean(pressedAt && now - pressedAt < STOCK_PRESS_MS);
+                : !app.bzHadList && Boolean(pressedAt && now - pressedAt < STOCK_PRESS_MS));
             if (gone) {
                 // One line a bazaar (3.23.0): every listing it lost on this visit folds into it (core/errlog.js).
                 if (!app.goneNoted.has(goneKey(seller, w.itemId))) logProblem('note', goneLine([[w.itemId, w.qty]]), null, { fold: goneFold(seller), gone: [[String(w.itemId), w.qty]] });
@@ -38505,6 +38851,9 @@
                 dayPace: w3bDayPace(Date.now()),
                 statusesKnown: info.statusesKnown ?? null, statusesWanted: info.statusesWanted ?? null,
                 teScanned: Object.values((sell.db && sell.db.traders) || {}).filter((t) => t && t.te && t.te.prices).length,
+                // 3.28.0: the item speeds in use (items measured by the server, how old its table is), how many of the flips
+                // shown are planned smaller for them, and how many trader-and-item pairs are known from finished trades.
+                speeds: sell.speedInfo || null,
             },
         };
     }
@@ -38643,6 +38992,11 @@
         if (world === 'sell') {
             gmOnChange(SHARED_LISTS_IN_KEY, () => takeSharedLists());
             takeSharedLists();
+            // A new table of item speeds (3.28.0): the amounts are worked out again with it.
+            gmOnChange(SHARED_MOVES_KEY, () => {
+                speedsReadAt = 0;
+                renderSelling();
+            });
         }
         gmOnChange(STORE_KEY, () => sharedSetUp());
         // The Public key's box in Torn Bids' Settings shows what the panel on Torn's pages saved or forgot.
@@ -40015,6 +40369,28 @@
         all[key] = tickAccepted(all[key], line, tick);
         saveSellAccepted(all);
         return all;
+    }
+
+    /*
+     * 3.28.0 - how fast items leave the bazaars, as the shared server counted it from its own reads of Torn
+     * (feed/shared-link.js keeps the table; core/liquidity.js says what an amount is). Read again at most every half
+     * minute (the tab that does the exchanging stores it itself and hears no change of its own), and not used once
+     * the server has said nothing new for hours: then every item is planned as it always was.
+     */
+    const SPEEDS_KEEP_MS = 3 * 60 * 60000;
+    const SPEEDS_REREAD_MS = 30000;
+    let speedsKept = null;
+    let speedsReadAt = 0;
+    function sharedSpeeds(now = Date.now()) {
+        if (!sharedLink || !sharedLink.config()) return null;
+        if (now - speedsReadAt >= SPEEDS_REREAD_MS || now < speedsReadAt) {
+            speedsReadAt = now;
+            const box = gmGet(SHARED_MOVES_KEY, null);
+            const ok = box && Number.isInteger(box.at) && Number.isFinite(box.got) && box.rows && typeof box.rows === 'object';
+            if (!ok) speedsKept = null;
+            else if (!speedsKept || speedsKept.at !== box.at || speedsKept.got !== box.got) speedsKept = { at: box.at, got: box.got, rows: new Map(Object.entries(box.rows)) };
+        }
+        return speedsKept && now - speedsKept.got < SPEEDS_KEEP_MS && speedsKept.got - now < 60000 ? speedsKept : null;
     }
 
     /** How fast items leave the bazaars: itemId -> {units, ms, at}, read once per page. */
@@ -41724,16 +42100,30 @@
             const item = itemOf(id);
             return flipBuyer(buyersOf(id), { avg: item ? Number(item.marketValue) || null : null, type: item ? item.type : null, subType: item ? item.subType : null, unitsOf });
         };
+        // 3.28.0 - how fast an item really moves (units an hour; null: the shared server has not measured it).
+        const speeds = sharedSpeeds(now);
+        const rateCache = new Map();
+        const rateOf = (id) => {
+            const key = String(id);
+            if (!rateCache.has(key)) rateCache.set(key, measuredRate(speeds ? speeds.rows.get(key) : null, sellMoves().get(key) || null));
+            return rateCache.get(key);
+        };
         // How easily an item trades: fast / normal / slow (core/liquidity.js).
         const kindCache = new Map();
         const kindOf = (id) => {
             const key = String(id);
             if (!kindCache.has(key)) {
                 const item = itemOf(key);
-                kindCache.set(key, liquidityKind({ type: item ? item.type : null, statItem: isStatItem(item), sellers: sellersOf(key), move: sellMoves().get(key) || null }));
+                kindCache.set(key, liquidityKind({ type: item ? item.type : null, statItem: isStatItem(item), sellers: sellersOf(key), move: sellMoves().get(key) || null, rate: rateOf(key) }));
             }
             return kindCache.get(key);
         };
+        // ...and how many of it one trade takes (amountCap): no more than about an hour of what moves, never under one,
+        // never fewer than this trader took from you before; an item not measured as it always was.
+        const tookBefore = pastTook(gmGet(STORE_SELL_PAST, null));
+        const buyerKeyOf = (b) => (b.id ? 'id:' + b.id : 'name:' + String(b.name).toLowerCase());
+        // (The kind only matters to an extra: a main flip is not asked for it - that would read every item's sellers.)
+        const amountOf = (id, key, extra) => amountCap({ most: prefs.maxPerFlip || 100, kind: extra ? kindOf(id) : 'normal', rate: rateOf(id), extra, took: key && tookBefore.size ? tookBefore.get(key + '|' + String(id)) || 0 : 0 });
         const flipBuyersCache = new Map();
         // Settings › Flips › Never flip (Clothing by default: the friend's "don't include clothes").
         const neverFlip = new Set(prefs.neverFlip || []);
@@ -41805,7 +42195,7 @@
             const rows = sellersOf(id);
             if (!rows) return null;
             const fbs = flipCheckedOf(id);
-            const k = keepers.plans.get(String(id), keptPlanSig(rows, prefs, fbs, (b) => declinedBy(id, b)), () => {
+            const k = keepers.plans.get(String(id), keptPlanSig(rows, prefs, fbs, (b) => declinedBy(id, b), (b) => amountOf(id, buyerKeyOf(b), false)), () => {
                 const best = planFrom(id, rows);
                 if (!best) return null;
                 const { buyer, ...plan } = best;
@@ -41819,9 +42209,12 @@
             for (const b of flipCheckedOf(id)) {
                 // A trade you declined is not a flip (the same trader's other items still are).
                 if (declinedAll.size && declinedAll.has(declineKey(id, b.id ? 'id:' + b.id : 'name:' + String(b.name).toLowerCase()))) continue;
-                const most = Math.min(prefs.maxPerFlip || 100, b.maxUnits ? b.maxUnits : Infinity);
+                const usual = Math.min(prefs.maxPerFlip || 100, b.maxUnits ? b.maxUnits : Infinity);
+                const most = Math.min(usual, amountOf(id, buyerKeyOf(b), false));
                 const plan = flipPlan(rows, b.price, { cash: prefs.cash, maxUnits: most, minPct: prefs.minProfitPct });
                 if (!plan) continue;
+                // What moves in an hour - not Most per flip, not their pay - is what stopped it: said on the row.
+                if (most < usual && plan.units >= most && plan.available > plan.units) plan.pace = rateOf(id);
                 if (!best || plan.profit > best.profit || (plan.profit === best.profit && plan.units > 0 && !best.units)) best = { ...plan, buyer: b };
             }
             return best;
@@ -41835,7 +42228,7 @@
                 const c = checkOf(id, b);
                 if (c.ok) return null;
                 if ((c.why !== 'not-checked' && c.why !== 'no-date') || declinedBy(id, b)) continue;
-                const most = Math.min(prefs.maxPerFlip || 100, b.maxUnits ? b.maxUnits : Infinity);
+                const most = Math.min(amountOf(id, buyerKeyOf(b), false), b.maxUnits ? b.maxUnits : Infinity);
                 const plan = flipPlan(rows, b.price, { cash: prefs.cash, maxUnits: most, minPct: prefs.minProfitPct });
                 return plan && plan.units > 0 ? { profit: plan.profit, buyer: b } : null;
             }
@@ -41897,7 +42290,7 @@
                 let pick = null;
                 let score = -Infinity;
                 for (const b of flipBuyersOf(id)) {
-                    const n = Math.min(prefs.maxPerFlip || 100, b.maxUnits || Infinity, prefs.cash > 0 ? Math.floor(prefs.cash / lowest) : Infinity);
+                    const n = Math.min(amountOf(id, buyerKeyOf(b), false), b.maxUnits || Infinity, prefs.cash > 0 ? Math.floor(prefs.cash / lowest) : Infinity);
                     const s = (b.price - lowest) * n;
                     if (s > score) {
                         score = s;
@@ -41916,7 +42309,9 @@
                 const sumRow = sell.summary.get(String(id));
                 const news = lightAge >= W3B_LIGHT_FIRST_MS && lightSummaryMoved(rec, id) && !(saidLow > 0 && saidLow <= sumRow.lowestPrice);
                 const light = lightAge < W3B_LIGHT_SAYS_MS && !news ? rec.lightRows : null;
-                const makeOpts = { cash: prefs.cash, maxUnits: Math.min(prefs.maxPerFlip || 100, pick.maxUnits || Infinity), enough: (each, price) => enoughProfit(each, price, 'TRADER', prefs.minProfitPct) };
+                // 3.28.0: its place in the order is what the amount a trade would really take makes.
+                const pickMost = Math.min(amountOf(id, buyerKeyOf(pick), false), pick.maxUnits || Infinity);
+                const makeOpts = { cash: prefs.cash, maxUnits: pickMost, enough: (each, price) => enoughProfit(each, price, 'TRADER', prefs.minProfitPct) };
                 let made = light ? cheapProfit(light, pick.price, makeOpts) : null;
                 // Its sellers were read: what their listings make (the ones TornW3B saw lately), the same way. With
                 // nothing to make on them it stays a guess - the summary may know of a newer listing.
@@ -41925,7 +42320,7 @@
                     const got = rows.length ? cheapProfit({ rows }, pick.price, makeOpts) : null;
                     if (got && got.profit > 0) made = got;
                 }
-                return { price: pick.price, maxUnits: pick.maxUnits || null, ...(made ? { score: made.profit } : {}) };
+                return { price: pick.price, maxUnits: pickMost, ...(made ? { score: made.profit } : {}) };
             }, { cash: prefs.cash, maxUnits: prefs.maxPerFlip, minPct: prefs.minProfitPct, limit: SELL_FLIP_CANDIDATES })
             : [];
         // Near-misses, then every other item someone buys, oldest read first (3.15).
@@ -42024,6 +42419,18 @@
                     : 'Every possible flip has its price checked: ' + shownFlips.length + ' shown');
             }
             sell.pricesWaiting = waiting.length;
+            // 3.28.0 - for the log and the zip: the item speeds in use, and how many of the flips shown they made smaller.
+            const pacedFlips = rows.filter((r) => r.plan && r.plan.units > 0 && typeof r.plan.pace === 'number').length;
+            sell.speedInfo = { itemsMeasured: speeds ? speeds.rows.size : 0, tableAgeMin: speeds ? Math.round((now - speeds.got) / 60000) : null, flipsShown: shownFlips.length, flipsPlannedSmaller: pacedFlips, tookBefore: tookBefore.size };
+            // Said once each way; the counts of the moment are in the zip (coverage.speeds).
+            const speedWord = speeds ? 'on' : 'off';
+            if (speedWord !== sell.speedWord) {
+                sell.speedWord = speedWord;
+                logProblem('note', speeds
+                    ? 'Item speeds from the shared server in use: ' + speeds.rows.size + ' items measured'
+                    : 'No item speeds from the shared server: every amount is planned as before',
+                'no more of an item in one trade than about ' + AMOUNT_HOURS + ' hour of what leaves the bazaars, never under one; an item not measured keeps the old limits');
+            }
         }
         sell.trustSlow = Boolean(prefs.trustedOnly) && !votesMissing;
         // The category filters the flips, the list and its counts together; its
@@ -42212,6 +42619,8 @@
                 // Never their own bazaar; the extras by how fast they sell.
                 traderId: buyer.id || null,
                 kindOf,
+                // 3.28.0: each line no more than about an hour of what moves (the main flip too).
+                capOf: (id, extra) => amountOf(id, key, extra),
                 extraItems: prefs.extraItems,
                 // "Every flip" pressed for this trader: all of it, within your cash, their pay and the 10,000.
                 everything: sell.tradeEvery.has(key),
@@ -42386,7 +42795,7 @@
                     const p = pickBazaars(list, bid, { maxUnits: n, minPct: prefs.minProfitPct, maxStops: every ? Infinity : MAIN_STOPS, exclude: chosen.buyer.id || null });
                     return p && p.units > 0 ? p.steps : null;
                 },
-                info: (id) => ({ name: nameOf(id), bid: bidNow(id), kind: kindOf(id), units: Math.min(prefs.maxPerFlip || 100, EXTRA_CAP[kindOf(id)] || 10), price: lowestOf(id) }),
+                info: (id) => ({ name: nameOf(id), bid: bidNow(id), kind: kindOf(id), units: amountOf(id, chosen.key, true), price: lowestOf(id) }),
             };
             const w3bT = chosen.buyer.id && sell.db.traders[chosen.buyer.id] ? sell.db.traders[chosen.buyer.id].w3b : null;
             const common = {
@@ -42412,7 +42821,7 @@
                     if (!list || !(bid > 0)) return null;
                     const p = pickBazaars(list, bid, every
                         ? { maxUnits: prefs.maxPerFlip || 100, minPct: prefs.minProfitPct, maxStops: Infinity, exclude: chosen.buyer.id || null }
-                        : { maxUnits: Math.min(prefs.maxPerFlip || 100, EXTRA_CAP[kindOf(id)] || 10), minPct: prefs.minProfitPct, maxStops: EXTRA_STOPS, exclude: chosen.buyer.id || null });
+                        : { maxUnits: amountOf(id, chosen.key, true), minPct: prefs.minProfitPct, maxStops: EXTRA_STOPS, exclude: chosen.buyer.id || null });
                     return p && p.units > 0 ? p.steps : null;
                 };
                 const held = resolveEstimated(hold.held, chosen.flips.map(named), pickOwn);
@@ -42593,7 +43002,7 @@
             // Buyers online only (3.20.5): a status read since is a reason too - a trader found
             // offline kept "Trade +$X" here until the next working-out.
             const whoStatus = prefs.onlineOnly ? [...who.keys()].map((id) => levelOf(id) + (holdFlips && unreadStatus(id) ? '?' : '')) : null;
-            const scanSig = JSON.stringify([prefs.cash, prefs.maxPerFlip, prefs.extraItems, prefs.minProfitPct, prefs.networthPct, prefs.onlineOnly, prefs.trustedOnly, prefs.freshOnly, favEdits, [...blacklist], [...who.keys()], sell.summaryAt, whoStatus, [...sell.tradeEvery]]);
+            const scanSig = JSON.stringify([prefs.cash, prefs.maxPerFlip, prefs.extraItems, prefs.minProfitPct, prefs.networthPct, prefs.onlineOnly, prefs.trustedOnly, prefs.freshOnly, favEdits, [...blacklist], [...who.keys()], sell.summaryAt, whoStatus, [...sell.tradeEvery], speeds ? speeds.at : 0, tookBefore.size]);
             const fresh = sell.scanSig === scanSig && now - (sell.scanAt || 0) < SCAN_EVERY_MS;
             if (!scan.open) sell.scanWatch = [];
             if (scan.open && fresh) scan.list = sell.scanList || [];
@@ -42858,6 +43267,8 @@
                 buy: r.badge && r.badge.kind === 'flip' && r.plan ? r.plan.firstPrice : null, sell: r.badge && r.badge.kind === 'flip' && r.plan && r.plan.buyer ? r.plan.buyer.price : null,
                 // The row as a line of a table (3.25.0): how many, from how many bazaars, to whom - and who pays most for one.
                 units: r.plan && r.plan.units > 0 ? r.plan.units : 0,
+                // 3.28.0: units an hour that leave the bazaars, when that is what held the amount down (null: it did not).
+                pace: r.plan && r.plan.units > 0 && typeof r.plan.pace === 'number' ? r.plan.pace : null,
                 stops: r.plan && r.plan.units > 0 ? new Set((r.plan.steps || []).map((st) => st.sellerId || st.sellerName)).size : 0,
                 to: r.plan && r.plan.units > 0 && r.plan.buyer ? { id: r.plan.buyer.id || null, name: r.plan.buyer.name, old: oldList(r.plan.buyer, listAtOf, now) } : null,
                 top: r.best ? { id: r.best.id || null, name: r.best.name, price: r.best.price } : null,
@@ -43781,7 +44192,11 @@
             getKey: getSellKey,
             ...tornSharing('sell'),
         });
-        startShared('sell', sharedWantSell, () => renderSelling());
+        startShared('sell', sharedWantSell, () => {
+            // A table of item speeds this tab's own exchange just stored is read at the next draw, not half a minute on.
+            speedsReadAt = 0;
+            renderSelling();
+        });
         loadSellNetworth();
         loadSellPresence();
         gmOnChange(STORE_SELL_PRESENCE, () => loadSellPresence());
@@ -44175,6 +44590,20 @@
             },
         });
         sell.page.mount();
+        // 3.27.1 - opened or reloaded with a page in the address (3.26.1: "#flips"), the page goes there while it
+        // is being built and tells nobody (its go() is quiet then). The script went on working out the list of
+        // the page it thought was in view ('all'), and a list is drawn only when it is the one worked out - so
+        // Best flips, My items and To sell stayed EMPTY, without a word, until a tab was pressed. Seen on the
+        // test page in the released 3.27.0: "Every possible flip has its price checked: 3 shown", no row drawn.
+        const openedOn = sell.page.shownNow();
+        if (openedOn) {
+            sell.bdPage = String(openedOn.page);
+            sell.bdTab = Number(openedOn.tab) || 0;
+            if (openedOn.filter && openedOn.filter !== sell.filter) {
+                sell.filter = openedOn.filter;
+                sell.boardOpen = sell.filter === 'sell' || sell.filter === 'trades';
+            }
+        }
 
         loadSellTraders();
         gmOnChange(STORE_TE, () => {
@@ -44919,7 +45348,8 @@
                 const full = await fetchTrade(led.buysClient, id, use);
                 if (!full) continue;
                 const whole = { ...x, ...full };
-                seen[id] = { t: tradeFinishedAt(whole) || t || Date.now(), partnerId: tradePartnerId(whole, self), gave: Object.fromEntries(itemsGiven(whole, self)) };
+                // empty: nothing changed hands (no item, no money, from either side).
+                seen[id] = { t: tradeFinishedAt(whole) || t || Date.now(), partnerId: tradePartnerId(whole, self), gave: Object.fromEntries(itemsGiven(whole, self)), empty: Array.isArray(full.items) && !full.items.length };
             }
             const used = new Set(Array.isArray(stored.used) ? stored.used.map(String) : []);
             let avail = Object.entries(seen).filter(([id, x]) => x.gave && x.partnerId && !used.has(id)).map(([id, x]) => ({ id, t: Number(x.t), partnerId: x.partnerId, gave: x.gave }));
@@ -44953,7 +45383,27 @@
                 changed = true;
             }
             if (changed) gmSet(STORE_SELL_CANCEL_UNDO, undoAll);
-            gmSet(STORE_SELL_TRADES_SEEN, { at: Date.now(), seen, used: [...used].slice(-200) });
+            // Called off on Torn (3.27.1, core/accepted.js tradesCalledOff): a trade with the trader was open there,
+            // is no longer, and did not go through. Not judged when the finished list came back full (it may not
+            // hold the newest), nor when Torn's list of open trades could not be read.
+            let going = stored.going && typeof stored.going === 'object' ? stored.going : {};
+            const still = Object.values(sellAccepted()).filter((t) => t.trader && t.trader.id);
+            if (still.length && list.length < 100) {
+                const ongoing = await fetchOngoingTrades(led.buysClient, use);
+                if (ongoing) {
+                    const listed = new Set(list.map((x) => String(x && x.id)));
+                    const finished = (id) => (seen[id] ? (seen[id].empty ? 'empty' : 'read') : listed.has(String(id)) ? 'listed' : null);
+                    const off = tradesCalledOff(going, still, ongoing.map((x) => ({ id: x && x.id, partnerId: tradePartnerId(x, self) })), { finished });
+                    going = off.going;
+                    for (const key of off.gone) {
+                        const t = still.find((x) => x.key === key);
+                        cancelSellAccepted(key, Date.now(), 'gone');
+                        logAction('Cancel trade - by itself (it left your open trades on Torn without going through; item ' + (t ? t.itemId : '?') + ')');
+                        changed = true;
+                    }
+                }
+            } else if (!still.length) going = {};
+            gmSet(STORE_SELL_TRADES_SEEN, { at: Date.now(), seen, used: [...used].slice(-200), going });
             if (changed) renderSellingNow();
         } catch (error) {
             markLedgerKeyDead(error);

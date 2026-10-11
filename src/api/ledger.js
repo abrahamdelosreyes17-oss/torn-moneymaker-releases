@@ -113,6 +113,16 @@ export async function fetchTradesPage(client, { from = null, use = undefined } =
     return Array.isArray(data && data.trades) ? data.trades : [];
 }
 
+/**
+ * The trades you have open on Torn now (3.27.1). The same path as the
+ * finished ones; Torn's word for the category is "ongoing", and it takes no
+ * limit, sort or from (Torn's spec). null: the answer was not a list.
+ */
+export async function fetchOngoingTrades(client, use = undefined) {
+    const data = await client.get('v2/user/trades', { cat: 'ongoing' }, use);
+    return Array.isArray(data && data.trades) ? data.trades : null;
+}
+
 /** One trade: both sides' items and money. */
 export async function fetchTrade(client, tradeId, use = undefined) {
     const id = String(tradeId).replace(/\D/g, '');

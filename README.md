@@ -2300,6 +2300,226 @@ no prices; nothing cut off at 1536 and 1920 wide. `test/past-trades.test.js`
 real trade on real Torn from yes to end, the "Copied" answer (the test browser
 refuses the clipboard), the By trader list with real statuses arriving.
 
+### A buy that was not one, a trade called off, a listing gone when you arrive, and three things on screen (built as 3.27.1, released inside 3.28.0)
+
+Built 2026-10-11 and held; it went out with 3.28.0 (the section after this
+one). Everything below was seen on the test page only
+(`test/harness-live.html`), never on real Torn.
+
+**1. "Why does Torn Bids think I have a Naval Cutlass in To sell?"** (the
+owner, 2026-10-11: a row "Naval Cutlass × 1 · Extra buy · $41,000,000" for an
+item he never bought.)
+
+*Why.* Torn's Buy on a bazaar card swaps the card for a buy form that has no
+picture. The cards and the rows of a bazaar are found by their pictures, so a
+listing whose form was open was not found at all - and "not found within 90
+seconds of your press on it" counted as "you bought all of it". Opening the
+form and closing it again was enough. A second way in: a listing's stock
+falling while the page was open counted as your buy even if you never touched
+it (someone else bought, or one of two listings at the same price left the part
+of the list Torn keeps in the page).
+
+*What is new.*
+- `src/sources/dom/buy-form.js` finds the open forms (name, price, stock). A
+  listing whose form is open is still in the bazaar: `readBazaarList` gives it
+  its place in its row, `trackSeenStock` keeps it.
+- The press that opens the form buys nothing. Only the form's own Buy (or
+  Enter in its number box) is a press that can buy out a listing.
+- A fall in stock is your buy only on a listing you pressed in on this visit.
+- A form that names no item we know: nothing is judged gone from that page.
+- The buying run reads the same rows, so a planned listing is not "gone"
+  while its form is open either.
+
+A false row already made leaves by itself: about an hour after it was made the
+To sell list is trimmed to what your inventory holds (needs the Limited key).
+
+Test page: `?page=bazaar&userId=777&bazaarwindow=3&buybox=1&job=bids&awake=1`
+(each card has Torn's Buy, which opens the form) and `&twin=1` (two listings of
+the same item at the same price). `test/buy-form.test.js`.
+
+**2. A trade the trader called off never left Torn Bids** (the friend on
+3.26.2, zip of 2026-10-12 02:38: "Trader declined the trade and the trades in
+torn bids doesn't disappear I have to manually remove them myself".)
+
+*Why.* An accepted trade closed by itself only when Torn showed it finished.
+Torn has no "cancelled" state: a trade that is declined is simply no longer
+among your open trades. Nothing looked there.
+
+*What is new.* While a trade is accepted, the once-a-minute check also reads
+Torn's list of your open trades (`/v2/user/trades?cat=ongoing`, the Ledger's
+Full key, one more request per check). `tradesCalledOff` in
+`src/core/accepted.js`:
+- a trade with that trader must first have been seen open on Torn - a trade
+  you never opened is left alone, however long;
+- it is called off when no trade with them is open on **two reads in a row**
+  and Torn does not show it finished (finished with nothing in it counts as
+  called off);
+- not judged when Torn's finished list comes back full, or the open list
+  cannot be read.
+
+It closes as Cancel trade does: what was bought goes to To sell, and for 3
+hours a trade that turns out to have gone through is put right. History says
+"it left your open trades on Torn without going through" - it does not say who
+called it off, Torn does not tell.
+
+Test page: `?ttv2=traders&sellkeys=1&ledgerkey=1&calledoff=1&awake=1#trades`
+(closes on the third read, a little over two minutes).
+`test/called-off.test.js`.
+
+**3. "Even when I go to a bazaar from Torn Bids and the item is no longer
+there, it doesn't update in Torn Bids and it still sees it"** (the owner,
+2026-10-11.)
+
+*Why.* A listing was marked gone in two cases only: this page had seen it and
+it then left, or it was a step of a trade a trader had said yes to. A listing
+already gone when you arrived was never seen, so nothing was said -
+`showBazaarTarget` just had nothing to point at.
+
+*What is new.* The link Torn Bids opens names the item (`ttItem`).
+`notePointedGone` in `src/main.js`: once every row of that bazaar has been in
+the page and the item is in none, the seller is marked as not listing it - the
+same mark as before (`sellGone`), so every plan in Torn Bids leaves that
+listing out until TornW3B has seen the bazaar change since. The panel says
+"That listing is not in this bazaar any more. Torn Bids leaves it out now."
+
+*What it does not do.* Torn keeps only the rows near the screen in the page. A
+bazaar too long to be there at once says nothing until you have scrolled
+through all of it; under the bazaar's own search box nothing is judged either.
+Not solved here.
+
+Test page: `?page=bazaar&userId=777&bazaarwindow=3&ttItem=206&ttPrice=840000&job=bids&awake=1`
+(Xanax is not in that bazaar: marked), `&ttItem=3001` (it is there: no mark),
+`&bazaarwindow=120` (too long to be read whole: no mark).
+
+**4. On screen.**
+- **"Open the trade" drawn above its own box** (the owner's screenshot,
+  "Sell to" card). The button had the class `lg`; the Ledger's page container
+  had it too (`.lg { display: flex; flex-direction: column; padding: 24px 24px
+  64px }`), and both sheets are in the one page. The Ledger's container is now
+  `lg-page`; the button uses `big`, the size of the Ask button beside it.
+- **Item names one letter per line in the panel's "In this bazaar"** (the
+  owner's screenshot on 3.27.0; this is the panel on a Torn page, the Torn
+  Bids job). The name's column was what was left beside a price line that
+  never wraps - nothing, in a 240 px panel. Now one row when it fits; in a
+  narrow panel the price line goes under the name, the name keeps its words
+  whole, Show stays in view. Seen at 241 px.
+- **"UI does not fit screen"** (the friend; the owner, 2026-10-12: "it needs
+  to scroll to see full item width wise ... maybe adjust font etc? or size
+  etc?"). At 1536 wide the three columns of a page are at their narrowest, and
+  every cell of a list stood on one line - so with real item names and figures
+  the lists of Flips (Best flips, By trader, All items), Trades > History and
+  To sell scrolled sideways. The test page's short names hid it; it showed once
+  they were swapped for long ones ("Bottle of Christmas Cocktail", a 16-letter
+  trader name, 8-figure prices). Two changes in `src/ui/bids-css.js`:
+  - **Under 1700 wide the whole of Torn Bids is drawn at nine tenths**
+    (`.app { zoom: .9 }`), so the columns have the room they were drawn with.
+    It is what the friend had done by hand (his zip: a 1707-wide window on a
+    1536 screen = the browser at 90%). From 1700 up nothing changes; from 2200
+    it is still drawn larger, as before.
+  - **The cell with the item's name gives way**: it wraps between words, only
+    when the row does not fit. Figures, a trader's name and the headings of the
+    pressed lists keep their one line.
+  Read on the test page at 1536, 1920 and 1366 wide, all 16 pages and tabs,
+  with the short names and the long ones: no list scrolls sideways at 1536 or
+  1920 (a long name takes two lines, three in What <trader> pays). At 1366
+  with the long names the Flips lists still scroll a little - not solved.
+- **Best flips empty until a tab was pressed** (found while testing the above;
+  in the released 3.27.0, since 3.26.1). Opened or reloaded with a page in the
+  address ("#flips"), the page goes there while it is built and tells the
+  script nothing; the script went on working out the list of the page it
+  thought was in view, and a list is drawn only when it is the one worked out.
+  So Best flips stayed empty, without a word: on the test page the log said
+  "Every possible flip has its price checked: 3 shown" over a list of no rows,
+  until All items and back was pressed. Now the script asks the page where it
+  opened (`shownNow()`, read in `src/main.js` after `mount()`). Seen with the
+  page opened on #flips, #mine, #sell, #trades and #today.
+
+**5. Housekeeping.** 67 class names of `src/ui/bids-css.js` that no source
+file uses, and their 140 rules, are out (the sheet was taken over from the
+drawings' stylesheets, and not every rule of theirs was ever used). Each
+name was looked for as a whole word and as a built name (`'pc-' + x`) in every
+other file of `src/`; on the test page no element of any Torn Bids page
+carries one. The file is 10 KB shorter.
+
+### How many of an item: by how fast it really moves (3.28.0)
+
+The owner, 2026-10-11: "i dont like how were finding deals ... tornbids wants
+to look for the fastest flippable items. and it wants to prioritize items that
+move quickly. so sometimes its like thimle x10 or cans x100. sometimes traders
+dont buy that. tornbids isnt smart enough, they would only buy high liquid
+items on that amount." And, before saying go, 2026-10-12: "im just scared we
+find 0 deals now."
+
+**What was wrong.** Every flip was placed by its profit, and the profit counted
+as many units as Most per flip allowed (100 unless changed). How fast the item
+moves was not in it. Only a trade's extra items had a limit by "kind" - fast:
+Most per flip, normal: 10, slow: 3 - and the kind was Torn's item type (drugs,
+plushies, flowers ... are "fast") unless this PC had read the item's sellers
+list twice, half an hour apart, which TornW3B's limit has made rare. His two
+examples are those two limits: a Thimble at the normal 10, cans at 100.
+
+**What it does now.**
+
+1. *The shared server counts what leaves the bazaars it reads from Torn*
+   (`D:\torn\server`, `src/moves.js`). Two reads of one bazaar and an item's
+   count fell: that many left it. Summed per item over every bazaar, fading by
+   half every six hours, it is units an hour, lately. Not counted: a bazaar
+   found empty, one that lost over half its listings at once (its owner took
+   them down), one not looked at for two hours, and a bazaar's first sight. The
+   Item Market and bazaars the server does not read are not in it, so the number
+   is the least that moves. An item is spoken of after two hours of watching;
+   "it hardly moves" (under one an hour) only when five bazaars list it.
+2. *Torn Bids' page asks for the table with one number* - `moves`, the time of
+   the table it holds - and is sent a newer one with its sync (the table is made
+   every ten minutes). Nothing else new leaves the PC. The panel on Torn's pages
+   never asks. Kept in `sharedMoves`; not used once the server has sent nothing
+   new for three hours.
+3. *No more of an item in one trade than about an hour of what moves*
+   (`amountCap` in `src/core/liquidity.js`; `AMOUNT_HOURS = 1` is our number,
+   not the owner's) - the main flip and the extras alike, never over Most per
+   flip. So a flip's profit, and with it its place in Best flips, in By trader
+   and among the possible flips read first, is that of an amount a trader would
+   take. A row held down this way says so: "× 6 · ... · about 6 an hour sell".
+4. *"Sells fast" / "slow seller" is the measure where there is one* (20 an hour
+   or more: fast; under one: slow), not the item's type.
+5. *What a trader took from you before is believed over the count*: the most
+   of an item they took in one trade that went through (Trades › History, the
+   last 30 trades) is never undercut for that trader.
+
+**Why this cannot cost a flip.** Three rules, each with a test:
+
+- It changes how many and in what order, never whether. An amount is never
+  under 1, and the least profit is a share of each item's price, so fewer of an
+  item cannot fail it. `test/amount.test.js` plans 600 made-up markets at six
+  rates each: every item the old rule made a flip of is still one, with a
+  profit, and each unit makes at least what it made before.
+- An item the server has not measured is planned exactly as before. A PC the
+  server does not know, or a server that is down, changes nothing at all: this
+  PC's own count of TornW3B's lists can raise a rate, never make or lower one.
+- A number you type in a trade is yours and is not cut.
+
+Where more possible flips qualify than are read (150), which of them are read
+first follows the new order: the ones whose realistic amount makes most.
+
+**Not changed.** "Every flip" with one trader still takes up to Most per flip
+of each (the owner: "1 trader that just buys everything"). What you bought to
+resell goes into a trade whole, as before. The order in which TornW3B is asked
+is not sorted by speed: with about ten sellers lists a minute that would starve
+the slow, well-paying flips of their price check.
+
+**For the log and the zip.** One line each way ("Item speeds from the shared
+server in use: N items measured" / "No item speeds ..."), and in
+`state.json` `coverage.speeds`: items measured, the table's age, flips shown,
+how many of them are planned smaller for it, and how many trader-and-item pairs
+are known from finished trades.
+
+**Never seen live.** The server half was tested against a pretend Torn (13
+tests) and the two halves together (`test/shared-link.test.js`); the page on
+the test page with `&shared=on&moves=335:6,206:300`. What the real numbers look
+like - how many items the server can speak of, and whether an hour is the right
+measure - is known only once the server has run with it for a few hours:
+`/admin/state` then names the items that move most.
+
 ## Architecture
 
 ```

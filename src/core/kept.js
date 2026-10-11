@@ -134,9 +134,10 @@ export function keptFreshUntil(rows, freshMs) {
  * @param {{maxPerFlip, cash, minProfitPct}} prefs
  * @param {object[]} buyers - flipBuyers()
  * @param {function} declined - (buyer) => boolean
+ * @param {function|null} [capOf] - (buyer) => the most of the item a trade with them takes (3.28.0, amountCap)
  */
-export function keptPlanSig(rows, prefs, buyers, declined) {
+export function keptPlanSig(rows, prefs, buyers, declined, capOf = null) {
     const sig = [rows, prefs.maxPerFlip, prefs.cash, prefs.minProfitPct, buyers.length];
-    for (const b of buyers) sig.push(b.id, b.name, b.price, b.maxUnits, Boolean(declined(b)));
+    for (const b of buyers) sig.push(b.id, b.name, b.price, b.maxUnits, Boolean(declined(b)), capOf ? capOf(b) : 0);
     return sig;
 }

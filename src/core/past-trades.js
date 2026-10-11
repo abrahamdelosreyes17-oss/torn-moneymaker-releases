@@ -191,6 +191,29 @@ export function endPastTrade(stored, trade, how, { now, by = null, facts = null,
     return pastTrades(at >= 0 ? list.map((r, k) => (k === at ? next : r)) : [next, ...list]);
 }
 
+/**
+ * The most of each item each trader took from you in one trade that went through: 'traderKey|itemId' -> units
+ * (3.28.0: what a trader took before is believed over a count of the market - core/liquidity.js amountCap).
+ * What stayed with you (To sell) is not counted as taken.
+ * @returns {Map<string, number>}
+ */
+export function pastTook(stored) {
+    const out = new Map();
+    for (const rec of pastTrades(stored)) {
+        if (!rec.end || rec.end.how !== 'traded') continue;
+        const per = new Map();
+        for (const row of rec.end.bought || []) {
+            const n = (Number(row.got) || 0) - (Number(row.kept) || 0);
+            if (n > 0) per.set(String(row.itemId), (per.get(String(row.itemId)) || 0) + n);
+        }
+        for (const [id, n] of per) {
+            const k = rec.key + '|' + id;
+            if (n > (out.get(k) || 0)) out.set(k, n);
+        }
+    }
+    return out;
+}
+
 /** 'going' while it has not ended, else how it ended. */
 export function pastState(rec) {
     return rec && rec.end ? rec.end.how : 'going';

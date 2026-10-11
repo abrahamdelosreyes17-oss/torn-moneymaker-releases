@@ -111,6 +111,65 @@ export function perHour(rec) {
     return (rec.units / rec.ms) * 3600000;
 }
 
+/*
+ * 3.28.0 - amounts by how fast an item really moves (the owner, 2026-10-11: "tornbids wants to look for the
+ * fastest flippable items ... thimle x10 or cans x100. sometimes traders dont buy that ... they would only buy
+ * high liquid items on that amount").
+ *
+ * Until now only a trade's EXTRA items had a limit by kind (fast: Most per flip, normal 10, slow 3), the kind was
+ * mostly Torn's item type, and the main flip had none. Now the shared server counts what leaves the bazaars it
+ * reads from Torn (server/src/moves.js) and sends units an hour per item; no more of an item goes in one trade
+ * than moves in about AMOUNT_HOURS, the main flip and the extras alike.
+ *
+ * Three rules keep this from costing a flip (the owner, 2026-10-12: "im just scared we find 0 deals now"):
+ *   - it changes how many and the order, never whether: an amount is never under 1, and the least profit is a
+ *     share of each item's price, so fewer of an item cannot fail it;
+ *   - an item nobody measured is planned exactly as before (measuredRate null -> the old limits);
+ *   - what a trader took from you before is believed over the count: never fewer than that.
+ */
+
+/** No more of an item in one trade than leaves the bazaars in this many hours. Ours, not the owner's number. */
+export const AMOUNT_HOURS = 1;
+/** Measured under this many an hour: a slow seller, whatever its type. */
+export const SLOW_PER_HOUR = 1;
+
+/**
+ * Units an hour that really move, or null when the shared server has not measured the item. This PC's own count
+ * (TornW3B's lists read twice) can only raise it: each sees a part of the market, so the higher is the nearer.
+ * Without the server's word there is no rate at all - a PC on its own plans as it always did.
+ *
+ * @param {number|null|undefined} serverRate - units an hour, from the shared server's table
+ * @param {{units, ms}|null} [move] - this PC's own movement record (addMovement)
+ */
+export function measuredRate(serverRate, move = null) {
+    if (typeof serverRate !== 'number' || !Number.isFinite(serverRate) || serverRate < 0) return null;
+    const own = perHour(move);
+    return own !== null && own > serverRate ? own : serverRate;
+}
+
+/**
+ * The most of one item a trade takes.
+ *
+ * @param {object} p
+ * @param {number} p.most - Most per flip
+ * @param {string} [p.kind] - 'fast' | 'normal' | 'slow'
+ * @param {number|null} [p.rate] - measuredRate(); null: not measured
+ * @param {boolean} [p.extra] - an extra item of a trade (cover), not its main flip
+ * @param {number} [p.took] - the most of it this trader took from you in one trade before (0: never)
+ */
+export function amountCap({ most = Infinity, kind = 'normal', rate = null, extra = false, took = 0 } = {}) {
+    const top = most > 0 ? Math.floor(most) : Infinity;
+    // Not measured: as it always was - the main flip up to Most per flip, an extra by its kind.
+    let n = extra ? Math.min(top, EXTRA_CAP[kind] ?? EXTRA_CAP.normal) : top;
+    if (typeof rate === 'number' && Number.isFinite(rate) && rate >= 0) {
+        n = Math.max(1, Math.ceil(rate * AMOUNT_HOURS));
+        // One of a kind (a weapon, armour): as cover, still only a few.
+        if (extra && kind === 'slow') n = Math.min(n, EXTRA_CAP.slow);
+    }
+    if (took > 0) n = Math.max(n, Math.floor(took));
+    return Math.max(1, Math.min(top, n));
+}
+
 /**
  * The kind of an item: 'fast', 'normal' or 'slow'.
  *
@@ -119,9 +178,11 @@ export function perHour(rec) {
  * @param {boolean} [p.statItem] - one of a kind (weapons, armour, cars)
  * @param {Array|null} [p.sellers] - its bazaar listings, when read
  * @param {{units, ms}|null} [p.move] - its movement record (addMovement)
+ * @param {number|null} [p.rate] - measuredRate(): when the item was measured, that decides - not its type
  */
-export function liquidityKind({ type = null, statItem = false, sellers = null, move = null } = {}) {
+export function liquidityKind({ type = null, statItem = false, sellers = null, move = null, rate: measured = null } = {}) {
     if (statItem) return 'slow';
+    if (typeof measured === 'number' && Number.isFinite(measured)) return measured >= FAST_PER_HOUR ? 'fast' : measured < SLOW_PER_HOUR ? 'slow' : 'normal';
     const rate = perHour(move);
     if (rate !== null && rate >= FAST_PER_HOUR) return 'fast';
     // Watched for hours and nothing moved: whatever its type, nobody is buying.

@@ -881,3 +881,54 @@ test('a page opened for the first time: the exchange that brings the server\'s b
     assert.ok(s.posts[n].at - grewAt <= SHARED_TICK_MS * 2);
     assert.equal(s.posts[n].body.since, 0);
 });
+
+test('item speeds (3.28.0): Torn Bids\' page asks with one number and is handed the server\'s table once the server has watched long enough; the panel alone never asks', async () => {
+    const { SHARED_MOVES_KEY } = await import('../src/feed/shared-link.js');
+    const { measuredRate, amountCap } = await import('../src/core/liquidity.js');
+
+    // The panel on a Torn page alone: nothing about speeds leaves this PC, and none are kept.
+    const alone = setUp();
+    alone.addTab('app', 't-app', { sellers: [11], worth: { 206: 850000 } });
+    await alone.pass(70000);
+    assert.ok(alone.posts.length >= 2);
+    assert.ok(alone.posts.every((p) => !('moves' in p.body)), 'the panel asked for item speeds');
+    assert.equal(alone.gm.values.has(SHARED_MOVES_KEY), false);
+
+    // Torn Bids' page open. Bazaar 11 sells one of item 206 a minute; item 180 stands still in five bazaars.
+    const s = setUp();
+    const still = [{ ID: 180, price: 50, quantity: 20 }];
+    for (const id of [12, 13, 14, 15]) s.world.bazaars.set(id, still);
+    let stock = 5000;
+    s.world.bazaars.set(11, [{ ID: 206, price: 790000, quantity: stock }, ...still]);
+    const tab = s.addTab('sell', 't-sell', { sellers: [11, 12, 13, 14, 15], looking: [11], worth: { 206: 850000, 180: 61 }, lists: true });
+    await s.pass(40000);
+    const first = s.posts.find((p) => 'moves' in p.body);
+    assert.ok(first, 'Torn Bids\' page never asked for item speeds');
+    assert.equal(first.body.moves, 0);
+    assert.ok(s.posts.every((p) => sharedOutgoingOk(p.body)));
+    // The first answer is an empty table: the server has watched nothing long enough, and every item is planned as before.
+    const early = s.gm.values.get(SHARED_MOVES_KEY);
+    assert.ok(early && early.at > 0 && Object.keys(early.rows).length === 0, JSON.stringify(early));
+    assert.equal(measuredRate(early.rows[206]), null);
+    // The table it holds is named by its time on the server's clock, and is not sent again.
+    await s.pass(40000);
+    assert.equal(s.posts.at(-1).body.moves, early.at);
+    assert.equal(s.gm.values.get(SHARED_MOVES_KEY).got, early.got, 'the same table was stored again');
+
+    for (let minute = 0; minute < 135; minute += 1) {
+        stock -= 1;
+        s.world.bazaars.set(11, [{ ID: 206, price: 790000, quantity: stock }, ...still]);
+        await s.pass(60000);
+    }
+    const box = s.gm.values.get(SHARED_MOVES_KEY);
+    assert.ok(box.at > early.at && box.got > early.got);
+    assert.ok(box.rows[206] > 40 && box.rows[206] < 75, `one a minute came as ${box.rows[206]} an hour`);
+    assert.equal(box.rows[180], 0, 'five bazaars list it and none sold: it stands still');
+    assert.equal(tab.link.status().moves, 2);
+    // What Torn Bids makes of it: the mover up to Most per flip, the still one a single unit - never none.
+    assert.equal(amountCap({ most: 100, rate: measuredRate(box.rows[206]) }), Math.ceil(box.rows[206]));
+    assert.equal(amountCap({ most: 100, rate: measuredRate(box.rows[180]) }), 1);
+    // This PC's word changed (another key): the table kept under the old one goes with the rest.
+    tab.link.forget();
+    assert.equal(s.gm.values.has(SHARED_MOVES_KEY), false);
+});

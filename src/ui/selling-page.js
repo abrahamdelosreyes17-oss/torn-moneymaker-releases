@@ -793,6 +793,11 @@ export class SellingPage {
         else this.render({});
     }
 
+    /** The page and tab in view, and the list they show: {page, tab, filter} - null before the page is built. */
+    shownNow() {
+        return this.bd ? { page: this.bd.page, tab: this.bd.tab, filter: bdFilterOf(this.bd.page, this.bd.tab) } : null;
+    }
+
     /** The older names for the three views: the list (Flips), the Ledger, Settings. */
     showView(view) {
         if (view === 'settings') this.go('settings');
@@ -1231,7 +1236,7 @@ export class SellingPage {
         const now = Date.now();
         const sig = JSON.stringify([
             'items', kind, s.counts, s.listTotal, s.desk && s.desk.itemId, info.hasKey, info.loading, info.inventoryAt ? 1 : 0, info.tradersLoading, Boolean(info.bazaarsAt), this.query, s.category,
-            list.map((r) => [r.itemId, r.name, r.held, r.lowest, r.badge && [r.badge.kind, r.badge.amount], r.pending, r.units, r.stops, r.bid, r.mark && r.mark.text, r.still && [r.still.move, r.still.gone, r.still.was],
+            list.map((r) => [r.itemId, r.name, r.held, r.lowest, r.badge && [r.badge.kind, r.badge.amount], r.pending, r.units, r.stops, r.pace, r.bid, r.mark && r.mark.text, r.still && [r.still.move, r.still.gone, r.still.was],
                 r.to && [r.to.name, this.dotSig(r.to), r.to.old ? listAgeText(now - r.to.old.at) : ''], r.top && [r.top.name, r.top.price, this.dotSig(r.top)], paidOf.has(r.itemId) ? paidOf.get(r.itemId).each : 0]),
             s.pinned || [],
         ]);
@@ -1274,7 +1279,10 @@ export class SellingPage {
                 gone ? spEl('span', { class: 'tag', title: 'It was a flip when the list was held. It keeps its place until your trade ends.', text: 'No flip now' }) : null,
             ];
             let sub;
-            if (kind === 'flips') sub = flip && r.units ? '× ' + count(r.units) + ' · ' + count(r.stops) + (r.stops === 1 ? ' bazaar' : ' bazaars') + (r.buy && r.sell ? ' · buy ' + formatMoney(r.buy) + ' · sell ' + formatMoney(r.sell) : '') : gone ? 'held in its place' : '';
+            // 3.28.0: the amount is what moves in about an hour, where that is less than there is to buy - said, so "× 3" is no riddle.
+            const paced = kind === 'flips' && flip && r.units && typeof r.pace === 'number';
+            const paceWords = paced ? ' · ' + (r.pace >= 1 ? 'about ' + count(Math.round(r.pace)) + ' an hour sell' : 'under one an hour sells') : '';
+            if (kind === 'flips') sub = flip && r.units ? '× ' + count(r.units) + ' · ' + count(r.stops) + (r.stops === 1 ? ' bazaar' : ' bazaars') + (r.buy && r.sell ? ' · buy ' + formatMoney(r.buy) + ' · sell ' + formatMoney(r.sell) : '') + paceWords : gone ? 'held in its place' : '';
             else if (kind === 'all') sub = flip ? null : r.badge && r.badge.kind === 'list' ? 'your bazaar pays ' + signed(r.badge.amount) + ' more than a trader' : r.pending ? 'Checking…' : r.lowest ? 'no flip now · from ' + formatMoney(r.lowest) : 'no flip now';
             else {
                 const paid = paidOf.get(r.itemId);
@@ -1283,7 +1291,7 @@ export class SellingPage {
             const first = spEl('td', {}, [spEl('div', { class: 'cell' }, [this.pic('list', r.itemId), spEl('div', {}, [
                 spEl('b', { text: r.name }),
                 ...tags,
-                kind === 'all' && flip ? spEl('small', { class: 't-good', text: 'flip ' + signed(r.badge.amount) }) : sub ? spEl('small', { text: sub }) : null,
+                kind === 'all' && flip ? spEl('small', { class: 't-good', text: 'flip ' + signed(r.badge.amount) }) : sub ? spEl('small', paced ? { text: sub, title: 'No more of an item in one trade than about an hour of what leaves the bazaars - a trader takes what they can sell on. Counted by the shared server from Torn\'s own bazaars; Most per flip still caps it.' } : { text: sub }) : null,
             ])])]);
             const cells = [first];
             if (kind === 'flips') {
@@ -2050,7 +2058,7 @@ export class SellingPage {
         return spEl('div', { class: 'stepbar' }, ['Ask', 'Yes', 'Buy', 'Trade'].map((word, i) => spEl('span', { class: i < at ? 'done' : i === at ? 'now' : '' }, [spEl('i', { text: i < at ? '✓' : String(i + 1) }), word])));
     }
 
-    /** "sells fast" / "slow seller" beside an extra item: why it is in, and in that amount. */
+    /** "sells fast" / "slow seller" beside an extra item: why it is in, and in that amount. Measured where the shared server counted it (3.28.0), else by its type. */
     kindTag(kind) {
         if (kind === 'fast') return spEl('span', { class: 'kind', text: 'sells fast' });
         if (kind === 'slow') return spEl('span', { class: 'kind', text: 'slow seller' });
@@ -2424,7 +2432,7 @@ export class SellingPage {
             this.chatLink(b, 'btn go big out'),
             spEl('button', { type: 'button', class: 'btn big', 'data-focus': 'trade:accept:' + c.key, title: b.name + ' said yes: the trade is frozen as it is now, so nothing in it moves while you buy and send. It moves to Trades.', text: b.name + ' said yes', onclick: () => this.h.onTradeAccept && this.h.onTradeAccept(d.itemId) }),
             // Nothing to buy: the trade itself can be opened now.
-            !c.stops && b.id ? this.link('Open the trade', tradeUrl(b.id), { cls: 'btn lg out', title: 'Start a trade with ' + b.name + ' on Torn', focus: 'step-trade' }) : null,
+            !c.stops && b.id ? this.link('Open the trade', tradeUrl(b.id), { cls: 'btn big out', title: 'Start a trade with ' + b.name + ' on Torn', focus: 'step-trade' }) : null,
             spEl('span', { class: 'sp' }),
             this.wordBtn(b.name + ' said no', 'trade:decline:' + c.key, b.name + ' said no to this trade: on to the next (this trade is passed over for an hour; their other trades stay). Undo shows on their row.', () => this.h.onTradeDecline && this.h.onTradeDecline(c.key), 'quiet'),
         ]);
@@ -2702,7 +2710,7 @@ export class SellingPage {
                 kids.push(spEl('p', { class: 'note', text: b.name + ' can pay for at most ' + count(b.maxUnits) + ': ' + (this.state.prefs.networthPct || 10) + '% of their networth' + (nw >= 0 && nw !== null ? ' (' + formatMoney(nw) + ')' : '') + '.' }));
             }
             if (b.differ) kids.push(spEl('div', { class: 'amber' }, [spEl('span', {}, [spEl('b', { text: b.name + '\'s lists differ' }), ' (' + this.listPrices(b, ', ') + '): planned at the lower. Check their list before trading.'])]));
-            kids.push(spEl('div', { class: 'acts' }, [this.chatLink(b, 'btn go big out'), b.id ? this.link('Open the trade', tradeUrl(b.id), { cls: 'btn lg out', title: 'Start a trade with ' + b.name + ' on Torn', focus: 'step-trade' }) : null]));
+            kids.push(spEl('div', { class: 'acts' }, [this.chatLink(b, 'btn go big out'), b.id ? this.link('Open the trade', tradeUrl(b.id), { cls: 'btn big out', title: 'Start a trade with ' + b.name + ' on Torn', focus: 'step-trade' }) : null]));
             return spEl('div', { class: 'plan' }, kids);
         }
         let text;
@@ -3056,7 +3064,7 @@ export class SellingPage {
         // Refused by the browser (it copies only from a page you are on): said on the button, never silent.
         const failed = this.pastCopyFailed === idOf(rec);
         const copy = spEl('button', { type: 'button', class: 'btn sm' + (copied ? ' done' : ''), 'data-focus': 'past:copy', title: 'Copies this trade as plain text, in Torn\'s time, to paste to ' + who, text: copied ? 'Copied' : failed ? 'Could not copy: press again' : 'Copy for ' + who, onclick: () => this.copyPast(rec, idOf(rec)) });
-        const BY = { seen: 'seen in your Torn trades', hand: 'Traded - done pressed in Torn Bids', bids: 'Cancel trade pressed in Torn Bids', torn: 'Cancel trade pressed on a Torn page' };
+        const BY = { seen: 'seen in your Torn trades', hand: 'Traded - done pressed in Torn Bids', bids: 'Cancel trade pressed in Torn Bids', torn: 'Cancel trade pressed on a Torn page', gone: 'it left your open trades on Torn without going through' };
         const later = end ? pastSpan(end.at - rec.at) + ' later' : '';
         const story = ['Said yes ' + pastWhen(rec.at, now)];
         if (state === 'traded') story.push(spEl('b', { text: 'traded ' + pastWhen(end.at, now) }), later, BY[end.by] || null);

@@ -76,6 +76,9 @@ export function extrasPerTrade(setting) {
  * @param {string|null} [p.traderId] - the trader: their own bazaar is never bought from
  * @param {function|null} [p.kindOf] - itemId -> 'fast' | 'normal' | 'slow': the main flip and its
  *   extras (see above); null plans every item up to Most, the item on the desk first
+ * @param {function|null} [p.capOf] - (itemId, extra) => the most of the item this trade takes (3.28.0,
+ *   core/liquidity.js amountCap: by how fast it really moves); null = Most per flip for the main flip and
+ *   EXTRA_CAP[kind] for an extra, as before. A number you typed is yours and is not cut by it.
  * @param {number} [p.extraItems] - Extras per trade (Settings); unset = EXTRA_ITEMS
  * @param {number} [p.maxUnits] - the most items one trade takes (TRADE_MAX_UNITS)
  * @param {boolean} [p.everything] - every flip with this trader (3.25.0; the owner: "we sometimes
@@ -188,7 +191,7 @@ export function fitLeftOut(cands, room, { route = null } = {}) {
 }
 
 /** The main flip and a few extras (the app's plan). */
-function planMainAndExtras({ first = null, flips = [], held = [], cash = null, maxPerItem = FLIP_MAX_UNITS, payCap = Infinity, minPct = MIN_PROFIT_PCT, edits = {}, keep = {}, traderId = null, kindOf, extraItems = EXTRA_ITEMS, maxUnits = TRADE_MAX_UNITS }) {
+function planMainAndExtras({ first = null, flips = [], held = [], cash = null, maxPerItem = FLIP_MAX_UNITS, payCap = Infinity, minPct = MIN_PROFIT_PCT, edits = {}, keep = {}, traderId = null, kindOf, capOf = null, extraItems = EXTRA_ITEMS, maxUnits = TRADE_MAX_UNITS }) {
     const extrasWanted = extrasPerTrade(extraItems);
     let cashLeft = cash > 0 ? cash : Infinity;
     // The items one trade takes (3.23.0): every line counts, bought or yours.
@@ -204,7 +207,11 @@ function planMainAndExtras({ first = null, flips = [], held = [], cash = null, m
         if (!kinds.has(id)) kinds.set(id, KIND_RANK[kindOf(id)] !== undefined ? kindOf(id) : 'normal');
         return kinds.get(id);
     };
-    const kindCap = (id) => Math.min(most, EXTRA_CAP[kind(id)]);
+    const measured = (id, extra) => {
+        const n = typeof capOf === 'function' ? Number(capOf(id, extra)) : NaN;
+        return n >= 1 ? Math.floor(n) : null;
+    };
+    const kindCap = (id) => Math.min(most, measured(id, true) ?? EXTRA_CAP[kind(id)]);
 
     const { items, off } = usable(flips, trader, minPct, edits);
     const plan = new Map();
@@ -243,10 +250,10 @@ function planMainAndExtras({ first = null, flips = [], held = [], cash = null, m
     // 1. The main flip: the item that makes the most, from at most 5 bazaars.
     // Items are weighed best-first by what they could make at most, and the
     // weighing stops once no item left could beat the best found.
-    const capOfMain = (it) => (it.typed ? Math.min(it.typed, most) : most);
+    const capOfMain = (it) => (it.typed ? Math.min(it.typed, most) : Math.min(most, measured(it.id, false) ?? most));
     // Your own lines keep their place in the trade's item limit: they are bought already. (What they
     // would take is tried on a copy of their pay; they are put in after the main flip, as before.)
-    const yoursWant = heldRowsOf(held, keep, edits, (id) => Math.min(most, EXTRA_CAP[kind(id)]), { left: pay.left }, kind).rows.reduce((a, r) => a + r.units, 0);
+    const yoursWant = heldRowsOf(held, keep, edits, kindCap, { left: pay.left }, kind).rows.reduce((a, r) => a + r.units, 0);
     const mainRoom = Math.max(0, room.left - yoursWant);
     // The most an item could make: its five best sellers' profit, and no more
     // than Most per flip (or the cash, or their pay) at its cheapest margin.

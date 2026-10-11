@@ -21,7 +21,7 @@ import {
     gmSize,
     gmPost,
 } from './platform/gm.js';
-import { SharedLink, SHARED_CONFIG_KEY, SHARED_STATE_KEY, SHARED_GRANT_KEY, SHARED_TICK_MS, SHARED_UNKNOWN_MS, SHARED_W3B_ASK_KEY, SHARED_LISTS_OUT_KEY, SHARED_LISTS_IN_KEY, SHARED_CALLS_KEY } from './feed/shared-link.js';
+import { SharedLink, SHARED_CONFIG_KEY, SHARED_STATE_KEY, SHARED_GRANT_KEY, SHARED_TICK_MS, SHARED_UNKNOWN_MS, SHARED_W3B_ASK_KEY, SHARED_LISTS_OUT_KEY, SHARED_LISTS_IN_KEY, SHARED_CALLS_KEY, SHARED_MOVES_KEY } from './feed/shared-link.js';
 import { sharedMayCall, withShared, sharedHome, sharedWord, sharedSaid, sharedSaidLine, sharedGoingOwn, sharedGoingByItem, sharedOnThis, sharedGoingFor, sharedBoughtLine, sharedPanelLine, sharedDirDue, sharedDealRows, sharedKnowsLowest, sharedMayRead, sharedAskLeft, sharedList, sharedItemsSeen, SHARED_MAX_WANT, SHARED_MAX_LISTS, SHARED_MAX_LIST_ITEMS } from './core/shared.js';
 import { perfStart, perfNow, perfDone, perfTimed, perfForeign, perfStartup, perfRecord, perfMachine, SPEED_STORE_KEY } from './platform/perf.js';
 import { speedFiles } from './core/speed.js';
@@ -37,6 +37,7 @@ import {
     itemCategory,
     categoryCounts,
     neverFlipOtherOnce,
+    findItemByName,
 } from './core/items.js';
 import {
     buildNpcShopIndex,
@@ -62,15 +63,16 @@ import {
 import { bazaarSellers, flipPlan, flipBuyer, listBid, believableBid, whereToSell, depthNearCheapest, flipCandidates, nearMisses, traderTagLabel, pickBazaars, MAIN_STOPS, EXTRA_STOPS, liveGone, markGone, withoutGone, goneKey, liveStock, noteStock, liveBought, addBought, withOwnBuys, OWN_KEEP_MS, FLIP_FRESH_MS } from './core/flips.js';
 import { coverAfter, coverRowsRead, coverListings, coverListingsRead, coverVerdict, listingBoughtOut } from './core/bazaar-cover.js';
 import { readBazaarList, BAZAAR_LIST_SELECTOR } from './sources/dom/bazaar-list.js';
+import { openBuyForms, buyFormBought } from './sources/dom/buy-form.js';
 import { fitLeftOut, planTrade, keepAfter } from './core/trade.js';
 import { holdTrade, holdKey, resolveEstimated, priceHeld, livePins, editHeld, keepHolds, keptHolds, HOLD_MS } from './core/held.js';
 import { priceChecked, applyListToItemBuyers, buyersEveryMs, FLIP_RECHECK_MS } from './core/checked.js';
 import { deskItem, steadyTrader, nextW3bRead, backgroundSlot, backgroundListSlot, flipsStale, W3B_HIDDEN_PER_MIN, HIDDEN_RENDER_MS, declineKey, declinedOn, freshnessMs, FRESH_TOP, dayPaceRoom } from './core/desk.js';
-import { liquidityKind, unitsMoved, addMovement, stopsMinutes, EXTRA_CAP } from './core/liquidity.js';
+import { liquidityKind, unitsMoved, addMovement, stopsMinutes, measuredRate, amountCap, AMOUNT_HOURS } from './core/liquidity.js';
 import { usageAdd, usageMerge, usageSeries, usageCallsAdd, USAGE_SERVICES, USAGE_RANGES, USAGE_LABELS } from './core/usage.js';
 import { makeSteadySleep } from './core/steady-sleep.js';
 import { addLogEntries, logText, lateButHeld, goneLine } from './core/errlog.js';
-import { checkoutList, boughtSince, stockBuys, addExtraBuy, applyLogBuys, bazaarBuyRows, addLogBuys, splitLogBuys, sellElsewhere, LOG_BUY_SLACK_MS, acceptTrade, liveAccepted, stepState, tickAccepted, stepDone, nextStep, boughtFromStock, boughtOverStock, recordBuy, sendUnits, acceptedTotals, replacementFor, replaceStep, dropLine, markLeft, leftoversOf, cancelledLeftovers, addLeftovers, sendList, fillNote, finishedTradeFor, tradedLeftovers, removeLeftovers, itemsGiven, tradePartnerId, tradeFinishedAt, TRADE_DONE_SLACK_MS, leftoversAfterSales, leftoverFrom, placeBuy, tradeCount, overLeftovers, toSellLessTradeBuys, logBuyPlace, TRADE_MAX_UNITS } from './core/accepted.js';
+import { checkoutList, boughtSince, stockBuys, addExtraBuy, applyLogBuys, bazaarBuyRows, addLogBuys, splitLogBuys, sellElsewhere, LOG_BUY_SLACK_MS, acceptTrade, liveAccepted, stepState, tickAccepted, stepDone, nextStep, boughtFromStock, boughtOverStock, recordBuy, sendUnits, acceptedTotals, replacementFor, replaceStep, dropLine, markLeft, leftoversOf, cancelledLeftovers, addLeftovers, sendList, fillNote, finishedTradeFor, tradesCalledOff, tradedLeftovers, removeLeftovers, itemsGiven, tradePartnerId, tradeFinishedAt, TRADE_DONE_SLACK_MS, leftoversAfterSales, leftoverFrom, placeBuy, tradeCount, overLeftovers, toSellLessTradeBuys, logBuyPlace, TRADE_MAX_UNITS } from './core/accepted.js';
 import { readTradeView, readTradeAddRows, readTradeAddRow } from './sources/dom/trade.js';
 import { BoughtWindow } from './ui/bought-window.js';
 import { makeTabId, LEADER_HEARTBEAT_MS } from './core/leader.js';
@@ -89,7 +91,7 @@ import {
     besideW3bText, besideW3bOther, BESIDE_W3B_OWN_MARK, BESIDE_W3B_OTHER_MARK,
 } from './core/beside.js';
 import { stillStart, stillList, stillCards, stillWaiting, stillEnded, stillTrade, stillAdopt, STILL_ENDED_MS } from './core/still.js';
-import { LedgerClient, fetchLedgerKeyInfo, isFullKey, fetchLogPage, fetchTradesPage, fetchTrade } from './api/ledger.js';
+import { LedgerClient, fetchLedgerKeyInfo, isFullKey, fetchLogPage, fetchTradesPage, fetchTrade, fetchOngoingTrades } from './api/ledger.js';
 import { LOG_BAZAAR_BUY, readLedger, emptyLedger, rowsFromLog, rowsFromTrade, addLedgerRows, logSpan, mugFromLog, addMugs, priceRecordOf, addPriceRecord, acceptedPricesFor, matchFifo, tradeReceipts } from './core/ledger.js';
 import { partnerStats, isFavourite, editFavourite, editBlacklist, withoutBlacklisted, favouritesFirstOnTie, tradedLine, partnerKey, scanOrder, blacklistKeys } from './core/partners.js';
 import {
@@ -146,7 +148,7 @@ import {
     liveW3bPrices,
 } from './core/traders.js';
 import { liveAsked, addAsked, liveEnded, addEnded, endedOf, tradesBoard } from './core/trades-board.js';
-import { pastTrades, pastTradeOf, addPastTrade, endPastTrade, pastBought } from './core/past-trades.js';
+import { pastTrades, pastTradeOf, addPastTrade, endPastTrade, pastBought, pastTook } from './core/past-trades.js';
 import { makeBuyersKeeper } from './core/kept-buyers.js';
 import { makeKeeper, keptMarkWords, keptFreshUntil, keptPlanSig } from './core/kept.js';
 import { JOB_NPC, JOB_BIDS, jobNow, jobLock, jobLockWords, jobSwitch } from './core/job.js';
@@ -604,6 +606,8 @@ const app = {
     buyWhere: null,
     /* Listings noted as not there, once per page load: 'seller|item'. */
     goneNoted: new Set(),
+    // The listing this page was opened for, once marked not here (notePointedGone).
+    pointedGone: null,
     tradeFillBound: false,
     // The buying run's "did you buy it?" (the step key it asks about).
     buyAsk: null,
@@ -1403,7 +1407,7 @@ function rescanNow() {
     markFriendRows(friendsHere.size ? listings.filter((l) => l.el && friendsHere.has(String(l.itemId))).map((l) => ({ el: l.el, label: sharedOnThis(friendsHere.get(String(l.itemId)), now).replace(/ · [^·]*$/, '') })) : []);
     showBazaarTarget(listings);
     // How much of this bazaar is in the page, and how much of it has been read (3.16.3).
-    app.bzRead = app.pageType === PAGE_BAZAAR && sellerId ? readBazaarList(document) : null;
+    app.bzRead = app.pageType === PAGE_BAZAAR && sellerId ? readBazaarList(document, buyFormItemId) : null;
     if (app.bzRead) {
         app.bzHadList = true;
         for (const r of app.bzRead.rows) for (const id of r.ids) app.bzEver.add(id);
@@ -1411,6 +1415,7 @@ function rescanNow() {
     app.bzCover = coverAfter(app.bzCover, location.href, app.bzRead);
     // How soon after this page showed its list was first read (see BUY_EARLY_READ_MS).
     if (app.bzCover && app.bzReadAfter === null) app.bzReadAfter = pageShownAt === null ? Infinity : Math.max(0, performance.now() - pageShownAt);
+    notePointedGone(listings);
     trackTradeBuying(app.pageType === PAGE_BAZAAR ? listings : []);
 
     app.lastScanAt = now;
@@ -1517,6 +1522,40 @@ function showBazaarTarget(listings) {
             'warn',
         );
     }
+}
+
+/**
+ * Sent here from Torn Bids for one listing, and this bazaar holds none of that
+ * item (3.27.1). The owner, 2026-10-11: "even when i go to a bazaar from
+ * tornbids, and i see ... item no longer there ... it doesnt update in
+ * tornbids and it still sees it". A listing was marked gone only when this
+ * page had SEEN it and it then left, or when it was a step of an accepted
+ * trade; one already gone when you arrived was never seen, so nothing was
+ * said - showBazaarTarget just had nothing to point at.
+ *
+ * The link names the item (bazaarTarget). Once every row of the bazaar has
+ * been read and the item is in none (coverVerdict 'absent' - never on rows
+ * not read yet, never under the bazaar's search box, never while a buy form
+ * that could not be named is open), it is marked gone as any other: out of
+ * every plan in Torn Bids until TornW3B has seen that bazaar change since.
+ */
+function notePointedGone(listings) {
+    if (!bidsOn() || app.pageType !== PAGE_BAZAAR || !Array.isArray(listings)) return;
+    const target = bazaarTarget(location.href);
+    const seller = bazaarOwnerId(location.href);
+    if (!target || !seller) return;
+    const k = goneKey(seller, target.itemId);
+    if (listings.some((l) => String(l.itemId) === target.itemId)) {
+        if (app.pointedGone === k) app.pointedGone = null;
+        forgetGoneListing(seller, target.itemId);
+        return;
+    }
+    if (coverVerdict(app.bzCover, target.itemId) !== 'absent') return;
+    if (app.pointedGone === k) return;
+    app.pointedGone = k;
+    if (!app.goneNoted.has(k)) logProblem('note', 'The listing Torn Bids sent you for is not in this bazaar (item ' + target.itemId + ') - left out of the plans in Torn Bids');
+    noteGoneListing(seller, target.itemId);
+    app.panel.setStatus('That listing is not in this bazaar any more. Torn Bids leaves it out now.', 'warn');
 }
 
 /** Shared: what the others are going for in this bazaar - Map of item (as text) -> {who, at, sellers}. Empty with Shared off. */
@@ -4372,9 +4411,34 @@ function bindExtraPress() {
         // ...and when: a card that is bought out leaves the page a moment later - after a confirm, and a
         // read or two of the page in between (3.23.0: one memory of a press, kept STOCK_PRESS_MS).
         for (const c of app.stockCards || []) {
-            if (c.el && c.el.contains(target)) (app.stockPressed = app.stockPressed || new Map()).set(String(c.itemId) + '|' + Number(c.listingPrice), Date.now());
+            if (c.el && c.el.contains(target)) pressedOnListing(String(c.itemId) + '|' + Number(c.listingPrice));
+        }
+        // Torn's own Buy, in the form that stands where the card was (3.27.1): the press that buys.
+        if (buyFormBought(target)) {
+            const form = openBuyForms(document).find((x) => x.el.contains(target));
+            const id = form ? buyFormItemId(form) : null;
+            if (id && form.price) pressedOnListing(id + '|' + form.price);
         }
     }, true);
+    // Enter in the form's number box buys as its Buy does.
+    document.addEventListener('keydown', (event) => {
+        if (event.key !== 'Enter' || !event.target || !event.target.closest) return;
+        const form = openBuyForms(document).find((x) => x.el.contains(event.target));
+        const id = form ? buyFormItemId(form) : null;
+        if (id && form.price) pressedOnListing(id + '|' + form.price);
+    }, true);
+}
+
+/** You pressed on this listing ('itemId|price'): when, for a listing that then leaves, and that you did, for stock that then falls. */
+function pressedOnListing(key) {
+    (app.stockPressed = app.stockPressed || new Map()).set(key, Date.now());
+    (app.stockTouched = app.stockTouched || new Set()).add(key);
+}
+
+/** The item a buy form is for, by the name it shows (it has no picture): its id, or null. */
+function buyFormItemId(form) {
+    const item = form && form.name && app.index ? findItemByName(app.index, form.name) : null;
+    return item ? String(item.id) : null;
 }
 
 /**
@@ -4423,11 +4487,32 @@ function trackSeenStock(listings) {
     }
     const was = store[seller] && store[seller].cards && typeof store[seller].cards === 'object' ? store[seller].cards : {};
     const now = Date.now();
-    const { bought: dropped, seen } = stockBuys(was, listings);
+    const { bought: fell, seen } = stockBuys(was, listings);
+    // A listing whose buy form is open (3.27.1, sources/dom/buy-form.js): its card is not in the page, and it
+    // is still there - not gone, and no stock of it fell (two listings of one item at one price count as one).
+    const forms = openBuyForms(document).map((x) => ({ ...x, itemId: buyFormItemId(x) }));
+    const formOpen = (itemId, price) => forms.some((x) => x.itemId === String(itemId) && (!x.price || x.price === Number(price)));
+    app.stockFormSeen = app.stockFormSeen || new Set();
+    for (const [key, w] of Object.entries(was)) {
+        if (!w || !formOpen(w.itemId, w.price)) {
+            app.stockFormSeen.delete(seller + '|' + key);
+            continue;
+        }
+        if (seen[key] && seen[key].qty < w.qty) seen[key].qty = w.qty;
+        // The press that opened the form bought nothing: from here only the form's own Buy counts as "you pressed".
+        if (!app.stockFormSeen.has(seller + '|' + key)) {
+            app.stockFormSeen.add(seller + '|' + key);
+            if (app.stockPressed) app.stockPressed.delete(key);
+        }
+    }
+    // A form that names no item we know: it may stand for any listing here, so none is judged gone.
+    const formUnknown = forms.some((x) => !x.itemId);
+    const dropped = fell.filter((b) => !formUnknown && !formOpen(b.itemId, b.price));
     // Cards read on this load of the page: only their rows are evidence (the list may be sorted another way after a reload).
     app.stockSeenLoad = app.stockSeenLoad || new Set();
-    // Stock that dropped since another visit is anyone's buy; only a drop in front of you is yours (3.21.1).
-    const tookHere = dropped.filter((b) => app.stockSeenLoad.has(seller + '|' + b.itemId + '|' + b.price));
+    // Stock that dropped since another visit is anyone's buy; only a drop in front of you is yours (3.21.1) -
+    // and only on a listing you pressed in on this visit (3.27.1): a drop on one you never touched is someone else's.
+    const tookHere = dropped.filter((b) => app.stockSeenLoad.has(seller + '|' + b.itemId + '|' + b.price) && app.stockTouched && app.stockTouched.has(b.itemId + '|' + b.price));
     for (const key of Object.keys(seen)) app.stockSeenLoad.add(seller + '|' + key);
     const here = Object.values(seen);
     // Each card's row of the list, as it is now: says later whether a card left the page or was bought out.
@@ -4453,6 +4538,11 @@ function trackSeenStock(listings) {
     const kept = {};
     for (const [key, w] of Object.entries(was)) {
         if (!w || seen[key]) continue;
+        // Its buy form is open in its place: still there, as it was.
+        if (formOpen(w.itemId, w.price)) {
+            kept[key] = w;
+            continue;
+        }
         // The item is here at another price: re-priced, counted from its new card.
         if (here.some((x) => x.itemId === w.itemId)) continue;
         const pressedAt = app.stockPressed ? app.stockPressed.get(key) : null;
@@ -4462,9 +4552,9 @@ function trackSeenStock(listings) {
         const rowNow = read && Number.isInteger(w.row) ? read.rows.find((r) => r.index === w.row) : null;
         const byRow = Boolean(read) && app.stockSeenLoad.has(seller + '|' + key) && !read.searching && !w.rowSearch
             && (!rowNow || rowNow.ids.length >= read.perRow || rowNow.index === read.rowsTotal - 1);
-        const gone = read
+        const gone = !formUnknown && (read
             ? absent || (byRow && listingBoughtOut(w.itemId, w, read, { hadList: true, absent: false }))
-            : !app.bzHadList && Boolean(pressedAt && now - pressedAt < STOCK_PRESS_MS);
+            : !app.bzHadList && Boolean(pressedAt && now - pressedAt < STOCK_PRESS_MS));
         if (gone) {
             // One line a bazaar (3.23.0): every listing it lost on this visit folds into it (core/errlog.js).
             if (!app.goneNoted.has(goneKey(seller, w.itemId))) logProblem('note', goneLine([[w.itemId, w.qty]]), null, { fold: goneFold(seller), gone: [[String(w.itemId), w.qty]] });
@@ -5729,6 +5819,9 @@ function usageState() {
             dayPace: w3bDayPace(Date.now()),
             statusesKnown: info.statusesKnown ?? null, statusesWanted: info.statusesWanted ?? null,
             teScanned: Object.values((sell.db && sell.db.traders) || {}).filter((t) => t && t.te && t.te.prices).length,
+            // 3.28.0: the item speeds in use (items measured by the server, how old its table is), how many of the flips
+            // shown are planned smaller for them, and how many trader-and-item pairs are known from finished trades.
+            speeds: sell.speedInfo || null,
         },
     };
 }
@@ -5867,6 +5960,11 @@ function startShared(world, getWant, onReads) {
     if (world === 'sell') {
         gmOnChange(SHARED_LISTS_IN_KEY, () => takeSharedLists());
         takeSharedLists();
+        // A new table of item speeds (3.28.0): the amounts are worked out again with it.
+        gmOnChange(SHARED_MOVES_KEY, () => {
+            speedsReadAt = 0;
+            renderSelling();
+        });
     }
     gmOnChange(STORE_KEY, () => sharedSetUp());
     // The Public key's box in Torn Bids' Settings shows what the panel on Torn's pages saved or forgot.
@@ -7239,6 +7337,28 @@ function tickSellAccepted(key, line, tick) {
     all[key] = tickAccepted(all[key], line, tick);
     saveSellAccepted(all);
     return all;
+}
+
+/*
+ * 3.28.0 - how fast items leave the bazaars, as the shared server counted it from its own reads of Torn
+ * (feed/shared-link.js keeps the table; core/liquidity.js says what an amount is). Read again at most every half
+ * minute (the tab that does the exchanging stores it itself and hears no change of its own), and not used once
+ * the server has said nothing new for hours: then every item is planned as it always was.
+ */
+const SPEEDS_KEEP_MS = 3 * 60 * 60000;
+const SPEEDS_REREAD_MS = 30000;
+let speedsKept = null;
+let speedsReadAt = 0;
+function sharedSpeeds(now = Date.now()) {
+    if (!sharedLink || !sharedLink.config()) return null;
+    if (now - speedsReadAt >= SPEEDS_REREAD_MS || now < speedsReadAt) {
+        speedsReadAt = now;
+        const box = gmGet(SHARED_MOVES_KEY, null);
+        const ok = box && Number.isInteger(box.at) && Number.isFinite(box.got) && box.rows && typeof box.rows === 'object';
+        if (!ok) speedsKept = null;
+        else if (!speedsKept || speedsKept.at !== box.at || speedsKept.got !== box.got) speedsKept = { at: box.at, got: box.got, rows: new Map(Object.entries(box.rows)) };
+    }
+    return speedsKept && now - speedsKept.got < SPEEDS_KEEP_MS && speedsKept.got - now < 60000 ? speedsKept : null;
 }
 
 /** How fast items leave the bazaars: itemId -> {units, ms, at}, read once per page. */
@@ -8948,16 +9068,30 @@ function renderSellingWork(src = null) {
         const item = itemOf(id);
         return flipBuyer(buyersOf(id), { avg: item ? Number(item.marketValue) || null : null, type: item ? item.type : null, subType: item ? item.subType : null, unitsOf });
     };
+    // 3.28.0 - how fast an item really moves (units an hour; null: the shared server has not measured it).
+    const speeds = sharedSpeeds(now);
+    const rateCache = new Map();
+    const rateOf = (id) => {
+        const key = String(id);
+        if (!rateCache.has(key)) rateCache.set(key, measuredRate(speeds ? speeds.rows.get(key) : null, sellMoves().get(key) || null));
+        return rateCache.get(key);
+    };
     // How easily an item trades: fast / normal / slow (core/liquidity.js).
     const kindCache = new Map();
     const kindOf = (id) => {
         const key = String(id);
         if (!kindCache.has(key)) {
             const item = itemOf(key);
-            kindCache.set(key, liquidityKind({ type: item ? item.type : null, statItem: isStatItem(item), sellers: sellersOf(key), move: sellMoves().get(key) || null }));
+            kindCache.set(key, liquidityKind({ type: item ? item.type : null, statItem: isStatItem(item), sellers: sellersOf(key), move: sellMoves().get(key) || null, rate: rateOf(key) }));
         }
         return kindCache.get(key);
     };
+    // ...and how many of it one trade takes (amountCap): no more than about an hour of what moves, never under one,
+    // never fewer than this trader took from you before; an item not measured as it always was.
+    const tookBefore = pastTook(gmGet(STORE_SELL_PAST, null));
+    const buyerKeyOf = (b) => (b.id ? 'id:' + b.id : 'name:' + String(b.name).toLowerCase());
+    // (The kind only matters to an extra: a main flip is not asked for it - that would read every item's sellers.)
+    const amountOf = (id, key, extra) => amountCap({ most: prefs.maxPerFlip || 100, kind: extra ? kindOf(id) : 'normal', rate: rateOf(id), extra, took: key && tookBefore.size ? tookBefore.get(key + '|' + String(id)) || 0 : 0 });
     const flipBuyersCache = new Map();
     // Settings › Flips › Never flip (Clothing by default: the friend's "don't include clothes").
     const neverFlip = new Set(prefs.neverFlip || []);
@@ -9029,7 +9163,7 @@ function renderSellingWork(src = null) {
         const rows = sellersOf(id);
         if (!rows) return null;
         const fbs = flipCheckedOf(id);
-        const k = keepers.plans.get(String(id), keptPlanSig(rows, prefs, fbs, (b) => declinedBy(id, b)), () => {
+        const k = keepers.plans.get(String(id), keptPlanSig(rows, prefs, fbs, (b) => declinedBy(id, b), (b) => amountOf(id, buyerKeyOf(b), false)), () => {
             const best = planFrom(id, rows);
             if (!best) return null;
             const { buyer, ...plan } = best;
@@ -9043,9 +9177,12 @@ function renderSellingWork(src = null) {
         for (const b of flipCheckedOf(id)) {
             // A trade you declined is not a flip (the same trader's other items still are).
             if (declinedAll.size && declinedAll.has(declineKey(id, b.id ? 'id:' + b.id : 'name:' + String(b.name).toLowerCase()))) continue;
-            const most = Math.min(prefs.maxPerFlip || 100, b.maxUnits ? b.maxUnits : Infinity);
+            const usual = Math.min(prefs.maxPerFlip || 100, b.maxUnits ? b.maxUnits : Infinity);
+            const most = Math.min(usual, amountOf(id, buyerKeyOf(b), false));
             const plan = flipPlan(rows, b.price, { cash: prefs.cash, maxUnits: most, minPct: prefs.minProfitPct });
             if (!plan) continue;
+            // What moves in an hour - not Most per flip, not their pay - is what stopped it: said on the row.
+            if (most < usual && plan.units >= most && plan.available > plan.units) plan.pace = rateOf(id);
             if (!best || plan.profit > best.profit || (plan.profit === best.profit && plan.units > 0 && !best.units)) best = { ...plan, buyer: b };
         }
         return best;
@@ -9059,7 +9196,7 @@ function renderSellingWork(src = null) {
             const c = checkOf(id, b);
             if (c.ok) return null;
             if ((c.why !== 'not-checked' && c.why !== 'no-date') || declinedBy(id, b)) continue;
-            const most = Math.min(prefs.maxPerFlip || 100, b.maxUnits ? b.maxUnits : Infinity);
+            const most = Math.min(amountOf(id, buyerKeyOf(b), false), b.maxUnits ? b.maxUnits : Infinity);
             const plan = flipPlan(rows, b.price, { cash: prefs.cash, maxUnits: most, minPct: prefs.minProfitPct });
             return plan && plan.units > 0 ? { profit: plan.profit, buyer: b } : null;
         }
@@ -9121,7 +9258,7 @@ function renderSellingWork(src = null) {
             let pick = null;
             let score = -Infinity;
             for (const b of flipBuyersOf(id)) {
-                const n = Math.min(prefs.maxPerFlip || 100, b.maxUnits || Infinity, prefs.cash > 0 ? Math.floor(prefs.cash / lowest) : Infinity);
+                const n = Math.min(amountOf(id, buyerKeyOf(b), false), b.maxUnits || Infinity, prefs.cash > 0 ? Math.floor(prefs.cash / lowest) : Infinity);
                 const s = (b.price - lowest) * n;
                 if (s > score) {
                     score = s;
@@ -9140,7 +9277,9 @@ function renderSellingWork(src = null) {
             const sumRow = sell.summary.get(String(id));
             const news = lightAge >= W3B_LIGHT_FIRST_MS && lightSummaryMoved(rec, id) && !(saidLow > 0 && saidLow <= sumRow.lowestPrice);
             const light = lightAge < W3B_LIGHT_SAYS_MS && !news ? rec.lightRows : null;
-            const makeOpts = { cash: prefs.cash, maxUnits: Math.min(prefs.maxPerFlip || 100, pick.maxUnits || Infinity), enough: (each, price) => enoughProfit(each, price, 'TRADER', prefs.minProfitPct) };
+            // 3.28.0: its place in the order is what the amount a trade would really take makes.
+            const pickMost = Math.min(amountOf(id, buyerKeyOf(pick), false), pick.maxUnits || Infinity);
+            const makeOpts = { cash: prefs.cash, maxUnits: pickMost, enough: (each, price) => enoughProfit(each, price, 'TRADER', prefs.minProfitPct) };
             let made = light ? cheapProfit(light, pick.price, makeOpts) : null;
             // Its sellers were read: what their listings make (the ones TornW3B saw lately), the same way. With
             // nothing to make on them it stays a guess - the summary may know of a newer listing.
@@ -9149,7 +9288,7 @@ function renderSellingWork(src = null) {
                 const got = rows.length ? cheapProfit({ rows }, pick.price, makeOpts) : null;
                 if (got && got.profit > 0) made = got;
             }
-            return { price: pick.price, maxUnits: pick.maxUnits || null, ...(made ? { score: made.profit } : {}) };
+            return { price: pick.price, maxUnits: pickMost, ...(made ? { score: made.profit } : {}) };
         }, { cash: prefs.cash, maxUnits: prefs.maxPerFlip, minPct: prefs.minProfitPct, limit: SELL_FLIP_CANDIDATES })
         : [];
     // Near-misses, then every other item someone buys, oldest read first (3.15).
@@ -9248,6 +9387,18 @@ function renderSellingWork(src = null) {
                 : 'Every possible flip has its price checked: ' + shownFlips.length + ' shown');
         }
         sell.pricesWaiting = waiting.length;
+        // 3.28.0 - for the log and the zip: the item speeds in use, and how many of the flips shown they made smaller.
+        const pacedFlips = rows.filter((r) => r.plan && r.plan.units > 0 && typeof r.plan.pace === 'number').length;
+        sell.speedInfo = { itemsMeasured: speeds ? speeds.rows.size : 0, tableAgeMin: speeds ? Math.round((now - speeds.got) / 60000) : null, flipsShown: shownFlips.length, flipsPlannedSmaller: pacedFlips, tookBefore: tookBefore.size };
+        // Said once each way; the counts of the moment are in the zip (coverage.speeds).
+        const speedWord = speeds ? 'on' : 'off';
+        if (speedWord !== sell.speedWord) {
+            sell.speedWord = speedWord;
+            logProblem('note', speeds
+                ? 'Item speeds from the shared server in use: ' + speeds.rows.size + ' items measured'
+                : 'No item speeds from the shared server: every amount is planned as before',
+            'no more of an item in one trade than about ' + AMOUNT_HOURS + ' hour of what leaves the bazaars, never under one; an item not measured keeps the old limits');
+        }
     }
     sell.trustSlow = Boolean(prefs.trustedOnly) && !votesMissing;
     // The category filters the flips, the list and its counts together; its
@@ -9436,6 +9587,8 @@ function renderSellingWork(src = null) {
             // Never their own bazaar; the extras by how fast they sell.
             traderId: buyer.id || null,
             kindOf,
+            // 3.28.0: each line no more than about an hour of what moves (the main flip too).
+            capOf: (id, extra) => amountOf(id, key, extra),
             extraItems: prefs.extraItems,
             // "Every flip" pressed for this trader: all of it, within your cash, their pay and the 10,000.
             everything: sell.tradeEvery.has(key),
@@ -9610,7 +9763,7 @@ function renderSellingWork(src = null) {
                 const p = pickBazaars(list, bid, { maxUnits: n, minPct: prefs.minProfitPct, maxStops: every ? Infinity : MAIN_STOPS, exclude: chosen.buyer.id || null });
                 return p && p.units > 0 ? p.steps : null;
             },
-            info: (id) => ({ name: nameOf(id), bid: bidNow(id), kind: kindOf(id), units: Math.min(prefs.maxPerFlip || 100, EXTRA_CAP[kindOf(id)] || 10), price: lowestOf(id) }),
+            info: (id) => ({ name: nameOf(id), bid: bidNow(id), kind: kindOf(id), units: amountOf(id, chosen.key, true), price: lowestOf(id) }),
         };
         const w3bT = chosen.buyer.id && sell.db.traders[chosen.buyer.id] ? sell.db.traders[chosen.buyer.id].w3b : null;
         const common = {
@@ -9636,7 +9789,7 @@ function renderSellingWork(src = null) {
                 if (!list || !(bid > 0)) return null;
                 const p = pickBazaars(list, bid, every
                     ? { maxUnits: prefs.maxPerFlip || 100, minPct: prefs.minProfitPct, maxStops: Infinity, exclude: chosen.buyer.id || null }
-                    : { maxUnits: Math.min(prefs.maxPerFlip || 100, EXTRA_CAP[kindOf(id)] || 10), minPct: prefs.minProfitPct, maxStops: EXTRA_STOPS, exclude: chosen.buyer.id || null });
+                    : { maxUnits: amountOf(id, chosen.key, true), minPct: prefs.minProfitPct, maxStops: EXTRA_STOPS, exclude: chosen.buyer.id || null });
                 return p && p.units > 0 ? p.steps : null;
             };
             const held = resolveEstimated(hold.held, chosen.flips.map(named), pickOwn);
@@ -9817,7 +9970,7 @@ function renderSellingWork(src = null) {
         // Buyers online only (3.20.5): a status read since is a reason too - a trader found
         // offline kept "Trade +$X" here until the next working-out.
         const whoStatus = prefs.onlineOnly ? [...who.keys()].map((id) => levelOf(id) + (holdFlips && unreadStatus(id) ? '?' : '')) : null;
-        const scanSig = JSON.stringify([prefs.cash, prefs.maxPerFlip, prefs.extraItems, prefs.minProfitPct, prefs.networthPct, prefs.onlineOnly, prefs.trustedOnly, prefs.freshOnly, favEdits, [...blacklist], [...who.keys()], sell.summaryAt, whoStatus, [...sell.tradeEvery]]);
+        const scanSig = JSON.stringify([prefs.cash, prefs.maxPerFlip, prefs.extraItems, prefs.minProfitPct, prefs.networthPct, prefs.onlineOnly, prefs.trustedOnly, prefs.freshOnly, favEdits, [...blacklist], [...who.keys()], sell.summaryAt, whoStatus, [...sell.tradeEvery], speeds ? speeds.at : 0, tookBefore.size]);
         const fresh = sell.scanSig === scanSig && now - (sell.scanAt || 0) < SCAN_EVERY_MS;
         if (!scan.open) sell.scanWatch = [];
         if (scan.open && fresh) scan.list = sell.scanList || [];
@@ -10082,6 +10235,8 @@ function renderSellingWork(src = null) {
             buy: r.badge && r.badge.kind === 'flip' && r.plan ? r.plan.firstPrice : null, sell: r.badge && r.badge.kind === 'flip' && r.plan && r.plan.buyer ? r.plan.buyer.price : null,
             // The row as a line of a table (3.25.0): how many, from how many bazaars, to whom - and who pays most for one.
             units: r.plan && r.plan.units > 0 ? r.plan.units : 0,
+            // 3.28.0: units an hour that leave the bazaars, when that is what held the amount down (null: it did not).
+            pace: r.plan && r.plan.units > 0 && typeof r.plan.pace === 'number' ? r.plan.pace : null,
             stops: r.plan && r.plan.units > 0 ? new Set((r.plan.steps || []).map((st) => st.sellerId || st.sellerName)).size : 0,
             to: r.plan && r.plan.units > 0 && r.plan.buyer ? { id: r.plan.buyer.id || null, name: r.plan.buyer.name, old: oldList(r.plan.buyer, listAtOf, now) } : null,
             top: r.best ? { id: r.best.id || null, name: r.best.name, price: r.best.price } : null,
@@ -11005,7 +11160,11 @@ function bootSellingPage() {
         getKey: getSellKey,
         ...tornSharing('sell'),
     });
-    startShared('sell', sharedWantSell, () => renderSelling());
+    startShared('sell', sharedWantSell, () => {
+        // A table of item speeds this tab's own exchange just stored is read at the next draw, not half a minute on.
+        speedsReadAt = 0;
+        renderSelling();
+    });
     loadSellNetworth();
     loadSellPresence();
     gmOnChange(STORE_SELL_PRESENCE, () => loadSellPresence());
@@ -11399,6 +11558,20 @@ function bootSellingPage() {
         },
     });
     sell.page.mount();
+    // 3.27.1 - opened or reloaded with a page in the address (3.26.1: "#flips"), the page goes there while it
+    // is being built and tells nobody (its go() is quiet then). The script went on working out the list of
+    // the page it thought was in view ('all'), and a list is drawn only when it is the one worked out - so
+    // Best flips, My items and To sell stayed EMPTY, without a word, until a tab was pressed. Seen on the
+    // test page in the released 3.27.0: "Every possible flip has its price checked: 3 shown", no row drawn.
+    const openedOn = sell.page.shownNow();
+    if (openedOn) {
+        sell.bdPage = String(openedOn.page);
+        sell.bdTab = Number(openedOn.tab) || 0;
+        if (openedOn.filter && openedOn.filter !== sell.filter) {
+            sell.filter = openedOn.filter;
+            sell.boardOpen = sell.filter === 'sell' || sell.filter === 'trades';
+        }
+    }
 
     loadSellTraders();
     gmOnChange(STORE_TE, () => {
@@ -12143,7 +12316,8 @@ async function watchFinishedTrades(now = Date.now(), { backup = false } = {}) {
             const full = await fetchTrade(led.buysClient, id, use);
             if (!full) continue;
             const whole = { ...x, ...full };
-            seen[id] = { t: tradeFinishedAt(whole) || t || Date.now(), partnerId: tradePartnerId(whole, self), gave: Object.fromEntries(itemsGiven(whole, self)) };
+            // empty: nothing changed hands (no item, no money, from either side).
+            seen[id] = { t: tradeFinishedAt(whole) || t || Date.now(), partnerId: tradePartnerId(whole, self), gave: Object.fromEntries(itemsGiven(whole, self)), empty: Array.isArray(full.items) && !full.items.length };
         }
         const used = new Set(Array.isArray(stored.used) ? stored.used.map(String) : []);
         let avail = Object.entries(seen).filter(([id, x]) => x.gave && x.partnerId && !used.has(id)).map(([id, x]) => ({ id, t: Number(x.t), partnerId: x.partnerId, gave: x.gave }));
@@ -12177,7 +12351,27 @@ async function watchFinishedTrades(now = Date.now(), { backup = false } = {}) {
             changed = true;
         }
         if (changed) gmSet(STORE_SELL_CANCEL_UNDO, undoAll);
-        gmSet(STORE_SELL_TRADES_SEEN, { at: Date.now(), seen, used: [...used].slice(-200) });
+        // Called off on Torn (3.27.1, core/accepted.js tradesCalledOff): a trade with the trader was open there,
+        // is no longer, and did not go through. Not judged when the finished list came back full (it may not
+        // hold the newest), nor when Torn's list of open trades could not be read.
+        let going = stored.going && typeof stored.going === 'object' ? stored.going : {};
+        const still = Object.values(sellAccepted()).filter((t) => t.trader && t.trader.id);
+        if (still.length && list.length < 100) {
+            const ongoing = await fetchOngoingTrades(led.buysClient, use);
+            if (ongoing) {
+                const listed = new Set(list.map((x) => String(x && x.id)));
+                const finished = (id) => (seen[id] ? (seen[id].empty ? 'empty' : 'read') : listed.has(String(id)) ? 'listed' : null);
+                const off = tradesCalledOff(going, still, ongoing.map((x) => ({ id: x && x.id, partnerId: tradePartnerId(x, self) })), { finished });
+                going = off.going;
+                for (const key of off.gone) {
+                    const t = still.find((x) => x.key === key);
+                    cancelSellAccepted(key, Date.now(), 'gone');
+                    logAction('Cancel trade - by itself (it left your open trades on Torn without going through; item ' + (t ? t.itemId : '?') + ')');
+                    changed = true;
+                }
+            }
+        } else if (!still.length) going = {};
+        gmSet(STORE_SELL_TRADES_SEEN, { at: Date.now(), seen, used: [...used].slice(-200), going });
         if (changed) renderSellingNow();
     } catch (error) {
         markLedgerKeyDead(error);

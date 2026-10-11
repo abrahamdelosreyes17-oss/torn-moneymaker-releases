@@ -38,7 +38,7 @@ export function coverAfter(prev, key, read) {
     const searching = Boolean(read.searching);
     const same = Boolean(prev && prev.key === key && prev.total === read.rowsTotal && Boolean(prev.searching) === searching);
     const perRow = Math.max(Number(read.perRow) || 0, same ? Number(prev.perRow) || 0 : 0);
-    const whole = (read.rows || []).filter((r) => r && Number.isInteger(r.index) && r.index >= 0 && r.index < read.rowsTotal && r.ids.length >= 1 && (r.index === read.rowsTotal - 1 || r.ids.length >= perRow));
+    const whole = (read.rows || []).filter((r) => r && Number.isInteger(r.index) && r.index >= 0 && r.index < read.rowsTotal && r.ids.length >= 1 && !r.open && (r.index === read.rowsTotal - 1 || r.ids.length >= perRow));
     const sigs = whole.map((r) => [String(r.index), r.ids.map(String).join(',')]);
     const moved = same && sigs.some(([i, s]) => i in prev.rows && prev.rows[i] !== s);
     const rows = same && !moved ? { ...prev.rows } : {};
@@ -118,6 +118,8 @@ export function listingBoughtOut(itemId, last, read, { hadList = false, absent =
         if (!hadList) return true;
         return Boolean(rest && !rest.length && last.rowTotal === 1);
     }
+    // A buy form is open on a listing that could not be named (3.27.1): it may be this one.
+    if ((read.rows || []).some((r) => r && r.open)) return false;
     if (absent) return true;
     if (!rest || last.row === null || last.row === undefined || Boolean(read.searching) !== Boolean(last.rowSearch)) return false;
     if (read.rows.some((r) => r.ids.map(String).includes(id))) return false;

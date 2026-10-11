@@ -98,7 +98,7 @@ export class LedgerView {
         this.tab = 'trade';
         this.fifoSig = null;
         this.fifo = new Map();
-        this.el = lvEl('div', { class: 'lg' });
+        this.el = lvEl('div', { class: 'lg-page' });
     }
 
     /** From / to (ms) for the period picked. */
@@ -902,7 +902,7 @@ export class LedgerView {
 }
 
 export const LEDGER_CSS = `
-.lg { display: flex; flex-direction: column; gap: 16px; padding: 24px 24px 64px; }
+.lg-page { display: flex; flex-direction: column; gap: 16px; padding: 24px 24px 64px; }
 .lg-card { background: var(--surface); border: 1px solid var(--line); border-radius: 16px; padding: 16px; min-width: 0; }
 .lg-card h3 { margin: 0 0 12px; font: 650 11px/1 var(--sans); letter-spacing: 0.09em; text-transform: uppercase; color: var(--text2); display: flex; align-items: center; gap: 8px; }
 .lg-card h3::before { content: ""; width: 3px; height: 12px; border-radius: 2px; background: var(--brand); flex: 0 0 auto; }
@@ -985,7 +985,7 @@ select.lg-in option { background-color: #1c1e23; color: #e6e8ee; }
 .lg-rows td:nth-child(3) { min-width: 160px; }
 @media (max-width: 1100px) { .lg-grid { grid-template-columns: minmax(0, 1fr); } }
 @media (max-width: 1000px) {
-    .lg { padding: 12px 12px 48px; }
+    .lg-page { padding: 12px 12px 48px; }
     .lg-tiles, .lg-tiles5 { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
     .lg-in { min-width: 0; width: 100%; }
     .lg-f { flex: 1 1 140px; }

@@ -23,7 +23,7 @@ import {
     SHARED_SYNC_MS, SHARED_BUCKETS, sharedAddress, sharedPassOk, sharedBody, sharedOutgoingOk, sharedVersion, sharedTake, sharedPrune,
     sharedReadBucket, sharedIndex, sharedInterest, sharedPerson, sharedMarks, sharedMarksIn, sharedMarksNow,
     sharedDir, sharedDirIn,
-    sharedList, sharedListsIn, sharedAskIn,
+    sharedList, sharedListsIn, sharedAskIn, sharedMovesIn,
 } from '../core/shared.js';
 
 export const SHARED_CONFIG_KEY = 'sharedConfig';
@@ -40,6 +40,8 @@ export const SHARED_LISTS_OUT_KEY = 'sharedListsOut';
 /* ... and the ones another person's PC read, for Torn Bids' page to take: {at, n, lists}. */
 export const SHARED_LISTS_IN_KEY = 'sharedListsIn';
 const SHARED_LISTS_IN_KEEP = 20;
+/* 3.28.0 - how fast items leave the bazaars, as the server counted it: {at (the server's clock), got (this PC's), rows: {item: units an hour}}. */
+export const SHARED_MOVES_KEY = 'sharedMoves';
 /* The other PCs' TornW3B reads and this PC's turn among them (core/shared.js, sharedDirIn). */
 export const SHARED_DIR_KEY = 'sharedDir';
 // 3.26.2 - this PC's request counts waiting to be sent, every tab's in one sum (core/usage.js usageCallsAdd).
@@ -314,6 +316,7 @@ export class SharedLink {
         const listsGot = [];
         const touched = new Set();
         let marksChanged = false;
+        let movesChanged = false;
         let born = before.born ?? null;
         let seen = Number.isFinite(before.seenAt) ? before.seenAt : 0;
         try {
@@ -333,7 +336,10 @@ export class SharedLink {
                     : [];
                 // This PC's own request counts since the last answered exchange, on the first page only ({} = none made).
                 const callsOut = page === 0 ? usageCallsOut(this.d.load(SHARED_CALLS_KEY), now) : null;
-                const body = sharedBody({ used: use.used, waiting: (Number(use.waiting) || 0) + others, wants: page === 0 ? wants : wants.map(({ want, w3b, ...w }) => w), since: seq, seen, sendWorth, now, ver, lists: listsOut, listsSince: takesLists && page === 0 ? listsAt : null, calls: callsOut });
+                // The item speeds (3.28.0): asked for only while Torn Bids' page is open - it plans by them.
+                const movesHeld = takesLists && page === 0 ? this.d.load(SHARED_MOVES_KEY) : null;
+                const movesAt = takesLists && page === 0 ? (movesHeld && Number.isInteger(movesHeld.at) && movesHeld.at > 0 ? movesHeld.at : 0) : null;
+                const body = sharedBody({ used: use.used, waiting: (Number(use.waiting) || 0) + others, wants: page === 0 ? wants : wants.map(({ want, w3b, ...w }) => w), since: seq, seen, sendWorth, now, ver, lists: listsOut, listsSince: takesLists && page === 0 ? listsAt : null, calls: callsOut, moves: movesAt });
                 if (!sharedOutgoingOk(body)) throw new Error('Not sent: the message was not in the agreed shape.');
 
                 const response = await this.d.post(`${cfg.address}/sync`, {
@@ -436,6 +442,13 @@ export class SharedLink {
                         if (Number.isInteger(answer.listsAt) && answer.listsAt >= 0) listsAt = answer.listsAt;
                         state.listsOut = (Number.isInteger(before.listsOut) ? before.listsOut : 0) + (body.lists || []).length;
                     }
+                    // A newer table of item speeds: kept whole (it replaces the one before).
+                    const moved = movesAt === null ? null : sharedMovesIn(answer);
+                    if (moved) {
+                        this.d.save(SHARED_MOVES_KEY, { at: moved.at, got, rows: moved.rows });
+                        state.moves = Object.keys(moved.rows).length;
+                        movesChanged = true;
+                    }
                 }
                 if (Number.isInteger(answer.seq)) seq = answer.seq;
                 if (Number.isFinite(answer.now)) seen = answer.now;
@@ -480,7 +493,8 @@ export class SharedLink {
         this.rev = state.rev;
         this.d.save(SHARED_STATE_KEY, state);
         if (touched.size) this.kept = null;
-        if (touched.size || marksChanged) this.d.onReads();
+        // (This tab hears no change of what it stored itself: the page is told here.)
+        if (touched.size || marksChanged || movesChanged) this.d.onReads();
     }
 
     /**
@@ -499,7 +513,7 @@ export class SharedLink {
     /** The server's address or this PC's word changed, or there is none now: what was kept under the old one goes. */
     forget() {
         for (let i = 0; i < SHARED_BUCKETS; i += 1) this.d.del(SHARED_READS_PREFIX + i);
-        for (const key of [SHARED_STATE_KEY, SHARED_GRANT_KEY, SHARED_MARKS_KEY, SHARED_INTEREST_KEY, SHARED_ASK_KEY, SHARED_DIR_KEY, SHARED_W3B_ASK_KEY, SHARED_LISTS_OUT_KEY, SHARED_LISTS_IN_KEY, SHARED_CALLS_KEY]) this.d.del(key);
+        for (const key of [SHARED_STATE_KEY, SHARED_GRANT_KEY, SHARED_MARKS_KEY, SHARED_INTEREST_KEY, SHARED_ASK_KEY, SHARED_DIR_KEY, SHARED_W3B_ASK_KEY, SHARED_LISTS_OUT_KEY, SHARED_LISTS_IN_KEY, SHARED_CALLS_KEY, SHARED_MOVES_KEY]) this.d.del(key);
         this.w3bAskKept = null;
         this.listsSent = new Map();
         this.buckets = null;
@@ -541,6 +555,8 @@ export class SharedLink {
             // 3.26.2: this PC's request counts told to the server so far, and in how many exchanges.
             callsOut: Number.isInteger(state.callsOut) ? state.callsOut : 0,
             callsSyncs: Number.isInteger(state.callsSyncs) ? state.callsSyncs : 0,
+            // 3.28.0: how many items the server's last table of speeds named (null: none came yet).
+            moves: Number.isInteger(state.moves) ? state.moves : null,
             unknown: Boolean(cfg && state.unknown),
             // When a PC the server does not know asks again (ms from the last asking).
             unknownWaitMs: cfg && state.unknown ? sharedUnknownWait(state.unknownTries) : null,

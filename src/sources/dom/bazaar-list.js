@@ -19,6 +19,7 @@
  */
 
 import { itemIdFromImage, ITEM_IMAGE_SELECTOR } from './detect.js';
+import { BUY_FORM_SELECTOR, openBuyForms } from './buy-form.js';
 
 export const BAZAAR_LIST_SELECTOR = '[data-testid="bazaar-items"]';
 export const BAZAAR_ROW_SELECTOR = '[data-testid="bazaar-items-row"]';
@@ -57,10 +58,16 @@ export function bazaarSearchInUse(list) {
 /**
  * What the page shows of the bazaar's list now.
  *
+ * A listing whose buy form is open has no picture (buy-form.js): it is named
+ * by its form - `idOfForm({name, price, qty})` gives its item id - and keeps
+ * its place in its row. One that cannot be named marks the row `open`: a
+ * listing is in it that the ids do not show, so nothing is judged from it.
+ *
  * @param {Document|Element} root
- * @returns {null|{rowsTotal: number, perRow: number, rows: Array<{index: number, ids: string[], el: Element}>, searching: boolean}}
+ * @param {function} [idOfForm]
+ * @returns {null|{rowsTotal: number, perRow: number, rows: Array<{index: number, ids: string[], el: Element, open?: boolean}>, searching: boolean}}
  */
-export function readBazaarList(root) {
+export function readBazaarList(root, idOfForm = () => null) {
     const list = root && root.querySelector ? root.querySelector(BAZAAR_LIST_SELECTOR) : null;
     if (!list) return null;
     const els = [...list.querySelectorAll(BAZAAR_ROW_SELECTOR)];
@@ -73,8 +80,22 @@ export function readBazaarList(root) {
         const y = styleNumber(el, OFFSET_RE);
         // A row not placed by its offset: not the list read above.
         if (y === null || y < 0) return null;
-        const ids = [...el.querySelectorAll(ITEM_IMAGE_SELECTOR)].map(itemIdFromImage).filter(Boolean).map(String);
-        rows.push({ index: Math.round(y / rowHeight), ids, el });
+        const forms = openBuyForms(el);
+        const ids = [];
+        let open = false;
+        // In page order: each listing by its picture, or by its open form.
+        for (const node of el.querySelectorAll(ITEM_IMAGE_SELECTOR + ', ' + BUY_FORM_SELECTOR)) {
+            const form = forms.find((x) => x.el === node);
+            if (form) {
+                const id = idOfForm(form);
+                if (id) ids.push(String(id));
+                else open = true;
+            } else if (!forms.some((x) => x.el.contains(node))) {
+                const id = itemIdFromImage(node);
+                if (id) ids.push(String(id));
+            }
+        }
+        rows.push(open ? { index: Math.round(y / rowHeight), ids, el, open } : { index: Math.round(y / rowHeight), ids, el });
     }
     const rowsTotal = Math.round(listHeight / rowHeight);
     if (!(rowsTotal > 0)) return null;

@@ -39,6 +39,17 @@ window.__sharedCalls = [];
 // server that already holds the bazaars - its first answer names player 6001, who sells every Bloom at $40
 // (Sweeper pays $50), read 30 s ago. TornW3B's summary still says $100, so this PC would not look soon.
 const SHARED_FIRST = /[?&]sharedfirst=1/.test(location.search);
+// &moves=206:3,1:400,180:0 (3.28.0, with &shared=on): the pretend server has counted how fast these items leave the
+// bazaars - item:units an hour - and hands the table to a page that asks with `moves` (Torn Bids' page; the
+// panel alone never asks). window.__movesAsked: what each message said (null = it did not ask).
+const MOVES = (() => {
+    const said = (/[?&]moves=([\d:.,]+)/.exec(location.search) || [])[1];
+    if (!said) return null;
+    return said.split(',').map((pair) => pair.split(':').map(Number)).filter((r) => r.length === 2 && r[0] > 0 && r[1] >= 0);
+})();
+const MOVES_AT = Date.now() - 60000;
+window.__movesAsked = [];
+window.__lastSync = null;
 // Defaults only: TornW3B must be on without the user ticking anything.
 // window.__ahead(minutes) (3.23.0): the clock jumps forward, as if the page had been left open that long.
 let _ahead = 0;
@@ -216,6 +227,8 @@ if (_tradeView) {
 // &bazaarcards=1 (with page=bazaar&userId=<seller>): a player's bazaar with
 // Stick of Dynamite ($17,500, 60 in stock) and Xanax ($840,000, 2 in stock).
 // window.__buy(id, n) takes n off a listing's stock, as a purchase does.
+// Since 3.27.1 a fall in stock counts as YOUR buy only on a listing you
+// pressed in on this visit: press the card's Buy (or its box) before __buy.
 if (/[?&]bazaarcards=1/.test(location.search)) {
     document.addEventListener('DOMContentLoaded', () => {
         const card = (id, name, price, stock) => '<div class="itemDescription___x" data-id="' + id + '" style="width:220px;height:110px;display:inline-block;margin:4px;padding:6px;background:#333;color:#ddd;font:12px Arial">' +
@@ -247,6 +260,10 @@ if (/[?&]bazaarcards=1/.test(location.search)) {
 // &buyplan=4: the plan's Xanax is at another bazaar only (a buy here is not
 // planned). &units=<n>: n of Thing 3 already bought for the trade.
 // window.__buy(id, n) takes n off a listing, as a purchase does.
+// &buybox=1 (3.27.1): each card has Torn's two buttons (Show info, Buy), and Buy swaps the card for
+// Torn's buy form in the same tile - the form has no picture (read on the owner's own bazaar page,
+// 2026-10-11): name, price, "(N in stock)", Close, the number box, Buy. &twin=1: listing 2 is the same
+// item at the same price as listing 1 (two weapons listed apart).
 const _bzWindow = Number(new URLSearchParams(location.search).get('bazaarwindow')) || 0;
 const BZW_ITEMS = {};
 if (_bzWindow) {
@@ -273,6 +290,9 @@ if (_bzWindow) {
         const ROW = 80, OVER = 10;
         let data = [];
         for (let i = 0; i < _bzWindow; i++) data.push(i === want ? { id: 206, name: 'Xanax', price: 840000, stock: 5 } : { id: 3000 + i, name: 'Thing ' + (i + 1), price: 500 + i, stock: 3 });
+        const _buybox = /[?&]buybox=1/.test(location.search);
+        if (/[?&]twin=1/.test(location.search) && data.length > 1) data[1] = { ...data[0], stock: 1 }, data[0].stock = 1;
+        data.forEach((x, i) => { x.u = i; });
         const d = document.createElement('div');
         d.id = 'fake-bazaar';
         // The owner banner as captured live (2026-09-24, sources/dom/owner.js): its status badge floats at its end (3.20).
@@ -282,10 +302,13 @@ if (_bzWindow) {
         document.body.prepend(d);
         const list = d.querySelector('[data-testid="bazaar-items"]');
         const search = d.querySelector('input');
-        const card = (x) => '<div class="item___x" data-testid="item" style="display:inline-block;width:220px;height:72px;margin:2px;background:#333;color:#ddd;font:12px Arial;vertical-align:top;position:relative"><div class="itemDescription___x" data-testid="item-description" data-id="' + x.id + '">' +
+        const tile = '<div class="item___x" data-testid="item" style="display:inline-block;width:220px;height:72px;margin:2px;background:#333;color:#ddd;font:12px Arial;vertical-align:top;position:relative">';
+        const buyForm = (x) => tile + '<div class="buyMenu___x overPanelContainer___x"><span class="name___x">' + x.name + '</span> <span class="price___x">$' + x.price.toLocaleString('en-US') + '</span> <span class="amount___x">(' + x.stock + ' in stock)</span> <button type="button" data-close="' + x.u + '" aria-label="Close">x</button><br><input class="numberInput___x buyAmountInput___x" type="text" value="1" style="width:50px"> <button type="button" class="buy___x" data-buy="' + x.u + '" aria-label="Buy: ' + x.name + '">Buy</button></div></div>';
+        const card = (x) => (_buybox && x.open ? buyForm(x) : tile + '<div class="itemDescription___x" data-testid="item-description" data-id="' + x.id + '">' +
+            (_buybox ? '<div class="controlPanel___x" style="float:right"><button type="button" aria-label="Show info: ' + x.name + '">i</button><button type="button" data-open="' + x.u + '" aria-label="Buy: ' + x.name + '">B</button></div>' : '') +
             '<div class="imgBar___x" role="button" aria-label="' + x.name + '"><div data-testid="img-container"><img class="item-plate" alt="' + x.name + '" src="https://www.torn.com/images/items/' + x.id + '/large.png" style="height:24px"></div></div>' +
             '<div data-testid="description"><p data-testid="name" class="name___x" style="margin:0">' + x.name + '</p><div data-testid="price" class="price___x">$' + x.price.toLocaleString('en-US') + '</div>' +
-            '<p class="amount___x" style="margin:0">(<span data-testid="amount-value">' + x.stock + '</span> in stock)</p></div></div></div>';
+            '<p class="amount___x" style="margin:0">(<span data-testid="amount-value">' + x.stock + '</span> in stock)</p></div></div></div>');
         const shown = () => (search.value.trim() ? data.filter((x) => x.name.toLowerCase().includes(search.value.trim().toLowerCase())) : data);
         const draw = (fresh) => {
             const rows = shown();
@@ -336,6 +359,22 @@ if (_bzWindow) {
             if (x.stock <= 0) data = data.filter((y) => y !== x);
             draw(true);
         };
+        // &buybox=1: Torn's Buy on a card opens its form in the card's place; Close puts the card back; the form's Buy takes the number typed.
+        list.addEventListener('click', (event) => {
+            const b = event.target.closest && event.target.closest('button');
+            if (!b) return;
+            const of = (u) => data.find((y) => String(y.u) === String(u));
+            if (b.dataset.open !== undefined && of(b.dataset.open)) { of(b.dataset.open).open = true; draw(true); }
+            else if (b.dataset.close !== undefined && of(b.dataset.close)) { of(b.dataset.close).open = false; draw(true); }
+            else if (b.dataset.buy !== undefined && of(b.dataset.buy)) {
+                const x = of(b.dataset.buy);
+                const typed = Math.max(1, Number(String(b.parentElement.querySelector('input').value).replace(/D/g, '')) || 1);
+                x.open = false;
+                x.stock -= Math.min(typed, x.stock);
+                if (x.stock <= 0) data = data.filter((y) => y !== x);
+                draw(true);
+            }
+        });
         // Sorted another way (Torn's Name / Cost tabs): the same listings, another order.
         window.__sort = () => { data = [...data].reverse(); draw(true); };
     });
@@ -464,6 +503,22 @@ if (/[?&]sendplan=(1|mid)/.test(location.search)) {
     const inTrade = (location.search.match(/[?&]intrade=(\d+)/) || [])[1];
     if (inTrade) sessionStorage.setItem('ttv2-tradeinside-5', JSON.stringify([{ name: 'Bottle of Beer', qty: Number(inTrade) }]));
     else sessionStorage.removeItem('ttv2-tradeinside-5');
+}
+/*
+ * &calledoff=1 (3.27.1, with ?ttv2=traders&sellkeys=1&ledgerkey=1; the friend's
+ * report of 2026-10-12): Bob accepted 20 minutes ago and 5 Camel Plushies were
+ * bought for him. Torn's list of open trades holds trade 801 with him the
+ * first time it is asked, and nothing after: he called it off. No finished
+ * trade shows it. The trade closes by itself on the third read (seen open,
+ * gone once, gone twice - a read a minute), the Plushies go to To sell.
+ * window.__ongoingAsks counts the reads.
+ */
+const CALLEDOFF = /[?&]calledoff=1/.test(location.search);
+window.__ongoingAsks = 0;
+if (CALLEDOFF) {
+    const now = Date.now();
+    _store[NS + 'ledgerSelf'] = JSON.stringify('999');
+    _store[NS + 'sellAccepted'] = JSON.stringify({ 'id:11': { key: 'id:11', trader: { id: '11', name: 'Bob' }, itemId: '384', at: now - 20 * 60000, items: [{ line: 'flip:384', itemId: '384', name: 'Camel Plushie', units: 5, bid: 73500, kind: 'flip', sent: false, steps: [{ sellerId: '777', qty: 5, price: 70000, bought: true, boughtQty: 5, boughtAt: now - 15 * 60000 }] }], cost: 350000, pays: 367500, profit: 17500 } });
 }
 const TRADEDONE = /[?&]tradedone=1/.test(location.search);
 const TRADEDONE_TRADES = {};
@@ -883,6 +938,11 @@ function respondFull(url) {
             return { log: all.filter((e) => e.timestamp >= from && e.timestamp <= to).sort((a, b) => b.timestamp - a.timestamp), _metadata: { links: {} } };
         }
         if (u.pathname === '/v2/user/trades') {
+            // Torn's open trades (cat=ongoing): none, but &calledoff=1's one with Bob on the first ask.
+            if (u.searchParams.get('cat') === 'ongoing') {
+                window.__ongoingAsks += 1;
+                return { trades: CALLEDOFF && window.__ongoingAsks === 1 ? [{ id: 801, user: { id: 999, name: 'Me' }, trader: { id: 11, name: 'Bob' }, expires_at: NOW_S + 3600, modified_at: NOW_S - 600 }] : [], _metadata: { links: {} } };
+            }
             if (MANY) return { trades: Object.values(MANY_TRADES).map((t) => ({ id: t.id, completed_at: t.completed_at, user: t.user, trader: t.trader })), _metadata: { links: {} } };
             const done = Object.values(TRADEDONE_TRADES).map((t) => ({ id: t.id, completed_at: t.completed_at, user: t.user, trader: t.trader }));
             const from = Number(u.searchParams.get('from')) || 0;
@@ -1083,7 +1143,10 @@ function w3bPretendSync() {
         if (SHARED === 'refused') return { __http: 404 };
         if (SHARED !== 'on') throw new Error('The pretend shared server is down');
         const now = Date.now();
+        const movesAsked = window.__lastSync && Number.isInteger(window.__lastSync.moves) ? window.__lastSync.moves : null;
+        window.__movesAsked.push(movesAsked);
         return {
+            ...(MOVES && movesAsked !== null && movesAsked < MOVES_AT ? { moves: { at: MOVES_AT, rows: MOVES } } : {}),
             grant: { at: now, need: 23, serverShare: 57, serverTimes: [now - 40000, now - 20000, now - 3000] },
             reads: SHARED_FIRST ? [
                 { id: 6001, at: now - 30000, items: Object.keys(SWEEP_ITEMS).map((id) => ({ id: +id, price: 40, qty: 5 })) },
@@ -1104,7 +1167,7 @@ function w3bPretendSync() {
 }
 function GM_xmlhttpRequest(opts) {
     window.__requests.push(opts.url);
-    if (/\.workers\.dev\/sync$/.test(opts.url)) { try { window.__sharedCalls.push(JSON.parse(opts.data).calls); } catch (e) { window.__sharedCalls.push('unreadable'); } }
+    if (/\.workers\.dev\/sync$/.test(opts.url)) { try { window.__lastSync = JSON.parse(opts.data); window.__sharedCalls.push(window.__lastSync.calls); } catch (e) { window.__lastSync = null; window.__sharedCalls.push('unreadable'); } }
     setTimeout(() => {
         try {
             const body = respond(opts.url);

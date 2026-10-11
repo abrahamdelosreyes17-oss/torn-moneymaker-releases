@@ -24,7 +24,7 @@ export const SHARED_BUCKETS = 16;
 const SHARED_MAX_SELLERS = 3000;
 const SHARED_MAX_NEAR = 200;
 const SHARED_MAX_WORTH = 5000;
-const SHARED_BODY_KEYS = ['app', 'ver', 'used', 'waiting', 'sellers', 'trades', 'looking', 'worth', 'since', 'seen', 'going', 'bought', 'dir', 'want', 'w3b', 'lists', 'listsSince', 'calls'];
+const SHARED_BODY_KEYS = ['app', 'ver', 'used', 'waiting', 'sellers', 'trades', 'looking', 'worth', 'since', 'seen', 'going', 'bought', 'dir', 'want', 'w3b', 'lists', 'listsSince', 'calls', 'moves'];
 /*
  * 3.26.0, the server handing out TornW3B's work (its /sync, deployed 2026-10-11):
  *   want        the items whose sellers list this PC would ask TornW3B for next, most wanted first (60 at most)
@@ -41,6 +41,32 @@ export const SHARED_MAX_LISTS = 5;
 export const SHARED_MAX_LIST_ITEMS = 2500;
 /** What the server handed out is gone by for this long after it was said (an exchange is every 30 s). */
 export const SHARED_ASK_FRESH_MS = 45000;
+
+/*
+ * 3.28.0 - how fast items leave the bazaars, as the server counted it from its own reads of Torn:
+ *   moves       the time of the table this PC holds (the server's clock; 0 for none)
+ *   -> moves    {at, rows: [[item, units an hour]]} when the server has a newer one
+ * Nothing new leaves this PC for it: one number.
+ */
+export const SHARED_MAX_MOVES = 3000;
+/** The answer's table, checked: {at, rows: {item: units an hour}}, or null when the server sent none. */
+export function sharedMovesIn(answer) {
+    const m = answer && answer.moves;
+    if (!m || typeof m !== 'object' || !Number.isInteger(m.at) || m.at <= 0 || m.at >= 1e13 || !Array.isArray(m.rows)) return null;
+    const rows = {};
+    let n = 0;
+    for (const r of m.rows) {
+        if (!Array.isArray(r) || r.length !== 2) continue;
+        const item = sharedId(r[0]);
+        if (item === null || typeof r[1] !== 'number' || !Number.isFinite(r[1]) || r[1] < 0 || r[1] > 1e7) continue;
+        if (!(item in rows)) {
+            if (n >= SHARED_MAX_MOVES) continue;
+            n += 1;
+        }
+        rows[item] = r[1];
+    }
+    return { at: m.at, rows };
+}
 
 /** One trader list as it may be sent or kept: [trader, readAt, {item: price}], or null. Numbers only. */
 export function sharedList(entry) {
@@ -270,7 +296,7 @@ export function sharedMarks(wants, now) {
  * come out of here, whatever is put in.
  * `now`: this PC's clock; the marks leave as ages, since every PC has its own clock.
  */
-export function sharedBody({ used = 0, waiting = 0, wants = [], since = 0, seen = 0, sendWorth = true, now = 0, ver = null, lists = null, listsSince = null, calls = null } = {}) {
+export function sharedBody({ used = 0, waiting = 0, wants = [], since = 0, seen = 0, sendWorth = true, now = 0, ver = null, lists = null, listsSince = null, calls = null, moves = null } = {}) {
     const count = (n) => (Number.isFinite(n) && n > 0 ? Math.min(1000, Math.floor(n)) : 0);
     const list = Array.isArray(wants) ? wants.filter((w) => w && typeof w === 'object') : [];
     const trades = sharedIds(list.map((w) => w.trades), SHARED_MAX_NEAR);
@@ -301,6 +327,8 @@ export function sharedBody({ used = 0, waiting = 0, wants = [], since = 0, seen 
     const out = (Array.isArray(lists) ? lists : []).map(sharedList).filter(Boolean).slice(0, SHARED_MAX_LISTS);
     if (out.length) body.lists = out;
     if (Number.isInteger(listsSince) && listsSince >= 0) body.listsSince = listsSince;
+    // 3.28.0 - the table of item speeds this PC holds (its time on the server's clock): a newer one is sent back.
+    if (Number.isInteger(moves) && moves >= 0 && moves < 1e13) body.moves = moves;
     // 3.26.2 - this PC's own request counts since the last answered exchange (core/usage.js): {} = none were made.
     if (calls && typeof calls === 'object' && !Array.isArray(calls)) {
         body.calls = {};

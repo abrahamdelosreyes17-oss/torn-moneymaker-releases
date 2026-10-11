@@ -1285,6 +1285,58 @@ export function finishedTradeFor(trade, finished, until = Infinity) {
     return hits.sort((a, b) => a.t - b.t)[0] || null;
 }
 
+/* ------------------------------------------- the trade was called off on Torn (3.27.1) */
+
+/*
+ * The friend (3.26.2, 2026-10-12): "Trader declined the trade and the trades
+ * in torn bids doesn't disappear I have to manually remove them myself". Only
+ * a trade that went through closed by itself; one the trader declined (or
+ * that ran out) stayed "under way" until Cancel trade was pressed.
+ *
+ * Torn lists the trades you have open (/v2/user/trades, cat ongoing). One
+ * with the trader of an accepted trade is remembered; when it is no longer
+ * open, did not go through, and no other trade with them is open, the trade
+ * was called off. Counted on TRADE_GONE_CHECKS reads in a row (a minute
+ * apart), so a trade that finished between two requests is first seen in
+ * your finished trades.
+ */
+export const TRADE_GONE_CHECKS = 2;
+
+/**
+ * @param {object|null} going - what was kept: trade key -> {yesAt, ids: string[], misses}
+ * @param {Array} open - the accepted trades (with a trader id)
+ * @param {Array<{id, partnerId}>} ongoing - your open trades on Torn, read now
+ * @param {object} [o]
+ * @param {function} [o.finished] - (Torn trade id) => null (not among your finished trades), 'empty' (listed, nothing changed hands), else truthy
+ * @returns {{going: object, gone: string[]}} what to keep, and the keys of the trades called off
+ */
+export function tradesCalledOff(going, open, ongoing, { finished = () => null, checks = TRADE_GONE_CHECKS } = {}) {
+    const next = {};
+    const gone = [];
+    for (const t of open || []) {
+        const partner = t && t.trader && t.trader.id ? String(t.trader.id) : null;
+        if (!partner || !t.key) continue;
+        const was = going && going[t.key] && Number(going[t.key].yesAt) === Number(t.at) ? going[t.key] : null;
+        const here = (ongoing || []).filter((x) => x && x.id && String(x.partnerId) === partner).map((x) => String(x.id));
+        if (here.length) {
+            next[t.key] = { yesAt: Number(t.at), ids: [...new Set([...(was ? was.ids : []), ...here])].slice(-10), misses: 0 };
+            continue;
+        }
+        // Never seen open on Torn: nothing to go by.
+        if (!was || !was.ids.length) continue;
+        // One that finished with something in it is not this (finishedTradeFor closes that), nor a calling off.
+        const ids = was.ids.filter((id) => {
+            const f = finished(id);
+            return !f || f === 'empty';
+        });
+        if (!ids.length) continue;
+        const misses = (Number(was.misses) || 0) + 1;
+        if (misses >= checks) gone.push(t.key);
+        else next[t.key] = { yesAt: Number(t.at), ids, misses };
+    }
+    return { going: next, gone };
+}
+
 /**
  * What a trade that went through leaves you, from what you really gave
  * (itemsGiven): per item, what you bought for it - planned and unplanned -

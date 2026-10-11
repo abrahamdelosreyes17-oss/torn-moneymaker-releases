@@ -2824,9 +2824,27 @@ ${TOKENS_CSS}
     margin-top: 6px;
 }
 
+/* One row when it fits. In a narrow panel the price line goes under the name
+   and the name keeps its words whole (3.27.1: the name's column was what was
+   left beside the price line - nothing - and it broke after every letter). */
+.ttv2-here-r {
+    display: flex;
+    flex-wrap: wrap;
+}
+
 .ttv2-here-n {
+    flex: 1 1 auto;
     min-width: 0;
-    overflow-wrap: anywhere;
+    overflow-wrap: break-word;
+}
+
+.ttv2-here-r .ttv2-here-l {
+    min-width: 0;
+    white-space: normal;
+}
+
+.ttv2-here-r .ttv2-link {
+    margin-left: auto;
 }
 
 .ttv2-here-n b,
