@@ -199,6 +199,31 @@ export function keepsUp(minutes, counts, budget = 60) {
     return { ok: false, want, otherEvery: left >= 1 && counts.other > 0 ? Math.ceil(counts.other / left) : null };
 }
 
+/*
+ * A day's allowance, paced (3.26.1). TornW3B counts two kinds of request by the day as well as by the
+ * minute: an item's sellers list (1,000) and its light list (10,000). Flat out, both days were used in two
+ * or three hours, and for the rest of the day no possible flip could be read at all. So an hour may take a
+ * part of what was left when it began (a quarter: the first hours get the most, and the day never runs
+ * out), handed out evenly through the hour, with a head start so a page just opened is not held back.
+ */
+export const DAY_PACE_PART = 4;
+export const DAY_PACE_HEAD_MIN = 15;
+
+/**
+ * @param {number} left - what is left of the day now
+ * @param {number} hourUsed - how many left in this clock hour already
+ * @param {number} now - ms
+ * @returns {{hour: number, room: number}} hour: this hour's share; room: how many more may leave now
+ */
+export function dayPaceRoom(left, hourUsed, now) {
+    const l = Math.max(0, Math.floor(Number(left)) || 0);
+    const used = Math.max(0, Math.floor(Number(hourUsed)) || 0);
+    const hour = Math.ceil((l + used) / DAY_PACE_PART);
+    const minute = (((Number(now) || 0) % 3600000) + 3600000) % 3600000 / 60000;
+    const line = hour * Math.min(1, (minute + DAY_PACE_HEAD_MIN) / 60);
+    return { hour, room: Math.max(0, Math.min(l, Math.floor(line) - used)) };
+}
+
 /**
  * The trader the desk's plan is with when you picked none (3.25.0): the one it showed last for this
  * item, for as long as they still make a trade with it. A better one is never swapped in by itself -

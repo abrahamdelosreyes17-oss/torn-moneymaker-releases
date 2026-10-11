@@ -366,6 +366,10 @@ export class SharedLink {
                     if (born !== null) this.worthJson = '';
                     born = answer.born;
                 }
+                // Another tab stored its own exchange while this one waited for the answer (onStored lets go of what
+                // is kept): taken up again first. 3.26.0 read a null here - "Cannot read properties of null".
+                this.loadInterest();
+                if (!this.buckets) this.loadBuckets();
                 for (const b of sharedTake(this.buckets, answer, this.interest, this.gen, got)) touched.add(b);
                 // The others' marks: stored only when they changed.
                 if (this.marksKept === undefined) this.marksKept = this.d.load(SHARED_MARKS_KEY) || null;
@@ -386,7 +390,7 @@ export class SharedLink {
                     // TornW3B's work: which of the wanted sellers lists are this PC's, and the others' trader lists.
                     for (const l of body.lists || []) this.listsSent.set(l[0], l[1]);
                     if (this.listsSent.size > 500) this.listsSent = new Map([...this.listsSent].slice(-250));
-                    const handed = sharedAskIn(answer, body.want || [], got);
+                    const handed = sharedAskIn(answer, body.want || [], got, Array.isArray(body.w3b) ? body.w3b[0] : null);
                     if (JSON.stringify(handed) !== JSON.stringify(this.w3bAsk())) {
                         this.w3bAskKept = handed;
                         if (handed) this.d.save(SHARED_W3B_ASK_KEY, handed);

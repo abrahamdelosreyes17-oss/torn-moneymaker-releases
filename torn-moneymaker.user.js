@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      3.26.0
+// @version      3.26.1
 // @description  Finds Bazaar and Item Market listings below NPC / market value - on the page you are viewing, and live from the Torn API and TornW3B - ranked by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -52,7 +52,7 @@
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '3.26.0';
+    const TTV2_BUILD_VERSION = '3.26.1';
     const TTV2_SHARED_HOME = 'https://torn-bids-shared.pumping-iron-worker.workers.dev';
 
     /* ===== src/platform/gm.js ===== */
@@ -433,26 +433,43 @@
      * What the server handed out, to keep: {at, want, ask} - `ask` only of what was wanted, in its order.
      * Null when the server said nothing about it (an older server, or nothing was wanted).
      */
-    function sharedAskIn(answer, want, now) {
+    function sharedAskIn(answer, want, now, room = null) {
         if (!answer || !Array.isArray(answer.ask) || !Array.isArray(want) || !want.length) return null;
-        const wanted = new Set(want);
+        const wanted = [...new Set(want)];
         const ask = [];
         for (const value of answer.ask) {
             const id = sharedId(value);
-            if (id !== null && wanted.has(id) && !ask.includes(id)) ask.push(id);
+            if (id !== null && wanted.includes(id) && !ask.includes(id)) ask.push(id);
         }
-        return { at: now, want: [...wanted], ask };
+        // 3.26.1 - the server goes down `want` and stops once it has handed out as many as this PC said it has left
+        // this minute (`room`). What comes after the last one handed was never looked at: it is nobody else's.
+        // 3.26.0 took all of it for another PC's, and a PC on its own read a few sellers lists per exchange.
+        // Two PCs behind one address share one minute, and the server then stops at a part of `room` this PC
+        // cannot know. A server that says how far down `want` it looked (`judged`) is believed over the reckoning.
+        const told = Number.isInteger(answer.judged) && answer.judged >= 0 && answer.judged <= wanted.length ? answer.judged : null;
+        const stopped = Number.isInteger(room) && room >= 0 && ask.length >= room;
+        const judged = told !== null ? told : stopped ? (ask.length ? wanted.indexOf(ask[ask.length - 1]) + 1 : 0) : wanted.length;
+        return { at: now, want: wanted, ask, judged };
     }
 
     /**
      * May this PC ask TornW3B for an item's sellers list now, by what the server handed out? Not when it was
      * wanted and the server left it to another PC; everything else as before - an item the server was not told
-     * of, a server that has been silent, a PC on its own.
+     * of or did not get to, a server that has been silent, a PC on its own.
      */
     function sharedMayRead(kept, itemId, now) {
         if (!kept || !(now - kept.at < SHARED_ASK_FRESH_MS) || now < kept.at) return true;
         const id = Number(itemId);
-        return !kept.want.includes(id) || kept.ask.includes(id);
+        const at = kept.want.indexOf(id);
+        if (at < 0 || kept.ask.includes(id)) return true;
+        return Number.isInteger(kept.judged) && at >= kept.judged;
+    }
+
+    /** How many of the wanted sellers lists the server left to another PC (it looked at them, and did not hand them here). */
+    function sharedAskLeft(kept) {
+        if (!kept) return 0;
+        const judged = Number.isInteger(kept.judged) ? kept.judged : kept.want.length;
+        return kept.want.slice(0, judged).filter((id) => !kept.ask.includes(id)).length;
     }
 
     // The server is shared with our other apps: each says which it is, so one person's apps are added up
@@ -1632,6 +1649,10 @@
                         if (born !== null) this.worthJson = '';
                         born = answer.born;
                     }
+                    // Another tab stored its own exchange while this one waited for the answer (onStored lets go of what
+                    // is kept): taken up again first. 3.26.0 read a null here - "Cannot read properties of null".
+                    this.loadInterest();
+                    if (!this.buckets) this.loadBuckets();
                     for (const b of sharedTake(this.buckets, answer, this.interest, this.gen, got)) touched.add(b);
                     // The others' marks: stored only when they changed.
                     if (this.marksKept === undefined) this.marksKept = this.d.load(SHARED_MARKS_KEY) || null;
@@ -1652,7 +1673,7 @@
                         // TornW3B's work: which of the wanted sellers lists are this PC's, and the others' trader lists.
                         for (const l of body.lists || []) this.listsSent.set(l[0], l[1]);
                         if (this.listsSent.size > 500) this.listsSent = new Map([...this.listsSent].slice(-250));
-                        const handed = sharedAskIn(answer, body.want || [], got);
+                        const handed = sharedAskIn(answer, body.want || [], got, Array.isArray(body.w3b) ? body.w3b[0] : null);
                         if (JSON.stringify(handed) !== JSON.stringify(this.w3bAsk())) {
                             this.w3bAskKept = handed;
                             if (handed) this.d.save(SHARED_W3B_ASK_KEY, handed);
@@ -5786,7 +5807,9 @@
      * @param {object} [opts]
      * @param {number|null} [opts.cash]
      * @param {number} [opts.limit]
-     * @returns {Array<{itemId, lowest, bid, each, score}>} best first
+     * @returns {Array<{itemId, lowest, bid, each, score, known}>} best first: the ones whose own listings are
+     *   known (`known`, placed by what those make) before the ones still guessed at - a guess is "a hundred at
+     *   the cheapest price", far over what one or two real listings make, and would push every real flip out.
      */
     function flipCandidates(summary, bidOf, { cash = null, limit = FLIP_CANDIDATES, maxUnits = FLIP_MAX_UNITS, minPct = MIN_PROFIT_PCT } = {}) {
         const out = [];
@@ -5801,9 +5824,12 @@
             const afford = Math.min(cash > 0 ? Math.floor(cash / lowest) : Infinity, maxUnits > 0 ? maxUnits : FLIP_MAX_UNITS, cap);
             if (afford <= 0) continue;
             const each = bid - lowest;
-            out.push({ itemId: String(itemId), lowest, bid, each, score: each * afford });
+            // `score` given: what the item's own listings would make (3.26.1, the light list), not a guess at the cheapest price.
+            const known = got && typeof got === 'object' && Number.isFinite(got.score) ? got.score : null;
+            if (known !== null && !(known > 0)) continue;
+            out.push({ itemId: String(itemId), lowest, bid, each, score: known !== null ? known : each * afford, known: known !== null });
         }
-        out.sort((a, b) => b.score - a.score || b.each - a.each);
+        out.sort((a, b) => b.known - a.known || b.score - a.score || b.each - a.each);
         return out.slice(0, limit);
     }
 
@@ -10129,6 +10155,31 @@
         return { ok: false, want, otherEvery: left >= 1 && counts.other > 0 ? Math.ceil(counts.other / left) : null };
     }
 
+    /*
+     * A day's allowance, paced (3.26.1). TornW3B counts two kinds of request by the day as well as by the
+     * minute: an item's sellers list (1,000) and its light list (10,000). Flat out, both days were used in two
+     * or three hours, and for the rest of the day no possible flip could be read at all. So an hour may take a
+     * part of what was left when it began (a quarter: the first hours get the most, and the day never runs
+     * out), handed out evenly through the hour, with a head start so a page just opened is not held back.
+     */
+    const DAY_PACE_PART = 4;
+    const DAY_PACE_HEAD_MIN = 15;
+
+    /**
+     * @param {number} left - what is left of the day now
+     * @param {number} hourUsed - how many left in this clock hour already
+     * @param {number} now - ms
+     * @returns {{hour: number, room: number}} hour: this hour's share; room: how many more may leave now
+     */
+    function dayPaceRoom(left, hourUsed, now) {
+        const l = Math.max(0, Math.floor(Number(left)) || 0);
+        const used = Math.max(0, Math.floor(Number(hourUsed)) || 0);
+        const hour = Math.ceil((l + used) / DAY_PACE_PART);
+        const minute = (((Number(now) || 0) % 3600000) + 3600000) % 3600000 / 60000;
+        const line = hour * Math.min(1, (minute + DAY_PACE_HEAD_MIN) / 60);
+        return { hour, room: Math.max(0, Math.min(l, Math.floor(line) - used)) };
+    }
+
     /**
      * The trader the desk's plan is with when you picked none (3.25.0): the one it showed last for this
      * item, for as long as they still make a trade with it. A better one is never swapped in by itself -
@@ -12977,6 +13028,8 @@
             return {
                 minute,
                 day,
+                // This clock hour's (the day is paced by it: core/desk.js dayPaceRoom).
+                hour: r.listingDay[Math.floor(t / W3B_HOUR_MS)] || 0,
                 minuteFreeAt: minute >= perMinute ? (mineOver >= 0 && recent.length ? recent[Math.min(recent.length - 1, mineOver)] + 60000 : t + 15000) : 0,
                 // The oldest counted hour leaves the day when the hour after its 24 have passed begins.
                 dayFreeAt: day >= perDay ? (hours.length ? (hours[0] + W3B_DAY_HOURS + 1) * W3B_HOUR_MS : t + W3B_HOUR_MS) : 0,
@@ -12992,6 +13045,7 @@
             const hours = Object.keys(r.lightDay).map(Number).sort((a, b) => a - b);
             return {
                 day,
+                hour: r.lightDay[Math.floor(t / W3B_HOUR_MS)] || 0,
                 dayFreeAt: day >= perDay ? (hours.length ? (hours[0] + W3B_DAY_HOURS + 1) * W3B_HOUR_MS : t + W3B_HOUR_MS) : 0,
                 until: r.lightUntil > t ? r.lightUntil : 0,
             };
@@ -13054,7 +13108,11 @@
                 // When a sellers list can next be asked for: 0 = now.
                 listingFreeAt: Math.max(listing.until, listing.minuteFreeAt, listing.dayFreeAt),
                 lightToday: light.day,
+                lightDayLeft: Math.max(0, Math.max(1, Math.floor(Number(this.lightPerDay)) || 1) - light.day),
                 lightFreeAt: Math.max(light.until, light.dayFreeAt),
+                // Used in this clock hour, of each kind with a day of its own.
+                listingHourUsed: listing.hour,
+                lightHourUsed: light.hour,
                 usedLastMinute: used,
                 remaining: Math.max(0, this.limit() - used),
                 coolingDown: t < this.blockedUntil(t),
@@ -13513,6 +13571,30 @@
         // Both empty and whole: nobody sells it, as before. Otherwise nothing under the cut is nothing learned.
         if (!prices && !(light && light.whole && !cut && !known.size)) return { same: false, why: 'nothing', prices: 0 };
         return { same: true, why: 'same', prices };
+    }
+
+    /**
+     * What the light list alone says a flip would make (3.26.1): its listings bought cheapest first and sold at
+     * `bid`, while a piece still leaves enough (`enough(profitEach, price)`), inside the cash and the most units.
+     * No seller is known yet, so this plans nothing: it only says which items' sellers lists are worth one of the
+     * few a minute TornW3B allows, and in what order. The last price may be listed in part (the list stops at ten).
+     *
+     * @returns {{units: number, profit: number, cost: number}}
+     */
+    function cheapProfit(light, bid, { cash = null, maxUnits = Infinity, enough = (each) => each > 0 } = {}) {
+        const out = { units: 0, profit: 0, cost: 0 };
+        if (!(bid > 0)) return out;
+        for (const r of light && Array.isArray(light.rows) ? light.rows : []) {
+            const each = bid - r.price;
+            if (!enough(each, r.price)) break;
+            const afford = cash > 0 ? Math.floor((cash - out.cost) / r.price) : Infinity;
+            const n = Math.min(r.qty, maxUnits - out.units, afford);
+            if (!(n > 0)) break;
+            out.units += n;
+            out.profit += each * n;
+            out.cost += r.price * n;
+        }
+        return out;
     }
 
     /* ===== src/core/front.js ===== */
@@ -27227,6 +27309,7 @@
         destroy() {
             if (this.keyHandler) document.removeEventListener('keydown', this.keyHandler);
             if (this.resizeHandler) window.removeEventListener('resize', this.resizeHandler);
+            if (this.stepHandler) window.removeEventListener('popstate', this.stepHandler);
             if (this.ticker) clearInterval(this.ticker);
             if (this.host && this.host.parentNode) this.host.parentNode.removeChild(this.host);
             document.documentElement.style.overflow = this.prevOverflow || '';
@@ -27402,6 +27485,34 @@
             bdPut(this, 'mine-tiles', this.mineTiles);
             bdPut(this, 'sell-tiles', this.sellTiles);
             this.go('today', 0, true);
+            // 3.26.1 - the browser's Back and Forward (and a mouse's side buttons) go between the pages: the address
+            // keeps the page. Opened or reloaded with a page in the address, that page is shown.
+            const named = String(location.hash || '').slice(1);
+            if (named !== 'today' && this.bd.pages[named]) this.go(named, null, true);
+            this.stepReady = true;
+            this.remember(false);
+            this.stepHandler = (e) => {
+                const at = (e && e.state) || {};
+                const page = at.ttv2Page || String(location.hash || '').slice(1) || 'today';
+                if (!this.bd || !this.bd.pages[page]) return;
+                this.stepping = true;
+                try {
+                    this.go(page, Number.isInteger(at.ttv2Tab) ? at.ttv2Tab : null);
+                } finally {
+                    this.stepping = false;
+                }
+            };
+            window.addEventListener('popstate', this.stepHandler);
+        }
+
+        /** The page and tab in view, kept in the address: a new page is a new step for Back, a tab only updates the step it is on. */
+        remember(step) {
+            if (!this.stepReady || this.stepping) return;
+            try {
+                window.history[step ? 'pushState' : 'replaceState']({ ttv2Page: this.bd.page, ttv2Tab: this.bd.tab }, '', '#' + this.bd.page);
+            } catch {
+                // a page that cannot keep its address still works
+            }
         }
 
         /* ------------------------------------------------------- pages and tabs */
@@ -27431,8 +27542,10 @@
             if (!this.bd || !this.bd.pages[id]) return;
             const t = tab === null || tab === undefined ? this.tabAt[id] || 0 : tab;
             const moved = this.bd.page !== id || this.bd.tab !== t;
+            const paged = this.bd.page !== id;
             bdShow(this, id, t, this.tabsOf(id));
             this.tabAt[id] = this.bd.tab;
+            if (moved) this.remember(paged);
             this.view = id === 'settings' ? 'settings' : id === 'ledger' ? 'ledger' : 'list';
             // API use and the report are drawn again every few seconds while Settings is open.
             if (id === 'settings' && !this.usageTimer) {
@@ -27754,7 +27867,9 @@
             if (sharedKnown(st)) said.push(['Shared', sharedNowLine(st, now).text]);
             if (!said.length) said.push(['', info.bazaarsAt ? 'Nothing new. Prices are read as they change.' : 'Loading bazaar prices…']);
             const right = [];
-            if (info.flipsWanted) right.push(['possible flips checked', info.flipsChecked + ' of ' + info.flipsWanted]);
+            // 3.26.1: priced by TornW3B's light list within minutes; their sellers follow, the biggest first, at the few a minute TornW3B allows.
+            if (info.flipsWanted) right.push(['possible flips priced', (info.flipsPriced ?? info.flipsChecked) + ' of ' + info.flipsWanted]);
+            if (info.flipsWanted) right.push(['bazaars read', info.flipsChecked + ' of ' + info.flipsWanted]);
             if (info.pricesWaiting) right.push(['flips waiting for a price check', count(info.pricesWaiting)]);
             if (info.w3bKnown) right.push(['price lists', count(info.w3bRead || 0) + ' of ' + count(info.w3bKnown)]);
             const sig = JSON.stringify([said, right]);
@@ -30314,7 +30429,7 @@
             const counts = info.freshCounts && info.flipsWanted ? info.freshCounts : { desk: 1, top: FRESH_TOP, other: 130 };
             const k = keepsUp(minutes, counts, info.w3bPerMin || 60);
             const text = k.ok
-                ? 'Keeps up: every group is read on time, with room left for traders\' price lists.'
+                ? 'Keeps up: every group is asked again on time. TornW3B allows only a few reads of an item\'s bazaars a minute (Keys and sharing › TornW3B), so between two of them only the ten cheapest prices are checked, and the bazaars are read again when those changed. Room is left for traders\' price lists.'
                 : k.otherEvery
                     ? 'Can\'t keep up: the other possible flips would be read about every ' + k.otherEvery + ' minutes instead. The desk and the top ' + FRESH_TOP + ' still come first.'
                     : 'Too fast to keep up: the other possible flips would hardly be read. The desk and the top ' + FRESH_TOP + ' still come first.';
@@ -30412,7 +30527,7 @@
             const parts = [];
             parts.push(known ? count(read) + ' of ' + count(known) + ' price lists read' : 'No trader known yet');
             parts.push(info.bazaarsAt ? 'bazaar prices ' + formatAge(now - info.bazaarsAt) : 'bazaar prices loading');
-            if (info.flipsWanted) parts.push('possible flips checked ' + info.flipsChecked + ' of ' + info.flipsWanted);
+            if (info.flipsWanted) parts.push('possible flips priced ' + (info.flipsPriced ?? info.flipsChecked) + ' of ' + info.flipsWanted + ', bazaars read ' + info.flipsChecked);
             if (info.pricesWaiting) parts.push(count(info.pricesWaiting) + (info.pricesWaiting === 1 ? ' possible flip waits' : ' possible flips wait') + ' for a price check');
             this.w3bStateEl.textContent = parts.join(' · ') + '.';
             this.w3bStateEl.className = 'sp-keystate' + (info.bazaarsError && !info.bazaarsAt ? ' sp-bad' : info.bazaarsAt ? ' sp-ok' : '');
@@ -30617,7 +30732,8 @@
             // The key registered on TornW3B, and what is left of its sellers lists (their own minute and day).
             // (The minute's count moves every few seconds: not on a settings page. The day's is said.)
             const L = info.w3bListing || null;
-            const left = L ? ' · ' + count(L.day) + ' of 900 today' : '';
+            // 3.26.1: the day is paced, so the hour's share is said too (it is what holds the reads, not the minute).
+            const left = L ? ' · ' + count(L.day) + ' of 900 today' + (L.hourLeft !== null && L.hourLeft !== undefined ? ', up to ' + count(L.hourLeft) + ' more this hour' : '') : '';
             this.w3bKeyStateEl.className = 'sp-keystate';
             if (info.w3bKeyMsg) {
                 this.w3bKeyStateEl.textContent = info.w3bKeyMsg;
@@ -37622,7 +37738,11 @@
                 // 3.26.0: the light list (read, could not be read, agreed with the sellers list, did not and why; off: why),
                 // sellers lists another PC read for this one, and sellers lists the server's prices stood in for.
                 lightList: sell.lightStats ? { ...sell.lightStats, off: sell.lightOff || null } : null,
+                // 3.26.1: possible flips the light list has priced, and those of them still waiting for their sellers list.
+                flipsPriced: info.flipsPriced ?? null, flipsWaitingForSellers: info.flipsToRead ?? null,
                 sellersListsLeftToOthers: sell.w3bLeftToOthers || 0,
+                // 3.26.1: the day's sellers lists and light lists are paced - used this hour, and this hour's share.
+                dayPace: w3bDayPace(Date.now()),
                 statusesKnown: info.statusesKnown ?? null, statusesWanted: info.statusesWanted ?? null,
                 teScanned: Object.values((sell.db && sell.db.traders) || {}).filter((t) => t && t.te && t.te.prices).length,
             },
@@ -37838,22 +37958,24 @@
         const soon = now + 30000;
         // Where the light list stands in (core/cheap.js), no sellers list is wanted: nothing to hand out.
         const lightOn = lightUsable(now);
+        const lightAny = lightOn && lightRoom(now).any;
         const wantFrom = (ids, every, how) => {
             for (const raw of ids || []) {
                 if (want.length >= SHARED_MAX_WANT) return;
                 const id = String(raw);
                 if (mine.has(id) || want.includes(Number(id))) continue;
-                if (lightOn && lightStandsIn(id, how, now)) continue;
+                if (how === 'sweep' ? lightOn : lightAny && lightStandsIn(id, how, now)) continue;
                 const b = sell.bazaars.get(id);
                 if (b && (b.loading || (!b.kept && !b.error && !(b.lightMiss > b.at) && soon - b.at < every(id)))) continue;
                 want.push(Number(id));
             }
         };
         wantFrom(sell.candidates.map((c) => c.itemId), (id) => (top.has(id) ? fresh.top : fresh.other), 'slow');
-        wantFrom(sell.nearIds, () => fresh.other, 'slow');
+        // 3.26.1: an item only near a flip is asked for its light list alone - no sellers list to hand out.
+        wantFrom(sell.nearIds, () => fresh.other, 'sweep');
         wantFrom(sell.sweepIds, () => W3B_SWEEP_MS, 'sweep');
         const st = sell.w3b ? sell.w3b.stats() : null;
-        sell.sharedWant = { trades, looking, sellers, worth: sell.sharedWorth || {}, going, bought, dir, want, w3b: st ? [st.listingMinuteLeft, st.listingDayLeft] : null, lists: true };
+        sell.sharedWant = { trades, looking, sellers, worth: sell.sharedWorth || {}, going, bought, dir, want, w3b: st ? [w3bListingRoom(now).paced, st.listingDayLeft] : null, lists: true };
         sell.sharedWantAt = now;
         return sell.sharedWant;
     }
@@ -39516,6 +39638,16 @@
      * sellers list (then it tells us nothing, and only costs).
      */
     const W3B_LIGHT_FULL_MS = 30 * 60 * 1000;
+    /* 3.26.1 - an item of a trade of yours (not the one on the desk): its sellers list at least this often, the light list between. */
+    const W3B_LIGHT_OWN_MS = 5 * 60 * 1000;
+    /* 3.26.1 - a possible flip with no sellers list of the last half hour: its light list first, and again this long after. */
+    const W3B_LIGHT_FIRST_MS = 5 * 60 * 1000;
+    /* ...and then not again before this, unless the summary's price of the item moved: something was listed, or sold. */
+    const W3B_LIGHT_AGAIN_MS = 20 * 60 * 1000;
+    /* What a light list said of an item whose sellers were not read since stands this long (the redraw's order of possible flips). */
+    const W3B_LIGHT_SAYS_MS = W3B_SWEEP_MS;
+    /* Every item in turn and the items near a flip read the light list only with this part of the hour's share in hand. */
+    const W3B_LIGHT_SPARE_PART = 6;
     const W3B_LIGHT_BAD_MAX = 2;
     const W3B_LIGHT_JUDGE_AFTER = 30;
     const W3B_LIGHT_SAME_LEAST = 0.2;
@@ -39525,12 +39657,65 @@
         return !(st.lightFreeAt > now);
     }
 
-    /** Would the next read of this item be its light list? `how`: 'sweep', or 'slow' (a possible flip, a near one). */
+    /**
+     * Room for a light list now (3.26.1). TornW3B allows 10,000 a day (we keep to 9,000); read flat out they
+     * were gone in about three hours, and from then on every possible flip cost a sellers list again. The day
+     * is paced (core/desk.js dayPaceRoom). `any`: one may leave for a possible flip or an item of a trade.
+     * `spare`: one may leave for every item in turn or an item near a flip - only with a part of the hour's
+     * share in hand, so they never take a possible flip's.
+     */
+    function lightRoom(now) {
+        const st = sell.w3b ? sell.w3b.stats() : null;
+        if (!st) return { any: false, spare: false };
+        const pace = dayPaceRoom(st.lightDayLeft, st.lightHourUsed, now);
+        if (!pace.room && !sell.lightPaceNoted) {
+            sell.lightPaceNoted = true;
+            logProblem('note', 'TornW3B\'s light list is paced from here: ' + st.lightToday + ' of today\'s ' + (st.lightToday + st.lightDayLeft) + ' used, ' + pace.hour + ' this hour', 'an hour takes a quarter of what is left of the day, so the day never runs out; possible flips and trades first, every item in turn with what is spare');
+        }
+        return { any: pace.room > 0, spare: pace.room > pace.hour / W3B_LIGHT_SPARE_PART };
+    }
+
+    /** The summary's cheapest price of an item is no longer the one it showed when the light list was read. */
+    function lightSummaryMoved(b, itemId) {
+        const row = sell.summary ? sell.summary.get(String(itemId)) : null;
+        return Boolean(b && row && row.lowestPrice > 0 && b.lightSaw > 0 && row.lowestPrice !== b.lightSaw);
+    }
+
+    /** A sellers list of this item read in full (not kept from the last visit, not a sweep's cut), no older than `within`, and nothing the light list said against it since. */
+    function lightHasFull(b, now, within) {
+        return Boolean(b && b.at && !b.kept && !b.error && !b.sweep && !(b.lightMiss > b.at) && now - (b.fullAt || b.at) < within);
+    }
+
+    /**
+     * Would the next read of this item be its light list? `how`: 'sweep' (every item in turn, and an item only
+     * near a flip: the cheapest price is all that is wanted), 'slow' (a possible flip), 'own' (an item of a trade
+     * of yours that is not on the desk).
+     *
+     * 3.26.1 - a possible flip with no sellers list of the last half hour is asked for its light list FIRST (the
+     * owner, 2026-10-11: "its only showing me 3, why is it so slow at finding"). TornW3B allows 8 sellers lists a
+     * minute and 200 light lists: 3.26.0 spent a sellers list on every one of the 150 possible flips in the order
+     * of a guess (the summary's one price, as if a hundred were listed at it), so the list took half an hour to
+     * fill. Now every possible flip has its real prices and counts within minutes, and the sellers lists go to
+     * the ones that make the most, in that order (sell.candidates, nextW3bJob).
+     */
     function lightStandsIn(itemId, how, now) {
         if (how === 'sweep') return true;
-        if (how !== 'slow') return false;
         const b = sell.bazaars.get(String(itemId));
-        return Boolean(b && b.at && !b.kept && !b.error && !b.sweep && !(b.lightMiss > b.at) && now - (b.fullAt || b.at) < W3B_LIGHT_FULL_MS);
+        if (how === 'own') return lightHasFull(b, now, W3B_LIGHT_OWN_MS);
+        if (how !== 'slow') return false;
+        if (lightHasFull(b, now, W3B_LIGHT_FULL_MS)) return true;
+        if (!(b && b.lightAt)) return true;
+        // Read already: again when it is old, or sooner when the summary (one request for every item) shows the
+        // item's cheapest price moved - a light list that would say the same thing is not asked for.
+        const age = now - b.lightAt;
+        if (age < W3B_LIGHT_FIRST_MS) return false;
+        return age >= W3B_LIGHT_AGAIN_MS || lightSummaryMoved(b, itemId);
+    }
+
+    /** A possible flip the light list has priced and whose sellers are still to read: the next sellers lists are theirs. */
+    function lightWantsFull(itemId, now) {
+        const b = sell.bazaars.get(String(itemId));
+        return Boolean(b && !b.loading && b.lightAt > (b.at || 0) && b.lightRows && now - b.lightAt < W3B_LIGHT_AGAIN_MS);
     }
 
     function loadCheapest(itemId, tag) {
@@ -39554,17 +39739,25 @@
                     return;
                 }
                 stats.read += 1;
+                if (!(prev.at > 0) || prev.kept) stats.first = (stats.first || 0) + 1;
                 if (stats.read === 1) logProblem('note', 'TornW3B\'s light list is read (ten cheapest prices, no seller; a limit of its own)', 'it stands in for a sellers list for every item in turn, and confirms the sellers of a possible flip; a sellers list is asked only where it says something new');
                 // A read kept from the last visit is compared as well: the same, and it stands as of now; not, and its sellers are read.
-                const full = prev.at > 0;
+                // 3.26.1: only a sellers list of the last half hour is confirmed this way - an older one is not made new by
+                // prices that happen to match; the light list then only says what the item costs now (lightRows).
+                const full = prev.at > 0 && at - (prev.fullAt || prev.at) < W3B_LIGHT_FULL_MS;
+                // What the summary showed as the item's cheapest price at this read (lightSummaryMoved).
+                const sawRow = sell.summary ? sell.summary.get(id) : null;
+                const lightSaw = sawRow && sawRow.lowestPrice > 0 ? sawRow.lowestPrice : null;
                 const said = full ? cheapSame(prev.rows, light, { cut: Boolean(prev.sweep) }) : { same: false, why: 'no-sellers-list' };
                 if (full) {
                     stats[said.same ? 'same' : 'miss'] += 1;
                     stats.why[said.why] = (stats.why[said.why] || 0) + 1;
                 }
                 // The same as the sellers list said: that read stands as of now, and its own time is kept (fullAt).
-                if (said.same) sell.bazaars.set(id, { ...prev, at, triedAt: at, fullAt: prev.fullAt || prev.at, lightAt: at, lightRows: light, lightMiss: 0, error: null, loading: false, kept: false });
-                else sell.bazaars.set(id, { ...prev, triedAt: at, lightAt: at, lightRows: light, lightMiss: at, error: null, loading: false, kept: false });
+                if (said.same) sell.bazaars.set(id, { ...prev, at, triedAt: at, fullAt: prev.fullAt || prev.at, lightAt: at, lightRows: light, lightSaw, lightMiss: 0, error: null, loading: false, kept: false });
+                // Not the same, or nothing to compare with: the sellers are to be read. A kept read stays kept until then
+                // (its rows are from the last visit), but for the sweep, which asks only for the cheapest price.
+                else sell.bazaars.set(id, { ...prev, triedAt: at, lightAt: at, lightRows: light, lightSaw, lightMiss: at, error: null, loading: false, kept: tag === 'w.sweep' ? false : Boolean(prev.kept) });
                 sell.bazaarsDirty = true;
                 // It hardly ever agrees with a sellers list read minutes before: it is not telling us what we took it to.
                 const judged = stats.same + stats.miss;
@@ -39606,14 +39799,23 @@
      * client keeps to 8 and 900 (api/w3b.js). `now`: one may leave. `back`: one may leave for a possible
      * flip or the sweep - they leave two of the minute and a hundred of the day to the desk and a trade,
      * which would otherwise wait out a minute the flips had used up.
+     *
+     * 3.26.1 - and the day is paced for them (core/desk.js dayPaceRoom): at 8 a minute the 900 were gone in two
+     * hours, and no possible flip could be read for the rest of the day. `paced`: how many may leave now, at
+     * most (what the shared server is told this PC has left).
      */
     const W3B_LISTING_KEEP_MINUTE = 2;
     const W3B_LISTING_KEEP_DAY = 100;
     let w3bRoomNoted = '';
     function w3bListingRoom(now) {
         const st = sell.w3b ? sell.w3b.stats() : null;
-        if (!st) return { now: true, back: true };
+        if (!st) return { now: true, back: true, paced: 0 };
         const free = !(st.listingFreeAt > now);
+        const pace = dayPaceRoom(Math.max(0, st.listingDayLeft - W3B_LISTING_KEEP_DAY), st.listingHourUsed, now);
+        if (free && !pace.room && st.listingDayLeft > W3B_LISTING_KEEP_DAY && !sell.listingPaceNoted) {
+            sell.listingPaceNoted = true;
+            logProblem('note', 'TornW3B sellers lists are paced from here: ' + st.listingToday + ' used today, ' + pace.hour + ' this hour for possible flips', 'an hour takes a quarter of what is left of the day, so the day never runs out; the item on the desk and a trade are never held by it');
+        }
         // For the log, once each time it changes: why no sellers list is asked for.
         const why = st.listingDayLeft <= 0 ? 'day' : st.listingDayLeft <= W3B_LISTING_KEEP_DAY ? 'day-low' : '';
         if (why !== w3bRoomNoted) {
@@ -39621,7 +39823,20 @@
             if (why === 'day') logProblem('note', 'TornW3B sellers lists: all ' + st.listingToday + ' of today are used (our own limit, under the 1,000 TornW3B allows)', 'none is asked until ' + new Date(st.listingFreeAt).toLocaleTimeString() + '; prices of bazaars the shared server reads go on');
             else if (why === 'day-low') logProblem('note', 'TornW3B sellers lists: ' + st.listingDayLeft + ' left today', 'kept for the item on the desk and the items of a trade; possible flips wait for the light list and the shared server');
         }
-        return { now: free, back: free && st.listingMinuteLeft > W3B_LISTING_KEEP_MINUTE && st.listingDayLeft > W3B_LISTING_KEEP_DAY };
+        return {
+            now: free,
+            back: free && st.listingMinuteLeft > W3B_LISTING_KEEP_MINUTE && st.listingDayLeft > W3B_LISTING_KEEP_DAY && pace.room > 0,
+            paced: free ? Math.min(st.listingMinuteLeft, pace.room) : 0,
+        };
+    }
+
+    /** For the page and the report: this hour's share of each day-limited kind, and how much of it is used. */
+    function w3bDayPace(now) {
+        const st = sell.w3b ? sell.w3b.stats() : null;
+        if (!st) return null;
+        const listing = dayPaceRoom(Math.max(0, st.listingDayLeft - W3B_LISTING_KEEP_DAY), st.listingHourUsed, now);
+        const light = dayPaceRoom(st.lightDayLeft, st.lightHourUsed, now);
+        return { sellersHourUsed: st.listingHourUsed, sellersHourShare: listing.hour, sellersToday: st.listingToday, lightHourUsed: st.lightHourUsed, lightHourShare: light.hour, lightToday: st.lightToday };
     }
 
     function nextW3bJob(now, hidden = false) {
@@ -39671,22 +39886,43 @@
             sell.sharedTurnOf = turnOf;
         }
         // What the server last handed out of the sellers lists this PC said it wants (null: nothing said, or it is old).
-        const handed = sharedLink && sharedLink.config() ? sharedLink.w3bAsk() : null;
-        const handedSig = handed ? handed.ask.length + '/' + handed.want.length : '';
-        if (handedSig !== sell.w3bHandedSig && (!handedSig || !sell.w3bHandedSig)) {
+        // 3.26.1: only while another PC is on - alone, nothing can be another PC's, and what the server did not
+        // get to (it stops at what this PC has left of its minute) is this PC's own (core/shared.js sharedAskIn).
+        const handedNow = sharedLink && sharedLink.config() && turnOf > 1 ? sharedLink.w3bAsk() : null;
+        const handed = handedNow && sharedAskLeft(handedNow) > 0 ? handedNow : null;
+        const handedSig = handed ? 'on' : '';
+        // Said when it changes, and not more than once in ten minutes (it can change with every exchange).
+        if (handedSig !== (sell.w3bHandedSig || '') && !(now - (sell.w3bHandedNoteAt || 0) < 10 * 60 * 1000)) {
+            sell.w3bHandedNoteAt = now;
             logProblem('note', handed
-                ? 'Shared: the server hands out TornW3B\'s sellers lists now - ' + handed.ask.length + ' of the ' + handed.want.length + ' this PC wanted are its own to read, the rest another PC reads'
-                : 'Shared: the server no longer says which sellers lists are this PC\'s - every one it wants is its own again', '');
+                ? 'Shared: another PC reads some of TornW3B\'s sellers lists for this one - ' + sharedAskLeft(handed) + ' of the ' + handed.want.length + ' this PC wanted now'
+                : 'Shared: no sellers list is left to another PC now - every one this PC wants is its own', '');
         }
         sell.w3bHandedSig = handedSig;
         const lightOn = lightUsable(now);
+        // The light list's day is paced (lightRoom): a possible flip or a trade's item with any room, every item
+        // in turn and the ones near a flip only with room to spare.
+        const lightHas = lightOn ? lightRoom(now) : { any: false, spare: false };
+        const lightFor = (kind) => kind !== 'desk' && (kind === 'sweep' ? lightHas.spare : lightHas.any);
+        // 3.26.1 - which read an item gets (lightStandsIn): an item only near a flip is asked for its cheapest price
+        // alone, as the sweep is; an item of a trade of yours that is not on the desk is 'own'.
+        const candSet = new Set(candIds.map(String));
+        const kindOf = (id, how) => (String(id) === String(sell.selected) ? 'desk' : ownIds.has(String(id)) || how === 'desk' ? 'own'
+            : how === 'slow' && !candSet.has(String(id)) ? 'sweep' : how);
+        // The possible flips the light list has priced come first for a sellers list, the most made first
+        // (sell.candidates is in that order); the others are asked for their light list meanwhile, which needs no
+        // room in the sellers lists' minute.
+        const candOrder = lightOn ? [...candIds.filter((id) => lightWantsFull(id, now)), ...candIds.filter((id) => !lightWantsFull(id, now))] : candIds;
+        // While possible flips have no price of their own yet, two reads of three are theirs (a light list each).
+        const unpriced = lightHas.any && candIds.some((id) => { const b = sell.bazaars.get(String(id)); return !b || (!b.loading && !(b.at > 0 && !b.kept) && !(b.lightAt > 0)); });
+        sell.w3bTurn3 = ((sell.w3bTurn3 || 0) + 1) % 3;
         const read = nextW3bRead({
             summaryDue: now - sell.summaryAt >= W3B_SUMMARY_MS && now - sell.summaryTriedAt >= W3B_FAILED_RETRY_MS,
             picked: sell.selected,
             active: sell.tradeActive,
             live: sell.tradeLive,
             wanted: sell.tradeWanted,
-            candidates: candIds,
+            candidates: candOrder,
             pinned: pinnedIds,
             // Every buyer: the desk's item, what you hold, then the possible flips.
             buyers: [...new Set([sell.selected, ...[...heldIds()].slice(0, 20), ...candIds].filter(Boolean).map(String))],
@@ -39702,22 +39938,34 @@
                 // Trusted on: a trader the switch hides has their list read every six hours, not every hour.
                 slow: sell.trustSlow ? (id) => { const tr = sell.trustById.get(String(id)); return !(tr && (tr.level === 'Trusted' || tr.level === 'Known')); } : null,
             }),
-            turn: sell.w3bTurn,
+            turn: unpriced ? (sell.w3bTurn3 ? 1 : 0) : sell.w3bTurn,
             hidden,
             // Settings › Bazaar prices (3.20): the desk and the trade, the top flips, the others.
             // 3.26.0: and only while the sellers list's own minute and day have room - the desk and a trade may use all of
             // it, everything else leaves them a share (w3bListingRoom).
             due: (id, how) => {
                 const own = how === 'desk' || ownIds.has(String(id));
-                // The light list needs no room in the sellers lists' minute or day: it has a limit of its own.
-                if (!(own ? room.now : room.back) && !(!own && lightOn && lightStandsIn(id, how, now))) return false;
-                // The server handed this one to another PC (it read it, or has more of its limit left): its
-                // bazaars come back through the server's own reads of Torn.
-                if (!own && handed && !sharedMayRead(handed, id, now)) {
-                    sell.w3bLeftToOthers = (sell.w3bLeftToOthers || 0) + 1;
-                    return false;
+                const kind = kindOf(id, how);
+                const b = sell.bazaars.get(String(id));
+                // The light list needs no room in the sellers lists' minute or day (it has a limit of its own), and
+                // is nobody else's to read.
+                // Every item in turn, and one near a flip: the light list or nothing while it is in use - never one
+                // of the few sellers lists.
+                if (lightOn && kind === 'sweep' && !lightHas.spare) return false;
+                if (lightFor(kind) && lightStandsIn(id, kind, now)) {
+                    if (b && (b.loading || (b.lightErrAt && now - b.lightErrAt < W3B_FAILED_RETRY_MS))) return false;
+                    // A possible flip not priced yet: its light list now, whatever was kept of it.
+                    if (kind === 'slow' && !lightHasFull(b, now, W3B_LIGHT_FULL_MS)) return true;
+                } else {
+                    if (!(own ? room.now : room.back)) return false;
+                    // The server left this one to another PC (it read it, or has more of its limit left): its
+                    // bazaars come back through the server's own reads of Torn.
+                    if (!own && handed && !sharedMayRead(handed, id, now)) {
+                        sell.w3bLeftToOthers = (sell.w3bLeftToOthers || 0) + 1;
+                        return false;
+                    }
                 }
-                return bazaarsDue(id, how === 'desk' ? fresh.desk : how === 'sweep' ? W3B_SWEEP_MS : topIds.has(String(id)) ? fresh.top : fresh.other, now, !own, how);
+                return bazaarsDue(id, how === 'desk' ? fresh.desk : how === 'sweep' ? W3B_SWEEP_MS : topIds.has(String(id)) ? fresh.top : fresh.other, now, !own, kind === 'sweep' ? 'sweep' : how);
             },
         });
         if (!read) return null;
@@ -39730,8 +39978,11 @@
             : sell.tradeLive.includes(id) || sell.tradeWanted.includes(id) || pinnedIds.includes(id) ? 'w.trade'
             : candIds.includes(id) || sell.nearIds.includes(id) ? 'w.flips'
             : 'w.sweep';
-        // The light list where the sellers are not the question (core/cheap.js): the sweep, and a possible flip read in full before.
-        if (lightOn && (tag === 'w.sweep' || tag === 'w.flips') && !ownIds.has(id) && lightStandsIn(id, tag === 'w.sweep' ? 'sweep' : 'slow', now)) return () => loadCheapest(read.id, tag);
+        // The light list where the sellers are not the question (core/cheap.js): the sweep and an item near a flip, a
+        // possible flip read in full before or not priced yet, and an item of a trade between two sellers lists.
+        const kind = kindOf(id, tag === 'w.sweep' ? 'sweep' : 'slow');
+        if (lightOn && kind === 'sweep' && !lightHas.spare) return null;
+        if (lightFor(kind) && lightStandsIn(id, kind, now)) return () => loadCheapest(read.id, kind === 'sweep' ? 'w.sweep' : tag);
         return () => loadBazaars(read.id, tag);
     }
 
@@ -40766,7 +41017,7 @@
             const b = sell.bazaars.get(String(id));
             // 3.26.0: the light list said something the sellers list does not (core/cheap.js) - its cheapest price is
             // the newest word on the item until the sellers are read, unless the summary is newer and cheaper still.
-            if (b && b.lightMiss > b.at && now - b.lightAt < W3B_CANDIDATE_MS * 2) {
+            if (b && b.lightRows && b.lightAt > (b.at || 0) && now - b.lightAt < W3B_CANDIDATE_MS * 2) {
                 const said = cheapLowest(b.lightRows);
                 const lowest = sell.summaryAt > b.lightAt && row.lowestPrice > 0 && !(said > 0 && said <= row.lowestPrice) ? row.lowestPrice : said;
                 effective.set(id, lowest === row.lowestPrice ? row : { ...row, lowestPrice: lowest });
@@ -40792,7 +41043,27 @@
                     }
                 }
                 if (pick) withBid.push(String(id));
-                return pick ? { price: pick.price, maxUnits: pick.maxUnits || null } : null;
+                if (!pick) return null;
+                // 3.26.1 - the light list has the item's real prices and counts: what the flip would make on them is
+                // its place in the order (no hundred units guessed at the cheapest price).
+                const rec = sell.bazaars.get(String(id));
+                const lightAge = rec && rec.lightRows && rec.lightAt > (rec.at || 0) ? now - rec.lightAt : Infinity;
+                // It stands until it is read again - but not against a new, cheaper price in the summary: then the
+                // item is a guess again, and its light list is read anew (lightStandsIn).
+                const saidLow = lightAge < Infinity ? cheapLowest(rec.lightRows) : null;
+                const sumRow = sell.summary.get(String(id));
+                const news = lightAge >= W3B_LIGHT_FIRST_MS && lightSummaryMoved(rec, id) && !(saidLow > 0 && saidLow <= sumRow.lowestPrice);
+                const light = lightAge < W3B_LIGHT_SAYS_MS && !news ? rec.lightRows : null;
+                const makeOpts = { cash: prefs.cash, maxUnits: Math.min(prefs.maxPerFlip || 100, pick.maxUnits || Infinity), enough: (each, price) => enoughProfit(each, price, 'TRADER', prefs.minProfitPct) };
+                let made = light ? cheapProfit(light, pick.price, makeOpts) : null;
+                // Its sellers were read: what their listings make (the ones TornW3B saw lately), the same way. With
+                // nothing to make on them it stays a guess - the summary may know of a newer listing.
+                if (!made && rec && rec.at && now - rec.at < W3B_CANDIDATE_MS * 2) {
+                    const rows = (sellersOf(id) || []).filter((r) => !r.stale);
+                    const got = rows.length ? cheapProfit({ rows }, pick.price, makeOpts) : null;
+                    if (got && got.profit > 0) made = got;
+                }
+                return { price: pick.price, maxUnits: pick.maxUnits || null, ...(made ? { score: made.profit } : {}) };
             }, { cash: prefs.cash, maxUnits: prefs.maxPerFlip, minPct: prefs.minProfitPct, limit: SELL_FLIP_CANDIDATES })
             : [];
         // Near-misses, then every other item someone buys, oldest read first (3.15).
@@ -40821,6 +41092,9 @@
             const b = sell.bazaars.get(c.itemId);
             return b && b.at && now - b.at < W3B_CANDIDATE_MS * 2;
         }).length;
+        // 3.26.1: priced - its own prices and counts are known, from its sellers list or its light list.
+        const flipsPriced = sell.candidates.filter((c) => now - bazaarSeenAt(sell.bazaars.get(c.itemId)) < W3B_CANDIDATE_MS * 2).length;
+        const flipsToRead = sell.candidates.filter((c) => lightWantsFull(c.itemId, now)).length;
 
         redrawStage('3 possible flips');
         // A hidden tab works out only what its next reads need - the possible flips, just above (3.25.0, plan
@@ -41724,7 +41998,7 @@
                 // Settings › TornW3B: the key registered there - 'none' | 'saved' | 'refused', and the sellers lists left.
                 w3bKey: w3bKeyRecord() ? (w3bKeyRecord().bad ? 'refused' : 'saved') : 'none',
                 w3bKeyMsg: sell.w3bKeyMsg || null,
-                w3bListing: sell.w3b ? (({ listingLastMinute, listingToday, listingMinuteLeft, listingDayLeft, listingFreeAt }) => ({ minute: listingLastMinute, day: listingToday, minuteLeft: listingMinuteLeft, dayLeft: listingDayLeft, freeAt: listingFreeAt }))(sell.w3b.stats()) : null,
+                w3bListing: sell.w3b ? ((s, pace) => ({ minute: s.listingLastMinute, day: s.listingToday, minuteLeft: s.listingMinuteLeft, dayLeft: s.listingDayLeft, freeAt: s.listingFreeAt, hourLeft: pace ? Math.max(0, pace.sellersHourShare - pace.sellersHourUsed) : null }))(sell.w3b.stats(), w3bDayPace(now)) : null,
                 teBadKey: Boolean(st.badKey),
                 teWaitUntil: st.blockedUntil > now ? st.blockedUntil : null,
                 teAt: sell.traders ? sell.traders.fetchedAt : null,
@@ -41749,6 +42023,8 @@
                 bazaarsAt: sell.summaryAt || null,
                 bazaarsError: sell.summaryError,
                 flipsChecked,
+                flipsPriced,
+                flipsToRead,
                 flipsWanted: sell.candidates.length,
                 // Possible flips not shown until TornW3B confirms their buyer's price (3.26.0).
                 pricesWaiting: sell.pricesWaiting || 0,

@@ -657,7 +657,9 @@ export function depthNearCheapest(rows, pct = 0.01) {
  * @param {object} [opts]
  * @param {number|null} [opts.cash]
  * @param {number} [opts.limit]
- * @returns {Array<{itemId, lowest, bid, each, score}>} best first
+ * @returns {Array<{itemId, lowest, bid, each, score, known}>} best first: the ones whose own listings are
+ *   known (`known`, placed by what those make) before the ones still guessed at - a guess is "a hundred at
+ *   the cheapest price", far over what one or two real listings make, and would push every real flip out.
  */
 export function flipCandidates(summary, bidOf, { cash = null, limit = FLIP_CANDIDATES, maxUnits = FLIP_MAX_UNITS, minPct = MIN_PROFIT_PCT } = {}) {
     const out = [];
@@ -672,9 +674,12 @@ export function flipCandidates(summary, bidOf, { cash = null, limit = FLIP_CANDI
         const afford = Math.min(cash > 0 ? Math.floor(cash / lowest) : Infinity, maxUnits > 0 ? maxUnits : FLIP_MAX_UNITS, cap);
         if (afford <= 0) continue;
         const each = bid - lowest;
-        out.push({ itemId: String(itemId), lowest, bid, each, score: each * afford });
+        // `score` given: what the item's own listings would make (3.26.1, the light list), not a guess at the cheapest price.
+        const known = got && typeof got === 'object' && Number.isFinite(got.score) ? got.score : null;
+        if (known !== null && !(known > 0)) continue;
+        out.push({ itemId: String(itemId), lowest, bid, each, score: known !== null ? known : each * afford, known: known !== null });
     }
-    out.sort((a, b) => b.score - a.score || b.each - a.each);
+    out.sort((a, b) => b.known - a.known || b.score - a.score || b.each - a.each);
     return out.slice(0, limit);
 }
 

@@ -1,12 +1,12 @@
 {
   "name": "torn-trading",
-  "version": "3.26.0",
+  "version": "3.26.1",
   "private": true,
   "type": "module",
   "description": "Buyer-side Torn trading helper: ranks listings by realizable profit.",
   "scripts": {
     "build": "node build.mjs",
-    "build:test": "node build.mjs --test 3.26.0",
+    "build:test": "node build.mjs --test 3.26.1",
     "test": "node --test \"test/*.test.js\"",
     "check": "node build.mjs && node --check dist/torn-trading.user.js && node --test \"test/*.test.js\"",
     "bench": "node build.mjs && node test/bench.mjs"

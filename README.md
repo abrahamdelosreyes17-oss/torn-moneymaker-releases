@@ -2076,6 +2076,84 @@ Not seen on real Torn pages or against the live server: all of the above. It
 was checked on the harness and by 674 tests, the shared parts against the
 server's real code. The light list's real answer has never been seen.
 
+### Flips found in minutes, not half an hour; Back and Forward (3.26.1)
+
+Seen on the owner's own Torn Bids, 3.26.0, the day it came out: 150 possible
+flips, 8 of them checked, three flips shown ("why is it so slow at finding"),
+and the browser's Back and Forward doing nothing.
+
+**Why it was slow.** TornW3B allows an address 10 sellers lists a minute (we
+use 8). 3.26.0 spent one on every possible flip, in the order of a guess: the
+summary's one cheapest price, as if a hundred were listed at it. So the list
+needed some twenty minutes to fill, and the first flips found were not the best.
+Three things made it worse:
+
+- the shared server hands out sellers lists only up to what this PC has left of
+  its minute, and 3.26.0 took everything after that for another PC's - a PC on
+  its own was allowed a handful per exchange ("6 of the 60 this PC wanted");
+- the items of a planned trade were each read in full every minute, ahead of
+  the flips (13 of 22 sellers lists in the sample);
+- a full sellers list was the only way to price an item at all.
+
+**What changed** (`src/main.js` nextW3bJob, `src/core/cheap.js`):
+
+- A possible flip with no sellers list of the last half hour is asked for its
+  **light list first** (ten cheapest prices and counts; 200 a minute). Within
+  minutes every possible flip has its real prices and counts.
+- The possible flips are **placed by what those listings make** (`cheapProfit`),
+  and the sellers lists go to them in that order: the biggest real flip first.
+  One whose cheap listings are gone drops out and costs no sellers list.
+  A flip whose own listings are known (from its light list, or its sellers
+  list) always comes before one still guessed at: a guess is "a hundred at the
+  cheapest price" and would push every real flip out of the 150
+  (`flipCandidates`).
+- A light list is asked for again after twenty minutes, or sooner when the
+  summary (one request for every item) shows the item's cheapest price moved.
+  One that would say the same thing is not asked for.
+- An item only near a flip is asked for its light list alone.
+- An item of a trade that is not on the desk has its sellers list every five
+  minutes and the light list between; a change calls for the sellers list at
+  once. The item on the desk is read in full as before.
+- What the server never looked at is this PC's own, and the hand-out counts
+  only while another PC is on (`sharedAskIn`, `sharedMayRead`).
+- A sellers list older than half an hour is no longer "confirmed" by a light
+  list that happens to match: its sellers are read again.
+
+**The day, paced** (`src/core/desk.js` dayPaceRoom). TornW3B counts both kinds
+by the day too: 1,000 sellers lists (we use 900; the same with a registered
+key) and 10,000 light lists (we use 9,000). Read flat out, both days were gone
+in two or three hours, and for the rest of the day no possible flip could be
+read at all. Now an hour takes a quarter of what is left of the day, handed out
+evenly through the hour with a head start of a quarter of an hour: about 200
+sellers lists in the first hour, 150 in the second, and the day never runs out.
+The item on the desk and a trade are never held by it. Every item in turn and
+the items near a flip read the light list only with part of the hour's share
+in hand, and never a sellers list while the light list is in use. Settings >
+Keys and sharing > TornW3B says the day and "up to N more this hour"; the log
+says once when the pace first holds a read; the report has `coverage.dayPace`.
+
+The rule for showing a flip is unchanged: its sellers read, and its trader's
+price checked in the last five minutes. The footer now says both counts:
+"possible flips priced 150 of 150" and "bazaars read 14 of 150".
+
+**Two PCs behind one address.** The server splits one address's minute between
+them, which a PC cannot reckon; there the hand-out is still read as in 3.26.0
+until the server says how far down the list it looked (`judged` in its answer,
+asked of the server's session; this version reads it when it is there).
+
+**Back and Forward.** The address keeps the page (`#flips`, `#trades`, ...). A
+new page is a new step for the browser's Back and Forward and a mouse's side
+buttons; a tab only updates the step it is on. A reload opens the same page.
+
+**An error on Torn's pages, fixed.** "Shared: no exchange - Cannot read
+properties of null (reading 'has')": two tabs talked to the server at the same
+moment, and the second let go of what the first was still using
+(`src/feed/shared-link.js`). A test reproduces it.
+
+Checked on the harness and by 681 tests. The new order of reading was seen on
+real TornW3B only through the page's own counts before the fix, not after; the
+day's pace only in tests (a harness visit does not use up a day).
+
 ---
 
 ## Architecture

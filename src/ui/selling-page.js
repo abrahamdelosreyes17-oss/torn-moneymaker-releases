@@ -511,6 +511,7 @@ export class SellingPage {
     destroy() {
         if (this.keyHandler) document.removeEventListener('keydown', this.keyHandler);
         if (this.resizeHandler) window.removeEventListener('resize', this.resizeHandler);
+        if (this.stepHandler) window.removeEventListener('popstate', this.stepHandler);
         if (this.ticker) clearInterval(this.ticker);
         if (this.host && this.host.parentNode) this.host.parentNode.removeChild(this.host);
         document.documentElement.style.overflow = this.prevOverflow || '';
@@ -686,6 +687,34 @@ export class SellingPage {
         bdPut(this, 'mine-tiles', this.mineTiles);
         bdPut(this, 'sell-tiles', this.sellTiles);
         this.go('today', 0, true);
+        // 3.26.1 - the browser's Back and Forward (and a mouse's side buttons) go between the pages: the address
+        // keeps the page. Opened or reloaded with a page in the address, that page is shown.
+        const named = String(location.hash || '').slice(1);
+        if (named !== 'today' && this.bd.pages[named]) this.go(named, null, true);
+        this.stepReady = true;
+        this.remember(false);
+        this.stepHandler = (e) => {
+            const at = (e && e.state) || {};
+            const page = at.ttv2Page || String(location.hash || '').slice(1) || 'today';
+            if (!this.bd || !this.bd.pages[page]) return;
+            this.stepping = true;
+            try {
+                this.go(page, Number.isInteger(at.ttv2Tab) ? at.ttv2Tab : null);
+            } finally {
+                this.stepping = false;
+            }
+        };
+        window.addEventListener('popstate', this.stepHandler);
+    }
+
+    /** The page and tab in view, kept in the address: a new page is a new step for Back, a tab only updates the step it is on. */
+    remember(step) {
+        if (!this.stepReady || this.stepping) return;
+        try {
+            window.history[step ? 'pushState' : 'replaceState']({ ttv2Page: this.bd.page, ttv2Tab: this.bd.tab }, '', '#' + this.bd.page);
+        } catch {
+            // a page that cannot keep its address still works
+        }
     }
 
     /* ------------------------------------------------------- pages and tabs */
@@ -715,8 +744,10 @@ export class SellingPage {
         if (!this.bd || !this.bd.pages[id]) return;
         const t = tab === null || tab === undefined ? this.tabAt[id] || 0 : tab;
         const moved = this.bd.page !== id || this.bd.tab !== t;
+        const paged = this.bd.page !== id;
         bdShow(this, id, t, this.tabsOf(id));
         this.tabAt[id] = this.bd.tab;
+        if (moved) this.remember(paged);
         this.view = id === 'settings' ? 'settings' : id === 'ledger' ? 'ledger' : 'list';
         // API use and the report are drawn again every few seconds while Settings is open.
         if (id === 'settings' && !this.usageTimer) {
@@ -1038,7 +1069,9 @@ export class SellingPage {
         if (sharedKnown(st)) said.push(['Shared', sharedNowLine(st, now).text]);
         if (!said.length) said.push(['', info.bazaarsAt ? 'Nothing new. Prices are read as they change.' : 'Loading bazaar prices…']);
         const right = [];
-        if (info.flipsWanted) right.push(['possible flips checked', info.flipsChecked + ' of ' + info.flipsWanted]);
+        // 3.26.1: priced by TornW3B's light list within minutes; their sellers follow, the biggest first, at the few a minute TornW3B allows.
+        if (info.flipsWanted) right.push(['possible flips priced', (info.flipsPriced ?? info.flipsChecked) + ' of ' + info.flipsWanted]);
+        if (info.flipsWanted) right.push(['bazaars read', info.flipsChecked + ' of ' + info.flipsWanted]);
         if (info.pricesWaiting) right.push(['flips waiting for a price check', count(info.pricesWaiting)]);
         if (info.w3bKnown) right.push(['price lists', count(info.w3bRead || 0) + ' of ' + count(info.w3bKnown)]);
         const sig = JSON.stringify([said, right]);
@@ -3598,7 +3631,7 @@ export class SellingPage {
         const counts = info.freshCounts && info.flipsWanted ? info.freshCounts : { desk: 1, top: FRESH_TOP, other: 130 };
         const k = keepsUp(minutes, counts, info.w3bPerMin || 60);
         const text = k.ok
-            ? 'Keeps up: every group is read on time, with room left for traders\' price lists.'
+            ? 'Keeps up: every group is asked again on time. TornW3B allows only a few reads of an item\'s bazaars a minute (Keys and sharing › TornW3B), so between two of them only the ten cheapest prices are checked, and the bazaars are read again when those changed. Room is left for traders\' price lists.'
             : k.otherEvery
                 ? 'Can\'t keep up: the other possible flips would be read about every ' + k.otherEvery + ' minutes instead. The desk and the top ' + FRESH_TOP + ' still come first.'
                 : 'Too fast to keep up: the other possible flips would hardly be read. The desk and the top ' + FRESH_TOP + ' still come first.';
@@ -3696,7 +3729,7 @@ export class SellingPage {
         const parts = [];
         parts.push(known ? count(read) + ' of ' + count(known) + ' price lists read' : 'No trader known yet');
         parts.push(info.bazaarsAt ? 'bazaar prices ' + formatAge(now - info.bazaarsAt) : 'bazaar prices loading');
-        if (info.flipsWanted) parts.push('possible flips checked ' + info.flipsChecked + ' of ' + info.flipsWanted);
+        if (info.flipsWanted) parts.push('possible flips priced ' + (info.flipsPriced ?? info.flipsChecked) + ' of ' + info.flipsWanted + ', bazaars read ' + info.flipsChecked);
         if (info.pricesWaiting) parts.push(count(info.pricesWaiting) + (info.pricesWaiting === 1 ? ' possible flip waits' : ' possible flips wait') + ' for a price check');
         this.w3bStateEl.textContent = parts.join(' · ') + '.';
         this.w3bStateEl.className = 'sp-keystate' + (info.bazaarsError && !info.bazaarsAt ? ' sp-bad' : info.bazaarsAt ? ' sp-ok' : '');
@@ -3901,7 +3934,8 @@ export class SellingPage {
         // The key registered on TornW3B, and what is left of its sellers lists (their own minute and day).
         // (The minute's count moves every few seconds: not on a settings page. The day's is said.)
         const L = info.w3bListing || null;
-        const left = L ? ' · ' + count(L.day) + ' of 900 today' : '';
+        // 3.26.1: the day is paced, so the hour's share is said too (it is what holds the reads, not the minute).
+        const left = L ? ' · ' + count(L.day) + ' of 900 today' + (L.hourLeft !== null && L.hourLeft !== undefined ? ', up to ' + count(L.hourLeft) + ' more this hour' : '') : '';
         this.w3bKeyStateEl.className = 'sp-keystate';
         if (info.w3bKeyMsg) {
             this.w3bKeyStateEl.textContent = info.w3bKeyMsg;

@@ -275,3 +275,25 @@ test('near-misses: a bazaar a little over the best bid is read too (the summary 
     assert.deepEqual(nearMisses(summary, (id) => bids[id]), ['3', '1']);
     assert.deepEqual(nearMisses(summary, (id) => bids[id], { exclude: new Set(['3']) }), ['1']);
 });
+
+test('a possible flip whose own prices and counts are known is placed by what they make, not by a guess at the cheapest price (3.26.1)', () => {
+    const summary = new Map([
+        ['384', { lowestPrice: 70000 }],
+        ['186', { lowestPrice: 450 }],
+        ['206', { lowestPrice: 800000 }],
+    ]);
+    const bids = { 384: 73500, 186: 520, 206: 850000 };
+    // Guessed: a hundred of each at its cheapest price - 206 first, then 384, then 186.
+    assert.deepEqual(flipCandidates(summary, (id) => bids[id]).map((c) => c.itemId), ['206', '384', '186']);
+    // Known: one 206 is listed at that price (50,000), 384 has forty (140,000), and 186's cheap ones are gone (nothing).
+    const known = { 384: 140000, 186: 0, 206: 50000 };
+    const out = flipCandidates(summary, (id) => ({ price: bids[id], score: known[id] }));
+    assert.deepEqual(out.map((c) => [c.itemId, c.score]), [['384', 140000], ['206', 50000]]);
+    // One of them not known yet keeps its guess - and comes after the known one, however big the guess: a guess
+    // ("a hundred at the cheapest price", 5,000,000 here) would otherwise push every real flip out of the list.
+    const mixed = flipCandidates(summary, (id) => ({ price: bids[id], ...(id === '206' ? {} : { score: known[id] }) }));
+    assert.deepEqual(mixed.map((c) => [c.itemId, c.known]), [['384', true], ['206', false]]);
+    assert.ok(mixed[1].score > mixed[0].score);
+    // The list is cut after that order: with room for one, it is the known one.
+    assert.deepEqual(flipCandidates(summary, (id) => ({ price: bids[id], ...(id === '206' ? {} : { score: known[id] }) }), { limit: 1 }).map((c) => c.itemId), ['384']);
+});

@@ -195,3 +195,17 @@ test('a key TornW3B does not know is said once and never sent again; something n
     await t.client.get('marketplace/206');
     assert.equal(t.calls[0].opts, null);
 });
+
+test('each kind with a day of its own says what it used in this clock hour (3.26.1: the day is paced by it)', async () => {
+    // T0 is 800 s into its hour.
+    const w = world();
+    for (let i = 0; i < 3; i++) await w.client.get('marketplace/' + (100 + i));
+    for (let i = 0; i < 5; i++) await w.client.get('marketplace/' + (100 + i), { query: { filler: 1 } });
+    let st = w.client.stats();
+    assert.deepEqual([st.listingHourUsed, st.lightHourUsed, st.lightToday, st.lightDayLeft], [3, 5, 5, W3B_LIGHT_PER_DAY - 5]);
+    // The next hour: the day still holds them, the hour does not.
+    w.t = T0 + HOUR;
+    await w.client.get('marketplace/200', { query: { filler: 1 } });
+    st = w.client.stats();
+    assert.deepEqual([st.listingHourUsed, st.listingToday, st.lightHourUsed, st.lightToday], [0, 3, 1, 6]);
+});

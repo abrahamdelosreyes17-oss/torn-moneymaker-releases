@@ -128,3 +128,27 @@ export function cheapSame(rows, light, { cut = false } = {}) {
     if (!prices && !(light && light.whole && !cut && !known.size)) return { same: false, why: 'nothing', prices: 0 };
     return { same: true, why: 'same', prices };
 }
+
+/**
+ * What the light list alone says a flip would make (3.26.1): its listings bought cheapest first and sold at
+ * `bid`, while a piece still leaves enough (`enough(profitEach, price)`), inside the cash and the most units.
+ * No seller is known yet, so this plans nothing: it only says which items' sellers lists are worth one of the
+ * few a minute TornW3B allows, and in what order. The last price may be listed in part (the list stops at ten).
+ *
+ * @returns {{units: number, profit: number, cost: number}}
+ */
+export function cheapProfit(light, bid, { cash = null, maxUnits = Infinity, enough = (each) => each > 0 } = {}) {
+    const out = { units: 0, profit: 0, cost: 0 };
+    if (!(bid > 0)) return out;
+    for (const r of light && Array.isArray(light.rows) ? light.rows : []) {
+        const each = bid - r.price;
+        if (!enough(each, r.price)) break;
+        const afford = cash > 0 ? Math.floor((cash - out.cost) / r.price) : Infinity;
+        const n = Math.min(r.qty, maxUnits - out.units, afford);
+        if (!(n > 0)) break;
+        out.units += n;
+        out.profit += each * n;
+        out.cost += r.price * n;
+    }
+    return out;
+}

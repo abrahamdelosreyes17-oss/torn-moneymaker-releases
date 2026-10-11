@@ -562,6 +562,8 @@ export class W3bClient {
         return {
             minute,
             day,
+            // This clock hour's (the day is paced by it: core/desk.js dayPaceRoom).
+            hour: r.listingDay[Math.floor(t / W3B_HOUR_MS)] || 0,
             minuteFreeAt: minute >= perMinute ? (mineOver >= 0 && recent.length ? recent[Math.min(recent.length - 1, mineOver)] + 60000 : t + 15000) : 0,
             // The oldest counted hour leaves the day when the hour after its 24 have passed begins.
             dayFreeAt: day >= perDay ? (hours.length ? (hours[0] + W3B_DAY_HOURS + 1) * W3B_HOUR_MS : t + W3B_HOUR_MS) : 0,
@@ -577,6 +579,7 @@ export class W3bClient {
         const hours = Object.keys(r.lightDay).map(Number).sort((a, b) => a - b);
         return {
             day,
+            hour: r.lightDay[Math.floor(t / W3B_HOUR_MS)] || 0,
             dayFreeAt: day >= perDay ? (hours.length ? (hours[0] + W3B_DAY_HOURS + 1) * W3B_HOUR_MS : t + W3B_HOUR_MS) : 0,
             until: r.lightUntil > t ? r.lightUntil : 0,
         };
@@ -639,7 +642,11 @@ export class W3bClient {
             // When a sellers list can next be asked for: 0 = now.
             listingFreeAt: Math.max(listing.until, listing.minuteFreeAt, listing.dayFreeAt),
             lightToday: light.day,
+            lightDayLeft: Math.max(0, Math.max(1, Math.floor(Number(this.lightPerDay)) || 1) - light.day),
             lightFreeAt: Math.max(light.until, light.dayFreeAt),
+            // Used in this clock hour, of each kind with a day of its own.
+            listingHourUsed: listing.hour,
+            lightHourUsed: light.hour,
             usedLastMinute: used,
             remaining: Math.max(0, this.limit() - used),
             coolingDown: t < this.blockedUntil(t),

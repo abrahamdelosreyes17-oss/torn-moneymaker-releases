@@ -74,26 +74,43 @@ export function sharedListsIn(answer) {
  * What the server handed out, to keep: {at, want, ask} - `ask` only of what was wanted, in its order.
  * Null when the server said nothing about it (an older server, or nothing was wanted).
  */
-export function sharedAskIn(answer, want, now) {
+export function sharedAskIn(answer, want, now, room = null) {
     if (!answer || !Array.isArray(answer.ask) || !Array.isArray(want) || !want.length) return null;
-    const wanted = new Set(want);
+    const wanted = [...new Set(want)];
     const ask = [];
     for (const value of answer.ask) {
         const id = sharedId(value);
-        if (id !== null && wanted.has(id) && !ask.includes(id)) ask.push(id);
+        if (id !== null && wanted.includes(id) && !ask.includes(id)) ask.push(id);
     }
-    return { at: now, want: [...wanted], ask };
+    // 3.26.1 - the server goes down `want` and stops once it has handed out as many as this PC said it has left
+    // this minute (`room`). What comes after the last one handed was never looked at: it is nobody else's.
+    // 3.26.0 took all of it for another PC's, and a PC on its own read a few sellers lists per exchange.
+    // Two PCs behind one address share one minute, and the server then stops at a part of `room` this PC
+    // cannot know. A server that says how far down `want` it looked (`judged`) is believed over the reckoning.
+    const told = Number.isInteger(answer.judged) && answer.judged >= 0 && answer.judged <= wanted.length ? answer.judged : null;
+    const stopped = Number.isInteger(room) && room >= 0 && ask.length >= room;
+    const judged = told !== null ? told : stopped ? (ask.length ? wanted.indexOf(ask[ask.length - 1]) + 1 : 0) : wanted.length;
+    return { at: now, want: wanted, ask, judged };
 }
 
 /**
  * May this PC ask TornW3B for an item's sellers list now, by what the server handed out? Not when it was
  * wanted and the server left it to another PC; everything else as before - an item the server was not told
- * of, a server that has been silent, a PC on its own.
+ * of or did not get to, a server that has been silent, a PC on its own.
  */
 export function sharedMayRead(kept, itemId, now) {
     if (!kept || !(now - kept.at < SHARED_ASK_FRESH_MS) || now < kept.at) return true;
     const id = Number(itemId);
-    return !kept.want.includes(id) || kept.ask.includes(id);
+    const at = kept.want.indexOf(id);
+    if (at < 0 || kept.ask.includes(id)) return true;
+    return Number.isInteger(kept.judged) && at >= kept.judged;
+}
+
+/** How many of the wanted sellers lists the server left to another PC (it looked at them, and did not hand them here). */
+export function sharedAskLeft(kept) {
+    if (!kept) return 0;
+    const judged = Number.isInteger(kept.judged) ? kept.judged : kept.want.length;
+    return kept.want.slice(0, judged).filter((id) => !kept.ask.includes(id)).length;
 }
 
 // The server is shared with our other apps: each says which it is, so one person's apps are added up

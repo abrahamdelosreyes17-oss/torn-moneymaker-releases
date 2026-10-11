@@ -88,3 +88,18 @@ test('the light list is asked with filler=1, counts on its own day, and takes no
     assert.equal(st.listingMinuteLeft, W3B_LISTING_PER_MINUTE);
     assert.ok(W3B_LIGHT_PER_DAY <= 10000);
 });
+
+test('what the light list alone says a flip would make: cheapest first, while a piece leaves enough, inside cash and the most units', async () => {
+    const { cheapProfit } = await import('../src/core/cheap.js');
+    const l = light([100, 5], [110, 10], [130, 50]);
+    // Sold at 125: the five at 100 and the ten at 110; 130 is over the bid.
+    assert.deepEqual(cheapProfit(l, 125), { units: 15, profit: 5 * 25 + 10 * 15, cost: 500 + 1100 });
+    // The most units, the cash, and "enough" each stop it earlier.
+    assert.deepEqual(cheapProfit(l, 125, { maxUnits: 7 }), { units: 7, profit: 5 * 25 + 2 * 15, cost: 500 + 220 });
+    assert.deepEqual(cheapProfit(l, 125, { cash: 830 }), { units: 8, profit: 5 * 25 + 3 * 15, cost: 500 + 330 });
+    assert.deepEqual(cheapProfit(l, 125, { enough: (each) => each >= 20 }), { units: 5, profit: 125, cost: 500 });
+    // Nothing under the bid, no bid, no list: nothing.
+    assert.deepEqual(cheapProfit(l, 90), { units: 0, profit: 0, cost: 0 });
+    assert.deepEqual(cheapProfit(l, null), { units: 0, profit: 0, cost: 0 });
+    assert.deepEqual(cheapProfit(null, 125), { units: 0, profit: 0, cost: 0 });
+});

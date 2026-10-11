@@ -730,3 +730,60 @@ test('the same key saved again while the server does not know this PC: asked aga
     await s.pass(40000);
     assert.equal(ok.link.knock(), false);
 });
+
+test('another tab stored its own exchange while this one waited for the answer: the answer is still taken (3.26.0 read a null there)', async () => {
+    const s = setUp();
+    s.world.bazaars.set(11, [{ ID: 206, price: 790000, quantity: 2 }]);
+    const tab = s.addTab('sell', 't1', { sellers: [11], worth: { 206: 850000 } });
+    // What a second tab's exchange does to this one, at the worst moment: between the request and its answer.
+    let rev = 500;
+    const between = () => {
+        rev += 7;
+        s.gm.values.set(SHARED_STATE_KEY, { ...(s.gm.values.get(SHARED_STATE_KEY) || {}), rev, touched: [] });
+        tab.link.onStored(SHARED_STATE_KEY);
+        s.pc.afterPost = between;
+    };
+    s.pc.afterPost = between;
+    const errors = [];
+    for (let i = 0; i < 6; i += 1) {
+        await s.pass(31000);
+        if (tab.link.status().error) errors.push(tab.link.status().error);
+    }
+    assert.deepEqual(errors, []);
+    assert.ok(s.posts.length >= 4);
+    // And the server's read of the bazaar came through.
+    assert.ok(tab.link.status().sellers > 0);
+});
+
+test('the server stops handing out at what this PC has left of its minute: what it did not get to is this PC\'s own', async () => {
+    const { sharedMayRead, sharedAskIn, sharedAskLeft } = await import('../src/core/shared.js');
+    const want = [11, 12, 13, 14, 15, 16];
+    // Room for two: the server handed 11 and 13, left 12 to another PC, and never looked at 14, 15, 16.
+    const cut = sharedAskIn({ ask: [11, 13] }, want, 1000, 2);
+    assert.equal(cut.judged, 3);
+    assert.equal(sharedMayRead(cut, 12, 2000), false);
+    for (const id of [11, 13, 14, 15, 16]) assert.equal(sharedMayRead(cut, id, 2000), true, 'item ' + id);
+    assert.equal(sharedAskLeft(cut), 1);
+    // Room to spare: the server looked at every one, and what it did not hand is another PC's.
+    const all = sharedAskIn({ ask: [11, 13] }, want, 1000, 8);
+    assert.equal(all.judged, 6);
+    assert.equal(sharedMayRead(all, 16, 2000), false);
+    assert.equal(sharedAskLeft(all), 4);
+    // No room at all: nothing was looked at, nothing is another PC's (this PC's own limit is what holds it).
+    const none = sharedAskIn({ ask: [] }, want, 1000, 0);
+    assert.equal(none.judged, 0);
+    assert.equal(sharedMayRead(none, 11, 2000), true);
+    assert.equal(sharedAskLeft(none), 0);
+    // The room not known (an older copy's stored answer): as 3.26.0 took it.
+    const old = { at: 1000, want, ask: [11, 13] };
+    assert.equal(sharedMayRead(old, 16, 2000), false);
+    assert.equal(sharedAskLeft(old), 4);
+    assert.equal(sharedAskLeft(null), 0);
+    // Two PCs behind one address: the server stops at half of what this PC said it has left, which this PC
+    // cannot reckon. A server that says how far it looked is believed; one that says something impossible is not.
+    const told = sharedAskIn({ ask: [11, 13], judged: 3 }, want, 1000, 4);
+    assert.equal(told.judged, 3);
+    assert.equal(sharedMayRead(told, 16, 2000), true);
+    assert.equal(sharedAskLeft(told), 1);
+    for (const bad of [-1, 7, 2.5, '3', null]) assert.equal(sharedAskIn({ ask: [11, 13], judged: bad }, want, 1000, 4).judged, 6, String(bad));
+});
