@@ -33,6 +33,12 @@ const SHARED = (/[?&]shared=(\w+)/.exec(location.search) || [])[1] || null;
 // Nobody types the address (it is built in): this page keeps a pretend one, and 'off' without &shared=.
 _store[NS + 'sharedHome'] = JSON.stringify(SHARED ? 'https://torn-bids-shared.example.workers.dev' : 'off');
 window.__sharedPosts = 0;
+// 3.26.2: what each message to the pretend server said of this PC's own request counts (`calls`; undefined = not said).
+window.__sharedCalls = [];
+// &sharedfirst=1 (3.26.2, with &shared=on&sweepitems=<n>&sweepfresh=1): a page opened for the first time, on a
+// server that already holds the bazaars - its first answer names player 6001, who sells every Bloom at $40
+// (Sweeper pays $50), read 30 s ago. TornW3B's summary still says $100, so this PC would not look soon.
+const SHARED_FIRST = /[?&]sharedfirst=1/.test(location.search);
 // Defaults only: TornW3B must be on without the user ticking anything.
 // window.__ahead(minutes) (3.23.0): the clock jumps forward, as if the page had been left open that long.
 let _ahead = 0;
@@ -698,7 +704,8 @@ if (_sweepItems) {
     const db = _store[NS + 'traderDb'] ? JSON.parse(_store[NS + 'traderDb']) : { version: 1, traders: {} };
     db.traders[5900] = { name: 'Sweeper', from: 'w3b', seenAt: t, w3b: { checkedAt: t, at: t, found: true, prices }, rating: { up: 400, down: 1, at: t } };
     _store[NS + 'traderDb'] = JSON.stringify(db);
-    localStorage.setItem('ttv2.bids.reads', JSON.stringify({ v: 1, at: t, items: reads }));
+    // &sweepfresh=1 (3.26.2): no reads kept - the page was never open before.
+    if (q.get('sweepfresh') !== '1') localStorage.setItem('ttv2.bids.reads', JSON.stringify({ v: 1, at: t, items: reads }));
 }
 
 /*
@@ -933,6 +940,10 @@ function respondFull(url) {
         // &listsold=0: no date given), so a flip's price can be checked. &nobuyers=1: none of them, as before.
         const trM = u.pathname.match(/^\/api\/marketplace\/(\d+)\/traders$/);
         if (trM) {
+            // &sharedfirst=1: TornW3B names Sweeper as each Bloom's buyer, so the server's flips can be confirmed.
+            if (SHARED_FIRST && SWEEP_ITEMS[trM[1]]) {
+                return { total_count: 1, traders: [{ player_id: 5900, player_name: 'Sweeper', price: 50, rating: { upvotes: 400, downvotes: 1 }, last_action: NOW_S - 600, last_trade: NOW_S - 3600, pricelist_updated: NOW_S - 3 * 3600 }] };
+            }
             const n = trM[1] === '206' ? Number(new URLSearchParams(location.search).get('w3bbuyers')) || 0 : 0;
             if (!n && !/[?&]nobuyers=1/.test(location.search)) {
                 const q = new URLSearchParams(location.search).get('listsold');
@@ -1014,7 +1025,9 @@ function w3bPretendSync() {
         const now = Date.now();
         return {
             grant: { at: now, need: 23, serverShare: 57, serverTimes: [now - 40000, now - 20000, now - 3000] },
-            reads: window.__sharedPosts < 3 ? [] : [
+            reads: SHARED_FIRST ? [
+                { id: 6001, at: now - 30000, items: Object.keys(SWEEP_ITEMS).map((id) => ({ id: +id, price: 40, qty: 5 })) },
+            ] : window.__sharedPosts < 3 ? [] : [
                 { id: 888, at: now - 5000, items: [{ id: 206, price: 835000, qty: 3 }] },
                 { id: 4444, at: now - 60000, items: [{ id: 206, price: 836000, qty: 1 }] },
                 { id: 555, at: now - 3 * 3600000, items: [{ id: 1, price: 40, qty: 9 }] },
@@ -1031,6 +1044,7 @@ function w3bPretendSync() {
 }
 function GM_xmlhttpRequest(opts) {
     window.__requests.push(opts.url);
+    if (/\.workers\.dev\/sync$/.test(opts.url)) { try { window.__sharedCalls.push(JSON.parse(opts.data).calls); } catch (e) { window.__sharedCalls.push('unreadable'); } }
     setTimeout(() => {
         try {
             const body = respond(opts.url);

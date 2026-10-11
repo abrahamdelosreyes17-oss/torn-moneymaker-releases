@@ -299,7 +299,9 @@ test('whatever a part of the script hands over, only the agreed numbers leave th
         assert.equal(sharedOutgoingOk(p.body), true);
         const text = JSON.stringify(p.body);
         for (const secret of ['Lumei', 'Xanax', 'inventory', '54321', '123456789', KEY_ABE, 'Abe', PASS_ABE]) assert.equal(text.includes(secret), false, `"${secret}" left this PC`);
-        assert.deepEqual(Object.keys(p.body).sort(), p.body.worth ? ['app', 'bought', 'going', 'looking', 'seen', 'sellers', 'since', 'trades', 'used', 'ver', 'waiting', 'worth'] : ['app', 'bought', 'going', 'looking', 'seen', 'sellers', 'since', 'trades', 'used', 'ver', 'waiting']);
+        // `calls` (3.26.2): this PC's request counts, with the first page of an exchange only.
+        assert.deepEqual(Object.keys(p.body).filter((k) => k !== 'calls').sort(), p.body.worth ? ['app', 'bought', 'going', 'looking', 'seen', 'sellers', 'since', 'trades', 'used', 'ver', 'waiting', 'worth'] : ['app', 'bought', 'going', 'looking', 'seen', 'sellers', 'since', 'trades', 'used', 'ver', 'waiting']);
+        for (const n of Object.values(p.body.calls || {})) assert.ok(Number.isInteger(n) && n >= 1);
         assert.deepEqual([p.body.app, p.body.ver], ['torn-bids', '3.25.0']);
     }
     assert.deepEqual(s.posts[0].body.sellers, [13, 11]);
@@ -786,4 +788,96 @@ test('the server stops handing out at what this PC has left of its minute: what 
     assert.equal(sharedMayRead(told, 16, 2000), true);
     assert.equal(sharedAskLeft(told), 1);
     for (const bad of [-1, 7, 2.5, '3', null]) assert.equal(sharedAskIn({ ask: [11, 13], judged: bad }, want, 1000, 4).judged, 6, String(bad));
+});
+
+test('this PC\'s request counts go to the server with each exchange, come off the sum once answered, and wait out a server that is down (3.26.2)', async () => {
+    const { SHARED_CALLS_KEY } = await import('../src/feed/shared-link.js');
+    const { usageAdd, usageCallsAdd } = await import('../src/core/usage.js');
+    let down = false;
+    const s = setUp({ down: () => down });
+    const tab = s.addTab('sell', 't1', { sellers: [11], worth: { 206: 850000 } });
+    const other = s.addTab('app', 't2', { looking: [12], worth: { 367: 1500 } });
+    const now = () => s.world.t + SKEW;
+    // As main.js flushUsage does it, from whichever tab made the requests.
+    const count = (tags) => {
+        const pending = {};
+        for (const [tag, n] of Object.entries(tags)) for (let i = 0; i < n; i += 1) usageAdd(pending, tag, now());
+        s.gm.values.set(SHARED_CALLS_KEY, usageCallsAdd(s.gm.values.get(SHARED_CALLS_KEY) || null, pending, now()));
+    };
+    const shown = async () => (await s.world.admin('GET', '/admin/state')).body.calls;
+
+    count({ 'w.flips': 4, 'w.lists': 9, 'r.w.ok': 12, 'r.w.429': 1, 'e.top': 1, 'r.e.slow': 1, 't.status': 3, 'r.s.ok': 2 });
+    await s.pass(10000);
+    assert.equal(s.posts.length, 1);
+    assert.deepEqual(s.posts[0].body.calls, { 'w.flips': 4, 'w.lists': 9, 'r.w.ok': 12, 'r.w.429': 1, 'e.top': 1, 'r.e.slow': 1, 't.status': 3 });
+    assert.deepEqual(s.gm.values.get(SHARED_CALLS_KEY), { since: null, n: {} });
+    let said = await shown();
+    assert.deepEqual(said.h2.abe, { on: 1, 'w.flips': 4, 'w.lists': 9, 'r.w.ok': 12, 'r.w.429': 1, 'e.top': 1, 'r.e.slow': 1, 't.status': 3 });
+    assert.deepEqual([tab.link.status().callsOut + other.link.status().callsOut > 0, tab.link.status().callsOut], [true, 31]);
+
+    // Nothing asked since: an empty object goes, and the server counts the minute as on.
+    await s.pass(60000);
+    assert.ok(s.posts.length >= 3);
+    assert.deepEqual(s.posts.at(-1).body.calls, {});
+    said = await shown();
+    assert.equal(said.h2.abe['w.lists'], 9);
+    assert.ok(said.h2.abe.on >= 2);
+
+    // The server does not answer: the sum is kept, added to, and sent whole with the first exchange that is answered.
+    down = true;
+    count({ 'w.flips': 2 });
+    await s.pass(45000);
+    assert.equal(s.gm.values.get(SHARED_CALLS_KEY).n['w.flips'], 2);
+    count({ 'w.flips': 5, 'e.trader': 1 });
+    down = false;
+    await s.pass(45000);
+    assert.deepEqual(s.gm.values.get(SHARED_CALLS_KEY), { since: null, n: {} });
+    said = await shown();
+    assert.equal(said.h2.abe['w.flips'], 4 + 7);
+    assert.equal(said.h2.abe['e.trader'], 1);
+    assert.ok(s.posts.every((p) => sharedOutgoingOk(p.body)));
+    // Shared forgotten (another key, or none): the sum goes with it.
+    count({ 'w.flips': 1 });
+    tab.link.forget();
+    assert.equal(s.gm.values.has(SHARED_CALLS_KEY), false);
+});
+
+test('a page opened for the first time: the exchange that brings the server\'s bazaars comes seconds after it knows its items, not half a minute (3.26.2)', async () => {
+    const s = setUp();
+    s.world.bazaars.set(11, [{ ID: 206, price: 790000, quantity: 2 }]);
+    // Another PC's page had the server read that bazaar long before.
+    const old = s.addTab('sell', 't0', { sellers: [11], looking: [11], worth: { 206: 850000 } });
+    await s.pass(90000);
+    assert.ok(old.link.reads().index.byItem.has('206'));
+    // The same storage wiped: as a first install. Its first exchange is made before its bids are worked out.
+    for (const key of [...s.gm.values.keys()]) if (key !== SHARED_CONFIG_KEY) s.gm.values.delete(key);
+    s.pc.links.length = 0;
+    const tab = s.addTab('sell', 't1', { sellers: [], worth: {} });
+    const from = s.posts.length;
+    await s.pass(4000);
+    assert.equal(s.posts.length, from + 1);
+    assert.equal(tab.link.reads().index.byItem.has('206'), false);
+    // With nothing to watch yet, the pace is the usual one: no second exchange before the half minute.
+    while (s.world.t - s.posts[from].at < 20000) await s.pass(1000);
+    assert.equal(s.posts.length, from + 1);
+    const knewAt = s.world.t;
+    tab.want = { sellers: [], worth: { 206: 850000 } };
+    await s.pass(SHARED_TICK_MS * 2);
+    assert.equal(s.posts.length, from + 2, 'the second exchange did not wait for the half minute');
+    assert.ok(s.posts[from + 1].at - knewAt <= SHARED_TICK_MS * 2);
+    assert.equal(s.posts.at(-1).body.since, 0);
+    assert.deepEqual(tab.link.reads().index.byItem.get('206').map((l) => [l.sellerId, l.price, l.qty]), [['11', 790000, 2]]);
+    // A few items more (fewer than it already asked about): the usual pace. Twice as many again: soon.
+    tab.want = { sellers: [], worth: { 206: 850000, 367: 1500 } };
+    await s.pass(60000);
+    assert.ok(s.posts.length >= from + 3);
+    assert.ok(s.posts[from + 2].at - s.posts[from + 1].at >= 30000);
+    while (s.world.t - s.posts.at(-1).at < 8000) await s.pass(1000);
+    const n = s.posts.length;
+    const grewAt = s.world.t;
+    tab.want = { sellers: [], worth: { 206: 850000, 367: 1500, 180: 61, 335: 18000, 1: 118 } };
+    await s.pass(SHARED_TICK_MS * 2);
+    assert.equal(s.posts.length, n + 1);
+    assert.ok(s.posts[n].at - grewAt <= SHARED_TICK_MS * 2);
+    assert.equal(s.posts[n].body.since, 0);
 });

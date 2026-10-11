@@ -114,6 +114,8 @@ export function packBazaarReads(reads, now = Date.now()) {
     const items = {};
     for (const [id, b] of reads || []) {
         if (!b || !(Number(b.at) > 0) || !Array.isArray(b.rows) || now - Number(b.at) >= KEPT_READS_MAX_AGE_MS) continue;
+        // Not a read of this PC's (3.26.2): the server's listings stand in for it, and come again from the server.
+        if (b.server) continue;
         items[String(id)] = { at: Number(b.at), sweep: Boolean(b.sweep), rows: b.rows.map((r) => KEPT_ROW.map((k) => (r ? r[k] : null))) };
     }
     return { v: 1, at: now, items };

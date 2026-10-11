@@ -18,6 +18,7 @@
  */
 
 import { decideLeader } from '../core/leader.js';
+import { usageCallsOut, usageCallsSent } from '../core/usage.js';
 import {
     SHARED_SYNC_MS, SHARED_BUCKETS, sharedAddress, sharedPassOk, sharedBody, sharedOutgoingOk, sharedVersion, sharedTake, sharedPrune,
     sharedReadBucket, sharedIndex, sharedInterest, sharedPerson, sharedMarks, sharedMarksIn, sharedMarksNow,
@@ -41,6 +42,8 @@ export const SHARED_LISTS_IN_KEY = 'sharedListsIn';
 const SHARED_LISTS_IN_KEEP = 20;
 /* The other PCs' TornW3B reads and this PC's turn among them (core/shared.js, sharedDirIn). */
 export const SHARED_DIR_KEY = 'sharedDir';
+// 3.26.2 - this PC's request counts waiting to be sent, every tab's in one sum (core/usage.js usageCallsAdd).
+export const SHARED_CALLS_KEY = 'sharedCalls';
 const SHARED_WANT_PREFIX = 'sharedWant.';
 const SHARED_READS_PREFIX = 'sharedReads.';
 export const SHARED_WORLDS = ['app', 'sell'];
@@ -236,6 +239,27 @@ export class SharedLink {
         this.d.save(SHARED_WANT_PREFIX + this.d.world, { at: now, sellers: clean.sellers, trades: clean.trades, looking: clean.looking, worth: clean.worth, going: marks.going, bought: marks.bought, dir, ...w3b, ...takes });
     }
 
+    /**
+     * 3.26.2 - a page opened for the first time talks to the server before it knows what it watches, and keeps
+     * nothing of that answer about the items it learns of next. When the items it now watches and never asked
+     * about outnumber the ones it has asked about, the next exchange comes soon, not half a minute on. The
+     * known ones at least double each time, so this happens a handful of times in a PC's life.
+     */
+    muchNew(now) {
+        this.loadInterest();
+        let fresh = 0;
+        for (const w of SHARED_WORLDS) {
+            const want = this.d.load(SHARED_WANT_PREFIX + w);
+            if (!want || now - want.at >= SHARED_WANT_LIVE_MS) continue;
+            for (const id of Object.keys(want.worth || {})) {
+                if (this.interest.has(id)) continue;
+                fresh += 1;
+                if (fresh > this.interest.size) return true;
+            }
+        }
+        return false;
+    }
+
     /** Call every SHARED_TICK_MS. */
     async tick() {
         const now = this.now();
@@ -254,7 +278,8 @@ export class SharedLink {
         const since = now - (state.syncAt || 0);
         if (state.unknown && since < sharedUnknownWait(state.unknownTries)) return;
         const asked = this.asked().at;
-        if (since < SHARED_SYNC_MS && !(asked >= (state.syncAt || 0) && asked > 0 && since >= SHARED_SOON_MS)) return;
+        const soon = since >= SHARED_SOON_MS && ((asked >= (state.syncAt || 0) && asked > 0) || this.muchNew(now));
+        if (since < SHARED_SYNC_MS && !soon) return;
 
         this.busy = true;
         try {
@@ -306,7 +331,9 @@ export class SharedLink {
                 const listsOut = takesLists && page === 0
                     ? (this.d.load(SHARED_LISTS_OUT_KEY) || []).map(sharedList).filter((l) => l && this.listsSent.get(l[0]) !== l[1])
                     : [];
-                const body = sharedBody({ used: use.used, waiting: (Number(use.waiting) || 0) + others, wants: page === 0 ? wants : wants.map(({ want, w3b, ...w }) => w), since: seq, seen, sendWorth, now, ver, lists: listsOut, listsSince: takesLists && page === 0 ? listsAt : null });
+                // This PC's own request counts since the last answered exchange, on the first page only ({} = none made).
+                const callsOut = page === 0 ? usageCallsOut(this.d.load(SHARED_CALLS_KEY), now) : null;
+                const body = sharedBody({ used: use.used, waiting: (Number(use.waiting) || 0) + others, wants: page === 0 ? wants : wants.map(({ want, w3b, ...w }) => w), since: seq, seen, sendWorth, now, ver, lists: listsOut, listsSince: takesLists && page === 0 ? listsAt : null, calls: callsOut });
                 if (!sharedOutgoingOk(body)) throw new Error('Not sent: the message was not in the agreed shape.');
 
                 const response = await this.d.post(`${cfg.address}/sync`, {
@@ -386,6 +413,13 @@ export class SharedLink {
                     this.d.save(SHARED_DIR_KEY, dirNow);
                 }
                 state.turn = dirNow.turn;
+                if (page === 0 && body.calls) {
+                    // Answered: what was sent comes off the sum (what the tabs counted meanwhile stays for the next one).
+                    const sum = Object.values(body.calls).reduce((a, n) => a + n, 0);
+                    if (sum) this.d.save(SHARED_CALLS_KEY, usageCallsSent(this.d.load(SHARED_CALLS_KEY), body.calls, got));
+                    state.callsOut = (Number.isInteger(before.callsOut) ? before.callsOut : 0) + sum;
+                    state.callsSyncs = (Number.isInteger(before.callsSyncs) ? before.callsSyncs : 0) + 1;
+                }
                 if (page === 0) {
                     // TornW3B's work: which of the wanted sellers lists are this PC's, and the others' trader lists.
                     for (const l of body.lists || []) this.listsSent.set(l[0], l[1]);
@@ -465,7 +499,7 @@ export class SharedLink {
     /** The server's address or this PC's word changed, or there is none now: what was kept under the old one goes. */
     forget() {
         for (let i = 0; i < SHARED_BUCKETS; i += 1) this.d.del(SHARED_READS_PREFIX + i);
-        for (const key of [SHARED_STATE_KEY, SHARED_GRANT_KEY, SHARED_MARKS_KEY, SHARED_INTEREST_KEY, SHARED_ASK_KEY, SHARED_DIR_KEY, SHARED_W3B_ASK_KEY, SHARED_LISTS_OUT_KEY, SHARED_LISTS_IN_KEY]) this.d.del(key);
+        for (const key of [SHARED_STATE_KEY, SHARED_GRANT_KEY, SHARED_MARKS_KEY, SHARED_INTEREST_KEY, SHARED_ASK_KEY, SHARED_DIR_KEY, SHARED_W3B_ASK_KEY, SHARED_LISTS_OUT_KEY, SHARED_LISTS_IN_KEY, SHARED_CALLS_KEY]) this.d.del(key);
         this.w3bAskKept = null;
         this.listsSent = new Map();
         this.buckets = null;
@@ -504,6 +538,9 @@ export class SharedLink {
             w3bAsk: Array.isArray(state.w3bAsk) ? state.w3bAsk : null,
             listsOut: Number.isInteger(state.listsOut) ? state.listsOut : 0,
             listsIn: Number.isInteger(state.listsIn) ? state.listsIn : 0,
+            // 3.26.2: this PC's request counts told to the server so far, and in how many exchanges.
+            callsOut: Number.isInteger(state.callsOut) ? state.callsOut : 0,
+            callsSyncs: Number.isInteger(state.callsSyncs) ? state.callsSyncs : 0,
             unknown: Boolean(cfg && state.unknown),
             // When a PC the server does not know asks again (ms from the last asking).
             unknownWaitMs: cfg && state.unknown ? sharedUnknownWait(state.unknownTries) : null,

@@ -2156,6 +2156,80 @@ day's pace only in tests (a harness visit does not use up a day).
 
 ---
 
+### The server's bazaars at once, and this PC's request counts (3.26.2)
+
+Two things the owner said on 2026-10-11, hours after 3.26.1: "friend opens
+tornbids, we already have data from server right? it takes forever to find deals
+even if we have the server" ("i have 33 flips already, friend had 3 upon
+opening"), and, of the server's page "What the PCs ask" being empty: "i have all
+keys set and working, but server does not pick it up".
+
+**Why a page just opened showed three flips.** The shared server reads bazaars
+from Torn itself and sends them with every exchange. Torn Bids kept them, and
+used them for one thing only: to correct a sellers list this PC had read from
+TornW3B itself. An item with no sellers list of this PC's had no sellers at all,
+whatever the server held - and sellers lists come a few a minute (8, paced over
+the day since 3.26.1). So a page just opened waited for TornW3B, item by item,
+for prices the server had already handed it.
+
+**What changed.**
+
+- An item this PC has no sellers list of (on this visit) has **the server's
+  listings as its sellers**, as soon as the server holds one read in the last
+  30 minutes (`sharedItemsSeen` in `src/core/shared.js`, `serverBazaars` in
+  `src/main.js`). A flip on them is on Torn's own prices and counts, read by the
+  server minutes ago at most. The seller has no name (the server gives none):
+  the row says "Player 1234", as TornW3B-less sellers already did.
+- The rule "a flip is shown only once its buyer's price was confirmed" is
+  untouched: such a flip waits for its price check like any other ("flips
+  waiting for a price check"), best profit first.
+- This PC's own sellers list of the item still comes in its turn, and takes
+  over when it does (the server's reads then correct it, as before). Until
+  then no light list is spent on the item: it is already priced.
+- A record standing on the server's listings is never told to the server as a
+  TornW3B read of this PC's, is never "confirmed" by a light list, and is not
+  kept for the next visit (the server's reads are kept on their own, as before).
+- **The very first opening.** The first exchange is made before Torn Bids has
+  worked out what it watches, so nothing of its answer is kept. Now the server
+  is told the moment the bids are worked out (not up to 20 s later), and when
+  the items watched more than double, the next exchange comes after 6 s, not 30
+  (`muchNew` in `src/feed/shared-link.js`). What is watched at least doubles
+  each time, so this happens a handful of times in a PC's life.
+
+**The counts** (`calls` in `/sync`). With the first message of each exchange
+this PC says how many requests it made of TornW3B, TornExchange and Torn since
+the last exchange the server answered, by what for: the tags of Settings > API
+use (`w.flips`, `e.top`, `t.status` ...) and how they were answered (`r.w.ok`,
+`r.w.429`, and new in 3.26.2 `r.e.ok`, `r.e.slow` = no answer in time,
+`r.e.fail`). **Counts only: no item, no player, no price, no key.**
+
+- Every tab adds its counts to one stored sum (`sharedCalls`); the tab that
+  talks to the server sends it and takes off what was sent once the server has
+  answered. Not answered: the sum is kept and goes with the next exchange.
+- Nothing asked since: `calls: {}` goes, which the server counts as "PC on".
+- At most 60 tags and 5,000 a tag in one exchange; the rest waits for the next.
+- Counts are collected only while Shared is on, and a sum that could not be
+  sent for an hour is dropped, so it never lands on the wrong hour of the
+  server's record. Both are this version's own choices, not the owner's words.
+- `sharedOutgoingOk` refuses a message whose `calls` holds anything but such
+  tags and whole counts; the log says once that counts are sent; the report's
+  `shared` block has `callsTold`, `callsExchanges`, `sellersFromServer`; the
+  Key use table in Settings names the counts in the server's column.
+
+**The overlay.** Nothing changes on screen. Its requests are counted like any
+tab's, and when a Torn page's tab is the one that talks to the server, it is
+that tab that sends the sum.
+
+**Seen and not seen.** In the harness (`&shared=on&sweepitems=40&sweepfresh=1&sharedfirst=1`,
+a first opening against a server that already holds 40 flips): 41 flips after
+15 s with none of this PC's own sellers lists read, one exchange made; the counts
+left with the second exchange. `test/calls.test.js` and three tests in
+`test/shared-link.test.js` run Torn Bids against the server's real code: the
+counts arrive, come off once answered, wait out a server that is down, and the
+server's own check drops none of them. Not seen: the live server, real TornW3B,
+the friend's laptop. How many bazaars the live server holds for the friend's
+items is not known, so how many flips his first minute shows is not known either.
+
 ## Architecture
 
 ```

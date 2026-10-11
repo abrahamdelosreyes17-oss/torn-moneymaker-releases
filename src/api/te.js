@@ -85,7 +85,9 @@ export class TeClient {
      *   same pace and the same penalty wait as this one.
      * @param {function} [options.saveState] - (state) => void
      */
-    constructor({ getKey, fetchImpl = gmFetch, now = () => Date.now(), loadState = null, saveState = null, onSent = null, onFailed = null } = {}) {
+    constructor({ getKey, fetchImpl = gmFetch, now = () => Date.now(), loadState = null, saveState = null, onSent = null, onFailed = null, onAnswered = null } = {}) {
+        /** ({path, tag, how}) => void, how a request that left was answered: 'ok', 'slow' (no answer in time) or 'fail' (3.26.2). */
+        this.onAnswered = onAnswered;
         /** ({path, tag, error}) => void, a request that failed (not "too soon"): the problem log (3.15). */
         this.onFailed = onFailed;
         /** ({path, tag}) => void, each request that leaves: the usage record (3.15). */
@@ -201,12 +203,21 @@ export class TeClient {
             }
         }
 
+        const answered = (how) => {
+            if (!this.onAnswered) return;
+            try {
+                this.onAnswered({ path, tag, how });
+            } catch {
+                // The usage record is best-effort.
+            }
+        };
         let response;
         try {
             response = timeoutMs ? await this.fetchImpl(url.toString(), { timeoutMs }) : await this.fetchImpl(url.toString());
         } catch (error) {
             // The message never carries the URL, so never the key.
             const timedOut = /timed out/i.test(String((error && error.message) || ''));
+            answered(timedOut ? 'slow' : 'fail');
             throw new TeError(timedOut ? 'TornExchange timed out.' : 'TornExchange network error.', { reason: timedOut ? 'no answer in ' + Math.round((timeoutMs || 30000) / 1000) + ' s' : 'no connection' });
         }
 
@@ -216,6 +227,8 @@ export class TeClient {
         } catch {
             body = null;
         }
+
+        answered(response.ok && body && !(body.status && body.status !== 'success') ? 'ok' : 'fail');
 
         if (response.status === 429) {
             const seconds = Number(body && body.retry_after);

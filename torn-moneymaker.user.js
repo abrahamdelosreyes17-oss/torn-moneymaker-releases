@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      3.26.1
+// @version      3.26.2
 // @description  Finds Bazaar and Item Market listings below NPC / market value - on the page you are viewing, and live from the Torn API and TornW3B - ranked by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -52,7 +52,7 @@
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '3.26.1';
+    const TTV2_BUILD_VERSION = '3.26.2';
     const TTV2_SHARED_HOME = 'https://torn-bids-shared.pumping-iron-worker.workers.dev';
 
     /* ===== src/platform/gm.js ===== */
@@ -356,6 +356,268 @@
         );
     }
 
+    /* ===== src/core/usage.js ===== */
+    /*
+     * API use (3.15, the owner: "I need to see the usage with a graph, so we're
+     * able to analyse what needs more priority and what needs less").
+     *
+     * Every request that leaves - Torn, TornW3B, TornExchange, any tab - is
+     * counted under what it was for (its tag), per minute. Each tab keeps its
+     * counts in memory and adds them to the stored record every few seconds; a
+     * day of minutes is kept, then folded into hours, kept a week. Two tabs
+     * writing in the same instant can lose a few counts: this is a record to
+     * read trends from, not the limiter (the limiters count exactly).
+     */
+
+    /* Minutes kept one by one; older ones are folded into their hour. */
+    const USAGE_MINUTES_KEPT = 24 * 60;
+    /* Hours kept. */
+    const USAGE_HOURS_KEPT = 7 * 24;
+
+    /** Each service: its name and how many a minute we allow ourselves (the meter's 100%). */
+    const USAGE_SERVICES = {
+        t: { name: 'Torn API', perMin: 70, note: 'every tab together; Torn allows 100' },
+        w: { name: 'TornW3B', perMin: 80, note: 'every tab together; TornW3B allows about 100' },
+        e: { name: 'TornExchange', perMin: 6, note: 'one every 10 s; TornExchange allows 10' },
+    };
+
+    /** What each tag means, and its lane (Torn only: high goes first, low waits for room). */
+    const USAGE_LABELS = {
+        't.fill': { name: 'Fill', lane: 'high' },
+        't.bazaar': { name: 'Pricing your bazaar', lane: 'high' },
+        't.market': { name: 'Held item: Item Market', lane: 'high' },
+        't.setup': { name: 'Items list, key, you', lane: 'high' },
+        't.feed': { name: 'Item Market feed (overlay)', lane: 'normal' },
+        't.inventory': { name: 'Your inventory', lane: 'normal' },
+        't.owner': { name: 'Bazaar owner status', lane: 'normal' },
+        't.sellers': { name: 'Seller statuses (overlay)', lane: 'low' },
+        't.status': { name: 'Trader statuses', lane: 'low' },
+        't.networth': { name: 'Trader networth', lane: 'low' },
+        't.ledger': { name: 'Ledger', lane: 'low' },
+        't.buys': { name: 'Buys for an accepted trade (your log)', lane: 'normal' },
+        't.traded': { name: 'Did an accepted trade go through (your trades)', lane: 'normal' },
+        't.other': { name: 'Other', lane: 'high' },
+        'w.summary': { name: 'Bazaar summary' },
+        'w.feed': { name: 'Overlay bazaar deals' },
+        'w.own': { name: 'Your bazaar / Fill' },
+        'w.desk': { name: 'Item on the desk' },
+        'w.flips': { name: 'Possible flips' },
+        'w.sweep': { name: 'Every item, in turn' },
+        'w.trade': { name: 'Trade and pins' },
+        'w.buyers': { name: 'Buyers per item' },
+        'w.lists': { name: 'Trader price lists' },
+        'w.other': { name: 'Other' },
+        'e.top': { name: 'Top 3 buyers, every item' },
+        'e.active': { name: 'Active traders' },
+        'e.list': { name: "An item's full list" },
+        'e.trader': { name: "A trader's whole list" },
+        'e.one': { name: 'Best buyer (no key)' },
+        'e.other': { name: 'Other' },
+        // Not requests: how TornW3B answered them (3.25.0, the zip of 2026-10-06: "sent" could not
+        // say whether a minute's dozen were taken or refused). In the export only - their letter is
+        // no service's, so no chart, total or limit counts them.
+        'r.w.ok': { name: 'Answered', service: 'w' },
+        'r.w.429': { name: 'Refused (429 or a blocked page)', service: 'w' },
+        // ...and how TornExchange did (3.26.2): slow = no answer in the time waited for.
+        'r.e.ok': { name: 'Answered', service: 'e' },
+        'r.e.slow': { name: 'No answer in time', service: 'e' },
+        'r.e.fail': { name: 'Failed or refused', service: 'e' },
+        // The shared server (3.25.0): its own address and its own limits, so it is in no chart here - only in the export.
+        'r.s.ok': { name: 'Answered', serviceName: 'Shared server' },
+        'r.s.fail': { name: 'Failed or refused', serviceName: 'Shared server' },
+    };
+
+    /** A tag that is not in the list is counted as its service's Other. */
+    function usageLabel(tag) {
+        const t = String(tag || '');
+        if (USAGE_LABELS[t]) return t;
+        const svc = t.charAt(0);
+        return USAGE_SERVICES[svc] ? svc + '.other' : 't.other';
+    }
+
+    /** One request, counted in this tab's pending counts. */
+    function usageAdd(pending, tag, at = Date.now()) {
+        const m = Math.floor(at / 60000);
+        const label = usageLabel(tag);
+        const row = pending[m] || (pending[m] = {});
+        row[label] = (row[label] || 0) + 1;
+        return pending;
+    }
+
+    function cleanStore(stored) {
+        const s = stored && typeof stored === 'object' ? stored : {};
+        return {
+            m: s.m && typeof s.m === 'object' ? { ...s.m } : {},
+            h: s.h && typeof s.h === 'object' ? { ...s.h } : {},
+        };
+    }
+
+    function addInto(target, key, counts) {
+        const row = { ...(target[key] || {}) };
+        for (const [label, n] of Object.entries(counts || {})) {
+            if (Number(n) > 0) row[label] = (row[label] || 0) + Number(n);
+        }
+        target[key] = row;
+    }
+
+    /**
+     * The stored record with this tab's pending counts added: minutes over a day
+     * old folded into their hour, hours over a week dropped.
+     */
+    function usageMerge(stored, pending, now = Date.now()) {
+        const out = cleanStore(stored);
+        for (const [minute, counts] of Object.entries(pending || {})) addInto(out.m, minute, counts);
+        const nowMin = Math.floor(now / 60000);
+        for (const minute of Object.keys(out.m)) {
+            if (nowMin - Number(minute) >= USAGE_MINUTES_KEPT) {
+                addInto(out.h, String(Math.floor(Number(minute) / 60)), out.m[minute]);
+                delete out.m[minute];
+            }
+        }
+        const nowHour = Math.floor(now / 3600000);
+        for (const hour of Object.keys(out.h)) if (nowHour - Number(hour) >= USAGE_HOURS_KEPT) delete out.h[hour];
+        return out;
+    }
+
+    /*
+     * This PC's counts for the shared server (3.26.2; the owner, 2026-10-11: "track in the server all tornw3b
+     * and torn exchange calls in every laptop so we can optimise it that way"). With each exchange the PC says
+     * how many requests it made of TornW3B, TornExchange and Torn since the last one the server answered, by
+     * what for - the tags above, and how they were answered. Counts only: no item, no player, no price, no key.
+     * Every tab adds its counts to one stored sum; the tab that talks to the server sends it, and takes off
+     * what was sent once the server has answered. What could not be sent for an hour is let go, so an old
+     * sum never lands on the wrong hour of the server's record.
+     */
+    const USAGE_CALLS_TAGS_MAX = 60;
+    const USAGE_CALLS_COUNT_MAX = 5000;
+    const USAGE_CALLS_KEEP_MS = 60 * 60000;
+    /** A service's own tag (w, e, t) or how one answered (r.w.429): the only names the server takes. */
+    const USAGE_CALLS_TAG = /^(?:[wet]\.[a-z0-9]{1,12}|r\.[wet]\.[a-z0-9]{1,12})$/;
+
+    function usageCallsKept(stored, now) {
+        const s = stored && typeof stored === 'object' && !Array.isArray(stored) ? stored : {};
+        const since = Number.isFinite(s.since) && s.since > 0 && s.since <= now ? s.since : null;
+        const n = {};
+        if (since !== null && now - since <= USAGE_CALLS_KEEP_MS && s.n && typeof s.n === 'object') {
+            for (const [tag, count] of Object.entries(s.n)) {
+                if (USAGE_CALLS_TAG.test(tag) && Number.isFinite(count) && count >= 1) n[tag] = Math.floor(count);
+            }
+        }
+        return { since: Object.keys(n).length ? since : null, n };
+    }
+
+    /** The sum waiting to be sent, with a tab's pending counts (usageAdd's, by minute) added: {since, n: {tag: count}}. */
+    function usageCallsAdd(stored, pending, now = Date.now()) {
+        const kept = usageCallsKept(stored, now);
+        for (const counts of Object.values(pending || {})) {
+            for (const [tag, count] of Object.entries(counts || {})) {
+                if (!USAGE_CALLS_TAG.test(tag) || !(Number(count) >= 1)) continue;
+                kept.n[tag] = (kept.n[tag] || 0) + Math.floor(Number(count));
+            }
+        }
+        if (kept.since === null && Object.keys(kept.n).length) kept.since = now;
+        return kept;
+    }
+
+    /** What goes with this exchange: {tag: count}, 60 tags at most (the biggest first), none over 5,000. {} = nothing was asked. */
+    function usageCallsOut(stored, now = Date.now()) {
+        const out = {};
+        const all = Object.entries(usageCallsKept(stored, now).n).sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1));
+        for (const [tag, count] of all.slice(0, USAGE_CALLS_TAGS_MAX)) out[tag] = Math.min(USAGE_CALLS_COUNT_MAX, count);
+        return out;
+    }
+
+    /** The server answered: what was sent comes off the sum; what the tabs added meanwhile, and what did not fit, stays. */
+    function usageCallsSent(stored, sent, now = Date.now()) {
+        const kept = usageCallsKept(stored, now);
+        for (const [tag, count] of Object.entries(sent || {})) {
+            if (!(tag in kept.n)) continue;
+            const left = kept.n[tag] - (Number(count) > 0 ? Math.floor(Number(count)) : 0);
+            if (left >= 1) kept.n[tag] = left;
+            else delete kept.n[tag];
+        }
+        // What is left was counted while the answer was awaited, or did not fit: it is young again.
+        return { since: Object.keys(kept.n).length ? now : null, n: kept.n };
+    }
+
+    /** The ranges the chart offers: how far back, and how wide each bar is. */
+    const USAGE_RANGES = {
+        '1h': { name: 'Last hour', bars: 60, barMs: 60000, barName: 'minute' },
+        '24h': { name: 'Last 24 hours', bars: 24, barMs: 3600000, barName: 'hour' },
+        '7d': { name: 'Last 7 days', bars: 7, barMs: 86400000, barName: 'day' },
+    };
+
+    /**
+     * One service's use over a range: a bar each minute / hour / day, split by
+     * tag, and each tag's total (biggest first).
+     *
+     * @param {object} stored - usageMerge output (already holding pending counts)
+     * @param {{service: 't'|'w'|'e', range: '1h'|'24h'|'7d', now?: number}} opts
+     * @returns {{bars: Array<{start: number, counts: object, total: number}>, labels: Array<{id, name, total, share}>, total: number, peak: number, perMinute: number}}
+     */
+    function usageSeries(stored, { service = 't', range = '1h', now = Date.now() } = {}) {
+        const r = USAGE_RANGES[range] || USAGE_RANGES['1h'];
+        const s = cleanStore(stored);
+        // The day bars start at local midnight, the others on the minute / hour.
+        const end = range === '7d'
+            ? (() => { const d = new Date(now); d.setHours(24, 0, 0, 0); return d.getTime(); })()
+            : (Math.floor(now / r.barMs) + 1) * r.barMs;
+        const start = end - r.bars * r.barMs;
+        const bars = Array.from({ length: r.bars }, (_, i) => ({ start: start + i * r.barMs, counts: {}, total: 0 }));
+        const put = (at, counts) => {
+            if (at < start || at >= end) return;
+            const bar = bars[Math.floor((at - start) / r.barMs)];
+            for (const [label, n] of Object.entries(counts)) {
+                if (label.charAt(0) !== service || !(Number(n) > 0)) continue;
+                bar.counts[label] = (bar.counts[label] || 0) + Number(n);
+                bar.total += Number(n);
+            }
+        };
+        for (const [minute, counts] of Object.entries(s.m)) put(Number(minute) * 60000, counts);
+        // Hours only where minutes are gone (older than a day): never both.
+        if (r.barMs >= 3600000) for (const [hour, counts] of Object.entries(s.h)) put(Number(hour) * 3600000, counts);
+        const totals = {};
+        for (const b of bars) for (const [label, n] of Object.entries(b.counts)) totals[label] = (totals[label] || 0) + n;
+        const total = Object.values(totals).reduce((a, n) => a + n, 0);
+        const labels = Object.entries(totals)
+            .map(([id, n]) => ({ id, name: (USAGE_LABELS[id] || { name: id }).name, lane: (USAGE_LABELS[id] || {}).lane || null, total: n, share: total ? n / total : 0 }))
+            .sort((a, b) => b.total - a.total);
+        // Per minute over the time the range has really covered (up to now, not the empty end of the last bar).
+        const covered = Math.max(60000, Math.min(now, end) - start);
+        return { bars, labels, total, peak: Math.max(0, ...bars.map((b) => b.total)), perMinute: total / (covered / 60000) };
+    }
+
+    /**
+     * The record as CSV rows, one per minute (or hour) per use - for a
+     * spreadsheet (3.15, the export's by-minute.csv / by-hour.csv). Local time.
+     */
+    function usageCsv(stored, { by = 'minute' } = {}) {
+        const s = cleanStore(stored);
+        const rows = [['time', 'service', 'what for', 'tag', 'requests']];
+        const pad = (n) => String(n).padStart(2, '0');
+        const local = (ms) => {
+            const d = new Date(ms);
+            return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+        };
+        const bucket = new Map();
+        const put = (at, counts) => {
+            const key = by === 'hour' ? Math.floor(at / 3600000) * 3600000 : at;
+            const row = bucket.get(key) || {};
+            for (const [label, n] of Object.entries(counts || {})) row[label] = (row[label] || 0) + Number(n || 0);
+            bucket.set(key, row);
+        };
+        for (const [minute, counts] of Object.entries(s.m)) put(Number(minute) * 60000, counts);
+        if (by === 'hour') for (const [hour, counts] of Object.entries(s.h)) put(Number(hour) * 3600000, counts);
+        for (const at of [...bucket.keys()].sort((a, b) => a - b)) {
+            for (const [label, n] of Object.entries(bucket.get(at)).sort()) {
+                if (!(n > 0)) continue;
+                const svc = USAGE_SERVICES[(USAGE_LABELS[label] || {}).service || label.charAt(0)];
+                rows.push([local(at), svc ? svc.name : (USAGE_LABELS[label] || {}).serviceName || '?', (USAGE_LABELS[label] || { name: label }).name, label, n]);
+            }
+        }
+        return rows.map((r) => r.map((c) => (/[",\n]/.test(String(c)) ? '"' + String(c).replace(/"/g, '""') + '"' : String(c))).join(',')).join('\n') + '\n';
+    }
+
     /* ===== src/core/shared.js ===== */
     /**
      * Shared: this PC's side of the shared server (server/).
@@ -369,6 +631,8 @@
      * Pure: no clock, no storage, no network. Times are milliseconds, passed in.
      */
 
+
+
     const SHARED_SYNC_MS = 30000;
     // The same split as server/src/budget.js (test/shared.test.js holds the two together):
     // of Torn's 100 calls a minute per person, 20 are never used by the server or this PC.
@@ -381,7 +645,7 @@
     const SHARED_MAX_SELLERS = 3000;
     const SHARED_MAX_NEAR = 200;
     const SHARED_MAX_WORTH = 5000;
-    const SHARED_BODY_KEYS = ['app', 'ver', 'used', 'waiting', 'sellers', 'trades', 'looking', 'worth', 'since', 'seen', 'going', 'bought', 'dir', 'want', 'w3b', 'lists', 'listsSince'];
+    const SHARED_BODY_KEYS = ['app', 'ver', 'used', 'waiting', 'sellers', 'trades', 'looking', 'worth', 'since', 'seen', 'going', 'bought', 'dir', 'want', 'w3b', 'lists', 'listsSince', 'calls'];
     /*
      * 3.26.0, the server handing out TornW3B's work (its /sync, deployed 2026-10-11):
      *   want        the items whose sellers list this PC would ask TornW3B for next, most wanted first (60 at most)
@@ -627,7 +891,7 @@
      * come out of here, whatever is put in.
      * `now`: this PC's clock; the marks leave as ages, since every PC has its own clock.
      */
-    function sharedBody({ used = 0, waiting = 0, wants = [], since = 0, seen = 0, sendWorth = true, now = 0, ver = null, lists = null, listsSince = null } = {}) {
+    function sharedBody({ used = 0, waiting = 0, wants = [], since = 0, seen = 0, sendWorth = true, now = 0, ver = null, lists = null, listsSince = null, calls = null } = {}) {
         const count = (n) => (Number.isFinite(n) && n > 0 ? Math.min(1000, Math.floor(n)) : 0);
         const list = Array.isArray(wants) ? wants.filter((w) => w && typeof w === 'object') : [];
         const trades = sharedIds(list.map((w) => w.trades), SHARED_MAX_NEAR);
@@ -658,6 +922,13 @@
         const out = (Array.isArray(lists) ? lists : []).map(sharedList).filter(Boolean).slice(0, SHARED_MAX_LISTS);
         if (out.length) body.lists = out;
         if (Number.isInteger(listsSince) && listsSince >= 0) body.listsSince = listsSince;
+        // 3.26.2 - this PC's own request counts since the last answered exchange (core/usage.js): {} = none were made.
+        if (calls && typeof calls === 'object' && !Array.isArray(calls)) {
+            body.calls = {};
+            for (const [tag, n] of Object.entries(calls).slice(0, USAGE_CALLS_TAGS_MAX)) {
+                if (USAGE_CALLS_TAG.test(tag) && Number.isFinite(n) && n >= 1) body.calls[tag] = Math.min(USAGE_CALLS_COUNT_MAX, Math.floor(n));
+            }
+        }
         if (sendWorth) {
             const worth = {};
             let n = 0;
@@ -713,6 +984,12 @@
                     if (!Array.isArray(l) || l.length !== 3 || !Number.isInteger(l[0]) || l[0] <= 0 || l[0] >= 1e10 || !whole(l[1]) || l[1] <= 0) return false;
                     if (!l[2] || typeof l[2] !== 'object' || Array.isArray(l[2]) || Object.keys(l[2]).length > SHARED_MAX_LIST_ITEMS) return false;
                     for (const [item, price] of Object.entries(l[2])) if (!/^\d{1,10}$/.test(item) || !Number.isInteger(price) || price <= 0) return false;
+                }
+            } else if (key === 'calls') {
+                // {tag: how many}: a service's tag or how one answered, a whole number from 1 to 5,000.
+                if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length > USAGE_CALLS_TAGS_MAX) return false;
+                for (const [tag, n] of Object.entries(value)) {
+                    if (!USAGE_CALLS_TAG.test(tag) || !Number.isInteger(n) || n < 1 || n > USAGE_CALLS_COUNT_MAX) return false;
                 }
             } else if (key === 'worth') {
                 if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
@@ -848,6 +1125,21 @@
             out.push({ sellerId: l.sellerId, sellerName: null, price: l.price, qty: l.qty, dataAt: l.seen, changedAt: l.at, sponsored: false, shared: true });
         }
         return out.sort((a, b) => a.price - b.price);
+    }
+
+    /**
+     * The items the server holds listings of, read from Torn within `maxAge`: itemId -> when the newest of them
+     * was seen (3.26.2: an item this PC has no sellers list of has the server's listings as its sellers).
+     * @returns {Map<string, number>}
+     */
+    function sharedItemsSeen(index, now, maxAge) {
+        const out = new Map();
+        for (const [item, listings] of (index && index.byItem) || []) {
+            let seen = 0;
+            for (const l of listings) if (l.price > 1 && l.qty > 0 && l.seen <= now && now - l.seen <= maxAge && l.seen > seen) seen = l.seen;
+            if (seen) out.set(item, seen);
+        }
+        return out;
     }
 
     /**
@@ -1308,6 +1600,7 @@
 
 
 
+
     const SHARED_CONFIG_KEY = 'sharedConfig';
     const SHARED_STATE_KEY = 'sharedState';
     const SHARED_GRANT_KEY = 'sharedGrant';
@@ -1324,6 +1617,8 @@
     const SHARED_LISTS_IN_KEEP = 20;
     /* The other PCs' TornW3B reads and this PC's turn among them (core/shared.js, sharedDirIn). */
     const SHARED_DIR_KEY = 'sharedDir';
+    // 3.26.2 - this PC's request counts waiting to be sent, every tab's in one sum (core/usage.js usageCallsAdd).
+    const SHARED_CALLS_KEY = 'sharedCalls';
     const SHARED_WANT_PREFIX = 'sharedWant.';
     const SHARED_READS_PREFIX = 'sharedReads.';
     const SHARED_WORLDS = ['app', 'sell'];
@@ -1519,6 +1814,27 @@
             this.d.save(SHARED_WANT_PREFIX + this.d.world, { at: now, sellers: clean.sellers, trades: clean.trades, looking: clean.looking, worth: clean.worth, going: marks.going, bought: marks.bought, dir, ...w3b, ...takes });
         }
 
+        /**
+         * 3.26.2 - a page opened for the first time talks to the server before it knows what it watches, and keeps
+         * nothing of that answer about the items it learns of next. When the items it now watches and never asked
+         * about outnumber the ones it has asked about, the next exchange comes soon, not half a minute on. The
+         * known ones at least double each time, so this happens a handful of times in a PC's life.
+         */
+        muchNew(now) {
+            this.loadInterest();
+            let fresh = 0;
+            for (const w of SHARED_WORLDS) {
+                const want = this.d.load(SHARED_WANT_PREFIX + w);
+                if (!want || now - want.at >= SHARED_WANT_LIVE_MS) continue;
+                for (const id of Object.keys(want.worth || {})) {
+                    if (this.interest.has(id)) continue;
+                    fresh += 1;
+                    if (fresh > this.interest.size) return true;
+                }
+            }
+            return false;
+        }
+
         /** Call every SHARED_TICK_MS. */
         async tick() {
             const now = this.now();
@@ -1537,7 +1853,8 @@
             const since = now - (state.syncAt || 0);
             if (state.unknown && since < sharedUnknownWait(state.unknownTries)) return;
             const asked = this.asked().at;
-            if (since < SHARED_SYNC_MS && !(asked >= (state.syncAt || 0) && asked > 0 && since >= SHARED_SOON_MS)) return;
+            const soon = since >= SHARED_SOON_MS && ((asked >= (state.syncAt || 0) && asked > 0) || this.muchNew(now));
+            if (since < SHARED_SYNC_MS && !soon) return;
 
             this.busy = true;
             try {
@@ -1589,7 +1906,9 @@
                     const listsOut = takesLists && page === 0
                         ? (this.d.load(SHARED_LISTS_OUT_KEY) || []).map(sharedList).filter((l) => l && this.listsSent.get(l[0]) !== l[1])
                         : [];
-                    const body = sharedBody({ used: use.used, waiting: (Number(use.waiting) || 0) + others, wants: page === 0 ? wants : wants.map(({ want, w3b, ...w }) => w), since: seq, seen, sendWorth, now, ver, lists: listsOut, listsSince: takesLists && page === 0 ? listsAt : null });
+                    // This PC's own request counts since the last answered exchange, on the first page only ({} = none made).
+                    const callsOut = page === 0 ? usageCallsOut(this.d.load(SHARED_CALLS_KEY), now) : null;
+                    const body = sharedBody({ used: use.used, waiting: (Number(use.waiting) || 0) + others, wants: page === 0 ? wants : wants.map(({ want, w3b, ...w }) => w), since: seq, seen, sendWorth, now, ver, lists: listsOut, listsSince: takesLists && page === 0 ? listsAt : null, calls: callsOut });
                     if (!sharedOutgoingOk(body)) throw new Error('Not sent: the message was not in the agreed shape.');
 
                     const response = await this.d.post(`${cfg.address}/sync`, {
@@ -1669,6 +1988,13 @@
                         this.d.save(SHARED_DIR_KEY, dirNow);
                     }
                     state.turn = dirNow.turn;
+                    if (page === 0 && body.calls) {
+                        // Answered: what was sent comes off the sum (what the tabs counted meanwhile stays for the next one).
+                        const sum = Object.values(body.calls).reduce((a, n) => a + n, 0);
+                        if (sum) this.d.save(SHARED_CALLS_KEY, usageCallsSent(this.d.load(SHARED_CALLS_KEY), body.calls, got));
+                        state.callsOut = (Number.isInteger(before.callsOut) ? before.callsOut : 0) + sum;
+                        state.callsSyncs = (Number.isInteger(before.callsSyncs) ? before.callsSyncs : 0) + 1;
+                    }
                     if (page === 0) {
                         // TornW3B's work: which of the wanted sellers lists are this PC's, and the others' trader lists.
                         for (const l of body.lists || []) this.listsSent.set(l[0], l[1]);
@@ -1748,7 +2074,7 @@
         /** The server's address or this PC's word changed, or there is none now: what was kept under the old one goes. */
         forget() {
             for (let i = 0; i < SHARED_BUCKETS; i += 1) this.d.del(SHARED_READS_PREFIX + i);
-            for (const key of [SHARED_STATE_KEY, SHARED_GRANT_KEY, SHARED_MARKS_KEY, SHARED_INTEREST_KEY, SHARED_ASK_KEY, SHARED_DIR_KEY, SHARED_W3B_ASK_KEY, SHARED_LISTS_OUT_KEY, SHARED_LISTS_IN_KEY]) this.d.del(key);
+            for (const key of [SHARED_STATE_KEY, SHARED_GRANT_KEY, SHARED_MARKS_KEY, SHARED_INTEREST_KEY, SHARED_ASK_KEY, SHARED_DIR_KEY, SHARED_W3B_ASK_KEY, SHARED_LISTS_OUT_KEY, SHARED_LISTS_IN_KEY, SHARED_CALLS_KEY]) this.d.del(key);
             this.w3bAskKept = null;
             this.listsSent = new Map();
             this.buckets = null;
@@ -1787,6 +2113,9 @@
                 w3bAsk: Array.isArray(state.w3bAsk) ? state.w3bAsk : null,
                 listsOut: Number.isInteger(state.listsOut) ? state.listsOut : 0,
                 listsIn: Number.isInteger(state.listsIn) ? state.listsIn : 0,
+                // 3.26.2: this PC's request counts told to the server so far, and in how many exchanges.
+                callsOut: Number.isInteger(state.callsOut) ? state.callsOut : 0,
+                callsSyncs: Number.isInteger(state.callsSyncs) ? state.callsSyncs : 0,
                 unknown: Boolean(cfg && state.unknown),
                 // When a PC the server does not know asks again (ms from the last asking).
                 unknownWaitMs: cfg && state.unknown ? sharedUnknownWait(state.unknownTries) : null,
@@ -10198,203 +10527,6 @@
         return { chosen: kept, better: best.profit > kept.profit * (1 + STEADY_MORE) ? best : null };
     }
 
-    /* ===== src/core/usage.js ===== */
-    /*
-     * API use (3.15, the owner: "I need to see the usage with a graph, so we're
-     * able to analyse what needs more priority and what needs less").
-     *
-     * Every request that leaves - Torn, TornW3B, TornExchange, any tab - is
-     * counted under what it was for (its tag), per minute. Each tab keeps its
-     * counts in memory and adds them to the stored record every few seconds; a
-     * day of minutes is kept, then folded into hours, kept a week. Two tabs
-     * writing in the same instant can lose a few counts: this is a record to
-     * read trends from, not the limiter (the limiters count exactly).
-     */
-
-    /* Minutes kept one by one; older ones are folded into their hour. */
-    const USAGE_MINUTES_KEPT = 24 * 60;
-    /* Hours kept. */
-    const USAGE_HOURS_KEPT = 7 * 24;
-
-    /** Each service: its name and how many a minute we allow ourselves (the meter's 100%). */
-    const USAGE_SERVICES = {
-        t: { name: 'Torn API', perMin: 70, note: 'every tab together; Torn allows 100' },
-        w: { name: 'TornW3B', perMin: 80, note: 'every tab together; TornW3B allows about 100' },
-        e: { name: 'TornExchange', perMin: 6, note: 'one every 10 s; TornExchange allows 10' },
-    };
-
-    /** What each tag means, and its lane (Torn only: high goes first, low waits for room). */
-    const USAGE_LABELS = {
-        't.fill': { name: 'Fill', lane: 'high' },
-        't.bazaar': { name: 'Pricing your bazaar', lane: 'high' },
-        't.market': { name: 'Held item: Item Market', lane: 'high' },
-        't.setup': { name: 'Items list, key, you', lane: 'high' },
-        't.feed': { name: 'Item Market feed (overlay)', lane: 'normal' },
-        't.inventory': { name: 'Your inventory', lane: 'normal' },
-        't.owner': { name: 'Bazaar owner status', lane: 'normal' },
-        't.sellers': { name: 'Seller statuses (overlay)', lane: 'low' },
-        't.status': { name: 'Trader statuses', lane: 'low' },
-        't.networth': { name: 'Trader networth', lane: 'low' },
-        't.ledger': { name: 'Ledger', lane: 'low' },
-        't.buys': { name: 'Buys for an accepted trade (your log)', lane: 'normal' },
-        't.traded': { name: 'Did an accepted trade go through (your trades)', lane: 'normal' },
-        't.other': { name: 'Other', lane: 'high' },
-        'w.summary': { name: 'Bazaar summary' },
-        'w.feed': { name: 'Overlay bazaar deals' },
-        'w.own': { name: 'Your bazaar / Fill' },
-        'w.desk': { name: 'Item on the desk' },
-        'w.flips': { name: 'Possible flips' },
-        'w.sweep': { name: 'Every item, in turn' },
-        'w.trade': { name: 'Trade and pins' },
-        'w.buyers': { name: 'Buyers per item' },
-        'w.lists': { name: 'Trader price lists' },
-        'w.other': { name: 'Other' },
-        'e.top': { name: 'Top 3 buyers, every item' },
-        'e.active': { name: 'Active traders' },
-        'e.list': { name: "An item's full list" },
-        'e.trader': { name: "A trader's whole list" },
-        'e.one': { name: 'Best buyer (no key)' },
-        'e.other': { name: 'Other' },
-        // Not requests: how TornW3B answered them (3.25.0, the zip of 2026-10-06: "sent" could not
-        // say whether a minute's dozen were taken or refused). In the export only - their letter is
-        // no service's, so no chart, total or limit counts them.
-        'r.w.ok': { name: 'Answered', service: 'w' },
-        'r.w.429': { name: 'Refused (429 or a blocked page)', service: 'w' },
-        // The shared server (3.25.0): its own address and its own limits, so it is in no chart here - only in the export.
-        'r.s.ok': { name: 'Answered', serviceName: 'Shared server' },
-        'r.s.fail': { name: 'Failed or refused', serviceName: 'Shared server' },
-    };
-
-    /** A tag that is not in the list is counted as its service's Other. */
-    function usageLabel(tag) {
-        const t = String(tag || '');
-        if (USAGE_LABELS[t]) return t;
-        const svc = t.charAt(0);
-        return USAGE_SERVICES[svc] ? svc + '.other' : 't.other';
-    }
-
-    /** One request, counted in this tab's pending counts. */
-    function usageAdd(pending, tag, at = Date.now()) {
-        const m = Math.floor(at / 60000);
-        const label = usageLabel(tag);
-        const row = pending[m] || (pending[m] = {});
-        row[label] = (row[label] || 0) + 1;
-        return pending;
-    }
-
-    function cleanStore(stored) {
-        const s = stored && typeof stored === 'object' ? stored : {};
-        return {
-            m: s.m && typeof s.m === 'object' ? { ...s.m } : {},
-            h: s.h && typeof s.h === 'object' ? { ...s.h } : {},
-        };
-    }
-
-    function addInto(target, key, counts) {
-        const row = { ...(target[key] || {}) };
-        for (const [label, n] of Object.entries(counts || {})) {
-            if (Number(n) > 0) row[label] = (row[label] || 0) + Number(n);
-        }
-        target[key] = row;
-    }
-
-    /**
-     * The stored record with this tab's pending counts added: minutes over a day
-     * old folded into their hour, hours over a week dropped.
-     */
-    function usageMerge(stored, pending, now = Date.now()) {
-        const out = cleanStore(stored);
-        for (const [minute, counts] of Object.entries(pending || {})) addInto(out.m, minute, counts);
-        const nowMin = Math.floor(now / 60000);
-        for (const minute of Object.keys(out.m)) {
-            if (nowMin - Number(minute) >= USAGE_MINUTES_KEPT) {
-                addInto(out.h, String(Math.floor(Number(minute) / 60)), out.m[minute]);
-                delete out.m[minute];
-            }
-        }
-        const nowHour = Math.floor(now / 3600000);
-        for (const hour of Object.keys(out.h)) if (nowHour - Number(hour) >= USAGE_HOURS_KEPT) delete out.h[hour];
-        return out;
-    }
-
-    /** The ranges the chart offers: how far back, and how wide each bar is. */
-    const USAGE_RANGES = {
-        '1h': { name: 'Last hour', bars: 60, barMs: 60000, barName: 'minute' },
-        '24h': { name: 'Last 24 hours', bars: 24, barMs: 3600000, barName: 'hour' },
-        '7d': { name: 'Last 7 days', bars: 7, barMs: 86400000, barName: 'day' },
-    };
-
-    /**
-     * One service's use over a range: a bar each minute / hour / day, split by
-     * tag, and each tag's total (biggest first).
-     *
-     * @param {object} stored - usageMerge output (already holding pending counts)
-     * @param {{service: 't'|'w'|'e', range: '1h'|'24h'|'7d', now?: number}} opts
-     * @returns {{bars: Array<{start: number, counts: object, total: number}>, labels: Array<{id, name, total, share}>, total: number, peak: number, perMinute: number}}
-     */
-    function usageSeries(stored, { service = 't', range = '1h', now = Date.now() } = {}) {
-        const r = USAGE_RANGES[range] || USAGE_RANGES['1h'];
-        const s = cleanStore(stored);
-        // The day bars start at local midnight, the others on the minute / hour.
-        const end = range === '7d'
-            ? (() => { const d = new Date(now); d.setHours(24, 0, 0, 0); return d.getTime(); })()
-            : (Math.floor(now / r.barMs) + 1) * r.barMs;
-        const start = end - r.bars * r.barMs;
-        const bars = Array.from({ length: r.bars }, (_, i) => ({ start: start + i * r.barMs, counts: {}, total: 0 }));
-        const put = (at, counts) => {
-            if (at < start || at >= end) return;
-            const bar = bars[Math.floor((at - start) / r.barMs)];
-            for (const [label, n] of Object.entries(counts)) {
-                if (label.charAt(0) !== service || !(Number(n) > 0)) continue;
-                bar.counts[label] = (bar.counts[label] || 0) + Number(n);
-                bar.total += Number(n);
-            }
-        };
-        for (const [minute, counts] of Object.entries(s.m)) put(Number(minute) * 60000, counts);
-        // Hours only where minutes are gone (older than a day): never both.
-        if (r.barMs >= 3600000) for (const [hour, counts] of Object.entries(s.h)) put(Number(hour) * 3600000, counts);
-        const totals = {};
-        for (const b of bars) for (const [label, n] of Object.entries(b.counts)) totals[label] = (totals[label] || 0) + n;
-        const total = Object.values(totals).reduce((a, n) => a + n, 0);
-        const labels = Object.entries(totals)
-            .map(([id, n]) => ({ id, name: (USAGE_LABELS[id] || { name: id }).name, lane: (USAGE_LABELS[id] || {}).lane || null, total: n, share: total ? n / total : 0 }))
-            .sort((a, b) => b.total - a.total);
-        // Per minute over the time the range has really covered (up to now, not the empty end of the last bar).
-        const covered = Math.max(60000, Math.min(now, end) - start);
-        return { bars, labels, total, peak: Math.max(0, ...bars.map((b) => b.total)), perMinute: total / (covered / 60000) };
-    }
-
-    /**
-     * The record as CSV rows, one per minute (or hour) per use - for a
-     * spreadsheet (3.15, the export's by-minute.csv / by-hour.csv). Local time.
-     */
-    function usageCsv(stored, { by = 'minute' } = {}) {
-        const s = cleanStore(stored);
-        const rows = [['time', 'service', 'what for', 'tag', 'requests']];
-        const pad = (n) => String(n).padStart(2, '0');
-        const local = (ms) => {
-            const d = new Date(ms);
-            return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + ' ' + pad(d.getHours()) + ':' + pad(d.getMinutes());
-        };
-        const bucket = new Map();
-        const put = (at, counts) => {
-            const key = by === 'hour' ? Math.floor(at / 3600000) * 3600000 : at;
-            const row = bucket.get(key) || {};
-            for (const [label, n] of Object.entries(counts || {})) row[label] = (row[label] || 0) + Number(n || 0);
-            bucket.set(key, row);
-        };
-        for (const [minute, counts] of Object.entries(s.m)) put(Number(minute) * 60000, counts);
-        if (by === 'hour') for (const [hour, counts] of Object.entries(s.h)) put(Number(hour) * 3600000, counts);
-        for (const at of [...bucket.keys()].sort((a, b) => a - b)) {
-            for (const [label, n] of Object.entries(bucket.get(at)).sort()) {
-                if (!(n > 0)) continue;
-                const svc = USAGE_SERVICES[(USAGE_LABELS[label] || {}).service || label.charAt(0)];
-                rows.push([local(at), svc ? svc.name : (USAGE_LABELS[label] || {}).serviceName || '?', (USAGE_LABELS[label] || { name: label }).name, label, n]);
-            }
-        }
-        return rows.map((r) => r.map((c) => (/[",\n]/.test(String(c)) ? '"' + String(c).replace(/"/g, '""') + '"' : String(c))).join(',')).join('\n') + '\n';
-    }
-
     /* ===== src/core/steady-sleep.js ===== */
     /*
      * A wait that a hidden tab keeps too (3.25.0).
@@ -14436,7 +14568,9 @@
          *   same pace and the same penalty wait as this one.
          * @param {function} [options.saveState] - (state) => void
          */
-        constructor({ getKey, fetchImpl = gmFetch, now = () => Date.now(), loadState = null, saveState = null, onSent = null, onFailed = null } = {}) {
+        constructor({ getKey, fetchImpl = gmFetch, now = () => Date.now(), loadState = null, saveState = null, onSent = null, onFailed = null, onAnswered = null } = {}) {
+            /** ({path, tag, how}) => void, how a request that left was answered: 'ok', 'slow' (no answer in time) or 'fail' (3.26.2). */
+            this.onAnswered = onAnswered;
             /** ({path, tag, error}) => void, a request that failed (not "too soon"): the problem log (3.15). */
             this.onFailed = onFailed;
             /** ({path, tag}) => void, each request that leaves: the usage record (3.15). */
@@ -14552,12 +14686,21 @@
                 }
             }
 
+            const answered = (how) => {
+                if (!this.onAnswered) return;
+                try {
+                    this.onAnswered({ path, tag, how });
+                } catch {
+                    // The usage record is best-effort.
+                }
+            };
             let response;
             try {
                 response = timeoutMs ? await this.fetchImpl(url.toString(), { timeoutMs }) : await this.fetchImpl(url.toString());
             } catch (error) {
                 // The message never carries the URL, so never the key.
                 const timedOut = /timed out/i.test(String((error && error.message) || ''));
+                answered(timedOut ? 'slow' : 'fail');
                 throw new TeError(timedOut ? 'TornExchange timed out.' : 'TornExchange network error.', { reason: timedOut ? 'no answer in ' + Math.round((timeoutMs || 30000) / 1000) + ' s' : 'no connection' });
             }
 
@@ -14567,6 +14710,8 @@
             } catch {
                 body = null;
             }
+
+            answered(response.ok && body && !(body.status && body.status !== 'success') ? 'ok' : 'fail');
 
             if (response.status === 429) {
                 const seconds = Number(body && body.retry_after);
@@ -15530,6 +15675,8 @@
         const items = {};
         for (const [id, b] of reads || []) {
             if (!b || !(Number(b.at) > 0) || !Array.isArray(b.rows) || now - Number(b.at) >= KEPT_READS_MAX_AGE_MS) continue;
+            // Not a read of this PC's (3.26.2): the server's listings stand in for it, and come again from the server.
+            if (b.server) continue;
             items[String(id)] = { at: Number(b.at), sweep: Boolean(b.sweep), rows: b.rows.map((r) => KEPT_ROW.map((k) => (r ? r[k] : null))) };
         }
         return { v: 1, at: now, items };
@@ -30392,7 +30539,7 @@
             tos.appendChild(spEl('tr', {}, [spEl('th'), spEl('th', { text: 'Limited key' }), spEl('th', { text: 'Public key (NPC Arbitrage)' }), spEl('th', { text: 'Full key (Torn Ledger)' }), spEl('th', { class: 'tos-sv', text: 'Public key on the shared server' })]));
             // The Public key's column (3.26.0: it can be pasted on this page now) says what its panel on Torn's pages says.
             for (const [k, limited, open, full, server] of [
-                ['Data storage', 'Only locally, in this browser', 'Only locally, in this browser', 'Only locally, in this browser: time, item, quantity, price, where, who. Never the log\'s own text.', 'On the server: the bazaar prices your key read. Nothing about your account.'],
+                ['Data storage', 'Only locally, in this browser', 'Only locally, in this browser', 'Only locally, in this browser: time, item, quantity, price, where, who. Never the log\'s own text.', 'On the server: the bazaar prices your key read, and how many requests this PC made of TornW3B, TornExchange and Torn (counts only). Nothing about your account.'],
                 ['Data sharing', 'Nobody', 'Nobody', 'Nobody. Your trades go into a zip only when you download one yourself (Report a problem, Export API usage): it names the traders you traded with, and you choose who gets it.', 'The people on this server only.'],
                 ['Purpose of use', 'Personal gain: who pays most for your items, and flips', 'Competitive advantage: finding Bazaar and Item Market listings below NPC or market value, and filling your own listing prices', 'Personal: profit tracking', 'Reading bazaars for the group, while any of you is on.'],
                 ['Key storage & sharing', 'Stored locally / Not shared', 'Stored locally / Not shared. A one-way code made from it, never the key, is sent to Torn Bids\' own server to ask whether this PC is one of its people.', 'Stored locally / Not shared', 'Kept on the server as a secret that cannot be read back. Shared with no one.'],
@@ -37771,6 +37918,9 @@
             // this PC of those it wanted; trader lists sent up and come down.
             unknown: Boolean(s.unknown), askedAgainAfterMinutes: s.unknownWaitMs ? Math.round(s.unknownWaitMs / 60000) : null,
             sellersListsHanded: s.w3bAsk || null, listsUp: s.listsOut ?? null, listsDown: s.listsIn ?? null,
+            // 3.26.2: this PC's own request counts told to the server (how many, in how many exchanges), and how
+            // many items have the server's listings as their sellers until this PC's own sellers list is read.
+            callsTold: s.callsOut ?? null, callsExchanges: s.callsSyncs ?? null, sellersFromServer: sell.serverBazaarsNow ?? null,
         };
     }
 
@@ -37787,6 +37937,9 @@
         const pending = usagePending;
         usagePending = {};
         gmSet(STORE_API_USAGE, usageMerge(gmGet(STORE_API_USAGE, null), pending));
+        // 3.26.2 - with Shared on, the same counts wait in one sum for the tab that talks to the server (how many
+        // requests of each kind, and how they were answered; nothing else).
+        if (sharedLink && sharedLink.config()) gmSet(SHARED_CALLS_KEY, usageCallsAdd(gmGet(SHARED_CALLS_KEY, null), pending));
     }
     if (typeof window !== 'undefined') window.addEventListener('pagehide', flushUsage);
 
@@ -37947,7 +38100,7 @@
         const bought = boughtNow.map((b) => [Number(b.sellerId), Number(b.itemId), b.qty, b.each, b.t]);
         // Which TornW3B lists this PC read in the last two minutes (item numbers and times): the others then leave those to it.
         const dir = [];
-        for (const [id, b] of sell.bazaars) if (b && b.at && !b.kept && !b.error && !b.loading && now - b.at < SHARED_DIR_TELL_MS) dir.push([Number(id), b.at]);
+        for (const [id, b] of sell.bazaars) if (b && b.at && !b.kept && !b.server && !b.error && !b.loading && now - b.at < SHARED_DIR_TELL_MS) dir.push([Number(id), b.at]);
         // 3.26.0 - TornW3B's work, handed out by the server: the sellers lists this PC would ask for in the next
         // half minute that are not its own alone (the possible flips, the near ones, the sweep - in that order),
         // and what is left of its limit. The desk's item and a trade's are never asked about: they are read anyway.
@@ -37966,7 +38119,7 @@
                 if (mine.has(id) || want.includes(Number(id))) continue;
                 if (how === 'sweep' ? lightOn : lightAny && lightStandsIn(id, how, now)) continue;
                 const b = sell.bazaars.get(id);
-                if (b && (b.loading || (!b.kept && !b.error && !(b.lightMiss > b.at) && soon - b.at < every(id)))) continue;
+                if (b && (b.loading || (!b.kept && !b.server && !b.error && !(b.lightMiss > b.at) && soon - b.at < every(id)))) continue;
                 want.push(Number(id));
             }
         };
@@ -38009,7 +38162,7 @@
         else gmDel(SHARED_CONFIG_KEY);
         sharedLink.onStored(SHARED_CONFIG_KEY);
         sell.sharedWantAt = 0;
-        logProblem('note', next ? 'Shared: this PC asks the shared server with the word of its Public key' : 'Shared: off (' + (getStoredKey() ? 'no server address in this copy' : 'no Public key') + ')', '');
+        logProblem('note', next ? 'Shared: this PC asks the shared server with the word of its Public key' : 'Shared: off (' + (getStoredKey() ? 'no server address in this copy' : 'no Public key') + ')', next ? 'with each exchange it also says how many requests this PC made of TornW3B, TornExchange and Torn, by what for (counts only: no item, no player, no price)' : '');
         if (next) sharedLink.tick().catch(() => {});
     }
 
@@ -39613,7 +39766,9 @@
         if (b.loading) return false;
         if (b.error) return now - b.triedAt >= W3B_FAILED_RETRY_MS;
         // Brought back from the last visit (3.19.0): read again in its turn, as on a page just opened.
-        if (b.kept) return true;
+        // 3.26.2 - the server's listings stand in for a sellers list (serverBazaars): this PC's own is still read in
+        // its turn. Not for the sweep, which wants the cheapest price only and has it from the server.
+        if (b.server ? how !== 'sweep' : b.kept) return true;
         // 3.26.0: the light list said something the sellers list read before it does not - the sellers are read at
         // once. Not for the sweep, which wants the cheapest price only and has it from the light list.
         if (how !== 'sweep' && b.lightMiss > b.at) return true;
@@ -39683,7 +39838,7 @@
 
     /** A sellers list of this item read in full (not kept from the last visit, not a sweep's cut), no older than `within`, and nothing the light list said against it since. */
     function lightHasFull(b, now, within) {
-        return Boolean(b && b.at && !b.kept && !b.error && !b.sweep && !(b.lightMiss > b.at) && now - (b.fullAt || b.at) < within);
+        return Boolean(b && b.at && !b.kept && !b.server && !b.error && !b.sweep && !(b.lightMiss > b.at) && now - (b.fullAt || b.at) < within);
     }
 
     /**
@@ -39704,6 +39859,8 @@
         if (how === 'own') return lightHasFull(b, now, W3B_LIGHT_OWN_MS);
         if (how !== 'slow') return false;
         if (lightHasFull(b, now, W3B_LIGHT_FULL_MS)) return true;
+        // Priced already, by the server's own reads of Torn (3.26.2): no light list is spent on it.
+        if (b && b.server && now - b.at < W3B_CANDIDATE_MS * 2) return false;
         if (!(b && b.lightAt)) return true;
         // Read already: again when it is old, or sooner when the summary (one request for every item) shows the
         // item's cheapest price moved - a light list that would say the same thing is not asked for.
@@ -39744,7 +39901,7 @@
                 // A read kept from the last visit is compared as well: the same, and it stands as of now; not, and its sellers are read.
                 // 3.26.1: only a sellers list of the last half hour is confirmed this way - an older one is not made new by
                 // prices that happen to match; the light list then only says what the item costs now (lightRows).
-                const full = prev.at > 0 && at - (prev.fullAt || prev.at) < W3B_LIGHT_FULL_MS;
+                const full = !prev.server && prev.at > 0 && at - (prev.fullAt || prev.at) < W3B_LIGHT_FULL_MS;
                 // What the summary showed as the item's cheapest price at this read (lightSummaryMoved).
                 const sawRow = sell.summary ? sell.summary.get(id) : null;
                 const lightSaw = sawRow && sawRow.lowestPrice > 0 ? sawRow.lowestPrice : null;
@@ -39914,7 +40071,7 @@
         // room in the sellers lists' minute.
         const candOrder = lightOn ? [...candIds.filter((id) => lightWantsFull(id, now)), ...candIds.filter((id) => !lightWantsFull(id, now))] : candIds;
         // While possible flips have no price of their own yet, two reads of three are theirs (a light list each).
-        const unpriced = lightHas.any && candIds.some((id) => { const b = sell.bazaars.get(String(id)); return !b || (!b.loading && !(b.at > 0 && !b.kept) && !(b.lightAt > 0)); });
+        const unpriced = lightHas.any && candIds.some((id) => { const b = sell.bazaars.get(String(id)); return !b || (!b.loading && !(b.at > 0 && (!b.kept || b.server)) && !(b.lightAt > 0)); });
         sell.w3bTurn3 = ((sell.w3bTurn3 || 0) + 1) % 3;
         const read = nextW3bRead({
             summaryDue: now - sell.summaryAt >= W3B_SUMMARY_MS && now - sell.summaryTriedAt >= W3B_FAILED_RETRY_MS,
@@ -40221,6 +40378,43 @@
     }
 
     /** Every bazaar listing of one item. */
+    /*
+     * 3.26.2 (the owner, 2026-10-11: "friend opens tornbids, we already have data from server right? it takes
+     * forever to find deals even if we have the server" - he had 33 flips, his friend 3 on opening).
+     *
+     * The server's reads of Torn were used only to correct a sellers list this PC had read from TornW3B itself
+     * (rowsNow in the redraw). So a page just opened showed no flip of an item until its own sellers list had
+     * come round - a few a minute - though the server already held those very bazaars' prices, read from Torn
+     * seconds ago and sent with the first exchange.
+     *
+     * Now an item this PC has no sellers list of (none, or one kept from the last visit) has the server's
+     * listings as its sellers: real listings, by Torn's own answer, with the seller's id. Such a record is like
+     * one kept from the last visit: this PC's own sellers list is still read in its turn (TornW3B may know a
+     * seller the server does not), it is never told to the server as a TornW3B read, and it is not kept for the
+     * next visit. Worked out when the server's reads changed, and every half minute.
+     */
+    const SERVER_BAZAARS_EVERY_MS = 30000;
+    function serverBazaars(index, now) {
+        if (sell.serverIndex === index && now - (sell.serverIndexAt || 0) < SERVER_BAZAARS_EVERY_MS) return;
+        sell.serverIndex = index;
+        sell.serverIndexAt = now;
+        let standing = 0;
+        for (const [id, seen] of sharedItemsSeen(index, now, FLIP_FRESH_MS)) {
+            const b = sell.bazaars.get(id);
+            if (b && b.loading) continue;
+            // Read by this PC on this visit: its own list stands, corrected by the server's reads as before.
+            if (b && b.at > 0 && !b.kept && !b.server) continue;
+            standing += 1;
+            if (b && b.server && b.at >= seen) continue;
+            sell.bazaars.set(id, { ...(b || { rows: [], error: null, triedAt: 0 }), at: Math.max(seen, (b && b.at) || 0), kept: b ? Boolean(b.kept) || !b.server : true, server: true, loading: false });
+        }
+        if (standing && !sell.serverBazaarsNoted) {
+            sell.serverBazaarsNoted = true;
+            logProblem('note', 'Shared: ' + standing + ' items have their sellers from the server\'s own reads of Torn', 'until this PC\'s own TornW3B sellers list of each comes round; a flip on them is on Torn\'s own prices, read minutes ago at most');
+        }
+        sell.serverBazaarsNow = standing;
+    }
+
     function loadBazaars(itemId, tag = 'w.desk') {
         const id = String(itemId);
         const prev = sell.bazaars.get(id) || { at: 0, rows: [], error: null };
@@ -40236,7 +40430,7 @@
                 const suspect = rows.length === 0 && (prev.rows || []).length > 0;
                 // Since the sellers were last read (fullAt): a light list that confirmed them in between moved nothing.
                 const prevAt = prev.fullAt || prev.at;
-                if (!sweep && !prev.sweep && prevAt && at - prevAt <= SELL_MOVES_GAP_MS && !suspect) noteMovement(id, unitsMoved(prev.rows, rows, (listings || []).length >= 100), at - prevAt, at);
+                if (!sweep && !prev.sweep && !prev.server && prevAt && at - prevAt <= SELL_MOVES_GAP_MS && !suspect) noteMovement(id, unitsMoved(prev.rows, rows, (listings || []).length >= 100), at - prevAt, at);
                 sell.bazaars.set(id, { at, fullAt: at, triedAt: at, rows, error: null, loading: false, sweep });
                 sell.bazaarsDirty = true;
             })
@@ -40813,6 +41007,8 @@
         // Shared: a bazaar the server read from Torn after TornW3B last checked it shows Torn's own price and count.
         const sharedReads = sharedLink ? sharedLink.reads() : null;
         const rowsNow = (b, key) => (sharedReads ? withShared(b.rows, key, sharedReads.index, sharedReads.joined) : b.rows);
+        // 3.26.2: an item this PC has no sellers list of has the server's listings as its sellers.
+        if (sharedReads) serverBazaars(sharedReads.index, now);
         // ...and kept between redraws (3.25.0) while its read, your marks on it and the server's reads are what they were.
         const keepers = sellWorkKeepers();
         keepers.sellers.begin();
@@ -41085,6 +41281,10 @@
                 if (bid > 0) worth[id] = bid;
             }
             for (const id of sell.bazaars.keys()) if (!(id in worth)) worth[id] = bestBidOf(id) || 1;
+            // 3.26.2 - many more items than the server was last told of (a page just opened, its bids just worked
+            // out): told at the next tick, not when the kept answer runs out, so the server's bazaars come in seconds.
+            const told = sell.sharedWant ? Object.keys(sell.sharedWant.worth || {}).length : 0;
+            if (Object.keys(worth).length > told * 2) sell.sharedWantAt = 0;
             sell.sharedWorth = worth;
         }
         const sweepChecked = withBid.filter((id) => now - readAt(id) < W3B_SWEEP_MS).length;
@@ -42902,6 +43102,7 @@
             loadState: () => teState(),
             saveState: (state) => setTeState(state),
             onSent: (x) => recordUse('e', 'sell', x.path, x.tag),
+            onAnswered: (x) => recordUse('e', 'sell', x.path, 'r.e.' + x.how),
             onFailed: (x) => logFailed('e', x),
         });
         // TornExchange and TornW3B keep going in the background (3.14, the

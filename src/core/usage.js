@@ -59,6 +59,10 @@ export const USAGE_LABELS = {
     // no service's, so no chart, total or limit counts them.
     'r.w.ok': { name: 'Answered', service: 'w' },
     'r.w.429': { name: 'Refused (429 or a blocked page)', service: 'w' },
+    // ...and how TornExchange did (3.26.2): slow = no answer in the time waited for.
+    'r.e.ok': { name: 'Answered', service: 'e' },
+    'r.e.slow': { name: 'No answer in time', service: 'e' },
+    'r.e.fail': { name: 'Failed or refused', service: 'e' },
     // The shared server (3.25.0): its own address and its own limits, so it is in no chart here - only in the export.
     'r.s.ok': { name: 'Answered', serviceName: 'Shared server' },
     'r.s.fail': { name: 'Failed or refused', serviceName: 'Shared server' },
@@ -114,6 +118,67 @@ export function usageMerge(stored, pending, now = Date.now()) {
     const nowHour = Math.floor(now / 3600000);
     for (const hour of Object.keys(out.h)) if (nowHour - Number(hour) >= USAGE_HOURS_KEPT) delete out.h[hour];
     return out;
+}
+
+/*
+ * This PC's counts for the shared server (3.26.2; the owner, 2026-10-11: "track in the server all tornw3b
+ * and torn exchange calls in every laptop so we can optimise it that way"). With each exchange the PC says
+ * how many requests it made of TornW3B, TornExchange and Torn since the last one the server answered, by
+ * what for - the tags above, and how they were answered. Counts only: no item, no player, no price, no key.
+ * Every tab adds its counts to one stored sum; the tab that talks to the server sends it, and takes off
+ * what was sent once the server has answered. What could not be sent for an hour is let go, so an old
+ * sum never lands on the wrong hour of the server's record.
+ */
+export const USAGE_CALLS_TAGS_MAX = 60;
+export const USAGE_CALLS_COUNT_MAX = 5000;
+export const USAGE_CALLS_KEEP_MS = 60 * 60000;
+/** A service's own tag (w, e, t) or how one answered (r.w.429): the only names the server takes. */
+export const USAGE_CALLS_TAG = /^(?:[wet]\.[a-z0-9]{1,12}|r\.[wet]\.[a-z0-9]{1,12})$/;
+
+function usageCallsKept(stored, now) {
+    const s = stored && typeof stored === 'object' && !Array.isArray(stored) ? stored : {};
+    const since = Number.isFinite(s.since) && s.since > 0 && s.since <= now ? s.since : null;
+    const n = {};
+    if (since !== null && now - since <= USAGE_CALLS_KEEP_MS && s.n && typeof s.n === 'object') {
+        for (const [tag, count] of Object.entries(s.n)) {
+            if (USAGE_CALLS_TAG.test(tag) && Number.isFinite(count) && count >= 1) n[tag] = Math.floor(count);
+        }
+    }
+    return { since: Object.keys(n).length ? since : null, n };
+}
+
+/** The sum waiting to be sent, with a tab's pending counts (usageAdd's, by minute) added: {since, n: {tag: count}}. */
+export function usageCallsAdd(stored, pending, now = Date.now()) {
+    const kept = usageCallsKept(stored, now);
+    for (const counts of Object.values(pending || {})) {
+        for (const [tag, count] of Object.entries(counts || {})) {
+            if (!USAGE_CALLS_TAG.test(tag) || !(Number(count) >= 1)) continue;
+            kept.n[tag] = (kept.n[tag] || 0) + Math.floor(Number(count));
+        }
+    }
+    if (kept.since === null && Object.keys(kept.n).length) kept.since = now;
+    return kept;
+}
+
+/** What goes with this exchange: {tag: count}, 60 tags at most (the biggest first), none over 5,000. {} = nothing was asked. */
+export function usageCallsOut(stored, now = Date.now()) {
+    const out = {};
+    const all = Object.entries(usageCallsKept(stored, now).n).sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1));
+    for (const [tag, count] of all.slice(0, USAGE_CALLS_TAGS_MAX)) out[tag] = Math.min(USAGE_CALLS_COUNT_MAX, count);
+    return out;
+}
+
+/** The server answered: what was sent comes off the sum; what the tabs added meanwhile, and what did not fit, stays. */
+export function usageCallsSent(stored, sent, now = Date.now()) {
+    const kept = usageCallsKept(stored, now);
+    for (const [tag, count] of Object.entries(sent || {})) {
+        if (!(tag in kept.n)) continue;
+        const left = kept.n[tag] - (Number(count) > 0 ? Math.floor(Number(count)) : 0);
+        if (left >= 1) kept.n[tag] = left;
+        else delete kept.n[tag];
+    }
+    // What is left was counted while the answer was awaited, or did not fit: it is young again.
+    return { since: Object.keys(kept.n).length ? now : null, n: kept.n };
 }
 
 /** The ranges the chart offers: how far back, and how wide each bar is. */

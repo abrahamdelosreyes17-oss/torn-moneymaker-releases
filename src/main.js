@@ -21,8 +21,8 @@ import {
     gmSize,
     gmPost,
 } from './platform/gm.js';
-import { SharedLink, SHARED_CONFIG_KEY, SHARED_STATE_KEY, SHARED_GRANT_KEY, SHARED_TICK_MS, SHARED_UNKNOWN_MS, SHARED_W3B_ASK_KEY, SHARED_LISTS_OUT_KEY, SHARED_LISTS_IN_KEY } from './feed/shared-link.js';
-import { sharedMayCall, withShared, sharedHome, sharedWord, sharedSaid, sharedSaidLine, sharedGoingOwn, sharedGoingByItem, sharedOnThis, sharedGoingFor, sharedBoughtLine, sharedPanelLine, sharedDirDue, sharedDealRows, sharedKnowsLowest, sharedMayRead, sharedAskLeft, sharedList, SHARED_MAX_WANT, SHARED_MAX_LISTS, SHARED_MAX_LIST_ITEMS } from './core/shared.js';
+import { SharedLink, SHARED_CONFIG_KEY, SHARED_STATE_KEY, SHARED_GRANT_KEY, SHARED_TICK_MS, SHARED_UNKNOWN_MS, SHARED_W3B_ASK_KEY, SHARED_LISTS_OUT_KEY, SHARED_LISTS_IN_KEY, SHARED_CALLS_KEY } from './feed/shared-link.js';
+import { sharedMayCall, withShared, sharedHome, sharedWord, sharedSaid, sharedSaidLine, sharedGoingOwn, sharedGoingByItem, sharedOnThis, sharedGoingFor, sharedBoughtLine, sharedPanelLine, sharedDirDue, sharedDealRows, sharedKnowsLowest, sharedMayRead, sharedAskLeft, sharedList, sharedItemsSeen, SHARED_MAX_WANT, SHARED_MAX_LISTS, SHARED_MAX_LIST_ITEMS } from './core/shared.js';
 import { perfStart, perfNow, perfDone, perfTimed, perfForeign, perfStartup, perfRecord, perfMachine, SPEED_STORE_KEY } from './platform/perf.js';
 import { speedFiles } from './core/speed.js';
 import { tradesFiles, keepEndedTrades } from './core/trades-export.js';
@@ -67,7 +67,7 @@ import { holdTrade, holdKey, resolveEstimated, priceHeld, livePins, editHeld, ke
 import { priceChecked, applyListToItemBuyers, buyersEveryMs, FLIP_RECHECK_MS } from './core/checked.js';
 import { deskItem, steadyTrader, nextW3bRead, backgroundSlot, backgroundListSlot, flipsStale, W3B_HIDDEN_PER_MIN, HIDDEN_RENDER_MS, declineKey, declinedOn, freshnessMs, FRESH_TOP, dayPaceRoom } from './core/desk.js';
 import { liquidityKind, unitsMoved, addMovement, stopsMinutes, EXTRA_CAP } from './core/liquidity.js';
-import { usageAdd, usageMerge, usageSeries, USAGE_SERVICES, USAGE_RANGES, USAGE_LABELS } from './core/usage.js';
+import { usageAdd, usageMerge, usageSeries, usageCallsAdd, USAGE_SERVICES, USAGE_RANGES, USAGE_LABELS } from './core/usage.js';
 import { makeSteadySleep } from './core/steady-sleep.js';
 import { addLogEntries, logText, lateButHeld, goneLine } from './core/errlog.js';
 import { checkoutList, boughtSince, stockBuys, addExtraBuy, applyLogBuys, bazaarBuyRows, addLogBuys, splitLogBuys, sellElsewhere, LOG_BUY_SLACK_MS, acceptTrade, liveAccepted, stepState, tickAccepted, stepDone, nextStep, boughtFromStock, boughtOverStock, recordBuy, sendUnits, acceptedTotals, replacementFor, replaceStep, dropLine, markLeft, leftoversOf, cancelledLeftovers, addLeftovers, sendList, fillNote, finishedTradeFor, tradedLeftovers, removeLeftovers, itemsGiven, tradePartnerId, tradeFinishedAt, TRADE_DONE_SLACK_MS, leftoversAfterSales, leftoverFrom, placeBuy, tradeCount, overLeftovers, toSellLessTradeBuys, logBuyPlace, TRADE_MAX_UNITS } from './core/accepted.js';
@@ -5752,6 +5752,9 @@ function usageShared() {
         // this PC of those it wanted; trader lists sent up and come down.
         unknown: Boolean(s.unknown), askedAgainAfterMinutes: s.unknownWaitMs ? Math.round(s.unknownWaitMs / 60000) : null,
         sellersListsHanded: s.w3bAsk || null, listsUp: s.listsOut ?? null, listsDown: s.listsIn ?? null,
+        // 3.26.2: this PC's own request counts told to the server (how many, in how many exchanges), and how
+        // many items have the server's listings as their sellers until this PC's own sellers list is read.
+        callsTold: s.callsOut ?? null, callsExchanges: s.callsSyncs ?? null, sellersFromServer: sell.serverBazaarsNow ?? null,
     };
 }
 
@@ -5768,6 +5771,9 @@ function flushUsage() {
     const pending = usagePending;
     usagePending = {};
     gmSet(STORE_API_USAGE, usageMerge(gmGet(STORE_API_USAGE, null), pending));
+    // 3.26.2 - with Shared on, the same counts wait in one sum for the tab that talks to the server (how many
+    // requests of each kind, and how they were answered; nothing else).
+    if (sharedLink && sharedLink.config()) gmSet(SHARED_CALLS_KEY, usageCallsAdd(gmGet(SHARED_CALLS_KEY, null), pending));
 }
 if (typeof window !== 'undefined') window.addEventListener('pagehide', flushUsage);
 
@@ -5928,7 +5934,7 @@ function sharedWantSell() {
     const bought = boughtNow.map((b) => [Number(b.sellerId), Number(b.itemId), b.qty, b.each, b.t]);
     // Which TornW3B lists this PC read in the last two minutes (item numbers and times): the others then leave those to it.
     const dir = [];
-    for (const [id, b] of sell.bazaars) if (b && b.at && !b.kept && !b.error && !b.loading && now - b.at < SHARED_DIR_TELL_MS) dir.push([Number(id), b.at]);
+    for (const [id, b] of sell.bazaars) if (b && b.at && !b.kept && !b.server && !b.error && !b.loading && now - b.at < SHARED_DIR_TELL_MS) dir.push([Number(id), b.at]);
     // 3.26.0 - TornW3B's work, handed out by the server: the sellers lists this PC would ask for in the next
     // half minute that are not its own alone (the possible flips, the near ones, the sweep - in that order),
     // and what is left of its limit. The desk's item and a trade's are never asked about: they are read anyway.
@@ -5947,7 +5953,7 @@ function sharedWantSell() {
             if (mine.has(id) || want.includes(Number(id))) continue;
             if (how === 'sweep' ? lightOn : lightAny && lightStandsIn(id, how, now)) continue;
             const b = sell.bazaars.get(id);
-            if (b && (b.loading || (!b.kept && !b.error && !(b.lightMiss > b.at) && soon - b.at < every(id)))) continue;
+            if (b && (b.loading || (!b.kept && !b.server && !b.error && !(b.lightMiss > b.at) && soon - b.at < every(id)))) continue;
             want.push(Number(id));
         }
     };
@@ -5990,7 +5996,7 @@ async function sharedSetUp(o) {
     else gmDel(SHARED_CONFIG_KEY);
     sharedLink.onStored(SHARED_CONFIG_KEY);
     sell.sharedWantAt = 0;
-    logProblem('note', next ? 'Shared: this PC asks the shared server with the word of its Public key' : 'Shared: off (' + (getStoredKey() ? 'no server address in this copy' : 'no Public key') + ')', '');
+    logProblem('note', next ? 'Shared: this PC asks the shared server with the word of its Public key' : 'Shared: off (' + (getStoredKey() ? 'no server address in this copy' : 'no Public key') + ')', next ? 'with each exchange it also says how many requests this PC made of TornW3B, TornExchange and Torn, by what for (counts only: no item, no player, no price)' : '');
     if (next) sharedLink.tick().catch(() => {});
 }
 
@@ -7594,7 +7600,9 @@ function bazaarsDue(itemId, every, now, background = false, how = '') {
     if (b.loading) return false;
     if (b.error) return now - b.triedAt >= W3B_FAILED_RETRY_MS;
     // Brought back from the last visit (3.19.0): read again in its turn, as on a page just opened.
-    if (b.kept) return true;
+    // 3.26.2 - the server's listings stand in for a sellers list (serverBazaars): this PC's own is still read in
+    // its turn. Not for the sweep, which wants the cheapest price only and has it from the server.
+    if (b.server ? how !== 'sweep' : b.kept) return true;
     // 3.26.0: the light list said something the sellers list read before it does not - the sellers are read at
     // once. Not for the sweep, which wants the cheapest price only and has it from the light list.
     if (how !== 'sweep' && b.lightMiss > b.at) return true;
@@ -7664,7 +7672,7 @@ function lightSummaryMoved(b, itemId) {
 
 /** A sellers list of this item read in full (not kept from the last visit, not a sweep's cut), no older than `within`, and nothing the light list said against it since. */
 function lightHasFull(b, now, within) {
-    return Boolean(b && b.at && !b.kept && !b.error && !b.sweep && !(b.lightMiss > b.at) && now - (b.fullAt || b.at) < within);
+    return Boolean(b && b.at && !b.kept && !b.server && !b.error && !b.sweep && !(b.lightMiss > b.at) && now - (b.fullAt || b.at) < within);
 }
 
 /**
@@ -7685,6 +7693,8 @@ function lightStandsIn(itemId, how, now) {
     if (how === 'own') return lightHasFull(b, now, W3B_LIGHT_OWN_MS);
     if (how !== 'slow') return false;
     if (lightHasFull(b, now, W3B_LIGHT_FULL_MS)) return true;
+    // Priced already, by the server's own reads of Torn (3.26.2): no light list is spent on it.
+    if (b && b.server && now - b.at < W3B_CANDIDATE_MS * 2) return false;
     if (!(b && b.lightAt)) return true;
     // Read already: again when it is old, or sooner when the summary (one request for every item) shows the
     // item's cheapest price moved - a light list that would say the same thing is not asked for.
@@ -7725,7 +7735,7 @@ function loadCheapest(itemId, tag) {
             // A read kept from the last visit is compared as well: the same, and it stands as of now; not, and its sellers are read.
             // 3.26.1: only a sellers list of the last half hour is confirmed this way - an older one is not made new by
             // prices that happen to match; the light list then only says what the item costs now (lightRows).
-            const full = prev.at > 0 && at - (prev.fullAt || prev.at) < W3B_LIGHT_FULL_MS;
+            const full = !prev.server && prev.at > 0 && at - (prev.fullAt || prev.at) < W3B_LIGHT_FULL_MS;
             // What the summary showed as the item's cheapest price at this read (lightSummaryMoved).
             const sawRow = sell.summary ? sell.summary.get(id) : null;
             const lightSaw = sawRow && sawRow.lowestPrice > 0 ? sawRow.lowestPrice : null;
@@ -7895,7 +7905,7 @@ function nextW3bJob(now, hidden = false) {
     // room in the sellers lists' minute.
     const candOrder = lightOn ? [...candIds.filter((id) => lightWantsFull(id, now)), ...candIds.filter((id) => !lightWantsFull(id, now))] : candIds;
     // While possible flips have no price of their own yet, two reads of three are theirs (a light list each).
-    const unpriced = lightHas.any && candIds.some((id) => { const b = sell.bazaars.get(String(id)); return !b || (!b.loading && !(b.at > 0 && !b.kept) && !(b.lightAt > 0)); });
+    const unpriced = lightHas.any && candIds.some((id) => { const b = sell.bazaars.get(String(id)); return !b || (!b.loading && !(b.at > 0 && (!b.kept || b.server)) && !(b.lightAt > 0)); });
     sell.w3bTurn3 = ((sell.w3bTurn3 || 0) + 1) % 3;
     const read = nextW3bRead({
         summaryDue: now - sell.summaryAt >= W3B_SUMMARY_MS && now - sell.summaryTriedAt >= W3B_FAILED_RETRY_MS,
@@ -8202,6 +8212,43 @@ function loadBazaarSummary() {
 }
 
 /** Every bazaar listing of one item. */
+/*
+ * 3.26.2 (the owner, 2026-10-11: "friend opens tornbids, we already have data from server right? it takes
+ * forever to find deals even if we have the server" - he had 33 flips, his friend 3 on opening).
+ *
+ * The server's reads of Torn were used only to correct a sellers list this PC had read from TornW3B itself
+ * (rowsNow in the redraw). So a page just opened showed no flip of an item until its own sellers list had
+ * come round - a few a minute - though the server already held those very bazaars' prices, read from Torn
+ * seconds ago and sent with the first exchange.
+ *
+ * Now an item this PC has no sellers list of (none, or one kept from the last visit) has the server's
+ * listings as its sellers: real listings, by Torn's own answer, with the seller's id. Such a record is like
+ * one kept from the last visit: this PC's own sellers list is still read in its turn (TornW3B may know a
+ * seller the server does not), it is never told to the server as a TornW3B read, and it is not kept for the
+ * next visit. Worked out when the server's reads changed, and every half minute.
+ */
+const SERVER_BAZAARS_EVERY_MS = 30000;
+function serverBazaars(index, now) {
+    if (sell.serverIndex === index && now - (sell.serverIndexAt || 0) < SERVER_BAZAARS_EVERY_MS) return;
+    sell.serverIndex = index;
+    sell.serverIndexAt = now;
+    let standing = 0;
+    for (const [id, seen] of sharedItemsSeen(index, now, FLIP_FRESH_MS)) {
+        const b = sell.bazaars.get(id);
+        if (b && b.loading) continue;
+        // Read by this PC on this visit: its own list stands, corrected by the server's reads as before.
+        if (b && b.at > 0 && !b.kept && !b.server) continue;
+        standing += 1;
+        if (b && b.server && b.at >= seen) continue;
+        sell.bazaars.set(id, { ...(b || { rows: [], error: null, triedAt: 0 }), at: Math.max(seen, (b && b.at) || 0), kept: b ? Boolean(b.kept) || !b.server : true, server: true, loading: false });
+    }
+    if (standing && !sell.serverBazaarsNoted) {
+        sell.serverBazaarsNoted = true;
+        logProblem('note', 'Shared: ' + standing + ' items have their sellers from the server\'s own reads of Torn', 'until this PC\'s own TornW3B sellers list of each comes round; a flip on them is on Torn\'s own prices, read minutes ago at most');
+    }
+    sell.serverBazaarsNow = standing;
+}
+
 function loadBazaars(itemId, tag = 'w.desk') {
     const id = String(itemId);
     const prev = sell.bazaars.get(id) || { at: 0, rows: [], error: null };
@@ -8217,7 +8264,7 @@ function loadBazaars(itemId, tag = 'w.desk') {
             const suspect = rows.length === 0 && (prev.rows || []).length > 0;
             // Since the sellers were last read (fullAt): a light list that confirmed them in between moved nothing.
             const prevAt = prev.fullAt || prev.at;
-            if (!sweep && !prev.sweep && prevAt && at - prevAt <= SELL_MOVES_GAP_MS && !suspect) noteMovement(id, unitsMoved(prev.rows, rows, (listings || []).length >= 100), at - prevAt, at);
+            if (!sweep && !prev.sweep && !prev.server && prevAt && at - prevAt <= SELL_MOVES_GAP_MS && !suspect) noteMovement(id, unitsMoved(prev.rows, rows, (listings || []).length >= 100), at - prevAt, at);
             sell.bazaars.set(id, { at, fullAt: at, triedAt: at, rows, error: null, loading: false, sweep });
             sell.bazaarsDirty = true;
         })
@@ -8794,6 +8841,8 @@ function renderSellingWork(src = null) {
     // Shared: a bazaar the server read from Torn after TornW3B last checked it shows Torn's own price and count.
     const sharedReads = sharedLink ? sharedLink.reads() : null;
     const rowsNow = (b, key) => (sharedReads ? withShared(b.rows, key, sharedReads.index, sharedReads.joined) : b.rows);
+    // 3.26.2: an item this PC has no sellers list of has the server's listings as its sellers.
+    if (sharedReads) serverBazaars(sharedReads.index, now);
     // ...and kept between redraws (3.25.0) while its read, your marks on it and the server's reads are what they were.
     const keepers = sellWorkKeepers();
     keepers.sellers.begin();
@@ -9066,6 +9115,10 @@ function renderSellingWork(src = null) {
             if (bid > 0) worth[id] = bid;
         }
         for (const id of sell.bazaars.keys()) if (!(id in worth)) worth[id] = bestBidOf(id) || 1;
+        // 3.26.2 - many more items than the server was last told of (a page just opened, its bids just worked
+        // out): told at the next tick, not when the kept answer runs out, so the server's bazaars come in seconds.
+        const told = sell.sharedWant ? Object.keys(sell.sharedWant.worth || {}).length : 0;
+        if (Object.keys(worth).length > told * 2) sell.sharedWantAt = 0;
         sell.sharedWorth = worth;
     }
     const sweepChecked = withBid.filter((id) => now - readAt(id) < W3B_SWEEP_MS).length;
@@ -10883,6 +10936,7 @@ function bootSellingPage() {
         loadState: () => teState(),
         saveState: (state) => setTeState(state),
         onSent: (x) => recordUse('e', 'sell', x.path, x.tag),
+        onAnswered: (x) => recordUse('e', 'sell', x.path, 'r.e.' + x.how),
         onFailed: (x) => logFailed('e', x),
     });
     // TornExchange and TornW3B keep going in the background (3.14, the

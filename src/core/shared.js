@@ -10,6 +10,8 @@
  * Pure: no clock, no storage, no network. Times are milliseconds, passed in.
  */
 
+import { USAGE_CALLS_TAG, USAGE_CALLS_TAGS_MAX, USAGE_CALLS_COUNT_MAX } from './usage.js';
+
 export const SHARED_SYNC_MS = 30000;
 // The same split as server/src/budget.js (test/shared.test.js holds the two together):
 // of Torn's 100 calls a minute per person, 20 are never used by the server or this PC.
@@ -22,7 +24,7 @@ export const SHARED_BUCKETS = 16;
 const SHARED_MAX_SELLERS = 3000;
 const SHARED_MAX_NEAR = 200;
 const SHARED_MAX_WORTH = 5000;
-const SHARED_BODY_KEYS = ['app', 'ver', 'used', 'waiting', 'sellers', 'trades', 'looking', 'worth', 'since', 'seen', 'going', 'bought', 'dir', 'want', 'w3b', 'lists', 'listsSince'];
+const SHARED_BODY_KEYS = ['app', 'ver', 'used', 'waiting', 'sellers', 'trades', 'looking', 'worth', 'since', 'seen', 'going', 'bought', 'dir', 'want', 'w3b', 'lists', 'listsSince', 'calls'];
 /*
  * 3.26.0, the server handing out TornW3B's work (its /sync, deployed 2026-10-11):
  *   want        the items whose sellers list this PC would ask TornW3B for next, most wanted first (60 at most)
@@ -268,7 +270,7 @@ export function sharedMarks(wants, now) {
  * come out of here, whatever is put in.
  * `now`: this PC's clock; the marks leave as ages, since every PC has its own clock.
  */
-export function sharedBody({ used = 0, waiting = 0, wants = [], since = 0, seen = 0, sendWorth = true, now = 0, ver = null, lists = null, listsSince = null } = {}) {
+export function sharedBody({ used = 0, waiting = 0, wants = [], since = 0, seen = 0, sendWorth = true, now = 0, ver = null, lists = null, listsSince = null, calls = null } = {}) {
     const count = (n) => (Number.isFinite(n) && n > 0 ? Math.min(1000, Math.floor(n)) : 0);
     const list = Array.isArray(wants) ? wants.filter((w) => w && typeof w === 'object') : [];
     const trades = sharedIds(list.map((w) => w.trades), SHARED_MAX_NEAR);
@@ -299,6 +301,13 @@ export function sharedBody({ used = 0, waiting = 0, wants = [], since = 0, seen 
     const out = (Array.isArray(lists) ? lists : []).map(sharedList).filter(Boolean).slice(0, SHARED_MAX_LISTS);
     if (out.length) body.lists = out;
     if (Number.isInteger(listsSince) && listsSince >= 0) body.listsSince = listsSince;
+    // 3.26.2 - this PC's own request counts since the last answered exchange (core/usage.js): {} = none were made.
+    if (calls && typeof calls === 'object' && !Array.isArray(calls)) {
+        body.calls = {};
+        for (const [tag, n] of Object.entries(calls).slice(0, USAGE_CALLS_TAGS_MAX)) {
+            if (USAGE_CALLS_TAG.test(tag) && Number.isFinite(n) && n >= 1) body.calls[tag] = Math.min(USAGE_CALLS_COUNT_MAX, Math.floor(n));
+        }
+    }
     if (sendWorth) {
         const worth = {};
         let n = 0;
@@ -354,6 +363,12 @@ export function sharedOutgoingOk(body) {
                 if (!Array.isArray(l) || l.length !== 3 || !Number.isInteger(l[0]) || l[0] <= 0 || l[0] >= 1e10 || !whole(l[1]) || l[1] <= 0) return false;
                 if (!l[2] || typeof l[2] !== 'object' || Array.isArray(l[2]) || Object.keys(l[2]).length > SHARED_MAX_LIST_ITEMS) return false;
                 for (const [item, price] of Object.entries(l[2])) if (!/^\d{1,10}$/.test(item) || !Number.isInteger(price) || price <= 0) return false;
+            }
+        } else if (key === 'calls') {
+            // {tag: how many}: a service's tag or how one answered, a whole number from 1 to 5,000.
+            if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length > USAGE_CALLS_TAGS_MAX) return false;
+            for (const [tag, n] of Object.entries(value)) {
+                if (!USAGE_CALLS_TAG.test(tag) || !Number.isInteger(n) || n < 1 || n > USAGE_CALLS_COUNT_MAX) return false;
             }
         } else if (key === 'worth') {
             if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
@@ -489,6 +504,21 @@ export function sharedDealRows(index, itemId, under, now, maxAge = SHARED_DEAL_M
         out.push({ sellerId: l.sellerId, sellerName: null, price: l.price, qty: l.qty, dataAt: l.seen, changedAt: l.at, sponsored: false, shared: true });
     }
     return out.sort((a, b) => a.price - b.price);
+}
+
+/**
+ * The items the server holds listings of, read from Torn within `maxAge`: itemId -> when the newest of them
+ * was seen (3.26.2: an item this PC has no sellers list of has the server's listings as its sellers).
+ * @returns {Map<string, number>}
+ */
+export function sharedItemsSeen(index, now, maxAge) {
+    const out = new Map();
+    for (const [item, listings] of (index && index.byItem) || []) {
+        let seen = 0;
+        for (const l of listings) if (l.price > 1 && l.qty > 0 && l.seen <= now && now - l.seen <= maxAge && l.seen > seen) seen = l.seen;
+        if (seen) out.set(item, seen);
+    }
+    return out;
 }
 
 /**
