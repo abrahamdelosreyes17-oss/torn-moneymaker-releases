@@ -90,6 +90,34 @@ export function clearMarks(root = document) {
     }
 }
 
+/*
+ * Shared: a friend is going for this listing (3.25.0, mockup AA drawing 3). A purple ring in place of
+ * the green one, and their Torn name on the card's top edge. Same contract: one class, one data
+ * attribute, nothing appended - and it never blocks: Fill and Buy work as always.
+ */
+export const FRIEND_CLASS = 'ttv2-friend';
+export const FRIEND_DATA_KEY = 'ttv2Friend';
+export const FRIEND_DATA_ATTR = 'data-ttv2-friend';
+
+/**
+ * Mark these cards as a friend's, and unmark every other one.
+ * @param {Array<{el: Element, label: string}>} rows
+ */
+export function markFriendRows(rows, root = document) {
+    const keep = new Set();
+    for (const row of rows || []) {
+        if (!row || !row.el || !row.el.classList || !row.label) continue;
+        keep.add(row.el);
+        row.el.classList.add(FRIEND_CLASS);
+        if (row.el.dataset[FRIEND_DATA_KEY] !== row.label) row.el.dataset[FRIEND_DATA_KEY] = row.label;
+    }
+    for (const el of root.querySelectorAll('[' + FRIEND_DATA_ATTR + ']')) {
+        if (keep.has(el)) continue;
+        el.classList.remove(FRIEND_CLASS);
+        delete el.dataset[FRIEND_DATA_KEY];
+    }
+}
+
 /** Scroll a marked row into view - the panel's action for on-page hits. */
 export function revealRow(el) {
     if (!el || typeof el.scrollIntoView !== 'function') return;

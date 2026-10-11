@@ -567,3 +567,16 @@ test('category counts: most first, then by name; a picked category is never drop
     ]);
     assert.deepEqual(categoryCounts([], ''), []);
 });
+
+test('3.25.0: a stored item list of any age can still be read with - the right shape and version, never a fresh-only rule', async () => {
+    const { itemsCacheUsable } = await import('../src/core/items.js');
+    const entry = makeItemsCacheEntry({ 1: { name: 'Hammer', sell_price: 10, market_value: 400 } }, 1000);
+    // A week old: not fresh, still usable.
+    assert.equal(isItemsCacheFresh(entry, 1000 + 7 * 24 * 3600 * 1000), false);
+    assert.equal(itemsCacheUsable(entry), true);
+    assert.equal(itemsCacheUsable({ ...entry, version: 'old' }), false);
+    assert.equal(itemsCacheUsable({ ...entry, items: {} }), false);
+    assert.equal(itemsCacheUsable({ ...entry, items: null }), false);
+    assert.equal(itemsCacheUsable(null), false);
+    assert.equal(itemsCacheUsable('junk'), false);
+});

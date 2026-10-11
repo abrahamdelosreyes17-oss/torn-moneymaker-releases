@@ -70,3 +70,43 @@ test('the trader is never asked for more than their networth share - for the who
     const free = planTrade({ first: '206', flips: FLIPS, held });
     assert.equal(free.payCapped, false);
 });
+
+test('3.25.0, every flip with one trader (the owner: "1 trader that just buys everything"): all of it in one trade - inside your cash, their pay and the 10,000', () => {
+    // As the app plans: every item's kind is known. These are slow sellers, the worst case for the usual plan.
+    const kindOf = () => 'slow';
+    // Twelve items the trader buys, each sold under their price by two bazaars.
+    const flips = Array.from({ length: 12 }, (_, i) => ({ itemId: String(100 + i), bid: 1000 + i, sellers: [s(900, 40, false, 'A' + i), s(950, 40, false, 'B' + i)] }));
+    const usual = planTrade({ first: '100', flips, maxPerItem: 100, kindOf });
+    assert.ok(usual.flips.length < 12, 'the usual plan is a main flip and a few extras: ' + usual.flips.length);
+    const every = planTrade({ first: '100', flips, maxPerItem: 100, kindOf, everything: true });
+    assert.equal(every.flips.length, 12, 'every item they buy that a bazaar sells for less');
+    assert.deepEqual(every.flips.map((r) => r.units), Array(12).fill(80), 'each from every bazaar under their price, up to Most per flip');
+    assert.equal(every.flips[0].itemId, '100', 'the item on the desk leads');
+    assert.equal(every.flips.every((r) => r.kind === 'slow'), true, 'a line keeps its kind');
+    assert.equal(every.items, 12);
+    assert.equal(every.stops, 24);
+    // Most per flip still holds, per item.
+    assert.deepEqual(planTrade({ flips, maxPerItem: 50, kindOf, everything: true }).flips.map((r) => r.units), Array(12).fill(50));
+    // Your cash: never more, all items together.
+    const poor = planTrade({ flips, maxPerItem: 100, cash: 90_000, kindOf, everything: true });
+    assert.ok(poor.cost <= 90_000 && poor.cost > 80_000, 'cash ' + poor.cost);
+    // With cash for one bazaar's worth, it goes to the item on the desk - not to the best return (item 111 here).
+    const tight = planTrade({ first: '100', flips, maxPerItem: 100, cash: 36_000, kindOf, everything: true });
+    assert.deepEqual(tight.flips.map((r) => [r.itemId, r.units]), [['100', 40]]);
+    // What the trader can pay: never asked for more.
+    const capped = planTrade({ flips, maxPerItem: 100, payCap: 200_000, kindOf, everything: true });
+    assert.ok(capped.pays <= 200_000 && capped.payCapped, 'pays ' + capped.pays);
+    // The 10,000 items one trade takes.
+    const big = Array.from({ length: 12 }, (_, i) => ({ itemId: String(100 + i), bid: 1000, sellers: [s(900, 5000, false, 'A' + i)] }));
+    const full = planTrade({ flips: big, maxPerItem: 10_000, kindOf, everything: true });
+    assert.equal(full.units, 10_000);
+    assert.equal(full.unitsCapped, true);
+    // Never their own bazaar; never a listing under the least profit; an item you unticked stays out.
+    const own = planTrade({ flips, maxPerItem: 100, traderId: 'A3', kindOf, everything: true });
+    assert.deepEqual(own.flips.find((r) => r.itemId === '103').steps.map((st) => st.sellerId), ['B3']);
+    const thin = planTrade({ flips, maxPerItem: 100, minPct: 8, kindOf, everything: true });
+    assert.equal(thin.flips.every((r) => r.steps.every((st) => st.price === 900)), true, 'the $950 listings make under 8%');
+    const off = planTrade({ flips, maxPerItem: 100, edits: { 105: { off: true } }, kindOf, everything: true });
+    assert.equal(off.flips.some((r) => r.itemId === '105'), false);
+    assert.deepEqual(off.off.map((r) => r.itemId), ['105']);
+});

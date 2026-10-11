@@ -7,7 +7,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { toSellRows, toSellBoard, toSellHeld, heldGain, afterYoursSent, toSellWhy, TO_SELL_WHY, bazaarAbove, whereAbovePaid } from '../src/core/to-sell.js';
+import { toSellRows, toSellBoard, toSellHeld, heldGain, afterYoursSent, toSellWhy, TO_SELL_WHY, bazaarAbove, whereAbovePaid, whereRowView } from '../src/core/to-sell.js';
 import { whereToSell } from '../src/core/flips.js';
 import { planTrade } from '../src/core/trade.js';
 import { acceptTrade, acceptedTotals, markLeft, leftoversOf, cancelledLeftovers, addLeftovers, recordBuy } from '../src/core/accepted.js';
@@ -181,4 +181,19 @@ test('To sell never suggests a loss (3.22.0): no trader under what you paid, you
     // Not a To sell item (nothing paid is known): the same object back.
     assert.equal(whereAbovePaid(base, 0), base);
     assert.equal(whereAbovePaid(null, 53000), null);
+});
+
+test('where to sell: a row\'s words and its figure are for the same units - a loss never shows a plus', () => {
+    // The bazaar is $53,000 a piece for the first 10: what you paid. The trader's $55,000 for the other 40 is not its plus.
+    const w = whereAbovePaid(whereToSell({ held: 50, bid: 55000, bazaarLowest: 53001, bazaarDepth: 10 }), 53000);
+    const bazaar = w.options.find((o) => o.venue === 'bazaar');
+    assert.equal(bazaar.total - 53000 * 50, 80000);
+    assert.deepEqual(whereRowView(bazaar, 50, 53000), { known: true, units: 10, total: 530000, gain: 0, loss: true, part: true });
+    // Over what you paid: the first 10 there, the rest to the trader, as worked out.
+    assert.deepEqual(whereRowView({ venue: 'bazaar', each: 60000, units: 10, total: 60000 * 10 + 55000 * 40 }, 50, 53000), { known: true, units: 10, total: 2800000, gain: 150000, loss: false, part: true });
+    // A loss on all of them is the whole loss.
+    assert.deepEqual(whereRowView({ venue: 'trader', each: 52400, units: 50, total: 52400 * 50 }, 50, 53000), { known: true, units: 50, total: 2620000, gain: -30000, loss: true, part: false });
+    // Not known: no figure; what you paid not known: no plus or loss.
+    assert.equal(whereRowView({ venue: 'market', each: null, units: 0, total: null }, 50, 53000).known, false);
+    assert.equal(whereRowView({ venue: 'trader', each: 100, units: 5, total: 500 }, 5, 0).gain, null);
 });

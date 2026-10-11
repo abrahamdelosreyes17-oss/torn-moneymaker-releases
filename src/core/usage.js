@@ -54,6 +54,14 @@ export const USAGE_LABELS = {
     'e.trader': { name: "A trader's whole list" },
     'e.one': { name: 'Best buyer (no key)' },
     'e.other': { name: 'Other' },
+    // Not requests: how TornW3B answered them (3.25.0, the zip of 2026-10-06: "sent" could not
+    // say whether a minute's dozen were taken or refused). In the export only - their letter is
+    // no service's, so no chart, total or limit counts them.
+    'r.w.ok': { name: 'Answered', service: 'w' },
+    'r.w.429': { name: 'Refused (429 or a blocked page)', service: 'w' },
+    // The shared server (3.25.0): its own address and its own limits, so it is in no chart here - only in the export.
+    'r.s.ok': { name: 'Answered', serviceName: 'Shared server' },
+    'r.s.fail': { name: 'Failed or refused', serviceName: 'Shared server' },
 };
 
 /** A tag that is not in the list is counted as its service's Other. */
@@ -179,8 +187,8 @@ export function usageCsv(stored, { by = 'minute' } = {}) {
     for (const at of [...bucket.keys()].sort((a, b) => a - b)) {
         for (const [label, n] of Object.entries(bucket.get(at)).sort()) {
             if (!(n > 0)) continue;
-            const svc = USAGE_SERVICES[label.charAt(0)];
-            rows.push([local(at), svc ? svc.name : '?', (USAGE_LABELS[label] || { name: label }).name, label, n]);
+            const svc = USAGE_SERVICES[(USAGE_LABELS[label] || {}).service || label.charAt(0)];
+            rows.push([local(at), svc ? svc.name : (USAGE_LABELS[label] || {}).serviceName || '?', (USAGE_LABELS[label] || { name: label }).name, label, n]);
         }
     }
     return rows.map((r) => r.map((c) => (/[",\n]/.test(String(c)) ? '"' + String(c).replace(/"/g, '""') + '"' : String(c))).join(',')).join('\n') + '\n';

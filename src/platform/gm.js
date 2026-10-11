@@ -154,6 +154,47 @@ export function gmFetch(url, { timeoutMs = 30000 } = {}) {
     });
 }
 
+/**
+ * A POST of JSON to the shared server (Settings > Shared). The only request in
+ * the script that sends a body; what may be in it is checked by its one caller
+ * (src/feed/shared-link.js). It requires `@connect workers.dev` in the header.
+ *
+ * @param {string} url
+ * @param {{headers?: object, body: string, timeoutMs?: number}} options
+ * @returns {Promise<{ok: boolean, status: number, json: function}>}
+ */
+export function gmPost(url, { headers = {}, body, timeoutMs = 20000 }) {
+    if (typeof GM_xmlhttpRequest !== 'function') {
+        if (typeof fetch === 'function') return fetch(url, { method: 'POST', headers, body });
+        return Promise.reject(new Error('No HTTP transport available.'));
+    }
+
+    return new Promise((resolve, reject) => {
+        GM_xmlhttpRequest({
+            method: 'POST',
+            url,
+            headers,
+            data: body,
+            timeout: timeoutMs,
+            // The password goes in a header of ours; no cookie of any site is sent along.
+            anonymous: true,
+            onload(response) {
+                resolve({
+                    ok: response.status >= 200 && response.status < 300,
+                    status: response.status,
+                    json: async () => JSON.parse(response.responseText),
+                });
+            },
+            onerror() {
+                reject(new Error('Network request failed.'));
+            },
+            ontimeout() {
+                reject(new Error('The shared server did not answer in time.'));
+            },
+        });
+    });
+}
+
 /** Open a URL in a new tab, if the host supports it; otherwise fall back. */
 export function gmOpenTab(url) {
     if (typeof GM_openInTab === 'function') {

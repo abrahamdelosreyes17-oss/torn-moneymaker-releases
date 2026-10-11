@@ -34,9 +34,40 @@ const REPO_RAW =
     'https://raw.githubusercontent.com/abrahamdelosreyes17-oss/' +
     'torn-moneymaker-releases/main/torn-moneymaker.user.js';
 
-const VERSION = JSON.parse(
-    await readFile(resolve(ROOT, 'package.json'), 'utf8'),
-).version;
+/*
+ * A test build (3.25.0: "we test with me using it ... only release on my command"):
+ *     node build.mjs --test 3.25.0
+ * writes dist/torn-trading.test.user.js and nothing else - not the released copy. Its version says
+ * what it is and when it was built (the log and the zip carry it), and it has no update address:
+ * Tampermonkey never swaps it for the released script, and nobody else's copy can turn into it.
+ */
+const TEST_AT = process.argv.indexOf('--test');
+const TEST_OF = TEST_AT > 0 ? process.argv[TEST_AT + 1] : null;
+if (TEST_AT > 0 && !/^[0-9]+[.][0-9]+[.][0-9]+$/.test(TEST_OF || '')) throw new Error('--test needs the version it is a test of: node build.mjs --test 3.25.0');
+const TEST_OUT = resolve(ROOT, 'dist/torn-trading.test.user.js');
+const stamp = (d) => [d.getFullYear(), d.getMonth() + 1, d.getDate()].map((n) => String(n).padStart(2, '0')).join('') + '.' + [d.getHours(), d.getMinutes()].map((n) => String(n).padStart(2, '0')).join('');
+
+const VERSION = TEST_OF
+    ? TEST_OF + '-test.' + stamp(new Date())
+    : JSON.parse(await readFile(resolve(ROOT, 'package.json'), 'utf8')).version;
+
+/*
+ * The shared server's address is built in (3.25.0), so nobody types it: the SHARED_URL line of the
+ * server's own .env on the laptop that builds (TORN_SERVER_ENV names another file). It is never
+ * printed here. No file or no such line: a copy without Shared, which works alone.
+ */
+const SHARED_ENV = process.env.TORN_SERVER_ENV || 'D:/torn/server/.env';
+let SHARED_HOME = '';
+try {
+    const line = /^SHARED_URL=(.*)$/m.exec(await readFile(SHARED_ENV, 'utf8'));
+    const url = line ? new URL(line[1].trim().replace(/^["']|["']$/g, '')) : null;
+    if (url && url.protocol === 'https:' && /^[a-z0-9-]+([.][a-z0-9-]+)*[.]workers[.]dev$/.test(url.hostname)) SHARED_HOME = url.origin;
+} catch {
+    // no server folder on this machine
+}
+const SHARED_HOST = SHARED_HOME ? new URL(SHARED_HOME).hostname : 'workers.dev';
+
+const UPDATE_LINES = TEST_OF ? '' : ['// @downloadURL  ' + REPO_RAW, '// @updateURL    ' + REPO_RAW, ''].join(String.fromCharCode(10));
 
 const HEADER = `// ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
@@ -58,9 +89,8 @@ const HEADER = `// ==UserScript==
 // @connect      api.torn.com
 // @connect      www.tornexchange.com
 // @connect      weav3r.dev
-// @downloadURL  ${REPO_RAW}
-// @updateURL    ${REPO_RAW}
-// @noframes
+// @connect      ${SHARED_HOST}
+${UPDATE_LINES}// @noframes
 // ==/UserScript==
 
 /*
@@ -77,6 +107,15 @@ const HEADER = `// ==UserScript==
  *   - The optional TornW3B bazaar feed (weav3r.dev) is opt-in, has its own
  *     client, and never receives the key.
  *   - The live feed runs in one visible tab only, and never raises alerts.
+ *   - Shared needs no setting up and serves only the people its owner added.
+ *     A copy with a Public key asks one server of ours (a workers.dev
+ *     address) a few times a day whether this PC is one of them, with a word
+ *     made from that key (a SHA-256 of it - not the key, which it cannot be
+ *     turned back into). Only a PC the server knows then sends it player
+ *     ids, item ids, prices and counts, and two marks for your friends: the
+ *     bazaar listings you are going for and those you just bought - and that
+ *     this is Torn Bids, with its version. Never a key, your name, your
+ *     inventory or your cash.
  */
 `;
 
@@ -253,7 +292,8 @@ async function main() {
         HEADER +
         '\n(function () {\n' +
         "    'use strict';\n\n" +
-        `    const TTV2_BUILD_VERSION = '${VERSION}';\n\n` +
+        `    const TTV2_BUILD_VERSION = '${VERSION}';\n` +
+        `    const TTV2_SHARED_HOME = '${SHARED_HOME}';\n\n` +
         indent(body) +
         '\n\n    boot();\n' +
         '})();\n';
@@ -277,6 +317,11 @@ async function main() {
     }
 
     await mkdir(dirname(OUT), { recursive: true });
+    if (TEST_OF) {
+        await writeFile(TEST_OUT, bundle, 'utf8');
+        console.log('Test build ' + VERSION + ': ' + relative(ROOT, TEST_OUT) + ' (no update address; the released copy is untouched).');
+        return;
+    }
     await writeFile(OUT, bundle, 'utf8');
     await writeFile(RELEASE_OUT, bundle, 'utf8');
 
@@ -284,6 +329,7 @@ async function main() {
     console.log(
         `Built ${relative(ROOT, OUT)} from ${ordered.length} modules (${kb} KB).`,
     );
+    console.log(SHARED_HOME ? 'Shared: the server address of this laptop is built in.' : 'Shared: no server address found (' + SHARED_ENV + '); this copy works alone.');
 }
 
 function indent(text) {

@@ -20,6 +20,19 @@ const KEY = 'abcdefgh12345678';
 const LIMITED = 'LIMITED123456789';
 const TEKEY = 'TEKEYabcdefgh123';
 _store[NS + 'apiKey'] = JSON.stringify(KEY);
+// &job=npc | bids (3.25.0): the panel's switch as stored - NPC Arbitrage or Torn Bids. Without it, never chosen.
+const JOB = (/[?&]job=(\w+)/.exec(location.search) || [])[1] || null;
+// A switch pressed in this tab outlives the reload it causes (the page reloads itself when the job changes).
+const JOB_KEPT = sessionStorage.getItem('harness.job.' + location.search);
+if (JOB_KEPT) _store[NS + 'job'] = JOB_KEPT;
+else if (JOB) _store[NS + 'job'] = JSON.stringify(JOB);
+// &shared=on | down | refused (3.25): the pretend shared server answers, is silent, or does not know this PC. on: it read XanSeller's bazaar after TornW3B did
+// (Xanax now 3 at $835,000), a bazaar TornW3B does not list (player 4444, 1 Xanax at $836,000), and found
+// OldNews's Hammers as TornW3B had them an hour ago.
+const SHARED = (/[?&]shared=(\w+)/.exec(location.search) || [])[1] || null;
+// Nobody types the address (it is built in): this page keeps a pretend one, and 'off' without &shared=.
+_store[NS + 'sharedHome'] = JSON.stringify(SHARED ? 'https://torn-bids-shared.example.workers.dev' : 'off');
+window.__sharedPosts = 0;
 // Defaults only: TornW3B must be on without the user ticking anything.
 // window.__ahead(minutes) (3.23.0): the clock jumps forward, as if the page had been left open that long.
 let _ahead = 0;
@@ -363,7 +376,7 @@ const SLOW = /[?&]slow=1/.test(location.search);
 const TESLOW = /[?&]teslow=1/.test(location.search);
 
 function GM_getValue(k, d) { return k in _store ? _store[k] : d; }
-function GM_setValue(k, v) { _store[k] = v; }
+function GM_setValue(k, v) { _store[k] = v; if (k === NS + 'job') sessionStorage.setItem('harness.job.' + location.search, v); }
 function GM_deleteValue(k) { delete _store[k]; }
 function GM_registerMenuCommand() {}
 function GM_addValueChangeListener() {}
@@ -958,6 +971,27 @@ function respond(url) {
         }
         return { total_listings: 0, listings: [] };
     }
+    if (u.hostname.endsWith('.workers.dev') && u.pathname === '/sync') {
+        window.__sharedPosts += 1;
+        if (SHARED === 'refused') return { __http: 404 };
+        if (SHARED !== 'on') throw new Error('The pretend shared server is down');
+        const now = Date.now();
+        return {
+            grant: { at: now, need: 23, serverShare: 57, serverTimes: [now - 40000, now - 20000, now - 3000] },
+            reads: window.__sharedPosts < 3 ? [] : [
+                { id: 888, at: now - 5000, items: [{ id: 206, price: 835000, qty: 3 }] },
+                { id: 4444, at: now - 60000, items: [{ id: 206, price: 836000, qty: 1 }] },
+                { id: 555, at: now - 3 * 3600000, items: [{ id: 1, price: 40, qty: 9 }] },
+            ],
+            seen: [[888, now - 5000], [4444, now - 4000], [555, now - 3000]],
+            now, seq: 7, state: 'reading', key: 'working', people: 3, on: [{ id: 2000002, name: 'xX-Vin-Xx' }], you: { id: 999, name: 'Me' }, born: 1,
+                marks: new URLSearchParams(location.search).get('marks') !== '0' ? {
+                    // &marks=hammer: a second friend, not named by Torn yet, on the Hammer in CheapSeller's bazaar.
+                    going: [{ who: 'xX-Vin-Xx', whoId: 2000002, item: 206, age: 185000, sellers: [888] }, ...(new URLSearchParams(location.search).get('marks') === 'hammer' ? [{ who: null, whoId: null, item: 1, age: 20000, sellers: [777] }] : [])],
+                    bought: [{ who: 'xX-Vin-Xx', whoId: 2000002, seller: 888, item: 206, qty: 1, price: 840000, age: 2000 }],
+                } : undefined,
+        };
+    }
     throw new Error('Unexpected host ' + u.hostname);
 }
 function GM_xmlhttpRequest(opts) {
@@ -974,6 +1008,13 @@ function GM_xmlhttpRequest(opts) {
         : TESLOW && /tornexchange\.com\/api\/(all_best_listings|listings)/.test(opts.url) ? 15000 : 5);
 }
 window.onerror = (m) => { document.getElementById('out').textContent = 'BOOT ERROR: ' + m; };
+</script>
+<script>
+// &scene=<name> (rig A, 2026-10-09): a scene's own stored data and answers, from test/scenes/<name>.js, run before the
+// script starts. Without it this page is as it always was.
+const _scene = new URLSearchParams(location.search).get('scene');
+if (_scene && !/^[\w-]+$/.test(_scene)) throw new Error('harness: &scene= must be the name of a file in test/scenes: ' + _scene);
+if (_scene) document.write('<script src="scenes/' + _scene + '.js?v=' + Date.now() + '"><' + '/script>');
 </script>
 <script>
 // Always the build just made, never a cached copy.

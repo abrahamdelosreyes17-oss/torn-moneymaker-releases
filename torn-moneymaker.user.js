@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      3.24.1
+// @version      3.25.0
 // @description  Finds Bazaar and Item Market listings below NPC / market value - on the page you are viewing, and live from the Torn API and TornW3B - ranked by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -18,6 +18,7 @@
 // @connect      api.torn.com
 // @connect      www.tornexchange.com
 // @connect      weav3r.dev
+// @connect      torn-bids-shared.pumping-iron-worker.workers.dev
 // @downloadURL  https://raw.githubusercontent.com/abrahamdelosreyes17-oss/torn-moneymaker-releases/main/torn-moneymaker.user.js
 // @updateURL    https://raw.githubusercontent.com/abrahamdelosreyes17-oss/torn-moneymaker-releases/main/torn-moneymaker.user.js
 // @noframes
@@ -37,12 +38,22 @@
  *   - The optional TornW3B bazaar feed (weav3r.dev) is opt-in, has its own
  *     client, and never receives the key.
  *   - The live feed runs in one visible tab only, and never raises alerts.
+ *   - Shared needs no setting up and serves only the people its owner added.
+ *     A copy with a Public key asks one server of ours (a workers.dev
+ *     address) a few times a day whether this PC is one of them, with a word
+ *     made from that key (a SHA-256 of it - not the key, which it cannot be
+ *     turned back into). Only a PC the server knows then sends it player
+ *     ids, item ids, prices and counts, and two marks for your friends: the
+ *     bazaar listings you are going for and those you just bought - and that
+ *     this is Torn Bids, with its version. Never a key, your name, your
+ *     inventory or your cash.
  */
 
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '3.24.1';
+    const TTV2_BUILD_VERSION = '3.25.0';
+    const TTV2_SHARED_HOME = 'https://torn-bids-shared.pumping-iron-worker.workers.dev';
 
     /* ===== src/platform/gm.js ===== */
     /*
@@ -201,6 +212,47 @@
         });
     }
 
+    /**
+     * A POST of JSON to the shared server (Settings > Shared). The only request in
+     * the script that sends a body; what may be in it is checked by its one caller
+     * (src/feed/shared-link.js). It requires `@connect workers.dev` in the header.
+     *
+     * @param {string} url
+     * @param {{headers?: object, body: string, timeoutMs?: number}} options
+     * @returns {Promise<{ok: boolean, status: number, json: function}>}
+     */
+    function gmPost(url, { headers = {}, body, timeoutMs = 20000 }) {
+        if (typeof GM_xmlhttpRequest !== 'function') {
+            if (typeof fetch === 'function') return fetch(url, { method: 'POST', headers, body });
+            return Promise.reject(new Error('No HTTP transport available.'));
+        }
+
+        return new Promise((resolve, reject) => {
+            GM_xmlhttpRequest({
+                method: 'POST',
+                url,
+                headers,
+                data: body,
+                timeout: timeoutMs,
+                // The password goes in a header of ours; no cookie of any site is sent along.
+                anonymous: true,
+                onload(response) {
+                    resolve({
+                        ok: response.status >= 200 && response.status < 300,
+                        status: response.status,
+                        json: async () => JSON.parse(response.responseText),
+                    });
+                },
+                onerror() {
+                    reject(new Error('Network request failed.'));
+                },
+                ontimeout() {
+                    reject(new Error('The shared server did not answer in time.'));
+                },
+            });
+        });
+    }
+
     /** Open a URL in a new tab, if the host supports it; otherwise fall back. */
     function gmOpenTab(url) {
         if (typeof GM_openInTab === 'function') {
@@ -224,6 +276,1253 @@
         });
 
         return true;
+    }
+
+    /* ===== src/core/leader.js ===== */
+    /*
+     * Which Torn tab runs the live feed. Pure: the caller reads and writes the
+     * shared record.
+     *
+     * Every Torn tab boots this script. Without one leader, five tabs make five
+     * times the requests - Torn's 100/min is per USER across every key and tool,
+     * and TornW3B's 100/min is per IP. So exactly one tab polls and the others
+     * render what it stores.
+     *
+     * Only a VISIBLE tab may lead. Torn's rules forbid software that works from
+     * unfocused pages to "generate alerts, or draw attention to itself"; a hidden
+     * tab polling in the background is the shape of that, so a tab that is
+     * hidden gives up the role instead of keeping it.
+     */
+
+    /** A leader that has not renewed in this long is presumed gone. */
+    const LEADER_STALE_MS = 10000;
+
+    /** How often the leader renews its claim. */
+    const LEADER_HEARTBEAT_MS = 3000;
+
+    /**
+     * @param {object|null} record - { id, ts } as last stored
+     * @param {string} me - this tab's id
+     * @param {object} opts
+     * @param {number} opts.now
+     * @param {boolean} opts.visible
+     * @returns {{lead: boolean, confirmed: boolean, write: object|null}}
+     *   `write` is the record to store (null = leave it alone). `confirmed` is
+     *   true only when the stored record ALREADY named this tab: two tabs can
+     *   both claim a stale record in the same instant, and only the one whose
+     *   write survived sees itself there on the next tick. Poll only when
+     *   confirmed, and the race costs one heartbeat instead of double requests.
+     */
+    function decideLeader(record, me, { now, visible, staleMs = LEADER_STALE_MS }) {
+        const held = record && record.id && Number.isFinite(record.ts);
+        const mine = held && record.id === me;
+        const fresh = held && now - record.ts < staleMs;
+
+        if (mine) {
+            if (visible) {
+                return { lead: true, confirmed: true, write: { id: me, ts: now } };
+            }
+            // Hidden: step down so a visible tab can take over at once.
+            return { lead: false, confirmed: false, write: { id: null, ts: 0 } };
+        }
+
+        if (!fresh && visible) {
+            return { lead: true, confirmed: false, write: { id: me, ts: now } };
+        }
+
+        return { lead: false, confirmed: false, write: null };
+    }
+
+    function makeTabId() {
+        return (
+            Date.now().toString(36) +
+            '-' +
+            Math.random().toString(36).slice(2, 10)
+        );
+    }
+
+    /* ===== src/core/shared.js ===== */
+    /**
+     * Shared: this PC's side of the shared server (server/).
+     *
+     * The server reads other players' bazaars from Torn with a key of each of us and
+     * hands every PC what changed. Each PC tells it, every 30 s, how much of its own
+     * Torn limit it is using and which bazaars matter to it. This module is the PC's
+     * half of that exchange, without the network: what may be sent (and nothing
+     * else), how the answers are kept, and how they correct the rows TornW3B gave.
+     *
+     * Pure: no clock, no storage, no network. Times are milliseconds, passed in.
+     */
+
+    const SHARED_SYNC_MS = 30000;
+    // The same split as server/src/budget.js (test/shared.test.js holds the two together):
+    // of Torn's 100 calls a minute per person, 20 are never used by the server or this PC.
+    const SHARED_USABLE = 80;
+    // No answer from the server for this long: this PC is on its own again, as with Shared off.
+    const SHARED_GRANT_STALE_MS = 5 * 60000;
+    // A bazaar the server has not confirmed for this long is forgotten here.
+    const SHARED_KEEP_MS = 3 * 60 * 60000;
+    const SHARED_BUCKETS = 16;
+    const SHARED_MAX_SELLERS = 3000;
+    const SHARED_MAX_NEAR = 200;
+    const SHARED_MAX_WORTH = 5000;
+    const SHARED_BODY_KEYS = ['app', 'ver', 'used', 'waiting', 'sellers', 'trades', 'looking', 'worth', 'since', 'seen', 'going', 'bought', 'dir'];
+    // The server is shared with our other apps: each says which it is, so one person's apps are added up
+    // against the one Torn limit, and whoever runs the server can ask for a newer version.
+    const SHARED_APP = 'torn-bids';
+    const SHARED_VER = /^\d{1,4}\.\d{1,4}\.\d{1,4}(-test\.\d{8}\.\d{4})?$/;
+
+    /** A version as build.mjs writes them (a release, or a test build of one), or null. */
+    function sharedVersion(value) {
+        return typeof value === 'string' && SHARED_VER.test(value) ? value : null;
+    }
+    /* TornW3B lists this PC read: how many are told in one exchange, and how long another PC's read is kept. */
+    const SHARED_MAX_DIR = 300;
+    const SHARED_DIR_KEEP_MS = 30 * 60000;
+    /* An item that is another PC's to read first: this PC waits this long past due, then reads it itself. Longer than one exchange. */
+    const SHARED_TURN_WAIT_MS = 45000;
+    // The two marks (the same limits as server/src/core.js): what you are going for, and what you just bought.
+    const SHARED_MAX_GOING = 50;
+    const SHARED_MAX_GOING_SELLERS = 30;
+    const SHARED_MAX_BOUGHT = 200;
+    // A buy is passed on this long (the server keeps it as long); after that the bazaars' own reads have shown it.
+    const SHARED_BOUGHT_MS = 30 * 60000;
+    // A trade nobody has taken a step in for this long is no longer "going for this" to the others.
+    const SHARED_GOING_QUIET_MS = 10 * 60000;
+    // The server silent this long: nobody is known to be going for anything.
+    const SHARED_MARKS_STALE_MS = 2 * 60000;
+    const SHARED_DAY_MS = 24 * 60 * 60000;
+
+    /** The server's address as typed, or null: https and a workers.dev name only (the one host the script may reach). */
+    function sharedAddress(typed) {
+        const text = String(typed ?? '').trim();
+        if (!text) return null;
+        let url;
+        try {
+            url = new URL(/^https?:\/\//i.test(text) ? text : `https://${text}`);
+        } catch {
+            return null;
+        }
+        if (url.protocol !== 'https:' || !/^[a-z0-9-]+(\.[a-z0-9-]+)*\.workers\.dev$/.test(url.hostname)) return null;
+        return url.origin;
+    }
+
+    /**
+     * Where the shared server is: the address this copy was built with, unless this PC keeps another
+     * (`kept`: an address, or 'off'). Nobody types it; null = no server, and Torn Bids works alone.
+     */
+    function sharedHome(built, kept) {
+        if (kept === 'off') return null;
+        return sharedAddress(kept) || sharedAddress(built);
+    }
+
+    // What a PC's word to the server is made from, with its Public key: changed only together with the server.
+    const SHARED_WORD_LABEL = 'torn-shared-server:1:';
+
+    /**
+     * This PC's word to the server (3.25.0): made from the Public key it already holds, so nobody types a
+     * password - and the key itself never leaves the PC. The server makes the same word from each key its
+     * owner typed in there; a PC whose word it does not know gets nothing. null without a key.
+     * @param {string} key - the Public key
+     * @param {(data: Uint8Array) => Promise<ArrayBuffer>} [digest] - SHA-256
+     */
+    async function sharedWord(key, digest = (data) => globalThis.crypto.subtle.digest('SHA-256', data)) {
+        if (typeof key !== 'string' || !/^[A-Za-z0-9]{16}$/.test(key)) return null;
+        const out = new Uint8Array(await digest(new TextEncoder().encode(SHARED_WORD_LABEL + key)));
+        return Array.from(out, (b) => b.toString(16).padStart(2, '0')).join('');
+    }
+
+    /** This PC's word to the server, as sharedWord() makes it (and a password of the first set-up): letters and digits, 24 or more. */
+    function sharedPassOk(pass) {
+        return typeof pass === 'string' && /^[A-Za-z0-9]{24,}$/.test(pass);
+    }
+
+    /**
+     * May this PC make one Torn call now? The PC's half of budget.js: its own calls of
+     * the last minute, one more, and the server's part must fit in what is usable.
+     * `grant` is the server's last answer ({at, need, serverShare, serverTimes}); none,
+     * or one too old to trust, and the PC is on its own.
+     */
+    function sharedMayCall(grant, pcTimes, now) {
+        if (!grant || !Number.isFinite(grant.at) || now - grant.at > SHARED_GRANT_STALE_MS) return true;
+        let mine = 0;
+        for (const t of pcTimes || []) if (now - t < 60000) mine += 1;
+        let lingering = 0;
+        for (const t of Array.isArray(grant.serverTimes) ? grant.serverTimes : []) if (now - t < 60000) lingering += 1;
+        const share = Number.isFinite(grant.serverShare) ? Math.max(0, grant.serverShare) : 0;
+        return mine + 1 + Math.max(lingering, share) <= SHARED_USABLE;
+    }
+
+    const sharedId = (value) => {
+        const n = typeof value === 'string' && /^\d{1,10}$/.test(value) ? Number(value) : value;
+        return Number.isInteger(n) && n > 0 && n < 1e10 ? n : null;
+    };
+
+    function sharedIds(lists, max) {
+        const out = new Set();
+        for (const list of lists) {
+            for (const value of Array.isArray(list) ? list : []) {
+                const id = sharedId(value);
+                if (id !== null) out.add(id);
+                if (out.size >= max) return [...out];
+            }
+        }
+        return [...out];
+    }
+
+    const sharedWhole = (n, max) => (Number.isInteger(n) && n >= 0 && n <= max ? n : null);
+
+    /**
+     * The two marks of every part of the script, merged, each once. Times are this PC's
+     * (milliseconds); `now` only says which are too old or not yet.
+     *  going:  [item, opened at, ...the bazaars of the plan] - one per item, the earliest opening
+     *  bought: [bazaar, item, how many, the price of each, when]
+     */
+    function sharedMarks(wants, now) {
+        const going = new Map();
+        const bought = new Map();
+        for (const w of Array.isArray(wants) ? wants : []) {
+            for (const entry of w && Array.isArray(w.going) ? w.going : []) {
+                if (!Array.isArray(entry)) continue;
+                const item = sharedId(entry[0]);
+                const at = entry[1];
+                if (item === null || !Number.isFinite(at) || at > now + 5000 || now - at > SHARED_DAY_MS) continue;
+                if (!going.has(item) && going.size >= SHARED_MAX_GOING) continue;
+                const had = going.get(item) || { at, sellers: new Set() };
+                had.at = Math.min(had.at, at);
+                for (const seller of sharedIds([entry.slice(2)], SHARED_MAX_GOING_SELLERS)) {
+                    if (had.sellers.size < SHARED_MAX_GOING_SELLERS) had.sellers.add(seller);
+                }
+                going.set(item, had);
+            }
+            for (const entry of w && Array.isArray(w.bought) ? w.bought : []) {
+                if (!Array.isArray(entry)) continue;
+                const seller = sharedId(entry[0]);
+                const item = sharedId(entry[1]);
+                const qty = sharedWhole(entry[2], 1e9);
+                const price = sharedWhole(Math.round(entry[3]), 1e13);
+                const at = entry[4];
+                if (seller === null || item === null || !qty || price === null || !Number.isFinite(at) || at > now + 5000 || now - at >= SHARED_BOUGHT_MS) continue;
+                const key = [seller, item, qty, price, Math.floor(at)].join('|');
+                if (!bought.has(key) && bought.size >= SHARED_MAX_BOUGHT) continue;
+                bought.set(key, [seller, item, qty, price, Math.floor(at)]);
+            }
+        }
+        return {
+            going: [...going].map(([item, g]) => [item, Math.floor(g.at), ...g.sellers]),
+            bought: [...bought.values()],
+        };
+    }
+
+    /**
+     * What this PC sends: its Torn use, and the bazaars and items that matter to it.
+     * `wants` are what each open part of the script asked for ({sellers, trades,
+     * looking, worth, going, bought}); they are merged. Player ids, item ids, prices,
+     * counts and how long ago - and which app this is and its version; nothing else can
+     * come out of here, whatever is put in.
+     * `now`: this PC's clock; the marks leave as ages, since every PC has its own clock.
+     */
+    function sharedBody({ used = 0, waiting = 0, wants = [], since = 0, seen = 0, sendWorth = true, now = 0, ver = null } = {}) {
+        const count = (n) => (Number.isFinite(n) && n > 0 ? Math.min(1000, Math.floor(n)) : 0);
+        const list = Array.isArray(wants) ? wants.filter((w) => w && typeof w === 'object') : [];
+        const trades = sharedIds(list.map((w) => w.trades), SHARED_MAX_NEAR);
+        const looking = sharedIds(list.map((w) => w.looking), SHARED_MAX_NEAR);
+        // The near ones first, so a full list never pushes them out.
+        const sellers = sharedIds([trades, looking, ...list.map((w) => w.sellers)], SHARED_MAX_SELLERS);
+        const body = {
+            app: SHARED_APP,
+            used: count(used), waiting: count(waiting), sellers, trades, looking,
+            since: Number.isInteger(since) && since > 0 ? since : 0,
+            seen: Number.isFinite(seen) && seen > 0 ? Math.floor(seen) : 0,
+        };
+        if (sharedVersion(ver)) body.ver = ver;
+        // The PC's whole current lists every time: left out would mean "none" to the server.
+        const marks = sharedMarks(list, now);
+        const age = (at) => Math.max(0, Math.floor(now - at));
+        body.going = marks.going.map(([item, at, ...sellers]) => [item, age(at), ...sellers]);
+        body.bought = marks.bought.map(([seller, item, qty, price, at]) => [seller, item, qty, price, age(at)]);
+        const dir = sharedDir(list);
+        if (dir.length) body.dir = dir.map(([item, at]) => [item, age(at)]);
+        if (sendWorth) {
+            const worth = {};
+            let n = 0;
+            for (const w of list) {
+                for (const [key, value] of Object.entries(w.worth && typeof w.worth === 'object' ? w.worth : {})) {
+                    const item = sharedId(key);
+                    if (item === null || typeof value !== 'number' || !Number.isFinite(value) || value <= 0) continue;
+                    if (!(item in worth)) {
+                        if (n >= SHARED_MAX_WORTH) continue;
+                        n += 1;
+                    }
+                    worth[item] = Math.max(worth[item] || 0, Math.round(value));
+                }
+            }
+            body.worth = worth;
+        }
+        return body;
+    }
+
+    /**
+     * The check on the way out: is this exactly a body sharedBody() makes? Numbers and
+     * lists of numbers only, beside this app's own name and version - no person's name,
+     * no other text, no key, nothing about an inventory.
+     */
+    function sharedOutgoingOk(body) {
+        if (!body || typeof body !== 'object' || Array.isArray(body)) return false;
+        const whole = (n) => Number.isInteger(n) && n >= 0 && n < 1e13;
+        for (const [key, value] of Object.entries(body)) {
+            if (!SHARED_BODY_KEYS.includes(key)) return false;
+            if (key === 'app') {
+                if (value !== SHARED_APP) return false;
+            } else if (key === 'ver') {
+                if (sharedVersion(value) === null) return false;
+            } else if (key === 'sellers' || key === 'trades' || key === 'looking') {
+                if (!Array.isArray(value) || !value.every((id) => Number.isInteger(id) && id > 0 && id < 1e10)) return false;
+            } else if (key === 'going') {
+                // [item, age, ...bazaars]
+                if (!Array.isArray(value) || !value.every((m) => Array.isArray(m) && m.length >= 2 && m.length <= SHARED_MAX_GOING_SELLERS + 2 && m.every(whole) && m[0] > 0)) return false;
+            } else if (key === 'dir') {
+                // [item, age]
+                if (!Array.isArray(value) || !value.every((m) => Array.isArray(m) && m.length === 2 && m.every(whole) && m[0] > 0)) return false;
+            } else if (key === 'bought') {
+                // [bazaar, item, how many, price, age]
+                if (!Array.isArray(value) || !value.every((m) => Array.isArray(m) && m.length === 5 && m.every(whole) && m[0] > 0 && m[1] > 0 && m[2] > 0)) return false;
+            } else if (key === 'worth') {
+                if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+                for (const [item, price] of Object.entries(value)) {
+                    if (!/^\d{1,10}$/.test(item) || !Number.isInteger(price) || price <= 0) return false;
+                }
+            } else if (!whole(value)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    function sharedBucketOf(sellerId) {
+        return Number(sellerId) % SHARED_BUCKETS;
+    }
+
+    /**
+     * The server's answer, taken into what is kept: `buckets` is an array of
+     * SHARED_BUCKETS objects, sellerId -> [changedAt, seenAt, gen, [[item, price, qty], ...]].
+     * Only items of `interest` (a Map itemId -> the gen it joined at) are kept; `gen`
+     * is the interest's count now, so a later reader knows which items this entry
+     * could have held (see withShared).
+     * @returns {Set<number>} the buckets that changed
+     */
+    function sharedTake(buckets, answer, interest, gen, now) {
+        const touched = new Set();
+        const reads = answer && Array.isArray(answer.reads) ? answer.reads : [];
+        for (const read of reads) {
+            const id = sharedId(read && read.id);
+            if (id === null || !Array.isArray(read.items)) continue;
+            const at = Number.isFinite(read.at) && read.at > 0 ? read.at : now;
+            const items = [];
+            for (const entry of read.items) {
+                const item = sharedId(entry && entry.id);
+                const price = entry && entry.price;
+                const qty = entry && entry.qty;
+                if (item === null || !interest.has(String(item))) continue;
+                if (!Number.isFinite(price) || price < 0 || !Number.isInteger(qty) || qty <= 0) continue;
+                items.push([item, price, qty]);
+            }
+            const bucket = sharedBucketOf(id);
+            const prev = buckets[bucket][id];
+            buckets[bucket][id] = [at, Math.max(at, prev ? prev[1] : 0), gen, items];
+            touched.add(bucket);
+        }
+        // Read again by the server and found the same: still true as of then.
+        for (const pair of answer && Array.isArray(answer.seen) ? answer.seen : []) {
+            const id = sharedId(Array.isArray(pair) ? pair[0] : null);
+            const at = Array.isArray(pair) ? pair[1] : null;
+            if (id === null || !Number.isFinite(at)) continue;
+            const bucket = sharedBucketOf(id);
+            const entry = buckets[bucket][id];
+            if (entry && at > entry[1]) {
+                entry[1] = at;
+                touched.add(bucket);
+            }
+        }
+        return touched;
+    }
+
+    /** Drops what the server has not confirmed for SHARED_KEEP_MS. @returns {Set<number>} the buckets that changed */
+    function sharedPrune(buckets, now) {
+        const touched = new Set();
+        buckets.forEach((bucket, i) => {
+            for (const id of Object.keys(bucket)) {
+                if (now - bucket[id][1] > SHARED_KEEP_MS) {
+                    delete bucket[id];
+                    touched.add(i);
+                }
+            }
+        });
+        return touched;
+    }
+
+    /** One stored bucket, read back strictly: anything not in shape is left out. */
+    function sharedReadBucket(stored) {
+        const out = {};
+        if (!stored || typeof stored !== 'object' || Array.isArray(stored)) return out;
+        for (const [id, entry] of Object.entries(stored)) {
+            if (!/^\d{1,10}$/.test(id) || !Array.isArray(entry) || entry.length !== 4) continue;
+            const [at, seen, gen, items] = entry;
+            if (!Number.isFinite(at) || !Number.isFinite(seen) || !Number.isInteger(gen) || !Array.isArray(items)) continue;
+            if (!items.every((i) => Array.isArray(i) && i.length === 3 && Number.isInteger(i[0]) && Number.isFinite(i[1]) && Number.isInteger(i[2]))) continue;
+            out[id] = entry;
+        }
+        return out;
+    }
+
+    /**
+     * What is kept, laid out for reading:
+     *  bySeller: sellerId -> {at, seen, gen, items: Map itemId -> [{price, qty}]}
+     *  byItem:   itemId -> [{sellerId, price, qty, at, seen}]
+     * Ids are strings, as in the TornW3B rows.
+     */
+    function sharedIndex(buckets) {
+        const bySeller = new Map();
+        const byItem = new Map();
+        for (const bucket of buckets) {
+            for (const [sellerId, entry] of Object.entries(bucket)) {
+                const [at, seen, gen, list] = entry;
+                const items = new Map();
+                for (const [item, price, qty] of list) {
+                    const key = String(item);
+                    if (!items.has(key)) items.set(key, []);
+                    items.get(key).push({ price, qty });
+                    if (!byItem.has(key)) byItem.set(key, []);
+                    byItem.get(key).push({ sellerId, price, qty, at, seen });
+                }
+                bySeller.set(sellerId, { at, seen, gen, items });
+            }
+        }
+        return { bySeller, byItem };
+    }
+
+    /**
+     * TornW3B's rows of one item, corrected by what the server read from Torn itself.
+     *  - a seller the server read AFTER TornW3B checked them: the server's price and
+     *    count stand (Torn's own answer); if that bazaar no longer holds the item,
+     *    the row goes - but only if the item was already of interest when the entry
+     *    was kept (`joined`), else the entry says nothing about it;
+     *  - a seller TornW3B checked after the server's read: TornW3B's row stands;
+     *  - a seller TornW3B does not list at all: added, with no name.
+     * A price of $1 or less is a locked listing, as in TornW3B's rows: left out.
+     * @param {object[]} rows - {sellerId, sellerName, price, qty, dataAt, changedAt, sponsored}
+     * @param {{bySeller: Map, byItem: Map}} index - sharedIndex()
+     * @param {Map<string, number>} joined - itemId -> the gen it joined the interest at
+     */
+    function withShared(rows, itemId, index, joined) {
+        const item = String(itemId);
+        if (!index || (!index.bySeller.size && !index.byItem.size)) return rows;
+        const out = [];
+        const dealt = new Set();
+        let changed = false;
+        for (const row of rows || []) {
+            const entry = index.bySeller.get(String(row.sellerId));
+            if (!entry || entry.seen <= (row.dataAt || 0)) {
+                out.push(row);
+                dealt.add(String(row.sellerId));
+                continue;
+            }
+            const listings = entry.items.get(item);
+            if (!listings) {
+                const covered = joined && joined.has(item) && joined.get(item) <= entry.gen;
+                if (covered) {
+                    changed = true;
+                    // A second row of the same seller must not bring them back from byItem.
+                    dealt.add(String(row.sellerId));
+                } else if (!dealt.has(String(row.sellerId))) {
+                    out.push(row);
+                    dealt.add(String(row.sellerId));
+                }
+                continue;
+            }
+            if (dealt.has(String(row.sellerId))) {
+                changed = true;
+                continue;
+            }
+            dealt.add(String(row.sellerId));
+            changed = true;
+            for (const l of listings) {
+                if (!(l.price > 1) || !(l.qty > 0)) continue;
+                const same = l.price === row.price && l.qty === row.qty;
+                out.push({ ...row, price: l.price, qty: l.qty, dataAt: entry.seen, changedAt: same ? row.changedAt : entry.at, shared: true });
+            }
+        }
+        for (const l of index.byItem.get(item) || []) {
+            if (dealt.has(l.sellerId) || !(l.price > 1) || !(l.qty > 0)) continue;
+            changed = true;
+            out.push({ sellerId: l.sellerId, sellerName: null, price: l.price, qty: l.qty, dataAt: l.seen, changedAt: l.at, sponsored: false, shared: true });
+        }
+        if (!changed) return rows;
+        return out.sort((a, b) => a.price - b.price);
+    }
+
+    /**
+     * The interest (itemId -> gen) with the items of `worth` added. A new item gets a
+     * new gen, so entries kept before it joined are known to say nothing about it.
+     * @returns {{interest: Map<string, number>, gen: number, grew: boolean}}
+     */
+    function sharedInterest(interest, gen, itemIds) {
+        let next = gen;
+        let grew = false;
+        for (const value of itemIds || []) {
+            const id = sharedId(value);
+            if (id === null || interest.has(String(id)) || interest.size >= SHARED_MAX_WORTH) continue;
+            if (!grew) next = gen + 1;
+            grew = true;
+            interest.set(String(id), next);
+        }
+        return { interest, gen: next, grew };
+    }
+
+    /* ------------------------------------------------------- the others' marks */
+
+    /**
+     * The others' marks from the server's answer, checked, with times as this PC counts them.
+     * `had`: the marks kept so far - one already known keeps its time, so nothing is
+     * rewritten for the second an answer took longer.
+     * @returns {{going: {who, whoId, item, at, sellers}[], bought: {who, whoId, seller, item, qty, price, at}[]}}
+     */
+    function sharedMarksIn(answer, had, now) {
+        const sent = answer && answer.marks && typeof answer.marks === 'object' ? answer.marks : {};
+        const near = (list, same, at) => {
+            const old = (list || []).find((m) => !m.used && same(m) && Math.abs(m.at - at) < 10000);
+            if (!old) return at;
+            old.used = true;
+            return old.at;
+        };
+        const hadGoing = ((had && had.going) || []).map((m) => ({ ...m }));
+        const hadBought = ((had && had.bought) || []).map((m) => ({ ...m }));
+        const going = [];
+        for (const m of Array.isArray(sent.going) ? sent.going.slice(0, 500) : []) {
+            const by = sharedPerson({ id: m && m.whoId, name: m && m.who });
+            const item = sharedId(m && m.item);
+            const age = sharedWhole(m && m.age, SHARED_DAY_MS);
+            if (item === null || age === null) continue;
+            const sellers = sharedIds([m.sellers], SHARED_MAX_GOING_SELLERS);
+            const at = near(hadGoing, (o) => o.whoId === by.id && o.who === by.name && o.item === item, now - age);
+            going.push({ who: by.name, whoId: by.id, item, at, sellers });
+        }
+        const bought = [];
+        for (const m of Array.isArray(sent.bought) ? sent.bought.slice(0, 1000) : []) {
+            const by = sharedPerson({ id: m && m.whoId, name: m && m.who });
+            const seller = sharedId(m && m.seller);
+            const item = sharedId(m && m.item);
+            const qty = sharedWhole(m && m.qty, 1e9);
+            const price = sharedWhole(m && m.price, 1e13);
+            const age = sharedWhole(m && m.age, SHARED_BOUGHT_MS);
+            if (seller === null || item === null || !qty || price === null || age === null) continue;
+            const at = near(hadBought, (o) => o.whoId === by.id && o.seller === seller && o.item === item && o.qty === qty && o.price === price, now - age);
+            bought.push({ who: by.name, whoId: by.id, seller, item, qty, price, at });
+        }
+        return { going, bought };
+    }
+
+    /**
+     * The marks to go by now: nobody is "going for" anything once the server has been
+     * silent two minutes (it may have ended long ago); a buy stays true for its half hour.
+     * @param {{going, bought}|null} kept - sharedMarksIn()
+     * @param {number|null} okAt - the last answer of the server
+     */
+    function sharedMarksNow(kept, okAt, now) {
+        const live = Number.isFinite(okAt) && now - okAt <= SHARED_MARKS_STALE_MS;
+        return {
+            going: live && kept ? kept.going || [] : [],
+            bought: kept ? (kept.bought || []).filter((m) => now - m.at < SHARED_BOUGHT_MS) : [],
+        };
+    }
+
+    /* ------------------------------------------------- the marks, on the screens */
+
+    /**
+     * What this PC is going for, to tell the others: [[item, opened at, ...the bazaars of its plan]].
+     *  - a trade you started on (Plan trade, or any press in its card) with a press in the last 10 minutes;
+     *  - a trade a trader said yes to, with a buy in the last 10 minutes - its items still to buy.
+     * A pinned trade is not one: a pin is kept for days. Walk away, and the mark goes by itself.
+     * @param {Iterable<{trade: {at, lines}, touched: number}>} holds
+     * @param {Array<{at, items}>} accepted
+     * @param {(step) => boolean} done - a step that is bought or skipped
+     */
+    function sharedGoingOwn({ holds = [], accepted = [], now, done = () => false } = {}) {
+        const out = [];
+        const sellersOf = (steps) => [...new Set((steps || []).filter((st) => st && st.sellerId).map((st) => Number(st.sellerId)))];
+        for (const h of holds || []) {
+            if (!h || !h.trade || !(now - h.touched < SHARED_GOING_QUIET_MS)) continue;
+            for (const line of h.trade.lines || []) {
+                if (!line || !(line.units > 0) || !(line.steps || []).length) continue;
+                out.push([Number(line.itemId), Number(h.trade.at) || h.touched, ...sellersOf(line.steps)]);
+            }
+        }
+        for (const t of accepted || []) {
+            if (!t) continue;
+            let last = Number(t.at) || 0;
+            for (const i of t.items || []) for (const st of i.steps || []) if (Number(st.boughtAt) > last) last = Number(st.boughtAt);
+            if (!(now - last < SHARED_GOING_QUIET_MS)) continue;
+            for (const i of t.items || []) {
+                const open = (i.steps || []).filter((st) => !done(st));
+                if (open.length) out.push([Number(i.itemId), Number(t.at) || last, ...sellersOf(open)]);
+            }
+        }
+        return out;
+    }
+
+    /** The others' "going for this", per item: Map of item (as text) -> {who: [Torn name or null, one per person], at: the earliest, sellers: Set of bazaars (as text)}. */
+    function sharedGoingByItem(going) {
+        const out = new Map();
+        for (const m of going || []) {
+            const key = String(m.item);
+            const had = out.get(key) || { who: [], ids: new Set(), at: m.at, sellers: new Set() };
+            const person = m.whoId || m.who || '?';
+            if (!had.ids.has(person)) {
+                had.ids.add(person);
+                had.who.push(m.who || null);
+            }
+            had.at = Math.min(had.at, m.at);
+            for (const seller of m.sellers || []) had.sellers.add(String(seller));
+            out.set(key, had);
+        }
+        return out;
+    }
+
+    // "now", "3m", "2h": as short as a tag needs.
+    function sharedAgo(ms) {
+        const minutes = Math.floor(Math.max(0, ms) / 60000);
+        return minutes < 1 ? 'now' : minutes < 60 ? minutes + 'm' : Math.floor(minutes / 60) + 'h';
+    }
+
+    // Who, by Torn name: "A", "A and B"; with a name not known, "A friend", "2 friends". And whether that is one or many.
+    function sharedWho(names) {
+        const known = (names || []).filter(Boolean);
+        const n = (names || []).length || 1;
+        if (known.length < n) return { text: n === 1 ? 'A friend' : n + ' friends', many: n > 1 };
+        return { text: known.length === 1 ? known[0] : known.slice(0, -1).join(', ') + ' and ' + known[known.length - 1], many: n > 1 };
+    }
+
+    /** The tag on a row: "xX-Vin-Xx is on this · 3m". */
+    function sharedOnThis(mark, now) {
+        const who = sharedWho(mark.who);
+        return who.text + (who.many ? ' are' : ' is') + ' on this · ' + sharedAgo(now - mark.at);
+    }
+
+    /** The line on a card: {lead: "xX-Vin-Xx is going for this", rest: "opened 3m ago"}; with an item's name, "...for the Xanax here". */
+    function sharedGoingFor(mark, now, itemHere = null) {
+        const who = sharedWho(mark.who);
+        const age = sharedAgo(now - mark.at);
+        return {
+            lead: who.text + (who.many ? ' are' : ' is') + ' going for ' + (itemHere ? 'the ' + itemHere + ' here' : 'this'),
+            rest: 'opened ' + (age === 'now' ? 'just now' : age + ' ago'),
+        };
+    }
+
+    /** A friend's buy that took from your plan: {lead: "xX-Vin-Xx bought 2", rest: "at swagbazaar · 1m ago · your plan is now 3"}. */
+    function sharedBoughtLine({ who = null, qty, bazaar = null, at, units }, now) {
+        const age = sharedAgo(now - at);
+        return {
+            lead: (who || 'A friend') + ' bought ' + qty,
+            rest: 'at ' + (bazaar || 'a bazaar') + ' · ' + (age === 'now' ? 'just now' : age + ' ago') + ' · your plan is now ' + units,
+        };
+    }
+
+    /* --------------------------------------------- Settings > Shared, in words */
+
+    const SHARED_QUIET_MS = 2 * 60000;
+
+    // A Torn name as Torn makes them. The server sends each person's own (asked of Torn for their key);
+    // anything else is not shown - "a friend" stands in. No person's name is written in this script.
+    const SHARED_TORN_NAME = /^[A-Za-z0-9_-]{1,32}$/;
+
+    /** {id, name} as the server sent it, checked: a Torn id and a Torn name, or nulls. */
+    function sharedPerson(sent) {
+        const id = sent && Number.isInteger(sent.id) && sent.id > 0 && sent.id < 1e10 ? sent.id : null;
+        const name = sent && typeof sent.name === 'string' && SHARED_TORN_NAME.test(sent.name) ? sent.name : null;
+        return { id, name };
+    }
+
+    /** "A is on now", "A and B are on now", "2 others are on now": Torn names where known, a count where not. */
+    function sharedOnNow(on) {
+        const names = on.map((p) => p && p.name).filter(Boolean);
+        if (!on.length) return 'nobody else is on now';
+        if (names.length < on.length) return on.length === 1 ? '1 other is on now' : on.length + ' others are on now';
+        return names.length === 1 ? names[0] + ' is on now' : names.slice(0, -1).join(', ') + ' and ' + names[names.length - 1] + ' are on now';
+    }
+
+    function sharedClock(at) {
+        const d = new Date(at);
+        return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+    }
+
+    /**
+     * Is the shared server something to show on this PC? Only once it has answered it as one of its people:
+     * anyone may install Torn Bids, and to everyone else there is no server and nothing is said of one.
+     */
+    function sharedKnown(st) {
+        return Boolean(st && st.on && !st.unknown && (st.okAt || st.update));
+    }
+
+    /**
+     * What the server last said to this PC, as one word; a change of it is one line in the log (3.25.0), so a
+     * zip shows at a glance whether the server knew this PC.
+     * @param {object} st - SharedLink.status()
+     */
+    function sharedSaid(st) {
+        if (!st || !st.on) return 'off';
+        if (st.unknown) return 'unknown';
+        if (st.update) return 'update';
+        if (st.error) return 'error';
+        return st.okAt ? 'ok' : 'waiting';
+    }
+
+    /** The log's line for that word; null = nothing to say yet. `hours`: how long until a PC it does not know asks again. */
+    function sharedSaidLine(st, hours) {
+        const word = sharedSaid(st);
+        if (word === 'unknown') {
+            return 'Shared: the server answered 404 - the Public key of this PC is not on the server as "runs our app". Nothing is exchanged; it is asked again in ' + hours + ' hours, or at once when the key changes';
+        }
+        if (word === 'ok') return 'Shared: the server knows this PC and answers';
+        if (word === 'update') return 'Shared: the server knows this PC and wants a newer Torn Bids (' + String(st.update).slice(0, 40) + '): nothing is exchanged until this copy is updated';
+        if (word === 'error') return 'Shared: no exchange - ' + String(st.error).slice(0, 120);
+        return null;
+    }
+
+    // The server answers, and reads nothing for now.
+    const SHARED_NOT_READING = ['blocked', 'paused', 'stopped', 'resting'];
+
+    /**
+     * The "Now" line: {level: 'off' | 'ok' | 'idle' | 'warn' | 'bad', text}. Only what is known.
+     * @param {object} st - SharedLink.status()
+     */
+    function sharedNowLine(st, now) {
+        if (!st || !st.on) return { level: 'off', text: 'Off. Torn Bids works alone.' };
+        // Not one of the server's people: nothing to do here, and nothing is asked of the person.
+        if (st.unknown) return { level: 'off', text: 'Not on the shared server. Torn Bids works alone.' };
+        // Whoever runs the server asked for a newer Torn Bids: nothing is exchanged until this one is updated.
+        if (st.update) return { level: 'bad', text: 'This server wants Torn Bids ' + st.update + ' or newer. Update Torn Bids · working alone until then' };
+        if (!st.okAt) return st.error ? { level: 'warn', text: 'No answer yet · working alone' } : { level: 'idle', text: 'Connecting…' };
+        if (st.error || now - st.okAt > SHARED_QUIET_MS) return { level: 'warn', text: 'No answer since ' + sharedClock(st.okAt) + ' · working alone' };
+        const parts = ['Connected'];
+        if (st.people) parts.push(st.people + (st.people === 1 ? ' person' : ' people'));
+        if (st.people > 1) parts.push(sharedOnNow(st.peopleOn || []));
+        parts.push('last exchange ' + Math.max(0, Math.floor((now - st.okAt) / 1000)) + ' s ago');
+        if (st.reading === 'blocked') parts.push('Torn has blocked the server for now');
+        else if (st.reading === 'paused') parts.push('the server is waiting on Torn');
+        else if (st.reading === 'stopped') parts.push('whoever runs the server has stopped its reading · working alone');
+        else if (st.reading === 'resting') parts.push('the server rests until 00:00 UTC, its free limit for today is near · working alone');
+        return { level: SHARED_NOT_READING.includes(st.reading) ? 'warn' : 'ok', text: parts.join(' · ') };
+    }
+
+    /**
+     * The one line in the small panel on Torn's pages (3.25.0, drawing 1): {lead, rest}, or null with
+     * Shared off. Shared is set up in Torn Bids only; here it is just said, with what is known.
+     * @param {object} st - SharedLink.status()
+     */
+    function sharedPanelLine(st, now) {
+        if (!sharedKnown(st)) return null;
+        const silent = !st.okAt || st.error || now - st.okAt > SHARED_QUIET_MS;
+        if (st.update) return { lead: 'Shared is on', rest: 'the server wants a newer Torn Bids, working alone' };
+        if (silent) return { lead: 'Shared is on', rest: 'no answer from the server, working alone' };
+        if (st.reading === 'stopped' || st.reading === 'resting') return { lead: 'Shared is on', rest: 'the server is not reading now, working alone' };
+        return { lead: 'Shared is on', rest: st.people ? st.people + (st.people === 1 ? ' person' : ' people') : 'connected' };
+    }
+
+    /** "Your Torn key on the server": {level, text}; what the server last said of it. */
+    function sharedKeyLine(st) {
+        if (!st || !st.on || !st.okAt || !st.key) return { level: 'off', text: 'Not known yet.' };
+        // Whose key the server holds for this PC, as Torn says: so a key put under the wrong person shows.
+        const whose = st.you && st.you.name ? st.you.name + (st.you.id ? ' [' + st.you.id + ']' : '') : null;
+        if (st.key === 'working') return { level: 'ok', text: whose ? 'Working · the key of ' + whose : 'Working' };
+        const code = /\((\d+)\)/.exec(st.key);
+        return { level: 'bad', text: 'Torn refused your key on the server' + (code ? ' (code ' + code[1] + ')' : '') + '. Whoever runs your server needs a new Public Only key from you.' };
+    }
+
+    /** "Your 100 Torn calls this minute", as last agreed with the server: {pc, server, free}; null when not known. */
+    function sharedSplit(st, now) {
+        if (!st || !st.on || !st.okAt || now - st.okAt > SHARED_GRANT_STALE_MS || !Number.isFinite(st.need) || !Number.isFinite(st.serverShare)) return null;
+        const pc = Math.max(0, Math.min(100, Math.round(st.need)));
+        const server = Math.max(0, Math.min(100 - pc, Math.round(st.serverShare)));
+        return { pc, server, free: 100 - pc - server };
+    }
+
+    /**
+     * The TornW3B lists the open parts of the script read (3.25.0): [[item, when]], the newest read of
+     * each item, newest first, in this PC's time. Item numbers and times - nothing else comes out.
+     */
+    function sharedDir(wants) {
+        const at = new Map();
+        for (const w of Array.isArray(wants) ? wants : []) {
+            for (const entry of w && Array.isArray(w.dir) ? w.dir : []) {
+                if (!Array.isArray(entry)) continue;
+                const item = sharedId(entry[0]);
+                const when = entry[1];
+                if (item === null || !Number.isFinite(when) || when <= 0) continue;
+                if (!(at.get(item) >= when)) at.set(item, Math.floor(when));
+            }
+        }
+        return [...at].sort((a, b) => b[1] - a[1]).slice(0, SHARED_MAX_DIR);
+    }
+
+    const SHARED_ALONE = { of: 1, me: 0 };
+
+    /**
+     * The other PCs' TornW3B reads, from the server's answer, added to what was kept: item -> when, in
+     * THIS PC's time (the answer carries ages). And this PC's turn among the PCs that are on.
+     * @returns {{reads: object, turn: {of: number, me: number}}}
+     */
+    function sharedDirIn(answer, had, now) {
+        const reads = {};
+        for (const [item, at] of Object.entries(had && had.reads && typeof had.reads === 'object' ? had.reads : {})) {
+            if (/^\d{1,10}$/.test(item) && Number.isFinite(at) && now - at < SHARED_DIR_KEEP_MS) reads[item] = at;
+        }
+        for (const entry of answer && Array.isArray(answer.dir) ? answer.dir : []) {
+            if (!Array.isArray(entry)) continue;
+            const item = sharedId(entry[0]);
+            const age = entry[1];
+            if (item === null || !Number.isFinite(age) || age < 0 || age >= SHARED_DIR_KEEP_MS) continue;
+            const at = Math.floor(now - age);
+            if (!(reads[item] >= at)) reads[item] = at;
+        }
+        const t = answer && answer.turn;
+        const turn = t && Number.isInteger(t.of) && t.of >= 1 && t.of <= 50 && Number.isInteger(t.me) && t.me >= 0 && t.me < t.of ? { of: t.of, me: t.me } : { ...SHARED_ALONE };
+        return { reads, turn };
+    }
+
+    /**
+     * Is an item's TornW3B list due on this PC (a background read - never the desk or a trade)?
+     * A read another PC made counts as a read; and with several PCs on, an item has one PC that goes
+     * first - the others wait SHARED_TURN_WAIT_MS past due, then read it themselves.
+     * @param {number} ownAt - this PC's own last read
+     * @param {{reads: object, turn: {of: number, me: number}}|null} kept - sharedDirIn(); null = Shared off
+     */
+    function sharedDirDue(ownAt, every, now, itemId, kept) {
+        if (!kept) return now - ownAt >= every;
+        const friendAt = Number(kept.reads && kept.reads[String(itemId)]) || 0;
+        const turn = kept.turn || SHARED_ALONE;
+        const mine = !(turn.of > 1) || Number(itemId) % turn.of === turn.me;
+        return now - Math.max(ownAt, friendAt) >= every + (mine ? 0 : SHARED_TURN_WAIT_MS);
+    }
+
+    /* ===== src/feed/shared-link.js ===== */
+    /**
+     * Shared: the exchange with the shared server, every 30 s, by one tab.
+     *
+     * Every open part of the script (the overlay's tabs, Torn Bids' tabs) says what
+     * it wants under its own name; one tab - whichever holds the lead - sends them
+     * together with this PC's Torn use, and stores what comes back for all of them:
+     * the server's reads of bazaars (in sixteen pieces, so a change rewrites little)
+     * and this PC's part of its Torn limit.
+     *
+     * Nobody sets it up: the address is built in and this PC's word is made from its
+     * Public key (main.js, sharedSetUp). Without either, none of this runs and nothing
+     * is sent; a server that does not know this PC is asked again a few times a day.
+     * With the server down, the reads kept so far age out and everything works as
+     * it did before.
+     *
+     * Everything it touches is passed in (storage, the request, the clock), so it
+     * runs whole in test/shared-link.test.js against the real server code.
+     */
+
+
+
+
+    const SHARED_CONFIG_KEY = 'sharedConfig';
+    const SHARED_STATE_KEY = 'sharedState';
+    const SHARED_GRANT_KEY = 'sharedGrant';
+    const SHARED_MARKS_KEY = 'sharedMarks';
+    const SHARED_LEADER_KEY = 'sharedLeader';
+    const SHARED_INTEREST_KEY = 'sharedInterest';
+    const SHARED_ASK_KEY = 'sharedAsk';
+    /* The other PCs' TornW3B reads and this PC's turn among them (core/shared.js, sharedDirIn). */
+    const SHARED_DIR_KEY = 'sharedDir';
+    const SHARED_WANT_PREFIX = 'sharedWant.';
+    const SHARED_READS_PREFIX = 'sharedReads.';
+    const SHARED_WORLDS = ['app', 'sell'];
+    const SHARED_TICK_MS = 3000;
+    // What a part of the script wants is written again when it changed, and at least this often.
+    const SHARED_WANT_EVERY_MS = 45000;
+    const SHARED_WANT_LIVE_MS = 2 * 60000;
+    // A tab whose Torn calls are waiting asks for an exchange sooner, but never closer than this.
+    const SHARED_SOON_MS = 6000;
+    // The server sends at most this many bazaars in one answer; a full answer means there are more.
+    const SHARED_PAGE = 400;
+    const SHARED_MAX_PAGES = 5;
+    const SHARED_PRUNE_EVERY_MS = 10 * 60000;
+    const SHARED_WORTH_EVERY_MS = 10 * 60000;
+    // A PC the server does not know (anyone may install Torn Bids): asked again this often, in case its owner let it in.
+    const SHARED_UNKNOWN_MS = 6 * 60 * 60000;
+
+    class SharedLink {
+        /**
+         * @param {object} d
+         * @param {string} d.tabId
+         * @param {string} d.world - 'app' (the overlay) or 'sell' (Torn Bids)
+         * @param {(key: string) => *} d.load
+         * @param {(key: string, value: *) => void} d.save
+         * @param {(key: string) => void} d.del
+         * @param {(url: string, options: object) => Promise<{ok, status, json}>} d.post
+         * @param {() => {used: number, waiting: number}} d.getUse - this PC's Torn calls of the last minute, and waiting
+         * @param {() => (object|null)} d.getWant - {sellers, trades, looking, worth} of this part of the script
+         * @param {() => void} d.onReads - the kept reads changed
+         * @param {() => number} [d.now]
+         */
+        constructor(d) {
+            this.d = d;
+            this.now = d.now || (() => Date.now());
+            this.busy = false;
+            this.leading = false;
+            this.buckets = null;
+            this.kept = null; // sharedIndex(), built when asked for
+            this.rev = null;
+            this.interest = null;
+            this.gen = 0;
+            this.grantKept = undefined;
+            this.marksKept = undefined;
+            this.dirKept = undefined;
+            this.wantJson = '';
+            this.wantAt = 0;
+            this.worthJson = '';
+            this.worthAt = 0;
+            this.prunedAt = 0;
+        }
+
+        /** {address, pass}, or null when Shared is off. */
+        config() {
+            const c = this.d.load(SHARED_CONFIG_KEY);
+            const address = c ? sharedAddress(c.address) : null;
+            return address && sharedPassOk(c.pass) ? { address, pass: c.pass } : null;
+        }
+
+        /** This PC's part of its Torn limit, as the server last gave it (null = on its own). */
+        grant() {
+            if (!this.config()) return null;
+            if (this.grantKept === undefined) this.grantKept = this.d.load(SHARED_GRANT_KEY) || null;
+            return this.grantKept;
+        }
+
+        /**
+         * The others' marks to go by now: {going: [{who, whoId, item, at, sellers}], bought: [{who, whoId, seller, item, qty, price, at}]}.
+         * Empty with Shared off; nobody is "going for" anything once the server has been silent two minutes.
+         */
+        marks(now = this.now()) {
+            if (!this.config()) return { going: [], bought: [] };
+            if (this.marksKept === undefined) this.marksKept = this.d.load(SHARED_MARKS_KEY) || null;
+            return sharedMarksNow(this.marksKept, (this.d.load(SHARED_STATE_KEY) || {}).okAt, now);
+        }
+
+        /** The other PCs' TornW3B reads and this PC's turn; alone (and with Shared off) every item is this PC's. */
+        dir() {
+            if (!this.config()) return { reads: {}, turn: { of: 1, me: 0 } };
+            if (this.dirKept === undefined) this.dirKept = this.d.load(SHARED_DIR_KEY) || null;
+            return this.dirKept || { reads: {}, turn: { of: 1, me: 0 } };
+        }
+
+        loadInterest() {
+            if (this.interest) return;
+            const stored = this.d.load(SHARED_INTEREST_KEY);
+            this.interest = new Map();
+            this.gen = 0;
+            if (stored && Number.isInteger(stored.gen) && stored.items && typeof stored.items === 'object') {
+                for (const [id, gen] of Object.entries(stored.items)) {
+                    if (/^\d{1,10}$/.test(id) && Number.isInteger(gen) && gen <= stored.gen) this.interest.set(id, gen);
+                }
+                this.gen = stored.gen;
+            }
+        }
+
+        loadBuckets(only = null) {
+            if (!this.buckets) {
+                this.buckets = Array.from({ length: SHARED_BUCKETS }, () => ({}));
+                only = null;
+            }
+            for (let i = 0; i < SHARED_BUCKETS; i += 1) {
+                if (only && !only.includes(i)) continue;
+                this.buckets[i] = sharedReadBucket(this.d.load(SHARED_READS_PREFIX + i));
+            }
+            this.kept = null;
+        }
+
+        /** The server's reads, laid out for reading: {index, joined} for withShared(); null when Shared is off. */
+        reads() {
+            if (!this.config()) return null;
+            if (!this.buckets) this.loadBuckets();
+            this.loadInterest();
+            if (!this.kept) this.kept = sharedIndex(this.buckets);
+            return { index: this.kept, joined: this.interest };
+        }
+
+        /** Another tab stored something of Shared: take it. */
+        onStored(key) {
+            if (key === SHARED_GRANT_KEY) {
+                this.grantKept = undefined;
+            } else if (key === SHARED_DIR_KEY) {
+                this.dirKept = undefined;
+            } else if (key === SHARED_MARKS_KEY) {
+                this.marksKept = undefined;
+                this.d.onReads();
+            } else if (key === SHARED_CONFIG_KEY) {
+                this.grantKept = undefined;
+                this.marksKept = undefined;
+                this.dirKept = undefined;
+                this.buckets = null;
+                this.kept = null;
+                this.d.onReads();
+            } else if (key === SHARED_STATE_KEY) {
+                const state = this.d.load(SHARED_STATE_KEY) || {};
+                if (state.rev === this.rev) return;
+                // One step on: only the pieces it names. Anything else: all of them.
+                const step = Number.isInteger(this.rev) && state.rev === this.rev + 1 && Array.isArray(state.touched);
+                this.rev = state.rev;
+                this.interest = null;
+                if (this.buckets) this.loadBuckets(step ? state.touched : null);
+                this.d.onReads();
+            }
+        }
+
+        /**
+         * Asks whichever tab leads for an exchange soon: this tab's Torn calls are waiting on its part.
+         * `waiting`: how many, so the leading tab can ask for room for them too.
+         */
+        askSoon(waiting = 0) {
+            if (this.config()) this.d.save(SHARED_ASK_KEY, { at: this.now(), n: Number.isFinite(waiting) && waiting > 0 ? Math.floor(waiting) : 0, tab: this.d.tabId });
+        }
+
+        /** The last ask: {at, n, tab}; at 0 when there is none. */
+        asked() {
+            const a = this.d.load(SHARED_ASK_KEY);
+            return a && typeof a === 'object' && Number.isFinite(a.at) ? a : { at: 0, n: 0, tab: null };
+        }
+
+        /** What this part of the script wants, written for the leading tab when it changed. */
+        writeWant(now) {
+            const want = this.d.getWant();
+            if (!want) return;
+            // Stored as it may be sent: ids and prices only, each once, no more than the limits.
+            // The two marks keep their times (this PC's clock); they become ages when they are sent.
+            const clean = sharedBody({ wants: [want] });
+            const marks = sharedMarks([want], now);
+            const dir = sharedDir([want]);
+            const json = JSON.stringify([clean.sellers, clean.trades, clean.looking, clean.worth, marks.going, marks.bought, dir]);
+            if (json === this.wantJson && now - this.wantAt < SHARED_WANT_EVERY_MS) return;
+            this.wantJson = json;
+            this.wantAt = now;
+            this.d.save(SHARED_WANT_PREFIX + this.d.world, { at: now, sellers: clean.sellers, trades: clean.trades, looking: clean.looking, worth: clean.worth, going: marks.going, bought: marks.bought, dir });
+        }
+
+        /** Call every SHARED_TICK_MS. */
+        async tick() {
+            const now = this.now();
+            const cfg = this.config();
+            if (!cfg) {
+                this.leading = false;
+                return;
+            }
+            this.writeWant(now);
+            const decision = decideLeader(this.d.load(SHARED_LEADER_KEY), this.d.tabId, { now, visible: true, staleMs: SHARED_TICK_MS * 4 });
+            if (decision.write) this.d.save(SHARED_LEADER_KEY, decision.write);
+            this.leading = decision.lead;
+            if (!decision.confirmed || this.busy) return;
+
+            const state = this.d.load(SHARED_STATE_KEY) || {};
+            const since = now - (state.syncAt || 0);
+            if (state.unknown && since < SHARED_UNKNOWN_MS) return;
+            const asked = this.asked().at;
+            if (since < SHARED_SYNC_MS && !(asked >= (state.syncAt || 0) && asked > 0 && since >= SHARED_SOON_MS)) return;
+
+            this.busy = true;
+            try {
+                await this.exchange(cfg, state);
+            } finally {
+                this.busy = false;
+            }
+        }
+
+        async exchange(cfg, before) {
+            const startedAt = this.now();
+            this.loadInterest();
+            if (!this.buckets) this.loadBuckets();
+            const wants = SHARED_WORLDS.map((w) => this.d.load(SHARED_WANT_PREFIX + w)).filter((w) => w && startedAt - w.at < SHARED_WANT_LIVE_MS);
+
+            // A new item to watch: what is kept says nothing about it, so everything is asked for again.
+            const items = new Set();
+            for (const w of wants) for (const id of Object.keys(w.worth || {})) items.add(id);
+            const grown = sharedInterest(this.interest, this.gen, items);
+            let seq = Number.isInteger(before.seq) ? before.seq : 0;
+            if (grown.grew) {
+                this.gen = grown.gen;
+                this.d.save(SHARED_INTEREST_KEY, { gen: this.gen, items: Object.fromEntries(this.interest) });
+                seq = 0;
+            }
+
+            const state = { ...before, syncAt: startedAt, error: null, unknown: false };
+            const touched = new Set();
+            let marksChanged = false;
+            let born = before.born ?? null;
+            let seen = Number.isFinite(before.seenAt) ? before.seenAt : 0;
+            try {
+                for (let page = 0; page < SHARED_MAX_PAGES; page += 1) {
+                    const now = this.now();
+                    const use = this.d.getUse() || {};
+                    // Another tab's calls held back since the last exchange: room is asked for them too.
+                    const ask = this.asked();
+                    const others = ask.tab !== this.d.tabId && startedAt - ask.at < SHARED_SYNC_MS * 2 ? ask.n : 0;
+                    const probe = sharedBody({ wants, sendWorth: true });
+                    const ver = this.d.version || null;
+                    const worthJson = JSON.stringify(probe.worth);
+                    const sendWorth = page === 0 && (worthJson !== this.worthJson || now - this.worthAt >= SHARED_WORTH_EVERY_MS || born === null);
+                    const body = sharedBody({ used: use.used, waiting: (Number(use.waiting) || 0) + others, wants, since: seq, seen, sendWorth, now, ver });
+                    if (!sharedOutgoingOk(body)) throw new Error('Not sent: the message was not in the agreed shape.');
+
+                    const response = await this.d.post(`${cfg.address}/sync`, {
+                        headers: { Authorization: `Bearer ${cfg.pass}`, 'Content-Type': 'application/json' },
+                        body: JSON.stringify(body),
+                    });
+                    if (response.status === 404) {
+                        state.unknown = true;
+                        throw new Error('The server does not know this PC.');
+                    }
+                    // Whoever runs the server asked for a newer Torn Bids. Our Torn use was still counted there, so
+                    // the split of the 100 is kept; nothing else is exchanged until this copy is updated.
+                    if (response.status === 426) {
+                        let told = null;
+                        try {
+                            told = await response.json();
+                        } catch {
+                            // no body to read: the version asked for is not known
+                        }
+                        const got = this.now();
+                        if (told && told.grant) {
+                            const skew = got - (Number.isFinite(told.grant.at) ? told.grant.at : got);
+                            this.grantKept = {
+                                at: got,
+                                need: told.grant.need,
+                                serverShare: told.grant.serverShare,
+                                serverTimes: (Array.isArray(told.grant.serverTimes) ? told.grant.serverTimes : []).filter(Number.isFinite).map((t) => t + skew),
+                            };
+                            this.d.save(SHARED_GRANT_KEY, this.grantKept);
+                        }
+                        state.update = sharedVersion(told && told.need) || 'a newer version';
+                        state.reading = null;
+                        break;
+                    }
+                    if (!response.ok) throw new Error(`The server answered with status ${response.status}.`);
+                    const answer = await response.json();
+                    if (!answer || typeof answer !== 'object' || !answer.grant) throw new Error('The server answered with something else.');
+                    const got = this.now();
+
+                    // The server's clock, turned into this PC's: its calls of the last minute as this PC counts time.
+                    const skew = got - (Number.isFinite(answer.grant.at) ? answer.grant.at : got);
+                    this.grantKept = {
+                        at: got,
+                        need: answer.grant.need,
+                        serverShare: answer.grant.serverShare,
+                        serverTimes: (Array.isArray(answer.grant.serverTimes) ? answer.grant.serverTimes : []).filter(Number.isFinite).map((t) => t + skew),
+                    };
+                    this.d.save(SHARED_GRANT_KEY, this.grantKept);
+
+                    if (sendWorth) {
+                        this.worthJson = worthJson;
+                        this.worthAt = now;
+                    }
+                    // A server that started afresh has forgotten what the items are worth: told again next time.
+                    if (answer.born !== undefined && answer.born !== born) {
+                        if (born !== null) this.worthJson = '';
+                        born = answer.born;
+                    }
+                    for (const b of sharedTake(this.buckets, answer, this.interest, this.gen, got)) touched.add(b);
+                    // The others' marks: stored only when they changed.
+                    if (this.marksKept === undefined) this.marksKept = this.d.load(SHARED_MARKS_KEY) || null;
+                    const marks = sharedMarksIn(answer, this.marksKept, got);
+                    if (JSON.stringify(marks) !== JSON.stringify(this.marksKept || { going: [], bought: [] })) {
+                        this.marksKept = marks;
+                        this.d.save(SHARED_MARKS_KEY, marks);
+                        marksChanged = true;
+                    }
+                    if (this.dirKept === undefined) this.dirKept = this.d.load(SHARED_DIR_KEY) || null;
+                    const dirNow = sharedDirIn(answer, this.dirKept, got);
+                    if (JSON.stringify(dirNow) !== JSON.stringify(this.dirKept)) {
+                        this.dirKept = dirNow;
+                        this.d.save(SHARED_DIR_KEY, dirNow);
+                    }
+                    state.turn = dirNow.turn;
+                    if (Number.isInteger(answer.seq)) seq = answer.seq;
+                    if (Number.isFinite(answer.now)) seen = answer.now;
+                    state.okAt = got;
+                    state.update = null;
+                    state.reading = answer.state ?? null;
+                    state.key = answer.key ?? null;
+                    state.need = answer.grant.need;
+                    state.serverShare = answer.grant.serverShare;
+                    state.serverUsed = this.grantKept.serverTimes.length;
+                    // How many of us, which of the others are on, and whose key the server holds for this password:
+                    // Torn ids and Torn names as the server got them from Torn, checked again here.
+                    state.people = Number.isInteger(answer.people) && answer.people > 0 ? answer.people : null;
+                    state.on = (Array.isArray(answer.on) ? answer.on : []).slice(0, 20).map(sharedPerson);
+                    state.you = sharedPerson(answer.you);
+                    if (!Array.isArray(answer.reads) || answer.reads.length < SHARED_PAGE) break;
+                }
+            } catch (error) {
+                state.error = String(error && error.message ? error.message : error).slice(0, 160);
+            }
+
+            if (startedAt - this.prunedAt >= SHARED_PRUNE_EVERY_MS) {
+                this.prunedAt = startedAt;
+                for (const b of sharedPrune(this.buckets, this.now())) touched.add(b);
+            }
+            for (const b of touched) this.d.save(SHARED_READS_PREFIX + b, this.buckets[b]);
+            state.seq = seq;
+            state.seenAt = seen;
+            state.born = born;
+            state.touched = [...touched];
+            state.rev = (Number.isInteger(before.rev) ? before.rev : 0) + 1;
+            state.sellers = this.buckets.reduce((n, b) => n + Object.keys(b).length, 0);
+            this.rev = state.rev;
+            this.d.save(SHARED_STATE_KEY, state);
+            if (touched.size) this.kept = null;
+            if (touched.size || marksChanged) this.d.onReads();
+        }
+
+        /** The server's address or this PC's word changed, or there is none now: what was kept under the old one goes. */
+        forget() {
+            for (let i = 0; i < SHARED_BUCKETS; i += 1) this.d.del(SHARED_READS_PREFIX + i);
+            for (const key of [SHARED_STATE_KEY, SHARED_GRANT_KEY, SHARED_MARKS_KEY, SHARED_INTEREST_KEY, SHARED_ASK_KEY, SHARED_DIR_KEY]) this.d.del(key);
+            this.buckets = null;
+            this.kept = null;
+            this.interest = null;
+            this.gen = 0;
+            this.rev = null;
+            this.grantKept = null;
+            this.marksKept = null;
+            this.dirKept = null;
+            this.worthJson = '';
+        }
+
+        /** What is known of the server, for the page. */
+        status(now = this.now()) {
+            const cfg = this.config();
+            const state = this.d.load(SHARED_STATE_KEY) || {};
+            return {
+                on: Boolean(cfg),
+                address: cfg ? cfg.address : null,
+                leading: this.leading,
+                okAt: state.okAt || null,
+                syncAt: state.syncAt || null,
+                error: state.error || null,
+                reading: state.reading || null,
+                update: state.update || null,
+                key: state.key || null,
+                need: Number.isFinite(state.need) ? state.need : null,
+                serverShare: Number.isFinite(state.serverShare) ? state.serverShare : null,
+                serverUsed: Number.isFinite(state.serverUsed) ? state.serverUsed : null,
+                sellers: Number.isFinite(state.sellers) ? state.sellers : 0,
+                people: Number.isInteger(state.people) ? state.people : null,
+                peopleOn: Array.isArray(state.on) ? state.on : [],
+                you: state.you || null,
+                unknown: Boolean(cfg && state.unknown),
+                now,
+            };
+        }
     }
 
     /* ===== src/core/speed.js ===== */
@@ -2975,6 +4274,8 @@
             trader: { id: chosen.buyer.id ? String(chosen.buyer.id) : null, name: chosen.buyer.name },
             itemId: String(itemId),
             main: chosen.main ? String(chosen.main) : null,
+            // Planned as "every flip with this trader" (3.25.0): the card goes on saying so while it is held.
+            every: Boolean(chosen.every),
             at: now,
             lines: (chosen.flips || []).map((r) => ({
                 itemId: String(r.itemId),
@@ -3173,6 +4474,42 @@
             .slice(0, PIN_MAX);
         for (const [k, t] of list) out[k] = t;
         return out;
+    }
+
+    /**
+     * What a reload must not lose (3.25.0): the trades you are in, who each of their items is planned
+     * with, and "every flip". Only what a held trade needs - with none, the desk starts as it always did.
+     *
+     * @param {object} p
+     * @param {Map<string, {trade: object, touched: number}>} p.holds - sell.tradeHold
+     * @param {Map<string, string>} p.picks - itemId -> trader key
+     * @param {Set<string>} p.every - trader keys planned with every flip
+     */
+    function keepHolds({ holds, picks, every }, now = Date.now()) {
+        const live = [...holds].filter(([, h]) => h && h.trade && now - h.touched < HOLD_MS);
+        const keys = new Set(live.map(([k]) => k));
+        return {
+            v: 1,
+            holds: live.map(([k, h]) => [k, { trade: h.trade, touched: h.touched }]),
+            picks: [...picks].filter(([id, key]) => keys.has(holdKey(id, key))),
+            every: [...every].filter((key) => live.some(([, h]) => h.trade.key === key)),
+        };
+    }
+
+    /** keepHolds read back after a reload: what is still a hold now. Junk is nothing, never an error. */
+    function keptHolds(raw, now = Date.now()) {
+        const none = { holds: [], picks: [], every: [] };
+        if (!raw || raw.v !== 1 || !Array.isArray(raw.holds)) return none;
+        const holds = raw.holds.filter((e) => Array.isArray(e) && typeof e[0] === 'string' && e[1] && e[1].trade && typeof e[1].trade.key === 'string' && Array.isArray(e[1].trade.lines)
+            && Number.isFinite(e[1].touched) && e[1].touched <= now && now - e[1].touched < HOLD_MS);
+        if (!holds.length) return none;
+        const keys = new Set(holds.map(([k]) => k));
+        const traders = new Set(holds.map(([, h]) => h.trade.key));
+        return {
+            holds: holds.map(([k, h]) => [k, { trade: h.trade, touched: h.touched }]),
+            picks: (Array.isArray(raw.picks) ? raw.picks : []).filter((e) => Array.isArray(e) && keys.has(holdKey(e[0], e[1]))).map(([id, key]) => [String(id), key]),
+            every: (Array.isArray(raw.every) ? raw.every : []).filter((k) => traders.has(k)),
+        };
     }
 
     /* ===== src/core/profit.js ===== */
@@ -4443,6 +5780,15 @@
         const ready = [];
         for (const t of [...accepted].sort((a, b) => b.at - a.at)) {
             const cart = checkoutList(t);
+            const tot = acceptedTotals(t);
+            const steps = (t.items || []).flatMap((i) => i.steps || []);
+            const open = steps.find((st) => !stepDone(st)) || null;
+            // A bazaar you skipped is not one you bought from: counted apart, bazaar by bazaar.
+            const took = (st) => Boolean(st.bought || st.boughtQty > 0);
+            const stops = new Map();
+            for (const st of steps) stops.set(String(st.sellerId), [...(stops.get(String(st.sellerId)) || []), st]);
+            const boughtStops = [...stops.values()].filter((list) => list.some(took)).length;
+            const skippedStops = [...stops.values()].filter((list) => list.every((st) => st.skipped && !took(st))).length;
             const row = {
                 key: String(t.key),
                 itemId: String(t.itemId),
@@ -4450,13 +5796,25 @@
                 name: t.trader ? t.trader.name : '',
                 at: Number(t.at) || 0,
                 items: (t.items || []).length,
-                profit: Math.round(acceptedTotals(t).profit),
+                profit: Math.round(tot.profit),
+                // The trade's totals, and what has gone to bazaars so far (the Trades page's tiles).
+                cost: Math.round(tot.cost),
+                pays: Math.round(tot.pays),
+                paid: Math.round(steps.reduce((a, st) => a + (st.bought || st.boughtQty > 0 ? (st.boughtQty > 0 ? st.boughtQty : st.qty) * st.price : 0), 0)),
+                // Lines in Torn's trade so far, and the bazaar to buy from next.
+                sent: (t.items || []).filter((i) => i.sent).length,
+                next: open ? open.sellerName || (open.sellerId ? 'Player ' + open.sellerId : null) : null,
                 bazaars: cart.bazaars,
                 bazaarsDone: cart.bazaars - cart.bazaarsLeft,
+                boughtStops,
+                skippedStops,
                 // Something of it is bought (a trade of your own items only has nothing to buy).
                 bought: (t.items || []).some((i) => (i.steps || []).some((st) => stepDone(st) && !(st.skipped && !st.bought && !(st.boughtQty > 0)))),
             };
-            (nextStep(t) ? buying : ready).push(row);
+            // Ready to trade is a trade with something to send: every bazaar skipped and nothing of yours in it
+            // is not "all bought" - it stays in Buying, with nothing bought.
+            const yours = (t.items || []).some((i) => i.kind !== 'flip');
+            (nextStep(t) || (steps.length && !row.bought && !yours) ? buying : ready).push(row);
         }
         return { waiting, buying, ready, ended, going: waiting.length + buying.length + ready.length };
     }
@@ -4618,6 +5976,30 @@
         const trader = options.find((o) => o.venue === 'trader');
         const overTrader = best && best.venue !== 'trader' && trader && trader.each !== null && !trader.loss;
         return { options, best: best ? best.venue : null, gain: was ? where.gain : overTrader ? best.total - trader.total : 0, paid };
+    }
+
+    /**
+     * One Where-to-sell row, as shown: its total and its plus or loss for the SAME units, so the words
+     * and the figure agree. A listing venue counted for only the first N adds the trader's price for the
+     * rest (whereToSell) - which made a venue that is a loss per piece show a plus. A loss shows only its
+     * own units.
+     *
+     * @param {{venue, each, units, total, loss?}|null} o - one option of whereAbovePaid
+     * @param {number} held
+     * @param {number} paidEach - 0 when not known: no plus or loss then
+     * @returns {{known: boolean, units: number, total: number|null, gain: number|null, loss: boolean, part: boolean}}
+     */
+    function whereRowView(o, held, paidEach) {
+        const n = held > 0 ? held : 0;
+        const paid = Number(paidEach) || 0;
+        if (!o || o.each === null || o.each === undefined) return { known: false, units: 0, total: null, gain: null, loss: false, part: false };
+        const units = o.units > 0 && o.units < n ? o.units : n;
+        const part = units < n;
+        const loss = paid > 0 && o.each <= paid;
+        const whole = o.total !== null && o.total !== undefined ? o.total : o.each * n;
+        const total = loss && part ? o.each * units : whole;
+        const gain = paid > 0 ? total - paid * (loss && part ? units : n) : null;
+        return { known: true, units, total, gain, loss, part };
     }
 
     /**
@@ -5183,6 +6565,17 @@
         if (!Number.isFinite(entry.fetchedAt)) return false;
 
         return now - entry.fetchedAt < (entry.partial ? Math.min(ttl, ITEMS_PARTIAL_TTL_MS) : ttl);
+    }
+
+    /**
+     * A stored entry a page can still be read with, whatever its age (3.25.0): the
+     * right shape and version. With no key Torn takes, names and ids are all that
+     * reading and marking a page need; the values in it are as old as it is.
+     */
+    function itemsCacheUsable(entry) {
+        if (!entry || typeof entry !== 'object') return false;
+        if (entry.version !== ITEMS_CACHE_VERSION) return false;
+        return Boolean(entry.items) && typeof entry.items === 'object' && Object.keys(entry.items).length > 0;
     }
 
     /**
@@ -6785,9 +8178,14 @@
      *   extras (see above); null plans every item up to Most, the item on the desk first
      * @param {number} [p.extraItems] - Extras per trade (Settings); unset = EXTRA_ITEMS
      * @param {number} [p.maxUnits] - the most items one trade takes (TRADE_MAX_UNITS)
+     * @param {boolean} [p.everything] - every flip with this trader (3.25.0; the owner: "we sometimes
+     *   have 1 trader that just buys everything so as long as its in the 10k limit and its a flip
+     *   should be good to go"): no main flip and extras - every item they buy that a bazaar sells for
+     *   less, each up to Most per flip from every bazaar under their price, the best return first.
+     *   Your cash, what they can pay, the trade's item limit and "never their own bazaar" all hold.
      */
     function planTrade(p) {
-        if (typeof p.kindOf === 'function') return planMainAndExtras(p);
+        if (typeof p.kindOf === 'function' && !p.everything) return planMainAndExtras(p);
         return planEverything(p);
     }
 
@@ -7069,7 +8467,7 @@
     }
 
     /** Every item up to Most, the item on the desk first, then the most profit per $ (no kinds given). */
-    function planEverything({ first = null, flips = [], held = [], cash = null, maxPerItem = FLIP_MAX_UNITS, payCap = Infinity, minPct = MIN_PROFIT_PCT, edits = {}, keep = {}, traderId = null, maxUnits = TRADE_MAX_UNITS }) {
+    function planEverything({ first = null, flips = [], held = [], cash = null, maxPerItem = FLIP_MAX_UNITS, payCap = Infinity, minPct = MIN_PROFIT_PCT, edits = {}, keep = {}, traderId = null, kindOf = null, maxUnits = TRADE_MAX_UNITS }) {
         let cashLeft = cash > 0 ? cash : Infinity;
         const room = { left: maxUnits > 0 ? Math.floor(maxUnits) : 0 };
         let unitsCapped = false;
@@ -7092,7 +8490,8 @@
         const route = new Set();
         let unknownStops = 0;
         const take = (c) => {
-            const r = plan.get(c.id) || { itemId: c.id, bid: c.bid, units: 0, cost: 0, profit: 0, steps: [], kind: 'fast' };
+            // Its kind, where kinds are known (the app): a held line keeps it. Nothing here is capped by it.
+            const r = plan.get(c.id) || { itemId: c.id, bid: c.bid, units: 0, cost: 0, profit: 0, steps: [], kind: typeof kindOf === 'function' ? (KIND_RANK[kindOf(c.id)] !== undefined ? kindOf(c.id) : 'normal') : 'fast' };
             const wanted = Math.min(c.s.qty, Math.floor(cashLeft / c.s.price), c.cap - r.units);
             const canPay = Math.min(wanted, Math.floor(pay.left / c.bid));
             const n = Math.min(canPay, room.left);
@@ -7249,9 +8648,13 @@
      * @param {string} p.filter - 'all' | 'mine' | 'flips'
      * @param {Array<{itemId}>} p.strip - the best flips, best first
      * @param {Array<{itemId}>} p.listed - the list, in its order
+     * @param {string|null} [p.underWay] - the item of the trade under way: one a trader said yes to, else one you planned
      */
-    function deskItem({ pickedByYou = false, selected = null, filter = 'all', strip = [], listed = [] }) {
+    function deskItem({ pickedByYou = false, selected = null, filter = 'all', strip = [], listed = [], underWay = null }) {
         if (pickedByYou && selected) return selected;
+        // 3.25.0: a trade under way owns the desk until you pick something else yourself. Before, a
+        // reload or a filter press in the middle of a buying run put the #1 flip there instead.
+        if (underWay) return String(underWay);
         if (filter !== 'mine' && strip.length) return strip[0].itemId;
         return listed.length ? listed[0].itemId : null;
     }
@@ -7366,6 +8769,24 @@
         return { ok: false, want, otherEvery: left >= 1 && counts.other > 0 ? Math.ceil(counts.other / left) : null };
     }
 
+    /**
+     * The trader the desk's plan is with when you picked none (3.25.0): the one it showed last for this
+     * item, for as long as they still make a trade with it. A better one is never swapped in by itself -
+     * it is said beside the plan instead, and only when it is better by more than STEADY_MORE of the
+     * plan's profit: two traders a few dollars apart would otherwise swap the note on every price read.
+     *
+     * @param {Array<{key: string, profit: number}>} ranked - the trades that can be shown, best first
+     * @param {string|null} keptKey - the trader shown last for this item
+     * @returns {{chosen: object|null, better: object|null}}
+     */
+    const STEADY_MORE = 0.02;
+    function steadyTrader(ranked, keptKey) {
+        const best = ranked[0] || null;
+        const kept = keptKey ? ranked.find((t) => t.key === keptKey) || null : null;
+        if (!kept || kept === best) return { chosen: best, better: null };
+        return { chosen: kept, better: best.profit > kept.profit * (1 + STEADY_MORE) ? best : null };
+    }
+
     /* ===== src/core/usage.js ===== */
     /*
      * API use (3.15, the owner: "I need to see the usage with a graph, so we're
@@ -7423,6 +8844,14 @@
         'e.trader': { name: "A trader's whole list" },
         'e.one': { name: 'Best buyer (no key)' },
         'e.other': { name: 'Other' },
+        // Not requests: how TornW3B answered them (3.25.0, the zip of 2026-10-06: "sent" could not
+        // say whether a minute's dozen were taken or refused). In the export only - their letter is
+        // no service's, so no chart, total or limit counts them.
+        'r.w.ok': { name: 'Answered', service: 'w' },
+        'r.w.429': { name: 'Refused (429 or a blocked page)', service: 'w' },
+        // The shared server (3.25.0): its own address and its own limits, so it is in no chart here - only in the export.
+        'r.s.ok': { name: 'Answered', serviceName: 'Shared server' },
+        'r.s.fail': { name: 'Failed or refused', serviceName: 'Shared server' },
     };
 
     /** A tag that is not in the list is counted as its service's Other. */
@@ -7548,11 +8977,91 @@
         for (const at of [...bucket.keys()].sort((a, b) => a - b)) {
             for (const [label, n] of Object.entries(bucket.get(at)).sort()) {
                 if (!(n > 0)) continue;
-                const svc = USAGE_SERVICES[label.charAt(0)];
-                rows.push([local(at), svc ? svc.name : '?', (USAGE_LABELS[label] || { name: label }).name, label, n]);
+                const svc = USAGE_SERVICES[(USAGE_LABELS[label] || {}).service || label.charAt(0)];
+                rows.push([local(at), svc ? svc.name : (USAGE_LABELS[label] || {}).serviceName || '?', (USAGE_LABELS[label] || { name: label }).name, label, n]);
             }
         }
         return rows.map((r) => r.map((c) => (/[",\n]/.test(String(c)) ? '"' + String(c).replace(/"/g, '""') + '"' : String(c))).join(',')).join('\n') + '\n';
+    }
+
+    /* ===== src/core/steady-sleep.js ===== */
+    /*
+     * A wait that a hidden tab keeps too (3.25.0).
+     *
+     * A hidden tab's timers fire late - once a second at first, after five minutes
+     * hidden once a minute. Torn Bids reads TornW3B from behind your Torn tab, so
+     * until now each of its reads started as the last one ended, with nothing
+     * between them: up to 40 back to back, the burst TornW3B refuses. The gap
+     * between two reads (api/w3b.js) has to be waited out there by something the
+     * browser does not slow: a worker's timer.
+     *
+     * In view no worker is ever made. Hidden, one is made for the tab, and the
+     * plain timer runs beside it - whichever ends first ends the wait - so a page
+     * that refuses a worker costs nothing but the late timer of before.
+     */
+
+    /** The whole worker: told [number, ms], it answers with the number after ms. */
+    const STEADY_WORKER_SOURCE = 'onmessage = function (e) { var id = e.data[0]; setTimeout(function () { postMessage(id); }, e.data[1]); }';
+
+    /**
+     * @param {object} o
+     * @param {function} o.makeWorker - (source) => Worker; may throw (the page's policy)
+     * @param {function} [o.isHidden] - () => boolean
+     * @returns {function(number): Promise<void>} sleep(ms)
+     */
+    function makeSteadySleep({ makeWorker = null, isHidden = () => false, setTimer = setTimeout, clearTimer = clearTimeout, onRefused = null } = {}) {
+        let worker = null;
+        let refused = false;
+        let next = 1;
+        const waiting = new Map();
+        const giveUp = () => {
+            const first = !refused;
+            refused = true;
+            worker = null;
+            // For the log, once: from here a hidden tab waits on the browser's slowed timer.
+            if (first && onRefused) {
+                try {
+                    onRefused();
+                } catch {
+                    // The log is best-effort.
+                }
+            }
+        };
+        const start = () => {
+            if (worker || refused || !makeWorker) return;
+            try {
+                worker = makeWorker(STEADY_WORKER_SOURCE);
+                worker.onmessage = (e) => {
+                    const done = waiting.get(e && e.data);
+                    if (done) done();
+                };
+                worker.onerror = giveUp;
+            } catch {
+                giveUp();
+            }
+        };
+        const sleep = (ms) => new Promise((resolve) => {
+            const id = next++;
+            let timer = null;
+            const done = () => {
+                if (!waiting.delete(id)) return;
+                clearTimer(timer);
+                resolve();
+            };
+            waiting.set(id, done);
+            timer = setTimer(done, ms);
+            if (!isHidden()) return;
+            start();
+            if (!worker) return;
+            try {
+                worker.postMessage([id, ms]);
+            } catch {
+                giveUp();
+            }
+        });
+        /** For the export: 'worker' (a hidden tab keeps time), 'refused' (the page allows no worker), or 'not needed yet'. */
+        sleep.state = () => (refused ? 'refused' : worker ? 'worker' : 'not needed yet');
+        return sleep;
     }
 
     /* ===== src/core/errlog.js ===== */
@@ -8535,69 +10044,6 @@
     .bw-link:focus-visible, .bw-btn:focus-visible { outline: 2px solid var(--profit); outline-offset: 1px; }
     `;
 
-    /* ===== src/core/leader.js ===== */
-    /*
-     * Which Torn tab runs the live feed. Pure: the caller reads and writes the
-     * shared record.
-     *
-     * Every Torn tab boots this script. Without one leader, five tabs make five
-     * times the requests - Torn's 100/min is per USER across every key and tool,
-     * and TornW3B's 100/min is per IP. So exactly one tab polls and the others
-     * render what it stores.
-     *
-     * Only a VISIBLE tab may lead. Torn's rules forbid software that works from
-     * unfocused pages to "generate alerts, or draw attention to itself"; a hidden
-     * tab polling in the background is the shape of that, so a tab that is
-     * hidden gives up the role instead of keeping it.
-     */
-
-    /** A leader that has not renewed in this long is presumed gone. */
-    const LEADER_STALE_MS = 10000;
-
-    /** How often the leader renews its claim. */
-    const LEADER_HEARTBEAT_MS = 3000;
-
-    /**
-     * @param {object|null} record - { id, ts } as last stored
-     * @param {string} me - this tab's id
-     * @param {object} opts
-     * @param {number} opts.now
-     * @param {boolean} opts.visible
-     * @returns {{lead: boolean, confirmed: boolean, write: object|null}}
-     *   `write` is the record to store (null = leave it alone). `confirmed` is
-     *   true only when the stored record ALREADY named this tab: two tabs can
-     *   both claim a stale record in the same instant, and only the one whose
-     *   write survived sees itself there on the next tick. Poll only when
-     *   confirmed, and the race costs one heartbeat instead of double requests.
-     */
-    function decideLeader(record, me, { now, visible, staleMs = LEADER_STALE_MS }) {
-        const held = record && record.id && Number.isFinite(record.ts);
-        const mine = held && record.id === me;
-        const fresh = held && now - record.ts < staleMs;
-
-        if (mine) {
-            if (visible) {
-                return { lead: true, confirmed: true, write: { id: me, ts: now } };
-            }
-            // Hidden: step down so a visible tab can take over at once.
-            return { lead: false, confirmed: false, write: { id: null, ts: 0 } };
-        }
-
-        if (!fresh && visible) {
-            return { lead: true, confirmed: false, write: { id: me, ts: now } };
-        }
-
-        return { lead: false, confirmed: false, write: null };
-    }
-
-    function makeTabId() {
-        return (
-            Date.now().toString(36) +
-            '-' +
-            Math.random().toString(36).slice(2, 10)
-        );
-    }
-
     /* ===== src/platform/tab-window.js ===== */
     /*
      * A request window every tab shares, without tabs losing each other's writes.
@@ -9001,11 +10447,17 @@
     const YIELDED = Symbol('yielded');
 
     class TornApiError extends Error {
-        constructor(message, { code = null, http = null, paused = false } = {}) {
+        constructor(message, { code = null, http = null, paused = false, fromTorn = false } = {}) {
             super(message);
             this.name = 'TornApiError';
             this.code = code;
             this.http = http;
+            /**
+             * Torn's own answer ({error: {code, error}} in its reply) - not a network failure, not a
+             * pause, not this client's "No API key set". Only such an error can say a key is rejected
+             * (core/key-dead.js, 3.25.0).
+             */
+            this.fromTorn = fromTorn === true;
             /** Refused by this client during a shared pause: nothing was sent. */
             this.paused = paused;
         }
@@ -9064,7 +10516,16 @@
             addToWindow = null,
             onSent = null,
             onFailed = null,
+            mayCall = null,
+            onHeld = null,
         } = {}) {
+            /**
+             * (now, recent) => boolean, asked before a request takes its slot. Settings > Shared: the
+             * shared server reads with this person's key too, and this PC keeps to its part of the limit.
+             * `onHeld`: () => void, each time a request waits because of it.
+             */
+            this.mayCall = mayCall;
+            this.onHeld = onHeld;
             /** ({path, tag, error}) => void, a call that failed for good (not each retry): the problem log (3.15). */
             this.onFailed = onFailed;
             /** ({path, params, tag, priority}) => void, each request that leaves (retries too): the usage record. */
@@ -9146,6 +10607,12 @@
 
                 // Hidden: take no slot and send nothing until the tab is back.
                 if (!this.isVisible()) {
+                    await apiSleep(HIDDEN_POLL_MS);
+                    continue;
+                }
+
+                if (this.mayCall && !this.mayCall(now, this.recent)) {
+                    if (this.onHeld) this.onHeld();
                     await apiSleep(HIDDEN_POLL_MS);
                     continue;
                 }
@@ -9446,12 +10913,143 @@
             if (err) {
                 throw new TornApiError(
                     'Torn API ' + err.code + ': ' + redactKey(err.error, key),
-                    { code: Number(err.code) },
+                    { code: Number(err.code), fromTorn: true },
                 );
             }
 
             return data;
         }
+    }
+
+    /* ===== src/core/key-dead.js ===== */
+    /*
+     * A key Torn has rejected (3.25.0; the friend's zip of 2026-10-08, "Doesn't
+     * highlight flips").
+     *
+     * His overlay read no Torn page for two days. Its key was fine: the script had
+     * marked it rejected itself - any error carrying the number 2, 13 or 18 counted,
+     * and a browser's SecurityError carries 18, the script's own "No API key set"
+     * carries 2 - and a key once marked stayed so until he pasted one again, with
+     * nothing in the log.
+     *
+     * The rules here, for the overlay's key, Torn Bids' and the Ledger's alike:
+     *   - only Torn's own answer rejects a key (an error made from Torn's reply);
+     *   - a rejected key is tried again by itself - when a page loads, then at most
+     *     once an hour - and comes back the moment Torn takes it;
+     *   - what is kept is Torn's number and when, so the words and the report can
+     *     say which of the three it was.
+     *
+     * Pure: no storage, no network.
+     */
+
+    /** A rejected key is asked about again this often, at most. */
+    const KEY_RETRY_MS = 60 * 60 * 1000;
+    /** ...and this soon when the try itself got no answer from Torn (offline, Torn down). */
+    const KEY_RETRY_SOON_MS = 5 * 60 * 1000;
+
+    /* Torn's three ways of saying a key is no good: wrong, owner inactive, paused by its owner. */
+    const KEY_REJECT_WORDS = {
+        2: 'Torn says this key is wrong',
+        13: 'Torn has switched this key off because its owner was away too long',
+        18: 'This key is paused in Torn\'s settings',
+    };
+    /* ...and, for the Ledger only (it needs a Full key), Torn says "access level not high enough". */
+    const KEY_TOO_LOW = 16;
+    const KEY_KEPT_WORDS = { ...KEY_REJECT_WORDS, [KEY_TOO_LOW]: 'Torn says this key\'s access is too low for this' };
+
+    /**
+     * Torn's number, when this error is Torn itself rejecting the key; else null.
+     * `fromTorn` is set by the API client on an error it built from Torn's reply,
+     * and by nothing else.
+     */
+    function keyRejectedCode(error, { tooLow = false } = {}) {
+        if (!error || error.fromTorn !== true) return null;
+        const code = Number(error.code);
+        return KEY_REJECT_WORDS[code] || (tooLow && code === KEY_TOO_LOW) ? code : null;
+    }
+
+    /**
+     * The stored rejection: {code, at, tried}, or null when there is none.
+     * What 3.24.1 and before stored (`true`, or the Ledger's words) has no number
+     * and no time: read as "tried never", so it is tried again at once.
+     */
+    function keyDeadRead(stored) {
+        if (!stored) return null;
+        const s = typeof stored === 'object' ? stored : {};
+        const time = (n) => (Number.isFinite(Number(n)) && Number(n) > 0 ? Number(n) : 0);
+        return { code: KEY_KEPT_WORDS[Number(s.code)] ? Number(s.code) : null, at: time(s.at), tried: time(s.tried) };
+    }
+
+    /** Torn rejected it (first, or again on a try): `at` stays while the reason is the same. */
+    function keyDeadMark(was, code, now) {
+        const prev = keyDeadRead(was);
+        const n = KEY_KEPT_WORDS[Number(code)] ? Number(code) : null;
+        return { code: n, at: prev && prev.at && prev.code === n ? prev.at : now, tried: now };
+    }
+
+    /** A try that Torn never answered: nothing learned, asked again soon. */
+    function keyDeadUnanswered(was, now) {
+        const prev = keyDeadRead(was) || { code: null, at: 0, tried: 0 };
+        return { ...prev, tried: now - KEY_RETRY_MS + KEY_RETRY_SOON_MS };
+    }
+
+    /** Time to ask Torn about it again? */
+    function keyDeadDue(was, now) {
+        const state = keyDeadRead(was);
+        if (!state) return false;
+        return now - state.tried >= KEY_RETRY_MS || state.tried > now;
+    }
+
+    /**
+     * What the screen says. `kind`: the key to paste ("Public", "Limited", "Full").
+     * null when the key is not rejected.
+     */
+    function keyDeadWords(was, kind, now) {
+        const state = keyDeadRead(was);
+        if (!state) return null;
+        const why = state.code ? KEY_KEPT_WORDS[state.code] + ' (error ' + state.code + ')' : 'An earlier version marked this key as rejected';
+        const left = keyDeadDue(state, now) ? 0 : Math.ceil((state.tried + KEY_RETRY_MS - now) / 60000);
+        return why + '. ' + (left > 0 ? 'It is tried again in ' + left + ' min by itself' : 'It is being tried again now') + ' - or paste a new ' + kind + ' key.';
+    }
+
+    /** For the report's state.json: stored, working or rejected - never the key itself. */
+    function keyReport(key, dead, now) {
+        if (!key) return { stored: false, state: 'none' };
+        const state = keyDeadRead(dead);
+        if (!state) return { stored: true, state: 'working' };
+        const minutes = (t) => (t ? Math.max(0, Math.round((now - t) / 60000)) : null);
+        return { stored: true, state: 'rejected', error: state.code, sinceMinutes: minutes(state.at), triedMinutesAgo: minutes(state.tried) };
+    }
+
+    /**
+     * Ask Torn about a rejected key again - one request, only when it is due.
+     *
+     * @param {object} o
+     * @param {function} o.load - () => the stored rejection
+     * @param {function} o.save - (state) => void
+     * @param {function} o.clear - () => void, the key is good again
+     * @param {function} o.ask - () => Promise, any request made with the key; it throws what Torn answered
+     * @param {boolean} [o.tooLow] - the Ledger: error 16 keeps it rejected too
+     * @returns {Promise<'not-due'|'back'|'rejected'|'unanswered'>}
+     */
+    async function keyDeadRetry({ load, save, clear, ask, now = Date.now, tooLow = false }) {
+        const was = keyDeadRead(load());
+        if (!was || !keyDeadDue(was, now())) return 'not-due';
+        // Written down before the request leaves: another tab does not ask too.
+        save({ ...was, tried: now() });
+        try {
+            await ask();
+        } catch (error) {
+            const code = keyRejectedCode(error, { tooLow });
+            if (code === null) {
+                save(keyDeadUnanswered(was, now()));
+                return 'unanswered';
+            }
+            save(keyDeadMark(was, code, now()));
+            return 'rejected';
+        }
+        clear();
+        return 'back';
     }
 
     /* ===== src/api/w3b.js ===== */
@@ -9500,6 +11098,34 @@
     const W3B_COOLDOWN_MS = 60000;
 
     /*
+     * The pace (3.25.0; the friend's zip of 2026-10-06, 3.24.1). TornW3B refused us
+     * minute after minute at a dozen requests a minute - the same hours it took 40
+     * and 43 in a minute when they came spread out. It refuses a BURST: a dozen left
+     * back to back, the last was a 429, we paused a minute, and the same dozen left
+     * again. The minute's ceilings above never saw it.
+     *
+     * So: a gap between any two requests, whichever tab makes them (the time of the
+     * last one is already shared). The gap finds its own length - a little shorter
+     * after each answer, never under its floor; after a refusal twice as long, and
+     * the pace that was refused is not tried again for two hours. After a pause the
+     * first request so goes alone and the next ones slowly.
+     */
+    /** Never closer than this: 60 a minute, the ceiling of before. */
+    const W3B_GAP_MIN_MS = 1000;
+    /** Where it starts, and never faster than this right after a refusal. */
+    const W3B_GAP_START_MS = 1500;
+    /** Never slower than this, whatever is refused. */
+    const W3B_GAP_MAX_MS = 8000;
+    /** Shorter by this after each answer. */
+    const W3B_GAP_STEP_MS = 25;
+    /** A pace that was refused is not tried again for this long. */
+    const W3B_GAP_HOLD_MS = 2 * 60 * 60 * 1000;
+    /** The gap is stored for the other tabs when it has moved this much (not at every answer). */
+    const W3B_GAP_SAVE_MS = 100;
+    /** A request with no other in this long before it went alone: refused, it says nothing about the pace. */
+    const W3B_ALONE_MS = 20000;
+
+    /*
      * Torn Bids first (3.20.5, the owner: "when we're in Torn Bids, we prioritize
      * Torn Bids, not the NPC arbitrage"). The overlay on Torn's pages took up to
      * 59 of every tab's 80 reads a minute (the friend's zip); back on Torn Bids,
@@ -9543,11 +11169,13 @@
     }
 
     class W3bError extends Error {
-        constructor(message, { http = null, blocked = false } = {}) {
+        constructor(message, { http = null, blocked = false, paused = false } = {}) {
             super(message);
             this.name = 'W3bError';
             this.http = http;
             this.blocked = blocked;
+            // Not sent at all: we are inside the wait a refusal started. Nothing for the problem log.
+            this.paused = paused;
         }
     }
 
@@ -9570,10 +11198,16 @@
          * @param {function} [options.addShared] - (at) => void: record one slot of
          *   THIS tab only (platform/tab-window.js), so tabs never overwrite each
          *   other's; without it the whole window is written back through saveShared
+         * @param {function} [options.sharedCeiling] - () => number: every tab together, right now, when
+         *   it is lower than sharedPerMinute (Torn Bids beside Torn Archive)
          * @param {number} [options.sharedPerMinute]
          * @param {function} [options.sleep] - (ms) => Promise; injectable for tests
          * @param {function} [options.isVisible] - () => boolean; nothing is sent
          *   from a hidden tab, even a request queued while it was visible
+         * @param {boolean} [options.pace] - keep a gap between any two requests,
+         *   across tabs (the script always does; off only for the tests of other parts)
+         * @param {function} [options.onAnswered] - ({path, tag, refused}) => void, each
+         *   answer: taken, or refused (a 429 or a challenge page)
          */
         constructor({
             fetchImpl = gmFetch,
@@ -9588,9 +11222,21 @@
             onSent = null,
             onFailed = null,
             perMinute = null,
+            sharedCeiling = null,
             onOver = null,
+            pace = false,
+            onAnswered = null,
+            onPace = null,
         } = {}) {
+            this.pace = Boolean(pace);
+            // This tab's own copy of the pace, for when nothing is shared; and what it has shortened the gap by since it last stored it.
+            this.paceOwn = null;
+            this.gapDebt = 0;
+            this.onAnswered = onAnswered;
+            /** A refusal changed the pace: ({was, gap, floor}, in ms) - for the log. */
+            this.onPace = onPace;
             this.perMinute = perMinute;
+            this.sharedCeiling = sharedCeiling;
             /**
              * ({count, limit, own}) => void (3.23.0): the minute every tab shares was found OVER
              * sharedPerMinute - tabs learn of each other's requests late, so two can take the same
@@ -9628,7 +11274,69 @@
             if (!s || typeof s !== 'object') return out;
             if (Array.isArray(s.recent)) out.recent = s.recent.filter((x) => Number.isFinite(x) && t - x < 60000).sort((a, b) => a - b);
             if (Number.isFinite(Number(s.cooldownUntil))) out.cooldownUntil = Number(s.cooldownUntil);
+            if (s.pace && typeof s.pace === 'object') out.pace = s.pace;
             return out;
+        }
+
+        /** The pace every tab goes by: {gap, floor, floorUntil}, each within its bounds. */
+        paceNow(shared, t) {
+            const p = (this.loadShared ? shared && shared.pace : this.paceOwn) || {};
+            const within = (n, fallback) => (Number.isFinite(Number(n)) ? Math.max(W3B_GAP_MIN_MS, Math.min(W3B_GAP_MAX_MS, Math.round(Number(n)))) : fallback);
+            const floorUntil = Number.isFinite(Number(p.floorUntil)) && Number(p.floorUntil) <= t + W3B_GAP_HOLD_MS ? Number(p.floorUntil) : 0;
+            const floor = floorUntil > t ? within(p.floor, W3B_GAP_MIN_MS) : W3B_GAP_MIN_MS;
+            return { gap: Math.max(floor, within(p.gap, W3B_GAP_START_MS)), floor, floorUntil: floorUntil > t ? floorUntil : 0 };
+        }
+
+        savePace(pace, t) {
+            this.gapDebt = 0;
+            if (this.loadShared) this.writeShared({ ...this.readShared(t), pace });
+            else this.paceOwn = pace;
+        }
+
+        /** An answer came: the gap a little shorter, never under its floor. */
+        paceAnswered() {
+            if (!this.pace) return;
+            const t = this.now();
+            const pace = this.paceNow(this.readShared(t), t);
+            const gap = Math.max(pace.floor, pace.gap - this.gapDebt - W3B_GAP_STEP_MS);
+            this.gapDebt = pace.gap - gap;
+            // Stored for the other tabs once it has moved enough, or has reached its floor.
+            if (this.gapDebt >= W3B_GAP_SAVE_MS || (gap === pace.floor && this.gapDebt > 0)) this.savePace({ ...pace, gap }, t);
+        }
+
+        /** Refused: twice the gap, and the pace that was refused is not tried again for two hours. */
+        paceRefused() {
+            if (!this.pace) return;
+            const t = this.now();
+            const shared = this.readShared(t);
+            // It went alone (the first after a pause; TornW3B down, or refusing this address for
+            // someone else's requests): slower would not have helped, so the pace stays.
+            const lately = (this.loadShared ? shared.recent : this.recent).filter((at) => t - at < W3B_ALONE_MS).length;
+            if (lately <= 1) return;
+            const pace = this.paceNow(shared, t);
+            const was = Math.max(pace.floor, pace.gap - this.gapDebt);
+            const next = {
+                gap: Math.min(W3B_GAP_MAX_MS, Math.max(W3B_GAP_START_MS, was * 2)),
+                floor: Math.min(W3B_GAP_MAX_MS, Math.max(pace.floor, Math.round(was * 1.25))),
+                floorUntil: t + W3B_GAP_HOLD_MS,
+            };
+            this.savePace(next, t);
+            if (this.onPace) {
+                try {
+                    this.onPace({ was: Math.round(was), gap: Math.round(next.gap), floor: Math.round(next.floor) });
+                } catch {
+                    // The log is best-effort.
+                }
+            }
+        }
+
+        answered(path, tag, refused) {
+            if (!this.onAnswered) return;
+            try {
+                this.onAnswered({ path, tag, refused });
+            } catch {
+                // The usage record is best-effort.
+            }
         }
 
         writeShared(state) {
@@ -9643,6 +11351,18 @@
         /** The later of this tab's wait and any other tab's. */
         blockedUntil(t = this.now()) {
             return Math.max(this.cooldownUntil, this.readShared(t).cooldownUntil);
+        }
+
+        /** Every tab's ceiling together now: sharedPerMinute, or less while sharedCeiling() says so. Never under 1. */
+        sharedNow() {
+            if (!this.sharedCeiling) return this.sharedPerMinute;
+            let n;
+            try {
+                n = Number(this.sharedCeiling());
+            } catch {
+                return this.sharedPerMinute;
+            }
+            return Number.isFinite(n) ? Math.max(1, Math.min(this.sharedPerMinute, Math.floor(n))) : this.sharedPerMinute;
         }
 
         /** This tab's ceiling now: maxPerMinute, or less while perMinute() says so. Never under 1. */
@@ -9665,6 +11385,8 @@
                 remaining: Math.max(0, this.limit() - used),
                 coolingDown: t < this.blockedUntil(t),
                 sharedLastMinute: this.loadShared ? this.readShared(t).recent.length : used,
+                // The gap every tab keeps between two requests now (null: no pace).
+                gapMs: this.pace ? this.paceNow(this.readShared(t), t).gap : null,
             };
         }
 
@@ -9678,8 +11400,18 @@
                 const t = this.now();
                 this.recent = this.recent.filter((x) => t - x < 60000);
                 const shared = this.readShared(t);
-                const sharedFull = this.loadShared && shared.recent.length >= this.sharedPerMinute;
+                const sharedMax = this.sharedNow();
+                const sharedFull = this.loadShared && shared.recent.length >= sharedMax;
                 const limit = this.limit();
+                // The pace: not sooner than the gap after the last request of any tab.
+                if (this.pace) {
+                    const last = Math.max(this.recent.length ? this.recent[this.recent.length - 1] : 0, shared.recent.length ? shared.recent[shared.recent.length - 1] : 0);
+                    const gap = Math.max(W3B_GAP_MIN_MS, this.paceNow(shared, t).gap - this.gapDebt);
+                    if (last > 0 && t >= last && t - last < gap) {
+                        await this.sleep(gap - (t - last));
+                        continue;
+                    }
+                }
                 if (this.onOver && this.loadShared && shared.recent.length > this.sharedPerMinute) {
                     try {
                         this.onOver({ count: shared.recent.length, limit: this.sharedPerMinute, own: this.recent.length });
@@ -9699,13 +11431,13 @@
                     } else if (this.loadShared) {
                         this.writeShared({ ...shared, recent: [...shared.recent, t] });
                     }
-                    return;
+                    return t;
                 }
 
                 // Wait until every full window has a slot again.
                 const frees = [];
                 if (this.recent.length >= limit) frees.push(this.recent[this.recent.length - limit]);
-                if (sharedFull) frees.push(shared.recent[shared.recent.length - this.sharedPerMinute]);
+                if (sharedFull) frees.push(shared.recent[shared.recent.length - sharedMax]);
                 await this.sleep(Math.max(50, 60000 - (t - Math.max(...frees)) + 25));
             }
         }
@@ -9739,7 +11471,8 @@
         /** GET one TornW3B path. Serialised, rate-limited, never keyed. `tag`: what it is for (the usage record). */
         get(path, { tag = null, query = null } = {}) {
             const run = () => this.execute(path, tag, query).catch((error) => {
-                if (this.onFailed) {
+                // Paused means silent: the one real refusal is logged, not every request that was not sent.
+                if (this.onFailed && !(error && error.paused)) {
                     try {
                         this.onFailed({ path, tag, error });
                     } catch {
@@ -9754,24 +11487,27 @@
         }
 
         async execute(path, tag = null, query = null) {
+            // Paused: not sent, not kept for later - whoever asked asks again when it is due.
             if (this.now() < this.blockedUntil()) {
                 throw new W3bError('TornW3B is rate limiting us; paused briefly.', {
                     blocked: true,
+                    paused: true,
                 });
             }
 
             const url = this.buildUrl(path, query);
-            await this.waitForSlot();
+            const at = await this.waitForSlot();
             // Another tab may have been blocked while this one waited for a slot.
             if (this.now() < this.blockedUntil()) {
                 throw new W3bError('TornW3B is rate limiting us; paused briefly.', {
                     blocked: true,
+                    paused: true,
                 });
             }
 
             if (this.onSent) {
                 try {
-                    this.onSent({ path, tag });
+                    this.onSent({ path, tag, at });
                 } catch {
                     // The usage record is best-effort.
                 }
@@ -9788,6 +11524,8 @@
 
             if (response.status === 429) {
                 this.coolDown();
+                this.paceRefused();
+                this.answered(path, tag, true);
                 throw new W3bError('TornW3B rate limit (429).', {
                     http: 429,
                     blocked: true,
@@ -9801,10 +11539,15 @@
             }
 
             try {
-                return await response.json();
+                const body = await response.json();
+                this.paceAnswered();
+                this.answered(path, tag, false);
+                return body;
             } catch {
                 // Cloudflare answers a challenge page with HTML, not JSON.
                 this.coolDown();
+                this.paceRefused();
+                this.answered(path, tag, true);
                 throw new W3bError('TornW3B returned a non-JSON page (blocked?).', {
                     blocked: true,
                 });
@@ -9927,6 +11670,417 @@
     function positiveOrNull(value) {
         const n = Number(value);
         return Number.isFinite(n) && n > 0 ? n : null;
+    }
+
+    /* ===== src/core/front.js ===== */
+    /*
+     * The requests go to where he is (3.25.0, plan part 1c). The owner, 2026-10-09:
+     * "we can take it out, and just throttle depending on usage/page he is viewing
+     * ... on the overlay/torn page, we can throttle the api calls from tornbids as
+     * he is already actively buying, when hes in tornbids, throttle the overlay so
+     * tornbids gets it all".
+     *
+     * So no switch ("Save API calls" and "Watch the Item Market anywhere" are gone).
+     * There are two sides - Torn Bids, and the panel on Torn's pages - and each
+     * leaves a sign of life while it is in view: when it was last seen, and when he
+     * last came to it. From those four numbers every tab works out the same answer:
+     *
+     *   a Torn page in front   the page asks. Torn Bids keeps its turn for a short
+     *                          while (a buying run goes back and forth), then asks
+     *                          only for what an accepted or held trade needs.
+     *   Torn Bids in front     Torn Bids has the reads; the panel asks nothing of
+     *                          its own.
+     *   neither in view        nothing of its own is asked by either.
+     *
+     * This divides the allowance, it does not make it larger: the pace is the gap
+     * in api/w3b.js and Torn's own limit, whoever asks.
+     *
+     * Pure: no storage, no DOM.
+     */
+
+    /** A side in view says so this often. */
+    const FRONT_BEAT_MS = 10000;
+    /** In view = seen within this (two signs of life may be missed). */
+    const FRONT_ALIVE_MS = 25000;
+    /** Torn Bids keeps its turn this long after he leaves it. */
+    const FRONT_KEEP_MS = 30000;
+
+    function frontClean(side) {
+        const time = (n) => (Number.isFinite(Number(n)) && Number(n) > 0 ? Number(n) : 0);
+        const s = side && typeof side === 'object' ? side : {};
+        return { seen: time(s.seen), front: time(s.front) };
+    }
+
+    function frontAlive(side, now) {
+        // A time from the future (the clock was changed) is not believed.
+        return side.seen > 0 && side.seen <= now + 60000 && now - side.seen < FRONT_ALIVE_MS;
+    }
+
+    /**
+     * Where he is: 'bids', 'page' or 'none'.
+     * @param {{bids: {seen, front}|null, page: {seen, front}|null}} sides
+     */
+    function frontSide(sides, now) {
+        const bids = frontClean(sides && sides.bids);
+        const page = frontClean(sides && sides.page);
+        const b = frontAlive(bids, now);
+        const p = frontAlive(page, now);
+        // Both in view (two windows): the one he came to last.
+        if (b && p) return bids.front >= page.front ? 'bids' : 'page';
+        return b ? 'bids' : p ? 'page' : 'none';
+    }
+
+    /**
+     * May this side ask for things of its own now? (What an accepted or held trade
+     * needs is not asked about here: that is first on both sides, always.)
+     * @param {'bids'|'page'} side
+     */
+    function frontMayAsk(side, sides, now) {
+        const front = frontSide(sides, now);
+        if (front === side) return true;
+        if (side !== 'bids') return false;
+        // Torn Bids keeps its turn for a short while after he leaves it.
+        const bids = frontClean(sides && sides.bids);
+        const page = frontClean(sides && sides.page);
+        if (!bids.seen || bids.seen > now + 60000) return false;
+        // Left when the page took over - or, hidden with no page in view, at its last sign of life.
+        const leftAt = front === 'page' && page.front > bids.front ? Math.min(page.front, bids.seen + FRONT_BEAT_MS) : bids.seen;
+        return now - leftAt < FRONT_KEEP_MS;
+    }
+
+    /**
+     * A side's next sign of life, or null when none is due. Only a tab in view
+     * writes one: every FRONT_BEAT_MS, and at once when he comes to it (`came`:
+     * the tab was shown, or its window got the focus).
+     */
+    function frontBeat(was, { visible, came, now }) {
+        if (!visible) return null;
+        const had = frontClean(was);
+        if (came || !had.front) return { seen: now, front: now };
+        if (now - had.seen >= FRONT_BEAT_MS || had.seen > now) return { seen: now, front: had.front };
+        return null;
+    }
+
+    /** The line in the panel's Settings, by where he is. */
+    function frontWords(front) {
+        if (front === 'page') return 'Reading for this page. Torn Bids in another tab asks only for a trade you accepted.';
+        if (front === 'bids') return 'Torn Bids has the reads. This panel asks nothing of its own.';
+        return 'Nothing is being read.';
+    }
+
+    /* ===== src/core/beside.js ===== */
+    /*
+     * Beside Torn Archive (3.25.0). The owner, 2026-10-10: both apps run together,
+     * "when im viewing torn trading, it goes to torn trading, if were viewing torn
+     * archive it goes to torn archive".
+     *
+     * Torn counts requests per player and TornW3B per address, so the two apps'
+     * shares must fit under one limit. Two userscripts cannot read each other's
+     * stored values, but Torn Bids' page and Torn Archive's page live on one site,
+     * so both can read that site's own page storage. Three marks are kept there
+     * (the agreement is written out in Torn Archive's src/core/turns.js):
+     *
+     *   tornapps.front    { app: 'archive' | 'trading', at }
+     *                     whose page was looked at last. Torn Archive writes it for
+     *                     both pages; Torn Bids only reads it.
+     *   tornapps.archive  { app: 'archive', at }
+     *                     Torn Archive is open (in any tab), renewed at least once a
+     *                     minute. Without it Torn Archive counts as open only while
+     *                     its `front` mark is still fresh.
+     *   tornapps.behind   { app: 'trading', at, torn, w3b }
+     *                     written HERE, and only while every tab of Torn Bids keeps
+     *                     to the smaller share. Torn Archive takes the larger share
+     *                     only while this mark is fresh, so a Torn Bids that says
+     *                     nothing is never squeezed and the two never pass a limit.
+     *
+     * Going down is done at once; going up waits a minute, so what the other asked
+     * in the minute before has left Torn's count.
+     *
+     * Only Torn Bids' own page can read the marks (the panel on Torn's pages is on
+     * another site). It works the answer out and keeps it in a stored value every
+     * tab of ours reads; when that page is closed the value goes stale and every
+     * tab is back to its whole limit - later than Torn Archive stops believing the
+     * `behind` mark, never sooner.
+     *
+     * Pure: no storage, no DOM, no clock.
+     */
+
+    const BESIDE_FRONT_MARK = 'tornapps.front';
+    const BESIDE_ALIVE_MARK = 'tornapps.archive';
+    const BESIDE_BEHIND_MARK = 'tornapps.behind';
+
+    /** What Torn Bids keeps to, all its tabs together, while Torn Archive is in front: requests a minute. */
+    const BESIDE_TORN_PER_MINUTE = 15;
+    const BESIDE_W3B_PER_MINUTE = 15;
+
+    /** A mark is believed this long (Torn Archive believes `behind` as long: over two of a hidden tab's once-a-minute ticks). */
+    const BESIDE_FRESH_MS = 150 * 1000;
+    /** The whole limit is taken back this long after Torn Archive left the front. */
+    const BESIDE_UP_MS = 60 * 1000;
+    /** Torn Bids' page looks at the marks this often (a hidden tab's timers run about once a minute). */
+    const BESIDE_LOOK_EVERY_MS = 5 * 1000;
+    /** While behind, the `behind` mark and the stored answer are renewed this often. */
+    const BESIDE_RENEW_MS = 30 * 1000;
+
+    /** One of the marks, read back from the page storage: null when it is missing or not one of ours. */
+    function besideMark(text) {
+        if (typeof text !== 'string' || !text || text.length > 300) return null;
+        let m = null;
+        try {
+            m = JSON.parse(text);
+        } catch {
+            return null;
+        }
+        if (!m || typeof m !== 'object' || (m.app !== 'archive' && m.app !== 'trading')) return null;
+        const at = Number(m.at);
+        return Number.isFinite(at) && at > 0 ? { app: m.app, at } : null;
+    }
+
+    /** Is Torn Archive the one in front, and open? A time from the future (the clock was changed) is not believed. */
+    function besideArchiveInFront(front, alive, now) {
+        if (!front || front.app !== 'archive' || front.at > now + 60000) return false;
+        const open = alive && alive.app === 'archive' && alive.at <= now + 60000 ? Math.max(front.at, alive.at) : front.at;
+        return now - open < BESIDE_FRESH_MS;
+    }
+
+    /**
+     * The answer Torn Bids' page keeps for every tab: { behind, leftAt, at }.
+     *  behind: every tab keeps to the smaller share;
+     *  leftAt: when Torn Archive was first found NOT in front while we were behind (0 = it is in front);
+     *  at:     when this was worked out (a tab believes it only while fresh, see besideBehind()).
+     * @param {object|null} prev - the stored answer
+     */
+    function besideStep(prev, { front = null, alive = null, now }) {
+        const was = besideClean(prev);
+        if (besideArchiveInFront(front, alive, now)) return { behind: true, leftAt: 0, at: now };
+        if (!was.behind) return { behind: false, leftAt: 0, at: now };
+        const leftAt = was.leftAt > 0 && was.leftAt <= now ? was.leftAt : now;
+        return now - leftAt >= BESIDE_UP_MS ? { behind: false, leftAt: 0, at: now } : { behind: true, leftAt, at: now };
+    }
+
+    function besideClean(stored) {
+        const s = stored && typeof stored === 'object' ? stored : {};
+        const time = (n) => (Number.isFinite(Number(n)) && Number(n) > 0 ? Number(n) : 0);
+        return { behind: s.behind === true, leftAt: time(s.leftAt), at: time(s.at) };
+    }
+
+    /**
+     * Does this tab keep to the smaller share now? `stored` is what Torn Bids' page last worked out. Stale while
+     * behind (that page was closed): still behind until Torn Archive has stopped believing the `behind` mark
+     * AND a minute more has passed.
+     */
+    function besideBehind(stored, now) {
+        const s = besideClean(stored);
+        if (!s.behind || !s.at || s.at > now + 60000) return false;
+        return now - s.at < BESIDE_FRESH_MS + BESIDE_UP_MS;
+    }
+
+    /** May one more request go out now? `recent`: every tab's requests of this kind in the last minute. */
+    function besideRoom(stored, recent, now, perMinute) {
+        if (!besideBehind(stored, now)) return true;
+        let n = 0;
+        for (const t of recent || []) if (now - t < 60000) n += 1;
+        return n < perMinute;
+    }
+
+    /** The `behind` mark as text, for the site's page storage. */
+    function besideBehindText(now) {
+        return JSON.stringify({ app: 'trading', at: now, torn: BESIDE_TORN_PER_MINUTE, w3b: BESIDE_W3B_PER_MINUTE });
+    }
+
+    /** Should the page write the stored answer (and, while behind, the mark) again? */
+    function besideDue(prev, next, now) {
+        const was = besideClean(prev);
+        if (was.behind !== next.behind || was.leftAt !== next.leftAt) return true;
+        // Not behind: nothing to renew, a stale "not behind" means the same as a fresh one.
+        return next.behind && now - was.at >= BESIDE_RENEW_MS;
+    }
+
+    /** One line for Settings and the log, or null when Torn Bids has its whole limit. */
+    function besideLine(stored, now) {
+        if (!besideBehind(stored, now)) return null;
+        return 'Torn Archive is the one you looked at last: Torn Bids keeps to ' + BESIDE_TORN_PER_MINUTE + ' Torn and ' + BESIDE_W3B_PER_MINUTE + ' TornW3B requests a minute until you come back to it.';
+    }
+
+    /* ===== src/core/still.js ===== */
+    /*
+     * A trade stays still (3.25.0; plan part 3, drawing 2 of mockup AA - the owner's
+     * yes of 2026-10-10, with his change: "the prices should still update").
+     *
+     * Before, a better deal could jump to the top of the list while he was reading
+     * a row, and the Best flips cards changed under his hand in the middle of a
+     * buying run. Now, from Plan trade until the trade ends:
+     *
+     *   - the list's rows and the cards keep their ORDER. Only the order: every
+     *     price and profit is the live one, where it stands, with a mark on a
+     *     number that changed since the list was held;
+     *   - a flip that is not one any more stays in its place, greyed;
+     *   - a deal that was not a flip at Plan trade does not come in: it waits,
+     *     counted in one amber line above the list, until the trade ends or he
+     *     lets it in.
+     *
+     * The state lives in memory (a page reload starts it again from the order of
+     * that moment). Pure: no DOM, no storage.
+     */
+
+    /** The "trade ended" line stays this long. */
+    const STILL_ENDED_MS = 6000;
+
+    const stillFlip = (row) => Boolean(row && row.badge && row.badge.kind === 'flip');
+    const stillPlace = (row) => ({ value: Number(row.value) || 0, held: row.held > 0 ? 1 : 0, bid: Number(row.bid) || 0, name: String(row.name || '') });
+
+    /**
+     * The list and the cards as they are now, to hold.
+     *
+     * @param {object} p
+     * @param {Array} p.rows - every row of the list, in its order ({itemId, name, value, held, bid, badge})
+     * @param {Array} p.cards - the Best flips cards shown ({itemId, name, plan: {profit}, buyer})
+     */
+    function stillStart({ rows = [], cards = [], now = Date.now() } = {}) {
+        const still = { at: now, place: new Map(), flips: new Set(), cards: [], cardWas: new Map(), seen: new Map() };
+        for (const r of rows) {
+            still.place.set(String(r.itemId), stillPlace(r));
+            if (stillFlip(r)) still.flips.add(String(r.itemId));
+        }
+        for (const c of cards) {
+            const id = String(c.itemId);
+            still.cards.push(id);
+            still.cardWas.set(id, { name: c.name || null, profit: c.plan ? Number(c.plan.profit) || 0 : 0, buyer: c.buyer || null });
+            still.flips.add(id);
+        }
+        return still;
+    }
+
+    /**
+     * Is a trade under way, with whom and on which item: {trader, itemId} - or null, and the list is
+     * live. Under way = a trade the trader said yes to (until it is traded or
+     * cancelled), or one you planned (held from Plan trade until you unplan,
+     * decline or pin it - or leave it untouched for `holdMs`).
+     *
+     * The name shown: the accepted trade on the desk, else the newest accepted
+     * one, else the plan you touched last.
+     *
+     * @param {object} p
+     * @param {Array<{itemId, at, trader: {name}}>} p.accepted
+     * @param {Array<{trade: {trader: {name}}, touched: number}>} p.holds
+     * @param {string|null} p.selected - the item on the desk
+     */
+    function stillTrade({ accepted = [], holds = [], selected = null, now = Date.now(), holdMs = Infinity } = {}) {
+        const name = (t) => (t && t.trader && t.trader.name ? String(t.trader.name) : null);
+        const yes = accepted.filter(Boolean);
+        if (yes.length) {
+            const onDesk = selected ? yes.find((t) => String(t.itemId) === String(selected)) : null;
+            const t = onDesk || [...yes].sort((a, b) => (Number(b.at) || 0) - (Number(a.at) || 0))[0];
+            return { trader: name(t), itemId: t.itemId ? String(t.itemId) : null };
+        }
+        const live = holds.filter((h) => h && h.trade && now - (Number(h.touched) || 0) < holdMs);
+        if (!live.length) return null;
+        const h = [...live].sort((a, b) => (Number(b.touched) || 0) - (Number(a.touched) || 0))[0].trade;
+        return { trader: name(h), itemId: h.itemId ? String(h.itemId) : null };
+    }
+
+    /**
+     * Rows the hold has not seen, brought back by a search you changed: they were
+     * there all along, so they are part of the hold as they are now - never "new".
+     * (A deal already counted as waiting stays waiting.)
+     */
+    function stillAdopt(still, rows) {
+        if (!still) return;
+        for (const r of rows) {
+            const id = String(r.itemId);
+            if (still.place.has(id)) continue;
+            still.place.set(id, stillPlace(r));
+            if (stillFlip(r) && !still.seen.has(id)) still.flips.add(id);
+        }
+    }
+
+    /**
+     * The list while held: the rows given (live numbers), in the order of the hold.
+     * Each gets `still`: {move: 'up' | 'down' | null (its number against the hold's),
+     * gone: it was a flip at the hold and is not one now, was: its number at the
+     * hold}. A row not seen before takes the place its numbers give it now, and
+     * keeps that place.
+     */
+    function stillList(still, rows) {
+        if (!still) return rows;
+        const out = [];
+        for (const r of rows) {
+            const id = String(r.itemId);
+            if (!still.place.has(id)) still.place.set(id, stillPlace(r));
+            const was = still.place.get(id);
+            const value = Number(r.value) || 0;
+            out.push({ ...r, still: { move: value > was.value ? 'up' : value < was.value ? 'down' : null, gone: still.flips.has(id) && !stillFlip(r), was: was.value } });
+        }
+        const at = (r) => still.place.get(String(r.itemId));
+        return out.sort((a, b) => at(b).value - at(a).value || at(b).held - at(a).held || at(b).bid - at(a).bid || at(a).name.localeCompare(at(b).name));
+    }
+
+    /**
+     * The cards while held: the ones of the hold, in their places. One that is
+     * still a flip is the live card (`still.move` on its profit); one that is not
+     * stays as a greyed card ({plan: null, still: {gone: true, was}}).
+     *
+     * @param {Array} flips - every flip now, best first ({itemId, name, plan, buyer})
+     */
+    function stillCards(still, flips, { limit = 4 } = {}) {
+        if (!still) return flips.slice(0, limit);
+        const live = new Map(flips.map((f) => [String(f.itemId), f]));
+        return still.cards.map((id) => {
+            const was = still.cardWas.get(id) || { name: null, profit: 0, buyer: null };
+            const now = live.get(id);
+            if (!now) return { itemId: id, name: was.name, plan: null, buyer: was.buyer, still: { gone: true, was: was.profit, move: null } };
+            const profit = now.plan ? Number(now.plan.profit) || 0 : 0;
+            return { ...now, still: { gone: false, was: was.profit, move: profit > was.profit ? 'up' : profit < was.profit ? 'down' : null } };
+        });
+    }
+
+    /**
+     * The deals waiting: flips now that were not flips at the hold, best first,
+     * each with when it was first seen ({itemId, name, trader, profit, since}).
+     */
+    function stillWaiting(still, flips, now = Date.now()) {
+        if (!still) return [];
+        const out = [];
+        for (const f of flips) {
+            const id = String(f.itemId);
+            if (still.flips.has(id)) continue;
+            if (!still.seen.has(id)) still.seen.set(id, now);
+            out.push({ itemId: id, name: f.name || null, trader: f.buyer ? f.buyer.name || null : null, profit: f.plan ? Number(f.plan.profit) || 0 : 0, since: still.seen.get(id) });
+        }
+        return out.sort((a, b) => b.profit - a.profit);
+    }
+
+    function stillAgo(ms) {
+        const s = Math.max(0, Math.round(ms / 1000));
+        return s < 60 ? s + ' s ago' : Math.floor(s / 60) + 'm ago';
+    }
+
+    /**
+     * The amber line above the list: {lead, rest, count, rows}.
+     * @param {{trader: string|null}} view - who the list is held for
+     * @param {function} money - (n) => "+$41,200"
+     */
+    function stillLine(view, waiting, now, money) {
+        const lead = view && view.trader ? 'Held while you trade with ' + view.trader + '.' : 'Held while you trade.';
+        const n = waiting.length;
+        return {
+            lead,
+            rest: !n ? 'Nothing new.' : n === 1 ? '1 new deal waiting · ' + money(waiting[0].profit) : n + ' new deals waiting · best ' + money(waiting[0].profit),
+            count: n,
+            rows: waiting.map((w) => ({ itemId: w.itemId, text: (w.name || 'Item ' + w.itemId) + (w.trader ? ' → ' + w.trader : '') + ' · new ' + stillAgo(now - w.since), profit: money(w.profit) })),
+        };
+    }
+
+    /**
+     * The line after the hold: the trade ended (or he let the new deals in), said
+     * once, for a few seconds. null when there is nothing to say (any more).
+     * @param {{trader: string|null, came: number, at: number, let?: boolean}|null} ended
+     */
+    function stillEnded(ended, now) {
+        if (!ended || now - ended.at >= STILL_ENDED_MS) return null;
+        const came = ended.came > 0 ? ended.came + (ended.came === 1 ? ' new deal came in' : ' new deals came in') + ', and the rows sorted.' : null;
+        if (ended.let) return came || 'The rows sorted.';
+        return 'Trade' + (ended.trader ? ' with ' + ended.trader : '') + ' ended. ' + (came || 'The rows sorted.');
     }
 
     /* ===== src/api/ledger.js ===== */
@@ -11948,6 +14102,223 @@
                 settled = false;
             },
             clear: () => kept.clear(),
+        };
+    }
+
+    /* ===== src/core/kept.js ===== */
+    /*
+     * A worked-out result kept between Torn Bids' redraws (3.25.0; PLAN-next-session.md part 2, step 3).
+     *
+     * A redraw follows one answer (a bazaar read, a status, one trader's list) and
+     * works every item out again, though nearly every item's bazaars and plan are
+     * what they were. Kept here, like each item's buyers (core/kept-buyers.js): a
+     * result is handed back as it was while everything it was worked out from is
+     * what it was. The caller says what that is, as a flat row of values (`sig`);
+     * each is compared with Object.is, so a list stands for itself only while it
+     * is the very same list. A result that goes out of date by the clock alone
+     * (a listing turning stale) says until when it holds.
+     *
+     * Nothing is told to this file when something changes: each redraw it looks.
+     * And it does not trust itself: one kept result a redraw is worked out again
+     * and compared (`same`); should they ever differ, keeping stops and `onDiffer`
+     * is called - the page then works everything out each time, as before.
+     *
+     * Pure: no DOM, no storage, no clock (the caller hands `now`).
+     */
+
+    const keptJsonSame = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+
+    function keptFreeze(v) {
+        if (!v || typeof v !== 'object' || Object.isFrozen(v)) return;
+        Object.freeze(v);
+        for (const k of Object.keys(v)) keptFreeze(v[k]);
+    }
+
+    function keptSameSig(a, b) {
+        if (a.length !== b.length) return false;
+        for (let i = 0; i < a.length; i += 1) if (!Object.is(a[i], b[i])) return false;
+        return true;
+    }
+
+    /**
+     * @param {object} [o]
+     * @param {function} [o.onDiffer] - (key) => void: a kept result differed from a fresh one (keeping is then off)
+     * @param {function} [o.same] - (fresh, kept) => boolean: do they say the same (JSON by default)
+     * @param {boolean} [o.checkAll] - compare every kept result with a fresh one, not one a redraw (tests, the harness)
+     * @param {boolean} [o.freeze] - freeze what is handed out, through and through (tests, the harness: a caller writing into a kept result fails loudly)
+     */
+    function makeKeeper({ onDiffer = null, same = keptJsonSame, checkAll = false, freeze = false } = {}) {
+        const kept = new Map();
+        const stats = { kept: 0, redone: 0, checked: 0, differed: 0 };
+        let off = false;
+        // One kept result a redraw is worked out again and compared: which one moves on each redraw.
+        let hits = 0;
+        let lastHits = 0;
+        let checkAt = 0;
+
+        /** Once a redraw, before any get(). */
+        function begin() {
+            lastHits = hits;
+            hits = 0;
+            checkAt = lastHits ? (checkAt + 7) % lastHits : 0;
+        }
+
+        /**
+         * compute(), or what it gave last time for this key when it would give the same again.
+         * @param {string} key
+         * @param {Array} sig - everything compute() reads that can change, value by value
+         * @param {function} compute - () => result (never changed by the caller afterwards)
+         * @param {object} [t]
+         * @param {number} [t.now] - the redraw's clock
+         * @param {function} [t.until] - (result) => the last moment it holds by the clock alone (Infinity: it does not age)
+         */
+        function get(key, sig, compute, { now = 0, until = null } = {}) {
+            if (off) return compute();
+            const was = kept.get(key);
+            if (was && now <= was.until && keptSameSig(was.sig, sig)) {
+                stats.kept += 1;
+                hits += 1;
+                if (!checkAll && hits - 1 !== checkAt) return was.out;
+                const fresh = compute();
+                stats.checked += 1;
+                if (same(fresh, was.out)) return was.out;
+                stats.differed += 1;
+                off = true;
+                kept.clear();
+                if (onDiffer) onDiffer(key);
+                return fresh;
+            }
+            const out = compute();
+            stats.redone += 1;
+            if (freeze) keptFreeze(out);
+            kept.set(key, { sig, until: until ? until(out) : Infinity, out });
+            return out;
+        }
+
+        return {
+            begin,
+            get,
+            stats,
+            /** Whether keeping is still on (off after a kept result differed). */
+            on: () => !off,
+            /** Forget the keys not in `keys` (items that left the page). */
+            only: (keys) => {
+                for (const k of [...kept.keys()]) if (!keys.has(k)) kept.delete(k);
+            },
+            clear: () => kept.clear(),
+        };
+    }
+
+    /* ------------------------------------------- what Torn Bids keeps with it */
+
+    /**
+     * Your marks on each item's bazaars - a listing a page showed gone, the stock a page showed, what you or
+     * a friend bought - as one word per item: an item's bazaars are worked out again when its word moves.
+     * @param {object} gone - liveGone(): 'seller|item' -> {at}
+     * @param {object} stock - liveStock(): 'seller|item' -> {qty, price, at}
+     * @param {Map<string, object[]>} boughtByItem - item -> [{sellerId, qty, each, t}]
+     * @returns {Map<string, string>}
+     */
+    function keptMarkWords(gone, stock, boughtByItem) {
+        const words = new Map();
+        const add = (item, text) => words.set(item, (words.get(item) || '') + text);
+        for (const k of Object.keys(gone || {})) add(k.slice(k.indexOf('|') + 1), 'g' + k + '@' + gone[k].at + ';');
+        for (const k of Object.keys(stock || {})) add(k.slice(k.indexOf('|') + 1), 's' + k + '=' + stock[k].qty + ',' + stock[k].price + '@' + stock[k].at + ';');
+        for (const [item, list] of boughtByItem || []) for (const x of list) add(String(item), 'b' + x.sellerId + '=' + x.qty + ',' + x.each + '@' + x.t + ';');
+        return words;
+    }
+
+    /** bazaarSellers() rows hold by the clock until the first fresh one turns stale: that moment (Infinity: none is fresh). */
+    function keptFreshUntil(rows, freshMs) {
+        let t = Infinity;
+        for (const r of rows || []) if (!r.stale && r.dataAt + freshMs < t) t = r.dataAt + freshMs;
+        return t;
+    }
+
+    /**
+     * What a flip plan is worked out from: the item's rows (the very list), your limits, and each believable
+     * buyer's bid, how many they can pay for and whether you declined them.
+     * @param {object[]} rows - sellersOf(): the kept list itself
+     * @param {{maxPerFlip, cash, minProfitPct}} prefs
+     * @param {object[]} buyers - flipBuyers()
+     * @param {function} declined - (buyer) => boolean
+     */
+    function keptPlanSig(rows, prefs, buyers, declined) {
+        const sig = [rows, prefs.maxPerFlip, prefs.cash, prefs.minProfitPct, buyers.length];
+        for (const b of buyers) sig.push(b.id, b.name, b.price, b.maxUnits, Boolean(declined(b)));
+        return sig;
+    }
+
+    /* ===== src/core/job.js ===== */
+    /*
+     * One job at a time (3.25.0, mockup AG; the owner, 2026-10-11): "npc arbitradge and tornbids kinda
+     * got tangled ... a small toggle button somewhere, that turns what on, npc arbitradge or tornbids".
+     *
+     * His three rules:
+     *   - "if there is an ongoing trade, you cant switch to npc arbitradge";
+     *   - "if were at tornbids, npc arbitradge is closed. 0 api calls, same thing when we have npc
+     *     arbitradge open, tornbids is closed";
+     *   - "npc arbitradge can still use our server".
+     *
+     * The job is one stored word for the whole browser: every Torn tab, and the Torn Bids page, are on the
+     * same one. Pure: who reads the store and who closes what is in main.js.
+     */
+
+    const JOB_NPC = 'npc';
+    const JOB_BIDS = 'bids';
+
+    /** The job stored - or, never chosen yet: Torn Bids for someone who set Torn Bids up, else NPC Arbitrage. */
+    function jobStored(stored, { bidsSetUp = false } = {}) {
+        if (stored === JOB_NPC || stored === JOB_BIDS) return stored;
+        return bidsSetUp ? JOB_BIDS : JOB_NPC;
+    }
+
+    /**
+     * The trade that keeps the switch on Torn Bids: a trade a trader said yes to, until it is traded or
+     * cancelled. The newest one's trader, for the words; null when none is going.
+     *
+     * @param {Array<{at: number, trader: {name: string}}>} accepted - core/accepted.js trades
+     * @returns {{name: string, trades: number}|null}
+     */
+    function jobLock(accepted) {
+        const going = (accepted || []).filter((t) => t && t.key);
+        if (!going.length) return null;
+        const newest = going.slice().sort((a, b) => (Number(b.at) || 0) - (Number(a.at) || 0))[0];
+        return { name: (newest.trader && newest.trader.name) || 'your trader', trades: going.length };
+    }
+
+    /** The job now: a trade going is Torn Bids, whatever was stored. */
+    function jobNow(stored, accepted, opts = {}) {
+        return jobLock(accepted) ? JOB_BIDS : jobStored(stored, opts);
+    }
+
+    /** The words of the lock, the same wherever it is said. */
+    function jobLockWords(lock) {
+        if (!lock) return '';
+        return 'NPC Arbitrage is locked. Finish or cancel ' + (lock.trades > 1 ? 'your ' + lock.trades + ' trades' : 'the trade with ' + lock.name) + ' first.';
+    }
+
+    /**
+     * A press on the switch: may it turn to `to`?
+     * @returns {{ok: boolean, why: string}} `why` is said when it may not
+     */
+    function jobSwitch(to, accepted) {
+        if (to !== JOB_NPC && to !== JOB_BIDS) return { ok: false, why: '' };
+        const lock = to === JOB_NPC ? jobLock(accepted) : null;
+        return lock ? { ok: false, why: jobLockWords(lock) } : { ok: true, why: '' };
+    }
+
+    /**
+     * What each side may do, from the job: the one that is off shows nothing and asks for nothing.
+     * Both keep the bazaar owner's line, Fill on your own shop's pages, and the server.
+     */
+    function jobParts(job) {
+        const bids = job === JOB_BIDS;
+        return {
+            // NPC Arbitrage: the deals list and its reads, Scan, the chips, the green outlines.
+            deals: !bids,
+            // Torn Bids: trader tags, the buying run, the trade box, Checkout, To sell, the Torn Bids page.
+            trades: bids,
         };
     }
 
@@ -15253,6 +17624,55 @@
         font-weight: 700 !important;
     }
 
+    /*
+     * Shared: a friend is going for this listing. A purple ring in place of the
+     * green (or amber) one, and "<their Torn name> is on this" where the profit
+     * label sits. Paint only, like every mark here, and never in the way of a
+     * click. The classes are repeated so these win over the rings and labels above.
+     */
+    .ttv2-friend.ttv2-friend.ttv2-friend {
+        position: relative !important;
+        box-shadow:
+            inset 0 0 0 2px #b8a4ff,
+            inset 0 0 0 9999px rgba(184, 164, 255, 0.1) !important;
+    }
+
+    .ttv2-friend.ttv2-friend.ttv2-friend.ttv2-friend::after {
+        content: attr(data-ttv2-friend) !important;
+
+        display: block !important;
+        position: absolute !important;
+        top: -13px !important;
+        right: 4px !important;
+        left: auto !important;
+        bottom: auto !important;
+
+        width: auto !important;
+        height: auto !important;
+        min-width: 0 !important;
+        max-width: none !important;
+        margin: 0 !important;
+        padding: 1px 7px !important;
+        transform: none !important;
+
+        overflow: visible !important;
+        white-space: nowrap !important;
+        text-align: right !important;
+        opacity: 1 !important;
+        visibility: visible !important;
+        z-index: 2147483000 !important;
+
+        background: #1c1730 !important;
+        border: 1px solid rgba(184, 164, 255, 0.5) !important;
+        border-radius: 9px !important;
+        box-shadow: 0 2px 6px rgba(0, 0, 0, 0.5) !important;
+
+        color: #ddd3ff !important;
+        font: 700 11px/15px "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif !important;
+
+        pointer-events: none !important;
+    }
+
     /* Bazaar owner status: floats at the end of the bazaar's banner line (3.20), taking no room in it. */
     .ttv2-owner {
         display: inline-flex;
@@ -16084,6 +18504,21 @@
         font-weight: normal;
     }
 
+    /* A warning or an error is read whole (3.25.0: "Torn says this key is paused ... tried again in 42 min"
+       was cut at the panel's edge): it goes onto a second line, never behind three dots. */
+    .ttv2-bar.ttv2-warn,
+    .ttv2-bar.ttv2-error {
+        align-items: flex-start;
+    }
+
+    .ttv2-bar.ttv2-warn .ttv2-bar-left,
+    .ttv2-bar.ttv2-error .ttv2-bar-left {
+        white-space: normal;
+        overflow: visible;
+        text-overflow: clip;
+        overflow-wrap: anywhere;
+    }
+
     .ttv2-bar-right {
         color: var(--muted);
         white-space: nowrap;
@@ -16102,6 +18537,37 @@
     .ttv2-dot-live { background: var(--profit); }
     .ttv2-dot-warn { background: var(--warn); }
     .ttv2-dot-other { background: var(--offer); }
+    .ttv2-dot-known { background: #b8a4ff; }
+
+    /* Settings › Watching (3.25.0): where the requests are going now, and Shared. Each is read whole. */
+    .ttv2-where {
+        display: flex;
+        align-items: baseline;
+        gap: 8px;
+        padding: 8px 10px;
+        border: 1px solid var(--buy-line);
+        border-radius: 10px;
+        background: var(--buy-bg);
+        font-size: 12px;
+    }
+
+    .ttv2-where[hidden] {
+        display: none;
+    }
+
+    .ttv2-where .ttv2-dot {
+        flex: 0 0 auto;
+        margin-right: 0;
+    }
+
+    .ttv2-where b {
+        font-weight: 600;
+    }
+
+    .ttv2-where-shared {
+        border-color: rgba(184, 164, 255, 0.4);
+        background: rgba(184, 164, 255, 0.1);
+    }
 
     /* Seller of the bazaar you are on. */
     .ttv2-tradebox {
@@ -16548,6 +19014,41 @@
     .ttv2-row-details .ttv2-guess {
         color: var(--warn);
         cursor: help;
+    }
+
+    /* Shared: a friend is going for this listing - their Torn name, in purple, first on the row's second line. */
+    .ttv2-row.ttv2-row-friend {
+        border-color: rgba(184, 164, 255, 0.4);
+    }
+
+    .ttv2-row-friend .ttv2-row-profit {
+        color: var(--muted);
+    }
+
+    .ttv2-friendtag {
+        display: inline-block;
+        margin-right: 6px;
+        padding: 0 6px;
+        border-radius: 999px;
+        color: #b8a4ff;
+        background: rgba(184, 164, 255, 0.14);
+        font-weight: 600;
+        white-space: nowrap;
+    }
+
+    /* ...and, on that bazaar's own page, the sentence above the list. */
+    .ttv2-friendline {
+        grid-column: 1 / -1;
+        padding: 6px 10px;
+        border: 1px solid rgba(184, 164, 255, 0.5);
+        border-radius: 9px;
+        background: #1c1730;
+        color: #ddd3ff;
+        font-size: 12px;
+    }
+
+    .ttv2-friendline b {
+        font-weight: 600;
     }
 
     /* "● Online" / "● Offline 3h" - an 8px dot and a word. */
@@ -17366,6 +19867,172 @@
         padding: 0 3px;
     }
 
+    /*
+     * One job at a time (3.25.0): the title is the switch, NPC Arbitrage | Torn Bids. The half that is on
+     * reads as the title; the other is a quiet word to press; locked (a trade is going) it is struck out.
+     */
+    .ttv2-job {
+        display: inline-flex;
+        align-items: baseline;
+        gap: 2px;
+        min-width: 0;
+    }
+
+    .ttv2-panel button.ttv2-jobb {
+        height: 26px;
+        padding: 0 7px;
+        border: 0;
+        border-radius: 7px;
+        background: transparent;
+        color: var(--muted);
+        font: 500 12.5px/26px var(--sans);
+        letter-spacing: 0;
+        white-space: nowrap;
+        cursor: pointer;
+    }
+
+    .ttv2-panel button.ttv2-jobb:first-child {
+        margin-left: -7px;
+    }
+
+    .ttv2-panel button.ttv2-jobb:hover:not(.ttv2-jobb-on):not(:disabled) {
+        background: var(--hover);
+        color: var(--text);
+    }
+
+    .ttv2-panel button.ttv2-jobb.ttv2-jobb-on {
+        color: var(--text);
+        font: 400 15px/26px var(--serif);
+        cursor: default;
+    }
+
+    .ttv2-panel button.ttv2-jobb.ttv2-jobb-lock {
+        color: var(--muted);
+        opacity: 0.7;
+        text-decoration: line-through;
+        text-decoration-color: rgba(255, 255, 255, 0.3);
+        cursor: not-allowed;
+    }
+
+    .ttv2-collapsed .ttv2-jobb:not(.ttv2-jobb-on) {
+        display: none;
+    }
+
+    .ttv2-job.ttv2-job-set {
+        margin: 2px 0 6px;
+    }
+
+    .ttv2-lockline {
+        flex: 0 0 auto;
+        padding: 7px 14px;
+        border-bottom: 1px solid var(--line);
+        color: var(--muted);
+        font-size: 12.5px;
+        line-height: 1.4;
+    }
+
+    .ttv2-lockline b {
+        color: var(--text);
+        font-weight: 600;
+    }
+
+    .ttv2-collapsed .ttv2-lockline {
+        display: none;
+    }
+
+    /* Torn Bids on: no chips, no tabs, no deals - what this page has for your traders instead. */
+    .ttv2-job-bids .ttv2-chips,
+    .ttv2-job-bids .ttv2-chip-note,
+    .ttv2-job-bids .ttv2-tabs,
+    .ttv2-job-bids .ttv2-list,
+    .ttv2-job-npc .ttv2-here {
+        display: none;
+    }
+
+    .ttv2-here {
+        flex: 1 1 auto;
+        min-height: 0;
+        overflow-y: auto;
+        padding: 4px 0 8px;
+    }
+
+    .ttv2-here-h {
+        display: flex;
+        align-items: baseline;
+        gap: 8px;
+        padding: 8px 14px 4px;
+    }
+
+    .ttv2-here-r,
+    .ttv2-here-sell {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto auto;
+        align-items: baseline;
+        gap: 0 10px;
+        padding: 6px 14px;
+        border-top: 1px solid var(--line);
+        font-size: 12.5px;
+    }
+
+    .ttv2-here-sell {
+        grid-template-columns: minmax(0, 1fr) auto;
+        margin-top: 6px;
+    }
+
+    .ttv2-here-n {
+        min-width: 0;
+        overflow-wrap: anywhere;
+    }
+
+    .ttv2-here-n b,
+    .ttv2-here-sell b {
+        color: var(--text);
+        font-weight: 600;
+    }
+
+    .ttv2-here-l {
+        color: var(--muted);
+        white-space: nowrap;
+    }
+
+    .ttv2-here-l.ttv2-here-old::before {
+        content: "";
+        display: inline-block;
+        width: 6px;
+        height: 6px;
+        margin-right: 5px;
+        border-radius: 50%;
+        background: var(--warn);
+        vertical-align: 1px;
+    }
+
+    .ttv2-here .ttv2-note {
+        padding: 6px 14px;
+    }
+
+    .ttv2-panel.ttv2-narrow button.ttv2-jobb {
+        padding: 0 5px;
+        font-size: 12px;
+    }
+
+    .ttv2-panel.ttv2-narrow button.ttv2-jobb.ttv2-jobb-on {
+        font-size: 13px;
+    }
+
+    .ttv2-panel.ttv2-tight button.ttv2-jobb {
+        padding: 0 4px;
+        font-size: 11.5px;
+    }
+
+    /* The tightest step: the header names only the side that is on; the switch itself is in Settings. */
+    .ttv2-panel.ttv2-tighter .ttv2-head button.ttv2-jobb:not(.ttv2-jobb-on) {
+        display: none;
+    }
+
+    .ttv2-panel.ttv2-tight button.ttv2-jobb.ttv2-jobb-on {
+        font-size: 12px;
+    }
+
     @media (prefers-reduced-motion: reduce) {
         .ttv2-panel *,
         .ttv2-panel *::before,
@@ -17978,6 +20645,9 @@
          */
         constructor(handlers = {}) {
             this.handlers = handlers;
+            // One job at a time: 'npc' (NPC Arbitrage) or 'bids' (Torn Bids), and why it is locked on Torn Bids.
+            this.job = 'npc';
+            this.jobLock = '';
             this.state = {
                 rows: [],
                 summary: { count: 0, totalProfit: 0, cashRequired: 0 },
@@ -18015,21 +20685,34 @@
             });
 
             this.titleEl = el('div', { class: 'ttv2-title' });
-            this.titleTextEl = el('span', { text: 'NPC Arbitrage' });
+            // The title is the switch (3.25.0, the owner: "npc arbitradge and tornbids kinda got tangled"): the panel
+            // does one job at a time. The one that is off is closed - it shows nothing here and asks for nothing.
+            this.jobBtns = {};
+            this.jobEl = el('span', { class: 'ttv2-job', role: 'group', 'aria-label': 'What this panel does' });
+            for (const [key, label] of [['npc', 'NPC Arbitrage'], ['bids', 'Torn Bids']]) {
+                this.jobBtns[key] = el('button', { type: 'button', class: 'ttv2-jobb', text: label, onclick: () => this.pressJob(key) });
+                this.jobEl.appendChild(this.jobBtns[key]);
+            }
+            // Settings, and My bazaar on your own shop's pages, are named in its place.
+            this.titleTextEl = el('span', { class: 'ttv2-titlet' });
             // Shown only while collapsed: the headline, so a collapsed panel
             // still answers "is there anything to buy?".
             this.miniEl = el('span', { class: 'ttv2-mini' });
+            this.titleEl.appendChild(this.jobEl);
             this.titleEl.appendChild(this.titleTextEl);
             this.titleEl.appendChild(this.miniEl);
 
-            // Torn Bids: its own tab, for traders' bids and flips.
+            // Torn Bids on: the way to its page, where Scan is for NPC Arbitrage.
             this.sellBtn = el('button', {
                 type: 'button',
                 class: 'ttv2-sell',
                 title: 'Open Torn Bids in a new tab',
-                text: 'Bids',
+                text: 'Open Torn Bids ↗',
                 onclick: guarded(this, 'Bids', () => this.handlers.onOpenSelling && this.handlers.onOpenSelling()),
             });
+            // Why the switch does not turn, said under the header when its locked half is pressed.
+            this.lockEl = el('div', { class: 'ttv2-lockline', role: 'status' });
+            this.lockEl.style.display = 'none';
 
             // One button for "look again": re-reads this page and refreshes every
             // price (it used to be two, Scan and ↻, doing halves of the same job).
@@ -18160,9 +20843,13 @@
             this.buyBoxEl = el('div', { class: 'ttv2-tradebox ttv2-buybox' });
             this.buyBoxEl.style.display = 'none';
 
+            // Torn Bids on: what this page has for your traders, in place of the deals list.
+            this.hereEl = el('div', { class: 'ttv2-here' });
+
             this.listPage = el('div', { class: 'ttv2-page ttv2-page-list' }, [
                 this.tradeBoxEl,
                 this.sellerEl,
+                this.hereEl,
                 this.chipsEl,
                 this.chipNoteEl,
                 this.tabsEl,
@@ -18193,7 +20880,8 @@
 
             // The buying run's box sits under the header, outside the pages: Next
             // is there on every page, in Settings, and with the panel collapsed.
-            this.root = el('div', { class: 'ttv2-panel' }, [this.headEl, this.buyBoxEl, this.bodyEl]);
+            this.root = el('div', { class: 'ttv2-panel' }, [this.headEl, this.lockEl, this.buyBoxEl, this.bodyEl]);
+            this.applyJob();
 
             // Esc closes an open chip editor, then Settings.
             this.root.addEventListener('keydown', (event) => {
@@ -18262,7 +20950,8 @@
             this.listPage.style.display = this.page === 'list' ? '' : 'none';
             this.bazaarPage.style.display = this.page === 'mybazaar' ? '' : 'none';
             this.settingsBtn.setAttribute('aria-pressed', String(settings));
-            this.titleTextEl.textContent = settings ? 'Settings' : this.page === 'mybazaar' ? (this.state.bazaar && this.state.bazaar.title) || 'My bazaar' : 'NPC Arbitrage';
+            this.titleTextEl.textContent = settings ? 'Settings' : this.page === 'mybazaar' ? (this.state.bazaar && this.state.bazaar.title) || 'My bazaar' : '';
+            this.applyJob();
 
             // Opening a page from a collapsed panel should show it.
             if (this.collapsed) this.setCollapsed(false, { save: true });
@@ -18276,6 +20965,133 @@
 
         openSettings({ focusKey = false } = {}) {
             this.showPage('settings', { focusKey });
+        }
+
+        /* -------------------------------------------- one job at a time (3.25.0) */
+
+        /**
+         * NPC Arbitrage or Torn Bids. `lock`: why it cannot be turned to NPC Arbitrage now (a trade is
+         * going), or ''.
+         */
+        setJob(job, lock = '') {
+            const next = job === 'bids' ? 'bids' : 'npc';
+            const words = lock || '';
+            if (next === this.job && words === this.jobLock) return;
+            this.job = next;
+            this.jobLock = words;
+            if (!words) this.hideLock();
+            if (next === 'bids') this.closeChipEditor();
+            this.applyJob();
+            if (this.root) {
+                this.renderBar();
+                this.fit();
+            }
+        }
+
+        /** The header, the list page and Settings as the job has them. */
+        applyJob() {
+            if (!this.root) return;
+            const bids = this.job === 'bids';
+            const list = this.page === 'list';
+            this.root.classList.toggle('ttv2-job-bids', bids);
+            this.root.classList.toggle('ttv2-job-npc', !bids);
+            // On Settings and My bazaar the page is named; the switch is on the list, and in Settings' first row.
+            this.jobEl.style.display = list ? '' : 'none';
+            this.titleTextEl.style.display = list ? 'none' : '';
+            for (const [key, btn] of Object.entries(this.jobBtns)) {
+                const on = (key === 'bids') === bids;
+                const locked = key === 'npc' && bids && Boolean(this.jobLock);
+                btn.classList.toggle('ttv2-jobb-on', on);
+                btn.classList.toggle('ttv2-jobb-lock', locked);
+                btn.setAttribute('aria-pressed', String(on));
+                btn.title = on ? (bids ? 'Torn Bids is on: NPC Arbitrage is closed and asks for nothing' : 'NPC Arbitrage is on: Torn Bids is closed and asks for nothing')
+                    : locked ? this.jobLock
+                    : bids ? 'Turn NPC Arbitrage on: Torn Bids closes, here and in its own tab' : 'Turn Torn Bids on: NPC Arbitrage closes';
+            }
+            for (const [key, btn] of Object.entries(this.jobSetBtns || {})) {
+                btn.classList.toggle('ttv2-jobb-on', (key === 'bids') === bids);
+                btn.classList.toggle('ttv2-jobb-lock', key === 'npc' && bids && Boolean(this.jobLock));
+                btn.setAttribute('aria-pressed', String((key === 'bids') === bids));
+            }
+            if (this.jobNoteEl) this.jobNoteEl.textContent = bids
+                ? (this.jobLock || 'Torn Bids is on. NPC Arbitrage is closed: no deals list, no Scan, and it asks for nothing.')
+                : 'NPC Arbitrage is on. Torn Bids is closed, here and in its own tab: it asks for nothing.';
+            // Scan is NPC Arbitrage's - and your own shop's pages', where it prices the rows again.
+            this.scanBtn.style.display = !bids || this.page === 'mybazaar' ? '' : 'none';
+            this.sellBtn.style.display = bids && this.page !== 'mybazaar' ? '' : 'none';
+            for (const node of this.npcSetEls || []) node.style.display = bids ? 'none' : '';
+            for (const node of this.bidsSetEls || []) node.style.display = bids ? '' : 'none';
+        }
+
+        /** A press on the switch: the half that is on does nothing, the locked half says why, the other is asked for. */
+        pressJob(key) {
+            if (key === this.job) return;
+            if (key === 'npc' && this.jobLock) {
+                this.showLock();
+                return;
+            }
+            if (this.handlers.onJob) this.handlers.onJob(key);
+        }
+
+        showLock() {
+            this.lockEl.textContent = '';
+            const cut = this.jobLock.indexOf('. ');
+            this.lockEl.append(el('b', { text: cut > 0 ? this.jobLock.slice(0, cut + 1) : this.jobLock }), cut > 0 ? this.jobLock.slice(cut + 1) : '');
+            this.lockEl.style.display = '';
+            clearTimeout(this.lockTimer);
+            this.lockTimer = setTimeout(() => this.hideLock(), 8000);
+        }
+
+        hideLock() {
+            clearTimeout(this.lockTimer);
+            if (this.lockEl) this.lockEl.style.display = 'none';
+        }
+
+        /**
+         * Torn Bids on: the list page, in place of the deals.
+         *
+         * @param {object} v
+         * @param {boolean} v.onBazaar - a bazaar page is open
+         * @param {Array<{key, name, qty, price, label, old, onShow}>} v.rows - the cards here a trusted trader pays more for
+         * @param {Array<{lead, rest}>} v.friendHere - Shared: what a friend is going for in this bazaar
+         * @param {boolean} v.trade - a trade is going (the buying run's box is under the header)
+         * @param {{items: number, kinds: number}|null} v.toSell - bought, not sold yet
+         * @param {string} v.line - the bar's words
+         */
+        renderBids(v) {
+            this.state.bidsLine = v.line || '';
+            if (!this.root) return;
+            const sig = JSON.stringify([v.onBazaar, v.rows.map((r) => [r.key, r.name, r.qty, r.price, r.label, r.old]), v.friendHere, v.trade, v.toSell, v.hasKey]);
+            if (sig !== this.hereSig) {
+                this.hereSig = sig;
+                const box = this.hereEl;
+                const keep = box.contains(this.shadow.activeElement) ? this.shadow.activeElement.dataset.here : null;
+                box.textContent = '';
+                for (const line of v.friendHere || []) box.appendChild(el('div', { class: 'ttv2-friendline' }, [el('b', { text: line.lead }), document.createTextNode(' · ' + line.rest)]));
+                if (v.onBazaar) {
+                    box.appendChild(el('div', { class: 'ttv2-here-h' }, [el('span', { class: 'ttv2-label', text: 'In this bazaar' }), el('span', { class: 'ttv2-sub', text: v.rows.length ? v.rows.length + (v.rows.length === 1 ? ' card a trusted trader pays more for' : ' cards a trusted trader pays more for') : '' })]));
+                    for (const r of v.rows) {
+                        box.appendChild(el('div', { class: 'ttv2-here-r' }, [
+                            el('span', { class: 'ttv2-here-n' }, [el('b', { text: r.name }), document.createTextNode(r.qty > 1 ? ' × ' + r.qty.toLocaleString('en-US') : '')]),
+                            el('span', { class: 'ttv2-here-l' + (r.old ? ' ttv2-here-old' : ''), title: r.old ? 'Their price is from a list not changed in over a day' : '', text: r.label }),
+                            el('button', { type: 'button', class: 'ttv2-link', 'data-here': r.key, title: 'Brings its card into view on Torn\'s page. Nothing is clicked for you.', text: 'Show', onclick: () => r.onShow && r.onShow() }),
+                        ]));
+                    }
+                    if (!v.rows.length) box.appendChild(el('div', { class: 'ttv2-note', text: 'Nothing here a trusted trader pays more for.' }));
+                }
+                if (!v.trade) box.appendChild(el('div', { class: 'ttv2-note ttv2-here-none', text: 'No trade accepted. Pick one in Torn Bids and the buying run shows here.' }));
+                if (v.toSell && v.toSell.items > 0) {
+                    box.appendChild(el('div', { class: 'ttv2-here-sell' }, [
+                        el('span', {}, [el('b', { text: 'To sell' }), document.createTextNode(' · ' + v.toSell.items.toLocaleString('en-US') + (v.toSell.items === 1 ? ' item' : ' items') + ' bought, not sold')]),
+                        v.toSell.url ? el('a', { class: 'ttv2-link', href: v.toSell.url, title: 'Opens your bazaar\'s add page', text: 'Your bazaar' }) : null,
+                    ]));
+                }
+                if (keep) {
+                    const node = [...box.querySelectorAll('[data-here]')].find((n) => n.dataset.here === keep);
+                    if (node) node.focus({ preventScroll: true });
+                }
+            }
+            this.renderBar();
         }
 
         /* ------------------------------------------------------------ chips */
@@ -18579,6 +21395,16 @@
                 onclick: () => this.handlers.onForgetKey && this.handlers.onForgetKey(),
             });
 
+            // The switch, here too: Settings and My bazaar name themselves in the header.
+            this.jobSetBtns = {};
+            const jobRow = el('span', { class: 'ttv2-job ttv2-job-set', role: 'group', 'aria-label': 'What this panel does' });
+            for (const [key, label] of [['npc', 'NPC Arbitrage'], ['bids', 'Torn Bids']]) {
+                this.jobSetBtns[key] = el('button', { type: 'button', class: 'ttv2-jobb', text: label, onclick: () => this.pressJob(key) });
+                jobRow.appendChild(this.jobSetBtns[key]);
+            }
+            this.jobNoteEl = note('');
+            this.settingsPage.appendChild(section('This panel does', [jobRow, this.jobNoteEl]));
+
             this.settingsPage.appendChild(
                 section('API key', [
                     el('div', { class: 'ttv2-inline' }, [this.keyInput, showBtn, saveBtn]),
@@ -18605,13 +21431,6 @@
                 return { input, row };
             };
 
-            const im = check(
-                'liveFeed',
-                'Watch the Item Market anywhere',
-                el('span', { class: 'ttv2-sub', text: 'One visible Torn tab, at most 30 API calls a minute.' }),
-            );
-            this.liveFeedInput = im.input;
-
             const w3bSub = el('span', { class: 'ttv2-sub' }, [
                 'Bazaar prices from ',
                 el('a', { href: W3B_SITE_URL, target: '_blank', rel: 'noopener noreferrer', text: 'weav3r.dev' }),
@@ -18623,13 +21442,13 @@
             const bz = check('useW3b', 'Watch bazaars via TornW3B', w3bSub);
             this.useW3bInput = bz.input;
 
-            // The friend's switch: every automatic NPC-deal call off at once.
-            const saveSw = check(
-                'saveCalls',
-                'NPC deals: save API calls',
-                el('span', { class: 'ttv2-sub', text: 'Turns off Item Market watching and sellers\' online status: 0 API calls. Bazaars are still watched through TornW3B, which uses none. Fill and Torn Bids are not affected.' }),
-            );
-            this.saveCallsInput = saveSw.input;
+            /*
+             * 3.25.0: "Save API calls" and "Watch the Item Market anywhere" are gone - the requests go to
+             * whatever you are looking at, by themselves (core/front.js). In their place a line that says
+             * where they are going now, and one for Shared (only where the server knows this PC).
+             */
+            this.frontEl = el('div', { class: 'ttv2-where' });
+            this.sharedLineEl = el('div', { class: 'ttv2-where ttv2-where-shared' });
 
             // Resale deals (the My bazaar / Market chips): a person may pay less
             // or never buy, so $1 is not a deal there. NPC deals keep $1.
@@ -18665,8 +21484,10 @@
             this.apiUseEl = el('div', { class: 'ttv2-note ttv2-apiuse' });
 
             this.settingsPage.appendChild(
-                section('Watching', [saveSw.row, im.row, bz.row, pctRow, this.apiUseEl, note('Nothing is bought, clicked or announced for you.')]),
+                section('Watching', [this.frontEl, bz.row, pctRow, this.sharedLineEl, this.apiUseEl, note('Nothing is bought, clicked or announced for you.')]),
             );
+            // NPC Arbitrage's own: watching bazaars, the least profit of a deal, how a deal opens.
+            this.npcSetEls = [bz.row, pctRow];
             this.renderApiUse();
 
             /* ---- links ---- */
@@ -18678,7 +21499,9 @@
             );
             this.newTabInput = nt.input;
 
-            this.settingsPage.appendChild(section('Links', [nt.row]));
+            const linksSection = section('Links', [nt.row]);
+            this.settingsPage.appendChild(linksSection);
+            this.npcSetEls.push(linksSection);
 
             /* ---- the Fill button (your bazaar's and the Item Market's own pages) ---- */
             this.fillForm = buildFillForm({
@@ -18691,17 +21514,19 @@
             ]);
             this.settingsPage.appendChild(this.fillSectionEl);
 
-            this.settingsPage.appendChild(
-                section('Torn Bids', [
-                    note('Torn Bids has its own keys and settings.'),
-                    el('button', {
-                        type: 'button',
-                        class: 'ttv2-link',
-                        text: 'Open Torn Bids',
-                        onclick: guarded(this, 'Bids', () => this.handlers.onOpenSelling && this.handlers.onOpenSelling()),
-                    }),
-                ]),
-            );
+            const bidsSection = section('Torn Bids', [
+                note('Torn Bids has its own keys and settings.'),
+                el('button', {
+                    type: 'button',
+                    class: 'ttv2-link',
+                    text: 'Open Torn Bids ↗',
+                    onclick: guarded(this, 'Bids', () => this.handlers.onOpenSelling && this.handlers.onOpenSelling()),
+                }),
+            ]);
+            this.settingsPage.appendChild(bidsSection);
+            // Torn Bids' own: with NPC Arbitrage on there is no way to it from here ("no more clicking on bids").
+            this.bidsSetEls = [bidsSection];
+            this.applyJob();
         }
 
         /**
@@ -18853,7 +21678,7 @@
                         text: 'Now ' + formatMoney(h.nowPrice) + ' each (planned ' + formatMoney(h.price) + ')' + (h.bid && h.nowPrice >= h.bid ? ' - not under what ' + v.trader + ' pays (' + formatMoney(h.bid) + '): skip it.' : '.'),
                     }));
                 }
-                if (!v.ask) box.appendChild(el('div', { class: h.bought >= h.qty ? 'ttv2-tb-ok' : h.listed ? 'ttv2-sub' : 'ttv2-tb-warn', text: h.bought ? 'You took ' + h.bought.toLocaleString('en-US') + ' of ' + h.qty.toLocaleString('en-US') + (h.bought >= h.qty ? ' ✓' : '') : h.listed ? 'Not bought yet - or skip it: Next counts only what you took.' : buyingWhereText(h) }));
+                if (!v.ask) box.appendChild(el('div', { class: h.bought >= h.qty ? 'ttv2-tb-ok' : h.listed ? 'ttv2-sub' : 'ttv2-tb-warn', text: h.bought ? 'You took ' + h.bought.toLocaleString('en-US') + ' of ' + h.qty.toLocaleString('en-US') + (h.bought >= h.qty ? ' ✓' : '') : h.listed ? 'Not bought yet - or skip it: Next counts only what you took.' : h.unread ? 'This page has not been read: ' + h.unread + '.' : buyingWhereText(h) }));
             }
             // The listing was never seen here, so nothing could be counted: ask.
             if (v.ask && v.here) {
@@ -18874,7 +21699,8 @@
                 return;
             }
             // "Not here" only when it is not: a listing further down a long bazaar is still here.
-            const notHere = v.here && !v.here.listed && !['below', 'searching', 'away'].includes(v.here.where);
+            // A page that was not read says nothing about what is in it.
+            const notHere = v.here && !v.here.listed && !v.here.unread && !['below', 'searching', 'away'].includes(v.here.where);
             const label = v.here && (!v.next || v.last) ? 'Done - go to the trade' : notHere ? 'Not here - next' : v.here && v.same ? 'Next item here' : v.here ? 'Next bazaar' : 'Open the next bazaar' + (v.next && v.next.seller ? ': ' + v.next.seller : '');
             this.buyNextBtn = el('button', { type: 'button', class: 'ttv2-primary ttv2-buynext', title: this.buyHereActive ? 'Key: N' : null, onclick: () => this.handlers.onBuyNext && this.handlers.onBuyNext() }, [label, this.buyHereActive ? el('span', { class: 'ttv2-kbd', text: 'N' }) : null]);
             box.appendChild(this.buyNextBtn);
@@ -18917,6 +21743,31 @@
             const s = this.handlers.getApiUse ? this.handlers.getApiUse() : null;
             const text = s ? 'Torn API calls in the last minute: ' + s.usedLastMinute + ' of 70 (all tabs; Torn allows 100).' : '';
             if (this.apiUseEl.textContent !== text) this.apiUseEl.textContent = text;
+            this.renderWhere();
+        }
+
+        /** Settings › Watching: where the requests are going now, and Shared - each redrawn only when its words change. */
+        renderWhere() {
+            const line = (box, dot, lead, rest) => {
+                const sig = lead === null ? '' : dot + '|' + lead + '|' + rest;
+                if (box.dataset.sig === sig) return;
+                box.dataset.sig = sig;
+                box.textContent = '';
+                box.hidden = lead === null;
+                if (lead === null) return;
+                box.appendChild(el('span', { class: 'ttv2-dot ttv2-dot-' + dot }));
+                box.appendChild(el('span', {}, [el('b', { text: lead }), rest ? ' ' + rest : null]));
+            };
+            if (this.frontEl) {
+                const words = this.handlers.getFront ? this.handlers.getFront() : null;
+                // The first sentence is the answer; the rest says what the other side does meanwhile.
+                const cut = words ? words.indexOf('. ') : -1;
+                line(this.frontEl, 'other', words ? (cut > 0 ? words.slice(0, cut + 1) : words) : null, words && cut > 0 ? words.slice(cut + 2) : '');
+            }
+            if (this.sharedLineEl) {
+                const shared = this.handlers.getSharedLine ? this.handlers.getSharedLine() : null;
+                line(this.sharedLineEl, 'known', shared ? shared.lead : null, shared ? '· ' + shared.rest : '');
+            }
         }
 
         /** My bazaar, scrolled to one part: 'graph' (IMA was pressed) or 'lows' (BP). */
@@ -18997,8 +21848,6 @@
 
         emitSettings(partial) {
             this.state.settings = { ...this.state.settings, ...partial };
-            if (this.liveFeedInput) this.liveFeedInput.disabled = Boolean(this.state.settings.saveCalls);
-            if (this.saveCallsInput && partial.saveCalls !== undefined) this.saveCallsInput.checked = Boolean(partial.saveCalls);
             this.syncChips();
             if (this.handlers.onSettingsChange) this.handlers.onSettingsChange(partial);
         }
@@ -19266,14 +22115,6 @@
 
             this.syncChips();
 
-            if (this.saveCallsInput && settings.saveCalls !== undefined) {
-                this.saveCallsInput.checked = Boolean(settings.saveCalls);
-            }
-            // Saving calls overrides watching: its tick box shows it cannot be on.
-            if (this.liveFeedInput) this.liveFeedInput.disabled = Boolean(this.state.settings.saveCalls);
-            if (this.liveFeedInput && settings.liveFeed !== undefined) {
-                this.liveFeedInput.checked = Boolean(settings.liveFeed);
-            }
             if (this.resaleMinInput && settings.resaleMinPct !== undefined && !(this.shadow && this.shadow.activeElement === this.resaleMinInput)) {
                 this.resaleMinInput.value = String(settings.resaleMinPct);
             }
@@ -19329,6 +22170,17 @@
                 kept.set(html, old || empty);
             } else {
                 want.push(this.colsEl);
+            }
+            // Shared: a friend is going for something in the bazaar you are in (said, never a lock).
+            for (const line of this.state.friendHere || []) {
+                const fresh = el('div', { class: 'ttv2-friendline' }, [el('b', { text: line.lead }), document.createTextNode(' · ' + line.rest)]);
+                const html = fresh.outerHTML;
+                const old = this.shownEls && this.shownEls.get(html);
+                const use = old && !kept.has(html) ? old : fresh;
+                if (!kept.has(html)) kept.set(html, use);
+                want.push(use);
+            }
+            if (rows.length) {
                 for (const row of rows) {
                     const fresh = this.renderRow(row);
                     const html = fresh.outerHTML;
@@ -19385,6 +22237,21 @@
             const showMessage =
                 st.text &&
                 (st.level !== 'info' || this.state.busy || now - st.at < INFO_STATUS_MS);
+
+            // Torn Bids on: no deals to count and nothing watched - the bar says what Torn Bids has here, or a message.
+            if (this.job === 'bids') {
+                this.barLeft.textContent = showMessage ? st.text : this.state.bidsLine || 'Torn Bids';
+                this.barLeft.title = showMessage ? st.text : '';
+                this.barEl.classList.toggle('ttv2-warn', Boolean(showMessage && st.level === 'warn'));
+                this.barEl.classList.toggle('ttv2-error', Boolean(showMessage && st.level === 'error'));
+                if (this.miniEl.textContent !== '') {
+                    this.miniEl.textContent = '';
+                    this.fit();
+                }
+                this.barRight.textContent = 'NPC Arbitrage closed';
+                this.barRight.title = 'NPC Arbitrage is closed: no deals are watched and it asks for nothing.';
+                return;
+            }
 
             this.barLeft.textContent = showMessage ? st.text : headline;
             this.barLeft.title = showMessage
@@ -19462,13 +22329,6 @@
             if (!d && tab === 'bazaar' && live && !live.w3b) {
                 return box('Bazaar watching is off.', 'Turn it on', () =>
                     this.emitSettings({ useW3b: true }),
-                );
-            }
-
-            // Saving API calls stops the Item Market only; bazaars stay watched.
-            if (!d && tab !== 'bazaar' && this.state.settings.saveCalls) {
-                return box('Saving API calls: the Item Market is not watched.', 'Stop saving', () =>
-                    this.emitSettings({ saveCalls: false }),
                 );
             }
 
@@ -19616,6 +22476,8 @@
             const details = el('div', { class: 'ttv2-row-details' });
             const sep = () => document.createTextNode(' · ');
 
+            // Shared: "<Torn name> is on this · 3m".
+            if (row.friend) details.appendChild(el('span', { class: 'ttv2-friendtag', title: 'A mark, not a lock: you can still take it', text: row.friend }));
             details.appendChild(el('b', { text: formatMoney(p.listingPrice) }));
             if (row.priceAssumed) {
                 details.appendChild(el('span', {
@@ -19670,6 +22532,7 @@
             rowEl.ttv2Row = row;
             rowEl.dataset.ttv2At = String(this.rowTime(row) || '');
             if (row.el) rowEl.classList.add('ttv2-onpage');
+            if (row.friend) rowEl.classList.add('ttv2-row-friend');
 
             return rowEl;
         }
@@ -20777,6 +23640,7 @@
     class LedgerView {
         /**
          * @param {object} h - onRead(), onOpenSettings(), onOpenUrl(url), onFavourite(b, on), onBlacklist(b, on)
+         *   onTab(key) - the Ledger moved to another of its tabs by itself
          */
         constructor(h = {}) {
             this.h = h;
@@ -20871,7 +23735,7 @@
                 lvEl('span', { text: status.join(' · ') }),
                 L.keyError ? lvEl('span', { class: 'lg-bad', text: L.keyError }) : L.error ? lvEl('span', { class: 'lg-bad', text: L.error }) : null,
                 lvEl('span', { class: 'sp-sp' }),
-                lvEl('button', { type: 'button', class: 'sp-btn', text: L.busy ? 'Reading…' : 'Read now', disabled: L.busy || L.keyError ? '' : null, onclick: () => this.h.onRead && this.h.onRead() }),
+                lvEl('button', { type: 'button', class: 'sp-btn', text: L.busy ? 'Reading…' : 'Read the log', disabled: L.busy || L.keyError ? '' : null, onclick: () => this.h.onRead && this.h.onRead() }),
             ]));
 
             /* Trading | Mugged */
@@ -21049,8 +23913,11 @@
                 lvEl('span', { class: 'lg-muted', text: this.f.period === 'all' ? 'everything read' : periodLabel }),
             ]));
             const tile = (label, value, cls = '', sub = '') => lvEl('div', { class: 'lg-tile ' + cls }, [lvEl('span', { class: 'lg-tl', text: label }), lvEl('b', { text: value }), sub ? lvEl('small', { text: sub }) : null]);
-            box.appendChild(lvEl('div', { class: 'lg-tiles' }, [
-                tile('Profit', lvSigned(t.profit), t.profit >= 0 ? 'lg-good' : 'lg-loss', lvCount(t.sales) + ' sale' + (t.sales === 1 ? '' : 's')),
+            // The totals and, under them, what muggings took: one group.
+            const profitBox = lvEl('div', { class: 'lg-profitbox' });
+            box.appendChild(profitBox);
+            profitBox.appendChild(lvEl('div', { class: 'lg-tiles' }, [
+                tile('Profit', lvSigned(t.profit), t.profit > 0 ? 'lg-good' : t.profit < 0 ? 'lg-loss' : '', lvCount(t.sales) + ' sale' + (t.sales === 1 ? '' : 's')),
                 tile('Sold, after fees', formatMoney(t.sold), '', lvCount(t.unitsSold) + ' items' + (t.fees ? ' · ' + formatMoney(t.fees) + ' in fees' : '')),
                 // What the units sold here had cost - wherever they were bought (an NPC sale's bazaar buy).
                 tile('Cost of what sold', formatMoney(t.cost), '', 'first in, first out'),
@@ -21059,7 +23926,7 @@
             // Muggings in the same period (not per item or place: a mugging takes cash).
             const mt = mugTotals(mugs, { from, to });
             if (mt.count && !this.f.itemId && !this.f.category && this.f.venue === 'all' && !this.f.who) {
-                box.appendChild(lvEl('p', { class: 'lg-mugline' }, [
+                profitBox.appendChild(lvEl('p', { class: 'lg-card lg-mugline' }, [
                     'Lost to ' + lvCount(mt.count) + ' mugging' + (mt.count === 1 ? '' : 's') + ': ',
                     lvEl('b', { class: 'lg-loss', text: '−' + formatMoney(mt.lost) }),
                     ' · profit after muggings ',
@@ -21069,6 +23936,7 @@
                         this.tab = 'mugs';
                         this.sig = null;
                         this.render(this.last);
+                        if (this.h.onTab) this.h.onTab('mugs');
                     } }),
                 ]));
             }
@@ -21476,7 +24344,9 @@
             list.forEach((p, i) => {
                 const top = y(Math.max(0, p.profit));
                 const h = Math.max(1, Math.abs(y(p.profit) - y(0)));
-                const r = svgNode('rect', { x: pad.l + i * bw + bw * 0.15, y: top, width: Math.max(1, bw * 0.7), height: h, class: p.profit >= 0 ? 'lg-bar-g' : 'lg-bar-r' });
+                // A bar is never wider than a finger: two days on the chart are two bars, not two walls.
+                const w = Math.min(28, Math.max(1, bw * 0.7));
+                const r = svgNode('rect', { x: pad.l + i * bw + (bw - w) / 2, y: top, width: w, height: h, class: p.profit >= 0 ? 'lg-bar-g' : 'lg-bar-r' });
                 const tt = svgNode('title');
                 tt.textContent = dateText(p.start) + ': ' + lvSigned(p.profit) + ' · sold ' + formatMoney(p.sold) + ' · bought ' + formatMoney(p.spent);
                 r.appendChild(tt);
@@ -21707,6 +24577,1091 @@
     }
     `;
 
+    /* ===== src/ui/bids-css.js ===== */
+    /*
+     * Torn Bids' look (3.25.0, mockup AD third pass): Torn Archive's shell - a sidebar, a page per job, panels,
+     * totals in tiles, a bar beside a number - in Torn Bids' own graphite. The rules below came from the drawing's
+     * two stylesheets (mockup AB's and AD's own) and are kept here from now on.
+     *
+     * The owner, 2026-10-10: "chill out a bit on the hues and accents ... it looks vibecoded". So one accent
+     * (green: your money, and the one next step), amber only for something to look at, red only for a loss or a
+     * refusal - and everything else grey: no coloured edges on tiles, no tinted panels, no glow, bars in one
+     * quiet tone. BIDS_CALM_CSS at the end is where that is said; it comes last, so it wins.
+     */
+    const BIDS_BASE_CSS = `
+    .bd {
+        --rail-w: 60px;
+        --side: 236px;
+        --bg: #111215;
+        --rail-bg: #16171b;
+        --panel: #1c1e23;
+        --raised: #24272e;
+        --hover: #2b2f37;
+        --input: #0e0f12;
+        --line: rgba(255,255,255,.075);
+        --line2: rgba(255,255,255,.14);
+        --text: #f2f4f8;
+        --text2: #cdd2db;
+        --muted: #949bab;
+        --faint: #6a7180;
+        --brand: #6fdc7f;
+        --brand-bg: rgba(111,220,127,.10);
+        --brand-line: rgba(111,220,127,.42);
+        --good: #6fdc7f;
+        --good-bg: rgba(111,220,127,.12);
+        --bad: #ff7b6e;
+        --bad-bg: rgba(255,123,110,.12);
+        --warn: #f6b74a;
+        --warn-bg: rgba(246,183,74,.12);
+        --need: #5aa7ff;
+        --need-bg: rgba(90,167,255,.12);
+        --grid: #24272e;
+        --axis: #3a3f4a;
+        --sans: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, Arial, sans-serif;
+        --disp: "Segoe UI Variable Display", "Segoe UI", system-ui, -apple-system, Arial, sans-serif;
+        --ease: cubic-bezier(.2,.8,.2,1);
+        --trust: #43d1be;
+        --trust-bg: rgba(67,209,190,.12);
+        --fav: #ffcc4d;
+        --serif: Georgia, "Iowan Old Style", "Times New Roman", serif;
+    }
+    b, strong { font-weight: 600; }
+    button { font: inherit; color: inherit; cursor: pointer; }
+    .num, td, th, .k-v { font-variant-numeric: tabular-nums; }
+    svg.ic { width: 20px; height: 20px; flex: none; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+
+    /* ---------- shell ---------- */
+    .app { position: absolute; inset: 0; display: grid; grid-template-columns: var(--rail-w) minmax(0, 1fr); transition: grid-template-columns .26s var(--ease); background: radial-gradient(1100px 520px at 12% -10%, rgba(143,123,255,.07), transparent 60%), var(--bg); }
+    .app.pinned { grid-template-columns: var(--side) minmax(0, 1fr); }
+    .side { position: relative; z-index: 40; }
+    .side-in { position: absolute; inset: 0 auto 0 0; width: var(--rail-w); display: flex; flex-direction: column; background: var(--rail-bg); border-right: 1px solid var(--line); overflow: hidden; transition: width .26s var(--ease), box-shadow .26s var(--ease); }
+    .side.open .side-in, .app.pinned .side-in { width: var(--side); }
+    .app:not(.pinned) .side.open .side-in { box-shadow: 18px 0 48px rgba(0,0,0,.55); border-right-color: var(--line2); }
+    .lab { opacity: 0; transform: translateX(-6px); transition: opacity .18s var(--ease), transform .26s var(--ease); white-space: nowrap; pointer-events: none; }
+    .side.open .lab, .app.pinned .lab { opacity: 1; transform: none; pointer-events: auto; }
+    .brand { height: 52px; flex: none; display: flex; align-items: center; gap: 12px; padding: 0 0 0 14px; border-bottom: 1px solid var(--line); }
+    .mark { width: 32px; height: 32px; flex: none; border-radius: 10px; display: grid; place-items: center; color: #fff; background: linear-gradient(145deg, #a694ff, #6a55e8); box-shadow: 0 0 0 1px rgba(255,255,255,.12) inset, 0 6px 18px rgba(143,123,255,.35); }
+    .brand .lab b { display: block; font: 650 15px/1.1 var(--disp); letter-spacing: .01em; }
+    .brand .lab span { color: var(--muted); font-size: 12px; } .brand .pin { margin-left: auto; margin-right: 10px; }
+    .nav { position: relative; flex: 1; padding: 8px; display: flex; flex-direction: column; gap: 2px; min-height: 0; }
+    .nav-ind { position: absolute; left: 8px; right: 8px; top: 0; height: 38px; border-radius: 10px; background: var(--brand-bg); box-shadow: inset 0 0 0 1px var(--brand-line); transition: transform .32s var(--ease); pointer-events: none; }
+    .nav-ind::before { content: ""; position: absolute; left: -8px; top: 10px; bottom: 10px; width: 3px; border-radius: 0 3px 3px 0; background: var(--brand); }
+    .nav-g { height: 26px; flex: none; display: flex; align-items: center; padding: 0 12px; color: var(--faint); font: 650 12px var(--sans); letter-spacing: .08em; text-transform: uppercase; position: relative; }
+    .nav-g::after { content: ""; position: absolute; left: 12px; right: 12px; top: 50%; border-top: 1px solid var(--line); transition: opacity .18s; }
+    .side.open .nav-g::after, .app.pinned .nav-g::after { opacity: 0; }
+    .nav-b { position: relative; height: 38px; flex: none; display: flex; align-items: center; gap: 14px; padding: 0 12px; border: 0; border-radius: 10px; background: none; color: var(--muted); text-align: left; transition: color .16s, background .16s; }
+    .nav-b:hover { color: var(--text); background: rgba(255,255,255,.04); }
+    .nav-b.on { color: var(--text); }
+    .nav-b.on svg { color: var(--brand); }
+    .nav-b .lab { flex: 1; font-weight: 550; }
+    .nav-b .cnt { font: 650 12px var(--sans); padding: 1px 7px; border-radius: 999px; color: var(--need); background: var(--need-bg); }
+    .nav-b .cnt.hot { color: var(--warn); background: var(--warn-bg); }
+    .nav-b .pip { position: absolute; left: 28px; top: 8px; width: 7px; height: 7px; border-radius: 50%; background: var(--warn); box-shadow: 0 0 0 2px var(--rail-bg); transition: opacity .18s; }
+    .side.open .pip, .app.pinned .pip { opacity: 0; }
+    .side-f { flex: none; padding: 8px; border-top: 1px solid var(--line); display: flex; flex-direction: column; gap: 6px; }
+    .shop { height: 40px; display: flex; align-items: center; gap: 14px; padding: 0 12px; border-radius: 10px; }
+    .shop .dot { margin: 0 6px 0 7px; }
+    .shop .lab { flex: 1; color: var(--text2); } .shop .lab b { color: var(--good); }
+    .pin { width: 30px; height: 30px; flex: none; border-radius: 8px; border: 1px solid var(--line2); background: var(--raised); display: grid; place-items: center; color: var(--muted); transition: color .16s, background .16s, opacity .18s var(--ease); }
+    .pin svg { width: 16px; height: 16px; transform: rotate(45deg); transition: transform .26s var(--ease); }
+    .app.pinned .pin svg { transform: none; }
+    .pin:hover { color: var(--text); }
+    .app.pinned .pin { color: #fff; background: var(--brand); border-color: transparent; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--good); flex: none; display: inline-block; }
+    .dot.warn { background: var(--warn); } .dot.off { background: var(--faint); } .dot.need { background: var(--need); }
+    .live { width: 8px; height: 8px; border-radius: 50%; background: var(--good); flex: none; display: inline-block; position: relative; }
+    .live::after { content: ""; position: absolute; inset: -4px; border-radius: 50%; border: 1px solid var(--good); animation: ping 2.4s var(--ease) infinite; }
+
+    .main { display: grid; grid-template-rows: 52px minmax(0, 1fr) 30px; height: 100%; min-width: 0; container-type: inline-size; }
+    .top { display: flex; align-items: center; gap: 10px; padding: 0 16px; border-bottom: 1px solid var(--line); white-space: nowrap; min-width: 0; }
+    .top h1 { margin: 0 8px 0 0; font: 650 19px/1 var(--disp); letter-spacing: -.01em; }
+    .tabs { display: flex; gap: 2px; align-self: stretch; }
+    .tab { position: relative; padding: 0 12px; border: 0; background: none; color: var(--muted); font-weight: 550; transition: color .16s; }
+    .tab:hover { color: var(--text); }
+    .tab.on { color: var(--text); }
+    .tab::after { content: ""; position: absolute; left: 12px; right: 12px; bottom: 0; height: 2px; border-radius: 2px 2px 0 0; background: var(--brand); transform: scaleX(0); transition: transform .26s var(--ease); }
+    .tab.on::after { transform: none; }
+    .sp { flex: 1; }
+    .pill { height: 30px; display: inline-flex; align-items: center; gap: 7px; padding: 0 10px; border-radius: 9px; background: var(--panel); border: 1px solid var(--line); color: var(--muted); font-size: 12px; }
+    .pill b { color: var(--text); font-size: 13px; }
+    .pill .dn { color: var(--warn); } .pill.flash { animation: flash 1s var(--ease); }
+    @container (max-width: 1130px) { .pill.opt { display: none; } }
+    @container (max-width: 1240px) { .page.stackable { grid-template-columns: minmax(0, 1fr); } .page.stackable .minc { min-height: 260px !important; } }
+    @container (max-width: 1420px) { .page.stackable.wide { grid-template-columns: minmax(0, 1fr); } .page.stackable.wide .minc { min-height: 260px !important; } }
+    .btn { height: 30px; padding: 0 12px; border-radius: 9px; border: 1px solid var(--line2); background: var(--raised); color: var(--text); font-weight: 550; font-size: 13px; display: inline-flex; align-items: center; justify-content: center; gap: 6px; white-space: nowrap; transition: background .16s, transform .16s var(--ease), border-color .16s; }
+    .btn:hover { background: var(--hover); border-color: rgba(255,255,255,.22); }
+    .btn:active { transform: scale(.97); }
+    .btn.sm { height: 26px; padding: 0 10px; border-radius: 8px; font-size: 12px; }
+    .btn.go { background: var(--brand); border-color: transparent; color: #fff; }
+    .btn.go:hover { background: #a08fff; }
+    .btn.link { background: var(--need-bg); border-color: transparent; color: #9cc6ff; }
+
+    .tape { display: flex; align-items: center; border-top: 1px solid var(--line); background: var(--rail-bg); font-size: 12px; color: var(--muted); white-space: nowrap; min-width: 0; }
+    .tape-l, .tape-r { flex: none; padding: 0 12px; height: 100%; display: flex; align-items: center; gap: 8px; }
+    .tape-l { border-right: 1px solid var(--line); color: var(--text2); font-weight: 600; }
+    .tape-r { border-left: 1px solid var(--line); gap: 14px; }
+    .tape-m { flex: 1; min-width: 0; overflow: hidden; mask-image: linear-gradient(90deg, transparent, #000 40px, #000 calc(100% - 40px), transparent); }
+    .tape-t { display: inline-flex; gap: 26px; padding-left: 26px; animation: tape 150s linear infinite; }
+    .tape-m:hover .tape-t { animation-play-state: paused; }
+    .tk b { color: var(--text2); font-weight: 550; margin-right: 6px; } .tk .num { color: var(--text); margin-right: 6px; }
+    .up { color: var(--bad); } .down { color: var(--good); }
+
+    /* ---------- pages and panels ---------- */
+    .view { overflow: auto; padding: 12px 16px; min-width: 0; scrollbar-width: thin; scrollbar-color: #2a303c transparent; }
+    .page { display: none; gap: 12px; min-height: 100%; }
+    .page.on { display: grid; }
+    .pane { display: none; gap: 12px; min-height: 0; min-width: 0; }
+    .pane.on { display: grid; }
+    .col { display: flex; flex-direction: column; gap: 12px; min-width: 0; min-height: 0; }
+    .panel { display: flex; flex-direction: column; min-width: 0; min-height: 0; background: linear-gradient(180deg, rgba(255,255,255,.018), transparent 120px), var(--panel); border: 1px solid var(--line); border-radius: 12px; transition: border-color .2s; animation: rise .46s var(--ease) both; animation-delay: calc(var(--i, 0) * 36ms); }
+    .panel:hover { border-color: var(--line2); }
+    .panel.grow { flex: 1; }
+    .panel.tint { border-color: var(--brand-line); background: linear-gradient(180deg, var(--brand-bg), transparent 140px), var(--panel); }
+    .panel.hold { border-color: rgba(245,165,36,.4); }
+    .ph { flex: none; display: flex; align-items: center; gap: 12px; padding: 11px 14px 0; white-space: nowrap; min-height: 37px; }
+    .ph h2 { margin: 0; font: 650 13px/1.2 var(--sans); color: var(--text); }
+    .ph .sub { color: var(--muted); font-size: 12px; }
+    .pb { flex: 1; min-height: 0; padding: 10px 14px 13px; position: relative; }
+    .pb.flush { padding: 6px 0 4px; }
+    .chart { position: absolute; inset: 4px 8px 6px 6px; }
+    .chart svg { width: 100%; height: 100%; display: block; overflow: visible; }
+    .legend { display: flex; gap: 14px; color: var(--text2); font-size: 12px; }
+    .legend span { display: inline-flex; align-items: center; gap: 6px; }
+    .key { width: 14px; height: 2px; border-radius: 2px; background: var(--c); flex: none; }
+    .key.box { height: 10px; width: 10px; border-radius: 3px; }
+    .key.band { height: 10px; background: rgba(255,255,255,.1); }
+    .key.dash { background: repeating-linear-gradient(90deg, var(--muted) 0 4px, transparent 4px 7px); }
+    .seg { display: inline-flex; background: var(--input); border: 1px solid var(--line); border-radius: 9px; padding: 2px; }
+    .seg button { height: 24px; padding: 0 10px; border: 0; border-radius: 7px; background: none; color: var(--muted); font-size: 12px; font-weight: 600; transition: background .16s, color .16s; }
+    .seg button.on { background: var(--raised); color: var(--text); }
+    .tip { position: absolute; left: 0; top: 0; z-index: 20; pointer-events: none; padding: 8px 10px; border-radius: 9px; background: #1d222d; border: 1px solid var(--line2); box-shadow: 0 10px 30px rgba(0,0,0,.5); font-size: 12px; white-space: nowrap; opacity: 0; transition: opacity .12s; }
+    .tip.on { opacity: 1; }
+    .tip h4 { margin: 0 0 4px; font: 600 12px var(--sans); color: var(--muted); }
+    .tip div { display: flex; align-items: center; gap: 7px; color: var(--text2); } .tip div b { margin-left: auto; padding-left: 14px; color: var(--text); }
+    svg .g { stroke: var(--grid); stroke-width: 1; } svg .ax { fill: var(--muted); font: 12px var(--sans); }
+    svg .lb { fill: var(--text2); font: 600 12px var(--sans); } svg .rl { fill: var(--muted); font: 12px var(--sans); }
+    svg .ln { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+    svg .ln.draw { stroke-dasharray: 1; stroke-dashoffset: 1; animation: draw 1.1s var(--ease) .1s forwards; }
+    svg .fade { animation: fade .9s ease .35s both; }
+    svg .bar.growy { transform-box: fill-box; transform-origin: bottom; animation: growy .55s var(--ease) both; }
+    svg .bar.neg.growy { transform-origin: top; }
+    svg .cross { stroke: var(--line2); stroke-width: 1; }
+
+    /* ---------- dashboard ---------- */
+    .p-dash { grid-template-columns: repeat(12, minmax(0, 1fr)); grid-template-rows: auto minmax(170px, 1.25fr) minmax(160px, 1fr); height: 100%; min-height: 470px; }
+    .kpi { grid-column: span 2; padding: 11px 14px 12px; position: relative; overflow: hidden; }
+    .k-l { color: var(--muted); font-size: 12px; white-space: nowrap; }
+    .k-v { font: 650 clamp(18px, 1.72cqw, 23px)/1.25 var(--disp); letter-spacing: -.015em; white-space: nowrap; }
+    .k-v.good { color: var(--good); }
+    .k-s { color: var(--muted); font-size: 12px; line-height: 1.4; } .k-s b { color: var(--text2); }
+    .k-x { position: absolute; right: 12px; top: 9px; opacity: .95; }
+    .meter { position: relative; height: 6px; border-radius: 4px; background: rgba(255,255,255,.07); margin: 7px 0 6px; }
+    .meter i { position: absolute; inset: 0 auto 0 0; border-radius: 4px; background: var(--brand); width: var(--w); animation: growx .8s var(--ease) .2s both; transform-origin: left; }
+    .meter u { position: absolute; top: -3px; bottom: -3px; width: 2px; background: var(--text2); left: var(--at); border-radius: 2px; }
+    .s8 { grid-column: span 8; } .s7 { grid-column: span 7; } .s6 { grid-column: span 6; } .s5 { grid-column: span 5; } .s4 { grid-column: span 4; } .s3 { grid-column: span 3; } .s12 { grid-column: span 12; }
+    .next { display: grid; grid-auto-rows: minmax(0, 1fr); height: 100%; }
+    .nx { display: flex; align-items: center; gap: 11px; padding: 6px 0; border-top: 1px solid var(--line); min-height: 0; }
+    .nx:first-child { border-top: 0; }
+    .nx-i { width: 30px; height: 30px; border-radius: 9px; display: grid; place-items: center; flex: none; background: var(--c-bg); color: var(--c); }
+    .nx-i svg { width: 17px; height: 17px; }
+    .nx-t { flex: 1; min-width: 0; color: var(--text2); line-height: 1.35; } .nx-t b { color: var(--text); }
+    [data-tip] { position: relative; }
+    [data-tip]:hover::after { content: attr(data-tip); position: absolute; left: 50%; bottom: calc(100% + 7px); transform: translateX(-50%); padding: 5px 8px; border-radius: 8px; background: #1d222d; border: 1px solid var(--line2); color: var(--text); font: 12px var(--sans); white-space: nowrap; z-index: 30; box-shadow: 0 8px 22px rgba(0,0,0,.5); }
+
+    /* ---------- tables, tiles, bits ---------- */
+    table.t { width: 100%; border-collapse: collapse; }
+    .t th { text-align: left; padding: 7px 8px; color: var(--faint); font: 650 12px var(--sans); border-bottom: 1px solid var(--line); white-space: nowrap; position: sticky; top: 0; background: var(--panel); }
+    .t td { padding: 7px 8px; border-bottom: 1px solid var(--line); color: var(--text2); white-space: nowrap; vertical-align: middle; }
+    .t tr:last-child td { border-bottom: 0; }
+    .t tbody tr { transition: background .14s; } .t tbody tr:hover { background: rgba(255,255,255,.028); }
+    .t th:first-child, .t td:first-child { padding-left: 14px; } .t th:last-child, .t td:last-child { padding-right: 14px; }
+    .t.kv th { position: static; width: 34%; white-space: normal; border-bottom: 1px solid var(--line); padding-left: 0; vertical-align: top; } .t.kv td { white-space: normal; padding-right: 0; } .t.kv tr:last-child th { border-bottom: 0; }
+    .t.tight td { padding-top: 5px; padding-bottom: 5px; } .t.wrapth th { white-space: normal; vertical-align: bottom; } .t .n { text-align: right; } .t td b { color: var(--text); }
+    .t tr.sum td { border-top: 1px solid var(--line2); border-bottom: 0; color: var(--text); font-weight: 600; }
+    .sw { width: 8px; height: 8px; border-radius: 3px; display: inline-block; margin-right: 8px; background: var(--c); }
+    .badge { display: inline-flex; align-items: center; gap: 5px; height: 20px; padding: 0 8px; border-radius: 999px; font: 600 12px/1 var(--sans); white-space: nowrap; color: var(--muted); background: rgba(255,255,255,.06); }
+    .badge.need { color: #8fc1ff; background: var(--need-bg); } .badge.ahead { color: var(--warn); background: var(--warn-bg); } .badge.ok { color: var(--good); background: var(--good-bg); } .badge.bad { color: #ff8a87; background: var(--bad-bg); } .badge.best { color: #c9bfff; background: var(--brand-bg); }
+    .t-good { color: var(--good); } .t-bad { color: #ff8a87; } .t-warn { color: var(--warn); } .t-need { color: #8fc1ff; } .t-muted { color: var(--muted); }
+    .tiles { display: grid; grid-template-columns: repeat(var(--n, 4), minmax(0, 1fr)); gap: 12px; }
+    .tile { padding: 11px 14px 12px; }
+    .pgrid { display: grid; gap: 8px; height: 100%; grid-auto-rows: minmax(70px, 1fr); }
+    .pc { border-radius: 10px; background: var(--raised); border: 1px solid var(--line); min-width: 0; transition: transform .2s var(--ease), border-color .2s; }
+    .pc:hover { transform: translateY(-2px); border-color: var(--line2); }
+    .pc.need .pc-bar i { background: var(--need); } .pc.ahead .pc-bar i { background: var(--warn); }
+    .pc.first { border-color: rgba(76,157,255,.5); box-shadow: 0 0 0 3px rgba(76,157,255,.08); }
+    .pc.act { background: var(--brand-bg); border-color: var(--brand-line); color: var(--text2); font-size: 12px; }
+    .flow { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 0; }
+    .fl .k-l { white-space: normal; } .fl { padding: 2px 10px 2px 14px; border-left: 1px solid var(--line); position: relative; } .fl:first-child { border-left: 0; padding-left: 0; }
+    .fl:not(:first-child)::before { content: "›"; position: absolute; left: -6px; top: 16px; color: var(--faint); background: var(--panel); font-size: 16px; line-height: 1; }
+    .rows { display: flex; flex-direction: column; }
+    .row { display: flex; align-items: center; gap: 10px; padding: 7px 0; border-top: 1px solid var(--line); white-space: nowrap; } .row:first-child { border-top: 0; }
+    .row .grow1 { flex: 1; min-width: 0; white-space: normal; color: var(--text2); } .row .grow1 b { color: var(--text); }
+    .li { display: flex; align-items: center; gap: 10px; padding: 8px 14px; border-top: 1px solid var(--line); transition: background .14s; } .li:hover { background: rgba(255,255,255,.028); }
+    .li.sel { background: var(--brand-bg); box-shadow: inset 2px 0 0 var(--brand); }
+    .li-m { flex: 1; min-width: 0; } .li-m b { display: block; } .li-m span { color: var(--muted); font-size: 12px; }
+    .av { width: 30px; height: 30px; border-radius: 50%; background: var(--raised); border: 1px solid var(--line2); display: grid; place-items: center; font: 650 12px var(--sans); color: var(--text2); flex: none; }
+    .msg { padding: 7px 12px; border-radius: 10px; background: var(--input); border: 1px solid var(--line); color: var(--text2); line-height: 1.5; }
+    .hero { font: 650 36px/1 var(--disp); letter-spacing: -.02em; } .hero small { font-size: 16px; color: var(--muted); font-weight: 500; letter-spacing: 0; margin-left: 6px; }
+    .toggle { display: inline-flex; align-items: center; gap: 8px; }
+    .sw-t { width: 38px; height: 22px; border-radius: 999px; background: var(--good); position: relative; flex: none; } .sw-t::after { content: ""; position: absolute; right: 3px; top: 3px; width: 16px; height: 16px; border-radius: 50%; background: #fff; }
+    .field { display: flex; align-items: center; gap: 10px; padding: 9px 0; border-top: 1px solid var(--line); white-space: nowrap; } .field:first-child { border-top: 0; }
+    .field .f-l { flex: 1; min-width: 0; white-space: normal; } .field .f-l span { display: block; color: var(--muted); font-size: 12px; }
+    .inp { display: inline-flex; align-items: center; height: 30px; padding: 0 10px; border-radius: 8px; background: var(--input); border: 1px solid var(--line2); color: var(--text); font-variant-numeric: tabular-nums; }
+    .inp.key { flex: 1; min-width: 0; letter-spacing: .2em; color: var(--muted); }
+    .stack { display: flex; height: 14px; gap: 2px; border-radius: 5px; overflow: hidden; margin: 10px 0; } .stack i { background: var(--c); width: var(--w); animation: growx .8s var(--ease) both; transform-origin: left; }
+
+    /* ---------- item pictures: Torn's own, as Torn Bids shows them ---------- */
+    .it { width: 38px; height: 19px; box-sizing: content-box; flex: none; display: inline-grid; place-items: center; vertical-align: middle; margin-right: 8px; border-radius: 4px; background: rgba(255,255,255,.05); border-bottom: 2px solid var(--c, transparent); font: 650 12px/1 var(--sans); color: var(--text2); overflow: hidden; }
+    .it img { width: 38px; height: 19px; object-fit: contain; display: block; }
+    .it.lg { width: 60px; height: 30px; } .it.lg img { width: 60px; height: 30px; }
+    .tk .it { margin-right: 6px; }
+    .t-brand { color: #c9bfff; }
+    .top.tight .pill.opt { display: none; } .top.tighter .pill .dn { display: none; }
+    .nx-p { width: 38px; flex: none; display: grid; place-items: center; } .nx-p .it { margin: 0; }
+    /* stock tiles: what is in a tile grows with the tile, so a tall screen leaves no empty box */
+    .pc { container: pc / size; display: block; padding: 0; cursor: pointer; }
+    .pc.act { cursor: default; } .pc.act .pc-in { justify-content: center; align-items: flex-start; gap: 7px; }
+    @container pc (min-height: 118px) { .pc-in { padding: 10px 12px 11px; gap: 3px; } .pc .it, .pc .it img { width: 60px; height: 30px; } .pc-n { font-size: 14px; margin-top: 2px; } .pc-q b, .pc-big { font-size: 21px; } .pc-bar { height: 6px; } .pc.act { font-size: 13px; } }
+    @container pc (min-height: 158px) and (min-width: 136px) { .pc-x { display: grid; gap: 3px; margin-top: 5px; padding-top: 6px; border-top: 1px solid var(--line); } }
+    @container pc (min-height: 192px) { .pc-k:nth-child(3) { display: flex; } }
+    @container pc (min-width: 176px) { .pc-k .w { display: inline; } .pc-k .n { display: none; } }
+    @container pc (min-height: 250px) and (max-width: 135.9px) { .pc-x { display: grid; gap: 3px; margin-top: 7px; padding-top: 8px; border-top: 1px solid var(--line); } .pc-k { flex-direction: column; } }
+    @container pc (min-height: 236px) and (min-width: 170px) { .pc-in { padding: 12px 14px 13px; gap: 4px; } .pc .it, .pc .it img { width: 100px; height: 50px; } .pc-n { font-size: 15px; } .pc-q b, .pc-big { font-size: 26px; } .pc-x { gap: 5px; } }
+    /* the buying run */
+    .stop.cur { background: var(--brand-bg); box-shadow: inset 3px 0 0 var(--brand); }
+    .stop.done .stop-n { background: var(--good-bg); border-color: transparent; color: var(--good); } .stop.skip .stop-n { color: var(--faint); }
+    .stop.done .chips, .stop.skip .chips { opacity: .55; }
+    .stop-st { font-size: 12px; color: var(--muted); } .stop.done .stop-st { color: var(--good); } .stop.cur .stop-st { color: #c9bfff; }
+    .kbd { display: inline-grid; place-items: center; min-width: 18px; height: 18px; margin-left: 8px; padding: 0 4px; border-radius: 5px; background: rgba(255,255,255,.22); font: 650 12px/1 var(--sans); }
+    .runbar { display: flex; align-items: center; gap: 8px 10px; flex-wrap: wrap; padding-bottom: 9px; color: var(--text2); } .runbar > span { flex: 1 1 220px; min-width: 0; } .runbar b { color: var(--text); }
+    /* a name or a button that opens the real page on Torn */
+    .lk { color: inherit; cursor: pointer; text-decoration: none; } .lk::after { content: "\\2197"; margin-left: 4px; font-size: 12px; font-weight: 400; color: var(--faint); transition: color .14s; } .lk:hover, .lk:hover::after { color: #c9bfff; }
+    .btn.out::after { content: "\\2197"; margin-left: 6px; opacity: .75; }
+    @container pc (max-width: 120px) { .pc .btn.out::after { display: none; } }
+    .main { position: relative; }
+    .kpis { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; } .kpis .kpi { grid-column: auto; }
+    /* is it worth opening */
+    .verdict { display: flex; align-items: center; gap: 10px; padding-bottom: 9px; white-space: nowrap; } .verdict b { font: 650 16px var(--disp); } .verdict .sp { flex: 1; } .verdict .lamp { margin: 0 4px; }
+    .chk { display: flex; align-items: baseline; gap: 10px; padding: 6px 0; border-top: 1px solid var(--line); color: var(--text2); line-height: 1.45; } .chk b { color: var(--text); }
+    .chk::before { content: "\\2713"; flex: none; width: 16px; color: var(--good); font-weight: 700; } .chk.no::before { content: "\\2715"; color: var(--warn); }
+    /* open trades */
+    .li[data-tr] { cursor: pointer; } .li .amt { text-align: right; white-space: nowrap; } .li .amt span { display: block; }
+    .st { font-size: 12px; white-space: nowrap; color: var(--muted); } .st.you { color: var(--warn); } .st.new { color: #c9bfff; }
+    .av.new { border-color: var(--brand); box-shadow: 0 0 0 3px var(--brand-bg); }
+    /* the notice of a new trade */
+    .toast { position: absolute; top: 62px; right: 16px; z-index: 60; display: flex; align-items: center; gap: 12px; padding: 10px 10px 10px 12px; border-radius: 12px; background: var(--panel); border: 1px solid var(--brand-line); box-shadow: 0 16px 40px rgba(0,0,0,.55); white-space: nowrap; opacity: 0; transform: translateY(-8px); pointer-events: none; transition: opacity .26s var(--ease), transform .26s var(--ease); }
+    .toast.on { opacity: 1; transform: none; pointer-events: auto; } .toast b { display: block; } .toast .s { color: var(--muted); font-size: 12px; }
+    .toast .x { width: 22px; height: 22px; padding: 0; border: 0; border-radius: 6px; background: none; color: var(--faint); font-size: 16px; line-height: 1; } .toast .x:hover { color: var(--text); background: rgba(255,255,255,.08); }
+    .shows { display: grid; gap: 18px; align-content: start; } .shows h4 { margin: 0 0 7px; font: 600 12px var(--sans); color: var(--muted); } .shows p { margin: 0; color: var(--text2); }
+    .field { flex-wrap: wrap; row-gap: 6px; } .field .f-l { flex: 1 1 150px; } .field > .seg, .field > .inp { margin-left: auto; }
+    .osn { width: 100%; display: flex; align-items: center; gap: 12px; padding: 12px 14px; border-radius: 10px; background: #2b2d33; border: 1px solid rgba(255,255,255,.1); color: #f1f1f1; font: 13px/1.4 "Segoe UI", system-ui, sans-serif; box-shadow: 0 10px 30px rgba(0,0,0,.5); } .osn b { display: block; } .osn span.s { color: #b9bcc4; font-size: 12px; }
+    .tabt { display: inline-flex; align-items: center; gap: 8px; padding: 7px 14px; border-radius: 9px 9px 0 0; background: var(--raised); border: 1px solid var(--line2); border-bottom: 0; color: var(--text2); } .tabt .mark, .osn .mark { width: 20px; height: 20px; border-radius: 6px; } .osn .mark { width: 30px; height: 30px; border-radius: 9px; } .tabt .mark svg { width: 12px; height: 12px; }
+    .ta-ok { color: var(--good); font-size: 12px; } .ta-warn { color: var(--warn); font-size: 12px; } .mk.fill[data-take] { cursor: pointer; }
+
+    /* ---------- buy: every place that sells a piece, and the shopping list ---------- */
+    .p-buy { grid-template-columns: minmax(0, 1fr); } .p-buy > .pane { height: 100%; } .gbuy { grid-template-columns: minmax(0, 7fr) minmax(0, 5fr); }
+    @container (max-width: 1240px) { .pane.stk { grid-template-columns: minmax(0, 1fr); } .pane.stk .minc { min-height: 260px !important; } }
+    .t tr.pick { cursor: pointer; } .t tbody tr.sel, .t tbody tr.sel:hover { background: var(--brand-bg); box-shadow: inset 2px 0 0 var(--brand); }
+    .rec { display: flex; align-items: center; gap: 10px 18px; flex-wrap: wrap; } .rec .hero { white-space: nowrap; } .rec-t { flex: 1; min-width: 240px; color: var(--text2); line-height: 1.5; } .rec-t b { color: var(--text); } .rec-b { display: flex; gap: 8px; }
+    .wl { display: grid; grid-template-columns: minmax(0, 1fr) 44px 72px 76px 104px; align-items: center; gap: 8px; padding: 6px 14px; border-top: 1px solid var(--line); white-space: nowrap; color: var(--text2); transition: background .14s; }
+    .wl:hover { background: rgba(255,255,255,.028); } .wl b { color: var(--text); } .wl .n { text-align: right; }
+    .wl.h { color: var(--faint); font: 650 12px var(--sans); } .wl.h:hover { background: none; }
+    .wl.cheap b.num { color: #c9bfff; } .wl.on { background: var(--brand-bg); box-shadow: inset 2px 0 0 var(--brand); }
+    .wl-a { display: flex; gap: 6px; justify-content: flex-end; }
+    .wl-s { padding: 4px 14px 9px; color: var(--text2); font-size: 12px; line-height: 1.5; } .wl-s b { color: var(--text); } .wl-s.foot { padding-top: 9px; border-top: 1px solid var(--line); color: var(--muted); }
+    .stop { display: flex; gap: 10px; padding: 9px 14px; border-top: 1px solid var(--line); } .stop:first-child { border-top: 0; }
+    .stop-n { width: 22px; height: 22px; flex: none; border-radius: 50%; display: grid; place-items: center; background: var(--raised); border: 1px solid var(--line2); font: 650 12px var(--sans); color: var(--text2); }
+    .stop-m { flex: 1; min-width: 0; } .stop-h { display: flex; align-items: center; gap: 10px; white-space: nowrap; flex-wrap: wrap; }
+    .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 7px; }
+    .chip { display: inline-flex; align-items: center; gap: 7px; height: 28px; padding: 0 4px 0 6px; border-radius: 8px; background: var(--raised); border: 1px solid var(--line); white-space: nowrap; font-size: 12px; color: var(--text2); }
+    .chip .it { margin: 0; } .chip b { color: var(--text); }
+    .chip .x { width: 18px; height: 18px; padding: 0; border: 0; border-radius: 5px; background: none; color: var(--faint); font-size: 15px; line-height: 1; } .chip .x:hover { color: var(--text); background: rgba(255,255,255,.08); }
+
+    /* ---------- is it safe to be open, lot sizes ---------- */
+    .safe { display: flex; gap: 14px; align-items: flex-start; color: var(--text2); line-height: 1.5; } .safe b { color: var(--text); } .safe p { margin: 0 0 6px; } .safe p:last-child { margin: 0; }
+    .lamp { width: 12px; height: 12px; margin-top: 4px; border-radius: 50%; flex: none; background: var(--good); box-shadow: 0 0 0 4px var(--good-bg); } .lamp.warn { background: var(--warn); box-shadow: 0 0 0 4px var(--warn-bg); }
+
+    /* ---------- Torn's own pages: a grey stand-in, our marks on top ---------- */
+    .mk-ring { box-shadow: inset 0 0 0 2px var(--need); } .mk-ring.top { box-shadow: inset 0 0 0 2px var(--need), 0 0 14px rgba(76,157,255,.45); } .mk-ring.ahead { box-shadow: inset 0 0 0 1px var(--warn); }
+    .mk { display: inline-flex; align-items: center; gap: 5px; height: 20px; padding: 0 8px; border-radius: 999px; font: 600 12px/1 var(--sans); white-space: nowrap; background: #10233b; color: #cfe5ff; border: 1px solid rgba(76,157,255,.5); box-shadow: 0 2px 8px rgba(0,0,0,.5); }
+    .mk b { color: #fff; } .mk.c { position: absolute; top: -11px; right: 6px; z-index: 2; } .mk.b { position: absolute; bottom: -11px; right: 6px; z-index: 2; }
+    .mk.ahead { background: #2a2110; color: var(--warn); border-color: rgba(245,165,36,.45); } .mk.grey { background: #23262c; color: #cfd4dc; border-color: rgba(255,255,255,.14); } .mk.good { background: #10261a; color: var(--good); border-color: rgba(63,207,107,.45); }
+    .mk.fill { background: var(--brand); color: #fff; border-color: transparent; }
+    .ta { position: sticky; top: 0; display: flex; flex-direction: column; border-radius: 12px; background: var(--panel); border: 1px solid var(--line2); box-shadow: 0 16px 40px rgba(0,0,0,.5); color: var(--text); font: 13px/1.45 var(--sans); overflow: hidden; }
+    .ta-h { display: flex; align-items: center; gap: 8px; height: 40px; padding: 0 8px 0 10px; border-bottom: 1px solid var(--line); background: var(--rail-bg); white-space: nowrap; }
+    .ta-h .mark { width: 24px; height: 24px; border-radius: 7px; } .ta-h .mark svg { width: 15px; height: 15px; } .ta-h b { font: 650 13px var(--disp); margin-right: auto; } .ta-h span.w { color: var(--muted); font-size: 12px; }
+    .ta-b { display: grid; gap: 8px; padding: 10px 12px 12px; }
+    .ta-b h4 { margin: 0; display: flex; align-items: baseline; gap: 8px; font: 650 13px var(--sans); white-space: nowrap; } .ta-b h4 span { margin-left: auto; color: var(--muted); font-weight: 400; font-size: 12px; }
+    .ta-l { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 2px 8px; padding: 6px 8px; border-radius: 9px; background: var(--raised); border: 1px solid var(--line); }
+    .ta-l .it { margin: 0; } .ta-l b { font-weight: 600; } .ta-l .s { grid-column: 1 / -1; color: var(--muted); font-size: 12px; } .ta-l.dim b { color: var(--muted); font-weight: 500; }
+    .ta-kv { display: flex; align-items: baseline; gap: 10px; font-size: 12px; color: var(--muted); } .ta-kv > :last-child { margin-left: auto; color: var(--text); text-align: right; } .ta-kv.sep { padding-top: 8px; border-top: 1px solid var(--line); }
+    .ta-n { color: var(--muted); font-size: 12px; line-height: 1.5; } .ta-n b { color: var(--text2); }
+    .ta-hold { padding: 8px 10px; border-radius: 9px; background: var(--warn-bg); border: 1px solid rgba(245,165,36,.4); color: var(--text2); font-size: 12px; line-height: 1.5; } .ta-hold b { color: var(--warn); }
+    .ta .msg { font-size: 12px; padding: 7px 10px; } .ta-btns { display: flex; gap: 6px; flex-wrap: wrap; }
+
+    /* page grids */
+    .g2 { grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); } .g2r { grid-template-columns: minmax(0, 1fr) minmax(0, 2fr); } .g57 { grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); } .g11 { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); } .g1 { grid-template-columns: minmax(0, 1fr); }
+    .p-tabs { grid-template-columns: minmax(0, 1fr); } .p-tabs > .pane { height: 100%; }
+    .minc { min-height: 180px; }
+
+    @keyframes rise { from { opacity: 0; transform: translateY(8px); } }
+    @keyframes draw { to { stroke-dashoffset: 0; } }
+    @keyframes fade { from { opacity: 0; } }
+    @keyframes growy { from { transform: scaleY(0); } }
+    @keyframes growx { from { transform: scaleX(0); } }
+    @keyframes ping { 0% { transform: scale(.6); opacity: .9; } 70%, 100% { transform: scale(1.5); opacity: 0; } }
+    @keyframes flash { 0% { background: rgba(245,165,36,.28); border-color: rgba(245,165,36,.6); } }
+    @keyframes tape { to { transform: translateX(-50%); } }
+    @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } svg .ln.draw { stroke-dashoffset: 0; } }
+
+    /* ---------- Mockup AD only: Torn Archive's shell, in Torn Bids' own graphite and green ---------- */
+
+    .app { background: radial-gradient(1100px 520px at 12% -10%, rgba(111,220,127,.05), transparent 60%), var(--bg); }
+    .main { position: relative; }
+    /* a panel moves in; it never starts invisible */
+    @keyframes rise { from { transform: translateY(8px); } }
+    /* a wide screen: everything a size bigger, not the same size with more black */
+    .mark { background: var(--brand); color: #0b1a0e; box-shadow: none; font: 700 18px/1 var(--serif); }
+    .brand .lab b { font: 400 18px/1.15 var(--serif); letter-spacing: 0; }
+    .top h1 { font: 400 21px/1 var(--serif); letter-spacing: 0; }
+    .panel { background: var(--panel); } .panel.tint { background: linear-gradient(180deg, var(--brand-bg), transparent 190px), var(--panel); }
+    .btn.go { color: #0b1a0e; font-weight: 650; } .btn.go:hover { background: #8ae897; } .btn.big { height: 36px; padding: 0 16px; font-size: 14px; }
+    .app.pinned .pin { color: #0b1a0e; }
+    .nav-b .cnt { color: var(--text2); background: rgba(255,255,255,.08); } .nav-b .cnt.hot { color: #0b1a0e; background: var(--brand); font-weight: 700; }
+    .badge.best { color: var(--good); } .badge.trust { color: var(--trust); background: var(--trust-bg); } .badge.need { color: #8fc1ff; }
+    .lk:hover, .lk:hover::after { color: var(--need); }
+    .star { color: var(--fav); margin-right: 5px; } .star.off { color: var(--faint); cursor: pointer; }
+    .t td .dot, .li .dot, .hd .dot, .who .dot, .tc .dot, .nx .dot, .gr .dot, .fr .dot { margin-right: 7px; }
+    .lbl, .k-l { font: 650 12px/1.3 var(--sans); letter-spacing: .07em; text-transform: uppercase; color: var(--muted); }
+    .t td small { display: block; color: var(--muted); font-size: 12px; font-weight: 400; }
+    .t tbody tr.dim td, .t tbody tr.dim td b { color: var(--faint); font-weight: 400; }
+    .t tbody tr.g td { padding-top: 13px; color: var(--muted); font-size: 12px; background: none !important; } .t tbody tr.g td b { color: var(--text); font-size: 13px; }
+    .t td .it { margin-right: 9px; }
+    .t td.t-good { color: var(--good); } .t td.t-bad { color: var(--bad); } .t td.t-warn { color: var(--warn); } .t td.t-need { color: var(--need); } .t td.t-muted { color: var(--muted); } .t-bad { color: var(--bad); }
+    .t tr.pick td { padding-top: 8px; padding-bottom: 8px; } .t tr.pick .cell b { font-size: 14px; }
+    .t td.n b.t-good, .t td.n b.amt { font: 650 15px var(--disp); }
+    .cell { display: flex; align-items: center; gap: 10px; min-width: 0; } .cell .it { margin: 0; } .cell > div { min-width: 0; }
+    /* a bar beside a number: how big it is next to the others */
+    .bar { display: inline-block; width: clamp(48px, 5cqw, 96px); height: 8px; border-radius: 4px; background: rgba(255,255,255,.06); vertical-align: middle; margin-right: 10px; overflow: hidden; }
+    .bar i { display: block; height: 100%; width: var(--w); min-width: 3px; border-radius: 4px; background: var(--good); animation: growx .7s var(--ease) both; transform-origin: left; }
+    .bar.buy i { background: var(--need); } .bar.dimb i { background: #4a5263; } .bar.wide { width: 100%; margin: 0; }
+    /* a page fills the window; a box ends where its rows end, and a long list scrolls inside its own box */
+    .page.fit, .page.fit > .pane { height: 100%; }
+    .pb.scroll, .fit .pb.flush, .snug .pb.flush { overflow: auto; scrollbar-width: thin; scrollbar-color: #3a3f4a transparent; }
+    .snug { align-items: start; } .snug > .panel, .snug > .col { max-height: 100%; }
+    .col > .panel.sh { flex: 0 1 auto; } .col > .panel.fx { flex: none; }
+    .c3 { grid-template-columns: minmax(0, 10fr) minmax(0, 11fr) minmax(0, 10fr); grid-template-rows: minmax(0, 1fr); }
+    .c3t { grid-template-columns: minmax(0, 8fr) minmax(0, 13fr) minmax(0, 10fr); }
+    @container (max-width: 1240px) { .page.fit:has(.c3), .page.fit > .pane.c3 { height: auto; } .c3 { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); grid-template-rows: auto; } .c3 > .panel.tint { grid-column: 1 / -1; } }
+    .c75 { grid-template-columns: minmax(0, 7fr) minmax(0, 5fr); }
+    .c11 { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); }
+    .pgrows { grid-template-columns: minmax(0, 1fr); align-content: start; }
+    /* the list's own search and filters */
+    .find { display: flex; gap: 6px; align-items: center; padding: 10px 14px 4px; white-space: nowrap; }
+    .find .inp { height: 28px; color: var(--faint); } .find .inp.q { flex: 1; min-width: 0; } .find kbd { margin-left: auto; padding: 0 5px; border-radius: 4px; background: rgba(255,255,255,.08); font: 12px var(--sans); color: var(--muted); }
+    .tog { height: 24px; padding: 0 9px; border-radius: 999px; border: 1px solid var(--line2); background: none; color: var(--muted); font-size: 12px; white-space: nowrap; }
+    .tog.on { color: var(--text); background: var(--raised); } .tog.on::before { content: "\\2713\\00a0"; color: var(--good); font-weight: 700; }
+    .only { display: flex; gap: 6px; align-items: center; padding: 4px 14px 6px; color: var(--faint); font-size: 12px; }
+    /* the head of what you picked: its picture, its name, its few numbers */
+    .hd { flex: none; flex-direction: row; align-items: center; gap: 14px; padding: 12px 16px; white-space: nowrap; }
+    .hd .it { margin: 0; } .hd h3 { margin: 0; font: 400 24px/1.15 var(--serif); color: var(--text); } .hd .sub { color: var(--muted); font-size: 12px; } .hd .sub b { color: var(--text2); }
+    .it.xl, .it.xl img { width: 100px; height: 50px; } .it.xl { background: rgba(255,255,255,.04); border-radius: 8px; padding: 4px 6px; }
+    .facts { display: flex; gap: 22px; } .facts span { color: var(--muted); font-size: 12px; } .facts b { display: block; color: var(--text); font: 650 16px/1.3 var(--disp); }
+    .acts { display: flex; gap: 8px; align-items: center; }
+    .quiet { color: var(--muted); font-size: 12px; cursor: pointer; white-space: nowrap; } .quiet:hover { color: var(--text); }
+    .amber { display: flex; gap: 8px; align-items: baseline; padding: 8px 11px; border-radius: 9px; background: var(--warn-bg); border: 1px solid rgba(246,183,74,.4); color: var(--text2); font-size: 12px; line-height: 1.45; } .amber b { color: var(--warn); }
+    .blue { display: inline-flex; gap: 7px; align-items: center; height: 22px; padding: 0 9px; border-radius: 999px; background: var(--need-bg); color: #8fc1ff; font: 600 12px var(--sans); }
+    /* the line in a price list where profit stops */
+    .t tr.mk td { padding: 6px 14px; background: var(--brand-bg); box-shadow: inset 0 1px 0 var(--brand-line); color: var(--text2); font-size: 12px; } .t tr.mk td b { color: var(--good); } .t tr.mk:hover { background: none; }
+    /* the trade: who, what it makes, where it is, the way round the bazaars */
+    .plan { display: flex; flex-direction: column; gap: 13px; padding: 14px 16px 15px; min-height: 0; }
+    .who { white-space: nowrap; min-width: 0; } .who-t { display: flex; align-items: center; gap: 10px; min-height: 26px; }
+    .who h3 { margin: 2px 0 3px; font: 400 23px/1.15 var(--serif); color: var(--text); } .who h3 .badge { vertical-align: 4px; margin-left: 4px; } .who .sub { color: var(--muted); font-size: 12px; } .who .star { font-size: 15px; margin: 0; }
+    .bigrow { display: flex; align-items: flex-end; gap: 18px; flex-wrap: wrap; }
+    .big { font: 650 clamp(30px, 2.7cqw, 40px)/1 var(--disp); color: var(--good); letter-spacing: -.02em; margin-top: 3px; }
+    .eq { color: var(--muted); font-size: 12px; line-height: 1.6; white-space: nowrap; } .eq b { color: var(--text); font: 600 13px var(--disp); margin-left: 6px; }
+    .stepbar { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 4px; }
+    .stepbar span { padding-top: 7px; border-top: 3px solid var(--line2); font: 600 12px var(--sans); color: var(--faint); white-space: nowrap; } .stepbar span i { font-style: normal; margin-right: 6px; }
+    .stepbar .done { border-color: rgba(111,220,127,.4); color: var(--text2); } .stepbar .done i { color: var(--good); }
+    .stepbar .now { border-color: var(--brand); color: var(--text); } .stepbar .now i { color: var(--good); }
+    .take { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 12px; white-space: nowrap; }
+    .route { min-height: 0; overflow: auto; scrollbar-width: thin; }
+    .rt { display: grid; grid-template-columns: 22px minmax(0, 1fr); gap: 0 10px; padding: 9px 0 8px; border-top: 1px solid var(--line); } .rt:first-child { border-top: 0; padding-top: 2px; }
+    .rt-h { display: flex; align-items: baseline; gap: 10px; white-space: nowrap; } .rt-h .seen { color: var(--muted); font-size: 12px; } .rt-h .st { margin-left: auto; font: 600 12px var(--sans); color: var(--muted); }
+    .rt.done .stop-n { background: var(--good-bg); border-color: transparent; color: var(--good); } .rt.done .st { color: var(--good); } .rt.done .pl, .rt.skip .pl { opacity: .6; }
+    .rt.cur { margin: 0 -10px; padding-left: 10px; padding-right: 10px; border-radius: 9px; background: var(--need-bg); border-top-color: transparent; } .rt.cur + .rt { border-top-color: transparent; } .rt.cur .stop-n { background: var(--need); border-color: transparent; color: #08131f; } .rt.cur .st { color: #8fc1ff; }
+    .pl { display: grid; grid-template-columns: 16px auto minmax(0, 1fr) auto; align-items: center; gap: 0 10px; padding: 5px 0 0; white-space: nowrap; }
+    .pl.noti { grid-template-columns: auto minmax(0, 1fr) auto; }
+    .pl .it { margin: 0; } .pl b { color: var(--text); } .pl small { color: var(--muted); font-size: 12px; margin-left: 6px; }
+    .pl .p { color: var(--good); font: 650 14px var(--disp); text-align: right; } .pl .p.warn { color: var(--warn); font: 600 12px var(--sans); } .pl .p.in { color: var(--good); font: 600 12px var(--sans); }
+    .tick { width: 16px; height: 16px; border-radius: 5px; border: 1px solid var(--line2); display: inline-grid; place-items: center; font: 700 12px/1 var(--sans); color: #0b1a0e; flex: none; vertical-align: -3px; }
+    .tick.on { background: var(--good); border-color: transparent; } .tick.on::after { content: "\\2713"; }
+    .none { color: var(--text2); line-height: 1.55; } .none b { color: var(--text); }
+    /* where to sell what you hold */
+    .opt { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; gap: 0 14px; align-items: center; padding: 11px 12px; border-radius: 10px; background: var(--raised); border: 1px solid var(--line); white-space: nowrap; }
+    .opt + .opt { margin-top: 8px; } .opt.best { border-color: var(--brand-line); background: var(--brand-bg); } .opt.dimo { opacity: .62; }
+    .sw-t.off { background: var(--raised); box-shadow: inset 0 0 0 1px var(--line2); } .sw-t.off::after { right: auto; left: 3px; background: var(--muted); }
+    .opt .w { min-width: 0; white-space: normal; } .opt .w b { color: var(--text); margin-right: 8px; font-size: 14px; } .opt .w small { display: block; color: var(--muted); font-size: 12px; } .opt .w .bar { margin-top: 7px; }
+    .opt .v { text-align: right; } .opt .v b { display: block; font: 650 17px var(--disp); color: var(--text); } .opt.best .v b { color: var(--good); } .opt .v small { font-size: 12px; color: var(--good); } .opt .v small.loss { color: var(--bad); }
+    .opt .btn { min-width: 176px; }
+    /* tiles: the page's few totals, each with its own colour */
+    .tile { position: relative; overflow: hidden; } .tile[style*="--c"], .kpi[style*="--c"] { box-shadow: inset 3px 0 0 var(--c); } [data-go] { cursor: pointer; }
+    .k-v { font-size: clamp(22px, 2cqw, 28px); margin: 2px 0 1px; } .k-v.bad { color: var(--bad); } .k-v.need { color: #8fc1ff; } .k-v small { font: 500 13px var(--sans); color: var(--muted); letter-spacing: 0; margin-left: 6px; }
+    .tile.pick { cursor: pointer; } .tile.on { border-color: var(--brand-line); background: linear-gradient(180deg, var(--brand-bg), transparent 150px), var(--panel); }
+    /* Today */
+    .p-dash { grid-template-rows: auto minmax(252px, 1.25fr) minmax(206px, 1fr); }
+    .grow-rows { display: grid; grid-auto-rows: minmax(34px, 1fr); height: 100%; }
+    .fr { display: grid; grid-template-columns: minmax(0, 15fr) minmax(0, 9fr) minmax(0, 14fr) auto; align-items: center; gap: 0 14px; padding: 0 14px; border-top: 1px solid var(--line); white-space: nowrap; cursor: pointer; } .fr:first-child { border-top: 0; } .fr:hover { background: rgba(255,255,255,.028); }
+    .fr b { color: var(--text); font-size: 14px; } .fr .p { font: 650 15px var(--disp); color: var(--good); min-width: 92px; text-align: right; } .fr .to { color: var(--text2); }
+    .gr { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 0 12px; padding: 0 14px; border-top: 1px solid var(--line); white-space: nowrap; cursor: pointer; } .gr:first-child { border-top: 0; } .gr:hover { background: rgba(255,255,255,.028); }
+    .gr b { color: var(--text); } .gr small { color: var(--muted); font-size: 12px; margin-left: 8px; } .gr .p { font: 650 14px var(--disp); color: var(--good); } .gr .prog { grid-column: 1 / -1; margin-top: -4px; }
+    .tk time { color: var(--faint); margin-right: 8px; }
+    /* Trades: a card per trade, a lane per step */
+    .board { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; align-items: start; }
+    .lane { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+    .lane-h { display: flex; align-items: center; gap: 8px; padding: 0 2px; white-space: nowrap; } .lane-h i { width: 8px; height: 8px; border-radius: 2px; background: var(--c); } .lane-h span:last-child { margin-left: auto; color: var(--faint); font-size: 12px; }
+    .tc { display: grid; gap: 6px; padding: 11px 13px 12px; border-radius: 11px; background: var(--panel); border: 1px solid var(--line); box-shadow: inset 3px 0 0 var(--c); cursor: pointer; white-space: nowrap; transition: border-color .16s, background .16s; }
+    .tc:hover { border-color: var(--line2); } .tc.sel { border-color: var(--brand-line); background: linear-gradient(180deg, var(--brand-bg), transparent 120px), var(--panel); }
+    .tc-h { display: flex; align-items: center; } .tc-h b { font-size: 15px; color: var(--text); } .tc-h .p { margin-left: auto; font: 650 17px var(--disp); color: var(--good); }
+    .tc small { color: var(--muted); font-size: 12px; } .tc small.t-warn { color: var(--warn); }
+    .tc.end { box-shadow: none; background: none; cursor: default; padding: 9px 13px; } .tc.end b { font-size: 13px; } .tc.end .p { font-size: 14px; }
+    .prog { height: 6px; border-radius: 3px; background: rgba(255,255,255,.07); overflow: hidden; } .prog i { display: block; height: 100%; width: var(--w); border-radius: 3px; background: var(--c, var(--good)); animation: growx .7s var(--ease) both; transform-origin: left; }
+    .det { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); } .det > div { min-width: 0; } .det > div + div { border-left: 1px solid var(--line); }
+    @container (max-width: 1100px) { .det { grid-template-columns: minmax(0, 1fr); } .det > div + div { border-left: 0; border-top: 1px solid var(--line); } .board { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+    /* ledger and settings */
+    .lgp { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); align-content: start; }
+    .lgf { display: flex; gap: 8px; align-items: center; white-space: nowrap; } .lgf .inp { height: 28px; color: var(--faint); font-size: 12px; }
+    .lg1 { grid-template-columns: minmax(0, 7fr) minmax(0, 5fr); grid-template-rows: auto 264px auto auto; align-content: start; } .lg1 > .tiles, .lg1 > .wide { grid-column: 1 / -1; }
+    .lg2 { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
+    .lg3 { grid-template-columns: minmax(0, 7fr) minmax(0, 5fr); align-items: start; }
+    .lims { display: grid; grid-auto-rows: 44px; }
+    .lim { display: grid; grid-template-columns: 150px minmax(0, 1fr) 150px; align-items: center; gap: 14px; white-space: nowrap; border-top: 1px solid var(--line); } .lim:first-child { border-top: 0; }
+    .lim b { color: var(--text); } .lim .r { text-align: right; color: var(--muted); } .lim .meter { margin: 0; height: 8px; } .meter i.warn { background: var(--warn); } .meter i.blue { background: var(--need); }
+    .field .inp.key { letter-spacing: .2em; flex: 0 0 150px; } .field .inp.txt { flex: 1; min-width: 0; color: var(--text2); letter-spacing: 0; }
+    .area { display: block; width: 100%; padding: 8px 10px; border-radius: 8px; background: var(--input); border: 1px solid var(--line2); color: var(--faint); }
+    /* Torn's pages keep the panel's own look */
+    .thost { display: block; }
+    .hide { display: none !important; }
+    /* small things */
+    .qty { display: inline-block; min-width: 30px; padding: 0 6px; border-radius: 5px; background: var(--input); border: 1px solid var(--line2); color: var(--text); text-align: center; font-weight: 600; cursor: text; }
+    u.quiet, .quiet u { text-decoration: underline; text-underline-offset: 3px; cursor: pointer; } .amber u.quiet { margin-left: 10px; color: var(--text2); }
+    .hl { display: flex; align-items: center; gap: 9px; padding: 4px 0; white-space: nowrap; color: var(--text2); } .hl i { width: 10px; height: 10px; border-radius: 3px; background: var(--c); flex: none; } .hl b { color: var(--text); } .hl span { margin-left: auto; font: 600 13px var(--disp); color: var(--text); }
+    .tape-r b { color: var(--text); }
+    .top.bare .pill, .top.bare > .btn { display: none; }
+    `;
+
+    /*
+     * Calmer (the owner, 2026-10-10), and what the real page needs that the drawing did not: real boxes to
+     * type in, real ticks, the parts moved between pages. It comes last, so it wins.
+     */
+    const BIDS_CALM_CSS = `
+    /* ---------- one accent: green is money and the one next step; the rest is grey ---------- */
+    .app { background: var(--bg); font: 400 13px/1.45 var(--sans); color: var(--text); }
+    .mark { background: var(--raised); color: var(--good); box-shadow: inset 0 0 0 1px var(--line2); }
+    .panel, .panel.tint { background: var(--panel); border-color: var(--line); animation: none; }
+    .panel:hover { border-color: var(--line); }
+    .tile[style*="--c"], .kpi[style*="--c"] { box-shadow: none; }
+    .tile.pick:hover, .kpi.pick:hover { border-color: var(--line2); }
+    .tile.on { background: var(--raised); border-color: var(--line2); }
+    .nav-ind { background: rgba(255,255,255,.055); box-shadow: none; } .nav-ind::before { background: var(--text2); }
+    .nav-b.on svg { color: var(--text); }
+    .nav-b .cnt.hot { color: #0b1a0e; background: var(--good); } .nav-b .pip { background: var(--good); }
+    .app.pinned .pin { color: var(--text); background: var(--hover); border-color: var(--line2); }
+    .tab::after { background: var(--text2); }
+    .t tbody tr.sel, .t tbody tr.sel:hover { background: rgba(255,255,255,.06); box-shadow: inset 2px 0 0 var(--text2); }
+    .bar i, .bar.buy i, .prog i { background: #586070; animation: none; } .bar.dimb i { background: #3d434f; }
+    .badge.trust { color: var(--text2); background: rgba(255,255,255,.07); }
+    .badge.best { color: var(--good); background: var(--good-bg); }
+    .blue { background: rgba(255,255,255,.06); color: var(--text2); } .dot.need { background: var(--muted); }
+    .t-need, .t td.t-need { color: var(--text2); }
+    .star { color: var(--text2); }
+    .t tr.mk td { background: rgba(255,255,255,.035); box-shadow: inset 0 1px 0 var(--line2); } .t tr.mk td b { color: var(--text); }
+    .stepbar .done { border-color: var(--line2); } .stepbar .done i { color: var(--text2); }
+    .stepbar .now { border-color: var(--good); }
+    .rt.cur { background: rgba(255,255,255,.045); } .rt.cur .stop-n { background: var(--text2); color: #111215; } .rt.cur .st { color: var(--text); }
+    .opt.best { border-color: var(--line2); background: var(--raised); }
+    .tc { box-shadow: none; } .tc.sel { border-color: var(--line2); background: var(--raised); }
+    .lane-h i { background: var(--faint); }
+    .nx-i { background: rgba(255,255,255,.06); color: var(--text2); }
+    .lk:hover, .lk:hover::after { color: var(--text); }
+    .tog.on::before { color: var(--text2); }
+    .tape-t { animation: none; padding-left: 14px; gap: 22px; } .tape-m { mask-image: linear-gradient(90deg, #000, #000 calc(100% - 40px), transparent); }
+    .stack i { animation: none; }
+    @media (min-width: 2200px) { .app { zoom: 1.25; } }
+
+    .dot.bad { background: var(--bad); }
+    .badge.trust[data-level="caution"] { color: var(--warn); background: var(--warn-bg); }
+    .pname { color: inherit; text-decoration: none; } .pname:hover { text-decoration: underline; text-underline-offset: 3px; }
+    .pin.on { color: var(--text); background: var(--hover); } .who-t .pin { width: 26px; height: 26px; }
+
+    /* ---------- the frame ---------- */
+    .app { grid-template-rows: minmax(0, 1fr); } .main { grid-template-rows: 52px auto minmax(0, 1fr) 30px; min-height: 0; }
+    .top { grid-row: 1; } .view { grid-row: 3; } .tape { grid-row: 4; }
+    .main > .sp-banner { grid-row: 2; margin: 10px 16px 0; }
+    .sp-card.sp-unknown { display: none; }
+    :where(.bd) .sp-banner { background: var(--panel); border: 1px solid var(--line2); border-radius: 10px; color: var(--text); } :where(.bd) .sp-banner-warn { background: var(--warn-bg); border-color: rgba(246,183,74,.4); } :where(.bd) .sp-banner-bad { background: var(--bad-bg); border-color: rgba(255,123,110,.4); }
+    .slot { display: contents; }
+    .snug > .slot > .panel { max-height: 100%; }
+    .col > .panel { flex: 0 1 auto; }
+    @container (max-width: 1240px) { .c3 > .slot > .planp { grid-column: 1 / -1; } }
+    .page.fit > .pane { min-height: 0; }
+    .pgrows > .pane { min-height: 0; }
+    .pgfill { height: 100%; grid-template-rows: auto minmax(0, 1fr); } .pgfill > .pane { grid-template-rows: minmax(0, 1fr); }
+    .pgfill .col { overflow-y: auto; scrollbar-width: thin; scrollbar-color: #3a3f4a transparent; } .pgfill .col > .panel { flex: none; }
+    @container (max-width: 1240px) { .pgfill { height: auto; grid-template-rows: auto; } .pgfill > .pane { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto; } .pgfill .col { overflow: visible; } }
+    .pill { font: inherit; font-size: 12px; cursor: default; } button.pill { cursor: pointer; } button.pill:hover { border-color: var(--line2); color: var(--text); }
+    .shop { height: auto; min-height: 40px; padding: 6px 12px; align-items: flex-start; } .shop .dot { margin: 5px 6px 0 7px; }
+    .shop .lab { white-space: normal; font-size: 12px; line-height: 1.4; color: var(--muted); } .shop .lab b { color: var(--text2); font-weight: 600; }
+
+    /* ---------- real boxes, real ticks ---------- */
+    input.inp, select.inp { font: inherit; outline: none; min-width: 0; } input.inp::placeholder { color: var(--faint); }
+    .find .inp { color: var(--text); } .find select.inp { color: var(--text2); cursor: pointer; max-width: 46%; }
+    .find input.inp:focus, .find select.inp:focus-visible { border-color: var(--text2); }
+    .find .quiet { cursor: default; margin-left: 4px; }
+    button.tog { cursor: pointer; font-family: inherit; } button.tog:hover { color: var(--text); }
+    button.quiet, a.quiet { background: none; border: 0; padding: 0; font: inherit; font-size: 12px; text-decoration: none; } a.quiet:hover { text-decoration: none; }
+    button.quiet.u { text-decoration: underline; text-underline-offset: 3px; }
+    input.tick { appearance: none; -webkit-appearance: none; margin: 0; cursor: pointer; background: none; }
+    input.tick:checked { background: var(--good); border-color: transparent; } input.tick:checked::after { content: "\\2713"; }
+    input.tick:disabled { opacity: .5; cursor: default; }
+    input.qty { width: 7ch; height: 22px; font: inherit; font-weight: 600; outline: none; } input.qty:focus { border-color: var(--text2); }
+    input.qty.sp-in-bad { border-color: var(--bad); }
+    button.star { background: none; border: 0; padding: 0; font: inherit; cursor: pointer; } button.star.off:hover { color: var(--text2); }
+    a.btn { text-decoration: none; } a.btn:hover { text-decoration: none; } .btn:disabled { opacity: .45; cursor: default; }
+    .btn.bad { color: var(--bad); border-color: rgba(255,123,110,.4); }
+    a.lk:hover { text-decoration: none; }
+    .seg button.on { cursor: default; } .seg button:disabled { opacity: .5; cursor: default; }
+    button.sw-t { border: 0; padding: 0; cursor: pointer; }
+
+    /* ---------- lists ---------- */
+    .t tr.pick:focus-visible { outline: 2px solid var(--text2); outline-offset: -2px; }
+    .t td .tag { display: inline-block; margin-left: 8px; padding: 0 7px; border-radius: 999px; background: rgba(255,255,255,.07); color: var(--text2); font: 600 12px/18px var(--sans); vertical-align: 1px; }
+    .t td .tag.warn { color: var(--warn); background: var(--warn-bg); }
+    .t td .chg { margin-left: 5px; font-size: 12px; color: var(--muted); }
+    .t td.act { width: 1%; padding-left: 0; } .t td.wrap, .t td.wrap small { white-space: normal; }
+    .t tr.gone td b { color: var(--faint); font-weight: 400; text-decoration: line-through; }
+    .t tr.pinrow td { background: rgba(255,255,255,.025); }
+    .rowpin { width: 22px; height: 22px; padding: 0; border: 0; border-radius: 6px; background: none; color: var(--faint); display: inline-grid; place-items: center; vertical-align: middle; margin-left: 6px; }
+    .rowpin:hover { color: var(--text); background: rgba(255,255,255,.08); } .rowpin.on { color: var(--text); }
+    .empty { padding: 22px 16px; color: var(--muted); text-align: center; line-height: 1.5; }
+    .more { display: block; margin: 8px auto 8px; }
+    .hd .none, .planp > .none, .panel > .none { padding: 14px 16px; }
+    .hd > div { min-width: 0; } .hd h3 a { color: inherit; text-decoration: none; }
+    .hd .frl { display: block; margin-top: 4px; color: var(--muted); font-size: 12px; white-space: normal; } .hd .frl b { color: var(--text2); }
+    .facts { flex-wrap: wrap; row-gap: 6px; justify-content: flex-end; }
+    .note { color: var(--muted); font-size: 12px; line-height: 1.5; margin: 0; white-space: normal; } .note b { color: var(--text2); }
+    .pb > .note, .pb.flush > .note { padding: 6px 14px; }
+    .amber { white-space: normal; flex-wrap: wrap; } .amber > span:first-child { flex: 1 1 200px; }
+
+    /* ---------- the trade ---------- */
+    .who h3 a { color: inherit; text-decoration: none; } .who .sub { display: block; white-space: normal; line-height: 1.5; }
+    .who .sp-status { display: inline; color: var(--muted); } .who .sp-status .sp-dot { margin-right: 6px; }
+    .who-t .lbl .tag { margin-left: 8px; padding: 0 7px; border-radius: 999px; background: rgba(255,255,255,.08); color: var(--text2); letter-spacing: 0; text-transform: none; font-weight: 600; }
+    .plan .note { margin: -4px 0; }
+    .take { flex-wrap: wrap; row-gap: 6px; }
+    .pl { grid-template-columns: 16px auto minmax(0, 1fr) auto; } .pl > span:nth-child(3) { white-space: normal; min-width: 0; }
+    :where(.bd) a { color: inherit; } .tiname { color: var(--text); font-weight: 600; text-decoration: none; } .tiname:hover { text-decoration: underline; text-underline-offset: 3px; }
+    .pl .tiname { color: var(--text); font-weight: 600; text-decoration: none; } .pl .tiname:hover { text-decoration: underline; text-underline-offset: 3px; }
+    .pl.off { opacity: .6; } .pl .p.none0 { color: var(--muted); font: 400 12px var(--sans); }
+    .pl .warnw { color: var(--warn); } .pl .badw { color: var(--bad); }
+    .pl .kind { margin-left: 8px; color: var(--muted); font-size: 12px; } .pl .here { margin-left: 8px; color: var(--text2); font: 650 12px var(--sans); letter-spacing: .06em; }
+    .rt-h a { color: var(--text); font-weight: 600; text-decoration: none; } .rt-h a.quiet { color: var(--muted); font-weight: 400; }
+    .rt .amber { margin: 6px 0 2px; }
+    .route { overflow-x: hidden; padding: 0 10px; margin: 0 -10px; }
+    /* The Ledger, Settings, API use and the report keep their own parts; their accents are turned down to this page's. */
+    :where(.bd) .sp-link, :where(.bd) .rv-link { color: var(--text2); text-decoration: underline; text-underline-offset: 3px; } :where(.bd) .sp-link:hover, :where(.bd) .rv-link:hover { color: var(--text); }
+    :where(.bd) .sp-link.sp-danger, :where(.bd) .sp-link.sp-cancel { color: var(--bad); } :where(.bd) .sp-link.sp-keep { color: var(--muted); }
+    :where(.bd) .uv-meter.uv-on { border-color: var(--text2); box-shadow: inset 0 0 0 1px var(--text2); } :where(.bd) .uv-fill { background: var(--text2); }
+    :where(.bd) .rv-text:focus { border-color: var(--text2); } :where(.bd) .rv-includes li::marker { color: var(--muted); }
+    :where(.bd) .lg-card h3::before { background: var(--line2); }
+    :where(.bd) .lg-tile.lg-good, :where(.bd) .lg-tile.lg-lossbox { background: var(--surface); border-color: var(--line); }
+    :where(.bd) .lg-bar-g { fill: #6d7584; background: #6d7584; }
+    :where(.bd) .lg-tilebtn[aria-pressed="true"] { border-color: var(--text2); box-shadow: inset 0 0 0 1px var(--text2); }
+    :where(.bd) .lg-buy .lg-side, :where(.bd) .lg-sell .lg-side, :where(.bd) .lg-tstag { color: var(--text2); background: rgba(255,255,255,.07); }
+    :where(.bd) .lg-table tr.lg-favrow td:first-child { box-shadow: inset 3px 0 0 var(--line2); } :where(.bd) .lg-star { color: var(--text2); }
+    :where(.bd) .sp-toggle[aria-pressed="true"] { border-color: var(--line2); background: rgba(255,255,255,.07); }
+    .grow-rows { grid-auto-rows: minmax(40px, 54px); align-content: start; height: auto; } .next { grid-auto-rows: minmax(46px, 58px); align-content: start; height: auto; }
+    .t tr.pick td:first-child { width: 100%; }
+    @container (max-width: 1800px) { .c3 > .slot > .panel .t tr.pick .bar { display: none; } }
+    .t td .cell small { white-space: normal; } .only { flex-wrap: wrap; row-gap: 4px; }
+    .sec { margin-top: 2px; }
+    .acts { flex-wrap: wrap; row-gap: 8px; } .acts .quiets { display: flex; gap: 12px; align-items: center; margin-left: auto; }
+    .det > .plan { align-content: start; }
+    .leftrows { display: grid; gap: 2px; }
+
+    /* ---------- where to sell, tiles, Today, Trades ---------- */
+    .opt { grid-template-columns: minmax(0, 1fr) auto auto; } .opt .btn { min-width: 0; }
+    @container (max-width: 1500px) { .opt { grid-template-columns: minmax(0, 1fr) auto; } .opt .btn { grid-column: 1 / -1; margin-top: 8px; justify-self: start; } }
+    .tiles, .kpis, .board { animation: none; }
+    .kpi.pick, .fr, .gr, .tc { outline-offset: -2px; }
+    .tc.end { cursor: default; } .tc small { white-space: normal; }
+    .nx .btn { flex: none; }
+    .p-dash .pb.flush { overflow: auto; }
+    .chartbox { position: absolute; inset: 6px 12px 8px; display: flex; align-items: flex-end; gap: 6px; }
+    .chartbox .day { flex: 1; min-width: 0; height: 100%; display: flex; flex-direction: column; justify-content: flex-end; align-items: center; gap: 4px; color: var(--faint); font-size: 12px; white-space: nowrap; }
+    .chartbox .day i { display: block; width: 100%; max-width: 46px; min-height: 2px; border-radius: 4px 4px 0 0; background: #586070; } .chartbox .day i.neg { background: var(--bad); opacity: .7; } .chartbox .day i.zero { background: var(--line2); }
+    .chartbox .day b { color: var(--text2); font: 600 12px var(--sans); }
+
+    /* ---------- Ledger and Settings: their own parts, in this look ---------- */
+    .page[data-page="ledger"], .page[data-page="settings"] { align-content: start; }
+    .lg-tabs { display: none; }
+    .sp-settings { display: block; } .sp-snav { display: none; }
+    .sp-sbody { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; align-items: start; max-width: none; }
+    @container (max-width: 1100px) { .sp-sbody { grid-template-columns: minmax(0, 1fr); } }
+    .sp-sbody .sp-card { margin: 0; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; }
+    .sp-sbody .sp-card.wide { grid-column: 1 / -1; }
+    .sp-card h2 .sstate { margin-left: 10px; font: 400 12px var(--sans); color: var(--muted); letter-spacing: 0; text-transform: none; } .sp-card h2 .sp-dot { margin-left: 10px; }
+    `;
+
+    /** The whole of Torn Bids' own look: the drawing's rules, then the calmer ones. */
+    const BIDS_FORM_CSS = `
+    /*
+     * One app, not boxes side by side (the owner, 2026-10-11: "the whole app also just looks like a bunch of cards
+     * stuck together", Settings "clunky, not professional and classy"; a critique of the old and the new page said
+     * why). The rules, for anything added later:
+     *  - two surfaces: the page, and a panel on it. A panel has no outline - an outline is what makes a card.
+     *    Only what you type in or press has one.
+     *  - nothing boxed inside a panel: a part of a panel is a row under a hairline, or a 3px rule at its left.
+     *  - more room between groups (16px) than inside one; the page's edge is 20px.
+     *  - one heading (14px, 600) for every part; the serif only for the page's name and an item's or a trader's.
+     *    Capitals only for the small label over a total.
+     *  - green is money and the one next step; amber a rule at the left of something to look at; red a loss.
+     */
+    .bd { --bg: #0c0d10; --rail-bg: #101114; --panel: #17191e; --raised: #1f2228; --hover: #262a31; --input: #0b0c0f; --surface: #17191e; --rail: #101114; }
+    .view { padding: 16px 20px 20px; }
+    .page, .pane, .col, .tiles, .kpis, .board { gap: 16px; }
+    .panel, .panel.tint, .panel.hold, .panel:hover { border: 0; }
+    .kpi, .tile { padding: 14px 16px; }
+    .tile.pick:hover, .kpi.pick:hover { background: var(--raised); }
+    .tile.on { background: var(--raised); box-shadow: inset 0 -2px 0 var(--text); }
+    .ph { padding: 14px 16px 0; min-height: 38px; } .pb { padding: 10px 16px 14px; } .pb.flush { padding: 6px 0; }
+    .ph h2 { font: 600 14px/1.3 var(--sans); }
+    .t th:first-child, .t td:first-child, .only, .gr, .fr { padding-left: 16px; } .t th:last-child, .t td:last-child, .gr, .fr { padding-right: 16px; }
+    .li { padding-left: 16px; padding-right: 16px; }
+    .lbl { font: 600 12px/1.4 var(--sans); letter-spacing: 0; text-transform: none; color: var(--muted); }
+    .k-l { font: 600 11px/1.3 var(--sans); letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }
+    .big { font-size: clamp(26px, 2.2cqw, 32px); } .who h3, .hd h3 { font-size: 22px; }
+    .dot { width: 6px; height: 6px; }
+    .badge.trust { color: var(--trust); background: none; padding: 0; height: auto; } .badge.trust[data-level="caution"] { color: var(--warn); background: none; }
+    .bar i { background: var(--good); opacity: .8; } .bar.dimb i, .bar.buy i { background: #586070; opacity: 1; }
+    .chartbox .day i { background: var(--good); opacity: .75; } .chartbox .day i.neg { background: var(--bad); opacity: .7; } .chartbox .day i.zero { background: var(--line2); opacity: 1; }
+    .t tbody tr.sel, .t tbody tr.sel:hover, .li.sel { background: rgba(255,255,255,.05); box-shadow: inset 3px 0 0 var(--text); }
+
+    /* the frame */
+    .pill { background: none; border: 0; padding: 0 4px; gap: 6px; } .top .pill + .pill { margin-left: 8px; }
+    .nav-ind { background: none; } .nav-ind::before { background: var(--text); }
+    .tab::after { background: var(--text); }
+    .mark { color: var(--text); }
+    .tape-l, .tape-r { border: 0; } .tape-l { color: var(--muted); }
+    .main > .sp-banner { margin: 0; padding: 8px 20px; min-height: 38px; justify-content: flex-start; gap: 16px; border: 0; border-bottom: 1px solid var(--line); border-radius: 0; background: var(--panel); }
+    .main > .sp-banner > span { flex: 0 1 auto; }
+    :where(.bd) .sp-banner-warn { background: var(--panel); box-shadow: inset 3px 0 0 var(--warn); } :where(.bd) .sp-banner-bad { background: var(--panel); box-shadow: inset 3px 0 0 var(--bad); }
+
+    /* the list's filters, and the amber line */
+    .tog { height: 24px; padding: 0 6px; border: 0; border-radius: 6px; background: none; } .tog.on { background: none; } .tog:hover { color: var(--text); background: rgba(255,255,255,.05); }
+    .amber { padding: 5px 0 5px 12px; border: 0; border-left: 3px solid var(--warn); border-radius: 0; background: none; }
+    .rt .amber { padding: 2px 0; border-left: 0; }
+
+    /* Today */
+    .p-dash { grid-template-rows: auto minmax(200px, max-content) minmax(220px, 1fr); }
+    .nx-i { width: 20px; height: 20px; border-radius: 0; background: none; color: var(--muted); }
+    .nx .btn:not(.go) { height: auto; padding: 2px 4px; border: 0; background: none; color: var(--text2); text-decoration: underline; text-underline-offset: 3px; } .nx .btn:not(.go):hover { color: var(--text); }
+
+    /* Flips: the item, who sells it and who pays for it are one panel */
+    .col.join { gap: 0; }
+    .col.join > .panel { border-radius: 0; } .col.join > .panel:first-child { border-radius: 12px 12px 0 0; } .col.join > .panel:last-child { border-radius: 0 0 12px 12px; } .col.join > .panel:only-child { border-radius: 12px; }
+    .col.join > .panel + .panel { box-shadow: inset 0 1px 0 var(--line); }
+    @container (max-width: 1240px) { .col.join > .panel, .col.join > .panel:first-child, .col.join > .panel:last-child { border-radius: 12px; } .col.join { gap: 16px; } .col.join > .panel + .panel { box-shadow: none; } }
+
+    /* the trade's plan: rows, not boxes in a box */
+    .rt.cur { margin: 0 -16px; padding-left: 16px; padding-right: 16px; border-radius: 0; background: none; box-shadow: inset 3px 0 0 var(--good); }
+    .rt.cur + .rt { border-top-color: var(--line); }
+    .route { padding: 0 16px; margin: 0 -16px; }
+    .msg { padding: 0; border: 0; border-radius: 0; background: none; }
+
+    /* Trades: a lane is one panel, a trade a row in it */
+    .lane { gap: 0; padding: 2px 0 6px; border-radius: 12px; background: var(--panel); }
+    .lane-h { padding: 12px 16px 8px; } .lane-h i { display: none; } .lane-h .lbl { font: 600 14px/1.3 var(--sans); color: var(--text); }
+    .tc, .tc.sel, .tc:hover { border: 0; border-radius: 0; background: none; }
+    .tc { padding: 10px 16px; border-top: 1px solid var(--line); } .tc:hover { background: rgba(255,255,255,.03); }
+    .tc.sel, .tc.sel:hover { background: rgba(255,255,255,.05); box-shadow: inset 3px 0 0 var(--text); }
+    .tc.end { padding: 9px 16px; } .tc.end:hover { background: none; }
+
+    /* To sell: the ways out of an item are rows */
+    .opt, .opt.best { padding: 12px 0; border: 0; border-top: 1px solid var(--line); border-radius: 0; background: none; } .opt:first-child { border-top: 0; padding-top: 2px; } .opt + .opt { margin-top: 0; }
+    .facts b { font-size: 16px; }
+
+    /* the Ledger: the same headings and plain totals as every other page */
+    .lg { padding: 0 0 48px; gap: 16px; }
+    .lg-card, .lg-tile, .lg-tile.lg-good, .lg-tile.lg-lossbox { border: 0; border-radius: 12px; background: var(--panel); }
+    .lg-card { padding: 14px 16px; } .lg-tile { padding: 14px 16px; }
+    .lg-card h3 { margin: 0 0 10px; font: 600 14px/1.3 var(--sans); letter-spacing: 0; text-transform: none; color: var(--text); } .lg-card h3::before { display: none; }
+    .lg-head h2 { font: 600 16px/1.3 var(--sans); }
+    .lg-tl { font: 600 11px/1.3 var(--sans); letter-spacing: .06em; }
+    .lg-filters { padding: 0 0 14px; border: 0; border-bottom: 1px solid var(--line); border-radius: 0; background: none; }
+    .lg-f { font: 600 12px/1.3 var(--sans); letter-spacing: 0; text-transform: none; color: var(--muted); }
+    .lg-tilebtn[aria-pressed="true"] { box-shadow: inset 0 -2px 0 var(--text); } .lg-tilebtn:hover { background: var(--raised); }
+    .lg-note { color: var(--muted); } .lg-note::before { content: ""; display: inline-block; width: 6px; height: 6px; margin-right: 7px; border-radius: 50%; background: var(--warn); vertical-align: 1px; }
+    :where(.bd) .lg-bar-g { fill: var(--good); background: var(--good); opacity: .8; }
+    .lg-receipts { grid-template-columns: repeat(auto-fill, minmax(420px, 720px)); }
+
+    /* Settings: one column of rows, no boxes */
+    .sp-settings { display: block; padding: 0 0 56px; }
+    .sp-sbody { display: block; }
+    .sp-sbody .sp-card, .sp-sbody .sp-card.wide { margin: 0; padding: 26px 0 14px; border: 0; border-top: 1px solid var(--line2); border-radius: 0; background: none; }
+    .sp-sbody .sp-card.sp-first { padding-top: 2px; border-top: 0; }
+    .sp-card h2 { display: flex; align-items: baseline; gap: 10px; margin: 0 0 3px; font: 600 15px/1.3 var(--sans); letter-spacing: 0; color: var(--text); }
+    .sp-card h2 .sp-dot { display: none; } .sp-card h2 .sstate { margin: 0; font: 400 12px var(--sans); color: var(--muted); }
+    .sp-card[data-sec="keys"] h2 .sstate, .sp-card[data-sec="te"] h2 .sstate, .sp-card[data-sec="w3b"] h2 .sstate, .sp-card[data-sec="shared"] h2 .sstate, .sp-card[data-sec="ledger"] h2 .sstate { display: none; }
+    .sp-lead { margin: 0 0 8px; font-size: 13px; line-height: 1.5; color: var(--muted); }
+    .sp-field { grid-template-columns: minmax(220px, 1fr) minmax(0, 2fr); gap: 4px 36px; padding: 14px 0; border-top: 1px solid var(--line); }
+    .sp-card > .sp-field:first-of-type { border-top: 0; }
+    .sp-flabel { gap: 3px; padding-top: 6px; } .sp-flabel b { font-size: 13px; }
+    .sp-flabel small, .sp-flabel .sp-note { margin: 0; font-size: 12px; line-height: 1.45; color: var(--muted); }
+    .sp-fctl { max-width: none; gap: 6px; }
+    .sp-fctl .sp-key, .sp-fctl select.sp-cat { height: 32px; border-radius: 8px; }
+    .sp-fctl .sp-btn { height: 32px; border-radius: 8px; }
+    .sp-inline { gap: 14px; } .sp-inline input.sp-key { flex: 1 1 340px; max-width: 720px; } .sp-inline.sp-pct input.sp-pctin { flex: 0 0 72px; }
+    .sp-radio-o .sp-key { flex: 0 1 160px; }
+    .sp-link.sp-quiet, :where(.bd) .sp-link.sp-quiet.sp-danger { color: var(--muted); text-decoration: none; white-space: nowrap; }
+    .sp-link.sp-quiet:hover { color: var(--text); text-decoration: underline; text-underline-offset: 3px; } .sp-link.sp-quiet.sp-danger:hover { color: var(--bad); }
+    .sp-fctl > .sp-keystate { display: flex; align-items: baseline; gap: 7px; padding: 0; font-size: 12px; color: var(--muted); }
+    .sp-fctl > .sp-keystate:empty { display: none; }
+    .sp-fctl > .sp-keystate::before { content: ""; flex: none; width: 6px; height: 6px; border-radius: 50%; background: var(--faint); transform: translateY(-1px); }
+    .sp-fctl > .sp-keystate.sp-ok { color: var(--text2); } .sp-fctl > .sp-keystate.sp-ok::before { background: var(--good); }
+    .sp-fctl > .sp-keystate.sp-bad { color: var(--bad); } .sp-fctl > .sp-keystate.sp-bad::before { background: var(--bad); }
+    .sp-fctl > .sp-keystate.sp-warn { color: var(--warn); } .sp-fctl > .sp-keystate.sp-warn::before { background: var(--warn); }
+    .sp-fctl > .sp-keystate:only-child { padding-top: 7px; }
+    .sp-keepup, .sp-keepup-ok, .sp-keepup-behind { display: flex; align-items: baseline; gap: 7px; padding: 0; border-radius: 0; background: none; font-size: 12px; color: var(--text2); }
+    .sp-keepup::before { content: ""; flex: none; width: 6px; height: 6px; border-radius: 50%; background: var(--good); transform: translateY(-1px); } .sp-keepup-behind { color: var(--warn); } .sp-keepup-behind::before { background: var(--warn); }
+    .sp-use { height: 20px; border: 0; border-radius: 4px; line-height: 20px; }
+    .sp-use-pc { background: rgba(255,255,255,.16); } .sp-use-sv { background: rgba(255,255,255,.08); } .sp-use-fr { background: var(--input); }
+    .sp-tos { max-width: none; } .sp-tos th, .sp-tos td { padding: 9px 20px 9px 0; line-height: 1.45; } .sp-tos th { width: 170px; }
+    .sp-tos tr:first-child th { border-top: 0; width: auto; color: var(--text2); font-weight: 600; } .sp-tos.no-sv .tos-sv { display: none; }
+    .uv-meter, .uv-meter:hover { padding: 0 0 12px; border: 0; border-radius: 0; background: none; } .uv-meters { gap: 28px; }
+    :where(.bd) .uv-meter.uv-on { box-shadow: inset 0 -2px 0 var(--text); border: 0; }
+    .rv-text { max-width: 760px; } .rv-log { max-width: 1040px; }
+    .sp-still { padding: 6px 16px 6px 13px; border: 0; border-left: 3px solid var(--warn); border-radius: 0; background: none; } .sp-still.sp-still-none, .sp-still.sp-still-done { border-left-color: var(--line2); }
+    :where(.bd) .sp-trust[data-level], :where(.bd) .sp-trust { height: auto; padding: 0; border-radius: 0; background: none; font: 600 11px/1.2 var(--sans); text-transform: none; letter-spacing: 0; }
+    :where(.bd) .lg-bar-r { opacity: .8; }
+    :where(.bd) .uv-cap { stroke: var(--faint); }
+    /* Today in a narrow window: its parts stand at their own height and the page scrolls, where they were squeezed into the window and ran over each other. */
+    @container (max-width: 1100px) { .p-dash { height: auto; min-height: 0; grid-template-rows: none; grid-auto-rows: auto; } .p-dash > .panel.s4 { grid-column: span 6; min-height: 240px; } .p-dash > .panel.s8 { grid-column: 1 / -1; min-height: 0; } .p-dash .empty { padding: 14px 16px; } .p-dash .next { height: auto; grid-auto-rows: auto; } .p-dash .pb { overflow: visible; } }
+    @container (max-width: 760px) { .p-dash > .panel.s4 { grid-column: 1 / -1; } }
+    /* Amber is a rule down the side, never the words (the plan's "gone", "buy it first"). */
+    .amber b { color: var(--text); } .rt .amber { margin: 6px 0 2px; padding: 2px 0 2px 10px; border-left: 3px solid var(--warn); }
+    .pl .warnw { color: var(--text2); } .pl .p.warn { color: var(--muted); }
+    /* A Settings tab that holds something to do carries a small mark, seen from any tab. */
+    .tab[data-flag]::before { content: ""; position: absolute; right: 3px; top: 50%; margin-top: -10px; width: 6px; height: 6px; border-radius: 50%; background: var(--warn); } .tab[data-flag="bad"]::before { background: var(--bad); }
+    /* The Ledger's tables read as the app's own: column names in plain words. */
+    :where(.bd) .lg-table th { font: 600 12px/1.3 var(--sans); letter-spacing: 0; text-transform: none; color: var(--faint); }
+    :where(.bd) .lg-bltag { padding: 0; background: none; font: 600 11px/16px var(--sans); letter-spacing: 0; text-transform: none; }
+    /* One green button a screen: while the bar on top asks for a key, a page's own main button is plain. */
+    .bd:has(.sp-banner-on .sp-primary) .lg .sp-btn.sp-primary { color: var(--text); background: var(--raised); border-color: var(--line2); font-weight: 500; }
+    /* Trusted is the one coloured word; Known reads plain, Caution amber. */
+    .badge.trust[data-level="known"], :where(.bd) .sp-trust[data-level="known"] { color: var(--text2); }
+
+    /* ---- after the free review (2026-10-11): what is said where ---- */
+    /* The trade as one row beside what you hold (My items, To sell): the whole of it is on Flips and Trades. */
+    .panel.fold { padding: 12px 16px 14px; } .panel.fold .lbl { display: block; margin-bottom: 6px; }
+    .foldrow { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 0 14px; white-space: nowrap; }
+    .foldrow .w { min-width: 0; white-space: normal; } .foldrow .w b { color: var(--text); margin-right: 8px; font-size: 14px; } .foldrow .w small { color: var(--muted); font-size: 12px; }
+    .foldrow .p { font: 650 15px var(--disp); color: var(--good); }
+    /* A zero is never green, a loss is red. */
+    .big.zero, .foldrow .p.zero { color: var(--text); } .big.neg, .foldrow .p.neg { color: var(--bad); }
+    /* Clear all asks first, where the button was. */
+    .clearq { display: inline-flex; align-items: center; gap: 10px; color: var(--text2); font-size: 12px; }
+    /* A note under one buy of the route. */
+    .rt .note { margin: 4px 0 2px; }
+    /* An empty panel is its words, not a box of air; a button in it sits beside them. */
+    .p-dash .empty .btn { margin-left: 8px; vertical-align: middle; }
+    /* Trades: the trade's own column starts at the top, whatever the route's height. */
+    .det > div:first-child { align-self: start; }
+    /* The Ledger: muggings are a row of the Profit group; one height for boxes and chips. */
+    .lg-profitbox { display: grid; gap: 12px; } .lg-profitbox .lg-mugline { padding: 10px 16px; }
+    .lg-chips { padding: 1px; } .lg-chips .sp-chip-f, .lg-chips-s .sp-chip-f { height: 28px; font-size: 12px; } .lg-in { height: 32px; }
+    .lg-filters { align-items: flex-end; gap: 10px 16px; }
+    `;
+
+    const BIDS_CSS = BIDS_BASE_CSS + BIDS_CALM_CSS + BIDS_FORM_CSS;
+
+    /* ===== src/ui/bids-shell.js ===== */
+    /*
+     * Torn Bids' shell (3.25.0, mockup AD third pass): a sidebar with a page per job, a bar across the top
+     * (where you are, its tabs, your Cash, how old the prices are, Read now) and one line along the bottom.
+     *
+     *   Today      the few totals, what to do now, the best flips, your trades, what you hold, your profit
+     *   Flips      Best flips | By trader | All items: pick on the left, who sells and who pays in the
+     *              middle, the trade on the right
+     *   Trades     a card per trade in the lane of its step, and the one you pressed under them
+     *   My items   what you hold, and where to sell it
+     *   To sell    what you bought to resell, by who pays most
+     *   Ledger     Trading | Sold | Receipts, traders, mugged
+     *   Settings   Keys and sharing | Flips and reading | Help
+     *
+     * This file builds the frame and moves the page's parts into the page in view; what is in each part is
+     * drawn by ui/selling-page.js and ui/bids-pages.js. One instance of each part exists (the list, the head of
+     * what you picked, the trade), so a part is never drawn twice: going to another page moves it there.
+     *
+     * Names from Torn, TornExchange or TornW3B only ever go in as text.
+     */
+
+    const BD_SVG = 'http://www.w3.org/2000/svg';
+
+    /* Line icons, 20 x 20, drawn in the current colour. Our own constant strings: nothing from outside. */
+    const BD_ICONS = {
+        dash: '<rect x="3" y="3" width="6" height="8" rx="1.5"/><rect x="11" y="3" width="6" height="5" rx="1.5"/><rect x="3" y="13" width="6" height="4" rx="1.5"/><rect x="11" y="10" width="6" height="7" rx="1.5"/>',
+        flip: '<path d="M3 14.5 7.5 10l3 3L17 6.5"/><path d="M12.5 6.5H17V11"/>',
+        trades: '<path d="M4 7h12l-3-3M16 13H4l3 3"/>',
+        stock: '<path d="M10 3 3 6.5 10 10l7-3.5L10 3Z"/><path d="m3 10 7 3.5 7-3.5"/><path d="m3 13.5 7 3.5 7-3.5"/>',
+        tag: '<path d="M3.5 10.4V4.5a1 1 0 0 1 1-1h5.9l6 6a1 1 0 0 1 0 1.4l-5.1 5.1a1 1 0 0 1-1.4 0l-6.4-5.6Z"/><circle cx="7.2" cy="7.2" r="1.1"/>',
+        book: '<path d="M6 3.5h9.5v13H6A1.5 1.5 0 0 1 4.5 15V5A1.5 1.5 0 0 1 6 3.5Z"/><path d="M4.5 14.8A1.5 1.5 0 0 1 6 13.5h9.5M8 7h4.5M8 9.8h3"/>',
+        set: '<path d="M4 6h6.5M15.5 6h.5M4 14h.5M9.5 14H16"/><circle cx="13" cy="6" r="2.2"/><circle cx="7" cy="14" r="2.2"/>',
+        pin: '<path d="M7 3h6l-.8 5 2.3 2.5v1.5h-9v-1.5L7.8 8 7 3ZM10 12v5"/>',
+        buy: '<path d="M2.5 4h2l1.7 8.2h8.3l1.8-5.7H5.4"/><circle cx="7.8" cy="15.6" r="1.2"/><circle cx="13.8" cy="15.6" r="1.2"/>',
+    };
+
+    function bdIcon(name) {
+        const svg = document.createElementNS(BD_SVG, 'svg');
+        svg.setAttribute('class', 'ic');
+        svg.setAttribute('viewBox', '0 0 20 20');
+        svg.setAttribute('aria-hidden', 'true');
+        svg.innerHTML = BD_ICONS[name] || '';
+        return svg;
+    }
+
+    /** An element: `text` is text, on* a listener, everything else an attribute. Children: nodes or strings (as text). */
+    function bdEl(tag, props = {}, children = []) {
+        const node = document.createElement(tag);
+        for (const [key, value] of Object.entries(props || {})) {
+            if (key === 'class') node.className = value;
+            else if (key === 'text') node.textContent = value;
+            else if (key.startsWith('on') && typeof value === 'function') node.addEventListener(key.slice(2).toLowerCase(), value);
+            // A string "on..." is never set: no inline handler, ever.
+            else if (!key.startsWith('on') && value !== null && value !== undefined && value !== false) node.setAttribute(key, String(value));
+        }
+        for (const child of [].concat(children)) {
+            if (child === null || child === undefined || child === false) continue;
+            node.appendChild(typeof child === 'string' ? document.createTextNode(child) : child);
+        }
+        return node;
+    }
+
+    /** The pages, in the sidebar's order. `gap`: a thin line between groups; `push`: what follows sits at the bottom. */
+    const BD_PAGES = [
+        { id: 'today', label: 'Today', icon: 'dash' },
+        { id: 'flips', label: 'Flips', icon: 'flip', tabs: ['Best flips', 'By trader', 'All items'] },
+        { id: 'trades', label: 'Trades', icon: 'trades' },
+        { gap: true },
+        { id: 'mine', label: 'My items', icon: 'stock' },
+        { id: 'sell', label: 'To sell', icon: 'tag' },
+        { id: 'ledger', label: 'Ledger', icon: 'book' },
+        { push: true },
+        { id: 'settings', label: 'Settings', icon: 'set', tabs: ['Keys and sharing', 'Flips and reading', 'Help'] },
+    ];
+
+    /** The tabs of Flips. */
+    const BD_FLIPS_BEST = 0;
+    const BD_FLIPS_TRADER = 1;
+    const BD_FLIPS_ITEMS = 2;
+
+    /**
+     * Which list a page shows: main.js works the item list out for one filter at a time
+     * ('all' | 'mine' | 'flips' | 'sell' | 'trades'). null: the page shows no item list of its own.
+     */
+    function bdFilterOf(pageId, tab) {
+        if (pageId === 'flips') return tab === BD_FLIPS_ITEMS ? 'all' : tab === BD_FLIPS_BEST ? 'flips' : null;
+        if (pageId === 'mine') return 'mine';
+        if (pageId === 'sell') return 'sell';
+        if (pageId === 'trades') return 'trades';
+        return null;
+    }
+
+    /** The page and tab that show a filter (a filter set from elsewhere: "see To sell", a trade opened from Today). */
+    function bdPageOf(filter) {
+        if (filter === 'mine') return { page: 'mine', tab: 0 };
+        if (filter === 'sell') return { page: 'sell', tab: 0 };
+        if (filter === 'trades') return { page: 'trades', tab: 0 };
+        if (filter === 'all') return { page: 'flips', tab: BD_FLIPS_ITEMS };
+        return { page: 'flips', tab: BD_FLIPS_BEST };
+    }
+
+    const BD_SIDE_PIN_KEY = 'tornBids.sidePinned';
+
+    /**
+     * Builds the frame into `page` (a SellingPage). It makes:
+     *   page.root            the whole page
+     *   page.bd.pages[id]    each page's section
+     *   page.bd.slots        where the parts go: slots[name] is an element a part is moved into
+     *   page.bd.nav[id]      {btn, count} of each sidebar entry
+     * and expects the parts themselves (page.listPanel, page.headEl, ...) to exist already.
+     */
+    function bdBuildShell(page, { title, tagline, parts }) {
+        const bd = { pages: {}, slots: {}, nav: {}, page: 'today', tab: 0, tabsOf: {} };
+        page.bd = bd;
+
+        /* ---- sidebar ---- */
+        bd.ind = bdEl('div', { class: 'nav-ind' });
+        const nav = bdEl('nav', { class: 'nav', 'aria-label': 'Pages' }, [bd.ind]);
+        for (const p of BD_PAGES) {
+            if (p.gap) {
+                nav.appendChild(bdEl('div', { class: 'nav-g' }));
+                continue;
+            }
+            if (p.push) {
+                nav.appendChild(bdEl('span', { class: 'sp' }));
+                continue;
+            }
+            const count = bdEl('span', { class: 'lab cnt', hidden: '' });
+            const pip = bdEl('i', { class: 'pip', hidden: '' });
+            const btn = bdEl('button', { type: 'button', class: 'nav-b', 'data-go': p.id, title: p.label, onclick: () => page.go(p.id) }, [bdIcon(p.icon), pip, bdEl('span', { class: 'lab', text: p.label }), count]);
+            bd.nav[p.id] = { btn, count, pip };
+            bd.tabsOf[p.id] = p.tabs || null;
+            nav.appendChild(btn);
+        }
+        bd.pinBtn = bdEl('button', { type: 'button', class: 'pin lab', title: 'Keep the sidebar open', 'aria-pressed': 'false', onclick: () => bdPin(page, !bd.pinned) }, [bdIcon('pin')]);
+        bd.sharedEl = bdEl('div', { class: 'shop', hidden: '' });
+        bd.sideEl = bdEl('aside', { class: 'side' }, [bdEl('div', { class: 'side-in' }, [
+            bdEl('div', { class: 'brand' }, [bdEl('div', { class: 'mark', 'aria-hidden': 'true', text: '$' }), bdEl('div', { class: 'lab' }, [bdEl('b', { text: title }), bdEl('span', { text: tagline })]), bd.pinBtn]),
+            nav,
+            bdEl('div', { class: 'side-f' }, [bd.sharedEl]),
+        ])]);
+        // The rail opens when the pointer is over it, and closes a moment after it leaves (never under a press).
+        let timer = null;
+        const open = (on) => {
+            clearTimeout(timer);
+            timer = setTimeout(() => bd.sideEl.classList.toggle('open', on), on ? 80 : 240);
+        };
+        bd.sideEl.addEventListener('mouseenter', () => open(true));
+        bd.sideEl.addEventListener('mouseleave', () => open(false));
+        bd.sideEl.addEventListener('focusin', () => open(true));
+        bd.sideEl.addEventListener('focusout', () => open(false));
+
+        /* ---- the bar across the top ---- */
+        bd.titleEl = bdEl('h1', { text: 'Today' });
+        bd.tabsEl = bdEl('nav', { class: 'tabs', 'aria-label': 'Tabs of this page' });
+        bd.topEl = bdEl('header', { class: 'top' }, [bd.titleEl, bd.tabsEl, bdEl('span', { class: 'sp' }), ...parts.top]);
+
+        /* ---- the pages ---- */
+        const slot = (name, tag = 'div', cls = '') => {
+            bd.slots[name] = bdEl(tag, { class: cls });
+            return bd.slots[name];
+        };
+        const section = (id, cls, children) => {
+            bd.pages[id] = bdEl('section', { class: 'page ' + cls, 'data-page': id }, children);
+            return bd.pages[id];
+        };
+        bd.viewEl = bdEl('div', { class: 'view' }, [
+            section('today', 'p-dash', parts.today),
+            // Flips: the picker, the middle and the trade; By trader swaps what the first two hold.
+            section('flips', 'fit', [bdEl('div', { class: 'pane on c3 snug' }, [slot('flips-list', 'div', 'slot'), slot('flips-mid', 'div', 'col join'), slot('flips-plan', 'div', 'slot')])]),
+            section('trades', 'pgrows', [slot('trades-tiles', 'div', 'slot'), slot('trades-board', 'div', 'slot'), slot('trades-detail', 'div', 'slot')]),
+            section('mine', 'pgrows pgfill', [slot('mine-tiles', 'div', 'slot'), bdEl('div', { class: 'pane on c75 snug' }, [slot('mine-list', 'div', 'slot'), slot('mine-side', 'div', 'col')])]),
+            section('sell', 'pgrows pgfill', [slot('sell-tiles', 'div', 'slot'), bdEl('div', { class: 'pane on c75 snug' }, [slot('sell-list', 'div', 'slot'), slot('sell-side', 'div', 'col')])]),
+            section('ledger', 'g1', parts.ledger),
+            section('settings', 'g1', parts.settings),
+        ]);
+
+        /* ---- the line along the bottom ---- */
+        bd.tapeEl = bdEl('div', { class: 'tape-t' });
+        bd.tapeRight = bdEl('div', { class: 'tape-r' });
+        const tape = bdEl('footer', { class: 'tape' }, [bdEl('div', { class: 'tape-l', text: 'Happening now' }), bdEl('div', { class: 'tape-m' }, [bd.tapeEl]), bd.tapeRight]);
+
+        bd.mainEl = bdEl('div', { class: 'main' }, [bd.topEl, bd.viewEl, tape]);
+        page.root = bdEl('div', { class: 'sp-page bd app' }, [bd.sideEl, bd.mainEl]);
+
+        let pinned = false;
+        try {
+            pinned = window.localStorage.getItem(BD_SIDE_PIN_KEY) === '1';
+        } catch {
+            // No page storage: the sidebar starts as a rail.
+        }
+        bdPin(page, pinned, false);
+        return bd;
+    }
+
+    /** The sidebar kept open, or a rail that opens under the pointer. Remembered in this browser. */
+    function bdPin(page, on, save = true) {
+        const bd = page.bd;
+        bd.pinned = Boolean(on);
+        page.root.classList.toggle('pinned', bd.pinned);
+        bd.pinBtn.setAttribute('aria-pressed', String(bd.pinned));
+        bd.pinBtn.title = bd.pinned ? 'Fold the sidebar to a rail' : 'Keep the sidebar open';
+        if (save) {
+            try {
+                window.localStorage.setItem(BD_SIDE_PIN_KEY, bd.pinned ? '1' : '0');
+            } catch {
+                // Not remembered: it works for this visit.
+            }
+        }
+        bdMoveInd(page);
+    }
+
+    /** The sidebar's marker slides to the page in view. */
+    function bdMoveInd(page) {
+        const bd = page.bd;
+        const cur = bd.nav[bd.page];
+        if (cur) bd.ind.style.transform = 'translateY(' + cur.btn.offsetTop + 'px)';
+    }
+
+    /**
+     * Shows a page and one of its tabs: the sidebar, the title, the tabs. What the page holds is moved in by
+     * the caller (page.place()), which knows the parts.
+     * @param {string[]|null} tabs - the tabs' words now (their counts change), or null for a page without tabs
+     */
+    function bdShow(page, id, tab, tabs) {
+        const bd = page.bd;
+        const entry = BD_PAGES.find((p) => p.id === id) || BD_PAGES[0];
+        bd.page = entry.id;
+        bd.tab = tabs && tab >= 0 && tab < tabs.length ? tab : 0;
+        for (const [key, el] of Object.entries(bd.pages)) el.classList.toggle('on', key === bd.page);
+        for (const [key, n] of Object.entries(bd.nav)) {
+            n.btn.classList.toggle('on', key === bd.page);
+            n.btn.setAttribute('aria-current', key === bd.page ? 'page' : 'false');
+        }
+        bd.titleEl.textContent = entry.label;
+        bdTabs(page, tabs);
+        bdMoveInd(page);
+        bd.viewEl.scrollTop = 0;
+    }
+
+    /** The tabs of the page in view, with the words given (drawn again only when they change). */
+    function bdTabs(page, tabs) {
+        const bd = page.bd;
+        const sig = JSON.stringify([bd.page, bd.tab, tabs || null]);
+        if (sig === bd.tabsSig) return;
+        bd.tabsSig = sig;
+        const had = bd.tabsEl.contains(page.root.getRootNode().activeElement);
+        bd.tabsEl.textContent = '';
+        (tabs || []).forEach((label, i) => {
+            bd.tabsEl.appendChild(bdEl('button', { type: 'button', class: 'tab' + (i === bd.tab ? ' on' : ''), 'aria-pressed': String(i === bd.tab), text: label, onclick: () => page.go(bd.page, i) }));
+        });
+        if (had && bd.tabsEl.children[bd.tab]) bd.tabsEl.children[bd.tab].focus({ preventScroll: true });
+    }
+
+    /** A number beside a sidebar entry (hidden at zero); `hot`: in the accent, for the one thing to do now. */
+    function bdNavCount(page, id, text, hot = false) {
+        const n = page.bd.nav[id];
+        if (!n) return;
+        const shown = text === null || text === undefined || text === '' || text === 0 ? '' : String(text);
+        if (n.count.textContent !== shown) n.count.textContent = shown;
+        n.count.hidden = !shown;
+        n.count.classList.toggle('hot', Boolean(hot));
+        // Folded to a rail there is no room for the number: a dot says there is something.
+        n.pip.hidden = !(shown && hot);
+    }
+
+    /** Moves a part into a slot (a part is in one place at a time). `null` empties the slot. */
+    function bdPut(page, slotName, ...parts) {
+        const slot = page.bd.slots[slotName];
+        if (!slot) return;
+        const want = parts.filter(Boolean);
+        const have = [...slot.children];
+        if (have.length === want.length && have.every((n, i) => n === want[i])) return;
+        for (const n of have) if (!want.includes(n)) slot.removeChild(n);
+        for (const n of want) slot.appendChild(n);
+    }
+
     /* ===== src/ui/selling-page.js ===== */
     /*
      * Torn Bids: every item, both sides - who pays most for it, who sells it
@@ -21731,6 +25686,12 @@
      * placeholder. Nothing is cut short with an ellipsis. Names from Torn,
      * TornExchange or TornW3B only ever go in via textContent.
      */
+
+
+
+
+
+
 
 
 
@@ -21791,25 +25752,22 @@
         freshOtherMin: FRESH_DEFAULTS.other,
     };
 
-    /* A flip card's "seen" dot: green under this many minutes, amber under the next, grey after. */
-    const SEEN_FRESH_MIN = 5;
-    const SEEN_OLD_MIN = 15;
-
-    /** Minutes since TornW3B saw the oldest listing of a flip's plan, or null when none says. */
-    function seenMinutes(steps) {
-        const at = (steps || []).map((st) => Number(st.dataAt || st.seenAt) || 0).filter((t) => t > 0);
-        if (!at.length) return null;
-        return Math.max(0, Math.floor((Date.now() - Math.min(...at)) / 60000));
-    }
+    /* Settings' tabs, and which of its parts each holds. */
+    const BD_SET_KEYS = 0;
+    const BD_SET_FLIPS = 1;
+    const BD_SET_HELP = 2;
+    const BD_SET_OF = { keys: BD_SET_KEYS, te: BD_SET_KEYS, w3b: BD_SET_KEYS, shared: BD_SET_KEYS, ledger: BD_SET_KEYS, flips: BD_SET_FLIPS, fresh: BD_SET_FLIPS, links: BD_SET_FLIPS, api: BD_SET_HELP, report: BD_SET_HELP, terms: BD_SET_KEYS };
+    /* The Ledger's tabs, in the order of the tabs on top. */
+    const BD_LEDGER_TABS = ['trade', 'sold', 'receipts', 'traders', 'mugs'];
+    /* Bazaars and traders shown for an item before "Show all" (its box scrolls). */
+    const BD_ROWS = 12;
 
 
     /** The item list shows this many at a time. */
     const ALL_ITEMS_PAGE = 50;
 
-    /** Traders and bazaars shown per item before "Show all". */
+    /** Traders and bazaars shown per item before "Show all" (on Torn's pages; Torn Bids' own boxes scroll). */
     const DESK_ROWS = 5;
-    /* One pulse of the amber dot on an old price list (3.22.3); the CSS below says the same. */
-    const OLD_PULSE_MS = 1600;
 
     /** The item list's filters. */
     const SELL_FILTERS = ['all', 'mine', 'flips', 'sell', 'trades'];
@@ -21829,36 +25787,12 @@
         return 'https://www.torn.com/trade.php#step=start&userID=' + encodeURIComponent(String(id));
     }
 
-    /** Torn's own picture of an item, as its pages show it. */
-    function itemImageUrl(itemId) {
-        return 'https://www.torn.com/images/items/' + encodeURIComponent(String(itemId)) + '/small.png';
+    /** Torn's own picture of an item, as its pages show it: 'small', 'medium' or 'large'. */
+    function itemImageUrl(itemId, size = 'small') {
+        return 'https://www.torn.com/images/items/' + encodeURIComponent(String(itemId)) + '/' + (size === 'large' || size === 'medium' ? size : 'small') + '.png';
     }
 
     /** The pin (3.14): an outline pin, drawn in the current colour. */
-    /** $809,351 or $809,351–$820,000: what a plan's steps cost each. */
-    function priceRange(steps) {
-        const prices = (steps || []).map((st) => st.price).filter((p) => p > 0);
-        if (!prices.length) return '–';
-        const lo = Math.min(...prices);
-        const hi = Math.max(...prices);
-        return lo === hi ? formatMoney(lo) : formatMoney(lo) + '–' + formatMoney(hi);
-    }
-
-    /** A speech bubble, drawn in the current colour (Chat). */
-    function chatIcon() {
-        const NS = 'http://www.w3.org/2000/svg';
-        const svg = document.createElementNS(NS, 'svg');
-        svg.setAttribute('viewBox', '0 0 16 16');
-        svg.setAttribute('width', '13');
-        svg.setAttribute('height', '13');
-        svg.setAttribute('aria-hidden', 'true');
-        const path = document.createElementNS(NS, 'path');
-        path.setAttribute('d', 'M2 3.5A1.5 1.5 0 0 1 3.5 2h9A1.5 1.5 0 0 1 14 3.5v6a1.5 1.5 0 0 1-1.5 1.5H7l-3.5 3v-3h0A1.5 1.5 0 0 1 2 9.5z');
-        path.setAttribute('fill', 'currentColor');
-        svg.appendChild(path);
-        return svg;
-    }
-
     function pinIcon() {
         const NS = 'http://www.w3.org/2000/svg';
         const svg = document.createElementNS(NS, 'svg');
@@ -21938,12 +25872,31 @@
     }
 
     /** "+$3,500" / "−$60,005": money made or lost. */
+    /** The waiting deals shown when the amber line is opened: the best few (a peek, not a second list). */
+    const STILL_PEEK = 6;
+
     function signed(n) {
         return (n >= 0 ? '+' : '−') + formatMoney(Math.abs(n));
     }
 
     function count(n) {
         return Number(n).toLocaleString('en-US');
+    }
+
+    /** "+$56k", "−$1.2m": a profit in the little room over a bar. */
+    function shortMoney(n) {
+        const v = Math.abs(n);
+        const text = v >= 1e9 ? (v / 1e9).toFixed(1) + 'b' : v >= 1e6 ? (v / 1e6).toFixed(1) + 'm' : v >= 1e3 ? Math.round(v / 1e3) + 'k' : String(Math.round(v));
+        return (n >= 0 ? '+$' : '−$') + text.replace('.0', '');
+    }
+
+    /** Sets style values on a node (a name starting "--" is a variable) and returns it. Never an inline style attribute. */
+    function spVars(node, vars) {
+        for (const [name, value] of Object.entries(vars)) {
+            if (name.startsWith('--')) node.style.setProperty(name, String(value));
+            else node.style[name] = String(value);
+        }
+        return node;
     }
 
     /** A masked key field with Show / Save. The saved key is never left in the field. */
@@ -22003,6 +25956,52 @@
             : name + ' buys ' + n + (hidden === 1 ? ' more item' : ' more items') + ', not shown' + why;
     }
 
+    /**
+     * Torn Bids, closed (3.25.0): the panel on Torn's pages is on NPC Arbitrage, and the owner's rule is one
+     * job at a time - "if were at tornbids, npc arbitradge is closed. 0 api calls, same thing when we have npc
+     * arbitradge open, tornbids is closed". The page says so and holds one button; nothing else of Torn Bids
+     * is started, so nothing is read.
+     *
+     * @param {object} h
+     * @param {function} h.onTurnOn - Torn Bids is turned on (NPC Arbitrage closes), and this page starts
+     * @returns {HTMLElement} the host element
+     */
+    function mountBidsClosed({ onTurnOn }) {
+        const host = document.createElement('div');
+        host.id = 'ttv2-sell-host';
+        host.style.cssText = 'position:fixed;inset:0;z-index:2147482000;';
+        const shadow = host.attachShadow({ mode: 'open' });
+        shadow.appendChild(spEl('style', { text: TOKENS_CSS + `
+    :host { all: initial; }
+    .closed-page { position: absolute; inset: 0; display: grid; place-items: center; background: #0c0d10; color: #e6e8ee; font: 400 14px/1.5 "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, sans-serif; }
+    .closed-box { width: min(440px, calc(100% - 40px)); padding: 26px 26px 24px; border-radius: 14px; background: #17191e; display: grid; gap: 12px; justify-items: start; }
+    .closed-box h1 { margin: 0; font: 400 24px/1.2 Georgia, "Iowan Old Style", "Times New Roman", serif; }
+    .closed-box p { margin: 0; color: #a2a8b6; }
+    .closed-box p b { color: #e6e8ee; font-weight: 600; }
+    .closed-box button { height: 34px; padding: 0 16px; border: 0; border-radius: 9px; background: #6fdc7f; color: #0b1a0e; font: 650 14px/1 "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif; cursor: pointer; }
+    .closed-box button:hover { background: #8ae897; }
+    .closed-box button:focus-visible { outline: 2px solid #e6e8ee; outline-offset: 2px; }
+    .closed-box small { color: #7c8392; font-size: 12px; }
+    ` }));
+        const btn = spEl('button', { type: 'button', text: 'Turn Torn Bids on', onclick: () => onTurnOn && onTurnOn() });
+        shadow.appendChild(spEl('div', { class: 'closed-page' }, [
+            spEl('div', { class: 'closed-box', role: 'status' }, [
+                spEl('h1', { text: 'Torn Bids is closed' }),
+                spEl('p', {}, [spEl('b', { text: 'NPC Arbitrage is on' }), ', so nothing is read here: 0 API calls. Your trades, To sell and Ledger are kept as they were.']),
+                btn,
+                spEl('small', { text: 'Turning it on closes NPC Arbitrage in the panel on Torn\'s pages. One job at a time.' }),
+            ]),
+        ]));
+        document.documentElement.appendChild(host);
+        document.title = SELLING_PAGE_TITLE + ' (closed)';
+        if (!document.querySelector('meta[name="viewport"]')) {
+            (document.head || document.documentElement).appendChild(spEl('meta', { name: 'viewport', content: 'width=device-width, initial-scale=1' }));
+        }
+        document.documentElement.style.overflow = 'hidden';
+        btn.focus({ preventScroll: true });
+        return host;
+    }
+
     class SellingPage {
         /**
          * @param {object} handlers
@@ -22011,6 +26010,7 @@
          *   onRefresh(), onPrefsChange(partial)
          *   onSelect(itemId)            - pick an item for the desk
      *   onTradeUnpick(itemId, key)  - Planning pressed again: that plan off the desk
+     *   onTradeEvery(itemId, key, on) - Every flip: the trade with that trader planned with every item they buy (off: the usual plan)
          *   onFilter(key), onQuery(text), onCategory(category), onMore()
          *   onOpenUrl(url)
          */
@@ -22087,22 +26087,19 @@
 
             this.keyHandler = (event) => {
                 if (event.key === 'Escape') {
-                    // Nothing is left unsaved (leaving a box saves it): Esc goes back.
-                    if (this.view !== 'list') this.showView('list');
+                    // Nothing is left unsaved (leaving a box saves it): Esc goes back from the Ledger and Settings.
+                    if (this.view !== 'list') this.go(this.backTo || 'today');
                     return;
                 }
-                // "/" jumps to the search box, as on most sites with one.
-                const typing = event.composedPath().some((n) => n && (n.tagName === 'INPUT' || n.tagName === 'TEXTAREA'));
-                if (event.key === '/' && !typing && this.view === 'list') {
+                // "/" jumps to the list's search box, as on most sites with one.
+                const typing = event.composedPath().some((n) => n && (n.tagName === 'INPUT' || n.tagName === 'TEXTAREA' || n.tagName === 'SELECT'));
+                if (event.key === '/' && !typing && this.listPanel.isConnected && !this.findEl.hidden) {
                     event.preventDefault();
                     this.searchEl.focus();
                 }
             };
             document.addEventListener('keydown', this.keyHandler);
-            this.resizeHandler = () => {
-                this.fitDesk();
-                this.fitScan();
-            };
+            this.resizeHandler = () => bdMoveInd(this);
             window.addEventListener('resize', this.resizeHandler);
             this.ticker = setInterval(() => {
                 this.renderPills();
@@ -22188,137 +26185,88 @@
 
         build() {
             const set = (partial) => this.h.onPrefsChange && this.h.onPrefsChange(partial);
+            this.tabAt = {};
+            this.visit = {};
+            this.traderQuery = '';
+            this.favOnly = false;
+            const ph = (title, sub, more = []) => spEl('div', { class: 'ph' }, [spEl('h2', { text: title }), sub ? spEl('span', { class: 'sub', text: sub }) : null, ...more]);
+            const sp = () => spEl('span', { class: 'sp' });
 
-            /* header: name, search, sources, refresh, settings */
-            this.backBtn = spEl('button', {
-                type: 'button',
-                class: 'sp-icon',
-                title: 'Back (Esc)',
-                'aria-label': 'Back',
-                text: '←',
-                hidden: '',
-                onclick: () => this.showView('list'),
-            });
-            this.titleEl = spEl('h1', { text: SELLING_PAGE_TITLE });
-            this.taglineEl = spEl('span', { class: 'sp-tagline', text: 'Every item, both sides' });
-            // Where you are, after the name (3.20.3): "Torn Bids › Settings". The logo and
-            // the name never move; pressing them, Esc, or Ledger / ⚙ again goes home.
-            this.crumbEl = spEl('span', { class: 'sp-crumb', hidden: '' });
-            this.searchEl = spEl('input', {
-                type: 'search',
-                class: 'sp-search',
-                placeholder: 'Search items… ( / )',
-                'aria-label': 'Search items',
-                autocomplete: 'off',
-                spellcheck: 'false',
-            });
+            /* the bar across the top: your Cash, how old the prices are, Read now */
+            this.cashPill = spEl('button', { type: 'button', class: 'pill', title: 'Flips never plan to spend more than this. Press to change it.', onclick: () => {
+                this.go('settings', BD_SET_FLIPS);
+                this.cashInput.focus();
+            } });
+            this.pricesPill = spEl('span', { class: 'pill', tabindex: '0' });
+            this.refreshBtn = spEl('button', { type: 'button', class: 'btn', title: 'Read what is on show again now', text: 'Read now', onclick: () => this.h.onRefresh && this.h.onRefresh() });
+            this.bannerEl = spEl('div', { class: 'sp-banner', role: 'status' });
+
+            /* the list: its own search and filters, then a table */
+            this.searchEl = spEl('input', { type: 'search', class: 'inp q', placeholder: 'Search items… ( / )', 'aria-label': 'Search', autocomplete: 'off', spellcheck: 'false' });
             this.searchEl.addEventListener('input', () => {
+                // By trader: the box looks through the traders, here; elsewhere through the items.
+                if (this.onTraders()) {
+                    this.traderQuery = this.searchEl.value;
+                    this.listSig = null;
+                    this.renderList();
+                    return;
+                }
                 this.query = this.searchEl.value;
                 if (this.h.onQuery) this.h.onQuery(this.searchEl.value);
             });
-            // The category (the owner picked mockups/M-category-dropdown.html):
-            // Torn's item types, each with how many items it has.
-            this.catEl = spEl('select', { class: 'sp-cat', 'aria-label': 'Category', title: 'Category: filters the flips and the list' });
+            // The category (the owner picked mockups/M-category-dropdown.html): Torn's item types, each with how many items it has.
+            this.catEl = spEl('select', { class: 'inp', 'aria-label': 'Category', title: 'Category: filters the flips and the list' });
             this.catEl.addEventListener('change', () => this.h.onCategory && this.h.onCategory(this.catEl.value));
-            this.pillsEl = spEl('div', { class: 'sp-pills' });
-            this.refreshBtn = spEl('button', {
-                type: 'button',
-                class: 'sp-icon',
-                title: 'Refresh now',
-                'aria-label': 'Refresh now',
-                text: '↻',
-                onclick: () => this.h.onRefresh && this.h.onRefresh(),
-            });
-            this.ledgerBtn = spEl('button', {
-                type: 'button',
-                class: 'sp-hbtn',
-                title: 'Torn Ledger: what you made',
-                'aria-pressed': 'false',
-                text: 'Ledger',
-                onclick: () => this.showView(this.view === 'ledger' ? 'list' : 'ledger'),
-            });
-            this.settingsBtn = spEl('button', {
-                type: 'button',
-                class: 'sp-icon',
-                title: 'Settings',
-                'aria-label': 'Settings',
-                'aria-pressed': 'false',
-                text: '⚙',
-                onclick: () => this.showView(this.view === 'settings' ? 'list' : 'settings'),
-            });
-            this.brandEl = spEl('div', { class: 'sp-brand', role: 'button', tabindex: '0', title: 'Torn Bids: home', 'aria-label': 'Torn Bids: home' }, [spEl('span', { class: 'sp-mark', 'aria-hidden': 'true', text: '$' }), this.titleEl, this.crumbEl, this.taglineEl]);
-            this.brandEl.addEventListener('click', () => {
-                if (this.view !== 'list') this.showView('list');
-            });
-            this.brandEl.addEventListener('keydown', (event) => {
-                if (event.key !== 'Enter' && event.key !== ' ') return;
-                event.preventDefault();
-                if (this.view !== 'list') this.showView('list');
-            });
-            this.headEl = spEl('header', { class: 'sp-head' }, [
-                this.backBtn,
-                this.brandEl,
-                this.searchEl,
-                this.catEl,
-                this.pillsEl,
-                this.refreshBtn,
-                this.ledgerBtn,
-                this.settingsBtn,
-            ]);
-
-            this.bannerEl = spEl('div', { class: 'sp-banner', role: 'status' });
-
-            /* the best flips, and what the whole page shows */
-            this.onlineBtn = spEl('button', {
-                type: 'button',
-                class: 'sp-toggle',
-                'aria-pressed': 'false',
-                onclick: () => set({ onlineOnly: !this.state.prefs.onlineOnly }),
-            }, [spEl('span', { class: 'sp-dot', 'data-level': 'online' }), 'Buyers online only']);
-            this.trustedBtn = spEl('button', {
-                type: 'button',
-                class: 'sp-toggle',
-                'aria-pressed': 'false',
-                onclick: () => set({ trustedOnly: !this.state.prefs.trustedOnly }),
-            }, [spEl('span', { class: 'sp-trust', 'data-level': 'trusted', 'aria-hidden': 'true', text: 'T' }), 'Trusted buyers only']);
+            this.invEl = spEl('span', { class: 'quiet', hidden: '', title: 'Torn\'s count of what is in your inventory' });
+            this.findEl = spEl('div', { class: 'find' }, [this.searchEl, this.catEl, this.invEl]);
+            const tog = (label, title, key) => spEl('button', { type: 'button', class: 'tog', 'aria-pressed': 'false', title, text: label, onclick: () => set({ [key]: !this.state.prefs[key] }) });
+            this.onlineBtn = tog('Online', 'Only traders known to be online', 'onlineOnly');
+            this.trustedBtn = tog('Trusted', 'Only traders other players vouch for', 'trustedOnly');
             // Fresh prices only (3.22.0, the owner): a price from a list not changed in two days is not shown.
-            this.freshBtn = spEl('button', {
-                type: 'button',
-                class: 'sp-toggle',
-                'aria-pressed': 'false',
-                title: 'Hides a trader\'s TornW3B price when they have not changed their price list in two days (TornExchange prices have no date and stay)',
-                onclick: () => set({ freshOnly: !this.state.prefs.freshOnly }),
-            }, ['Fresh prices only']);
-            this.stripEl = spEl('div', { class: 'sp-strip' });
-            // Numbers update under your pointer, the order does not: a card never
-            // moves while you are about to press it (3.14).
-            this.stripEl.addEventListener('mouseenter', () => {
-                this.stripHover = true;
-            });
-            this.stripEl.addEventListener('mouseleave', () => {
-                this.stripHover = false;
-                this.renderStrip();
-            });
-            this.catLineEl = spEl('div', { class: 'sp-catline', hidden: '' });
-            /* Your traders: the best whole trade with each favourite and Trusted trader now (3.14.3) */
-            this.scanEl = spEl('section', { class: 'sp-scan', 'aria-label': 'Your traders' });
-            this.scanAll = false;
-
-            /* the desk: every item, and the one picked */
-            this.chipBtns = {};
-            this.chipCounts = {};
-            const chip = (key, label) => {
-                this.chipCounts[key] = spEl('small');
-                const btn = spEl('button', {
-                    type: 'button',
-                    class: 'sp-chip-f',
-                    'aria-pressed': 'false',
-                    onclick: () => this.h.onFilter && this.h.onFilter(key),
-                }, [label, this.chipCounts[key]]);
-                this.chipBtns[key] = btn;
-                return btn;
+            this.freshBtn = tog('Fresh prices', 'Hides a trader\'s TornW3B price when they have not changed their price list in two days (TornExchange prices have no date and stay)', 'freshOnly');
+            this.favBtn = spEl('button', { type: 'button', class: 'tog', 'aria-pressed': 'false', hidden: '', title: 'Your favourites only', text: '★ Favourites', onclick: () => {
+                this.favOnly = !this.favOnly;
+                this.favBtn.classList.toggle('on', this.favOnly);
+                this.favBtn.setAttribute('aria-pressed', String(this.favOnly));
+                this.listSig = null;
+                this.renderList();
+            } });
+            this.onlyEl = spEl('div', { class: 'only' }, ['Only', this.onlineBtn, this.trustedBtn, this.freshBtn, sp(), this.favBtn]);
+            // Clear all asks first (the whole list goes in one press): the question stands where the button was.
+            this.clearEl = spEl('span', { class: 'clearq' });
+            const drawClear = (asking) => {
+                this.clearEl.textContent = '';
+                if (!asking) {
+                    this.clearEl.appendChild(spEl('button', {
+                        type: 'button',
+                        class: 'quiet u',
+                        'data-focus': 'sell:clear',
+                        title: 'Takes every row a trade left off this list. The items stay in your inventory; rows also go by themselves, as your Ledger shows them sold.',
+                        text: 'Clear all',
+                        onclick: () => drawClear(true),
+                    }));
+                    return;
+                }
+                const yes = spEl('button', { type: 'button', class: 'btn sm', 'data-focus': 'sell:clear-yes', text: 'Yes, clear', onclick: () => {
+                    drawClear(false);
+                    if (this.h.onLeftoversClear) this.h.onLeftoversClear();
+                } });
+                this.clearEl.append(spEl('span', { text: 'Clear every row? The items stay in your inventory.' }), yes, this.wordBtn('Keep them', 'sell:clear-no', '', () => drawClear(false)));
+                yes.focus({ preventScroll: true });
             };
-            this.listBox = spEl('div', { class: 'sp-list' });
+            drawClear(false);
+            this.listPh = ph('Bought to resell, still held', 'by who pays most · a row leaves when it is sold', [sp(), this.clearEl]);
+            this.listPh.hidden = true;
+            // A trade stays still (3.25.0): the line above the list.
+            this.stillEl = spEl('div', { class: 'sp-still-box', hidden: '' });
+            this.stillTag = spEl('span');
+            this.stillOpen = false;
+            this.listHead = spEl('thead');
+            this.listBody = spEl('tbody');
+            this.listEmpty = spEl('div', { class: 'empty', hidden: '' });
+            this.moreBtn = spEl('button', { type: 'button', class: 'btn sm more', text: 'Show more', hidden: '', onclick: () => this.h.onMore && this.h.onMore() });
+            this.listBox = spEl('div', { class: 'pb flush' }, [spEl('table', { class: 't' }, [this.listHead, this.listBody]), this.listEmpty, this.moreBtn]);
+            // Numbers update under your pointer, the order does not: a row never moves while you are about to press it.
             this.listBox.addEventListener('pointerenter', () => {
                 this.hover = true;
             });
@@ -22327,122 +26275,2453 @@
                 this.listSig = null;
                 this.renderList();
             });
-            this.moreBtn = spEl('button', {
-                type: 'button',
-                class: 'sp-btn sp-more',
-                text: 'Show more',
-                hidden: '',
-                onclick: () => this.h.onMore && this.h.onMore(),
-            });
-            this.deskEl = spEl('section', { class: 'sp-ws', 'aria-label': 'The item picked' });
+            this.listPanel = spEl('div', { class: 'panel' }, [this.listPh, this.findEl, this.onlyEl, this.stillEl, this.listBox]);
 
-            this.listEl = spEl('main', { class: 'sp-main' }, [
-                // Your traders on top, Best flips under them (3.20, the owner's order).
-                spEl('div', { class: 'sp-wrap' }, [
-                    this.scanEl,
-                    spEl('div', { class: 'sp-sec sp-sec-flips' }, [
-                        spEl('h2', { text: 'Best flips · each within your cash' }),
-                        spEl('span', { class: 'sp-sp' }),
-                        this.onlineBtn,
-                        this.trustedBtn,
-                        this.freshBtn,
-                    ]),
-                    this.stripEl,
-                    this.catLineEl,
-                    spEl('div', { class: 'sp-desk' }, [
-                        spEl('div', { class: 'sp-col-list' }, [
-                            spEl('div', { class: 'sp-chips', role: 'group', 'aria-label': 'Show items' }, [chip('all', 'All'), chip('mine', 'Mine'), chip('flips', 'Flips'), chip('sell', 'To sell'), chip('trades', 'Trades')]),
-                            this.listBox,
-                            this.moreBtn,
-                        ]),
-                        this.deskEl,
-                    ]),
-                ]),
-            ]);
+            /* what you picked: its head, who sells it, who pays for it, the trade, where to sell it */
+            this.headEl = spEl('div', { class: 'panel hd fx' });
+            this.askBox = spEl('div', { class: 'pb flush' });
+            this.askEl = spEl('div', { class: 'panel' }, [ph('Bazaars sell', 'cheapest first'), this.askBox]);
+            this.paySub = spEl('span', { class: 'sub', text: 'highest first · press one to trade with them' });
+            this.payBox = spEl('div', { class: 'pb flush' });
+            this.payEl = spEl('div', { class: 'panel' }, [spEl('div', { class: 'ph' }, [spEl('h2', { text: 'Traders pay' }), this.paySub]), this.payBox]);
+            this.buysTitle = spEl('h2', { text: 'What they pay' });
+            this.buysBox = spEl('div', { class: 'pb flush' });
+            this.buysEl = spEl('div', { class: 'panel' }, [spEl('div', { class: 'ph' }, [this.buysTitle, spEl('span', { class: 'sub', text: 'beside the cheapest bazaar · grey rows leave too little' })]), this.buysBox]);
+            this.planEl = spEl('div', { class: 'panel planp' });
+            this.whereEl = spEl('div', { class: 'panel' });
+            // On My items and To sell the trade is one row: the whole of it is on Flips and on Trades.
+            this.tradeFoldEl = spEl('div', { class: 'panel fold', hidden: '' });
+            this.deskParts = [this.headEl, this.askEl, this.payEl, this.buysEl, this.planEl, this.whereEl, this.tradeFoldEl];
+
+            /* each page's few totals, the Trades board, and Today */
+            this.tradesTiles = spVars(spEl('div', { class: 'tiles' }), { '--n': 4 });
+            this.mineTiles = spVars(spEl('div', { class: 'tiles' }), { '--n': 3 });
+            this.sellTiles = spVars(spEl('div', { class: 'tiles' }), { '--n': 3 });
+            this.boardEl = spEl('div', { class: 'board' });
+            this.todayTiles = spEl('div', { class: 'kpis' });
+            this.todayFlips = spEl('div', { class: 'grow-rows' });
+            this.todayDo = spEl('div', { class: 'next' });
+            this.todayTrades = spEl('div', { class: 'grow-rows' });
+            this.todayHold = spEl('div', { class: 'pb' });
+            this.todayChart = spEl('div', { class: 'chartbox' });
+            const goBtn = (label, id, tab = null) => spEl('button', { type: 'button', class: 'btn sm', text: label, onclick: () => this.go(id, tab) });
+            const today = [
+                this.todayTiles,
+                spEl('div', { class: 'panel s8' }, [ph('Best flips now', 'what each leaves you · press one to open it', [sp(), goBtn('All flips', 'flips', BD_FLIPS_BEST)]), spEl('div', { class: 'pb flush' }, [this.todayFlips])]),
+                spEl('div', { class: 'panel s4' }, [ph('Do now', null), spEl('div', { class: 'pb' }, [this.todayDo])]),
+                spEl('div', { class: 'panel s4' }, [ph('Trades going', null, [sp(), goBtn('Trades', 'trades')]), spEl('div', { class: 'pb flush' }, [this.todayTrades])]),
+                spEl('div', { class: 'panel s4' }, [ph('What you hold', 'at what traders pay now', [sp(), goBtn('My items', 'mine')]), this.todayHold]),
+                spEl('div', { class: 'panel s4' }, [ph('Profit per day', '10 days', [sp(), goBtn('Ledger', 'ledger')]), spEl('div', { class: 'pb' }, [this.todayChart])]),
+            ];
 
             /* the Torn Ledger */
             this.ledgerView = new LedgerView({
                 onRead: () => this.h.onLedgerRead && this.h.onLedgerRead(),
                 onOpenSettings: () => {
-                    this.showView('settings');
+                    this.go('settings', BD_SET_KEYS);
                     const sec = this.snavSections && this.snavSections.find((x) => x.id === 'ledger');
-                    if (sec) {
-                        this.snavPick('ledger');
-                        sec.sec.scrollIntoView({ block: 'start' });
-                    }
+                    if (sec) sec.sec.scrollIntoView({ block: 'start' });
                     if (this.ledgerKeyInput) this.ledgerKeyInput.focus({ preventScroll: true });
+                },
+                // The Ledger moved to another of its tabs by itself (a press inside it): the tabs on top follow.
+                onTab: (key) => {
+                    const i = BD_LEDGER_TABS.indexOf(key);
+                    if (i >= 0 && this.bd.page === 'ledger') this.go('ledger', i, true);
                 },
                 onOpenUrl: (url) => this.h.onOpenUrl && this.h.onOpenUrl(url),
                 onFavourite: (b, on) => this.h.onFavourite && this.h.onFavourite(b, on),
                 onBlacklist: (b, on) => this.h.onBlacklist && this.h.onBlacklist(b, on),
             });
-            this.ledgerEl = spEl('main', { class: 'sp-main', hidden: '' }, [this.ledgerView.el]);
 
             /* settings */
-            this.settingsEl = spEl('main', { class: 'sp-main', hidden: '' });
+            this.settingsEl = spEl('div');
             this.buildSettings();
 
-            this.root = spEl('div', { class: 'sp-page' }, [this.headEl, this.bannerEl, this.listEl, this.ledgerEl, this.settingsEl]);
+            bdBuildShell(this, {
+                title: SELLING_PAGE_TITLE,
+                tagline: 'Every item, both sides',
+                parts: { top: [this.cashPill, this.pricesPill, this.refreshBtn], today, ledger: [this.ledgerView.el], settings: [this.settingsEl] },
+            });
+            this.bd.mainEl.insertBefore(this.bannerEl, this.bd.viewEl);
+            this.bd.sharedEl.addEventListener('click', () => this.go('settings', BD_SET_KEYS));
+            bdPut(this, 'trades-tiles', this.tradesTiles);
+            bdPut(this, 'trades-board', this.boardEl);
+            bdPut(this, 'mine-tiles', this.mineTiles);
+            bdPut(this, 'sell-tiles', this.sellTiles);
+            this.go('today', 0, true);
+        }
+
+        /* ------------------------------------------------------- pages and tabs */
+
+        /** The tabs of a page, in the words shown now. */
+        tabsOf(id) {
+            if (id === 'flips') return ['Best flips', 'By trader', 'All items'];
+            if (id === 'ledger') {
+                const mugs = ((this.state.ledger || {}).mugs || []).length;
+                return ['Trading', 'Sold', 'Receipts', 'Traders', 'Mugged' + (mugs ? ' · ' + count(mugs) : '')];
+            }
+            if (id === 'settings') return ['Keys and sharing', 'Flips and reading', 'Help'];
+            return null;
+        }
+
+        /** Flips › By trader is in view. */
+        onTraders() {
+            return Boolean(this.bd) && this.bd.page === 'flips' && this.bd.tab === BD_FLIPS_TRADER;
         }
 
         /**
-         * Settings (the owner picked mockups/J-settings-sidebar.html): a menu down
-         * the left, each part with its state like the header pills, and the full
-         * width for the parts themselves - a label on the left, the field on the
-         * right. The page scrolls; the menu stays in view and follows it.
+         * Goes to a page and one of its tabs (the tab it had last when none is given). The parts move there, and
+         * the script is told, so the list it works out is this page's.
+         * @param {boolean} quiet - only the frame: nothing is told (the page being built, or a tab the Ledger changed itself)
+         */
+        go(id, tab = null, quiet = false) {
+            if (!this.bd || !this.bd.pages[id]) return;
+            const t = tab === null || tab === undefined ? this.tabAt[id] || 0 : tab;
+            const moved = this.bd.page !== id || this.bd.tab !== t;
+            bdShow(this, id, t, this.tabsOf(id));
+            this.tabAt[id] = this.bd.tab;
+            this.view = id === 'settings' ? 'settings' : id === 'ledger' ? 'ledger' : 'list';
+            // API use and the report are drawn again every few seconds while Settings is open.
+            if (id === 'settings' && !this.usageTimer) {
+                this.renderUsage();
+                this.usageTimer = setInterval(() => this.renderUsage(), 5000);
+            } else if (id !== 'settings' && this.usageTimer) {
+                clearInterval(this.usageTimer);
+                this.usageTimer = null;
+            }
+            if (id === 'settings') this.settingsTab();
+            else if (id !== 'ledger') this.backTo = id;
+            if (id === 'ledger') {
+                const key = BD_LEDGER_TABS[this.bd.tab] || 'trade';
+                if (this.ledgerView.tab !== key) {
+                    this.ledgerView.tab = key;
+                    this.ledgerView.sig = null;
+                }
+                this.ledgerView.render(this.ledgerArgs());
+            }
+            if (moved) this.visit = {};
+            this.syncFind();
+            this.place();
+            this.listSig = null;
+            this.deskSig = null;
+            this.renderBanner();
+            if (quiet) return;
+            if (this.h.onPage) this.h.onPage(this.bd.page, this.bd.tab, bdFilterOf(this.bd.page, this.bd.tab));
+            else this.render({});
+        }
+
+        /** The older names for the three views: the list (Flips), the Ledger, Settings. */
+        showView(view) {
+            if (view === 'settings') this.go('settings');
+            else if (view === 'ledger') this.go('ledger');
+            else if (this.view !== 'list') this.go('flips');
+        }
+
+        openSettings() {
+            this.go('settings', BD_SET_KEYS);
+        }
+
+        /** Settings shows the parts of the tab in view. */
+        settingsTab() {
+            const tab = this.bd.tab;
+            for (const s of this.snavSections || []) s.sec.hidden = BD_SET_OF[s.id] !== tab;
+            // The first part of a tab has no line over it.
+            const first = (this.snavSections || []).map((x) => x.sec).filter((sec) => !sec.hidden).sort((a, b) => (a.compareDocumentPosition(b) & 4 ? -1 : 1))[0];
+            for (const x of this.snavSections || []) x.sec.classList.toggle('sp-first', x.sec === first);
+            this.flagSettingsTabs();
+        }
+
+        /** The mark on a Settings tab that holds something to do (renderSettingsNav works out which). */
+        flagSettingsTabs() {
+            if (!this.bd || this.bd.page !== 'settings') return;
+            [...this.bd.tabsEl.children].forEach((b, i) => {
+                const flag = (this.setFlags || [])[i] || null;
+                if (flag) {
+                    b.setAttribute('data-flag', flag);
+                    b.title = flag === 'bad' ? 'A key was refused' : 'A key is missing';
+                } else if (b.hasAttribute('data-flag')) {
+                    b.removeAttribute('data-flag');
+                    b.removeAttribute('title');
+                }
+            });
+        }
+
+        /** The list's search row and filters, as the page in view uses them. */
+        syncFind() {
+            const page = this.bd.page;
+            const traders = this.onTraders();
+            this.listPh.hidden = page !== 'sell';
+            this.findEl.hidden = page === 'sell';
+            this.catEl.hidden = traders;
+            this.favBtn.hidden = !traders;
+            this.invEl.hidden = page !== 'mine';
+            this.searchEl.placeholder = traders ? 'Search traders… ( / )' : page === 'mine' ? 'Search your items… ( / )' : 'Search items… ( / )';
+            const want = traders ? this.traderQuery || '' : this.query;
+            if (this.searchEl.value !== want) this.searchEl.value = want;
+        }
+
+        /** A trade is shown beside what you hold only once you asked for it (or they said yes). */
+        planOnSide() {
+            const T = this.state.desk && this.state.desk.trade;
+            return Boolean(T && (T.accepted || (T.chosen && T.picked)));
+        }
+
+        /** Each part into the page in view: one list, one head, one trade - moved, never drawn twice. */
+        place() {
+            const { page } = this.bd;
+            const traders = this.onTraders();
+            const flips = page === 'flips';
+            this.bd.pages.flips.firstElementChild.classList.toggle('c3t', traders);
+            bdPut(this, 'flips-list', flips ? this.listPanel : null);
+            bdPut(this, 'flips-mid', ...(flips ? (traders ? [this.buysEl] : [this.headEl, this.askEl, this.payEl]) : []));
+            bdPut(this, 'flips-plan', flips ? this.planEl : null);
+            bdPut(this, 'trades-detail', page === 'trades' ? this.planEl : null);
+            // Beside what you hold: where to sell it straight under its head, then its trade as one row.
+            const side = [this.headEl, this.whereEl, this.planOnSide() ? this.tradeFoldEl : null];
+            bdPut(this, 'mine-list', page === 'mine' ? this.listPanel : null);
+            bdPut(this, 'mine-side', ...(page === 'mine' ? side : []));
+            bdPut(this, 'sell-list', page === 'sell' ? this.listPanel : null);
+            bdPut(this, 'sell-side', ...(page === 'sell' ? side : []));
+        }
+
+        ledgerArgs() {
+            const s = this.state;
+            return { ledger: s.ledger || {}, nameOf: s.itemNameOf, typeOf: s.itemTypeOf };
+        }
+
+        /* ----------------------------------------------------------- render */
+
+        /**
+         * @param {object} view
+         *   strip     - the best flips: [{itemId, name, plan, buyer}]
+         *   list      - item rows for the filter: [{itemId, name, held, lowest, badge, pending, units, stops, to, top, bid}]
+         *   listTotal - rows before the page cut
+         *   counts    - {all, mine, flips, sell, trades}
+         *   filter    - 'all' | 'mine' | 'flips' | 'sell' | 'trades'
+         *   categories - [{category, count}] for the Category dropdown
+         *   category  - the one picked, or ''
+         *   desk      - the item picked (see renderDesk), or null
+         *   scan      - Your traders: the best whole trade with each
+         *   toSell, trades, hold, ledger - the pages of those names
+         *   statuses  - Map traderId -> {level, text, title}
+         *   prefs     - this page's preferences
+         *   info      - key states, sources, loading
+         */
+        render(view) {
+            Object.assign(this.state, view);
+            if (!this.root) return;
+
+            const p = this.state.prefs;
+            for (const [btn, on] of [[this.onlineBtn, p.onlineOnly], [this.trustedBtn, p.trustedOnly], [this.freshBtn, p.freshOnly]]) {
+                btn.setAttribute('aria-pressed', String(Boolean(on)));
+                btn.classList.toggle('on', Boolean(on));
+            }
+            this.linksInput.checked = p.linksNewTab !== false;
+            // Every settings box shows what is saved (not while you are in it).
+            for (const box of this.boxes || []) box.sync();
+            const hasCash = p.cash > 0;
+            this.cashNone.checked = !hasCash;
+            if (!(this.cashInput.getRootNode && this.cashInput.getRootNode().activeElement === this.cashInput)) this.cashUpTo.checked = hasCash;
+            this.cashInput.classList.toggle('sp-dim', !hasCash);
+            this.renderKeepList(p);
+            this.renderNeverFlip(p);
+            this.renderFresh(p);
+            this.renderBlackList();
+
+            this.renderCategory();
+            this.renderLedgerKey();
+            if (this.bd.page === 'ledger') this.ledgerView.render(this.ledgerArgs());
+            this.renderKeyStates();
+            this.renderShared();
+            this.renderSettingsNav();
+            this.renderPills();
+            this.renderBanner();
+            this.renderNav();
+            this.autoPick();
+            this.place();
+            this.renderStill();
+            this.renderList();
+            this.renderDesk();
+            this.renderTiles();
+            this.renderBoard();
+            this.renderToday();
+            this.renderTape();
+        }
+
+        /**
+         * A page that shows one thing of a list opens on the first: To sell on its first row, Trades on the
+         * first trade going, By trader on the best trade. Once a visit, and never under a press of yours.
+         */
+        autoPick() {
+            const s = this.state;
+            const v = this.visit;
+            if (v.picked) return;
+            const page = this.bd.page;
+            if (page === 'sell' && s.filter === 'sell') {
+                v.picked = true;
+                const first = s.toSell && s.toSell.open ? (s.toSell.groups[0] ? s.toSell.groups[0].rows[0] : s.toSell.rows[0]) : null;
+                if (first) queueMicrotask(() => this.select(first.itemId));
+            } else if (page === 'trades' && s.filter === 'trades') {
+                v.picked = true;
+                const first = s.trades && s.trades.open ? this.tradesGoing().slice().reverse()[0] : null;
+                if (first) queueMicrotask(() => this.openTrade(first[0], first[1]));
+            } else if (this.onTraders()) {
+                const list = ((s.scan && s.scan.list) || []).filter((x) => this.traderReady(x));
+                if (!list.length) return;
+                v.picked = true;
+                const key = this.tradeKeyOnShow();
+                if (!list.some((x) => x.key === key)) queueMicrotask(() => this.h.onTradePick && this.h.onTradePick(list[0].mainId, list[0].key));
+            }
+        }
+
+        /** The key of the trader whose trade is on show, or null. */
+        tradeKeyOnShow() {
+            const T = this.state.desk && this.state.desk.trade;
+            return T && T.accepted ? T.accepted.key : T && T.chosen ? T.chosen.key : null;
+        }
+
+        /** A Your traders row has a trade to plan now. */
+        traderReady(x) {
+            return x.items > 0 && x.profit > 0 && !x.hiddenBy && !x.waiting;
+        }
+
+        /* ------------------------------------------ top bar, sidebar, bottom line */
+
+        /**
+         * Your Cash for flips (press it to change it), and one pill for how old the prices are: the four
+         * sources behind it are on its hover and read out. A source in trouble turns the pill amber or red
+         * and is named in it - it never takes over the page while the others are working.
+         */
+        renderPills() {
+            if (!this.root) return;
+            const info = this.state.info || {};
+            const now = Date.now();
+            const pills = [];
+            const pill = (level, label, text, title) => pills.push({ level, label, text, title });
+            const age = (at) => formatAge(now - at).replace(' ago', '');
+
+            const known = info.w3bKnown || 0;
+            const read = info.w3bRead || 0;
+            if (!known) pill('unknown', 'TornW3B', 'no traders yet', 'No trader known yet');
+            else if (read < known) pill('idle', 'TornW3B', read + '/' + known, 'Reading traders\' TornW3B price lists: ' + read + ' of ' + known);
+            else pill('online', 'TornW3B', (info.w3bTraders || 0) + ' lists', 'Every known trader\'s TornW3B list read; ' + (info.w3bTraders || 0) + ' have one');
+
+            const checked = info.flipsChecked || 0;
+            const wanted = info.flipsWanted || 0;
+            if (info.bazaarsError && !info.bazaarsAt) pill('bad', 'Bazaars', 'not loaded', info.bazaarsError);
+            else if (!info.bazaarsAt) pill('idle', 'Bazaars', 'loading', 'Loading bazaar prices from TornW3B');
+            else pill(checked < wanted ? 'idle' : 'online', 'Bazaars', age(info.bazaarsAt), 'TornW3B bazaar prices, ' + formatAge(now - info.bazaarsAt) + (wanted ? '. Possible flips checked against every bazaar: ' + checked + ' of ' + wanted : ''));
+
+            const perItem = info.heldCount ? ' Best buyer per item, without a key: ' + (info.teOneDone || 0) + ' of ' + info.heldCount + '.' : '';
+            if (info.teStatus === 'ok' && info.teError) pill('idle', 'TornExchange', info.teAt ? age(info.teAt) : '', info.teError);
+            else if (info.teStatus === 'ok') pill('online', 'TornExchange', info.teAt ? age(info.teAt) : '', 'TornExchange prices ' + (info.teAt ? formatAge(now - info.teAt) : ''));
+            else if (info.teStatus === 'badkey') pill('bad', 'TornExchange', 'key refused', 'Key not accepted.' + perItem);
+            else if (info.teStatus === 'nokey') pill('unknown', 'TornExchange', 'no key', 'No TornExchange key.' + perItem);
+            else pill('idle', 'TornExchange', 'loading', 'Loading TornExchange prices');
+
+            const want = info.statusesWanted || 0;
+            const got = info.statusesKnown || 0;
+            pill(want && got >= want ? 'online' : 'idle', 'Online', got + '/' + want, 'Traders\' online status checked: ' + got + ' of ' + want);
+
+            const inv = info.inventoryAt ? 'inventory read ' + formatAge(now - info.inventoryAt) : '';
+            if (this.invEl.textContent !== inv) this.invEl.textContent = inv;
+
+            const cash = this.state.prefs.cash;
+            const sig = JSON.stringify([pills, cash]);
+            if (sig === this.pillSig) return;
+            this.pillSig = sig;
+            this.cashPill.textContent = '';
+            this.cashPill.append('Cash', spEl('b', { text: cash > 0 ? formatMoney(cash) : 'no limit' }));
+            // The worst of the four is the pill's dot; a refused or missing one is named in it.
+            const bad = pills.find((x) => x.level === 'bad');
+            const worst = bad || pills.find((x) => x.level === 'unknown' && x.label === 'TornExchange') || null;
+            const busy = pills.some((x) => x.level === 'idle');
+            const bz = pills[1];
+            const text = worst ? worst.label + ': ' + worst.text : bz.text;
+            const said = pills.map((x) => x.label + ': ' + x.title).join('\n');
+            this.pricesPill.textContent = '';
+            this.pricesPill.append(spEl('i', { class: 'dot' + (bad ? ' bad' : worst || busy ? ' warn' : '') }), worst ? '' : 'Prices', spEl('b', { text }));
+            this.pricesPill.title = said;
+            this.pricesPill.setAttribute('aria-label', 'Prices. ' + pills.map((x) => x.title).join('. '));
+        }
+
+        /** The sidebar: how many each page holds, the tabs' words, and Shared in one line. */
+        renderNav() {
+            const s = this.state;
+            const c = s.counts || {};
+            const T = s.trades || {};
+            bdNavCount(this, 'flips', c.flips || 0);
+            bdNavCount(this, 'trades', c.trades || 0, Boolean((T.ready || []).length));
+            bdNavCount(this, 'mine', c.mine || 0);
+            bdNavCount(this, 'sell', c.sell || 0);
+            bdTabs(this, this.tabsOf(this.bd.page));
+
+            const info = s.info || {};
+            const now = Date.now();
+            const st = info.shared || null;
+            const line = sharedKnown(st) ? sharedNowLine(st, now) : null;
+            const word = !line ? '' : line.level === 'ok' ? (st.people ? st.people + (st.people === 1 ? ' person' : ' people') : 'connected')
+                : line.level === 'bad' ? 'update Torn Bids'
+                    : line.level === 'idle' ? 'connecting' : 'working alone';
+            const sig = JSON.stringify([line && line.level, word, info.beside || null]);
+            if (sig === this.sharedSig) return;
+            this.sharedSig = sig;
+            const box = this.bd.sharedEl;
+            box.textContent = '';
+            box.hidden = !line && !info.beside;
+            if (box.hidden) return;
+            box.title = [line ? 'Shared: ' + line.text : '', info.beside || ''].filter(Boolean).join('\n');
+            box.append(
+                spEl('i', { class: 'dot' + (line && line.level === 'ok' && !info.beside ? '' : line && line.level === 'bad' ? ' bad' : ' warn') }),
+                spEl('span', { class: 'lab' }, [
+                    line ? spEl('span', {}, [spEl('b', { text: 'Shared' }), ' · ' + word]) : null,
+                    line && info.beside ? spEl('br') : null,
+                    info.beside ? spEl('span', { text: 'Torn Archive is in front: fewer reads here' }) : null,
+                ]),
+            );
+        }
+
+        /** The line along the bottom: what just happened, and how far the reading is. */
+        renderTape() {
+            const s = this.state;
+            const info = s.info || {};
+            const now = Date.now();
+            const said = [];
+            if (s.stillEnded) said.push(['', s.stillEnded]);
+            const d = s.desk;
+            if (d && d.friend && d.friend.going) said.push([d.name, d.friend.going.lead + ' · ' + d.friend.going.rest]);
+            // The item on show has said it: once.
+            const shown = d && d.friend && d.friend.going ? String(d.itemId) : null;
+            for (const r of s.list || []) if (r.mark && r.mark.kind === 'friend' && String(r.itemId) !== shown) said.push([r.name, r.mark.text]);
+            const HOW = { traded: 'traded', cancel: 'cancelled', old: 'no trade in a day' };
+            for (const e of ((s.trades && s.trades.ended) || []).slice(0, 4)) {
+                said.push([e.name, (HOW[e.how] || 'ended') + (e.how === 'traded' && e.profit ? ' ' + signed(e.profit) : '') + (e.moved && e.moved.length ? ' · ' + e.moved.map((m) => count(m.qty) + ' ' + m.name).join(', ') + ' went to To sell' : '') + ' · ' + formatAge(now - e.at)]);
+            }
+            const st = info.shared || null;
+            if (sharedKnown(st)) said.push(['Shared', sharedNowLine(st, now).text]);
+            if (!said.length) said.push(['', info.bazaarsAt ? 'Nothing new. Prices are read as they change.' : 'Loading bazaar prices…']);
+            const right = [];
+            if (info.flipsWanted) right.push(['possible flips checked', info.flipsChecked + ' of ' + info.flipsWanted]);
+            if (info.w3bKnown) right.push(['price lists', count(info.w3bRead || 0) + ' of ' + count(info.w3bKnown)]);
+            const sig = JSON.stringify([said, right]);
+            if (sig === this.tapeSig) return;
+            this.tapeSig = sig;
+            const bd = this.bd;
+            bd.tapeEl.textContent = '';
+            for (const [lead, text] of said) bd.tapeEl.appendChild(spEl('span', { class: 'tk' }, [lead ? spEl('b', { text: lead }) : null, text]));
+            bd.tapeRight.textContent = '';
+            for (const [k, v] of right) bd.tapeRight.appendChild(spEl('span', {}, [k + ' ', spEl('b', { text: v })]));
+            bd.tapeRight.hidden = !right.length;
+        }
+
+        /* ------------------------------------------------------- small pieces */
+
+        /** A picture, kept per place so a re-render never reloads it. */
+        image(place, itemId, size = 'small') {
+            const key = place + ':' + itemId;
+            let img = this.images.get(key);
+            if (!img) {
+                img = spEl('img', { alt: '', loading: 'lazy', src: itemImageUrl(itemId, size) });
+                img.addEventListener('error', () => {
+                    img.style.visibility = 'hidden';
+                });
+                this.images.set(key, img);
+            }
+            return img;
+        }
+
+        /** Torn's picture of an item in its frame: small in a row, 'lg' or 'xl' where it leads. */
+        pic(place, itemId, size = '') {
+            return spEl('span', { class: 'it' + (size ? ' ' + size : '') }, [this.image(place + size, itemId, size === 'xl' ? 'large' : size === 'lg' ? 'medium' : 'small')]);
+        }
+
+        /** A trader's status as one dot (green online, amber busy or idle, grey offline). Nothing when not known yet. */
+        dot(b) {
+            const st = b && b.id && this.state.statuses ? this.state.statuses.get(String(b.id)) : null;
+            if (!st) return null;
+            return spEl('i', { class: 'dot' + (st.level === 'online' ? '' : st.level === 'offline' ? ' off' : ' warn'), title: (b.name ? b.name + ': ' : '') + (st.title || st.text), 'aria-label': st.title || st.text });
+        }
+
+        /** What the status dot of a trader shows, for a signature. */
+        dotSig(b) {
+            const st = b && b.id && this.state.statuses ? this.state.statuses.get(String(b.id)) : null;
+            return st ? st.level + st.text : '';
+        }
+
+        /** A bar beside a number: how big it is next to the others. */
+        bar(value, max, cls = '') {
+            const w = max > 0 ? Math.max(2, Math.min(100, Math.round((value / max) * 100))) : 2;
+            return spEl('span', { class: 'bar' + (cls ? ' ' + cls : ''), 'aria-hidden': 'true' }, [spVars(spEl('i'), { '--w': w + '%' })]);
+        }
+
+        /** A table row you can press; Enter and Space press it too. A button or a link inside it keeps its own press. */
+        pickRow(cls, focus, onPick, cells, title = '') {
+            const tr = spEl('tr', { class: 'pick' + (cls ? ' ' + cls : ''), tabindex: '0', role: 'button', 'data-focus': focus, title: title || null }, cells);
+            tr.addEventListener('click', (event) => {
+                const t = event.target;
+                if (t && t.closest && t.closest('a, button, input, select') && t.closest('a, button, input, select') !== tr) return;
+                onPick();
+            });
+            tr.addEventListener('keydown', (event) => {
+                if (event.target !== tr || (event.key !== 'Enter' && event.key !== ' ')) return;
+                event.preventDefault();
+                onPick();
+            });
+            return tr;
+        }
+
+        /** A small button in words (Undo, Show them, Keep). It never presses the row it sits in. */
+        wordBtn(text, focus, title, onPress, cls = 'quiet u') {
+            return spEl('button', { type: 'button', class: cls, 'data-focus': focus, title: title || null, text, onclick: (event) => {
+                event.stopPropagation();
+                onPress();
+            } });
+        }
+
+        /** An item's name, opening the Item Market at it. */
+        itemLink(itemId, name, focus) {
+            return this.link(name, itemMarketUrl(itemId, name), { cls: 'tiname', title: 'Opens the Item Market at this item', focus });
+        }
+
+        /** Shared: "<Torn name> is going for this · opened 3m ago" / "<Torn name> bought 2 at <bazaar> · 1m ago · your plan is now 3". */
+        friendEl(line, sep = ' · ', more = '') {
+            if (!line) return null;
+            return spEl('span', { class: 'frl', title: 'A mark, not a lock: you can still take it' + (more ? ' · ' + more : '') }, [spEl('b', { text: line.lead }), sep + line.rest]);
+        }
+
+        select(itemId) {
+            if (this.h.onSelect) this.h.onSelect(itemId);
+        }
+
+        /* ------------------------------------------------------------- lists */
+
+        /** The list of the page in view: flips, every item, what you hold, what you bought to resell, or the traders. */
+        renderList() {
+            if (!this.listPanel.isConnected) return;
+            const page = this.bd.page;
+            if (this.onTraders()) this.renderTraderList();
+            else if (page === 'sell') this.renderSellList();
+            else if (page === 'mine') this.renderItemList('mine');
+            else if (page === 'flips') this.renderItemList(this.bd.tab === BD_FLIPS_ITEMS ? 'all' : 'flips');
+        }
+
+        /** The table's head and rows put in, the focus kept on the same row's new copy. */
+        listDraw(heads, rows, empty) {
+            const key = this.focusKeyIn(this.listBox);
+            this.listHead.textContent = '';
+            this.listHead.appendChild(spEl('tr', {}, heads.map((h) => spEl('th', { class: h.n ? 'n' : '', title: h.title || null, text: h.text }))));
+            this.listBody.textContent = '';
+            for (const r of rows) this.listBody.appendChild(r);
+            this.listHead.hidden = !rows.length;
+            this.listEmpty.hidden = rows.length > 0;
+            this.listEmpty.textContent = rows.length ? '' : empty;
+            this.focusBack(this.listBox, key);
+        }
+
+        /**
+         * Best flips, All items and My items: one row an item.
+         *   flips  Item (how many, from how many bazaars) | Sell to | Profit
+         *   all    Item (its flip, if any)                | You hold | Top price
+         *   mine   Item (bought to resell: what you paid) | You hold | Best trader pays | For all of it
+         * A pinned trade is listed once, on top (the owner: "it created something doubled, instead of just pinning it").
+         */
+        renderItemList(kind) {
+            const s = this.state;
+            const info = s.info || {};
+            // The rows are still the last page's: the script draws again in a moment.
+            if (s.filter !== kind) return;
+            const pinnedItems = new Set((s.pinned || []).map((p) => p.itemId));
+            const list = this.stableOrder(s.list).filter((r) => !pinnedItems.has(r.itemId));
+            const paidOf = new Map(kind === 'mine' ? ((s.toSell && s.toSell.rows) || []).map((r) => [String(r.itemId), r]) : []);
+            const now = Date.now();
+            const sig = JSON.stringify([
+                'items', kind, s.counts, s.listTotal, s.desk && s.desk.itemId, info.hasKey, info.loading, info.inventoryAt ? 1 : 0, info.tradersLoading, Boolean(info.bazaarsAt), this.query, s.category,
+                list.map((r) => [r.itemId, r.name, r.held, r.lowest, r.badge && [r.badge.kind, r.badge.amount], r.pending, r.units, r.stops, r.bid, r.mark && r.mark.text, r.still && [r.still.move, r.still.gone, r.still.was],
+                    r.to && [r.to.name, this.dotSig(r.to), r.to.old ? listAgeText(now - r.to.old.at) : ''], r.top && [r.top.name, r.top.price, this.dotSig(r.top)], paidOf.has(r.itemId) ? paidOf.get(r.itemId).each : 0]),
+                s.pinned || [],
+            ]);
+            if (sig === this.listSig) return;
+            this.listSig = sig;
+
+            const heads = kind === 'flips'
+                ? [{ text: 'Item' }, { text: 'Sell to' }, { text: 'Profit', n: true }]
+                : kind === 'all'
+                    ? [{ text: 'Item' }, { text: 'You hold', n: true }, { text: 'Top price', n: true, title: 'What the best trader pays for one' }]
+                    : [{ text: 'Item' }, { text: 'You hold', n: true }, { text: 'Best trader pays', n: true }, { text: 'For all of it', n: true }];
+            const rows = [];
+            // Pinned trades first, whatever the list: the main flip, the trader, the profit now.
+            for (const pt of s.pinned || []) {
+                const unpin = spEl('button', { type: 'button', class: 'rowpin on', 'aria-pressed': 'true', 'data-focus': 'unpin:' + pt.key, 'aria-label': 'Unpin the trade with ' + pt.trader, title: 'Pinned: press to unpin', onclick: (event) => {
+                    event.stopPropagation();
+                    if (this.h.onUnpin) this.h.onUnpin(pt.key);
+                } }, [pinIcon()]);
+                rows.push(this.pickRow('pinrow' + (pt.on ? ' sel' : ''), 'pin:' + pt.key, () => this.h.onPinnedOpen && this.h.onPinnedOpen(pt.key), [
+                    spEl('td', { colspan: String(heads.length - 1) }, [spEl('div', { class: 'cell' }, [this.pic('pin', pt.itemId), spEl('div', {}, [
+                        spEl('b', { text: pt.name }),
+                        spEl('small', { text: pt.trader + (pt.mainId !== pt.itemId ? ' · main ' + pt.mainName : '') + ' · ' + count(pt.items) + (pt.items === 1 ? ' item' : ' items') + ' · ' + count(pt.stops) + (pt.stops === 1 ? ' bazaar' : ' bazaars') }),
+                    ])])]),
+                    spEl('td', { class: 'n' }, [spEl('b', { class: pt.profit < 0 ? 't-bad' : 't-good', text: signed(pt.profit) }), unpin]),
+                ], 'Your pinned trade: only prices and profit move'));
+            }
+            const pinnedIds = new Set((s.pinned || []).map((p) => p.itemId));
+            const max = kind === 'flips'
+                ? Math.max(1, ...list.map((r) => (r.badge && r.badge.kind === 'flip' ? r.badge.amount : 0)))
+                : Math.max(1, ...list.map((r) => (r.held || 0) * (r.bid || 0)));
+            const trader = (b, withPrice) => (b ? [this.dot(b), b.name, withPrice ? ' ' : null, withPrice ? spEl('b', { text: formatMoney(b.price) }) : null] : [spEl('span', { class: 't-muted', text: '–' })]);
+            for (const r of list) {
+                const on = Boolean(s.desk && s.desk.itemId === r.itemId);
+                const flip = Boolean(r.badge && r.badge.kind === 'flip');
+                const friend = Boolean(r.mark && r.mark.kind === 'friend');
+                // A trade is under way and this row is no flip any more (3.25.0): it keeps its place, greyed.
+                const gone = Boolean(r.still && r.still.gone);
+                const tags = [
+                    r.mark ? spEl('span', { class: 'tag', title: friend ? 'A mark, not a lock: you can still take it' : 'Your friends see that you are going for this', text: r.mark.text }) : null,
+                    gone ? spEl('span', { class: 'tag', title: 'It was a flip when the list was held. It keeps its place until your trade ends.', text: 'No flip now' }) : null,
+                ];
+                let sub;
+                if (kind === 'flips') sub = flip && r.units ? '× ' + count(r.units) + ' · ' + count(r.stops) + (r.stops === 1 ? ' bazaar' : ' bazaars') + (r.buy && r.sell ? ' · buy ' + formatMoney(r.buy) + ' · sell ' + formatMoney(r.sell) : '') : gone ? 'held in its place' : '';
+                else if (kind === 'all') sub = flip ? null : r.badge && r.badge.kind === 'list' ? 'your bazaar pays ' + signed(r.badge.amount) + ' more than a trader' : r.pending ? 'Checking…' : r.lowest ? 'no flip now · from ' + formatMoney(r.lowest) : 'no flip now';
+                else {
+                    const paid = paidOf.get(r.itemId);
+                    sub = paid ? 'bought to resell · you paid ' + formatMoney(paid.each) : r.badge && r.badge.kind === 'list' ? 'your bazaar pays ' + signed(r.badge.amount) + ' more than a trader' : '';
+                }
+                const first = spEl('td', {}, [spEl('div', { class: 'cell' }, [this.pic('list', r.itemId), spEl('div', {}, [
+                    spEl('b', { text: r.name }),
+                    ...tags,
+                    kind === 'all' && flip ? spEl('small', { class: 't-good', text: 'flip ' + signed(r.badge.amount) }) : sub ? spEl('small', { text: sub }) : null,
+                ])])]);
+                const cells = [first];
+                if (kind === 'flips') {
+                    const pinned = pinnedIds.has(r.itemId);
+                    // The pin (the owner: "put it here as well"): pressing it changes only its colour - the row stays where it is.
+                    const pin = flip ? spEl('button', { type: 'button', class: 'rowpin' + (pinned ? ' on' : ''), 'aria-pressed': String(pinned), 'data-focus': 'rowpin:' + r.itemId, 'aria-label': (pinned ? 'Unpin ' : 'Pin ') + r.name + '\'s trade', title: pinned ? 'Pinned on top of the list: press to unpin' : 'Pin this trade: it stays on top of the list, only prices move', onclick: (event) => {
+                        event.stopPropagation();
+                        if (this.h.onPin) this.h.onPin(r.itemId);
+                    } }, [pinIcon()]) : null;
+                    cells.push(
+                        spEl('td', {}, r.to ? [this.dot(r.to), r.to.name, r.to.old ? spEl('small', { class: 't-warn', title: 'Their TornW3B price list was last changed then: check it before you buy', text: 'list changed ' + listAgeText(now - r.to.old.at) }) : null] : []),
+                        spEl('td', { class: 'n' }, gone
+                            ? [spEl('b', { text: signed(r.still.was) })]
+                            : flip ? [this.bar(r.badge.amount, max), spEl('b', { class: 't-good', text: signed(r.badge.amount) }), this.stillMark(r.still), pin] : []),
+                    );
+                } else {
+                    cells.push(spEl('td', { class: 'n' }, [r.held ? count(r.held) : spEl('span', { class: 't-muted', text: '–' })]));
+                    cells.push(spEl('td', { class: 'n' }, r.top ? trader(r.top, true) : [spEl('span', { class: 't-muted', text: r.pending ? 'Checking…' : '–' })]));
+                    if (kind === 'mine') {
+                        const worth = (r.held || 0) * (r.bid || 0);
+                        cells.push(spEl('td', { class: 'n' }, worth > 0 ? [this.bar(worth, max), spEl('b', { class: 'amt', text: formatMoney(worth) })] : [spEl('span', { class: 't-muted', text: '–' })]));
+                    }
+                }
+                rows.push(this.pickRow((on ? 'sel' : '') + (gone ? ' gone' : ''), 'item:' + r.itemId, () => this.select(r.itemId), cells));
+            }
+            let empty = 'Loading…';
+            const q = this.query.trim();
+            if (q) empty = 'No item matches "' + q + '"' + (s.category ? ' in ' + s.category : '') + '.';
+            else if (s.category && !(s.counts && s.counts[s.filter])) empty = 'Nothing in ' + s.category + (kind === 'mine' ? ' that you hold' : kind === 'flips' ? ' to flip right now' : '') + '.';
+            else if (kind === 'mine' && !info.hasKey) empty = 'Add your Limited key to see your items.';
+            else if (kind === 'mine' && info.loading) empty = 'Loading your inventory…';
+            else if (kind === 'mine' && info.inventoryAt) empty = 'Your inventory has nothing to sell.';
+            else if (kind === 'flips') empty = this.noFlipsText();
+            else if (!info.tradersLoading && !info.traderCount && !info.hasKey) empty = 'No traders loaded yet.';
+            this.listDraw(heads, rows, empty);
+            this.moreBtn.hidden = !(s.listTotal > s.list.length);
+        }
+
+        /**
+         * Flips › By trader (Your traders, 3.14.3): one row per favourite and Trusted trader - the best whole
+         * trade with each now, the biggest first. A favourite a filter leaves out stays in view, greyed, saying why.
+         */
+        renderTraderList() {
+            const s = this.state;
+            const sc = s.scan || { list: [], favourites: 0, trusted: 0 };
+            const q = (this.traderQuery || '').trim().toLowerCase();
+            const list = (sc.list || []).filter((x) => (!q || String(x.name).toLowerCase().includes(q)) && (!this.favOnly || x.favourite));
+            const key = this.tradeKeyOnShow();
+            const now = Date.now();
+            const sig = JSON.stringify(['traders', q, this.favOnly, key, sc.favourites, sc.trusted, sc.open,
+                list.map((x) => [x.id, x.name, x.profit, x.items, x.stops, x.reading, x.lastPaid, x.mainId, x.mainUnits, x.every, x.favourite, x.waiting, x.hiddenBy, this.dotSig(x), x.traded, x.trust && x.trust.level + x.trust.score, x.estimated, x.listOld ? x.listOld.level + listAgeText(now - x.listOld.at) : ''])]);
+            if (sig === this.listSig) return;
+            this.listSig = sig;
+            const max = Math.max(1, ...list.map((x) => (this.traderReady(x) ? x.profit : 0)));
+            const rows = list.map((x) => {
+                const ready = this.traderReady(x);
+                const about = x.lastPaid || x.estimated;
+                let sub;
+                if (x.hiddenBy) sub = (x.hiddenBy === 'offline' ? 'offline: not counted while Online is ticked' : x.hiddenBy === 'stale' ? 'old price list: not counted while Fresh prices is ticked' : 'not counted while Trusted is ticked');
+                else if (ready) sub = count(x.items) + (x.items === 1 ? ' item' : ' items') + ' · ' + count(x.stops) + (x.stops === 1 ? ' bazaar' : ' bazaars') + (x.every ? ' · everything they buy' : x.mainName ? ' · ' + x.mainName + ' × ' + count(x.mainUnits) : '');
+                else sub = x.waiting ? 'Checking if they are online…' : x.reading ? 'Reading their list…' : 'No trade now: nothing in bazaars under their prices';
+                const cells = [
+                    spEl('td', {}, [spEl('div', { class: 'cell' }, [this.dot(x), spEl('div', {}, [
+                        spEl('b', {}, [x.favourite ? spEl('span', { class: 'star', title: 'A favourite', text: '★' }) : null, x.name]),
+                        x.lastPaid ? spEl('span', { class: 'tag warn', title: 'No public list: the prices they accepted from you last time. Check before buying.', text: 'Last paid' }) : null,
+                        spEl('small', { text: sub + (x.traded ? ' · ' + x.traded : '') }),
+                        ready && x.listOld ? this.oldListEl(x.listOld) : null,
+                    ])])]),
+                    spEl('td', { class: 'n' }, ready
+                        ? [this.bar(x.profit, max), spEl('b', { class: 't-good', title: x.lastPaid ? 'About: from what they paid you last time' : x.estimated ? 'About: some bazaars are still being read' : null, text: (about ? '≈ ' : '') + signed(x.profit) })]
+                        : [spEl('span', { class: 't-muted', text: '–' })]),
+                ];
+                if (!ready) return spEl('tr', { class: 'dim', title: x.hiddenBy ? 'A favourite stays in view. Their trade is not counted while the filter is on.' : null }, cells);
+                return this.pickRow(key === x.key ? 'sel' : '', 'scan:' + x.id, () => this.h.onTradePick && this.h.onTradePick(x.mainId, x.key), cells, 'Show the trade with ' + x.name);
+            });
+            const total = (sc.favourites || 0) + (sc.trusted || 0);
+            const empty = q || this.favOnly
+                ? (this.favOnly && !sc.favourites ? 'No favourites yet. Press ☆ beside a trader to keep them here; traders you traded with 5 or more times in 30 days join by themselves.' : 'No trader matches.')
+                : !sc.open || (total && !(sc.list || []).length) ? 'Working out the best trade with each…'
+                    : 'No favourites or trusted traders yet. Press ☆ beside a trader to keep them here; traders you traded with 5 or more times in 30 days join by themselves.';
+            this.listDraw([{ text: 'Trader' }, { text: 'The trade', n: true }], rows, empty);
+            this.moreBtn.hidden = true;
+        }
+
+        /** Why a To sell item is in the list, in a word or two. */
+        whyText(why) {
+            return why === 'cancel' ? 'Cancelled trade' : TO_SELL_WHY[why] || TO_SELL_WHY.left;
+        }
+
+        /**
+         * To sell (3.21.0): what you bought to resell and still hold, under the trader who pays most for it now -
+         * one trade for everything of yours they take. Then what nobody pays more for yet (never a trader who
+         * pays less than you paid, 3.22.0), then what you marked Not for sale (3.23.0).
+         */
+        renderSellList() {
+            const s = this.state;
+            if (s.filter !== 'sell') return;
+            const T = s.toSell || { rows: [], groups: [], waiting: [], kept: [] };
+            const rowSig = (r) => [r.itemId, r.name, r.qty, r.each, r.why, r.best && [r.best.name, r.best.price], r.gain, r.short, r.bazaar, r.kept, r.ready];
+            const sig = JSON.stringify(['sell', s.desk && s.desk.itemId, s.prefs.onlineOnly, s.prefs.trustedOnly,
+                (T.groups || []).map((g) => [g.key, g.trader.name, this.dotSig(g.trader), g.gain, g.rows.map(rowSig)]), (T.waiting || []).map(rowSig), (T.kept || []).map(rowSig)]);
+            if (sig === this.listSig) return;
+            this.listSig = sig;
+            const heads = [{ text: 'Item' }, { text: 'Why it is here' }, { text: 'You paid', n: true }, { text: 'Best now', n: true }, { text: 'Profit', n: true }, { text: '' }];
+            const rows = [];
+            const max = Math.max(1, ...(T.groups || []).flatMap((g) => g.rows.map((r) => r.gain || 0)));
+            // "Not for sale" on a row (3.23.0), and the way back: the row is kept out of every trade, not removed.
+            const keep = (r) => this.wordBtn(r.kept ? 'For sale again' : 'Keep', 'board:keep:' + r.itemId,
+                r.kept ? 'Put ' + r.name + ' back: traders who pay more than you paid are named again, and it goes into their trades'
+                    : 'Not for sale: ' + r.name + ' stays in this list, in no trade and off your bazaar\'s Fill all, until you put it back',
+                () => this.h.onNotForSale && this.h.onNotForSale(r.itemId, !r.kept));
+            const row = (r, best, profit) => this.pickRow(s.desk && s.desk.itemId === r.itemId ? 'sel' : '', 'sell:' + r.itemId, () => this.select(r.itemId), [
+                spEl('td', {}, [spEl('div', { class: 'cell' }, [this.pic('sell', r.itemId), spEl('span', {}, [this.itemLink(r.itemId, r.name, 'sell:name:' + r.itemId), ' × ' + count(r.qty)])])]),
+                spEl('td', { text: this.whyText(r.why) }),
+                spEl('td', { class: 'n', text: formatMoney(r.each) }),
+                spEl('td', { class: 'n' }, best),
+                spEl('td', { class: 'n' }, profit),
+                spEl('td', { class: 'n act' }, [keep(r)]),
+            ], 'Show where to sell it');
+            for (const g of T.groups || []) {
+                const b = g.trader;
+                rows.push(spEl('tr', { class: 'g' }, [
+                    spEl('td', { colspan: '4' }, [this.dot(b), spEl('b', {}, [this.playerName(b.name, b.id, 'board:who:' + g.key)]), ' pays more than you paid · ' + count(g.rows.length) + (g.rows.length === 1 ? ' item' : ' items') + ' · ', spEl('span', { class: 't-good', text: signed(g.gain) })]),
+                    spEl('td', { class: 'n', colspan: '2' }, [spEl('button', { type: 'button', class: 'btn sm', 'data-focus': 'board:plan:' + g.key, title: 'One trade for everything of yours ' + b.name + ' takes: these go in as yours', text: 'Trade ' + (g.rows.length === 1 ? 'it' : 'these') + ' to ' + b.name, onclick: () => this.h.onTradePick && this.h.onTradePick(g.rows[0].itemId, g.key) })]),
+                ]));
+                for (const r of g.rows) rows.push(row(r, [spEl('b', { text: formatMoney(r.best.price) })], [this.bar(r.gain, max), spEl('b', { class: 't-good', text: signed(r.gain) })]));
+            }
+            if ((T.waiting || []).length) {
+                rows.push(spEl('tr', { class: 'g' }, [spEl('td', { colspan: '6' }, [spEl('b', { text: 'Nobody pays more yet' }), ' · ' + count(T.waiting.length) + (T.waiting.length === 1 ? ' item waits' : ' items wait') + ' for a trader who pays more than you paid'])]));
+                for (const r of T.waiting) {
+                    // One over what you paid but under your least profit, your own bazaar, or nothing yet.
+                    const best = r.best
+                        ? [spEl('span', { class: 't-muted', title: 'Over what you paid, but under your least profit per item' }, [r.best.name + ' ' + formatMoney(r.best.price)])]
+                        : r.bazaar ? [spEl('span', { class: 't-muted', title: '$1 under the cheapest bazaar', text: 'your bazaar ' + formatMoney(r.bazaar.price) })] : [spEl('span', { class: 't-muted', text: '–' })];
+                    rows.push(row(r, best, [r.bazaar && !r.best ? spEl('span', { class: 't-muted', text: 'bazaar ' + signed(r.bazaar.gain) }) : spEl('span', { class: 't-muted', text: 'waiting' })]));
+                }
+            }
+            if ((T.kept || []).length) {
+                rows.push(spEl('tr', { class: 'g' }, [spEl('td', { colspan: '6' }, [spEl('b', { text: 'Not for sale' }), ' · in no trade, and off your bazaar\'s Fill all'])]));
+                for (const r of T.kept) rows.push(row(r, [spEl('span', { class: 't-muted', text: '–' })], [spEl('span', { class: 't-muted', text: 'kept' })]));
+            }
+            const all = T.rows || [];
+            if (all.length) {
+                rows.push(spEl('tr', { class: 'sum' }, [
+                    spEl('td', { text: count(all.reduce((a, r) => a + r.qty, 0)) + ' items' }),
+                    spEl('td'),
+                    spEl('td', { class: 'n', text: formatMoney(all.reduce((a, r) => a + r.qty * r.each, 0)) }),
+                    spEl('td', { class: 'n', text: 'if sold now' }),
+                    spEl('td', { class: 'n t-good', text: signed((T.groups || []).reduce((a, g) => a + g.gain, 0)) }),
+                    spEl('td'),
+                ]));
+            }
+            this.listDraw(heads, rows, 'Nothing to sell. What you bought for a trade that was cancelled, what a trader did not take, and extra buys wait here until a trader pays more than you paid.');
+            this.moreBtn.hidden = true;
+        }
+
+        /* ------------------------------------------------- what you picked */
+
+        /**
+         * Everything about the item picked, each part in its own panel: its head, who sells it, who pays for
+         * it (or, by trader, everything they pay for), the trade, and where to sell what you hold. One
+         * signature for all of them, so they are drawn again together and only when something shown changed.
+         *
+         * desk: {itemId, name, held, avg, bazaars,
+         *   buyers, buyersTotal, buyersLoading, pending,
+         *   sellers: {state: 'loading'|'error'|'ok', rows, error},
+         *   plan, planWhy: 'nobuyer'|'nounder'|'loading'|null,
+         *   where: {options, best, gain}|null, market: {state, lowest}, trade}
+         */
+        renderDesk() {
+            const page = this.bd.page;
+            if (page !== 'flips' && page !== 'mine' && page !== 'sell' && page !== 'trades') return;
+            const s = this.state;
+            // Trades: until a trade is opened, none is on show.
+            const d = page === 'trades' && s.trades && s.trades.open ? null : s.desk;
+            if (d && this.showAll.item !== d.itemId) this.showAll = { item: d.itemId, buyers: false, sellers: false, hidden: false };
+            const statusOf = (b) => {
+                const st = b.id && s.statuses ? s.statuses.get(String(b.id)) : null;
+                return st ? st.level + st.text : '';
+            };
+            const now = Date.now();
+            const p = s.prefs;
+            const info = s.info || {};
+            const where = [page, this.bd.tab, this.planOnSide()];
+            const sig = d
+                ? JSON.stringify([
+                    where,
+                    d.itemId, d.name, d.held, d.avg, d.bazaars, d.buyersTotal, d.buyersLoading, d.buyersListNote, d.pending, d.planWhy, d.paid,
+                    d.buyers.map((b) => [b.id, b.name, b.price, b.te, b.teTop, b.teList, b.w3b, statusOf(b), b.trust ? b.trust.level + b.trust.score : '', s.networth && b.id ? s.networth.get(String(b.id)) : null, Boolean(b.favourite), b.traded || '', Boolean(b.troll), Boolean(b.lastPaidOnly)]),
+                    this.justBlacklisted ? this.justBlacklisted.at : 0,
+                    (d.hidden || []).map((b) => [b.tradeKey, b.price, b.hiddenBy, statusOf(b), b.trust ? b.trust.level + b.trust.score : '']),
+                    // How old a list is, in the words shown: drawn again when they change, not every second.
+                    Object.entries(d.oldLists || {}).map(([k, o]) => [k, o.level, listAgeText(now - o.at)]),
+                    p.freshOnly, p.networthPct, p.minProfitPct,
+                    d.sellers.state, d.sellers.error,
+                    d.sellers.rows.map((r) => [r.sellerId, r.sellerName, r.price, r.qty, r.stale, Math.floor((now - (r.dataAt || 0)) / 60000)]),
+                    d.plan, d.where, d.market, d.trade, d.friend || null,
+                    this.showAll, this.showLeft || null, this.cancelAsk || null, [...(this.leftOpen || [])],
+                    p.onlineOnly, p.trustedOnly, p.cash, Boolean(info.knownTraders), info.tradersLoading,
+                    (s.pinned || []).map((x) => x.itemId), this.askedNow(d), this.keptNow(d),
+                    where[2] ? this.foldView(d) : null, this.goingWith(d), page === 'trades' ? (this.waitingOnDesk(d) || {}).key || null : null,
+                ])
+                : JSON.stringify([where, info.hasKey, info.loading, Boolean(info.bazaarsAt), info.tradersLoading, s.counts, (s.trades || {}).going || 0]);
+            if (sig === this.deskSig) return;
+
+            const shadow = this.root.getRootNode();
+            const active = shadow && shadow.activeElement;
+            const inside = (n) => this.deskParts.some((part) => part.contains(n));
+            // A box you are in is never replaced (3.14.3: it only waited once you had typed, so a selection
+            // made by a double-click was wiped within seconds by the next read): drawn again once you leave it.
+            if (active && inside(active) && active.tagName === 'INPUT' && active.type !== 'checkbox' && (active.dataset.dirty || document.hasFocus())) return;
+            this.deskSig = sig;
+            const keep = active && inside(active) && active.dataset ? active.dataset.focus : null;
+
+            if (this.headEl.isConnected) this.drawHead(d);
+            if (this.askEl.isConnected) this.drawAsk(d);
+            if (this.payEl.isConnected) this.drawPay(d);
+            if (this.buysEl.isConnected) this.drawBuys(d);
+            if (this.planEl.isConnected) this.drawPlan(d);
+            if (this.whereEl.isConnected) this.drawWhere(d);
+            if (this.tradeFoldEl.isConnected) this.drawFold(d);
+
+            if (keep) {
+                // A trader just blacklisted is gone from the rows: their Undo takes the focus.
+                // Said no: that trader's Undo (never the next trader's, review M3).
+                const want = keep.startsWith('blk:') && this.justBlacklisted ? 'desk:bl-undo' : keep.startsWith('trade:decline:') ? 'plan:undo:' + keep.slice('trade:decline:'.length) : keep;
+                for (const part of this.deskParts) {
+                    const node = part.isConnected ? [...part.querySelectorAll('[data-focus]')].find((n) => n.dataset.focus === want) : null;
+                    if (node) {
+                        node.focus({ preventScroll: true });
+                        break;
+                    }
+                }
+            }
+        }
+
+        /** Drawn again now, whatever the signature says (something of the page's own changed: a fold, a question). */
+        redrawDesk() {
+            this.deskSig = null;
+            this.renderDesk();
+        }
+
+        /** You asked the trader of the trade on show (Chat, or their Trade link): it waits for their yes. */
+        askedNow(d) {
+            const c = d && d.trade && !d.trade.accepted ? d.trade.chosen : null;
+            if (!c) return false;
+            return ((this.state.trades || {}).waiting || []).some((w) => w.asked && w.itemId === String(d.itemId) && w.key === c.key);
+        }
+
+        /**
+         * The trade of the item on show, in one row's worth: who, its profit, the step it is at, and where
+         * the whole of it is - Trades once you asked or they said yes, Flips while it is only a plan.
+         */
+        foldView(d) {
+            const T = d && d.trade;
+            const A = T && T.accepted;
+            const c = !A && T && T.chosen && T.picked ? T.chosen : null;
+            if (!A && !c) return null;
+            const b = (A || c).buyer || {};
+            const going = this.tradesGoing();
+            if (A) {
+                const at = going.findIndex(([kind, r]) => kind !== 'waiting' && r.key === A.key);
+                const profit = Math.round((A.totals || A).profit || 0);
+                return { name: b.name, id: b.id || null, profit, about: false, line: at >= 0 ? this.tradeStage(going[at][0], going[at][1]).line : 'said yes ' + formatAge(Date.now() - A.at), to: 'trades', at };
+            }
+            const at = going.findIndex(([kind, r]) => kind === 'waiting' && r.key === c.key && String(r.itemId) === String(d.itemId));
+            const line = at >= 0 ? this.tradeStage('waiting', going[at][1]).line : this.plural((c.flips || []).length, 'item') + (c.stops ? ' · ' + this.plural(c.stops, 'bazaar') : '');
+            return { name: b.name, id: b.id || null, profit: Math.round(c.profit || 0), about: Boolean(c.estimated), line, to: at >= 0 ? 'trades' : 'flips', at };
+        }
+
+        /**
+         * A trade already going with the trader who pays most for the item on show: [kind, row], or null.
+         * Where to sell then points at that trade, and offers no second one.
+         */
+        goingWith(d) {
+            const b = d && d.held && d.where ? d.buyers[0] : null;
+            const key = b ? b.tradeKey || (b.id ? 'id:' + b.id : null) : null;
+            if (!key) return null;
+            return this.tradesGoing().find(([kind, r]) => r.key === key && (kind !== 'waiting' || String(r.itemId) === String(d.itemId))) || null;
+        }
+
+        /** The trade as one row, on My items and To sell. */
+        drawFold(d) {
+            const box = this.tradeFoldEl;
+            box.textContent = '';
+            const v = this.foldView(d);
+            box.hidden = !v;
+            if (!v) return;
+            const row = v.at >= 0 ? this.tradesGoing()[v.at] : null;
+            box.append(
+                spEl('div', { class: 'lbl', text: 'Your trade on this item' }),
+                spEl('div', { class: 'foldrow' }, [
+                    spEl('span', { class: 'w' }, [spEl('b', {}, [this.playerName(v.name, v.id, 'fold:who')]), spEl('small', { text: v.line })]),
+                    spEl('span', { class: 'p' + (v.profit > 0 ? '' : v.profit < 0 ? ' neg' : ' zero'), text: (v.about ? '≈ ' : '') + signed(v.profit) }),
+                    spEl('button', { type: 'button', class: 'btn sm', 'data-focus': 'fold:open', title: v.to === 'trades' ? 'The whole trade, bazaar by bazaar, is on Trades' : 'The whole plan, bazaar by bazaar, is on Flips', text: v.to === 'trades' ? 'Open on Trades' : 'Open on Flips', onclick: () => {
+                        if (v.to === 'flips') this.showFlip(d.itemId);
+                        else if (row) this.showTrade(row[0], row[1]);
+                        else this.go('trades');
+                    } }),
+                ]),
+            );
+        }
+
+        /** The item on show is one you marked Not for sale. */
+        keptNow(d) {
+            const row = d ? (((this.state.toSell || {}).rows) || []).find((r) => String(r.itemId) === String(d.itemId)) : null;
+            return row ? Boolean(row.kept) : null;
+        }
+
+        /** Who a piece is priced against in Bazaars sell: the trader of the trade on show, else the best one. */
+        payFor(d) {
+            const T = d.trade;
+            const c = T && (T.accepted || T.chosen);
+            if (c && c.buyer) {
+                const line = (c.flips || c.items || []).find((r) => String(r.itemId) === String(d.itemId));
+                const row = d.buyers.find((b) => b.tradeKey === c.key);
+                const price = line && line.bid > 0 ? line.bid : row ? row.price : 0;
+                if (price > 0) return { name: c.buyer.name, price };
+            }
+            const b = (d.plan && d.plan.units > 0 && d.plan.buyer) || d.buyers.find((x) => !x.troll) || null;
+            return b ? { name: b.name, price: b.price } : null;
+        }
+
+        /** The head of what you picked: its picture, its name (the Item Market), a friend's mark, its few numbers. */
+        drawHead(d) {
+            const box = this.headEl;
+            const s = this.state;
+            const info = s.info || {};
+            box.textContent = '';
+            if (!d) {
+                const none = !(s.counts && s.counts.all);
+                // The list beside it says what is being waited for: this says what will stand here, once.
+                box.appendChild(spEl('div', { class: 'none', text: none ? 'The bazaars that sell an item, and the traders who pay for it, show here.' : 'Pick an item.' }));
+                return;
+            }
+            const page = this.bd.page;
+            const avg = ['Market average', d.avg ? formatMoney(d.avg) : '–'];
+            const cheapest = d.sellers.rows.find((r) => !r.stale) || d.sellers.rows[0] || null;
+            const sellRow = page === 'sell' ? (((s.toSell || {}).rows) || []).find((r) => String(r.itemId) === String(d.itemId)) : null;
+            const facts = (page === 'flips'
+                ? [avg, d.held ? ['You hold', count(d.held)] : null, ['Bazaars', count(d.bazaars || d.sellers.rows.length)], ['Traders', count(d.buyers.length)]]
+                : page === 'sell'
+                    ? [sellRow ? ['To sell', count(sellRow.qty) + (d.held !== sellRow.qty ? ' of ' + count(d.held) + ' held' : '')] : ['You hold', count(d.held)], d.paid ? ['You paid', formatMoney(d.paid)] : null, sellRow ? ['Why', this.whyText(sellRow.why)] : null, avg]
+                    : [['You hold', count(d.held)], avg, cheapest ? ['Cheapest bazaar', formatMoney(cheapest.price)] : null]).filter(Boolean);
+            box.append(
+                this.pic('desk', d.itemId, 'xl'),
+                spEl('div', {}, [
+                    spEl('h3', {}, [this.link(d.name, itemMarketUrl(d.itemId, d.name), { cls: 'lk', title: 'Opens the Item Market at this item', focus: 'desk:name' })]),
+                    // One line of what a friend did: going for it now, else what they took. The rest is in its title.
+                    d.friend && d.friend.going
+                        ? this.friendEl(d.friend.going, ' · ', d.friend.took ? d.friend.took.lead + ' ' + d.friend.took.rest + ' · ' + d.friend.took.was : '')
+                        : this.friendEl(d.friend && d.friend.took, ' ', d.friend && d.friend.took ? d.friend.took.was : ''),
+                ]),
+                spEl('span', { class: 'sp' }),
+                spEl('div', { class: 'facts' }, facts.map(([k, v]) => spEl('span', { title: k === 'Market average' ? 'Item Market Average' : null }, [k, spEl('b', { text: v })]))),
+            );
+        }
+
+        /**
+         * Bazaars sell, cheapest first: the seller (their bazaar at this item), how many, the price, what a
+         * piece leaves you with the trader of the trade on show, and when TornW3B last saw it. One line says
+         * where profit stops.
+         */
+        drawAsk(d) {
+            const box = this.askBox;
+            box.textContent = '';
+            this.askEl.hidden = !d;
+            if (!d) return;
+            const sel = d.sellers;
+            if (sel.state === 'loading' && !sel.rows.length) box.appendChild(spEl('p', { class: 'note', text: 'Loading bazaars from TornW3B…' }));
+            else if (sel.state === 'error' && !sel.rows.length) box.appendChild(spEl('p', { class: 'note t-bad', text: sel.error || 'TornW3B did not answer. Trying again soon.' }));
+            else if (!sel.rows.length) box.appendChild(spEl('p', { class: 'note', text: 'No bazaar is selling it.' }));
+            if (!sel.rows.length) return;
+            const pay = this.payFor(d);
+            const pct = this.state.prefs.minProfitPct ?? 1;
+            const good = (r) => Boolean(pay) && !r.stale && pay.price - r.price >= Math.max(1, (r.price * pct) / 100);
+            const all = this.showAll.sellers;
+            const rows = all ? sel.rows : sel.rows.slice(0, BD_ROWS);
+            const most = Math.max(1, ...rows.map((r) => r.qty || 0));
+            // The line sits over the first bazaar seen lately that leaves too little; every one under it does too.
+            const cut = pay ? rows.findIndex((r) => !r.stale && !good(r)) : -1;
+            const anyGood = rows.some(good);
+            const now = Date.now();
+            const body = spEl('tbody');
+            rows.forEach((r, i) => {
+                if (i === cut) {
+                    body.appendChild(spEl('tr', { class: 'mk' }, [spEl('td', { colspan: '5' }, [
+                        spEl('b', { text: pay.name + ' pays ' + formatMoney(pay.price) + '.' }),
+                        anyGood ? ' Under this line a piece leaves less than your ' + pct + '%.' : ' No bazaar leaves your ' + pct + '% now.',
+                    ])]));
+                }
+                const ok = good(r);
+                const gap = pay ? pay.price - r.price : 0;
+                const piece = !pay ? null
+                    : r.stale ? spEl('span', { title: 'TornW3B has not seen this bazaar lately: it is not counted', text: 'not seen' })
+                        : ok ? spEl('b', { class: 't-good', text: signed(gap) })
+                            : gap > 0 ? spEl('span', { title: signed(gap) + ' a piece: under your least profit of ' + pct + '%', text: 'too thin' })
+                                : spEl('span', { title: 'Over what ' + pay.name + ' pays', text: 'over' });
+                const name = r.sellerName || 'Player ' + r.sellerId;
+                body.appendChild(spEl('tr', { class: ok || !pay ? (r.stale ? 'dim' : '') : 'dim' }, [
+                    spEl('td', {}, [this.link(name, bazaarUrl(r.sellerId, d.itemId, r.price), { cls: 'lk', title: 'Opens ' + name + '\'s bazaar at this item', focus: 'bazaar:' + r.sellerId, children: [spEl('b', { text: name })] })]),
+                    spEl('td', { class: 'n' }, [this.bar(r.qty, most, ok ? '' : 'dimb'), count(r.qty)]),
+                    spEl('td', { class: 'n' }, [spEl('b', { text: formatMoney(r.price) })]),
+                    spEl('td', { class: 'n' }, [piece]),
+                    spEl('td', { class: 'n t-muted', text: r.dataAt ? formatAge(now - r.dataAt).replace(' ago', '') : '–' }),
+                ]));
+            });
+            if (sel.rows.length > BD_ROWS) {
+                body.appendChild(spEl('tr', {}, [spEl('td', { colspan: '5' }, [this.wordBtn(all ? 'Show the cheapest ' + BD_ROWS : 'Show all ' + count(sel.rows.length) + ' bazaars', 'desk:sellers-all', '', () => {
+                    this.showAll.sellers = !all;
+                    this.redrawDesk();
+                })])]));
+            }
+            box.appendChild(spEl('table', { class: 't' }, [
+                spEl('thead', {}, [spEl('tr', {}, [
+                    spEl('th', { text: 'Seller' }), spEl('th', { class: 'n', text: 'Has' }), spEl('th', { class: 'n', text: 'Price' }),
+                    spEl('th', { class: 'n', title: pay ? 'What a piece leaves you when it goes to ' + pay.name : null, text: 'A piece' }),
+                    spEl('th', { class: 'n', title: 'When TornW3B last saw this listing', text: 'Seen' }),
+                ])]),
+                body,
+            ]));
+        }
+
+        /**
+         * Traders pay, highest first. A row is the trader: press it to plan the trade with them (the owner:
+         * "trader 1 didn't want to trade - click trader 2 to see the flip plan there"); pressed again, a plan
+         * you picked comes off. What the whole trade with each makes is beside their price. A trader who said
+         * no goes to the bottom, greyed, with Undo; what your filters leave out is counted in one line.
+         */
+        drawPay(d) {
+            const box = this.payBox;
+            box.textContent = '';
+            this.payEl.hidden = !d;
+            if (!d) return;
+            const T = d.trade || null;
+            const declined = (T && T.declined) || {};
+            const ordered = [...d.buyers.filter((b) => !declined[b.tradeKey] && !b.troll), ...d.buyers.filter((b) => !declined[b.tradeKey] && b.troll), ...d.buyers.filter((b) => declined[b.tradeKey])];
+            const all = this.showAll.buyers;
+            const rows = all ? ordered : ordered.slice(0, BD_ROWS);
+            this.paySub.textContent = T ? 'highest first · press one to trade with them' : 'highest first';
+            if (d.buyersLoading) box.appendChild(spEl('p', { class: 'note', text: 'Loading more buyers from TornExchange…' }));
+            else if (d.buyersListNote) box.appendChild(spEl('p', { class: 'note', text: d.buyersListNote }));
+            // Just blacklisted: a moment to take it back (then only the Ledger's Traders tab has Undo).
+            const justOff = this.justBlacklisted && Date.now() - this.justBlacklisted.at < 15000 ? this.justBlacklisted.b : null;
+            if (justOff) {
+                box.appendChild(spEl('p', { class: 'note' }, ['Blacklisted ' + justOff.name + ': never a buyer. ', this.wordBtn('Undo', 'desk:bl-undo', '', () => {
+                    this.justBlacklisted = null;
+                    if (this.h.onBlacklist) this.h.onBlacklist(justOff, false);
+                })]));
+            }
+            if (!rows.length) box.appendChild(spEl('p', { class: 'note', text: this.noTraderText(d) }));
+            const tradeOf = (b) => (T && T.perTrader ? T.perTrader[b.tradeKey] : null);
+            const max = Math.max(1, ...rows.map((b) => (tradeOf(b) && tradeOf(b).items ? tradeOf(b).profit : 0)));
+            const body = spEl('tbody');
+            for (const b of rows) {
+                const planning = Boolean(T && ((T.chosen && T.chosen.key === b.tradeKey) || (T.accepted && T.accepted.key === b.tradeKey)));
+                const until = declined[b.tradeKey];
+                const t = tradeOf(b);
+                const first = spEl('td', { class: 'wrap' }, [
+                    b.favourite ? spEl('span', { class: 'star', title: 'A favourite', text: '★' }) : null,
+                    this.dot(b),
+                    spEl('b', { text: b.name }),
+                    until ? spEl('small', {}, ['said no · passed over for ' + formatAge(until - Date.now()).replace(' ago', '') + ' · ', this.wordBtn('Undo', 'plan:undo:' + b.tradeKey, 'Plan with ' + b.name + ' again', () => this.h.onTradeUndecline && this.h.onTradeUndecline(b.tradeKey))]) : null,
+                    this.oldListLine(d, b),
+                    // Their two lists disagree: the lower is counted, and said.
+                    b.differ ? spEl('small', { title: 'Their two price lists do not agree: check before trading', text: 'Lists differ: ' + this.listPrices(b, ' · ') + ' · counted at the lower' }) : null,
+                    b.troll ? spEl('small', { class: 't-warn', text: 'Over 3× Item Market Average: not counted' }) : null,
+                    // No public list: what they paid you last (review M2).
+                    b.lastPaidOnly ? spEl('small', { class: 't-warn', text: 'Last paid: no public list, check with them' }) : null,
+                ]);
+                const trade = !t ? []
+                    : t.items ? [this.bar(t.profit, max), spEl('b', { class: 't-good', text: (t.estimated ? '≈ ' : '') + signed(t.profit) }), spEl('small', { text: count(t.items) + (t.items === 1 ? ' item' : ' items') + (t.stops ? ' · ' + count(t.stops) + (t.stops === 1 ? ' bazaar' : ' bazaars') : '') + (!t.hasItem ? ' · not this item' : '') })]
+                        : [spEl('span', { class: 't-muted', text: b.troll ? 'their bid is not believable' : 'no trade with your Cash' })];
+                const cells = [first, spEl('td', { class: 'n' }, [spEl('b', { text: formatMoney(b.price) })]), spEl('td', { class: 'n' }, trade)];
+                if (until || !T) {
+                    body.appendChild(spEl('tr', { class: until ? 'dim' : '' }, cells));
+                    continue;
+                }
+                // Shared: a friend is on this item. Said, never a lock.
+                const anyway = Boolean(d.friend && d.friend.going);
+                const title = planning
+                    ? (T.accepted ? b.name + ' said yes: the trade is the one on show' : T.picked ? 'Planning with ' + b.name + ': press to take this plan off' : 'The trade on show is with ' + b.name)
+                    : (anyway ? d.friend.going.lead + '. ' : '') + 'Plan the trade with ' + b.name + ': this item and their other items';
+                body.appendChild(this.pickRow(planning ? 'sel' : '', 'plan:' + b.tradeKey, () => {
+                    // Pressed again, a plan you picked comes off (3.20.2): nothing was said yet.
+                    if (planning && !T.accepted && T.picked) return this.h.onTradeUnpick && this.h.onTradeUnpick(d.itemId, b.tradeKey);
+                    if (!planning) return this.h.onTradePick && this.h.onTradePick(d.itemId, b.tradeKey);
+                    return null;
+                }, cells, title));
+            }
+            if (d.buyers.length > BD_ROWS) {
+                body.appendChild(spEl('tr', {}, [spEl('td', { colspan: '3' }, [this.wordBtn(all ? 'Show the top ' + BD_ROWS : 'Show all ' + count(d.buyers.length) + ' traders', 'desk:buyers-all', '', () => {
+                    this.showAll.buyers = !all;
+                    this.redrawDesk();
+                })])]));
+            }
+            this.hiddenBuyers(body, d);
+            if (!body.children.length) return;
+            box.appendChild(spEl('table', { class: 't' }, [
+                spEl('thead', {}, [spEl('tr', {}, [spEl('th', { text: 'Trader' }), spEl('th', { class: 'n', text: 'Pays' }), spEl('th', { class: 'n', title: 'What the whole trade with them makes: this item and their other items', text: 'The trade' })])]),
+                body,
+            ]));
+        }
+
+        /**
+         * Traders your Online / Trusted / Fresh prices leave out here, and those who pay no more than you paid:
+         * how many and why in one line and, on a press, who (greyed, never planned). The list never empties
+         * with no reason (the friend, 3.14.4).
+         */
+        hiddenBuyers(body, d) {
+            const hidden = d.hidden || [];
+            if (!hidden.length) return;
+            const open = Boolean(this.showAll.hidden);
+            const n = (k) => hidden.filter((b) => b.hiddenBy === k).length;
+            const parts = [];
+            if (n('trust')) parts.push('Trusted hides ' + count(n('trust')));
+            if (n('offline')) parts.push('Online hides ' + count(n('offline')));
+            if (n('stale')) parts.push('Fresh prices hides ' + count(n('stale')));
+            if (n('loss')) parts.push(count(n('loss')) + (n('loss') === 1 ? ' pays' : ' pay') + ' no more than the ' + formatMoney(d.paid) + ' you paid');
+            body.appendChild(spEl('tr', { class: 'dim' }, [spEl('td', { colspan: '3', class: 'wrap' }, [
+                parts.join(' · ') + ' · ',
+                this.wordBtn(open ? 'Hide them' : 'Show them', 'desk:hidden', '', () => {
+                    this.showAll.hidden = !open;
+                    this.redrawDesk();
+                }),
+            ])]));
+            if (!open) return;
+            for (const b of hidden) {
+                const why = b.hiddenBy === 'loss'
+                    ? 'Pays no more than you paid: a loss, never suggested'
+                    : b.hiddenBy === 'offline'
+                        ? 'Offline: hidden by Online'
+                        : b.hiddenBy === 'stale' ? 'Price list last changed ' + formatAge(Date.now() - b.listAt) + ': hidden by Fresh prices'
+                            : !b.trust ? 'No votes yet: hidden by Trusted'
+                                : b.trust.level === 'Caution' ? 'More votes against than for: hidden by Trusted'
+                                    : 'Fewer than 20 votes: hidden by Trusted';
+                body.appendChild(spEl('tr', { class: 'dim' }, [
+                    spEl('td', { class: 'wrap' }, [this.dot(b), this.playerName(b.name, b.id, 'hidden:' + (b.id || b.name)), spEl('small', { text: why + (b.traded ? ' · ' + b.traded : '') })]),
+                    spEl('td', { class: 'n', text: formatMoney(b.price) }),
+                    spEl('td'),
+                ]));
+            }
+        }
+
+        /**
+         * Flips › By trader: everything the trader of the trade on show pays for that a bazaar sells, beside
+         * the cheapest bazaar - what a piece leaves, and what the flip makes. Grey rows leave too little.
+         * A row in black can be pressed: the trade is planned again with that item leading.
+         */
+        drawBuys(d) {
+            const box = this.buysBox;
+            box.textContent = '';
+            const T = d && d.trade;
+            const c = T && (T.accepted || T.chosen);
+            this.buysTitle.textContent = c && c.buyer ? 'What ' + c.buyer.name + ' pays' : 'What they pay';
+            if (!c) {
+                box.appendChild(spEl('p', { class: 'note', text: 'Pick a trader on the left: what they pay shows here, and the trade beside it.' }));
+                return;
+            }
+            const pct = this.state.prefs.minProfitPct ?? 1;
+            const made = new Map();
+            for (const r of c.flips || []) made.set(String(r.itemId), { profit: r.profit, about: Boolean(r.estimated) });
+            for (const r of c.left || []) if (!made.has(String(r.itemId))) made.set(String(r.itemId), { profit: r.profit, about: true });
+            for (const i of T.accepted ? c.items || [] : []) {
+                if (i.kind === 'yours') continue;
+                made.set(String(i.itemId), { profit: (i.steps || []).reduce((a, st) => a + (i.bid - st.price) * st.qty, 0), about: false });
+            }
+            const rows = (T.buys || []).slice().sort((a, b) => ((made.get(b.itemId) || {}).profit || 0) - ((made.get(a.itemId) || {}).profit || 0) || (b.bid - (b.ask || b.bid)) - (a.bid - (a.ask || a.bid)) || String(a.name).localeCompare(String(b.name)));
+            if (!rows.length) {
+                box.appendChild(spEl('p', { class: 'note', text: 'Nothing a bazaar sells is on ' + c.buyer.name + '\'s list now.' }));
+                return;
+            }
+            const max = Math.max(1, ...rows.map((r) => (made.get(r.itemId) || {}).profit || 0));
+            const body = spEl('tbody');
+            for (const r of rows) {
+                const gap = r.ask ? r.bid - r.ask : null;
+                const ok = gap !== null && gap >= Math.max(1, (r.ask * pct) / 100);
+                const m = made.get(r.itemId) || null;
+                const cells = [
+                    spEl('td', {}, [spEl('div', { class: 'cell' }, [this.pic('buys', r.itemId), spEl('b', { text: r.name })])]),
+                    spEl('td', { class: 'n' }, [spEl('b', { text: formatMoney(r.bid) })]),
+                    spEl('td', { class: 'n', text: r.ask ? formatMoney(r.ask) : '–' }),
+                    spEl('td', { class: 'n' }, [gap === null ? spEl('span', { title: 'Its bazaars are not read yet', text: '–' })
+                        : ok ? spEl('span', { class: 't-good', text: signed(gap) })
+                            : gap > 0 ? spEl('span', { title: signed(gap) + ' a piece: under your least profit of ' + pct + '%', text: 'too thin' }) : spEl('span', { title: 'Over what ' + c.buyer.name + ' pays', text: 'over' })]),
+                    spEl('td', { class: 'n' }, m && m.profit > 0 ? [this.bar(m.profit, max), spEl('b', { class: 't-good', text: (m.about ? '≈ ' : '') + signed(m.profit) })] : []),
+                ];
+                const on = String(d.itemId) === String(r.itemId);
+                if (ok && !T.accepted) body.appendChild(this.pickRow(on ? 'sel' : '', 'buys:' + r.itemId, () => !on && this.h.onTradePick && this.h.onTradePick(r.itemId, c.key), cells, on ? r.name + ' leads this trade' : 'Plan the trade with ' + r.name + ' leading'));
+                else body.appendChild(spEl('tr', { class: ok ? (on ? 'sel' : '') : 'dim' }, cells));
+            }
+            box.appendChild(spEl('table', { class: 't' }, [
+                spEl('thead', {}, [spEl('tr', {}, [spEl('th', { text: 'Item' }), spEl('th', { class: 'n', text: c.buyer.name + ' pays' }), spEl('th', { class: 'n', text: 'A bazaar asks' }), spEl('th', { class: 'n', text: 'A piece' }), spEl('th', { class: 'n', text: 'The flip' })])]),
+                body,
+            ]));
+        }
+
+        /* ------------------------------------------------------------ traders */
+
+        /**
+         * A price from a TornW3B list its trader has not changed in over 24 hours (3.22.3; the owner picked
+         * mockup X-B): amber, and how long ago, under the trader - the price itself is left as it is.
+         */
+        oldListLine(d, b) {
+            const o = d.oldLists && b.tradeKey ? d.oldLists[b.tradeKey] : null;
+            return o ? this.oldListEl(o) : null;
+        }
+
+        /** The line itself. @param {{at: number, level: 'aging'|'stale'}} o */
+        oldListEl(o) {
+            return spEl('small', { class: 't-warn', title: 'Check their list before you buy' }, ['Price list last changed ' + listAgeText(Date.now() - o.at)]);
+        }
+
+        /** The star of a trader: a favourite (5+ trades this month, or added by you); press to change. */
+        favButton(b) {
+            if (!b || !b.id) return null;
+            const on = Boolean(b.favourite);
+            return spEl('button', {
+                type: 'button',
+                class: 'star' + (on ? '' : ' off'),
+                'data-focus': 'fav:' + b.id,
+                title: on ? 'A favourite: press to remove. Traders you traded with 5 or more times in 30 days join by themselves.' : 'Make ' + b.name + ' a favourite: they stay in view in By trader',
+                'aria-pressed': String(on),
+                'aria-label': on ? 'Remove ' + b.name + ' from favourites' : 'Make ' + b.name + ' a favourite',
+                text: on ? '★' : '☆',
+                onclick: () => this.h.onFavourite && this.h.onFavourite(b, !on),
+            });
+        }
+
+        /** TE list and W3B list, the ones that exist; then ⊘ (blacklist: never a buyer). @returns {Node[]} */
+        traderLinks(b, { blacklist = false } = {}) {
+            const out = [];
+            if (b.te) out.push(this.link('TE list', tePriceListUrl(b.teName || b.name), { cls: 'quiet lk', title: b.name + '\'s TornExchange price list: ' + formatMoney(b.te), focus: 'step-te' }));
+            if (b.w3b && b.id) out.push(this.link('W3B list', w3bPriceListUrl(b.id), { cls: 'quiet lk', title: b.name + '\'s TornW3B price list: ' + formatMoney(b.w3b), focus: 'step-w3b' }));
+            if (blacklist) {
+                out.push(spEl('button', {
+                    type: 'button',
+                    class: 'quiet',
+                    'data-focus': 'blk:' + (b.id || b.name),
+                    title: 'Blacklist ' + b.name + ': never a buyer (their bazaars are still used)',
+                    'aria-label': 'Blacklist ' + b.name,
+                    text: '⊘',
+                    onclick: () => {
+                        this.justBlacklisted = { b: { id: b.id || null, name: b.name }, at: Date.now() };
+                        clearTimeout(this.blNoteTimer);
+                        this.blNoteTimer = setTimeout(() => {
+                            this.justBlacklisted = null;
+                            this.renderDesk();
+                        }, 15000);
+                        if (this.h.onBlacklist) this.h.onBlacklist(b, true);
+                    },
+                }));
+            }
+            return out;
+        }
+
+        /**
+         * Who a trade is with: a label over it (and Pinned / Held), their two price lists, their star, the
+         * blacklist, then the name (their Torn profile) with the trust badge, and one line - online or not,
+         * their networth, your own history with them.
+         */
+        whoBox(d, b, label, { tag = null, extra = [], focus = 'trade:buyer' } = {}) {
+            const row = (d.buyers || []).find((x) => b.tradeKey && x.tradeKey === b.tradeKey) || (d.buyers || []).find((x) => b.id && String(x.id) === String(b.id)) || b;
+            const nw = row.id && this.state.networth ? this.state.networth.get(String(row.id)) : null;
+            const st = this.status(row);
+            const sub = [st.childNodes.length ? st : null, nw >= 0 && nw !== null ? (st.childNodes.length ? ' · ' : '') + 'networth ' + formatMoney(nw) : null, ' · ' + (row.traded || 'not traded with yet')];
+            if (!st.childNodes.length && !(nw >= 0 && nw !== null)) sub[2] = row.traded || 'not traded with yet';
+            return spEl('div', { class: 'who' }, [
+                spEl('div', { class: 'who-t' }, [
+                    spEl('span', { class: 'lbl' }, [label, tag ? spEl('span', { class: 'tag', title: tag.title, text: tag.text }) : null]),
+                    spEl('span', { class: 'sp' }),
+                    ...this.traderLinks(row, { blacklist: true }),
+                    this.favButton(row),
+                    ...extra,
+                ]),
+                spEl('h3', {}, [this.playerName(b.name, b.id || row.id, focus), this.trustBadge(row)]),
+                spEl('span', { class: 'sub' }, sub),
+            ]);
+        }
+
+        /** Ask, Yes, Buy, Trade: where a trade stands (0 to 3). */
+        stepBar(at) {
+            return spEl('div', { class: 'stepbar' }, ['Ask', 'Yes', 'Buy', 'Trade'].map((word, i) => spEl('span', { class: i < at ? 'done' : i === at ? 'now' : '' }, [spEl('i', { text: i < at ? '✓' : String(i + 1) }), word])));
+        }
+
+        /** "sells fast" / "slow seller" beside an extra item: why it is in, and in that amount. */
+        kindTag(kind) {
+            if (kind === 'fast') return spEl('span', { class: 'kind', text: 'sells fast' });
+            if (kind === 'slow') return spEl('span', { class: 'kind', text: 'slow seller' });
+            return null;
+        }
+
+        /**
+         * Ask the trader (the owner, 2026-09-28: "we don't need copy offer, what we need is a button that goes
+         * straight to chatting that trader"): their Torn profile, where Torn's own chat button is marked; a
+         * trader known by name only, their TornExchange page.
+         */
+        chatLink(b, cls) {
+            const label = 'Ask ' + b.name;
+            if (b.id) {
+                const a = this.link(label, spProfileUrl(b.id), { cls: cls + ' sp-chat', title: 'Opens ' + b.name + '\'s profile on Torn: their chat button is marked', focus: 'trade:chat' });
+                // Remembered for the overlay, which marks Torn's chat button there.
+                const want = () => this.h.onChatWanted && this.h.onChatWanted(b.id, b.name);
+                a.addEventListener('click', want);
+                a.addEventListener('auxclick', want);
+                return a;
+            }
+            if (b.te) return this.link(label, tePriceListUrl(b.teName || b.name), { cls: cls + ' sp-chat', title: b.name + ' is known by name only: their TornExchange page', focus: 'trade:chat' });
+            return null;
+        }
+
+        /* -------------------------------------------------------------- the trade */
+
+        /**
+         * The trade panel: who, what it makes, where it stands (Ask, Yes, Buy, Trade), the way round the
+         * bazaars, and the one thing to press next. On Trades it lies wide: the trade on the left, what to
+         * buy or send on the right.
+         */
+        drawPlan(d) {
+            const box = this.planEl;
+            box.textContent = '';
+            const wide = this.bd.page === 'trades';
+            const T = d && d.trade;
+            const on = T && (T.accepted || T.chosen);
+            // A waiting trade just pressed: its prices are being read, the plan with its trader follows.
+            const loading = wide ? this.waitingOnDesk(d) : null;
+            if (!d || (wide && (!on || loading))) {
+                const going = (this.state.trades || {}).going || 0;
+                box.appendChild(spEl('div', { class: 'none', text: wide
+                    ? (loading ? 'Loading the trade with ' + loading.name + '…' : going ? 'Press a trade above to open it.' : 'No trade going. A trade you ask a trader about, pin, or mark "said yes" shows here until it is traded, cancelled or they say no.')
+                    : 'Pick an item: the trade with its best trader shows here.' }));
+                return;
+            }
+            if (!on) {
+                box.appendChild(this.flipPlan(d));
+                return;
+            }
+            const parts = T.accepted ? this.acceptedPlan(d) : this.tradePlan(d);
+            const left = spEl('div', { class: 'plan' }, wide ? [...parts.left, parts.acts] : [...parts.left, ...parts.right, parts.acts]);
+            const whole = wide ? spEl('div', { class: 'det' }, [left, spEl('div', { class: 'plan' }, parts.right)]) : left;
+            if (parts.wire) parts.wire(whole);
+            box.appendChild(whole);
+        }
+
+        /** A tick you can press (a checkbox drawn as the drawing's tick). */
+        tickBox(checked, label, focus, onChange, title = null) {
+            const input = spEl('input', { type: 'checkbox', class: 'tick', 'aria-label': label, 'data-focus': focus, title });
+            input.checked = checked;
+            input.addEventListener('change', () => onChange(input.checked));
+            return input;
+        }
+
+        /**
+         * A how-many box: what is there is selected when you enter it; Enter or leaving it saves, Esc puts
+         * back what was there; anything that is not a whole number is refused in place, and said.
+         */
+        qtyBox(value, label, focus, onSet) {
+            const input = spEl('input', { type: 'text', class: 'qty', inputmode: 'numeric', value: String(value), 'aria-label': label, 'data-focus': focus, autocomplete: 'off', spellcheck: 'false' });
+            selectOnFocus(input);
+            // Just refused, and the panel drawn again since: still said.
+            if (this.qtyRefused && this.qtyRefused.focus === focus && Date.now() - this.qtyRefused.at < 2500) queueMicrotask(() => flashBad(input, 'Type a whole number, like 25'));
+            const commit = () => {
+                if (!input.dataset.dirty) return;
+                delete input.dataset.dirty;
+                const n = readWholeNumber(input.value);
+                if (n !== null) {
+                    onSet(n);
+                    return;
+                }
+                // Not a number: put back what was there, and say so (3.14.3: it was silent).
+                input.value = String(value);
+                flashBad(input, 'Type a whole number, like 25');
+                this.qtyRefused = { focus, at: Date.now() };
+            };
+            input.addEventListener('input', () => {
+                input.dataset.dirty = '1';
+            });
+            // Saved once focus has moved on (Tab to the next box keeps you there), and the panel catches up
+            // with what it held back while you were in the box.
+            input.addEventListener('blur', () => setTimeout(() => {
+                if (input.dataset.dirty) commit();
+                else this.renderDesk();
+            }, 0));
+            input.addEventListener('keydown', (event) => {
+                if (event.key === 'Escape') {
+                    // Esc: what was there, unchanged.
+                    event.preventDefault();
+                    event.stopPropagation();
+                    delete input.dataset.dirty;
+                    input.value = String(value);
+                    input.blur();
+                    return;
+                }
+                if (event.key !== 'Enter') return;
+                // Enter: done - saved, and out of the box.
+                event.preventDefault();
+                input.blur();
+            });
+            return input;
+        }
+
+        /**
+         * The flip plan as ONE trade with one trader (mockup N3, the owner's pick; drawn bazaar by bazaar
+         * since 3.25.0): every item in it under the bazaar it is bought from - a tick to leave an item out
+         * and a number to change how many, on the item's first line - then what you hold that they pay more
+         * for than you paid, what else they buy, and Ask / said yes / said no.
+         * @returns {{left: Node[], right: Node[], acts: Node, wire: function}}
+         */
+        tradePlan(d) {
+            const T = d.trade;
+            const c = T.chosen;
+            const b = c.buyer;
+            const approx = c.estimated ? '≈ ' : '';
+            const now = Date.now();
+            const pinnedTrade = c.hold && c.hold.pinned;
+            const itemPinned = (this.state.pinned || []).some((x) => x.itemId === String(d.itemId));
+            const pin = spEl('button', {
+                type: 'button',
+                class: 'pin' + (itemPinned ? ' on' : ''),
+                'aria-pressed': String(itemPinned),
+                'data-focus': 'trade:pin',
+                'aria-label': (itemPinned ? 'Unpin' : 'Pin') + ' this trade',
+                title: itemPinned ? 'Pinned on top of the list and in Trades: press to unpin' : 'Keep this trade on top of the list and in Trades: only its prices move',
+                onclick: () => this.h.onPin && this.h.onPin(d.itemId),
+            }, [bdIcon('pin')]);
+            const left = [
+                this.whoBox(d, b, 'Trade with', {
+                    // Held (you started on it) or pinned: the items stay, prices and profit are live.
+                    tag: c.hold ? { text: c.hold.pinned ? 'Pinned' : 'Held', title: 'The items stay as they are; prices and profit are live' } : null,
+                    extra: [pin],
+                }),
+                spEl('div', { class: 'bigrow' }, [
+                    spEl('div', {}, [spEl('span', { class: 'lbl', text: 'Profit' }), spEl('div', { class: 'big' + this.moneyTone(c.profit), text: approx + signed(c.profit) })]),
+                    spEl('div', { class: 'eq' }, ['You pay the bazaars', spEl('b', { text: formatMoney(c.cost) }), spEl('br'), b.name + ' pays you', spEl('b', { text: approx + formatMoney(c.pays) })]),
+                ]),
+                this.stepBar(this.askedNow(d) ? 1 : 0),
+            ];
+            const note = (cls, children) => left.push(spEl(cls === 'amber' ? 'div' : 'p', { class: cls }, children));
+            if (c.payCapped) {
+                const nw = b.id && this.state.networth ? this.state.networth.get(String(b.id)) : null;
+                note('note', [b.name + ' can pay at most ' + (this.state.prefs.networthPct || 10) + '% of their networth' + (nw >= 0 && nw !== null ? ' (' + formatMoney(nw) + ')' : '') + ' for the whole trade: it stops there.']);
+            }
+            // Held with a trader who is not on this item's list now (3.25.0): the trade stays, and says what it is.
+            if (c.away) note('amber', [spEl('span', {}, [spEl('b', { text: b.name + ' is not on the list of buyers for ' + d.name + ' now.' }), ' This trade is shown as you held it: check their list before buying.'])]);
+            // Another trader's whole trade makes more now (3.25.0): said here, never swapped in under you.
+            if (T.better && !c.hold) {
+                note('amber', [
+                    spEl('span', {}, [spEl('b', { text: T.better.name + '\'s whole trade makes ' + formatMoney(T.better.more) + ' more now.' }), ' This plan stays with ' + b.name + ' until you change it.']),
+                    spEl('button', { type: 'button', class: 'btn sm', 'data-focus': 'trade:better:' + T.better.key, title: 'Plan the trade with ' + T.better.name + ' instead', text: 'Plan with ' + T.better.name, onclick: (event) => {
+                        event.stopPropagation();
+                        if (this.h.onTradePick) this.h.onTradePick(d.itemId, T.better.key);
+                    } }),
+                ]);
+            }
+            // One trade takes 10,000 items (3.23.0): the plan stops there, and says so.
+            if (c.unitsCapped) note('note', [count(c.units) + ' of ' + count(TRADE_MAX_UNITS) + ' items: one trade takes no more, so this one stops there. The rest is for a second trade with ' + b.name + '.']);
+            // Another item makes the most with this trader: it is the main flip, this one is cover.
+            // Everything they buy: no main flip and cover - each line is a flip of its own.
+            const mainRow = c.main && !c.every ? c.flips.find((r) => r.itemId === String(c.main)) : null;
+            if (mainRow && mainRow.itemId !== String(d.itemId) && c.flips.some((r) => r.itemId === String(d.itemId))) {
+                note('note', ['Main: ', spEl('b', { text: mainRow.name + ' ' + signed(mainRow.profit) }), ' · ' + d.name + ' is cover']);
+            }
+            // Planned with a trader who makes no flip on this item: said, with the numbers.
+            if (c.itemNote) {
+                const n = c.itemNote;
+                const why = {
+                    type: 'weapons, armour and cars are one of a kind - not flipped',
+                    never: 'its category is in Settings › Flips and reading › Never flip',
+                    profit: 'under your least profit per item',
+                    none: 'no bazaar sells it under their price',
+                    cash: 'your Cash went to the other items',
+                }[n.why] || 'not a flip with your settings';
+                note('note', [spEl('b', { text: d.name + ' is not in this trade:' }), ' ' + b.name + ' pays ' + formatMoney(n.bid) + (n.cheapest ? ', the cheapest bazaar is ' + formatMoney(n.cheapest) : '') + ' - ' + why + '.']);
+            }
+            // Main flip and a few extras, or everything this trader buys. A pinned trade stays as pinned.
+            const takeBtn = (label, every, title) => spEl('button', {
+                type: 'button',
+                class: Boolean(c.every) === every ? 'on' : '',
+                'aria-pressed': String(Boolean(c.every) === every),
+                'data-focus': 'trade:every:' + (every ? 'all' : 'main'),
+                disabled: pinnedTrade ? '' : null,
+                title: pinnedTrade ? 'Pinned as it is: unpin it to plan it another way' : title,
+                text: label,
+                onclick: () => Boolean(c.every) !== every && this.h.onTradeEvery && this.h.onTradeEvery(d.itemId, c.key, every),
+            });
+            left.push(spEl('div', { class: 'take' }, [
+                spEl('span', { text: 'Take' }),
+                spEl('div', { class: 'seg' }, [
+                    takeBtn('Main flip and extras', false, 'The flip you picked and a few more they buy (Settings › Extras per trade)'),
+                    takeBtn('Everything ' + b.name + ' buys', true, 'Every item ' + b.name + ' buys that a bazaar sells for less: up to your Cash, what they can pay and the ' + count(TRADE_MAX_UNITS) + ' items one trade takes'),
+                ]),
+                spEl('span', { class: 'sp' }),
+                spEl('span', { text: c.stops ? count(c.stops) + (c.stops === 1 ? ' bazaar' : ' bazaars') + ' · about ' + c.minutes + ' min' : 'Nothing to buy: all yours' }),
+            ]));
+
+            const edit = (id, e) => this.h.onTradeEdit && this.h.onTradeEdit(c.key, id, e);
+            // You typed more than bazaars list (mockup R-inputs): the plan takes what there is, and says so.
+            const cutNote = (r) => {
+                const t = this.typedQty;
+                if (!t || t.itemId !== r.itemId || Date.now() - t.at > 8000) return null;
+                const got = r.plannedUnits || r.units;
+                if (!(t.n > got)) return null;
+                return spEl('small', { class: 'warnw', role: 'status', text: count(got) + ' listed - ' + count(t.n) + ' is more than bazaars have' });
+            };
+            // A held trade's step against the bazaar now: re-priced, fewer left, gone.
+            const mark = (st) => {
+                const k = st.check && st.check.state;
+                if (k === 'price') return spEl('span', { class: 'warnw', text: ' · now ' + formatMoney(st.price) + ' (was ' + formatMoney(st.planned) + ')' });
+                if (k === 'short') return spEl('span', { class: 'warnw', text: ' · only ' + count(st.qty) + ' left of ' + count(st.plannedQty) });
+                if (k === 'gone') return spEl('span', { class: 'badw', text: ' · gone' });
+                return null;
+            };
+            // Bazaar by bazaar, in the order the plan visits them: each line is one item bought there.
+            const stops = [];
+            const stopOf = new Map();
+            for (const r of c.flips) {
+                r.steps.forEach((st, k) => {
+                    const key = st.sellerId ? 'id:' + st.sellerId : 'read';
+                    if (!stopOf.has(key)) {
+                        stopOf.set(key, { key, sellerId: st.sellerId || null, sellerName: st.sellerName, lines: [] });
+                        stops.push(stopOf.get(key));
+                    }
+                    stopOf.get(key).lines.push({ r, st, first: k === 0, many: r.steps.length > 1 });
+                });
+            }
+            const line = ({ r, st, first, many }, j) => {
+                const isMain = !c.every && c.main && r.itemId === String(c.main);
+                const here = r.itemId === String(d.itemId);
+                const qty = st.check && st.check.state === 'gone' ? st.plannedQty : st.qty;
+                const price = st.check && st.check.state === 'price' ? st.planned : st.price;
+                const made = (r.bid - price) * qty;
+                const box = first ? this.qtyBox(r.plannedUnits || r.units, 'How many ' + r.name, 'trade:qty:' + r.itemId, (n) => {
+                    // Remembered for a moment: more than bazaars have is cut down, and said.
+                    this.typedQty = { itemId: r.itemId, n, at: Date.now() };
+                    edit(r.itemId, n > 0 ? { qty: n } : { off: true });
+                }) : null;
+                const at = first ? '' : ':' + (st.sellerId || 'read');
+                return spEl('div', { class: 'pl' }, [
+                    first ? this.tickBox(true, 'Include ' + r.name, 'trade:tick:' + r.itemId, (yes) => edit(r.itemId, yes ? null : { off: true }), 'Untick to leave it out') : spEl('span'),
+                    this.pic('trade-buy' + at, r.itemId),
+                    spEl('span', {}, [
+                        this.itemLink(r.itemId, r.name, 'trade:name:' + r.itemId + at),
+                        ' × ',
+                        box && !many ? box : count(qty),
+                        box && many ? spEl('small', { title: 'How many in all, over every bazaar' }, ['of ', box]) : null,
+                        spEl('small', {}, [st.sellerId ? 'at ' + formatMoney(price) : '≈ from ' + formatMoney(st.price), mark(st), first && r.noBid ? spEl('span', { class: 'warnw', text: ' · not on their list now' }) : null]),
+                        first ? (isMain ? spEl('span', { class: 'here', text: 'MAIN' }) : here && !c.every ? spEl('span', { class: 'here', text: 'THIS ITEM' }) : this.kindTag(r.kind)) : null,
+                        j > 0 && st.sellerId ? this.link('bazaar', bazaarUrl(st.sellerId, r.itemId, st.price), { cls: 'quiet lk', title: 'Opens their bazaar at this item and the price', focus: 'trade:bazaar:' + r.itemId + ':' + st.sellerId }) : null,
+                        first ? cutNote(r) : null,
+                    ]),
+                    spEl('span', { class: 'p' + (made < 0 ? ' badw' : '') }, [(r.estimated ? '≈ ' : '') + signed(made)]),
+                ]);
+            };
+            const route = spEl('div', { class: 'route' });
+            stops.forEach((stop, i) => {
+                const l0 = stop.lines[0];
+                const seen = stop.lines.map((x) => Number(x.st.seenAt) || 0).filter((t) => t > 0);
+                const name = stop.sellerName || 'Player ' + stop.sellerId;
+                route.appendChild(spEl('div', { class: 'rt' }, [
+                    spEl('span', { class: 'stop-n', text: String(i + 1) }),
+                    spEl('div', {}, [
+                        spEl('div', { class: 'rt-h' }, stop.sellerId ? [
+                            this.playerName(name, stop.sellerId, 'trade:seller:' + stop.sellerId),
+                            seen.length ? spEl('span', { class: 'seen', title: 'When TornW3B last saw these listings', text: 'seen ' + formatAge(now - Math.min(...seen)) }) : null,
+                            spEl('span', { class: 'st' }),
+                            this.link('bazaar', bazaarUrl(stop.sellerId, l0.r.itemId, l0.st.price), { cls: 'quiet lk', title: 'Opens ' + name + '\'s bazaar at the item and the price', focus: 'trade:bazaar:' + l0.r.itemId + ':' + stop.sellerId }),
+                        ] : [spEl('b', { text: 'Still being read' }), spEl('span', { class: 'seen', text: 'TornW3B\'s lowest price stands in until its bazaars are read' })]),
+                        ...stop.lines.map(line),
+                    ]),
+                ]));
+            });
+            // Yours: what you bought to resell (the To sell page), where this trader pays more than you paid.
+            if (c.held.length) {
+                route.appendChild(spEl('div', { class: 'rt' }, [
+                    spEl('span', { class: 'stop-n', text: '★' }),
+                    spEl('div', {}, [
+                        spEl('div', { class: 'rt-h' }, [spEl('b', { text: 'Yours to sell' }), spEl('span', { class: 'seen', text: b.name + ' pays more than you paid' })]),
+                        ...c.held.map((r) => {
+                            const give = (n) => this.h.onTradeHeld && this.h.onTradeHeld(r.itemId, r.held, n, c.key);
+                            const on = r.units > 0;
+                            return spEl('div', { class: 'pl' + (on ? '' : ' off') }, [
+                                this.tickBox(on, 'Include your ' + r.name, 'trade:htick:' + r.itemId, (yes) => give(yes ? r.held : null), 'Untick to keep it'),
+                                this.pic('trade-yours', r.itemId),
+                                spEl('span', {}, on
+                                    ? [spEl('b', { text: r.name }), ' × ', this.qtyBox(r.units, 'How many of your ' + r.name, 'trade:hqty:' + r.itemId, give), spEl('small', { text: 'of ' + count(r.held) + ' at ' + formatMoney(r.bid) + ' each' + (r.kept ? ' · keeping ' + (r.kept === 'all' ? 'all' : count(r.kept)) : '') + (r.units < r.spare && !r.kept && !c.payCapped ? ' · a normal amount' : '') })]
+                                    : [spEl('b', { text: r.name }), spEl('small', { text: 'kept · you hold ' + count(r.held) })]),
+                                spEl('span', { class: 'p' + (on ? '' : ' none0'), text: on ? formatMoney(r.units * r.bid) : '–' }),
+                            ]);
+                        }),
+                    ]),
+                ]));
+            }
+            // Left out by you: back in with its tick.
+            for (const r of c.off) {
+                route.appendChild(spEl('div', { class: 'pl off' }, [
+                    this.tickBox(false, 'Include ' + r.name, 'trade:tick:' + r.itemId, (yes) => edit(r.itemId, yes ? null : { off: true }), 'Tick to put it back'),
+                    this.pic('trade-off', r.itemId),
+                    spEl('span', {}, [spEl('b', { text: r.name }), spEl('small', { text: 'left out of this trade' })]),
+                    spEl('span', { class: 'p none0', text: '–' }),
+                ]));
+            }
+            // Was in this trade, is not now: said, never just gone (the friend lost track of what to buy when rows vanished mid-trade).
+            for (const r of c.gone || []) {
+                route.appendChild(spEl('div', { class: 'pl off' }, [
+                    spEl('span', { class: 'warnw', text: '!' }),
+                    this.pic('trade-gone', r.itemId),
+                    spEl('span', {}, [spEl('b', { text: r.name }), spEl('small', { text: c.unitsCapped ? 'no longer in the trade: it is full at ' + count(TRADE_MAX_UNITS) + ' items' : 'no longer in the trade: no bazaar sells it under ' + b.name + '\'s price now (bought, or re-priced), or your Cash went to the others' })]),
+                    spEl('span', { class: 'p none0', text: '–' }),
+                ]));
+            }
+            const right = [];
+            if (this.bd.page === 'trades') right.push(spEl('div', { class: 'lbl', text: 'The plan · prices can still move until they say yes' }));
+            if (route.children.length) right.push(route);
+            // What else they buy, left out so the buying stays quick: listed on a press, each with Add (the owner:
+            // "5 extra items, not max, but soft cap"). What does not fit this trade is counted in one line (3.23.0).
+            const fits = (c.left || []).length;
+            const hidden = c.leftHidden || 0;
+            if (!fits && hidden) {
+                right.push(spEl('p', { class: 'note', text: leftHiddenText(b.name, 0, hidden) }));
+            } else if (c.more > 0) {
+                const open = this.showLeft === c.key;
+                right.push(spEl('p', { class: 'note' }, [
+                    b.name + ' buys ' + count(c.more) + (c.more === 1 ? ' more item' : ' more items') + ', left out to keep it quick. ',
+                    this.wordBtn(open ? 'Hide ' + (c.more === 1 ? 'it' : 'them') : 'Show ' + (c.more === 1 ? 'it' : 'them'), 'trade:left', '', () => {
+                        this.showLeft = open ? null : c.key;
+                        this.redrawDesk();
+                    }),
+                    // Add all (the friend, 2026-09-29): every one of them in one press, past Extras per trade.
+                    fits > 1 ? ' · ' : null,
+                    fits > 1 ? this.wordBtn('Add all ' + count(fits), 'trade:addall', 'Put every item ' + b.name + ' buys into this trade (more bazaars to visit)', () => this.h.onTradeAddAll && this.h.onTradeAddAll(c.key, c.left.map((r) => ({ itemId: r.itemId, units: r.units })))) : null,
+                ]));
+                if (open) {
+                    right.push(spEl('div', { class: 'leftrows' }, (c.left || []).map((r) => spEl('div', { class: 'pl noti' }, [
+                        spEl('button', { type: 'button', class: 'btn sm', 'data-focus': 'trade:add:' + r.itemId, 'aria-label': 'Add ' + r.name + ' to the trade', text: 'Add', onclick: () => edit(r.itemId, { qty: r.units }) }),
+                        spEl('span', {}, [this.pic('trade-left', r.itemId), spEl('b', { text: r.name }), this.kindTag(r.kind), spEl('small', { text: 'from ' + formatMoney(r.price) + ' · ' + b.name + ' pays ' + formatMoney(r.bid) })]),
+                        spEl('span', { class: 'p', text: '≈ ' + signed(r.profit) }),
+                    ]))));
+                }
+                if (hidden) right.push(spEl('p', { class: 'note', text: leftHiddenText(b.name, fits, hidden) }));
+            }
+            const kept = Object.entries(T.keep || {});
+            if (kept.length) {
+                const nameOf = this.state.itemNameOf || ((id) => 'Item ' + id);
+                right.push(spEl('p', { class: 'note', text: 'Kept for yourself: ' + kept.map(([id, k]) => nameOf(id) + ' ' + (k === 'all' ? '(all)' : count(k))).join(' · ') + '. Change it in Settings › Flips and reading.' }));
+            }
+            // How old their prices are: amber once the list itself is old, or their two lists disagree.
+            const old = d.oldLists && d.oldLists[c.key] ? d.oldLists[c.key] : null;
+            const ages = [];
+            if (b.te && T.teAt) ages.push('TornExchange ' + formatAge(now - T.teAt));
+            if (b.w3b && T.w3bAt) ages.push('TornW3B ' + formatAge(now - T.w3bAt));
+            if (old) right.push(spEl('div', { class: 'amber' }, [spEl('span', {}, [spEl('b', { text: 'Check ' + b.name + '\'s list before you buy.' }), ' Their prices were last changed ' + listAgeText(now - old.at) + '.'])]));
+            else if (ages.length) right.push(spEl('p', { class: 'note', text: b.name + '\'s prices were read from ' + ages.join(', ') + '. Check their list before you buy.' }));
+            if (b.differ) right.push(spEl('div', { class: 'amber' }, [spEl('span', {}, [spEl('b', { text: b.name + '\'s lists differ' }), ' (' + this.listPrices(b, ', ') + '): planned at the lower.'])]));
+
+            // In the order you do it: ask them, then their answer. "Said no" passes this trade over for an hour.
+            const acts = spEl('div', { class: 'acts' }, [
+                this.chatLink(b, 'btn go big out'),
+                spEl('button', { type: 'button', class: 'btn big', 'data-focus': 'trade:accept:' + c.key, title: b.name + ' said yes: the trade is frozen as it is now, so nothing in it moves while you buy and send. It moves to Trades.', text: b.name + ' said yes', onclick: () => this.h.onTradeAccept && this.h.onTradeAccept(d.itemId) }),
+                // Nothing to buy: the trade itself can be opened now.
+                !c.stops && b.id ? this.link('Open the trade', tradeUrl(b.id), { cls: 'btn lg out', title: 'Start a trade with ' + b.name + ' on Torn', focus: 'step-trade' }) : null,
+                spEl('span', { class: 'sp' }),
+                this.wordBtn(b.name + ' said no', 'trade:decline:' + c.key, b.name + ' said no to this trade: on to the next (this trade is passed over for an hour; their other trades stay). Undo shows on their row.', () => this.h.onTradeDecline && this.h.onTradeDecline(c.key), 'quiet'),
+            ]);
+            const wire = (el) => {
+                // Anything you do here pins the page to this item and this trader, so the plan cannot move
+                // away while you buy and trade.
+                el.addEventListener('click', (event) => {
+                    const t = event.target;
+                    if (t && t.closest && t.closest('a, button, input, label') && this.h.onTradePin) this.h.onTradePin(d.itemId, c.key);
+                }, true);
+                // Ask, or the trade's own link: you asked - the trade waits for their yes in Trades (3.22.0).
+                const asked = (event) => {
+                    const a = event.target && event.target.closest ? event.target.closest('a') : null;
+                    if (a && (a.classList.contains('sp-chat') || a.dataset.focus === 'step-trade') && this.h.onTradeAsked) this.h.onTradeAsked(d.itemId, c.key);
+                };
+                el.addEventListener('click', asked, true);
+                el.addEventListener('auxclick', asked, true);
+            };
+            return { left, right, acts, wire };
+        }
+
+        /**
+         * A trade the trader said yes to: frozen, so nothing in it moves. Bazaar by bazaar, each buy is
+         * checked against the bazaar now (still there, re-priced, fewer left, gone) with a tick for bought;
+         * then each item a tick for sent - the same list shows in the panel on Torn's trade page. One thing to
+         * press next, always in the same place: the next bazaar, then the trade, then Traded.
+         * @returns {{left: Node[], right: Node[], acts: Node}}
+         */
+        acceptedPlan(d) {
+            const A = d.trade.accepted;
+            const b = A.buyer;
+            const now = Date.now();
+            const done = (st) => st.bought || st.skipped || st.boughtQty > 0;
+            // Only items with something to send count (review: "sent 0 of 2" counted a skipped one).
+            const skippedAll = (i) => i.kind !== 'yours' && (i.steps || []).length > 0 && i.steps.every((st) => st.skipped && !st.bought && !(st.boughtQty > 0));
+            const toSend = A.items.filter((i) => !skippedAll(i));
+            const sent = toSend.filter((i) => i.sent).length;
+            const tot = A.totals || { pays: A.pays, cost: A.cost, profit: A.profit };
+            const steps = A.items.flatMap((i) => i.steps || []);
+            const left0 = steps.filter((st) => !done(st)).length;
+            // A buy skipped is not a buy done: each is counted as what it is.
+            const boughtN = steps.filter((st) => st.bought || st.boughtQty > 0).length;
+            const skippedN = steps.filter((st) => st.skipped && !st.bought && !(st.boughtQty > 0)).length;
+            const inTrade = toSend.length ? sent + ' of ' + this.plural(toSend.length, 'line') + ' in Torn\'s trade' : 'nothing to send';
+            const left = [
+                this.whoBox(d, b, 'said yes ' + formatAge(now - A.at), { focus: 'acc:buyer' }),
+                spEl('div', { class: 'bigrow' }, [
+                    // What the trade comes to now (planned prices until you buy, then what you took). A zero is never green.
+                    spEl('div', {}, [spEl('span', { class: 'lbl', text: 'Profit' }), spEl('div', { class: 'big' + this.moneyTone(tot.profit), text: signed(tot.profit) })]),
+                    spEl('div', { class: 'eq' }, ['You pay the bazaars', spEl('b', { text: formatMoney(tot.cost) }), spEl('br'), b.name + ' pays you', spEl('b', { text: formatMoney(tot.pays) }),
+                        // It no longer comes to what they said yes to (a buy skipped, dropped or re-priced): said once, here.
+                        ...(A.profit > 0 && Math.round(A.profit) !== Math.round(tot.profit) ? [spEl('br'), 'Planned at their yes', spEl('b', { text: signed(A.profit) })] : [])]),
+                ]),
+                this.stepBar(left0 ? 2 : 3),
+                spEl('p', { class: 'note', text: steps.length
+                    ? count(boughtN) + ' of ' + this.plural(steps.length, 'buy') + ' done' + (skippedN ? ' · ' + count(skippedN) + ' skipped' : '') + (left0 ? ' · about ' + Math.max(1, Math.round(left0 / 2)) + ' min left' : boughtN ? ' · now the trade' : ' · nothing bought') + ' · ' + inTrade
+                    : 'Nothing to buy: send yours · ' + inTrade }),
+            ];
+            // Its items against the 10,000 one trade takes (3.23.0): said from nine tenths of it.
+            const cv = countView(A.count, b.name);
+            if (cv && cv.say) left.push(cv.state === 'full' ? spEl('div', { class: 'amber' }, [spEl('span', {}, [spEl('b', { text: cv.text + ' items.' }), ' ' + cv.say])]) : spEl('p', { class: 'note', text: cv.text + ' items. ' + cv.say }));
+
+            const words = {
+                ok: (c) => 'still listed' + (c.seenAt ? ' · seen ' + formatAge(now - c.seenAt) : ''),
+                price: (c, st) => 'now ' + formatMoney(c.price) + (c.price < st.price ? ' - cheaper' : ' - dearer'),
+                short: (c) => 'only ' + count(c.qty) + ' left',
+                gone: () => 'gone from their bazaar',
+                unknown: () => 'checking…',
+                bought: () => 'bought',
+            };
+            const right = [];
+            // Buy: bazaar by bazaar. A tick says bought (by hand, if Torn Bids did not see the buy).
+            const stops = [];
+            const stopOf = new Map();
+            for (const i of A.items) {
+                (i.steps || []).forEach((st, k) => {
+                    const key = 'id:' + st.sellerId;
+                    if (!stopOf.has(key)) {
+                        stopOf.set(key, { sellerId: st.sellerId, sellerName: st.sellerName, lines: [] });
+                        stops.push(stopOf.get(key));
+                    }
+                    stopOf.get(key).lines.push({ i, st, k });
+                });
+            }
+            if (stops.length) {
+                const cur = stops.find((s) => !s.lines.every((x) => done(x.st))) || null;
+                const route = spEl('div', { class: 'route' });
+                stops.forEach((stop, n) => {
+                    const all = stop.lines.every((x) => done(x.st));
+                    const skipped = stop.lines.every((x) => x.st.skipped && !x.st.bought && !(x.st.boughtQty > 0));
+                    const l0 = stop.lines.find((x) => !done(x.st)) || stop.lines[0];
+                    const name = stop.sellerName || 'Player ' + stop.sellerId;
+                    const kids = [spEl('div', { class: 'rt-h' }, [
+                        this.playerName(name, stop.sellerId, 'acc:seller:' + stop.sellerId),
+                        spEl('span', { class: 'st', text: skipped ? 'skipped' : all ? 'bought' : stop === cur ? 'next' : '' }),
+                        all ? null : this.link('bazaar', bazaarUrl(stop.sellerId, l0.i.itemId, l0.st.price), { cls: 'quiet lk', title: 'Opens ' + name + '\'s bazaar at the item and the price', focus: 'acc:bazaar:' + l0.i.itemId + ':' + l0.k }),
+                    ])];
+                    for (const { i, st, k } of stop.lines) {
+                        // Listed at another price now (cheaper included): over their price there is no profit; under it but
+                        // under your least profit it is said so; with enough profit it is news, not something to look at.
+                        const nowAt = st.check.state === 'price' && !st.bought ? st.check.price : null;
+                        const nowEach = nowAt !== null ? i.bid - nowAt : 0;
+                        const stillGood = nowAt !== null && nowEach > 0 && enoughProfit(nowEach, nowAt, 'TRADER', this.state.prefs.minProfitPct);
+                        const thin = nowAt !== null && nowEach > 0 && !stillGood;
+                        const bad = ['gone', 'price'].includes(st.check.state) && !st.bought && !stillGood;
+                        kids.push(spEl('div', { class: 'pl' }, [
+                            this.tickBox(st.bought, 'Bought ' + st.qty + ' ' + i.name + ' from ' + name, 'acc:bought:' + i.line + ':' + k, (yes) => this.h.onTradeTick && this.h.onTradeTick(A.key, i.line, { step: k, bought: yes }), 'Bought: tick it by hand if Torn Bids did not see the buy'),
+                            this.pic('acc-buy:' + i.line + ':' + k, i.itemId),
+                            spEl('span', {}, [spEl('b', { text: i.name }), ' × ' + count(st.qty), spEl('small', {}, ['at ' + formatMoney(st.price) + ' · ', spEl('span', { class: bad ? 'warnw' : '', text: st.skipped ? 'skipped' : st.boughtQty > 0 && !st.bought ? 'bought ' + count(st.boughtQty) + ' of ' + count(st.qty) : words[st.check.state](st.check, st) })])]),
+                            spEl('span', { class: 'p' + (bad || (st.skipped && !st.bought) ? ' none0' : ''), text: signed((i.bid - st.price) * st.qty) }),
+                        ]));
+                        // Gone or re-priced: the next cheapest still under their price, or drop the line.
+                        if (stillGood && !st.skipped) kids.push(spEl('p', { class: 'note', text: 'Now ' + formatMoney(nowAt) + (nowAt < st.price ? ', cheaper than planned: ' : ', dearer than planned, still over your least profit: ') + signed(nowEach * st.qty) + ' on this line.' }));
+                        if (bad) {
+                            kids.push(spEl('div', { class: 'amber' }, [
+                                spEl('span', {}, [
+                                    spEl('b', { text: st.check.state === 'gone' ? 'Gone: no profit here any more.' : thin ? 'Now ' + formatMoney(nowAt) + ': ' + signed(nowEach) + ' a piece, under your least profit.' : 'Now ' + formatMoney(st.check.price) + ': no profit any more.' }),
+                                    st.repl ? ' Next cheapest: ' + count(st.repl.qty) + ' from ' + (st.repl.sellerName || 'Player ' + st.repl.sellerId) + ' at ' + formatMoney(st.repl.price) + '.' : thin ? ' No other bazaar sells it with enough profit now.' : ' No bazaar sells it under ' + b.name + '\'s price now.',
+                                ]),
+                                st.repl ? this.wordBtn('Use it', 'acc:repl:' + i.line + ':' + k, 'Buy this one instead', () => this.h.onTradeReplace && this.h.onTradeReplace(A.key, i.line, k, st.repl)) : null,
+                                this.wordBtn('Drop it', 'acc:drop:' + i.line + ':' + k, 'Take ' + i.name + ' out of this trade', () => this.h.onTradeDrop && this.h.onTradeDrop(A.key, i.line)),
+                            ]));
+                        }
+                    }
+                    route.appendChild(spEl('div', { class: 'rt' + (skipped ? ' skip' : all ? ' done' : stop === cur ? ' cur' : '') }, [spEl('span', { class: 'stop-n', text: skipped ? '–' : all ? '✓' : String(n + 1) }), spEl('div', {}, kids)]));
+                });
+                right.push(spEl('div', { class: 'lbl', title: 'Next bazaar counts only what you took', text: 'Buy, bazaar by bazaar' }), route);
+            }
+            // Into Torn's trade: a tick says sent. They took fewer: how many, kept to sell elsewhere at Traded.
+            this.leftOpen = this.leftOpen || new Set();
+            const sendBox = spEl('div', { class: 'route sec' });
+            for (const i of A.items) {
+                const send = i.send !== undefined ? i.send : i.units;
+                const notTaken = Math.min(send, i.left || 0);
+                const bought = i.kind === 'yours' || (i.steps || []).every(done);
+                let leftCtl = null;
+                const openKey = A.key + '|' + i.line;
+                if (notTaken > 0 || this.leftOpen.has(openKey)) {
+                    // Same focus key as the button that opened it: the box takes the focus.
+                    const input = spEl('input', { type: 'text', class: 'qty', inputmode: 'numeric', value: notTaken > 0 ? String(notTaken) : '', placeholder: '0-' + send, 'aria-label': 'How many ' + i.name + ' ' + b.name + ' did not take (0 to ' + send + ')', 'data-focus': 'acc:left:' + i.line, autocomplete: 'off', spellcheck: 'false' });
+                    selectOnFocus(input);
+                    const was = input.value;
+                    const commit = () => {
+                        if (input.value === was) return;
+                        const n = readWholeNumber(input.value);
+                        if (n === null || n > send) {
+                            // Refused in place (3.14.3: the browser's own bubble), and what was there put back.
+                            input.value = was;
+                            flashBad(input, 'A number from 0 to ' + send);
+                            return;
+                        }
+                        this.leftOpen.delete(openKey);
+                        input.value = String(n);
+                        if (this.h.onTradeLeft) this.h.onTradeLeft(A.key, i.line, n);
+                    };
+                    // Saved once you leave the box (Enter leaves it); Esc puts back what was there.
+                    input.addEventListener('blur', () => setTimeout(commit, 0));
+                    input.addEventListener('keydown', (event) => {
+                        if (event.key === 'Escape') {
+                            event.preventDefault();
+                            event.stopPropagation();
+                            input.value = was;
+                            input.blur();
+                            return;
+                        }
+                        if (event.key !== 'Enter') return;
+                        event.preventDefault();
+                        input.blur();
+                    });
+                    leftCtl = spEl('small', {}, [
+                        input,
+                        ' not taken' + (i.kind === 'flip' ? ' - kept to sell elsewhere · ' : ' · '),
+                        this.wordBtn(notTaken > 0 ? 'They took all' : 'Cancel', 'acc:leftundo:' + i.line, '', () => {
+                            this.leftOpen.delete(openKey);
+                            if (notTaken > 0 && this.h.onTradeLeft) this.h.onTradeLeft(A.key, i.line, 0);
+                            else this.redrawDesk();
+                        }),
+                    ]);
+                } else if (bought && send > 0 && !left0) {
+                    // Only once everything is bought: the trade is what is left to happen.
+                    leftCtl = this.wordBtn('They took fewer…', 'acc:left:' + i.line, b.name + ' did not take all of it: say how many, kept to sell elsewhere', () => {
+                        this.leftOpen.add(openKey);
+                        this.redrawDesk();
+                    });
+                }
+                const out = skippedAll(i);
+                sendBox.appendChild(spEl('div', { class: 'pl' + (out ? ' off' : '') }, [
+                    this.tickBox(i.sent, 'Sent ' + i.name, 'acc:sent:' + i.line, (yes) => this.h.onTradeTick && this.h.onTradeTick(A.key, i.line, { sent: yes }), 'Sent: tick it by hand if Torn Bids did not see it go into the trade'),
+                    this.pic('acc-' + i.kind, i.itemId),
+                    spEl('span', {}, [
+                        spEl('b', { text: i.name }), ' × ' + count(send - notTaken),
+                        spEl('small', { text: formatMoney(i.bid) + ' each' + (i.kind === 'yours' ? ' · yours' : '') + (send !== i.units && i.kind !== 'yours' ? ' · planned ' + count(i.units) : '') }),
+                        leftCtl ? spEl('small', {}, [' ', leftCtl]) : null,
+                    ]),
+                    spEl('span', { class: 'p ' + (i.sent ? 'in' : out ? 'none0' : 'warn'), text: i.sent ? 'in the trade ✓' : out ? 'skipped' : bought ? 'add ' + count(send - notTaken) : 'buy it first' }),
+                ]));
+            }
+            right.push(spEl('div', { class: 'lbl', text: 'Into Torn\'s trade · Fill all types these on the trade page' }), sendBox);
+
+            // Cancel trade (the owner, 2026-09-29): they said yes, then it was called off - the plan goes. Asked first.
+            if (this.cancelAsk === A.key) {
+                const acts = spEl('div', { class: 'amber' }, [
+                    spEl('span', {}, [spEl('b', { text: 'Cancel the trade with ' + b.name + '?' }), ' This plan goes (they are not marked as having said no); what you already bought stays yours and goes to To sell.']),
+                    spEl('button', { type: 'button', class: 'btn sm bad', 'data-focus': 'acc:cancel-yes', text: 'Yes, cancel it', onclick: () => {
+                        this.cancelAsk = null;
+                        if (this.h.onTradeCancel) this.h.onTradeCancel(A.key);
+                    } }),
+                    this.wordBtn('Keep it', 'acc:cancel-no', '', () => {
+                        this.cancelAsk = null;
+                        this.redrawDesk();
+                    }),
+                ]);
+                return { left, right, acts };
+            }
+            const cur = steps.find((st) => !done(st)) || null;
+            const acts = spEl('div', { class: 'acts' }, [
+                left0
+                    ? spEl('button', { type: 'button', class: 'btn go big out', 'data-focus': 'acc:start', title: 'Opens the next bazaar on Torn: what to buy is marked there', text: 'Next bazaar' + (cur && cur.sellerName ? ': ' + cur.sellerName : ''), onclick: () => this.h.onTradeStartBuying && this.h.onTradeStartBuying(A.key) })
+                    : b.id ? this.link('Open the trade', tradeUrl(b.id), { cls: 'btn go big out', title: 'Start a trade with ' + b.name + ' on Torn', focus: 'acc:trade' }) : null,
+                left0 ? null : spEl('button', { type: 'button', class: 'btn big', 'data-focus': 'acc:done', title: 'The trade went through: close it' + (A.items.some((i) => i.left > 0 && i.kind === 'flip') ? ', and keep what they did not take to sell elsewhere' : '') + '. Torn Bids marks it traded by itself when it sees the trade finish.', text: 'Traded', onclick: () => this.h.onTradeClose && this.h.onTradeClose(A.key, true) }),
+                spEl('span', { class: 'sp' }),
+                spEl('span', { class: 'quiets' }, [
+                    left0 ? this.wordBtn('Traded', 'acc:done', 'The trade went through: close it (what they did not take goes to To sell)', () => this.h.onTradeClose && this.h.onTradeClose(A.key, true), 'quiet') : null,
+                    this.wordBtn('Back to the live plan', 'acc:back', 'Unfreeze: back to the live plan (nothing is kept)', () => this.h.onTradeClose && this.h.onTradeClose(A.key, false), 'quiet'),
+                    this.wordBtn('Cancel trade', 'acc:cancel', 'They said yes, then the trade was called off: this plan goes (they are not marked as having said no)', () => {
+                        this.cancelAsk = A.key;
+                        this.redrawDesk();
+                    }, 'quiet'),
+                ]),
+            ]);
+            return { left, right, acts };
+        }
+
+        /**
+         * No trade with a trader is on show: the plain flip (buy from these bazaars, sell to this trader) when
+         * there is one, else why there is none - in the numbers.
+         */
+        flipPlan(d) {
+            const f = d.plan;
+            const fb = f && f.units > 0 ? f.buyer || d.buyers[0] : null;
+            const fbKey = fb ? (fb.id ? 'id:' + fb.id : 'name:' + String(fb.name).toLowerCase()) : null;
+            const until = fbKey && d.trade && d.trade.declined ? d.trade.declined[fbKey] : null;
+            const none = (text, more = null) => spEl('div', { class: 'plan' }, [spEl('span', { class: 'lbl', text: 'The trade' }), spEl('div', { class: 'none', text }), more ? spEl('p', { class: 'note', text: more }) : null]);
+            if (until) return none(fb.name + ' said no (passed over for ' + formatAge(until - Date.now()).replace(' ago', '') + '). No other trader makes a trade on ' + d.name + ' now: Undo on their row, or pick another item.');
+            if (f && f.units > 0) {
+                const b = fb;
+                const kids = [
+                    this.whoBox(d, b, 'Sell to', { focus: 'step-buyer' }),
+                    spEl('div', { class: 'bigrow' }, [
+                        spEl('div', {}, [spEl('span', { class: 'lbl', text: 'Profit' }), spEl('div', { class: 'big', text: signed(f.profit) })]),
+                        spEl('div', { class: 'eq' }, ['You pay the bazaars', spEl('b', { text: formatMoney(f.cost) }), spEl('br'), count(f.units) + ' flipped' + (f.available > f.units ? ' of ' + count(f.available) + ' under their price' : ''), spEl('b', { text: formatMoney(b.price) + ' each' })]),
+                    ]),
+                    spEl('div', { class: 'route' }, f.steps.map((st, i) => spEl('div', { class: 'rt' }, [
+                        spEl('span', { class: 'stop-n', text: String(i + 1) }),
+                        spEl('div', {}, [
+                            spEl('div', { class: 'rt-h' }, [
+                                this.playerName(st.sellerName || 'Player ' + st.sellerId, st.sellerId, 'step-seller:' + st.sellerId),
+                                spEl('span', { class: 'st' }),
+                                this.link('bazaar', bazaarUrl(st.sellerId, d.itemId, st.price), { cls: 'quiet lk', title: 'Opens their bazaar at this item and the price', focus: 'step-bazaar:' + st.sellerId }),
+                            ]),
+                            spEl('div', { class: 'pl noti' }, [this.pic('step:' + i, d.itemId), spEl('span', {}, [spEl('b', { text: d.name }), ' × ' + count(st.qty), spEl('small', { text: 'at ' + formatMoney(st.price) })]), spEl('span', { class: 'p', text: signed((b.price - st.price) * st.qty) })]),
+                        ]),
+                    ]))),
+                ];
+                // Their networth capped the plan: say so, with the numbers.
+                if (b.maxUnits && f.units >= b.maxUnits) {
+                    const nw = b.id && this.state.networth ? this.state.networth.get(String(b.id)) : null;
+                    kids.push(spEl('p', { class: 'note', text: b.name + ' can pay for at most ' + count(b.maxUnits) + ': ' + (this.state.prefs.networthPct || 10) + '% of their networth' + (nw >= 0 && nw !== null ? ' (' + formatMoney(nw) + ')' : '') + '.' }));
+                }
+                if (b.differ) kids.push(spEl('div', { class: 'amber' }, [spEl('span', {}, [spEl('b', { text: b.name + '\'s lists differ' }), ' (' + this.listPrices(b, ', ') + '): planned at the lower. Check their list before trading.'])]));
+                kids.push(spEl('div', { class: 'acts' }, [this.chatLink(b, 'btn go big out'), b.id ? this.link('Open the trade', tradeUrl(b.id), { cls: 'btn lg out', title: 'Start a trade with ' + b.name + ' on Torn', focus: 'step-trade' }) : null]));
+                return spEl('div', { class: 'plan' }, kids);
+            }
+            let text;
+            const top = d.buyers[0];
+            const p = this.state.prefs;
+            const who = p.trustedOnly ? 'trusted buyer' : 'buyer';
+            const pct = p.minProfitPct ?? 1;
+            const fresh = d.sellers.rows.find((r) => !r.stale) || null;
+            if (f && f.units === 0) text = 'One costs ' + formatMoney(f.needs) + ', more than your cash (' + formatMoney(p.cash) + ').';
+            else if (d.planWhy === 'loading') text = 'Loading bazaars from TornW3B…';
+            else if (!top) text = 'No flip: no ' + who + ' for this item.';
+            else if (d.statItem) text = 'No flip: every copy is its own (weapons, armour, cars), and traders pay one price for one - nobody buys them by the hundred.';
+            else if (d.sellers.rows.some((r) => !r.stale && r.price < top.price && top.price - r.price < Math.max(1, (r.price * pct) / 100))) text = 'No flip: ' + top.name + ' pays ' + formatMoney(top.price) + ' and the cheapest bazaar asks ' + formatMoney(fresh.price) + '. That leaves ' + formatMoney(top.price - fresh.price) + ' a piece, under your least profit of ' + pct + '%.';
+            else if (d.sellers.rows.some((r) => !r.stale && r.price < top.price)) text = 'No flip: none of these buyers can take it at a profit (their price is over 3× the average, or their networth is too small).';
+            else if (fresh) text = 'No flip: ' + top.name + ' pays ' + formatMoney(top.price) + '; the cheapest bazaar asks ' + formatMoney(fresh.price) + ', ' + formatMoney(fresh.price - top.price) + ' over it.';
+            else if (d.sellers.rows.length) text = 'No flip: TornW3B has not seen these bazaars in the last 30 minutes.';
+            else text = 'No flip: no bazaar is selling it.';
+            // No flip on this item - but a trader's other items may still make a trade.
+            return none(text, d.trade && !d.trade.chosen && d.buyers.length ? 'Press a trader under Traders pay to plan a trade with their other items.' : null);
+        }
+
+        /* ------------------------------------------------------ where to sell */
+
+        /**
+         * Where to sell your N: a trader now, or wait in your bazaar or on the Item Market - the one that
+         * pays most first, marked Best. A place that gives no more than you paid is said so, and is no link
+         * (3.22.0). For what you bought to resell: Not for sale, which keeps it out of every trade.
+         */
+        drawWhere(d) {
+            const box = this.whereEl;
+            box.textContent = '';
+            box.hidden = !(d && d.held && d.where);
+            if (box.hidden) return;
+            const w = d.where;
+            const b = d.buyers[0];
+            const n = d.held;
+            // A trade with them is going already: the row points at it, and offers no second one.
+            const going = this.goingWith(d);
+            const folded = Boolean(going && this.planOnSide() && this.tradeKeyOnShow() === going[1].key);
+            const rows = [
+                { venue: 'trader', name: 'Trade to ' + (b ? b.name : 'a trader'), when: going ? (going[0] === 'waiting' ? 'you asked ' + b.name + ' · it waits for their yes' : 'a trade with ' + b.name + ' is going') + (folded ? ' · below' : '') : 'paid now, in one trade', url: b && b.id ? tradeUrl(b.id) : null, go: b ? 'Start a trade with ' + b.name : '', missing: 'No ' + (this.state.prefs.trustedOnly ? 'trusted ' : '') + 'trader buys it' },
+                { venue: 'bazaar', name: 'Your bazaar', when: '$1 under the cheapest · paid when someone buys', url: MY_BAZAAR_ADD_URL, go: 'Add to your bazaar', missing: 'No bazaar listing to price against' },
+                { venue: 'market', name: 'Item Market', when: 'after the 5% fee · paid when someone buys', url: MARKET_ADD_URL, go: 'List on the Item Market', missing: d.market.state === 'loading' ? 'Checking the Item Market…' : 'No Item Market listing to price against' },
+            ].map((r) => {
+                const o = w.options.find((x) => x.venue === r.venue) || null;
+                const v = whereRowView(o, n, w.paid);
+                return { ...r, o, v, each: v.known ? o.each : null, total: v.total };
+            }).sort((x, y) => (y.venue === w.best) - (x.venue === w.best) || (y.total === null ? -1 : y.total) - (x.total === null ? -1 : x.total));
+            const body = spEl('div', { class: 'pb' });
+            for (const r of rows) {
+                const { each, v } = r;
+                const win = w.best === r.venue;
+                // The words and the figure are for the same units (whereRowView): a loss never sits beside a plus.
+                const { loss, part, gain } = v;
+                const listAt = r.venue === 'bazaar' && each !== null ? ' at ' + formatMoney(each) : r.venue === 'market' && d.market.lowest > 1 ? ' at ' + formatMoney(d.market.lowest - 1) : '';
+                // A listing counted for only the first N (as many as are listed near that price now): the rest go to the trader, and it says so.
+                const rest = b ? (loss ? ' · the rest to the trader' : ', the rest to the trader') : '';
+                body.appendChild(spEl('div', { class: 'opt' + (win ? ' best' : '') + (each === null || loss ? ' dimo' : '') }, [
+                    spEl('span', { class: 'w' }, [
+                        spEl('b', { text: r.name + listAt }),
+                        win ? spEl('span', { class: 'badge best', text: 'Best' }) : null,
+                        spEl('small', { text: each === null ? r.missing : loss ? 'No more than the ' + formatMoney(w.paid) + ' you paid: a loss' + (part ? ' on the first ' + count(v.units) + rest : '') : r.when + (part ? ' · first ' + count(v.units) + rest : '') }),
+                    ]),
+                    spEl('span', { class: 'v' }, each === null ? [spEl('b', { text: '–' })] : [
+                        spEl('b', { text: formatMoney(r.total) }),
+                        gain !== null ? spEl('small', { class: gain <= 0 ? 'loss' : '', text: signed(gain) }) : n > 1 ? spEl('small', { class: 't-muted', text: formatMoney(each) + ' each' }) : null,
+                    ]),
+                    r.venue === 'trader' && going ? (folded ? spEl('span') : spEl('button', { type: 'button', class: 'btn', 'data-focus': 'where:going', title: 'The trade with ' + b.name + ' is on Trades', text: 'Open on Trades', onclick: () => this.showTrade(going[0], going[1]) }))
+                        : r.url && each !== null && !loss ? this.link(r.go, r.url, { cls: 'btn out' + (win ? ' go' : ''), title: r.venue === 'trader' ? 'Start a trade on Torn' : r.venue === 'bazaar' ? 'Opens your bazaar\'s add page' : 'Opens the Item Market\'s add page', focus: 'where:' + r.venue }) : spEl('span'),
+                ]));
+            }
+            const bazaar = w.options.find((x) => x.venue === 'bazaar');
+            let verdict = '';
+            if (w.best === 'bazaar' || w.best === 'market') {
+                const won = w.options.find((x) => x.venue === w.best);
+                const place = (w.best === 'bazaar' ? 'your bazaar' : 'the Item Market') + (won && won.units < n ? ' for the first ' + count(won.units) + ' (as many as are listed near that price now)' : '');
+                verdict = b ? 'Best: ' + place + ', ' + signed(w.gain) + ' more than the trader, but you wait for a buyer.' : 'Best: ' + place + '. ' + rows.find((r) => r.venue === 'trader').missing + '.';
+            } else if (w.best === 'trader' && bazaar && bazaar.each !== null) {
+                const diff = bazaar.total - b.price * n;
+                verdict = diff > 0 ? 'Your bazaar would get only ' + signed(diff) + ' more than ' + b.name + '\'s trade, and you would wait.' : 'Your bazaar would get ' + formatMoney(-diff) + ' less than ' + b.name + '\'s trade.';
+            }
+            if (verdict) body.appendChild(spEl('p', { class: 'note', text: verdict }));
+            if (!w.best && w.paid) body.appendChild(spEl('div', { class: 'amber' }, [spEl('span', {}, [spEl('b', { text: 'Nobody pays more than the ' + formatMoney(w.paid) + ' you paid.' }), ' It waits in To sell until someone does.'])]));
+            const kept = this.keptNow(d);
+            if (kept !== null) {
+                body.appendChild(spEl('div', { class: 'field' }, [
+                    spEl('div', { class: 'f-l' }, [spEl('b', { text: 'Not for sale' }), spEl('span', { text: 'keeps it out of every trade and off your bazaar\'s Fill all' })]),
+                    spEl('button', { type: 'button', class: 'sw-t' + (kept ? '' : ' off'), role: 'switch', 'aria-checked': String(kept), 'aria-label': 'Not for sale', 'data-focus': 'where:keep', onclick: () => this.h.onNotForSale && this.h.onNotForSale(d.itemId, !kept) }),
+                ]));
+            }
+            box.append(spEl('div', { class: 'ph' }, [spEl('h2', { text: 'Where to sell your ' + count(n) }), d.paid > 0 ? spEl('span', { class: 'sub' }, ['you paid ', spEl('b', { text: formatMoney(d.paid) }), ' each']) : null]), body);
+        }
+
+        /* ------------------------------------------- totals, the Trades board, Today */
+
+        /** One total in a tile: a label, the number, a line under it. `pick`: pressing it goes somewhere. */
+        tile({ label, value, small = '', sub = [], good = false, bad = false, cls = 'tile', onPick = null, title = null }) {
+            // A zero is never green.
+            const zero = value === '+$0' || value === '$0';
+            const el = spEl('div', { class: 'panel ' + cls + (onPick ? ' pick' : ''), title }, [
+                spEl('div', { class: 'k-l', text: label }),
+                spEl('div', { class: 'k-v' + (good && !zero ? ' good' : bad ? ' bad' : '') }, [value, small ? spEl('small', { text: small }) : null]),
+                spEl('div', { class: 'k-s' }, sub),
+            ]);
+            if (onPick) {
+                el.setAttribute('role', 'button');
+                el.setAttribute('tabindex', '0');
+                el.addEventListener('click', onPick);
+                el.addEventListener('keydown', (event) => {
+                    if (event.key !== 'Enter' && event.key !== ' ') return;
+                    event.preventDefault();
+                    onPick();
+                });
+            }
+            return el;
+        }
+
+        /** A page's few totals, drawn again only when a number in them changes. */
+        tilesInto(box, key, tiles) {
+            const sig = JSON.stringify(tiles.map((t) => [t.label, t.value, t.small, t.sub.map((x) => (typeof x === 'string' ? x : x.textContent)), t.good, t.bad]));
+            this.tileSigs = this.tileSigs || {};
+            if (this.tileSigs[key] === sig) return;
+            this.tileSigs[key] = sig;
+            box.textContent = '';
+            for (const t of tiles) box.appendChild(this.tile(t));
+        }
+
+        /** The class of a big money figure: green only over zero, red under it. */
+        moneyTone(n) {
+            const v = Math.round(Number(n) || 0);
+            return v > 0 ? '' : v < 0 ? ' neg' : ' zero';
+        }
+
+        /** "3 trades", "1 item": a number and its word. */
+        plural(n, word) {
+            return count(n) + ' ' + word + (n === 1 ? '' : 's');
+        }
+
+        renderTiles() {
+            const s = this.state;
+            const page = this.bd.page;
+            const b = (text, cls = '') => spEl('b', { class: cls, text });
+            if (page === 'trades') {
+                const T = s.trades || { waiting: [], buying: [], ready: [] };
+                const yes = [...T.buying, ...T.ready];
+                const all = [...T.waiting, ...yes];
+                const stand = [T.ready.length ? count(T.ready.length) + ' ready to trade' : null, T.buying.length ? count(T.buying.length) + ' buying' : null, T.waiting.length ? count(T.waiting.length) + ' waiting for a yes' : null].filter(Boolean);
+                const paid = yes.reduce((a, r) => a + (r.paid || 0), 0);
+                const cost = yes.reduce((a, r) => a + (r.cost || 0), 0);
+                this.tilesInto(this.tradesTiles, 'trades', [
+                    { label: 'Going', value: count(all.length), small: all.length === 1 ? 'trade' : 'trades', sub: [stand.length ? stand.join(' · ') : 'none now'] },
+                    { label: 'Paid to bazaars so far', value: formatMoney(paid), sub: yes.length ? ['in the ' + this.plural(yes.length, 'trade') + ' they said yes to · ', b(formatMoney(Math.max(0, cost - paid))), ' still to buy'] : ['nothing is bought before a yes'] },
+                    { label: 'They pay you', value: formatMoney(yes.reduce((a, r) => a + (r.pays || 0), 0)), sub: [yes.length ? 'when ' + (yes.length === 1 ? 'that one is' : 'those ' + count(yes.length) + ' are') + ' traded' : 'no trade said yes to yet'] },
+                    { label: 'Profit in all of them', value: signed(all.reduce((a, r) => a + (r.profit || 0), 0)), good: all.reduce((a, r) => a + (r.profit || 0), 0) > 0, sub: yes.length ? [b(signed(yes.reduce((a, r) => a + (r.profit || 0), 0))), ' in the ' + this.plural(yes.length, 'trade') + ' said yes to'] : ['none said yes to yet'] },
+                ]);
+            } else if (page === 'mine') {
+                const H = s.hold || { items: 0, kinds: 0, paidKinds: 0, worth: 0 };
+                const rows = ((s.toSell || {}).rows || []);
+                const gain = ((s.toSell || {}).groups || []).reduce((a, g) => a + g.gain, 0);
+                this.tilesInto(this.mineTiles, 'mine', [
+                    { label: 'In your inventory', value: count(H.items), small: 'items', sub: [b(count(H.paidKinds)), ' of ' + this.plural(H.kinds, 'kind') + ' a trader pays for'] },
+                    { label: 'Traders pay now', value: formatMoney(H.worth), good: H.worth > 0, sub: ['for all of it, each item at its best trader'] },
+                    { label: 'Bought to resell', value: count(rows.length), small: (rows.length === 1 ? 'kind' : 'kinds') + ' · ' + this.plural(rows.reduce((a, r) => a + r.qty, 0), 'item'), sub: [b(signed(gain), gain > 0 ? 't-good' : ''), ' over what you paid if sold now · see To sell'], onPick: () => this.go('sell'), title: 'Open To sell' },
+                ]);
+            } else if (page === 'sell') {
+                const T = s.toSell || { rows: [], groups: [], waiting: [] };
+                const rows = T.rows || [];
+                const good = (T.groups || []).reduce((a, g) => a + g.rows.length, 0);
+                this.tilesInto(this.sellTiles, 'sell', [
+                    { label: 'Held to resell', value: count(rows.reduce((a, r) => a + r.qty, 0)), small: 'items', sub: ['you paid ', b(formatMoney(rows.reduce((a, r) => a + r.qty * r.each, 0))), ' in all'] },
+                    { label: 'If sold to traders now', value: signed((T.groups || []).reduce((a, g) => a + g.gain, 0)), good: good > 0, sub: [b(count(good)), ' of ' + this.plural(rows.length, 'kind') + ': a trader pays more than you paid'] },
+                    { label: 'Waiting', value: count((T.waiting || []).length), small: (T.waiting || []).length === 1 ? 'kind' : 'kinds', sub: ['nobody pays more than you paid yet' + ((T.kept || []).length ? ' · ' + count(T.kept.length) + ' not for sale' : '')] },
+                ]);
+            }
+        }
+
+        /** One trade of the Trades page: how far it is (a bar), and its line. */
+        tradeStage(kind, r) {
+            const ago = (at) => formatAge(Date.now() - at);
+            if (kind === 'waiting') return { at: 1, prog: 25, line: (r.asked ? 'asked ' : 'pinned ') + ago(r.at) + ' · ' + this.plural(r.items, 'item') };
+            // A bazaar skipped is said as skipped, never as bought.
+            const skipped = r.skippedStops ? ' · ' + count(r.skippedStops) + ' skipped' : '';
+            const boughtOf = count(r.boughtStops || 0) + ' of ' + this.plural(r.bazaars, 'bazaar') + ' bought' + skipped;
+            if (kind === 'buying') return { at: 2, prog: 25 + Math.round((50 * (r.bazaarsDone || 0)) / Math.max(1, r.bazaars || 1)), line: !r.next && !r.bought ? 'nothing bought' + skipped : boughtOf };
+            return { at: 3, prog: 75 + Math.round((25 * (r.sent || 0)) / Math.max(1, r.items || 1)), line: (!r.bazaars ? 'all yours' : r.skippedStops ? boughtOf : 'all bought') + ' · ' + count(r.sent || 0) + ' of ' + this.plural(r.items, 'line') + ' in Torn\'s trade' };
+        }
+
+        /** Every trade going, as [kind, row] in the board's order. */
+        tradesGoing() {
+            const T = this.state.trades || { waiting: [], buying: [], ready: [] };
+            return [...T.waiting.map((r) => ['waiting', r]), ...T.buying.map((r) => ['buying', r]), ...T.ready.map((r) => ['ready', r])];
+        }
+
+        /** A trade opened from Trades or Today: on show as planned, or as they said yes to it. */
+        openTrade(kind, r) {
+            if (kind === 'waiting') return this.h.onTradesOpen && this.h.onTradesOpen(r.itemId, r.key);
+            return this.h.onTradesShow && this.h.onTradesShow(r.itemId, r.key);
+        }
+
+        /** The trade a card stands for is the one on show. */
+        tradeOnShow(r, kind = '') {
+            const s = this.state;
+            if ((s.trades && s.trades.open) || !s.desk || String(s.desk.itemId) !== String(r.itemId)) return false;
+            // A waiting trade just pressed, its prices not read yet: no plan with them to show so far, and it is still the one picked.
+            const loading = kind === 'waiting' ? this.waitingOnDesk(s.desk) : null;
+            return loading ? loading === r : this.tradeKeyOnShow() === r.key;
+        }
+
+        /**
+         * The waiting trade (asked or pinned) of the item on show while the plan with its trader is not
+         * worked out yet - nothing read so far, or only another trader's prices: its row, or null.
+         */
+        waitingOnDesk(d) {
+            const T = d && d.trade;
+            if (!d || (T && (T.accepted || (T.chosen && T.picked)))) return null;
+            const rows = ((this.state.trades || {}).waiting || []).filter((r) => String(r.itemId) === String(d.itemId));
+            if (T && T.chosen && rows.some((r) => r.key === T.chosen.key)) return null;
+            return rows.length === 1 ? rows[0] : null;
+        }
+
+        /**
+         * The Trades board (3.22.0, mockup V; as lanes since 3.25.0): a card per trade in the lane of its step -
+         * waiting for a yes, buying, ready to trade - and what ended today, with what went to To sell by itself.
+         * Pressing a card opens the trade under the board.
+         */
+        renderBoard() {
+            if (this.bd.page !== 'trades') return;
+            const s = this.state;
+            const T = s.trades || { waiting: [], buying: [], ready: [], ended: [] };
+            const minute = Math.floor(Date.now() / 60000);
+            const going = this.tradesGoing();
+            const sig = JSON.stringify(['board', going.map(([kind, r]) => [kind, r.itemId, r.key, r.name, r.items, r.profit, r.at, r.asked, r.bazaars, r.bazaarsDone, r.sent, r.boughtStops, r.skippedStops, r.bought, r.next, this.dotSig(r), this.tradeOnShow(r, kind)]), (T.ended || []).map((e) => [e.key, e.how, e.at, e.profit, e.moved]), minute]);
+            if (sig === this.boardSig) return;
+            this.boardSig = sig;
+            const box = this.boardEl;
+            const keep = this.focusKeyIn(box);
+            box.textContent = '';
+            const lane = (title, n, cards) => spEl('div', { class: 'lane' }, [spEl('div', { class: 'lane-h' }, [spEl('i'), spEl('span', { class: 'lbl', text: title }), spEl('span', { text: count(n) })]), ...cards]);
+            const card = (kind, r) => {
+                const st = this.tradeStage(kind, r);
+                const off = s.statuses && r.id && s.statuses.get(String(r.id)) && s.statuses.get(String(r.id)).level === 'offline';
+                const el = spEl('div', { class: 'tc' + (this.tradeOnShow(r, kind) ? ' sel' : ''), role: 'button', tabindex: '0', 'data-focus': 'tb:' + kind + ':' + r.itemId + ':' + r.key, title: 'Open the trade with ' + r.name, onclick: () => this.openTrade(kind, r) }, [
+                    spEl('div', { class: 'tc-h' }, [this.dot(r), spEl('b', { text: r.name }), spEl('span', { class: 'p', text: signed(r.profit) })]),
+                    spEl('div', { class: 'prog' }, [spVars(spEl('i'), { '--w': st.prog + '%' })]),
+                    spEl('small', { class: off && kind === 'waiting' ? 't-warn' : '', text: (off && kind === 'waiting' ? 'offline · ' : '') + st.line }),
+                ]);
+                el.addEventListener('keydown', (event) => {
+                    if (event.target !== el || (event.key !== 'Enter' && event.key !== ' ')) return;
+                    event.preventDefault();
+                    this.openTrade(kind, r);
+                });
+                return el;
+            };
+            const HOW = { traded: 'traded', cancel: 'cancelled', old: 'no answer in a day' };
+            box.append(
+                lane('Waiting for a yes', T.waiting.length, T.waiting.map((r) => card('waiting', r))),
+                lane('Buying', T.buying.length, T.buying.map((r) => card('buying', r))),
+                lane('Ready to trade', T.ready.length, T.ready.map((r) => card('ready', r))),
+                lane('Ended today', (T.ended || []).length, (T.ended || []).map((e) => spEl('div', { class: 'tc end' }, [
+                    spEl('div', { class: 'tc-h' }, [spEl('b', {}, [this.playerName(e.name, /^id:\d+$/.test(String(e.key)) ? String(e.key).slice(3) : null, 'tb:ended:' + e.key + ':' + e.at)]), spEl('span', { class: 'p', text: e.how === 'traded' && e.profit ? signed(e.profit) : '' })]),
+                    spEl('small', { text: (HOW[e.how] || 'ended') + ' · ' + (e.moved && e.moved.length ? e.moved.map((m) => count(m.qty) + ' ' + m.name).join(', ') + ' went to To sell' : e.how === 'traded' ? 'they took everything' : 'nothing was bought') + ' · ' + formatAge(Date.now() - e.at) }),
+                ]))),
+            );
+            this.focusBack(box, keep);
+        }
+
+        /** Profit per day for the last `n` days, from your Ledger: [{start, profit}], oldest first. Empty without a Ledger key. */
+        profitDays(n) {
+            const L = this.state.ledger || {};
+            const rows = L.rows || [];
+            if (!L.hasKey || !rows.length) return [];
+            const sig = rows.length + ':' + rows[rows.length - 1].id + ':' + n + ':' + periodStart(Date.now(), 'day');
+            if (this.daysSig !== sig) {
+                this.daysSig = sig;
+                const by = new Map(ledgerByPeriod(rows, matchFifo(rows), 'day').map((p) => [p.start, p.profit]));
+                const today = periodStart(Date.now(), 'day');
+                this.days = [];
+                for (let i = n - 1; i >= 0; i -= 1) {
+                    // Midnight of each day by the calendar (a day is not always 24 hours).
+                    const d = new Date(today);
+                    d.setDate(d.getDate() - i);
+                    const start = periodStart(d.getTime(), 'day');
+                    this.days.push({ start, profit: by.get(start) || 0 });
+                }
+            }
+            return this.days;
+        }
+
+        /**
+         * Today: the few totals, the best flips, what to do now, your trades, what you hold and your profit.
+         * Everything here is a way in: a press opens the page it is from.
+         */
+        renderToday() {
+            if (this.bd.page !== 'today') return;
+            const s = this.state;
+            const info = s.info || {};
+            const T = s.trades || { waiting: [], buying: [], ready: [] };
+            const going = this.tradesGoing();
+            const flips = (s.strip || []).filter((f) => f.plan);
+            const traders = ((s.scan || {}).list || []).filter((x) => this.traderReady(x)).sort((a, b) => b.profit - a.profit);
+            const best = traders[0] || null;
+            const sellT = s.toSell || { rows: [], groups: [] };
+            const sellGain = (sellT.groups || []).reduce((a, g) => a + g.gain, 0);
+            const H = s.hold || { items: 0, kinds: 0, worth: 0, top: [] };
+            const days = this.profitDays(10);
+            const week = days.slice(-7).reduce((a, x) => a + x.profit, 0);
+            const todayP = days.length ? days[days.length - 1].profit : 0;
+            const minute = Math.floor(Date.now() / 60000);
+            const sig = JSON.stringify(['today',
+                flips.slice(0, 7).map((f) => [f.itemId, f.name, f.plan.profit, f.buyer && f.buyer.name, this.dotSig(f.buyer)]), (s.counts || {}).flips,
+                best && [best.key, best.profit, best.items, best.stops, best.name],
+                going.map(([kind, r]) => [kind, r.itemId, r.key, r.name, r.profit, r.items, r.bazaars, r.bazaarsDone, r.sent, r.next, r.at]),
+                sellGain, (sellT.rows || []).length, (sellT.groups || []).map((g) => [g.key, g.gain, g.rows.length]),
+                H, days, Boolean((s.ledger || {}).hasKey), this.noFlipsText(), info.hasKey, minute,
+                s.still ? [s.still.trader, (s.still.waiting || []).length] : null,
+                going.map(([, r]) => [r.boughtStops, r.skippedStops, r.bought])]);
+            if (sig === this.todaySig) return;
+            this.todaySig = sig;
+            const b = (text, cls = '') => spEl('b', { class: cls, text });
+
+            /* the five totals */
+            this.todayTiles.textContent = '';
+            const kpi = (o) => this.todayTiles.appendChild(this.tile({ ...o, cls: 'kpi' }));
+            kpi(best
+                ? { label: 'Best trade now', value: signed(best.profit), good: best.profit > 0, sub: [b(best.name), ' · ' + this.plural(best.items, 'item') + ' · ' + this.plural(best.stops, 'bazaar')], onPick: () => this.showTrader(best), title: 'Open this trade' }
+                : { label: 'Best trade now', value: '–', sub: [(s.scan || {}).open && !((s.scan || {}).list || []).length ? 'working it out…' : 'none with your traders now'], onPick: () => this.go('flips', BD_FLIPS_TRADER) });
+            // A trade under way holds the list: Today says so, and where what is new waits.
+            const heldFor = !flips.length && s.still && s.still.trader ? s.still.trader : null;
+            const heldNew = heldFor ? (s.still.waiting || []).length : 0;
+            kpi({ label: 'Flips now', value: count((s.counts || {}).flips || 0), sub: flips.length ? [b(signed(flips.reduce((a, f) => a + f.plan.profit, 0))), ' in the best ' + count(flips.length)] : heldFor ? [(heldNew ? count(heldNew) + ' waiting · ' : '') + 'list held for your trade with ' + heldFor] : [this.noFlipsText()], onPick: () => this.go('flips', BD_FLIPS_BEST) });
+            kpi({ label: 'Trades going', value: count(going.length), sub: going.length ? [T.ready.length ? b(count(T.ready.length) + ' ready to trade') : T.buying.length ? b(count(T.buying.length) + ' buying') : b(count(T.waiting.length) + ' waiting for a yes'), ' · ' + signed(going.reduce((a, [, r]) => a + (r.profit || 0), 0)) + ' in all'] : ['none now'], onPick: () => this.go('trades') });
+            kpi({ label: 'To sell', value: (sellT.rows || []).length ? signed(sellGain) : '–', sub: (sellT.rows || []).length ? ['if sold now · ', b(count(sellT.rows.reduce((a, r) => a + r.qty, 0))), ' items held'] : ['nothing bought to resell'], onPick: () => this.go('sell') });
+            kpi(days.length
+                ? { label: 'Profit, 7 days', value: signed(week), good: week > 0, bad: week < 0, sub: ['today ', b(signed(todayP))], onPick: () => this.go('ledger') }
+                : { label: 'Profit, 7 days', value: '–', sub: [(s.ledger || {}).hasKey ? 'reading your log…' : 'needs your Full key: Settings'], onPick: () => this.go((s.ledger || {}).hasKey ? 'ledger' : 'settings', (s.ledger || {}).hasKey ? null : BD_SET_KEYS) });
+
+            /* best flips now */
+            const fbox = this.todayFlips;
+            fbox.textContent = '';
+            const max = Math.max(1, ...flips.map((f) => f.plan.profit));
+            for (const f of flips.slice(0, 7)) {
+                const open = () => this.showFlip(f.itemId);
+                const row = spEl('div', { class: 'fr', role: 'button', tabindex: '0', 'data-focus': 'today:flip:' + f.itemId, title: 'Open this flip', onclick: open }, [
+                    spEl('div', { class: 'cell' }, [this.pic('today', f.itemId), spEl('b', { text: f.name })]),
+                    spEl('span', { class: 'to' }, [this.dot(f.buyer), f.buyer ? f.buyer.name : '']),
+                    this.bar(f.plan.profit, max, 'wide'),
+                    spEl('span', { class: 'p', text: signed(f.plan.profit) }),
+                ]);
+                row.addEventListener('keydown', (event) => {
+                    if (event.key !== 'Enter' && event.key !== ' ') return;
+                    event.preventDefault();
+                    open();
+                });
+                fbox.appendChild(row);
+            }
+            if (!flips.length && heldFor) {
+                fbox.appendChild(spEl('div', { class: 'empty' }, [
+                    'Held while you trade with ' + heldFor + '. ' + (heldNew ? this.plural(heldNew, 'new flip') + (heldNew === 1 ? ' waits' : ' wait') + ' in Flips. ' : 'New flips wait in Flips. '),
+                    spEl('button', { type: 'button', class: 'btn sm', 'data-focus': 'today:held', text: 'Open Flips', onclick: () => this.go('flips', BD_FLIPS_BEST) }),
+                ]));
+            } else if (!flips.length) fbox.appendChild(spEl('div', { class: 'empty', text: this.noFlipsText() }));
+
+            /* do now: the next step of each trade, then the best trade to ask for, then what to sell */
+            const dbox = this.todayDo;
+            dbox.textContent = '';
+            const nx = (icon, lead, rest, btn) => dbox.appendChild(spEl('div', { class: 'nx' }, [spEl('span', { class: 'nx-i' }, [bdIcon(icon)]), spEl('span', { class: 'nx-t' }, [spEl('b', { text: lead }), ' ' + rest]), btn]));
+            const press = (label, fn, go = false, focus = '') => spEl('button', { type: 'button', class: 'btn sm' + (go ? ' go' : ''), 'data-focus': focus || null, text: label, onclick: fn });
+            let first = true;
+            const lead = () => {
+                const was = first;
+                first = false;
+                return was;
+            };
+            for (const r of T.ready.slice(0, 2)) {
+                nx('trades', r.name + ': ' + (!r.bazaars ? 'all yours.' : r.skippedStops ? count(r.boughtStops || 0) + ' of ' + this.plural(r.bazaars, 'bazaar') + ' bought, ' + count(r.skippedStops) + ' skipped.' : 'everything is bought.'), count(r.sent || 0) + ' of ' + this.plural(r.items, 'line') + ' in Torn\'s trade.',
+                    r.id ? this.link('Open the trade', tradeUrl(r.id), { cls: 'btn sm out' + (lead() ? ' go' : ''), title: 'Start a trade with ' + r.name + ' on Torn', focus: 'today:trade:' + r.key }) : press('See it', () => this.showTrade('ready', r)));
+            }
+            for (const r of T.buying.slice(0, 2)) {
+                // Every bazaar skipped: nothing to press next but the trade itself.
+                if (!r.next) nx('buy', r.name + ': nothing bought.', count(r.skippedStops || 0) + ' of ' + this.plural(r.bazaars, 'bazaar') + ' skipped.', press('See it', () => this.showTrade('buying', r), false, 'today:skipped:' + r.key));
+                else nx('buy', r.name + ': ' + count(r.boughtStops || 0) + ' of ' + this.plural(r.bazaars, 'bazaar') + ' bought' + (r.skippedStops ? ', ' + count(r.skippedStops) + ' skipped' : '') + '.', 'Next is ' + r.next + '.',
+                    press('Next bazaar', () => this.h.onTradeStartBuying && this.h.onTradeStartBuying(r.key), lead(), 'today:next:' + r.key));
+            }
+            for (const r of T.waiting.filter((w) => w.asked).slice(0, 1)) {
+                nx('trades', r.name + ' has not answered yet.', 'Asked ' + formatAge(Date.now() - r.at) + ' · ' + signed(r.profit) + '.', press('See it', () => this.showTrade('waiting', r), false, 'today:wait:' + r.key));
+            }
+            if (best) nx('flip', 'Ask ' + best.name + '.', signed(best.profit) + ' for ' + this.plural(best.items, 'item') + ' at ' + this.plural(best.stops, 'bazaar') + '.', press('See it', () => this.showTrader(best), lead(), 'today:best'));
+            const g0 = (sellT.groups || [])[0] || null;
+            if (g0) nx('tag', 'Sell your ' + (g0.rows.length === 1 ? count(g0.rows[0].qty) + ' ' + g0.rows[0].name : this.plural(g0.rows.length, 'item') + ' held') + '.', g0.trader.name + ' pays ' + formatMoney(g0.gain) + ' more than you paid.', press('To sell', () => this.go('sell'), false, 'today:sell'));
+            if (!dbox.children.length) dbox.appendChild(spEl('div', { class: 'empty', text: info.hasKey ? 'Nothing to do now. ' + this.noFlipsText() : 'Add your Limited key in Settings to see your items and your trades.' }));
+
+            /* trades going */
+            const tbox = this.todayTrades;
+            tbox.textContent = '';
+            for (const [kind, r] of going.slice(0, 6)) {
+                const st = this.tradeStage(kind, r);
+                const open = () => this.showTrade(kind, r);
+                const row = spEl('div', { class: 'gr', role: 'button', tabindex: '0', 'data-focus': 'today:tr:' + r.itemId + ':' + r.key, title: 'Open the trade with ' + r.name, onclick: open }, [
+                    spEl('span', {}, [this.dot(r), spEl('b', { text: r.name }), spEl('small', { text: st.line })]),
+                    spEl('span', { class: 'p', text: signed(r.profit) }),
+                    spEl('div', { class: 'prog' }, [spVars(spEl('i'), { '--w': st.prog + '%' })]),
+                ]);
+                row.addEventListener('keydown', (event) => {
+                    if (event.key !== 'Enter' && event.key !== ' ') return;
+                    event.preventDefault();
+                    open();
+                });
+                tbox.appendChild(row);
+            }
+            if (!going.length) tbox.appendChild(spEl('div', { class: 'empty', text: 'No trade going. Ask a trader about a flip, and it waits here for their yes.' }));
+
+            /* what you hold: all of it in one bar, the biggest four named */
+            const hbox = this.todayHold;
+            hbox.textContent = '';
+            if (!H.kinds) hbox.appendChild(spEl('div', { class: 'empty', text: !info.hasKey ? 'Add your Limited key in Settings to see your items.' : info.loading ? 'Loading your inventory…' : 'Your inventory has nothing a trader pays for.' }));
+            else {
+                const greys = ['#8b93a3', '#6d7584', '#555c6a', '#434a57', '#333842'];
+                const rest = { kinds: H.kinds - H.top.length, worth: H.worth - H.top.reduce((a, r) => a + r.worth, 0) };
+                const share = (v) => Math.max(1, (v / Math.max(1, H.worth)) * 100).toFixed(1) + '%';
+                hbox.append(...[
+                    spEl('div', { class: 'bigrow' }, [spEl('div', { class: 'hero', text: formatMoney(H.worth) }), spEl('div', { class: 'eq', text: count(H.items) + ' items · ' + this.plural(H.kinds, 'kind') })]),
+                    spEl('div', { class: 'stack' }, [...H.top.map((r, i) => spVars(spEl('i'), { '--c': greys[i], '--w': share(r.worth) })), rest.kinds > 0 ? spVars(spEl('i'), { '--c': greys[4], '--w': share(rest.worth) }) : null]),
+                    ...H.top.map((r, i) => spEl('div', { class: 'hl' }, [spVars(spEl('i'), { '--c': greys[i] }), spEl('b', { text: r.name }), ' × ' + count(r.held), spEl('span', { text: formatMoney(r.worth) })])),
+                    rest.kinds > 0 ? spEl('div', { class: 'hl' }, [spVars(spEl('i'), { '--c': greys[4] }), this.plural(rest.kinds, 'more kind'), spEl('span', { text: formatMoney(rest.worth) })]) : null,
+                ].filter(Boolean));
+            }
+
+            /* profit per day */
+            const cbox = this.todayChart;
+            cbox.textContent = '';
+            if (!days.length) cbox.appendChild(spEl('div', { class: 'empty', text: (s.ledger || {}).hasKey ? 'Reading your log…' : 'Your profit per day comes from your own Torn log. It needs a Full key, kept apart: Settings › Keys and sharing.' }));
+            else {
+                const top = Math.max(1, ...days.map((x) => Math.abs(x.profit)));
+                for (const x of days) {
+                    const day = new Date(x.start);
+                    cbox.appendChild(spEl('div', { class: 'day', title: day.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' }) + ': ' + signed(x.profit) }, [
+                        x.profit ? spEl('b', { class: x.profit < 0 ? 't-bad' : '', text: shortMoney(x.profit) }) : null,
+                        spVars(spEl('i', { class: x.profit < 0 ? 'neg' : x.profit ? '' : 'zero' }), { height: x.profit ? Math.max(4, Math.round((Math.abs(x.profit) / top) * 70)) + '%' : '2px' }),
+                        String(day.getDate()),
+                    ]));
+                }
+            }
+        }
+
+        /** From Today: a flip opened in Flips › Best flips. */
+        showFlip(itemId) {
+            this.go('flips', BD_FLIPS_BEST);
+            this.select(itemId);
+        }
+
+        /** From Today: the trade with a trader opened in Flips › By trader. */
+        showTrader(x) {
+            this.go('flips', BD_FLIPS_TRADER);
+            this.visit.picked = true;
+            if (this.h.onTradePick) this.h.onTradePick(x.mainId, x.key);
+        }
+
+        /** From Today: a trade going opened in Trades. */
+        showTrade(kind, r) {
+            this.go('trades');
+            this.visit.picked = true;
+            this.openTrade(kind, r);
+        }
+
+        /**
+         * Settings: its parts under three tabs on top (Keys and sharing | Flips and reading | Help), in one
+         * column and without boxes (the owner, 2026-10-11: "clunky, not professional and classy"): a part is
+         * a heading and a line of what it is, then rows - the setting's name and what it is for on the left,
+         * its control and one line of state on the right - with a hairline between them.
          */
         buildSettings() {
             const body = spEl('div', { class: 'sp-sbody' });
-            this.snavEl = spEl('nav', { class: 'sp-snav', 'aria-label': 'Settings' });
-            const box = spEl('div', { class: 'sp-settings' }, [this.snavEl, body]);
+            const box = spEl('div', { class: 'sp-settings' }, [body]);
             this.snav = [];
             this.snavSections = [];
 
-            const group = (title) => this.snavEl.appendChild(spEl('div', { class: 'sp-snav-g', text: title }));
+            const group = () => {};
             const section = (id, title, lead, children) => {
+                // What the part's state is, in the words the pills use: beside its name.
+                const dot = spEl('span', { class: 'sp-dot' });
+                const state = spEl('span', { class: 'sstate' });
                 const sec = spEl('section', { class: 'sp-card', 'data-sec': id }, [
-                    spEl('h2', { text: title }),
+                    spEl('h2', {}, [title, dot, state]),
                     lead ? spEl('p', { class: 'sp-lead' }, [].concat(lead)) : null,
                     ...children,
                 ]);
-                const dot = spEl('span', { class: 'sp-dot' });
-                const state = spEl('small');
-                const btn = spEl('button', {
-                    type: 'button',
-                    class: 'sp-snav-a',
-                    onclick: () => {
-                        this.snavPick(id);
-                        sec.scrollIntoView({ block: 'start' });
-                    },
-                }, [dot, spEl('span', { text: title }), state]);
-                this.snav.push({ id, btn, dot, state });
+                this.snav.push({ id, dot, state });
                 this.snavSections.push({ id, sec });
-                this.snavEl.appendChild(btn);
                 body.appendChild(sec);
             };
-            const field = (label, sub, control) =>
-                spEl('div', { class: 'sp-field' }, [
-                    spEl('div', { class: 'sp-flabel' }, [spEl('b', { text: label }), sub ? spEl('small', {}, [].concat(sub)) : null]),
-                    spEl('div', { class: 'sp-fctl' }, [].concat(control)),
+            const field = (label, sub, control) => {
+                const parts = [].concat(control);
+                // What a setting is for reads beside its name: the right side is the control and its one line of state.
+                const notes = parts.filter((n) => n && n.classList && n.classList.contains('sp-note'));
+                const beside = notes.length < parts.length ? notes : [];
+                return spEl('div', { class: 'sp-field' }, [
+                    spEl('div', { class: 'sp-flabel' }, [spEl('b', { text: label }), sub ? spEl('small', {}, [].concat(sub)) : null, ...beside]),
+                    spEl('div', { class: 'sp-fctl' }, parts.filter((n) => !beside.includes(n))),
                 ]);
+            };
             const note = (children) => spEl('p', { class: 'sp-note' }, children);
             const newTab = (text, href) => spEl('a', { href, target: '_blank', rel: 'noopener noreferrer', text });
-
-            // The menu follows the page as it scrolls: the part at the top is lit.
-            // At the very bottom the last parts can never reach the top: there,
-            // the one you picked stays lit while it is in view, else the last.
-            this.settingsEl.addEventListener('scroll', () => {
-                const el = this.settingsEl;
-                const box = el.getBoundingClientRect();
-                let on = this.snavSections[0] && this.snavSections[0].id;
-                for (const s of this.snavSections) if (s.sec.getBoundingClientRect().top <= box.top + 24) on = s.id;
-                if (el.scrollTop + el.clientHeight >= el.scrollHeight - 2) {
-                    const picked = this.snavSections.find((s) => s.id === this.snavOn);
-                    const seen = picked && picked.sec.getBoundingClientRect().top < box.bottom && picked.sec.getBoundingClientRect().bottom > box.top;
-                    on = seen ? picked.id : this.snavSections[this.snavSections.length - 1].id;
-                }
-                this.snavPick(on);
-            });
 
             /* Torn key (Limited) */
             group('Keys and sources');
@@ -22453,14 +28732,13 @@
                 onReveal: () => this.h.onRevealKey && this.h.onRevealKey(),
             });
             this.keyStateEl = spEl('div', { class: 'sp-keystate', text: 'No key saved.' });
+            this.keyForgetBtn = spEl('button', { type: 'button', class: 'sp-link sp-quiet', text: 'Forget key', onclick: () => this.h.onForgetKey && this.h.onForgetKey() });
+            torn.row.appendChild(this.keyForgetBtn);
             section('keys', 'Torn API key', 'Used only on this page, sent to api.torn.com only.', [
                 field('Limited key', ['Make one at ', newTab('Torn › Settings › API Key', TORN_API_KEY_URL)], [
                     torn.row,
                     this.keyStateEl,
                     note(['Reads your inventory, your own id, item names, the Item Market for the item on the desk, and traders\' online status.']),
-                    spEl('div', { class: 'sp-inline sp-actions' }, [
-                        spEl('button', { type: 'button', class: 'sp-link', text: 'Forget key', onclick: () => this.h.onForgetKey && this.h.onForgetKey() }),
-                    ]),
                 ]),
             ]);
 
@@ -22473,25 +28751,44 @@
             this.teStateEl = spEl('div', { class: 'sp-keystate', text: 'No TornExchange key saved.' });
             this.teSameBtn = spEl('button', {
                 type: 'button',
-                class: 'sp-link',
+                class: 'sp-link sp-quiet',
                 text: 'Use my Limited key',
                 onclick: () => this.h.onSaveTeKey && this.h.onSaveTeKey(this.h.onRevealKey ? this.h.onRevealKey() : ''),
             });
 
+            this.teForgetBtn = spEl('button', { type: 'button', class: 'sp-link sp-quiet', text: 'Forget key', onclick: () => this.h.onForgetTeKey && this.h.onForgetTeKey() });
+            te.row.append(this.teSameBtn, this.teForgetBtn);
             section('te', 'TornExchange', 'Traders\' buy prices and trust votes.', [
                 field('TornExchange key', ['The Torn key you log into ', newTab('tornexchange.com', TE_SITE_URL), ' with. Often your Limited key.'], [
                     te.row,
                     this.teStateEl,
-                    spEl('div', { class: 'sp-inline sp-actions' }, [
-                        this.teSameBtn,
-                        spEl('button', { type: 'button', class: 'sp-link', text: 'Forget key', onclick: () => this.h.onForgetTeKey && this.h.onForgetTeKey() }),
-                    ]),
                 ]),
             ]);
 
             this.w3bStateEl = spEl('div', { class: 'sp-keystate' });
             section('w3b', 'TornW3B', ['Bazaar prices and traders\' price lists, from ', newTab('weav3r.dev', 'https://weav3r.dev/'), '. No key needed; it only receives item and trader ids.'], [
                 field('State', null, [this.w3bStateEl]),
+            ]);
+
+            /*
+             * Shared (3.25): what the server last said and what it does with your key. Nothing is typed
+             * here - the address is built in and this PC is known by its Public key - and the part shows
+             * only to the server's own people (renderShared).
+             */
+            this.sharedNowEl = spEl('div', { class: 'sp-keystate' });
+            this.sharedKeyEl = spEl('div', { class: 'sp-keystate' });
+            this.sharedUsePc = spEl('span', { class: 'sp-use-pc' });
+            this.sharedUseSv = spEl('span', { class: 'sp-use-sv' });
+            this.sharedUseFr = spEl('span', { class: 'sp-use-fr' });
+            this.sharedUseEl = spEl('div', { class: 'sp-use' }, [this.sharedUsePc, this.sharedUseSv, this.sharedUseFr]);
+            this.sharedUseNote = spEl('div', { class: 'sp-keystate' });
+            section('shared', 'Shared', 'One server for you and your friends. While any of you is on, it reads bazaar prices from Torn itself and passes them to everyone. Nothing to set up here.', [
+                field('Now', 'If the server does not answer, nothing waits for it.', [this.sharedNowEl]),
+                field('Your Torn key on the server', 'A Public Only key. You gave it to whoever runs the server, and they typed it in there. This page never sends a key anywhere.', [this.sharedKeyEl]),
+                field('Your 100 Torn calls this minute', 'This PC always goes first. The server takes only what is left, and always leaves some free for TornTools or your phone.', [this.sharedUseEl, this.sharedUseNote]),
+                field('What leaves this PC', 'Checked on the way out.', [
+                    note(['Which bazaars and items matter to you (player numbers, item numbers, the most a trader pays for an item), how many Torn calls this PC made, and two marks your friends see: the trade you are going for (the item and its bazaars) and what you just bought at a bazaar (the item, how many, the price). ', spEl('b', { text: 'Never' }), ' your inventory, ledger, cash, names or keys.']),
+                ]),
             ]);
 
             /*
@@ -22764,7 +29061,7 @@
             this.ledgerStateEl = spEl('div', { class: 'sp-keystate' });
             this.ledgerForgetBtn = spEl('button', {
                 type: 'button',
-                class: 'sp-link sp-danger',
+                class: 'sp-link sp-quiet sp-danger',
                 text: 'Forget key and delete the ledger',
                 onclick: () => {
                     // Twice to delete: a year of log is not read back in a moment.
@@ -22784,25 +29081,12 @@
                     }, 5100);
                 },
             });
-            const ledgerTos = spEl('table', { class: 'sp-tos sp-tos-ledger' });
-            for (const [k, v] of [
-                ['Data storage', 'Only locally, in this browser: time, item, quantity, price, where, who. Never the log\'s own text.'],
-                ['Data sharing', 'Nobody. Your trades go into a zip only when you download one yourself (Report a problem, Export API usage): it names the traders you traded with, and you choose who gets it.'],
-                ['Purpose of use', 'Personal: profit tracking'],
-                ['Key storage & sharing', 'Stored locally / Not shared'],
-                ['Key access level', 'Full, used only for your log (bazaar, Item Market and NPC shop buys and sells, and muggings), your trades, and key info'],
-                ['Other services', 'None: never sent to TornExchange or TornW3B'],
-            ]) {
-                ledgerTos.appendChild(spEl('tr', {}, [spEl('th', { text: k }), spEl('td', { text: v })]));
-            }
             section('ledger', 'Torn Ledger', 'Your profit from your own Torn log. It needs a Full key, kept apart from your Limited key and used for nothing else.', [
                 field('Full key', 'Never shown again once saved', [
-                    spEl('div', { class: 'sp-inline' }, [this.ledgerKeyInput]),
+                    spEl('div', { class: 'sp-inline' }, [this.ledgerKeyInput, this.ledgerForgetBtn]),
                     this.ledgerStateEl,
                     note(['Torn is asked whether it is a Full key before it is saved; anything else is refused. It is sent only to api.torn.com, only for your log, your trades and key info. Paste a new one to change it.']),
-                    spEl('div', { class: 'sp-inline sp-actions' }, [this.ledgerForgetBtn]),
                 ]),
-                field('Key use', 'Torn API terms, Full key', [ledgerTos]),
             ]);
 
             /* preferences */
@@ -22813,21 +29097,32 @@
                 field('Where links open', null, [spEl('label', { class: 'sp-check' }, [this.linksInput, spEl('span', { text: 'Open links in a new tab' })])]),
             ]);
 
+            /*
+             * Key use (Torn's API terms), once for every key: it was a table under each. The server's column
+             * shows only to the server's own people (renderShared).
+             */
             const tos = spEl('table', { class: 'sp-tos' });
-            for (const [k, v] of [
-                ['Data storage', 'Only locally, in this browser'],
-                ['Data sharing', 'Nobody'],
-                ['Purpose of use', 'Personal gain: who pays most for your items, and flips'],
-                ['Key storage & sharing', 'Stored locally / Not shared'],
-                ['Key access level', 'Limited (your inventory and your own id; item names; Item Market prices; traders\' public status and networth)'],
-                ['Other services', 'TornExchange, only with the key you log in there with'],
+            this.tosEl = tos;
+            tos.appendChild(spEl('tr', {}, [spEl('th'), spEl('th', { text: 'Limited key' }), spEl('th', { text: 'Full key (Torn Ledger)' }), spEl('th', { class: 'tos-sv', text: 'Public key on the shared server' })]));
+            for (const [k, limited, full, server] of [
+                ['Data storage', 'Only locally, in this browser', 'Only locally, in this browser: time, item, quantity, price, where, who. Never the log\'s own text.', 'On the server: the bazaar prices your key read. Nothing about your account.'],
+                ['Data sharing', 'Nobody', 'Nobody. Your trades go into a zip only when you download one yourself (Report a problem, Export API usage): it names the traders you traded with, and you choose who gets it.', 'The people on this server only.'],
+                ['Purpose of use', 'Personal gain: who pays most for your items, and flips', 'Personal: profit tracking', 'Reading bazaars for the group, while any of you is on.'],
+                ['Key storage & sharing', 'Stored locally / Not shared', 'Stored locally / Not shared', 'Kept on the server as a secret that cannot be read back. Shared with no one.'],
+                ['Key access level', 'Limited (your inventory and your own id; item names; Item Market prices; traders\' public status and networth)', 'Full, used only for your log (bazaar, Item Market and NPC shop buys and sells, and muggings), your trades, and key info', 'Public Only'],
+                ['Other services', 'TornExchange, only with the key you log in there with', 'None: never sent to TornExchange or TornW3B', 'None'],
             ]) {
-                tos.appendChild(spEl('tr', {}, [spEl('th', { text: k }), spEl('td', { text: v })]));
+                tos.appendChild(spEl('tr', {}, [spEl('th', { text: k }), spEl('td', { text: limited }), spEl('td', { text: full }), spEl('td', { class: 'tos-sv', text: server })]));
             }
-            section('terms', 'Key use (Torn API terms)', 'For your Limited key.', [tos]);
+            section('terms', 'Key use', 'Torn\'s API terms: what each key is used for, and where it is kept.', [tos]);
+
+            // The order on each tab, top to bottom: what you set first, what you only read last.
+            for (const id of ['keys', 'te', 'w3b', 'shared', 'ledger', 'terms', 'flips', 'fresh', 'links', 'report', 'api']) {
+                const x = this.snavSections.find((y) => y.id === id);
+                if (x) body.appendChild(x.sec);
+            }
 
             this.settingsEl.appendChild(box);
-            this.snavPick('keys');
         }
 
         /** Settings › Bazaar prices: the saved minutes, and whether they keep up. */
@@ -22856,10 +29151,34 @@
             if (this.keepUpEl.className !== cls) this.keepUpEl.className = cls;
         }
 
-        /** Light one part in the settings menu. */
-        snavPick(id) {
-            this.snavOn = id;
-            for (const n of this.snav) n.btn.setAttribute('aria-current', n.id === id ? 'true' : 'false');
+        /** Settings › Shared: what is saved, what the server last said, and how your 100 calls are split. */
+        renderShared() {
+            if (!this.sharedNowEl) return;
+            const st = (this.state.info || {}).shared || null;
+            const now = Date.now();
+            // Only for the server's own people: to anyone else there is no server, and no part of Settings for one.
+            const sec = (this.snavSections.find((x) => x.id === 'shared') || {}).sec;
+            if (sec) sec.classList.toggle('sp-unknown', !sharedKnown(st));
+            if (this.tosEl) this.tosEl.classList.toggle('no-sv', !sharedKnown(st));
+            const say = (el, line) => {
+                const cls = 'sp-keystate' + (line.level === 'ok' ? ' sp-ok' : line.level === 'bad' ? ' sp-bad' : line.level === 'warn' ? ' sp-warn' : '');
+                if (el.textContent !== line.text) el.textContent = line.text;
+                if (el.className !== cls) el.className = cls;
+                el.hidden = !line.text;
+            };
+            say(this.sharedNowEl, sharedNowLine(st, now));
+            say(this.sharedKeyEl, sharedKeyLine(st));
+            const split = sharedSplit(st, now);
+            this.sharedUseEl.hidden = !split;
+            if (split) {
+                for (const [el, label, n] of [[this.sharedUsePc, 'This PC', split.pc], [this.sharedUseSv, 'Server', split.server], [this.sharedUseFr, 'Free', split.free]]) {
+                    const text = label + ' ' + n;
+                    if (el.textContent !== text) el.textContent = text;
+                    el.style.width = n + '%';
+                    el.hidden = !(n > 0);
+                }
+            }
+            say(this.sharedUseNote, split ? { level: '', text: '' } : { level: '', text: st && st.on ? 'Not agreed with the server yet: this PC uses your calls alone, as before.' : 'Shared is off: this PC uses your calls alone, as before.' });
         }
 
         /** Each part's state in the settings menu, in the header pills' words. */
@@ -22871,6 +29190,12 @@
                 keys: info.keyError ? ['bad', 'refused'] : !info.hasKey ? ['unknown', 'no key'] : ['online', info.keyAccess ? String(info.keyAccess).replace(/\s*access$/i, '') : 'saved'],
                 te: info.teBadKey ? ['bad', 'key refused'] : !info.hasTeKey ? ['unknown', 'no key'] : info.teAt ? ['online', formatAge(now - info.teAt)] : ['idle', 'loading'],
                 w3b: (info.w3bRead || 0) < (info.w3bKnown || 0) ? ['idle', (info.w3bRead || 0) + '/' + info.w3bKnown] : ['online', count(info.w3bTraders || 0) + ' lists'],
+                shared: (() => {
+                    const st = info.shared || null;
+                    if (!sharedKnown(st)) return ['unknown', 'off'];
+                    const level = sharedNowLine(st, now).level;
+                    return [level === 'ok' ? 'online' : level === 'bad' ? 'bad' : 'idle', level === 'bad' ? 'refused' : level === 'ok' ? (st.people ? st.people + (st.people === 1 ? ' person' : ' people') : 'on') : 'no answer'];
+                })(),
                 flips: p.cash > 0 ? ['online', formatMoney(p.cash) + ' · ' + (p.networthPct || 10) + '%'] : ['idle', 'no cash limit'],
                 fresh: ['online', freshMinutes(p.freshDeskMin, FRESH_DEFAULTS.desk) + ' · ' + freshMinutes(p.freshTopMin, FRESH_DEFAULTS.top) + ' · ' + freshMinutes(p.freshOtherMin, FRESH_DEFAULTS.other) + ' min'],
                 links: ['online', p.linksNewTab !== false ? 'new tab' : 'this tab'],
@@ -22899,6 +29224,16 @@
                 n.dot.hidden = !level;
                 n.state.textContent = text;
             }
+            // What needs you is seen from any tab: a mark on the tab that holds it (a key refused, a key Torn Bids cannot work without).
+            const need = [null, null, null];
+            for (const n of this.snav) {
+                const level = (states[n.id] || [])[0];
+                const flag = level === 'bad' ? 'bad' : level === 'unknown' && (n.id === 'keys' || n.id === 'te') ? 'warn' : null;
+                const t = BD_SET_OF[n.id];
+                if (flag && (flag === 'bad' || !need[t])) need[t] = flag;
+            }
+            this.setFlags = need;
+            this.flagSettingsTabs();
 
             const read = info.w3bRead || 0;
             const known = info.w3bKnown || 0;
@@ -22921,97 +29256,88 @@
             }
         }
 
-        showView(view) {
-            this.view = view === 'settings' || view === 'ledger' ? view : 'list';
-            if (!this.root) return;
-            const settings = this.view === 'settings';
-            if (settings && !this.usageTimer) {
-                this.renderUsage();
-                this.usageTimer = setInterval(() => this.renderUsage(), 5000);
-            } else if (!settings && this.usageTimer) {
-                clearInterval(this.usageTimer);
-                this.usageTimer = null;
-            }
-            const ledger = this.view === 'ledger';
-            const list = this.view === 'list';
-            this.settingsEl.hidden = !settings;
-            this.ledgerEl.hidden = !ledger;
-            this.listEl.hidden = !list;
-            // The back arrow stays hidden (3.20.3): it pushed the logo along. The logo is the way home.
-            this.backBtn.hidden = true;
-            this.refreshBtn.hidden = !list;
-            this.searchEl.hidden = !list;
-            this.catEl.hidden = !list;
-            this.settingsBtn.setAttribute('aria-pressed', String(settings));
-            this.ledgerBtn.setAttribute('aria-pressed', String(ledger));
-            this.titleEl.textContent = SELLING_PAGE_TITLE;
-            this.crumbEl.textContent = settings ? '› Settings' : ledger ? '› Torn Ledger' : '';
-            this.crumbEl.hidden = list;
-            this.brandEl.title = list ? 'Torn Bids' : 'Back to Torn Bids (Esc)';
-            this.brandEl.classList.toggle('sp-brand-back', !list);
-            this.taglineEl.hidden = !list;
-            this.renderBanner();
-            if (ledger) this.ledgerView.render(this.ledgerArgs());
-            if (list) this.fitDesk();
-        }
-
-        ledgerArgs() {
-            const s = this.state;
-            return { ledger: s.ledger || {}, nameOf: s.itemNameOf, typeOf: s.itemTypeOf };
-        }
-
-        openSettings() {
-            this.showView('settings');
-        }
-
-        /* ----------------------------------------------------------- render */
-
         /**
-         * @param {object} view
-         *   strip     - the best flips: [{itemId, name, plan, buyer}]
-         *   list      - item rows: [{itemId, name, held, lowest, badge, pending}]
-         *   listTotal - rows before the page cut
-         *   counts    - {all, mine, flips}
-         *   filter    - 'all' | 'mine' | 'flips'
-         *   categories - [{category, count}] for the Category dropdown
-         *   category  - the one picked, or ''
-         *   desk      - the item picked (see renderDesk), or null
-         *   statuses  - Map traderId -> {level, text, title}
-         *   prefs     - this page's preferences
-         *   info      - key states, sources, loading
+         * A trade stays still (3.25.0; mockup AA, drawing 2). While a trade is under way the list and the
+         * cards keep their order; this is the one line that says so and counts the deals waiting:
+         *
+         *   Held while you trade with Lumei. 3 new deals waiting · best +$41,200      [Show ▸]
+         *
+         * Opened, it lists them ("Let them in now" sorts once; "Keep waiting" folds it). With nothing
+         * waiting it still says the list is held - on purpose, not stuck. When the trade ends, one green
+         * line for a few seconds.
          */
-        render(view) {
-            Object.assign(this.state, view);
-            if (!this.root) return;
+        renderStill() {
+            const s = this.state;
+            const held = s.still || null;
+            const line = held ? stillLine({ trader: held.trader }, held.waiting || [], held.now, signed) : null;
+            const ended = s.stillEnded || null;
+            // The box, with its Show and its way in, is on Flips only; My items says it in one quiet line.
+            const quiet = s.filter === 'mine';
+            const onList = s.filter !== 'sell' && s.filter !== 'trades';
+            if (!line || !line.count) this.stillOpen = false;
+            const sig = JSON.stringify([line, ended, this.stillOpen, onList, quiet]);
+            if (sig === this.stillSig) return;
+            this.stillSig = sig;
 
-            const p = this.state.prefs;
-            this.onlineBtn.setAttribute('aria-pressed', String(Boolean(p.onlineOnly)));
-            this.trustedBtn.setAttribute('aria-pressed', String(Boolean(p.trustedOnly)));
-            this.freshBtn.setAttribute('aria-pressed', String(Boolean(p.freshOnly)));
-            this.linksInput.checked = p.linksNewTab !== false;
-            // Every settings box shows what is saved (not while you are in it).
-            for (const box of this.boxes || []) box.sync();
-            const hasCash = p.cash > 0;
-            this.cashNone.checked = !hasCash;
-            if (!(this.cashInput.getRootNode && this.cashInput.getRootNode().activeElement === this.cashInput)) this.cashUpTo.checked = hasCash;
-            this.cashInput.classList.toggle('sp-dim', !hasCash);
-            this.renderKeepList(p);
-            this.renderNeverFlip(p);
-            this.renderFresh(p);
-            this.renderBlackList();
+            this.stillTag.hidden = !line;
+            this.stillTag.textContent = line ? 'Held' + (line.count ? ' · ' + count(line.count) + ' new waiting' : '') : '';
 
-            this.renderCategory();
-            this.renderLedgerKey();
-            if (this.view === 'ledger') this.ledgerView.render(this.ledgerArgs());
-            this.renderKeyStates();
-            this.renderSettingsNav();
-            this.renderPills();
-            this.renderBanner();
-            this.renderStrip();
-            this.renderScan();
-            this.renderList();
-            this.renderDesk();
-            this.fitDesk();
+            const box = this.stillEl;
+            const refocus = this.focusKeyIn(box);
+            box.textContent = '';
+            box.hidden = !onList || (!line && !ended) || (quiet && !line);
+            if (box.hidden) return;
+            if (quiet) {
+                box.appendChild(spEl('div', { class: 'sp-still sp-still-none', role: 'status' }, [spEl('span', { class: 'sp-dot sp-dot-off' }), spEl('span', { class: 'sp-still-t', text: 'Held while you trade with ' + held.trader + '. ' + (line.count ? 'The waiting deals are on Flips.' : 'New deals wait on Flips.') })]));
+                return;
+            }
+            if (ended) {
+                box.appendChild(spEl('div', { class: 'sp-still sp-still-done', role: 'status' }, [spEl('span', { class: 'sp-dot sp-dot-done' }), spEl('span', { class: 'sp-still-t', text: ended })]));
+                return;
+            }
+            const open = this.stillOpen;
+            box.appendChild(spEl('div', { class: 'sp-still' + (line.count ? '' : ' sp-still-none'), role: 'status' }, [
+                spEl('span', { class: 'sp-dot ' + (line.count ? 'sp-dot-wait' : 'sp-dot-off') }),
+                spEl('span', { class: 'sp-still-t' }, [line.lead + ' ', line.count ? spEl('b', { text: line.rest }) : line.rest]),
+                line.count
+                    ? spEl('button', {
+                        type: 'button',
+                        class: 'sp-btn sp-still-show',
+                        'data-focus': 'still:show',
+                        'aria-expanded': String(open),
+                        title: open ? 'Fold the waiting deals' : 'Look at the waiting deals. Nothing comes in until you say so.',
+                        text: open ? 'Show ▾' : 'Show ▸',
+                        onclick: () => {
+                            this.stillOpen = !open;
+                            this.renderStill();
+                        },
+                    })
+                    : null,
+            ]));
+            if (open) {
+                box.appendChild(spEl('div', { class: 'sp-still-fold' }, [
+                    ...line.rows.slice(0, STILL_PEEK).map((w) => {
+                        const cut = w.text.indexOf(' → ') >= 0 ? w.text.indexOf(' → ') : w.text.indexOf(' · ');
+                        return spEl('button', { type: 'button', class: 'sp-still-w', 'data-focus': 'still:' + w.itemId, title: 'Look at it on the desk. It stays waiting.', onclick: () => this.select(w.itemId) }, [
+                            spEl('b', { text: cut >= 0 ? w.text.slice(0, cut) : w.text }),
+                            spEl('small', { text: cut >= 0 ? w.text.slice(cut) : '' }),
+                            spEl('span', { text: w.profit }),
+                        ]);
+                    }),
+                    line.rows.length > STILL_PEEK ? spEl('small', { class: 'sp-still-more', text: 'and ' + count(line.rows.length - STILL_PEEK) + ' more, smaller' }) : null,
+                    spEl('div', { class: 'sp-still-acts' }, [
+                        spEl('button', { type: 'button', class: 'sp-btn sp-primary', 'data-focus': 'still:let', title: 'The new deals come in and the rows sort, once. Your trade goes on.', text: 'Let them in now', onclick: () => {
+                            this.stillOpen = false;
+                            if (this.h.onStillLet) this.h.onStillLet();
+                        } }),
+                        spEl('button', { type: 'button', class: 'sp-btn', 'data-focus': 'still:keep', text: 'Keep waiting', onclick: () => {
+                            this.stillOpen = false;
+                            this.renderStill();
+                        } }),
+                    ]),
+                ]));
+            }
+            this.focusBack(box, refocus);
         }
 
         /** The Ledger key's state in Settings: never the key itself. */
@@ -23057,20 +29383,15 @@
                 if (o.textContent !== text) o.textContent = text;
             }
             if (this.catEl.value !== (s.category || '')) this.catEl.value = s.category || '';
-            this.catEl.classList.toggle('sp-cat-on', Boolean(s.category));
-            this.catLineEl.hidden = !s.category;
-            if (s.category && this.catLineEl.dataset.cat !== s.category) {
-                this.catLineEl.dataset.cat = s.category;
-                this.catLineEl.textContent = '';
-                this.catLineEl.append('Showing ', spEl('b', { text: s.category }), ' only, in the flips and the list. ');
-                this.catLineEl.appendChild(spEl('button', { type: 'button', class: 'sp-link', text: 'Show all', onclick: () => this.h.onCategory && this.h.onCategory('') }));
-            }
-            if (!s.category) delete this.catLineEl.dataset.cat;
+            this.catEl.classList.toggle('on', Boolean(s.category));
         }
 
         renderKeyStates() {
             const info = this.state.info || {};
 
+            // Nothing to forget, nothing offered.
+            this.keyForgetBtn.hidden = !info.hasKey;
+            this.teForgetBtn.hidden = !info.hasTeKey;
             this.keyStateEl.className = 'sp-keystate';
             if (info.keyError) {
                 this.keyStateEl.textContent = info.keyError;
@@ -23101,67 +29422,6 @@
                 if (info.teError) this.teStateEl.classList.add('sp-bad');
             }
             this.teSameBtn.hidden = !info.hasKey;
-        }
-
-        /**
-         * Every source as a small pill: a dot and a few words, the detail on
-         * hover. A source in trouble turns amber here - it never takes over the
-         * page with a banner while the others are working. The last one is your
-         * cash for flips: press it to change it.
-         */
-        renderPills() {
-            if (!this.root) return;
-            const info = this.state.info || {};
-            const now = Date.now();
-            const pills = [];
-            const pill = (level, label, text, title) => pills.push({ level, label, text, title });
-            const age = (at) => formatAge(now - at).replace(' ago', '');
-
-            const known = info.w3bKnown || 0;
-            const read = info.w3bRead || 0;
-            if (!known) pill('unknown', 'TornW3B', 'no traders yet', 'No trader known yet');
-            else if (read < known) pill('idle', 'TornW3B', read + '/' + known, 'Reading traders\' TornW3B price lists: ' + read + ' of ' + known);
-            else pill('online', 'TornW3B', (info.w3bTraders || 0) + ' lists', 'Every known trader\'s TornW3B list read; ' + (info.w3bTraders || 0) + ' have one');
-
-            const checked = info.flipsChecked || 0;
-            const wanted = info.flipsWanted || 0;
-            const flips = wanted ? ' · ' + checked + '/' + wanted : '';
-            if (info.bazaarsError && !info.bazaarsAt) pill('bad', 'Bazaars', 'not loaded', info.bazaarsError);
-            else if (!info.bazaarsAt) pill('idle', 'Bazaars', 'loading', 'Loading bazaar prices from TornW3B');
-            else pill(checked < wanted ? 'idle' : 'online', 'Bazaars', age(info.bazaarsAt) + flips, 'TornW3B bazaar prices, ' + formatAge(now - info.bazaarsAt) + (wanted ? '. Possible flips checked against every bazaar: ' + checked + ' of ' + wanted : ''));
-
-            const perItem = info.heldCount ? ' Best buyer per item, without a key: ' + (info.teOneDone || 0) + ' of ' + info.heldCount + '.' : '';
-            if (info.teStatus === 'ok' && info.teError) pill('idle', 'TornExchange', info.teAt ? age(info.teAt) : '', info.teError);
-            else if (info.teStatus === 'ok') pill('online', 'TornExchange', info.teAt ? age(info.teAt) : '', 'TornExchange prices ' + (info.teAt ? formatAge(now - info.teAt) : ''));
-            else if (info.teStatus === 'badkey') pill('bad', 'TornExchange', 'key', 'Key not accepted.' + perItem);
-            else if (info.teStatus === 'nokey') pill('unknown', 'TornExchange', 'no key', 'No TornExchange key.' + perItem);
-            else pill('idle', 'TornExchange', 'loading', 'Loading TornExchange prices');
-
-            const want = info.statusesWanted || 0;
-            const got = info.statusesKnown || 0;
-            pill(want && got >= want ? 'online' : 'idle', 'Online', got + '/' + want, 'Traders\' online status checked: ' + got + ' of ' + want);
-
-            const cash = this.state.prefs.cash;
-            const sig = JSON.stringify([pills, cash]);
-            if (sig === this.pillSig) return;
-            this.pillSig = sig;
-            this.pillsEl.textContent = '';
-            for (const p of pills) {
-                this.pillsEl.appendChild(spEl('span', { class: 'sp-pill', title: p.title, 'data-src': p.label }, [
-                    spEl('span', { class: 'sp-dot', 'data-level': p.level }),
-                    spEl('b', { text: p.label }),
-                    p.text ? ' ' + p.text : '',
-                ]));
-            }
-            this.pillsEl.appendChild(spEl('button', {
-                type: 'button',
-                class: 'sp-pill sp-pill-btn',
-                title: 'Flips never plan to spend more than this. Press to change it.',
-                onclick: () => {
-                    this.showView('settings');
-                    this.cashInput.focus();
-                },
-            }, [spEl('b', { text: 'Cash' }), ' ' + (cash > 0 ? formatMoney(cash) : 'no limit')]));
         }
 
         /** Only what stops the page working: a key missing or refused, or a wait. */
@@ -23222,24 +29482,8 @@
         /** A player's name, linking to their Torn profile when their id is known. */
         playerName(name, id, focus) {
             if (!id) return spEl('b', { text: name });
-            return this.link(name, spProfileUrl(id), { cls: 'sp-pname', title: 'Torn profile', focus });
+            return this.link(name, spProfileUrl(id), { cls: 'pname', title: 'Their profile on Torn', focus });
         }
-
-        /**
-         * Names you can press, in To sell and Trades (3.22.0; the owner: "in the
-         * to sell, the names are not clickable"): a trader's name opens their Torn
-         * profile, an item's name the Item Market. The row around them still acts
-         * on a press anywhere else in it.
-         */
-        whoName(name, id, focus) {
-            return spEl('span', { class: 'sp-bd-who' }, [this.playerName(name, id, focus)]);
-        }
-
-        itemName(r, focus) {
-            return spEl('b', { class: 'sp-iname' }, [count(r.qty) + ' ', this.link(r.name, itemMarketUrl(r.itemId, r.name), { cls: 'sp-tiname', title: 'Open it on the Item Market', focus })]);
-        }
-
-        /* ------------------------------------------------------------ strip */
 
         /** The focus key of what has the focus inside `box`, or null. */
         focusKeyIn(box) {
@@ -23255,792 +29499,11 @@
             if (node) node.focus({ preventScroll: true });
         }
 
-        /**
-         * Your traders (3.14.3; mockup Q4 A, collapsible): one card per favourite
-         * and Trusted trader - the best whole trade with them now, and Put on desk.
-         * Folded, it says how many; open, the biggest trades first.
-         */
-        renderScan() {
-            const s = this.state;
-            const sc = s && s.scan;
-            const box = this.scanEl;
-            if (!sc) return;
-            const refocus = this.focusKeyIn(box);
-            queueMicrotask(() => this.focusBack(box, refocus));
-            const sig = JSON.stringify([sc.open, sc.favourites, sc.trusted, this.scanAll, s.desk && s.desk.itemId, s.desk && s.desk.trade && s.desk.trade.chosen && s.desk.trade.chosen.key,
-                sc.list.map((x) => [x.id, x.name, x.profit, x.items, x.stops, x.reading, x.lastPaid, x.mainId, x.mainUnits, x.favourite, x.waiting, x.hiddenBy, x.hiddenBy && s.statuses && JSON.stringify(s.statuses.get(String(x.id)) || null), x.traded, x.trust && x.trust.level + x.trust.score, x.listOld ? x.listOld.level + listAgeText(Date.now() - x.listOld.at) : ''])]);
-            if (sig === this.scanSig) return;
-            this.scanSig = sig;
-            box.textContent = '';
-            const total = sc.favourites + sc.trusted;
-            const toggle = () => this.h.onPrefsChange && this.h.onPrefsChange({ scanOpen: !sc.open });
-            box.appendChild(spEl('div', { class: 'sp-sec sp-scanh' }, [
-                spEl('button', { type: 'button', class: 'sp-fold', 'aria-expanded': String(sc.open), 'data-focus': 'scan:fold', title: sc.open ? 'Fold away' : 'Show the best trade with each', onclick: toggle }, [
-                    spEl('span', { class: 'sp-chev', text: sc.open ? '▾' : '▸' }),
-                    spEl('h2', { text: 'Your traders · best trade now' }),
-                ]),
-                spEl('span', { class: 'sp-sp' }),
-                spEl('small', { class: 'sp-muted', text: total ? count(sc.favourites) + (sc.favourites === 1 ? ' favourite' : ' favourites') + ' · ' + count(sc.trusted) + ' trusted' : 'No favourites or trusted traders yet' }),
-                // They filter the whole page, Your traders too: at its top (3.20.1, the owner).
-                this.onlineBtn,
-                this.trustedBtn,
-                this.freshBtn,
-            ]));
-            if (!sc.open || !total) return;
-            const onDesk = s.desk && s.desk.trade && s.desk.trade.chosen ? s.desk.trade.chosen.key : null;
-            // Favourites get a row of their own (3.20), every one of them, always
-            // shown; the Trusted row after it, the top few until Show all. The same
-            // sums for both: a favourite is never ranked up, only kept in view.
-            const favs = sc.list.filter((x) => x.favourite);
-            const rest = sc.list.filter((x) => !x.favourite);
-            // One row each (3.20.1, the owner: "one row for favorites, and one row for
-            // trusted"): as many cards as fit across; the rest under Show all.
-            const card = (x) => {
-                // Buyers online only (3.20.5): no trade offered until their status is read.
-                const ready = x.items > 0 && x.profit > 0 && !x.hiddenBy && !x.waiting;
-                const sel = ready && onDesk === x.key && s.desk && s.desk.itemId === x.mainId;
-                const head = spEl('span', { class: 'sp-fc-top' }, [
-                    x.favourite ? spEl('span', { class: 'sp-star', title: 'Favourite', text: '★' }) : null,
-                    spEl('b', { class: 'sp-iname', text: x.name }),
-                    this.trustBadge(x),
-                    x.lastPaid ? spEl('span', { class: 'sp-lastpaid', title: 'No public list: the prices they accepted from you last time. Check before buying.', text: 'Last paid' }) : null,
-                ]);
-                const el = spEl('div', { class: 'sp-fc sp-tc' + (ready ? ' sp-tc-ready' : ' sp-tc-none') + (x.favourite ? ' sp-tc-fav' : '') + (x.hiddenBy ? ' sp-tc-hidden' : '') + (sel ? ' sp-sel' : '') }, [head]);
-                if (x.hiddenBy) {
-                    const st = this.status({ id: x.id, name: x.name });
-                    el.append(
-                        spEl('small', { class: 'sp-tc-why' }, [st, st.childNodes.length ? ' · ' : '', 'hidden by ', spEl('b', { text: x.hiddenBy === 'offline' ? 'Buyers online only' : x.hiddenBy === 'stale' ? 'Fresh prices only' : 'Trusted buyers only' })]),
-                        spEl('small', { text: 'Their trade is not counted while the filter is on.' }),
-                    );
-                } else if (ready) {
-                    el.append(
-                        spEl('span', { class: 'sp-fc-p' + (x.lastPaid || x.estimated ? ' sp-est' : ''), title: x.lastPaid ? 'About: from what they paid you last time' : x.estimated ? 'About: some bazaars are still being read' : null, text: (x.lastPaid || x.estimated ? '≈ ' : '') + 'Trade ' + signed(x.profit) }),
-                        spEl('small', {}, [spEl('b', { text: count(x.items) + (x.items === 1 ? ' item' : ' items') }), ' · ' + count(x.stops) + (x.stops === 1 ? ' bazaar' : ' bazaars') + (x.mainName ? ' · ' + x.mainName + ' ×' + count(x.mainUnits) + (x.items > 1 ? ' + ' + count(x.items - 1) + (x.items === 2 ? ' extra' : ' extras') : '') : '')]),
-                    );
-                } else {
-                    el.appendChild(spEl('small', { text: x.waiting ? 'Checking if they are online…' : x.reading ? 'Reading their list…' : 'No trade now: nothing in bazaars under their prices' }));
-                }
-                if (x.traded) el.appendChild(spEl('small', { class: 'sp-traded', text: x.traded }));
-                // A price this trade counts on is from a list getting old (3.23.0): the same line as on the desk.
-                if (ready && x.listOld) el.appendChild(this.oldListEl(x.listOld));
-                el.appendChild(spEl('button', {
-                    type: 'button',
-                    class: 'sp-btn sp-go' + (sel ? ' sp-go-on' : ''),
-                    'data-focus': 'scan:' + x.id,
-                    disabled: ready ? null : '',
-                    title: ready ? 'Put this trade on the desk: ' + x.mainName + ' with ' + x.name : '',
-                    text: sel ? 'On the desk ✓' : 'Put on desk',
-                    onclick: () => {
-                        if (!ready || !this.h.onTradePick) return;
-                        this.h.onTradePick(x.mainId, x.key);
-                        this.deskEl.scrollIntoView({ block: 'start', behavior: 'smooth' });
-                    },
-                }));
-                return el;
-            };
-            const group = (cls, title, sub, cards, empty) => spEl('div', { class: 'sp-tgroup ' + cls }, [
-                spEl('div', { class: 'sp-tlabel' }, [spEl('b', { text: title }), sub ? spEl('small', { text: sub }) : null]),
-                cards.length ? spEl('div', { class: 'sp-scangrid' + (this.scanAll ? '' : ' sp-onerow') }, cards.map(card)) : empty,
-            ]);
-            const groups = spEl('div', { class: 'sp-tgroups' });
-            groups.appendChild(group('sp-tg-fav', '★ Favourites', 'Yours, always here. Same sums as everyone.', favs,
-                spEl('div', { class: 'sp-empty sp-tg-empty' }, [spEl('b', { text: 'No favourites yet' }), spEl('span', { text: 'Press ☆ next to any trader to keep them here. Traders you have traded with 5 or more times in 30 days join by themselves.' })])));
-            if (rest.length) groups.appendChild(group('sp-tg-trust', 'Trusted', 'Best trade first.', rest, null));
-            box.appendChild(groups);
-            this.scanAllBtn = spEl('button', {
-                type: 'button',
-                class: 'sp-link sp-showall',
-                'data-focus': 'scan:all',
-                hidden: '',
-                text: this.scanAll ? 'Show one row each' : 'Show all ' + count(sc.list.length) + ' traders',
-                onclick: () => {
-                    this.scanAll = !this.scanAll;
-                    this.scanSig = null;
-                    this.renderScan();
-                },
-            });
-            box.appendChild(this.scanAllBtn);
-            this.fitScan();
-        }
-
-        /** Show all only when a row has cards past its end (how many fit depends on the width). */
-        fitScan() {
-            const btn = this.scanAllBtn;
-            if (!btn || !btn.isConnected) return;
-            let hidden = this.scanAll;
-            if (!hidden) {
-                for (const grid of this.scanEl.querySelectorAll('.sp-scangrid.sp-onerow')) {
-                    const first = grid.firstElementChild;
-                    if (first && [...grid.children].some((c) => c.offsetTop > first.offsetTop)) hidden = true;
-                }
-            }
-            btn.hidden = !hidden;
-        }
-
-        renderStrip() {
-            const s = this.state;
-            if (!s) return;
-            const info = s.info || {};
-            // Under your pointer the cards keep their places: the numbers update,
-            // a card never jumps to another slot (the new order comes on leaving).
-            const order = s.strip.map((f) => f.itemId).join(',');
-            let strip = s.strip;
-            if (this.stripHover && this.stripShown && order !== this.stripOrder) {
-                const byId = new Map(s.strip.map((f) => [f.itemId, f]));
-                strip = this.stripShown.map((f) => byId.get(f.itemId) || f);
-            } else {
-                this.stripOrder = order;
-            }
-            const pinnedIds = new Set((s.pinned || []).map((p) => p.itemId));
-            const sig = JSON.stringify([
-                [...pinnedIds],
-                strip.map((f) => [f.itemId, f.name, f.plan.profit, f.plan.units, f.plan.steps.map((st) => st.sellerName), f.buyer.name, f.buyer.price, f.buyer.trust && f.buyer.trust.level, seenMinutes(f.plan.steps)]),
-                s.desk && s.desk.itemId,
-                info.flipsChecked,
-                info.flipsWanted,
-                Boolean(info.bazaarsAt),
-                info.tradersLoading,
-                Boolean(info.flipsWaiting),
-                s.prefs.onlineOnly,
-                s.prefs.trustedOnly,
-                (s.leftovers || []).map((l) => [l.itemId, l.qty, l.each, l.best && l.best.name, l.best && l.best.price]),
-                Boolean(this.leftoversOpen),
-            ]);
-            if (sig === this.stripSig) return;
-            this.stripSig = sig;
-            this.stripShown = strip;
-
-            const box = this.stripEl;
-            const refocus = this.focusKeyIn(box);
-            box.textContent = '';
-            // Leftovers and flips below: focus goes back once they are drawn.
-            queueMicrotask(() => this.focusBack(box, refocus));
-            // What a trader did not take: first, until it is sold. One card for all
-            // of it (3.16.4: the friend's page was two dozen of these, each with a
-            // Sold ✓ to press; the owner: "why is it there?") - opened, it lists
-            // them. They go by themselves as your Ledger shows them sold.
-            const left = s.leftovers || [];
-            if (left.length) {
-                const open = Boolean(this.leftoversOpen);
-                const priced = left.filter((l) => l.gain !== null);
-                const paid = left.reduce((a, l) => a + l.qty * l.each, 0);
-                const toggle = () => {
-                    this.leftoversOpen = !open;
-                    this.renderStrip();
-                };
-                const all = spEl('div', {
-                    class: 'sp-fc sp-lo sp-lo-all',
-                    role: 'button',
-                    tabindex: '0',
-                    'data-focus': 'left:all',
-                    'aria-expanded': String(open),
-                    title: open ? 'Hide the leftovers' : 'What traders did not take: show each, and where to sell it',
-                }, [
-                    spEl('span', { class: 'sp-fc-top' }, [
-                        spEl('b', { class: 'sp-iname', text: 'Left over · ' + count(left.length) + (left.length === 1 ? ' item' : ' items') }),
-                        open ? spEl('button', { type: 'button', class: 'sp-link sp-lo-x', title: 'Take every leftover off this list. They also go by themselves, as your Ledger shows them sold.', text: 'Clear all', onclick: (event) => {
-                            event.stopPropagation();
-                            this.leftoversOpen = false;
-                            if (this.h.onLeftoversClear) this.h.onLeftoversClear();
-                        } }) : null,
-                    ]),
-                    spEl('span', { class: 'sp-fc-p' + (priced.length ? '' : ' sp-fc-none'), text: priced.length ? signed(priced.reduce((a, l) => a + l.gain, 0)) : '–' }),
-                    spEl('small', { text: (priced.length ? 'If sold to traders now' : 'No trader buys them now') + ' · paid ' + formatMoney(paid) + ' in all' }),
-                    spEl('small', { class: 'sp-fc-sell', text: open ? 'Hide them ▴' : 'Show them ▾' }),
-                ]);
-                all.addEventListener('click', toggle);
-                all.addEventListener('keydown', (event) => {
-                    if (event.key !== 'Enter' && event.key !== ' ') return;
-                    event.preventDefault();
-                    toggle();
-                });
-                box.appendChild(all);
-            }
-            for (const l of this.leftoversOpen ? left : []) {
-                const on = Boolean(s.desk && s.desk.itemId === String(l.itemId));
-                const card = spEl('div', {
-                    class: 'sp-fc sp-lo' + (on ? ' sp-sel' : ''),
-                    role: 'button',
-                    tabindex: '0',
-                    'data-focus': 'left:' + l.itemId,
-                    'aria-pressed': String(on),
-                    title: (l.why === 'extra' ? 'An extra buy' : 'Left over from the trade with ' + (l.from || 'a trader')) + ': show where to sell it',
-                }, [
-                    spEl('span', { class: 'sp-fc-top' }, [
-                        spEl('span', { class: 'sp-pic sp-pic-s' }, [this.image('left', l.itemId)]),
-                        spEl('b', { class: 'sp-iname', text: count(l.qty) + ' ' + l.name }),
-                    ]),
-                    spEl('span', { class: 'sp-fc-p' + (l.gain !== null ? '' : ' sp-fc-none'), text: l.gain !== null ? signed(l.gain) : '–' }),
-                    spEl('small', { text: (l.why === 'extra' ? 'Extra buy' : 'Left over') + ' · paid ' + formatMoney(l.each) + ' each' }),
-                    spEl('small', { class: 'sp-fc-sell' }, l.best ? ['Sell to ', spEl('b', { text: l.best.name }), ' at ' + formatMoney(l.best.price)] : ['No trader buys it now']),
-                ]);
-                card.addEventListener('click', () => this.select(String(l.itemId)));
-                card.addEventListener('keydown', (event) => {
-                    if (event.key !== 'Enter' && event.key !== ' ') return;
-                    event.preventDefault();
-                    this.select(String(l.itemId));
-                });
-                box.appendChild(card);
-            }
-            if (!strip.length && (s.leftovers || []).length) return;
-            if (!strip.length) {
-                const text = this.noFlipsText();
-                box.appendChild(spEl('div', { class: 'sp-empty sp-strip-empty', text }));
-                return;
-            }
-            for (const f of strip) {
-                const on = Boolean(s.desk && s.desk.itemId === f.itemId);
-                const pinned = pinnedIds.has(f.itemId);
-                // The pin: always shown, in the card's top corner; pressing it
-                // changes only its colour - the card stays where it is.
-                const pin = spEl('button', {
-                    type: 'button',
-                    class: 'sp-pin' + (pinned ? ' sp-pin-on' : ''),
-                    'aria-pressed': String(pinned),
-                    'data-focus': 'strippin:' + f.itemId,
-                    'aria-label': (pinned ? 'Unpin ' : 'Pin ') + f.name + '\'s trade',
-                    title: pinned ? 'Pinned on top of the list: press to unpin' : 'Pin this trade: it stays on top of the list, only prices move',
-                    onclick: (event) => {
-                        event.stopPropagation();
-                        if (this.h.onPin) this.h.onPin(f.itemId);
-                    },
-                }, [pinIcon()]);
-                const card = spEl('div', {
-                    class: 'sp-fc' + (on ? ' sp-sel' : ''),
-                    role: 'button',
-                    tabindex: '0',
-                    'data-focus': 'strip:' + f.itemId,
-                    'aria-pressed': String(on),
-                    title: 'Show its flip plan',
-                }, [
-                    spEl('span', { class: 'sp-fc-top' }, [spEl('span', { class: 'sp-pic sp-pic-s' }, [this.image('strip', f.itemId)]), spEl('b', { class: 'sp-iname', text: f.name }), pin]),
-                    spEl('span', { class: 'sp-fc-p', text: signed(f.plan.profit) }),
-                    // What the bazaars sell it for (cheapest to dearest bought), and to whom.
-                    spEl('small', {}, ['Buy ', spEl('b', { text: count(f.plan.units) }), ' at ', spEl('b', { text: priceRange(f.plan.steps) }), ' from ' + [...new Set(f.plan.steps.map((st) => st.sellerName || 'a bazaar'))].join(', ')]),
-                    spEl('small', { class: 'sp-fc-sell' }, ['Sell to ', spEl('b', { text: f.buyer.name }), ' at ' + formatMoney(f.buyer.price), this.trustBadge(f.buyer)]),
-                    this.seenLine(f.plan.steps),
-                ]);
-                card.addEventListener('click', () => this.select(f.itemId));
-                card.addEventListener('keydown', (event) => {
-                    if (event.target !== card || (event.key !== 'Enter' && event.key !== ' ')) return;
-                    event.preventDefault();
-                    this.select(f.itemId);
-                });
-                box.appendChild(card);
-            }
-        }
-
-        /**
-         * How old a flip's prices are (3.20): when TornW3B last saw the oldest of
-         * the listings it buys - "seen 3m ago", its dot green while that is a few
-         * minutes, amber after, grey when older than a read would ever be.
-         */
-        seenLine(steps) {
-            const m = seenMinutes(steps);
-            if (m === null) return null;
-            const level = m < SEEN_FRESH_MIN ? 'online' : m < SEEN_OLD_MIN ? 'idle' : 'offline';
-            return spEl('small', { class: 'sp-seen', title: 'When TornW3B last saw these listings' }, [spEl('span', { class: 'sp-dot', 'data-level': level }), m < 1 ? 'seen just now' : 'seen ' + formatAge(m * 60000)]);
-        }
-
-        /* ------------------------------------------------------------- list */
-
-        /** The tabs over the list: which one is on, and how many each holds. */
-        syncChips() {
-            const s = this.state;
-            for (const key of SELL_FILTERS) {
-                this.chipBtns[key].setAttribute('aria-pressed', String(s.filter === key));
-                this.chipCounts[key].textContent = count((s.counts && s.counts[key]) || 0);
-            }
-            // To sell with something in it: its number in the buying colour (mockup U).
-            this.chipBtns.sell.classList.toggle('sp-chip-has', Boolean(s.counts && s.counts.sell));
-            this.chipBtns.trades.classList.toggle('sp-chip-has', Boolean(s.counts && s.counts.trades));
-        }
-
-        /* ----------------------------------------------------------- trades */
-
-        /** One trade of the Trades tab: its stage in a few words, and its line. */
-        tradeStage(kind, r) {
-            const ago = (at) => formatAge(Date.now() - at);
-            const n = count(r.items) + (r.items === 1 ? ' item' : ' items');
-            if (kind === 'waiting') return { cls: 'ask', word: 'Waiting for a yes', line: n + ' · ' + signed(r.profit) + ' · ' + (r.asked ? 'asked ' + ago(r.at) : 'pinned ' + ago(r.at)) };
-            if (kind === 'buying') return { cls: 'yes', word: 'Buying · ' + count(r.bazaarsDone) + ' of ' + count(r.bazaars), line: n + ' · ' + signed(r.profit) + ' · yes ' + ago(r.at) };
-            return { cls: 'go', word: 'Ready to trade', line: n + ' · ' + signed(r.profit) + ' · ' + (r.bazaars ? 'all bought' : 'all yours') };
-        }
-
-        /** Every trade going, as [kind, row] in the board's order. */
-        tradesGoing() {
-            const T = this.state.trades || { waiting: [], buying: [], ready: [] };
-            return [...T.waiting.map((r) => ['waiting', r]), ...T.buying.map((r) => ['buying', r]), ...T.ready.map((r) => ['ready', r])];
-        }
-
-        /** A trade opened from the Trades tab: on the desk, as planned or as accepted. */
-        openTrade(kind, r) {
-            if (kind === 'waiting') return this.h.onTradesOpen && this.h.onTradesOpen(r.itemId, r.key);
-            return this.h.onTradesShow && this.h.onTradesShow(r.itemId, r.key);
-        }
-
-        /**
-         * The Trades tab's rows (3.22.0, mockup V, A): one per trade you have going
-         * - who, where it stands, how many items and the profit. A press puts it on
-         * the desk.
-         */
-        renderTradesList() {
-            const s = this.state;
-            const T = s.trades || { open: false };
-            const going = this.tradesGoing();
-            const minute = Math.floor(Date.now() / 60000);
-            const sig = JSON.stringify(['trades', s.counts, T.open, s.desk && s.desk.itemId, going.map(([kind, r]) => [kind, r.itemId, r.key, r.name, r.items, r.profit, r.at, r.asked, r.bazaars, r.bazaarsDone]), minute]);
-            if (sig === this.listSig) return;
-            this.listSig = sig;
-            const shadow = this.root.getRootNode();
-            const active = shadow && shadow.activeElement;
-            const focusKey = active && this.listBox.contains(active) && active.dataset ? active.dataset.focus : null;
-            this.syncChips();
-            this.listBox.textContent = '';
-            this.moreBtn.hidden = true;
-            if (!going.length) this.listBox.appendChild(spEl('div', { class: 'sp-empty', text: 'No trade going. A trade you ask a trader about (Chat or Trade on its plan), pin, or mark accepted shows here.' }));
-            for (const [kind, r] of going) {
-                const st = this.tradeStage(kind, r);
-                this.listBox.appendChild(spEl('div', {
-                    class: 'sp-it sp-tl',
-                    role: 'button',
-                    tabindex: '0',
-                    'data-focus': 'trades:' + kind + ':' + r.itemId + ':' + r.key,
-                    title: 'Show the trade with ' + r.name + ' on the desk',
-                    onclick: () => this.openTrade(kind, r),
-                    onkeydown: (event) => {
-                        if (event.target !== event.currentTarget || (event.key !== 'Enter' && event.key !== ' ')) return;
-                        event.preventDefault();
-                        this.openTrade(kind, r);
-                    },
-                }, [
-                    spEl('b', { class: 'sp-iname', text: r.name }),
-                    spEl('span', { class: 'sp-badge sp-st sp-st-' + st.cls, text: st.word }),
-                    spEl('small', { text: st.line }),
-                ]));
-            }
-            if (focusKey) {
-                const again = [...this.listBox.querySelectorAll('[data-focus]')].find((n) => n.dataset.focus === focusKey);
-                if (again) again.focus({ preventScroll: true });
-            }
-        }
-
-        /**
-         * The Trades board (3.22.0, mockup V): beside the list while its tab is on.
-         * Waiting for their yes, accepted and still buying, accepted and ready to
-         * trade, and what ended today - with what went to To sell by itself.
-         */
-        renderTradesBoard() {
-            const s = this.state;
-            const T = s.trades;
-            const box = this.deskEl;
-            const statusOf = (r) => {
-                const st = r && r.id && s.statuses ? s.statuses.get(String(r.id)) : null;
-                return st ? st.level + st.text : '';
-            };
-            const minute = Math.floor(Date.now() / 60000);
-            const sig = JSON.stringify(['trades-board', this.tradesGoing().map(([kind, r]) => [kind, r.itemId, r.key, r.name, r.items, r.profit, r.at, r.asked, r.bazaars, r.bazaarsDone, statusOf(r)]), (T.ended || []).map((e) => [e.key, e.how, e.at, e.profit, e.moved]), minute]);
-            if (sig === this.deskSig) return;
-            const shadow = this.root.getRootNode();
-            const active = shadow && shadow.activeElement;
-            const keep = active && box.contains(active) && active.dataset ? active.dataset.focus : null;
-            this.deskSig = sig;
-            box.textContent = '';
-            const going = T.going || 0;
-            box.appendChild(spEl('div', { class: 'sp-wsh sp-bd-top' }, [
-                spEl('span', { class: 'sp-wst' }, [
-                    spEl('span', { class: 'sp-wsname', text: 'Trades' }),
-                    spEl('small', { text: going ? count(going) + (going === 1 ? ' trade' : ' trades') + ' going' : 'Every trade you have going' }),
-                ]),
-            ]));
-            const ago = (at) => formatAge(Date.now() - at);
-            const stage = (title, sub, rows, draw) => {
-                if (!rows.length) return;
-                const g = spEl('div', { class: 'sp-tb-stage' }, [spEl('div', { class: 'sp-tb-h' }, [spEl('b', { text: title }), spEl('small', { text: sub })])]);
-                for (const r of rows) g.appendChild(draw(r));
-                box.appendChild(g);
-            };
-            const who = (r) => [this.whoName(r.name, r.id, 'tb:who:' + r.key), this.status({ id: r.id, name: r.name })];
-            const open = (kind, r) => spEl('button', { type: 'button', class: 'sp-link', 'data-focus': 'tb:open:' + r.itemId + ':' + r.key, title: 'Show this trade on the desk', text: 'Open', onclick: () => this.openTrade(kind, r) });
-            const items = (r) => count(r.items) + (r.items === 1 ? ' item' : ' items');
-            stage('Waiting for their yes', 'you asked; nothing is bought yet', T.waiting, (r) => spEl('div', { class: 'sp-tb-r sp-tb-ask' }, [
-                ...who(r),
-                spEl('small', { text: items(r) + ' · ' + (r.asked ? 'asked ' + ago(r.at) : 'pinned ' + ago(r.at)) }),
-                spEl('span', { class: 'sp-sp' }),
-                spEl('span', { class: 'sp-bd-gain', text: signed(r.profit) }),
-                spEl('button', { type: 'button', class: 'sp-btn sp-primary', 'data-focus': 'tb:yes:' + r.itemId + ':' + r.key, title: r.name + ' said yes: the trade goes on the desk and is frozen as it is there now', text: r.name + ' accepted', onclick: () => this.h.onTradesYes && this.h.onTradesYes(r.itemId, r.key) }),
-                spEl('button', { type: 'button', class: 'sp-btn', 'data-focus': 'tb:no:' + r.itemId + ':' + r.key, title: r.name + ' said no: this trade is passed over for an hour', text: 'Declined', onclick: () => this.h.onTradesNo && this.h.onTradesNo(r.itemId, r.key) }),
-                open('waiting', r),
-            ]));
-            stage('Accepted · still buying', 'they said yes; the plan is frozen', T.buying, (r) => spEl('div', { class: 'sp-tb-r sp-tb-yes' }, [
-                ...who(r),
-                spEl('small', {}, ['yes ' + ago(r.at) + ' · ', spEl('b', { text: count(r.bazaarsDone) + ' of ' + count(r.bazaars) }), r.bazaars === 1 ? ' bazaar bought' : ' bazaars bought']),
-                spEl('span', { class: 'sp-sp' }),
-                spEl('span', { class: 'sp-bd-gain', text: signed(r.profit) }),
-                spEl('button', { type: 'button', class: 'sp-btn', 'data-focus': 'tb:next:' + r.key, title: 'Open the next bazaar to buy from (one page)', text: 'Next bazaar', onclick: () => this.h.onTradeStartBuying && this.h.onTradeStartBuying(r.key) }),
-                open('buying', r),
-            ]));
-            stage('Accepted · ready to trade', 'everything is bought; make the trade on Torn', T.ready, (r) => spEl('div', { class: 'sp-tb-r sp-tb-go' }, [
-                ...who(r),
-                spEl('small', { text: 'yes ' + ago(r.at) + ' · ' + (r.bazaars ? 'all bought' : 'all yours') + ' · ' + items(r) }),
-                spEl('span', { class: 'sp-sp' }),
-                spEl('span', { class: 'sp-bd-gain', text: signed(r.profit) }),
-                r.id ? this.link('Trade', tradeUrl(r.id), { cls: 'sp-btn sp-primary', title: 'Start a trade with ' + r.name, focus: 'tb:trade:' + r.key }) : null,
-                spEl('button', { type: 'button', class: 'sp-btn', 'data-focus': 'tb:done:' + r.key, title: 'The trade went through: close it (what they did not take goes to To sell)', text: 'Traded - done', onclick: () => this.h.onTradeClose && this.h.onTradeClose(r.key, true) }),
-                open('ready', r),
-            ]));
-            if (!going) box.appendChild(spEl('p', { class: 'sp-note', text: 'No trade going. A trade you ask a trader about (Chat or Trade on its plan), pin, or mark accepted shows here until it is traded, cancelled or declined.' }));
-            const HOW = { traded: 'Traded', cancel: 'Cancelled', old: 'No trade in a day' };
-            stage('Ended today', 'what was bought and not sold went to To sell by itself', T.ended || [], (e) => spEl('div', { class: 'sp-tb-r sp-tb-end' }, [
-                this.whoName(e.name, /^id:\d+$/.test(String(e.key)) ? String(e.key).slice(3) : null, 'tb:ended:' + e.key + ':' + e.at),
-                spEl('span', { class: 'sp-why', text: HOW[e.how] || 'Ended' }),
-                e.moved && e.moved.length
-                    ? spEl('small', {}, [e.moved.map((m) => count(m.qty) + ' ' + m.name).join(', ') + ' ', spEl('b', { class: 'sp-tb-arrow', text: '→ To sell' })])
-                    : spEl('small', { text: e.how === 'traded' ? 'took everything' : 'nothing was bought' }),
-                spEl('span', { class: 'sp-sp' }),
-                e.how === 'traded' && e.profit ? spEl('span', { class: 'sp-bd-gain', text: signed(e.profit) }) : null,
-                spEl('small', { text: ago(e.at) }),
-            ]));
-            if (keep) {
-                const again = [...box.querySelectorAll('[data-focus]')].find((n) => n.dataset.focus === keep);
-                if (again) again.focus({ preventScroll: true });
-            }
-        }
-
-        /** Why a To sell item is in the list: a small tag. */
-        whyTag(why, long = false) {
-            const text = why === 'cancel' && long ? 'Cancelled trade' : TO_SELL_WHY[why] || TO_SELL_WHY.left;
-            return spEl('span', { class: 'sp-why', 'data-why': why, text });
-        }
-
-        /**
-         * The To sell tab's rows (3.21.0, mockup U): what you bought to resell and
-         * still hold - why it is here, what you paid, who pays most now, and
-         * "Sell +$X" or "Waiting". The best profit first.
-         */
-        renderSellList() {
-            const s = this.state;
-            const T = s.toSell || { rows: [], open: false };
-            const rows = T.rows || [];
-            const sig = JSON.stringify(['sell', s.counts, T.open, s.desk && s.desk.itemId, s.prefs.onlineOnly, s.prefs.trustedOnly,
-                rows.map((r) => [r.itemId, r.name, r.qty, r.each, r.why, r.best && [r.best.name, r.best.price], r.gain, r.ready, r.bazaar, r.kept])]);
-            if (sig === this.listSig) return;
-            this.listSig = sig;
-            const shadow = this.root.getRootNode();
-            const active = shadow && shadow.activeElement;
-            const focusKey = active && this.listBox.contains(active) && active.dataset ? active.dataset.focus : null;
-            this.syncChips();
-            this.listBox.textContent = '';
-            this.moreBtn.hidden = true;
-            if (!rows.length) this.listBox.appendChild(spEl('div', { class: 'sp-empty', text: 'Nothing to sell. What you bought for a trade that was cancelled, what a trader did not take, and extra buys wait here.' }));
-            for (const r of rows) {
-                // With the board beside it no row is "the one on the desk".
-                const on = !T.open && Boolean(s.desk && s.desk.itemId === r.itemId);
-                // Never a trader who pays less than you paid (3.22.0): your own bazaar when that is a profit, else it waits.
-                // Not for sale (3.23.0): yours to keep - in no trade until you put it back (on the board).
-                const line = r.kept
-                    ? ['Paid ' + formatMoney(r.each) + ' · in no trade until you put it back']
-                    : r.best
-                        ? ['Paid ' + formatMoney(r.each) + ' · ', this.playerName(r.best.name, r.best.id, 'sell:who:' + r.itemId), ' pays ' + formatMoney(r.best.price)]
-                        : ['Paid ' + formatMoney(r.each) + ' · ' + (r.bazaar ? 'your bazaar at ' + formatMoney(r.bazaar.price) : 'no trader pays more yet')];
-                this.listBox.appendChild(spEl('div', {
-                    class: 'sp-it sp-ts' + (on ? ' sp-sel' : '') + (r.ready ? '' : ' sp-ts-wait') + (r.kept ? ' sp-ts-kept' : ''),
-                    role: 'button',
-                    tabindex: '0',
-                    'aria-pressed': String(on),
-                    'data-focus': 'sell:' + r.itemId,
-                    title: r.kept ? 'Not for sale: it is in no trade. Show it on the desk' : r.ready ? 'Show it on the desk' : r.bazaar ? 'No trader pays more than you paid; your own bazaar would, $1 under the cheapest: show it on the desk' : 'Waiting for a trader who pays more than you paid: show it on the desk',
-                    onclick: () => this.select(r.itemId),
-                    onkeydown: (event) => {
-                        if (event.target !== event.currentTarget || (event.key !== 'Enter' && event.key !== ' ')) return;
-                        event.preventDefault();
-                        this.select(r.itemId);
-                    },
-                }, [
-                    spEl('span', { class: 'sp-pic sp-pic-s' }, [this.image('sell', r.itemId)]),
-                    spEl('span', { class: 'sp-ts-top' }, [this.itemName(r, 'sell:name:' + r.itemId), this.whyTag(r.why)]),
-                    r.kept ? spEl('span', { class: 'sp-badge sp-badge-kept', text: 'Not for sale' })
-                        : r.ready ? spEl('span', { class: 'sp-badge sp-badge-tosell', text: 'Sell ' + signed(r.gain) }) : r.bazaar ? spEl('span', { class: 'sp-badge sp-badge-list', text: 'Bazaar ' + signed(r.bazaar.gain) }) : spEl('span', { class: 'sp-badge sp-badge-wait', text: 'Waiting' }),
-                    spEl('small', {}, line),
-                ]));
-            }
-            if (focusKey) {
-                const again = [...this.listBox.querySelectorAll('[data-focus]')].find((n) => n.dataset.focus === focusKey);
-                if (again) again.focus({ preventScroll: true });
-            }
-        }
-
-        /**
-         * The To sell board (3.21.0, mockup U, B): beside the list while its tab is
-         * on - everything to sell under the trader who pays most for it now, one
-         * Plan trade per trader (their trade, with these as its "yours" lines), and
-         * what has no profit yet waiting at the bottom.
-         */
-        renderBoard() {
-            const s = this.state;
-            const T = s.toSell;
-            const box = this.deskEl;
-            const statusOf = (b) => {
-                const st = b && b.id && s.statuses ? s.statuses.get(String(b.id)) : null;
-                return st ? st.level + st.text : '';
-            };
-            const rowSig = (r) => [r.itemId, r.name, r.qty, r.each, r.why, r.best && [r.best.name, r.best.price], r.gain, r.short, r.bazaar];
-            const keptRows = T.kept || [];
-            const sig = JSON.stringify(['board', T.groups.map((g) => [g.key, g.trader.name, statusOf(g.trader), g.trader.trust ? g.trader.trust.level + g.trader.trust.score : '', g.gain, g.rows.map(rowSig)]), T.waiting.map(rowSig), keptRows.map(rowSig), s.prefs.onlineOnly, s.prefs.trustedOnly]);
-            if (sig === this.deskSig) return;
-            const shadow = this.root.getRootNode();
-            const active = shadow && shadow.activeElement;
-            const keep = active && box.contains(active) && active.dataset ? active.dataset.focus : null;
-            this.deskSig = sig;
-            box.textContent = '';
-            const total = T.rows.length;
-            box.appendChild(spEl('div', { class: 'sp-wsh sp-bd-top' }, [
-                spEl('span', { class: 'sp-wst' }, [
-                    spEl('span', { class: 'sp-wsname', text: 'To sell' }),
-                    spEl('small', { text: total ? count(total) + (total === 1 ? ' item' : ' items') + ' you bought to resell and still hold' : 'What you bought to resell and still hold' }),
-                ]),
-            ]));
-            if (!total) {
-                box.appendChild(spEl('p', { class: 'sp-note', text: 'Nothing to sell. What you bought for a trade that was cancelled, what a trader did not take, and extra buys wait here until a trader pays more than you paid.' }));
-                return;
-            }
-            // "Not for sale" on a row (3.23.0), and the way back: the row is kept out of every trade, not removed.
-            const keepBtn = (r) => spEl('button', {
-                type: 'button',
-                class: 'sp-link sp-keep',
-                'data-focus': 'board:keep:' + r.itemId,
-                title: r.kept
-                    ? 'Put ' + r.name + ' back: traders who pay more than you paid are named again, and it goes into their trades'
-                    : 'Keep ' + r.name + ': it stays in this list, in no trade and off your bazaar\'s Fill all, until you put it back',
-                text: r.kept ? 'For sale again' : 'Not for sale',
-                onclick: (event) => {
-                    // The row itself opens the desk: this press is not that.
-                    event.stopPropagation();
-                    if (this.h.onNotForSale) this.h.onNotForSale(r.itemId, !r.kept);
-                },
-            });
-            const itemRow = (r, right) => {
-                const el = spEl('div', { class: 'sp-bd-r', role: 'button', tabindex: '0', 'data-focus': 'board:' + r.itemId, title: 'Show it on the desk', onclick: () => this.select(r.itemId) }, [
-                    spEl('span', { class: 'sp-pic sp-pic-s' }, [this.image('board', r.itemId)]),
-                    this.itemName(r, 'board:name:' + r.itemId),
-                    this.whyTag(r.why, true),
-                    spEl('span', { class: 'sp-sp' }),
-                    ...right,
-                    keepBtn(r),
-                ]);
-                el.addEventListener('keydown', (event) => {
-                    if (event.target !== el || (event.key !== 'Enter' && event.key !== ' ')) return;
-                    event.preventDefault();
-                    this.select(r.itemId);
-                });
-                return el;
-            };
-            for (const g of T.groups) {
-                const b = g.trader;
-                const group = spEl('div', { class: 'sp-bd-g sp-bd-ready' }, [
-                    spEl('div', { class: 'sp-bd-h' }, [
-                        this.whoName(b.name, b.id, 'board:who:' + g.key),
-                        this.trustBadge(b),
-                        this.status(b),
-                        spEl('small', { text: count(g.rows.length) + (g.rows.length === 1 ? ' item' : ' items') }),
-                        spEl('span', { class: 'sp-sp' }),
-                        spEl('span', { class: 'sp-bd-gain', text: signed(g.gain) }),
-                        spEl('button', {
-                            type: 'button',
-                            class: 'sp-btn sp-primary',
-                            'data-focus': 'board:plan:' + g.key,
-                            title: 'Put the trade with ' + b.name + ' on the desk: these items go in as yours',
-                            text: 'Plan trade',
-                            onclick: () => this.h.onTradePick && this.h.onTradePick(g.rows[0].itemId, g.key),
-                        }),
-                    ]),
-                ]);
-                for (const r of g.rows) {
-                    group.appendChild(itemRow(r, [
-                        spEl('small', {}, ['Paid ', spEl('b', { text: formatMoney(r.each) }), ' each · they pay ', spEl('b', { text: formatMoney(r.best.price) })]),
-                        spEl('span', { class: 'sp-bd-gain', text: signed(r.gain) }),
-                    ]));
-                }
-                box.appendChild(group);
-            }
-            if (T.waiting.length) {
-                const group = spEl('div', { class: 'sp-bd-g sp-bd-wait' }, [
-                    spEl('div', { class: 'sp-bd-h' }, [
-                        spEl('b', { class: 'sp-bd-who', text: 'Waiting for a price' }),
-                        spEl('small', { text: count(T.waiting.length) + (T.waiting.length === 1 ? ' item' : ' items') }),
-                    ]),
-                ]);
-                for (const r of T.waiting) {
-                    group.appendChild(itemRow(r, [
-                        // Never a trader who pays less than you paid: one over it but under your margin, your own bazaar, or nothing yet.
-                        r.best
-                            ? spEl('small', {}, ['Paid ', spEl('b', { text: formatMoney(r.each) }), ' each · ', this.playerName(r.best.name, r.best.id, 'board:best:' + r.itemId), ' pays ', spEl('b', { text: formatMoney(r.best.price) }), ' (under your minimum profit)'])
-                            : r.bazaar
-                                ? spEl('small', {}, ['Paid ', spEl('b', { text: formatMoney(r.each) }), ' each · your bazaar at ', spEl('b', { text: formatMoney(r.bazaar.price) }), ' ($1 under the cheapest)'])
-                                : spEl('small', {}, ['Paid ', spEl('b', { text: formatMoney(r.each) }), ' each · no trader pays more yet']),
-                        r.bazaar && !r.best ? spEl('span', { class: 'sp-bd-gain sp-bd-baz', text: 'Bazaar ' + signed(r.bazaar.gain) }) : spEl('span', { class: 'sp-bd-short', text: 'Waiting' }),
-                    ]));
-                }
-                box.appendChild(group);
-            }
-            if (keptRows.length) {
-                const group = spEl('div', { class: 'sp-bd-g sp-bd-wait sp-bd-kept' }, [
-                    spEl('div', { class: 'sp-bd-h' }, [
-                        spEl('b', { class: 'sp-bd-who', text: 'Not for sale' }),
-                        spEl('small', { text: count(keptRows.length) + (keptRows.length === 1 ? ' item' : ' items') + ' · in no trade, and off your bazaar\'s Fill all' }),
-                    ]),
-                ]);
-                for (const r of keptRows) group.appendChild(itemRow(r, [spEl('small', {}, ['Paid ', spEl('b', { text: formatMoney(r.each) }), ' each'])]));
-                box.appendChild(group);
-            }
-            box.appendChild(spEl('p', { class: 'sp-note', text: 'A row leaves by itself when your Ledger shows it sold or you no longer hold it. "Not for sale" keeps one here, out of every trade, until you put it back.' }));
-            if (keep) {
-                const again = [...box.querySelectorAll('[data-focus]')].find((n) => n.dataset.focus === keep);
-                if (again) again.focus({ preventScroll: true });
-            }
-        }
-
-        renderList() {
-            const s = this.state;
-            const info = s.info || {};
-            if (s.filter === 'sell') {
-                this.renderSellList();
-                return;
-            }
-            if (s.filter === 'trades') {
-                this.renderTradesList();
-                return;
-            }
-            // A pinned item is listed once: its row moves to the top, pinned (the
-            // owner: "it created something doubled, instead of just pinning it").
-            const pinnedItems = new Set((s.pinned || []).map((p) => p.itemId));
-            const list = this.stableOrder(s.list).filter((r) => !pinnedItems.has(r.itemId));
-            const sig = JSON.stringify([
-                s.filter,
-                s.counts,
-                s.listTotal,
-                s.desk && s.desk.itemId,
-                info.hasKey,
-                info.loading,
-                info.inventoryAt ? 1 : 0,
-                info.tradersLoading,
-                Boolean(info.bazaarsAt),
-                this.query,
-                list.map((r) => [r.itemId, r.name, r.held, r.lowest, r.badge && [r.badge.kind, r.badge.amount], r.pending, r.buy, r.sell]),
-                s.pinned || [],
-            ]);
-            if (sig === this.listSig) return;
-            this.listSig = sig;
-
-            // A rebuild replaces the item you had focused: focus its new copy.
-            const shadow = this.root.getRootNode();
-            const active = shadow && shadow.activeElement;
-            const focusKey = active && this.listBox.contains(active) && active.dataset ? active.dataset.focus : null;
-
-            this.syncChips();
-
-            this.listBox.textContent = '';
-            // Pinned trades first, whatever the filter: the main flip, the trader, the profit now.
-            for (const pt of s.pinned || []) {
-                const unpin = spEl('button', {
-                    type: 'button',
-                    class: 'sp-pin sp-pin-on',
-                    'aria-pressed': 'true',
-                    'data-focus': 'unpin:' + pt.key,
-                    'aria-label': 'Unpin the trade with ' + pt.trader,
-                    title: 'Pinned: press to unpin',
-                    onclick: (event) => {
-                        event.stopPropagation();
-                        if (this.h.onUnpin) this.h.onUnpin(pt.key);
-                    },
-                }, [pinIcon()]);
-                const open = () => this.h.onPinnedOpen && this.h.onPinnedOpen(pt.key);
-                this.listBox.appendChild(spEl('div', {
-                    class: 'sp-it sp-pinrow' + (pt.on ? ' sp-sel' : ''),
-                    role: 'button',
-                    tabindex: '0',
-                    'aria-pressed': String(pt.on),
-                    'data-focus': 'pin:' + pt.key,
-                    title: 'Your pinned trade: only prices and profit move',
-                    onclick: open,
-                    onkeydown: (event) => {
-                        if (event.target !== event.currentTarget || (event.key !== 'Enter' && event.key !== ' ')) return;
-                        event.preventDefault();
-                        open();
-                    },
-                }, [
-                    spEl('span', { class: 'sp-pic sp-pic-s' }, [this.image('pin', pt.itemId)]),
-                    spEl('b', { class: 'sp-iname', text: pt.name }),
-                    // The whole trade with that trader (the flip and its cover), live.
-                    spEl('span', { class: 'sp-pinrow-r' }, [spEl('span', { class: 'sp-badge ' + (pt.profit < 0 ? 'sp-badge-bad' : 'sp-badge-flip'), text: 'Trade ' + signed(pt.profit) }), unpin]),
-                    spEl('small', { text: pt.trader + (pt.mainId !== pt.itemId ? ' · main ' + pt.mainName : '') + ' · ' + count(pt.items) + (pt.items === 1 ? ' item' : ' items') + ' · ' + count(pt.stops) + (pt.stops === 1 ? ' bazaar' : ' bazaars') }),
-                ]));
-            }
-            if ((s.pinned || []).length) this.listBox.appendChild(spEl('div', { class: 'sp-pinsep', 'aria-hidden': 'true' }));
-            if (!list.length) {
-                let text = 'Loading…';
-                const q = this.query.trim();
-                if (q) text = 'No item matches "' + q + '"' + (s.category ? ' in ' + s.category : '') + '.';
-                else if (s.category && !(s.counts && s.counts[s.filter])) text = 'Nothing in ' + s.category + (s.filter === 'mine' ? ' that you hold' : s.filter === 'flips' ? ' to flip right now' : '') + '.';
-                else if (s.filter === 'mine' && !info.hasKey) text = 'Add your Limited key to see your items.';
-                else if (s.filter === 'mine' && info.loading) text = 'Loading your inventory…';
-                else if (s.filter === 'mine' && info.inventoryAt) text = 'Your inventory has nothing to sell.';
-                else if (s.filter === 'flips') text = this.noFlipsText();
-                else if (!info.tradersLoading && !info.traderCount && !info.hasKey) text = 'No traders loaded yet.';
-                this.listBox.appendChild(spEl('div', { class: 'sp-empty', text }));
-            }
-            const pinnedIds = new Set((s.pinned || []).map((p) => p.itemId));
-            for (const r of list) {
-                const on = Boolean(s.desk && s.desk.itemId === r.itemId);
-                const sub = [];
-                if (r.held) sub.push('You hold ' + count(r.held));
-                // A flip: what the bazaar sells it for, and what the trader pays.
-                if (r.buy && r.sell) sub.push('Buy ' + formatMoney(r.buy) + ' · Sell ' + formatMoney(r.sell));
-                else if (r.lowest) sub.push('from ' + formatMoney(r.lowest));
-                // A flip row has the pin too (the owner: "put it here as well"), in
-                // its bottom corner, out of the flow: pinning moves nothing.
-                const flip = Boolean(r.badge && r.badge.kind === 'flip');
-                const pinned = pinnedIds.has(r.itemId);
-                const pin = flip
-                    ? spEl('button', {
-                        type: 'button',
-                        class: 'sp-pin sp-pin-row' + (pinned ? ' sp-pin-on' : ''),
-                        'aria-pressed': String(pinned),
-                        'data-focus': 'rowpin:' + r.itemId,
-                        'aria-label': (pinned ? 'Unpin ' : 'Pin ') + r.name + '\'s trade',
-                        title: pinned ? 'Pinned on top of the list: press to unpin' : 'Pin this trade: it stays on top of the list, only prices move',
-                        onclick: (event) => {
-                            event.stopPropagation();
-                            if (this.h.onPin) this.h.onPin(r.itemId);
-                        },
-                    }, [pinIcon()])
-                    : null;
-                this.listBox.appendChild(spEl('div', {
-                    class: 'sp-it' + (on ? ' sp-sel' : '') + (flip ? ' sp-it-pin' : ''),
-                    role: 'button',
-                    tabindex: '0',
-                    'aria-pressed': String(on),
-                    'data-focus': 'item:' + r.itemId,
-                    onclick: () => this.select(r.itemId),
-                    onkeydown: (event) => {
-                        if (event.target !== event.currentTarget || (event.key !== 'Enter' && event.key !== ' ')) return;
-                        event.preventDefault();
-                        this.select(r.itemId);
-                    },
-                }, [
-                    spEl('span', { class: 'sp-pic sp-pic-s' }, [this.image('list', r.itemId)]),
-                    spEl('b', { class: 'sp-iname', text: r.name }),
-                    this.badge(r),
-                    spEl('small', { text: sub.join(' · ') || (r.pending ? 'Checking…' : '') }),
-                    pin,
-                ]));
-            }
-            this.moreBtn.hidden = !(s.listTotal > list.length);
-
-            if (focusKey) {
-                const again = [...this.listBox.querySelectorAll('[data-focus]')].find((n) => n.dataset.focus === focusKey);
-                if (again) again.focus({ preventScroll: true });
-            }
+        /** A held row's or card's number changed since the list was held: ▲ or ▼ beside it (the row itself stays put). */
+        stillMark(st) {
+            if (!st || !st.move) return null;
+            const up = st.move === 'up';
+            return spEl('small', { class: 'sp-chg ' + (up ? 'sp-chg-up' : 'sp-chg-dn'), title: (up ? 'Higher' : 'Lower') + ' than when the list was held. It keeps its place until your trade ends.', text: up ? ' ▲' : ' ▼' });
         }
 
         /** Why there is no flip to show: still loading, still checking, or none. */
@@ -24052,274 +29515,12 @@
             // Buyers online only (3.20.5): flips are found, their buyers' statuses are being read.
             if (info.flipsWaiting) return 'Checking who is online…';
             if (info.flipsChecked < info.flipsWanted) return 'No flips found yet. Checking ' + info.flipsChecked + ' of ' + info.flipsWanted + '.';
+            // A trade under way holds the list as it was: empty then, empty now, and that is said - before
+            // "Looking for traders", which a held list is not doing.
+            const held = this.state.still;
+            if (held && held.trader) return 'No flips were here when the list was held for your trade with ' + held.trader + '.';
             if (info.tradersLoading) return 'Looking for traders…';
             return 'No flips with these settings right now.';
-        }
-
-        /** Flip +$X / List +$X / Sell to trader, or nothing. */
-        badge(r) {
-            const b = r.badge;
-            if (!b) return spEl('span');
-            if (b.kind === 'flip') return spEl('span', { class: 'sp-badge sp-badge-flip', text: 'Flip ' + signed(b.amount) });
-            if (b.kind === 'list') return spEl('span', { class: 'sp-badge sp-badge-list', text: 'List ' + signed(b.amount) });
-            return spEl('span', { class: 'sp-badge sp-badge-sell', text: 'Sell to trader' });
-        }
-
-        select(itemId) {
-            if (this.h.onSelect) this.h.onSelect(itemId);
-            // On a phone the desk sits above the list: bring it into view.
-            if (typeof window.matchMedia === 'function' && window.matchMedia('(max-width: 1000px)').matches && this.deskEl.scrollIntoView) {
-                this.deskEl.scrollIntoView({ block: 'start' });
-            }
-        }
-
-        /* ------------------------------------------------------------- desk */
-
-        /**
-         * Everything about the item picked, at once.
-         *
-         * desk: {itemId, name, held, avg, bazaars,
-         *   buyers, buyersTotal, buyersLoading, pending,
-         *   sellers: {state: 'loading'|'error'|'ok', rows, error},
-         *   plan, planWhy: 'nobuyer'|'nounder'|'loading'|null,
-         *   where: {options, best, gain}|null, market: {state, lowest}}
-         */
-        renderDesk() {
-            // The To sell tab: its board, until a row is picked or a trade planned.
-            if (this.state.toSell && this.state.toSell.open) {
-                this.renderBoard();
-                return;
-            }
-            // The Trades tab: its board, until a trade is opened.
-            if (this.state.trades && this.state.trades.open) {
-                this.renderTradesBoard();
-                return;
-            }
-            const d = this.state.desk;
-            const box = this.deskEl;
-            // On the To sell tab the desk has a way back to the board.
-            const fromSell = this.state.filter === 'sell' ? 'sell' : this.state.filter === 'trades' ? 'trades' : '';
-            if (d && this.showAll.item !== d.itemId) this.showAll = { item: d.itemId, buyers: false, sellers: false, hidden: false };
-            const statusOf = (b) => {
-                const st = b.id && this.state.statuses ? this.state.statuses.get(String(b.id)) : null;
-                return st ? st.level + st.text : '';
-            };
-            const now = Date.now();
-            const p = this.state.prefs;
-            const info = this.state.info || {};
-            const sig = d
-                ? JSON.stringify([
-                    d.itemId, d.name, d.held, d.avg, d.bazaars, d.buyersTotal, d.buyersLoading, d.buyersListNote, d.pending, d.planWhy,
-                    d.buyers.map((b) => [b.id, b.name, b.price, b.te, b.teTop, b.teList, b.w3b, statusOf(b), b.trust ? b.trust.level + b.trust.score : '', this.state.networth && b.id ? this.state.networth.get(String(b.id)) : null, Boolean(b.favourite), b.traded || '', Boolean(b.troll), Boolean(b.lastPaidOnly)]),
-                    this.justBlacklisted ? this.justBlacklisted.at : 0,
-                    (d.hidden || []).map((b) => [b.tradeKey, b.price, b.hiddenBy, statusOf(b), b.trust ? b.trust.level + b.trust.score : '']),
-                    // How old a list is, in the words shown: drawn again when they change, not every second.
-                    Object.entries(d.oldLists || {}).map(([k, o]) => [k, o.level, listAgeText(now - o.at)]),
-                    p.freshOnly,
-                    p.networthPct,
-                    d.sellers.state, d.sellers.error,
-                    d.sellers.rows.map((r) => [r.sellerId, r.sellerName, r.price, r.qty, r.stale, Math.floor((now - (r.dataAt || 0)) / 60000)]),
-                    d.plan, d.where, d.market, d.trade,
-                    this.showAll, p.onlineOnly, p.trustedOnly, p.cash, Boolean(info.knownTraders), info.tradersLoading, fromSell,
-                ])
-                : JSON.stringify([info.hasKey, info.loading, Boolean(info.bazaarsAt), info.tradersLoading, this.state.counts, fromSell]);
-            if (sig === this.deskSig) return;
-
-            const shadow = this.root.getRootNode();
-            const active = shadow && shadow.activeElement;
-            // A box you are in is never replaced (3.14.3: it only waited once you
-            // had typed, so a selection made by a double-click was wiped within
-            // seconds by the next read): the desk is drawn again once you leave it.
-            if (active && box.contains(active) && active.tagName === 'INPUT' && active.type !== 'checkbox' && (active.dataset.dirty || document.hasFocus())) return;
-            this.deskSig = sig;
-            const keep = active && box.contains(active) && active.dataset ? active.dataset.focus : null;
-
-            box.textContent = '';
-            if (fromSell) {
-                box.appendChild(spEl('button', { type: 'button', class: 'sp-link sp-bd-back', 'data-focus': 'board:back', title: fromSell === 'trades' ? 'Back to every trade you have going' : 'Back to everything to sell, by trader', text: fromSell === 'trades' ? '← Trades' : '← To sell', onclick: () => this.h.onFilter && this.h.onFilter(fromSell) }));
-            }
-            if (!d) {
-                const none = !(this.state.counts && this.state.counts.all);
-                box.appendChild(spEl('p', { class: 'sp-note', text: none ? (info.tradersLoading ? 'Looking for traders…' : 'Nothing to show yet.') : 'Pick an item.' }));
-                return;
-            }
-
-            const facts = ['Item Market Average ' + (d.avg ? formatMoney(d.avg) : '–')];
-            if (d.bazaars) facts.push(count(d.bazaars) + (d.bazaars === 1 ? ' bazaar' : ' bazaars'));
-            if (d.held) facts.push('you hold ' + count(d.held));
-            box.appendChild(spEl('div', { class: 'sp-wsh' }, [
-                spEl('span', { class: 'sp-pic sp-pic-l' }, [this.image('desk', d.itemId)]),
-                spEl('span', { class: 'sp-wst' }, [
-                    this.link(d.name, itemMarketUrl(d.itemId, d.name), { cls: 'sp-wsname', title: 'Open it on the Item Market', focus: 'desk:name' }),
-                    spEl('small', { text: facts.join(' · ') }),
-                ]),
-            ]));
-
-            const quad = spEl('div', { class: 'sp-quad' });
-            // A trade being planned or bought: its card beside the traders, at the
-            // top, where Plan trade was pressed - not below the fold.
-            // Two columns, each as tall as its own cards: a long plan never
-            // stretches the traders' side (it did as a spanning grid row).
-            // A To sell item (3.22.0; the owner: "its in the very bottom and unnoticeable in the to sell"): where to
-            // sell it is the question, so its card comes first, across the desk - not under a list of 100 bazaars.
-            const whereFirst = Boolean(d.held && d.paid > 0);
-            if (d.trade && (d.trade.chosen || d.trade.accepted)) {
-                const plan = this.planCard(d);
-                plan.classList.remove('sp-wide');
-                quad.append(
-                    spEl('div', { class: 'sp-col' }, whereFirst ? [this.whereCard(d), this.buyersCard(d), this.sellersCard(d)] : [this.buyersCard(d), this.sellersCard(d), d.held ? this.whereCard(d) : null]),
-                    spEl('div', { class: 'sp-col' }, [plan]),
-                );
-            } else {
-                if (whereFirst) {
-                    const where = this.whereCard(d);
-                    where.classList.add('sp-wide');
-                    quad.appendChild(where);
-                }
-                quad.append(this.buyersCard(d), this.sellersCard(d), this.planCard(d));
-                if (d.held && !whereFirst) quad.appendChild(this.whereCard(d));
-            }
-            box.appendChild(quad);
-
-            if (keep) {
-                // A trader just blacklisted is gone from the rows: their Undo takes the focus.
-                // Declined: that trader's Undo (never the next trader's "declined", review M3).
-                const want = keep.startsWith('blk:') && this.justBlacklisted ? 'desk:bl-undo' : keep.startsWith('trade:decline:') ? 'plan:' + keep.slice('trade:decline:'.length) : keep;
-                const node = [...box.querySelectorAll('[data-focus]')].find((n) => n.dataset.focus === want);
-                if (node) node.focus({ preventScroll: true });
-            }
-        }
-
-        /** Traders pay, highest first: name (their profile), trust, status, price; Trade and both price lists. */
-        buyersCard(d) {
-            const card = spEl('div', { class: 'sp-q' }, [spEl('h3', { text: 'Traders pay · highest first' })]);
-            const all = this.showAll.buyers;
-            // Traders you marked Declined go to the bottom (greyed) until their hour is up.
-            const T = d.trade || null;
-            const declined = (T && T.declined) || {};
-            const ordered = [...d.buyers.filter((b) => !declined[b.tradeKey] && !b.troll), ...d.buyers.filter((b) => !declined[b.tradeKey] && b.troll), ...d.buyers.filter((b) => declined[b.tradeKey])];
-            const rows = all ? ordered : ordered.slice(0, DESK_ROWS);
-            if (d.buyersLoading) card.appendChild(spEl('p', { class: 'sp-note', text: 'Loading more buyers from TornExchange…' }));
-            else if (d.buyersListNote) card.appendChild(spEl('p', { class: 'sp-note', text: d.buyersListNote }));
-            // Just blacklisted: a moment to take it back (then only the Ledger's Traders tab has Undo).
-            const justOff = this.justBlacklisted && Date.now() - this.justBlacklisted.at < 15000 ? this.justBlacklisted.b : null;
-            if (justOff) {
-                card.appendChild(spEl('p', { class: 'sp-note sp-blnote' }, [
-                    'Blacklisted ' + justOff.name + ': never a buyer. ',
-                    spEl('button', { type: 'button', class: 'sp-link', 'data-focus': 'desk:bl-undo', text: 'Undo', onclick: () => {
-                        this.justBlacklisted = null;
-                        if (this.h.onBlacklist) this.h.onBlacklist(justOff, false);
-                    } }),
-                ]));
-            }
-            if (!rows.length) card.appendChild(spEl('p', { class: 'sp-note', text: this.noTraderText(d) }));
-            // The top row is the best real bid: a troll one (over 3x the market price) is never it.
-            const topRow = rows.find((b) => !b.troll && !declined[b.tradeKey]);
-            rows.forEach((b) => {
-                const planning = Boolean(T && ((T.chosen && T.chosen.key === b.tradeKey) || (T.accepted && T.accepted.key === b.tradeKey)));
-                const until = declined[b.tradeKey];
-                card.appendChild(spEl('div', { class: 'sp-tr' + (b === topRow ? ' sp-top' : '') + (b.troll ? ' sp-troll' : '') + (planning ? ' sp-planning' : '') + (until ? ' sp-declined' : '') + (b.favourite ? ' sp-favrow' : '') }, [
-                    spEl('span', { class: 'sp-tr-l' }, [
-                        spEl('span', { class: 'sp-trader-l' }, [this.favButton(b), this.playerName(b.name, b.id, 'buyer:' + (b.id || b.name)), this.trustBadge(b), b.favourite ? spEl('span', { class: 'sp-favtag', text: 'Favourite' }) : null]),
-                        this.status(b),
-                        this.networthLine(b),
-                        // Your own history with them (the Ledger): "Traded 7× · last 3d ago".
-                        b.traded ? spEl('small', { class: 'sp-traded', text: b.traded }) : null,
-                        this.oldListLine(d, b),
-                        // Their two lists disagree: the lower is counted, and said.
-                        b.differ
-                            ? spEl('small', { class: 'sp-differ', text: 'Lists differ: ' + this.listPrices(b, ' · ') + '. Counted at the lower; check before trading.' })
-                            : null,
-                        b.troll ? spEl('small', { class: 'sp-differ', text: 'Over 3× Item Market Average: not counted' }) : null,
-                        // No public list: what they paid you last (review M2).
-                        b.lastPaidOnly ? spEl('small', { class: 'sp-differ', text: 'Last paid: no public list, check with them' }) : null,
-                        T ? this.tradeLine(d, b, planning, until) : null,
-                    ]),
-                    spEl('span', { class: 'sp-tprice', text: formatMoney(b.price) }),
-                    this.traderLinks(b, { blacklist: true }),
-                ]));
-            });
-            if (d.buyers.length > DESK_ROWS) {
-                card.appendChild(spEl('button', {
-                    type: 'button',
-                    class: 'sp-link sp-showall',
-                    'data-focus': 'desk:buyers-all',
-                    text: all ? 'Show the top ' + DESK_ROWS : 'Show all ' + count(d.buyers.length) + ' traders',
-                    onclick: () => {
-                        this.showAll.buyers = !all;
-                        this.renderDesk();
-                        this.fitDesk();
-                    },
-                }));
-            }
-            this.hiddenBuyersPart(card, d);
-            return card;
-        }
-
-        /**
-         * A price from a TornW3B list its trader has not changed in over 24 hours
-         * (3.22.3; the owner picked mockup X-B): an amber dot and how long ago,
-         * under the trader - the price itself is left as it is. The dot pulses
-         * until two days; past that (Fresh prices only off) it is still.
-         */
-        oldListLine(d, b) {
-            const o = d.oldLists && b.tradeKey ? d.oldLists[b.tradeKey] : null;
-            return o ? this.oldListEl(o) : null;
-        }
-
-        /** The line itself, for a desk row or a Your traders card (3.23.0). @param {{at: number, level: 'aging'|'stale'}} o */
-        oldListEl(o) {
-            const dot = spEl('span', { class: 'sp-olddot' });
-            // The desk is drawn again often: the pulse goes on from where the clock is, never from its start.
-            if (o.level === 'aging') dot.style.animationDelay = -(Date.now() % OLD_PULSE_MS) + 'ms';
-            return spEl('small', { class: 'sp-oldlist' + (o.level === 'aging' ? ' sp-oldlist-pulse' : '') }, [dot, 'Price list last changed ' + listAgeText(Date.now() - o.at)]);
-        }
-
-        /**
-         * Traders your Buyers online only / Trusted buyers only leave out here:
-         * how many and which switch, and on a press, who (greyed, never planned).
-         * The list never empties with no reason (the friend, 3.14.4).
-         */
-        hiddenBuyersPart(card, d) {
-            const hidden = d.hidden || [];
-            if (!hidden.length) return;
-            const open = Boolean(this.showAll.hidden);
-            const n = (k) => hidden.filter((b) => b.hiddenBy === k).length;
-            const parts = [];
-            if (n('trust')) parts.push('Trusted buyers only hides ' + count(n('trust')) + (n('trust') === 1 ? ' trader' : ' traders'));
-            if (n('offline')) parts.push('Buyers online only hides ' + count(n('offline')) + (n('offline') === 1 ? ' trader' : ' traders') + ' (offline)');
-            if (n('loss')) parts.push(count(n('loss')) + (n('loss') === 1 ? ' trader pays' : ' traders pay') + ' no more than the ' + formatMoney(d.paid) + ' you paid: never suggested');
-            if (n('stale')) parts.push('Fresh prices only hides ' + count(n('stale')) + (n('stale') === 1 ? ' trader' : ' traders') + ' (price list not changed in two days)');
-            card.appendChild(spEl('p', { class: 'sp-note sp-hidnote' }, [
-                parts.join(' · ') + ' here. ',
-                spEl('button', { type: 'button', class: 'sp-link', 'aria-expanded': String(open), 'data-focus': 'desk:hidden', text: open ? 'Hide them' : 'Show them', onclick: () => {
-                    this.showAll.hidden = !open;
-                    this.deskSig = null;
-                    this.renderDesk();
-                    this.fitDesk();
-                } }),
-            ]));
-            if (!open) return;
-            for (const b of hidden) {
-                const why = b.hiddenBy === 'loss'
-                    ? 'Pays no more than you paid: a loss, never suggested'
-                    : b.hiddenBy === 'offline'
-                    ? 'Offline: hidden by Buyers online only'
-                    : b.hiddenBy === 'stale' ? 'Price list last changed ' + formatAge(Date.now() - b.listAt) + ': hidden by Fresh prices only'
-                    : !b.trust ? 'No votes yet: hidden by Trusted buyers only'
-                    : b.trust.level === 'Caution' ? 'More votes against than for: hidden by Trusted buyers only'
-                    : 'Fewer than 20 votes: hidden by Trusted buyers only';
-                card.appendChild(spEl('div', { class: 'sp-tr sp-hidden' }, [
-                    spEl('span', { class: 'sp-tr-l' }, [
-                        spEl('span', { class: 'sp-trader-l' }, [this.playerName(b.name, b.id, 'hidden:' + (b.id || b.name)), this.trustBadge(b)]),
-                        this.status(b),
-                        b.traded ? spEl('small', { class: 'sp-traded', text: b.traded }) : null,
-                        spEl('small', { class: 'sp-differ', text: why }),
-                    ]),
-                    spEl('span', { class: 'sp-tprice', text: formatMoney(b.price) }),
-                    this.traderLinks(b),
-                ]));
-            }
         }
 
         /**
@@ -24336,767 +29537,6 @@
             }
             if (b.w3b > 0) parts.push('W3B ' + formatMoney(b.w3b));
             return parts.join(sep);
-        }
-
-        /**
-         * Under a trader on the desk: what the whole trade with them makes, and
-         * the button that puts the flip plan on them (the owner: "trader 1 didn't
-         * want to trade - click trader 2 to see the flip plan there"). Declined:
-         * how long they are passed over, and Undo.
-         */
-        tradeLine(d, b, planning, until) {
-            const t = d.trade.perTrader[b.tradeKey];
-            const words = [];
-            if (t && t.items) words.push('whole trade ' + (t.estimated ? '≈ ' : '') + signed(t.profit) + ' · ' + count(t.items) + (t.items === 1 ? ' item' : ' items') + (t.stops ? ' · ' + count(t.stops) + (t.stops === 1 ? ' bazaar' : ' bazaars') : ''));
-            else if (t) words.push(b.troll ? 'their bid is not believable' : 'no trade with your Cash');
-            if (t && !t.hasItem && t.items) words.push('not this item');
-            let btn;
-            if (until) {
-                words.unshift('Declined · passed over for ' + formatAge(until - Date.now()).replace(' ago', ''));
-                btn = spEl('button', { type: 'button', class: 'sp-btn sp-plan', 'data-focus': 'plan:' + b.tradeKey, text: 'Undo', onclick: () => this.h.onTradeUndecline && this.h.onTradeUndecline(b.tradeKey) });
-            } else if (planning && !d.trade.accepted && d.trade.picked) {
-                // Pressed again, it comes off the desk (3.20.2): you planned it, nothing was said yet.
-                btn = spEl('button', { type: 'button', class: 'sp-btn sp-plan sp-plan-on', 'data-focus': 'plan:' + b.tradeKey, 'aria-pressed': 'true', title: 'Planning with ' + b.name + ': press to take this plan off the desk', text: 'Planning', onclick: () => this.h.onTradeUnpick && this.h.onTradeUnpick(d.itemId, b.tradeKey) });
-            } else if (planning) {
-                btn = spEl('span', { class: 'sp-plan sp-plan-on', text: d.trade.accepted ? 'Accepted' : 'Planning' });
-            } else {
-                btn = spEl('button', { type: 'button', class: 'sp-btn sp-plan', 'data-focus': 'plan:' + b.tradeKey, title: 'Put the flip plan on ' + b.name + ': this item and their other items', text: 'Plan trade', onclick: () => this.h.onTradePick && this.h.onTradePick(d.itemId, b.tradeKey) });
-            }
-            return spEl('span', { class: 'sp-tradeline' }, [btn, words.length ? spEl('small', { text: words.join(' · ') }) : null]);
-        }
-
-        /** "Networth $1.2b" under a trader, once Torn has said. */
-        networthLine(b) {
-            const nw = b && b.id && this.state.networth ? this.state.networth.get(String(b.id)) : null;
-            if (!(nw >= 0)) return null;
-            return spEl('small', { class: 'sp-networth', text: 'Networth ' + formatMoney(nw) });
-        }
-
-        /** The star before a trader's name: a favourite (5+ trades this month, or added by you); press to change. */
-        favButton(b) {
-            if (!b || !b.id) return null;
-            const on = Boolean(b.favourite);
-            return spEl('button', {
-                type: 'button',
-                class: 'sp-fav' + (on ? ' sp-fav-on' : ''),
-                'data-focus': 'fav:' + b.id,
-                title: on ? 'Favourite - press to remove' : 'Make ' + b.name + ' a favourite',
-                'aria-pressed': String(on),
-                'aria-label': on ? 'Remove ' + b.name + ' from favourites' : 'Make ' + b.name + ' a favourite',
-                text: on ? '★' : '☆',
-                onclick: () => this.h.onFavourite && this.h.onFavourite(b, !on),
-            });
-        }
-
-        /** TE list and W3B list, the ones that exist, from the left (3.20: an empty slot left W3B list adrift); ⊘ (blacklist) at the end on the desk. */
-        traderLinks(b, { blacklist = false } = {}) {
-            const links = spEl('span', { class: 'sp-links' });
-            const slot = (text, url, title) => {
-                if (!url) return;
-                links.appendChild(this.link(text, url, { title, focus: 'link:' + (b.id || b.name) + ':' + text }));
-            };
-            slot('TE list', b.te ? tePriceListUrl(b.teName || b.name) : null, 'TornExchange price list: ' + formatMoney(b.te || 0));
-            slot('W3B list', b.w3b && b.id ? w3bPriceListUrl(b.id) : null, 'TornW3B price list: ' + formatMoney(b.w3b || 0));
-            if (blacklist) {
-                links.appendChild(spEl('button', {
-                    type: 'button',
-                    class: 'sp-blk',
-                    'data-focus': 'blk:' + (b.id || b.name),
-                    title: 'Blacklist ' + b.name + ': never a buyer (their bazaars are still used)',
-                    'aria-label': 'Blacklist ' + b.name,
-                    text: '⊘',
-                    onclick: () => {
-                        this.justBlacklisted = { b: { id: b.id || null, name: b.name }, at: Date.now() };
-                        clearTimeout(this.blNoteTimer);
-                        this.blNoteTimer = setTimeout(() => {
-                            this.justBlacklisted = null;
-                            this.renderDesk();
-                        }, 15000);
-                        if (this.h.onBlacklist) this.h.onBlacklist(b, true);
-                    },
-                }));
-            }
-            return links;
-        }
-
-        /**
-         * The flip's last step: Trade, and the trader's own price lists, so the
-         * price can be checked on their page before the trade. Only the links
-         * that exist, in the same order as on the traders card.
-         */
-        stepTraderLinks(b, { trade = true } = {}) {
-            const links = [];
-            if (trade && b.id) links.push(this.link('Trade', tradeUrl(b.id), { title: 'Start a trade with ' + b.name, focus: 'step-trade' }));
-            if (b.te) links.push(this.link('TE list', tePriceListUrl(b.teName || b.name), { title: b.name + '\'s TornExchange price list: ' + formatMoney(b.te), focus: 'step-te' }));
-            if (b.w3b && b.id) links.push(this.link('W3B list', w3bPriceListUrl(b.id), { title: b.name + '\'s TornW3B price list: ' + formatMoney(b.w3b), focus: 'step-w3b' }));
-            return spEl('span', { class: 'sp-step-links' }, links);
-        }
-
-        /** Bazaars sell, cheapest first: seller (their profile), stock, when TornW3B saw it, price; Open bazaar. */
-        sellersCard(d) {
-            const card = spEl('div', { class: 'sp-q' }, [spEl('h3', { text: 'Bazaars sell · cheapest first' })]);
-            const sel = d.sellers;
-            if (sel.state === 'loading' && !sel.rows.length) card.appendChild(spEl('p', { class: 'sp-note', text: 'Loading bazaars from TornW3B…' }));
-            else if (sel.state === 'error' && !sel.rows.length) card.appendChild(spEl('p', { class: 'sp-note sp-bad', text: sel.error || 'TornW3B did not answer. Trying again soon.' }));
-            else if (!sel.rows.length) card.appendChild(spEl('p', { class: 'sp-note', text: 'No bazaar is selling it.' }));
-            const all = this.showAll.sellers;
-            const rows = all ? sel.rows : sel.rows.slice(0, DESK_ROWS);
-            const now = Date.now();
-            rows.forEach((r, i) => {
-                const seen = r.dataAt ? 'seen ' + formatAge(now - r.dataAt) : 'not seen lately';
-                card.appendChild(spEl('div', { class: 'sp-tr' + (i === 0 && !r.stale ? ' sp-top' : '') + (r.stale ? ' sp-stale' : '') }, [
-                    spEl('span', { class: 'sp-tr-l' }, [
-                        this.playerName(r.sellerName || 'Player ' + r.sellerId, r.sellerId, 'seller:' + r.sellerId),
-                        spEl('small', { text: count(r.qty) + ' in stock · ' + seen }),
-                    ]),
-                    spEl('span', { class: 'sp-tprice', text: formatMoney(r.price) }),
-                    spEl('span', { class: 'sp-links sp-links-one' }, [this.link('Open bazaar', bazaarUrl(r.sellerId, d.itemId, r.price), { title: 'Open ' + (r.sellerName || 'their') + '\'s bazaar', focus: 'bazaar:' + r.sellerId })]),
-                ]));
-            });
-            if (sel.rows.length > DESK_ROWS) {
-                card.appendChild(spEl('button', {
-                    type: 'button',
-                    class: 'sp-link sp-showall',
-                    'data-focus': 'desk:sellers-all',
-                    text: all ? 'Show the cheapest ' + DESK_ROWS : 'Show all ' + count(sel.rows.length) + ' bazaars',
-                    onclick: () => {
-                        this.showAll.sellers = !all;
-                        this.renderDesk();
-                        this.fitDesk();
-                    },
-                }));
-            }
-            return card;
-        }
-
-        /**
-         * The flip plan as ONE trade with one trader (mockup N3, the owner's pick):
-         * Sell to (every trader you can flip this item to, ranked by what the
-         * whole trade makes), then every item in the trade - this one first,
-         * each with a tick and a number - then what you hold that they pay most
-         * for, minus what you keep. Totals, Trade and their lists, and how old
-         * their prices are.
-         */
-        /** "sells fast" / "slow seller" beside an extra item: why it is in, and in that amount. */
-        kindTag(kind) {
-            if (kind === 'fast') return spEl('span', { class: 'sp-kind sp-kind-fast', text: 'sells fast' });
-            if (kind === 'slow') return spEl('span', { class: 'sp-kind sp-kind-slow', text: 'slow seller' });
-            return null;
-        }
-
-        /**
-         * Chat with the trader (the owner, 2026-09-28: "we don't need copy offer,
-         * what we need is a button that goes straight to chatting that trader"):
-         * their Torn profile, where Torn's own chat button is; a trader known by
-         * name only, their TornExchange page.
-         */
-        chatLink(b) {
-            if (b.id) {
-                const a = this.link('Chat', spProfileUrl(b.id), { cls: 'sp-btn sp-chat', title: 'Open ' + b.name + '\'s profile: their chat button is marked', focus: 'trade:chat', children: [chatIcon(), 'Chat'] });
-                // Remembered for the overlay, which marks Torn's chat button there.
-                const want = () => this.h.onChatWanted && this.h.onChatWanted(b.id, b.name);
-                a.addEventListener('click', want);
-                a.addEventListener('auxclick', want);
-                return a;
-            }
-            if (b.te) return this.link('Chat', tePriceListUrl(b.teName || b.name), { cls: 'sp-btn sp-chat', title: b.name + ' is known by name only: their TornExchange page', focus: 'trade:chat' });
-            return null;
-        }
-
-        tradeCard(d) {
-            const T = d.trade;
-            const c = T.chosen;
-            const b = c.buyer;
-            const approx = c.estimated ? '≈ ' : '';
-            const card = spEl('div', { class: 'sp-q sp-hot sp-wide sp-trade' }, [spEl('h3', {}, [
-                'Flip plan · one trade with ' + b.name,
-                // Held (you started on it) or pinned: the items stay, prices and profit are live.
-                c.hold ? spEl('span', { class: 'sp-heldtag', title: 'The items stay as they are; prices and profit are live', text: c.hold.pinned ? 'Pinned' : 'Held' }) : null,
-            ])]);
-            // Anything you do here pins the desk to this item and this trader, so
-            // the plan cannot move away while you buy and trade.
-            card.addEventListener('click', (event) => {
-                const t = event.target;
-                if (t && t.closest && t.closest('a, button, input, label') && this.h.onTradePin) this.h.onTradePin(d.itemId, c.key);
-            }, true);
-            // Chat, or the Trade link to them: you asked - the trade waits for their yes on the Trades board (3.22.0).
-            const asked = (event) => {
-                const a = event.target && event.target.closest ? event.target.closest('a') : null;
-                if (a && (a.classList.contains('sp-chat') || a.dataset.focus === 'step-trade') && this.h.onTradeAsked) this.h.onTradeAsked(d.itemId, c.key);
-            };
-            card.addEventListener('click', asked, true);
-            card.addEventListener('auxclick', asked, true);
-
-            // In the order you do it: message them (Copy offer), then their answer.
-            // Declined passes them over for an hour (the next best is planned).
-            card.appendChild(spEl('div', { class: 'sp-tpick' }, [
-                spEl('span', { class: 'sp-note', text: c.stops ? count(c.stops) + (c.stops === 1 ? ' bazaar' : ' bazaars') + ' to buy from · about ' + c.minutes + ' min' : 'Nothing to buy: all yours' }),
-                spEl('span', { class: 'sp-tpick-b' }, [
-                    this.chatLink(b),
-                    spEl('button', { type: 'button', class: 'sp-btn sp-primary', 'data-focus': 'trade:accept:' + c.key, title: b.name + ' said yes: freeze this trade, so nothing in it moves while you buy and send', text: b.name + ' accepted', onclick: () => this.h.onTradeAccept && this.h.onTradeAccept(d.itemId) }),
-                    spEl('button', { type: 'button', class: 'sp-btn', 'data-focus': 'trade:decline:' + c.key, title: b.name + ' said no to this trade: on to the next flip (this trade is passed over for an hour; their other trades stay)', text: b.name + ' declined', onclick: () => this.h.onTradeDecline && this.h.onTradeDecline(c.key) }),
-                ]),
-            ]));
-
-            // Who, and the totals.
-            card.appendChild(spEl('div', { class: 'sp-th' }, [
-                spEl('span', { class: 'sp-th-l' }, [
-                    spEl('span', {}, [this.playerName(b.name, b.id, 'trade:buyer'), ' ', this.trustBadge(b)]),
-                    this.status(b),
-                    this.networthLine(b),
-                ]),
-                spEl('span', { class: 'sp-th-r' }, [
-                    spEl('div', { class: 'sp-big', text: approx + signed(c.profit) }),
-                    spEl('small', { text: count(c.items) + (c.items === 1 ? ' item' : ' items') + ' · cash needed ' + formatMoney(c.cost) + ' · ' + b.name + ' pays ' + approx + formatMoney(c.pays) }),
-                ]),
-            ]));
-            if (c.payCapped) {
-                const nw = b.id && this.state.networth ? this.state.networth.get(String(b.id)) : null;
-                card.appendChild(spEl('p', { class: 'sp-note', text: b.name + ' can pay at most ' + (this.state.prefs.networthPct || 10) + '% of their networth' + (nw >= 0 ? ' (' + formatMoney(nw) + ')' : '') + ' for the whole trade: it stops there.' }));
-            }
-            // One trade takes 10,000 items (3.23.0): the plan stops there, and says so.
-            if (c.unitsCapped) {
-                card.appendChild(spEl('p', { class: 'sp-note sp-units', text: count(c.units) + ' of ' + count(TRADE_MAX_UNITS) + ' items: one trade takes no more, so this one stops there. The rest is for a second trade with ' + b.name + '.' }));
-            }
-
-            const tick = (checked, label, focus, onChange) => {
-                const input = spEl('input', { type: 'checkbox', class: 'sp-tick', 'aria-label': label, 'data-focus': focus });
-                input.checked = checked;
-                input.addEventListener('change', () => onChange(input.checked));
-                return input;
-            };
-            const qtyBox = (value, label, focus, onSet) => {
-                const input = spEl('input', { type: 'text', class: 'sp-qty', inputmode: 'numeric', value: String(value), 'aria-label': label, 'data-focus': focus, autocomplete: 'off', spellcheck: 'false' });
-                selectOnFocus(input);
-                // Just refused, and the desk drawn again since: still said.
-                if (this.qtyRefused && this.qtyRefused.focus === focus && Date.now() - this.qtyRefused.at < 2500) queueMicrotask(() => flashBad(input, 'Type a whole number, like 25'));
-                const commit = () => {
-                    if (!input.dataset.dirty) return;
-                    delete input.dataset.dirty;
-                    const n = readWholeNumber(input.value);
-                    if (n !== null) {
-                        onSet(n);
-                        return;
-                    }
-                    // Not a number: put back what was there, and say so (3.14.3: it was silent).
-                    input.value = String(value);
-                    flashBad(input, 'Type a whole number, like 25');
-                    this.qtyRefused = { focus, at: Date.now() };
-                };
-                input.addEventListener('input', () => {
-                    input.dataset.dirty = '1';
-                });
-                // Saved once focus has moved on (Tab to the next box keeps you there),
-                // and the desk catches up with what it held back while you were in the box.
-                input.addEventListener('blur', () => setTimeout(() => {
-                    if (input.dataset.dirty) commit();
-                    else this.renderDesk();
-                }, 0));
-                input.addEventListener('keydown', (event) => {
-                    if (event.key === 'Escape') {
-                        // Esc: what was there, unchanged.
-                        event.preventDefault();
-                        event.stopPropagation();
-                        delete input.dataset.dirty;
-                        input.value = String(value);
-                        input.blur();
-                        return;
-                    }
-                    if (event.key !== 'Enter') return;
-                    // Enter: done - saved, and out of the box.
-                    event.preventDefault();
-                    input.blur();
-                });
-                return input;
-            };
-            const edit = (id, e) => this.h.onTradeEdit && this.h.onTradeEdit(c.key, id, e);
-            // You typed more than bazaars list (mockup R-inputs): the plan takes what there is, and says so.
-            const cutNote = (r) => {
-                const t = this.typedQty;
-                if (!t || t.itemId !== r.itemId || Date.now() - t.at > 8000) return null;
-                const got = r.plannedUnits || r.units;
-                if (!(t.n > got)) return null;
-                return spEl('small', { class: 'sp-warnnote', role: 'status', text: count(got) + ' listed - ' + count(t.n) + ' is more than bazaars have' });
-            };
-
-            // Buy, then trade: the main flip first.
-            if (c.flips.length || c.off.length || c.itemNote) card.appendChild(spEl('div', { class: 'sp-tsec', text: 'Buy, then trade to ' + b.name }));
-            // Another item makes the most with this trader: it is the main flip, this one is cover.
-            const mainRow = c.main ? c.flips.find((r) => r.itemId === String(c.main)) : null;
-            if (mainRow && mainRow.itemId !== String(d.itemId) && c.flips.some((r) => r.itemId === String(d.itemId))) {
-                card.appendChild(spEl('p', { class: 'sp-note sp-mainnote', text: 'Main: ' + mainRow.name + ' ' + signed(mainRow.profit) + ' · ' + d.name + ' is cover' }));
-            }
-            // Planned with a trader who makes no flip on this item: said, with the numbers.
-            if (c.itemNote) {
-                const n = c.itemNote;
-                const why = {
-                    type: 'weapons, armour and cars are one of a kind - not flipped',
-                    never: 'its category is in Settings › Flips › Never flip',
-                    profit: 'under your least profit per item',
-                    none: 'no bazaar sells it under their price',
-                    cash: 'your Cash went to the other items',
-                }[n.why] || 'not a flip with your settings';
-                card.appendChild(spEl('p', { class: 'sp-note sp-itemnote', text: d.name + ' is not in this trade: ' + b.name + ' pays ' + formatMoney(n.bid) + (n.cheapest ? ', the cheapest bazaar is ' + formatMoney(n.cheapest) : '') + ' - ' + why + '.' }));
-            }
-            // A held trade's step against the bazaar now: re-priced, fewer left, gone.
-            const mark = (st) => {
-                const k = st.check && st.check.state;
-                if (k === 'price') return spEl('span', { class: 'sp-warnnote', text: ' · now ' + formatMoney(st.price) + ' (was ' + formatMoney(st.planned) + ')' });
-                if (k === 'short') return spEl('span', { class: 'sp-warnnote', text: ' · only ' + count(st.qty) + ' left of ' + count(st.plannedQty) });
-                if (k === 'gone') return spEl('span', { class: 'sp-bad', text: ' · gone' });
-                return null;
-            };
-            for (const r of c.flips) {
-                const here = r.itemId === String(d.itemId);
-                const isMain = c.main && r.itemId === String(c.main);
-                const steps = r.steps.map((st) => (st.sellerId
-                    ? spEl('div', { class: 'sp-buy' }, [
-                        spEl('span', {}, ['Buy ', spEl('b', { text: count(st.check && st.check.state === 'gone' ? st.plannedQty : st.qty) }), ' from ', this.playerName(st.sellerName || 'Player ' + st.sellerId, st.sellerId, 'trade:seller:' + r.itemId + ':' + st.sellerId), ' at ' + formatMoney(st.check && st.check.state === 'price' ? st.planned : st.price) + (st.along ? ' · same bazaar' : '') + (st.seenAt ? ' · seen ' + formatAge(Date.now() - st.seenAt) : ''), mark(st)]),
-                        this.link('Open bazaar', bazaarUrl(st.sellerId, r.itemId, st.price), { focus: 'trade:bazaar:' + r.itemId + ':' + st.sellerId }),
-                    ])
-                    : spEl('div', { class: 'sp-buy' }, [spEl('span', { text: '≈ from ' + formatMoney(st.price) + ': its bazaars are being read' })])));
-                card.appendChild(spEl('div', { class: 'sp-ti' }, [
-                    tick(true, 'Include ' + r.name, 'trade:tick:' + r.itemId, (on) => edit(r.itemId, on ? null : { off: true })),
-                    spEl('span', { class: 'sp-pic sp-pic-s' }, [this.image('trade-buy', r.itemId)]),
-                    spEl('span', { class: 'sp-ti-l' }, [
-                        spEl('span', {}, [this.link(r.name, itemMarketUrl(r.itemId, r.name), { cls: 'sp-tiname', title: 'Open it on the Item Market', focus: 'trade:name:' + r.itemId }), isMain ? spEl('span', { class: 'sp-here', text: 'MAIN' }) : here ? spEl('span', { class: 'sp-here', text: 'THIS ITEM' }) : this.kindTag(r.kind)]),
-                        spEl('small', {}, [qtyBox(r.plannedUnits || r.units, 'How many ' + r.name, 'trade:qty:' + r.itemId, (n) => {
-                            // Remembered for a moment: more than bazaars have is cut down, and said.
-                            this.typedQty = { itemId: r.itemId, n, at: Date.now() };
-                            edit(r.itemId, n > 0 ? { qty: n } : { off: true });
-                        }), ' at ' + formatMoney(r.bid) + ' each', r.noBid ? spEl('span', { class: 'sp-warnnote', text: ' · not on their list now' }) : null]),
-                        cutNote(r),
-                    ]),
-                    spEl('span', { class: 'sp-ti-p ' + (r.profit < 0 ? 'sp-bad' : 'sp-good') }, [(r.estimated ? '≈ ' : '') + signed(r.profit), spEl('small', { text: 'cost ' + formatMoney(r.cost) })]),
-                    spEl('div', { class: 'sp-buys' }, steps),
-                ]));
-            }
-            for (const r of c.off) {
-                card.appendChild(spEl('div', { class: 'sp-ti sp-off' }, [
-                    tick(false, 'Include ' + r.name, 'trade:tick:' + r.itemId, (on) => edit(r.itemId, on ? null : { off: true })),
-                    spEl('span', { class: 'sp-pic sp-pic-s' }, [this.image('trade-off', r.itemId)]),
-                    spEl('span', { class: 'sp-ti-l' }, [spEl('b', { text: r.name }), spEl('small', { text: 'left out of this trade' })]),
-                    spEl('span', { class: 'sp-ti-p', text: '–' }),
-                ]));
-            }
-            // What else they buy, left out so the buying stays quick: listed on a
-            // press, each with Add (the owner: "5 extra items, not max, but soft cap").
-            // 3.23.0: the list is what still fits this trade - your Cash for flips, what
-            // they can pay and the 10,000 - best first; what does not fit is counted in one line.
-            const fits = (c.left || []).length;
-            const hidden = c.leftHidden || 0;
-            if (!fits && hidden) {
-                card.appendChild(spEl('p', { class: 'sp-note sp-leftline', text: leftHiddenText(b.name, 0, hidden) }));
-            } else if (c.more > 0) {
-                const open = this.showLeft === c.key;
-                card.appendChild(spEl('p', { class: 'sp-note sp-leftline' }, [
-                    b.name + ' buys ' + count(c.more) + (c.more === 1 ? ' more item' : ' more items') + ', left out to keep it quick. ',
-                    spEl('button', { type: 'button', class: 'sp-link', 'aria-expanded': String(open), 'data-focus': 'trade:left', text: open ? 'Hide them' : 'Show them', onclick: () => {
-                        this.showLeft = open ? null : c.key;
-                        this.deskSig = null;
-                        this.renderDesk();
-                    } }),
-                    // Add all (the friend, 2026-09-29): every one of them in one press, past Extras per trade.
-                    (c.left || []).length > 1
-                        ? spEl('span', {}, [' · ', spEl('button', { type: 'button', class: 'sp-link', 'data-focus': 'trade:addall', title: 'Put every item ' + b.name + ' buys into this trade (more bazaars to visit)', text: 'Add all ' + count(c.left.length), onclick: () => this.h.onTradeAddAll && this.h.onTradeAddAll(c.key, c.left.map((r) => ({ itemId: r.itemId, units: r.units }))) })])
-                        : null,
-                ]));
-                if (open) {
-                    for (const r of c.left || []) {
-                        card.appendChild(spEl('div', { class: 'sp-ti sp-off sp-leftrow' }, [
-                            spEl('button', { type: 'button', class: 'sp-btn sp-add', 'data-focus': 'trade:add:' + r.itemId, 'aria-label': 'Add ' + r.name + ' to the trade', text: 'Add', onclick: () => edit(r.itemId, { qty: r.units }) }),
-                            spEl('span', { class: 'sp-pic sp-pic-s' }, [this.image('trade-left', r.itemId)]),
-                            spEl('span', { class: 'sp-ti-l' }, [spEl('span', {}, [spEl('b', { text: r.name }), this.kindTag(r.kind)]), spEl('small', { text: 'from ' + formatMoney(r.price) + ' · ' + b.name + ' pays ' + formatMoney(r.bid) })]),
-                            spEl('span', { class: 'sp-ti-p', text: '≈ ' + signed(r.profit) }),
-                        ]));
-                    }
-                }
-                if (hidden) card.appendChild(spEl('p', { class: 'sp-note sp-lefthidden', text: leftHiddenText(b.name, fits, hidden) }));
-            }
-            // Was in this trade, is not now: said, never just gone (the friend lost
-            // track of what to buy when rows vanished mid-trade).
-            for (const r of c.gone || []) {
-                card.appendChild(spEl('div', { class: 'sp-ti sp-off sp-gone' }, [
-                    spEl('span', { class: 'sp-gone-mark', text: '!' }),
-                    spEl('span', { class: 'sp-pic sp-pic-s' }, [this.image('trade-gone', r.itemId)]),
-                    spEl('span', { class: 'sp-ti-l' }, [spEl('b', { text: r.name }), spEl('small', { text: c.unitsCapped ? 'no longer in the trade: it is full at ' + count(TRADE_MAX_UNITS) + ' items' : 'no longer in the trade: no bazaar sells it under ' + b.name + '\'s price now (bought, or re-priced), or your Cash went to the others' })]),
-                    spEl('span', { class: 'sp-ti-p', text: '–' }),
-                ]));
-            }
-
-            // Yours: what they pay most for, minus what you keep.
-            // Since 3.21.0 only what you bought to resell (the To sell tab), where this trader pays more than you paid.
-            if (c.held.length) card.appendChild(spEl('div', { class: 'sp-tsec', text: 'Yours to sell · ' + b.name + ' pays more than you paid' }));
-            for (const r of c.held) {
-                const give = (n) => this.h.onTradeHeld && this.h.onTradeHeld(r.itemId, r.held, n, c.key);
-                const on = r.units > 0;
-                card.appendChild(spEl('div', { class: 'sp-ti' + (on ? '' : ' sp-off') }, [
-                    tick(on, 'Include your ' + r.name, 'trade:htick:' + r.itemId, (yes) => give(yes ? r.held : null)),
-                    spEl('span', { class: 'sp-pic sp-pic-s' }, [this.image('trade-yours', r.itemId)]),
-                    spEl('span', { class: 'sp-ti-l' }, [
-                        spEl('b', { text: r.name }),
-                        on
-                            ? spEl('small', {}, [qtyBox(r.units, 'How many of your ' + r.name, 'trade:hqty:' + r.itemId, give), ' of ' + count(r.held) + ' at ' + formatMoney(r.bid) + ' each' + (r.kept ? ' · keeping ' + (r.kept === 'all' ? 'all' : count(r.kept)) : '') + (r.units < r.spare && !r.kept && !c.payCapped ? ' · a normal amount' : '')])
-                            : spEl('small', { text: 'kept · you hold ' + count(r.held) }),
-                    ]),
-                    spEl('span', { class: 'sp-ti-p', text: on ? formatMoney(r.units * r.bid) : '–' }),
-                ]));
-            }
-            const kept = Object.entries(T.keep || {});
-            if (kept.length) {
-                const nameOf = this.state.itemNameOf || ((id) => 'Item ' + id);
-                card.appendChild(spEl('p', { class: 'sp-note', text: 'Kept for yourself: ' + kept.map(([id, k]) => nameOf(id) + ' ' + (k === 'all' ? '(all)' : count(k))).join(' · ') + '. Change it in Settings › Flips.' }));
-            }
-
-            // Their lists, to check a price; the trade itself opens after buying.
-            card.appendChild(spEl('div', { class: 'sp-trade-links' }, [this.stepTraderLinks(b, { trade: !c.stops })]));
-            const ages = [];
-            if (b.te && T.teAt) ages.push('TE ' + formatAge(Date.now() - T.teAt));
-            if (b.w3b && T.w3bAt) ages.push('W3B ' + formatAge(Date.now() - T.w3bAt));
-            card.appendChild(spEl('p', { class: 'sp-note sp-warnnote', text: 'Check ' + b.name + '\'s list before buying' + (ages.length ? ': prices from ' + ages.join(', ') : '') + '.' }));
-            if (b.differ) card.appendChild(spEl('p', { class: 'sp-note sp-warnnote', text: b.name + '\'s lists differ (' + this.listPrices(b, ', ') + '): planned at the lower.' }));
-            return card;
-        }
-
-        /**
-         * A trade the trader said yes to: frozen, so nothing in it moves. Each
-         * buy step is checked against the bazaar now (still there, re-priced,
-         * fewer left, gone) with a tick for bought; each item a tick for sent -
-         * the same list shows in the panel on Torn's trade page. Then Traded, or
-         * back to the live plan.
-         */
-        acceptedCard(d) {
-            const A = d.trade.accepted;
-            const b = A.buyer;
-            const card = spEl('div', { class: 'sp-q sp-hot sp-wide sp-trade sp-accepted' }, [
-                spEl('h3', { text: 'Trade with ' + b.name + ' · accepted ' + formatAge(Date.now() - A.at) }),
-            ]);
-            const done = (st) => st.bought || st.skipped || st.boughtQty > 0;
-            // Only items with something to send count (review: "sent 0 of 2" counted a skipped one).
-            const skippedAll = (i) => i.kind !== 'yours' && (i.steps || []).length > 0 && i.steps.every((st) => st.skipped && !st.bought && !(st.boughtQty > 0));
-            const toSend = A.items.filter((i) => !skippedAll(i));
-            const sent = toSend.filter((i) => i.sent).length;
-            const tot = A.totals || { pays: A.pays, cost: A.cost, profit: A.profit };
-            const steps = A.items.flatMap((i) => i.steps || []);
-            const left = steps.filter((st) => !done(st)).length;
-            card.appendChild(spEl('div', { class: 'sp-th' }, [
-                spEl('span', { class: 'sp-th-l' }, [
-                    spEl('span', {}, [this.playerName(b.name, b.id, 'acc:buyer'), ' ', this.trustBadge(b)]),
-                    this.status(b),
-                ]),
-                spEl('span', { class: 'sp-th-r' }, [
-                    spEl('div', { class: 'sp-big', text: signed(tot.profit) }),
-                    spEl('small', { text: 'buy for ' + formatMoney(tot.cost) + ' · ' + b.name + ' pays ' + formatMoney(tot.pays) + ' · sent ' + sent + ' of ' + toSend.length }),
-                ]),
-            ]));
-            // Its items against the 10,000 one trade takes (3.23.0): said from nine tenths of it.
-            const cv = countView(A.count, b.name);
-            if (cv && cv.say) card.appendChild(spEl('p', { class: 'sp-note sp-units' + (cv.state === 'full' ? ' sp-units-full' : ''), text: cv.text + ' items. ' + cv.say }));
-            // One thing to press next, always in the same place: buy, then trade.
-            const next = left
-                ? spEl('button', { type: 'button', class: 'sp-btn sp-primary', 'data-focus': 'acc:start', text: left === steps.length ? 'Start buying' : 'Continue buying', onclick: () => this.h.onTradeStartBuying && this.h.onTradeStartBuying(A.key) })
-                : b.id
-                    ? this.link('Open the trade with ' + b.name, tradeUrl(b.id), { cls: 'sp-btn sp-primary', title: 'Start a trade with ' + b.name, focus: 'acc:trade' })
-                    : null;
-            card.appendChild(spEl('div', { class: 'sp-tpick' }, [
-                spEl('span', { class: 'sp-note', text: steps.length ? (steps.length - left) + ' of ' + steps.length + (steps.length === 1 ? ' bazaar' : ' bazaars') + ' done' + (left ? ' · about ' + Math.max(1, Math.round(left / 2)) + ' min left' : ' · now the trade') : 'Nothing to buy: send yours' }),
-                next,
-            ]));
-
-            const words = {
-                ok: (c) => 'still listed' + (c.seenAt ? ' · seen ' + formatAge(Date.now() - c.seenAt) : ''),
-                price: (c) => 'now ' + formatMoney(c.price) + ' - re-priced',
-                short: (c) => 'only ' + count(c.qty) + ' left',
-                gone: () => 'gone from their bazaar',
-                unknown: () => 'checking…',
-                bought: () => 'bought',
-            };
-            const box = (checked, label, focus, onChange, title = null) => {
-                const input = spEl('input', { type: 'checkbox', class: 'sp-tick', 'aria-label': label, 'data-focus': focus, title });
-                input.checked = checked;
-                input.addEventListener('change', () => onChange(input.checked));
-                return input;
-            };
-            // The left ticks here mean "sent" (in the plan card they meant "include").
-            card.appendChild(spEl('div', { class: 'sp-tsec', text: 'Sent · what goes to ' + b.name }));
-            this.leftOpen = this.leftOpen || new Set();
-            for (const i of A.items) {
-                const send = i.send !== undefined ? i.send : i.units;
-                const notTaken = Math.min(send, i.left || 0);
-                const bought = i.kind === 'yours' || (i.steps || []).every(done);
-                // They did not take some (or all): how many, kept to sell elsewhere at Traded - done.
-                let leftCtl = null;
-                const openKey = A.key + '|' + i.line;
-                const redraw = () => {
-                    this.deskSig = null;
-                    this.renderDesk();
-                };
-                if (notTaken > 0 || this.leftOpen.has(openKey)) {
-                    // Same focus key as the button that opened it: the box takes the focus.
-                    const input = spEl('input', { type: 'text', class: 'sp-qty', inputmode: 'numeric', value: notTaken > 0 ? String(notTaken) : '', placeholder: '0-' + send, 'aria-label': 'How many ' + i.name + ' ' + b.name + ' did not take (0 to ' + send + ')', 'data-focus': 'acc:left:' + i.line, autocomplete: 'off', spellcheck: 'false' });
-                    selectOnFocus(input);
-                    const was = input.value;
-                    const commit = () => {
-                        if (input.value === was) return;
-                        const n = readWholeNumber(input.value);
-                        if (n === null || n > send) {
-                            // Refused in place (3.14.3: the browser's own bubble), and what was there put back.
-                            input.value = was;
-                            flashBad(input, 'A number from 0 to ' + send);
-                            return;
-                        }
-                        this.leftOpen.delete(openKey);
-                        input.value = String(n);
-                        if (this.h.onTradeLeft) this.h.onTradeLeft(A.key, i.line, n);
-                    };
-                    // Saved once you leave the box (Enter leaves it); Esc puts back what was there.
-                    input.addEventListener('blur', () => setTimeout(commit, 0));
-                    input.addEventListener('keydown', (event) => {
-                        if (event.key === 'Escape') {
-                            event.preventDefault();
-                            event.stopPropagation();
-                            input.value = was;
-                            input.blur();
-                            return;
-                        }
-                        if (event.key !== 'Enter') return;
-                        event.preventDefault();
-                        input.blur();
-                    });
-                    leftCtl = spEl('small', { class: 'sp-left' }, [
-                        input,
-                        ' not taken' + (i.kind === 'flip' ? ' - kept to sell elsewhere · ' : ' · '),
-                        spEl('button', { type: 'button', class: 'sp-link', 'data-focus': 'acc:leftundo:' + i.line, text: notTaken > 0 ? 'They took all' : 'Cancel', onclick: () => {
-                            this.leftOpen.delete(openKey);
-                            if (notTaken > 0 && this.h.onTradeLeft) this.h.onTradeLeft(A.key, i.line, 0);
-                            else redraw();
-                        } }),
-                    ]);
-                } else if (bought && send > 0 && !left) {
-                    // Only once everything is bought: the trade is what is left to happen.
-                    leftCtl = spEl('button', { type: 'button', class: 'sp-link sp-left', 'data-focus': 'acc:left:' + i.line, title: b.name + ' did not take all of it: say how many, kept to sell elsewhere', text: 'They took fewer…', onclick: () => {
-                        this.leftOpen.add(openKey);
-                        redraw();
-                    } });
-                }
-                card.appendChild(spEl('div', { class: 'sp-ti' + (i.sent ? ' sp-off' : '') }, [
-                    box(i.sent, 'Sent ' + i.name, 'acc:sent:' + i.line, (yes) => this.h.onTradeTick && this.h.onTradeTick(A.key, i.line, { sent: yes }), 'Tick when it is in the trade'),
-                    spEl('span', { class: 'sp-pic sp-pic-s' }, [this.image('acc-' + i.kind, i.itemId)]),
-                    spEl('span', { class: 'sp-ti-l' }, [
-                        spEl('b', { text: i.name }),
-                        spEl('small', { text: 'send ' + count(send - notTaken) + (i.kind === 'yours' ? ' of yours' : '') + (send !== i.units && i.kind !== 'yours' ? ' (planned ' + count(i.units) + ')' : '') + ' · ' + b.name + ' pays ' + formatMoney(i.bid) + ' each' + (i.sent ? ' · sent' : '') }),
-                        leftCtl,
-                    ]),
-                    spEl('span', { class: 'sp-ti-p' }, [
-                        formatMoney((send - notTaken) * i.bid),
-                        // Not profitable any more (no listing under their price): drop it.
-                        i.kind !== 'yours' && (i.steps || []).some((st) => ['gone', 'price'].includes(st.check.state) && !st.repl && !st.bought)
-                            ? spEl('button', { type: 'button', class: 'sp-btn sp-drop', 'data-focus': 'acc:drop:' + i.line, title: 'No bazaar sells it under ' + b.name + '\'s price now', text: 'Drop it', onclick: () => this.h.onTradeDrop && this.h.onTradeDrop(A.key, i.line) })
-                            : null,
-                    ]),
-                    i.steps.length ? spEl('div', { class: 'sp-buys' }, i.steps.map((st, k) => spEl('div', { class: 'sp-buy sp-check-' + st.check.state }, [
-                        box(st.bought, 'Bought ' + st.qty + ' from ' + (st.sellerName || st.sellerId), 'acc:bought:' + i.line + ':' + k, (yes) => this.h.onTradeTick && this.h.onTradeTick(A.key, i.line, { step: k, bought: yes })),
-                        spEl('span', {}, [
-                            'Buy ', spEl('b', { text: count(st.qty) }), ' from ', this.playerName(st.sellerName || 'Player ' + st.sellerId, st.sellerId, 'acc:seller:' + i.itemId + ':' + k), ' at ' + formatMoney(st.price) + ' · ',
-                            spEl('span', { class: 'sp-checkword', text: st.skipped ? 'skipped' : st.boughtQty > 0 && !st.bought ? 'bought ' + count(st.boughtQty) + ' of ' + count(st.qty) : words[st.check.state](st.check) }),
-                            // Gone or re-priced: the next cheapest still under their price.
-                            st.repl ? spEl('span', { class: 'sp-repl' }, [' · next cheapest: ' + count(st.repl.qty) + ' from ' + (st.repl.sellerName || 'Player ' + st.repl.sellerId) + ' at ' + formatMoney(st.repl.price) + ' ', spEl('button', { type: 'button', class: 'sp-link', 'data-focus': 'acc:repl:' + i.line + ':' + k, text: 'Use it', onclick: () => this.h.onTradeReplace && this.h.onTradeReplace(A.key, i.line, k, st.repl) })]) : null,
-                            ['gone', 'price'].includes(st.check.state) && !st.repl && !st.bought ? spEl('span', { class: 'sp-bad', text: ' · not profitable any more' }) : null,
-                        ]),
-                        st.bought ? null : this.link('Open bazaar', bazaarUrl(st.sellerId, i.itemId, st.price), { focus: 'acc:bazaar:' + i.itemId + ':' + k }),
-                    ]))) : null,
-                ]));
-            }
-            // Cancel trade (the owner, 2026-09-29): they accepted, then it was
-            // called off - the plan goes. Asked first, like on Torn's pages.
-            if (this.cancelAsk === A.key) {
-                card.appendChild(spEl('div', { class: 'sp-tpick sp-acc-foot sp-cancelask' }, [
-                    spEl('span', { class: 'sp-warnnote', text: 'Cancel the trade with ' + b.name + '? This flip plan goes (they are not marked declined); what you already bought stays yours to sell.' }),
-                    spEl('span', { class: 'sp-tpick-b' }, [
-                        spEl('button', { type: 'button', class: 'sp-btn sp-btn-bad', 'data-focus': 'acc:cancel-yes', text: 'Yes, cancel it', onclick: () => {
-                            this.cancelAsk = null;
-                            if (this.h.onTradeCancel) this.h.onTradeCancel(A.key);
-                        } }),
-                        spEl('button', { type: 'button', class: 'sp-link', 'data-focus': 'acc:cancel-no', text: 'Keep it', onclick: () => {
-                            this.cancelAsk = null;
-                            this.deskSig = null;
-                            this.renderDesk();
-                        } }),
-                    ]),
-                ]));
-                return card;
-            }
-            // Back (the plan unfreezes) and Cancel trade on the left, apart from Traded - done on the right.
-            card.appendChild(spEl('div', { class: 'sp-tpick sp-acc-foot' }, [
-                spEl('span', { class: 'sp-tpick-b' }, [
-                    spEl('button', { type: 'button', class: 'sp-link', 'data-focus': 'acc:back', title: 'Unfreeze: back to the live plan (nothing is kept)', text: '← Back to the live plan', onclick: () => this.h.onTradeClose && this.h.onTradeClose(A.key, false) }),
-                    spEl('button', { type: 'button', class: 'sp-link sp-cancel', 'data-focus': 'acc:cancel', title: 'They accepted, then the trade was called off: this flip plan goes (not marked declined)', text: 'Cancel trade', onclick: () => {
-                        this.cancelAsk = A.key;
-                        this.deskSig = null;
-                        this.renderDesk();
-                    } }),
-                    this.stepTraderLinks(b, { trade: false }),
-                ]),
-                spEl('button', { type: 'button', class: 'sp-btn', 'data-focus': 'acc:done', title: 'The trade went through: close it' + (A.items.some((i) => i.left > 0 && i.kind === 'flip') ? ', and keep what they did not take to sell elsewhere' : ''), text: 'Traded - done', onclick: () => this.h.onTradeClose && this.h.onTradeClose(A.key, true) }),
-            ]));
-            return card;
-        }
-
-        /** The flip plan: buy from these bazaars, sell to this trader, what it makes and costs. */
-        planCard(d) {
-            if (d.trade && d.trade.accepted) return this.acceptedCard(d);
-            if (d.trade && d.trade.chosen) return this.tradeCard(d);
-            const wide = d.held ? '' : ' sp-wide';
-            const f = d.plan;
-            const fb = f && f.units > 0 ? f.buyer || d.buyers[0] : null;
-            const fbKey = fb ? (fb.id ? 'id:' + fb.id : 'name:' + String(fb.name).toLowerCase()) : null;
-            const until = fbKey && d.trade && d.trade.declined ? d.trade.declined[fbKey] : null;
-            if (until) {
-                const card = spEl('div', { class: 'sp-q' + wide }, [spEl('h3', { text: 'Flip plan' })]);
-                card.appendChild(spEl('p', { class: 'sp-note', text: fb.name + ' declined (passed over for ' + formatAge(until - Date.now()).replace(' ago', '') + '). No other trader makes a trade on ' + d.name + ' now: Undo above, or pick another item.' }));
-                return card;
-            }
-            if (f && f.units > 0) {
-                const b = f.buyer || d.buyers[0];
-                const card = spEl('div', { class: 'sp-q sp-hot' + wide }, [
-                    spEl('h3', { text: 'Flip plan' }),
-                    spEl('div', { class: 'sp-big', text: signed(f.profit) }),
-                    spEl('p', { class: 'sp-note', text: count(f.units) + ' flipped' + (f.available > f.units ? ' (of ' + count(f.available) + ' under the bid)' : '') + ' · cash needed ' + formatMoney(f.cost) }),
-                ]);
-                f.steps.forEach((st, i) => {
-                    card.appendChild(spEl('div', { class: 'sp-step' }, [
-                        spEl('span', { class: 'sp-n', text: String(i + 1) }),
-                        spEl('span', {}, ['Buy ', spEl('b', { text: count(st.qty) }), ' from ', this.playerName(st.sellerName || 'Player ' + st.sellerId, st.sellerId, 'step-seller:' + st.sellerId), ' at ' + formatMoney(st.price)]),
-                        this.link('Open bazaar', bazaarUrl(st.sellerId, d.itemId, st.price), { focus: 'step-bazaar:' + st.sellerId }),
-                    ]));
-                });
-                card.appendChild(spEl('div', { class: 'sp-step' }, [
-                    spEl('span', { class: 'sp-n', text: String(f.steps.length + 1) }),
-                    spEl('span', {}, ['Sell ', spEl('b', { text: count(f.units) }), ' to ', this.playerName(b.name, b.id, 'step-buyer'), ' at ' + formatMoney(b.price) + ' ', this.trustBadge(b)]),
-                    this.stepTraderLinks(b),
-                ]));
-                // Their networth capped the plan: say so, with the numbers.
-                if (b.maxUnits && f.units >= b.maxUnits) {
-                    const nw = b.id && this.state.networth ? this.state.networth.get(String(b.id)) : null;
-                    card.appendChild(spEl('p', { class: 'sp-note', text: b.name + ' can pay for at most ' + count(b.maxUnits) + ': ' + (this.state.prefs.networthPct || 10) + '% of their networth' + (nw >= 0 ? ' (' + formatMoney(nw) + ')' : '') + '.' }));
-                }
-                if (b.differ) card.appendChild(spEl('p', { class: 'sp-note sp-warnnote', text: b.name + '\'s lists differ (' + this.listPrices(b, ', ') + '): planned at the lower. Check their list before trading.' }));
-                return card;
-            }
-            const card = spEl('div', { class: 'sp-q' + wide }, [spEl('h3', { text: 'Flip plan' })]);
-            let text;
-            const top = d.buyers[0];
-            const who = this.state.prefs.trustedOnly ? 'trusted buyer' : 'buyer';
-            if (f && f.units === 0) text = 'One costs ' + formatMoney(f.needs) + ', more than your cash (' + formatMoney(this.state.prefs.cash) + ').';
-            else if (d.planWhy === 'loading') text = 'Loading bazaars from TornW3B…';
-            else if (!top) text = 'No flip: no ' + who + ' for this item.';
-            else if (d.statItem) text = 'No flip: every copy is its own (weapons, armour, cars), and traders pay one price for one - nobody buys them by the hundred.';
-            else if (d.sellers.rows.some((r) => !r.stale && r.price < top.price && top.price - r.price < Math.max(1, (r.price * (this.state.prefs.minProfitPct ?? 1)) / 100))) {
-                // Under the bid, but by less than Settings' least profit per item.
-                const r = d.sellers.rows.find((x) => !x.stale);
-                text = 'No flip: the cheapest bazaar makes only ' + formatMoney(top.price - r.price) + ' each, under your ' + (this.state.prefs.minProfitPct ?? 1) + '% least profit per item.';
-            } else if (d.sellers.rows.some((r) => !r.stale && r.price < top.price)) {
-                text = 'No flip: none of these buyers can take it at a profit (their price is over 3× the average, or their networth is too small).';
-            } else if (d.sellers.rows.some((r) => !r.stale)) text = 'No flip: the cheapest bazaar is ' + formatMoney(d.sellers.rows.find((r) => !r.stale).price - top.price) + ' over the best ' + who + '.';
-            else if (d.sellers.rows.length) text = 'No flip: TornW3B has not seen these bazaars in the last 30 minutes.';
-            else text = 'No flip: no bazaar is selling it.';
-            card.appendChild(spEl('p', { class: 'sp-note', text }));
-            // No flip on this item - but a trader's other items may still make a trade.
-            if (d.trade && !d.trade.chosen && d.buyers.length) card.appendChild(spEl('p', { class: 'sp-note', text: 'Press Plan trade on a trader to plan a trade with their other items.' }));
-            return card;
-        }
-
-        /** Where to sell your N: a trader now, or wait in your bazaar or on the Item Market. Each row is its link. */
-        whereCard(d) {
-            const w = d.where;
-            const card = spEl('div', { class: 'sp-q' + (d.paid > 0 ? ' sp-q-tosell' : '') }, [spEl('h3', { text: 'Where to sell your ' + count(d.held) + (d.paid > 0 ? ' · you paid ' + formatMoney(d.paid) + ' each' : '') })]);
-            const b = d.buyers[0];
-            const n = d.held;
-            const rows = [
-                {
-                    venue: 'trader',
-                    name: 'Sell to trader' + (b ? ' ' + b.name : ''),
-                    when: 'Paid now, in one trade',
-                    url: b && b.id ? tradeUrl(b.id) : null,
-                    missing: 'No ' + (this.state.prefs.trustedOnly ? 'trusted ' : '') + 'trader buys it',
-                },
-                {
-                    venue: 'bazaar',
-                    name: 'Your bazaar',
-                    when: 'Paid when someone buys it · $1 under the cheapest',
-                    url: MY_BAZAAR_ADD_URL,
-                    missing: 'No bazaar listing to price against',
-                },
-                {
-                    venue: 'market',
-                    name: 'Item Market',
-                    when: 'Paid when someone buys it · after the 5% fee',
-                    url: MARKET_ADD_URL,
-                    missing: d.market.state === 'loading' ? 'Checking the Item Market…' : 'No Item Market listing to price against',
-                },
-            ];
-            for (const r of rows) {
-                const o = w.options.find((x) => x.venue === r.venue);
-                const each = o ? o.each : null;
-                const win = w.best === r.venue;
-                // A To sell item (3.22.0): a venue that gives no more than you paid is said so, and is no link.
-                const loss = Boolean(o && o.loss);
-                const listAt = r.venue === 'bazaar' && each !== null ? ' at ' + formatMoney(each) : r.venue === 'market' && d.market.lowest > 1 ? ' at ' + formatMoney(d.market.lowest - 1) : '';
-                // A listing counted for only the first N (as many as are listed
-                // near that price now): the rest go to the trader, and it says so.
-                const part = o && each !== null && o.units < n;
-                const eachText = formatMoney(each) + ' each' + (part ? ' · first ' + count(o.units) + (b ? ', rest to trader' : '') : '');
-                const inner = [
-                    spEl('span', { class: 'sp-opt-l' }, [spEl('b', { text: r.name + listAt }), spEl('small', { text: each === null ? r.missing : loss ? 'No more than the ' + formatMoney(w.paid) + ' you paid: a loss' : r.when })]),
-                    spEl('span', { class: 'sp-opt-p' }, each === null ? ['–'] : [formatMoney(o.total !== null ? o.total : each * n), n > 1 ? spEl('small', { text: eachText }) : null]),
-                ];
-                if (r.url && each !== null && !loss) card.appendChild(this.link('', r.url, { cls: 'sp-opt' + (win ? ' sp-win' : ''), title: r.venue === 'trader' ? 'Start a trade' : r.venue === 'bazaar' ? 'Open your bazaar\'s add page' : 'Open the Item Market\'s add page', focus: 'where:' + r.venue, children: inner }));
-                else card.appendChild(spEl('div', { class: 'sp-opt sp-opt-none' }, inner));
-            }
-
-            const bazaar = w.options.find((x) => x.venue === 'bazaar');
-            let verdict = '';
-            if (w.best === 'bazaar' || w.best === 'market') {
-                const won = w.options.find((x) => x.venue === w.best);
-                const place = (w.best === 'bazaar' ? 'your bazaar' : 'the Item Market') + (won && won.units < n ? ' for the first ' + count(won.units) + ' (as many as are listed near that price now)' : '');
-                verdict = b ? 'Best: ' + place + ', ' + signed(w.gain) + ' more than the trader, but you wait for a buyer.' : 'Best: ' + place + '. ' + rows[0].missing + '.';
-            } else if (w.best === 'trader') {
-                verdict = 'Best: sell to trader ' + b.name + '.';
-                if (bazaar && bazaar.each !== null) {
-                    const diff = bazaar.total - b.price * n;
-                    verdict += diff > 0 ? ' Your bazaar would get only ' + signed(diff) + ' more, and you would wait.' : ' Your bazaar would get ' + formatMoney(-diff) + ' less.';
-                }
-            }
-            if (!w.best && w.paid) verdict = 'Nothing pays more than the ' + formatMoney(w.paid) + ' you paid now: it waits in To sell.';
-            // Against what you paid: what the best one makes on all of them.
-            const best = w.best ? w.options.find((x) => x.venue === w.best) : null;
-            if (best && w.paid > 0 && best.total !== null && best.total !== undefined) verdict += ' That is ' + signed(best.total - w.paid * n) + ' over what you paid.';
-            if (verdict) card.appendChild(spEl('p', { class: 'sp-verdict' + (w.best && w.best !== 'trader' ? ' sp-win' : ''), text: verdict }));
-            return card;
-        }
-
-        /**
-         * The desk stays in view while the list scrolls. When it is taller than
-         * the window, it scrolls with the page until its bottom shows, then stays.
-         */
-        fitDesk() {
-            if (!this.root || this.view !== 'list') return;
-            const room = this.listEl.clientHeight;
-            const h = this.deskEl.offsetHeight;
-            if (!room || !h) return;
-            this.deskEl.style.top = Math.min(16, room - h - 16) + 'px';
-        }
-
-        /** A picture, kept per place so a re-render never reloads it. */
-        image(place, itemId) {
-            const key = place + ':' + itemId;
-            let img = this.images.get(key);
-            if (!img) {
-                img = spEl('img', { class: 'sp-img', alt: '', loading: 'lazy', src: itemImageUrl(itemId) });
-                img.addEventListener('error', () => img.classList.add('sp-img-none'));
-                this.images.set(key, img);
-            }
-            return img;
         }
 
         /** What an item with no trader says: only "No Trader Found" once every source has answered. */
@@ -25123,7 +29563,7 @@
             // The more trades behind them, the bigger the number (3.14, the owner:
             // "the more trusted the trader, show it").
             const score = Number.isFinite(t.score) ? ' ' + count(t.score) : '';
-            return spEl('span', { class: 'sp-trust', 'data-level': t.level.toLowerCase(), title: parts.join(' · '), 'aria-label': t.level + (parts.length ? ': ' + parts.join(', ') : ''), text: t.level + score });
+            return spEl('span', { class: 'badge trust', 'data-level': t.level.toLowerCase(), title: parts.join(' · '), 'aria-label': t.level + (parts.length ? ': ' + parts.join(', ') : ''), text: t.level + score });
         }
 
         /** A dot and a word: Online, Idle 5m, Offline 3h, Online · Hospital. Nothing when not known yet. */
@@ -25351,6 +29791,43 @@
     .sp-it .sp-iname { font-weight: 600; }
     .sp-it small { grid-column: 2 / 4; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
     .sp-it small:empty { display: none; }
+    .sp-itop { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 8px; min-width: 0; }
+    .sp-tag { font: 650 11px/18px var(--sans); height: 18px; padding: 0 7px; border-radius: 999px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+    .sp-tag-friend { color: var(--known); background: rgba(184, 164, 255, 0.14); }
+    .sp-tag-you { color: var(--buy); background: var(--buy-bg); }
+    .sp-tag-gone { color: var(--muted); background: var(--raised); font-weight: 600; }
+    .sp-it-gone .sp-iname, .sp-badge-gone, .sp-fc-gone .sp-fc-p { color: var(--faint); text-decoration: line-through; }
+    .sp-badge-gone { background: rgba(255, 255, 255, 0.05); }
+    .sp-fc-gone { opacity: 0.6; }
+    .sp-chg { font-size: 10px; font-weight: 700; }
+    .sp-chg-up { color: var(--profit); }
+    .sp-chg-dn { color: var(--warn); }
+    .sp-fc-p .sp-chg { font-size: 12px; vertical-align: middle; }
+    .sp-still-box { display: grid; gap: 6px; }
+    .sp-still-box[hidden] { display: none; }
+    .sp-still { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: 12px; background: var(--warn-bg); border: 1px solid var(--warn-line); font-size: 12.5px; color: var(--text2); }
+    .sp-still b { color: var(--text); }
+    .sp-still-t { min-width: 0; }
+    .sp-still .sp-btn { margin-left: auto; flex: none; }
+    .sp-still-none { background: var(--surface); border-color: var(--line); }
+    .sp-still-done { background: var(--profit-bg); border-color: var(--profit-line); }
+    .sp-dot-wait { background: var(--warn); }
+    .sp-dot-off { background: var(--faint); }
+    .sp-dot-done { background: var(--profit); }
+    .sp-still-fold { display: grid; gap: 2px; padding: 8px; border-radius: 12px; border: 1px dashed var(--warn-line); }
+    .sp-still-w { display: flex; align-items: baseline; gap: 8px; padding: 4px 6px; border: 0; border-radius: 8px; background: none; color: var(--text); font: inherit; font-size: 12.5px; text-align: left; white-space: nowrap; cursor: pointer; }
+    .sp-still-w:hover, .sp-still-w:focus-visible { background: var(--surface); }
+    .sp-still-w small { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+    .sp-still-w span { margin-left: auto; color: var(--profit); font-weight: 700; font-variant-numeric: tabular-nums; }
+    .sp-still-more { padding: 2px 6px; color: var(--muted); font-size: 12px; }
+    .sp-still-acts { display: flex; gap: 6px; justify-content: flex-end; padding-top: 6px; }
+    .sp-it.sp-it-friend { border-color: rgba(184, 164, 255, 0.4); }
+    .sp-it-friend .sp-badge-flip { color: var(--muted); background: rgba(255, 255, 255, 0.05); }
+    .sp-fc.sp-fc-friend { border-color: rgba(184, 164, 255, 0.4); }
+    .sp-fc-friend .sp-fc-p { color: var(--muted); }
+    .sp-friend { display: flex; align-items: baseline; gap: 6px; color: var(--text2); }
+    .sp-friend b { color: var(--text); font-weight: 600; }
+    .sp-dot.sp-dot-friend { background: var(--known); flex: none; align-self: center; }
     .sp-badge { font: 650 12px/22px var(--sans); height: 22px; padding: 0 8px; border-radius: 7px; white-space: nowrap; font-variant-numeric: tabular-nums; }
     .sp-badge:empty { display: none; }
     .sp-badge-flip { color: var(--profit); background: var(--profit-bg); }
@@ -25503,7 +29980,10 @@
     .sp-tc.sp-tc-none { background: var(--surface); border-color: var(--line); }
     .sp-tc.sp-tc-fav.sp-tc-none { border-color: var(--fav-line); background: linear-gradient(180deg, rgba(255, 204, 77, 0.06), var(--surface) 55%); }
     .sp-inerr { color: var(--bad); font-size: 12px; font-weight: 600; }
+    .sp-tc-acts { display: flex; gap: 6px; margin-top: auto; }
+    .sp-tc-acts .sp-go { flex: 1 1 0; min-width: 0; white-space: nowrap; }
     .sp-tc .sp-go { margin-top: auto; height: 28px; border-radius: 8px; font-size: 12px; }
+    .sp-btn.sp-every-on { color: var(--buy); border-color: var(--buy); font-weight: 600; }
     .sp-tc .sp-go.sp-go-on { color: var(--on-profit); background: var(--profit); border-color: transparent; font-weight: 600; }
     .sp-star { color: var(--fav); }
     .sp-lastpaid { display: inline-flex; align-items: center; height: 18px; padding: 0 7px; font: 700 10px/1 var(--sans); text-transform: uppercase; letter-spacing: 0.05em; border-radius: 999px; color: var(--known); background: rgba(184, 164, 255, 0.12); white-space: nowrap; }
@@ -25512,6 +29992,7 @@
     .sp-tc small.sp-traded { color: var(--muted); }
     .sp-tpick { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin: 4px 0 8px; }
     .sp-itemnote { margin: 8px 0; }
+    .sp-better { display: flex; align-items: center; justify-content: space-between; gap: 8px 12px; flex-wrap: wrap; margin: 8px 0; }
     .sp-tpick-b { display: flex; gap: 8px; flex-wrap: wrap; }
     .sp-buy .sp-tick { flex: 0 0 auto; }
     .sp-check-ok .sp-checkword { color: var(--profit); font-weight: 600; }
@@ -25612,6 +30093,12 @@
     .sp-radio-o .sp-key { flex: 0 1 220px; }
     .sp-key.sp-dim { color: var(--muted); }
     .sp-keystate.sp-bad { color: var(--bad); }
+    .sp-keystate.sp-warn { color: var(--warn); }
+    .sp-use { display: flex; height: 22px; max-width: 420px; border-radius: 7px; overflow: hidden; border: 1px solid var(--line2); font-size: 11px; font-weight: 600; line-height: 20px; white-space: nowrap; }
+    .sp-use span { text-align: center; overflow: hidden; min-width: 0; }
+    .sp-use-pc { background: var(--buy-bg); color: var(--text); }
+    .sp-use-sv { background: rgba(184, 164, 255, 0.16); color: var(--text); }
+    .sp-use-fr { background: var(--input); color: var(--muted); }
     .sp-check { display: flex; gap: 8px; align-items: flex-start; cursor: pointer; }
     input[type="checkbox"] { accent-color: var(--profit); margin: 3px 0 0; }
     .sp-tos { width: 100%; max-width: 900px; border-collapse: collapse; font-size: 12.5px; }
@@ -25661,7 +30148,7 @@
         .sp-flabel { padding-top: 0; }
         .sp-tos th { width: 40%; }
     }
-    `;
+    ` + BIDS_CSS;
 
     /* ===== src/core/seed-traders.js ===== */
     /*
@@ -25807,6 +30294,34 @@
         // Torn re-render.
         for (const el of root.querySelectorAll('[' + HIT_DATA_ATTR + ']')) {
             unmarkRow(el);
+        }
+    }
+
+    /*
+     * Shared: a friend is going for this listing (3.25.0, mockup AA drawing 3). A purple ring in place of
+     * the green one, and their Torn name on the card's top edge. Same contract: one class, one data
+     * attribute, nothing appended - and it never blocks: Fill and Buy work as always.
+     */
+    const FRIEND_CLASS = 'ttv2-friend';
+    const FRIEND_DATA_KEY = 'ttv2Friend';
+    const FRIEND_DATA_ATTR = 'data-ttv2-friend';
+
+    /**
+     * Mark these cards as a friend's, and unmark every other one.
+     * @param {Array<{el: Element, label: string}>} rows
+     */
+    function markFriendRows(rows, root = document) {
+        const keep = new Set();
+        for (const row of rows || []) {
+            if (!row || !row.el || !row.el.classList || !row.label) continue;
+            keep.add(row.el);
+            row.el.classList.add(FRIEND_CLASS);
+            if (row.el.dataset[FRIEND_DATA_KEY] !== row.label) row.el.dataset[FRIEND_DATA_KEY] = row.label;
+        }
+        for (const el of root.querySelectorAll('[' + FRIEND_DATA_ATTR + ']')) {
+            if (keep.has(el)) continue;
+            el.classList.remove(FRIEND_CLASS);
+            delete el.dataset[FRIEND_DATA_KEY];
         }
     }
 
@@ -26398,6 +30913,15 @@
 
 
 
+
+
+
+
+
+
+
+
+
     const STORE_KEY = 'apiKey';
     const STORE_ITEMS = 'itemsCache';
     const STORE_NPC = 'npcCache';
@@ -26410,6 +30934,8 @@
     /* TornW3B calls of the last minute and any 429 wait, for every tab together. */
     const STORE_W3B_WINDOW = 'w3bWindow';
     const STORE_W3B_COOLDOWN = 'w3bCooldown';
+    /* The gap every tab keeps between two TornW3B requests, as it has found it (3.25.0, api/w3b.js): {gap, floor, floorUntil}. */
+    const STORE_W3B_PACE = 'w3bPace';
     const STORE_KEY_DEAD = 'keyDead';
     const STORE_OPENED = 'opened';
 
@@ -26432,6 +30958,11 @@
     const STORE_IM_WATCH = 'itemMarketWatch';
     /* When Torn Bids was last in view, for every tab (3.20.5): the overlay's TornW3B reads step back while it is in use. */
     const STORE_BIDS_SEEN = 'bidsSeen';
+    /* Where he is (3.25.0, core/front.js): each side's sign of life while it is in view - {seen, front}. */
+    const STORE_FRONT_BIDS = 'frontBids';
+    const STORE_FRONT_PAGE = 'frontPage';
+    // Beside Torn Archive (core/beside.js): what Torn Bids' page last worked out, for every tab.
+    const STORE_BESIDE = 'besideArchive';
     /* When each trader last changed their TornW3B price list, for every page (3.23.0, core/traders.js packListAt): [[id, seconds]]. */
     const STORE_LIST_AT = 'listAt';
     /* Each tab adds its counts to the stored record this often. */
@@ -26469,6 +31000,8 @@
     const STORE_SELL_CANCELLED = 'sellCancelled';
     /* Trades you pinned (core/held.js): 'item|trader key' -> held trade. Only prices move in them. */
     const STORE_SELL_PINNED = 'sellPinned';
+    // One job at a time (3.25.0, core/job.js): 'npc' or 'bids', one word for every tab.
+    const STORE_JOB = 'job';
     /* Trades you asked a trader about (3.22.0, core/trades-board.js): 'item|trader key' -> {itemId, key, id, name, items, profit, at}. An hour. */
     const STORE_SELL_ASKED = 'sellAsked';
     /* Trades that ended - traded, cancelled, never made - for the Trades board: a list, a day. */
@@ -26608,10 +31141,10 @@
          */
         liveFeed: true,
         /*
-         * NPC deals: save API calls (the friend's request). On: no live feed and
-         * no sellers' / bazaar owners' online-status checks - deals come only from
-         * the page you are viewing, which costs no API calls. Fill, your own
-         * pages' prices and Torn Bids are not affected.
+         * Was "NPC deals: save API calls" (the friend's request). 3.25.0: both this
+         * and the switch above are gone from Settings - the requests go to whatever
+         * you are looking at, by themselves (core/front.js) - and whatever is stored
+         * for them is not read (loadSettings).
          */
         saveCalls: false,
 
@@ -26814,7 +31347,136 @@
      */
     /** The settings as the feed must follow them: saving API calls turns watching off. */
     function effectiveSettings() {
-        return app.settings.saveCalls ? { ...app.settings, liveFeed: false } : app.settings;
+        return app.settings;
+    }
+
+    /*
+     * Where he is (3.25.0, core/front.js). Each side - Torn Bids, and the panel on Torn's pages - leaves
+     * a sign of life while it is in view; from the two, every tab works out who may ask for what.
+     */
+    function frontSides() {
+        return { bids: gmGet(STORE_FRONT_BIDS, null), page: gmGet(STORE_FRONT_PAGE, null) };
+    }
+
+    function frontBeatNow(store, came = false) {
+        const next = frontBeat(gmGet(store, null), { visible: document.visibilityState === 'visible', came, now: Date.now() });
+        if (next) gmSet(store, next);
+        frontSeenNow();
+    }
+
+    /*
+     * For the export (3.25.0): since this tab opened, how long the reads were Torn Bids', a Torn page's,
+     * or nobody's - and how often that changed. As this tab saw it (a hidden tab looks less often).
+     */
+    const frontSeen = { at: 0, side: null, ms: { bids: 0, page: 0, none: 0 }, switches: 0 };
+    function frontSeenNow(now = Date.now()) {
+        const side = frontSide(frontSides(), now);
+        if (frontSeen.side) {
+            frontSeen.ms[frontSeen.side] += Math.max(0, now - frontSeen.at);
+            if (frontSeen.side !== side) frontSeen.switches += 1;
+        }
+        frontSeen.side = side;
+        frontSeen.at = now;
+        return { now: side, switches: frontSeen.switches, seconds: { bids: Math.round(frontSeen.ms.bids / 1000), page: Math.round(frontSeen.ms.page / 1000), none: Math.round(frontSeen.ms.none / 1000) } };
+    }
+
+    /** This side's sign of life: now, every few seconds while in view, and at once when he comes to it. */
+    function frontWatch(store) {
+        frontBeatNow(store, document.visibilityState === 'visible' && document.hasFocus());
+        setInterval(() => frontBeatNow(store), 5000);
+        window.addEventListener('focus', () => frontBeatNow(store, true));
+        document.addEventListener('visibilitychange', () => {
+            if (document.visibilityState === 'visible') frontBeatNow(store, true);
+        });
+    }
+
+    /*
+     * One job at a time (3.25.0, core/job.js; the owner's rules): NPC Arbitrage or Torn Bids. The side that
+     * is off is closed - it shows nothing and asks for nothing; a trade going keeps it on Torn Bids.
+     */
+    function jobAccepted() {
+        return Object.values(sellAccepted());
+    }
+
+    /** The job now, read from the store: a trade going is Torn Bids whatever was chosen. */
+    function jobRead() {
+        return jobNow(gmGet(STORE_JOB, null), jobAccepted(), { bidsSetUp: Boolean(getSellKey()) });
+    }
+
+    /** NPC Arbitrage is on in this Torn tab: the deals, their reads, the green outlines. */
+    function npcOn() {
+        return app.job === JOB_NPC;
+    }
+
+    /** Torn Bids is on in this Torn tab: trader tags, the buying run, the trade box, To sell. */
+    function bidsOn() {
+        return app.job === JOB_BIDS;
+    }
+
+    /**
+     * A Torn tab follows the job: at start, on every pass, and the moment another tab turns the switch or a
+     * trade is accepted or ended. What the side that closed had put on the page is taken off.
+     */
+    function applyJob(why = '') {
+        const was = app.job || null;
+        const accepted = jobAccepted();
+        const lock = jobLock(accepted);
+        app.job = jobNow(gmGet(STORE_JOB, null), accepted, { bidsSetUp: Boolean(getSellKey()) });
+        if (app.panel) app.panel.setJob(app.job, lock ? jobLockWords(lock) : '');
+        if (was === app.job) return false;
+        sharedWantAppKept = null;
+        if (!was) return false;
+        logProblem('note', app.job === JOB_BIDS ? 'The panel is Torn Bids now: NPC Arbitrage is closed and asks for nothing' : 'The panel is NPC Arbitrage now: Torn Bids is closed and asks for nothing', why || null);
+        if (app.job === JOB_BIDS) {
+            clearMarks();
+            app.pageRows = [];
+        } else {
+            // The shops' prices were not asked for while Torn Bids was on: now they are needed.
+            if (app.shopsOwed && app.client && hasUsableKey()) {
+                loadShops()
+                    .then(() => rescan('the shops\' prices'))
+                    .catch(() => {});
+            }
+            app.bidsHere = [];
+            markTraderTags([]);
+            markFriendRows([]);
+            clearBuyMarks();
+            clearSendMarks();
+            app.tradeCheck = null;
+            app.buyHere = null;
+            if (app.panel) {
+                app.panel.setTrades(null);
+                app.panel.setBuying(null);
+            }
+            if (app.bought) app.bought.render(null);
+        }
+        return true;
+    }
+
+    /** A press on the panel's switch. A trade going keeps it on Torn Bids (the panel says why before it gets here). */
+    function onJob(to) {
+        const can = jobSwitch(to, jobAccepted());
+        if (!can.ok) {
+            if (can.why && app.panel) app.panel.setStatus(can.why, 'warn');
+            return;
+        }
+        logAction(to === JOB_BIDS ? 'Turned Torn Bids on' : 'Turned NPC Arbitrage on');
+        gmSet(STORE_JOB, to);
+        if (applyJob('the switch was pressed here')) {
+            rescan('the switch');
+            scanTradePage();
+            if (app.feed) app.feed.tick().catch(() => {});
+        }
+    }
+
+    /** The panel on a Torn page: may it ask for things of its own (the feed, sellers' and the bazaar owner's status)? */
+    function overlayMayAsk() {
+        return frontMayAsk('page', frontSides(), Date.now());
+    }
+
+    /** Torn Bids: its flips, buyers and price lists - or only what an accepted or held trade needs? */
+    function bidsMayAsk(now = Date.now()) {
+        return frontMayAsk('bids', frontSides(), now);
     }
 
     function loadSettings() {
@@ -26828,6 +31490,9 @@
         // The NPC switch was called compareNpc.
         if (stored.compareNpc === false && !('sellToNpc' in stored)) out.sellToNpc = false;
         if (out.viewTab !== 'bazaar' && out.viewTab !== 'itemmarket') out.viewTab = 'bazaar';
+        // 3.25.0: the two switches are gone; what a version before stored for them is not read.
+        out.liveFeed = true;
+        out.saveCalls = false;
 
         // 3.9.4: the panel docks beside Torn's content by default. A spot it was
         // dragged to before then (often over Torn's page) is let go once.
@@ -26853,21 +31518,75 @@
         return Boolean(getStoredKey()) && !app.keyDead;
     }
 
+    /**
+     * Torn itself said this key is no good (error 2, 13 or 18 in Torn's own answer). Never a browser
+     * error that happens to carry one of those numbers, never this script's "No API key set": that is
+     * what marked a good key rejected for two days (3.25.0, core/key-dead.js).
+     */
     function isKeyDeadError(error) {
-        return Boolean(error && KEY_DEAD_CODES.has(Number(error.code)));
+        return keyRejectedCode(error) !== null;
     }
 
-    /** Torn rejected the key: stop using it until the user saves another. */
-    function markKeyDead(error) {
-        app.keyDead = true;
-        gmSet(STORE_KEY_DEAD, true);
+    /*
+     * A rejected key is asked about again by itself (core/key-dead.js): one request when it is due -
+     * when a page loads, then at most once an hour - and only from a tab in view.
+     */
+    const overlayKeyRetry = { asking: false };
+    const sellKeyRetry = { asking: false };
+    const ledgerKeyRetry = { asking: false };
 
-        app.panel.setStatus(
-            'Torn rejected this key (' +
-                redactKey((error && error.message) || 'invalid key', getStoredKey()) +
-                '). Paste a new Public key.',
-            'error',
-        );
+    function retryDeadKey({ store, busy, name, ask, onBack, onStill = null, tooLow = false }) {
+        if (busy.asking || document.visibilityState !== 'visible' || !keyDeadDue(gmGet(store, null), Date.now())) return;
+        busy.asking = true;
+        const before = keyDeadRead(gmGet(store, null));
+        keyDeadRetry({ load: () => gmGet(store, null), save: (state) => gmSet(store, state), clear: () => gmDel(store), ask, tooLow })
+            .then((result) => {
+                if (result === 'back') {
+                    logProblem('note', 'Torn accepts ' + name + ' again', 'tried by itself; nothing for you to do');
+                    onBack();
+                    return;
+                }
+                // Torn's reason is new (or was never known: a mark an older version left): logged once, with its number.
+                const after = keyDeadRead(gmGet(store, null));
+                if (result === 'rejected' && after && before && after.code !== before.code) logProblem('error', 'Torn rejected ' + name, 'error ' + after.code + ' - on a try by itself; tried again within the hour');
+                if (result !== 'not-due' && onStill) onStill();
+            })
+            .catch(() => {})
+            .finally(() => {
+                busy.asking = false;
+            });
+    }
+
+    /**
+     * Torn rejected the overlay's key: its own requests stop - pages are still read and marked
+     * (loadStoredReference) - and it is tried again by itself.
+     */
+    function markKeyDead(error) {
+        const code = keyRejectedCode(error);
+        if (code === null) return;
+        const now = Date.now();
+        const state = keyDeadMark(gmGet(STORE_KEY_DEAD, null), code, now);
+        if (!app.keyDead) logProblem('error', 'Torn rejected the overlay\'s key', 'error ' + code + ': ' + redactKey((error && error.message) || '', getStoredKey()) + ' - pages are still read and marked; the key is tried again by itself');
+        app.keyDead = true;
+        gmSet(STORE_KEY_DEAD, state);
+        if (app.panel) app.panel.setStatus(keyDeadWords(state, 'Public', now), 'error');
+    }
+
+    function retryOverlayKey() {
+        if (!app.keyDead || !getStoredKey() || !app.client) return;
+        retryDeadKey({
+            store: STORE_KEY_DEAD,
+            busy: overlayKeyRetry,
+            name: 'the overlay\'s key',
+            ask: () => app.client.get('key', { selections: 'info' }, { tag: 't.setup' }),
+            onBack: () => {
+                app.keyDead = false;
+                refreshKeyState();
+                app.panel.setStatus('Torn accepts the saved key again.');
+                onScan();
+            },
+            onStill: () => app.panel.setStatus(keyDeadWords(gmGet(STORE_KEY_DEAD, null), 'Public', Date.now()), 'error'),
+        });
     }
 
     function looksLikeTornKey(key) {
@@ -26907,6 +31626,7 @@
         gmDel(STORE_KEY_ACCESS);
         gmDel(STORE_KEY_DEAD);
         app.keyDead = false;
+        sharedSetUp();
         // Saved: the box no longer holds it (Show fetches it again).
         if (app.panel.keyMask) app.panel.keyMask.hide();
         if (app.panel.keyInput) app.panel.keyInput.value = '';
@@ -26924,6 +31644,7 @@
         gmDel(STORE_KEY_ACCESS);
         gmDel(STORE_KEY_DEAD);
         app.keyDead = false;
+        sharedSetUp();
 
         if (app.panel.keyMask) app.panel.keyMask.hide();
         if (app.panel.keyInput) app.panel.keyInput.value = '';
@@ -26990,7 +31711,19 @@
             app.itemsPartial = Boolean(entry.partial);
         }
 
+        // The shops' prices are NPC Arbitrage's own: with Torn Bids on they are not asked for (3.25.0).
+        if (npcOn()) await loadShops();
+        else {
+            const kept = gmGet(STORE_NPC, null);
+            app.npcShops = readNpcCacheEntry(kept);
+            app.shopsOwed = !isNpcCacheFresh(kept);
+        }
+    }
+
+    /** What the city's shops pay, kept a day: read from Torn only when the kept copy is old. */
+    async function loadShops() {
         const cachedNpc = gmGet(STORE_NPC, null);
+        app.shopsOwed = false;
 
         if (isNpcCacheFresh(cachedNpc)) {
             app.npcShops = readNpcCacheEntry(cachedNpc);
@@ -27014,6 +31747,38 @@
                     (error && error.message) || 'shop data unavailable';
             }
         }
+    }
+
+    /**
+     * No key Torn takes (none saved, or rejected): the page is read and marked all the same, from the
+     * item list kept from before - whatever its age; its names and ids are what reading needs, its
+     * values are as old as it is. Nothing is asked of Torn. True when there is a list to read with.
+     * (3.25.0: a rejected key left his overlay reading no page at all for two days.)
+     */
+    function loadStoredReference() {
+        if (app.index) return true;
+        const cached = gmGet(STORE_ITEMS, null);
+        if (!itemsCacheUsable(cached)) return false;
+        try {
+            app.index = buildItemIndex(cached.items);
+        } catch {
+            app.index = null;
+            return false;
+        }
+        app.indexStored = true;
+        app.itemsFetchedAt = cached.fetchedAt;
+        app.itemsDataAt = cached.fetchedAt;
+        app.itemsPartial = Boolean(cached.partial);
+        if (!app.npcShops) app.npcShops = readNpcCacheEntry(gmGet(STORE_NPC, null));
+        return true;
+    }
+
+    /** Why this Torn page has not been read, for the buying box - it never says "marked" of a page it did not read. */
+    function pageUnreadWhy() {
+        if (app.index) return 'it is being read now';
+        if (!getStoredKey()) return 'there is no item list yet - paste a Public key in the panel';
+        if (app.keyDead) return 'there is no item list yet, and Torn rejected the saved key';
+        return 'the item list is still loading';
     }
 
     /**
@@ -27177,6 +31942,7 @@
             app.tabOverride = null;
             clearMarks();
             markTraderTags([]);
+            markFriendRows([]);
         }
 
         if (location.href !== app.pageHref) {
@@ -27243,7 +32009,9 @@
             l.sellerId = sellerId;
         }
 
-        const priced = buildOpportunities(listings);
+        // NPC Arbitrage closed (Torn Bids is on): no deal is worked out, marked or listed.
+        const deals = npcOn();
+        const priced = deals ? buildOpportunities(listings) : [];
 
         // No limit here; only the markers and the panel are capped.
         const ranked = rankOpportunities(priced, rankSettings({ limit: 0 }));
@@ -27259,7 +32027,7 @@
          */
         const feed = readFeedCacheEntry(gmGet(FEED_STORE_KEY, null), now);
 
-        if (listings.length) {
+        if (listings.length && deals) {
             const removed = reconcileWithPage(feed, {
                 pageType: app.pageType,
                 sellerId,
@@ -27289,7 +32057,13 @@
 
         markRows(live.slice(0, 100), document, lower.slice(0, 100));
         // A trusted trader pays more than a listing here asks: named on its card.
-        markTraderTags(app.pageType === PAGE_BAZAAR && sellerId && !closedHere ? traderTags(listings) : []);
+        // Torn Bids closed (NPC Arbitrage is on): no trader is named on a card, no friend's mark.
+        const trades = bidsOn();
+        app.bidsHere = trades && app.pageType === PAGE_BAZAAR && sellerId && !closedHere ? traderTags(listings) : [];
+        markTraderTags(app.bidsHere);
+        // Shared: the listings here a friend is going for - a purple ring and their Torn name.
+        const friendsHere = trades && app.pageType === PAGE_BAZAAR && sellerId && !closedHere ? sharedGoingHere(sellerId, now) : new Map();
+        markFriendRows(friendsHere.size ? listings.filter((l) => l.el && friendsHere.has(String(l.itemId))).map((l) => ({ el: l.el, label: sharedOnThis(friendsHere.get(String(l.itemId)), now).replace(/ · [^·]*$/, '') })) : []);
         showBazaarTarget(listings);
         // How much of this bazaar is in the page, and how much of it has been read (3.16.3).
         app.bzRead = app.pageType === PAGE_BAZAAR && sellerId ? readBazaarList(document) : null;
@@ -27367,7 +32141,8 @@
             if (!label) continue;
             // Their price is from a list not changed in over 24 hours (3.23.0): an amber dot in the tag.
             const old = oldList(buyer, listAtOf, now);
-            rows.push({ el: l.el, label, old: old ? old.level : null });
+            const known = app.index && app.index.byId ? app.index.byId.get(String(l.itemId)) : null;
+            rows.push({ el: l.el, label, old: old ? old.level : null, itemId: String(l.itemId), name: known ? known.name : 'Item ' + l.itemId, qty: Number(l.qty) || 1, price: l.listingPrice });
         }
         return rows;
     }
@@ -27407,6 +32182,14 @@
         }
     }
 
+    /** Shared: what the others are going for in this bazaar - Map of item (as text) -> {who, at, sellers}. Empty with Shared off. */
+    function sharedGoingHere(sellerId, now = Date.now()) {
+        const out = new Map();
+        if (!sharedLink || !sellerId) return out;
+        for (const [item, g] of sharedGoingByItem(sharedLink.marks(now).going)) if (g.sellers.has(String(sellerId))) out.set(item, g);
+        return out;
+    }
+
     /**
      * Everything the panel shows: this page, what you saw elsewhere, and the
      * live feed. Never reads the DOM, so the feed can re-render it whenever
@@ -27433,12 +32216,49 @@
     /* The panel redraws a change of the feed asks for (refreshView's `why`): the ones a hidden tab puts off. */
     const FEED_REDRAWS = new Set(['the feed changed', 'the feed, from another tab', 'the feed tick']);
 
+    /** Torn Bids on: the panel's list page - what this bazaar has for your traders, and what you hold to sell. */
+    function refreshBidsView(now, sellerHere) {
+        const friendHere = [];
+        if (sellerHere && sharedLink) {
+            for (const [item, g] of sharedGoingHere(sellerHere, now)) {
+                const known = app.index ? app.index.byId.get(String(item)) : null;
+                friendHere.push(sharedGoingFor(g, now, known ? known.name : "item"));
+            }
+        }
+        const accepted = jobAccepted();
+        const held = bzSell(now).list.filter((e) => !e.kept);
+        const rows = (app.bidsHere || []).filter((r) => r.el && document.contains(r.el)).map((r) => ({
+            key: r.itemId + ':' + r.price,
+            name: r.name,
+            qty: r.qty,
+            price: r.price,
+            label: 'at ' + formatMoney(r.price) + ' · ' + r.label,
+            old: Boolean(r.old),
+            onShow: () => markTarget(r.el, true),
+        }));
+        const lock = jobLock(accepted);
+        app.panel.renderBids({
+            onBazaar: app.pageType === PAGE_BAZAAR && Boolean(sellerHere),
+            rows,
+            friendHere,
+            trade: accepted.length > 0,
+            toSell: held.length ? { items: held.reduce((a, e) => a + (Number(e.qty) || 0), 0), kinds: held.length, url: MY_BAZAAR_ADD_URL } : null,
+            line: lock ? (lock.trades > 1 ? lock.trades + ' trades going' : 'Trade with ' + lock.name) : 'No trade going',
+        });
+        if (app.ownBazaar) renderMyBazaar();
+    }
+
     function refreshViewNow() {
         if (!app.panel) return;
 
         const now = Date.now();
         const sellerHere =
             app.pageType === PAGE_BAZAAR ? bazaarOwnerId(location.href) : null;
+
+        if (bidsOn()) {
+            refreshBidsView(now, sellerHere);
+            return;
+        }
 
         // Listings on the page you are viewing, by source - they win over any
         // remembered or remote copy of the same listing.
@@ -27447,6 +32267,14 @@
         );
 
         const feed = readFeedCacheEntry(gmGet(FEED_STORE_KEY, null), now);
+        // Shared: a bazaar the server read from Torn after TornW3B last checked it shows Torn's own price and count.
+        const sharedReads = sharedLink ? sharedLink.reads() : null;
+        if (sharedReads) {
+            for (const [id, snap] of feed.bazaar) {
+                const rows = withShared(snap.rows, id, sharedReads.index, sharedReads.joined);
+                if (rows !== snap.rows) feed.bazaar.set(id, { ...snap, rows });
+            }
+        }
         const feedRows = app.index
             ? feedOpportunities(feed, app.index, app.settings, {
                   now,
@@ -27480,12 +32308,29 @@
         const marketRows = rankOpportunities(lists.itemmarket, rankSettings());
 
         const tab = activeTab();
-        const shown = tab === 'bazaar' ? bazaarRows : marketRows;
+        // Shared: a bazaar listing a friend is going for says so on its row, by their Torn name; on that bazaar's own page, above the list too.
+        const friendGoingAll = sharedLink ? sharedGoingByItem(sharedLink.marks(now).going) : new Map();
+        const friendOn = (r) => {
+            const g = r.source === SOURCE_BAZAAR && r.sellerId ? friendGoingAll.get(String(r.itemId)) : null;
+            return g && g.sellers.has(String(r.sellerId)) ? sharedOnThis(g, now) : null;
+        };
+        const shown = (tab === 'bazaar' ? bazaarRows : marketRows).map((r) => {
+            const friend = friendGoingAll.size ? friendOn(r) : null;
+            return friend ? { ...r, friend } : r;
+        });
+        const friendHere = [];
+        if (sellerHere && friendGoingAll.size) {
+            for (const [item, g] of sharedGoingHere(sellerHere, now)) {
+                const known = app.index ? app.index.byId.get(String(item)) : null;
+                friendHere.push(sharedGoingFor(g, now, known ? known.name : 'item'));
+            }
+        }
 
         updatePresence(tab === 'bazaar' ? listedSellers(bazaarRows) : [], now);
 
         app.panel.render({
             rows: shown,
+            friendHere,
             tab,
             statuses: statusMap(now),
             hidden: hiddenCounts(tab === 'itemmarket' ? lists.itemmarket : lists.bazaar, rankSettings()),
@@ -27535,11 +32380,14 @@
         if (!getStoredKey()) {
             app.panel.setStatus('No API key yet. Paste a Public key.', 'error');
             app.panel.openSettings({ focusKey: !getStoredKey() });
+            // Reading and marking a page never waits on a key (3.25.0).
+            if (loadStoredReference()) rescan();
             return;
         }
 
         if (app.keyDead) {
-            app.panel.setStatus('Torn rejected the saved key. Paste a new Public key.', 'error');
+            app.panel.setStatus(keyDeadWords(gmGet(STORE_KEY_DEAD, null), 'Public', Date.now()), 'error');
+            if (loadStoredReference()) rescan();
             return;
         }
 
@@ -27547,8 +32395,12 @@
         app.panel.setBusy(true);
 
         try {
-            const firstLoad = !app.index;
-            if (firstLoad) await loadReferenceData();
+            // A list taken from storage while there was no key is read again now there is one.
+            const firstLoad = !app.index || app.indexStored;
+            if (firstLoad) {
+                await loadReferenceData();
+                app.indexStored = false;
+            }
             await checkKeyAccess();
 
             /*
@@ -27557,7 +32409,7 @@
              * survives a Scan.
              */
             clearMarks();
-            if (app.feed) {
+            if (app.feed && npcOn()) {
                 app.feed.requestRefresh();
                 app.feed.tick().catch(() => {});
             }
@@ -27650,8 +32502,10 @@
             now - owner.fetchedAt >= OWNER_REFRESH_MS;
         if (!due || !app.client || !hasUsableKey()) return;
         if (document.visibilityState !== 'visible') return;
-        // Saving API calls: the owner's online status is not asked.
-        if (app.settings.saveCalls) return;
+        // Torn Bids is in front (another window): this panel asks nothing of its own (3.25.0).
+        if (!overlayMayAsk()) return;
+        // The owner's status is NPC Arbitrage's: with Torn Bids on the panel shows only what the page says.
+        if (!npcOn()) return;
 
         owner.pending = true;
         fetchUserPresence(app.client, ownerId, { tag: 't.owner', priority: 'normal' })
@@ -27679,7 +32533,8 @@
         if (!app.panel) return;
         const words = owner.presence
             ? presenceText(owner.presence, now)
-            : { level: 'unknown', text: owner.pending || !owner.fetchedAt ? 'checking' : 'unknown' };
+            // With no key Torn takes nobody is asked: said, not "checking" for ever (3.25.0).
+            : { level: 'unknown', text: !hasUsableKey() ? 'not checked: needs a key' : owner.pending || !owner.fetchedAt ? 'checking' : 'unknown' };
 
         app.panel.setSeller({
             name: (owner.presence && owner.presence.name) || null,
@@ -27732,8 +32587,10 @@
         if (!app.client || !hasUsableKey()) return;
         if (document.visibilityState !== 'visible') return;
         if (app.panel.collapsed) return;
-        // Saving API calls: sellers' online status is not asked.
-        if (app.settings.saveCalls) return;
+        // Torn Bids is in front (another window): this panel asks nothing of its own (3.25.0).
+        if (!overlayMayAsk()) return;
+        // The deals' sellers are NPC Arbitrage's: closed with Torn Bids on.
+        if (!npcOn()) return;
 
         let pending = 0;
         for (const s of app.presence.values()) if (s.pending) pending++;
@@ -28135,7 +32992,7 @@
             if (!summaryFresh && app.w3b && app.settings.useW3b && now - (rec.bzAt || 0) >= BZ_W3B_TTL_MS) {
                 rec.pending = true;
                 app.bzLastFetchAt = now;
-                fetchW3bListings(app.w3b, id)
+                fetchW3bListings(app.w3b, id, { tag: 'w.own' })
                     .then(({ listings }) => {
                         const at = Date.now();
                         rec.bzAt = at;
@@ -28475,7 +33332,7 @@
 
         let promise;
         if (market === 'bazaar' && app.w3b && app.settings.useW3b !== false) {
-            promise = fetchW3bListings(app.w3b, itemId).then(({ listings }) => ({
+            promise = fetchW3bListings(app.w3b, itemId, { tag: 'w.own' }).then(({ listings }) => ({
                 rows: normalizeW3bListingsForFill(listings),
                 at: Date.now(),
                 note: null,
@@ -29297,8 +34154,9 @@
 
     /** One row of the add page: marked (and what you paid said) when it is something you bought and still hold. */
     function paintSellRow(row, tag, entry) {
+        // The red box under what you paid is a guard: it stays in both jobs. The Paid chip is Torn Bids'.
         paintPriceTone(row, entry);
-        const on = Boolean(entry);
+        const on = Boolean(entry) && bidsOn();
         const was = row.el.classList.contains(BZ_SELL_CLASS);
         if (!on && !was) return;
         if (on !== was) row.el.classList.toggle(BZ_SELL_CLASS, on);
@@ -29434,7 +34292,8 @@
      */
     function paintSellBar(sell = app.ownBazaar === 'add' ? bzSell() : null) {
         let bar = document.querySelector('.' + BZ_SELLBAR_CLASS);
-        const view = sell ? bzSellView(sell) : null;
+        // "Fill all you bought" is Torn Bids': gone with NPC Arbitrage on.
+        const view = sell && bidsOn() ? bzSellView(sell) : null;
         const first = view ? document.querySelector('ul.items-cont') : null;
         if (!first || !first.parentElement) {
             if (bar) bar.remove();
@@ -29475,6 +34334,7 @@
 
     /** The panel's part: the list, and Fill all's words. */
     function bzSellPanel() {
+        if (!bidsOn()) return null;
         const view = bzSellView();
         return view ? { rows: view.rows, words: bzSellWords(view), logAt: view.logAt } : null;
     }
@@ -30348,7 +35208,8 @@
      */
     function trackTradeBuying(listings) {
         if (!app.panel) return;
-        if (detectPage(location.href) === PAGE_BAZAAR) trackSeenStock(listings);
+        // Torn Bids closed (NPC Arbitrage is on): a bazaar's stock is not noted, and a buy there is not put in To sell.
+        if (bidsOn() && detectPage(location.href) === PAGE_BAZAAR) trackSeenStock(listings);
         updateBoughtWindow();
         const scanned = Array.isArray(listings);
         const pending = Object.values(sellAccepted()).filter((t) => nextStep(t));
@@ -30466,7 +35327,9 @@
                     qty: here.step.qty,
                     price: here.step.price,
                     seller: here.step.sellerName || 'this bazaar',
-                    listed: Boolean(here.listing) || !scanned,
+                    listed: Boolean(here.listing),
+                    // The page was not read at all (3.25.0; before, this said "marked on the page"): said, with why.
+                    unread: scanned ? null : pageUnreadWhy(),
                     // Not among the page's cards, never seen here (3.16.3): not in this
                     // bazaar, or only not in the page yet - with how much of it was read.
                     where: here.listing ? null : app.buyWhere,
@@ -30631,7 +35494,7 @@
     function markChatButton() {
         const id = profileIdOf(location.href);
         const want = gmGet(STORE_CHAT_WANTED, null);
-        const on = Boolean(id && want && String(want.id) === id && Date.now() - Number(want.at) < CHAT_WANTED_MS);
+        const on = Boolean(bidsOn() && id && want && String(want.id) === id && Date.now() - Number(want.at) < CHAT_WANTED_MS);
         const btn = on ? document.getElementById('button2-profile-' + id) || document.querySelector('.profile-button-initiateChat') : null;
         for (const b of document.querySelectorAll('.' + CHAT_MARK_CLASS)) {
             if (b !== btn) b.classList.remove(CHAT_MARK_CLASS);
@@ -30690,6 +35553,13 @@
         if (!isTradePage(location.href)) {
             clearSendMarks();
             app.tradeCheck = null;
+            return;
+        }
+        // Torn Bids closed (NPC Arbitrage is on): Torn's trade page is not read.
+        if (!bidsOn()) {
+            clearSendMarks();
+            app.tradeCheck = null;
+            app.panel.setTrades(null);
             return;
         }
         watchTradePage();
@@ -31180,13 +36050,15 @@
 
     /** Another tab saved, forgot, or found dead the Public key: follow it without a reload. */
     function onRemoteKey() {
-        const dead = Boolean(gmGet(STORE_KEY_DEAD, false));
+        const state = keyDeadRead(gmGet(STORE_KEY_DEAD, null));
+        const dead = Boolean(state);
         const was = hasUsableKey();
         app.keyDead = dead;
         if (!app.panel) return;
         refreshKeyState();
-        if (dead) app.panel.setStatus('Torn rejected this key (in another tab). Paste a new Public key.', 'error');
-        else if (!was && hasUsableKey() && app.index) rescan();
+        if (dead) app.panel.setStatus(keyDeadWords(state, 'Public', Date.now()), 'error');
+        // Back (saved again, or Torn takes it again): a list taken from storage meanwhile is read anew.
+        else if (!was && hasUsableKey() && app.index) app.indexStored ? onScan() : rescan();
     }
 
     /* ------------------------------------------------------------------ *
@@ -31463,12 +36335,30 @@
         return {
             script: typeof TTV2_BUILD_VERSION !== 'undefined' ? TTV2_BUILD_VERSION : null,
             keys: { torn: Boolean(getSellKey()), tornExchange: Boolean(getTeKey()), ledger: Boolean(getLedgerKey()), overlay: Boolean(gmGet(STORE_KEY, '')) },
+            // Each Torn key: stored, working or rejected - with Torn's error number and how long ago (3.25.0). Never a key.
+            keyStates: {
+                overlay: keyReport(gmGet(STORE_KEY, ''), gmGet(STORE_KEY_DEAD, null), Date.now()),
+                torn: keyReport(getSellKey(), gmGet(STORE_SELL_KEY_DEAD, null), Date.now()),
+                ledger: keyReport(getLedgerKey(), gmGet(STORE_LEDGER_KEY_DEAD, null), Date.now()),
+            },
             tornBids: {
                 cash: p.cash || null, mostPerFlip: p.maxPerFlip || null, extrasPerTrade: p.extraItems || null, minProfitPct: p.minProfitPct ?? null,
                 traderCanPayPct: p.networthPct ?? null, onlineOnly: Boolean(p.onlineOnly), trustedOnly: Boolean(p.trustedOnly), freshOnly: Boolean(p.freshOnly),
                 favourites: favouriteTraders().length, blacklisted: sellBlacklist().length,
             },
-            overlay: { liveFeed: overlay.liveFeed !== false, saveCalls: Boolean(overlay.saveCalls), useW3b: overlay.useW3b !== false },
+            overlay: { useW3b: overlay.useW3b !== false },
+            // Where he was when this was written: 'bids', 'page' or 'none' (3.25.0, core/front.js).
+            front: frontSide(frontSides(), Date.now()),
+            // Since this tab opened: seconds on each side, and how often it changed.
+            frontSeen: frontSeenNow(),
+            // TornW3B's pace as it is now: the gap between two requests, its floor, and how long the floor is still held.
+            w3bPace: usagePace(),
+            // The wait between two reads behind another tab: 'worker', 'refused' (the page allows none) or 'not needed yet'.
+            hiddenTimer: steadySleep.state(),
+            // The shared server, as this tab knows it. No address, no name.
+            shared: usageShared(),
+            // A trade under way holds the list still: for how long now, and how many new deals wait.
+            listHeld: sell.still ? { seconds: Math.round((Date.now() - sell.still.at) / 1000), waiting: sell.still.waiting || 0, rows: sell.still.place.size, cards: sell.still.cards.length } : null,
             coverage: {
                 tradersKnown: info.w3bKnown ?? null, tradersRead: info.w3bRead ?? null,
                 flipsChecked: info.flipsChecked ?? null, flipsWanted: info.flipsWanted ?? null,
@@ -31476,6 +36366,27 @@
                 statusesKnown: info.statusesKnown ?? null, statusesWanted: info.statusesWanted ?? null,
                 teScanned: Object.values((sell.db && sell.db.traders) || {}).filter((t) => t && t.te && t.te.prices).length,
             },
+        };
+    }
+
+    function usagePace() {
+        const p = gmGet(STORE_W3B_PACE, null);
+        const until = Number(gmGet(STORE_W3B_COOLDOWN, 0)) || 0;
+        const now = Date.now();
+        return {
+            gapMs: p && Number.isFinite(p.gap) ? Math.round(p.gap) : null,
+            floorMs: p && Number.isFinite(p.floor) ? Math.round(p.floor) : null,
+            floorHeldMinutes: p && p.floorUntil > now ? Math.round((p.floorUntil - now) / 60000) : 0,
+            pausedSeconds: until > now ? Math.round((until - now) / 1000) : 0,
+        };
+    }
+
+    function usageShared() {
+        if (!sharedLink) return null;
+        const s = sharedLink.status();
+        return {
+            on: s.on, leading: Boolean(s.leading), answeredSecondsAgo: s.okAt ? Math.round((Date.now() - s.okAt) / 1000) : null, error: s.error ? String(s.error).slice(0, 120) : null,
+            people: s.people, need: s.need, serverShare: s.serverShare, serverUsed: s.serverUsed, sellers: s.sellers,
         };
     }
 
@@ -31510,7 +36421,207 @@
             loadPause: () => gmGet(STORE_TORN_PAUSE, null),
             savePause: (p) => gmSet(STORE_TORN_PAUSE, p),
             isVisible: () => document.visibilityState === 'visible',
+            // Shared: the server reads with your key too, and this PC keeps to its part of your limit.
+            // Beside Torn Archive while it is in front: every tab together keeps to the smaller share.
+            mayCall: (now, recent) => besideRoom(gmGet(STORE_BESIDE, null), recent, now, BESIDE_TORN_PER_MINUTE)
+                && (!sharedLink || sharedMayCall(sharedLink.grant(), recent, now)),
+            onHeld: sharedHeld,
         };
+    }
+
+    /*
+     * Shared (3.25): the shared server (server/) reads other players' bazaars from
+     * Torn with a key of each of us, and hands every PC what changed. This is the
+     * tab's side: one link per tab (feed/shared-link.js), of which one - whichever
+     * leads - talks to the server every 30 s. Nobody sets it up (sharedSetUp):
+     * the address is built in, and this PC's word is made from its Public key.
+     */
+    let sharedLink = null;
+    // This PC keeps another address than the one built in, or 'off' (the test page does; there is no box for it).
+    const STORE_SHARED_HOME = 'sharedHome';
+    let sharedHeldAt = 0;
+    const SHARED_HELD_EVERY_MS = 5000;
+    const SHARED_WANT_MS = 20000;
+    // Of each item's bazaars, the cheapest are asked for first, then the next ones.
+    const SHARED_TOP = 8;
+    const SHARED_DEEP = 30;
+    // A bazaar you bought from is read again soon after, for this long.
+    const SHARED_LOOK_BOUGHT_MS = 5 * 60000;
+
+    /** Torn calls waiting in this tab. */
+    function sharedWaitingHere() {
+        let n = 0;
+        for (const c of [app.client, sell.client, led.client, led.buysClient]) if (c && Array.isArray(c.queue)) n += c.queue.length;
+        return n;
+    }
+
+    /** A Torn call of this tab is waiting on this PC's part of the limit: the leading tab is asked to sync sooner. */
+    function sharedHeld() {
+        const now = Date.now();
+        if (!sharedLink || now - sharedHeldAt < SHARED_HELD_EVERY_MS) return;
+        sharedHeldAt = now;
+        sharedLink.askSoon(sharedWaitingHere());
+    }
+
+    /** Starts this tab's side of Shared. `world`: 'app' (the overlay) or 'sell' (Torn Bids). */
+    function startShared(world, getWant, onReads) {
+        sharedLink = new SharedLink({
+            tabId: app.tabId,
+            world,
+            // Told to the server with every exchange: which of our apps this is, and its version.
+            version: typeof TTV2_BUILD_VERSION !== 'undefined' ? TTV2_BUILD_VERSION : null,
+            load: (key) => gmGet(key, null),
+            save: gmSet,
+            del: gmDel,
+            // Counted for the export (3.25.0): how often the shared server was asked, and how often it did not answer.
+            post: async (url, options) => {
+                try {
+                    const response = await gmPost(url, options);
+                    recordUse('s', world, '', response && response.ok ? 'r.s.ok' : 'r.s.fail');
+                    return response;
+                } catch (error) {
+                    recordUse('s', world, '', 'r.s.fail');
+                    throw error;
+                }
+            },
+            getUse: () => ({ used: sharedTabWindow(STORE_API_WINDOW).load().length, waiting: sharedWaitingHere() }),
+            getWant,
+            onReads,
+        });
+        for (const key of [SHARED_CONFIG_KEY, SHARED_STATE_KEY, SHARED_GRANT_KEY]) gmOnChange(key, () => sharedLink.onStored(key));
+        gmOnChange(STORE_KEY, sharedSetUp);
+        sharedSetUp();
+        // What the server said goes to the log once per change, from the tab that does the exchanging: it knows
+        // this PC, it does not (404), it wants a newer copy, or there was no exchange.
+        let said = null;
+        const say = () => {
+            const st = sharedLink.status();
+            if (!st.leading) return;
+            const word = sharedSaid(st) + (st.error ? ':' + st.error : '');
+            if (word === said) return;
+            said = word;
+            const line = sharedSaidLine(st, Math.round(SHARED_UNKNOWN_MS / 3600000));
+            if (line) logProblem('note', line, world === 'sell' ? 'Torn Bids' : 'the panel on a Torn page');
+        };
+        const tick = () =>
+            sharedLink
+                .tick()
+                .then(say)
+                .catch((error) => logProblem('note', 'Shared: ' + String(error && error.message ? error.message : error).slice(0, 120), ''));
+        setInterval(tick, SHARED_TICK_MS);
+        tick();
+        return sharedLink;
+    }
+
+    /**
+     * What Torn Bids asks the shared server to read. `trades`: the bazaars of trades under way (every 30 s);
+     * `looking`: the trade on the desk, pinned trades, a bazaar you just bought from; `sellers`: the cheapest
+     * bazaars of every item read, the flips' first; `worth`: the best believable bid per item.
+     * Player ids, item ids and prices - core/shared.js lets nothing else through.
+     */
+    /* A TornW3B list read this long ago or less is told to the server (four exchanges: one that fails loses nothing). */
+    const SHARED_DIR_TELL_MS = 2 * 60000;
+
+    function sharedWantSell() {
+        const now = Date.now();
+        if (sell.sharedWant && now - sell.sharedWantAt < SHARED_WANT_MS) return sell.sharedWant;
+        const trades = [];
+        const accepted = Object.values(sellAccepted(now));
+        for (const t of accepted) {
+            for (const line of t.items || []) for (const st of line.steps || []) if (st.sellerId && !stepDone(st)) trades.push(st.sellerId);
+        }
+        for (const h of sell.tradeHold.values()) {
+            for (const line of (h.trade && h.trade.lines) || []) for (const st of line.steps || []) if (st.sellerId) trades.push(st.sellerId);
+        }
+        const looking = [];
+        const chosen = sell.selected && sell.lastTrade ? sell.lastTrade.chosen : null;
+        for (const r of (chosen && chosen.flips) || []) for (const st of r.steps || []) if (st.sellerId) looking.push(st.sellerId);
+        const boughtNow = liveBought(gmGet(STORE_SELL_BOUGHT, null), now);
+        for (const b of boughtNow) if (b.sellerId && now - b.t < SHARED_LOOK_BOUGHT_MS) looking.push(b.sellerId);
+        for (const t of Object.values(sellPinned(now))) {
+            for (const line of t.lines || []) for (const st of line.steps || []) if (st.sellerId) looking.push(st.sellerId);
+        }
+        const order = new Set([...(sell.selected ? [String(sell.selected)] : []), ...sell.candidates.map((c) => String(c.itemId)), ...(sell.nearIds || []).map(String), ...sell.bazaars.keys()]);
+        const cheapest = new Map();
+        for (const id of order) {
+            const b = sell.bazaars.get(id);
+            if (b && b.at && b.rows.length) cheapest.set(id, [...b.rows].sort((x, y) => x.price - y.price).slice(0, SHARED_DEEP));
+        }
+        const sellers = [];
+        for (const [from, to] of [[0, SHARED_TOP], [SHARED_TOP, SHARED_DEEP]]) {
+            for (const rows of cheapest.values()) for (const r of rows.slice(from, to)) if (r.sellerId) sellers.push(r.sellerId);
+        }
+        // The two marks for the others: what you are going for, and what you bought (numbers and times only).
+        const going = sharedGoingOwn({ holds: sell.tradeHold.values(), accepted, now, done: stepDone });
+        const bought = boughtNow.map((b) => [Number(b.sellerId), Number(b.itemId), b.qty, b.each, b.t]);
+        // Which TornW3B lists this PC read in the last two minutes (item numbers and times): the others then leave those to it.
+        const dir = [];
+        for (const [id, b] of sell.bazaars) if (b && b.at && !b.kept && !b.error && !b.loading && now - b.at < SHARED_DIR_TELL_MS) dir.push([Number(id), b.at]);
+        sell.sharedWant = { trades, looking, sellers, worth: sell.sharedWorth || {}, going, bought, dir };
+        sell.sharedWantAt = now;
+        return sell.sharedWant;
+    }
+
+    /**
+     * Shared needs no setting up (3.25.0): the server's address is built into this copy, and this PC's word
+     * to it is made from the Public key it already holds (core/shared.js, sharedWord) - the key itself is
+     * sent nowhere. Run at start-up and whenever the key changes; what was kept under an old word goes.
+     */
+    async function sharedSetUp() {
+        if (!sharedLink) return;
+        let next = null;
+        try {
+            const home = sharedHome(typeof TTV2_SHARED_HOME !== 'undefined' ? TTV2_SHARED_HOME : '', gmGet(STORE_SHARED_HOME, null));
+            const pass = home ? await sharedWord(getStoredKey()) : null;
+            if (home && pass) next = { address: home, pass };
+        } catch (error) {
+            logProblem('note', 'Shared: the word of this PC could not be made (' + String(error && error.message ? error.message : error).slice(0, 80) + ')', '');
+        }
+        const had = gmGet(SHARED_CONFIG_KEY, null);
+        if (JSON.stringify(had || null) === JSON.stringify(next)) return;
+        sharedLink.forget();
+        if (next) gmSet(SHARED_CONFIG_KEY, next);
+        else gmDel(SHARED_CONFIG_KEY);
+        sharedLink.onStored(SHARED_CONFIG_KEY);
+        sell.sharedWantAt = 0;
+        logProblem('note', next ? 'Shared: this PC asks the shared server with the word of its Public key' : 'Shared: off (' + (getStoredKey() ? 'no server address in this copy' : 'no Public key') + ')', '');
+        if (next) sharedLink.tick().catch(() => {});
+    }
+
+    /**
+     * What the overlay asks the shared server to read. `trades`: the bazaars of trades under way (a buying run
+     * goes on with Torn Bids closed); `looking`: the bazaar you are in; `sellers`: the bazaars of the deals shown;
+     * `worth`: what each of those items sells for the ways you ticked in Settings (NPC, its value).
+     */
+    let sharedWantAppKept = null;
+    let sharedWantAppAt = 0;
+    function sharedWantApp() {
+        const now = Date.now();
+        if (sharedWantAppKept && now - sharedWantAppAt < SHARED_WANT_MS) return sharedWantAppKept;
+        const trades = [];
+        const accepted = Object.values(sellAccepted(now));
+        for (const t of accepted) {
+            for (const line of t.items || []) for (const st of line.steps || []) if (st.sellerId && !stepDone(st)) trades.push(st.sellerId);
+        }
+        const here = app.pageType === PAGE_BAZAAR ? bazaarOwnerId(location.href) : null;
+        const looking = here ? [here] : [];
+        const sellers = [];
+        const worth = {};
+        // The deals' bazaars are NPC Arbitrage's ask; with Torn Bids on, this tab asks only for a trade's bazaars and the one it is on.
+        const feed = npcOn() ? readFeedCacheEntry(gmGet(FEED_STORE_KEY, null), now) : { bazaar: new Map() };
+        for (const [id, snap] of feed.bazaar) {
+            const item = app.index && app.index.byId ? app.index.byId.get(id) : null;
+            const best = Math.max(0, ...Object.values(exitsFor(item, app.settings)));
+            worth[id] = best > 0 ? best : 1;
+            for (const r of snap.rows) if (r.sellerId) sellers.push(r.sellerId);
+        }
+        // The two marks, with Torn Bids closed too: a buying run stays marked, and what your log shows bought is passed on.
+        // Torn Bids' two marks: none while it is closed.
+        const going = bidsOn() ? sharedGoingOwn({ accepted, now, done: stepDone }) : [];
+        const bought = bidsOn() ? liveBought(gmGet(STORE_SELL_BOUGHT, null), now).map((b) => [Number(b.sellerId), Number(b.itemId), b.qty, b.each, b.t]) : [];
+        sharedWantAppKept = { trades, looking, sellers, worth, going, bought };
+        sharedWantAppAt = now;
+        return sharedWantAppKept;
     }
 
     /**
@@ -31518,14 +36629,34 @@
      * its tab is in view, unless `background` (Torn Bids, 3.14: TornW3B is not
      * Torn, and a page that sleeps while you play shows hour-old prices).
      */
+    /* Torn Bids reads from behind your Torn tab, where a tab's own timers are slowed: the gap between two reads is waited out by a worker there (core/steady-sleep.js). */
+    const steadySleep = makeSteadySleep({
+        makeWorker: (source) => new Worker(URL.createObjectURL(new Blob([source], { type: 'text/javascript' }))),
+        isHidden: () => document.visibilityState !== 'visible',
+        // For the log, once: Torn's page may allow no worker (it was never seen on real Torn before 3.25.0).
+        onRefused: () => logProblem('note', 'This page allows no background timer', 'behind another tab, the wait between two TornW3B reads is on the browser\'s slowed timer'),
+    });
+
     function newW3bClient({ background = false, who = 'app', ...options } = {}) {
         return new W3bClient({
             ...options,
+            // Beside Torn Archive while it is in front (core/beside.js): every tab together keeps to the smaller share.
+            sharedCeiling: () => (besideBehind(gmGet(STORE_BESIDE, null), Date.now()) ? BESIDE_W3B_PER_MINUTE : Infinity),
+            // A gap between any two requests, every tab together (3.25.0): TornW3B refuses a burst, not a minute's count.
+            pace: true,
+            ...(background ? { sleep: steadySleep } : {}),
             onSent: (x) => recordUse('w', who, x.path, x.tag),
+            onAnswered: (x) => recordUse('w', who, x.path, x.refused ? 'r.w.429' : 'r.w.ok'),
+            // For the log (3.25.0): the pace finds itself by being refused, so each time it changes is written down.
+            onPace: (p) => logProblem('note', 'TornW3B refused at one request every ' + p.was + ' ms', 'now one every ' + p.gap + ' ms, never under ' + p.floor + ' ms for two hours'),
             onFailed: (x) => logFailed('w', { ...x, tag: x.tag || usageTagFor('w', who, x.path, null) }),
             // Slots per tab (never overwritten by another tab); the 429 wait in one value.
-            loadShared: () => ({ recent: sharedTabWindow(STORE_W3B_WINDOW).load(), cooldownUntil: Number(gmGet(STORE_W3B_COOLDOWN, 0)) || 0 }),
-            saveShared: (state) => gmSet(STORE_W3B_COOLDOWN, state.cooldownUntil),
+            loadShared: () => ({ recent: sharedTabWindow(STORE_W3B_WINDOW).load(), cooldownUntil: Number(gmGet(STORE_W3B_COOLDOWN, 0)) || 0, pace: gmGet(STORE_W3B_PACE, null) }),
+            // Each value written only when it has changed: the pace is saved every few answers while it is settling.
+            saveShared: (state) => {
+                if ((Number(gmGet(STORE_W3B_COOLDOWN, 0)) || 0) !== state.cooldownUntil) gmSet(STORE_W3B_COOLDOWN, state.cooldownUntil);
+                if (state.pace && JSON.stringify(state.pace) !== JSON.stringify(gmGet(STORE_W3B_PACE, null))) gmSet(STORE_W3B_PACE, state.pace);
+            },
             addShared: (at) => sharedTabWindow(STORE_W3B_WINDOW).add(at),
             isVisible: () => background || document.visibilityState === 'visible',
             onOver: (x) => noteW3bOver(x, who),
@@ -31572,8 +36703,8 @@
     }
 
     function startLiveFeed() {
-        // Torn Bids first: while it is in use, the overlay takes what its reads leave (api/w3b.js overlayPerMinute).
-        app.w3b = newW3bClient({ perMinute: () => overlayPerMinute(gmGet(STORE_BIDS_SEEN, 0)) });
+        // Torn Bids in front: what this panel still reads (your own bazaar, Fill) takes what Torn Bids' reads leave.
+        app.w3b = newW3bClient({ perMinute: () => (frontSide(frontSides(), Date.now()) === 'bids' ? W3B_BESIDE_BIDS_PER_MINUTE : W3B_MAX_PER_MINUTE) });
 
         app.feed = new LiveFeed({
             tabId: app.tabId,
@@ -31582,7 +36713,9 @@
             getIndex: () => app.index,
             getSettings: () => effectiveSettings(),
             hasUsableKey,
-            isVisible: () => document.visibilityState === 'visible',
+            // In view, and in front: with Torn Bids in front (another window) the feed stands down, as a hidden tab's does.
+            // And only while NPC Arbitrage is on (3.25.0): with Torn Bids on, the deals are closed - nothing is asked for them.
+            isVisible: () => document.visibilityState === 'visible' && overlayMayAsk() && npcOn(),
             load: (key) => gmGet(key, null),
             save: (key, value) => gmSet(key, value),
             onChange: () => refreshView('the feed changed'),
@@ -31699,7 +36832,7 @@
         ];
         // The values the first list missed (3.17.0: the speed log's "everything stored"), and this tab's own request windows.
         keys.push(
-            STORE_W3B_COOLDOWN, STORE_IM_WATCH, STORE_BIDS_SEEN, STORE_LIST_AT, STORE_SELL_DECLINED, STORE_SELL_ASKED, STORE_SELL_ENDED, STORE_SELL_ENDED_FULL, STORE_SELL_CANCELLED, STORE_BOUGHT_WINDOW, STORE_SELL_PRICE_RECORDS, STORE_SELL_BLACKLIST,
+            STORE_W3B_COOLDOWN, STORE_W3B_PACE, STORE_IM_WATCH, STORE_BIDS_SEEN, STORE_LIST_AT, STORE_SELL_DECLINED, STORE_SELL_ASKED, STORE_SELL_ENDED, STORE_SELL_ENDED_FULL, STORE_SELL_CANCELLED, STORE_BOUGHT_WINDOW, STORE_SELL_PRICE_RECORDS, STORE_SELL_BLACKLIST,
             STORE_SELL_FAVOURITES, STORE_SELL_TE_OWN, STORE_CHAT_WANTED, STORE_SELL_MOVES, STORE_LEDGER_REV, STORE_SELL_PRESENCE, STORE_SELL_HELD, STORE_SELL_WAS,
             FEED_LEADER_KEY, FEED_RECHECK_KEY, FEED_REFRESH_KEY, SPEED_STORE_KEY, STORE_CLEANED,
             STORE_API_WINDOW + '.' + app.tabId, STORE_W3B_WINDOW + '.' + app.tabId,
@@ -31870,6 +37003,9 @@
         statusPressed: false,
         /* The To sell tab (3.21.0): its board is beside the list until you pick a row or plan a trade. */
         boardOpen: false,
+        /* The page of Torn Bids in view, and its tab (3.25.0): what is worked out follows it. */
+        bdPage: 'today',
+        bdTab: 0,
         /* When each trader last changed their TornW3B price list: id -> ms (3.22.0, "Fresh prices only"). */
         listAt: new Map(),
         listAtDirty: false,
@@ -31904,6 +37040,10 @@
         summaryError: null,
         /* Every bazaar listing of an item, once read: itemId -> {at, triedAt, rows, error, loading}. */
         bazaars: new Map(),
+        /* Shared: what the server is asked for (worked out every 20 s), and each item's best believable bid as last drawn. */
+        sharedWant: null,
+        sharedWantAt: 0,
+        sharedWorth: null,
         /* Items worth reading every bazaar of, for a flip: from the summary, best first. */
         candidates: [],
         /*
@@ -31914,6 +37054,12 @@
          */
         tradePick: new Map(),
         tradeEdits: new Map(),
+        /*
+         * Every flip with one trader (3.25.0; the owner: "we sometimes have 1 trader that just buys
+         * everything"): the trader keys planned that way - every item, not a main flip and extras.
+         * Until that trade is accepted, declined or unplanned.
+         */
+        tradeEvery: new Set(),
         tradeWanted: [],
         /* The chosen trade's items, re-read like the item picked (every 2 min) while it is on the desk. */
         tradeLive: [],
@@ -31926,6 +37072,26 @@
          * re-picks one line you change.
          */
         tradeHold: new Map(),
+        /* Plan trade pressed on a trade the desk was not showing: held as it is drawn at the next redraw ({itemId, key}). */
+        holdWanted: null,
+        /* The trader the desk's plan was last with ({itemId, key}): kept while they still make a trade with it, never swapped by itself (3.25.0). */
+        deskTrader: null,
+        /* How many PCs the TornW3B lists are split between (Shared), as last logged. */
+        sharedTurnOf: 1,
+        /*
+         * A trade stays still (3.25.0, core/still.js): `still` is the order the list and the cards had
+         * when the trade began (null: the list is live); `stillEnded` the line said once when it ends;
+         * `stillLet`: "Let them in now" (or Refresh) was pressed; `shownRows` / `shownCards`: what the
+         * last redraw drew, so the hold begins from what he was looking at when he pressed.
+         */
+        still: null,
+        stillEnded: null,
+        stillLet: false,
+        stillReady: false,
+        stillFrom: 0,
+        shownRows: null,
+        shownCards: null,
+        shownQ: '',
         pinWanted: null,
         heldEdit: null,
         /* A trade under way on the desk (picked, held or pinned): its reads come before the flips'. */
@@ -32720,7 +37886,8 @@
     function stepW3b() {
         if (sell.w3bBusy) return;
         const now = Date.now();
-        if (now < sell.w3bPauseUntil) return;
+        // Paused means silent: TornW3B refused a request (of this tab or the overlay's) - nothing is asked until that wait is over.
+        if (now < sell.w3bPauseUntil || (sell.w3b && sell.w3b.stats().coolingDown)) return;
         // In the background: a few reads a minute (backgroundSlot), each started
         // as the last one ends - a hidden tab's timers fire once a minute at best.
         const hidden = document.visibilityState !== 'visible';
@@ -32863,8 +38030,52 @@
         if (own.size) sell.listAtShare = true;
     }
 
+    /*
+     * Beside Torn Archive (core/beside.js): this page and Torn Archive's are on one site, so here - and only here -
+     * the marks in the site's own page storage can be read. Which of the two was looked at last is worked out, kept
+     * for every tab of ours, and while Torn Bids keeps to the smaller share that is said for Torn Archive to read.
+     */
+    function besideLook() {
+        let front = null;
+        let alive = null;
+        try {
+            front = besideMark(window.localStorage.getItem(BESIDE_FRONT_MARK));
+            alive = besideMark(window.localStorage.getItem(BESIDE_ALIVE_MARK));
+        } catch {
+            // No page storage: Torn Archive is never heard, and Torn Bids keeps its whole limit.
+        }
+        const now = Date.now();
+        const prev = gmGet(STORE_BESIDE, null);
+        const next = besideStep(prev, { front, alive, now });
+        if (!besideDue(prev, next, now)) return;
+        const was = Boolean(prev && prev.behind);
+        gmSet(STORE_BESIDE, next);
+        if (next.behind) {
+            try {
+                window.localStorage.setItem(BESIDE_BEHIND_MARK, besideBehindText(now));
+            } catch {
+                // Not said: Torn Archive then stays on its smaller share, and the two are still under the limit.
+            }
+        }
+        if (was !== next.behind) {
+            logProblem('note', next.behind
+                ? 'Torn Archive is in front: Torn Bids keeps to ' + BESIDE_TORN_PER_MINUTE + ' Torn and ' + BESIDE_W3B_PER_MINUTE + ' TornW3B requests a minute'
+                : 'Torn Bids has its whole limit again (Torn Archive is not in front)', '');
+        }
+    }
+
+    function besideWatch() {
+        besideLook();
+        // A change in the site's page storage is told to every other tab of the site, hidden ones too.
+        window.addEventListener('storage', (e) => {
+            if (!e || e.key === null || e.key === BESIDE_FRONT_MARK || e.key === BESIDE_ALIVE_MARK) besideLook();
+        });
+        setInterval(besideLook, BESIDE_LOOK_EVERY_MS);
+    }
+
     /** Torn Bids is in view: said for every tab, so the overlay's reads make room (written at most every 10 s). */
     function markBidsSeen() {
+        frontBeatNow(STORE_FRONT_BIDS);
         if (document.visibilityState !== 'visible') return;
         const now = Date.now();
         if (now - (Number(gmGet(STORE_BIDS_SEEN, 0)) || 0) >= 10000) gmSet(STORE_BIDS_SEEN, now);
@@ -32881,13 +38092,16 @@
     }
 
     /** Are an item's bazaar listings due to be read? */
-    function bazaarsDue(itemId, every, now) {
+    function bazaarsDue(itemId, every, now, background = false) {
         const b = sell.bazaars.get(String(itemId));
         if (!b) return true;
         if (b.loading) return false;
         if (b.error) return now - b.triedAt >= W3B_FAILED_RETRY_MS;
         // Brought back from the last visit (3.19.0): read again in its turn, as on a page just opened.
         if (b.kept) return true;
+        // A background read with Shared on (3.25.0): a list a friend's PC just read is not read again here,
+        // and each item has one PC that goes first (core/shared.js). The desk and a trade never wait on anyone.
+        if (background && sharedLink && sharedLink.config()) return sharedDirDue(b.at, every, now, itemId, sharedLink.dir());
         return now - b.at >= every;
     }
 
@@ -32895,7 +38109,28 @@
      * The next TornW3B request: the summary when old, then the item picked, then
      * possible flips and price lists taking turns, so neither waits on the other.
      */
+    /** The items an accepted trade still has to buy, and those of a trade held on the desk: read whoever is in front. */
+    function tradeNeedIds(now) {
+        const ids = new Set();
+        for (const t of Object.values(sellAccepted(now))) {
+            for (const i of t.items || []) if ((i.steps || []).some((st) => !stepDone(st))) ids.add(String(i.itemId));
+        }
+        for (const h of sell.tradeHold.values()) {
+            for (const line of (h && h.trade && h.trade.lines) || []) if (line && line.units > 0) ids.add(String(line.itemId));
+        }
+        return [...ids];
+    }
+
     function nextW3bJob(now, hidden = false) {
+        // A Torn page is in front, or nothing of ours is in view (3.25.0, core/front.js): Torn Bids asks
+        // only for what an accepted or held trade needs - the one read longest ago first. Its flips,
+        // buyers and price lists wait until he is back (it keeps its turn for a short while after he leaves).
+        if (!bidsMayAsk(now)) {
+            const every = freshnessMs(sellPrefs()).desk;
+            const readAt = (id) => Number((sell.bazaars.get(String(id)) || {}).at) || 0;
+            const due = tradeNeedIds(now).filter((id) => bazaarsDue(id, every, now)).sort((a, b) => readAt(a) - readAt(b));
+            return due.length ? () => loadBazaars(due[0], 'w.trade') : null;
+        }
         sell.w3bTurn ^= 1;
         // Refresh was pressed: what you were looking at, before everything but the one-call summary of every price.
         const summaryFirst = now - sell.summaryAt >= W3B_SUMMARY_MS && now - sell.summaryTriedAt >= W3B_FAILED_RETRY_MS;
@@ -32912,6 +38147,13 @@
         const candIds = sell.candidates.map((c) => c.itemId);
         const fresh = freshnessMs(sellPrefs());
         const topIds = new Set(candIds.slice(0, FRESH_TOP).map(String));
+        // Yours alone, whoever else is on: the desk's item and everything a trade of yours holds.
+        const ownIds = new Set([sell.selected, ...sell.tradeLive, ...sell.tradeWanted, ...pinnedIds].filter(Boolean).map(String));
+        const turnOf = sharedLink && sharedLink.config() ? sharedLink.dir().turn.of : 1;
+        if (turnOf !== sell.sharedTurnOf) {
+            logProblem('note', turnOf > 1 ? 'Shared: TornW3B lists are split between ' + turnOf + ' PCs now' : 'Shared: no other PC is on, every TornW3B list is this PC\'s again');
+            sell.sharedTurnOf = turnOf;
+        }
         const read = nextW3bRead({
             summaryDue: now - sell.summaryAt >= W3B_SUMMARY_MS && now - sell.summaryTriedAt >= W3B_FAILED_RETRY_MS,
             picked: sell.selected,
@@ -32930,7 +38172,7 @@
             turn: sell.w3bTurn,
             hidden,
             // Settings › Bazaar prices (3.20): the desk and the trade, the top flips, the others.
-            due: (id, how) => bazaarsDue(id, how === 'desk' ? fresh.desk : how === 'sweep' ? W3B_SWEEP_MS : topIds.has(String(id)) ? fresh.top : fresh.other, now),
+            due: (id, how) => bazaarsDue(id, how === 'desk' ? fresh.desk : how === 'sweep' ? W3B_SWEEP_MS : topIds.has(String(id)) ? fresh.top : fresh.other, now, how !== 'desk' && !ownIds.has(String(id))),
         });
         if (!read) return null;
         if (read.kind === 'summary') return loadBazaarSummary;
@@ -33004,7 +38246,7 @@
             })
             .catch((error) => {
                 sell.itemTraders.set(id, { ...(prev || { at: 0, traders: [], total: 0 }), loading: false, triedAt: Date.now(), error: true });
-                if (error && error.blocked) sell.w3bPauseUntil = Date.now() + 60000;
+                if (error && error.blocked && !error.paused) sell.w3bPauseUntil = Date.now() + 60000;
             });
     }
 
@@ -33051,7 +38293,7 @@
             .then((body) => recordW3bList(sell.db, id, { prices: parseW3bPriceList(body) }, Date.now()))
             .catch((error) => {
                 recordW3bList(sell.db, id, { error: true }, Date.now());
-                if (error && error.blocked) sell.w3bPauseUntil = Date.now() + 60000;
+                if (error && error.blocked && !error.paused) sell.w3bPauseUntil = Date.now() + 60000;
             })
             .finally(() => {
                 sell.dbDirty = true;
@@ -33084,7 +38326,7 @@
             })
             .catch((error) => {
                 sell.summaryError = 'TornW3B did not answer. Trying again soon.';
-                if (error && error.blocked) sell.w3bPauseUntil = Date.now() + 60000;
+                if (error && error.blocked && !error.paused) sell.w3bPauseUntil = Date.now() + 60000;
             });
     }
 
@@ -33108,7 +38350,7 @@
             })
             .catch((error) => {
                 sell.bazaars.set(id, { ...prev, triedAt: Date.now(), error: 'TornW3B did not answer. Trying again soon.', loading: false });
-                if (error && error.blocked) sell.w3bPauseUntil = Date.now() + 60000;
+                if (error && error.blocked && !error.paused) sell.w3bPauseUntil = Date.now() + 60000;
             });
     }
 
@@ -33134,11 +38376,7 @@
                 sell.market.set(id, { at: Date.now(), triedAt: Date.now(), lowest, depth, loading: false, error: null });
             })
             .catch((error) => {
-                if (isKeyDeadError(error)) {
-                    sell.keyDead = true;
-                    sell.keyError = sellKeyErrorText(error);
-                    gmSet(STORE_SELL_KEY_DEAD, true);
-                }
+                if (isKeyDeadError(error)) markSellKeyDead(error);
                 sell.market.set(id, { ...(m || { at: 0, lowest: null }), triedAt: Date.now(), loading: false, error: true });
             })
             .finally(() => {
@@ -33236,6 +38474,27 @@
             });
         }
         return sell.buyersKeeper;
+    }
+
+    /**
+     * Each item's bazaars and its flip plan, kept between redraws (3.25.0, core/kept.js; plan part 2, step 3):
+     * the same promise as the buyers' keeper above - looked at each redraw, one kept result a redraw checked
+     * against a fresh one, and off with a line in the problem log should they ever differ.
+     * `keptcheck=1` in the page's address checks every kept result on every redraw (the harness).
+     */
+    function sellWorkKeepers() {
+        if (!sell.workKeepers) {
+            const checkAll = typeof location !== 'undefined' && /[?&]keptcheck=1(&|$)/.test(location.search || '');
+            const make = (what) =>
+                makeKeeper({
+                    checkAll,
+                    freeze: checkAll,
+                    onDiffer: (itemId) => logProblem('error', 'Kept ' + what + ' differed from fresh ones (item ' + itemId + ')', 'keeping is off until this page is reloaded; nothing shown was wrong after this line'),
+                });
+            sell.workKeepers = { sellers: make('bazaars'), plans: make('flip plans') };
+            logProblem('note', 'Kept between redraws: each item\'s bazaars and flip plan' + (checkAll ? ' (every kept result checked)' : ''), '');
+        }
+        return sell.workKeepers;
     }
 
     /** Everything the page shows, from what is loaded now. */
@@ -33401,13 +38660,14 @@
      */
     function renderSellingNow(src = null, t0 = sellClock(), before = 0) {
         sell.drew = false;
+        sell.hiddenWork = false;
         // Pieces under way are overtaken by this draw (it works out what they had not reached).
         stopSellWarm();
         try {
             renderSellingWork(src);
         } finally {
             // The page rebuild is counted apart and is inside this one.
-            perfDone(sell.drew ? 'Torn Bids redraw (working out + page)' : 'Torn Bids redraw not due (hidden tab)', t0);
+            perfDone(sell.drew ? 'Torn Bids redraw (working out + page)' : sell.hiddenWork ? 'Torn Bids hidden tab: the possible flips only' : 'Torn Bids redraw not due (hidden tab)', t0);
             if (sell.drew) {
                 // The redraw budget: the next one asked for by data waits by all the work this one was.
                 sell.redrawEnded = sellClock();
@@ -33459,15 +38719,30 @@
         if (!sell.page) return;
         const now = Date.now();
         if (document.visibilityState !== 'visible') {
+            // 3.25.0: behind a Torn page (or with nothing of ours in view) Torn Bids reads only what an accepted
+            // or held trade needs (core/front.js), and that takes no working out: nothing is worked out here
+            // until he is back. (48 of the friend's 50 slowest events were hidden redraws of 4.5-8.5 s.)
+            if (!bidsMayAsk(now)) return;
             if (now - (sell.hiddenRenderAt || 0) < HIDDEN_RENDER_MS) return;
             sell.hiddenRenderAt = now;
         }
+        /*
+         * 3.25.0 (plan part 2, step 1): each stage of the working out is timed for the speed log, so a
+         * zip names the slow stage. (The friend's redraw is about a second; the bench at his size
+         * explains a third of it, and which stage holds the rest is not known.)
+         */
+        let stageT0 = perfNow();
+        const redrawStage = (name) => {
+            perfDone('Torn Bids redraw · ' + name, stageT0);
+            stageT0 = perfNow();
+        };
         const prefs = sellPrefs();
         const st = teState();
         const access = gmGet(STORE_SELL_KEY_ACCESS, null);
 
         // Worked out in pieces a moment ago (renderSellingInPieces), or here.
         const sources = src || sellBuyerSources(now);
+        redrawStage('1 who buys what');
         const { w3bByItem, teMap, favsNow, ownLists, ownByItem, buyersAll } = sources;
         // A search may draw with them again (renderSellingTyped).
         if (sources !== sell.lastSrc) {
@@ -33621,13 +38896,51 @@
             ownBuysLogged.add(sig);
             logProblem('note', 'Your buys taken off the TornW3B number (item ' + id + '): ' + units + ' fewer, ' + (before.length - after.length) + ' listings gone', 'its bazaars read ' + Math.round((now - b.at) / 1000) + ' s ago');
         }
+        // Shared: what a friend bought comes off the same way (their PC said so; a mark, by their Torn name).
+        // After the note above, which is about your own buys.
+        const friendMarks = sharedLink ? sharedLink.marks(now) : { going: [], bought: [] };
+        const friendGoing = sharedGoingByItem(friendMarks.going);
+        const friendBought = new Map();
+        for (const m of friendMarks.bought) {
+            const key = String(m.item);
+            const buy = { sellerId: String(m.seller), itemId: key, qty: m.qty, each: m.price, t: m.at, friend: true, who: m.who };
+            if (!ownBought.has(key)) ownBought.set(key, []);
+            ownBought.get(key).push(buy);
+            if (!friendBought.has(key)) friendBought.set(key, []);
+            friendBought.get(key).push(buy);
+        }
+        // What you are going for yourself: the very list the others are sent (sharedWantSell), so the row says what they see.
+        const ownGoing = new Set(sharedLink && sharedLink.grant() && sell.sharedWant ? (sell.sharedWant.going || []).map((m) => String(m[0])) : []);
         // Worked out once a redraw per item (3.17.1): a dozen places ask, and each used to filter, copy and sort the rows again.
         const sellersKept = new Map();
+        // Shared: a bazaar the server read from Torn after TornW3B last checked it shows Torn's own price and count.
+        const sharedReads = sharedLink ? sharedLink.reads() : null;
+        const rowsNow = (b, key) => (sharedReads ? withShared(b.rows, key, sharedReads.index, sharedReads.joined) : b.rows);
+        // ...and kept between redraws (3.25.0) while its read, your marks on it and the server's reads are what they were.
+        const keepers = sellWorkKeepers();
+        keepers.sellers.begin();
+        keepers.plans.begin();
+        // Your marks on an item's bazaars (gone, the stock a page showed, what you or a friend bought), as one word per item.
+        let ownSigs = null;
+        const ownSigOf = (key) => {
+            if (!ownSigs) ownSigs = keptMarkWords(gone, ownStock, ownBought);
+            return ownSigs.get(key) || '';
+        };
+        // A listing turns stale by the clock alone: the rows hold until the first fresh one does.
+        const freshUntil = (rows) => keptFreshUntil(rows, FLIP_FRESH_MS);
         const sellersOf = (id) => {
             const key = String(id);
             if (sellersKept.has(key)) return sellersKept.get(key);
             const b = sell.bazaars.get(key);
-            const rows = b && b.at ? bazaarSellers(withOwnBuys(withoutGone(b.rows, key, gone), key, { stock: ownStock, bought: ownBought.get(key) || null }), { selfId: sell.selfId, now }) : null;
+            const rows =
+                b && b.at
+                    ? keepers.sellers.get(
+                          key,
+                          [b.rows, b.at, sell.selfId, ownSigOf(key), sharedReads ? sharedReads.index : null, sharedReads && sharedReads.joined ? sharedReads.joined.get(key) : undefined],
+                          () => bazaarSellers(withOwnBuys(withoutGone(rowsNow(b, key), key, gone), key, { stock: ownStock, bought: ownBought.get(key) || null }), { selfId: sell.selfId, now }),
+                          { now, until: freshUntil },
+                      )
+                    : null;
             sellersKept.set(key, rows);
             return rows;
         };
@@ -33638,8 +38951,9 @@
             const b = sell.bazaars.get(String(id));
             if (!b || !b.at) return null;
             const stock = Object.fromEntries(Object.entries(ownStock).filter(([, s]) => s.at < at));
-            const bought = (ownBought.get(String(id)) || []).filter((x) => x.t < at);
-            return bazaarSellers(withOwnBuys(withoutGone(b.rows, String(id), gone), String(id), { stock, bought }), { selfId: sell.selfId, now });
+            // A friend's buy is never this step's own: it comes off whenever it was.
+            const bought = (ownBought.get(String(id)) || []).filter((x) => x.friend || x.t < at);
+            return bazaarSellers(withOwnBuys(withoutGone(rowsNow(b, String(id)), String(id), gone), String(id), { stock, bought }), { selfId: sell.selfId, now });
         };
         // Units other sellers list near the cheapest (fresh listings): the most a listing is counted for.
         const bazaarDepthOf = (id) => {
@@ -33693,8 +39007,23 @@
         // The plan that makes the most among the believable buyers (each capped
         // by what they can pay); a tie goes to the higher bid.
         const declinedAll = sellDeclined(now);
+        const declinedBy = (id, b) => declinedAll.size > 0 && declinedAll.has(declineKey(id, b.id ? 'id:' + b.id : 'name:' + String(b.name).toLowerCase()));
+        // Kept between redraws (3.25.0) while the item's bazaars are the very rows they were and its believable
+        // buyers bid, can pay and are declined as they did. The buyer of a kept plan is today's row of that
+        // trader (their badge and marks may have moved; the plan reads none of those).
         const planOf = (id) => {
             const rows = sellersOf(id);
+            if (!rows) return null;
+            const fbs = flipBuyersOf(id);
+            const k = keepers.plans.get(String(id), keptPlanSig(rows, prefs, fbs, (b) => declinedBy(id, b)), () => {
+                const best = planFrom(id, rows);
+                if (!best) return null;
+                const { buyer, ...plan } = best;
+                return { plan, at: fbs.indexOf(buyer) };
+            });
+            return k ? { ...k.plan, buyer: fbs[k.at] } : null;
+        };
+        const planFrom = (id, rows) => {
             if (!rows) return null;
             let best = null;
             for (const b of flipBuyersOf(id)) {
@@ -33706,6 +39035,33 @@
                 if (!best || plan.profit > best.profit || (plan.profit === best.profit && plan.units > 0 && !best.units)) best = { ...plan, buyer: b };
             }
             return best;
+        };
+
+        // Shared, for a card and the desk: who of the others is going for this item, and what a friend's buy took from its plan.
+        const friendOf = (id, plan) => {
+            const key = String(id);
+            const out = { on: null, going: null, took: null };
+            const g = friendGoing.get(key);
+            if (g) {
+                out.on = sharedOnThis(g, now);
+                out.going = sharedGoingFor(g, now);
+            }
+            const buys = friendBought.get(key);
+            const b = buys && plan && plan.units > 0 ? sell.bazaars.get(key) : null;
+            if (b && b.at) {
+                // The plan as it would be had they not bought: only where that is more than the plan now.
+                const mine = (ownBought.get(key) || []).filter((x) => !x.friend);
+                const was = planFrom(key, bazaarSellers(withOwnBuys(withoutGone(rowsNow(b, key), key, gone), key, { stock: ownStock, bought: mine }), { selfId: sell.selfId, now }));
+                if (was && was.units > plan.units) {
+                    const last = buys.reduce((a, x) => (x.t > a.t ? x : a));
+                    const row = b.rows.find((r) => String(r.sellerId) === last.sellerId);
+                    out.took = {
+                        ...sharedBoughtLine({ who: last.who, qty: last.qty, bazaar: row ? row.sellerName : null, at: last.t, units: plan.units }, now),
+                        was: 'was ' + was.units + ' from ' + new Set(was.steps.map((st) => st.sellerId)).size,
+                    };
+                }
+            }
+            return out.on || out.took ? out : null;
         };
 
         // Which items' bazaars to read for a flip: where a buyer you would sell
@@ -33720,6 +39076,7 @@
             const lowest = read > 0 && !(sell.summaryAt > b.at && row.lowestPrice > 0 && row.lowestPrice < read) ? read : b && b.at && !(read > 0) && !(sell.summaryAt > b.at) ? null : row.lowestPrice;
             effective.set(id, lowest === row.lowestPrice ? row : { ...row, lowestPrice: lowest });
         }
+        redrawStage('2 your buys, friends, prices in force');
         const withBid = [];
         sell.candidates = sell.summary
             ? flipCandidates(effective, (id, lowest) => {
@@ -33751,11 +39108,30 @@
             return b ? b.at || 0 : 0;
         };
         sell.sweepIds = withBid.filter((id) => !candSet.has(id) && !nearSet.has(id)).sort((a, b) => readAt(a) - readAt(b));
+        // Shared: what each item is worth to a trader, for the server's order of reading; every item read is in it.
+        if (sharedReads) {
+            const worth = {};
+            for (const id of withBid) {
+                const bid = bestBidOf(id);
+                if (bid > 0) worth[id] = bid;
+            }
+            for (const id of sell.bazaars.keys()) if (!(id in worth)) worth[id] = bestBidOf(id) || 1;
+            sell.sharedWorth = worth;
+        }
         const sweepChecked = withBid.filter((id) => now - readAt(id) < W3B_SWEEP_MS).length;
         const flipsChecked = sell.candidates.filter((c) => {
             const b = sell.bazaars.get(c.itemId);
             return b && b.at && now - b.at < W3B_CANDIDATE_MS * 2;
         }).length;
+
+        redrawStage('3 possible flips');
+        // A hidden tab works out only what its next reads need - the possible flips, just above (3.25.0, plan
+        // part 2 step 6). No list, no cards, no desk, no Your traders, no page: the whole of it is drawn the
+        // moment the tab is shown again.
+        if (document.visibilityState !== 'visible') {
+            sell.hiddenWork = true;
+            return;
+        }
 
         /* Every item: what you hold, and everything any trader buys. */
         const oneIds = [...sell.teOne].filter(([, rec]) => rec.best).map(([id]) => id);
@@ -33792,6 +39168,8 @@
         // The category filters the flips, the list and its counts together; its
         // own counts follow the search only.
         const categories = categoryCounts(rows.map((r) => r.category), sell.category);
+        // Every row, whatever the category: a held list is held across a category press too.
+        const rowsAll = rows;
         if (sell.category) rows = rows.filter((r) => r.category === sell.category);
         const counts = {
             all: rows.length,
@@ -33801,27 +39179,103 @@
             sell: forSaleCount(toSell),
         };
         const pass = (r) => (sell.filter === 'mine' ? r.held > 0 : sell.filter === 'flips' ? Boolean(r.badge && r.badge.kind === 'flip') : sell.filter === 'sell' ? toSellIds.has(r.itemId) : true);
-        // Money to be made first, then what you hold, then the best price.
-        const listed = rows
-            .filter(pass)
-            .sort((a, b) => b.value - a.value || (b.held > 0) - (a.held > 0) || b.bid - a.bid || String(a.name).localeCompare(String(b.name)));
         // Buyers online only (3.20.5): a flip is a card once its buyer's status is
         // read - while one can be read (a key, the tab in view; a failed read is not waited for).
         const holdFlips = Boolean(prefs.onlineOnly) && Boolean(getSellKey()) && !sell.keyDead && document.visibilityState === 'visible';
         const unreadStatus = (id) => statusUnread(sell.presence.get(String(id)), levelOf(id), now);
-        const { strip, waiting: stripWaiting } = flipCards(
-            rows
-                .filter((r) => r.badge && r.badge.kind === 'flip')
-                .sort((a, b) => b.plan.profit - a.plan.profit)
-                .map((r) => ({ itemId: r.itemId, name: r.name, plan: r.plan, buyer: r.plan.buyer })),
-            { hold: holdFlips, unread: unreadStatus, limit: 4 },
-        );
+        const flipsOf = (list) => list
+            .filter((r) => r.badge && r.badge.kind === 'flip')
+            .sort((a, b) => b.plan.profit - a.plan.profit)
+            .map((r) => ({ itemId: r.itemId, name: r.name, plan: r.plan, buyer: r.plan.buyer }));
+        const cardsOf = (list) => flipCards(flipsOf(list), { hold: holdFlips, unread: unreadStatus, limit: 4 });
+        const traderKey = (b) => (b.id ? 'id:' + b.id : 'name:' + String(b.name).toLowerCase());
+
+        /*
+         * A trade stays still (3.25.0, core/still.js; drawing 2 of mockup AA, the owner's yes of
+         * 2026-10-10): while a trade is planned, held or accepted, the list and the cards keep the order
+         * they had. Every number stays live where it stands; a deal that was not a flip then waits in
+         * the amber line until the trade ends, "Let them in now" or Refresh.
+         *
+         * It begins from what the last redraw drew - what he was looking at when he pressed - and only
+         * once the page has its prices: a reload in the middle of a trade would otherwise hold a
+         * half-loaded list and call every flip found after it "new".
+         */
+        const acceptedNow = Object.values(sellAccepted(now));
+        const underWay = stillTrade({ accepted: acceptedNow, holds: [...sell.tradeHold.values()], selected: sell.selected, now, holdMs: HOLD_MS });
+        const wantedHold = sell.holdWanted;
+        const wantedBy = wantedHold ? buyersOf(wantedHold.itemId).find((x) => traderKey(x) === wantedHold.key) || null : null;
+        if (!sell.stillFrom) {
+            sell.stillFrom = now;
+            // No trade under way as Torn Bids opens: a trade planned from here on is planned on what he sees.
+            if (!underWay && !wantedBy) sell.stillReady = true;
+        }
+        if (!sell.stillReady && sell.summaryAt && (flipsChecked >= sell.candidates.length || now - sell.stillFrom > STILL_SETTLE_MS)) sell.stillReady = true;
+        const stillWho = !sell.stillReady ? null : underWay || (wantedBy ? { trader: wantedBy.name, itemId: wantedHold.itemId } : null);
+        const letIn = sell.stillLet;
+        sell.stillLet = false;
+        if (sell.still && (!stillWho || letIn)) {
+            // Planned with a trader no plan could be made with: nothing was held, so nothing "ended".
+            if (!sell.still.quiet) {
+                sell.stillEnded = { trader: sell.still.trader, came: sell.still.waiting || 0, at: now, let: Boolean(stillWho) };
+                setTimeout(() => renderSellingNow(), STILL_ENDED_MS + 100);
+                logProblem('note', 'The list was let go (' + (stillWho ? 'new deals let in' : 'the trade ended') + '): held ' + Math.round((now - sell.still.at) / 1000) + ' s, ' + (sell.still.waiting || 0) + ' new deals came in');
+            }
+            sell.still = null;
+        }
+        if (stillWho && !sell.still) {
+            const fromShown = !letIn && sell.shownRows;
+            sell.still = stillStart({ rows: fromShown ? sell.shownRows : rowsAll, cards: fromShown ? sell.shownCards || [] : cardsOf(rows).strip, now });
+            sell.still.q = fromShown ? sell.shownQ : q;
+            sell.still.quiet = !underWay;
+            logProblem('note', 'The list is held (a trade is under way): ' + sell.still.place.size + ' rows, ' + sell.still.flips.size + ' flips, ' + sell.still.cards.length + ' cards');
+        }
+        let stillWaits = [];
+        let stillFlips = null;
+        // Money to be made first, then what you hold, then the best price.
+        let listed;
+        if (sell.still) {
+            const still = sell.still;
+            still.trader = stillWho.trader;
+            if (underWay) still.quiet = false;
+            // A search changed since: the rows it brings back were there all along - not new.
+            if (still.q !== q) {
+                stillAdopt(still, rowsAll);
+                still.q = q;
+            }
+            stillFlips = flipsOf(rowsAll);
+            stillWaits = stillWaiting(still, stillFlips, now);
+            still.waiting = stillWaits.length;
+            // The Flips tab: the flips of the hold (one that is no flip now stays, greyed); a new one waits in the line.
+            listed = stillList(still, rows.filter((r) => (sell.filter === 'flips' ? still.flips.has(r.itemId) : pass(r))));
+            counts.flips = rows.filter((r) => still.flips.has(r.itemId)).length;
+        } else {
+            listed = rows
+                .filter(pass)
+                .sort((a, b) => b.value - a.value || (b.held > 0) - (a.held > 0) || b.bid - a.bid || String(a.name).localeCompare(String(b.name)));
+        }
+        redrawStage('4 the list (every item)');
+        let strip;
+        let stripWaiting = [];
+        if (sell.still) {
+            // The cards of the hold, in their places (a search shows those it finds, as always).
+            const found = new Set(rowsAll.map((r) => r.itemId));
+            strip = stillCards(sell.still, stillFlips, { limit: 4 }).filter((c) => found.has(c.itemId));
+        } else {
+            ({ strip, waiting: stripWaiting } = cardsOf(rows));
+        }
+
+        for (const f of strip) if (f.plan) f.friend = friendOf(f.itemId, f.plan);
 
         // The item you picked stays picked. Until you pick one, the desk shows
         // the best flip (or the first item), following it as flips are found.
         // Only an item you pick asks TornExchange for its full buyer list: its
         // 10 a minute are not spent on the desk following flips.
-        if (sell.selected && !allIds.has(sell.selected)) {
+        // An accepted trade's item stays, whatever the lists say now (3.25.0): its card never goes by itself.
+        const acceptedIds = new Set(acceptedNow.map((t) => String(t.itemId)));
+        // So does the item of a trade waiting on the Trades board (asked or pinned): its card, pressed before its
+        // bazaars were read, lost the pick here - and the trade under way was shown in its place.
+        const boardIds = new Set([...acceptedIds, ...Object.values(sellAsked(now)).map((a) => String(a.itemId)), ...Object.values(sellPinned(now)).map((t) => String(t.itemId))]);
+        if (sell.selected && !allIds.has(sell.selected) && !boardIds.has(sell.selected)) {
             sell.selected = null;
             sell.pickedByYou = false;
         }
@@ -33834,7 +39288,8 @@
                 sell.pickedByYou = false;
             }
         }
-        sell.selected = deskItem({ pickedByYou: sell.pickedByYou, selected: sell.selected, filter: sell.filter, strip, listed });
+        // A trade under way owns the desk (3.25.0): a reload, a filter or a category press never puts the #1 flip there instead.
+        sell.selected = deskItem({ pickedByYou: sell.pickedByYou, selected: sell.selected, filter: sell.filter, strip: strip.filter((f) => f.plan), listed, underWay: underWay && (allIds.has(underWay.itemId) || acceptedIds.has(underWay.itemId)) ? underWay.itemId : null });
 
         /*
          * One trade with one trader (mockup N3, the owner, 2026-09-27): the
@@ -33843,7 +39298,7 @@
          * "Sell to" lists every trader who makes a flip on the item picked,
          * ranked by what the WHOLE trade with them makes.
          */
-        const traderKey = (b) => (b.id ? 'id:' + b.id : 'name:' + String(b.name).toLowerCase());
+        redrawStage('5 Best flips cards');
         let tradeIndex = null;
         const tradeItemsOf = (buyer) => {
             if (!tradeIndex) {
@@ -33895,9 +39350,11 @@
                 traderId: buyer.id || null,
                 kindOf,
                 extraItems: prefs.extraItems,
+                // "Every flip" pressed for this trader: all of it, within your cash, their pay and the 10,000.
+                everything: sell.tradeEvery.has(key),
             });
             // A To sell line makes what they pay over what you paid: part of what the trade makes.
-            return { ...t, profit: t.profit + heldGain(t.held), flipProfit: t.profit, key, buyer, estimated, payCap };
+            return { ...t, profit: t.profit + heldGain(t.held), flipProfit: t.profit, key, buyer, estimated, payCap, every: sell.tradeEvery.has(key) };
         };
         /*
          * A trade's old list (3.23.0): the first of its lines - a flip, or one of
@@ -33936,7 +39393,7 @@
          * trader you picked or pinned is used even when a Show toggle hides them
          * (a pin must come back as it was pinned).
          */
-        const chooseTrade = (pickId, buyers) => {
+        const chooseTrade = (pickId, buyers, keptKey = null) => {
             const declined = declinedOn(declinedAll, pickId);
             const plans = new Map();
             for (const b of buyers.slice(0, TRADE_TRADERS_MAX)) plans.set(traderKey(b), tradeWith(b, pickId));
@@ -33946,21 +39403,28 @@
             if (pickedKey && !plans.has(pickedKey)) {
                 const b = buyers.find((x) => traderKey(x) === pickedKey) || buyersAllowed(pickId).find((x) => traderKey(x) === pickedKey);
                 if (b) plans.set(pickedKey, tradeWith({ ...b, tradeKey: pickedKey }, pickId));
+                else {
+                    // Held with them, and they are not on this item's list now (3.25.0): the held trade stays on the desk, and says so.
+                    const h = heldTradeFor(pickId, pickedKey, now);
+                    if (h && h.held.trader && h.held.trader.name) plans.set(pickedKey, { ...tradeWith({ id: h.held.trader.id || null, name: h.held.trader.name, price: null }, pickId), key: pickedKey, away: true });
+                }
             }
             const hasItem = (t) => t.flips.some((r) => r.itemId === String(pickId));
             let chosen = pickedKey && !declined.has(pickedKey) ? plans.get(pickedKey) || null : null;
+            // You picked none: the trader it showed last stays while they make a trade with it; a better one is said, not swapped in.
+            let better = null;
             if (!chosen) {
-                chosen = [...plans.values()]
+                const ranked = [...plans.values()]
                     .filter((t) => !declined.has(t.key) && hasItem(t))
-                    .sort((a, b) => b.profit - a.profit || b.buyer.price - a.buyer.price)[0] || null;
+                    .sort((a, b) => b.profit - a.profit || b.buyer.price - a.buyer.price);
+                ({ chosen, better } = steadyTrader(ranked, keptKey));
             }
-            return { plans, pickedKey, chosen, declined, hasItem };
+            return { plans, pickedKey, chosen, declined, hasItem, better };
         };
         // A plan's lines with their names and ≈ marks, as a held trade keeps them.
         const namedTrade = (t) => ({ ...t, flips: t.flips.map((r) => ({ ...r, name: nameOf(r.itemId), estimated: t.estimated.includes(r.itemId) })), off: t.off.map((r) => ({ ...r, name: nameOf(r.itemId) })) });
         const tradeDesk = (pickId, buyers) => {
             const rows = sellersOf(pickId);
-            if (!rows || !buyers.length) return null;
             const declined = declinedOn(declinedAll, pickId);
             // They said yes: the trade is frozen; only each step's check is live.
             const acc = Object.values(sellAccepted(now)).find((t) => t.itemId === String(pickId));
@@ -33996,7 +39460,17 @@
                     },
                 };
             }
-            const { plans, pickedKey, chosen, hasItem } = chooseTrade(pickId, buyers);
+            // (The accepted trade above is shown whatever is missing. From here: nothing without the item's bazaars -
+            // and nothing without a trader, unless a trade is held with one who has left the list.)
+            const pickedNow = sell.tradePick.get(String(pickId)) || null;
+            if (!rows || (!buyers.length && !(pickedNow && heldTradeFor(pickId, pickedNow, now)))) return null;
+            const keptTrader = sell.deskTrader && sell.deskTrader.itemId === String(pickId) ? sell.deskTrader.key : null;
+            const { plans, pickedKey, chosen, hasItem, better } = chooseTrade(pickId, buyers, keptTrader);
+            if (better && !(sell.deskBetter === String(pickId) + '|' + better.key)) {
+                sell.deskBetter = String(pickId) + '|' + better.key;
+                logProblem('note', 'A better trader came up for the item on the desk: the plan stayed with the one shown', 'the other makes ' + Math.round(better.profit - chosen.profit) + ' more');
+            }
+            sell.deskTrader = chosen ? { itemId: String(pickId), key: chosen.key } : null;
             const perTrader = {};
             for (const [k, t] of plans) perTrader[k] = { profit: t.profit, items: t.items, estimated: t.estimated.length, hasItem: hasItem(t), stops: t.stops, minutes: t.minutes };
             const declinedOut = Object.fromEntries(declined);
@@ -34004,7 +39478,23 @@
             // The trade holds still once you start on it (a press in its card,
             // held at that press) or pin it: its items stay, only prices and profit move.
             const named = (r) => ({ ...r, name: nameOf(r.itemId), estimated: chosen.estimated.includes(r.itemId) });
+            // Plan trade holds the trade at once (3.25.0) - trader, items, units, bazaars, as drawn at this
+            // press. Before, it was held only at the first press inside its card, and until then a line
+            // could be swapped under him.
+            const wanted = sell.holdWanted;
+            if (chosen && wanted && wanted.itemId === String(pickId) && wanted.key === chosen.key && !heldTradeFor(pickId, chosen.key, now)) {
+                sell.tradeHold.set(holdKey(pickId, chosen.key), { trade: holdTrade(namedTrade(chosen), pickId, now), touched: now });
+                sell.sharedWantAt = 0;
+                if (sharedLink) sharedLink.askSoon(sharedWaitingHere());
+                // For the log: how big "every flip" came out, and what stopped it. No names.
+                if (chosen.every) {
+                    const stopped = [chosen.unitsCapped ? 'the 10,000 items' : null, chosen.payCapped ? 'what they can pay' : null, prefs.cash > 0 && chosen.cost > prefs.cash * 0.95 ? 'your cash' : null].filter(Boolean);
+                    logProblem('note', 'Every flip planned with one trader: ' + chosen.items + ' items, ' + (chosen.units || 0) + ' units, ' + chosen.stops + ' bazaars, ' + chosen.estimated.length + ' not read yet', stopped.length ? 'stopped by ' + stopped.join(' and ') : 'nothing stopped it');
+                }
+            }
             const hold = chosen ? heldTradeFor(pickId, chosen.key, now) : null;
+            // Every flip: as it was held, else as it is planned now.
+            const every = Boolean(chosen && (hold ? hold.held.every : chosen.every));
             // Its reads come before the possible flips' only while you work on it.
             sell.tradeActive = Boolean(sell.pickedByYou || hold);
             // The chosen trader's items not read yet (their ≈ lines) - not twelve traders' worth.
@@ -34027,7 +39517,7 @@
                     const bid = bidNow(id);
                     const list = sellersOf(id);
                     if (!(bid > 0) || !list) return null;
-                    const p = pickBazaars(list, bid, { maxUnits: n, minPct: prefs.minProfitPct, maxStops: MAIN_STOPS, exclude: chosen.buyer.id || null });
+                    const p = pickBazaars(list, bid, { maxUnits: n, minPct: prefs.minProfitPct, maxStops: every ? Infinity : MAIN_STOPS, exclude: chosen.buyer.id || null });
                     return p && p.units > 0 ? p.steps : null;
                 },
                 info: (id) => ({ name: nameOf(id), bid: bidNow(id), kind: kindOf(id), units: Math.min(prefs.maxPerFlip || 100, EXTRA_CAP[kindOf(id)] || 10), price: lowestOf(id) }),
@@ -34037,6 +39527,8 @@
                 perTrader,
                 declined: declinedOut,
                 picked: chosen.key === pickedKey,
+                // Another trader's whole trade makes more now: said beside the plan, never swapped in by itself.
+                better: better ? { key: better.key, name: better.buyer.name, more: Math.round(better.profit - chosen.profit) } : null,
                 keep: prefs.keep || {},
                 // How old the prices are: check their list before buying.
                 teAt: sell.traders ? sell.traders.fetchedAt : null,
@@ -34052,7 +39544,9 @@
                     const list = sellersOf(id);
                     const bid = bidOf(id);
                     if (!list || !(bid > 0)) return null;
-                    const p = pickBazaars(list, bid, { maxUnits: Math.min(prefs.maxPerFlip || 100, EXTRA_CAP[kindOf(id)] || 10), minPct: prefs.minProfitPct, maxStops: EXTRA_STOPS, exclude: chosen.buyer.id || null });
+                    const p = pickBazaars(list, bid, every
+                        ? { maxUnits: prefs.maxPerFlip || 100, minPct: prefs.minProfitPct, maxStops: Infinity, exclude: chosen.buyer.id || null }
+                        : { maxUnits: Math.min(prefs.maxPerFlip || 100, EXTRA_CAP[kindOf(id)] || 10), minPct: prefs.minProfitPct, maxStops: EXTRA_STOPS, exclude: chosen.buyer.id || null });
                     return p && p.units > 0 ? p.steps : null;
                 };
                 const held = resolveEstimated(hold.held, chosen.flips.map(named), pickOwn);
@@ -34107,6 +39601,9 @@
                         left,
                         gone: [],
                         itemNote: null,
+                        every,
+                        // Held with a trader who is not on this item's list now: shown as it was held.
+                        away: Boolean(chosen.away),
                         hold: { pinned: hold.pinned, at: held.at },
                     },
                 };
@@ -34153,6 +39650,7 @@
                     gone: gone.map((id) => ({ itemId: id, name: nameOf(id) })),
                     // Planned with a trader who makes no flip on this item: say why.
                     itemNote: hasItem(chosen) ? null : { bid: chosen.buyer.price, cheapest: fresh ? fresh.price : null, why: noFlipWhy(pickId, chosen.buyer.price, fresh) },
+                    every,
                     hold: null,
                 },
             };
@@ -34196,7 +39694,8 @@
          * trade with them now - the same plan the desk makes (main flip + extras).
          * Worked out only while the section is open.
          */
-        let scan = { open: prefs.scanOpen !== false, list: [], favourites: 0, trusted: 0 };
+        redrawStage('6 pins and held trades');
+        let scan = { open: sell.bdPage === 'today' || (sell.bdPage === 'flips' && sell.bdTab === 1), list: [], favourites: 0, trusted: 0 };
         {
             // Every item's buyers, whatever the search box shows (review L3): who is
             // Trusted does not depend on what you typed.
@@ -34228,7 +39727,7 @@
             // Buyers online only (3.20.5): a status read since is a reason too - a trader found
             // offline kept "Trade +$X" here until the next working-out.
             const whoStatus = prefs.onlineOnly ? [...who.keys()].map((id) => levelOf(id) + (holdFlips && unreadStatus(id) ? '?' : '')) : null;
-            const scanSig = JSON.stringify([prefs.cash, prefs.maxPerFlip, prefs.extraItems, prefs.minProfitPct, prefs.networthPct, prefs.onlineOnly, prefs.trustedOnly, prefs.freshOnly, favEdits, [...blacklist], [...who.keys()], sell.summaryAt, whoStatus]);
+            const scanSig = JSON.stringify([prefs.cash, prefs.maxPerFlip, prefs.extraItems, prefs.minProfitPct, prefs.networthPct, prefs.onlineOnly, prefs.trustedOnly, prefs.freshOnly, favEdits, [...blacklist], [...who.keys()], sell.summaryAt, whoStatus, [...sell.tradeEvery]]);
             const fresh = sell.scanSig === scanSig && now - (sell.scanAt || 0) < SCAN_EVERY_MS;
             if (!scan.open) sell.scanWatch = [];
             if (scan.open && fresh) scan.list = sell.scanList || [];
@@ -34239,7 +39738,11 @@
                     const trust = sell.trustById.get(w.id) || null;
                     // Not "reading" when TornExchange refused the key: it never will (review L8).
                     const reading = w.favourite && getTeKey() && !teBad && !ownLists[w.id];
-                    const t = tradeWith({ id: w.id, name: w.name, trust }, null);
+                    const any = tradeWith({ id: w.id, name: w.name, trust }, null);
+                    // Every flip: the card's numbers are the desk's. There the item on the desk leads - so here too
+                    // (the item planned with them, else the biggest).
+                    const lead = any && any.every ? (sell.selected && sell.tradePick.get(String(sell.selected)) === 'id:' + w.id ? String(sell.selected) : any.main) : null;
+                    const t = lead ? tradeWith({ id: w.id, name: w.name, trust }, lead) : any;
                     // The main flip; a trade of your To sell items only is named by the first of them.
                     const main = (t && t.main ? t.flips.find((r) => r.itemId === String(t.main)) : null) || (t ? t.held.find((r) => r.units > 0) : null) || null;
                     // A favourite that Buyers online only / Trusted buyers only leaves out stays in its row,
@@ -34265,6 +39768,7 @@
                         mainId: main ? main.itemId : null,
                         mainName: main ? nameOf(main.itemId) : null,
                         mainUnits: main ? main.units : 0,
+                        every: Boolean(t && t.every),
                         itemIds: t ? t.flips.map((r) => r.itemId) : [],
                     });
                 }
@@ -34277,6 +39781,7 @@
             }
         }
 
+        redrawStage('7 Your traders');
         let desk = null;
         const pick = sell.selected;
         if (pick) {
@@ -34324,6 +39829,8 @@
                     error: b ? b.error : null,
                 },
                 plan: planOf(pick),
+                // Shared: a friend is going for this item, or bought part of its plan (said, never a lock).
+                friend: friendOf(pick, planOf(pick)),
                 planWhy: b && b.at ? null : 'loading',
                 // Weapons and armour: every copy has its own stats, so no flip (say why).
                 statItem: isStatItem(item),
@@ -34331,6 +39838,11 @@
                 market: { state: m && m.at ? 'ok' : m && m.error ? 'error' : 'loading', lowest: m ? m.lowest : null },
             };
             desk.trade = tradeDesk(pick, buyers);
+            // Flips > By trader: everything the trader of the trade on show buys, beside the cheapest bazaar.
+            const shownTrade = desk.trade && (desk.trade.chosen || desk.trade.accepted);
+            if (shownTrade && shownTrade.buyer && sell.bdPage === 'flips' && sell.bdTab === 1) {
+                desk.trade.buys = tradeItemsOf(shownTrade.buyer).map(({ id, fb }) => ({ itemId: String(id), name: nameOf(id), bid: fb.price, ask: lowestOf(id) || null }));
+            }
             sell.lastTrade = desk.trade;
             if (held) loadSellMarket(pick);
         }
@@ -34340,9 +39852,12 @@
             sell.tradeActive = false;
             sell.heldEdit = null;
         }
+        // Asked for one redraw only: a plan that could not be made is not waited for.
+        sell.holdWanted = null;
 
         // Pinned trades, on top of the list: the main flip, the trader, and the profit now.
         const deskKey = desk && desk.trade && desk.trade.chosen ? desk.trade.chosen.key : null;
+        redrawStage('8 the desk');
         // A trader blacklisted after the pin: the pin is not shown (it stays stored, for Undo).
         const pinned = Object.entries(sellPinned(now)).filter(([, t]) => !blacklist.has(t.key)).map(([k, t]) => {
             const bidOf = (id) => {
@@ -34408,10 +39923,33 @@
             const top = buyersOf(l.itemId).find((b) => !l.from || String(b.name).toLowerCase() !== String(l.from).toLowerCase()) || null;
             return { ...l, best: top ? { name: top.name, price: top.price } : null, gain: top ? (top.price - l.each) * l.qty : null };
         });
+        // What you hold, at what traders pay now (Today, and My items' totals): whatever the search box says.
+        const holdRows = [...heldQty].filter(([, n]) => n > 0).map(([id, n]) => {
+            const avg = itemOf(id) ? Number(itemOf(id).marketValue) || null : null;
+            const top = buyersOf(id)[0] || null;
+            const bid = avg > 0 ? listBid(buyersOf(id), avg) : top ? top.price : 0;
+            return { itemId: String(id), name: nameOf(id), held: n, worth: n * (bid || 0) };
+        }).sort((a, b) => b.worth - a.worth || String(a.name).localeCompare(String(b.name)));
+        const hold = {
+            items: holdRows.reduce((a, r) => a + r.held, 0),
+            kinds: holdRows.length,
+            paidKinds: holdRows.filter((r) => r.worth > 0).length,
+            worth: holdRows.reduce((a, r) => a + r.worth, 0),
+            top: holdRows.slice(0, 4),
+        };
+        redrawStage('9 pins shown, Trades tab, counts');
         const pageT0 = perfNow();
         sell.drew = true;
+        // What this redraw shows: where a hold begins from, if he presses Plan trade now.
+        keepHoldsNow(now);
+        sell.shownRows = rowsAll;
+        sell.shownCards = strip.filter((f) => f.plan);
+        sell.shownQ = q;
         sell.page.render({
             strip,
+            // A trade stays still: who the list is held for and the deals waiting - and the line said once when it ends.
+            still: sell.still ? { trader: sell.still.trader, waiting: stillWaits, now } : null,
+            stillEnded: stillEnded(sell.stillEnded, now),
             pinned,
             leftovers: leftShown,
             // The To sell tab: its rows, and its board (beside the list until a row is picked or a trade planned).
@@ -34419,6 +39957,7 @@
             // The Trades tab: its rows by stage, and its board (beside the list until a trade is opened).
             trades: { ...tradesView, open: sell.filter === 'trades' && sell.boardOpen },
             ledger: ledgerView(),
+            hold,
             scan,
             blacklist: sellBlacklist(),
             itemNameOf: (id) => nameOf(id),
@@ -34428,7 +39967,16 @@
             },
             networth: networthMap(),
             // A flip row says what you buy at and what the trader pays (the owner: "it doesn't say how much the bazaar sells it for and how much the trader buys it for").
-            list: listed.slice(0, sell.allShown).map((r) => ({ itemId: r.itemId, name: r.name, held: r.held, lowest: r.lowest, badge: r.badge, pending: r.pending, buy: r.badge && r.badge.kind === 'flip' && r.plan ? r.plan.firstPrice : null, sell: r.badge && r.badge.kind === 'flip' && r.plan && r.plan.buyer ? r.plan.buyer.price : null })),
+            list: listed.slice(0, sell.allShown).map((r) => ({ itemId: r.itemId, name: r.name, held: r.held, lowest: r.lowest, badge: r.badge, pending: r.pending, still: r.still || null,
+                // Shared: your own mark as you see it, else a friend's on a flip (the row stays where its profit puts it).
+                mark: ownGoing.has(r.itemId) ? { kind: 'you', text: 'You are on this' } : r.badge && r.badge.kind === 'flip' && friendGoing.has(r.itemId) ? { kind: 'friend', text: sharedOnThis(friendGoing.get(r.itemId), now) } : null,
+                buy: r.badge && r.badge.kind === 'flip' && r.plan ? r.plan.firstPrice : null, sell: r.badge && r.badge.kind === 'flip' && r.plan && r.plan.buyer ? r.plan.buyer.price : null,
+                // The row as a line of a table (3.25.0): how many, from how many bazaars, to whom - and who pays most for one.
+                units: r.plan && r.plan.units > 0 ? r.plan.units : 0,
+                stops: r.plan && r.plan.units > 0 ? new Set((r.plan.steps || []).map((st) => st.sellerId || st.sellerName)).size : 0,
+                to: r.plan && r.plan.units > 0 && r.plan.buyer ? { id: r.plan.buyer.id || null, name: r.plan.buyer.name, old: oldList(r.plan.buyer, listAtOf, now) } : null,
+                top: r.best ? { id: r.best.id || null, name: r.best.name, price: r.best.price } : null,
+                bid: r.bid || (r.best ? r.best.price : 0) })),
             listTotal: listed.length,
             counts,
             filter: sell.filter,
@@ -34440,7 +39988,8 @@
             info: {
                 hasKey: Boolean(getSellKey()),
                 keyAccess: access && access.name,
-                keyError: sell.keyError,
+                // Rejected: Torn's reason and when it is tried again, as it is now.
+                keyError: (sell.keyDead && keyDeadWords(gmGet(STORE_SELL_KEY_DEAD, null), 'Limited', Date.now())) || sell.keyError,
                 hasTeKey: Boolean(teKey),
                 teSameAsLimited: Boolean(teKey) && teKey === getSellKey(),
                 teError: st.error || null,
@@ -34461,6 +40010,10 @@
                 heldCount,
                 w3bKnown: stats.total,
                 w3bRead: stats.total - stats.unchecked,
+                // Settings › Shared.
+                shared: sharedLink ? sharedLink.status(now) : null,
+                // Beside Torn Archive while it is in front: said once, in the sidebar.
+                beside: besideLine(gmGet(STORE_BESIDE, null), now),
                 bazaarsAt: sell.summaryAt || null,
                 bazaarsError: sell.summaryError,
                 flipsChecked,
@@ -34533,8 +40086,47 @@
         if (error && Number(error.code) === TORN_ERROR_ACCESS_LEVEL) {
             return 'This key cannot read your inventory. It needs Limited access.';
         }
-        if (isKeyDeadError(error)) return 'Torn rejected this key. Paste a new Limited key.';
+        if (isKeyDeadError(error)) return keyDeadWords(keyDeadMark(gmGet(STORE_SELL_KEY_DEAD, null), keyRejectedCode(error), Date.now()), 'Limited', Date.now());
         return redactKey((error && error.message) || String(error), getSellKey());
+    }
+
+    /** Torn rejected Torn Bids' key (its own answer only): its requests stop, and it is tried again by itself. */
+    function markSellKeyDead(error) {
+        const code = keyRejectedCode(error);
+        if (code === null) return;
+        const now = Date.now();
+        const state = keyDeadMark(gmGet(STORE_SELL_KEY_DEAD, null), code, now);
+        if (!sell.keyDead) logProblem('error', 'Torn rejected Torn Bids\' key', 'error ' + code + ': ' + redactKey((error && error.message) || '', getSellKey()) + ' - the key is tried again by itself');
+        sell.keyDead = true;
+        sell.keyError = keyDeadWords(state, 'Limited', now);
+        gmSet(STORE_SELL_KEY_DEAD, state);
+    }
+
+    function retrySellKey() {
+        if (!sell.keyDead || !getSellKey() || !sell.client) return;
+        retryDeadKey({
+            store: STORE_SELL_KEY_DEAD,
+            busy: sellKeyRetry,
+            name: 'Torn Bids\' key',
+            ask: () => sell.client.get('key', { selections: 'info' }, { tag: 't.setup' }),
+            onBack: () => {
+                sell.keyDead = false;
+                sell.keyError = null;
+                (async () => {
+                    try {
+                        if (!sell.index) await loadSellIndex();
+                    } catch (error) {
+                        sell.keyError = sellKeyErrorText(error);
+                        if (isKeyDeadError(error)) markSellKeyDead(error);
+                    }
+                    await loadSellInventory({ force: true });
+                    loadSelfId();
+                    await refreshSellTraders();
+                    renderSelling(true);
+                })();
+            },
+            onStill: () => renderSelling(),
+        });
     }
 
     async function loadSellInventory({ force = false } = {}) {
@@ -34575,10 +40167,7 @@
             sell.keyError = sellKeyErrorText(error);
             // Not again for a while; a rejected key, not until a new one is saved.
             sell.inventoryRetryAt = Date.now() + INVENTORY_RETRY_MS;
-            if (isKeyDeadError(error)) {
-                sell.keyDead = true;
-                gmSet(STORE_SELL_KEY_DEAD, true);
-            }
+            if (isKeyDeadError(error)) markSellKeyDead(error);
         } finally {
             sell.loading = false;
             renderSelling();
@@ -34812,11 +40401,7 @@
                     saveSellNetworth();
                 })
                 .catch((error) => {
-                    if (isKeyDeadError(error)) {
-                        sell.keyDead = true;
-                        sell.keyError = sellKeyErrorText(error);
-                        gmSet(STORE_SELL_KEY_DEAD, true);
-                    }
+                    if (isKeyDeadError(error)) markSellKeyDead(error);
                     rec.retryAt = Date.now() + SELL_NETWORTH_RETRY_MS;
                 })
                 .finally(() => {
@@ -34859,11 +40444,7 @@
                     }
                 })
                 .catch((error) => {
-                    if (isKeyDeadError(error)) {
-                        sell.keyDead = true;
-                        sell.keyError = sellKeyErrorText(error);
-                        gmSet(STORE_SELL_KEY_DEAD, true);
-                    }
+                    if (isKeyDeadError(error)) markSellKeyDead(error);
                     s.retryAt = Date.now() + PRESENCE_RETRY_MS;
                 })
                 .finally(() => {
@@ -35031,12 +40612,16 @@
      * buyers read before anything else, one read a second as every other.
      */
     const SELL_REFRESH_FIRST = 25;
+    /** After Torn Bids opens with a trade under way, the list is not held before its flips are checked - or this long. */
+    const STILL_SETTLE_MS = 90000;
 
     function onSellRefresh() {
         logAction('Refresh (Torn Bids)');
         const looking = [...new Set([sell.selected, ...(sell.viewIds || [])].filter(Boolean).map(String))];
         sell.refreshQueue = looking.flatMap((id) => [{ kind: 'bazaars', id }, { kind: 'buyers', id }]);
         sell.refreshAt = Date.now();
+        // A held list (a trade under way) lets its waiting deals in, and sorts.
+        sell.stillLet = true;
         for (const s of sell.presence.values()) s.fetchedAt = 0;
         // Lists of traders buying what you hold are read again first.
         const held = heldIds();
@@ -35056,6 +40641,36 @@
     }
 
     /** "X accepted": the trade on the desk is frozen (core/accepted.js acceptTrade), from the desk or the Trades board. */
+    /*
+     * A reload must not lose the trade you are in (3.25.0): the held trades, who each of their items is
+     * planned with, and "every flip" - kept for this tab, put back when Torn Bids starts. A hold older
+     * than HOLD_MS is let go, as always.
+     */
+    const HELD_SESSION = 'ttv2-held';
+    let heldKeptText = '';
+    function keepHoldsNow(now) {
+        try {
+            const text = JSON.stringify(keepHolds({ holds: sell.tradeHold, picks: sell.tradePick, every: sell.tradeEvery }, now));
+            if (text === heldKeptText) return;
+            heldKeptText = text;
+            sessionStorage.setItem(HELD_SESSION, text);
+        } catch {
+            // No session storage: the trade is then held for this page only, as before.
+        }
+    }
+
+    function restoreHolds(now = Date.now()) {
+        try {
+            const kept = keptHolds(JSON.parse(sessionStorage.getItem(HELD_SESSION) || 'null'), now);
+            for (const [key, h] of kept.holds) sell.tradeHold.set(key, h);
+            for (const [id, key] of kept.picks) sell.tradePick.set(id, key);
+            for (const key of kept.every) sell.tradeEvery.add(key);
+            if (kept.holds.length) logProblem('note', 'After a reload: ' + kept.holds.length + (kept.holds.length === 1 ? ' held trade' : ' held trades') + ' put back');
+        } catch {
+            // Junk in the store: nothing is put back.
+        }
+    }
+
     function acceptDeskTrade(itemId) {
         logAction('Pressed accepted (item ' + itemId + ')');
         const t = sell.lastTrade && sell.lastTrade.chosen;
@@ -35079,6 +40694,7 @@
         if (rec) gmSet(STORE_SELL_PRICE_RECORDS, addPriceRecord(gmGet(STORE_SELL_PRICE_RECORDS, []), rec));
         // Accepted takes over from the held plan, and from waiting for their yes.
         sell.tradeHold.delete(holdKey(itemId, acc.key));
+        sell.tradeEvery.delete(acc.key);
         dropSellAsked(itemId, acc.key);
         sell.selected = String(itemId);
         sell.pickedByYou = true;
@@ -35131,11 +40747,42 @@
         else location.assign(url);
     }
 
+    /** Torn Bids' page while NPC Arbitrage is on: one sentence and one button. No client, no timer, no request. */
+    function bootSellingClosed() {
+        logProblem('note', 'Torn Bids opened while NPC Arbitrage is on: it stays closed and reads nothing');
+        flushProblemLog();
+        mountBidsClosed({
+            onTurnOn: () => {
+                logAction('Turned Torn Bids on, from its page');
+                flushProblemLog();
+                gmSet(STORE_JOB, JOB_BIDS);
+                location.reload();
+            },
+        });
+        // Turned on from a Torn tab, or a trade came to be going: this page starts.
+        const start = () => {
+            if (jobRead() === JOB_BIDS) location.reload();
+        };
+        gmOnChange(STORE_JOB, start);
+        gmOnChange(STORE_SELL_ACCEPTED, start);
+    }
+
     function bootSellingPage() {
+        // The switch turned to NPC Arbitrage in a Torn tab (it cannot while a trade is going): this page closes.
+        // A reload starts it closed - nothing of it is left running to ask for anything.
+        gmOnChange(STORE_JOB, () => {
+            if (jobRead() === JOB_BIDS) return;
+            logProblem('note', 'NPC Arbitrage was turned on: Torn Bids closes');
+            flushProblemLog();
+            location.reload();
+        });
+        // Opened by hand or from the panel: the store says Torn Bids from here on (it was only the start's guess, or a trade's lock).
+        if (gmGet(STORE_JOB, null) !== JOB_BIDS) gmSet(STORE_JOB, JOB_BIDS);
         sell.client = new TornApiClient({
             getKey: getSellKey,
             ...tornSharing('sell'),
         });
+        startShared('sell', sharedWantSell, () => renderSelling());
         loadSellNetworth();
         loadSellPresence();
         gmOnChange(STORE_SELL_PRESENCE, () => loadSellPresence());
@@ -35166,8 +40813,10 @@
         restoreActivity();
         restoreListAt();
         markBidsSeen();
-        sell.keyDead = Boolean(gmGet(STORE_SELL_KEY_DEAD, false));
-        if (sell.keyDead) sell.keyError = 'Torn rejected this key. Paste a new Limited key.';
+        frontWatch(STORE_FRONT_BIDS);
+        besideWatch();
+        sell.keyDead = Boolean(keyDeadRead(gmGet(STORE_SELL_KEY_DEAD, null)));
+        if (sell.keyDead) sell.keyError = keyDeadWords(gmGet(STORE_SELL_KEY_DEAD, null), 'Limited', Date.now());
 
         loadTraderDb();
         // Start from TornW3B's public traders, so no one source (or key) is
@@ -35193,6 +40842,7 @@
         // (3.8.1 kept "That is a Torn key" forever) would outlive its cause.
         if (teState().error) setTeState({ error: null });
 
+        restoreHolds();
         sell.page = new SellingPage({
             onSaveKey: onSellSaveKey,
             onForgetKey: onSellForgetKey,
@@ -35220,6 +40870,19 @@
             // and what you keep of your own (remembered in the prefs).
             onTradePick: (itemId, key) => {
                 logAction('Plan trade on item ' + itemId);
+                // Held at this press (3.25.0): as the desk draws it now, or - planned from a trader's row, the
+                // board or another item - as the next redraw draws it.
+                const hk = holdKey(itemId, key);
+                if (!sell.tradeHold.has(hk) && !sellPinned()[hk]) {
+                    const shown = sell.lastTrade && sell.lastTrade.chosen;
+                    if (shown && shown.key === key && !shown.hold && String(sell.selected) === String(itemId)) {
+                        sell.tradeHold.set(hk, { trade: holdTrade(shown, itemId), touched: Date.now() });
+                        sell.sharedWantAt = 0;
+                        if (sharedLink) sharedLink.askSoon(sharedWaitingHere());
+                    } else {
+                        sell.holdWanted = { itemId: String(itemId), key };
+                    }
+                }
                 sell.tradePick.set(String(itemId), key);
                 sell.selected = String(itemId);
                 sell.pickedByYou = true;
@@ -35234,11 +40897,42 @@
             // Planning pressed again (3.20.2, the owner): the plan with them comes off
             // the desk - not declined, nothing kept - and the desk shows the best
             // trade again. A pin stays until you unpin it.
+            // "Let them in now" on the amber line: the new deals come in and the rows sort, once. The trade goes on.
+            onStillLet: () => {
+                logAction('Let the new deals in');
+                sell.stillLet = true;
+                renderSellingNow();
+            },
             onTradeUnpick: (itemId, key) => {
                 logAction('Unplanned trade on item ' + itemId);
                 const id = String(itemId);
                 if (sell.tradePick.get(id) === key) sell.tradePick.delete(id);
                 sell.tradeHold.delete(holdKey(id, key));
+                sell.tradeEvery.delete(key);
+                renderSellingNow();
+            },
+            /*
+             * "Every flip" on a Your traders card or on the trade's card (3.25.0; the owner: "option to
+             * find all possible flips for that trader ... as long as its in the 10k limit and its a flip
+             * should be good to go"): the trade with them is planned again, whole - every item they buy
+             * that a bazaar sells for less - and held as it is drawn. Pressed again: the usual plan.
+             */
+            onTradeEvery: (itemId, key, on) => {
+                if (!itemId || !key) return;
+                logAction((on ? 'Every flip with one trader' : 'Back to the usual plan') + ' (item ' + itemId + ')');
+                if (on) sell.tradeEvery.add(key);
+                else sell.tradeEvery.delete(key);
+                // What was held was the other plan: it goes, and the new one is held at the next redraw. A pin stays as pinned.
+                sell.tradeHold.delete(holdKey(itemId, key));
+                sell.tradeSeen.delete(String(itemId) + '|' + key);
+                sell.holdWanted = { itemId: String(itemId), key };
+                sell.tradePick.set(String(itemId), key);
+                sell.selected = String(itemId);
+                sell.pickedByYou = true;
+                sell.statusPressed = true;
+                sell.boardOpen = false;
+                if (sellDeclined().has(declineKey(itemId, key))) setSellDeclined(declineKey(itemId, key), null);
+                rereadTraderList(key);
                 renderSellingNow();
             },
             onTradePin: (itemId, key) => {
@@ -35255,7 +40949,12 @@
                     const shown = sell.lastTrade && sell.lastTrade.chosen;
                     if (h) h.touched = Date.now();
                     // Held at this press, as drawn - before any tick or number of yours lands.
-                    else if (shown && shown.key === key && !shown.hold && !sellPinned()[k]) sell.tradeHold.set(k, { trade: holdTrade(shown, itemId), touched: Date.now() });
+                    else if (shown && shown.key === key && !shown.hold && !sellPinned()[k]) {
+                        sell.tradeHold.set(k, { trade: holdTrade(shown, itemId), touched: Date.now() });
+                        // Shared: the others are told you are on this within seconds, not at the next half minute.
+                        sell.sharedWantAt = 0;
+                        if (sharedLink) sharedLink.askSoon(sharedWaitingHere());
+                    }
                 }
             },
             // The pin on a Best flips card: pin that flip's trade, or unpin it.
@@ -35320,6 +41019,7 @@
                 setSellDeclined(declineKey(itemId, key), Date.now() + TRADE_DECLINE_MS);
                 dropSellAsked(itemId, key);
                 sell.tradeHold.delete(holdKey(itemId, key));
+                sell.tradeEvery.delete(key);
                 if (sell.tradePick.get(String(itemId)) === key) sell.tradePick.delete(String(itemId));
                 renderSellingNow();
             },
@@ -35403,6 +41103,7 @@
                 dropSellAsked(item, key);
                 // The held plan with them goes (a pin stays until you unpin it).
                 sell.tradeHold.delete(holdKey(item, key));
+                sell.tradeEvery.delete(key);
                 sell.tradePick.delete(String(item));
                 sell.pickedByYou = false;
                 renderSellingNow();
@@ -35441,6 +41142,13 @@
             },
             onSelect: onSellSelect,
             onFilter: onSellFilter,
+            // A page or a tab of Torn Bids came into view: its list is worked out (and Your traders, where they show).
+            onPage: (id, tab, filter) => {
+                sell.bdPage = String(id);
+                sell.bdTab = Number(tab) || 0;
+                if (filter && filter !== sell.filter) onSellFilter(filter);
+                else renderSellingNow();
+            },
             onQuery: onSellQuery,
             onCategory: onSellCategory,
             onMore: () => {
@@ -35486,10 +41194,10 @@
             renderSellingNow();
         });
         const onSellKeyElsewhere = () => {
-            const dead = Boolean(gmGet(STORE_SELL_KEY_DEAD, false));
+            const dead = Boolean(keyDeadRead(gmGet(STORE_SELL_KEY_DEAD, null)));
             if (dead === sell.keyDead) return renderSelling();
             sell.keyDead = dead;
-            if (dead) sell.keyError = 'Torn rejected this key (in another tab). Paste a new Limited key.';
+            if (dead) sell.keyError = keyDeadWords(gmGet(STORE_SELL_KEY_DEAD, null), 'Limited', Date.now());
             else sell.keyError = null;
             renderSelling();
         };
@@ -35511,10 +41219,7 @@
                 if (getSellKey() && !sell.keyDead) await loadSellIndex();
             } catch (error) {
                 sell.keyError = sellKeyErrorText(error);
-                if (isKeyDeadError(error)) {
-                    sell.keyDead = true;
-                    gmSet(STORE_SELL_KEY_DEAD, true);
-                }
+                if (isKeyDeadError(error)) markSellKeyDead(error);
             }
             await loadSellInventory();
             loadSelfId();
@@ -35522,6 +41227,9 @@
             renderSelling();
         })();
 
+        // A key Torn rejected: asked about again when it is due (now, if an older version left it marked).
+        retrySellKey();
+        setInterval(retrySellKey, 20000);
         setInterval(stepW3b, W3B_LIST_STEP_MS);
         setInterval(stepTeOne, TE_ONE_STEP_MS);
         setInterval(stepTeOwn, TE_ONE_STEP_MS);
@@ -35549,7 +41257,11 @@
             shareBought();
             runLedger();
         });
-        setInterval(() => runLedger(), 15000);
+        setInterval(() => {
+            retryLedgerKey();
+            runLedger();
+        }, 15000);
+        retryLedgerKey();
         // Your buys for an accepted trade, from your log - in the background too (3.16).
         led.buysClient = new LedgerClient({
             getKey: getLedgerKey,
@@ -35703,9 +41415,38 @@
         return redactKey(String((error && error.message) || error || 'Could not read your log.'), getLedgerKey());
     }
 
+    /** Torn rejected the Ledger's key, or says it is not a Full key (its own answer only): tried again by itself. */
     function markLedgerKeyDead(error) {
-        led.keyError = ledgerErrorText(error);
-        gmSet(STORE_LEDGER_KEY_DEAD, led.keyError);
+        const code = keyRejectedCode(error, { tooLow: true });
+        if (code === null) return;
+        const now = Date.now();
+        const was = gmGet(STORE_LEDGER_KEY_DEAD, null);
+        const state = keyDeadMark(was, code, now);
+        if (!was) logProblem('error', 'Torn rejected the Ledger\'s key', 'error ' + code + ': ' + ledgerErrorText(error) + ' - the key is tried again by itself');
+        led.keyError = keyDeadWords(state, 'Full', now);
+        gmSet(STORE_LEDGER_KEY_DEAD, state);
+    }
+
+    function retryLedgerKey() {
+        if (!getLedgerKey() || !led.client || !gmGet(STORE_LEDGER_KEY_DEAD, null)) return;
+        retryDeadKey({
+            store: STORE_LEDGER_KEY_DEAD,
+            busy: ledgerKeyRetry,
+            name: 'the Ledger\'s key',
+            tooLow: true,
+            ask: async () => {
+                const info = await fetchLedgerKeyInfo(led.client);
+                // Torn answered, and it is still not a Full key.
+                if (!isFullKey(info)) throw new TornApiError('Not a Full key.', { code: 16, fromTorn: true });
+            },
+            onBack: () => {
+                led.keyError = null;
+                led.nextAt = 0;
+                runLedger();
+                renderSelling(true);
+            },
+            onStill: () => renderSelling(),
+        });
     }
 
     /** Save a key only when Torn says it is a Full key; anything else is refused, with why. */
@@ -35864,7 +41605,7 @@
                     try {
                         full = await fetchTrade(led.client, t.id);
                     } catch (error) {
-                        if (error && (KEY_DEAD_CODES.has(error.code) || error.code === 16 || error.code === 5)) throw error;
+                        if (error && (keyRejectedCode(error, { tooLow: true }) !== null || error.code === 5)) throw error;
                         // One trade Torn will not give: tried 3 times, then passed over.
                         fails[t.id] = (fails[t.id] || 0) + 1;
                         data.tradeFails = fails;
@@ -35907,7 +41648,7 @@
                 led.nextAt = 0;
                 reloadLedger();
             } else {
-                if (error && (KEY_DEAD_CODES.has(error.code) || error.code === 16)) markLedgerKeyDead(error);
+                markLedgerKeyDead(error);
                 led.error = ledgerErrorText(error);
                 led.nextAt = Date.now() + LEDGER_EVERY_MS;
                 saveLedger();
@@ -36074,7 +41815,7 @@
             // This tab is not told of its own write: its accepted cards show the buys now.
             if (document.visibilityState === 'visible') renderSelling();
         } catch (error) {
-            if (error && (KEY_DEAD_CODES.has(error.code) || error.code === 16)) markLedgerKeyDead(error);
+            markLedgerKeyDead(error);
             // Torn asked to slow down, or a pause is on: a longer wait; the next read catches up.
             if (error && (error.code === 5 || error.paused)) led.buysNextAt = Date.now() + 3 * BUYS_EVERY_MS;
             gmSet(STORE_SELL_LOG_BUYS, { ...(gmGet(STORE_SELL_LOG_BUYS, null) || stored), state: 'error', at: Date.now() });
@@ -36204,7 +41945,7 @@
             gmSet(STORE_SELL_TRADES_SEEN, { at: Date.now(), seen, used: [...used].slice(-200) });
             if (changed) renderSellingNow();
         } catch (error) {
-            if (error && (KEY_DEAD_CODES.has(error.code) || error.code === 16)) markLedgerKeyDead(error);
+            markLedgerKeyDead(error);
             // Torn asked to slow down, or a pause is on: a longer wait.
             if (error && (error.code === 5 || error.paused)) led.tradedNextAt = Date.now() + 3 * every;
         } finally {
@@ -36219,6 +41960,8 @@
      * is made the first time there is something to ask.
      */
     function watchFinishedTradesHere() {
+        // Torn Bids closed (NPC Arbitrage is on): its Full key asks nothing from a Torn tab.
+        if (!bidsOn()) return;
         if (document.visibilityState !== 'visible' || !getLedgerKey()) return;
         if (!Object.keys(gmGet(STORE_SELL_ACCEPTED, null) || {}).length && !Object.keys(gmGet(STORE_SELL_CANCEL_UNDO, null) || {}).length) return;
         if (!led.buysClient) led.buysClient = new LedgerClient({ getKey: getLedgerKey, ...tornSharing('led') });
@@ -36237,7 +41980,7 @@
         const data = hasKey ? ledgerData() : null;
         return {
             hasKey,
-            keyError: gmGet(STORE_LEDGER_KEY_DEAD, null) || null,
+            keyError: keyDeadWords(gmGet(STORE_LEDGER_KEY_DEAD, null), 'Full', Date.now()),
             checking: Boolean(led.checking),
             // A refusal is said for a while, then the key's own state shows again (review: it stuck).
             saveMsg: led.saveMsg && led.saveMsg.bad && Date.now() - (led.saveMsg.at || 0) > LEDGER_MSG_MS ? null : led.saveMsg,
@@ -36337,17 +42080,24 @@
 
         // A tab opened for the traders page: this whole tab is the page.
         if (isTradersPageUrl(location.href)) {
-            bootSellingPage();
+            // One job at a time (3.25.0): with NPC Arbitrage on, Torn Bids is closed - its page starts nothing and reads nothing.
+            // Never chosen yet, and he came to this page: that is the choice. Only NPC Arbitrage turned on closes it.
+            if (gmGet(STORE_JOB, null) !== JOB_NPC || jobRead() === JOB_BIDS) bootSellingPage();
+            else bootSellingClosed();
             return;
         }
 
         injectStyles();
 
         app.settings = loadSettings();
-        app.keyDead = Boolean(gmGet(STORE_KEY_DEAD, false));
+        app.keyDead = Boolean(keyDeadRead(gmGet(STORE_KEY_DEAD, null)));
         gmOnChange(STORE_SETTINGS, onRemoteSettings);
+        // This Torn page's sign of life: who is in front decides who asks (core/front.js).
+        frontWatch(STORE_FRONT_PAGE);
         // A trade accepted, bought or changed in another tab: the marks and boxes follow.
         const onAcceptedElsewhere = () => {
+            // A trade said yes to keeps the panel on Torn Bids; its end frees the switch.
+            applyJob('a trade was accepted or ended');
             scanTradePage();
             if (app.pageType === PAGE_BAZAAR) rescan('another tab');
             else trackTradeBuying([]);
@@ -36369,6 +42119,7 @@
             getKey: getStoredKey,
             ...tornSharing(),
         });
+        startShared('app', sharedWantApp, () => refreshView('the feed changed'));
 
         app.panel = new Panel({
             onScan,
@@ -36386,6 +42137,7 @@
              */
             onRevealKey: () => getStoredKey(),
             onOpenSelling: () => gmOpenTab(tradersPageUrl()),
+            onJob,
             onSelectBazaarItem: (itemId) => {
                 app.bzSelected = String(itemId);
                 repaintOwnBazaar();
@@ -36397,6 +42149,8 @@
                 renderMyBazaar();
             },
             getApiUse: () => (app.client ? app.client.stats() : null),
+            getFront: () => frontWords(frontSide(frontSides(), Date.now())),
+            getSharedLine: () => (sharedLink ? sharedPanelLine(sharedLink.status(Date.now()), Date.now()) : null),
             onBuyNext,
             onTradeCancel: onOverlayTradeCancel,
             // A tick on Torn's trade page: shared with Torn Bids.
@@ -36419,6 +42173,13 @@
         });
 
         app.panel.mount();
+        applyJob();
+        // The switch turned in another tab: this one follows at once.
+        gmOnChange(STORE_JOB, () => {
+            if (!applyJob('the switch was pressed in another tab')) return;
+            rescan('another tab');
+            scanTradePage();
+        });
         app.panelShownAt = Math.round(performance.now());
         app.panel.enableHotkey();
         // Fill settings changed in another tab (or in Torn Bids): show them here too.
@@ -36437,7 +42198,7 @@
             app.panel.setStatus('Paste a Public API key to begin.', 'warn');
             app.panel.openSettings({ focusKey: !getStoredKey() });
         } else if (app.keyDead) {
-            app.panel.setStatus('Torn rejected the saved key. Paste a new Public key.', 'error');
+            app.panel.setStatus(keyDeadWords(gmGet(STORE_KEY_DEAD, null), 'Public', Date.now()), 'error');
         }
 
         window.addEventListener('hashchange', handleRouteChange);
@@ -36446,8 +42207,12 @@
         setInterval(() => {
             if (document.visibilityState !== 'visible') return;
 
-            // Never loaded yet (no key at boot, or a failed first load). A key
-            // Torn has rejected is never retried - see markKeyDead.
+            // A key Torn rejected: asked about again when it is due (once at this page's load, then hourly).
+            retryOverlayKey();
+            // The job, read again: a trade that ended by itself (a day old) frees the switch.
+            applyJob();
+
+            // Never loaded yet (no key at boot, or a failed first load).
             if (!app.index) {
                 // The trade page and the buying box need no item list: never wait for it.
                 if (isTradePage(location.href)) scanTradePage();
@@ -36455,6 +42220,9 @@
                 trackTradeBuying(null);
                 if (hasUsableKey() && !app.loading && Date.now() >= app.retryLoadAt) {
                     onScan();
+                } else if (!hasUsableKey() && loadStoredReference()) {
+                    // No key Torn takes: this page is read and marked all the same, from the list kept from before.
+                    rescan('stored item list');
                 }
                 return;
             }

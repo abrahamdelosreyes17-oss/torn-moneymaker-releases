@@ -74,9 +74,13 @@ export function declinedOn(declined, itemId) {
  * @param {string} p.filter - 'all' | 'mine' | 'flips'
  * @param {Array<{itemId}>} p.strip - the best flips, best first
  * @param {Array<{itemId}>} p.listed - the list, in its order
+ * @param {string|null} [p.underWay] - the item of the trade under way: one a trader said yes to, else one you planned
  */
-export function deskItem({ pickedByYou = false, selected = null, filter = 'all', strip = [], listed = [] }) {
+export function deskItem({ pickedByYou = false, selected = null, filter = 'all', strip = [], listed = [], underWay = null }) {
     if (pickedByYou && selected) return selected;
+    // 3.25.0: a trade under way owns the desk until you pick something else yourself. Before, a
+    // reload or a filter press in the middle of a buying run put the #1 flip there instead.
+    if (underWay) return String(underWay);
     if (filter !== 'mine' && strip.length) return strip[0].itemId;
     return listed.length ? listed[0].itemId : null;
 }
@@ -189,4 +193,22 @@ export function keepsUp(minutes, counts, budget = 60) {
     if (want <= room) return { ok: true, want, otherEvery: minutes.other };
     const left = room - counts.desk / minutes.desk - counts.top / minutes.top;
     return { ok: false, want, otherEvery: left >= 1 && counts.other > 0 ? Math.ceil(counts.other / left) : null };
+}
+
+/**
+ * The trader the desk's plan is with when you picked none (3.25.0): the one it showed last for this
+ * item, for as long as they still make a trade with it. A better one is never swapped in by itself -
+ * it is said beside the plan instead, and only when it is better by more than STEADY_MORE of the
+ * plan's profit: two traders a few dollars apart would otherwise swap the note on every price read.
+ *
+ * @param {Array<{key: string, profit: number}>} ranked - the trades that can be shown, best first
+ * @param {string|null} keptKey - the trader shown last for this item
+ * @returns {{chosen: object|null, better: object|null}}
+ */
+export const STEADY_MORE = 0.02;
+export function steadyTrader(ranked, keptKey) {
+    const best = ranked[0] || null;
+    const kept = keptKey ? ranked.find((t) => t.key === keptKey) || null : null;
+    if (!kept || kept === best) return { chosen: best, better: null };
+    return { chosen: kept, better: best.profit > kept.profit * (1 + STEADY_MORE) ? best : null };
 }

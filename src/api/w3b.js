@@ -43,6 +43,34 @@ export const W3B_SHARED_PER_MINUTE = 80;
 export const W3B_COOLDOWN_MS = 60000;
 
 /*
+ * The pace (3.25.0; the friend's zip of 2026-10-06, 3.24.1). TornW3B refused us
+ * minute after minute at a dozen requests a minute - the same hours it took 40
+ * and 43 in a minute when they came spread out. It refuses a BURST: a dozen left
+ * back to back, the last was a 429, we paused a minute, and the same dozen left
+ * again. The minute's ceilings above never saw it.
+ *
+ * So: a gap between any two requests, whichever tab makes them (the time of the
+ * last one is already shared). The gap finds its own length - a little shorter
+ * after each answer, never under its floor; after a refusal twice as long, and
+ * the pace that was refused is not tried again for two hours. After a pause the
+ * first request so goes alone and the next ones slowly.
+ */
+/** Never closer than this: 60 a minute, the ceiling of before. */
+export const W3B_GAP_MIN_MS = 1000;
+/** Where it starts, and never faster than this right after a refusal. */
+export const W3B_GAP_START_MS = 1500;
+/** Never slower than this, whatever is refused. */
+export const W3B_GAP_MAX_MS = 8000;
+/** Shorter by this after each answer. */
+const W3B_GAP_STEP_MS = 25;
+/** A pace that was refused is not tried again for this long. */
+const W3B_GAP_HOLD_MS = 2 * 60 * 60 * 1000;
+/** The gap is stored for the other tabs when it has moved this much (not at every answer). */
+const W3B_GAP_SAVE_MS = 100;
+/** A request with no other in this long before it went alone: refused, it says nothing about the pace. */
+const W3B_ALONE_MS = 20000;
+
+/*
  * Torn Bids first (3.20.5, the owner: "when we're in Torn Bids, we prioritize
  * Torn Bids, not the NPC arbitrage"). The overlay on Torn's pages took up to
  * 59 of every tab's 80 reads a minute (the friend's zip); back on Torn Bids,
@@ -86,11 +114,13 @@ function w3bWhole(value, min, max) {
 }
 
 export class W3bError extends Error {
-    constructor(message, { http = null, blocked = false } = {}) {
+    constructor(message, { http = null, blocked = false, paused = false } = {}) {
         super(message);
         this.name = 'W3bError';
         this.http = http;
         this.blocked = blocked;
+        // Not sent at all: we are inside the wait a refusal started. Nothing for the problem log.
+        this.paused = paused;
     }
 }
 
@@ -113,10 +143,16 @@ export class W3bClient {
      * @param {function} [options.addShared] - (at) => void: record one slot of
      *   THIS tab only (platform/tab-window.js), so tabs never overwrite each
      *   other's; without it the whole window is written back through saveShared
+     * @param {function} [options.sharedCeiling] - () => number: every tab together, right now, when
+     *   it is lower than sharedPerMinute (Torn Bids beside Torn Archive)
      * @param {number} [options.sharedPerMinute]
      * @param {function} [options.sleep] - (ms) => Promise; injectable for tests
      * @param {function} [options.isVisible] - () => boolean; nothing is sent
      *   from a hidden tab, even a request queued while it was visible
+     * @param {boolean} [options.pace] - keep a gap between any two requests,
+     *   across tabs (the script always does; off only for the tests of other parts)
+     * @param {function} [options.onAnswered] - ({path, tag, refused}) => void, each
+     *   answer: taken, or refused (a 429 or a challenge page)
      */
     constructor({
         fetchImpl = gmFetch,
@@ -131,9 +167,21 @@ export class W3bClient {
         onSent = null,
         onFailed = null,
         perMinute = null,
+        sharedCeiling = null,
         onOver = null,
+        pace = false,
+        onAnswered = null,
+        onPace = null,
     } = {}) {
+        this.pace = Boolean(pace);
+        // This tab's own copy of the pace, for when nothing is shared; and what it has shortened the gap by since it last stored it.
+        this.paceOwn = null;
+        this.gapDebt = 0;
+        this.onAnswered = onAnswered;
+        /** A refusal changed the pace: ({was, gap, floor}, in ms) - for the log. */
+        this.onPace = onPace;
         this.perMinute = perMinute;
+        this.sharedCeiling = sharedCeiling;
         /**
          * ({count, limit, own}) => void (3.23.0): the minute every tab shares was found OVER
          * sharedPerMinute - tabs learn of each other's requests late, so two can take the same
@@ -171,7 +219,69 @@ export class W3bClient {
         if (!s || typeof s !== 'object') return out;
         if (Array.isArray(s.recent)) out.recent = s.recent.filter((x) => Number.isFinite(x) && t - x < 60000).sort((a, b) => a - b);
         if (Number.isFinite(Number(s.cooldownUntil))) out.cooldownUntil = Number(s.cooldownUntil);
+        if (s.pace && typeof s.pace === 'object') out.pace = s.pace;
         return out;
+    }
+
+    /** The pace every tab goes by: {gap, floor, floorUntil}, each within its bounds. */
+    paceNow(shared, t) {
+        const p = (this.loadShared ? shared && shared.pace : this.paceOwn) || {};
+        const within = (n, fallback) => (Number.isFinite(Number(n)) ? Math.max(W3B_GAP_MIN_MS, Math.min(W3B_GAP_MAX_MS, Math.round(Number(n)))) : fallback);
+        const floorUntil = Number.isFinite(Number(p.floorUntil)) && Number(p.floorUntil) <= t + W3B_GAP_HOLD_MS ? Number(p.floorUntil) : 0;
+        const floor = floorUntil > t ? within(p.floor, W3B_GAP_MIN_MS) : W3B_GAP_MIN_MS;
+        return { gap: Math.max(floor, within(p.gap, W3B_GAP_START_MS)), floor, floorUntil: floorUntil > t ? floorUntil : 0 };
+    }
+
+    savePace(pace, t) {
+        this.gapDebt = 0;
+        if (this.loadShared) this.writeShared({ ...this.readShared(t), pace });
+        else this.paceOwn = pace;
+    }
+
+    /** An answer came: the gap a little shorter, never under its floor. */
+    paceAnswered() {
+        if (!this.pace) return;
+        const t = this.now();
+        const pace = this.paceNow(this.readShared(t), t);
+        const gap = Math.max(pace.floor, pace.gap - this.gapDebt - W3B_GAP_STEP_MS);
+        this.gapDebt = pace.gap - gap;
+        // Stored for the other tabs once it has moved enough, or has reached its floor.
+        if (this.gapDebt >= W3B_GAP_SAVE_MS || (gap === pace.floor && this.gapDebt > 0)) this.savePace({ ...pace, gap }, t);
+    }
+
+    /** Refused: twice the gap, and the pace that was refused is not tried again for two hours. */
+    paceRefused() {
+        if (!this.pace) return;
+        const t = this.now();
+        const shared = this.readShared(t);
+        // It went alone (the first after a pause; TornW3B down, or refusing this address for
+        // someone else's requests): slower would not have helped, so the pace stays.
+        const lately = (this.loadShared ? shared.recent : this.recent).filter((at) => t - at < W3B_ALONE_MS).length;
+        if (lately <= 1) return;
+        const pace = this.paceNow(shared, t);
+        const was = Math.max(pace.floor, pace.gap - this.gapDebt);
+        const next = {
+            gap: Math.min(W3B_GAP_MAX_MS, Math.max(W3B_GAP_START_MS, was * 2)),
+            floor: Math.min(W3B_GAP_MAX_MS, Math.max(pace.floor, Math.round(was * 1.25))),
+            floorUntil: t + W3B_GAP_HOLD_MS,
+        };
+        this.savePace(next, t);
+        if (this.onPace) {
+            try {
+                this.onPace({ was: Math.round(was), gap: Math.round(next.gap), floor: Math.round(next.floor) });
+            } catch {
+                // The log is best-effort.
+            }
+        }
+    }
+
+    answered(path, tag, refused) {
+        if (!this.onAnswered) return;
+        try {
+            this.onAnswered({ path, tag, refused });
+        } catch {
+            // The usage record is best-effort.
+        }
     }
 
     writeShared(state) {
@@ -186,6 +296,18 @@ export class W3bClient {
     /** The later of this tab's wait and any other tab's. */
     blockedUntil(t = this.now()) {
         return Math.max(this.cooldownUntil, this.readShared(t).cooldownUntil);
+    }
+
+    /** Every tab's ceiling together now: sharedPerMinute, or less while sharedCeiling() says so. Never under 1. */
+    sharedNow() {
+        if (!this.sharedCeiling) return this.sharedPerMinute;
+        let n;
+        try {
+            n = Number(this.sharedCeiling());
+        } catch {
+            return this.sharedPerMinute;
+        }
+        return Number.isFinite(n) ? Math.max(1, Math.min(this.sharedPerMinute, Math.floor(n))) : this.sharedPerMinute;
     }
 
     /** This tab's ceiling now: maxPerMinute, or less while perMinute() says so. Never under 1. */
@@ -208,6 +330,8 @@ export class W3bClient {
             remaining: Math.max(0, this.limit() - used),
             coolingDown: t < this.blockedUntil(t),
             sharedLastMinute: this.loadShared ? this.readShared(t).recent.length : used,
+            // The gap every tab keeps between two requests now (null: no pace).
+            gapMs: this.pace ? this.paceNow(this.readShared(t), t).gap : null,
         };
     }
 
@@ -221,8 +345,18 @@ export class W3bClient {
             const t = this.now();
             this.recent = this.recent.filter((x) => t - x < 60000);
             const shared = this.readShared(t);
-            const sharedFull = this.loadShared && shared.recent.length >= this.sharedPerMinute;
+            const sharedMax = this.sharedNow();
+            const sharedFull = this.loadShared && shared.recent.length >= sharedMax;
             const limit = this.limit();
+            // The pace: not sooner than the gap after the last request of any tab.
+            if (this.pace) {
+                const last = Math.max(this.recent.length ? this.recent[this.recent.length - 1] : 0, shared.recent.length ? shared.recent[shared.recent.length - 1] : 0);
+                const gap = Math.max(W3B_GAP_MIN_MS, this.paceNow(shared, t).gap - this.gapDebt);
+                if (last > 0 && t >= last && t - last < gap) {
+                    await this.sleep(gap - (t - last));
+                    continue;
+                }
+            }
             if (this.onOver && this.loadShared && shared.recent.length > this.sharedPerMinute) {
                 try {
                     this.onOver({ count: shared.recent.length, limit: this.sharedPerMinute, own: this.recent.length });
@@ -242,13 +376,13 @@ export class W3bClient {
                 } else if (this.loadShared) {
                     this.writeShared({ ...shared, recent: [...shared.recent, t] });
                 }
-                return;
+                return t;
             }
 
             // Wait until every full window has a slot again.
             const frees = [];
             if (this.recent.length >= limit) frees.push(this.recent[this.recent.length - limit]);
-            if (sharedFull) frees.push(shared.recent[shared.recent.length - this.sharedPerMinute]);
+            if (sharedFull) frees.push(shared.recent[shared.recent.length - sharedMax]);
             await this.sleep(Math.max(50, 60000 - (t - Math.max(...frees)) + 25));
         }
     }
@@ -282,7 +416,8 @@ export class W3bClient {
     /** GET one TornW3B path. Serialised, rate-limited, never keyed. `tag`: what it is for (the usage record). */
     get(path, { tag = null, query = null } = {}) {
         const run = () => this.execute(path, tag, query).catch((error) => {
-            if (this.onFailed) {
+            // Paused means silent: the one real refusal is logged, not every request that was not sent.
+            if (this.onFailed && !(error && error.paused)) {
                 try {
                     this.onFailed({ path, tag, error });
                 } catch {
@@ -297,24 +432,27 @@ export class W3bClient {
     }
 
     async execute(path, tag = null, query = null) {
+        // Paused: not sent, not kept for later - whoever asked asks again when it is due.
         if (this.now() < this.blockedUntil()) {
             throw new W3bError('TornW3B is rate limiting us; paused briefly.', {
                 blocked: true,
+                paused: true,
             });
         }
 
         const url = this.buildUrl(path, query);
-        await this.waitForSlot();
+        const at = await this.waitForSlot();
         // Another tab may have been blocked while this one waited for a slot.
         if (this.now() < this.blockedUntil()) {
             throw new W3bError('TornW3B is rate limiting us; paused briefly.', {
                 blocked: true,
+                paused: true,
             });
         }
 
         if (this.onSent) {
             try {
-                this.onSent({ path, tag });
+                this.onSent({ path, tag, at });
             } catch {
                 // The usage record is best-effort.
             }
@@ -331,6 +469,8 @@ export class W3bClient {
 
         if (response.status === 429) {
             this.coolDown();
+            this.paceRefused();
+            this.answered(path, tag, true);
             throw new W3bError('TornW3B rate limit (429).', {
                 http: 429,
                 blocked: true,
@@ -344,10 +484,15 @@ export class W3bClient {
         }
 
         try {
-            return await response.json();
+            const body = await response.json();
+            this.paceAnswered();
+            this.answered(path, tag, false);
+            return body;
         } catch {
             // Cloudflare answers a challenge page with HTML, not JSON.
             this.coolDown();
+            this.paceRefused();
+            this.answered(path, tag, true);
             throw new W3bError('TornW3B returned a non-JSON page (blocked?).', {
                 blocked: true,
             });

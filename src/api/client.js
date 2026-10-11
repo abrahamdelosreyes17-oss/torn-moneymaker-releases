@@ -70,11 +70,17 @@ export const LOW_RESERVE = 20;
 const YIELDED = Symbol('yielded');
 
 export class TornApiError extends Error {
-    constructor(message, { code = null, http = null, paused = false } = {}) {
+    constructor(message, { code = null, http = null, paused = false, fromTorn = false } = {}) {
         super(message);
         this.name = 'TornApiError';
         this.code = code;
         this.http = http;
+        /**
+         * Torn's own answer ({error: {code, error}} in its reply) - not a network failure, not a
+         * pause, not this client's "No API key set". Only such an error can say a key is rejected
+         * (core/key-dead.js, 3.25.0).
+         */
+        this.fromTorn = fromTorn === true;
         /** Refused by this client during a shared pause: nothing was sent. */
         this.paused = paused;
     }
@@ -133,7 +139,16 @@ export class TornApiClient {
         addToWindow = null,
         onSent = null,
         onFailed = null,
+        mayCall = null,
+        onHeld = null,
     } = {}) {
+        /**
+         * (now, recent) => boolean, asked before a request takes its slot. Settings > Shared: the
+         * shared server reads with this person's key too, and this PC keeps to its part of the limit.
+         * `onHeld`: () => void, each time a request waits because of it.
+         */
+        this.mayCall = mayCall;
+        this.onHeld = onHeld;
         /** ({path, tag, error}) => void, a call that failed for good (not each retry): the problem log (3.15). */
         this.onFailed = onFailed;
         /** ({path, params, tag, priority}) => void, each request that leaves (retries too): the usage record. */
@@ -215,6 +230,12 @@ export class TornApiClient {
 
             // Hidden: take no slot and send nothing until the tab is back.
             if (!this.isVisible()) {
+                await apiSleep(HIDDEN_POLL_MS);
+                continue;
+            }
+
+            if (this.mayCall && !this.mayCall(now, this.recent)) {
+                if (this.onHeld) this.onHeld();
                 await apiSleep(HIDDEN_POLL_MS);
                 continue;
             }
@@ -515,7 +536,7 @@ export class TornApiClient {
         if (err) {
             throw new TornApiError(
                 'Torn API ' + err.code + ': ' + redactKey(err.error, key),
-                { code: Number(err.code) },
+                { code: Number(err.code), fromTorn: true },
             );
         }
 

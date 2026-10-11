@@ -196,6 +196,9 @@ export class Panel {
      */
     constructor(handlers = {}) {
         this.handlers = handlers;
+        // One job at a time: 'npc' (NPC Arbitrage) or 'bids' (Torn Bids), and why it is locked on Torn Bids.
+        this.job = 'npc';
+        this.jobLock = '';
         this.state = {
             rows: [],
             summary: { count: 0, totalProfit: 0, cashRequired: 0 },
@@ -233,21 +236,34 @@ export class Panel {
         });
 
         this.titleEl = el('div', { class: 'ttv2-title' });
-        this.titleTextEl = el('span', { text: 'NPC Arbitrage' });
+        // The title is the switch (3.25.0, the owner: "npc arbitradge and tornbids kinda got tangled"): the panel
+        // does one job at a time. The one that is off is closed - it shows nothing here and asks for nothing.
+        this.jobBtns = {};
+        this.jobEl = el('span', { class: 'ttv2-job', role: 'group', 'aria-label': 'What this panel does' });
+        for (const [key, label] of [['npc', 'NPC Arbitrage'], ['bids', 'Torn Bids']]) {
+            this.jobBtns[key] = el('button', { type: 'button', class: 'ttv2-jobb', text: label, onclick: () => this.pressJob(key) });
+            this.jobEl.appendChild(this.jobBtns[key]);
+        }
+        // Settings, and My bazaar on your own shop's pages, are named in its place.
+        this.titleTextEl = el('span', { class: 'ttv2-titlet' });
         // Shown only while collapsed: the headline, so a collapsed panel
         // still answers "is there anything to buy?".
         this.miniEl = el('span', { class: 'ttv2-mini' });
+        this.titleEl.appendChild(this.jobEl);
         this.titleEl.appendChild(this.titleTextEl);
         this.titleEl.appendChild(this.miniEl);
 
-        // Torn Bids: its own tab, for traders' bids and flips.
+        // Torn Bids on: the way to its page, where Scan is for NPC Arbitrage.
         this.sellBtn = el('button', {
             type: 'button',
             class: 'ttv2-sell',
             title: 'Open Torn Bids in a new tab',
-            text: 'Bids',
+            text: 'Open Torn Bids ↗',
             onclick: guarded(this, 'Bids', () => this.handlers.onOpenSelling && this.handlers.onOpenSelling()),
         });
+        // Why the switch does not turn, said under the header when its locked half is pressed.
+        this.lockEl = el('div', { class: 'ttv2-lockline', role: 'status' });
+        this.lockEl.style.display = 'none';
 
         // One button for "look again": re-reads this page and refreshes every
         // price (it used to be two, Scan and ↻, doing halves of the same job).
@@ -378,9 +394,13 @@ export class Panel {
         this.buyBoxEl = el('div', { class: 'ttv2-tradebox ttv2-buybox' });
         this.buyBoxEl.style.display = 'none';
 
+        // Torn Bids on: what this page has for your traders, in place of the deals list.
+        this.hereEl = el('div', { class: 'ttv2-here' });
+
         this.listPage = el('div', { class: 'ttv2-page ttv2-page-list' }, [
             this.tradeBoxEl,
             this.sellerEl,
+            this.hereEl,
             this.chipsEl,
             this.chipNoteEl,
             this.tabsEl,
@@ -411,7 +431,8 @@ export class Panel {
 
         // The buying run's box sits under the header, outside the pages: Next
         // is there on every page, in Settings, and with the panel collapsed.
-        this.root = el('div', { class: 'ttv2-panel' }, [this.headEl, this.buyBoxEl, this.bodyEl]);
+        this.root = el('div', { class: 'ttv2-panel' }, [this.headEl, this.lockEl, this.buyBoxEl, this.bodyEl]);
+        this.applyJob();
 
         // Esc closes an open chip editor, then Settings.
         this.root.addEventListener('keydown', (event) => {
@@ -480,7 +501,8 @@ export class Panel {
         this.listPage.style.display = this.page === 'list' ? '' : 'none';
         this.bazaarPage.style.display = this.page === 'mybazaar' ? '' : 'none';
         this.settingsBtn.setAttribute('aria-pressed', String(settings));
-        this.titleTextEl.textContent = settings ? 'Settings' : this.page === 'mybazaar' ? (this.state.bazaar && this.state.bazaar.title) || 'My bazaar' : 'NPC Arbitrage';
+        this.titleTextEl.textContent = settings ? 'Settings' : this.page === 'mybazaar' ? (this.state.bazaar && this.state.bazaar.title) || 'My bazaar' : '';
+        this.applyJob();
 
         // Opening a page from a collapsed panel should show it.
         if (this.collapsed) this.setCollapsed(false, { save: true });
@@ -494,6 +516,133 @@ export class Panel {
 
     openSettings({ focusKey = false } = {}) {
         this.showPage('settings', { focusKey });
+    }
+
+    /* -------------------------------------------- one job at a time (3.25.0) */
+
+    /**
+     * NPC Arbitrage or Torn Bids. `lock`: why it cannot be turned to NPC Arbitrage now (a trade is
+     * going), or ''.
+     */
+    setJob(job, lock = '') {
+        const next = job === 'bids' ? 'bids' : 'npc';
+        const words = lock || '';
+        if (next === this.job && words === this.jobLock) return;
+        this.job = next;
+        this.jobLock = words;
+        if (!words) this.hideLock();
+        if (next === 'bids') this.closeChipEditor();
+        this.applyJob();
+        if (this.root) {
+            this.renderBar();
+            this.fit();
+        }
+    }
+
+    /** The header, the list page and Settings as the job has them. */
+    applyJob() {
+        if (!this.root) return;
+        const bids = this.job === 'bids';
+        const list = this.page === 'list';
+        this.root.classList.toggle('ttv2-job-bids', bids);
+        this.root.classList.toggle('ttv2-job-npc', !bids);
+        // On Settings and My bazaar the page is named; the switch is on the list, and in Settings' first row.
+        this.jobEl.style.display = list ? '' : 'none';
+        this.titleTextEl.style.display = list ? 'none' : '';
+        for (const [key, btn] of Object.entries(this.jobBtns)) {
+            const on = (key === 'bids') === bids;
+            const locked = key === 'npc' && bids && Boolean(this.jobLock);
+            btn.classList.toggle('ttv2-jobb-on', on);
+            btn.classList.toggle('ttv2-jobb-lock', locked);
+            btn.setAttribute('aria-pressed', String(on));
+            btn.title = on ? (bids ? 'Torn Bids is on: NPC Arbitrage is closed and asks for nothing' : 'NPC Arbitrage is on: Torn Bids is closed and asks for nothing')
+                : locked ? this.jobLock
+                : bids ? 'Turn NPC Arbitrage on: Torn Bids closes, here and in its own tab' : 'Turn Torn Bids on: NPC Arbitrage closes';
+        }
+        for (const [key, btn] of Object.entries(this.jobSetBtns || {})) {
+            btn.classList.toggle('ttv2-jobb-on', (key === 'bids') === bids);
+            btn.classList.toggle('ttv2-jobb-lock', key === 'npc' && bids && Boolean(this.jobLock));
+            btn.setAttribute('aria-pressed', String((key === 'bids') === bids));
+        }
+        if (this.jobNoteEl) this.jobNoteEl.textContent = bids
+            ? (this.jobLock || 'Torn Bids is on. NPC Arbitrage is closed: no deals list, no Scan, and it asks for nothing.')
+            : 'NPC Arbitrage is on. Torn Bids is closed, here and in its own tab: it asks for nothing.';
+        // Scan is NPC Arbitrage's - and your own shop's pages', where it prices the rows again.
+        this.scanBtn.style.display = !bids || this.page === 'mybazaar' ? '' : 'none';
+        this.sellBtn.style.display = bids && this.page !== 'mybazaar' ? '' : 'none';
+        for (const node of this.npcSetEls || []) node.style.display = bids ? 'none' : '';
+        for (const node of this.bidsSetEls || []) node.style.display = bids ? '' : 'none';
+    }
+
+    /** A press on the switch: the half that is on does nothing, the locked half says why, the other is asked for. */
+    pressJob(key) {
+        if (key === this.job) return;
+        if (key === 'npc' && this.jobLock) {
+            this.showLock();
+            return;
+        }
+        if (this.handlers.onJob) this.handlers.onJob(key);
+    }
+
+    showLock() {
+        this.lockEl.textContent = '';
+        const cut = this.jobLock.indexOf('. ');
+        this.lockEl.append(el('b', { text: cut > 0 ? this.jobLock.slice(0, cut + 1) : this.jobLock }), cut > 0 ? this.jobLock.slice(cut + 1) : '');
+        this.lockEl.style.display = '';
+        clearTimeout(this.lockTimer);
+        this.lockTimer = setTimeout(() => this.hideLock(), 8000);
+    }
+
+    hideLock() {
+        clearTimeout(this.lockTimer);
+        if (this.lockEl) this.lockEl.style.display = 'none';
+    }
+
+    /**
+     * Torn Bids on: the list page, in place of the deals.
+     *
+     * @param {object} v
+     * @param {boolean} v.onBazaar - a bazaar page is open
+     * @param {Array<{key, name, qty, price, label, old, onShow}>} v.rows - the cards here a trusted trader pays more for
+     * @param {Array<{lead, rest}>} v.friendHere - Shared: what a friend is going for in this bazaar
+     * @param {boolean} v.trade - a trade is going (the buying run's box is under the header)
+     * @param {{items: number, kinds: number}|null} v.toSell - bought, not sold yet
+     * @param {string} v.line - the bar's words
+     */
+    renderBids(v) {
+        this.state.bidsLine = v.line || '';
+        if (!this.root) return;
+        const sig = JSON.stringify([v.onBazaar, v.rows.map((r) => [r.key, r.name, r.qty, r.price, r.label, r.old]), v.friendHere, v.trade, v.toSell, v.hasKey]);
+        if (sig !== this.hereSig) {
+            this.hereSig = sig;
+            const box = this.hereEl;
+            const keep = box.contains(this.shadow.activeElement) ? this.shadow.activeElement.dataset.here : null;
+            box.textContent = '';
+            for (const line of v.friendHere || []) box.appendChild(el('div', { class: 'ttv2-friendline' }, [el('b', { text: line.lead }), document.createTextNode(' · ' + line.rest)]));
+            if (v.onBazaar) {
+                box.appendChild(el('div', { class: 'ttv2-here-h' }, [el('span', { class: 'ttv2-label', text: 'In this bazaar' }), el('span', { class: 'ttv2-sub', text: v.rows.length ? v.rows.length + (v.rows.length === 1 ? ' card a trusted trader pays more for' : ' cards a trusted trader pays more for') : '' })]));
+                for (const r of v.rows) {
+                    box.appendChild(el('div', { class: 'ttv2-here-r' }, [
+                        el('span', { class: 'ttv2-here-n' }, [el('b', { text: r.name }), document.createTextNode(r.qty > 1 ? ' × ' + r.qty.toLocaleString('en-US') : '')]),
+                        el('span', { class: 'ttv2-here-l' + (r.old ? ' ttv2-here-old' : ''), title: r.old ? 'Their price is from a list not changed in over a day' : '', text: r.label }),
+                        el('button', { type: 'button', class: 'ttv2-link', 'data-here': r.key, title: 'Brings its card into view on Torn\'s page. Nothing is clicked for you.', text: 'Show', onclick: () => r.onShow && r.onShow() }),
+                    ]));
+                }
+                if (!v.rows.length) box.appendChild(el('div', { class: 'ttv2-note', text: 'Nothing here a trusted trader pays more for.' }));
+            }
+            if (!v.trade) box.appendChild(el('div', { class: 'ttv2-note ttv2-here-none', text: 'No trade accepted. Pick one in Torn Bids and the buying run shows here.' }));
+            if (v.toSell && v.toSell.items > 0) {
+                box.appendChild(el('div', { class: 'ttv2-here-sell' }, [
+                    el('span', {}, [el('b', { text: 'To sell' }), document.createTextNode(' · ' + v.toSell.items.toLocaleString('en-US') + (v.toSell.items === 1 ? ' item' : ' items') + ' bought, not sold')]),
+                    v.toSell.url ? el('a', { class: 'ttv2-link', href: v.toSell.url, title: 'Opens your bazaar\'s add page', text: 'Your bazaar' }) : null,
+                ]));
+            }
+            if (keep) {
+                const node = [...box.querySelectorAll('[data-here]')].find((n) => n.dataset.here === keep);
+                if (node) node.focus({ preventScroll: true });
+            }
+        }
+        this.renderBar();
     }
 
     /* ------------------------------------------------------------ chips */
@@ -797,6 +946,16 @@ export class Panel {
             onclick: () => this.handlers.onForgetKey && this.handlers.onForgetKey(),
         });
 
+        // The switch, here too: Settings and My bazaar name themselves in the header.
+        this.jobSetBtns = {};
+        const jobRow = el('span', { class: 'ttv2-job ttv2-job-set', role: 'group', 'aria-label': 'What this panel does' });
+        for (const [key, label] of [['npc', 'NPC Arbitrage'], ['bids', 'Torn Bids']]) {
+            this.jobSetBtns[key] = el('button', { type: 'button', class: 'ttv2-jobb', text: label, onclick: () => this.pressJob(key) });
+            jobRow.appendChild(this.jobSetBtns[key]);
+        }
+        this.jobNoteEl = note('');
+        this.settingsPage.appendChild(section('This panel does', [jobRow, this.jobNoteEl]));
+
         this.settingsPage.appendChild(
             section('API key', [
                 el('div', { class: 'ttv2-inline' }, [this.keyInput, showBtn, saveBtn]),
@@ -823,13 +982,6 @@ export class Panel {
             return { input, row };
         };
 
-        const im = check(
-            'liveFeed',
-            'Watch the Item Market anywhere',
-            el('span', { class: 'ttv2-sub', text: 'One visible Torn tab, at most 30 API calls a minute.' }),
-        );
-        this.liveFeedInput = im.input;
-
         const w3bSub = el('span', { class: 'ttv2-sub' }, [
             'Bazaar prices from ',
             el('a', { href: W3B_SITE_URL, target: '_blank', rel: 'noopener noreferrer', text: 'weav3r.dev' }),
@@ -841,13 +993,13 @@ export class Panel {
         const bz = check('useW3b', 'Watch bazaars via TornW3B', w3bSub);
         this.useW3bInput = bz.input;
 
-        // The friend's switch: every automatic NPC-deal call off at once.
-        const saveSw = check(
-            'saveCalls',
-            'NPC deals: save API calls',
-            el('span', { class: 'ttv2-sub', text: 'Turns off Item Market watching and sellers\' online status: 0 API calls. Bazaars are still watched through TornW3B, which uses none. Fill and Torn Bids are not affected.' }),
-        );
-        this.saveCallsInput = saveSw.input;
+        /*
+         * 3.25.0: "Save API calls" and "Watch the Item Market anywhere" are gone - the requests go to
+         * whatever you are looking at, by themselves (core/front.js). In their place a line that says
+         * where they are going now, and one for Shared (only where the server knows this PC).
+         */
+        this.frontEl = el('div', { class: 'ttv2-where' });
+        this.sharedLineEl = el('div', { class: 'ttv2-where ttv2-where-shared' });
 
         // Resale deals (the My bazaar / Market chips): a person may pay less
         // or never buy, so $1 is not a deal there. NPC deals keep $1.
@@ -883,8 +1035,10 @@ export class Panel {
         this.apiUseEl = el('div', { class: 'ttv2-note ttv2-apiuse' });
 
         this.settingsPage.appendChild(
-            section('Watching', [saveSw.row, im.row, bz.row, pctRow, this.apiUseEl, note('Nothing is bought, clicked or announced for you.')]),
+            section('Watching', [this.frontEl, bz.row, pctRow, this.sharedLineEl, this.apiUseEl, note('Nothing is bought, clicked or announced for you.')]),
         );
+        // NPC Arbitrage's own: watching bazaars, the least profit of a deal, how a deal opens.
+        this.npcSetEls = [bz.row, pctRow];
         this.renderApiUse();
 
         /* ---- links ---- */
@@ -896,7 +1050,9 @@ export class Panel {
         );
         this.newTabInput = nt.input;
 
-        this.settingsPage.appendChild(section('Links', [nt.row]));
+        const linksSection = section('Links', [nt.row]);
+        this.settingsPage.appendChild(linksSection);
+        this.npcSetEls.push(linksSection);
 
         /* ---- the Fill button (your bazaar's and the Item Market's own pages) ---- */
         this.fillForm = buildFillForm({
@@ -909,17 +1065,19 @@ export class Panel {
         ]);
         this.settingsPage.appendChild(this.fillSectionEl);
 
-        this.settingsPage.appendChild(
-            section('Torn Bids', [
-                note('Torn Bids has its own keys and settings.'),
-                el('button', {
-                    type: 'button',
-                    class: 'ttv2-link',
-                    text: 'Open Torn Bids',
-                    onclick: guarded(this, 'Bids', () => this.handlers.onOpenSelling && this.handlers.onOpenSelling()),
-                }),
-            ]),
-        );
+        const bidsSection = section('Torn Bids', [
+            note('Torn Bids has its own keys and settings.'),
+            el('button', {
+                type: 'button',
+                class: 'ttv2-link',
+                text: 'Open Torn Bids ↗',
+                onclick: guarded(this, 'Bids', () => this.handlers.onOpenSelling && this.handlers.onOpenSelling()),
+            }),
+        ]);
+        this.settingsPage.appendChild(bidsSection);
+        // Torn Bids' own: with NPC Arbitrage on there is no way to it from here ("no more clicking on bids").
+        this.bidsSetEls = [bidsSection];
+        this.applyJob();
     }
 
     /**
@@ -1071,7 +1229,7 @@ export class Panel {
                     text: 'Now ' + formatMoney(h.nowPrice) + ' each (planned ' + formatMoney(h.price) + ')' + (h.bid && h.nowPrice >= h.bid ? ' - not under what ' + v.trader + ' pays (' + formatMoney(h.bid) + '): skip it.' : '.'),
                 }));
             }
-            if (!v.ask) box.appendChild(el('div', { class: h.bought >= h.qty ? 'ttv2-tb-ok' : h.listed ? 'ttv2-sub' : 'ttv2-tb-warn', text: h.bought ? 'You took ' + h.bought.toLocaleString('en-US') + ' of ' + h.qty.toLocaleString('en-US') + (h.bought >= h.qty ? ' ✓' : '') : h.listed ? 'Not bought yet - or skip it: Next counts only what you took.' : buyingWhereText(h) }));
+            if (!v.ask) box.appendChild(el('div', { class: h.bought >= h.qty ? 'ttv2-tb-ok' : h.listed ? 'ttv2-sub' : 'ttv2-tb-warn', text: h.bought ? 'You took ' + h.bought.toLocaleString('en-US') + ' of ' + h.qty.toLocaleString('en-US') + (h.bought >= h.qty ? ' ✓' : '') : h.listed ? 'Not bought yet - or skip it: Next counts only what you took.' : h.unread ? 'This page has not been read: ' + h.unread + '.' : buyingWhereText(h) }));
         }
         // The listing was never seen here, so nothing could be counted: ask.
         if (v.ask && v.here) {
@@ -1092,7 +1250,8 @@ export class Panel {
             return;
         }
         // "Not here" only when it is not: a listing further down a long bazaar is still here.
-        const notHere = v.here && !v.here.listed && !['below', 'searching', 'away'].includes(v.here.where);
+        // A page that was not read says nothing about what is in it.
+        const notHere = v.here && !v.here.listed && !v.here.unread && !['below', 'searching', 'away'].includes(v.here.where);
         const label = v.here && (!v.next || v.last) ? 'Done - go to the trade' : notHere ? 'Not here - next' : v.here && v.same ? 'Next item here' : v.here ? 'Next bazaar' : 'Open the next bazaar' + (v.next && v.next.seller ? ': ' + v.next.seller : '');
         this.buyNextBtn = el('button', { type: 'button', class: 'ttv2-primary ttv2-buynext', title: this.buyHereActive ? 'Key: N' : null, onclick: () => this.handlers.onBuyNext && this.handlers.onBuyNext() }, [label, this.buyHereActive ? el('span', { class: 'ttv2-kbd', text: 'N' }) : null]);
         box.appendChild(this.buyNextBtn);
@@ -1135,6 +1294,31 @@ export class Panel {
         const s = this.handlers.getApiUse ? this.handlers.getApiUse() : null;
         const text = s ? 'Torn API calls in the last minute: ' + s.usedLastMinute + ' of 70 (all tabs; Torn allows 100).' : '';
         if (this.apiUseEl.textContent !== text) this.apiUseEl.textContent = text;
+        this.renderWhere();
+    }
+
+    /** Settings › Watching: where the requests are going now, and Shared - each redrawn only when its words change. */
+    renderWhere() {
+        const line = (box, dot, lead, rest) => {
+            const sig = lead === null ? '' : dot + '|' + lead + '|' + rest;
+            if (box.dataset.sig === sig) return;
+            box.dataset.sig = sig;
+            box.textContent = '';
+            box.hidden = lead === null;
+            if (lead === null) return;
+            box.appendChild(el('span', { class: 'ttv2-dot ttv2-dot-' + dot }));
+            box.appendChild(el('span', {}, [el('b', { text: lead }), rest ? ' ' + rest : null]));
+        };
+        if (this.frontEl) {
+            const words = this.handlers.getFront ? this.handlers.getFront() : null;
+            // The first sentence is the answer; the rest says what the other side does meanwhile.
+            const cut = words ? words.indexOf('. ') : -1;
+            line(this.frontEl, 'other', words ? (cut > 0 ? words.slice(0, cut + 1) : words) : null, words && cut > 0 ? words.slice(cut + 2) : '');
+        }
+        if (this.sharedLineEl) {
+            const shared = this.handlers.getSharedLine ? this.handlers.getSharedLine() : null;
+            line(this.sharedLineEl, 'known', shared ? shared.lead : null, shared ? '· ' + shared.rest : '');
+        }
     }
 
     /** My bazaar, scrolled to one part: 'graph' (IMA was pressed) or 'lows' (BP). */
@@ -1215,8 +1399,6 @@ export class Panel {
 
     emitSettings(partial) {
         this.state.settings = { ...this.state.settings, ...partial };
-        if (this.liveFeedInput) this.liveFeedInput.disabled = Boolean(this.state.settings.saveCalls);
-        if (this.saveCallsInput && partial.saveCalls !== undefined) this.saveCallsInput.checked = Boolean(partial.saveCalls);
         this.syncChips();
         if (this.handlers.onSettingsChange) this.handlers.onSettingsChange(partial);
     }
@@ -1484,14 +1666,6 @@ export class Panel {
 
         this.syncChips();
 
-        if (this.saveCallsInput && settings.saveCalls !== undefined) {
-            this.saveCallsInput.checked = Boolean(settings.saveCalls);
-        }
-        // Saving calls overrides watching: its tick box shows it cannot be on.
-        if (this.liveFeedInput) this.liveFeedInput.disabled = Boolean(this.state.settings.saveCalls);
-        if (this.liveFeedInput && settings.liveFeed !== undefined) {
-            this.liveFeedInput.checked = Boolean(settings.liveFeed);
-        }
         if (this.resaleMinInput && settings.resaleMinPct !== undefined && !(this.shadow && this.shadow.activeElement === this.resaleMinInput)) {
             this.resaleMinInput.value = String(settings.resaleMinPct);
         }
@@ -1547,6 +1721,17 @@ export class Panel {
             kept.set(html, old || empty);
         } else {
             want.push(this.colsEl);
+        }
+        // Shared: a friend is going for something in the bazaar you are in (said, never a lock).
+        for (const line of this.state.friendHere || []) {
+            const fresh = el('div', { class: 'ttv2-friendline' }, [el('b', { text: line.lead }), document.createTextNode(' · ' + line.rest)]);
+            const html = fresh.outerHTML;
+            const old = this.shownEls && this.shownEls.get(html);
+            const use = old && !kept.has(html) ? old : fresh;
+            if (!kept.has(html)) kept.set(html, use);
+            want.push(use);
+        }
+        if (rows.length) {
             for (const row of rows) {
                 const fresh = this.renderRow(row);
                 const html = fresh.outerHTML;
@@ -1603,6 +1788,21 @@ export class Panel {
         const showMessage =
             st.text &&
             (st.level !== 'info' || this.state.busy || now - st.at < INFO_STATUS_MS);
+
+        // Torn Bids on: no deals to count and nothing watched - the bar says what Torn Bids has here, or a message.
+        if (this.job === 'bids') {
+            this.barLeft.textContent = showMessage ? st.text : this.state.bidsLine || 'Torn Bids';
+            this.barLeft.title = showMessage ? st.text : '';
+            this.barEl.classList.toggle('ttv2-warn', Boolean(showMessage && st.level === 'warn'));
+            this.barEl.classList.toggle('ttv2-error', Boolean(showMessage && st.level === 'error'));
+            if (this.miniEl.textContent !== '') {
+                this.miniEl.textContent = '';
+                this.fit();
+            }
+            this.barRight.textContent = 'NPC Arbitrage closed';
+            this.barRight.title = 'NPC Arbitrage is closed: no deals are watched and it asks for nothing.';
+            return;
+        }
 
         this.barLeft.textContent = showMessage ? st.text : headline;
         this.barLeft.title = showMessage
@@ -1680,13 +1880,6 @@ export class Panel {
         if (!d && tab === 'bazaar' && live && !live.w3b) {
             return box('Bazaar watching is off.', 'Turn it on', () =>
                 this.emitSettings({ useW3b: true }),
-            );
-        }
-
-        // Saving API calls stops the Item Market only; bazaars stay watched.
-        if (!d && tab !== 'bazaar' && this.state.settings.saveCalls) {
-            return box('Saving API calls: the Item Market is not watched.', 'Stop saving', () =>
-                this.emitSettings({ saveCalls: false }),
             );
         }
 
@@ -1834,6 +2027,8 @@ export class Panel {
         const details = el('div', { class: 'ttv2-row-details' });
         const sep = () => document.createTextNode(' · ');
 
+        // Shared: "<Torn name> is on this · 3m".
+        if (row.friend) details.appendChild(el('span', { class: 'ttv2-friendtag', title: 'A mark, not a lock: you can still take it', text: row.friend }));
         details.appendChild(el('b', { text: formatMoney(p.listingPrice) }));
         if (row.priceAssumed) {
             details.appendChild(el('span', {
@@ -1888,6 +2083,7 @@ export class Panel {
         rowEl.ttv2Row = row;
         rowEl.dataset.ttv2At = String(this.rowTime(row) || '');
         if (row.el) rowEl.classList.add('ttv2-onpage');
+        if (row.friend) rowEl.classList.add('ttv2-row-friend');
 
         return rowEl;
     }

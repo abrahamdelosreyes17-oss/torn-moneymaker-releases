@@ -78,9 +78,14 @@ export function extrasPerTrade(setting) {
  *   extras (see above); null plans every item up to Most, the item on the desk first
  * @param {number} [p.extraItems] - Extras per trade (Settings); unset = EXTRA_ITEMS
  * @param {number} [p.maxUnits] - the most items one trade takes (TRADE_MAX_UNITS)
+ * @param {boolean} [p.everything] - every flip with this trader (3.25.0; the owner: "we sometimes
+ *   have 1 trader that just buys everything so as long as its in the 10k limit and its a flip
+ *   should be good to go"): no main flip and extras - every item they buy that a bazaar sells for
+ *   less, each up to Most per flip from every bazaar under their price, the best return first.
+ *   Your cash, what they can pay, the trade's item limit and "never their own bazaar" all hold.
  */
 export function planTrade(p) {
-    if (typeof p.kindOf === 'function') return planMainAndExtras(p);
+    if (typeof p.kindOf === 'function' && !p.everything) return planMainAndExtras(p);
     return planEverything(p);
 }
 
@@ -362,7 +367,7 @@ function planMainAndExtras({ first = null, flips = [], held = [], cash = null, m
 }
 
 /** Every item up to Most, the item on the desk first, then the most profit per $ (no kinds given). */
-function planEverything({ first = null, flips = [], held = [], cash = null, maxPerItem = FLIP_MAX_UNITS, payCap = Infinity, minPct = MIN_PROFIT_PCT, edits = {}, keep = {}, traderId = null, maxUnits = TRADE_MAX_UNITS }) {
+function planEverything({ first = null, flips = [], held = [], cash = null, maxPerItem = FLIP_MAX_UNITS, payCap = Infinity, minPct = MIN_PROFIT_PCT, edits = {}, keep = {}, traderId = null, kindOf = null, maxUnits = TRADE_MAX_UNITS }) {
     let cashLeft = cash > 0 ? cash : Infinity;
     const room = { left: maxUnits > 0 ? Math.floor(maxUnits) : 0 };
     let unitsCapped = false;
@@ -385,7 +390,8 @@ function planEverything({ first = null, flips = [], held = [], cash = null, maxP
     const route = new Set();
     let unknownStops = 0;
     const take = (c) => {
-        const r = plan.get(c.id) || { itemId: c.id, bid: c.bid, units: 0, cost: 0, profit: 0, steps: [], kind: 'fast' };
+        // Its kind, where kinds are known (the app): a held line keeps it. Nothing here is capped by it.
+        const r = plan.get(c.id) || { itemId: c.id, bid: c.bid, units: 0, cost: 0, profit: 0, steps: [], kind: typeof kindOf === 'function' ? (KIND_RANK[kindOf(c.id)] !== undefined ? kindOf(c.id) : 'normal') : 'fast' };
         const wanted = Math.min(c.s.qty, Math.floor(cashLeft / c.s.price), c.cap - r.units);
         const canPay = Math.min(wanted, Math.floor(pay.left / c.bid));
         const n = Math.min(canPay, room.left);

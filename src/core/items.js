@@ -93,6 +93,17 @@ export function isItemsCacheFresh(entry, now = Date.now(), ttl = ITEMS_TTL_MS) {
 }
 
 /**
+ * A stored entry a page can still be read with, whatever its age (3.25.0): the
+ * right shape and version. With no key Torn takes, names and ids are all that
+ * reading and marking a page need; the values in it are as old as it is.
+ */
+export function itemsCacheUsable(entry) {
+    if (!entry || typeof entry !== 'object') return false;
+    if (entry.version !== ITEMS_CACHE_VERSION) return false;
+    return Boolean(entry.items) && typeof entry.items === 'object' && Object.keys(entry.items).length > 0;
+}
+
+/**
  * Look an item up by display name. Returns null on a miss - never a guess.
  *
  * @param {object} index - from buildItemIndex

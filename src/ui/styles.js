@@ -469,6 +469,55 @@ export const PAGE_CSS = `
     font-weight: 700 !important;
 }
 
+/*
+ * Shared: a friend is going for this listing. A purple ring in place of the
+ * green (or amber) one, and "<their Torn name> is on this" where the profit
+ * label sits. Paint only, like every mark here, and never in the way of a
+ * click. The classes are repeated so these win over the rings and labels above.
+ */
+.ttv2-friend.ttv2-friend.ttv2-friend {
+    position: relative !important;
+    box-shadow:
+        inset 0 0 0 2px #b8a4ff,
+        inset 0 0 0 9999px rgba(184, 164, 255, 0.1) !important;
+}
+
+.ttv2-friend.ttv2-friend.ttv2-friend.ttv2-friend::after {
+    content: attr(data-ttv2-friend) !important;
+
+    display: block !important;
+    position: absolute !important;
+    top: -13px !important;
+    right: 4px !important;
+    left: auto !important;
+    bottom: auto !important;
+
+    width: auto !important;
+    height: auto !important;
+    min-width: 0 !important;
+    max-width: none !important;
+    margin: 0 !important;
+    padding: 1px 7px !important;
+    transform: none !important;
+
+    overflow: visible !important;
+    white-space: nowrap !important;
+    text-align: right !important;
+    opacity: 1 !important;
+    visibility: visible !important;
+    z-index: 2147483000 !important;
+
+    background: #1c1730 !important;
+    border: 1px solid rgba(184, 164, 255, 0.5) !important;
+    border-radius: 9px !important;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.5) !important;
+
+    color: #ddd3ff !important;
+    font: 700 11px/15px "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif !important;
+
+    pointer-events: none !important;
+}
+
 /* Bazaar owner status: floats at the end of the bazaar's banner line (3.20), taking no room in it. */
 .ttv2-owner {
     display: inline-flex;
@@ -1300,6 +1349,21 @@ ${TOKENS_CSS}
     font-weight: normal;
 }
 
+/* A warning or an error is read whole (3.25.0: "Torn says this key is paused ... tried again in 42 min"
+   was cut at the panel's edge): it goes onto a second line, never behind three dots. */
+.ttv2-bar.ttv2-warn,
+.ttv2-bar.ttv2-error {
+    align-items: flex-start;
+}
+
+.ttv2-bar.ttv2-warn .ttv2-bar-left,
+.ttv2-bar.ttv2-error .ttv2-bar-left {
+    white-space: normal;
+    overflow: visible;
+    text-overflow: clip;
+    overflow-wrap: anywhere;
+}
+
 .ttv2-bar-right {
     color: var(--muted);
     white-space: nowrap;
@@ -1318,6 +1382,37 @@ ${TOKENS_CSS}
 .ttv2-dot-live { background: var(--profit); }
 .ttv2-dot-warn { background: var(--warn); }
 .ttv2-dot-other { background: var(--offer); }
+.ttv2-dot-known { background: #b8a4ff; }
+
+/* Settings › Watching (3.25.0): where the requests are going now, and Shared. Each is read whole. */
+.ttv2-where {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    padding: 8px 10px;
+    border: 1px solid var(--buy-line);
+    border-radius: 10px;
+    background: var(--buy-bg);
+    font-size: 12px;
+}
+
+.ttv2-where[hidden] {
+    display: none;
+}
+
+.ttv2-where .ttv2-dot {
+    flex: 0 0 auto;
+    margin-right: 0;
+}
+
+.ttv2-where b {
+    font-weight: 600;
+}
+
+.ttv2-where-shared {
+    border-color: rgba(184, 164, 255, 0.4);
+    background: rgba(184, 164, 255, 0.1);
+}
 
 /* Seller of the bazaar you are on. */
 .ttv2-tradebox {
@@ -1764,6 +1859,41 @@ ${TOKENS_CSS}
 .ttv2-row-details .ttv2-guess {
     color: var(--warn);
     cursor: help;
+}
+
+/* Shared: a friend is going for this listing - their Torn name, in purple, first on the row's second line. */
+.ttv2-row.ttv2-row-friend {
+    border-color: rgba(184, 164, 255, 0.4);
+}
+
+.ttv2-row-friend .ttv2-row-profit {
+    color: var(--muted);
+}
+
+.ttv2-friendtag {
+    display: inline-block;
+    margin-right: 6px;
+    padding: 0 6px;
+    border-radius: 999px;
+    color: #b8a4ff;
+    background: rgba(184, 164, 255, 0.14);
+    font-weight: 600;
+    white-space: nowrap;
+}
+
+/* ...and, on that bazaar's own page, the sentence above the list. */
+.ttv2-friendline {
+    grid-column: 1 / -1;
+    padding: 6px 10px;
+    border: 1px solid rgba(184, 164, 255, 0.5);
+    border-radius: 9px;
+    background: #1c1730;
+    color: #ddd3ff;
+    font-size: 12px;
+}
+
+.ttv2-friendline b {
+    font-weight: 600;
 }
 
 /* "● Online" / "● Offline 3h" - an 8px dot and a word. */
@@ -2580,6 +2710,172 @@ ${TOKENS_CSS}
 
 .ttv2-panel.ttv2-tighter button.ttv2-tab {
     padding: 0 3px;
+}
+
+/*
+ * One job at a time (3.25.0): the title is the switch, NPC Arbitrage | Torn Bids. The half that is on
+ * reads as the title; the other is a quiet word to press; locked (a trade is going) it is struck out.
+ */
+.ttv2-job {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 2px;
+    min-width: 0;
+}
+
+.ttv2-panel button.ttv2-jobb {
+    height: 26px;
+    padding: 0 7px;
+    border: 0;
+    border-radius: 7px;
+    background: transparent;
+    color: var(--muted);
+    font: 500 12.5px/26px var(--sans);
+    letter-spacing: 0;
+    white-space: nowrap;
+    cursor: pointer;
+}
+
+.ttv2-panel button.ttv2-jobb:first-child {
+    margin-left: -7px;
+}
+
+.ttv2-panel button.ttv2-jobb:hover:not(.ttv2-jobb-on):not(:disabled) {
+    background: var(--hover);
+    color: var(--text);
+}
+
+.ttv2-panel button.ttv2-jobb.ttv2-jobb-on {
+    color: var(--text);
+    font: 400 15px/26px var(--serif);
+    cursor: default;
+}
+
+.ttv2-panel button.ttv2-jobb.ttv2-jobb-lock {
+    color: var(--muted);
+    opacity: 0.7;
+    text-decoration: line-through;
+    text-decoration-color: rgba(255, 255, 255, 0.3);
+    cursor: not-allowed;
+}
+
+.ttv2-collapsed .ttv2-jobb:not(.ttv2-jobb-on) {
+    display: none;
+}
+
+.ttv2-job.ttv2-job-set {
+    margin: 2px 0 6px;
+}
+
+.ttv2-lockline {
+    flex: 0 0 auto;
+    padding: 7px 14px;
+    border-bottom: 1px solid var(--line);
+    color: var(--muted);
+    font-size: 12.5px;
+    line-height: 1.4;
+}
+
+.ttv2-lockline b {
+    color: var(--text);
+    font-weight: 600;
+}
+
+.ttv2-collapsed .ttv2-lockline {
+    display: none;
+}
+
+/* Torn Bids on: no chips, no tabs, no deals - what this page has for your traders instead. */
+.ttv2-job-bids .ttv2-chips,
+.ttv2-job-bids .ttv2-chip-note,
+.ttv2-job-bids .ttv2-tabs,
+.ttv2-job-bids .ttv2-list,
+.ttv2-job-npc .ttv2-here {
+    display: none;
+}
+
+.ttv2-here {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 4px 0 8px;
+}
+
+.ttv2-here-h {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    padding: 8px 14px 4px;
+}
+
+.ttv2-here-r,
+.ttv2-here-sell {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto auto;
+    align-items: baseline;
+    gap: 0 10px;
+    padding: 6px 14px;
+    border-top: 1px solid var(--line);
+    font-size: 12.5px;
+}
+
+.ttv2-here-sell {
+    grid-template-columns: minmax(0, 1fr) auto;
+    margin-top: 6px;
+}
+
+.ttv2-here-n {
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+.ttv2-here-n b,
+.ttv2-here-sell b {
+    color: var(--text);
+    font-weight: 600;
+}
+
+.ttv2-here-l {
+    color: var(--muted);
+    white-space: nowrap;
+}
+
+.ttv2-here-l.ttv2-here-old::before {
+    content: "";
+    display: inline-block;
+    width: 6px;
+    height: 6px;
+    margin-right: 5px;
+    border-radius: 50%;
+    background: var(--warn);
+    vertical-align: 1px;
+}
+
+.ttv2-here .ttv2-note {
+    padding: 6px 14px;
+}
+
+.ttv2-panel.ttv2-narrow button.ttv2-jobb {
+    padding: 0 5px;
+    font-size: 12px;
+}
+
+.ttv2-panel.ttv2-narrow button.ttv2-jobb.ttv2-jobb-on {
+    font-size: 13px;
+}
+
+.ttv2-panel.ttv2-tight button.ttv2-jobb {
+    padding: 0 4px;
+    font-size: 11.5px;
+}
+
+/* The tightest step: the header names only the side that is on; the switch itself is in Settings. */
+.ttv2-panel.ttv2-tighter .ttv2-head button.ttv2-jobb:not(.ttv2-jobb-on) {
+    display: none;
+}
+
+.ttv2-panel.ttv2-tight button.ttv2-jobb.ttv2-jobb-on {
+    font-size: 12px;
 }
 
 @media (prefers-reduced-motion: reduce) {

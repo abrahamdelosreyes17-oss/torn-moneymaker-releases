@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { usageAdd, usageMerge, usageSeries, usageLabel, USAGE_MINUTES_KEPT } from '../src/core/usage.js';
+import { usageAdd, usageMerge, usageSeries, usageLabel, usageCsv, USAGE_MINUTES_KEPT } from '../src/core/usage.js';
 
 const NOW = Date.UTC(2026, 8, 29, 12, 30, 20);
 
@@ -53,4 +53,37 @@ test('Export API usage: one zip - the record, CSVs, state and a readme; no key, 
     const dv = new DataView(zip.buffer);
     assert.equal(dv.getUint32(0, true), 0x04034b50, 'a zip');
     assert.equal(dv.getUint16(zip.length - 22 + 10, true), 5, 'five files');
+});
+
+test('3.25.0: how TornW3B answered is counted beside what was sent - in the export, never in a chart or a total', () => {
+    const now = Date.UTC(2026, 9, 10, 12, 0, 30);
+    const pending = {};
+    for (let i = 0; i < 12; i++) usageAdd(pending, 'w.flips', now);
+    for (let i = 0; i < 11; i++) usageAdd(pending, 'r.w.ok', now);
+    usageAdd(pending, 'r.w.429', now);
+    const stored = usageMerge(null, pending, now);
+    const w = usageSeries(stored, { service: 'w', range: '1h', now });
+    assert.equal(w.total, 12);
+    assert.deepEqual(w.labels.map((l) => l.id), ['w.flips']);
+    for (const service of ['t', 'e']) assert.equal(usageSeries(stored, { service, range: '1h', now }).total, 0);
+    const rows = usageCsv(stored).trim().split('\n').map((r) => r.split(','));
+    assert.deepEqual(rows.slice(1).map((r) => r.slice(1)), [
+        ['TornW3B', 'Refused (429 or a blocked page)', 'r.w.429', '1'],
+        ['TornW3B', 'Answered', 'r.w.ok', '11'],
+        ['TornW3B', 'Possible flips', 'w.flips', '12'],
+    ]);
+});
+
+test('3.25.0: the shared server\'s requests are in the export under its own name - never in a chart, a total or a limit', () => {
+    const now = Date.UTC(2026, 9, 10, 12, 0, 30);
+    const pending = {};
+    for (let i = 0; i < 4; i++) usageAdd(pending, 'r.s.ok', now);
+    usageAdd(pending, 'r.s.fail', now);
+    const stored = usageMerge(null, pending, now);
+    for (const service of ['t', 'w', 'e']) assert.equal(usageSeries(stored, { service, range: '1h', now }).total, 0);
+    const rows = usageCsv(stored).trim().split('\n').map((r) => r.split(','));
+    assert.deepEqual(rows.slice(1).map((r) => r.slice(1)), [
+        ['Shared server', 'Failed or refused', 'r.s.fail', '1'],
+        ['Shared server', 'Answered', 'r.s.ok', '4'],
+    ]);
 });

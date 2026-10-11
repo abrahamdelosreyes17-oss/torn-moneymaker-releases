@@ -949,3 +949,30 @@ test('the Item Market side (the shared Torn budget) waits until someone looks at
     await a.tick();
     assert.ok(tornCalls.length >= 1);
 });
+
+test('paused means silent: while TornW3B has us wait, the feed asks nothing - and asks again when the wait is over', async () => {
+    const store = memoryStore();
+    let t = 1_000_000;
+    let refuse = true;
+    const calls = [];
+    const fetchImpl = async (url) => {
+        calls.push(url);
+        if (refuse) return { ok: false, status: 429, json: async () => ({}) };
+        return w3bServer()(url);
+    };
+    const a = makeFeed({ store, w3bFetch: fetchImpl, now: () => t });
+    await a.tick();
+    t += 5000;
+    await a.tick();
+    // The one request that was refused.
+    assert.equal(calls.length, 1);
+    for (let i = 0; i < 10; i++) {
+        t += 3000;
+        await a.tick();
+    }
+    assert.equal(calls.length, 1, 'asked ' + (calls.length - 1) + ' more times during the wait');
+    refuse = false;
+    t += 60000;
+    await a.tick();
+    assert.ok(calls.length >= 2, 'did not ask again after the wait');
+});

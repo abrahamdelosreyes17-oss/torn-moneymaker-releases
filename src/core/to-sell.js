@@ -157,6 +157,30 @@ export function whereAbovePaid(where, paidEach) {
 }
 
 /**
+ * One Where-to-sell row, as shown: its total and its plus or loss for the SAME units, so the words
+ * and the figure agree. A listing venue counted for only the first N adds the trader's price for the
+ * rest (whereToSell) - which made a venue that is a loss per piece show a plus. A loss shows only its
+ * own units.
+ *
+ * @param {{venue, each, units, total, loss?}|null} o - one option of whereAbovePaid
+ * @param {number} held
+ * @param {number} paidEach - 0 when not known: no plus or loss then
+ * @returns {{known: boolean, units: number, total: number|null, gain: number|null, loss: boolean, part: boolean}}
+ */
+export function whereRowView(o, held, paidEach) {
+    const n = held > 0 ? held : 0;
+    const paid = Number(paidEach) || 0;
+    if (!o || o.each === null || o.each === undefined) return { known: false, units: 0, total: null, gain: null, loss: false, part: false };
+    const units = o.units > 0 && o.units < n ? o.units : n;
+    const part = units < n;
+    const loss = paid > 0 && o.each <= paid;
+    const whole = o.total !== null && o.total !== undefined ? o.total : o.each * n;
+    const total = loss && part ? o.each * units : whole;
+    const gain = paid > 0 ? total - paid * (loss && part ? units : n) : null;
+    return { known: true, units, total, gain, loss, part };
+}
+
+/**
  * The board: the rows with a profit under the trader who pays most for each
  * (the biggest total first), the ones waiting, and the ones you marked "Not
  * for sale" (3.23.0).

@@ -19,6 +19,19 @@
  *                                         this one - and whether both sent the
  *                                         same requests and drew the same page
  *
+ * Rig A (2026-10-09), all of it asked for - without these the bench is as it was:
+ *     node test/bench.mjs --only friend   the scene at the friend's size (test/scenes/friend-size.js); it is
+ *                                         left out of a run of every scene, and always runs --offline
+ *     --profile                           a processor profile of each scene run (Profiler.start / Profiler.stop
+ *                                         over the same DevTools connection), summed up by test/bench-profile.mjs
+ *     --profile-out file.cpuprofile       the profile itself, to open in DevTools or read again
+ *     --profile-interval 250              microseconds between its samples (a slowed processor pays for each
+ *                                         one: at --rate 9, 250 makes a redraw two thirds longer, 1000 does not)
+ *     --offline                           the browser can look up no name but this machine's own: the item
+ *                                         pictures Torn Bids asks www.torn.com for are not fetched
+ *     --warm 330                          the friend's scene: how many TornW3B reads its warm-up makes
+ *     --scene-args "&fdb=570000"          the friend's scene: more of its own settings (see its first lines)
+ *
  * No dependencies: it starts Chrome (or Edge) itself with a throw-away
  * profile, talks to it over the DevTools protocol, and serves the repo from
  * a port of its own. Nothing leaves the machine: the harness answers every
@@ -36,6 +49,7 @@ import { dirname, resolve, extname, join, sep, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { speedExpand, speedMerge, speedText } from '../src/core/speed.js';
+import { profileReport } from './bench-profile.mjs';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const args = process.argv.slice(2);
@@ -47,6 +61,13 @@ const RATE = Number(arg('rate', 4)) || 1;
 const ONLY = arg('only', null);
 const JSON_OUT = arg('json', null);
 const SECONDS = Number(arg('seconds', 14)) || 14;
+// Rig A (2026-10-09): a processor profile of each scene, asked for; nothing changes without it.
+const PROFILE = args.includes('--profile') || args.includes('--profile-out');
+const PROFILE_OUT = arg('profile-out', null);
+const PROFILE_US = Number(arg('profile-interval', 250)) >= 50 ? Math.round(Number(arg('profile-interval', 250))) : 250;
+const OFFLINE = args.includes('--offline');
+const WARM = Number.isFinite(Number(arg('warm', 330))) ? Math.max(0, Number(arg('warm', 330))) : 330;
+const SCENE_ARGS = /^[\w=&.%-]*$/.test(arg('scene-args', '')) ? arg('scene-args', '') : '';
 // The build to compare with: a path inside the repo, as the harness page will ask for it (with / between its parts).
 const buildArg = (name) => {
     const given = arg(name, null);
@@ -115,6 +136,22 @@ const SCENES = [
         name: 'your own bazaar\'s add page',
         url: 'test/harness-live.html?ownbazaar=1&page=bazaar&ttvalues=1&awake=1&nofeed=1&bigstore=2000#/add',
         run: 'await wait(' + SECONDS * 1000 + ');',
+    },
+    {
+        // Rig A (2026-10-09): the friend's page, by his zip of 2026-10-06 - 2,825 traders, 387 items with a buyer,
+        // 150 possible flips, about 20,000 listings, stored values the size of his (test/scenes/friend-size.js).
+        // `warm` runs first with the processor as it is (the 108 seed lists, the flips' bazaars, a few items'
+        // buyers: minutes of once-a-second reads, done in seconds on the page's own clock); then the processor is
+        // slowed, a few redraws pass, `mark` begins the speed log again, and only then is the scene timed.
+        // Left out of a run of every scene (optIn): --only friend.
+        name: 'Torn Bids at the friend\'s size (2,825 traders, 387 items, 150 flips)',
+        url: 'test/harness-live.html?ttv2=traders&sellkeys=1&awake=1&scene=friend-size' + SCENE_ARGS,
+        warm: 'window.__sceneWarm = await window.__sceneWarmUp(' + WARM + ');',
+        mark: 'await window.__sceneMark();',
+        run: 'await wait(' + SECONDS * 1000 + ');',
+        timedOnly: true,
+        optIn: true,
+        offline: true,
     },
     {
         name: 'the trade page\'s add step',
@@ -221,7 +258,7 @@ async function runScene(port, base, scene, script = null) {
         await page.send('Runtime.enable');
         // A desktop window, in view (a hidden page's timers are slowed by the browser).
         await page.send('Emulation.setDeviceMetricsOverride', { width: 1600, height: 1000, deviceScaleFactor: 1, mobile: false });
-        await page.send('Emulation.setCPUThrottlingRate', { rate: RATE });
+        await page.send('Emulation.setCPUThrottlingRate', { rate: scene.warm ? 1 : RATE });
         // Script errors on the page are part of the result.
         // And the page is kept drawing frames, as a window in view is (3.19.0): a headless page that goes quiet has
         // its timers run late - the script's once-a-second read fired 74 times in 90 s, against every 1,000 ms in a
@@ -233,6 +270,21 @@ async function runScene(port, base, scene, script = null) {
         const url = base + (script ? scene.url.replace(/(#|$)/, '&script=' + script + '$1') : scene.url);
         await page.send('Page.navigate', { url });
         await within(loaded, 30000, 'loading ' + scene.name);
+        // A scene that warms up first (rig A): at this machine's own speed; then slowed, a few redraws, its log begun again.
+        if (scene.warm) {
+            const step = async (code, what) => {
+                const done = await page.send('Runtime.evaluate', { expression: '(async () => { const wait = (ms) => new Promise((r) => setTimeout(r, ms));' + code + '})()', awaitPromise: true, returnByValue: true });
+                if (done.exceptionDetails) throw new Error(scene.name + ' (' + what + '): ' + (done.exceptionDetails.exception && done.exceptionDetails.exception.description || done.exceptionDetails.text));
+            };
+            await step('await wait(1500);' + scene.warm, 'warming up');
+            await page.send('Emulation.setCPUThrottlingRate', { rate: RATE });
+            await step('await wait(6000);' + (scene.mark || ''), 'settling');
+        }
+        if (PROFILE) {
+            await page.send('Profiler.enable');
+            await page.send('Profiler.setSamplingInterval', { interval: PROFILE_US });
+            await page.send('Profiler.start');
+        }
         const body = 'const wait = (ms) => new Promise((r) => setTimeout(r, ms));' +
             'await wait(1500);' + scene.run +
             // The tab "goes": the recorder writes what it holds.
@@ -245,7 +297,9 @@ async function runScene(port, base, scene, script = null) {
             // and but for whether an item's picture has failed to load yet, sp-img-none: the browser's doing, not the script's).
             'const requests = (window.__requests || []).map((u) => String(u).replace(/key=[^&]+/g, "key=K").replace(/\\d{9,}/g, "T"));' +
             'const shape = (root) => [...root.querySelectorAll("*")].filter((e) => !/^(SCRIPT|STYLE)$/.test(e.tagName) && e.id !== "out").map((e) => e.tagName + "." + (typeof e.className === "string" ? e.className.replace(" sp-img-none", "") : "") + (e.children.length ? "" : ":" + (e.textContent || "").replace(/\\d+/g, "#").slice(0, 60)) + (e.shadowRoot ? "{" + shape(e.shadowRoot) + "}" : "")).join("|");' +
-            'return JSON.stringify({ record: store["tornTrading.v2.speedLog"] ? JSON.parse(store["tornTrading.v2.speedLog"]) : null, sizes, errors: window.__benchErrors || [], requests, dom: shape(document) });';
+            // A scene with its own counts (rig A) hands them over too.
+            'const scene = typeof window.__sceneCounts === "function" ? { warm: window.__sceneWarm || null, end: window.__sceneCounts() } : null;' +
+            'return JSON.stringify({ record: store["tornTrading.v2.speedLog"] ? JSON.parse(store["tornTrading.v2.speedLog"]) : null, sizes, errors: window.__benchErrors || [], requests, dom: shape(document), scene });';
         const began = Date.now();
         const running = page.send('Runtime.evaluate', { expression: '(async () => {' + body + '})()', awaitPromise: true, returnByValue: true, timeout: (SECONDS + 30) * 1000 });
         // A real mouse and keyboard, while the scene runs (a step whose element is not in the page is skipped).
@@ -272,12 +326,43 @@ async function runScene(port, base, scene, script = null) {
             }
         }
         const out = await running;
+        const profile = PROFILE ? (await page.send('Profiler.stop')).profile : null;
         if (out.exceptionDetails) throw new Error(scene.name + ': ' + (out.exceptionDetails.exception && out.exceptionDetails.exception.description || out.exceptionDetails.text));
-        return JSON.parse(out.result.value);
+        return profile ? { ...JSON.parse(out.result.value), profile } : JSON.parse(out.result.value);
     } finally {
         page.close();
         await fetch('http://127.0.0.1:' + port + '/json/close/' + page.id).catch(() => {});
     }
+}
+
+/** Rig A: how many Torn Bids redraws a record holds (every hour of it added up). */
+function redrawsIn(expanded) {
+    let n = 0;
+    for (const hour of Object.values((expanded && expanded.h) || {})) {
+        for (const [kind, v] of Object.entries((hour && hour.w) || {})) if (/^Torn Bids redraw \(working out/.test(kind) && Array.isArray(v)) n += Number(v[0]) || 0;
+    }
+    return n;
+}
+
+/** Rig A: what a scene says of itself - what it made, what the page held at the end, what was asked while it was timed. */
+function sceneText(scene) {
+    const line = (o) => Object.entries(o || {}).map(([k, v]) => k + ' ' + (typeof v === 'number' ? v.toLocaleString('en-US') : v)).join(', ');
+    const tasks = (scene.end && scene.end.tasks) || [];
+    const sum = tasks.reduce((a, t) => a + t[1], 0);
+    const out = ['THE SCENE (seed ' + scene.end.seed + ')'];
+    out.push('  made: ' + line(scene.end.made));
+    if (scene.warm) out.push('  after the warm-up: ' + line(scene.warm.now) + ' | asked: ' + line(scene.warm.asked));
+    out.push('  at the end: ' + line(scene.end.now));
+    out.push('  asked while timed: ' + line(scene.end.asked));
+    out.push('  the browser\'s own count of the page held up 50 ms or more while timed: ' + tasks.length + ' times, ' + sum.toLocaleString('en-US') + ' ms in all' + (tasks.length ? ', ' + Math.round(sum / tasks.length) + ' ms each, longest ' + Math.max(...tasks.map((t) => t[1])).toLocaleString('en-US') + ' ms' : ''));
+    out.push('  item pictures the page points at www.torn.com for (not fetched when offline): ' + scene.end.picturesAskedOfTorn);
+    const page = scene.end.page;
+    if (page) {
+        out.push('  the page says: ' + [...(page.pills || []), ...(page.line || [])].join(' | '));
+        out.push('  its tabs: ' + (page.chips || []).join(' | '));
+        out.push('  drawn: ' + page.elements + ' elements - ' + page.classes);
+    }
+    return out.join('\n');
 }
 
 async function main() {
@@ -285,13 +370,18 @@ async function main() {
     if (!existsSync(resolve(ROOT, 'dist/torn-trading.user.js'))) throw new Error('Build first: node build.mjs');
     const exe = findBrowser();
     if (!exe) throw new Error('No Chrome or Edge found. Set CHROME_PATH to one.');
-    const scenes = SCENES.filter((s) => !ONLY || s.name.toLowerCase().includes(String(ONLY).toLowerCase()));
+    // A scene marked optIn (rig A's) runs only when asked for by name.
+    const scenes = SCENES.filter((s) => (ONLY ? s.name.toLowerCase().includes(String(ONLY).toLowerCase()) : !s.optIn));
     if (!scenes.length) throw new Error('No scene has "' + ONLY + '" in its name.');
 
     const server = await serve();
     const base = 'http://127.0.0.1:' + server.address().port + '/';
     const profile = await mkdtemp(join(tmpdir(), 'torn-bench-'));
-    const browser = spawn(exe, ['--headless=new', '--remote-debugging-port=0', '--user-data-dir=' + profile, '--no-first-run', '--no-default-browser-check', '--disable-extensions', '--window-size=1600,1000', 'about:blank'], { stdio: 'ignore' });
+    // --offline (and a scene that asks for it): no name is looked up but this machine's own, and the browser's own
+    // background calls are off - Torn Bids' item pictures (www.torn.com/images/items/...) are then not fetched.
+    const offline = OFFLINE || scenes.some((s) => s.offline);
+    const cut = offline ? ['--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1 , EXCLUDE localhost', '--disable-background-networking', '--disable-component-update', '--disable-sync', '--disable-domain-reliability', '--no-pings', '--disable-features=OptimizationHints,MediaRouter,Translate'] : [];
+    const browser = spawn(exe, ['--headless=new', '--remote-debugging-port=0', '--user-data-dir=' + profile, '--no-first-run', '--no-default-browser-check', '--disable-extensions', '--window-size=1600,1000', ...cut, 'about:blank'], { stdio: 'ignore' });
     const results = [];
     try {
         // The browser writes the port it took into its profile.
@@ -306,7 +396,7 @@ async function main() {
         }
         if (!port) throw new Error('The browser did not start.');
 
-        console.log('Torn Trading speed bench - processor slowed ' + RATE + 'x, ' + SECONDS + ' s a scene, ' + exe.replace(/.*[\\/]/, '') + (BUILD ? ' - the build ' + BUILD : ''));
+        console.log('Torn Trading speed bench - processor slowed ' + RATE + 'x, ' + SECONDS + ' s a scene, ' + exe.replace(/.*[\\/]/, '') + (BUILD ? ' - the build ' + BUILD : '') + (offline ? ' - offline (no name looked up but this machine\'s own)' : '') + (PROFILE ? ' - with a processor profile' : ''));
         if (COMPARE) {
             // Nothing compromised: the same requests and the same page - before and after.
             let same = true;
@@ -336,12 +426,25 @@ async function main() {
             return;
         }
         for (const scene of scenes) {
-            const got = await runScene(port, base, scene, BUILD);
+            const { profile: taken = null, ...got } = await runScene(port, base, scene, BUILD);
             results.push({ scene: scene.name, ...got });
             const now = Date.now();
             console.log('\n' + '='.repeat(100) + '\n' + scene.name.toUpperCase() + '\n' + '='.repeat(100));
             if (got.errors.length) console.log('SCRIPT ERRORS ON THE PAGE: ' + got.errors.join(' | '));
+            if (got.scene) console.log(sceneText(got.scene) + '\n');
             console.log(got.record ? speedText(got.record, { sizes: got.sizes, now }) : '(the script recorded nothing)');
+            if (taken) {
+                // How many redraws the scene's own log counted while the profile ran: each part is given for one of them.
+                const redraws = got.record ? redrawsIn(speedExpand(got.record)) : 0;
+                const report = profileReport(taken, { redraws, build: BUILD });
+                results[results.length - 1].profile = report.data;
+                console.log('\n' + report.text);
+                if (PROFILE_OUT) {
+                    const file = scenes.length > 1 ? PROFILE_OUT.replace(/(\.[^./\\]+)?$/, '-' + (scenes.indexOf(scene) + 1) + '$1') : PROFILE_OUT;
+                    await writeFile(resolve(process.cwd(), file), JSON.stringify(taken));
+                    console.log('Wrote ' + file);
+                }
+            }
         }
         // Every scene added together: one table to compare a before and an after by.
         let all = null;

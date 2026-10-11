@@ -116,6 +116,15 @@ export function tradesBoard({ asked = [], pins = [], accepted = [], ended = [], 
     const ready = [];
     for (const t of [...accepted].sort((a, b) => b.at - a.at)) {
         const cart = checkoutList(t);
+        const tot = acceptedTotals(t);
+        const steps = (t.items || []).flatMap((i) => i.steps || []);
+        const open = steps.find((st) => !stepDone(st)) || null;
+        // A bazaar you skipped is not one you bought from: counted apart, bazaar by bazaar.
+        const took = (st) => Boolean(st.bought || st.boughtQty > 0);
+        const stops = new Map();
+        for (const st of steps) stops.set(String(st.sellerId), [...(stops.get(String(st.sellerId)) || []), st]);
+        const boughtStops = [...stops.values()].filter((list) => list.some(took)).length;
+        const skippedStops = [...stops.values()].filter((list) => list.every((st) => st.skipped && !took(st))).length;
         const row = {
             key: String(t.key),
             itemId: String(t.itemId),
@@ -123,13 +132,25 @@ export function tradesBoard({ asked = [], pins = [], accepted = [], ended = [], 
             name: t.trader ? t.trader.name : '',
             at: Number(t.at) || 0,
             items: (t.items || []).length,
-            profit: Math.round(acceptedTotals(t).profit),
+            profit: Math.round(tot.profit),
+            // The trade's totals, and what has gone to bazaars so far (the Trades page's tiles).
+            cost: Math.round(tot.cost),
+            pays: Math.round(tot.pays),
+            paid: Math.round(steps.reduce((a, st) => a + (st.bought || st.boughtQty > 0 ? (st.boughtQty > 0 ? st.boughtQty : st.qty) * st.price : 0), 0)),
+            // Lines in Torn's trade so far, and the bazaar to buy from next.
+            sent: (t.items || []).filter((i) => i.sent).length,
+            next: open ? open.sellerName || (open.sellerId ? 'Player ' + open.sellerId : null) : null,
             bazaars: cart.bazaars,
             bazaarsDone: cart.bazaars - cart.bazaarsLeft,
+            boughtStops,
+            skippedStops,
             // Something of it is bought (a trade of your own items only has nothing to buy).
             bought: (t.items || []).some((i) => (i.steps || []).some((st) => stepDone(st) && !(st.skipped && !st.bought && !(st.boughtQty > 0)))),
         };
-        (nextStep(t) ? buying : ready).push(row);
+        // Ready to trade is a trade with something to send: every bazaar skipped and nothing of yours in it
+        // is not "all bought" - it stays in Buying, with nothing bought.
+        const yours = (t.items || []).some((i) => i.kind !== 'flip');
+        (nextStep(t) || (steps.length && !row.bought && !yours) ? buying : ready).push(row);
     }
     return { waiting, buying, ready, ended, going: waiting.length + buying.length + ready.length };
 }

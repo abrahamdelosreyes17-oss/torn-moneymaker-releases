@@ -6,8 +6,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { deskItem, nextW3bRead } from '../src/core/desk.js';
-import { holdTrade, priceHeld, resolveEstimated, editHeld, livePins, PIN_MAX, PIN_MAX_AGE_MS } from '../src/core/held.js';
+import { deskItem, nextW3bRead, steadyTrader } from '../src/core/desk.js';
+import { holdTrade, priceHeld, resolveEstimated, editHeld, livePins, keepHolds, keptHolds, PIN_MAX, PIN_MAX_AGE_MS } from '../src/core/held.js';
 
 const f = (itemId) => ({ itemId });
 
@@ -19,6 +19,17 @@ test('the desk shows the #1 flip until you pick one - not the first flip that lo
     assert.equal(deskItem({ selected: 'kit', strip, filter: 'mine', listed: [f('held1')] }), 'held1', 'Mine: the first of yours');
     assert.equal(deskItem({ strip: [], listed: [f('a')] }), 'a');
     assert.equal(deskItem({ strip: [], listed: [] }), null);
+});
+
+test('a trade under way owns the desk: after a reload, a filter or a category press it is that trade that shows - not the #1 flip', () => {
+    const strip = [f('virus'), f('cache')];
+    // Nothing picked by you (a reload forgets it, a filter press never set it): the trade they said yes to.
+    assert.equal(deskItem({ selected: null, underWay: 'lawyer', strip, listed: [f('a')] }), 'lawyer');
+    assert.equal(deskItem({ selected: 'virus', underWay: 'lawyer', strip, listed: [f('a')] }), 'lawyer');
+    assert.equal(deskItem({ selected: 'virus', underWay: 'lawyer', filter: 'mine', strip, listed: [f('held1')] }), 'lawyer', 'on Mine too');
+    assert.equal(deskItem({ underWay: 'lawyer', strip: [], listed: [] }), 'lawyer', 'with no flip and an empty list too');
+    // An item you picked yourself stays: looking at something else during a trade is yours to do.
+    assert.equal(deskItem({ pickedByYou: true, selected: 'kit', underWay: 'lawyer', strip }), 'kit');
 });
 
 const due = (set) => (id) => set.has(id);
@@ -167,4 +178,39 @@ test('Add (and Add all) on a held trade before the item\'s bazaars are read: in 
     assert.equal(done.lines.find((l) => l.itemId === '1020').estimated, false);
     // No price known at all: nothing to go on, left as it was.
     assert.equal(editHeld(held, '1020', { qty: 40 }, unread, { name: 'Gold Ribbon' }), held);
+});
+
+test('3.25.0: a reload keeps the trade you are in - its lines, who it is with, every flip - and nothing older than a hold lasts', () => {
+    const now = 1_000_000_000_000;
+    const trade = holdTrade({ key: 'id:7', buyer: { id: 7, name: 'T' }, main: '1', every: true, flips: [{ itemId: '1', bid: 100, units: 2, steps: [{ sellerId: 5, qty: 2, price: 90 }] }], off: [] }, '1', now);
+    const old = holdTrade({ key: 'id:8', buyer: { id: 8, name: 'U' }, flips: [], off: [] }, '2', now);
+    const holds = new Map([['1|id:7', { trade, touched: now - 60_000 }], ['2|id:8', { trade: old, touched: now - 3 * 60 * 60 * 1000 }]]);
+    const kept = JSON.parse(JSON.stringify(keepHolds({ holds, picks: new Map([['1', 'id:7'], ['2', 'id:8'], ['3', 'id:9']]), every: new Set(['id:7', 'id:9']) }, now)));
+    // What is written is already only what a held trade needs.
+    assert.deepEqual(kept.holds.map((h) => h[0]), ['1|id:7'], 'a hold of three hours ago is not written');
+    assert.deepEqual(kept.picks, [['1', 'id:7']]);
+    assert.deepEqual(kept.every, ['id:7']);
+    const back = keptHolds(kept, now + 5000);
+    assert.deepEqual(back.holds, [['1|id:7', { trade, touched: now - 60_000 }]]);
+    assert.deepEqual(back.picks, [['1', 'id:7']], 'only the pick a held trade needs: the rest of the desk starts as it always did');
+    assert.deepEqual(back.every, ['id:7']);
+    assert.equal(back.holds[0][1].trade.every, true);
+    // Two hours on with no press: let go, as a hold is.
+    assert.deepEqual(keptHolds(kept, now + 2 * 60 * 60 * 1000), { holds: [], picks: [], every: [] });
+    // Junk, or another version's shape: nothing, never an error.
+    const junks = [null, 'x', {}, { ...kept, v: 2 }, { v: 1, holds: [['1|id:7', { touched: now }]] }, { v: 1, holds: [['1|id:7', { trade: { key: 'id:7' }, touched: now }]] }, { v: 1, holds: 'no' }];
+    for (const junk of junks) assert.deepEqual(keptHolds(junk, now), { holds: [], picks: [], every: [] });
+});
+
+test('3.25.0: the desk keeps its trader - a better one is said, never swapped in by itself', () => {
+    const a = { key: 'a', profit: 100 };
+    const b = { key: 'b', profit: 150 };
+    assert.deepEqual(steadyTrader([b, a], null), { chosen: b, better: null }, 'nothing shown yet: the best');
+    assert.deepEqual(steadyTrader([b, a], 'a'), { chosen: a, better: b }, 'a was shown: a stays, b is said');
+    assert.deepEqual(steadyTrader([b, a], 'b'), { chosen: b, better: null });
+    // A hair better is not worth a note (it would come and go with every price read): over 2% is.
+    assert.deepEqual(steadyTrader([{ key: 'c', profit: 102 }, a], 'a'), { chosen: a, better: null });
+    assert.equal(steadyTrader([{ key: 'c', profit: 103 }, a], 'a').better.key, 'c');
+    assert.deepEqual(steadyTrader([b], 'a'), { chosen: b, better: null }, 'a makes no trade with it now: the best');
+    assert.deepEqual(steadyTrader([], 'a'), { chosen: null, better: null });
 });

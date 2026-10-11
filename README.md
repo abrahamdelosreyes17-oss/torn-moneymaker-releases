@@ -1902,6 +1902,88 @@ and was marked seen. It is now worked out each time from the Ledger's rows
 (`leftoversAfterSales`, src/core/accepted.js; three tests in
 test/own-buys.test.js).
 
+### One job at a time, a calmer Torn Bids, and Shared (3.25.0)
+
+**The panel on Torn's pages does one job at a time.** Its title is the switch:
+`NPC Arbitrage | Torn Bids` (the same switch is in the panel's Settings, under
+"This panel does"). It is one setting for the whole browser.
+
+- **NPC Arbitrage on:** the deals list, Scan, the chips and the green outlines.
+  Torn Bids is closed: no trader tags, no buying run, the trade page is not
+  read, and the Torn Bids web page says "Torn Bids is closed" with one button,
+  "Turn Torn Bids on". Closed means it asks for nothing.
+- **Torn Bids on:** trader tags, the buying run, Checkout, the trade box, and a
+  list "In this bazaar" of the cards a trusted trader pays more for; "Open Torn
+  Bids" where Scan was. NPC Arbitrage is closed: no deals, no shop prices, no
+  bazaar owner's status - it asks for nothing. The panel asks only for the item
+  list (once a day) and the key check.
+- **A trade you accepted keeps it on Torn Bids:** the NPC Arbitrage half is
+  struck out and says whose trade to finish or cancel first.
+- Fill on your own bazaar and its red "under what you paid" guard work on both
+  sides; the Paid chips and "Fill all you bought" belong to Torn Bids.
+- Never chosen: Torn Bids if its Limited key is saved, else NPC Arbitrage.
+  Opening the Torn Bids page before ever pressing the switch chooses Torn Bids.
+
+The rules are in `src/core/job.js` (`test/job.test.js`).
+
+**Torn Bids, rebuilt.** A sidebar - Today, Flips, Trades, My items, To sell,
+Ledger, Settings - in one calm look, full width. Every feature of 3.24.1 is
+still there; what moved:
+
+- A trade is one row on My items and To sell ("Your trade on this item"); its
+  whole route is on Flips and on Trades.
+- API use is in Settings, on the Help tab, under Report a problem.
+- Clear all on To sell asks first.
+
+And what is said where:
+
+- A row in Where to sell never shows a plus beside "a loss": the words and the
+  figure are for the same units (`whereRowView`, src/core/to-sell.js).
+- A bazaar you skipped is not one you bought from: the Trades board counts
+  them apart, and a trade with nothing bought is not "ready".
+- A waiting card on the Trades board opens its own trade, not the best
+  trader's.
+- A profit of $0 is never green. A listing that got cheaper is "cheaper", one
+  that got dearer but still clears your least profit is a plain note.
+- While a list is held for a trade, Today and Flips say so once, with the way
+  to Flips.
+
+**Shared.** A few PCs whose owner added them share what they read, through a
+small server of ours: bazaars read from Torn once reach every PC, and each PC
+keeps to its part of its own Torn limit. There is nothing to set up and
+nothing to type: a copy with a Public key asks the server with a word made
+from that key (a SHA-256 of it - the key itself never leaves the PC). A PC the
+server does not know is answered "not found", is told nothing, shows nothing
+about a server, and asks again hours later. What is sent: player ids, item
+ids, prices and counts, the listings you are going for and those you just
+bought, and that this is Torn Bids with its version. Never a key, your name,
+your inventory or your cash. TornW3B is never read by the server. The log says
+once, per change, what the server answered (`sharedSaid`, src/core/shared.js).
+The tests that hold the script against the server's own code
+(`test/shared-link.test.js`, `test/shared-marks-ui.test.js`) need the server's
+folder beside this one and are for the owner's laptop.
+
+**A key Torn rejects no longer blinds the panel.** The page is still read and
+marked from the item list kept from before; nothing is asked of Torn until a
+working key is saved (src/core/key-dead.js).
+
+**Cheaper redraws.** Each item's bazaars and its flip plan are kept between
+redraws and worked out again only when what they were made from changes
+(src/core/kept.js, `test/kept.test.js`; `&keptcheck=1` on the harness checks
+every kept result against a fresh one).
+
+**Who is in front asks.** With Torn Bids in view, the panel on a Torn page asks
+for nothing of its own, and the other way round (src/core/front.js); the same
+marks let another of our apps run beside it without doubling the requests.
+
+**A test build.** `npm run build:test` writes `dist/torn-trading.test.user.js`
+with a version that says it is a test and no update address: it never becomes
+anybody else's copy.
+
+Not seen on real Torn pages before release: the panel's switch, the "In this
+bazaar" list, the closed Torn Bids page, and the rebuilt pages - they were
+checked on the harness (1536, 2560 and 900 wide, first run), 639 tests.
+
 ---
 
 ## Architecture

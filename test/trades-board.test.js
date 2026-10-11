@@ -174,3 +174,18 @@ test('how long ago a list was changed (3.22.3): in words, never shortened - hour
     assert.deepEqual([0, 59 * 60 * 1000, HOUR, 23 * HOUR].map(listAgeText), ['under an hour ago', 'under an hour ago', '1 hour ago', '23 hours ago']);
     assert.deepEqual([NaN, -1, undefined, Infinity].map(listAgeText), ['not known', 'not known', 'not known', 'not known']);
 });
+
+test('the board: a bazaar skipped is not one bought from - a trade with every bazaar skipped is never "ready, all bought"', () => {
+    const skip = (t, which) => ({ ...t, items: t.items.map((i) => ({ ...i, steps: i.steps.map((st, k) => (which.includes(k) ? { ...st, skipped: true } : st)) })) });
+    const two = [{ sellerId: '5', sellerName: 'A', qty: 2, price: 840000 }, { sellerId: '6', sellerName: 'B', qty: 1, price: 841000 }];
+    // Its only bazaar skipped: nothing bought, nothing to send - it stays in Buying, with no next bazaar.
+    const none = skip(acceptTrade(chosen(11, 'Bob', [two[0]]), '206', NOW - 6 * MIN), [0]);
+    // One bought, one skipped: ready, and it says one of two.
+    const part = skip(recordBuy(acceptTrade(chosen(12, 'Alice', two), '206', NOW - 9 * MIN), 'flip:206', 0, 2, NOW - 8 * MIN), [1]);
+    const b = tradesBoard({ accepted: [none, part] });
+    assert.deepEqual(b.buying.map((r) => [r.name, r.boughtStops, r.skippedStops, r.bought, r.next, r.profit]), [['Bob', 0, 1, false, null, 0]]);
+    assert.deepEqual(b.ready.map((r) => [r.name, r.boughtStops, r.skippedStops, r.bought, r.bazaars]), [['Alice', 1, 1, true, 2]]);
+    // Something of yours in it: there is something to send, whatever was skipped.
+    const yours = { ...none, items: [...none.items, { kind: 'yours', line: 'yours:258', itemId: '258', name: 'Lion Plushie', units: 3, bid: 100 }] };
+    assert.equal(tradesBoard({ accepted: [yours] }).ready.length, 1);
+});

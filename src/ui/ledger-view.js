@@ -88,6 +88,7 @@ function dayValue(t) {
 export class LedgerView {
     /**
      * @param {object} h - onRead(), onOpenSettings(), onOpenUrl(url), onFavourite(b, on), onBlacklist(b, on)
+     *   onTab(key) - the Ledger moved to another of its tabs by itself
      */
     constructor(h = {}) {
         this.h = h;
@@ -182,7 +183,7 @@ export class LedgerView {
             lvEl('span', { text: status.join(' · ') }),
             L.keyError ? lvEl('span', { class: 'lg-bad', text: L.keyError }) : L.error ? lvEl('span', { class: 'lg-bad', text: L.error }) : null,
             lvEl('span', { class: 'sp-sp' }),
-            lvEl('button', { type: 'button', class: 'sp-btn', text: L.busy ? 'Reading…' : 'Read now', disabled: L.busy || L.keyError ? '' : null, onclick: () => this.h.onRead && this.h.onRead() }),
+            lvEl('button', { type: 'button', class: 'sp-btn', text: L.busy ? 'Reading…' : 'Read the log', disabled: L.busy || L.keyError ? '' : null, onclick: () => this.h.onRead && this.h.onRead() }),
         ]));
 
         /* Trading | Mugged */
@@ -360,8 +361,11 @@ export class LedgerView {
             lvEl('span', { class: 'lg-muted', text: this.f.period === 'all' ? 'everything read' : periodLabel }),
         ]));
         const tile = (label, value, cls = '', sub = '') => lvEl('div', { class: 'lg-tile ' + cls }, [lvEl('span', { class: 'lg-tl', text: label }), lvEl('b', { text: value }), sub ? lvEl('small', { text: sub }) : null]);
-        box.appendChild(lvEl('div', { class: 'lg-tiles' }, [
-            tile('Profit', lvSigned(t.profit), t.profit >= 0 ? 'lg-good' : 'lg-loss', lvCount(t.sales) + ' sale' + (t.sales === 1 ? '' : 's')),
+        // The totals and, under them, what muggings took: one group.
+        const profitBox = lvEl('div', { class: 'lg-profitbox' });
+        box.appendChild(profitBox);
+        profitBox.appendChild(lvEl('div', { class: 'lg-tiles' }, [
+            tile('Profit', lvSigned(t.profit), t.profit > 0 ? 'lg-good' : t.profit < 0 ? 'lg-loss' : '', lvCount(t.sales) + ' sale' + (t.sales === 1 ? '' : 's')),
             tile('Sold, after fees', formatMoney(t.sold), '', lvCount(t.unitsSold) + ' items' + (t.fees ? ' · ' + formatMoney(t.fees) + ' in fees' : '')),
             // What the units sold here had cost - wherever they were bought (an NPC sale's bazaar buy).
             tile('Cost of what sold', formatMoney(t.cost), '', 'first in, first out'),
@@ -370,7 +374,7 @@ export class LedgerView {
         // Muggings in the same period (not per item or place: a mugging takes cash).
         const mt = mugTotals(mugs, { from, to });
         if (mt.count && !this.f.itemId && !this.f.category && this.f.venue === 'all' && !this.f.who) {
-            box.appendChild(lvEl('p', { class: 'lg-mugline' }, [
+            profitBox.appendChild(lvEl('p', { class: 'lg-card lg-mugline' }, [
                 'Lost to ' + lvCount(mt.count) + ' mugging' + (mt.count === 1 ? '' : 's') + ': ',
                 lvEl('b', { class: 'lg-loss', text: '−' + formatMoney(mt.lost) }),
                 ' · profit after muggings ',
@@ -380,6 +384,7 @@ export class LedgerView {
                     this.tab = 'mugs';
                     this.sig = null;
                     this.render(this.last);
+                    if (this.h.onTab) this.h.onTab('mugs');
                 } }),
             ]));
         }
@@ -787,7 +792,9 @@ export class LedgerView {
         list.forEach((p, i) => {
             const top = y(Math.max(0, p.profit));
             const h = Math.max(1, Math.abs(y(p.profit) - y(0)));
-            const r = svgNode('rect', { x: pad.l + i * bw + bw * 0.15, y: top, width: Math.max(1, bw * 0.7), height: h, class: p.profit >= 0 ? 'lg-bar-g' : 'lg-bar-r' });
+            // A bar is never wider than a finger: two days on the chart are two bars, not two walls.
+            const w = Math.min(28, Math.max(1, bw * 0.7));
+            const r = svgNode('rect', { x: pad.l + i * bw + (bw - w) / 2, y: top, width: w, height: h, class: p.profit >= 0 ? 'lg-bar-g' : 'lg-bar-r' });
             const tt = svgNode('title');
             tt.textContent = dateText(p.start) + ': ' + lvSigned(p.profit) + ' · sold ' + formatMoney(p.sold) + ' · bought ' + formatMoney(p.spent);
             r.appendChild(tt);

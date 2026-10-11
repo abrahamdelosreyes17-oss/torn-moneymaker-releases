@@ -248,3 +248,25 @@ test('priority lanes: with the shared window nearly full, a low call waits and a
     assert.equal(client.laneLimit(1), 65);
     assert.equal(client.laneLimit(2), 70);
 });
+
+test('Shared: a request waits while "may I call now?" says no, sends nothing meanwhile, and goes when it says yes', async () => {
+    const fetchImpl = recordingFetch(() => jsonResponse({ ok: 1 }));
+    let allowed = false;
+    let held = 0;
+    const asked = [];
+    const client = makeClient(fetchImpl, {
+        mayCall: (now, recent) => { asked.push(recent.length); return allowed; },
+        onHeld: () => { held += 1; },
+    });
+    const pending = client.get('/user', { selections: 'basic' });
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+    assert.equal(fetchImpl.calls.length, 0, 'a request left while this PC was over its part');
+    assert.ok(held >= 1);
+    assert.equal(client.stats().usedLastMinute, 0, 'a slot was taken for a request that did not leave');
+    allowed = true;
+    await pending;
+    assert.equal(fetchImpl.calls.length, 1);
+    assert.equal(client.stats().usedLastMinute, 1);
+    // It is asked with this PC's calls of the last minute, before the new one is counted.
+    assert.equal(asked[asked.length - 1], 0);
+});

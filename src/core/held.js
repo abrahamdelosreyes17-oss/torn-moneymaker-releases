@@ -32,6 +32,8 @@ export function holdTrade(chosen, itemId, now = Date.now()) {
         trader: { id: chosen.buyer.id ? String(chosen.buyer.id) : null, name: chosen.buyer.name },
         itemId: String(itemId),
         main: chosen.main ? String(chosen.main) : null,
+        // Planned as "every flip with this trader" (3.25.0): the card goes on saying so while it is held.
+        every: Boolean(chosen.every),
         at: now,
         lines: (chosen.flips || []).map((r) => ({
             itemId: String(r.itemId),
@@ -230,4 +232,40 @@ export function livePins(stored, now = Date.now()) {
         .slice(0, PIN_MAX);
     for (const [k, t] of list) out[k] = t;
     return out;
+}
+
+/**
+ * What a reload must not lose (3.25.0): the trades you are in, who each of their items is planned
+ * with, and "every flip". Only what a held trade needs - with none, the desk starts as it always did.
+ *
+ * @param {object} p
+ * @param {Map<string, {trade: object, touched: number}>} p.holds - sell.tradeHold
+ * @param {Map<string, string>} p.picks - itemId -> trader key
+ * @param {Set<string>} p.every - trader keys planned with every flip
+ */
+export function keepHolds({ holds, picks, every }, now = Date.now()) {
+    const live = [...holds].filter(([, h]) => h && h.trade && now - h.touched < HOLD_MS);
+    const keys = new Set(live.map(([k]) => k));
+    return {
+        v: 1,
+        holds: live.map(([k, h]) => [k, { trade: h.trade, touched: h.touched }]),
+        picks: [...picks].filter(([id, key]) => keys.has(holdKey(id, key))),
+        every: [...every].filter((key) => live.some(([, h]) => h.trade.key === key)),
+    };
+}
+
+/** keepHolds read back after a reload: what is still a hold now. Junk is nothing, never an error. */
+export function keptHolds(raw, now = Date.now()) {
+    const none = { holds: [], picks: [], every: [] };
+    if (!raw || raw.v !== 1 || !Array.isArray(raw.holds)) return none;
+    const holds = raw.holds.filter((e) => Array.isArray(e) && typeof e[0] === 'string' && e[1] && e[1].trade && typeof e[1].trade.key === 'string' && Array.isArray(e[1].trade.lines)
+        && Number.isFinite(e[1].touched) && e[1].touched <= now && now - e[1].touched < HOLD_MS);
+    if (!holds.length) return none;
+    const keys = new Set(holds.map(([k]) => k));
+    const traders = new Set(holds.map(([, h]) => h.trade.key));
+    return {
+        holds: holds.map(([k, h]) => [k, { trade: h.trade, touched: h.touched }]),
+        picks: (Array.isArray(raw.picks) ? raw.picks : []).filter((e) => Array.isArray(e) && keys.has(holdKey(e[0], e[1]))).map(([id, key]) => [String(id), key]),
+        every: (Array.isArray(raw.every) ? raw.every : []).filter((k) => traders.has(k)),
+    };
 }
