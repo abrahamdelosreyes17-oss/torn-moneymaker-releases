@@ -95,6 +95,18 @@ test('Your traders: biggest trade first, then still reading, then no trade now; 
     assert.deepEqual(out, ['Big', 'FavSmall', 'Small', 'Reading', 'None']);
 });
 
+test('Your traders: a trade you can make now is above one being checked, and above a favourite a filter leaves out', () => {
+    const out = scanOrder([
+        { name: 'Offline', items: 9, profit: 90000, favourite: true, hiddenBy: 'offline' },
+        { name: 'Checking', items: 5, profit: 50000, waiting: true },
+        { name: 'None', items: 0, profit: 0 },
+        { name: 'CheckingBig', items: 5, profit: 70000, waiting: true },
+        { name: 'Ready', items: 2, profit: 1000 },
+        { name: 'Reading', items: 0, profit: 0, reading: true },
+    ]).map((x) => x.name);
+    assert.deepEqual(out, ['Ready', 'CheckingBig', 'Checking', 'Reading', 'None', 'Offline']);
+});
+
 import { blacklistKeys } from '../src/core/partners.js';
 
 test('a trader blacklisted by id is left out as a name-only buyer too', () => {

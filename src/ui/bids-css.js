@@ -810,4 +810,17 @@ export const BIDS_FORM_CSS = `
 .tog:hover { border-color: var(--faint); }
 `;
 
-export const BIDS_CSS = BIDS_BASE_CSS + BIDS_CALM_CSS + BIDS_FORM_CSS;
+/* Trades > History (3.27.0, mockup AH): the last 30 trades on the left, the one picked on the right. */
+export const BIDS_PAST_CSS = `
+.c57 { grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); }
+.c57.one { grid-template-columns: minmax(0, 1fr); }
+.hist .plan { gap: 12px; }
+.hist .ph h2 { font: 600 14px/1.3 var(--sans); color: var(--text); margin: 0; }
+.hist .ph + .note { padding: 2px 16px 0; }
+.hist .big.off { color: var(--text2); }
+.hist .who-t .btn.done { color: var(--good); }
+.t td small.t-good { color: var(--good); }
+.t td.same { color: var(--faint); }
+`;
+
+export const BIDS_CSS = BIDS_BASE_CSS + BIDS_CALM_CSS + BIDS_FORM_CSS + BIDS_PAST_CSS;

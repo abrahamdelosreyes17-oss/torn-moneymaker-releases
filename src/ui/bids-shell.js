@@ -5,7 +5,8 @@
  *   Today      the few totals, what to do now, the best flips, your trades, what you hold, your profit
  *   Flips      Best flips | By trader | All items: pick on the left, who sells and who pays in the
  *              middle, the trade on the right
- *   Trades     a card per trade in the lane of its step, and the one you pressed under them
+ *   Trades     Going | History: a card per trade in the lane of its step, and the one you pressed under
+ *              them; the last 30 trades, each with the prices it was made on
  *   My items   what you hold, and where to sell it
  *   To sell    what you bought to resell, by who pays most
  *   Ledger     Trading | Sold | Receipts, traders, mugged
@@ -63,7 +64,7 @@ export function bdEl(tag, props = {}, children = []) {
 export const BD_PAGES = [
     { id: 'today', label: 'Today', icon: 'dash' },
     { id: 'flips', label: 'Flips', icon: 'flip', tabs: ['Best flips', 'By trader', 'All items'] },
-    { id: 'trades', label: 'Trades', icon: 'trades' },
+    { id: 'trades', label: 'Trades', icon: 'trades', tabs: ['Going', 'History'] },
     { gap: true },
     { id: 'mine', label: 'My items', icon: 'stock' },
     { id: 'sell', label: 'To sell', icon: 'tag' },
@@ -71,6 +72,10 @@ export const BD_PAGES = [
     { push: true },
     { id: 'settings', label: 'Settings', icon: 'set', tabs: ['Keys and sharing', 'Flips and reading', 'Help'] },
 ];
+
+/** The tabs of Trades. */
+export const BD_TRADES_GOING = 0;
+export const BD_TRADES_PAST = 1;
 
 /** The tabs of Flips. */
 export const BD_FLIPS_BEST = 0;
@@ -167,7 +172,8 @@ export function bdBuildShell(page, { title, tagline, parts }) {
         section('today', 'p-dash', parts.today),
         // Flips: the picker, the middle and the trade; By trader swaps what the first two hold.
         section('flips', 'fit', [bdEl('div', { class: 'pane on c3 snug' }, [slot('flips-list', 'div', 'slot'), slot('flips-mid', 'div', 'col join'), slot('flips-plan', 'div', 'slot')])]),
-        section('trades', 'pgrows', [slot('trades-tiles', 'div', 'slot'), slot('trades-board', 'div', 'slot'), slot('trades-detail', 'div', 'slot')]),
+        // Trades: Going is the board and the trade pressed; History is its own pane (the list, and the trade picked).
+        section('trades', 'pgrows', [slot('trades-tiles', 'div', 'slot'), slot('trades-board', 'div', 'slot'), slot('trades-detail', 'div', 'slot'), (bd.pastPane = bdEl('div', { class: 'pane c57 snug' }, [slot('past-list', 'div', 'slot'), slot('past-side', 'div', 'col')]))]),
         section('mine', 'pgrows pgfill', [slot('mine-tiles', 'div', 'slot'), bdEl('div', { class: 'pane on c75 snug' }, [slot('mine-list', 'div', 'slot'), slot('mine-side', 'div', 'col')])]),
         section('sell', 'pgrows pgfill', [slot('sell-tiles', 'div', 'slot'), bdEl('div', { class: 'pane on c75 snug' }, [slot('sell-list', 'div', 'slot'), slot('sell-side', 'div', 'col')])]),
         section('ledger', 'g1', parts.ledger),

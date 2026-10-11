@@ -120,12 +120,17 @@ export function editBlacklist(list, buyer, on, now = Date.now()) {
 }
 
 /**
- * Your traders' cards in order: trades that make money, biggest first; then
- * the ones still reading their list; then "no trade now". A favourite goes
- * first only on a tie.
+ * Your traders' rows in order: trades you can make now, biggest first; then
+ * the ones whose trader is still being checked (online?); then the ones still
+ * reading their list; then "no trade now"; last the favourites a filter leaves
+ * out. A favourite goes first only on a tie.
+ *
+ * 3.27.0 (the owner's screenshot, "issue with this hierarchy"): a row that
+ * shows no trade - being checked, or left out by a filter - was ranked by the
+ * trade behind it, so seven rows of "–" sat above the one trade on offer.
  */
 export function scanOrder(list) {
-    const rank = (x) => (x.items && x.profit > 0 ? 0 : x.reading ? 1 : 2);
+    const rank = (x) => (x.hiddenBy ? 4 : x.items && x.profit > 0 ? (x.waiting ? 1 : 0) : x.reading ? 2 : 3);
     return [...(list || [])].sort((a, b) => rank(a) - rank(b) || b.profit - a.profit || (b.favourite ? 1 : 0) - (a.favourite ? 1 : 0) || String(a.name).localeCompare(String(b.name)));
 }
 

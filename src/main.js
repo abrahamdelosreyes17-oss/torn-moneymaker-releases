@@ -146,6 +146,7 @@ import {
     liveW3bPrices,
 } from './core/traders.js';
 import { liveAsked, addAsked, liveEnded, addEnded, endedOf, tradesBoard } from './core/trades-board.js';
+import { pastTrades, pastTradeOf, addPastTrade, endPastTrade, pastBought } from './core/past-trades.js';
 import { makeBuyersKeeper } from './core/kept-buyers.js';
 import { makeKeeper, keptMarkWords, keptFreshUntil, keptPlanSig } from './core/kept.js';
 import { JOB_NPC, JOB_BIDS, jobNow, jobLock, jobLockWords, jobSwitch } from './core/job.js';
@@ -342,6 +343,8 @@ const STORE_SELL_ASKED = 'sellAsked';
 const STORE_SELL_ENDED = 'sellEnded';
 // The last trades that ended, in full, for the zip (3.23.0, core/trades-export.js keepEndedTrades).
 const STORE_SELL_ENDED_FULL = 'sellEndedFull';
+// Trades > History (3.27.0, core/past-trades.js): the last 30 trades from their yes, each with the prices it was made on. This PC only.
+const STORE_SELL_PAST = 'sellPast';
 /* The Bought window (3.14.3): {pos: {x, y}|null, folded}. Where you dragged it, kept. */
 const STORE_BOUGHT_WINDOW = 'boughtWindow';
 /* What traders agreed to pay, per accepted trade (core/ledger.js): the Ledger splits a trade's money by it. */
@@ -4754,7 +4757,7 @@ function onOverlayTradeCancel(key) {
         if (took > 0 && all[key]) saveSellAccepted({ ...all, [key]: buyOverHere(recordBuy(all[key], here.line, here.index, took), here) });
     }
     if (buyRun.stepKey) saveBuyRunSeen(buyRun.stepKey, null);
-    cancelSellAccepted(key);
+    cancelSellAccepted(key, Date.now(), 'torn');
     buyRun.stepKey = null;
     app.buyAsk = null;
     scanTradePage();
@@ -6279,7 +6282,7 @@ function storageSizes() {
     ];
     // The values the first list missed (3.17.0: the speed log's "everything stored"), and this tab's own request windows.
     keys.push(
-        STORE_W3B_COOLDOWN, STORE_W3B_PACE, STORE_IM_WATCH, STORE_BIDS_SEEN, STORE_LIST_AT, STORE_SELL_DECLINED, STORE_SELL_ASKED, STORE_SELL_ENDED, STORE_SELL_ENDED_FULL, STORE_SELL_CANCELLED, STORE_BOUGHT_WINDOW, STORE_SELL_PRICE_RECORDS, STORE_SELL_BLACKLIST,
+        STORE_W3B_COOLDOWN, STORE_W3B_PACE, STORE_IM_WATCH, STORE_BIDS_SEEN, STORE_LIST_AT, STORE_SELL_DECLINED, STORE_SELL_ASKED, STORE_SELL_ENDED, STORE_SELL_ENDED_FULL, STORE_SELL_PAST, STORE_SELL_CANCELLED, STORE_BOUGHT_WINDOW, STORE_SELL_PRICE_RECORDS, STORE_SELL_BLACKLIST,
         STORE_SELL_FAVOURITES, STORE_SELL_TE_OWN, STORE_CHAT_WANTED, STORE_SELL_MOVES, STORE_LEDGER_REV, STORE_SELL_PRESENCE, STORE_SELL_HELD, STORE_SELL_WAS,
         FEED_LEADER_KEY, FEED_RECHECK_KEY, FEED_REFRESH_KEY, SPEED_STORE_KEY, STORE_CLEANED,
         STORE_API_WINDOW + '.' + app.tabId, STORE_W3B_WINDOW + '.' + app.tabId,
@@ -7069,6 +7072,7 @@ function expireSellAccepted(now = Date.now()) {
         const mine = cancelledLeftovers(t, now).map((l) => ({ ...l, why: 'old' }));
         left = addLeftovers(left, mine);
         ended = addEnded(ended, endedOf(t, 'old', mine, now), now);
+        notePastEnd(t, 'old', { left: mine, now });
         logProblem('note', 'An accepted trade with no trade made in a day was let go (' + (t.trader ? t.trader.name : t.key) + '): ' + mine.length + (mine.length === 1 ? ' item' : ' items') + ' bought for it went to To sell');
     }
     if (left.length) saveSellLeftovers(addLeftovers(sellLeftovers(now), left));
@@ -7077,11 +7081,47 @@ function expireSellAccepted(now = Date.now()) {
 }
 
 /** A trade ended (traded, cancelled): written down for the Trades board, with what went to To sell. */
-function noteSellEnded(trade, how, moved, now = Date.now()) {
+function noteSellEnded(trade, how, moved, now = Date.now(), by = null, endedAt = null) {
     if (!trade || !trade.key) return;
+    notePastEnd(trade, how === 'traded' ? 'traded' : 'cancel', { by, left: moved, now: endedAt || now });
     gmSet(STORE_SELL_ENDED, addEnded(gmGet(STORE_SELL_ENDED, null), endedOf(trade, how, moved, now), now));
     // As it was, for the next zip (3.23.0): the last few only.
     gmSet(STORE_SELL_ENDED_FULL, keepEndedTrades(gmGet(STORE_SELL_ENDED_FULL, null), trade, how, now));
+}
+
+/**
+ * What is known of a trade's trader's list right now (3.27.0, core/past-trades.js): when they last changed
+ * it, when Torn Bids last read it, and what it pays for each of the trade's items. In Torn Bids from what
+ * the page holds; on a Torn page from what Torn Bids last stored for every page. null: nothing is known.
+ */
+function pastFactsNow(trade) {
+    try {
+        const ids = [...new Set((trade.items || []).map((i) => String(i.itemId)))];
+        if (sell.pricesSeen) {
+            const seen = sell.pricesSeen(trade.key, ids);
+            const bids = {};
+            for (const [id, x] of Object.entries(seen.items)) bids[id] = x.price;
+            return { changedAt: seen.changedAt, readAt: seen.readAt, bids };
+        }
+        const bids = {};
+        for (const id of ids) bids[id] = traderBidOf(trade, id);
+        const traderId = trade.trader && trade.trader.id ? String(trade.trader.id) : null;
+        const t = traderId ? readTraderDb(gmGet(STORE_TRADER_DB, null)).traders[traderId] : null;
+        return { changedAt: (traderId && app.traderLookup && app.traderLookup.listAt.get(traderId)) || 0, readAt: t && t.w3b && t.w3b.at ? t.w3b.at : 0, bids };
+    } catch {
+        return null;
+    }
+}
+
+/** A trade ended: its record in Trades > History is closed (how, what was bought, their list by then). Never in the way of the ending itself. */
+function notePastEnd(trade, how, { by = null, left = [], now = Date.now() } = {}) {
+    try {
+        const facts = pastFactsNow(trade);
+        gmSet(STORE_SELL_PAST, endPastTrade(gmGet(STORE_SELL_PAST, null), trade, how, { now, by, facts, left }));
+        logProblem('note', 'Trade history: the trade with ' + (trade.trader ? trade.trader.name : trade.key) + ' closed as ' + how + (by ? ' (' + by + ')' : '') + (facts ? '' : '; their list was not known then'));
+    } catch (error) {
+        logProblem('error', 'Trade history: an ended trade could not be written down', { message: String((error && error.message) || error).slice(0, 160) });
+    }
 }
 
 /** Trades you asked a trader about, still waiting for a yes (an hour). */
@@ -7257,13 +7297,13 @@ function saveSellLeftovers(list) {
  * later trade by them), what you already bought is kept to sell elsewhere,
  * and Torn Bids lets go of the plan (never marked Declined; a pin stays).
  */
-function cancelSellAccepted(key, now = Date.now()) {
+function cancelSellAccepted(key, now = Date.now(), where = 'bids') {
     const all = sellAccepted(now);
     const t = all[key];
     if (!t) return;
     const left = cancelledLeftovers(t, now);
     if (left.length) saveSellLeftovers(addLeftovers(sellLeftovers(now), left));
-    noteSellEnded(t, 'cancel', left, now);
+    noteSellEnded(t, 'cancel', left, now, where);
     const recs = gmGet(STORE_SELL_PRICE_RECORDS, []) || [];
     const id = t.trader && t.trader.id ? String(t.trader.id) : null;
     const kept = recs.filter((r) => !(r && id && String(r.traderId) === id && Number(r.at) === Number(t.at)));
@@ -7292,8 +7332,10 @@ function sellCancelUndo(now = Date.now()) {
  * (3.16.1), else what you marked; its pin goes too. Back to the live plan
  * (done false) keeps nothing, and keeps the pin.
  */
-function closeSellAccepted(key, { done = false, left = null } = {}) {
+function closeSellAccepted(key, { done = false, left = null, seenAt = null } = {}) {
     const all = sellAccepted();
+    // The yes undone (Back to the live plan): said so in Trades > History.
+    if (!done && all[key]) notePastEnd(all[key], 'back', { by: 'bids' });
     if (done && all[key]) {
         // By hand: what you marked not taken, and what a full trade never had room for (3.23.0).
         const rest = left || addLeftovers(leftoversOf(all[key]), overLeftovers(all[key]));
@@ -7301,7 +7343,7 @@ function closeSellAccepted(key, { done = false, left = null } = {}) {
         const before = sellLeftovers();
         const mine = afterYoursSent(before, all[key]);
         if (rest.length || mine !== before) saveSellLeftovers(addLeftovers(mine, rest));
-        noteSellEnded(all[key], 'traded', rest);
+        noteSellEnded(all[key], 'traded', rest, Date.now(), seenAt ? 'seen' : 'hand', seenAt);
     }
     const itemId = all[key] ? String(all[key].itemId) : null;
     forgetLogBuysOf(key, all);
@@ -8949,6 +8991,20 @@ function renderSellingWork(src = null) {
         }
         return c;
     };
+    // What Torn Bids sees of one trader's prices right now (3.27.0, core/past-trades.js): asked for at a yes and at a trade's end.
+    sell.pricesSeen = (key, ids) => {
+        const keyOf = (b) => (b.id ? 'id:' + b.id : 'name:' + String(b.name).toLowerCase());
+        const items = {};
+        let traderId = /^id:\d+$/.test(String(key)) ? String(key).slice(3) : null;
+        for (const id of ids) {
+            const b = buyersAllowed(id).find((x) => keyOf(x) === key);
+            if (!b) continue;
+            if (b.id) traderId = String(b.id);
+            items[String(id)] = { price: b.price, w3b: b.w3b > 0 ? b.w3b : 0, te: b.te > 0 ? b.te : 0, checkedAt: checkOf(id, b).at || 0 };
+        }
+        const own = traderId && sell.db && sell.db.traders[traderId] ? sell.db.traders[traderId].w3b : null;
+        return { changedAt: traderId ? listAtOf(traderId) : 0, readAt: own && own.at ? own.at : 0, items };
+    };
     const flipCheckedCache = new Map();
     const flipCheckedOf = (id) => {
         const key = String(id);
@@ -9809,7 +9865,8 @@ function renderSellingWork(src = null) {
             // Biggest trade first; still reading, then nothing now, after.
             // The cards in view: their traders' statuses kept fresh, one not read yet says so.
             const cards = traderCards(scanOrder(scan.list), { hold: holdFlips, unread: unreadStatus });
-            scan.list = cards.list;
+            // In order again once "being checked" is known: a trade that cannot be offered yet goes under the ones that can.
+            scan.list = scanOrder(cards.list);
             sell.scanList = scan.list;
             sell.scanWatch = cards.watch;
         }
@@ -9923,6 +9980,22 @@ function renderSellingWork(src = null) {
         declined: (itemId, key) => declinedAll.has(declineKey(itemId, key)),
     });
     counts.trades = tradesView.going;
+    // Trades > History (3.27.0): read only while that tab is in view. A trade still going shows what was bought
+    // so far, and their list as it is now.
+    let past = null;
+    if (sell.bdPage === 'trades' && sell.bdTab === 1) {
+        const open = sellAccepted(now);
+        const stage = new Map([...tradesView.buying.map((r) => [r.key, { ...r, ready: false }]), ...tradesView.ready.map((r) => [r.key, { ...r, ready: true }])]);
+        past = {
+            rows: pastTrades(gmGet(STORE_SELL_PAST, null)).map((rec) => {
+                const t = rec.end ? null : open[rec.key];
+                if (!t || Number(t.at) !== Number(rec.at)) return rec;
+                const facts = pastFactsNow(t);
+                const st = stage.get(rec.key) || null;
+                return { ...rec, live: { list: facts ? { changedAt: facts.changedAt, readAt: facts.readAt } : null, bids: facts ? facts.bids : null, bought: pastBought(t), ready: Boolean(st && st.ready), bazaars: st ? st.bazaars : 0, boughtStops: st ? st.boughtStops : 0 } };
+            }),
+        };
+    }
     // What the list shows now, for Refresh (3.22.1): the rows under the filter, the search and the category -
     // on the Trades tab, the items of the trades going. The first screenfuls only.
     sell.viewIds = (sell.filter === 'trades'
@@ -9991,6 +10064,7 @@ function renderSellingWork(src = null) {
         toSell: { rows: toSell, ...toSellBoard(toSell), open: sell.filter === 'sell' && sell.boardOpen },
         // The Trades tab: its rows by stage, and its board (beside the list until a trade is opened).
         trades: { ...tradesView, open: sell.filter === 'trades' && sell.boardOpen },
+        past,
         ledger: ledgerView(),
         hold,
         scan,
@@ -10830,6 +10904,14 @@ function acceptDeskTrade(itemId) {
     }
     all[acc.key] = acc;
     saveSellAccepted(all);
+    // Written down now, with the prices it is made on (3.27.0): their list can change afterwards.
+    try {
+        const seen = sell.pricesSeen ? sell.pricesSeen(acc.key, acc.items.map((i) => i.itemId)) : null;
+        gmSet(STORE_SELL_PAST, addPastTrade(gmGet(STORE_SELL_PAST, null), pastTradeOf(acc, seen)));
+        logProblem('note', 'Trade history: the trade with ' + acc.trader.name + ' written down at the yes (' + acc.items.length + (acc.items.length === 1 ? ' item' : ' items') + (seen ? ', their list changed ' + (seen.changedAt ? Math.round((acc.at - seen.changedAt) / 60000) + ' min before' : 'at a time not known') + ', read ' + (seen.readAt ? Math.round((acc.at - seen.readAt) / 1000) + ' s before' : 'at a time not known') : ', their list not known') + ')');
+    } catch (error) {
+        logProblem('error', 'Trade history: the yes could not be written down', { message: String((error && error.message) || error).slice(0, 160) });
+    }
     // Kept after the trade: the Ledger splits what they paid by these prices.
     const rec = priceRecordOf(acc);
     if (rec) gmSet(STORE_SELL_PRICE_RECORDS, addPriceRecord(gmGet(STORE_SELL_PRICE_RECORDS, []), rec));
@@ -12074,7 +12156,7 @@ async function watchFinishedTrades(now = Date.now(), { backup = false } = {}) {
         for (const t of open.sort((a, b) => a.at - b.at)) {
             const f = finishedTradeFor(t, avail);
             if (!f) continue;
-            closeSellAccepted(t.key, { done: true, left: tradedLeftovers(t, take(f), Date.now(), f.t) });
+            closeSellAccepted(t.key, { done: true, left: tradedLeftovers(t, take(f), Date.now(), f.t), seenAt: Number(f.t) || Date.now() });
             logAction('Traded - done (your Torn trades show it; item ' + t.itemId + ')');
             changed = true;
         }
@@ -12090,6 +12172,7 @@ async function watchFinishedTrades(now = Date.now(), { backup = false } = {}) {
             for (const r of u.recs || []) recs = addPriceRecord(recs, r);
             gmSet(STORE_SELL_PRICE_RECORDS, recs);
             delete undoAll[u.trade.key];
+            notePastEnd(u.trade, 'traded', { by: 'seen', left, now: Number(f.t) || Date.now() });
             logAction('Cancel trade put right: it had gone through (item ' + u.trade.itemId + ')');
             changed = true;
         }

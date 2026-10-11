@@ -2230,6 +2230,76 @@ server's own check drops none of them. Not seen: the live server, real TornW3B,
 the friend's laptop. How many bazaars the live server holds for the friend's
 items is not known, so how many flips his first minute shows is not known either.
 
+### Trades › History: the last 30 trades and the prices they were made on (3.27.0)
+
+The owner, 2026-10-11: a trader cancelled a trade and asked which price list had
+been seen, and it could not be found - "a history showing the last 30 trades?
+with their pricelists and if success or not etc?". Drawn first as mockup AH
+("i like that page make it").
+
+**Why it could not be found.** A trade a trader said yes to was kept 24 hours,
+10 at most, and dropped the moment it ended; the zip kept the last three ended
+trades, without the prices. Nothing on screen showed an ended trade.
+
+**What is new.** Trades has two tabs. **Going** is the page as it was.
+**History** lists the last 30 trades a trader said yes to, newest first:
+
+- **The list:** trader, when they said yes, how many items, what they pay, and
+  how it ended - Traded, Cancelled, No trade in a day, Yes undone, or Still going.
+- **The trade you press:** each item, its count, the trader's price at the
+  moment of the yes, whether that price came from TornW3B or TornExchange, how
+  long before the yes it was checked, and what their list said when the trade
+  ended (for a trade still going: now). Under it, what you bought for it: how
+  many, at what price, in how many bazaars.
+- **If their price list changed after the yes**, an amber line says how long
+  after and which prices moved. This is the answer to "what list did you see".
+- **Copy for the trader:** the trade as plain text, times in Torn's time (TCT),
+  to paste to them. The button says "Copied", or "Could not copy: press again"
+  when the browser refuses the clipboard.
+
+**How it is kept** (`src/core/past-trades.js`, stored as `sellPast`).
+
+- The record is written **at the yes**, because the list can change afterwards
+  (`pastTradeOf`, from `acceptDeskTrade`). It holds the prices of the trade's
+  own items only, not the trader's whole list, with each price's source and
+  when it was last checked, and when the list was last changed and last read.
+- It is closed when the trade ends (`endPastTrade`): traded (seen in Torn's
+  finished trades, or marked by hand), cancelled (in Torn Bids or on Torn's
+  trade page), no trade in a day, or the yes undone. The first ending stands,
+  with one exception: a trade cancelled here that Torn then lists as finished
+  is put right to Traded.
+- **"Cancelled" never says who cancelled.** Torn's API lists finished and
+  ongoing trades only; a trade that was called off is in neither, with no word
+  of who did it. The row says where Cancel was pressed, when it was.
+- A trade already going when the update arrives gets its row when it ends,
+  without the prices at the yes (they were not written down then). The row
+  says so.
+- 30 trades, the oldest dropped. **This PC only:** not in the Report a problem
+  zip, not sent to the shared server. No request is made for it: every number
+  comes from what Torn Bids had already read.
+
+**Flips › By trader: the order.** The owner's screenshot of the same day: seven
+rows of "Checking if they are online…" with "–" above the one trader with a
+trade on offer. The list was put in order by the size of each trade *before*
+the rows still being checked were marked, so a trade that could not be offered
+yet kept its place by its profit. Now (`scanOrder` in `src/core/partners.js`,
+applied again after `traderCards`): trades you can make now, biggest first;
+then the ones being checked; then the ones still reading their list; then "no
+trade now"; last the favourites a filter leaves out. A row moves up when its
+trader turns out to be online.
+
+**The overlay.** Nothing changes on screen on Torn's pages or in NPC Arbitrage.
+A trade that ends on Torn's trade page (Cancel there, or seen finished) closes
+its row in the history.
+
+**Seen and not seen.** In the harness
+(`&tradesgoing=1&past=1#trades`, History tab; `&past=0` empty, `&past=30` full):
+the list, the detail of each of the five endings, the amber line, a record with
+no prices; nothing cut off at 1536 and 1920 wide. `test/past-trades.test.js`
+(12 tests) and one more in `test/partners.test.js` for the order. Not seen: a
+real trade on real Torn from yes to end, the "Copied" answer (the test browser
+refuses the clipboard), the By trader list with real statuses arriving.
+
 ## Architecture
 
 ```

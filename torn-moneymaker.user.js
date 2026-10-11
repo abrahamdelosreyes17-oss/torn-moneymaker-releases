@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      3.26.2
+// @version      3.27.0
 // @description  Finds Bazaar and Item Market listings below NPC / market value - on the page you are viewing, and live from the Torn API and TornW3B - ranked by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -52,7 +52,7 @@
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '3.26.2';
+    const TTV2_BUILD_VERSION = '3.27.0';
     const TTV2_SHARED_HOME = 'https://torn-bids-shared.pumping-iron-worker.workers.dev';
 
     /* ===== src/platform/gm.js ===== */
@@ -14455,12 +14455,17 @@
     }
 
     /**
-     * Your traders' cards in order: trades that make money, biggest first; then
-     * the ones still reading their list; then "no trade now". A favourite goes
-     * first only on a tie.
+     * Your traders' rows in order: trades you can make now, biggest first; then
+     * the ones whose trader is still being checked (online?); then the ones still
+     * reading their list; then "no trade now"; last the favourites a filter leaves
+     * out. A favourite goes first only on a tie.
+     *
+     * 3.27.0 (the owner's screenshot, "issue with this hierarchy"): a row that
+     * shows no trade - being checked, or left out by a filter - was ranked by the
+     * trade behind it, so seven rows of "–" sat above the one trade on offer.
      */
     function scanOrder(list) {
-        const rank = (x) => (x.items && x.profit > 0 ? 0 : x.reading ? 1 : 2);
+        const rank = (x) => (x.hiddenBy ? 4 : x.items && x.profit > 0 ? (x.waiting ? 1 : 0) : x.reading ? 2 : 3);
         return [...(list || [])].sort((a, b) => rank(a) - rank(b) || b.profit - a.profit || (b.favourite ? 1 : 0) - (a.favourite ? 1 : 0) || String(a.name).localeCompare(String(b.name)));
     }
 
@@ -15063,6 +15068,333 @@
     async function fetchTeActiveTraderList(client) {
         const body = await client.get('active_traders', {}, { timeoutMs: TE_ACTIVE_TIMEOUT_MS });
         return { byName: parseTeActiveTraders(body), list: parseTeActiveTraderList(body) };
+    }
+
+    /* ===== src/core/past-trades.js ===== */
+    /*
+     * Trades > History (3.27.0, mockup AH).
+     *
+     * The owner, 2026-10-11: "trader cancelled trade, and then he asked what
+     * pricelist did you see, we couldnt find them again." / "can we have a history
+     * showing the last 30 trades? with their pricelists and if success or not etc?"
+     *
+     * An accepted trade was kept a day and dropped the moment it ended, and
+     * nothing said which prices it had been made on. Now a record is written at
+     * the yes - the moment the plan is frozen - with, for each item, the price the
+     * trader was to pay, which site it came from, when TornW3B last confirmed it,
+     * and when the trader last changed their list. It is written then because the
+     * list can change afterwards, and that change is the whole question. When the
+     * trade ends the record is closed with how it ended, what was bought for it,
+     * and what their list said by then.
+     *
+     * The last PAST_TRADES_MAX are kept, on this PC only: they are not sent to the
+     * shared server and are not in the Report a problem zip. Pure: no DOM, no
+     * storage, no clock of its own.
+     */
+
+
+
+    const PAST_TRADES_MAX = 30;
+
+    const pastPos = (x) => (Number.isFinite(Number(x)) && Number(x) > 0 ? Number(x) : 0);
+    const pastMoney = (n) => (n < 0 ? '-' : '') + '$' + Math.abs(Math.round(Number(n) || 0)).toLocaleString('en-US');
+    const pastCount = (n) => Math.round(Number(n) || 0).toLocaleString('en-US');
+
+    /** The stored records, newest yes first: only what is one, PAST_TRADES_MAX at most. */
+    function pastTrades(stored) {
+        return (Array.isArray(stored) ? stored : [])
+            .filter((r) => r && r.key && Number(r.at) > 0 && Array.isArray(r.lines))
+            .sort((a, b) => b.at - a.at)
+            .slice(0, PAST_TRADES_MAX);
+    }
+
+    /**
+     * The record of a trade, from the frozen trade at the yes.
+     *
+     * @param {object} acc - core/accepted.js acceptTrade
+     * @param {{changedAt: number, readAt: number, items: object}|null} seen - what Torn Bids saw of the trader's
+     *   prices at that moment: when they last changed their TornW3B list, when Torn Bids last read it, and per
+     *   item id {w3b, te, checkedAt} (their price on each site, when TornW3B last confirmed it). null: not known
+     *   (a trade accepted before there was a history).
+     */
+    function pastTradeOf(acc, seen = null) {
+        const items = (seen && seen.items) || {};
+        const lines = (acc.items || []).map((i) => {
+            const line = { itemId: String(i.itemId), name: i.name || null, kind: i.kind === 'flip' ? 'flip' : 'yours', units: Number(i.units) || 0, bid: Number(i.bid) || 0 };
+            const s = items[String(i.itemId)] || null;
+            if (s) {
+                line.w3b = pastPos(s.w3b);
+                line.te = pastPos(s.te);
+                line.checkedAt = pastPos(s.checkedAt);
+            }
+            return line;
+        });
+        return {
+            key: String(acc.key),
+            at: Number(acc.at),
+            itemId: String(acc.itemId),
+            trader: { id: acc.trader && acc.trader.id ? String(acc.trader.id) : null, name: acc.trader ? acc.trader.name || null : null },
+            list: seen ? { changedAt: pastPos(seen.changedAt), readAt: pastPos(seen.readAt) } : null,
+            lines,
+            cost: Math.round(Number(acc.cost) || 0),
+            pays: Math.round(Number(acc.pays) || 0),
+            profit: Math.round(Number(acc.profit) || 0),
+            end: null,
+        };
+    }
+
+    const pastSame = (r, trade) => r.key === String(trade.key) && Number(r.at) === Number(trade.at);
+
+    /** The list with one more record: one trade once (by trader and when they said yes), newest first. */
+    function addPastTrade(stored, rec) {
+        const list = pastTrades(stored);
+        if (!rec || !rec.key || list.some((r) => pastSame(r, rec))) return list;
+        return pastTrades([rec, ...list]);
+    }
+
+    /**
+     * What was bought for a trade, item by item: the plan's lines as the buying
+     * run and your Torn log counted them, your own items in it, and what you
+     * bought for it outside the plan.
+     *
+     * @returns {Array<{itemId, name, kind: 'flip'|'yours'|'extra', got, of, each: number|null, stops, stopsAll}>}
+     *   got: units bought (yours: units in the trade); of: units planned (extra: 0); each: what one cost
+     *   (null: not known); stops: bazaars bought from; stopsAll: bazaars planned
+     */
+    function pastBought(trade) {
+        const rows = [];
+        const byItem = new Map();
+        for (const i of (trade && trade.items) || []) {
+            if (i.kind !== 'flip') {
+                rows.push({ itemId: String(i.itemId), name: i.name || null, kind: 'yours', got: Number(i.units) || 0, of: Number(i.units) || 0, each: Number.isFinite(i.each) ? Number(i.each) : null, stops: 0, stopsAll: 0 });
+                continue;
+            }
+            let got = 0;
+            let spent = 0;
+            const from = new Set();
+            const all = new Set();
+            for (const st of i.steps || []) {
+                all.add(String(st.sellerId));
+                if (!stepDone(st)) continue;
+                const n = st.boughtQty > 0 ? st.boughtQty : st.bought ? st.qty : 0;
+                if (!(n > 0)) continue;
+                got += n;
+                spent += n * st.price;
+                from.add(String(st.sellerId));
+            }
+            const row = { itemId: String(i.itemId), name: i.name || null, kind: 'flip', got, of: Number(i.units) || 0, each: got ? spent / got : null, stops: from.size, stopsAll: all.size, from, spent };
+            rows.push(row);
+            if (!byItem.has(row.itemId)) byItem.set(row.itemId, row);
+        }
+        // Bought for it and not planned: only what this trader pays for (as Checkout counts it).
+        for (const x of (trade && trade.extra) || []) {
+            if (!x || !(Number(x.bid) > 0) || !(Number(x.qty) > 0)) continue;
+            const id = String(x.itemId);
+            let row = byItem.get(id);
+            if (!row) {
+                row = { itemId: id, name: x.name || null, kind: 'extra', got: 0, of: 0, each: null, stops: 0, stopsAll: 0, from: new Set(), spent: 0 };
+                rows.push(row);
+                byItem.set(id, row);
+            }
+            row.got += Number(x.qty);
+            row.spent += Number(x.qty) * (Number(x.price) || 0);
+            row.from.add(String(x.sellerId || x.seller || '?'));
+            row.each = row.got ? row.spent / row.got : null;
+            row.stops = row.from.size;
+        }
+        return rows.map(({ from, spent, ...row }) => (row.each === null ? row : { ...row, each: Math.round(row.each) }));
+    }
+
+    /**
+     * The record closed: how the trade ended.
+     *
+     * @param {Array} stored - the records
+     * @param {object} trade - the accepted trade as it was when it ended
+     * @param {'traded'|'cancel'|'old'|'back'} how - traded; Cancel trade; no trade made in a day; the yes undone
+     *   (Back to the live plan)
+     * @param {object} [o]
+     * @param {number} o.now - when it ended (a trade seen in your Torn trades: when Torn says it finished)
+     * @param {'seen'|'hand'|'bids'|'torn'|null} [o.by] - traded: seen in your Torn trades, or Traded - done
+     *   pressed; cancel: pressed in Torn Bids, or on a Torn page
+     * @param {{changedAt, readAt, bids: object}|null} [o.facts] - their list as Torn Bids knew it then: when they
+     *   last changed it, when Torn Bids last read it, and what it pays per item id
+     * @param {Array<{itemId, qty}>} [o.left] - what went to To sell
+     *
+     * A trade with no record (accepted before there was a history) gets one now, with the prices it was accepted
+     * at and nothing about the list. The first ending stands - but a trade you cancelled that had in fact gone
+     * through is put right to traded.
+     */
+    function endPastTrade(stored, trade, how, { now, by = null, facts = null, left = [] } = {}) {
+        const list = pastTrades(stored);
+        if (!trade || !trade.key || !(Number(trade.at) > 0)) return list;
+        const at = list.findIndex((r) => pastSame(r, trade));
+        const rec = at >= 0 ? list[at] : pastTradeOf(trade, null);
+        if (rec.end && !(rec.end.how === 'cancel' && how === 'traded')) return list;
+        const kept = new Map();
+        for (const l of left || []) if (l && Number(l.qty) > 0) kept.set(String(l.itemId), (kept.get(String(l.itemId)) || 0) + Number(l.qty));
+        const bought = pastBought(trade).map((row) => {
+            // What went to To sell is shared out over the item's rows, bought ones first.
+            const n = row.kind === 'yours' ? 0 : Math.min(row.got, kept.get(row.itemId) || 0);
+            if (n) kept.set(row.itemId, kept.get(row.itemId) - n);
+            return { ...row, kept: n };
+        });
+        for (const row of bought) {
+            const n = row.kind === 'yours' ? Math.min(row.got, kept.get(row.itemId) || 0) : 0;
+            if (n) {
+                kept.set(row.itemId, kept.get(row.itemId) - n);
+                row.kept = n;
+            }
+        }
+        const tot = acceptedTotals(trade);
+        const bids = {};
+        for (const [id, bid] of Object.entries((facts && facts.bids) || {})) if (Number(bid) > 0) bids[String(id)] = Number(bid);
+        const end = {
+            how,
+            at: Number(now),
+            by: by || null,
+            // null: their list was not known then (bids then says nothing).
+            list: facts ? { changedAt: pastPos(facts.changedAt), readAt: pastPos(facts.readAt) } : null,
+            bids: facts ? bids : null,
+            bought,
+            cost: Math.round(tot.cost),
+            pays: Math.round(tot.pays),
+            profit: Math.round(tot.profit),
+        };
+        const next = { ...rec, end };
+        return pastTrades(at >= 0 ? list.map((r, k) => (k === at ? next : r)) : [next, ...list]);
+    }
+
+    /** 'going' while it has not ended, else how it ended. */
+    function pastState(rec) {
+        return rec && rec.end ? rec.end.how : 'going';
+    }
+
+    /**
+     * What moved in their list after the yes, as far as Torn Bids knew.
+     *
+     * @param {object} rec
+     * @param {{list: {changedAt, readAt}|null, bids: object|null}|null} then - the record's `end`, or for a
+     *   trade still going what Torn Bids knows now
+     * @returns {{known: boolean, changedAt: number, moved: Array<{itemId, name, was, is}>, readAfter: boolean}}
+     *   known: their list was known then; changedAt: when they changed it, if that was after the yes (else 0);
+     *   moved: the trade's prices that are different (is 0: no longer on their list); readAfter: Torn Bids read
+     *   their list after the yes
+     */
+    function pastMoved(rec, then) {
+        const out = { known: false, changedAt: 0, moved: [], readAfter: false };
+        if (!rec || !then || !then.bids) return out;
+        out.known = true;
+        const list = then.list || {};
+        if (pastPos(list.changedAt) > Number(rec.at)) out.changedAt = pastPos(list.changedAt);
+        out.readAfter = pastPos(list.readAt) > Number(rec.at);
+        const seen = new Set();
+        for (const l of rec.lines || []) {
+            if (seen.has(l.itemId)) continue;
+            seen.add(l.itemId);
+            const is = pastPos(then.bids[l.itemId]);
+            if (is !== Number(l.bid)) out.moved.push({ itemId: l.itemId, name: l.name || 'Item ' + l.itemId, was: Number(l.bid), is });
+        }
+        return out;
+    }
+
+    /** The few totals over the records: {kept, going, traded, profit, cancelled, old, back}. */
+    function pastTotals(list) {
+        const out = { kept: 0, going: 0, traded: 0, profit: 0, cancelled: 0, old: 0, back: 0 };
+        for (const r of pastTrades(list)) {
+            out.kept += 1;
+            const s = pastState(r);
+            if (s === 'going') out.going += 1;
+            else if (s === 'traded') {
+                out.traded += 1;
+                out.profit += Number(r.end.profit) || 0;
+            } else if (s === 'cancel') out.cancelled += 1;
+            else if (s === 'old') out.old += 1;
+            else out.back += 1;
+        }
+        return out;
+    }
+
+    /** A length of time, never shortened to nothing: "40s", "2m 10s", "7 min", "3h 12m", "2 days 4h". */
+    function pastSpan(ms) {
+        const s = Math.max(0, Math.round((Number(ms) || 0) / 1000));
+        if (s < 60) return s + 's';
+        const m = Math.floor(s / 60);
+        if (m < 10 && s % 60) return m + 'm ' + (s % 60) + 's';
+        if (m < 60) return m + ' min';
+        const h = Math.floor(m / 60);
+        if (h < 24) return h + 'h' + (m % 60 ? ' ' + (m % 60) + 'm' : '');
+        const d = Math.floor(h / 24);
+        return d + (d === 1 ? ' day' : ' days') + (h % 24 ? ' ' + (h % 24) + 'h' : '');
+    }
+
+    const PAST_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    const pastTwo = (n) => String(n).padStart(2, '0');
+
+    /** A moment on your own clock, beside now: "today 11:40", "yesterday 21:05", "9 Oct 22:47". */
+    function pastWhen(t, now) {
+        const d = new Date(Number(t));
+        const n = new Date(Number(now));
+        const day = (x) => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+        const days = Math.round((day(n) - day(d)) / (24 * 60 * 60 * 1000));
+        const time = pastTwo(d.getHours()) + ':' + pastTwo(d.getMinutes());
+        if (days === 0) return 'today ' + time;
+        if (days === 1) return 'yesterday ' + time;
+        return d.getDate() + ' ' + PAST_MONTHS[d.getMonth()] + ' ' + time;
+    }
+
+    /** A moment on Torn's clock (TCT is UTC): "11 Oct 03:40 TCT" - the time alone on the same Torn day as `ref`. */
+    function pastTct(t, ref = null) {
+        const d = new Date(Number(t));
+        const time = pastTwo(d.getUTCHours()) + ':' + pastTwo(d.getUTCMinutes()) + ' TCT';
+        if (ref !== null) {
+            const r = new Date(Number(ref));
+            if (r.getUTCFullYear() === d.getUTCFullYear() && r.getUTCMonth() === d.getUTCMonth() && r.getUTCDate() === d.getUTCDate()) return time;
+        }
+        return d.getUTCDate() + ' ' + PAST_MONTHS[d.getUTCMonth()] + ' ' + time;
+    }
+
+    /** Where a line's price came from: 'w3b' (TornW3B, the one a flip is made on), 'te' (TornExchange only), or null (not written down). */
+    function pastSource(line) {
+        if (!line || line.w3b === undefined) return null;
+        if (line.w3b > 0) return 'w3b';
+        return line.te > 0 ? 'te' : null;
+    }
+
+    /**
+     * The trade as plain text, to paste to the trader: who, when (Torn's clock,
+     * which both of you see), each item at the price it was made on, and what
+     * moved in their list afterwards.
+     *
+     * @param {object} rec
+     * @param {object|null} [then] - for a trade still going, what Torn Bids knows of their list now (as `end`)
+     */
+    function pastTradeText(rec, then = null) {
+        const name = (rec.trader && rec.trader.name) || 'the trader';
+        const id = rec.trader && rec.trader.id ? ' [' + rec.trader.id + ']' : '';
+        const out = ['Trade with ' + name + id];
+        const end = rec.end;
+        const ended = !end ? '' : end.how === 'traded' ? ' Traded ' + pastTct(end.at, rec.at) + '.'
+            : end.how === 'cancel' ? ' Cancelled ' + pastTct(end.at, rec.at) + '.'
+                : end.how === 'old' ? ' No trade was made.' : '';
+        out.push('You said yes ' + pastTct(rec.at) + '.' + ended, '');
+        const onW3b = (rec.lines || []).some((l) => pastSource(l) === 'w3b');
+        const list = rec.list;
+        if (list && onW3b) {
+            const facts = [list.changedAt ? 'you last changed it ' + pastTct(list.changedAt, rec.at) : null, list.readAt ? 'I read it ' + pastTct(list.readAt, rec.at) : null].filter(Boolean);
+            out.push('Prices from your TornW3B list' + (facts.length ? ' (' + facts.join(', ') + ')' : '') + ':');
+        } else {
+            out.push('Prices the trade was made on:');
+        }
+        for (const l of rec.lines || []) {
+            out.push('  ' + (l.name || 'Item ' + l.itemId) + ' x ' + pastCount(l.units) + ' at ' + pastMoney(l.bid) + ' = ' + pastMoney(l.units * l.bid) + (list && onW3b && pastSource(l) === 'te' ? ' (your TornExchange price)' : ''));
+        }
+        out.push('  Total ' + pastMoney((rec.lines || []).reduce((a, l) => a + l.units * l.bid, 0)));
+        const m = pastMoved(rec, end || then);
+        if (m.moved.length) {
+            const what = m.moved.map((x) => x.name + ' ' + pastMoney(x.was) + ' -> ' + (x.is > 0 ? pastMoney(x.is) : 'no longer listed')).join(', ');
+            out.push('', (m.changedAt ? 'Your list changed at ' + pastTct(m.changedAt, rec.at) : 'After the yes your list changed') + ': ' + what + '.');
+        }
+        return out.join('\n');
     }
 
     /* ===== src/core/kept-buyers.js ===== */
@@ -26663,7 +26995,20 @@
     .tog:hover { border-color: var(--faint); }
     `;
 
-    const BIDS_CSS = BIDS_BASE_CSS + BIDS_CALM_CSS + BIDS_FORM_CSS;
+    /* Trades > History (3.27.0, mockup AH): the last 30 trades on the left, the one picked on the right. */
+    const BIDS_PAST_CSS = `
+    .c57 { grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); }
+    .c57.one { grid-template-columns: minmax(0, 1fr); }
+    .hist .plan { gap: 12px; }
+    .hist .ph h2 { font: 600 14px/1.3 var(--sans); color: var(--text); margin: 0; }
+    .hist .ph + .note { padding: 2px 16px 0; }
+    .hist .big.off { color: var(--text2); }
+    .hist .who-t .btn.done { color: var(--good); }
+    .t td small.t-good { color: var(--good); }
+    .t td.same { color: var(--faint); }
+    `;
+
+    const BIDS_CSS = BIDS_BASE_CSS + BIDS_CALM_CSS + BIDS_FORM_CSS + BIDS_PAST_CSS;
 
     /* ===== src/ui/bids-shell.js ===== */
     /*
@@ -26673,7 +27018,8 @@
      *   Today      the few totals, what to do now, the best flips, your trades, what you hold, your profit
      *   Flips      Best flips | By trader | All items: pick on the left, who sells and who pays in the
      *              middle, the trade on the right
-     *   Trades     a card per trade in the lane of its step, and the one you pressed under them
+     *   Trades     Going | History: a card per trade in the lane of its step, and the one you pressed under
+     *              them; the last 30 trades, each with the prices it was made on
      *   My items   what you hold, and where to sell it
      *   To sell    what you bought to resell, by who pays most
      *   Ledger     Trading | Sold | Receipts, traders, mugged
@@ -26731,7 +27077,7 @@
     const BD_PAGES = [
         { id: 'today', label: 'Today', icon: 'dash' },
         { id: 'flips', label: 'Flips', icon: 'flip', tabs: ['Best flips', 'By trader', 'All items'] },
-        { id: 'trades', label: 'Trades', icon: 'trades' },
+        { id: 'trades', label: 'Trades', icon: 'trades', tabs: ['Going', 'History'] },
         { gap: true },
         { id: 'mine', label: 'My items', icon: 'stock' },
         { id: 'sell', label: 'To sell', icon: 'tag' },
@@ -26739,6 +27085,10 @@
         { push: true },
         { id: 'settings', label: 'Settings', icon: 'set', tabs: ['Keys and sharing', 'Flips and reading', 'Help'] },
     ];
+
+    /** The tabs of Trades. */
+    const BD_TRADES_GOING = 0;
+    const BD_TRADES_PAST = 1;
 
     /** The tabs of Flips. */
     const BD_FLIPS_BEST = 0;
@@ -26835,7 +27185,8 @@
             section('today', 'p-dash', parts.today),
             // Flips: the picker, the middle and the trade; By trader swaps what the first two hold.
             section('flips', 'fit', [bdEl('div', { class: 'pane on c3 snug' }, [slot('flips-list', 'div', 'slot'), slot('flips-mid', 'div', 'col join'), slot('flips-plan', 'div', 'slot')])]),
-            section('trades', 'pgrows', [slot('trades-tiles', 'div', 'slot'), slot('trades-board', 'div', 'slot'), slot('trades-detail', 'div', 'slot')]),
+            // Trades: Going is the board and the trade pressed; History is its own pane (the list, and the trade picked).
+            section('trades', 'pgrows', [slot('trades-tiles', 'div', 'slot'), slot('trades-board', 'div', 'slot'), slot('trades-detail', 'div', 'slot'), (bd.pastPane = bdEl('div', { class: 'pane c57 snug' }, [slot('past-list', 'div', 'slot'), slot('past-side', 'div', 'col')]))]),
             section('mine', 'pgrows pgfill', [slot('mine-tiles', 'div', 'slot'), bdEl('div', { class: 'pane on c75 snug' }, [slot('mine-list', 'div', 'slot'), slot('mine-side', 'div', 'col')])]),
             section('sell', 'pgrows pgfill', [slot('sell-tiles', 'div', 'slot'), bdEl('div', { class: 'pane on c75 snug' }, [slot('sell-list', 'div', 'slot'), slot('sell-side', 'div', 'col')])]),
             section('ledger', 'g1', parts.ledger),
@@ -26966,6 +27317,7 @@
      * placeholder. Nothing is cut short with an ellipsis. Names from Torn,
      * TornExchange or TornW3B only ever go in via textContent.
      */
+
 
 
 
@@ -27581,6 +27933,14 @@
             this.mineTiles = spVars(spEl('div', { class: 'tiles' }), { '--n': 3 });
             this.sellTiles = spVars(spEl('div', { class: 'tiles' }), { '--n': 3 });
             this.boardEl = spEl('div', { class: 'board' });
+            // Trades > History (3.27.0): its totals, the last 30 trades, and the one picked.
+            this.pastTiles = spVars(spEl('div', { class: 'tiles' }), { '--n': 4 });
+            this.pastBody = spEl('tbody');
+            this.pastEmpty = spEl('div', { class: 'empty', hidden: '', text: 'No trade yet. A trade is written down here the moment its trader says yes, with the prices it was made on.' });
+            this.pastTable = spEl('table', { class: 't' }, [spEl('thead', {}, [spEl('tr', {}, [spEl('th', { text: 'Trader' }), spEl('th', { text: 'They said yes' }), spEl('th', { class: 'n', text: 'In it' }), spEl('th', { class: 'n', text: 'They pay' }), spEl('th', { text: 'How it ended' })])]), this.pastBody]);
+            this.pastListEl = spEl('div', { class: 'panel' }, [ph('The last 30 trades', 'from their yes · newest first · press one'), spEl('div', { class: 'pb flush' }, [this.pastTable, this.pastEmpty])]);
+            this.pastSideEl = spEl('div', { class: 'panel planp hist' });
+            this.pastSel = null;
             this.todayTiles = spEl('div', { class: 'kpis' });
             this.todayFlips = spEl('div', { class: 'grow-rows' });
             this.todayDo = spEl('div', { class: 'next' });
@@ -27672,7 +28032,13 @@
                 return ['Trading', 'Sold', 'Receipts', 'Traders', 'Mugged' + (mugs ? ' · ' + count(mugs) : '')];
             }
             if (id === 'settings') return ['Keys and sharing', 'Flips and reading', 'Help'];
+            if (id === 'trades') return ['Going', 'History'];
             return null;
+        }
+
+        /** Trades › History is in view. */
+        onPast() {
+            return Boolean(this.bd) && this.bd.page === 'trades' && this.bd.tab === BD_TRADES_PAST;
         }
 
         /** Flips › By trader is in view. */
@@ -27788,7 +28154,15 @@
             bdPut(this, 'flips-list', flips ? this.listPanel : null);
             bdPut(this, 'flips-mid', ...(flips ? (traders ? [this.buysEl] : [this.headEl, this.askEl, this.payEl]) : []));
             bdPut(this, 'flips-plan', flips ? this.planEl : null);
-            bdPut(this, 'trades-detail', page === 'trades' ? this.planEl : null);
+            // Trades: the board and the trade pressed (Going), or the last 30 trades and the one picked (History).
+            const past = this.onPast();
+            bdPut(this, 'trades-tiles', past ? this.pastTiles : this.tradesTiles);
+            bdPut(this, 'trades-board', past ? null : this.boardEl);
+            bdPut(this, 'trades-detail', page === 'trades' && !past ? this.planEl : null);
+            bdPut(this, 'past-list', past ? this.pastListEl : null);
+            bdPut(this, 'past-side', past ? this.pastSideEl : null);
+            this.bd.pastPane.classList.toggle('on', past);
+            this.bd.pages.trades.classList.toggle('pgfill', past);
             // Beside what you hold: where to sell it straight under its head, then its trade as one row.
             const side = [this.headEl, this.whereEl, this.planOnSide() ? this.tradeFoldEl : null];
             bdPut(this, 'mine-list', page === 'mine' ? this.listPanel : null);
@@ -27857,6 +28231,7 @@
             this.renderDesk();
             this.renderTiles();
             this.renderBoard();
+            this.renderPast();
             this.renderToday();
             this.renderTape();
         }
@@ -29766,7 +30141,9 @@
             const s = this.state;
             const page = this.bd.page;
             const b = (text, cls = '') => spEl('b', { class: cls, text });
-            if (page === 'trades') {
+            if (page === 'trades' && this.onPast()) {
+                // Drawn with the list (renderPast): its totals are of the trades kept.
+            } else if (page === 'trades') {
                 const T = s.trades || { waiting: [], buying: [], ready: [] };
                 const yes = [...T.buying, ...T.ready];
                 const all = [...T.waiting, ...yes];
@@ -29888,6 +30265,239 @@
                 ]))),
             );
             this.focusBack(box, keep);
+        }
+
+        /**
+         * Trades › History (3.27.0, mockup AH; the owner, 2026-10-11: "trader cancelled trade, and then he asked
+         * what pricelist did you see, we couldnt find them again"): the last 30 trades from their yes, and for the
+         * one picked the prices it was made on, where each came from, how long before the yes it was checked, what
+         * their list said when the trade ended, and what you bought for it.
+         */
+        renderPast() {
+            if (!this.onPast()) return;
+            const P = this.state.past;
+            // Not read yet (the script reads the trades only while this tab is in view): what is drawn stays.
+            if (!P) return;
+            const rows = P.rows || [];
+            const now = Date.now();
+            const idOf = (r) => r.key + '|' + r.at;
+            if (!rows.some((r) => idOf(r) === this.pastSel)) this.pastSel = rows.length ? idOf(rows[0]) : null;
+            const minute = Math.floor(now / 60000);
+            const sig = JSON.stringify(['past', rows, this.pastSel, this.pastCopied || null, this.pastCopyFailed || null, minute]);
+            if (sig === this.pastSig) return;
+            this.pastSig = sig;
+
+            /* the totals */
+            const T = pastTotals(rows);
+            const b = (text, cls = '') => spEl('b', { class: cls, text });
+            const none = T.old + T.back;
+            this.tilesInto(this.pastTiles, 'past', [
+                { label: 'Kept', value: count(T.kept), small: T.kept === 1 ? 'trade' : 'trades', sub: [(T.going ? count(T.going) + ' still going · ' : '') + 'the last 30 stay, on this PC only'] },
+                { label: 'Traded', value: count(T.traded), sub: T.traded ? [b(signed(T.profit), T.profit > 0 ? 't-good' : ''), ' made in ' + (T.traded === 1 ? 'it' : 'them')] : ['none yet'] },
+                { label: 'Cancelled', value: count(T.cancelled), sub: [T.cancelled ? 'after the yes · what was bought went to To sell' : 'none after a yes'] },
+                { label: 'No trade made', value: count(none), sub: [none ? [T.old ? count(T.old) + ' with no trade in a day' : null, T.back ? count(T.back) + (T.back === 1 ? ' yes undone' : ' yeses undone') : null].filter(Boolean).join(' · ') : 'every yes was traded or cancelled'] },
+            ]);
+
+            /* the list */
+            const keep = this.focusKeyIn(this.pastListEl);
+            this.bd.pastPane.classList.toggle('one', !rows.length);
+            this.pastTable.hidden = !rows.length;
+            this.pastEmpty.hidden = rows.length > 0;
+            this.pastSideEl.hidden = !rows.length;
+            this.pastBody.textContent = '';
+            const HOW = { traded: 'Traded', cancel: 'Cancelled', old: 'No trade in a day', back: 'Yes undone' };
+            for (const r of rows) {
+                const state = pastState(r);
+                const units = (r.lines || []).reduce((a, l) => a + (l.units || 0), 0);
+                const kinds = new Set((r.lines || []).map((l) => l.itemId)).size;
+                const L = r.live || null;
+                const head = state === 'going' ? (L && L.ready ? 'Ready to trade' : L ? 'Buying' : 'Going') : HOW[state] || 'Ended';
+                const sub = state === 'traded' ? signed(r.end.profit)
+                    : state === 'cancel' ? pastSpan(r.end.at - r.at) + ' after the yes'
+                        : state === 'old' ? 'what was bought went to To sell'
+                            : state === 'back' ? 'back to the live plan'
+                                : L && L.bazaars ? count(L.boughtStops || 0) + ' of ' + this.plural(L.bazaars, 'bazaar') + ' bought' : 'said yes ' + formatAge(now - r.at);
+                const pick = () => {
+                    this.pastSel = idOf(r);
+                    this.renderPast();
+                };
+                const tr = spEl('tr', { class: 'pick' + (idOf(r) === this.pastSel ? ' sel' : ''), tabindex: '0', 'data-focus': 'past:' + idOf(r), title: 'See the prices this trade was made on', onclick: pick }, [
+                    spEl('td', {}, [spEl('div', { class: 'cell' }, [spEl('div', {}, [spEl('b', { text: r.trader.name || 'Trader ' + (r.trader.id || '') })])])]),
+                    spEl('td', { text: pastWhen(r.at, now) }),
+                    spEl('td', { class: 'n' }, [count(units), spEl('small', { text: this.plural(kinds, 'kind') })]),
+                    spEl('td', { class: 'n', text: formatMoney(r.pays) }),
+                    spEl('td', { class: state === 'cancel' || state === 'old' ? 't-warn' : '' }, [head, spEl('small', { class: state === 'traded' && r.end.profit > 0 ? 't-good' : '', text: sub })]),
+                ]);
+                tr.addEventListener('keydown', (event) => {
+                    if (event.key !== 'Enter' && event.key !== ' ') return;
+                    event.preventDefault();
+                    pick();
+                });
+                this.pastBody.appendChild(tr);
+            }
+            this.focusBack(this.pastListEl, keep);
+
+            /* the trade picked */
+            const rec = rows.find((r) => idOf(r) === this.pastSel);
+            const side = this.pastSideEl;
+            const keepSide = this.focusKeyIn(side);
+            side.textContent = '';
+            if (!rec) return;
+            const state = pastState(rec);
+            const end = rec.end;
+            const L = rec.live || null;
+            const then = end || L;
+            const who = rec.trader.name || 'Trader ' + (rec.trader.id || '');
+            const copied = this.pastCopied === idOf(rec);
+            // Refused by the browser (it copies only from a page you are on): said on the button, never silent.
+            const failed = this.pastCopyFailed === idOf(rec);
+            const copy = spEl('button', { type: 'button', class: 'btn sm' + (copied ? ' done' : ''), 'data-focus': 'past:copy', title: 'Copies this trade as plain text, in Torn\'s time, to paste to ' + who, text: copied ? 'Copied' : failed ? 'Could not copy: press again' : 'Copy for ' + who, onclick: () => this.copyPast(rec, idOf(rec)) });
+            const BY = { seen: 'seen in your Torn trades', hand: 'Traded - done pressed in Torn Bids', bids: 'Cancel trade pressed in Torn Bids', torn: 'Cancel trade pressed on a Torn page' };
+            const later = end ? pastSpan(end.at - rec.at) + ' later' : '';
+            const story = ['Said yes ' + pastWhen(rec.at, now)];
+            if (state === 'traded') story.push(spEl('b', { text: 'traded ' + pastWhen(end.at, now) }), later, BY[end.by] || null);
+            else if (state === 'cancel') story.push(spEl('b', { text: 'cancelled ' + pastWhen(end.at, now) }), later, BY[end.by] || null);
+            else if (state === 'old') story.push(spEl('b', { text: 'no trade made in a day' }), 'let go ' + pastWhen(end.at, now));
+            else if (state === 'back') story.push(spEl('b', { text: 'yes undone ' + pastWhen(end.at, now) }), later, 'Back to the live plan pressed');
+            else story.push(spEl('b', { text: L && L.ready ? 'ready to trade' : L ? 'buying' : 'still going' }), L && L.bazaars ? count(L.boughtStops || 0) + ' of ' + this.plural(L.bazaars, 'bazaar') + ' bought' : null);
+            const subKids = [];
+            // "traded today 21:31, 26 min later · seen in your Torn trades": the time and how long after go together.
+            story.filter(Boolean).forEach((part, i) => {
+                if (i) subKids.push(i === 2 && later && part === later ? ', ' : ' · ');
+                subKids.push(part);
+            });
+            const made = state === 'traded';
+            const off = Boolean(end) && !made;
+            const plan = spEl('div', { class: 'plan' }, [
+                spEl('div', { class: 'who' }, [
+                    spEl('div', { class: 'who-t' }, [
+                        spEl('span', { class: 'lbl', text: 'Trade with' }), spEl('span', { class: 'sp' }),
+                        rec.trader.id ? this.link('W3B list', w3bPriceListUrl(rec.trader.id), { cls: 'btn sm lk', title: who + '\'s TornW3B price list, as it is now', focus: 'past:w3b' }) : null,
+                        rec.trader.name ? this.link('TE list', tePriceListUrl(rec.trader.name), { cls: 'btn sm lk', title: who + '\'s TornExchange price list, as it is now', focus: 'past:te' }) : null,
+                        copy,
+                    ]),
+                    spEl('h3', {}, [this.playerName(who, rec.trader.id, 'past:who')]),
+                    spEl('span', { class: 'sub' }, subKids),
+                ]),
+                spEl('div', { class: 'bigrow' }, [
+                    spEl('div', {}, [spEl('span', { class: 'lbl', text: made ? 'Profit' : off ? 'It would have made' : 'Profit as planned' }), spEl('div', { class: 'big' + (off ? ' off' : this.moneyTone(made ? end.profit : rec.profit)), text: signed(made ? end.profit : rec.profit) })]),
+                    spEl('div', { class: 'eq' }, made
+                        ? ['You paid the bazaars', spEl('b', { text: formatMoney(end.cost) }), spEl('br'), who + ' paid you', spEl('b', { text: formatMoney(end.pays) })]
+                        : off ? ['You were to pay the bazaars', spEl('b', { text: formatMoney(rec.cost) }), spEl('br'), who + ' was to pay you', spEl('b', { text: formatMoney(rec.pays) })]
+                            : ['You pay the bazaars', spEl('b', { text: formatMoney(rec.cost) }), spEl('br'), who + ' pays you', spEl('b', { text: formatMoney(rec.pays) })]),
+                ]),
+            ]);
+            const M = pastMoved(rec, then);
+            if (M.moved.length) {
+                const what = M.moved.map((x) => x.name + (x.is > 0 ? ' went from ' + formatMoney(x.was) + ' to ' + formatMoney(x.is) : ' is no longer on their list')).join('; ') + '.';
+                const lead = M.changedAt ? who + ' changed their list ' + pastWhen(M.changedAt, now) + ', ' + pastSpan(M.changedAt - rec.at) + ' after the yes.' : who + '\'s prices moved after the yes.';
+                const rest = (rec.lines || []).length > M.moved.length ? ' The other prices stayed.' : '';
+                plan.appendChild(spEl('div', { class: 'amber' }, [spEl('span', {}, [spEl('b', { text: lead }), ' ' + what + rest])]));
+            }
+            side.appendChild(plan);
+
+            /* their prices at the yes */
+            const list = rec.list;
+            const onW3b = (rec.lines || []).some((l) => pastSource(l) === 'w3b');
+            let listNote;
+            if (!list) listNote = ['This trade was accepted before Torn Bids kept a history: these are the prices it was accepted at. Where they came from and how old ' + who + '\'s list was were not written down.'];
+            else {
+                listNote = [spEl('b', { text: onW3b ? 'TornW3B list' : 'TornExchange prices' })];
+                if (onW3b) listNote.push(list.changedAt ? ', last changed by ' + who + ' ' + pastWhen(list.changedAt, now) + ', ' + pastSpan(rec.at - list.changedAt) + ' before the yes.' : '. When ' + who + ' last changed it is not known.');
+                else listNote.push(': TornExchange gives no date for a price.');
+                if (onW3b && list.readAt) listNote.push(' Torn Bids read it ' + pastWhen(list.readAt, now) + '.');
+                if (M.known && !M.moved.length) listNote.push(M.changedAt ? ' They changed it ' + pastWhen(M.changedAt, now) + ', after the yes: none of this trade\'s prices moved.' : M.readAfter ? (end ? ' It had not changed when the trade ended.' : ' It has not changed since.') : ' Torn Bids has not read it again since the yes.');
+            }
+            side.appendChild(spEl('div', { class: 'ph' }, [spEl('h2', { text: who + '\'s prices when they said yes' })]));
+            side.appendChild(spEl('p', { class: 'note' }, listNote));
+            const priceRows = (rec.lines || []).map((l) => {
+                const src = pastSource(l);
+                const from = src === 'w3b' ? ['TornW3B', spEl('small', { text: l.te > 0 ? 'TornExchange said ' + formatMoney(l.te) : 'not on TornExchange' })]
+                    : src === 'te' ? ['TornExchange', spEl('small', { text: 'not on TornW3B' })] : ['–'];
+                const checked = l.checkedAt > 0 && l.checkedAt <= rec.at ? pastSpan(rec.at - l.checkedAt) : '–';
+                const moved = M.moved.find((x) => x.itemId === l.itemId);
+                const last = !M.known ? spEl('td', { class: 'n t-muted', text: '–' })
+                    : !moved ? spEl('td', { class: 'n same', text: 'the same' })
+                        : moved.is > 0 ? spEl('td', { class: 'n t-warn' }, [formatMoney(moved.is), spEl('small', { text: signed(moved.is - moved.was) + ' each' })])
+                            : spEl('td', { class: 'n t-warn', text: 'not listed' });
+                return spEl('tr', {}, [
+                    spEl('td', {}, [this.pic('past', l.itemId), spEl('b', { text: l.name || 'Item ' + l.itemId }), l.kind === 'yours' ? spEl('span', { class: 'tag', text: 'yours' }) : null]),
+                    spEl('td', { class: 'n', text: count(l.units) }),
+                    spEl('td', { class: 'n' }, [spEl('b', { text: formatMoney(l.bid) })]),
+                    spEl('td', {}, from),
+                    spEl('td', { class: 'n', text: checked }),
+                    last,
+                ]);
+            });
+            side.appendChild(spEl('div', { class: 'pb flush' }, [spEl('table', { class: 't tight wrapth' }, [
+                spEl('thead', {}, [spEl('tr', {}, [spEl('th', { text: 'Item' }), spEl('th', { class: 'n', text: 'Count' }), spEl('th', { class: 'n', text: 'They pay each' }), spEl('th', { text: 'Price from' }), spEl('th', { class: 'n', title: 'How long before their yes TornW3B last confirmed this price', text: 'Checked before the yes' }), spEl('th', { class: 'n', text: end ? 'When it ended' : 'Now' })])]),
+                spEl('tbody', {}, priceRows),
+            ])]));
+
+            /* what you bought for it */
+            const bought = (end ? end.bought : L ? L.bought : null) || [];
+            if (bought.length) {
+                const each = (n) => (n === null || n === undefined ? '–' : formatMoney(n));
+                const stops = (n) => this.plural(n, 'bazaar');
+                const thenOf = (r) => {
+                    if (state === 'going') return r.kind === 'yours' ? 'to send' : r.got >= r.of ? 'bought' : r.got ? 'some still to buy' : 'still to buy';
+                    if (state === 'traded') {
+                        const took = Math.max(0, r.got - (r.kept || 0));
+                        return who + ' took ' + count(took) + (r.kept ? ' · ' + count(r.kept) + ' went to To sell' : '');
+                    }
+                    if (r.kind === 'yours') return r.each === null ? 'stayed yours' : 'stayed in To sell';
+                    return r.got ? (r.kept ? (r.kept < r.got ? count(r.kept) + ' went to To sell' : 'went to To sell') : 'stayed yours') : 'not bought';
+                };
+                side.appendChild(spEl('div', { class: 'ph' }, [spEl('h2', { text: 'What you bought for it' }), spEl('span', { class: 'sub', text: state === 'going' ? 'so far' : made ? 'and what ' + who + ' took' : 'when it ended' })]));
+                side.appendChild(spEl('div', { class: 'pb flush' }, [spEl('table', { class: 't tight' }, [
+                    spEl('thead', {}, [spEl('tr', {}, [spEl('th', { text: 'Item' }), spEl('th', { class: 'n', text: 'Bought' }), spEl('th', { class: 'n', text: 'You paid each' }), spEl('th', { text: 'At' }), spEl('th', { text: 'Then' })])]),
+                    spEl('tbody', {}, bought.map((r) => spEl('tr', {}, [
+                        spEl('td', {}, [this.pic('past', r.itemId), spEl('b', { text: r.name || 'Item ' + r.itemId })]),
+                        spEl('td', { class: 'n', text: r.kind === 'yours' ? 'yours, ' + count(r.got) : r.kind === 'extra' ? count(r.got) + ', not planned' : count(r.got) + ' of ' + count(r.of) }),
+                        spEl('td', { class: 'n', text: r.got || r.kind === 'yours' ? each(r.each) : '–' }),
+                        spEl('td', { text: r.kind === 'yours' ? (r.each === null ? 'your own' : 'from To sell') : r.got ? stops(r.stops) : stops(r.stopsAll) + ', not been to' }),
+                        spEl('td', { class: !r.got && r.kind !== 'yours' ? 't-muted' : '', text: thenOf(r) }),
+                    ]))),
+                ])]));
+            }
+            this.focusBack(side, keepSide);
+        }
+
+        /** Copy for the trader: the trade as plain text on the clipboard. The button says Copied for a moment, or that it could not. */
+        copyPast(rec, id) {
+            const text = pastTradeText(rec, rec.live || null);
+            const done = (ok) => {
+                this.pastCopied = ok ? id : null;
+                this.pastCopyFailed = ok ? null : id;
+                this.renderPast();
+                clearTimeout(this.pastCopyTimer);
+                this.pastCopyTimer = setTimeout(() => {
+                    this.pastCopied = null;
+                    this.pastCopyFailed = null;
+                    this.renderPast();
+                }, 2500);
+            };
+            const old = () => {
+                // No clipboard permission: the older way, through a text box of our own.
+                try {
+                    const box = spEl('textarea', { 'aria-hidden': 'true' });
+                    box.value = text;
+                    box.style.cssText = 'position:fixed;left:-9999px;top:0;';
+                    this.root.appendChild(box);
+                    box.select();
+                    const ok = document.execCommand('copy');
+                    box.remove();
+                    done(ok);
+                } catch {
+                    done(false);
+                }
+            };
+            try {
+                if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(() => done(true), old);
+                else old();
+            } catch {
+                old();
+            }
         }
 
         /** Profit per day for the last `n` days, from your Ledger: [{start, profit}], oldest first. Empty without a Ledger key. */
@@ -32414,6 +33024,7 @@
 
 
 
+
     const STORE_KEY = 'apiKey';
     const STORE_ITEMS = 'itemsCache';
     const STORE_NPC = 'npcCache';
@@ -32508,6 +33119,8 @@
     const STORE_SELL_ENDED = 'sellEnded';
     // The last trades that ended, in full, for the zip (3.23.0, core/trades-export.js keepEndedTrades).
     const STORE_SELL_ENDED_FULL = 'sellEndedFull';
+    // Trades > History (3.27.0, core/past-trades.js): the last 30 trades from their yes, each with the prices it was made on. This PC only.
+    const STORE_SELL_PAST = 'sellPast';
     /* The Bought window (3.14.3): {pos: {x, y}|null, folded}. Where you dragged it, kept. */
     const STORE_BOUGHT_WINDOW = 'boughtWindow';
     /* What traders agreed to pay, per accepted trade (core/ledger.js): the Ledger splits a trade's money by it. */
@@ -36920,7 +37533,7 @@
             if (took > 0 && all[key]) saveSellAccepted({ ...all, [key]: buyOverHere(recordBuy(all[key], here.line, here.index, took), here) });
         }
         if (buyRun.stepKey) saveBuyRunSeen(buyRun.stepKey, null);
-        cancelSellAccepted(key);
+        cancelSellAccepted(key, Date.now(), 'torn');
         buyRun.stepKey = null;
         app.buyAsk = null;
         scanTradePage();
@@ -38445,7 +39058,7 @@
         ];
         // The values the first list missed (3.17.0: the speed log's "everything stored"), and this tab's own request windows.
         keys.push(
-            STORE_W3B_COOLDOWN, STORE_W3B_PACE, STORE_IM_WATCH, STORE_BIDS_SEEN, STORE_LIST_AT, STORE_SELL_DECLINED, STORE_SELL_ASKED, STORE_SELL_ENDED, STORE_SELL_ENDED_FULL, STORE_SELL_CANCELLED, STORE_BOUGHT_WINDOW, STORE_SELL_PRICE_RECORDS, STORE_SELL_BLACKLIST,
+            STORE_W3B_COOLDOWN, STORE_W3B_PACE, STORE_IM_WATCH, STORE_BIDS_SEEN, STORE_LIST_AT, STORE_SELL_DECLINED, STORE_SELL_ASKED, STORE_SELL_ENDED, STORE_SELL_ENDED_FULL, STORE_SELL_PAST, STORE_SELL_CANCELLED, STORE_BOUGHT_WINDOW, STORE_SELL_PRICE_RECORDS, STORE_SELL_BLACKLIST,
             STORE_SELL_FAVOURITES, STORE_SELL_TE_OWN, STORE_CHAT_WANTED, STORE_SELL_MOVES, STORE_LEDGER_REV, STORE_SELL_PRESENCE, STORE_SELL_HELD, STORE_SELL_WAS,
             FEED_LEADER_KEY, FEED_RECHECK_KEY, FEED_REFRESH_KEY, SPEED_STORE_KEY, STORE_CLEANED,
             STORE_API_WINDOW + '.' + app.tabId, STORE_W3B_WINDOW + '.' + app.tabId,
@@ -39235,6 +39848,7 @@
             const mine = cancelledLeftovers(t, now).map((l) => ({ ...l, why: 'old' }));
             left = addLeftovers(left, mine);
             ended = addEnded(ended, endedOf(t, 'old', mine, now), now);
+            notePastEnd(t, 'old', { left: mine, now });
             logProblem('note', 'An accepted trade with no trade made in a day was let go (' + (t.trader ? t.trader.name : t.key) + '): ' + mine.length + (mine.length === 1 ? ' item' : ' items') + ' bought for it went to To sell');
         }
         if (left.length) saveSellLeftovers(addLeftovers(sellLeftovers(now), left));
@@ -39243,11 +39857,47 @@
     }
 
     /** A trade ended (traded, cancelled): written down for the Trades board, with what went to To sell. */
-    function noteSellEnded(trade, how, moved, now = Date.now()) {
+    function noteSellEnded(trade, how, moved, now = Date.now(), by = null, endedAt = null) {
         if (!trade || !trade.key) return;
+        notePastEnd(trade, how === 'traded' ? 'traded' : 'cancel', { by, left: moved, now: endedAt || now });
         gmSet(STORE_SELL_ENDED, addEnded(gmGet(STORE_SELL_ENDED, null), endedOf(trade, how, moved, now), now));
         // As it was, for the next zip (3.23.0): the last few only.
         gmSet(STORE_SELL_ENDED_FULL, keepEndedTrades(gmGet(STORE_SELL_ENDED_FULL, null), trade, how, now));
+    }
+
+    /**
+     * What is known of a trade's trader's list right now (3.27.0, core/past-trades.js): when they last changed
+     * it, when Torn Bids last read it, and what it pays for each of the trade's items. In Torn Bids from what
+     * the page holds; on a Torn page from what Torn Bids last stored for every page. null: nothing is known.
+     */
+    function pastFactsNow(trade) {
+        try {
+            const ids = [...new Set((trade.items || []).map((i) => String(i.itemId)))];
+            if (sell.pricesSeen) {
+                const seen = sell.pricesSeen(trade.key, ids);
+                const bids = {};
+                for (const [id, x] of Object.entries(seen.items)) bids[id] = x.price;
+                return { changedAt: seen.changedAt, readAt: seen.readAt, bids };
+            }
+            const bids = {};
+            for (const id of ids) bids[id] = traderBidOf(trade, id);
+            const traderId = trade.trader && trade.trader.id ? String(trade.trader.id) : null;
+            const t = traderId ? readTraderDb(gmGet(STORE_TRADER_DB, null)).traders[traderId] : null;
+            return { changedAt: (traderId && app.traderLookup && app.traderLookup.listAt.get(traderId)) || 0, readAt: t && t.w3b && t.w3b.at ? t.w3b.at : 0, bids };
+        } catch {
+            return null;
+        }
+    }
+
+    /** A trade ended: its record in Trades > History is closed (how, what was bought, their list by then). Never in the way of the ending itself. */
+    function notePastEnd(trade, how, { by = null, left = [], now = Date.now() } = {}) {
+        try {
+            const facts = pastFactsNow(trade);
+            gmSet(STORE_SELL_PAST, endPastTrade(gmGet(STORE_SELL_PAST, null), trade, how, { now, by, facts, left }));
+            logProblem('note', 'Trade history: the trade with ' + (trade.trader ? trade.trader.name : trade.key) + ' closed as ' + how + (by ? ' (' + by + ')' : '') + (facts ? '' : '; their list was not known then'));
+        } catch (error) {
+            logProblem('error', 'Trade history: an ended trade could not be written down', { message: String((error && error.message) || error).slice(0, 160) });
+        }
     }
 
     /** Trades you asked a trader about, still waiting for a yes (an hour). */
@@ -39423,13 +40073,13 @@
      * later trade by them), what you already bought is kept to sell elsewhere,
      * and Torn Bids lets go of the plan (never marked Declined; a pin stays).
      */
-    function cancelSellAccepted(key, now = Date.now()) {
+    function cancelSellAccepted(key, now = Date.now(), where = 'bids') {
         const all = sellAccepted(now);
         const t = all[key];
         if (!t) return;
         const left = cancelledLeftovers(t, now);
         if (left.length) saveSellLeftovers(addLeftovers(sellLeftovers(now), left));
-        noteSellEnded(t, 'cancel', left, now);
+        noteSellEnded(t, 'cancel', left, now, where);
         const recs = gmGet(STORE_SELL_PRICE_RECORDS, []) || [];
         const id = t.trader && t.trader.id ? String(t.trader.id) : null;
         const kept = recs.filter((r) => !(r && id && String(r.traderId) === id && Number(r.at) === Number(t.at)));
@@ -39458,8 +40108,10 @@
      * (3.16.1), else what you marked; its pin goes too. Back to the live plan
      * (done false) keeps nothing, and keeps the pin.
      */
-    function closeSellAccepted(key, { done = false, left = null } = {}) {
+    function closeSellAccepted(key, { done = false, left = null, seenAt = null } = {}) {
         const all = sellAccepted();
+        // The yes undone (Back to the live plan): said so in Trades > History.
+        if (!done && all[key]) notePastEnd(all[key], 'back', { by: 'bids' });
         if (done && all[key]) {
             // By hand: what you marked not taken, and what a full trade never had room for (3.23.0).
             const rest = left || addLeftovers(leftoversOf(all[key]), overLeftovers(all[key]));
@@ -39467,7 +40119,7 @@
             const before = sellLeftovers();
             const mine = afterYoursSent(before, all[key]);
             if (rest.length || mine !== before) saveSellLeftovers(addLeftovers(mine, rest));
-            noteSellEnded(all[key], 'traded', rest);
+            noteSellEnded(all[key], 'traded', rest, Date.now(), seenAt ? 'seen' : 'hand', seenAt);
         }
         const itemId = all[key] ? String(all[key].itemId) : null;
         forgetLogBuysOf(key, all);
@@ -41115,6 +41767,20 @@
             }
             return c;
         };
+        // What Torn Bids sees of one trader's prices right now (3.27.0, core/past-trades.js): asked for at a yes and at a trade's end.
+        sell.pricesSeen = (key, ids) => {
+            const keyOf = (b) => (b.id ? 'id:' + b.id : 'name:' + String(b.name).toLowerCase());
+            const items = {};
+            let traderId = /^id:\d+$/.test(String(key)) ? String(key).slice(3) : null;
+            for (const id of ids) {
+                const b = buyersAllowed(id).find((x) => keyOf(x) === key);
+                if (!b) continue;
+                if (b.id) traderId = String(b.id);
+                items[String(id)] = { price: b.price, w3b: b.w3b > 0 ? b.w3b : 0, te: b.te > 0 ? b.te : 0, checkedAt: checkOf(id, b).at || 0 };
+            }
+            const own = traderId && sell.db && sell.db.traders[traderId] ? sell.db.traders[traderId].w3b : null;
+            return { changedAt: traderId ? listAtOf(traderId) : 0, readAt: own && own.at ? own.at : 0, items };
+        };
         const flipCheckedCache = new Map();
         const flipCheckedOf = (id) => {
             const key = String(id);
@@ -41975,7 +42641,8 @@
                 // Biggest trade first; still reading, then nothing now, after.
                 // The cards in view: their traders' statuses kept fresh, one not read yet says so.
                 const cards = traderCards(scanOrder(scan.list), { hold: holdFlips, unread: unreadStatus });
-                scan.list = cards.list;
+                // In order again once "being checked" is known: a trade that cannot be offered yet goes under the ones that can.
+                scan.list = scanOrder(cards.list);
                 sell.scanList = scan.list;
                 sell.scanWatch = cards.watch;
             }
@@ -42089,6 +42756,22 @@
             declined: (itemId, key) => declinedAll.has(declineKey(itemId, key)),
         });
         counts.trades = tradesView.going;
+        // Trades > History (3.27.0): read only while that tab is in view. A trade still going shows what was bought
+        // so far, and their list as it is now.
+        let past = null;
+        if (sell.bdPage === 'trades' && sell.bdTab === 1) {
+            const open = sellAccepted(now);
+            const stage = new Map([...tradesView.buying.map((r) => [r.key, { ...r, ready: false }]), ...tradesView.ready.map((r) => [r.key, { ...r, ready: true }])]);
+            past = {
+                rows: pastTrades(gmGet(STORE_SELL_PAST, null)).map((rec) => {
+                    const t = rec.end ? null : open[rec.key];
+                    if (!t || Number(t.at) !== Number(rec.at)) return rec;
+                    const facts = pastFactsNow(t);
+                    const st = stage.get(rec.key) || null;
+                    return { ...rec, live: { list: facts ? { changedAt: facts.changedAt, readAt: facts.readAt } : null, bids: facts ? facts.bids : null, bought: pastBought(t), ready: Boolean(st && st.ready), bazaars: st ? st.bazaars : 0, boughtStops: st ? st.boughtStops : 0 } };
+                }),
+            };
+        }
         // What the list shows now, for Refresh (3.22.1): the rows under the filter, the search and the category -
         // on the Trades tab, the items of the trades going. The first screenfuls only.
         sell.viewIds = (sell.filter === 'trades'
@@ -42157,6 +42840,7 @@
             toSell: { rows: toSell, ...toSellBoard(toSell), open: sell.filter === 'sell' && sell.boardOpen },
             // The Trades tab: its rows by stage, and its board (beside the list until a trade is opened).
             trades: { ...tradesView, open: sell.filter === 'trades' && sell.boardOpen },
+            past,
             ledger: ledgerView(),
             hold,
             scan,
@@ -42996,6 +43680,14 @@
         }
         all[acc.key] = acc;
         saveSellAccepted(all);
+        // Written down now, with the prices it is made on (3.27.0): their list can change afterwards.
+        try {
+            const seen = sell.pricesSeen ? sell.pricesSeen(acc.key, acc.items.map((i) => i.itemId)) : null;
+            gmSet(STORE_SELL_PAST, addPastTrade(gmGet(STORE_SELL_PAST, null), pastTradeOf(acc, seen)));
+            logProblem('note', 'Trade history: the trade with ' + acc.trader.name + ' written down at the yes (' + acc.items.length + (acc.items.length === 1 ? ' item' : ' items') + (seen ? ', their list changed ' + (seen.changedAt ? Math.round((acc.at - seen.changedAt) / 60000) + ' min before' : 'at a time not known') + ', read ' + (seen.readAt ? Math.round((acc.at - seen.readAt) / 1000) + ' s before' : 'at a time not known') : ', their list not known') + ')');
+        } catch (error) {
+            logProblem('error', 'Trade history: the yes could not be written down', { message: String((error && error.message) || error).slice(0, 160) });
+        }
         // Kept after the trade: the Ledger splits what they paid by these prices.
         const rec = priceRecordOf(acc);
         if (rec) gmSet(STORE_SELL_PRICE_RECORDS, addPriceRecord(gmGet(STORE_SELL_PRICE_RECORDS, []), rec));
@@ -44240,7 +44932,7 @@
             for (const t of open.sort((a, b) => a.at - b.at)) {
                 const f = finishedTradeFor(t, avail);
                 if (!f) continue;
-                closeSellAccepted(t.key, { done: true, left: tradedLeftovers(t, take(f), Date.now(), f.t) });
+                closeSellAccepted(t.key, { done: true, left: tradedLeftovers(t, take(f), Date.now(), f.t), seenAt: Number(f.t) || Date.now() });
                 logAction('Traded - done (your Torn trades show it; item ' + t.itemId + ')');
                 changed = true;
             }
@@ -44256,6 +44948,7 @@
                 for (const r of u.recs || []) recs = addPriceRecord(recs, r);
                 gmSet(STORE_SELL_PRICE_RECORDS, recs);
                 delete undoAll[u.trade.key];
+                notePastEnd(u.trade, 'traded', { by: 'seen', left, now: Number(f.t) || Date.now() });
                 logAction('Cancel trade put right: it had gone through (item ' + u.trade.itemId + ')');
                 changed = true;
             }

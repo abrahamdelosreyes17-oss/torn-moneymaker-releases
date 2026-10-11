@@ -43,7 +43,8 @@ import { LedgerView, LEDGER_CSS } from './ledger-view.js';
 import { keyInputAttrs, keyMask } from './mask.js';
 import { FRESH_DEFAULTS, FRESH_MIN, FRESH_MAX, FRESH_TOP, freshMinutes, keepsUp } from '../core/desk.js';
 import { BIDS_CSS } from './bids-css.js';
-import { bdBuildShell, bdShow, bdTabs, bdNavCount, bdPut, bdMoveInd, bdIcon, bdFilterOf, BD_FLIPS_BEST, BD_FLIPS_TRADER, BD_FLIPS_ITEMS } from './bids-shell.js';
+import { bdBuildShell, bdShow, bdTabs, bdNavCount, bdPut, bdMoveInd, bdIcon, bdFilterOf, BD_FLIPS_BEST, BD_FLIPS_TRADER, BD_FLIPS_ITEMS, BD_TRADES_PAST } from './bids-shell.js';
+import { pastState, pastMoved, pastTotals, pastSpan, pastWhen, pastSource, pastTradeText } from '../core/past-trades.js';
 
 export const SELLING_PAGE_TITLE = 'Torn Bids';
 
@@ -636,6 +637,14 @@ export class SellingPage {
         this.mineTiles = spVars(spEl('div', { class: 'tiles' }), { '--n': 3 });
         this.sellTiles = spVars(spEl('div', { class: 'tiles' }), { '--n': 3 });
         this.boardEl = spEl('div', { class: 'board' });
+        // Trades > History (3.27.0): its totals, the last 30 trades, and the one picked.
+        this.pastTiles = spVars(spEl('div', { class: 'tiles' }), { '--n': 4 });
+        this.pastBody = spEl('tbody');
+        this.pastEmpty = spEl('div', { class: 'empty', hidden: '', text: 'No trade yet. A trade is written down here the moment its trader says yes, with the prices it was made on.' });
+        this.pastTable = spEl('table', { class: 't' }, [spEl('thead', {}, [spEl('tr', {}, [spEl('th', { text: 'Trader' }), spEl('th', { text: 'They said yes' }), spEl('th', { class: 'n', text: 'In it' }), spEl('th', { class: 'n', text: 'They pay' }), spEl('th', { text: 'How it ended' })])]), this.pastBody]);
+        this.pastListEl = spEl('div', { class: 'panel' }, [ph('The last 30 trades', 'from their yes · newest first · press one'), spEl('div', { class: 'pb flush' }, [this.pastTable, this.pastEmpty])]);
+        this.pastSideEl = spEl('div', { class: 'panel planp hist' });
+        this.pastSel = null;
         this.todayTiles = spEl('div', { class: 'kpis' });
         this.todayFlips = spEl('div', { class: 'grow-rows' });
         this.todayDo = spEl('div', { class: 'next' });
@@ -727,7 +736,13 @@ export class SellingPage {
             return ['Trading', 'Sold', 'Receipts', 'Traders', 'Mugged' + (mugs ? ' · ' + count(mugs) : '')];
         }
         if (id === 'settings') return ['Keys and sharing', 'Flips and reading', 'Help'];
+        if (id === 'trades') return ['Going', 'History'];
         return null;
+    }
+
+    /** Trades › History is in view. */
+    onPast() {
+        return Boolean(this.bd) && this.bd.page === 'trades' && this.bd.tab === BD_TRADES_PAST;
     }
 
     /** Flips › By trader is in view. */
@@ -843,7 +858,15 @@ export class SellingPage {
         bdPut(this, 'flips-list', flips ? this.listPanel : null);
         bdPut(this, 'flips-mid', ...(flips ? (traders ? [this.buysEl] : [this.headEl, this.askEl, this.payEl]) : []));
         bdPut(this, 'flips-plan', flips ? this.planEl : null);
-        bdPut(this, 'trades-detail', page === 'trades' ? this.planEl : null);
+        // Trades: the board and the trade pressed (Going), or the last 30 trades and the one picked (History).
+        const past = this.onPast();
+        bdPut(this, 'trades-tiles', past ? this.pastTiles : this.tradesTiles);
+        bdPut(this, 'trades-board', past ? null : this.boardEl);
+        bdPut(this, 'trades-detail', page === 'trades' && !past ? this.planEl : null);
+        bdPut(this, 'past-list', past ? this.pastListEl : null);
+        bdPut(this, 'past-side', past ? this.pastSideEl : null);
+        this.bd.pastPane.classList.toggle('on', past);
+        this.bd.pages.trades.classList.toggle('pgfill', past);
         // Beside what you hold: where to sell it straight under its head, then its trade as one row.
         const side = [this.headEl, this.whereEl, this.planOnSide() ? this.tradeFoldEl : null];
         bdPut(this, 'mine-list', page === 'mine' ? this.listPanel : null);
@@ -912,6 +935,7 @@ export class SellingPage {
         this.renderDesk();
         this.renderTiles();
         this.renderBoard();
+        this.renderPast();
         this.renderToday();
         this.renderTape();
     }
@@ -2821,7 +2845,9 @@ export class SellingPage {
         const s = this.state;
         const page = this.bd.page;
         const b = (text, cls = '') => spEl('b', { class: cls, text });
-        if (page === 'trades') {
+        if (page === 'trades' && this.onPast()) {
+            // Drawn with the list (renderPast): its totals are of the trades kept.
+        } else if (page === 'trades') {
             const T = s.trades || { waiting: [], buying: [], ready: [] };
             const yes = [...T.buying, ...T.ready];
             const all = [...T.waiting, ...yes];
@@ -2943,6 +2969,239 @@ export class SellingPage {
             ]))),
         );
         this.focusBack(box, keep);
+    }
+
+    /**
+     * Trades › History (3.27.0, mockup AH; the owner, 2026-10-11: "trader cancelled trade, and then he asked
+     * what pricelist did you see, we couldnt find them again"): the last 30 trades from their yes, and for the
+     * one picked the prices it was made on, where each came from, how long before the yes it was checked, what
+     * their list said when the trade ended, and what you bought for it.
+     */
+    renderPast() {
+        if (!this.onPast()) return;
+        const P = this.state.past;
+        // Not read yet (the script reads the trades only while this tab is in view): what is drawn stays.
+        if (!P) return;
+        const rows = P.rows || [];
+        const now = Date.now();
+        const idOf = (r) => r.key + '|' + r.at;
+        if (!rows.some((r) => idOf(r) === this.pastSel)) this.pastSel = rows.length ? idOf(rows[0]) : null;
+        const minute = Math.floor(now / 60000);
+        const sig = JSON.stringify(['past', rows, this.pastSel, this.pastCopied || null, this.pastCopyFailed || null, minute]);
+        if (sig === this.pastSig) return;
+        this.pastSig = sig;
+
+        /* the totals */
+        const T = pastTotals(rows);
+        const b = (text, cls = '') => spEl('b', { class: cls, text });
+        const none = T.old + T.back;
+        this.tilesInto(this.pastTiles, 'past', [
+            { label: 'Kept', value: count(T.kept), small: T.kept === 1 ? 'trade' : 'trades', sub: [(T.going ? count(T.going) + ' still going · ' : '') + 'the last 30 stay, on this PC only'] },
+            { label: 'Traded', value: count(T.traded), sub: T.traded ? [b(signed(T.profit), T.profit > 0 ? 't-good' : ''), ' made in ' + (T.traded === 1 ? 'it' : 'them')] : ['none yet'] },
+            { label: 'Cancelled', value: count(T.cancelled), sub: [T.cancelled ? 'after the yes · what was bought went to To sell' : 'none after a yes'] },
+            { label: 'No trade made', value: count(none), sub: [none ? [T.old ? count(T.old) + ' with no trade in a day' : null, T.back ? count(T.back) + (T.back === 1 ? ' yes undone' : ' yeses undone') : null].filter(Boolean).join(' · ') : 'every yes was traded or cancelled'] },
+        ]);
+
+        /* the list */
+        const keep = this.focusKeyIn(this.pastListEl);
+        this.bd.pastPane.classList.toggle('one', !rows.length);
+        this.pastTable.hidden = !rows.length;
+        this.pastEmpty.hidden = rows.length > 0;
+        this.pastSideEl.hidden = !rows.length;
+        this.pastBody.textContent = '';
+        const HOW = { traded: 'Traded', cancel: 'Cancelled', old: 'No trade in a day', back: 'Yes undone' };
+        for (const r of rows) {
+            const state = pastState(r);
+            const units = (r.lines || []).reduce((a, l) => a + (l.units || 0), 0);
+            const kinds = new Set((r.lines || []).map((l) => l.itemId)).size;
+            const L = r.live || null;
+            const head = state === 'going' ? (L && L.ready ? 'Ready to trade' : L ? 'Buying' : 'Going') : HOW[state] || 'Ended';
+            const sub = state === 'traded' ? signed(r.end.profit)
+                : state === 'cancel' ? pastSpan(r.end.at - r.at) + ' after the yes'
+                    : state === 'old' ? 'what was bought went to To sell'
+                        : state === 'back' ? 'back to the live plan'
+                            : L && L.bazaars ? count(L.boughtStops || 0) + ' of ' + this.plural(L.bazaars, 'bazaar') + ' bought' : 'said yes ' + formatAge(now - r.at);
+            const pick = () => {
+                this.pastSel = idOf(r);
+                this.renderPast();
+            };
+            const tr = spEl('tr', { class: 'pick' + (idOf(r) === this.pastSel ? ' sel' : ''), tabindex: '0', 'data-focus': 'past:' + idOf(r), title: 'See the prices this trade was made on', onclick: pick }, [
+                spEl('td', {}, [spEl('div', { class: 'cell' }, [spEl('div', {}, [spEl('b', { text: r.trader.name || 'Trader ' + (r.trader.id || '') })])])]),
+                spEl('td', { text: pastWhen(r.at, now) }),
+                spEl('td', { class: 'n' }, [count(units), spEl('small', { text: this.plural(kinds, 'kind') })]),
+                spEl('td', { class: 'n', text: formatMoney(r.pays) }),
+                spEl('td', { class: state === 'cancel' || state === 'old' ? 't-warn' : '' }, [head, spEl('small', { class: state === 'traded' && r.end.profit > 0 ? 't-good' : '', text: sub })]),
+            ]);
+            tr.addEventListener('keydown', (event) => {
+                if (event.key !== 'Enter' && event.key !== ' ') return;
+                event.preventDefault();
+                pick();
+            });
+            this.pastBody.appendChild(tr);
+        }
+        this.focusBack(this.pastListEl, keep);
+
+        /* the trade picked */
+        const rec = rows.find((r) => idOf(r) === this.pastSel);
+        const side = this.pastSideEl;
+        const keepSide = this.focusKeyIn(side);
+        side.textContent = '';
+        if (!rec) return;
+        const state = pastState(rec);
+        const end = rec.end;
+        const L = rec.live || null;
+        const then = end || L;
+        const who = rec.trader.name || 'Trader ' + (rec.trader.id || '');
+        const copied = this.pastCopied === idOf(rec);
+        // Refused by the browser (it copies only from a page you are on): said on the button, never silent.
+        const failed = this.pastCopyFailed === idOf(rec);
+        const copy = spEl('button', { type: 'button', class: 'btn sm' + (copied ? ' done' : ''), 'data-focus': 'past:copy', title: 'Copies this trade as plain text, in Torn\'s time, to paste to ' + who, text: copied ? 'Copied' : failed ? 'Could not copy: press again' : 'Copy for ' + who, onclick: () => this.copyPast(rec, idOf(rec)) });
+        const BY = { seen: 'seen in your Torn trades', hand: 'Traded - done pressed in Torn Bids', bids: 'Cancel trade pressed in Torn Bids', torn: 'Cancel trade pressed on a Torn page' };
+        const later = end ? pastSpan(end.at - rec.at) + ' later' : '';
+        const story = ['Said yes ' + pastWhen(rec.at, now)];
+        if (state === 'traded') story.push(spEl('b', { text: 'traded ' + pastWhen(end.at, now) }), later, BY[end.by] || null);
+        else if (state === 'cancel') story.push(spEl('b', { text: 'cancelled ' + pastWhen(end.at, now) }), later, BY[end.by] || null);
+        else if (state === 'old') story.push(spEl('b', { text: 'no trade made in a day' }), 'let go ' + pastWhen(end.at, now));
+        else if (state === 'back') story.push(spEl('b', { text: 'yes undone ' + pastWhen(end.at, now) }), later, 'Back to the live plan pressed');
+        else story.push(spEl('b', { text: L && L.ready ? 'ready to trade' : L ? 'buying' : 'still going' }), L && L.bazaars ? count(L.boughtStops || 0) + ' of ' + this.plural(L.bazaars, 'bazaar') + ' bought' : null);
+        const subKids = [];
+        // "traded today 21:31, 26 min later · seen in your Torn trades": the time and how long after go together.
+        story.filter(Boolean).forEach((part, i) => {
+            if (i) subKids.push(i === 2 && later && part === later ? ', ' : ' · ');
+            subKids.push(part);
+        });
+        const made = state === 'traded';
+        const off = Boolean(end) && !made;
+        const plan = spEl('div', { class: 'plan' }, [
+            spEl('div', { class: 'who' }, [
+                spEl('div', { class: 'who-t' }, [
+                    spEl('span', { class: 'lbl', text: 'Trade with' }), spEl('span', { class: 'sp' }),
+                    rec.trader.id ? this.link('W3B list', w3bPriceListUrl(rec.trader.id), { cls: 'btn sm lk', title: who + '\'s TornW3B price list, as it is now', focus: 'past:w3b' }) : null,
+                    rec.trader.name ? this.link('TE list', tePriceListUrl(rec.trader.name), { cls: 'btn sm lk', title: who + '\'s TornExchange price list, as it is now', focus: 'past:te' }) : null,
+                    copy,
+                ]),
+                spEl('h3', {}, [this.playerName(who, rec.trader.id, 'past:who')]),
+                spEl('span', { class: 'sub' }, subKids),
+            ]),
+            spEl('div', { class: 'bigrow' }, [
+                spEl('div', {}, [spEl('span', { class: 'lbl', text: made ? 'Profit' : off ? 'It would have made' : 'Profit as planned' }), spEl('div', { class: 'big' + (off ? ' off' : this.moneyTone(made ? end.profit : rec.profit)), text: signed(made ? end.profit : rec.profit) })]),
+                spEl('div', { class: 'eq' }, made
+                    ? ['You paid the bazaars', spEl('b', { text: formatMoney(end.cost) }), spEl('br'), who + ' paid you', spEl('b', { text: formatMoney(end.pays) })]
+                    : off ? ['You were to pay the bazaars', spEl('b', { text: formatMoney(rec.cost) }), spEl('br'), who + ' was to pay you', spEl('b', { text: formatMoney(rec.pays) })]
+                        : ['You pay the bazaars', spEl('b', { text: formatMoney(rec.cost) }), spEl('br'), who + ' pays you', spEl('b', { text: formatMoney(rec.pays) })]),
+            ]),
+        ]);
+        const M = pastMoved(rec, then);
+        if (M.moved.length) {
+            const what = M.moved.map((x) => x.name + (x.is > 0 ? ' went from ' + formatMoney(x.was) + ' to ' + formatMoney(x.is) : ' is no longer on their list')).join('; ') + '.';
+            const lead = M.changedAt ? who + ' changed their list ' + pastWhen(M.changedAt, now) + ', ' + pastSpan(M.changedAt - rec.at) + ' after the yes.' : who + '\'s prices moved after the yes.';
+            const rest = (rec.lines || []).length > M.moved.length ? ' The other prices stayed.' : '';
+            plan.appendChild(spEl('div', { class: 'amber' }, [spEl('span', {}, [spEl('b', { text: lead }), ' ' + what + rest])]));
+        }
+        side.appendChild(plan);
+
+        /* their prices at the yes */
+        const list = rec.list;
+        const onW3b = (rec.lines || []).some((l) => pastSource(l) === 'w3b');
+        let listNote;
+        if (!list) listNote = ['This trade was accepted before Torn Bids kept a history: these are the prices it was accepted at. Where they came from and how old ' + who + '\'s list was were not written down.'];
+        else {
+            listNote = [spEl('b', { text: onW3b ? 'TornW3B list' : 'TornExchange prices' })];
+            if (onW3b) listNote.push(list.changedAt ? ', last changed by ' + who + ' ' + pastWhen(list.changedAt, now) + ', ' + pastSpan(rec.at - list.changedAt) + ' before the yes.' : '. When ' + who + ' last changed it is not known.');
+            else listNote.push(': TornExchange gives no date for a price.');
+            if (onW3b && list.readAt) listNote.push(' Torn Bids read it ' + pastWhen(list.readAt, now) + '.');
+            if (M.known && !M.moved.length) listNote.push(M.changedAt ? ' They changed it ' + pastWhen(M.changedAt, now) + ', after the yes: none of this trade\'s prices moved.' : M.readAfter ? (end ? ' It had not changed when the trade ended.' : ' It has not changed since.') : ' Torn Bids has not read it again since the yes.');
+        }
+        side.appendChild(spEl('div', { class: 'ph' }, [spEl('h2', { text: who + '\'s prices when they said yes' })]));
+        side.appendChild(spEl('p', { class: 'note' }, listNote));
+        const priceRows = (rec.lines || []).map((l) => {
+            const src = pastSource(l);
+            const from = src === 'w3b' ? ['TornW3B', spEl('small', { text: l.te > 0 ? 'TornExchange said ' + formatMoney(l.te) : 'not on TornExchange' })]
+                : src === 'te' ? ['TornExchange', spEl('small', { text: 'not on TornW3B' })] : ['–'];
+            const checked = l.checkedAt > 0 && l.checkedAt <= rec.at ? pastSpan(rec.at - l.checkedAt) : '–';
+            const moved = M.moved.find((x) => x.itemId === l.itemId);
+            const last = !M.known ? spEl('td', { class: 'n t-muted', text: '–' })
+                : !moved ? spEl('td', { class: 'n same', text: 'the same' })
+                    : moved.is > 0 ? spEl('td', { class: 'n t-warn' }, [formatMoney(moved.is), spEl('small', { text: signed(moved.is - moved.was) + ' each' })])
+                        : spEl('td', { class: 'n t-warn', text: 'not listed' });
+            return spEl('tr', {}, [
+                spEl('td', {}, [this.pic('past', l.itemId), spEl('b', { text: l.name || 'Item ' + l.itemId }), l.kind === 'yours' ? spEl('span', { class: 'tag', text: 'yours' }) : null]),
+                spEl('td', { class: 'n', text: count(l.units) }),
+                spEl('td', { class: 'n' }, [spEl('b', { text: formatMoney(l.bid) })]),
+                spEl('td', {}, from),
+                spEl('td', { class: 'n', text: checked }),
+                last,
+            ]);
+        });
+        side.appendChild(spEl('div', { class: 'pb flush' }, [spEl('table', { class: 't tight wrapth' }, [
+            spEl('thead', {}, [spEl('tr', {}, [spEl('th', { text: 'Item' }), spEl('th', { class: 'n', text: 'Count' }), spEl('th', { class: 'n', text: 'They pay each' }), spEl('th', { text: 'Price from' }), spEl('th', { class: 'n', title: 'How long before their yes TornW3B last confirmed this price', text: 'Checked before the yes' }), spEl('th', { class: 'n', text: end ? 'When it ended' : 'Now' })])]),
+            spEl('tbody', {}, priceRows),
+        ])]));
+
+        /* what you bought for it */
+        const bought = (end ? end.bought : L ? L.bought : null) || [];
+        if (bought.length) {
+            const each = (n) => (n === null || n === undefined ? '–' : formatMoney(n));
+            const stops = (n) => this.plural(n, 'bazaar');
+            const thenOf = (r) => {
+                if (state === 'going') return r.kind === 'yours' ? 'to send' : r.got >= r.of ? 'bought' : r.got ? 'some still to buy' : 'still to buy';
+                if (state === 'traded') {
+                    const took = Math.max(0, r.got - (r.kept || 0));
+                    return who + ' took ' + count(took) + (r.kept ? ' · ' + count(r.kept) + ' went to To sell' : '');
+                }
+                if (r.kind === 'yours') return r.each === null ? 'stayed yours' : 'stayed in To sell';
+                return r.got ? (r.kept ? (r.kept < r.got ? count(r.kept) + ' went to To sell' : 'went to To sell') : 'stayed yours') : 'not bought';
+            };
+            side.appendChild(spEl('div', { class: 'ph' }, [spEl('h2', { text: 'What you bought for it' }), spEl('span', { class: 'sub', text: state === 'going' ? 'so far' : made ? 'and what ' + who + ' took' : 'when it ended' })]));
+            side.appendChild(spEl('div', { class: 'pb flush' }, [spEl('table', { class: 't tight' }, [
+                spEl('thead', {}, [spEl('tr', {}, [spEl('th', { text: 'Item' }), spEl('th', { class: 'n', text: 'Bought' }), spEl('th', { class: 'n', text: 'You paid each' }), spEl('th', { text: 'At' }), spEl('th', { text: 'Then' })])]),
+                spEl('tbody', {}, bought.map((r) => spEl('tr', {}, [
+                    spEl('td', {}, [this.pic('past', r.itemId), spEl('b', { text: r.name || 'Item ' + r.itemId })]),
+                    spEl('td', { class: 'n', text: r.kind === 'yours' ? 'yours, ' + count(r.got) : r.kind === 'extra' ? count(r.got) + ', not planned' : count(r.got) + ' of ' + count(r.of) }),
+                    spEl('td', { class: 'n', text: r.got || r.kind === 'yours' ? each(r.each) : '–' }),
+                    spEl('td', { text: r.kind === 'yours' ? (r.each === null ? 'your own' : 'from To sell') : r.got ? stops(r.stops) : stops(r.stopsAll) + ', not been to' }),
+                    spEl('td', { class: !r.got && r.kind !== 'yours' ? 't-muted' : '', text: thenOf(r) }),
+                ]))),
+            ])]));
+        }
+        this.focusBack(side, keepSide);
+    }
+
+    /** Copy for the trader: the trade as plain text on the clipboard. The button says Copied for a moment, or that it could not. */
+    copyPast(rec, id) {
+        const text = pastTradeText(rec, rec.live || null);
+        const done = (ok) => {
+            this.pastCopied = ok ? id : null;
+            this.pastCopyFailed = ok ? null : id;
+            this.renderPast();
+            clearTimeout(this.pastCopyTimer);
+            this.pastCopyTimer = setTimeout(() => {
+                this.pastCopied = null;
+                this.pastCopyFailed = null;
+                this.renderPast();
+            }, 2500);
+        };
+        const old = () => {
+            // No clipboard permission: the older way, through a text box of our own.
+            try {
+                const box = spEl('textarea', { 'aria-hidden': 'true' });
+                box.value = text;
+                box.style.cssText = 'position:fixed;left:-9999px;top:0;';
+                this.root.appendChild(box);
+                box.select();
+                const ok = document.execCommand('copy');
+                box.remove();
+                done(ok);
+            } catch {
+                done(false);
+            }
+        };
+        try {
+            if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(() => done(true), old);
+            else old();
+        } catch {
+            old();
+        }
     }
 
     /** Profit per day for the last `n` days, from your Ledger: [{start, profit}], oldest first. Empty without a Ledger key. */

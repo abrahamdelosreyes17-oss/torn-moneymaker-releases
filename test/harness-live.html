@@ -566,6 +566,66 @@ if (/[?&]tradesgoing=1/.test(location.search)) {
     _store[NS + 'sellEnded'] = JSON.stringify([{ key: 'id:5001', name: 'KayMalta', how: 'traded', at: now - 2 * 60 * 60000, yesAt: now - 3 * 60 * 60000, profit: 48000, moved: [] }]);
 }
 /*
+ * &past=1 (3.27.0): Trades > History - a trade Marla cancelled 12 minutes
+ * after her yes, her list changed 7 minutes after it (Camel Plushie $13,500 to
+ * $12,900); a trade with Bob seen traded; one never made in a day; a yes
+ * undone; one cancelled whose list was never read again; one accepted before
+ * there was a history (no list written down). With &tradesgoing=1 the trades
+ * Bob and Alice accepted are in it too, still going. &past=0: the store is
+ * there and empty. &past=30: thirty of them.
+ */
+if (/[?&]past=\d+/.test(location.search)) {
+    const now = Date.now();
+    const MIN = 60000;
+    const HOUR = 60 * MIN;
+    const n = Number(new URLSearchParams(location.search).get('past'));
+    const line = (itemId, name, units, bid, o = {}) => ({ itemId: String(itemId), name, kind: 'flip', units, bid, w3b: bid, te: 0, checkedAt: 0, ...o });
+    const rec = (id, name, at, lines, o = {}) => ({ key: 'id:' + id, at, itemId: lines[0].itemId, trader: { id: String(id), name }, list: { changedAt: at - 192 * MIN, readAt: at - 40000 }, lines: lines.map((l) => (l.checkedAt ? l : { ...l, checkedAt: l.w3b ? at - 40000 : 0 })), cost: 0, pays: lines.reduce((a, l) => a + l.units * l.bid, 0), profit: 0, end: null, ...o });
+    const got = (itemId, name, n2, of, each, stops, kept = 0, kind = 'flip') => ({ itemId: String(itemId), name, kind, got: n2, of, each, stops, stopsAll: Math.max(1, stops), kept });
+    const marlaAt = now - 3 * HOUR;
+    const bobAt = now - 20 * HOUR;
+    const list = [
+        rec(2400111, 'Marla', marlaAt, [line(384, 'Camel Plushie', 1320, 13500, { te: 13500 }), line(281, 'Lion Plushie', 300, 13900), line(335, 'Stick of Dynamite', 53, 18000, { kind: 'yours', te: 18200, checkedAt: marlaAt - 130000 })], {
+            cost: 21363240, pays: 22944000, profit: 653260,
+            end: { how: 'cancel', at: marlaAt + 12 * MIN, by: 'torn', list: { changedAt: marlaAt + 7 * MIN, readAt: marlaAt + 9 * MIN }, bids: { 384: 12900, 281: 13900, 335: 18000 }, cost: 17268240, pays: 17820000, profit: 551760,
+                bought: [got(384, 'Camel Plushie', 1320, 1320, 13082, 3, 1320), { ...got(281, 'Lion Plushie', 0, 300, null, 0), stopsAll: 1 }, got(335, 'Stick of Dynamite', 53, 53, 17500, 0, 0, 'yours')] },
+        }),
+        rec(11, 'Bob', bobAt, [line(206, 'Xanax', 2, 850000, { te: 850000 }), line(335, 'Stick of Dynamite', 100, 18000, { te: 18000 }), line(258, 'Jaguar Plushie', 33, 13700)], {
+            cost: 3859250, pays: 3952100, profit: 92850, list: { changedAt: bobAt - 75 * MIN, readAt: bobAt - 55000 },
+            end: { how: 'traded', at: bobAt + 26 * MIN, by: 'seen', list: { changedAt: bobAt - 75 * MIN, readAt: bobAt + 20 * MIN }, bids: { 206: 850000, 335: 18000, 258: 13700 }, cost: 3859250, pays: 3952100, profit: 92850,
+                bought: [got(206, 'Xanax', 2, 2, 840000, 1), got(335, 'Stick of Dynamite', 100, 100, 17420, 2), got(258, 'Jaguar Plushie', 33, 33, 13250, 1)] },
+        }),
+        rec(77, 'Tomas', now - 50 * HOUR, [line(206, 'Xanax', 3, 850000), line(384, 'Camel Plushie', 257, 13000)], {
+            cost: 5809000, pays: 5891000, profit: 82000,
+            end: { how: 'old', at: now - 26 * HOUR, by: null, list: { changedAt: now - 53 * HOUR, readAt: now - 27 * HOUR }, bids: { 206: 850000 }, cost: 2520000, pays: 2550000, profit: 30000, bought: [got(206, 'Xanax', 3, 3, 840000, 1, 3), { ...got(384, 'Camel Plushie', 0, 257, null, 0), stopsAll: 2 }] },
+        }),
+        rec(44, 'Oona', now - 55 * HOUR, [line(335, 'Stick of Dynamite', 150, 13900)], {
+            cost: 2010000, pays: 2085000, profit: 75000,
+            end: { how: 'back', at: now - 55 * HOUR + 4 * MIN, by: 'bids', list: { changedAt: now - 58 * HOUR, readAt: now - 55 * HOUR + 2 * MIN }, bids: { 335: 13900 }, cost: 2010000, pays: 2085000, profit: 75000, bought: [{ ...got(335, 'Stick of Dynamite', 0, 150, null, 0), stopsAll: 2 }] },
+        }),
+        rec(5002, 'Pell', now - 70 * HOUR, [line(281, 'Lion Plushie', 320, 13800, { te: 13800 })], {
+            cost: 4352000, pays: 4416000, profit: 64000,
+            end: { how: 'cancel', at: now - 69 * HOUR + 4 * MIN, by: 'bids', list: { changedAt: now - 73 * HOUR, readAt: now - 70 * HOUR - 40000 }, bids: { 281: 13800 }, cost: 4352000, pays: 4416000, profit: 64000, bought: [got(281, 'Lion Plushie', 320, 320, 13600, 2, 320)] },
+        }),
+        // Accepted before there was a history: closed with the prices it was accepted at, nothing about the list.
+        { key: 'id:5001', at: now - 80 * HOUR, itemId: '206', trader: { id: '5001', name: 'KayMalta' }, list: null, lines: [{ itemId: '206', name: 'Xanax', kind: 'flip', units: 4, bid: 852000 }], cost: 3360000, pays: 3408000, profit: 48000,
+            end: { how: 'traded', at: now - 79 * HOUR, by: 'hand', list: null, bids: null, cost: 3360000, pays: 3408000, profit: 48000, bought: [got(206, 'Xanax', 4, 4, 840000, 1)] } },
+    ];
+    // The trades going (with &tradesgoing=1): written down at their yes, as Torn Bids would have.
+    try {
+        for (const t of Object.values(JSON.parse(_store[NS + 'sellAccepted'] || '{}'))) {
+            if (now - t.at > 24 * HOUR) continue;
+            list.push(rec(t.trader.id, t.trader.name, t.at, t.items.map((i) => line(i.itemId, i.name, i.units, i.bid)), { cost: 0, pays: t.items.reduce((a, i) => a + i.units * i.bid, 0), profit: 0 }));
+        }
+    } catch { /* no accepted trade seeded */ }
+    const more = [];
+    for (let k = 0; more.length + list.length < n; k += 1) {
+        const at = now - (90 + 7 * k) * HOUR;
+        more.push(rec(6000 + k, 'Trader' + (k + 1), at, [line(206, 'Xanax', 2 + k, 850000)], { cost: (2 + k) * 840000, pays: (2 + k) * 850000, profit: (2 + k) * 10000, end: { how: 'traded', at: at + 30 * MIN, by: 'seen', list: { changedAt: at - 3 * HOUR, readAt: at + 10 * MIN }, bids: { 206: 850000 }, cost: (2 + k) * 840000, pays: (2 + k) * 850000, profit: (2 + k) * 10000, bought: [got(206, 'Xanax', 2 + k, 2 + k, 840000, 1)] } }));
+    }
+    _store[NS + 'sellPast'] = JSON.stringify(n === 0 ? [] : [...list, ...more]);
+}
+/*
  * &stalelist=<trader id> (3.22.0): that trader last changed their TornW3B
  * price list five days ago (as Torn Bids kept it from an earlier visit) -
  * Fresh prices only leaves their TornW3B prices out. Without it, no list date
