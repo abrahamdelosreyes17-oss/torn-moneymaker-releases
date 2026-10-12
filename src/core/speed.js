@@ -368,6 +368,8 @@ export const SPEED_BIDS = Object.freeze({
     priceLists: 'traders with a price list in use',
     buyerRows: 'buyer rows of all items (who buys an item, added up)',
     byData: 'redraws asked for by arriving data (they wait their turn)',
+    // 3.30.0: of those, the ones about what is on the desk - they do not wait for the calm pace.
+    byNear: 'redraws asked for by data about the item or the trade on the desk (not held to the calm pace)',
     byPress: 'redraws asked for by the answer to something pressed (after a moment, not waiting their turn)',
     byStatus: 'redraws asked for by the first status answer after a press',
     byTyping: 'redraws asked for by typing in the search box',
@@ -491,8 +493,8 @@ export function speedText(record, { sizes = [], machine = null, version = null, 
     out.push('  beside the redraw (ms in the hour), and who asked for the redraws');
     out.push(...spTable(bidsHours.map(([hour, b]) => [
         stamp(Number(hour) * SP_HOUR_MS).slice(0, 13) + 'h', cell(b.w[B.pieces] ? b.w[B.pieces][1] : null, spMs), count(b.w[B.pieces]), cell(b.w[B.index] ? b.w[B.index][1] : null, spMs), count(b.w[B.index]),
-        count(b.g[B.byData]), count(b.g[B.byPress]), count(b.g[B.byStatus]), count(b.g[B.byTyping]), count(b.g[B.byOther]),
-    ]), ['hour', 'pieces ms', 'pieces', 'index ms', 'index made', 'by data', 'by a press', 'by a status', 'by typing', 'by the page']));
+        count(b.g[B.byData]), count(b.g[B.byNear]), count(b.g[B.byPress]), count(b.g[B.byStatus]), count(b.g[B.byTyping]), count(b.g[B.byOther]),
+    ]), ['hour', 'pieces ms', 'pieces', 'index ms', 'index made', 'by data', 'the desk\'s of them', 'by a press', 'by a status', 'by typing', 'by the page']));
     out.push('  what it worked through (the usual of the hour)');
     out.push(...spTable(bidsHours.map(([hour, b]) => [
         stamp(Number(hour) * SP_HOUR_MS).slice(0, 13) + 'h', cell(each(b.g[B.items])), cell(each(b.g[B.buyerRows])), cell(each(b.g[B.priceLists])), cell(each(b.g[B.lists])), cell(each(b.g[B.rows])), cell(each(b.g[B.traders])), cell(each(b.g[B.serverBazaars])),

@@ -90,7 +90,8 @@ import {
     BESIDE_FRONT_MARK, BESIDE_ALIVE_MARK, BESIDE_BEHIND_MARK, BESIDE_TORN_PER_MINUTE, BESIDE_W3B_PER_MINUTE, BESIDE_LOOK_EVERY_MS, BESIDE_RENEW_MS,
     besideW3bText, besideW3bOther, BESIDE_W3B_OWN_MARK, BESIDE_W3B_OTHER_MARK,
 } from './core/beside.js';
-import { stillStart, stillList, stillCards, stillWaiting, stillEnded, stillTrade, stillAdopt, STILL_ENDED_MS } from './core/still.js';
+import { stillStart, stillList, stillCards, stillWaiting, stillEnded, stillTrade, stillAdopt, togetherBy, flipTraderKey, STILL_ENDED_MS } from './core/still.js';
+import { sameGoods, goodsAbove } from './core/same-goods.js';
 import { LedgerClient, fetchLedgerKeyInfo, isFullKey, fetchLogPage, fetchTradesPage, fetchTrade, fetchOngoingTrades } from './api/ledger.js';
 import { LOG_BAZAAR_BUY, readLedger, emptyLedger, rowsFromLog, rowsFromTrade, addLedgerRows, logSpan, mugFromLog, addMugs, priceRecordOf, addPriceRecord, acceptedPricesFor, matchFifo, tradeReceipts } from './core/ledger.js';
 import { partnerStats, isFavourite, editFavourite, editBlacklist, withoutBlacklisted, tradedLine, partnerKey, scanOrder, blacklistKeys } from './core/partners.js';
@@ -155,7 +156,7 @@ import { makeBuyersKeeper } from './core/kept-buyers.js';
 import { makeKeeper, keptMarkWords, keptFreshUntil, keptPlanSig } from './core/kept.js';
 import { shownFavourites, shownVersions, shownKept, shownBuyers } from './core/shown-buyers.js';
 import { JOB_NPC, JOB_BIDS, jobNow, jobLock, jobLockWords, jobSwitch } from './core/job.js';
-import { redrawWait, warmSlice, packBazaarReads, unpackBazaarReads, WARM_SLICE_MS } from './core/start-up.js';
+import { redrawWait, warmSlice, packBazaarReads, unpackBazaarReads, WARM_SLICE_MS, REDRAW_CALM_MS } from './core/start-up.js';
 import { toSellRows, toSellBoard, toSellHeld, heldGain, afterYoursSent, whereAbovePaid, liveWasToSell, noteToSell, toSellWhy, TO_SELL_WHY, setNotForSale, forSaleCount } from './core/to-sell.js';
 import { BOUGHT_WINDOW_MS, boughtRecord, liveBoughtItems, sameBoughtItems, bazaarSellList, fillAllList, underPaid } from './core/bazaar-sell.js';
 import { statusWatch, statusAsks, flipCards, traderCards, packActivity, unpackActivity, STATUS_EVERY_MS } from './core/status.js';
@@ -6552,6 +6553,9 @@ const sell = {
     /* The redraw on its way (renderSelling): when it is due, and whether it answers something you pressed. */
     renderDue: 0,
     renderYours: false,
+    /* What the last redraw drew of what you are working on (sellNearStamp), and whether an answer has moved it since. */
+    nearDrawn: null,
+    nearAsked: false,
     /* The draw for keys typed in the search box, on its way (renderSellingTyped): one for all keys typed meanwhile. */
     typedTimer: null,
     /* The buyers the last draw was made with, and when they were worked out (a search draws with them again). */
@@ -8750,7 +8754,52 @@ function sellClock() {
     return typeof performance !== 'undefined' && typeof performance.now === 'function' ? performance.now() : Date.now();
 }
 
+/*
+ * 3.30.0 - what you are working on, as it stands: the item on the desk and the items of the trade on show
+ * (their bazaars, their buyers' price check), that trade's trader (their list, status, networth), a list
+ * read at your press, and the page's own loading words. Every one of these is replaced when it changes, so
+ * two of these lists are "the same" exactly when nothing of it moved (sellNearMoved). An answer that moved
+ * any of it is drawn on the old budget; everything else keeps the calm pace (core/start-up.js REDRAW_CALM_MS).
+ */
+function sellNearStamp() {
+    const out = [sell.selected, sell.loading, sell.teLoading, sell.keyError, sell.keyDead, sell.inventoryAt, sell.selfId, led.loaded, led.busy, led.error, sell.acceptWait, sell.acceptNote];
+    // The item on the desk: whatever of it moves, its "reading…" too.
+    if (sell.selected) out.push(sell.bazaars.get(sell.selected), sell.itemTraders.get(sell.selected));
+    // The other items of the trade on show (each read again every minute, a big trade many times a minute): only
+    // when a read brought other listings or other buyers - not for "being read", nor for an answer that said the same.
+    for (const raw of [...(sell.tradeLive || []), ...(sell.tradeWanted || [])]) {
+        if (!raw || String(raw) === String(sell.selected)) continue;
+        const id = String(raw);
+        const b = sell.bazaars.get(id);
+        const it = sell.itemTraders.get(id);
+        out.push(id, b ? b.rows : null, b ? b.error : null, it ? it.traders : null, it ? Boolean(it.error) : false);
+    }
+    if (sell.selected) out.push(sell.market.get(sell.selected), sell.teOne.get(sell.selected), sell.listState.get(sell.selected));
+    const key = sell.deskTrader ? String(sell.deskTrader.key || '') : '';
+    const traderId = key.startsWith('id:') ? key.slice(3) : null;
+    if (traderId) {
+        const t = sell.db && sell.db.traders ? sell.db.traders[traderId] : null;
+        const nw = sell.networth.get(traderId);
+        const read = sell.listRead ? sell.listRead.get(traderId) : null;
+        out.push(traderId, t ? t.w3b : null, t && t.w3b ? t.w3b.at : 0, t && t.w3b ? t.w3b.checkedAt : 0, sell.listAt.get(traderId), sell.presence.get(traderId), nw ? nw.value : null, Boolean(sell.listReading && sell.listReading.has(traderId)), read ? read.at : 0);
+    }
+    return out;
+}
+
+/** Has what you are working on moved since the last redraw drew it? (Before the first redraw: yes.) */
+function sellNearMoved() {
+    const was = sell.nearDrawn;
+    if (!was) return true;
+    const now = sellNearStamp();
+    if (now.length !== was.length) return true;
+    for (let i = 0; i < now.length; i += 1) if (!Object.is(now[i], was[i])) return true;
+    return false;
+}
+
 function renderSelling(yours = false, by = null) {
+    // 3.30.0: an answer about what is on the desk does not wait for the calm pace (asked before the pieces
+    // are looked at: the draw that follows them is then this one's, on the old budget).
+    if (!yours && !sell.nearAsked && sellNearMoved()) sell.nearAsked = true;
     if (sell.warm && !yours) {
         // The buyers are being worked out in pieces: the draw follows them, and one more for this.
         sell.warm.asked = true;
@@ -8760,10 +8809,12 @@ function renderSelling(yours = false, by = null) {
     // they have worked out so far, 3.29.0. Until then it threw that away and worked every item out again.)
     if (yours) sell.redrawBy = by || 'byPress';
     const now = sellClock();
-    let due = now + (yours ? SELL_RENDER_MS : redrawWait({ base: SELL_RENDER_MS, took: sell.redrawTook, ended: sell.redrawEnded, now }));
+    let due = now + (yours ? SELL_RENDER_MS : redrawWait({ base: SELL_RENDER_MS, took: sell.redrawTook, ended: sell.redrawEnded, now, calm: sell.nearAsked ? 0 : REDRAW_CALM_MS }));
     if (sell.renderTimer) {
-        // One is on its way; only something you pressed brings it forward (never back).
-        if (!yours || sell.renderYours) return;
+        // One is on its way; only something you pressed brings it forward (never back) - or, 3.30.0, an answer
+        // about what is on the desk, when the one on its way is waiting out the calm pace.
+        if (sell.renderYours) return;
+        if (!yours && !(due < sell.renderDue - 1)) return;
         clearTimeout(sell.renderTimer);
         due = Math.min(due, sell.renderDue);
     }
@@ -8935,6 +8986,12 @@ function renderSellingNow(src = null, t0 = sellClock(), before = 0) {
             perfStartup({ script: SCRIPT_START_MS, panel: perfNow(), items: null });
         }
         if (sell.drew && SPEED_BIDS[by]) perfGauge(SPEED_BIDS[by], 1);
+        if (sell.drew) {
+            // 3.30.0 - what this redraw drew of the desk: an answer that moves it draws without the calm wait.
+            if (by === 'byData' && sell.nearAsked) perfGauge(SPEED_BIDS.byNear, 1);
+            sell.nearAsked = false;
+            sell.nearDrawn = sellNearStamp();
+        }
         // What the pieces were for, and what arrived while they were worked out: its own redraw, in its turn.
         if (again) renderSelling();
     }
@@ -9731,12 +9788,15 @@ function renderSellingWork(src = null) {
         stillWaits = stillWaiting(still, stillFlips, now);
         still.waiting = stillWaits.length;
         // The Flips tab: the flips of the hold (one that is no flip now stays, greyed); a new one waits in the line.
-        listed = stillList(still, rows.filter((r) => (sell.filter === 'flips' ? still.flips.has(r.itemId) : pass(r))));
+        listed = stillList(still, rows.filter((r) => (sell.filter === 'flips' ? still.flips.has(r.itemId) : pass(r))), { together: sell.filter === 'flips' });
         counts.flips = rows.filter((r) => still.flips.has(r.itemId)).length;
     } else {
         listed = rows
             .filter(pass)
             .sort((a, b) => b.value - a.value || (b.held > 0) - (a.held > 0) || b.bid - a.bid || String(a.name).localeCompare(String(b.name)));
+        // 3.30.0 - Best flips: the flips that sell to one trader are one trade with them, and stand together
+        // under its total (the page draws the line over them) - not scattered down the list as so many deals.
+        if (sell.filter === 'flips') listed = togetherBy(listed, flipTraderKey, (r) => r.value);
     }
     redrawStage('4 the list (every item)');
     // 3.28.1 - for the speed log: where the time inside went, and what this redraw had to work through.
@@ -10006,6 +10066,14 @@ function renderSellingWork(src = null) {
             sell.tradeLive = [];
             sell.heldEdit = null;
             return { perTrader, declined: declinedOut, chosen: null, picked: false };
+        }
+        // 3.30.0 (core/same-goods.js) - every other trader's trade is planned alone, from the same bazaar listings:
+        // how many of its items are the goods of the trade on show is said on its row, so it reads as "instead".
+        const shownGoods = new Set((hold ? hold.held.lines || [] : chosen.flips).map((r) => String(r.itemId)));
+        for (const [k, t] of plans) {
+            if (k === chosen.key || !perTrader[k]) continue;
+            const g = sameGoods(t.flips, shownGoods);
+            perTrader[k] = { ...perTrader[k], same: g.same, flips: g.of, own: g.own };
         }
         // What this trader pays now (whatever the Show toggles hide), and how a
         // line you change is re-picked alone (at most 5 bazaars) - the others stay.
@@ -10285,6 +10353,7 @@ function renderSellingWork(src = null) {
                     mainUnits: main ? main.units : 0,
                     every: Boolean(t && t.every),
                     itemIds: t ? t.flips.map((r) => r.itemId) : [],
+                    flipLines: t ? t.flips.map((r) => ({ itemId: r.itemId, profit: r.profit })) : [],
                 });
             }
             // Biggest trade first; still reading, then nothing now, after.
@@ -10292,6 +10361,13 @@ function renderSellingWork(src = null) {
             const cards = traderCards(scanOrder(scan.list), { hold: holdFlips, unread: unreadStatus });
             // In order again once "being checked" is known: a trade that cannot be offered yet goes under the ones that can.
             scan.list = scanOrder(cards.list);
+            // 3.30.0 - each trade is planned alone: what a trade further down shares with one above it is said on its row.
+            const above = goodsAbove(scan.list.map((x) => ({ key: x.key, flips: x.flipLines, ready: x.items > 0 && x.profit > 0 && !x.hiddenBy && !x.waiting })));
+            const scanNames = new Map(scan.list.map((x) => [x.key, x.name]));
+            scan.list = scan.list.map((x) => {
+                const g = above.get(x.key);
+                return g && g.same ? { ...x, same: { n: g.same, of: g.of, own: g.own, with: scanNames.get(g.with) || null } } : x;
+            });
             sell.scanList = scan.list;
             sell.scanWatch = cards.watch;
         }
@@ -10469,7 +10545,14 @@ function renderSellingWork(src = null) {
     const heldCount = sell.inventory ? sell.inventory.length : 0;
     const teOneDone = sell.inventory ? [...heldIds()].filter((i) => sell.teOne.has(i) && !sell.teOne.get(i).failed).length : 0;
     const statuses = sellStatusMap(now);
-    const counted = countTraders(allIds, buyersAll);
+    // 3.30.0 - counted again only when an item's buyers were worked out since the last count: it walked every
+    // buyer row of every item (61,773 on the owner's page), and looked every item's buyers up a second time,
+    // each redraw, for one number in the status line.
+    const countKeeper = sellBuyersKeeper();
+    const countWas = sell.countKept;
+    const counted = countWas && countKeeper.on() && countWas.redone === countKeeper.stats.redone && countWas.items === allIds.size ? countWas.out : countTraders(allIds, buyersAll);
+    // (Noted after the count: the count's own lookups may have worked an aged item out again.)
+    sell.countKept = { redone: countKeeper.stats.redone, items: allIds.size, out: counted };
     const traderCount = counted.traders;
     // 3.29.0, for the speed log: what every redraw walks (not when a search shows part of the items).
     if (!q) {
@@ -10532,6 +10615,8 @@ function renderSellingWork(src = null) {
         networth: networthMap(),
         // A flip row says what you buy at and what the trader pays (the owner: "it doesn't say how much the bazaar sells it for and how much the trader buys it for").
         list: listed.slice(0, sell.allShown).map((r) => ({ itemId: r.itemId, name: r.name, held: r.held, lowest: r.lowest, badge: r.badge, pending: r.pending, still: r.still || null,
+            // 3.30.0 - Best flips: the trader whose trade this flip is part of (while a trade holds the list still: as it was held).
+            group: sell.filter === 'flips' ? (r.still ? r.still.to || null : flipTraderKey(r)) : null,
             // Shared: your own mark as you see it, else a friend's on a flip (the row stays where its profit puts it).
             mark: ownGoing.has(r.itemId) ? { kind: 'you', text: 'You are on this' } : r.badge && r.badge.kind === 'flip' && friendGoing.has(r.itemId) ? { kind: 'friend', text: sharedOnThis(friendGoing.get(r.itemId), now) } : null,
             buy: r.badge && r.badge.kind === 'flip' && r.plan ? r.plan.firstPrice : null, sell: r.badge && r.badge.kind === 'flip' && r.plan && r.plan.buyer ? r.plan.buyer.price : null,

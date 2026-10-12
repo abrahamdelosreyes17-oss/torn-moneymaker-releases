@@ -2692,6 +2692,83 @@ closed; the log will name any other). That a press was what made redraws come
 150 ms apart there. The press taking over the pieces has no test of its own: it
 was read, and the bench drew the same page with it.
 
+### The calm pace, and one trade once (3.30.0)
+
+The owner, 2026-10-12: "torn archive fixed lag ... maybe we get inspiration?",
+and, on Flips with a trade planned: "theres multiple traders with multiple
+deals, but in reality they share the same or similar items". Before it: "2 flips
+for the same trader ... why are they on different cards?".
+Everything below was seen on the test page and in tests only, never on real
+Torn. His page has not been measured on 3.29.0 or on this build: the lag is not
+"fixed" until the same count is taken there again (before, on 3.28.1: 10
+freezes, 9,961 ms, a fifth of the time in 49 seconds).
+
+**The calm pace** (`core/start-up.js` `REDRAW_CALM_MS`, `src/main.js`
+`renderSelling`, `sellNearStamp`). What Torn Archive 1.3.0 did and Torn Bids did
+not: draw by itself at a fixed, slow pace, and at once only for what you press
+or what concerns your list. Torn Bids' redraw budget (3.19.0) only said "leave
+three times the last redraw free". So a redraw of 250 ms came again 750 ms
+later, and with an answer a second the page was in a redraw a quarter of the
+time; making a redraw quicker (3.29.0) gives more and shorter freezes, not
+fewer. Now:
+
+- A redraw asked for by arriving data comes no sooner than 3 seconds after the
+  last one ended. A redraw of 250 ms is then 8% of the time, one of 100 ms 3%,
+  one of 500 ms 14%. A redraw of a second or more waits its 3 seconds as before.
+- **Not** an answer about what you are working on: the item on the desk and the
+  items of the trade on show (their bazaars, their buyers' price check), that
+  trade's trader (their list, status, networth), a list read at your press, and
+  the page's own loading words. Those draw as soon as they did. Every one of
+  them is replaced when it changes, so "has it moved since the last redraw" is
+  one look at a short list - no call site was touched.
+- What you press draws at once, as always. A hidden tab is as it was.
+- The speed log's "who asked" table has a column for the redraws that were about
+  the desk.
+
+Seen on the test page (400 items being read, 25 seconds): redraws 3.0 seconds
+apart, and three sooner ones as the desk's own item was read.
+
+**One count less** (`src/main.js`): the number of traders in the status line was
+counted every redraw by walking every buyer row of every item - and looking
+every item's buyers up a second time. It is counted again only when an item's
+buyers were worked out since.
+
+**One trade, once.** The cause of what he saw: the trade with each trader is
+planned alone, from the same bazaar listings, as if no other trade were made.
+That is the right number to choose a trader by, and wrong as a list of deals: a
+listing can be bought once. And Best flips had one row an item, so two flips to
+one trader stood apart as two deals. Nothing is re-planned; the page now says
+what is one trade and what is the same goods:
+
+- *Flips > Best flips* (`core/still.js` `togetherBy`): the flips that sell to one
+  trader stand together under one line - the trader, how many flips, "one
+  trade", what they make together. The trader is named on that line and not on
+  each row under it. Traders are in the order of what their flips make
+  together. A press on the line opens the trade on its biggest flip. A trader
+  with one flip is a row as before. While a trade holds the list still, the
+  rows keep the trader and the place of the hold.
+- *Today > Best flips now*: the same order, the trader named once, "same trade"
+  on the rows under.
+- *Traders pay* (`core/same-goods.js` `sameGoods`): another trader's trade says
+  how much of it is the goods of the trade on show - "The same item as the trade
+  with Bob", "2 of its 5 items are also in the trade with Bob".
+- *Flips > By trader* (`goodsAbove`): a trade says what it shares with a bigger
+  trade above it, and what the rest of it makes.
+
+**My choices, not confirmed by him.** 3 seconds; what counts as "on the desk";
+grouping the rows under a line instead of one row a trader (every row, pin and
+mark of today stays); the sum on the line is the flips' own, not the whole
+trade's (that is on the right once opened); the words.
+
+**Tests.** `test/start-up.test.js` (the calm wait; the share of time at 100, 250
+and 500 ms a redraw, with and without it), `test/build-3-30.test.js` (the order,
+live and held; what two trades share; the joins in `src/main.js` and the page).
+767 tests.
+
+**Not done.** The count on his page. Why keeping went off there (3.29.0's log
+line names it in his next zip). The desk's trades are still planned every redraw
+(up to 139 ms on his page); at the calm pace that is every 3 seconds.
+
 ## Architecture
 
 ```

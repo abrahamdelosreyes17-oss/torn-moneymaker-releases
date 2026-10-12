@@ -497,6 +497,13 @@ button.sw-t { border: 0; padding: 0; cursor: pointer; }
 .t td.act { width: 1%; padding-left: 0; } .t td.wrap, .t td.wrap small { white-space: normal; }
 .t tr.gone td b { color: var(--faint); font-weight: 400; text-decoration: line-through; }
 .t tr.pinrow td { background: rgba(255,255,255,.025); }
+/* 3.30.0 - Best flips: one line over the flips that are one trade with a trader; its rows stand in under it. */
+.t tr.grp td { padding-top: 9px; padding-bottom: 5px; border-bottom: 0; color: var(--text2); }
+.t tr.grp td .grp-n { margin-left: 8px; color: var(--muted); font-size: 12px; }
+.t tr.grp td small { display: inline; margin-left: 8px; }
+.t tr.ingrp td:first-child { padding-left: 30px; box-shadow: inset 2px 0 0 var(--line); }
+.t tbody tr.ingrp.sel td:first-child { box-shadow: none; }
+.fr .to.same { color: var(--faint); }
 .rowpin { width: 22px; height: 22px; padding: 0; border: 0; border-radius: 6px; background: none; color: var(--faint); display: inline-grid; place-items: center; vertical-align: middle; margin-left: 6px; }
 .rowpin:hover { color: var(--text); background: rgba(255,255,255,.08); } .rowpin.on { color: var(--text); }
 .empty { padding: 22px 16px; color: var(--muted); text-align: center; line-height: 1.5; }

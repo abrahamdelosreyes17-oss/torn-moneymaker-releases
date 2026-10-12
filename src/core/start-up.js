@@ -40,6 +40,18 @@ export const REDRAW_BUDGET_TIMES = 3;
 /** ...and never longer than this: on the slowest machine the numbers still move every few seconds. */
 export const REDRAW_WAIT_MAX_MS = 3000;
 
+/**
+ * The calm pace (3.30.0; Torn Archive 1.3.0 got quick the same way, "calm automatic is fine"): a redraw
+ * asked for by data that does not concern what you are working on - the item on the desk, the trade on
+ * show, its trader - comes no sooner than this after the last one ended. The budget above only says
+ * "three times the last redraw free": a redraw of 250 ms came again 750 ms later, so with an answer a
+ * second (all day, while reads run) the page was in a redraw a quarter of the time - and making a redraw
+ * quicker gave more and shorter freezes, not fewer. With this one of 250 ms is 8% of the time, one of
+ * 100 ms 3%, one of 500 ms 14%; a redraw of a second or more waits its 3 s as before.
+ * What you press, and an answer about what is on the desk, draws as soon as it did.
+ */
+export const REDRAW_CALM_MS = 3000;
+
 /** The first working-out goes in pieces of this long, the page free between them. */
 export const WARM_SLICE_MS = 30;
 
@@ -55,13 +67,14 @@ export const WARM_SLICE_MS = 30;
  * @param {number} p.took - how long the last redraw took (ms; 0: none yet)
  * @param {number} p.ended - when it ended, on the same clock as `now`
  * @param {number} p.now
+ * @param {number} [p.calm] - the least rest after the last redraw, however quick it was (REDRAW_CALM_MS; 0: the budget alone)
  * @returns {number} ms from now
  */
-export function redrawWait({ base = 0, took = 0, ended = 0, now = 0 } = {}) {
+export function redrawWait({ base = 0, took = 0, ended = 0, now = 0, calm = 0 } = {}) {
     const b = Math.max(0, Number(base) || 0);
     const t = Number(took);
     if (!(t > 0) || !Number.isFinite(t)) return b;
-    const rest = Math.min(REDRAW_WAIT_MAX_MS, REDRAW_BUDGET_TIMES * t);
+    const rest = Math.max(Math.min(REDRAW_WAIT_MAX_MS, REDRAW_BUDGET_TIMES * t), Math.max(0, Number(calm) || 0));
     const since = Number(now) - Number(ended);
     // A clock that went back (or no clock): the whole rest, never more.
     const left = since >= 0 ? rest - since : rest;

@@ -101,8 +101,9 @@ test('the text lays Torn Bids\' redraw out hour by hour: its time beside what we
     assert.match(slowTime, /\b4\s+1,200\b/);
     // 3.29.0: what follows "who buys an item" has a column of its own (it was outside every count)...
     assert.match(calmTime, /\b125\s+50\.0\b/, 'in: buyers, then in: shown');
-    // ...and so has the work beside the redraw, and who asked for the redraws: 3 by data, 1 by a press.
-    assert.match(calmBeside, /h\s+120\s+4\s+-\s+0\s+3\s+1\s+0\s+0\s+0$/);
+    // ...and so has the work beside the redraw, and who asked for the redraws: 3 by data (3.30.0: none of them
+    // about the desk), 1 by a press.
+    assert.match(calmBeside, /h\s+120\s+4\s+-\s+0\s+3\s+0\s+1\s+0\s+0\s+0$/);
     // The same market in both hours...
     assert.match(calmSizes, /\b1,000\s+60,000\s+2,900\s+400\b/);
     assert.match(slowSizes, /\b1,000\s+60,000\s+2,900\s+400\b/);

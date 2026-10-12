@@ -5,7 +5,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { redrawWait, warmSlice, packBazaarReads, unpackBazaarReads, REDRAW_BUDGET_TIMES, REDRAW_WAIT_MAX_MS, WARM_SLICE_MS, KEPT_READS_MAX_AGE_MS } from '../src/core/start-up.js';
+import { redrawWait, warmSlice, packBazaarReads, unpackBazaarReads, REDRAW_BUDGET_TIMES, REDRAW_WAIT_MAX_MS, REDRAW_CALM_MS, WARM_SLICE_MS, KEPT_READS_MAX_AGE_MS } from '../src/core/start-up.js';
 import { nextW3bRead } from '../src/core/desk.js';
 import { bazaarSellers, FLIP_FRESH_MS } from '../src/core/flips.js';
 import { normalizeW3bListings } from '../src/core/feed.js';
@@ -45,7 +45,7 @@ test('the redraw budget: a slow redraw is followed by a rest a few times as long
  * the page stuck - as it was (each redraw 120 ms after the first answer
  * waiting), and on the budget.
  */
-function busyShare({ budget, took, everyMs = 1000, forMs = 5 * 60000 }) {
+function busyShare({ budget, took, everyMs = 1000, forMs = 5 * 60000, calm = 0 }) {
     let busy = 0;
     let redraws = 0;
     let ended = 0;
@@ -67,10 +67,40 @@ function busyShare({ budget, took, everyMs = 1000, forMs = 5 * 60000 }) {
         }
         // The answer lands when the page is free.
         const at = Math.max(ask, t);
-        if (timerAt === null) timerAt = at + (budget ? redrawWait({ base: BASE, took: lastTook, ended, now: at }) : BASE);
+        if (timerAt === null) timerAt = at + (budget ? redrawWait({ base: BASE, took: lastTook, ended, now: at, calm }) : BASE);
     }
     return { share: busy / forMs, redraws, longestGap };
 }
+
+test('the calm pace: a redraw for data that is not about the desk rests at least that long, however quick the last one was', () => {
+    // The budget alone: three times the redraw. With the calm pace: never less than it.
+    assert.equal(redrawWait({ base: BASE, took: 100, ended: 10000, now: 10000 }), 300);
+    assert.equal(redrawWait({ base: BASE, took: 100, ended: 10000, now: 10000, calm: REDRAW_CALM_MS }), REDRAW_CALM_MS);
+    assert.equal(redrawWait({ base: BASE, took: 100, ended: 10000, now: 10000 + 1000, calm: REDRAW_CALM_MS }), REDRAW_CALM_MS - 1000, 'counted from the end of the last redraw');
+    assert.equal(redrawWait({ base: BASE, took: 100, ended: 10000, now: 10000 + REDRAW_CALM_MS + 5, calm: REDRAW_CALM_MS }), BASE, 'a quiet page: drawn as fast as ever');
+    // A slow redraw: the budget is the longer of the two, and it is still capped.
+    assert.equal(redrawWait({ base: BASE, took: 2755, ended: 10000, now: 10000, calm: REDRAW_CALM_MS }), Math.max(REDRAW_CALM_MS, REDRAW_WAIT_MAX_MS));
+    // No redraw yet (a page just opened): the first one is not held back.
+    assert.equal(redrawWait({ base: BASE, took: 0, ended: 0, now: 5000, calm: REDRAW_CALM_MS }), BASE);
+    assert.equal(redrawWait({ base: BASE, took: 100, ended: 10000, now: 10000, calm: -5 }), 300);
+    assert.equal(redrawWait({ base: BASE, took: 100, ended: 10000, now: 10000, calm: NaN }), 300);
+});
+
+test('an answer a second: on the budget alone a quick redraw still takes its share of the time; at the calm pace a few percent', () => {
+    for (const [took, most, less] of [[100, 0.04, 2], [250, 0.09, 2], [500, 0.16, 1.5]]) {
+        const budget = busyShare({ budget: true, took });
+        const calm = busyShare({ budget: true, took, calm: REDRAW_CALM_MS });
+        assert.ok(calm.share <= most, took + ' ms: ' + JSON.stringify(calm));
+        assert.ok(calm.share < budget.share / less, took + ' ms, the budget alone ' + JSON.stringify(budget) + ', calm ' + JSON.stringify(calm));
+        assert.ok(calm.longestGap <= REDRAW_CALM_MS + 1000 + BASE, 'and what arrives is still drawn within seconds: ' + calm.longestGap);
+    }
+    // Answers that come faster than one a second (statuses, lists and bazaars together): the budget alone is a quarter.
+    const fast = busyShare({ budget: true, took: 100, everyMs: 200 });
+    assert.ok(fast.share > 0.2, JSON.stringify(fast));
+    assert.ok(busyShare({ budget: true, took: 100, everyMs: 200, calm: REDRAW_CALM_MS }).share < 0.04);
+    // A redraw of a second or more: as it was (the calm pace is no longer than the cap).
+    assert.deepEqual(busyShare({ budget: true, took: 1000, calm: REDRAW_CALM_MS }), busyShare({ budget: true, took: 1000 }));
+});
 
 test('an answer a second at 788 ms a redraw: stuck most of the time before, a quarter of it on the budget', () => {
     const before = busyShare({ budget: false, took: 788 });

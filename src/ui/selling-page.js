@@ -26,7 +26,8 @@ import { formatMoney, formatAge, parseMoneyInput, readWholeNumber } from '../cor
 import { sharedNowLine, sharedKeyLine, sharedKeyBoxLine, sharedSplit, sharedKnown } from '../core/shared.js';
 import { TRADE_MAX_UNITS, countView } from '../core/accepted.js';
 import { enoughProfit } from '../core/profit.js';
-import { stillLine } from '../core/still.js';
+import { stillLine, togetherBy } from '../core/still.js';
+import { sameGoodsWords } from '../core/same-goods.js';
 import { TO_SELL_WHY, whereRowView } from '../core/to-sell.js';
 import { matchFifo, ledgerByPeriod, periodStart } from '../core/ledger.js';
 import { listAgeText } from '../core/traders.js';
@@ -1243,7 +1244,7 @@ export class SellingPage {
         const now = Date.now();
         const sig = JSON.stringify([
             'items', kind, s.counts, s.listTotal, s.desk && s.desk.itemId, info.hasKey, info.loading, info.inventoryAt ? 1 : 0, info.tradersLoading, Boolean(info.bazaarsAt), this.query, s.category,
-            list.map((r) => [r.itemId, r.name, r.held, r.lowest, r.badge && [r.badge.kind, r.badge.amount], r.pending, r.units, r.stops, r.pace, r.bid, r.mark && r.mark.text, r.still && [r.still.move, r.still.gone, r.still.was],
+            list.map((r) => [r.itemId, r.name, r.held, r.lowest, r.badge && [r.badge.kind, r.badge.amount], r.pending, r.units, r.stops, r.pace, r.bid, r.mark && r.mark.text, r.still && [r.still.move, r.still.gone, r.still.was], r.group,
                 r.to && [r.to.name, this.dotSig(r.to), r.to.old ? listAgeText(now - r.to.old.at) : ''], r.top && [r.top.name, r.top.price, this.dotSig(r.top), r.top.checked], paidOf.has(r.itemId) ? paidOf.get(r.itemId).each : 0]),
             s.pinned || [],
         ]);
@@ -1278,10 +1279,41 @@ export class SellingPage {
         // pick the item, and their list is read at once).
         const unsure = 'Not checked: TornW3B has not confirmed this price in the last 5 minutes. Pick the item and their list is read now.';
         const trader = (b, withPrice) => (b ? [this.dot(b), b.name, withPrice ? ' ' : null, withPrice ? (b.checked === false ? spEl('span', { class: 't-muted', title: unsure, text: formatMoney(b.price) }) : spEl('b', { text: formatMoney(b.price) })) : null] : [spEl('span', { class: 't-muted', text: '–' })]);
+        /*
+         * 3.30.0 - one trade, once (the owner, 2026-10-12: "2 flips for the same trader ... why are they on
+         * different cards?"). Best flips: the flips that sell to one trader are one trade with them, so they stand
+         * together under one line - the trader, how many flips, what they make together. The trader is named on
+         * that line and not again on each row under it. A trader with one flip has no such line: the row says it.
+         */
+        const runOf = new Map();
+        if (kind === 'flips') {
+            for (let i = 0; i < list.length;) {
+                let j = i + 1;
+                while (list[i].group && j < list.length && list[j].group === list[i].group) j += 1;
+                if (j - i > 1) {
+                    const run = list.slice(i, j);
+                    const live = run.filter((r) => r.badge && r.badge.kind === 'flip' && !(r.still && r.still.gone));
+                    runOf.set(list[i].itemId, { rows: run, live, to: (run.find((r) => r.to) || {}).to || null, total: live.reduce((a, r) => a + r.badge.amount, 0), stops: live.reduce((a, r) => a + (r.stops || 0), 0) });
+                    for (const r of run.slice(1)) runOf.set(r.itemId, null);
+                }
+                i = j;
+            }
+        }
         for (const r of list) {
             const on = Boolean(s.desk && s.desk.itemId === r.itemId);
             const flip = Boolean(r.badge && r.badge.kind === 'flip');
             const friend = Boolean(r.mark && r.mark.kind === 'friend');
+            const run = runOf.get(r.itemId);
+            const inRun = runOf.has(r.itemId);
+            if (run && run.to) {
+                // Pressed, it opens the trade on its biggest flip: the trade panel lists every item of it.
+                const lead = run.live[0] || run.rows[0];
+                rows.push(this.pickRow('grp', 'group:' + r.group, () => this.select(lead.itemId), [
+                    spEl('td', { colspan: '2' }, [this.dot(run.to), spEl('b', { text: run.to.name }), spEl('span', { class: 'grp-n', text: count(run.live.length) + (run.live.length === 1 ? ' flip' : ' flips') + ' · one trade' }),
+                        run.to.old ? spEl('small', { class: 't-warn', title: 'Their TornW3B price list was last changed then: check it before you buy', text: 'list changed ' + listAgeText(now - run.to.old.at) }) : null]),
+                    spEl('td', { class: 'n' }, run.live.length ? [spEl('b', { class: 't-good', title: 'What these flips make together. The trade with ' + run.to.name + ' may take more of their items: it is on the right once you open it.', text: signed(run.total) })] : []),
+                ], 'Open the trade with ' + run.to.name));
+            }
             // A trade is under way and this row is no flip any more (3.25.0): it keeps its place, greyed.
             const gone = Boolean(r.still && r.still.gone);
             const tags = [
@@ -1312,7 +1344,7 @@ export class SellingPage {
                     if (this.h.onPin) this.h.onPin(r.itemId);
                 } }, [pinIcon()]) : null;
                 cells.push(
-                    spEl('td', {}, r.to ? [this.dot(r.to), r.to.name, r.to.old ? spEl('small', { class: 't-warn', title: 'Their TornW3B price list was last changed then: check it before you buy', text: 'list changed ' + listAgeText(now - r.to.old.at) }) : null] : []),
+                    inRun && r.to ? spEl('td', { class: 'same', title: 'Part of the trade with ' + r.to.name + ', named on the line above' }) : spEl('td', {}, r.to ? [this.dot(r.to), r.to.name, r.to.old ? spEl('small', { class: 't-warn', title: 'Their TornW3B price list was last changed then: check it before you buy', text: 'list changed ' + listAgeText(now - r.to.old.at) }) : null] : []),
                     spEl('td', { class: 'n' }, gone
                         ? [spEl('b', { text: signed(r.still.was) })]
                         : flip ? [this.bar(r.badge.amount, max), spEl('b', { class: 't-good', text: signed(r.badge.amount) }), this.stillMark(r.still), pin] : []),
@@ -1326,7 +1358,7 @@ export class SellingPage {
                     cells.push(spEl('td', { class: 'n' }, worth > 0 ? [this.bar(worth, max), spEl('b', { class: 'amt', title: about ? 'About: at a price that is not checked' : null, text: (about ? '≈ ' : '') + formatMoney(worth) })] : [spEl('span', { class: 't-muted', text: '–' })]));
                 }
             }
-            rows.push(this.pickRow((on ? 'sel' : '') + (gone ? ' gone' : ''), 'item:' + r.itemId, () => this.select(r.itemId), cells));
+            rows.push(this.pickRow((on ? 'sel' : '') + (gone ? ' gone' : '') + (inRun ? ' ingrp' : ''), 'item:' + r.itemId, () => this.select(r.itemId), cells));
         }
         let empty = 'Loading…';
         const q = this.query.trim();
@@ -1353,7 +1385,7 @@ export class SellingPage {
         const key = this.tradeKeyOnShow();
         const now = Date.now();
         const sig = JSON.stringify(['traders', q, this.favOnly, key, sc.favourites, sc.trusted, sc.open,
-            list.map((x) => [x.id, x.name, x.profit, x.items, x.stops, x.reading, x.lastPaid, x.mainId, x.mainUnits, x.every, x.favourite, x.waiting, x.hiddenBy, this.dotSig(x), x.traded, x.trust && x.trust.level + x.trust.score, x.estimated, x.listOld ? x.listOld.level + listAgeText(now - x.listOld.at) : ''])]);
+            list.map((x) => [x.id, x.name, x.profit, x.items, x.stops, x.reading, x.lastPaid, x.mainId, x.mainUnits, x.every, x.favourite, x.waiting, x.hiddenBy, this.dotSig(x), x.traded, x.trust && x.trust.level + x.trust.score, x.estimated, x.same && [x.same.n, x.same.of, x.same.own, x.same.with], x.listOld ? x.listOld.level + listAgeText(now - x.listOld.at) : ''])]);
         if (sig === this.listSig) return;
         this.listSig = sig;
         const max = Math.max(1, ...list.map((x) => (this.traderReady(x) ? x.profit : 0)));
@@ -1369,6 +1401,8 @@ export class SellingPage {
                     spEl('b', {}, [x.favourite ? spEl('span', { class: 'star', title: 'A favourite', text: '★' }) : null, x.name]),
                     x.lastPaid ? spEl('span', { class: 'tag warn', title: 'No public list: the prices they accepted from you last time. Check before buying.', text: 'Last paid' }) : null,
                     spEl('small', { text: sub + (x.traded ? ' · ' + x.traded : '') }),
+                    // 3.30.0: each trade is planned alone - what this one shares with a bigger one above can be bought once.
+                    ready && x.same && x.same.with ? spEl('small', { title: 'The trade with each trader is planned alone, from the same bazaar listings. What two trades both have is one or the other.', text: sameGoodsWords(x.same.n, x.same.of) + ' the trade with ' + x.same.with + (x.same.n < x.same.of && x.same.own > 0 ? ' · the rest makes ' + signed(x.same.own) : '') }) : null,
                     ready && x.listOld ? this.oldListEl(x.listOld) : null,
                 ])])]),
                 spEl('td', { class: 'n' }, ready
@@ -1797,7 +1831,9 @@ export class SellingPage {
                 b.lastPaidOnly ? spEl('small', { class: 't-warn', text: 'Last paid: no public list, check with them' }) : null,
             ]);
             const trade = !t ? []
-                : t.items ? [this.bar(t.profit, max), spEl('b', { class: 't-good', text: (t.estimated ? '≈ ' : '') + signed(t.profit) }), spEl('small', { text: count(t.items) + (t.items === 1 ? ' item' : ' items') + (t.stops ? ' · ' + count(t.stops) + (t.stops === 1 ? ' bazaar' : ' bazaars') : '') + (!t.hasItem ? ' · not this item' : '') })]
+                : t.items ? [this.bar(t.profit, max), spEl('b', { class: 't-good', text: (t.estimated ? '≈ ' : '') + signed(t.profit) }), spEl('small', { text: count(t.items) + (t.items === 1 ? ' item' : ' items') + (t.stops ? ' · ' + count(t.stops) + (t.stops === 1 ? ' bazaar' : ' bazaars') : '') + (!t.hasItem ? ' · not this item' : '') }),
+                    // 3.30.0: planned alone, from the same listings as the trade on show - it is that trade's goods, sold to another trader.
+                    t.same && T && T.chosen && T.chosen.buyer ? spEl('small', { title: 'The trade with each trader is planned alone, from the same bazaar listings. What both trades have can be bought once: it is one or the other.' + (t.own > 0 ? ' Its other items make ' + signed(t.own) + '.' : ''), text: sameGoodsWords(t.same, t.flips) + ' the trade with ' + T.chosen.buyer.name }) : null]
                     : [spEl('span', { class: 't-muted', text: b.troll ? 'their bid is not believable' : 'no trade with your Cash' })];
             const cells = [first, spEl('td', { class: 'n' }, [spEl('b', { text: formatMoney(b.price) })]), spEl('td', { class: 'n' }, trade)];
             if (until || !T) {
@@ -3350,7 +3386,11 @@ export class SellingPage {
         const info = s.info || {};
         const T = s.trades || { waiting: [], buying: [], ready: [] };
         const going = this.tradesGoing();
-        const flips = (s.strip || []).filter((f) => f.plan);
+        // 3.30.0 - the flips that sell to one trader are one trade: they stand together, the trader named once.
+        // (Not while a trade holds the list still: the cards keep the places of the hold.)
+        const flipTo = (f) => (f.buyer ? (f.buyer.id ? 'id:' + f.buyer.id : 'name:' + String(f.buyer.name || '').toLowerCase()) : null);
+        const flipsNow = (s.strip || []).filter((f) => f.plan);
+        const flips = s.still ? flipsNow : togetherBy(flipsNow, flipTo, (f) => f.plan.profit);
         const traders = ((s.scan || {}).list || []).filter((x) => this.traderReady(x)).sort((a, b) => b.profit - a.profit);
         const best = traders[0] || null;
         const sellT = s.toSell || { rows: [], groups: [] };
@@ -3392,11 +3432,17 @@ export class SellingPage {
         const fbox = this.todayFlips;
         fbox.textContent = '';
         const max = Math.max(1, ...flips.map((f) => f.plan.profit));
+        let toBefore = null;
         for (const f of flips.slice(0, 7)) {
             const open = () => this.showFlip(f.itemId);
+            const to = flipTo(f);
+            const sameTrade = Boolean(to) && to === toBefore;
+            toBefore = to;
             const row = spEl('div', { class: 'fr', role: 'button', tabindex: '0', 'data-focus': 'today:flip:' + f.itemId, title: 'Open this flip', onclick: open }, [
                 spEl('div', { class: 'cell' }, [this.pic('today', f.itemId), spEl('b', { text: f.name })]),
-                spEl('span', { class: 'to' }, [this.dot(f.buyer), f.buyer ? f.buyer.name : '']),
+                sameTrade
+                    ? spEl('span', { class: 'to same', title: 'One trade with ' + f.buyer.name + ': this flip and the one above it', text: 'same trade' })
+                    : spEl('span', { class: 'to' }, [this.dot(f.buyer), f.buyer ? f.buyer.name : '']),
                 this.bar(f.plan.profit, max, 'wide'),
                 spEl('span', { class: 'p', text: signed(f.plan.profit) }),
             ]);

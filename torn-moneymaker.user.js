@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      3.29.0
+// @version      3.30.0
 // @description  Finds Bazaar and Item Market listings below NPC / market value - on the page you are viewing, and live from the Torn API and TornW3B - ranked by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -52,7 +52,7 @@
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '3.29.0';
+    const TTV2_BUILD_VERSION = '3.30.0';
     const TTV2_SHARED_HOME = 'https://torn-bids-shared.pumping-iron-worker.workers.dev';
 
     /* ===== src/platform/gm.js ===== */
@@ -2539,6 +2539,8 @@
         priceLists: 'traders with a price list in use',
         buyerRows: 'buyer rows of all items (who buys an item, added up)',
         byData: 'redraws asked for by arriving data (they wait their turn)',
+        // 3.30.0: of those, the ones about what is on the desk - they do not wait for the calm pace.
+        byNear: 'redraws asked for by data about the item or the trade on the desk (not held to the calm pace)',
         byPress: 'redraws asked for by the answer to something pressed (after a moment, not waiting their turn)',
         byStatus: 'redraws asked for by the first status answer after a press',
         byTyping: 'redraws asked for by typing in the search box',
@@ -2662,8 +2664,8 @@
         out.push('  beside the redraw (ms in the hour), and who asked for the redraws');
         out.push(...spTable(bidsHours.map(([hour, b]) => [
             stamp(Number(hour) * SP_HOUR_MS).slice(0, 13) + 'h', cell(b.w[B.pieces] ? b.w[B.pieces][1] : null, spMs), count(b.w[B.pieces]), cell(b.w[B.index] ? b.w[B.index][1] : null, spMs), count(b.w[B.index]),
-            count(b.g[B.byData]), count(b.g[B.byPress]), count(b.g[B.byStatus]), count(b.g[B.byTyping]), count(b.g[B.byOther]),
-        ]), ['hour', 'pieces ms', 'pieces', 'index ms', 'index made', 'by data', 'by a press', 'by a status', 'by typing', 'by the page']));
+            count(b.g[B.byData]), count(b.g[B.byNear]), count(b.g[B.byPress]), count(b.g[B.byStatus]), count(b.g[B.byTyping]), count(b.g[B.byOther]),
+        ]), ['hour', 'pieces ms', 'pieces', 'index ms', 'index made', 'by data', 'the desk\'s of them', 'by a press', 'by a status', 'by typing', 'by the page']));
         out.push('  what it worked through (the usual of the hour)');
         out.push(...spTable(bidsHours.map(([hour, b]) => [
             stamp(Number(hour) * SP_HOUR_MS).slice(0, 13) + 'h', cell(each(b.g[B.items])), cell(each(b.g[B.buyerRows])), cell(each(b.g[B.priceLists])), cell(each(b.g[B.lists])), cell(each(b.g[B.rows])), cell(each(b.g[B.traders])), cell(each(b.g[B.serverBazaars])),
@@ -14600,7 +14602,46 @@
     const STILL_ENDED_MS = 6000;
 
     const stillFlip = (row) => Boolean(row && row.badge && row.badge.kind === 'flip');
-    const stillPlace = (row) => ({ value: Number(row.value) || 0, held: row.held > 0 ? 1 : 0, bid: Number(row.bid) || 0, name: String(row.name || '') });
+    const stillPlace = (row) => ({ value: Number(row.value) || 0, held: row.held > 0 ? 1 : 0, bid: Number(row.bid) || 0, name: String(row.name || ''), to: flipTraderKey(row) });
+
+    /**
+     * The trader a flip row sells to, as one word ('id:123', or 'name:bob' for a buyer known by name only) -
+     * null for a row that is no flip.
+     */
+    function flipTraderKey(row) {
+        const b = stillFlip(row) && row.plan ? row.plan.buyer : null;
+        if (!b) return null;
+        return b.id ? 'id:' + b.id : b.name ? 'name:' + String(b.name).toLowerCase() : null;
+    }
+
+    /**
+     * One trade, once (3.30.0; the owner, 2026-10-12: "2 flips for the same trader ... why are they on different
+     * cards?"): the flips that sell to one trader stand together, since they are one trade with that trader.
+     * The rows come in their own order (best first) and keep it inside a trader; the traders are in the order
+     * of what all their flips make together, then of their first row. A row with no trader stands alone.
+     *
+     * @param {Array} rows - in order
+     * @param {function} keyOf - (row) => trader key or null
+     * @param {function} valueOf - (row) => what the row makes
+     * @returns {Array} the same rows, each trader's together
+     */
+    function togetherBy(rows, keyOf, valueOf) {
+        const groups = new Map();
+        const order = [];
+        (rows || []).forEach((r, i) => {
+            const key = keyOf(r);
+            const k = key === null || key === undefined || key === '' ? ' ' + i : String(key);
+            let g = groups.get(k);
+            if (!g) {
+                groups.set(k, (g = { rows: [], total: 0, first: i }));
+                order.push(g);
+            }
+            g.rows.push(r);
+            g.total += Number(valueOf(r)) || 0;
+        });
+        order.sort((a, b) => b.total - a.total || a.first - b.first);
+        return order.flatMap((g) => g.rows);
+    }
 
     /**
      * The list and the cards as they are now, to hold.
@@ -14673,8 +14714,10 @@
      * gone: it was a flip at the hold and is not one now, was: its number at the
      * hold}. A row not seen before takes the place its numbers give it now, and
      * keeps that place.
+     * `together` (3.30.0, Best flips): each trader's flips stand together, by the trader and the numbers of the
+     * hold - a flip that is none now, or sells to another trader now, keeps its place among them.
      */
-    function stillList(still, rows) {
+    function stillList(still, rows, { together = false } = {}) {
         if (!still) return rows;
         const out = [];
         for (const r of rows) {
@@ -14682,10 +14725,11 @@
             if (!still.place.has(id)) still.place.set(id, stillPlace(r));
             const was = still.place.get(id);
             const value = Number(r.value) || 0;
-            out.push({ ...r, still: { move: value > was.value ? 'up' : value < was.value ? 'down' : null, gone: still.flips.has(id) && !stillFlip(r), was: was.value } });
+            out.push({ ...r, still: { move: value > was.value ? 'up' : value < was.value ? 'down' : null, gone: still.flips.has(id) && !stillFlip(r), was: was.value, to: was.to || null } });
         }
         const at = (r) => still.place.get(String(r.itemId));
-        return out.sort((a, b) => at(b).value - at(a).value || at(b).held - at(a).held || at(b).bid - at(a).bid || at(a).name.localeCompare(at(b).name));
+        out.sort((a, b) => at(b).value - at(a).value || at(b).held - at(a).held || at(b).bid - at(a).bid || at(a).name.localeCompare(at(b).name));
+        return together ? togetherBy(out, (r) => at(r).to, (r) => at(r).value) : out;
     }
 
     /**
@@ -14754,6 +14798,84 @@
         const came = ended.came > 0 ? ended.came + (ended.came === 1 ? ' new deal came in' : ' new deals came in') + ', and the rows sorted.' : null;
         if (ended.let) return came || 'The rows sorted.';
         return 'Trade' + (ended.trader ? ' with ' + ended.trader : '') + ' ended. ' + (came || 'The rows sorted.');
+    }
+
+    /* ===== src/core/same-goods.js ===== */
+    /*
+     * The same goods in more than one trade (3.30.0).
+     *
+     * The owner, 2026-10-12, on Flips with a trade planned: "theres multiple traders
+     * with multiple deals, but in reality they share the same or similar items".
+     *
+     * The cause: the trade with each trader is planned alone, from the same bazaar
+     * listings, as if no other trade were made. That is right for one question -
+     * "what would the trade with THIS trader make" - and wrong as a list of deals:
+     * a listing can be bought once, so two trades that count it are one deal with
+     * two possible buyers, not two deals. Nothing on the page said so.
+     *
+     * Nothing is re-planned here. Each trade stays what it would make alone (that
+     * is the number to choose a trader by); this says how much of it is the same
+     * goods as a trade already on show, so it reads as "instead", not "as well".
+     *
+     * Pure: no DOM, no storage, no clock.
+     */
+
+    const sgIds = (flips) => (flips || []).map((r) => String(r.itemId));
+
+    /**
+     * A trade against the trade on show: how many of its bazaar items are in that one too, and what its
+     * other items make.
+     *
+     * @param {Array<{itemId, profit}>} flips - the trade's bazaar lines
+     * @param {Iterable<string>} shownIds - the item ids of the trade on show
+     * @returns {{same: number, of: number, own: number}} own: what the lines NOT in the trade on show make
+     */
+    function sameGoods(flips, shownIds) {
+        const shown = shownIds instanceof Set ? shownIds : new Set([...(shownIds || [])].map(String));
+        let same = 0;
+        let own = 0;
+        for (const r of flips || []) {
+            if (shown.has(String(r.itemId))) same += 1;
+            else own += Number(r.profit) || 0;
+        }
+        return { same, of: (flips || []).length, own };
+    }
+
+    /**
+     * A list of trades, biggest first (By trader): for each, how many of its bazaar items a trade above it
+     * already has, and what the rest of it makes - what it adds when the ones above are made first.
+     * A trade that is not ready (nothing to make, hidden by a filter) takes nothing and is given nothing.
+     *
+     * @param {Array<{key, flips: Array<{itemId, profit}>, ready: boolean}>} list - in the order shown
+     * @returns {Map<string, {same: number, of: number, own: number, with: string|null}>} by key; `with`: the key of
+     *          the first trade above that has one of its items
+     */
+    function goodsAbove(list) {
+        const taken = new Map();
+        const out = new Map();
+        for (const t of list || []) {
+            if (!t || !t.ready) continue;
+            let same = 0;
+            let own = 0;
+            let withKey = null;
+            for (const r of t.flips || []) {
+                const id = String(r.itemId);
+                if (taken.has(id)) {
+                    same += 1;
+                    if (withKey === null) withKey = taken.get(id);
+                } else own += Number(r.profit) || 0;
+            }
+            out.set(String(t.key), { same, of: (t.flips || []).length, own, with: withKey });
+            for (const id of sgIds(t.flips)) if (!taken.has(id)) taken.set(id, String(t.key));
+        }
+        return out;
+    }
+
+    /** "The same item as", "The same 3 items as", "2 of its 5 items are also in" - before the other trade's name. */
+    function sameGoodsWords(same, of) {
+        if (!(same > 0)) return '';
+        if (same >= of) return of === 1 ? 'The same item as' : 'The same ' + of + ' items as';
+        return same + ' of its ' + of + ' items ' + (same === 1 ? 'is' : 'are') + ' also in';
     }
 
     /* ===== src/api/ledger.js ===== */
@@ -16811,6 +16933,18 @@
     /** ...and never longer than this: on the slowest machine the numbers still move every few seconds. */
     const REDRAW_WAIT_MAX_MS = 3000;
 
+    /**
+     * The calm pace (3.30.0; Torn Archive 1.3.0 got quick the same way, "calm automatic is fine"): a redraw
+     * asked for by data that does not concern what you are working on - the item on the desk, the trade on
+     * show, its trader - comes no sooner than this after the last one ended. The budget above only says
+     * "three times the last redraw free": a redraw of 250 ms came again 750 ms later, so with an answer a
+     * second (all day, while reads run) the page was in a redraw a quarter of the time - and making a redraw
+     * quicker gave more and shorter freezes, not fewer. With this one of 250 ms is 8% of the time, one of
+     * 100 ms 3%, one of 500 ms 14%; a redraw of a second or more waits its 3 s as before.
+     * What you press, and an answer about what is on the desk, draws as soon as it did.
+     */
+    const REDRAW_CALM_MS = 3000;
+
     /** The first working-out goes in pieces of this long, the page free between them. */
     const WARM_SLICE_MS = 30;
 
@@ -16826,13 +16960,14 @@
      * @param {number} p.took - how long the last redraw took (ms; 0: none yet)
      * @param {number} p.ended - when it ended, on the same clock as `now`
      * @param {number} p.now
+     * @param {number} [p.calm] - the least rest after the last redraw, however quick it was (REDRAW_CALM_MS; 0: the budget alone)
      * @returns {number} ms from now
      */
-    function redrawWait({ base = 0, took = 0, ended = 0, now = 0 } = {}) {
+    function redrawWait({ base = 0, took = 0, ended = 0, now = 0, calm = 0 } = {}) {
         const b = Math.max(0, Number(base) || 0);
         const t = Number(took);
         if (!(t > 0) || !Number.isFinite(t)) return b;
-        const rest = Math.min(REDRAW_WAIT_MAX_MS, REDRAW_BUDGET_TIMES * t);
+        const rest = Math.max(Math.min(REDRAW_WAIT_MAX_MS, REDRAW_BUDGET_TIMES * t), Math.max(0, Number(calm) || 0));
         const since = Number(now) - Number(ended);
         // A clock that went back (or no clock): the whole rest, never more.
         const left = since >= 0 ? rest - since : rest;
@@ -27592,6 +27727,13 @@
     .t td.act { width: 1%; padding-left: 0; } .t td.wrap, .t td.wrap small { white-space: normal; }
     .t tr.gone td b { color: var(--faint); font-weight: 400; text-decoration: line-through; }
     .t tr.pinrow td { background: rgba(255,255,255,.025); }
+    /* 3.30.0 - Best flips: one line over the flips that are one trade with a trader; its rows stand in under it. */
+    .t tr.grp td { padding-top: 9px; padding-bottom: 5px; border-bottom: 0; color: var(--text2); }
+    .t tr.grp td .grp-n { margin-left: 8px; color: var(--muted); font-size: 12px; }
+    .t tr.grp td small { display: inline; margin-left: 8px; }
+    .t tr.ingrp td:first-child { padding-left: 30px; box-shadow: inset 2px 0 0 var(--line); }
+    .t tbody tr.ingrp.sel td:first-child { box-shadow: none; }
+    .fr .to.same { color: var(--faint); }
     .rowpin { width: 22px; height: 22px; padding: 0; border: 0; border-radius: 6px; background: none; color: var(--faint); display: inline-grid; place-items: center; vertical-align: middle; margin-left: 6px; }
     .rowpin:hover { color: var(--text); background: rgba(255,255,255,.08); } .rowpin.on { color: var(--text); }
     .empty { padding: 22px 16px; color: var(--muted); text-align: center; line-height: 1.5; }
@@ -28175,6 +28317,7 @@
      * placeholder. Nothing is cut short with an ellipsis. Names from Torn,
      * TornExchange or TornW3B only ever go in via textContent.
      */
+
 
 
 
@@ -29397,7 +29540,7 @@
             const now = Date.now();
             const sig = JSON.stringify([
                 'items', kind, s.counts, s.listTotal, s.desk && s.desk.itemId, info.hasKey, info.loading, info.inventoryAt ? 1 : 0, info.tradersLoading, Boolean(info.bazaarsAt), this.query, s.category,
-                list.map((r) => [r.itemId, r.name, r.held, r.lowest, r.badge && [r.badge.kind, r.badge.amount], r.pending, r.units, r.stops, r.pace, r.bid, r.mark && r.mark.text, r.still && [r.still.move, r.still.gone, r.still.was],
+                list.map((r) => [r.itemId, r.name, r.held, r.lowest, r.badge && [r.badge.kind, r.badge.amount], r.pending, r.units, r.stops, r.pace, r.bid, r.mark && r.mark.text, r.still && [r.still.move, r.still.gone, r.still.was], r.group,
                     r.to && [r.to.name, this.dotSig(r.to), r.to.old ? listAgeText(now - r.to.old.at) : ''], r.top && [r.top.name, r.top.price, this.dotSig(r.top), r.top.checked], paidOf.has(r.itemId) ? paidOf.get(r.itemId).each : 0]),
                 s.pinned || [],
             ]);
@@ -29432,10 +29575,41 @@
             // pick the item, and their list is read at once).
             const unsure = 'Not checked: TornW3B has not confirmed this price in the last 5 minutes. Pick the item and their list is read now.';
             const trader = (b, withPrice) => (b ? [this.dot(b), b.name, withPrice ? ' ' : null, withPrice ? (b.checked === false ? spEl('span', { class: 't-muted', title: unsure, text: formatMoney(b.price) }) : spEl('b', { text: formatMoney(b.price) })) : null] : [spEl('span', { class: 't-muted', text: '–' })]);
+            /*
+             * 3.30.0 - one trade, once (the owner, 2026-10-12: "2 flips for the same trader ... why are they on
+             * different cards?"). Best flips: the flips that sell to one trader are one trade with them, so they stand
+             * together under one line - the trader, how many flips, what they make together. The trader is named on
+             * that line and not again on each row under it. A trader with one flip has no such line: the row says it.
+             */
+            const runOf = new Map();
+            if (kind === 'flips') {
+                for (let i = 0; i < list.length;) {
+                    let j = i + 1;
+                    while (list[i].group && j < list.length && list[j].group === list[i].group) j += 1;
+                    if (j - i > 1) {
+                        const run = list.slice(i, j);
+                        const live = run.filter((r) => r.badge && r.badge.kind === 'flip' && !(r.still && r.still.gone));
+                        runOf.set(list[i].itemId, { rows: run, live, to: (run.find((r) => r.to) || {}).to || null, total: live.reduce((a, r) => a + r.badge.amount, 0), stops: live.reduce((a, r) => a + (r.stops || 0), 0) });
+                        for (const r of run.slice(1)) runOf.set(r.itemId, null);
+                    }
+                    i = j;
+                }
+            }
             for (const r of list) {
                 const on = Boolean(s.desk && s.desk.itemId === r.itemId);
                 const flip = Boolean(r.badge && r.badge.kind === 'flip');
                 const friend = Boolean(r.mark && r.mark.kind === 'friend');
+                const run = runOf.get(r.itemId);
+                const inRun = runOf.has(r.itemId);
+                if (run && run.to) {
+                    // Pressed, it opens the trade on its biggest flip: the trade panel lists every item of it.
+                    const lead = run.live[0] || run.rows[0];
+                    rows.push(this.pickRow('grp', 'group:' + r.group, () => this.select(lead.itemId), [
+                        spEl('td', { colspan: '2' }, [this.dot(run.to), spEl('b', { text: run.to.name }), spEl('span', { class: 'grp-n', text: count(run.live.length) + (run.live.length === 1 ? ' flip' : ' flips') + ' · one trade' }),
+                            run.to.old ? spEl('small', { class: 't-warn', title: 'Their TornW3B price list was last changed then: check it before you buy', text: 'list changed ' + listAgeText(now - run.to.old.at) }) : null]),
+                        spEl('td', { class: 'n' }, run.live.length ? [spEl('b', { class: 't-good', title: 'What these flips make together. The trade with ' + run.to.name + ' may take more of their items: it is on the right once you open it.', text: signed(run.total) })] : []),
+                    ], 'Open the trade with ' + run.to.name));
+                }
                 // A trade is under way and this row is no flip any more (3.25.0): it keeps its place, greyed.
                 const gone = Boolean(r.still && r.still.gone);
                 const tags = [
@@ -29466,7 +29640,7 @@
                         if (this.h.onPin) this.h.onPin(r.itemId);
                     } }, [pinIcon()]) : null;
                     cells.push(
-                        spEl('td', {}, r.to ? [this.dot(r.to), r.to.name, r.to.old ? spEl('small', { class: 't-warn', title: 'Their TornW3B price list was last changed then: check it before you buy', text: 'list changed ' + listAgeText(now - r.to.old.at) }) : null] : []),
+                        inRun && r.to ? spEl('td', { class: 'same', title: 'Part of the trade with ' + r.to.name + ', named on the line above' }) : spEl('td', {}, r.to ? [this.dot(r.to), r.to.name, r.to.old ? spEl('small', { class: 't-warn', title: 'Their TornW3B price list was last changed then: check it before you buy', text: 'list changed ' + listAgeText(now - r.to.old.at) }) : null] : []),
                         spEl('td', { class: 'n' }, gone
                             ? [spEl('b', { text: signed(r.still.was) })]
                             : flip ? [this.bar(r.badge.amount, max), spEl('b', { class: 't-good', text: signed(r.badge.amount) }), this.stillMark(r.still), pin] : []),
@@ -29480,7 +29654,7 @@
                         cells.push(spEl('td', { class: 'n' }, worth > 0 ? [this.bar(worth, max), spEl('b', { class: 'amt', title: about ? 'About: at a price that is not checked' : null, text: (about ? '≈ ' : '') + formatMoney(worth) })] : [spEl('span', { class: 't-muted', text: '–' })]));
                     }
                 }
-                rows.push(this.pickRow((on ? 'sel' : '') + (gone ? ' gone' : ''), 'item:' + r.itemId, () => this.select(r.itemId), cells));
+                rows.push(this.pickRow((on ? 'sel' : '') + (gone ? ' gone' : '') + (inRun ? ' ingrp' : ''), 'item:' + r.itemId, () => this.select(r.itemId), cells));
             }
             let empty = 'Loading…';
             const q = this.query.trim();
@@ -29507,7 +29681,7 @@
             const key = this.tradeKeyOnShow();
             const now = Date.now();
             const sig = JSON.stringify(['traders', q, this.favOnly, key, sc.favourites, sc.trusted, sc.open,
-                list.map((x) => [x.id, x.name, x.profit, x.items, x.stops, x.reading, x.lastPaid, x.mainId, x.mainUnits, x.every, x.favourite, x.waiting, x.hiddenBy, this.dotSig(x), x.traded, x.trust && x.trust.level + x.trust.score, x.estimated, x.listOld ? x.listOld.level + listAgeText(now - x.listOld.at) : ''])]);
+                list.map((x) => [x.id, x.name, x.profit, x.items, x.stops, x.reading, x.lastPaid, x.mainId, x.mainUnits, x.every, x.favourite, x.waiting, x.hiddenBy, this.dotSig(x), x.traded, x.trust && x.trust.level + x.trust.score, x.estimated, x.same && [x.same.n, x.same.of, x.same.own, x.same.with], x.listOld ? x.listOld.level + listAgeText(now - x.listOld.at) : ''])]);
             if (sig === this.listSig) return;
             this.listSig = sig;
             const max = Math.max(1, ...list.map((x) => (this.traderReady(x) ? x.profit : 0)));
@@ -29523,6 +29697,8 @@
                         spEl('b', {}, [x.favourite ? spEl('span', { class: 'star', title: 'A favourite', text: '★' }) : null, x.name]),
                         x.lastPaid ? spEl('span', { class: 'tag warn', title: 'No public list: the prices they accepted from you last time. Check before buying.', text: 'Last paid' }) : null,
                         spEl('small', { text: sub + (x.traded ? ' · ' + x.traded : '') }),
+                        // 3.30.0: each trade is planned alone - what this one shares with a bigger one above can be bought once.
+                        ready && x.same && x.same.with ? spEl('small', { title: 'The trade with each trader is planned alone, from the same bazaar listings. What two trades both have is one or the other.', text: sameGoodsWords(x.same.n, x.same.of) + ' the trade with ' + x.same.with + (x.same.n < x.same.of && x.same.own > 0 ? ' · the rest makes ' + signed(x.same.own) : '') }) : null,
                         ready && x.listOld ? this.oldListEl(x.listOld) : null,
                     ])])]),
                     spEl('td', { class: 'n' }, ready
@@ -29951,7 +30127,9 @@
                     b.lastPaidOnly ? spEl('small', { class: 't-warn', text: 'Last paid: no public list, check with them' }) : null,
                 ]);
                 const trade = !t ? []
-                    : t.items ? [this.bar(t.profit, max), spEl('b', { class: 't-good', text: (t.estimated ? '≈ ' : '') + signed(t.profit) }), spEl('small', { text: count(t.items) + (t.items === 1 ? ' item' : ' items') + (t.stops ? ' · ' + count(t.stops) + (t.stops === 1 ? ' bazaar' : ' bazaars') : '') + (!t.hasItem ? ' · not this item' : '') })]
+                    : t.items ? [this.bar(t.profit, max), spEl('b', { class: 't-good', text: (t.estimated ? '≈ ' : '') + signed(t.profit) }), spEl('small', { text: count(t.items) + (t.items === 1 ? ' item' : ' items') + (t.stops ? ' · ' + count(t.stops) + (t.stops === 1 ? ' bazaar' : ' bazaars') : '') + (!t.hasItem ? ' · not this item' : '') }),
+                        // 3.30.0: planned alone, from the same listings as the trade on show - it is that trade's goods, sold to another trader.
+                        t.same && T && T.chosen && T.chosen.buyer ? spEl('small', { title: 'The trade with each trader is planned alone, from the same bazaar listings. What both trades have can be bought once: it is one or the other.' + (t.own > 0 ? ' Its other items make ' + signed(t.own) + '.' : ''), text: sameGoodsWords(t.same, t.flips) + ' the trade with ' + T.chosen.buyer.name }) : null]
                         : [spEl('span', { class: 't-muted', text: b.troll ? 'their bid is not believable' : 'no trade with your Cash' })];
                 const cells = [first, spEl('td', { class: 'n' }, [spEl('b', { text: formatMoney(b.price) })]), spEl('td', { class: 'n' }, trade)];
                 if (until || !T) {
@@ -31504,7 +31682,11 @@
             const info = s.info || {};
             const T = s.trades || { waiting: [], buying: [], ready: [] };
             const going = this.tradesGoing();
-            const flips = (s.strip || []).filter((f) => f.plan);
+            // 3.30.0 - the flips that sell to one trader are one trade: they stand together, the trader named once.
+            // (Not while a trade holds the list still: the cards keep the places of the hold.)
+            const flipTo = (f) => (f.buyer ? (f.buyer.id ? 'id:' + f.buyer.id : 'name:' + String(f.buyer.name || '').toLowerCase()) : null);
+            const flipsNow = (s.strip || []).filter((f) => f.plan);
+            const flips = s.still ? flipsNow : togetherBy(flipsNow, flipTo, (f) => f.plan.profit);
             const traders = ((s.scan || {}).list || []).filter((x) => this.traderReady(x)).sort((a, b) => b.profit - a.profit);
             const best = traders[0] || null;
             const sellT = s.toSell || { rows: [], groups: [] };
@@ -31546,11 +31728,17 @@
             const fbox = this.todayFlips;
             fbox.textContent = '';
             const max = Math.max(1, ...flips.map((f) => f.plan.profit));
+            let toBefore = null;
             for (const f of flips.slice(0, 7)) {
                 const open = () => this.showFlip(f.itemId);
+                const to = flipTo(f);
+                const sameTrade = Boolean(to) && to === toBefore;
+                toBefore = to;
                 const row = spEl('div', { class: 'fr', role: 'button', tabindex: '0', 'data-focus': 'today:flip:' + f.itemId, title: 'Open this flip', onclick: open }, [
                     spEl('div', { class: 'cell' }, [this.pic('today', f.itemId), spEl('b', { text: f.name })]),
-                    spEl('span', { class: 'to' }, [this.dot(f.buyer), f.buyer ? f.buyer.name : '']),
+                    sameTrade
+                        ? spEl('span', { class: 'to same', title: 'One trade with ' + f.buyer.name + ': this flip and the one above it', text: 'same trade' })
+                        : spEl('span', { class: 'to' }, [this.dot(f.buyer), f.buyer ? f.buyer.name : '']),
                     this.bar(f.plan.profit, max, 'wide'),
                     spEl('span', { class: 'p', text: signed(f.plan.profit) }),
                 ]);
@@ -33933,6 +34121,7 @@
      *   - the selling page tab (index.php?ttv2=traders): its own keys, its own
      *     settings, its own requests. See bootSellingPage().
      */
+
 
 
 
@@ -40307,6 +40496,9 @@
         /* The redraw on its way (renderSelling): when it is due, and whether it answers something you pressed. */
         renderDue: 0,
         renderYours: false,
+        /* What the last redraw drew of what you are working on (sellNearStamp), and whether an answer has moved it since. */
+        nearDrawn: null,
+        nearAsked: false,
         /* The draw for keys typed in the search box, on its way (renderSellingTyped): one for all keys typed meanwhile. */
         typedTimer: null,
         /* The buyers the last draw was made with, and when they were worked out (a search draws with them again). */
@@ -42505,7 +42697,52 @@
         return typeof performance !== 'undefined' && typeof performance.now === 'function' ? performance.now() : Date.now();
     }
 
+    /*
+     * 3.30.0 - what you are working on, as it stands: the item on the desk and the items of the trade on show
+     * (their bazaars, their buyers' price check), that trade's trader (their list, status, networth), a list
+     * read at your press, and the page's own loading words. Every one of these is replaced when it changes, so
+     * two of these lists are "the same" exactly when nothing of it moved (sellNearMoved). An answer that moved
+     * any of it is drawn on the old budget; everything else keeps the calm pace (core/start-up.js REDRAW_CALM_MS).
+     */
+    function sellNearStamp() {
+        const out = [sell.selected, sell.loading, sell.teLoading, sell.keyError, sell.keyDead, sell.inventoryAt, sell.selfId, led.loaded, led.busy, led.error, sell.acceptWait, sell.acceptNote];
+        // The item on the desk: whatever of it moves, its "reading…" too.
+        if (sell.selected) out.push(sell.bazaars.get(sell.selected), sell.itemTraders.get(sell.selected));
+        // The other items of the trade on show (each read again every minute, a big trade many times a minute): only
+        // when a read brought other listings or other buyers - not for "being read", nor for an answer that said the same.
+        for (const raw of [...(sell.tradeLive || []), ...(sell.tradeWanted || [])]) {
+            if (!raw || String(raw) === String(sell.selected)) continue;
+            const id = String(raw);
+            const b = sell.bazaars.get(id);
+            const it = sell.itemTraders.get(id);
+            out.push(id, b ? b.rows : null, b ? b.error : null, it ? it.traders : null, it ? Boolean(it.error) : false);
+        }
+        if (sell.selected) out.push(sell.market.get(sell.selected), sell.teOne.get(sell.selected), sell.listState.get(sell.selected));
+        const key = sell.deskTrader ? String(sell.deskTrader.key || '') : '';
+        const traderId = key.startsWith('id:') ? key.slice(3) : null;
+        if (traderId) {
+            const t = sell.db && sell.db.traders ? sell.db.traders[traderId] : null;
+            const nw = sell.networth.get(traderId);
+            const read = sell.listRead ? sell.listRead.get(traderId) : null;
+            out.push(traderId, t ? t.w3b : null, t && t.w3b ? t.w3b.at : 0, t && t.w3b ? t.w3b.checkedAt : 0, sell.listAt.get(traderId), sell.presence.get(traderId), nw ? nw.value : null, Boolean(sell.listReading && sell.listReading.has(traderId)), read ? read.at : 0);
+        }
+        return out;
+    }
+
+    /** Has what you are working on moved since the last redraw drew it? (Before the first redraw: yes.) */
+    function sellNearMoved() {
+        const was = sell.nearDrawn;
+        if (!was) return true;
+        const now = sellNearStamp();
+        if (now.length !== was.length) return true;
+        for (let i = 0; i < now.length; i += 1) if (!Object.is(now[i], was[i])) return true;
+        return false;
+    }
+
     function renderSelling(yours = false, by = null) {
+        // 3.30.0: an answer about what is on the desk does not wait for the calm pace (asked before the pieces
+        // are looked at: the draw that follows them is then this one's, on the old budget).
+        if (!yours && !sell.nearAsked && sellNearMoved()) sell.nearAsked = true;
         if (sell.warm && !yours) {
             // The buyers are being worked out in pieces: the draw follows them, and one more for this.
             sell.warm.asked = true;
@@ -42515,10 +42752,12 @@
         // they have worked out so far, 3.29.0. Until then it threw that away and worked every item out again.)
         if (yours) sell.redrawBy = by || 'byPress';
         const now = sellClock();
-        let due = now + (yours ? SELL_RENDER_MS : redrawWait({ base: SELL_RENDER_MS, took: sell.redrawTook, ended: sell.redrawEnded, now }));
+        let due = now + (yours ? SELL_RENDER_MS : redrawWait({ base: SELL_RENDER_MS, took: sell.redrawTook, ended: sell.redrawEnded, now, calm: sell.nearAsked ? 0 : REDRAW_CALM_MS }));
         if (sell.renderTimer) {
-            // One is on its way; only something you pressed brings it forward (never back).
-            if (!yours || sell.renderYours) return;
+            // One is on its way; only something you pressed brings it forward (never back) - or, 3.30.0, an answer
+            // about what is on the desk, when the one on its way is waiting out the calm pace.
+            if (sell.renderYours) return;
+            if (!yours && !(due < sell.renderDue - 1)) return;
             clearTimeout(sell.renderTimer);
             due = Math.min(due, sell.renderDue);
         }
@@ -42690,6 +42929,12 @@
                 perfStartup({ script: SCRIPT_START_MS, panel: perfNow(), items: null });
             }
             if (sell.drew && SPEED_BIDS[by]) perfGauge(SPEED_BIDS[by], 1);
+            if (sell.drew) {
+                // 3.30.0 - what this redraw drew of the desk: an answer that moves it draws without the calm wait.
+                if (by === 'byData' && sell.nearAsked) perfGauge(SPEED_BIDS.byNear, 1);
+                sell.nearAsked = false;
+                sell.nearDrawn = sellNearStamp();
+            }
             // What the pieces were for, and what arrived while they were worked out: its own redraw, in its turn.
             if (again) renderSelling();
         }
@@ -43486,12 +43731,15 @@
             stillWaits = stillWaiting(still, stillFlips, now);
             still.waiting = stillWaits.length;
             // The Flips tab: the flips of the hold (one that is no flip now stays, greyed); a new one waits in the line.
-            listed = stillList(still, rows.filter((r) => (sell.filter === 'flips' ? still.flips.has(r.itemId) : pass(r))));
+            listed = stillList(still, rows.filter((r) => (sell.filter === 'flips' ? still.flips.has(r.itemId) : pass(r))), { together: sell.filter === 'flips' });
             counts.flips = rows.filter((r) => still.flips.has(r.itemId)).length;
         } else {
             listed = rows
                 .filter(pass)
                 .sort((a, b) => b.value - a.value || (b.held > 0) - (a.held > 0) || b.bid - a.bid || String(a.name).localeCompare(String(b.name)));
+            // 3.30.0 - Best flips: the flips that sell to one trader are one trade with them, and stand together
+            // under its total (the page draws the line over them) - not scattered down the list as so many deals.
+            if (sell.filter === 'flips') listed = togetherBy(listed, flipTraderKey, (r) => r.value);
         }
         redrawStage('4 the list (every item)');
         // 3.28.1 - for the speed log: where the time inside went, and what this redraw had to work through.
@@ -43761,6 +44009,14 @@
                 sell.tradeLive = [];
                 sell.heldEdit = null;
                 return { perTrader, declined: declinedOut, chosen: null, picked: false };
+            }
+            // 3.30.0 (core/same-goods.js) - every other trader's trade is planned alone, from the same bazaar listings:
+            // how many of its items are the goods of the trade on show is said on its row, so it reads as "instead".
+            const shownGoods = new Set((hold ? hold.held.lines || [] : chosen.flips).map((r) => String(r.itemId)));
+            for (const [k, t] of plans) {
+                if (k === chosen.key || !perTrader[k]) continue;
+                const g = sameGoods(t.flips, shownGoods);
+                perTrader[k] = { ...perTrader[k], same: g.same, flips: g.of, own: g.own };
             }
             // What this trader pays now (whatever the Show toggles hide), and how a
             // line you change is re-picked alone (at most 5 bazaars) - the others stay.
@@ -44040,6 +44296,7 @@
                         mainUnits: main ? main.units : 0,
                         every: Boolean(t && t.every),
                         itemIds: t ? t.flips.map((r) => r.itemId) : [],
+                        flipLines: t ? t.flips.map((r) => ({ itemId: r.itemId, profit: r.profit })) : [],
                     });
                 }
                 // Biggest trade first; still reading, then nothing now, after.
@@ -44047,6 +44304,13 @@
                 const cards = traderCards(scanOrder(scan.list), { hold: holdFlips, unread: unreadStatus });
                 // In order again once "being checked" is known: a trade that cannot be offered yet goes under the ones that can.
                 scan.list = scanOrder(cards.list);
+                // 3.30.0 - each trade is planned alone: what a trade further down shares with one above it is said on its row.
+                const above = goodsAbove(scan.list.map((x) => ({ key: x.key, flips: x.flipLines, ready: x.items > 0 && x.profit > 0 && !x.hiddenBy && !x.waiting })));
+                const scanNames = new Map(scan.list.map((x) => [x.key, x.name]));
+                scan.list = scan.list.map((x) => {
+                    const g = above.get(x.key);
+                    return g && g.same ? { ...x, same: { n: g.same, of: g.of, own: g.own, with: scanNames.get(g.with) || null } } : x;
+                });
                 sell.scanList = scan.list;
                 sell.scanWatch = cards.watch;
             }
@@ -44224,7 +44488,14 @@
         const heldCount = sell.inventory ? sell.inventory.length : 0;
         const teOneDone = sell.inventory ? [...heldIds()].filter((i) => sell.teOne.has(i) && !sell.teOne.get(i).failed).length : 0;
         const statuses = sellStatusMap(now);
-        const counted = countTraders(allIds, buyersAll);
+        // 3.30.0 - counted again only when an item's buyers were worked out since the last count: it walked every
+        // buyer row of every item (61,773 on the owner's page), and looked every item's buyers up a second time,
+        // each redraw, for one number in the status line.
+        const countKeeper = sellBuyersKeeper();
+        const countWas = sell.countKept;
+        const counted = countWas && countKeeper.on() && countWas.redone === countKeeper.stats.redone && countWas.items === allIds.size ? countWas.out : countTraders(allIds, buyersAll);
+        // (Noted after the count: the count's own lookups may have worked an aged item out again.)
+        sell.countKept = { redone: countKeeper.stats.redone, items: allIds.size, out: counted };
         const traderCount = counted.traders;
         // 3.29.0, for the speed log: what every redraw walks (not when a search shows part of the items).
         if (!q) {
@@ -44287,6 +44558,8 @@
             networth: networthMap(),
             // A flip row says what you buy at and what the trader pays (the owner: "it doesn't say how much the bazaar sells it for and how much the trader buys it for").
             list: listed.slice(0, sell.allShown).map((r) => ({ itemId: r.itemId, name: r.name, held: r.held, lowest: r.lowest, badge: r.badge, pending: r.pending, still: r.still || null,
+                // 3.30.0 - Best flips: the trader whose trade this flip is part of (while a trade holds the list still: as it was held).
+                group: sell.filter === 'flips' ? (r.still ? r.still.to || null : flipTraderKey(r)) : null,
                 // Shared: your own mark as you see it, else a friend's on a flip (the row stays where its profit puts it).
                 mark: ownGoing.has(r.itemId) ? { kind: 'you', text: 'You are on this' } : r.badge && r.badge.kind === 'flip' && friendGoing.has(r.itemId) ? { kind: 'friend', text: sharedOnThis(friendGoing.get(r.itemId), now) } : null,
                 buy: r.badge && r.badge.kind === 'flip' && r.plan ? r.plan.firstPrice : null, sell: r.badge && r.badge.kind === 'flip' && r.plan && r.plan.buyer ? r.plan.buyer.price : null,
