@@ -10,6 +10,7 @@ import { SharedLink, SHARED_CONFIG_KEY, SHARED_OWN_KEY, SHARED_TICK_MS } from '.
 import { sharedBody, sharedOutgoingOk, sharedOwnIn, sharedOwnKeep } from '../src/core/shared.js';
 import { emptyTraderDb, recordW3bList, indexW3bByItem, buyersForItem, saidLists, SAID_MAX_AGE_MS, oldList, stalePrice } from '../src/core/traders.js';
 import { priceChecked, FLIP_CHECK_MS } from '../src/core/checked.js';
+import { ownerList } from '../src/core/owner-tab.js';
 import { serverFile } from './server-path.js';
 
 const { peopleFrom, whoIs } = await import(serverFile('src/host.js'));
@@ -39,6 +40,21 @@ test('the answer\'s own lists: ages into this PC\'s time, whole prices only, and
         { trader: 2000002, at: NOW, since: NOW, open: true, prices: { [SHEEP]: 600 }, off: [] },
     ]);
     assert.deepEqual(sharedOwnIn({}, NOW), []);
+    // 3.32.0 - what the server says beside a list: the trader's name, a whole set's prices, how many are taken.
+    const more = sharedOwnIn({
+        own: [[2000001, 0, 0, 0, { [SHEEP]: 612 }, [KITTEN]], [2000002, 0, 0, 1, { [SHEEP]: 600 }, []]],
+        ownMore: {
+            2000001: { name: 'Buyer', all: { [SHEEP]: 612, [KITTEN]: 510, x: 5, 300: 0 }, sets: { plushie: 3, flower: 0, 'Not A Set': 2, deep: -1 }, take: { [SHEEP]: 4, [KITTEN]: 0, 301: 1.5 }, holds: { [SHEEP]: 99 } },
+            2000002: { name: '', all: [], sets: 'x' },
+            2000009: { name: 'Nobody' },
+        },
+    }, NOW);
+    assert.deepEqual(more[0], { trader: 2000001, at: NOW, since: NOW, open: false, prices: { [SHEEP]: 612 }, off: [KITTEN], name: 'Buyer', all: { [SHEEP]: 612, [KITTEN]: 510 }, sets: { plushie: 3, flower: 0 }, take: { [SHEEP]: 4, [KITTEN]: 0 } });
+    assert.deepEqual(more[1], { trader: 2000002, at: NOW, since: NOW, open: true, prices: { [SHEEP]: 600 }, off: [] });
+    const keptMore = sharedOwnKeep(null, more, 3);
+    assert.deepEqual(keptMore.lists['2000001'].sets, { plushie: 3, flower: 0 });
+    assert.equal(keptMore.lists['2000001'].name, 'Buyer');
+    assert.equal('all' in keptMore.lists['2000002'], false);
     // Kept by trader; the newer one stands; the running number is the server's.
     const kept = sharedOwnKeep(null, got, 7);
     assert.equal(kept.mark, 7);
@@ -139,6 +155,8 @@ test('the whole way: his Torn Archive tells the real server, he closes and his P
     const archive = (own) => world.host.handle('abe', 'POST', '/sync', { app: 'torn-archive', ver: '1.3.6', used: 3, waiting: 0, sellers: [], trades: [], looking: [], since: 0, seen: 0, going: [], bought: [], own });
     // The server learns whose each key is, Torn Bids syncs: nobody has said an own list yet.
     world.host.handle('abe', 'POST', '/sync', { used: 0 });
+    // 3.32.0 - the server keeps one price list: the one from the key marked as its owner's own.
+    assert.equal((await world.admin('POST', '/admin/keys/owner', { who: 'abe', on: true })).status, 200);
     await pass(3 * MIN);
     assert.ok(posts.some((b) => b.ownSince === 0), 'Torn Bids asks for own lists');
     assert.equal(values.has(SHARED_OWN_KEY) ? Object.keys(values.get(SHARED_OWN_KEY).lists).length : 0, 0);
@@ -162,4 +180,18 @@ test('the whole way: his Torn Archive tells the real server, he closes and his P
     assert.deepEqual([row.id, row.price], [HIM, 510]);
     const check = priceChecked(row, { itemId: String(KITTEN), said: said.get(HIM), now });
     assert.deepEqual([check.ok, check.why, check.closed], [true, 'said', true]);
+    // 3.32.0 - his Torn Archive 1.3.10 says what a whole set is paid and how many he still takes; then he is away
+    // over a day. The other tabs let his list lapse after a day - Flips > For him does not: his last word stands.
+    archive({ open: 0, prices: { [KITTEN]: 510, [SHEEP]: 612 }, off: [PANDA], all: { [KITTEN]: 510, [SHEEP]: 612, [PANDA]: 700 }, sets: { plushie: 3, flower: 0 }, take: { [KITTEN]: 4, [SHEEP]: 2, [PANDA]: 0 } });
+    await pass(26 * HOUR);
+    const later = values.get(SHARED_OWN_KEY);
+    const after = world.t + 7 * MIN;
+    assert.equal(saidLists(later, after).size, 0, 'over a day unheard: no buyer row on the other tabs');
+    const his = ownerList(later);
+    assert.equal(his.id, HIM);
+    assert.equal(his.name, WHO[KEY_ABE].name, 'his Torn name, as Torn gave it to the server');
+    assert.deepEqual(his.all, { [KITTEN]: 510, [SHEEP]: 612, [PANDA]: 700 });
+    assert.deepEqual(his.sets, { plushie: 3, flower: 0 });
+    assert.deepEqual(his.take, { [KITTEN]: 4, [SHEEP]: 2, [PANDA]: 0 });
+    assert.ok(after - his.at > 25 * HOUR);
 });

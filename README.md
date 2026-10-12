@@ -2830,6 +2830,81 @@ an offline trader - that switch is the person's who is buying.
 (`test/said-list.test.js`): his Archive says a list, he closes, four hours on
 another person's Torn Bids still has his prices and counts them checked.
 
+### A tab for the server owner's list: whole sets, bought for one trader (3.32.0)
+
+The friend's report, 2026-10-13: "I want to trade my friend a set of plushies
+and flowers for his points trading ... so that whenever he is offline I can
+directly trade him a whole set"; he expected "a flip menu for a whole set".
+The owner: "by the set, so its always complete", "the price still needs to be
+profitable for him", "I will pay whatever the most recent pricelist when i was
+online said (even if i closed it)", "as long as it fills up my sets, in torn
+archive", "bazaars first but item market can be there as long as its a flip,
+just have both on" - and then: "its just For [him]. so im the only trader
+(only pricelist) it sees", "make it my key ... my torn archive (owners torn
+archive)".
+
+**Who.** The shared server now keeps one own price list: the one said by the
+Torn Archive of the key marked as the owner's on the server's page (server
+`src/lists.js` `ownOnly`). Anybody else's Archive is answered "not kept". Torn
+Bids hardcodes no name and no id: the tab is named `For <name>` with the name
+the server hands (from that key, as Torn gave it), and is there only while such
+a list is held (`core/owner-tab.js` `ownerList`). Besides the prices of 3.31.0
+his Archive (1.3.10) says what a whole set is paid a piece (every piece, also
+one he holds enough of) and how many he still takes - whole sets and single
+pieces. Never what he holds.
+
+**The tab** (Flips, after All items; `ui/owner-page.js`, drawn from mockup AI).
+Four tiles: each set (what one makes, how many pay now), what he takes now,
+how old his prices are. His last word stands there with no age limit - on
+every other tab a list not heard for a day lapses, as before.
+
+- *Whole sets*: each piece as many times as sets, the cheapest units first,
+  from bazaars and the Item Market together (each can be switched off; one
+  stays on). A set counts when the whole set leaves your least profit: a dear
+  piece is carried by its set. Capped by what he takes, your Cash, and the
+  items one trade holds. "Set by set" says what each further set costs and why
+  the next one is not on the list.
+- *Every piece that flips*: a piece only where it is under his price by your
+  least profit, up to what he takes of it; a piece he holds enough of is not
+  bought.
+- Never bought from: his own bazaar, and yours. A listing TornW3B has not
+  confirmed lately is not planned on.
+
+**The list.** "Make the list" freezes the plan as an accepted trade with him
+(`owner: {mode, set, n}`, `stops`): the same checkout, the same Next on Torn's
+pages, the same Trades tab, the same history as any trade. Bazaars are walked
+in the list's order, the Item Market last (`core/accepted.js` `nextStep`). No
+page counts an Item Market buy: your Torn log ticks it (log 1112 is read beside
+1225 only while a list buys there), and Next then walks the pieces still to
+buy there, one page each. A step can be taken off (x). A whole-sets list sends
+whole sets only (`sendMax`): the trade page's Fill types the whole sets bought;
+what was bought beyond them is still yours and goes to To sell when the trade
+ends or is cleared. Short of a piece at the end, the tab says what is listed
+now to close the set and adds it on a press.
+
+**What is read for it, only while the tab is in view:** the pieces' TornW3B
+sellers lists (the set in view first, as the top flips are; `w.sets` in
+Settings > API use) and their Item Market listings with your Torn key (one
+every 4 s, a piece again after 90 s, the other set's after 5 min; `t.sets`).
+TornW3B allows about ten sellers lists a minute: a set of 13 pieces is first
+read in a minute or two.
+
+**My choices, not confirmed:** no age limit on his list on this tab; a whole
+set judged as a set (not piece by piece); sets taken = what his Archive says,
+never more; the cancel is "Clear" pressed twice; no "Buy from" switch once a
+list is made (it is frozen like any accepted trade); pieces already in To sell
+are not counted into a new list; friends are told how many he takes, not what
+he holds.
+
+**Not seen on real Torn.** Tested: the parts (`test/owner-tab.test.js`), the
+list through the real server code (`test/said-list.test.js`), the joins
+(`test/wiring.test.js`), and the page on `test/harness-live.html` with
+`&scene=owner` at 1536x960 and 2560x1300 - both sets, both modes, a list made,
+steps bought, a piece short and added, a step taken off, Clear. Never run on
+Torn itself: Next on the real Item Market page (it only changes the address
+after `#`), the log ticking a real Item Market buy, the trade page's Fill with
+a capped line, and the owner mark on the live server.
+
 ## Architecture
 
 ```

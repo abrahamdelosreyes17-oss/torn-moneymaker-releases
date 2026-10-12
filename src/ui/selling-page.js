@@ -24,7 +24,7 @@
 
 import { formatMoney, formatAge, parseMoneyInput, readWholeNumber } from '../core/parse.js';
 import { sharedNowLine, sharedKeyLine, sharedKeyBoxLine, sharedSplit, sharedKnown } from '../core/shared.js';
-import { TRADE_MAX_UNITS, countView } from '../core/accepted.js';
+import { TRADE_MAX_UNITS, countView, stepRank } from '../core/accepted.js';
 import { enoughProfit } from '../core/profit.js';
 import { stillLine, togetherBy } from '../core/still.js';
 import { sameGoodsWords } from '../core/same-goods.js';
@@ -44,7 +44,9 @@ import { LedgerView, LEDGER_CSS } from './ledger-view.js';
 import { keyInputAttrs, keyMask } from './mask.js';
 import { FRESH_DEFAULTS, FRESH_MIN, FRESH_MAX, FRESH_TOP, freshMinutes, keepsUp } from '../core/desk.js';
 import { BIDS_CSS } from './bids-css.js';
-import { bdBuildShell, bdShow, bdTabs, bdNavCount, bdPut, bdMoveInd, bdIcon, bdFilterOf, BD_FLIPS_BEST, BD_FLIPS_TRADER, BD_FLIPS_ITEMS, BD_TRADES_PAST } from './bids-shell.js';
+import { bdBuildShell, bdShow, bdTabs, bdNavCount, bdPut, bdMoveInd, bdIcon, bdFilterOf, BD_FLIPS_BEST, BD_FLIPS_TRADER, BD_FLIPS_ITEMS, BD_FLIPS_OWNER, BD_TRADES_PAST } from './bids-shell.js';
+import { OwnerView, OWNER_CSS } from './owner-page.js';
+import { OWNER_MARKET, OWNER_MARKET_NAME } from '../core/owner-tab.js';
 import { pastState, pastMoved, pastTotals, pastSpan, pastWhen, pastSource, pastTradeText } from '../core/past-trades.js';
 
 export const SELLING_PAGE_TITLE = 'Torn Bids';
@@ -663,6 +665,8 @@ export class SellingPage {
         ];
 
         /* the Torn Ledger */
+        // 3.32.0 - Flips > For <the shared server's owner>: its three parts and its tiles (place() moves them in).
+        this.ownerView = new OwnerView(this, { tradeUrl });
         this.ledgerView = new LedgerView({
             onRead: () => this.h.onLedgerRead && this.h.onLedgerRead(),
             onOpenSettings: () => {
@@ -731,7 +735,8 @@ export class SellingPage {
 
     /** The tabs of a page, in the words shown now. */
     tabsOf(id) {
-        if (id === 'flips') return ['Best flips', 'By trader', 'All items'];
+        // 3.32.0 - a tab for the one trader whose own price list the shared server holds, by the name Torn gave.
+        if (id === 'flips') return ['Best flips', 'By trader', 'All items', ...(this.state.owner ? ['For ' + this.state.owner.name] : [])];
         if (id === 'ledger') {
             const mugs = ((this.state.ledger || {}).mugs || []).length;
             return ['Trading', 'Sold', 'Receipts', 'Traders', 'Mugged' + (mugs ? ' · ' + count(mugs) : '')];
@@ -749,6 +754,11 @@ export class SellingPage {
     /** Flips › By trader is in view. */
     onTraders() {
         return Boolean(this.bd) && this.bd.page === 'flips' && this.bd.tab === BD_FLIPS_TRADER;
+    }
+
+    /** Flips › For <the owner> is in view (and a list of his is held). */
+    onOwner() {
+        return Boolean(this.bd) && this.bd.page === 'flips' && this.bd.tab === BD_FLIPS_OWNER && Boolean(this.state.owner);
     }
 
     /**
@@ -859,8 +869,19 @@ export class SellingPage {
     place() {
         const { page } = this.bd;
         const traders = this.onTraders();
-        const flips = page === 'flips';
-        this.bd.pages.flips.firstElementChild.classList.toggle('c3t', traders);
+        // For the owner: the section is laid out as a page of totals over two columns, and the picker's pane is off.
+        const owner = this.onOwner();
+        const flips = page === 'flips' && !owner;
+        const fl = this.bd.pages.flips;
+        fl.classList.toggle('fit', !owner);
+        fl.classList.toggle('pgrows', owner);
+        fl.classList.toggle('pgfill', owner);
+        fl.firstElementChild.classList.toggle('on', !owner);
+        this.bd.ownerPane.classList.toggle('on', owner);
+        bdPut(this, 'owner-tiles', owner ? this.ownerView.tilesEl : null);
+        bdPut(this, 'owner-left', owner ? this.ownerView.leftEl : null);
+        bdPut(this, 'owner-right', ...(owner ? this.ownerView.right() : []));
+        fl.firstElementChild.classList.toggle('c3t', traders);
         bdPut(this, 'flips-list', flips ? this.listPanel : null);
         bdPut(this, 'flips-mid', ...(flips ? (traders ? [this.buysEl] : [this.headEl, this.askEl, this.payEl]) : []));
         bdPut(this, 'flips-plan', flips ? this.planEl : null);
@@ -935,6 +956,7 @@ export class SellingPage {
         this.renderBanner();
         this.renderNav();
         this.autoPick();
+        this.renderOwner();
         this.place();
         this.renderStill();
         this.renderList();
@@ -944,6 +966,15 @@ export class SellingPage {
         this.renderPast();
         this.renderToday();
         this.renderTape();
+    }
+
+    /**
+     * Flips › For <the owner> (3.32.0), drawn before the parts are placed (what is under the plan depends on it).
+     * His list is no longer held while the tab is in view: back to Best flips - the tab is gone from the bar.
+     */
+    renderOwner() {
+        if (this.onOwner()) this.ownerView.render(this.state.owner);
+        else if (this.bd.page === 'flips' && this.bd.tab === BD_FLIPS_OWNER) queueMicrotask(() => this.bd.page === 'flips' && this.bd.tab === BD_FLIPS_OWNER && !this.state.owner && this.go('flips', BD_FLIPS_BEST));
     }
 
     /**
@@ -2645,6 +2676,8 @@ export class SellingPage {
                 stopOf.get(key).lines.push({ i, st, k });
             });
         }
+        // 3.32.0 - a trade that names its stops is drawn in the order Next walks it: its bazaars, the Item Market last.
+        stops.sort((x, y) => stepRank(A, x.sellerId) - stepRank(A, y.sellerId));
         if (stops.length) {
             const cur = stops.find((s) => !s.lines.every((x) => done(x.st))) || null;
             const route = spEl('div', { class: 'route' });
@@ -2652,11 +2685,15 @@ export class SellingPage {
                 const all = stop.lines.every((x) => done(x.st));
                 const skipped = stop.lines.every((x) => x.st.skipped && !x.st.bought && !(x.st.boughtQty > 0));
                 const l0 = stop.lines.find((x) => !done(x.st)) || stop.lines[0];
-                const name = stop.sellerName || 'Player ' + stop.sellerId;
+                // 3.32.0 - a stop on the Item Market (a list made on Flips > For <the owner>): no player, no bazaar.
+                const market = String(stop.sellerId) === OWNER_MARKET;
+                const name = market ? OWNER_MARKET_NAME : stop.sellerName || 'Player ' + stop.sellerId;
                 const kids = [spEl('div', { class: 'rt-h' }, [
-                    this.playerName(name, stop.sellerId, 'acc:seller:' + stop.sellerId),
+                    market ? spEl('b', { text: name }) : this.playerName(name, stop.sellerId, 'acc:seller:' + stop.sellerId),
                     spEl('span', { class: 'st', text: skipped ? 'skipped' : all ? 'bought' : stop === cur ? 'next' : '' }),
-                    all ? null : this.link('bazaar', bazaarUrl(stop.sellerId, l0.i.itemId, l0.st.price), { cls: 'quiet lk', title: 'Opens ' + name + '\'s bazaar at the item and the price', focus: 'acc:bazaar:' + l0.i.itemId + ':' + l0.k }),
+                    all ? null : market
+                        ? this.link('market', itemMarketUrl(l0.i.itemId, l0.i.name), { cls: 'quiet lk', title: 'Opens the Item Market at the item', focus: 'acc:bazaar:' + l0.i.itemId + ':' + l0.k })
+                        : this.link('bazaar', bazaarUrl(stop.sellerId, l0.i.itemId, l0.st.price), { cls: 'quiet lk', title: 'Opens ' + name + '\'s bazaar at the item and the price', focus: 'acc:bazaar:' + l0.i.itemId + ':' + l0.k }),
                 ])];
                 for (const { i, st, k } of stop.lines) {
                     // Listed at another price now (cheaper included): over their price there is no profit; under it but
@@ -2775,10 +2812,11 @@ export class SellingPage {
             ]);
             return { left, right, acts };
         }
-        const cur = steps.find((st) => !done(st)) || null;
+        const cur = [...steps].sort((x, y) => stepRank(A, x.sellerId) - stepRank(A, y.sellerId)).find((st) => !done(st)) || null;
+        const curMarket = Boolean(cur) && String(cur.sellerId) === OWNER_MARKET;
         const acts = spEl('div', { class: 'acts' }, [
             left0
-                ? spEl('button', { type: 'button', class: 'btn go big out', 'data-focus': 'acc:start', title: 'Opens the next bazaar on Torn: what to buy is marked there', text: 'Next bazaar' + (cur && cur.sellerName ? ': ' + cur.sellerName : ''), onclick: () => this.h.onTradeStartBuying && this.h.onTradeStartBuying(A.key) })
+                ? spEl('button', { type: 'button', class: 'btn go big out', 'data-focus': 'acc:start', title: curMarket ? 'Opens the Item Market on Torn at the next piece to buy' : 'Opens the next bazaar on Torn: what to buy is marked there', text: curMarket ? 'Next: ' + OWNER_MARKET_NAME : 'Next bazaar' + (cur && cur.sellerName ? ': ' + cur.sellerName : ''), onclick: () => this.h.onTradeStartBuying && this.h.onTradeStartBuying(A.key) })
                 : b.id ? this.link('Open the trade', tradeUrl(b.id), { cls: 'btn go big out', title: 'Start a trade with ' + b.name + ' on Torn', focus: 'acc:trade' }) : null,
             left0 ? null : spEl('button', { type: 'button', class: 'btn big', 'data-focus': 'acc:done', title: 'The trade went through: close it' + (A.items.some((i) => i.left > 0 && i.kind === 'flip') ? ', and keep what they did not take to sell elsewhere' : '') + '. Torn Bids marks it traded by itself when it sees the trade finish.', text: 'Traded', onclick: () => this.h.onTradeClose && this.h.onTradeClose(A.key, true) }),
             spEl('span', { class: 'sp' }),
@@ -5100,4 +5138,4 @@ input[type="checkbox"] { accent-color: var(--profit); margin: 3px 0 0; }
     .sp-flabel { padding-top: 0; }
     .sp-tos th { width: 40%; }
 }
-` + BIDS_CSS;
+` + BIDS_CSS + OWNER_CSS;

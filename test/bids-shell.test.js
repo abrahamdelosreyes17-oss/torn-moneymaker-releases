@@ -38,3 +38,9 @@ test('the shell: every page a filter lands on is in the sidebar, with the tab it
     // Sidebar ids are each used once.
     assert.equal(pages.size, BD_PAGES.filter((p) => p.id).length);
 });
+
+test('the shell: Flips > For <the server owner> (3.32.0) is the tab after All items, and asks for no item list', async () => {
+    const { BD_FLIPS_OWNER } = await import('../src/ui/bids-shell.js');
+    assert.equal(BD_FLIPS_OWNER, BD_FLIPS_ITEMS + 1);
+    assert.equal(bdFilterOf('flips', BD_FLIPS_OWNER), null);
+});

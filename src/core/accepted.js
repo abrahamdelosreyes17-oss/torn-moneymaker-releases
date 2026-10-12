@@ -145,8 +145,8 @@ export function stepDone(step) {
     return Boolean(step && (step.bought || step.skipped || step.boughtQty > 0));
 }
 
-/** How many of a line to send: yours as planned; a flip what you actually bought, once you started buying it. */
-export function sendUnits(line) {
+/** What you hold of a line for the trade: yours as planned; a flip what you actually bought, once you started buying it. */
+export function heldForTrade(line) {
     if (!line) return 0;
     if (line.kind === 'yours') return line.units;
     const started = (line.steps || []).some(stepDone);
@@ -154,13 +154,58 @@ export function sendUnits(line) {
     return line.steps.reduce((a, st) => a + (st.bought ? (st.boughtQty > 0 ? st.boughtQty : st.qty) : st.boughtQty || 0), 0);
 }
 
-/** The next step to buy: {line, index, step, itemId, name}, or null when every step is done. */
+/**
+ * How many of a line to send: what you hold of it for the trade (heldForTrade).
+ * A line of a whole-sets list (3.32.0, core/owner-tab.js ownerCapped) sends no more than the whole sets bought
+ * (`sendMax`): the rest of the piece is still yours - it is counted with what the trade leaves you (leftoversOf,
+ * cancelledLeftovers, tradedLeftovers, acceptedTotals), so it goes to To sell.
+ */
+export function sendUnits(line) {
+    const n = heldForTrade(line);
+    if (!line || line.kind === 'yours' || !Number.isInteger(line.sendMax) || line.sendMax < 0 || !(line.steps || []).some(stepDone)) return n;
+    return Math.min(n, line.sendMax);
+}
+
+/** A step's "seller" when it is bought on the Item Market (3.32.0, core/owner-tab.js OWNER_MARKET). */
+const STEP_MARKET = 'market';
+
+/**
+ * The next step to buy: {line, index, step, itemId, name}, or null when every step is done.
+ * The first step not done, in the trade's own order - but (3.32.0) a trade that names its stops (`stops`: seller
+ * ids, the order its list was made in) is walked stop by stop, and a step bought on the Item Market comes after
+ * every bazaar ("its bazaars first").
+ */
 export function nextStep(trade) {
+    const order = trade && Array.isArray(trade.stops) ? trade.stops.map(String) : null;
+    let best = null;
     for (const i of (trade && trade.items) || []) {
-        const k = (i.steps || []).findIndex((st) => !stepDone(st));
-        if (k >= 0) return { line: i.line || 'flip:' + i.itemId, index: k, step: i.steps[k], itemId: i.itemId, name: i.name };
+        const steps = i.steps || [];
+        for (let k = 0; k < steps.length; k += 1) {
+            const st = steps[k];
+            if (stepDone(st)) continue;
+            const rank = stepRank(trade, st.sellerId);
+            if (!best || rank < best.rank) best = { rank, line: i.line || 'flip:' + i.itemId, index: k, step: st, itemId: i.itemId, name: i.name };
+            // A trade without stops: the first step not done of the first item that has one, as ever.
+            if (!order && rank === 0) break;
+        }
+        if (best && !order && best.rank === 0) break;
     }
-    return null;
+    if (!best) return null;
+    const { rank, ...next } = best;
+    return next;
+}
+
+/**
+ * Where a seller comes in the order nextStep walks a trade that names its stops (3.32.0): its place among the
+ * stops, a bazaar the list did not name after them, the Item Market last. 0 for a trade without stops (its own
+ * order stands). The Trades desk draws its stops and names its next one by this.
+ */
+export function stepRank(trade, sellerId) {
+    const order = trade && Array.isArray(trade.stops) ? trade.stops.map(String) : null;
+    if (!order) return 0;
+    if (String(sellerId) === STEP_MARKET) return 2e9;
+    const at = order.indexOf(String(sellerId));
+    return at < 0 ? 1e9 : at;
 }
 
 /**
@@ -827,7 +872,8 @@ function extraForTrade(x) {
 export function leftoversOf(trade, now = Date.now()) {
     const out = [];
     for (const i of (trade && trade.items) || []) {
-        const n = Math.min(sendUnits(i), Math.max(0, Math.floor(Number(i.left) || 0)));
+        // What they did not take of what you sent, and (a whole-sets list) what you bought but did not send.
+        const n = Math.min(sendUnits(i), Math.max(0, Math.floor(Number(i.left) || 0))) + Math.max(0, heldForTrade(i) - sendUnits(i));
         if (i.kind !== 'flip' || !(n > 0)) continue;
         out.push({ itemId: String(i.itemId), name: i.name, qty: n, each: Math.round(costEach(i)), from: trade.trader ? trade.trader.name : null, at: now, why: 'left' });
     }
@@ -847,7 +893,7 @@ export function cancelledLeftovers(trade, now = Date.now()) {
     const out = [];
     for (const i of (trade && trade.items) || []) {
         if (i.kind !== 'flip' || !(i.steps || []).some(stepDone)) continue;
-        const n = sendUnits(i);
+        const n = heldForTrade(i);
         if (n > 0) out.push({ itemId: String(i.itemId), name: i.name, qty: n, each: Math.round(costEach(i)), from, at: now, why: 'cancel', ...stamp });
     }
     for (const x of (trade && trade.extra) || []) {
@@ -930,7 +976,7 @@ export function acceptedTotals(trade) {
             }
         }
         // Bought, and they did not take it: its cost is not this trade's - it is yours to sell.
-        const kept = Math.max(0, sendUnits(i) - taken);
+        const kept = Math.max(0, heldForTrade(i) - taken);
         if (started && kept) {
             left.units += kept;
             left.cost += kept * each;
@@ -1372,7 +1418,7 @@ export function tradedLeftovers(trade, gave, now = Date.now(), finishedAt = null
             continue;
         }
         if (i.kind !== 'flip' || !(i.steps || []).some(stepDone)) continue;
-        const n = sendUnits(i);
+        const n = heldForTrade(i);
         if (n > 0) add(id, i.name, n, costEach(i));
     }
     for (const x of (trade && trade.extra) || []) {

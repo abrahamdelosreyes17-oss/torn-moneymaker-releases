@@ -109,14 +109,51 @@ export function sharedListsIn(answer) {
  */
 export const SHARED_MAX_OWN = 50;
 export const SHARED_MAX_OWN_ITEMS = 200;
+const SHARED_MAX_OWN_SETS = 8;
+const SHARED_MAX_OWN_COUNT = 1000000;
+const SHARED_OWN_SET = /^[a-z]{1,16}$/;
+
+/** A table of whole numbers from the server, checked: {key: n} with `key` passed by `keyOf`, n from `least` up. */
+function sharedOwnTable(given, keyOf, least, most, max) {
+    if (!given || typeof given !== 'object' || Array.isArray(given)) return null;
+    const out = {};
+    let n = 0;
+    for (const [name, value] of Object.entries(given)) {
+        const key = keyOf(name);
+        if (key === null || !Number.isInteger(value) || value < least || value > most || n >= max) continue;
+        out[key] = value;
+        n += 1;
+    }
+    return n ? out : null;
+}
+
+/**
+ * What the server says beside a trader's own list (3.32.0, Flips > For <the owner>): the trader's Torn name, what a
+ * whole set is paid a piece (`all`: every piece, also one held enough of), and how many are still taken - whole
+ * sets (`sets`: {set: n}) and single pieces (`take`: {item: n}). Never what the trader holds.
+ */
+function sharedOwnMore(given) {
+    if (!given || typeof given !== 'object' || Array.isArray(given)) return {};
+    const more = {};
+    if (typeof given.name === 'string' && given.name.length > 0 && given.name.length <= 40) more.name = given.name;
+    const all = sharedOwnTable(given.all, sharedId, 1, 1e12, SHARED_MAX_OWN_ITEMS);
+    const sets = sharedOwnTable(given.sets, (k) => (SHARED_OWN_SET.test(k) ? k : null), 0, SHARED_MAX_OWN_COUNT, SHARED_MAX_OWN_SETS);
+    const take = sharedOwnTable(given.take, sharedId, 0, SHARED_MAX_OWN_COUNT, SHARED_MAX_OWN_ITEMS);
+    if (all) more.all = all;
+    if (sets) more.sets = sets;
+    if (take) more.take = take;
+    return more;
+}
 
 /**
  * The answer's own lists, checked: [{trader, at, since, open, prices: {item: price}, off: [item]}] by this PC's
  * clock - `at`: when the server last heard it from the trader's Torn Archive, `since`: since when it says the same.
+ * With `name`, `all`, `sets`, `take` when the server says them (`ownMore`, 3.32.0).
  */
 export function sharedOwnIn(answer, got) {
     const out = [];
     const age = (n) => Number.isFinite(n) && n >= 0 && n < 1e11;
+    const moreOf = answer && answer.ownMore && typeof answer.ownMore === 'object' && !Array.isArray(answer.ownMore) ? answer.ownMore : {};
     for (const row of answer && Array.isArray(answer.own) ? answer.own : []) {
         if (!Array.isArray(row) || row.length !== 6) continue;
         const trader = sharedId(row[0]);
@@ -132,7 +169,7 @@ export function sharedOwnIn(answer, got) {
         }
         const off = [...new Set(row[5].map(sharedId).filter((id) => id !== null && !(id in prices)))].slice(0, SHARED_MAX_OWN_ITEMS);
         if (!n && !off.length) continue;
-        out.push({ trader, at: Math.floor(got - row[1]), since: Math.floor(got - Math.max(row[1], row[2])), open: row[3] === 1, prices, off });
+        out.push({ trader, at: Math.floor(got - row[1]), since: Math.floor(got - Math.max(row[1], row[2])), open: row[3] === 1, prices, off, ...sharedOwnMore(moreOf[trader]) });
         if (out.length >= SHARED_MAX_OWN) break;
     }
     return out;
@@ -143,7 +180,10 @@ export function sharedOwnKeep(kept, got, mark) {
     const lists = { ...(kept && kept.lists && typeof kept.lists === 'object' ? kept.lists : {}) };
     for (const l of got) {
         const had = lists[l.trader];
-        if (!had || !(had.at > l.at)) lists[l.trader] = { at: l.at, since: l.since, open: l.open, prices: l.prices, off: l.off };
+        if (had && had.at > l.at) continue;
+        const more = {};
+        for (const key of ['name', 'all', 'sets', 'take']) if (l[key]) more[key] = l[key];
+        lists[l.trader] = { at: l.at, since: l.since, open: l.open, prices: l.prices, off: l.off, ...more };
     }
     return { mark: Number.isInteger(mark) && mark >= 0 ? mark : 0, lists: Object.fromEntries(Object.entries(lists).slice(-SHARED_MAX_OWN)) };
 }

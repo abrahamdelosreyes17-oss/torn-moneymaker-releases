@@ -4,7 +4,7 @@
  *
  *   Today      the few totals, what to do now, the best flips, your trades, what you hold, your profit
  *   Flips      Best flips | By trader | All items: pick on the left, who sells and who pays in the
- *              middle, the trade on the right
+ *              middle, the trade on the right; For <the shared server's owner> (3.32.0): his list only
  *   Trades     Going | History: a card per trade in the lane of its step, and the one you pressed under
  *              them; the last 30 trades, each with the prices it was made on
  *   My items   what you hold, and where to sell it
@@ -81,6 +81,8 @@ export const BD_TRADES_PAST = 1;
 export const BD_FLIPS_BEST = 0;
 export const BD_FLIPS_TRADER = 1;
 export const BD_FLIPS_ITEMS = 2;
+/** 3.32.0 - For <the shared server's owner>: there only while a price list of his is held (ui/owner-page.js). */
+export const BD_FLIPS_OWNER = 3;
 
 /**
  * Which list a page shows: main.js works the item list out for one filter at a time
@@ -171,7 +173,12 @@ export function bdBuildShell(page, { title, tagline, parts }) {
     bd.viewEl = bdEl('div', { class: 'view' }, [
         section('today', 'p-dash', parts.today),
         // Flips: the picker, the middle and the trade; By trader swaps what the first two hold.
-        section('flips', 'fit', [bdEl('div', { class: 'pane on c3 snug' }, [slot('flips-list', 'div', 'slot'), slot('flips-mid', 'div', 'col join'), slot('flips-plan', 'div', 'slot')])]),
+        // For the owner (3.32.0) it is another page in the same section: a few totals over a list and what it makes.
+        section('flips', 'fit', [
+            bdEl('div', { class: 'pane on c3 snug' }, [slot('flips-list', 'div', 'slot'), slot('flips-mid', 'div', 'col join'), slot('flips-plan', 'div', 'slot')]),
+            slot('owner-tiles', 'div', 'slot'),
+            (bd.ownerPane = bdEl('div', { class: 'pane c75 snug' }, [slot('owner-left', 'div', 'slot'), slot('owner-right', 'div', 'col')])),
+        ]),
         // Trades: Going is the board and the trade pressed; History is its own pane (the list, and the trade picked).
         section('trades', 'pgrows', [slot('trades-tiles', 'div', 'slot'), slot('trades-board', 'div', 'slot'), slot('trades-detail', 'div', 'slot'), (bd.pastPane = bdEl('div', { class: 'pane c57 snug' }, [slot('past-list', 'div', 'slot'), slot('past-side', 'div', 'col')]))]),
         section('mine', 'pgrows pgfill', [slot('mine-tiles', 'div', 'slot'), bdEl('div', { class: 'pane on c75 snug' }, [slot('mine-list', 'div', 'slot'), slot('mine-side', 'div', 'col')])]),
