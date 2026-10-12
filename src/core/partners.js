@@ -102,6 +102,36 @@ export function tradedLine(stat, now = Date.now()) {
  * better place than their price earns (no ranking bias toward anyone).
  */
 export function favouritesFirstOnTie(buyers, isFav) {
+    // 3.29.0 - the list comes in price order already (buyersForItem sorts it), so only a run of buyers at
+    // the same price can change places: favourites to its front, the others as they stood. On the owner's
+    // page the sort below was a sixth of every redraw (588 of 3,514 ms, 61,773 rows). The same order comes out.
+    const list = buyers || [];
+    const out = list.slice();
+    const priceOf = (b) => Number(b.price) || 0;
+    let i = 0;
+    while (i < out.length) {
+        const p = priceOf(out[i]);
+        let j = i + 1;
+        while (j < out.length && priceOf(out[j]) === p) j += 1;
+        // Not in price order after all: sorted, as before.
+        if (j < out.length && priceOf(out[j]) > p) return favouritesSorted(list, isFav);
+        if (j - i > 1) {
+            const favs = [];
+            const rest = [];
+            for (let k = i; k < j; k += 1) (isFav(out[k]) ? favs : rest).push(out[k]);
+            if (favs.length && rest.length) {
+                let k = i;
+                for (const b of favs) out[k++] = b;
+                for (const b of rest) out[k++] = b;
+            }
+        }
+        i = j;
+    }
+    return out;
+}
+
+/** favouritesFirstOnTie for a list in any order: by price, favourites first among equal prices, else as they stood. */
+export function favouritesSorted(buyers, isFav) {
     // Whether a buyer is a favourite only matters between two at the same price: it is asked
     // only then, and once per buyer (3.17.1 - asking it of every buyer of every item was a
     // fifth of Torn Bids' redraw). The order that comes out is the same.

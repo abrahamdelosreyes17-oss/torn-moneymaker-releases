@@ -72,7 +72,8 @@ test('the board: one group per trader who pays most, the biggest first; the rest
     ]);
     assert.deepEqual(board.waiting.map((r) => r.name), ['Peony', 'Red Fox Plushie']);
     // `kept` (3.23.0): the rows marked "Not for sale" - test/not-for-sale.test.js.
-    assert.deepEqual(toSellBoard([]), { groups: [], waiting: [], kept: [] });
+    // `unchecked` (3.29.0): the rows whose trader's price waits for its check - test/build-3-29.test.js.
+    assert.deepEqual(toSellBoard([]), { groups: [], unchecked: [], waiting: [], kept: [] });
 });
 
 test('what goes into a trade as yours: every To sell item that trader pays enough for - all of it, and nothing else', () => {

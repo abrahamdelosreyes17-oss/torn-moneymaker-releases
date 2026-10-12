@@ -11,14 +11,68 @@
  * (a listing turning stale) says until when it holds.
  *
  * Nothing is told to this file when something changes: each redraw it looks.
- * And it does not trust itself: one kept result a redraw is worked out again
- * and compared (`same`); should they ever differ, keeping stops and `onDiffer`
- * is called - the page then works everything out each time, as before.
+ * And it does not trust itself: about one kept result in KEPT_CHECK_ONE_IN a
+ * redraw (never fewer than one) is worked out again and compared (`same`);
+ * should they ever differ, everything kept is dropped, `onDiffer` is called,
+ * the rest of that redraw is worked out fresh and keeping begins again with
+ * the next (3.29.0). And no kept result stands for longer than about
+ * KEPT_MAX_AGE_MS: older, it is worked out again (and compared, which costs
+ * nothing more) - so whatever the keeping fails to look at, what is shown is
+ * never further behind than that.
+ * Until 3.29.0 one difference switched keeping off until the page was
+ * reloaded, and one result a redraw was checked: on the owner's page every
+ * redraw then worked out all 1,361 items for hours, and a kept row that was
+ * wrong could have stood for 1,361 redraws before its turn came.
  *
  * Pure: no DOM, no storage, no clock (the caller hands `now`).
  */
 
 const keptJsonSame = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+
+/** No kept result stands for longer than this (and up to half as long again: see keptAgeLimit). */
+export const KEPT_MAX_AGE_MS = 60 * 1000;
+
+/**
+ * How long this key's kept result may stand: KEPT_MAX_AGE_MS and up to half as long again, by the key - so
+ * what was all worked out in one redraw (a page just opened) does not all fall due in another.
+ */
+export function keptAgeLimit(key, maxAge = KEPT_MAX_AGE_MS) {
+    const s = String(key);
+    let h = 0;
+    for (let i = 0; i < s.length; i += 1) h = (h * 31 + s.charCodeAt(i)) % 64;
+    return maxAge * (1 + h / 128);
+}
+
+/** Of the kept results handed out in a redraw, about one in this many is worked out again and compared. */
+export const KEPT_CHECK_ONE_IN = 64;
+
+/**
+ * Which of a redraw's kept results are checked (3.29.0): every `stride`-th, from a place that moves on each
+ * redraw - so each is checked within `stride` redraws, and at least one a redraw while anything is kept.
+ * @returns {{begin: function(number): void, due: function(number): boolean}}
+ */
+export function keptCheckTurn(oneIn = KEPT_CHECK_ONE_IN) {
+    let stride = oneIn;
+    let phase = 0;
+    let done = 0;
+    return {
+        /** @param {number} lastHits - how many kept results the redraw before handed out (0: none - the first one of this redraw is checked) */
+        begin: (lastHits) => {
+            stride = lastHits > 0 ? Math.max(1, Math.min(oneIn, lastHits)) : oneIn;
+            // (One on each redraw, whatever the stride: a longer step that shares a divisor with it would come
+            // back to the same few places and never check the others.)
+            phase = lastHits > 0 ? (phase + 1) % stride : 0;
+            done = 0;
+        },
+        /** @param {number} hit - this redraw's n-th kept result, from 0 */
+        due: (hit) => {
+            // (A redraw far bigger than the one before - a search cleared - still checks about one in `oneIn`.)
+            if (hit % stride !== phase || done >= 1 + Math.floor(hit / oneIn)) return false;
+            done += 1;
+            return true;
+        },
+    };
+}
 
 /**
  * Where a fresh result and the kept one part (3.28.1), for the problem log: the first few places, each as
@@ -67,7 +121,7 @@ function keptSameSig(a, b) {
 
 /**
  * @param {object} [o]
- * @param {function} [o.onDiffer] - (key, where) => void: a kept result differed from a fresh one (keeping is then off); `where`: keptDiffWords
+ * @param {function} [o.onDiffer] - (key, where) => void: a kept result differed from a fresh one (everything kept is dropped; the rest of the redraw is worked out fresh); `where`: keptDiffWords
  * @param {function} [o.same] - (fresh, kept) => boolean: do they say the same (JSON by default)
  * @param {boolean} [o.checkAll] - compare every kept result with a fresh one, not one a redraw (tests, the harness)
  * @param {boolean} [o.freeze] - freeze what is handed out, through and through (tests, the harness: a caller writing into a kept result fails loudly)
@@ -76,16 +130,29 @@ export function makeKeeper({ onDiffer = null, same = keptJsonSame, checkAll = fa
     const kept = new Map();
     const stats = { kept: 0, redone: 0, checked: 0, differed: 0 };
     let off = false;
-    // One kept result a redraw is worked out again and compared: which one moves on each redraw.
+    let clock = 0;
+    // Some kept results a redraw are worked out again and compared: which ones moves on each redraw.
     let hits = 0;
-    let lastHits = 0;
-    let checkAt = 0;
+    const turn = keptCheckTurn();
 
-    /** Once a redraw, before any get(). */
-    function begin() {
-        lastHits = hits;
+    /**
+     * Once a redraw, before any get().
+     * @param {number} [now] - the redraw's clock: with it, keeping that went off begins again here, and a kept result ages (none handed: neither)
+     */
+    function begin(now = 0) {
+        turn.begin(hits);
         hits = 0;
-        checkAt = lastHits ? (checkAt + 7) % lastHits : 0;
+        clock = Number(now) || 0;
+        if (off && clock > 0) off = false;
+    }
+
+    /** A kept result differed from a fresh one: all of it goes, and the rest of this redraw is worked out fresh. */
+    function differed(key, fresh, was) {
+        stats.differed += 1;
+        off = true;
+        kept.clear();
+        if (onDiffer) onDiffer(key, keptDiffWords(fresh, was));
+        return fresh;
     }
 
     /**
@@ -105,22 +172,28 @@ export function makeKeeper({ onDiffer = null, same = keptJsonSame, checkAll = fa
         }
         const was = kept.get(key);
         if (was && now <= was.until && keptSameSig(was.sig, sig)) {
+            // Stood long enough: worked out again - and it should say what was kept.
+            if (clock > 0 && clock - was.at >= keptAgeLimit(key)) {
+                const fresh = compute();
+                stats.redone += 1;
+                stats.checked += 1;
+                if (!same(fresh, was.out)) return differed(key, fresh, was.out);
+                // The very result that was kept is handed out again: whoever holds it holds the same one.
+                was.at = clock;
+                return was.out;
+            }
             stats.kept += 1;
             hits += 1;
-            if (!checkAll && hits - 1 !== checkAt) return was.out;
+            if (!checkAll && !turn.due(hits - 1)) return was.out;
             const fresh = compute();
             stats.checked += 1;
             if (same(fresh, was.out)) return was.out;
-            stats.differed += 1;
-            off = true;
-            kept.clear();
-            if (onDiffer) onDiffer(key, keptDiffWords(fresh, was.out));
-            return fresh;
+            return differed(key, fresh, was.out);
         }
         const out = compute();
         stats.redone += 1;
         if (freeze) keptFreeze(out);
-        kept.set(key, { sig, until: until ? until(out) : Infinity, out });
+        kept.set(key, { sig, until: until ? until(out) : Infinity, out, at: clock });
         return out;
     }
 
@@ -128,7 +201,7 @@ export function makeKeeper({ onDiffer = null, same = keptJsonSame, checkAll = fa
         begin,
         get,
         stats,
-        /** Whether keeping is still on (off after a kept result differed). */
+        /** Whether keeping is on (off for the rest of a redraw in which a kept result differed). */
         on: () => !off,
         /** Forget the keys not in `keys` (items that left the page). */
         only: (keys) => {

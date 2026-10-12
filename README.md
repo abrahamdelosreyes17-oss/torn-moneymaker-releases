@@ -2575,6 +2575,123 @@ else in what Torn Bids shows or asks was changed. Cost: about a millisecond a
 minute for the sum, two clock reads around each of those calls. Seen on the test
 page: the tables in a zip made there, the keepings at 96-99 % kept.
 
+### The lag, and no trader's price to act on unless it is checked (3.29.0)
+
+The owner, 2026-10-12: "tornbids gets laggy still the longer it goes on"; To sell
+naming a trader at a price nobody had confirmed for hours; and, after the plan:
+"does this also fix the issue that the price list is always fresh when getting a
+deal? remember tornbids exist ebcause of fast flips to traders".
+Everything below was seen on the test page and in the speed bench only, never on
+real Torn. Whether his page is faster is not known until it is measured there
+again.
+
+**Measured on his page before any of this** (3.28.1, the page five minutes old,
+49 seconds in view): 10 freezes, 9,961 ms, a fifth of the time; the usual one
+937 ms, the longest 1,475 ms; every freeze was one whole redraw. The keeping of
+each item's buyers was OFF: all 1,361 items and 61,773 trader rows were worked
+out on every redraw - about 445 ms for who buys what and 545 ms for what follows
+it (the blacklist, favourites first on a tie, the Show choices, the possible
+flips), none of which was kept at all.
+
+**The lag.**
+
+- *Keeping never stays off* (`core/kept.js`, `core/kept-buyers.js`). One
+  difference between a kept result and a fresh one used to switch keeping off
+  until the page was reloaded. Now everything kept is dropped, the rest of that
+  redraw is worked out fresh, and keeping begins again with the next redraw; the
+  problem log says where they parted (the first 5 times, then every 25th).
+  About one kept result in 64 is checked each redraw (it was one, of 1,361), and
+  none stands for longer than a minute to a minute and a half: older, it is
+  worked out again and compared. So whatever the keeping fails to look at, what
+  is shown is never further behind than that.
+- *One way a kept row came to differ, found and closed.* A trader's rating is
+  held in the rows with the moment it was read. Two sources that disagree on a
+  trader's votes, both heard between two redraws (523, then 524, then 523 again)
+  left the numbers as they were and the rating another one: the kept rows
+  differed from fresh ones though nothing shown had changed. The keeping now
+  looks at the rating itself. Reproduced in a test; whether it is what happened
+  on his page is not known - from now on the log says.
+- *The buyers an item shows are kept* (`core/shown-buyers.js`): without the
+  blacklisted, favourites first on a tie, and the rows with a badge. Kept against
+  the very list of buyers and one number that moves when the blacklist or a
+  favourite does. Who is a favourite is worked out once a redraw, not asked per
+  buyer; a list already in price order is no longer sorted (only buyers at the
+  same price can change places); who is online is asked once per trader.
+- *An item's possible flip is kept*, as its flip plan is.
+- *A press does not throw away the work under way.* A draw for something pressed
+  took down the pieces a redraw was being worked out in and began every item
+  again; it now goes on from what they had reached. Of the status answers after
+  a press only the first draws at once.
+- *The speed log* says what it could not: the time in the shown buyers, the
+  pieces and the lists index beside the redraw, buyer rows and price lists gone
+  through, and who asked for each redraw (data, a press, a status, typing).
+
+Not built: the once-a-minute save of the trader database and the other stored
+values. Measured on his page they were 1-2 ms a redraw: not the cause.
+
+**The prices.** One rule: a trader's price is something to act on only while
+TornW3B confirmed it in the last five minutes and their list changed within a
+day (`core/checked.js`, as flips have had since 3.26.0). Anything else is shown
+muted, says "not checked" and why, carries the links to their lists, and is in no
+total, never "Best", never a trade button.
+
+- *To sell.* A profit only on a checked price. The best payer whose price is
+  checked is the one named; with none checked the best payer is named under
+  "Waiting for a price check", muted, in no total. TE list / W3B list beside
+  every trader. Its items' buyers are read as often as a flip's (every 3 minutes;
+  it was 10, against a check that stands 5), and their best payers' own lists
+  too. The flips are checked first; the To sell rows first while To sell is the
+  tab in view.
+- *"Yours to sell" in a trade*: checked lines only. The others are listed under
+  the trade as waiting and count in nothing (this also corrects By trader's
+  totals and Today's "Best trade now").
+- *Where to sell, Bazaars sell's "X pays", "No flip: X pays..."*: the best
+  checked buyer; with none, the top believable price, muted.
+- *All items "Top price" / My items "Best trader pays"*: the best believable
+  payer (it could be a troll bid), muted when not checked; worth figures say ≈.
+- *Held and pinned trades*: a line whose check lapsed keeps its last checked
+  price and says how long ago that was; pinned trades' traders have their lists
+  read every few minutes, as the desk's have.
+- *On Torn's pages* (bazaar card tags, "In this bazaar", Checkout's "sell to X"):
+  Torn Bids writes down the prices it has checked (item, trader, price, when;
+  at most every 30 seconds, only when changed) and the overlay shows a price as
+  sure only from that table. With Torn Bids closed every tag is muted within
+  five minutes.
+- *The list is read when you take a deal.* Picking a flip or a To sell row, Plan
+  trade, "Trade these to X" and "X said yes" each read that trader's price list
+  (one read, 15 seconds apart at most). The trade says "Reading X's price
+  list..." and then how many of their prices had changed. "Said yes" waits for
+  the answer - up to 4 seconds - and the yes is written with the trade as the
+  new prices make it; no answer in time, it is written and says the prices were
+  not confirmed; no longer a trade with them, it is not written and says so.
+- *Bulk prices* (`bulkThreshold`, `bulkBuyPrice` of a TornW3B list) are kept and
+  shown in amber beside the price. No sum uses them yet.
+- *The top status* says when TornW3B frees up, when the sellers lists are used up.
+
+A price only on TornExchange has no date and can never be checked: such a To
+sell row stays under "Waiting for a price check", with the link to open.
+
+**Tests.** `test/build-3-29.test.js`: the session of 3.18.0 replayed with the
+redraw's clock and the writers it left out (another tab's copy folded in, the
+seed, a TornW3B page, a status answer naming a trader, a rating moved and moved
+back, a trader dropped and learned again); the shown buyers against the pipeline
+as 3.28.1 ran it, every item at every step, with the buyers kept and not, and
+once at the size of his page (2,900 price lists, 1,361 items, about 62,000 buyer
+rows); an input nothing looks at is found, said, and gone within the age limit;
+To sell and the trade's lines on checked, unchecked and TornExchange-only
+prices; the checked table; bulk prices. `test/wiring.test.js` reads `src/main.js`
+for the joins no test can run. 754 tests.
+
+**The bench** (`node test/bench.mjs --only friend`, the friend's size, processor
+slowed 4x, keeping on in both): 3.28.1 and this build asked the same requests
+and drew the same page. A redraw after the first: 409-932 ms before, 276-545 ms
+after; the first, which works everything out, 1,140 and 1,174 ms.
+
+**Not proven, not claimed.** Why keeping went off on his page (one cause is
+closed; the log will name any other). That a press was what made redraws come
+150 ms apart there. The press taking over the pieces has no test of its own: it
+was read, and the bench drew the same page with it.
+
 ## Architecture
 
 ```

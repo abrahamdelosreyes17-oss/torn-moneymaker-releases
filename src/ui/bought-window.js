@@ -222,7 +222,10 @@ export class BoughtWindow {
                 bwEl('b', { text: l.name }),
                 ' ×' + l.qty.toLocaleString('en-US') + ' · ',
                 l.best
-                    ? bwEl('span', {}, ['sell to ', bwEl('b', { text: l.best.name }), ' at ' + bwMoney(l.best.price) + ' (', bwEl('span', { class: l.gain >= 0 ? 'bw-g' : 'bw-neg', text: bwSigned(l.gain) }), ')'])
+                    // A price Torn Bids has not checked in the last minutes (3.29.0): named, muted, with no gain beside it.
+                    ? l.best.unchecked
+                        ? bwEl('span', { class: 'bw-mute', title: 'Torn Bids has not checked this price in the last 5 minutes (it checks while its tab is open): look at their list first' }, [l.best.name + ' paid ' + bwMoney(l.best.price) + ' when last seen · not checked'])
+                        : bwEl('span', {}, ['sell to ', bwEl('b', { text: l.best.name }), ' at ' + bwMoney(l.best.price) + ' (', bwEl('span', { class: l.gain >= 0 ? 'bw-g' : 'bw-neg', text: bwSigned(l.gain) }), ')'])
                     : bwEl('span', { class: 'bw-mute', text: 'no other trader buys it now' }),
             ]))) : null,
             bwEl('button', { type: 'button', class: 'bw-btn', text: 'Yes, cancel it', onclick: () => {

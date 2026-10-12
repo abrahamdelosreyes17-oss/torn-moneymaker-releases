@@ -1007,6 +1007,13 @@ export class SellingPage {
         const wanted = info.flipsWanted || 0;
         if (info.bazaarsError && !info.bazaarsAt) pill('bad', 'Bazaars', 'not loaded', info.bazaarsError);
         else if (!info.bazaarsAt) pill('idle', 'Bazaars', 'loading', 'Loading bazaar prices from TornW3B');
+        // 3.29.0 - TornW3B's sellers lists are used up (its minute, our day's share, or it refused): said, with when
+        // the next one can be read. Until now the page only stood still, and nothing said why or for how long.
+        else if (info.w3bListing && info.w3bListing.freeAt > now) {
+            const ms = info.w3bListing.freeAt - now;
+            const wait = ms < 90000 ? Math.max(5, Math.ceil(ms / 5000) * 5) + ' s' : ms < 90 * 60000 ? Math.ceil(ms / 60000) + ' min' : Math.ceil(ms / 3600000) + ' h';
+            pill('idle', 'Bazaars', 'TornW3B frees up in ' + wait, 'TornW3B\'s sellers lists are used up for now: the next can be read in ' + wait + '. Prices already read stay, trader price lists are still read (they have no such limit)' + (wanted ? ', and ' + checked + ' of ' + wanted + ' possible flips are checked against every bazaar' : '') + '.');
+        }
         else pill(checked < wanted ? 'idle' : 'online', 'Bazaars', age(info.bazaarsAt), 'TornW3B bazaar prices, ' + formatAge(now - info.bazaarsAt) + (wanted ? '. Possible flips checked against every bazaar: ' + checked + ' of ' + wanted : ''));
 
         const perItem = info.heldCount ? ' Best buyer per item, without a key: ' + (info.teOneDone || 0) + ' of ' + info.heldCount + '.' : '';
@@ -1237,7 +1244,7 @@ export class SellingPage {
         const sig = JSON.stringify([
             'items', kind, s.counts, s.listTotal, s.desk && s.desk.itemId, info.hasKey, info.loading, info.inventoryAt ? 1 : 0, info.tradersLoading, Boolean(info.bazaarsAt), this.query, s.category,
             list.map((r) => [r.itemId, r.name, r.held, r.lowest, r.badge && [r.badge.kind, r.badge.amount], r.pending, r.units, r.stops, r.pace, r.bid, r.mark && r.mark.text, r.still && [r.still.move, r.still.gone, r.still.was],
-                r.to && [r.to.name, this.dotSig(r.to), r.to.old ? listAgeText(now - r.to.old.at) : ''], r.top && [r.top.name, r.top.price, this.dotSig(r.top)], paidOf.has(r.itemId) ? paidOf.get(r.itemId).each : 0]),
+                r.to && [r.to.name, this.dotSig(r.to), r.to.old ? listAgeText(now - r.to.old.at) : ''], r.top && [r.top.name, r.top.price, this.dotSig(r.top), r.top.checked], paidOf.has(r.itemId) ? paidOf.get(r.itemId).each : 0]),
             s.pinned || [],
         ]);
         if (sig === this.listSig) return;
@@ -1267,7 +1274,10 @@ export class SellingPage {
         const max = kind === 'flips'
             ? Math.max(1, ...list.map((r) => (r.badge && r.badge.kind === 'flip' ? r.badge.amount : 0)))
             : Math.max(1, ...list.map((r) => (r.held || 0) * (r.bid || 0)));
-        const trader = (b, withPrice) => (b ? [this.dot(b), b.name, withPrice ? ' ' : null, withPrice ? spEl('b', { text: formatMoney(b.price) }) : null] : [spEl('span', { class: 't-muted', text: '–' })]);
+        // 3.29.0: a price TornW3B has not confirmed in the last 5 minutes is shown muted (it is a figure to read:
+        // pick the item, and their list is read at once).
+        const unsure = 'Not checked: TornW3B has not confirmed this price in the last 5 minutes. Pick the item and their list is read now.';
+        const trader = (b, withPrice) => (b ? [this.dot(b), b.name, withPrice ? ' ' : null, withPrice ? (b.checked === false ? spEl('span', { class: 't-muted', title: unsure, text: formatMoney(b.price) }) : spEl('b', { text: formatMoney(b.price) })) : null] : [spEl('span', { class: 't-muted', text: '–' })]);
         for (const r of list) {
             const on = Boolean(s.desk && s.desk.itemId === r.itemId);
             const flip = Boolean(r.badge && r.badge.kind === 'flip');
@@ -1312,7 +1322,8 @@ export class SellingPage {
                 cells.push(spEl('td', { class: 'n' }, r.top ? trader(r.top, true) : [spEl('span', { class: 't-muted', text: r.pending ? 'Checking…' : '–' })]));
                 if (kind === 'mine') {
                     const worth = (r.held || 0) * (r.bid || 0);
-                    cells.push(spEl('td', { class: 'n' }, worth > 0 ? [this.bar(worth, max), spEl('b', { class: 'amt', text: formatMoney(worth) })] : [spEl('span', { class: 't-muted', text: '–' })]));
+                    const about = Boolean(r.top && r.top.checked === false);
+                    cells.push(spEl('td', { class: 'n' }, worth > 0 ? [this.bar(worth, max), spEl('b', { class: 'amt', title: about ? 'About: at a price that is not checked' : null, text: (about ? '≈ ' : '') + formatMoney(worth) })] : [spEl('span', { class: 't-muted', text: '–' })]));
                 }
             }
             rows.push(this.pickRow((on ? 'sel' : '') + (gone ? ' gone' : ''), 'item:' + r.itemId, () => this.select(r.itemId), cells));
@@ -1389,10 +1400,10 @@ export class SellingPage {
     renderSellList() {
         const s = this.state;
         if (s.filter !== 'sell') return;
-        const T = s.toSell || { rows: [], groups: [], waiting: [], kept: [] };
-        const rowSig = (r) => [r.itemId, r.name, r.qty, r.each, r.why, r.best && [r.best.name, r.best.price], r.gain, r.short, r.bazaar, r.kept, r.ready];
+        const T = s.toSell || { rows: [], groups: [], unchecked: [], waiting: [], kept: [] };
+        const rowSig = (r) => [r.itemId, r.name, r.qty, r.each, r.why, r.best && [r.best.name, r.best.price, r.best.te, r.best.w3b], r.gain, r.short, r.bazaar, r.kept, r.ready, r.unchecked, r.check];
         const sig = JSON.stringify(['sell', s.desk && s.desk.itemId, s.prefs.onlineOnly, s.prefs.trustedOnly,
-            (T.groups || []).map((g) => [g.key, g.trader.name, this.dotSig(g.trader), g.gain, g.rows.map(rowSig)]), (T.waiting || []).map(rowSig), (T.kept || []).map(rowSig)]);
+            (T.groups || []).map((g) => [g.key, g.trader.name, this.dotSig(g.trader), g.gain, g.rows.map(rowSig)]), (T.unchecked || []).map(rowSig), (T.waiting || []).map(rowSig), (T.kept || []).map(rowSig)]);
         if (sig === this.listSig) return;
         this.listSig = sig;
         const heads = [{ text: 'Item' }, { text: 'Why it is here' }, { text: 'You paid', n: true }, { text: 'Best now', n: true }, { text: 'Profit', n: true }, { text: '' }];
@@ -1414,10 +1425,26 @@ export class SellingPage {
         for (const g of T.groups || []) {
             const b = g.trader;
             rows.push(spEl('tr', { class: 'g' }, [
-                spEl('td', { colspan: '4' }, [this.dot(b), spEl('b', {}, [this.playerName(b.name, b.id, 'board:who:' + g.key)]), ' pays more than you paid · ' + count(g.rows.length) + (g.rows.length === 1 ? ' item' : ' items') + ' · ', spEl('span', { class: 't-good', text: signed(g.gain) })]),
+                // (3.29.0: their price lists beside the name - the price is checked, and one press shows it to you.)
+                spEl('td', { colspan: '4' }, [this.dot(b), spEl('b', {}, [this.playerName(b.name, b.id, 'board:who:' + g.key)]), ' pays more than you paid · ' + count(g.rows.length) + (g.rows.length === 1 ? ' item' : ' items') + ' · ', spEl('span', { class: 't-good', text: signed(g.gain) }), ' ', ...this.traderLinks(b)]),
                 spEl('td', { class: 'n', colspan: '2' }, [spEl('button', { type: 'button', class: 'btn sm', 'data-focus': 'board:plan:' + g.key, title: 'One trade for everything of yours ' + b.name + ' takes: these go in as yours', text: 'Trade ' + (g.rows.length === 1 ? 'it' : 'these') + ' to ' + b.name, onclick: () => this.h.onTradePick && this.h.onTradePick(g.rows[0].itemId, g.key) })]),
             ]));
             for (const r of g.rows) rows.push(row(r, [spEl('b', { text: formatMoney(r.best.price) })], [this.bar(r.gain, max), spEl('b', { class: 't-good', text: signed(r.gain) })]));
+        }
+        // 3.29.0 - a trader's list says they pay more than you paid, and that price is not checked: named, muted,
+        // with their lists to look at - in no total, and no "Trade these" until TornW3B has confirmed it.
+        if ((T.unchecked || []).length) {
+            const n = T.unchecked.length;
+            const never = T.unchecked.every((r) => r.check === 'te-only' || r.check === 'no-id');
+            rows.push(spEl('tr', { class: 'g' }, [spEl('td', { colspan: '6' }, [spEl('b', { text: 'Waiting for a price check' }), ' · ' + count(n) + (n === 1 ? ' item' : ' items') + ' · '
+                + (never ? 'a price only on TornExchange has no date and cannot be checked: open their list' : 'a trader\'s list says more than you paid; shown as a trade once TornW3B confirms the price')])]));
+            for (const r of T.unchecked) {
+                const b = r.best;
+                const why = this.uncheckedWhy(r.check);
+                rows.push(row(r,
+                    [spEl('span', { class: 't-muted', title: b.name + '\'s price is not checked: ' + why }, [b.name + ' ' + formatMoney(b.price)]), ' ', ...this.traderLinks(b)],
+                    [spEl('span', { class: 't-muted', title: 'What it would make at that price. Not counted until the price is checked.', text: 'not checked' })]));
+            }
         }
         if ((T.waiting || []).length) {
             rows.push(spEl('tr', { class: 'g' }, [spEl('td', { colspan: '6' }, [spEl('b', { text: 'Nobody pays more yet' }), ' · ' + count(T.waiting.length) + (T.waiting.length === 1 ? ' item waits' : ' items wait') + ' for a trader who pays more than you paid'])]));
@@ -1480,7 +1507,8 @@ export class SellingPage {
             ? JSON.stringify([
                 where,
                 d.itemId, d.name, d.held, d.avg, d.bazaars, d.buyersTotal, d.buyersLoading, d.buyersListNote, d.pending, d.planWhy, d.paid,
-                d.buyers.map((b) => [b.id, b.name, b.price, b.te, b.teTop, b.teList, b.w3b, statusOf(b), b.trust ? b.trust.level + b.trust.score : '', s.networth && b.id ? s.networth.get(String(b.id)) : null, Boolean(b.favourite), b.traded || '', Boolean(b.troll), Boolean(b.lastPaidOnly), this.checkSig(b, now)]),
+                d.yesNote || false, d.trade && d.trade.listCheck && d.trade.listCheck.readAt ? Math.min(13, Math.floor((now - d.trade.listCheck.readAt) / 5000)) : 0,
+                d.buyers.map((b) => [b.id, b.name, b.price, b.te, b.teTop, b.teList, b.w3b, b.bulk || null, statusOf(b), b.trust ? b.trust.level + b.trust.score : '', s.networth && b.id ? s.networth.get(String(b.id)) : null, Boolean(b.favourite), b.traded || '', Boolean(b.troll), Boolean(b.lastPaidOnly), this.checkSig(b, now)]),
                 this.justBlacklisted ? this.justBlacklisted.at : 0,
                 (d.hidden || []).map((b) => [b.tradeKey, b.price, b.hiddenBy, statusOf(b), b.trust ? b.trust.level + b.trust.score : '']),
                 // How old a list is, in the words shown: drawn again when they change, not every second.
@@ -1611,8 +1639,11 @@ export class SellingPage {
             const price = line && line.bid > 0 ? line.bid : row ? row.price : 0;
             if (price > 0) return { name: c.buyer.name, price };
         }
-        const b = (d.plan && d.plan.units > 0 && d.plan.buyer) || d.buyers.find((x) => !x.troll) || null;
-        return b ? { name: b.name, price: b.price } : null;
+        // 3.29.0: else the best trader whose price is checked; with none checked, the best believable one - and the
+        // gaps beside each bazaar are then muted ("not checked"), never green.
+        const sure = (d.plan && d.plan.units > 0 && d.plan.buyer) || d.buyers.find((x) => !x.troll && (!x.check || x.check.ok)) || null;
+        const b = sure || d.buyers.find((x) => !x.troll) || null;
+        return b ? { name: b.name, price: b.price, unchecked: !sure } : null;
     }
 
     /** The head of what you picked: its picture, its name (the Item Market), a friend's mark, its few numbers. */
@@ -1679,7 +1710,7 @@ export class SellingPage {
         rows.forEach((r, i) => {
             if (i === cut) {
                 body.appendChild(spEl('tr', { class: 'mk' }, [spEl('td', { colspan: '5' }, [
-                    spEl('b', { text: pay.name + ' pays ' + formatMoney(pay.price) + '.' }),
+                    spEl('b', { text: pay.name + (pay.unchecked ? '\'s list says ' : ' pays ') + formatMoney(pay.price) + (pay.unchecked ? ', not checked.' : '.') }),
                     anyGood ? ' Under this line a piece leaves less than your ' + pct + '%.' : ' No bazaar leaves your ' + pct + '% now.',
                 ])]));
             }
@@ -1687,7 +1718,7 @@ export class SellingPage {
             const gap = pay ? pay.price - r.price : 0;
             const piece = !pay ? null
                 : r.stale ? spEl('span', { title: 'TornW3B has not seen this bazaar lately: it is not counted', text: 'not seen' })
-                    : ok ? spEl('b', { class: 't-good', text: signed(gap) })
+                    : ok ? (pay.unchecked ? spEl('span', { class: 't-muted', title: 'At a price that is not checked: ' + pay.name + '\'s list says ' + formatMoney(pay.price), text: '≈ ' + signed(gap) }) : spEl('b', { class: 't-good', text: signed(gap) }))
                         : gap > 0 ? spEl('span', { title: signed(gap) + ' a piece: under your least profit of ' + pct + '%', text: 'too thin' })
                             : spEl('span', { title: 'Over what ' + pay.name + ' pays', text: 'over' });
             const name = r.sellerName || 'Player ' + r.sellerId;
@@ -1757,6 +1788,8 @@ export class SellingPage {
                 until ? spEl('small', {}, ['said no · passed over for ' + formatAge(until - Date.now()).replace(' ago', '') + ' · ', this.wordBtn('Undo', 'plan:undo:' + b.tradeKey, 'Plan with ' + b.name + ' again', () => this.h.onTradeUndecline && this.h.onTradeUndecline(b.tradeKey))]) : null,
                 this.oldListLine(d, b),
                 this.checkLine(d, b),
+                // 3.29.0 - their list pays another price from a count up: said in amber; the sums stand on the price for one.
+                b.bulk ? spEl('small', { class: 't-warn', title: 'Their TornW3B list has a bulk price for this item. The sums here use ' + formatMoney(b.price) + ' each: check their list before a big trade.', text: 'Bulk price from ' + count(b.bulk.from) + ': ' + formatMoney(b.bulk.price) }) : null,
                 // Their two lists disagree: the lower is counted, and said.
                 b.differ ? spEl('small', { title: 'Their two price lists do not agree: check before trading', text: 'Lists differ: ' + this.listPrices(b, ' · ') + ' · counted at the lower' }) : null,
                 b.troll ? spEl('small', { class: 't-warn', text: 'Over 3× Item Market Average: not counted' }) : null,
@@ -1927,6 +1960,14 @@ export class SellingPage {
         if (reading) return spEl('small', { text: 'Reading their price list…' });
         const said = c.ok ? 'Price checked ' + this.checkAge(now - c.at) : this.checkWhy(b, now);
         return spEl('small', {}, [said, refresh ? ' · ' : null, refresh]);
+    }
+
+    /** Why a price is not checked (core/checked.js), as the end of a sentence: "X's price is not checked: …". */
+    uncheckedWhy(why) {
+        if (why === 'te-only' || why === 'no-id') return 'it is only on TornExchange, which gives no date for a price - it cannot be checked, so look at their list';
+        if (why === 'old-list') return 'their list was not changed in over a day';
+        if (why === 'no-date') return 'when their list last changed is not known yet';
+        return 'TornW3B has not confirmed it in the last 5 minutes; it is being read';
     }
 
     /** How long ago a price was checked: "just now" under five seconds (a Refresh just answered), else the age. */
@@ -2106,6 +2147,9 @@ export class SellingPage {
                 : 'Pick an item: the trade with its best trader shows here.' }));
             return;
         }
+        // 3.29.0 - "said yes" was pressed, and their list as read at that press no longer makes the trade: said for a
+        // minute, so a press that wrote nothing down says why.
+        if (d.yesNote && !(T && T.accepted)) box.appendChild(spEl('div', { class: 'amber', role: 'status' }, [spEl('span', {}, [spEl('b', { text: 'The yes was not written down.' }), ' Their price list, read as you pressed, no longer makes the trade that was on show. What is here now is at their prices as just read.'])]));
         if (!on) {
             box.appendChild(this.flipPlan(d));
             return;
@@ -2318,7 +2362,11 @@ export class SellingPage {
                     ' × ',
                     box && !many ? box : count(qty),
                     box && many ? spEl('small', { title: 'How many in all, over every bazaar' }, ['of ', box]) : null,
-                    spEl('small', {}, [st.sellerId ? 'at ' + formatMoney(price) : '≈ from ' + formatMoney(st.price), mark(st), first && r.noBid ? spEl('span', { class: 'warnw', text: ' · not on their list now' }) : null]),
+                    spEl('small', {}, [st.sellerId ? 'at ' + formatMoney(price) : '≈ from ' + formatMoney(st.price), mark(st), first && r.noBid ? spEl('span', { class: 'warnw', text: ' · not on their list now' }) : null,
+                        // 3.29.0 - a held line whose price check lapsed keeps the last checked price, and says how long ago that was.
+                        first && r.lapsed ? spEl('span', { class: 'warnw', title: b.name + '\'s ' + formatMoney(r.bid) + ' for it is the last price that was checked. Refresh reads their list now.', text: ' · price ' + (r.lapsed.at ? 'checked ' + formatAge(now - r.lapsed.at) : 'not checked yet') }) : null,
+                        // Their list has a bulk price for it (3.29.0): shown, in no sum.
+                        first && r.bulk ? spEl('span', { class: 'warnw', title: 'Their list pays another price from that count up. The sums here use ' + formatMoney(r.bid) + ' each: check their list before a big trade.', text: ' · bulk price from ' + count(r.bulk.from) + ': ' + formatMoney(r.bulk.price) }) : null]),
                     first ? (isMain ? spEl('span', { class: 'here', text: 'MAIN' }) : here && !c.every ? spEl('span', { class: 'here', text: 'THIS ITEM' }) : this.kindTag(r.kind)) : null,
                     j > 0 && st.sellerId ? this.link('bazaar', bazaarUrl(st.sellerId, r.itemId, st.price), { cls: 'quiet lk', title: 'Opens their bazaar at this item and the price', focus: 'trade:bazaar:' + r.itemId + ':' + st.sellerId }) : null,
                     first ? cutNote(r) : null,
@@ -2362,6 +2410,21 @@ export class SellingPage {
                             spEl('span', { class: 'p' + (on ? '' : ' none0'), text: on ? formatMoney(r.units * r.bid) : '–' }),
                         ]);
                     }),
+                ]),
+            ]));
+        }
+        // Yours, at a price of theirs that is not checked (3.29.0): listed, in no sum - it joins once the price is confirmed.
+        if ((c.heldWaiting || []).length) {
+            route.appendChild(spEl('div', { class: 'rt' }, [
+                spEl('span', { class: 'stop-n', text: '…' }),
+                spEl('div', {}, [
+                    spEl('div', { class: 'rt-h' }, [spEl('b', { text: 'Yours, waiting for a price check' }), spEl('span', { class: 'seen', text: 'not counted until ' + b.name + '\'s price is confirmed' })]),
+                    ...c.heldWaiting.map((r) => spEl('div', { class: 'pl off' }, [
+                        spEl('span'),
+                        this.pic('trade-yours-wait', r.itemId),
+                        spEl('span', {}, [spEl('b', { text: r.name }), ' × ' + count(r.held), spEl('small', { title: 'Not checked: ' + this.uncheckedWhy(r.check), text: 'their list says ' + formatMoney(r.bid) + ' each · not checked' })]),
+                        spEl('span', { class: 'p none0', text: '–' }),
+                    ])),
                 ]),
             ]));
         }
@@ -2423,14 +2486,29 @@ export class SellingPage {
         const ages = [];
         if (b.te && T.teAt) ages.push('TornExchange ' + formatAge(now - T.teAt));
         if (b.w3b && T.w3bAt) ages.push('TornW3B ' + formatAge(now - T.w3bAt));
+        // 3.29.0 - their list is read at the press of a deal (picking it, Plan trade, said yes): said while it is
+        // out, and for a minute after what the read found.
+        const LC = T.listCheck || {};
+        const refresh = b.id ? this.wordBtn('Refresh', 'trade:check', 'Reads ' + b.name + '\'s price list on TornW3B now', () => this.h.onTraderCheck && this.h.onTraderCheck(d.itemId, c.key)) : null;
+        if (LC.reading) right.push(spEl('p', { class: 'note', role: 'status', text: LC.waitingYes ? 'Reading ' + b.name + '\'s price list before the yes is written down…' : 'Reading ' + b.name + '\'s price list…' }));
+        else if (LC.readAt && now - LC.readAt < 60000) {
+            right.push(spEl('p', { class: 'note', role: 'status' }, [
+                spEl('b', { text: 'Price list read ' + this.checkAge(now - LC.readAt) + '.' }),
+                LC.changed === null ? '' : LC.changed > 0 ? ' ' + this.plural(LC.changed, 'price') + ' of theirs had changed: this trade is priced with the list as it is now.' : ' None of their prices had changed.',
+            ]));
+        }
+        if (c.lapsed > 0 && !LC.reading) {
+            right.push(spEl('div', { class: 'amber' }, [spEl('span', {}, [spEl('b', { text: this.plural(c.lapsed, 'price') + ' in this trade ' + (c.lapsed === 1 ? 'is' : 'are') + ' not checked now.' }), ' Each keeps the last price that was checked, and says when. ']), refresh]));
+        }
         if (old) right.push(spEl('div', { class: 'amber' }, [spEl('span', {}, [spEl('b', { text: 'Check ' + b.name + '\'s list before you buy.' }), ' Their prices were last changed ' + listAgeText(now - old.at) + '.'])]));
-        else if (ages.length) right.push(spEl('p', { class: 'note', text: b.name + '\'s prices were read from ' + ages.join(', ') + '. Check their list before you buy.' }));
+        else if (ages.length && !LC.reading && !(LC.readAt && now - LC.readAt < 60000)) right.push(spEl('p', { class: 'note', text: b.name + '\'s prices were read from ' + ages.join(', ') + '. Check their list before you buy.' }));
         if (b.differ) right.push(spEl('div', { class: 'amber' }, [spEl('span', {}, [spEl('b', { text: b.name + '\'s lists differ' }), ' (' + this.listPrices(b, ', ') + '): planned at the lower.'])]));
 
         // In the order you do it: ask them, then their answer. "Said no" passes this trade over for an hour.
         const acts = spEl('div', { class: 'acts' }, [
             this.chatLink(b, 'btn go big out'),
-            spEl('button', { type: 'button', class: 'btn big', 'data-focus': 'trade:accept:' + c.key, title: b.name + ' said yes: the trade is frozen as it is now, so nothing in it moves while you buy and send. It moves to Trades.', text: b.name + ' said yes', onclick: () => this.h.onTradeAccept && this.h.onTradeAccept(d.itemId) }),
+            // (3.29.0: their price list is read first - a few seconds - and the yes is written with the prices as just read.)
+            spEl('button', { type: 'button', class: 'btn big', 'data-focus': 'trade:accept:' + c.key, disabled: LC.waitingYes ? '' : null, title: b.name + ' said yes: their price list is read first (a few seconds), then the trade is frozen as it is, so nothing in it moves while you buy and send. It moves to Trades.', text: LC.waitingYes ? 'Reading their list…' : b.name + ' said yes', onclick: () => this.h.onTradeAccept && this.h.onTradeAccept(d.itemId) }),
             // Nothing to buy: the trade itself can be opened now.
             !c.stops && b.id ? this.link('Open the trade', tradeUrl(b.id), { cls: 'btn big out', title: 'Start a trade with ' + b.name + ' on Torn', focus: 'step-trade' }) : null,
             spEl('span', { class: 'sp' }),
@@ -2498,6 +2576,11 @@ export class SellingPage {
                 ? count(boughtN) + ' of ' + this.plural(steps.length, 'buy') + ' done' + (skippedN ? ' · ' + count(skippedN) + ' skipped' : '') + (left0 ? ' · about ' + Math.max(1, Math.round(left0 / 2)) + ' min left' : boughtN ? ' · now the trade' : ' · nothing bought') + ' · ' + inTrade
                 : 'Nothing to buy: send yours · ' + inTrade }),
         ];
+        // 3.29.0 - their price list was read as you pressed "said yes": what that read found, once, here.
+        const PC = A.priceCheck || null;
+        if (PC && !PC.confirmed) left.push(spEl('div', { class: 'amber' }, [spEl('span', {}, [spEl('b', { text: b.name + '\'s price list did not answer when you pressed yes.' }), ' These are the prices last checked: look at their list before you buy.'])]));
+        else if (PC && PC.changed > 0) left.push(spEl('p', { class: 'note', text: 'Their price list was read as you pressed yes: ' + this.plural(PC.changed, 'price') + ' of theirs had changed, and this trade was written down with the list as it was then.' }));
+        else if (PC && PC.confirmed) left.push(spEl('p', { class: 'note', text: 'Their price list was read as you pressed yes: these prices were confirmed then.' }));
         // Its items against the 10,000 one trade takes (3.23.0): said from nine tenths of it.
         const cv = countView(A.count, b.name);
         if (cv && cv.say) left.push(cv.state === 'full' ? spEl('div', { class: 'amber' }, [spEl('span', {}, [spEl('b', { text: cv.text + ' items.' }), ' ' + cv.say])]) : spEl('p', { class: 'note', text: cv.text + ' items. ' + cv.say }));
@@ -2714,7 +2797,11 @@ export class SellingPage {
             return spEl('div', { class: 'plan' }, kids);
         }
         let text;
-        const top = d.buyers[0];
+        // 3.29.0: the best trader whose price is checked (it was the top row, checked or not, troll bid or not);
+        // with none checked, the best believable one - and the sentence says its price is not checked.
+        const real = d.buyers.filter((x) => !x.troll);
+        const sure = real.find((x) => !x.check || x.check.ok) || null;
+        const top = sure || real[0] || d.buyers[0];
         const p = this.state.prefs;
         const who = p.trustedOnly ? 'trusted buyer' : 'buyer';
         const pct = p.minProfitPct ?? 1;
@@ -2723,6 +2810,7 @@ export class SellingPage {
         else if (d.planWhy === 'loading') text = 'Loading bazaars from TornW3B…';
         else if (!top) text = 'No flip: no ' + who + ' for this item.';
         else if (d.statItem) text = 'No flip: every copy is its own (weapons, armour, cars), and traders pay one price for one - nobody buys them by the hundred.';
+        else if (!sure && top.check && !top.check.ok && !top.troll && fresh && top.price > fresh.price) text = 'No flip yet: ' + top.name + '\'s list says ' + formatMoney(top.price) + ' and the cheapest bazaar asks ' + formatMoney(fresh.price) + ', but that price is not checked: ' + this.uncheckedWhy(top.check.why) + '.';
         else if (d.sellers.rows.some((r) => !r.stale && r.price < top.price && top.price - r.price < Math.max(1, (r.price * pct) / 100))) text = 'No flip: ' + top.name + ' pays ' + formatMoney(top.price) + ' and the cheapest bazaar asks ' + formatMoney(fresh.price) + '. That leaves ' + formatMoney(top.price - fresh.price) + ' a piece, under your least profit of ' + pct + '%.';
         else if (d.sellers.rows.some((r) => !r.stale && r.price < top.price)) text = 'No flip: none of these buyers can take it at a profit (their price is over 3× the average, or their networth is too small).';
         else if (fresh) text = 'No flip: ' + top.name + ' pays ' + formatMoney(top.price) + '; the cheapest bazaar asks ' + formatMoney(fresh.price) + ', ' + formatMoney(fresh.price - top.price) + ' over it.';
@@ -2745,13 +2833,18 @@ export class SellingPage {
         box.hidden = !(d && d.held && d.where);
         if (box.hidden) return;
         const w = d.where;
-        const b = d.buyers[0];
+        // 3.29.0 - the trader this counts is the best one whose price is CHECKED (it was the top row, checked or
+        // not, troll bid or not). With none checked, the best believable one is named (`u`): muted, "not
+        // checked", with their lists and Refresh - never Best, never a trade link.
+        const b = w.trader || null;
+        const u = b ? null : w.unchecked || null;
+        const who = b || u;
         const n = d.held;
         // A trade with them is going already: the row points at it, and offers no second one.
-        const going = this.goingWith(d);
+        const going = who ? this.goingWith(d) : null;
         const folded = Boolean(going && this.planOnSide() && this.tradeKeyOnShow() === going[1].key);
         const rows = [
-            { venue: 'trader', name: 'Trade to ' + (b ? b.name : 'a trader'), when: going ? (going[0] === 'waiting' ? 'you asked ' + b.name + ' · it waits for their yes' : 'a trade with ' + b.name + ' is going') + (folded ? ' · below' : '') : 'paid now, in one trade', url: b && b.id ? tradeUrl(b.id) : null, go: b ? 'Start a trade with ' + b.name : '', missing: 'No ' + (this.state.prefs.trustedOnly ? 'trusted ' : '') + 'trader buys it' },
+            { venue: 'trader', name: 'Trade to ' + (who ? who.name : 'a trader'), when: going ? (going[0] === 'waiting' ? 'you asked ' + who.name + ' · it waits for their yes' : 'a trade with ' + who.name + ' is going') + (folded ? ' · below' : '') : 'paid now, in one trade', url: b && b.id ? tradeUrl(b.id) : null, go: b ? 'Start a trade with ' + b.name : '', missing: 'No ' + (this.state.prefs.trustedOnly ? 'trusted ' : '') + 'trader buys it' },
             { venue: 'bazaar', name: 'Your bazaar', when: '$1 under the cheapest · paid when someone buys', url: MY_BAZAAR_ADD_URL, go: 'Add to your bazaar', missing: 'No bazaar listing to price against' },
             { venue: 'market', name: 'Item Market', when: 'after the 5% fee · paid when someone buys', url: MARKET_ADD_URL, go: 'List on the Item Market', missing: d.market.state === 'loading' ? 'Checking the Item Market…' : 'No Item Market listing to price against' },
         ].map((r) => {
@@ -2768,17 +2861,21 @@ export class SellingPage {
             const listAt = r.venue === 'bazaar' && each !== null ? ' at ' + formatMoney(each) : r.venue === 'market' && d.market.lowest > 1 ? ' at ' + formatMoney(d.market.lowest - 1) : '';
             // A listing counted for only the first N (as many as are listed near that price now): the rest go to the trader, and it says so.
             const rest = b ? (loss ? ' · the rest to the trader' : ', the rest to the trader') : '';
+            // A trader named at a price that is not checked: what their list says, muted - and how to check it.
+            const unsure = r.venue === 'trader' && each === null && u ? u : null;
             body.appendChild(spEl('div', { class: 'opt' + (win ? ' best' : '') + (each === null || loss ? ' dimo' : '') }, [
                 spEl('span', { class: 'w' }, [
                     spEl('b', { text: r.name + listAt }),
                     win ? spEl('span', { class: 'badge best', text: 'Best' }) : null,
-                    spEl('small', { text: each === null ? r.missing : loss ? 'No more than the ' + formatMoney(w.paid) + ' you paid: a loss' + (part ? ' on the first ' + count(v.units) + rest : '') : r.when + (part ? ' · first ' + count(v.units) + rest : '') }),
+                    spEl('small', { text: unsure ? unsure.name + '\'s list says ' + formatMoney(unsure.price) + ' each. Not checked: ' + this.uncheckedWhy(unsure.why) + '.'
+                        : each === null ? r.missing : loss ? 'No more than the ' + formatMoney(w.paid) + ' you paid: a loss' + (part ? ' on the first ' + count(v.units) + rest : '') : r.when + (part ? ' · first ' + count(v.units) + rest : '') }),
                 ]),
-                spEl('span', { class: 'v' }, each === null ? [spEl('b', { text: '–' })] : [
+                spEl('span', { class: 'v' }, unsure ? [spEl('b', { class: 't-muted', text: formatMoney(unsure.price * n) }), spEl('small', { class: 't-muted', text: 'not checked' })] : each === null ? [spEl('b', { text: '–' })] : [
                     spEl('b', { text: formatMoney(r.total) }),
                     gain !== null ? spEl('small', { class: gain <= 0 ? 'loss' : '', text: signed(gain) }) : n > 1 ? spEl('small', { class: 't-muted', text: formatMoney(each) + ' each' }) : null,
                 ]),
-                r.venue === 'trader' && going ? (folded ? spEl('span') : spEl('button', { type: 'button', class: 'btn', 'data-focus': 'where:going', title: 'The trade with ' + b.name + ' is on Trades', text: 'Open on Trades', onclick: () => this.showTrade(going[0], going[1]) }))
+                r.venue === 'trader' && going ? (folded ? spEl('span') : spEl('button', { type: 'button', class: 'btn', 'data-focus': 'where:going', title: 'The trade with ' + who.name + ' is on Trades', text: 'Open on Trades', onclick: () => this.showTrade(going[0], going[1]) }))
+                    : unsure ? spEl('span', {}, [...this.traderLinks(unsure), unsure.id && unsure.w3b > 0 ? this.wordBtn('Refresh', 'where:check', 'Reads ' + unsure.name + '\'s price list on TornW3B now, then who buys this item', () => this.h.onTraderCheck && this.h.onTraderCheck(d.itemId, unsure.tradeKey)) : null])
                     : r.url && each !== null && !loss ? this.link(r.go, r.url, { cls: 'btn out' + (win ? ' go' : ''), title: r.venue === 'trader' ? 'Start a trade on Torn' : r.venue === 'bazaar' ? 'Opens your bazaar\'s add page' : 'Opens the Item Market\'s add page', focus: 'where:' + r.venue }) : spEl('span'),
             ]));
         }
@@ -2787,13 +2884,18 @@ export class SellingPage {
         if (w.best === 'bazaar' || w.best === 'market') {
             const won = w.options.find((x) => x.venue === w.best);
             const place = (w.best === 'bazaar' ? 'your bazaar' : 'the Item Market') + (won && won.units < n ? ' for the first ' + count(won.units) + ' (as many as are listed near that price now)' : '');
-            verdict = b ? 'Best: ' + place + ', ' + signed(w.gain) + ' more than the trader, but you wait for a buyer.' : 'Best: ' + place + '. ' + rows.find((r) => r.venue === 'trader').missing + '.';
+            verdict = b ? 'Best: ' + place + ', ' + signed(w.gain) + ' more than the trader, but you wait for a buyer.'
+                : u ? 'Best: ' + place + '. ' + u.name + '\'s price is not checked, so it is not counted.' : 'Best: ' + place + '. ' + rows.find((r) => r.venue === 'trader').missing + '.';
         } else if (w.best === 'trader' && bazaar && bazaar.each !== null) {
             const diff = bazaar.total - b.price * n;
             verdict = diff > 0 ? 'Your bazaar would get only ' + signed(diff) + ' more than ' + b.name + '\'s trade, and you would wait.' : 'Your bazaar would get ' + formatMoney(-diff) + ' less than ' + b.name + '\'s trade.';
         }
         if (verdict) body.appendChild(spEl('p', { class: 'note', text: verdict }));
-        if (!w.best && w.paid) body.appendChild(spEl('div', { class: 'amber' }, [spEl('span', {}, [spEl('b', { text: 'Nobody pays more than the ' + formatMoney(w.paid) + ' you paid.' }), ' It waits in To sell until someone does.'])]));
+        if (!w.best && w.paid) {
+            body.appendChild(spEl('div', { class: 'amber' }, [spEl('span', {}, u && u.price > w.paid
+                ? [spEl('b', { text: 'No checked price is over the ' + formatMoney(w.paid) + ' you paid.' }), ' ' + u.name + '\'s ' + formatMoney(u.price) + ' waits for its check; it stays in To sell until then.']
+                : [spEl('b', { text: 'Nobody pays more than the ' + formatMoney(w.paid) + ' you paid.' }), ' It waits in To sell until someone does.'])]));
+        }
         const kept = this.keptNow(d);
         if (kept !== null) {
             body.appendChild(spEl('div', { class: 'field' }, [
@@ -2874,17 +2976,21 @@ export class SellingPage {
             const gain = ((s.toSell || {}).groups || []).reduce((a, g) => a + g.gain, 0);
             this.tilesInto(this.mineTiles, 'mine', [
                 { label: 'In your inventory', value: count(H.items), small: 'items', sub: [b(count(H.paidKinds)), ' of ' + this.plural(H.kinds, 'kind') + ' a trader pays for'] },
-                { label: 'Traders pay now', value: formatMoney(H.worth), good: H.worth > 0, sub: ['for all of it, each item at its best trader'] },
-                { label: 'Bought to resell', value: count(rows.length), small: (rows.length === 1 ? 'kind' : 'kinds') + ' · ' + this.plural(rows.reduce((a, r) => a + r.qty, 0), 'item'), sub: [b(signed(gain), gain > 0 ? 't-good' : ''), ' over what you paid if sold now · see To sell'], onPick: () => this.go('sell'), title: 'Open To sell' },
+                // 3.29.0: about (≈) while a price in it is not checked - a figure to read, not a price to act on.
+                { label: 'Traders pay now', value: (H.approx ? '≈ ' : '') + formatMoney(H.worth), good: H.worth > 0, sub: ['for all of it, each item at its best trader' + (H.approx ? ' · some prices not checked' : '')], title: H.approx ? 'About: some of these prices were not checked with TornW3B in the last 5 minutes' : null },
+                { label: 'Bought to resell', value: count(rows.length), small: (rows.length === 1 ? 'kind' : 'kinds') + ' · ' + this.plural(rows.reduce((a, r) => a + r.qty, 0), 'item'), sub: [b(signed(gain), gain > 0 ? 't-good' : ''), ' over what you paid if sold now, at checked prices · see To sell'], onPick: () => this.go('sell'), title: 'Open To sell' },
             ]);
         } else if (page === 'sell') {
-            const T = s.toSell || { rows: [], groups: [], waiting: [] };
+            const T = s.toSell || { rows: [], groups: [], unchecked: [], waiting: [] };
             const rows = T.rows || [];
             const good = (T.groups || []).reduce((a, g) => a + g.rows.length, 0);
+            // 3.29.0: only what a CHECKED price makes is in the sum; a trader whose price waits for its check is counted beside it.
+            const unsure = (T.unchecked || []).length;
+            const nobody = (T.waiting || []).length;
             this.tilesInto(this.sellTiles, 'sell', [
                 { label: 'Held to resell', value: count(rows.reduce((a, r) => a + r.qty, 0)), small: 'items', sub: ['you paid ', b(formatMoney(rows.reduce((a, r) => a + r.qty * r.each, 0))), ' in all'] },
-                { label: 'If sold to traders now', value: signed((T.groups || []).reduce((a, g) => a + g.gain, 0)), good: good > 0, sub: [b(count(good)), ' of ' + this.plural(rows.length, 'kind') + ': a trader pays more than you paid'] },
-                { label: 'Waiting', value: count((T.waiting || []).length), small: (T.waiting || []).length === 1 ? 'kind' : 'kinds', sub: ['nobody pays more than you paid yet' + ((T.kept || []).length ? ' · ' + count(T.kept.length) + ' not for sale' : '')] },
+                { label: 'If sold to traders now', value: signed((T.groups || []).reduce((a, g) => a + g.gain, 0)), good: good > 0, sub: [b(count(good)), ' of ' + this.plural(rows.length, 'kind') + ': a trader pays more than you paid, price checked'] },
+                { label: 'Waiting', value: count(unsure + nobody), small: unsure + nobody === 1 ? 'kind' : 'kinds', sub: [[unsure ? count(unsure) + ' for a price check' : null, nobody || !unsure ? 'nobody pays more than you paid yet' + (unsure ? ' for ' + count(nobody) : '') : null, (T.kept || []).length ? count(T.kept.length) + ' not for sale' : null].filter(Boolean).join(' · ')] },
             ]);
         }
     }
@@ -3366,7 +3472,8 @@ export class SellingPage {
             const rest = { kinds: H.kinds - H.top.length, worth: H.worth - H.top.reduce((a, r) => a + r.worth, 0) };
             const share = (v) => Math.max(1, (v / Math.max(1, H.worth)) * 100).toFixed(1) + '%';
             hbox.append(...[
-                spEl('div', { class: 'bigrow' }, [spEl('div', { class: 'hero', text: formatMoney(H.worth) }), spEl('div', { class: 'eq', text: count(H.items) + ' items · ' + this.plural(H.kinds, 'kind') })]),
+                // 3.29.0: about (≈) while a price in it is not checked.
+                spEl('div', { class: 'bigrow' }, [spEl('div', { class: 'hero', title: H.approx ? 'About: some of these prices were not checked with TornW3B in the last 5 minutes' : null, text: (H.approx ? '≈ ' : '') + formatMoney(H.worth) }), spEl('div', { class: 'eq', text: count(H.items) + ' items · ' + this.plural(H.kinds, 'kind') })]),
                 spEl('div', { class: 'stack' }, [...H.top.map((r, i) => spVars(spEl('i'), { '--c': greys[i], '--w': share(r.worth) })), rest.kinds > 0 ? spVars(spEl('i'), { '--c': greys[4], '--w': share(rest.worth) }) : null]),
                 ...H.top.map((r, i) => spEl('div', { class: 'hl' }, [spVars(spEl('i'), { '--c': greys[i] }), spEl('b', { text: r.name }), ' × ' + count(r.held), spEl('span', { text: formatMoney(r.worth) })])),
                 rest.kinds > 0 ? spEl('div', { class: 'hl' }, [spVars(spEl('i'), { '--c': greys[4] }), this.plural(rest.kinds, 'more kind'), spEl('span', { text: formatMoney(rest.worth) })]) : null,

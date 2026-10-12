@@ -244,6 +244,19 @@ export const PAGE_CSS = `
 }
 
 /*
+ * That trader's price is one Torn Bids has not checked in the last minutes
+ * (3.29.0; it checks only while its own tab is open): the tag says "not
+ * checked" and is drawn grey. Not on a card that is also an NPC deal: its
+ * line is the deal's (green, and sure) with the trader's words after it.
+ */
+.ttv2-trader.ttv2-trader.ttv2-trader[data-ttv2-trader-unsure]:not(.ttv2-hit)::after {
+    background-color: rgba(24, 27, 32, 0.94) !important;
+    border-color: rgba(150, 158, 170, 0.4) !important;
+    color: #9aa3af !important;
+    font-weight: 600 !important;
+}
+
+/*
  * A trade you accepted (3.12.8): the listing to buy on a bazaar, in blue with
  * its own words, apart from the NPC deals' green; on Torn's trade page the
  * rows to send, and Fill.

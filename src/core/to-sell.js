@@ -80,14 +80,22 @@ function sameTrader(name, from) {
  * as he pays higher than what we bought it for"). `bazaar`: your own bazaar, $1 under
  * the cheapest listing, when that is over what you paid.
  *
+ * 3.29.0 (the owner's page, 2026-10-12: To sell named a trader at a price
+ * TornW3B had not confirmed for hours - nothing here asked): `ready` only on
+ * a price that is checked (`checkOf`, core/checked.js). The best payer whose
+ * price is checked is the one named; with none checked, the best payer is
+ * still named, and the row says it waits for the check (`unchecked`, and
+ * `check`: why) - never under "pays more than you paid", never in a total.
+ *
  * @param {Array<{itemId, name, qty, each, from, why}>} leftovers
  * @param {object} o
  * @param {function} o.buyersOf - (itemId) => buyers, best first ({id, name, price, trust})
  * @param {function} [o.keyOf] - (buyer) => the trade key of a trader
  * @param {function} [o.enough] - (profitEach, paidEach) => boolean
  * @param {function} [o.bazaarOf] - (itemId) => the cheapest bazaar listing of it that is not yours, or null
+ * @param {function} [o.checkOf] - (itemId, buyer) => {ok, why}: is that price checked (none handed: every price counts as checked)
  */
-export function toSellRows(leftovers, { buyersOf, keyOf = (b) => (b.id ? 'id:' + b.id : 'name:' + String(b.name).toLowerCase()), enough = (profit) => profit > 0, extraWaiting = TO_SELL_EXTRA_WAITING, bazaarOf = () => null } = {}) {
+export function toSellRows(leftovers, { buyersOf, keyOf = (b) => (b.id ? 'id:' + b.id : 'name:' + String(b.name).toLowerCase()), enough = (profit) => profit > 0, extraWaiting = TO_SELL_EXTRA_WAITING, bazaarOf = () => null, checkOf = null } = {}) {
     const rows = [];
     // Extra buys still waiting for a price: the newest few only.
     const waitingExtras = [];
@@ -102,11 +110,17 @@ export function toSellRows(leftovers, { buyersOf, keyOf = (b) => (b.id ? 'id:' +
         // Only a trader who pays more than you paid: one who pays less is never named.
         const over = (buyersOf(String(l.itemId)) || []).filter((b) => b && Number(b.price) > each && !sameTrader(b.name, l.from));
         // What a full trade left (3.23.0) waits for a second trade with that trader, while they pay more than you paid.
-        const top = (toSellWhy(l.why) === 'over' && l.for ? over.find((b) => sameTrader(b.name, l.for)) : null) || over[0] || null;
+        const forThem = toSellWhy(l.why) === 'over' && l.for ? over.find((b) => sameTrader(b.name, l.for)) || null : null;
+        const stateOf = (b) => (checkOf ? checkOf(String(l.itemId), b) || { ok: false, why: 'not-checked' } : { ok: true, why: 'checked' });
+        // The best payer whose price is checked; with none, the best payer - named, and waiting for the check.
+        const sure = forThem ? (stateOf(forThem).ok ? forThem : null) : over.find((b) => stateOf(b).ok) || null;
+        const top = sure || forThem || over[0] || null;
+        const unchecked = top !== null && !sure;
         const per = top ? Number(top.price) - each : null;
-        const ready = top !== null && per > 0 && Boolean(enough(per, each));
+        const ready = top !== null && !unchecked && per > 0 && Boolean(enough(per, each));
         const bazaar = bazaarAbove(bazaarOf(String(l.itemId)), each, Number(l.qty));
-        if (!ready && toSellWhy(l.why) === 'extra') waitingExtras.push({ itemId: String(l.itemId), at: Number(l.at) || 0 });
+        // (A row whose trader waits for a check is not one of the "newest few": it has a payer, and is shown.)
+        if (!ready && !unchecked && toSellWhy(l.why) === 'extra') waitingExtras.push({ itemId: String(l.itemId), at: Number(l.at) || 0 });
         rows.push({
             itemId: String(l.itemId),
             name: l.name || 'Item ' + l.itemId,
@@ -114,18 +128,23 @@ export function toSellRows(leftovers, { buyersOf, keyOf = (b) => (b.id ? 'id:' +
             each,
             why: toSellWhy(l.why),
             from: l.from || null,
-            best: top ? { key: keyOf(top), id: top.id ? String(top.id) : null, name: top.name, price: Number(top.price), trust: top.trust || null } : null,
+            // (te, w3b, teName: for the links to their price lists.)
+            best: top ? { key: keyOf(top), id: top.id ? String(top.id) : null, name: top.name, price: Number(top.price), trust: top.trust || null, te: top.te || 0, w3b: top.w3b || 0, teName: top.teName || null } : null,
             gain: top ? per * Number(l.qty) : null,
             ready,
+            // Their price is not checked (3.29.0): the row waits for the check, and why it is not (core/checked.js).
+            unchecked,
+            check: unchecked ? stateOf(top).why : null,
             // Waiting, with a trader over what you paid but under the margin: by how much, each (below 0).
             short: top && !ready ? each - Number(top.price) : null,
             bazaar,
         });
     }
     const old = new Set(waitingExtras.sort((a, b) => b.at - a.at).slice(Math.max(0, extraWaiting)).map((x) => x.itemId));
-    // A profit with a trader, then one in your own bazaar, then a trader under the margin, then nothing yet - and what is not for sale.
-    const rank = (r) => (r.kept ? 4 : r.ready ? 0 : r.bazaar ? 1 : r.best ? 2 : 3);
-    const worth = (r) => (r.ready ? r.gain : r.bazaar ? r.bazaar.gain : r.best ? r.gain : 0);
+    // A profit with a trader, then a trader whose price waits for its check, then one in your own bazaar, then a
+    // trader under the margin, then nothing yet - and what is not for sale.
+    const rank = (r) => (r.kept ? 5 : r.ready ? 0 : r.unchecked ? 1 : r.bazaar ? 2 : r.best ? 3 : 4);
+    const worth = (r) => (r.ready || r.unchecked ? r.gain : r.bazaar ? r.bazaar.gain : r.best ? r.gain : 0);
     return rows.filter((r) => !old.has(r.itemId)).sort((a, b) => rank(a) - rank(b) || worth(b) - worth(a) || String(a.name).localeCompare(String(b.name)));
 }
 
@@ -182,18 +201,24 @@ export function whereRowView(o, held, paidEach) {
 
 /**
  * The board: the rows with a profit under the trader who pays most for each
- * (the biggest total first), the ones waiting, and the ones you marked "Not
- * for sale" (3.23.0).
+ * (the biggest total first), the ones whose trader's price waits for its
+ * check (3.29.0: named, in no total), the ones waiting, and the ones you
+ * marked "Not for sale" (3.23.0).
  *
- * @returns {{groups: Array<{key, trader, rows, gain}>, waiting: Array, kept: Array}}
+ * @returns {{groups: Array<{key, trader, rows, gain}>, unchecked: Array, waiting: Array, kept: Array}}
  */
 export function toSellBoard(rows) {
     const byKey = new Map();
+    const unchecked = [];
     const waiting = [];
     const kept = [];
     for (const r of rows || []) {
         if (r.kept) {
             kept.push(r);
+            continue;
+        }
+        if (r.unchecked && r.best) {
+            unchecked.push(r);
             continue;
         }
         if (!r.ready || !r.best) {
@@ -206,7 +231,7 @@ export function toSellBoard(rows) {
         g.gain += r.gain;
     }
     const groups = [...byKey.values()].sort((a, b) => b.gain - a.gain || String(a.trader.name).localeCompare(String(b.trader.name)));
-    return { groups, waiting, kept };
+    return { groups, unchecked, waiting, kept };
 }
 
 /**
@@ -216,9 +241,12 @@ export function toSellBoard(rows) {
  * items stay out of every trade (the owner, 2026-09-28: "my own items as
  * cover, omit it"; 2026-10-03: back on "for resell items only").
  *
- * @returns {Map<string, Array<{itemId, bid, held, each, all: true}>>} trade key -> lines
+ * 3.29.0: a line whose price is not checked (`checkOf`) is marked
+ * `unchecked` - the trade lists it as waiting and counts nothing of it.
+ *
+ * @returns {Map<string, Array<{itemId, bid, held, each, all: true, unchecked?: true, check?: string}>>} trade key -> lines
  */
-export function toSellHeld(leftovers, { buyersOf, keyOf = (b) => (b.id ? 'id:' + b.id : 'name:' + String(b.name).toLowerCase()), enough = (profit) => profit > 0 } = {}) {
+export function toSellHeld(leftovers, { buyersOf, keyOf = (b) => (b.id ? 'id:' + b.id : 'name:' + String(b.name).toLowerCase()), enough = (profit) => profit > 0, checkOf = null } = {}) {
     const out = new Map();
     for (const l of leftovers || []) {
         if (!l || !l.itemId || !(Number(l.qty) > 0)) continue;
@@ -233,7 +261,13 @@ export function toSellHeld(leftovers, { buyersOf, keyOf = (b) => (b.id ? 'id:' +
             if (!out.has(key)) out.set(key, []);
             // One line per item per trader (a trader listed twice for it: their first, the better, price).
             if (out.get(key).some((x) => x.itemId === String(l.itemId))) continue;
-            out.get(key).push({ itemId: String(l.itemId), bid: Number(b.price), held: Number(l.qty), each, all: true });
+            const line = { itemId: String(l.itemId), bid: Number(b.price), held: Number(l.qty), each, all: true };
+            const c = checkOf ? checkOf(String(l.itemId), b) || { ok: false, why: 'not-checked' } : null;
+            if (c && !c.ok) {
+                line.unchecked = true;
+                line.check = c.why;
+            }
+            out.get(key).push(line);
         }
     }
     return out;

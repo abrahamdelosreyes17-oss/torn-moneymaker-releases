@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      3.28.1
+// @version      3.29.0
 // @description  Finds Bazaar and Item Market listings below NPC / market value - on the page you are viewing, and live from the Torn API and TornW3B - ranked by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -52,7 +52,7 @@
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '3.28.1';
+    const TTV2_BUILD_VERSION = '3.29.0';
     const TTV2_SHARED_HOME = 'https://torn-bids-shared.pumping-iron-worker.workers.dev';
 
     /* ===== src/platform/gm.js ===== */
@@ -2498,6 +2498,11 @@
         stage3: 'Torn Bids redraw · 3 possible flips',
         stage4: 'Torn Bids redraw · 4 the list (every item)',
         inBuyers: 'Torn Bids redraw · inside: who buys an item, all items of one redraw',
+        // 3.29.0: what follows "who buys an item" for every item was outside every count - and was the larger half.
+        inShown: 'Torn Bids redraw · inside: the buyers an item shows (blacklist, favourites, Show choices), all items of one redraw',
+        // The buyers worked out in pieces before a redraw: not inside "Torn Bids redraw" above (only the last piece is).
+        pieces: 'Torn Bids buyers worked out in pieces (before a redraw)',
+        index: 'Torn Bids: the price lists index made again',
         inSellers: 'Torn Bids redraw · inside: an item\'s bazaars, all items of one redraw',
         inPlans: 'Torn Bids redraw · inside: an item\'s flip plan, all items of one redraw',
         inPossible: 'Torn Bids redraw · inside: an item\'s possible flip, all items of one redraw',
@@ -2524,6 +2529,20 @@
         plansKept: 'an item\'s flip plan: kept from the redraw before',
         plansRedone: 'an item\'s flip plan: worked out again',
         plansOn: 'an item\'s flip plan: keeping on (1) or switched off (0)',
+        shownKept: 'the buyers an item shows: kept from the redraw before',
+        shownRedone: 'the buyers an item shows: worked out again',
+        shownOn: 'the buyers an item shows: keeping on (1) or switched off (0)',
+        possibleKept: 'an item\'s possible flip: kept from the redraw before',
+        possibleRedone: 'an item\'s possible flip: worked out again',
+        possibleOn: 'an item\'s possible flip: keeping on (1) or switched off (0)',
+        // 3.29.0: what a redraw walks. The friend's redraw grew 16x in five hours with no size on record growing.
+        priceLists: 'traders with a price list in use',
+        buyerRows: 'buyer rows of all items (who buys an item, added up)',
+        byData: 'redraws asked for by arriving data (they wait their turn)',
+        byPress: 'redraws asked for by the answer to something pressed (after a moment, not waiting their turn)',
+        byStatus: 'redraws asked for by the first status answer after a press',
+        byTyping: 'redraws asked for by typing in the search box',
+        byOther: 'redraws drawn at once (a press on the page itself, a setting changed in another tab)',
         age: 'minutes since this Torn Bids page was opened',
         heap: 'memory the tab holds (MB, as the browser says)',
         nodes: 'elements in Torn Bids\' page',
@@ -2635,18 +2654,26 @@
         out.push('  time of one redraw (ms)');
         out.push(...spTable(bidsHours.map(([hour, b]) => [
             stamp(Number(hour) * SP_HOUR_MS).slice(0, 13) + 'h', b.w[B.redraw][0], cell(each(b.w[B.redraw]), spMs), cell(b.w[B.redraw][2], spMs), cell(each(b.w[B.stage3]), spMs), cell(each(b.w[B.stage4]), spMs),
-            cell(each(b.w[B.inBuyers]), spMs), cell(each(b.w[B.inSellers]), spMs), cell(each(b.w[B.inPlans]), spMs), cell(each(b.w[B.inPossible]), spMs), cell(each(b.w[B.yard]), spMs), cell(each(b.w[B.yardHidden]), spMs),
-        ]), ['hour', 'redraws', 'each', 'longest', 'possible flips', 'the list', 'in: buyers', 'in: bazaars', 'in: plans', 'in: possible', 'same sum', 'same sum hidden']));
+            cell(each(b.w[B.inBuyers]), spMs), cell(each(b.w[B.inShown]), spMs), cell(each(b.w[B.inSellers]), spMs), cell(each(b.w[B.inPlans]), spMs), cell(each(b.w[B.inPossible]), spMs), cell(each(b.w[B.yard]), spMs), cell(each(b.w[B.yardHidden]), spMs),
+        ]), ['hour', 'redraws', 'each', 'longest', 'possible flips', 'the list', 'in: buyers', 'in: shown', 'in: bazaars', 'in: plans', 'in: possible', 'same sum', 'same sum hidden']));
+        // 3.29.0: work that is NOT inside "each" above - the buyers worked out in pieces before a redraw, and the
+        // price lists index - and who asked for the redraws. (A redraw asked for by something pressed does not wait.)
+        const count = (row) => (row ? row[0] : 0);
+        out.push('  beside the redraw (ms in the hour), and who asked for the redraws');
+        out.push(...spTable(bidsHours.map(([hour, b]) => [
+            stamp(Number(hour) * SP_HOUR_MS).slice(0, 13) + 'h', cell(b.w[B.pieces] ? b.w[B.pieces][1] : null, spMs), count(b.w[B.pieces]), cell(b.w[B.index] ? b.w[B.index][1] : null, spMs), count(b.w[B.index]),
+            count(b.g[B.byData]), count(b.g[B.byPress]), count(b.g[B.byStatus]), count(b.g[B.byTyping]), count(b.g[B.byOther]),
+        ]), ['hour', 'pieces ms', 'pieces', 'index ms', 'index made', 'by data', 'by a press', 'by a status', 'by typing', 'by the page']));
         out.push('  what it worked through (the usual of the hour)');
         out.push(...spTable(bidsHours.map(([hour, b]) => [
-            stamp(Number(hour) * SP_HOUR_MS).slice(0, 13) + 'h', cell(each(b.g[B.items])), cell(each(b.g[B.lists])), cell(each(b.g[B.rows])), cell(each(b.g[B.traders])), cell(each(b.g[B.serverBazaars])),
+            stamp(Number(hour) * SP_HOUR_MS).slice(0, 13) + 'h', cell(each(b.g[B.items])), cell(each(b.g[B.buyerRows])), cell(each(b.g[B.priceLists])), cell(each(b.g[B.lists])), cell(each(b.g[B.rows])), cell(each(b.g[B.traders])), cell(each(b.g[B.serverBazaars])),
             cell(each(b.g[B.candidates])), cell(each(b.g[B.shown])), cell(each(b.g[B.waiting])), cell(b.g[B.fresh] ? b.g[B.fresh][1] : null), cell(each(b.g[B.measured])),
-        ]), ['hour', 'items', 'sellers lists', 'sellers rows', 'traders', 'server bazaars', 'picked to read', 'flips shown', 'waiting', 'new flips', 'speeds']));
+        ]), ['hour', 'items', 'buyer rows', 'price lists', 'sellers lists', 'sellers rows', 'traders', 'server bazaars', 'picked to read', 'flips shown', 'waiting', 'new flips', 'speeds']));
         out.push('  what was kept from the redraw before (share kept; keeping on or OFF), the page\'s age, memory');
         out.push(...spTable(bidsHours.map(([hour, b]) => [
-            stamp(Number(hour) * SP_HOUR_MS).slice(0, 13) + 'h', share(b.g[B.buyersKept], b.g[B.buyersRedone]), onOff(b.g[B.buyersOn]), share(b.g[B.sellersKept], b.g[B.sellersRedone]), onOff(b.g[B.sellersOn]),
-            share(b.g[B.plansKept], b.g[B.plansRedone]), onOff(b.g[B.plansOn]), cell(b.g[B.age] ? b.g[B.age][2] : null), cell(each(b.g[B.heap])), cell(b.g[B.heap] ? b.g[B.heap][2] : null), cell(each(b.g[B.nodes])), cell(each(b.g[B.gap])),
-        ]), ['hour', 'buyers kept', '', 'bazaars kept', '', 'plans kept', '', 'page age min', 'memory MB', 'most', 'elements', 's between redraws']));
+            stamp(Number(hour) * SP_HOUR_MS).slice(0, 13) + 'h', share(b.g[B.buyersKept], b.g[B.buyersRedone]), onOff(b.g[B.buyersOn]), share(b.g[B.shownKept], b.g[B.shownRedone]), onOff(b.g[B.shownOn]), share(b.g[B.sellersKept], b.g[B.sellersRedone]), onOff(b.g[B.sellersOn]),
+            share(b.g[B.plansKept], b.g[B.plansRedone]), onOff(b.g[B.plansOn]), share(b.g[B.possibleKept], b.g[B.possibleRedone]), onOff(b.g[B.possibleOn]), cell(b.g[B.age] ? b.g[B.age][2] : null), cell(each(b.g[B.heap])), cell(b.g[B.heap] ? b.g[B.heap][2] : null), cell(each(b.g[B.nodes])), cell(each(b.g[B.gap])),
+        ]), ['hour', 'buyers kept', '', 'shown kept', '', 'bazaars kept', '', 'plans kept', '', 'possible kept', '', 'page age min', 'memory MB', 'most', 'elements', 's between redraws']));
         out.push('');
 
         out.push('BY HOUR (UTC) - our own work, freezes, slow clicks and keys');
@@ -4658,12 +4685,15 @@
      * again on every tick of every Torn page while a trade was accepted, each time
      * with a layout of the page.
      */
-    function sellElsewhere(trade, buyersOf) {
+    function sellElsewhere(trade, buyersOf, checkedOf = null) {
         const id = trade && trade.trader && trade.trader.id ? String(trade.trader.id) : null;
         const name = trade && trade.trader ? String(trade.trader.name || '').toLowerCase() : '';
         return cancelledLeftovers(trade).map(({ at, ...l }) => {
             const top = ((buyersOf && buyersOf(l.itemId)) || []).find((b) => b && !(id && b.id && String(b.id) === id) && String(b.name || '').toLowerCase() !== name) || null;
-            return { ...l, best: top ? { name: top.name, price: top.price } : null, gain: top ? (top.price - l.each) * l.qty : null };
+            // 3.29.0 (`checkedOf` handed): a price Torn Bids has not checked in the last minutes says so, and shows no gain.
+            const best = top ? { name: top.name, price: top.price } : null;
+            if (best && checkedOf && !checkedOf(l.itemId, top)) best.unchecked = true;
+            return { ...l, best, gain: top ? (top.price - l.each) * l.qty : null };
         });
     }
 
@@ -6434,12 +6464,15 @@
      *
      * @param {{name, price, trust}|null} buyer - the best buyer
      * @param {number} listingPrice
+     * @param {boolean} [checked] - Torn Bids checked that price in the last minutes (3.29.0, core/checked.js). Not
+     *   checked: the price is said, with "not checked" where what it would make stood - a figure nobody confirmed
+     *   is not a profit to show.
      */
-    function traderTagLabel(buyer, listingPrice) {
+    function traderTagLabel(buyer, listingPrice, checked = true) {
         if (!buyer || !buyer.trust || buyer.trust.level !== 'Trusted') return null;
         if (!(buyer.price > listingPrice) || !(listingPrice > 0)) return null;
         // One line (3.20.4, the owner: two lines covered the item and its price).
-        return buyer.name + ' pays ' + formatMoney(buyer.price) + ' · +' + formatMoney(buyer.price - listingPrice) + ' each';
+        return buyer.name + ' pays ' + formatMoney(buyer.price) + ' · ' + (checked ? '+' + formatMoney(buyer.price - listingPrice) + ' each' : 'not checked');
     }
 
     /* ===== src/core/selling.js ===== */
@@ -6774,14 +6807,22 @@
      * as he pays higher than what we bought it for"). `bazaar`: your own bazaar, $1 under
      * the cheapest listing, when that is over what you paid.
      *
+     * 3.29.0 (the owner's page, 2026-10-12: To sell named a trader at a price
+     * TornW3B had not confirmed for hours - nothing here asked): `ready` only on
+     * a price that is checked (`checkOf`, core/checked.js). The best payer whose
+     * price is checked is the one named; with none checked, the best payer is
+     * still named, and the row says it waits for the check (`unchecked`, and
+     * `check`: why) - never under "pays more than you paid", never in a total.
+     *
      * @param {Array<{itemId, name, qty, each, from, why}>} leftovers
      * @param {object} o
      * @param {function} o.buyersOf - (itemId) => buyers, best first ({id, name, price, trust})
      * @param {function} [o.keyOf] - (buyer) => the trade key of a trader
      * @param {function} [o.enough] - (profitEach, paidEach) => boolean
      * @param {function} [o.bazaarOf] - (itemId) => the cheapest bazaar listing of it that is not yours, or null
+     * @param {function} [o.checkOf] - (itemId, buyer) => {ok, why}: is that price checked (none handed: every price counts as checked)
      */
-    function toSellRows(leftovers, { buyersOf, keyOf = (b) => (b.id ? 'id:' + b.id : 'name:' + String(b.name).toLowerCase()), enough = (profit) => profit > 0, extraWaiting = TO_SELL_EXTRA_WAITING, bazaarOf = () => null } = {}) {
+    function toSellRows(leftovers, { buyersOf, keyOf = (b) => (b.id ? 'id:' + b.id : 'name:' + String(b.name).toLowerCase()), enough = (profit) => profit > 0, extraWaiting = TO_SELL_EXTRA_WAITING, bazaarOf = () => null, checkOf = null } = {}) {
         const rows = [];
         // Extra buys still waiting for a price: the newest few only.
         const waitingExtras = [];
@@ -6796,11 +6837,17 @@
             // Only a trader who pays more than you paid: one who pays less is never named.
             const over = (buyersOf(String(l.itemId)) || []).filter((b) => b && Number(b.price) > each && !sameTrader(b.name, l.from));
             // What a full trade left (3.23.0) waits for a second trade with that trader, while they pay more than you paid.
-            const top = (toSellWhy(l.why) === 'over' && l.for ? over.find((b) => sameTrader(b.name, l.for)) : null) || over[0] || null;
+            const forThem = toSellWhy(l.why) === 'over' && l.for ? over.find((b) => sameTrader(b.name, l.for)) || null : null;
+            const stateOf = (b) => (checkOf ? checkOf(String(l.itemId), b) || { ok: false, why: 'not-checked' } : { ok: true, why: 'checked' });
+            // The best payer whose price is checked; with none, the best payer - named, and waiting for the check.
+            const sure = forThem ? (stateOf(forThem).ok ? forThem : null) : over.find((b) => stateOf(b).ok) || null;
+            const top = sure || forThem || over[0] || null;
+            const unchecked = top !== null && !sure;
             const per = top ? Number(top.price) - each : null;
-            const ready = top !== null && per > 0 && Boolean(enough(per, each));
+            const ready = top !== null && !unchecked && per > 0 && Boolean(enough(per, each));
             const bazaar = bazaarAbove(bazaarOf(String(l.itemId)), each, Number(l.qty));
-            if (!ready && toSellWhy(l.why) === 'extra') waitingExtras.push({ itemId: String(l.itemId), at: Number(l.at) || 0 });
+            // (A row whose trader waits for a check is not one of the "newest few": it has a payer, and is shown.)
+            if (!ready && !unchecked && toSellWhy(l.why) === 'extra') waitingExtras.push({ itemId: String(l.itemId), at: Number(l.at) || 0 });
             rows.push({
                 itemId: String(l.itemId),
                 name: l.name || 'Item ' + l.itemId,
@@ -6808,18 +6855,23 @@
                 each,
                 why: toSellWhy(l.why),
                 from: l.from || null,
-                best: top ? { key: keyOf(top), id: top.id ? String(top.id) : null, name: top.name, price: Number(top.price), trust: top.trust || null } : null,
+                // (te, w3b, teName: for the links to their price lists.)
+                best: top ? { key: keyOf(top), id: top.id ? String(top.id) : null, name: top.name, price: Number(top.price), trust: top.trust || null, te: top.te || 0, w3b: top.w3b || 0, teName: top.teName || null } : null,
                 gain: top ? per * Number(l.qty) : null,
                 ready,
+                // Their price is not checked (3.29.0): the row waits for the check, and why it is not (core/checked.js).
+                unchecked,
+                check: unchecked ? stateOf(top).why : null,
                 // Waiting, with a trader over what you paid but under the margin: by how much, each (below 0).
                 short: top && !ready ? each - Number(top.price) : null,
                 bazaar,
             });
         }
         const old = new Set(waitingExtras.sort((a, b) => b.at - a.at).slice(Math.max(0, extraWaiting)).map((x) => x.itemId));
-        // A profit with a trader, then one in your own bazaar, then a trader under the margin, then nothing yet - and what is not for sale.
-        const rank = (r) => (r.kept ? 4 : r.ready ? 0 : r.bazaar ? 1 : r.best ? 2 : 3);
-        const worth = (r) => (r.ready ? r.gain : r.bazaar ? r.bazaar.gain : r.best ? r.gain : 0);
+        // A profit with a trader, then a trader whose price waits for its check, then one in your own bazaar, then a
+        // trader under the margin, then nothing yet - and what is not for sale.
+        const rank = (r) => (r.kept ? 5 : r.ready ? 0 : r.unchecked ? 1 : r.bazaar ? 2 : r.best ? 3 : 4);
+        const worth = (r) => (r.ready || r.unchecked ? r.gain : r.bazaar ? r.bazaar.gain : r.best ? r.gain : 0);
         return rows.filter((r) => !old.has(r.itemId)).sort((a, b) => rank(a) - rank(b) || worth(b) - worth(a) || String(a.name).localeCompare(String(b.name)));
     }
 
@@ -6876,18 +6928,24 @@
 
     /**
      * The board: the rows with a profit under the trader who pays most for each
-     * (the biggest total first), the ones waiting, and the ones you marked "Not
-     * for sale" (3.23.0).
+     * (the biggest total first), the ones whose trader's price waits for its
+     * check (3.29.0: named, in no total), the ones waiting, and the ones you
+     * marked "Not for sale" (3.23.0).
      *
-     * @returns {{groups: Array<{key, trader, rows, gain}>, waiting: Array, kept: Array}}
+     * @returns {{groups: Array<{key, trader, rows, gain}>, unchecked: Array, waiting: Array, kept: Array}}
      */
     function toSellBoard(rows) {
         const byKey = new Map();
+        const unchecked = [];
         const waiting = [];
         const kept = [];
         for (const r of rows || []) {
             if (r.kept) {
                 kept.push(r);
+                continue;
+            }
+            if (r.unchecked && r.best) {
+                unchecked.push(r);
                 continue;
             }
             if (!r.ready || !r.best) {
@@ -6900,7 +6958,7 @@
             g.gain += r.gain;
         }
         const groups = [...byKey.values()].sort((a, b) => b.gain - a.gain || String(a.trader.name).localeCompare(String(b.trader.name)));
-        return { groups, waiting, kept };
+        return { groups, unchecked, waiting, kept };
     }
 
     /**
@@ -6910,9 +6968,12 @@
      * items stay out of every trade (the owner, 2026-09-28: "my own items as
      * cover, omit it"; 2026-10-03: back on "for resell items only").
      *
-     * @returns {Map<string, Array<{itemId, bid, held, each, all: true}>>} trade key -> lines
+     * 3.29.0: a line whose price is not checked (`checkOf`) is marked
+     * `unchecked` - the trade lists it as waiting and counts nothing of it.
+     *
+     * @returns {Map<string, Array<{itemId, bid, held, each, all: true, unchecked?: true, check?: string}>>} trade key -> lines
      */
-    function toSellHeld(leftovers, { buyersOf, keyOf = (b) => (b.id ? 'id:' + b.id : 'name:' + String(b.name).toLowerCase()), enough = (profit) => profit > 0 } = {}) {
+    function toSellHeld(leftovers, { buyersOf, keyOf = (b) => (b.id ? 'id:' + b.id : 'name:' + String(b.name).toLowerCase()), enough = (profit) => profit > 0, checkOf = null } = {}) {
         const out = new Map();
         for (const l of leftovers || []) {
             if (!l || !l.itemId || !(Number(l.qty) > 0)) continue;
@@ -6927,7 +6988,13 @@
                 if (!out.has(key)) out.set(key, []);
                 // One line per item per trader (a trader listed twice for it: their first, the better, price).
                 if (out.get(key).some((x) => x.itemId === String(l.itemId))) continue;
-                out.get(key).push({ itemId: String(l.itemId), bid: Number(b.price), held: Number(l.qty), each, all: true });
+                const line = { itemId: String(l.itemId), bid: Number(b.price), held: Number(l.qty), each, all: true };
+                const c = checkOf ? checkOf(String(l.itemId), b) || { ok: false, why: 'not-checked' } : null;
+                if (c && !c.ok) {
+                    line.unchecked = true;
+                    line.check = c.why;
+                }
+                out.get(key).push(line);
             }
         }
         return out;
@@ -9756,6 +9823,35 @@
         return prices;
     }
 
+    /**
+     * The bulk prices of a TornW3B price list (3.29.0): {itemId: [from how many, price each]} for every item
+     * the trader pays another price for from a count up (a row is {itemId, name, buyPrice, bulkThreshold,
+     * bulkBuyPrice}). Until now they were thrown away, and every sum stood on `buyPrice` alone: a trader who
+     * pays less for 100 than for one showed the price for one. Kept and SHOWN (in amber, beside the price) -
+     * no sum is worked out from them until one real list has been seen with them in use.
+     */
+    function parseW3bBulk(body) {
+        const bulk = {};
+        if (!Array.isArray(body)) return bulk;
+        for (const row of body) {
+            const itemId = Number(row && row.itemId);
+            const price = Number(row && row.buyPrice);
+            const from = Number(row && row.bulkThreshold);
+            const each = Number(row && row.bulkBuyPrice);
+            if (!Number.isInteger(itemId) || itemId <= 0 || !Number.isFinite(price) || price <= 0) continue;
+            if (!Number.isFinite(from) || from <= 1 || !Number.isFinite(each) || each <= 0 || each === price) continue;
+            bulk[String(itemId)] = [Math.floor(from), each];
+        }
+        return bulk;
+    }
+
+    /** A trader's bulk price for one item, from their stored list: {from, price}, or null. */
+    function bulkPriceOf(db, traderId, itemId) {
+        const t = db && db.traders ? db.traders[String(traderId)] : null;
+        const row = t && t.w3b && t.w3b.found && t.w3b.bulk ? t.w3b.bulk[String(itemId)] : null;
+        return Array.isArray(row) && row[0] > 1 && row[1] > 0 ? { from: row[0], price: row[1] } : null;
+    }
+
     /** Record the result of reading one trader's TornW3B list. */
     function recordW3bList(db, traderId, result, now = Date.now()) {
         const id = cleanId(traderId);
@@ -9771,6 +9867,8 @@
         t.w3b = Object.keys(prices).length
             ? { checkedAt: now, at: now, found: true, prices }
             : { checkedAt: now, found: false };
+        // (3.29.0: their bulk prices, when the list has any - see parseW3bBulk.)
+        if (t.w3b.found && result.bulk && Object.keys(result.bulk).length) t.w3b.bulk = result.bulk;
     }
 
     /** Ask for a list again soon (Refresh), without hiding the prices we have. */
@@ -10664,6 +10762,56 @@
             changed.push(String(itemId));
         }
         return changed;
+    }
+
+    /*
+     * The prices a check stands on, for the pages on torn.com (3.29.0).
+     *
+     * The overlay names a trader on a bazaar card ("X pays $Y"), in "In this
+     * bazaar" and in Checkout ("sell to X at $Y") from the lists this browser
+     * has stored - with no check at all: a price hours old looked as sure as
+     * one read a minute ago. Torn Bids alone asks TornW3B; so it writes down
+     * what it has checked - item, trader, price, when - and the overlay shows a
+     * price as sure only while it is in this table and under FLIP_CHECK_MS old.
+     * Anything else it shows muted, "not checked". With Torn Bids closed the
+     * table stops being written, and within five minutes every tag is muted.
+     *
+     * Small and seldom: only checks still standing, at most CHECKED_TABLE_MAX of
+     * them, written at most every CHECKED_TABLE_WRITE_MS and only when it says
+     * something else than it did.
+     */
+    const CHECKED_TABLE_WRITE_MS = 30 * 1000;
+    const CHECKED_TABLE_MAX = 2000;
+
+    /**
+     * @param {Map<string, {price: number, at: number}>} lastChecked - 'itemId|traderId' -> the price a check stood on, and when
+     * @returns {{at: number, p: Object<string, Array<[string, number, number]>>}} item id -> [[trader id, price, checked at (s)]]
+     */
+    function checkedTable(lastChecked, now = Date.now(), { checkMs = FLIP_CHECK_MS, max = CHECKED_TABLE_MAX } = {}) {
+        const rows = [];
+        for (const [k, v] of lastChecked || []) {
+            const cut = String(k).indexOf('|');
+            const itemId = cut > 0 ? String(k).slice(0, cut) : '';
+            const traderId = cut > 0 ? String(k).slice(cut + 1) : '';
+            // (A trader known by name only has no TornW3B price: nothing of theirs is ever checked.)
+            if (!/^\d+$/.test(itemId) || !/^\d+$/.test(traderId) || !v || !(v.price > 0) || !(v.at > 0) || now - v.at > checkMs) continue;
+            rows.push([itemId, traderId, v.price, Math.floor(v.at / 1000)]);
+        }
+        rows.sort((a, b) => b[3] - a[3] || Number(a[0]) - Number(b[0]) || Number(a[1]) - Number(b[1]));
+        const p = {};
+        for (const [itemId, traderId, price, at] of rows.slice(0, max)) (p[itemId] || (p[itemId] = [])).push([traderId, price, at]);
+        return { at: now, p };
+    }
+
+    /** Is this trader's price for this item in the table, at this price, checked within `checkMs`? */
+    function checkedInTable(table, itemId, traderId, price, now = Date.now(), checkMs = FLIP_CHECK_MS) {
+        const rows = table && table.p && traderId ? table.p[String(itemId)] : null;
+        if (!Array.isArray(rows)) return false;
+        for (const r of rows) {
+            if (!Array.isArray(r) || String(r[0]) !== String(traderId)) continue;
+            return Number(r[1]) === Number(price) && now - Number(r[2]) * 1000 <= checkMs && now - Number(r[2]) * 1000 > -60000;
+        }
+        return false;
     }
 
     /**
@@ -11692,7 +11840,10 @@
                     bwEl('b', { text: l.name }),
                     ' ×' + l.qty.toLocaleString('en-US') + ' · ',
                     l.best
-                        ? bwEl('span', {}, ['sell to ', bwEl('b', { text: l.best.name }), ' at ' + bwMoney(l.best.price) + ' (', bwEl('span', { class: l.gain >= 0 ? 'bw-g' : 'bw-neg', text: bwSigned(l.gain) }), ')'])
+                        // A price Torn Bids has not checked in the last minutes (3.29.0): named, muted, with no gain beside it.
+                        ? l.best.unchecked
+                            ? bwEl('span', { class: 'bw-mute', title: 'Torn Bids has not checked this price in the last 5 minutes (it checks while its tab is open): look at their list first' }, [l.best.name + ' paid ' + bwMoney(l.best.price) + ' when last seen · not checked'])
+                            : bwEl('span', {}, ['sell to ', bwEl('b', { text: l.best.name }), ' at ' + bwMoney(l.best.price) + ' (', bwEl('span', { class: l.gain >= 0 ? 'bw-g' : 'bw-neg', text: bwSigned(l.gain) }), ')'])
                         : bwEl('span', { class: 'bw-mute', text: 'no other trader buys it now' }),
                 ]))) : null,
                 bwEl('button', { type: 'button', class: 'bw-btn', text: 'Yes, cancel it', onclick: () => {
@@ -14844,6 +14995,36 @@
      * better place than their price earns (no ranking bias toward anyone).
      */
     function favouritesFirstOnTie(buyers, isFav) {
+        // 3.29.0 - the list comes in price order already (buyersForItem sorts it), so only a run of buyers at
+        // the same price can change places: favourites to its front, the others as they stood. On the owner's
+        // page the sort below was a sixth of every redraw (588 of 3,514 ms, 61,773 rows). The same order comes out.
+        const list = buyers || [];
+        const out = list.slice();
+        const priceOf = (b) => Number(b.price) || 0;
+        let i = 0;
+        while (i < out.length) {
+            const p = priceOf(out[i]);
+            let j = i + 1;
+            while (j < out.length && priceOf(out[j]) === p) j += 1;
+            // Not in price order after all: sorted, as before.
+            if (j < out.length && priceOf(out[j]) > p) return favouritesSorted(list, isFav);
+            if (j - i > 1) {
+                const favs = [];
+                const rest = [];
+                for (let k = i; k < j; k += 1) (isFav(out[k]) ? favs : rest).push(out[k]);
+                if (favs.length && rest.length) {
+                    let k = i;
+                    for (const b of favs) out[k++] = b;
+                    for (const b of rest) out[k++] = b;
+                }
+            }
+            i = j;
+        }
+        return out;
+    }
+
+    /** favouritesFirstOnTie for a list in any order: by price, favourites first among equal prices, else as they stood. */
+    function favouritesSorted(buyers, isFav) {
         // Whether a buyer is a favourite only matters between two at the same price: it is asked
         // only then, and once per buyer (3.17.1 - asking it of every buyer of every item was a
         // fifth of Torn Bids' redraw). The order that comes out is the same.
@@ -15841,14 +16022,68 @@
      * (a listing turning stale) says until when it holds.
      *
      * Nothing is told to this file when something changes: each redraw it looks.
-     * And it does not trust itself: one kept result a redraw is worked out again
-     * and compared (`same`); should they ever differ, keeping stops and `onDiffer`
-     * is called - the page then works everything out each time, as before.
+     * And it does not trust itself: about one kept result in KEPT_CHECK_ONE_IN a
+     * redraw (never fewer than one) is worked out again and compared (`same`);
+     * should they ever differ, everything kept is dropped, `onDiffer` is called,
+     * the rest of that redraw is worked out fresh and keeping begins again with
+     * the next (3.29.0). And no kept result stands for longer than about
+     * KEPT_MAX_AGE_MS: older, it is worked out again (and compared, which costs
+     * nothing more) - so whatever the keeping fails to look at, what is shown is
+     * never further behind than that.
+     * Until 3.29.0 one difference switched keeping off until the page was
+     * reloaded, and one result a redraw was checked: on the owner's page every
+     * redraw then worked out all 1,361 items for hours, and a kept row that was
+     * wrong could have stood for 1,361 redraws before its turn came.
      *
      * Pure: no DOM, no storage, no clock (the caller hands `now`).
      */
 
     const keptJsonSame = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+
+    /** No kept result stands for longer than this (and up to half as long again: see keptAgeLimit). */
+    const KEPT_MAX_AGE_MS = 60 * 1000;
+
+    /**
+     * How long this key's kept result may stand: KEPT_MAX_AGE_MS and up to half as long again, by the key - so
+     * what was all worked out in one redraw (a page just opened) does not all fall due in another.
+     */
+    function keptAgeLimit(key, maxAge = KEPT_MAX_AGE_MS) {
+        const s = String(key);
+        let h = 0;
+        for (let i = 0; i < s.length; i += 1) h = (h * 31 + s.charCodeAt(i)) % 64;
+        return maxAge * (1 + h / 128);
+    }
+
+    /** Of the kept results handed out in a redraw, about one in this many is worked out again and compared. */
+    const KEPT_CHECK_ONE_IN = 64;
+
+    /**
+     * Which of a redraw's kept results are checked (3.29.0): every `stride`-th, from a place that moves on each
+     * redraw - so each is checked within `stride` redraws, and at least one a redraw while anything is kept.
+     * @returns {{begin: function(number): void, due: function(number): boolean}}
+     */
+    function keptCheckTurn(oneIn = KEPT_CHECK_ONE_IN) {
+        let stride = oneIn;
+        let phase = 0;
+        let done = 0;
+        return {
+            /** @param {number} lastHits - how many kept results the redraw before handed out (0: none - the first one of this redraw is checked) */
+            begin: (lastHits) => {
+                stride = lastHits > 0 ? Math.max(1, Math.min(oneIn, lastHits)) : oneIn;
+                // (One on each redraw, whatever the stride: a longer step that shares a divisor with it would come
+                // back to the same few places and never check the others.)
+                phase = lastHits > 0 ? (phase + 1) % stride : 0;
+                done = 0;
+            },
+            /** @param {number} hit - this redraw's n-th kept result, from 0 */
+            due: (hit) => {
+                // (A redraw far bigger than the one before - a search cleared - still checks about one in `oneIn`.)
+                if (hit % stride !== phase || done >= 1 + Math.floor(hit / oneIn)) return false;
+                done += 1;
+                return true;
+            },
+        };
+    }
 
     /**
      * Where a fresh result and the kept one part (3.28.1), for the problem log: the first few places, each as
@@ -15897,7 +16132,7 @@
 
     /**
      * @param {object} [o]
-     * @param {function} [o.onDiffer] - (key, where) => void: a kept result differed from a fresh one (keeping is then off); `where`: keptDiffWords
+     * @param {function} [o.onDiffer] - (key, where) => void: a kept result differed from a fresh one (everything kept is dropped; the rest of the redraw is worked out fresh); `where`: keptDiffWords
      * @param {function} [o.same] - (fresh, kept) => boolean: do they say the same (JSON by default)
      * @param {boolean} [o.checkAll] - compare every kept result with a fresh one, not one a redraw (tests, the harness)
      * @param {boolean} [o.freeze] - freeze what is handed out, through and through (tests, the harness: a caller writing into a kept result fails loudly)
@@ -15906,16 +16141,29 @@
         const kept = new Map();
         const stats = { kept: 0, redone: 0, checked: 0, differed: 0 };
         let off = false;
-        // One kept result a redraw is worked out again and compared: which one moves on each redraw.
+        let clock = 0;
+        // Some kept results a redraw are worked out again and compared: which ones moves on each redraw.
         let hits = 0;
-        let lastHits = 0;
-        let checkAt = 0;
+        const turn = keptCheckTurn();
 
-        /** Once a redraw, before any get(). */
-        function begin() {
-            lastHits = hits;
+        /**
+         * Once a redraw, before any get().
+         * @param {number} [now] - the redraw's clock: with it, keeping that went off begins again here, and a kept result ages (none handed: neither)
+         */
+        function begin(now = 0) {
+            turn.begin(hits);
             hits = 0;
-            checkAt = lastHits ? (checkAt + 7) % lastHits : 0;
+            clock = Number(now) || 0;
+            if (off && clock > 0) off = false;
+        }
+
+        /** A kept result differed from a fresh one: all of it goes, and the rest of this redraw is worked out fresh. */
+        function differed(key, fresh, was) {
+            stats.differed += 1;
+            off = true;
+            kept.clear();
+            if (onDiffer) onDiffer(key, keptDiffWords(fresh, was));
+            return fresh;
         }
 
         /**
@@ -15935,22 +16183,28 @@
             }
             const was = kept.get(key);
             if (was && now <= was.until && keptSameSig(was.sig, sig)) {
+                // Stood long enough: worked out again - and it should say what was kept.
+                if (clock > 0 && clock - was.at >= keptAgeLimit(key)) {
+                    const fresh = compute();
+                    stats.redone += 1;
+                    stats.checked += 1;
+                    if (!same(fresh, was.out)) return differed(key, fresh, was.out);
+                    // The very result that was kept is handed out again: whoever holds it holds the same one.
+                    was.at = clock;
+                    return was.out;
+                }
                 stats.kept += 1;
                 hits += 1;
-                if (!checkAll && hits - 1 !== checkAt) return was.out;
+                if (!checkAll && !turn.due(hits - 1)) return was.out;
                 const fresh = compute();
                 stats.checked += 1;
                 if (same(fresh, was.out)) return was.out;
-                stats.differed += 1;
-                off = true;
-                kept.clear();
-                if (onDiffer) onDiffer(key, keptDiffWords(fresh, was.out));
-                return fresh;
+                return differed(key, fresh, was.out);
             }
             const out = compute();
             stats.redone += 1;
             if (freeze) keptFreeze(out);
-            kept.set(key, { sig, until: until ? until(out) : Infinity, out });
+            kept.set(key, { sig, until: until ? until(out) : Infinity, out, at: clock });
             return out;
         }
 
@@ -15958,7 +16212,7 @@
             begin,
             get,
             stats,
-            /** Whether keeping is still on (off after a kept result differed). */
+            /** Whether keeping is on (off for the rest of a redraw in which a kept result differed). */
             on: () => !off,
             /** Forget the keys not in `keys` (items that left the page). */
             only: (keys) => {
@@ -16036,11 +16290,21 @@
      * Proof (test/kept-buyers.test.js): a long made-up session - lists read,
      * traders learned and dropped, ratings and votes moving, lists ageing out -
      * with the kept rows compared with a fresh buyersForItem for every item at
-     * every step. And in use, one kept item each redraw is worked out again and
-     * compared: should they ever differ, keeping stops for that page and it is
-     * written in the problem log.
+     * every step. And in use, about one kept item in KEPT_CHECK_ONE_IN each
+     * redraw (never fewer than one) is worked out again and compared: should
+     * they ever differ, it is written in the problem log, everything kept is
+     * dropped, the rest of that redraw is worked out fresh, and keeping begins
+     * again with the next. And no item's kept rows stand for longer than about
+     * KEPT_MAX_AGE_MS (core/kept.js): whatever the keeping should fail to look
+     * at, what is shown is never further behind than that.
      *
-     * Pure: no DOM, no storage, no clock.
+     * 3.29.0 (the owner's page, measured 2026-10-12): until now one difference
+     * switched keeping off until the page was reloaded, and every redraw then
+     * worked out all 1,361 items (61,773 trader rows) for the rest of the day.
+     * And one kept item a redraw was checked, so a wrong row could have stood
+     * for 1,361 redraws before its turn came.
+     *
+     * Pure: no DOM, no storage, no clock of its own (begin() is handed the redraw's).
      */
 
 
@@ -16063,7 +16327,7 @@
     /**
      * @param {object} [o]
      * @param {function} [o.compute] - buyersForItem (a test may count its calls)
-     * @param {function} [o.onDiffer] - (itemId, where) => void: a kept item differed from a fresh one (keeping is then off); `where`: keptDiffWords
+     * @param {function} [o.onDiffer] - (itemId, where) => void: a kept item differed from a fresh one (everything kept is dropped; the rest of the redraw is worked out fresh); `where`: keptDiffWords
      * @param {boolean} [o.freeze] - freeze what is handed out (tests: a caller writing into kept rows fails loudly)
      */
     function makeBuyersKeeper({ compute = buyersForItem, onDiffer = null, freeze = false } = {}) {
@@ -16087,19 +16351,23 @@
             items.clear();
         };
         let off = false;
-        // One kept item a redraw is worked out again and compared: which one moves on each redraw.
+        let clock = 0;
+        // Some kept items a redraw are worked out again and compared: which ones moves on each redraw.
         let hits = 0;
-        let lastHits = 0;
-        let checkAt = 0;
+        const turn = keptCheckTurn();
         // What this redraw's begin() was handed, and whether it is still what was looked at (see `unsettled`).
         let shared = {};
         let settled = true;
 
-        /** Once a redraw, before any buyers(): what every item shares is looked at. */
-        function begin(given = {}) {
-            lastHits = hits;
+        /**
+         * Once a redraw, before any buyers(): what every item shares is looked at.
+         * @param {number} [now] - the redraw's clock: with it, keeping that went off begins again here, and kept rows age (none handed: neither)
+         */
+        function begin(given = {}, now = 0) {
+            turn.begin(hits);
             hits = 0;
-            checkAt = lastHits ? (checkAt + 7) % lastHits : 0;
+            clock = Number(now) || 0;
+            if (off && clock > 0) off = false;
             shared = given || {};
             settled = true;
             look(shared);
@@ -16139,12 +16407,16 @@
                 const down = rating ? rating.down : null;
                 const p = people.get(id);
                 if (!p) {
-                    people.set(id, { there: Boolean(t), name, rated: Boolean(rating), up, down });
+                    people.set(id, { there: Boolean(t), name, rating, up, down });
                     changedTrader(id);
-                } else if (p.there !== Boolean(t) || p.name !== name || p.rated !== Boolean(rating) || !Object.is(p.up, up) || !Object.is(p.down, down)) {
+                } else if (p.there !== Boolean(t) || p.name !== name || p.rating !== rating || !Object.is(p.up, up) || !Object.is(p.down, down)) {
+                    // (`rating`: the rating itself, not only its numbers - the rows hold it, with when it was
+                    // read. 3.29.0: two sources that disagreed on a trader's votes, both heard between two
+                    // redraws - 523, then 524, then 523 - left the numbers as they were and the rating another
+                    // one; the kept rows then differed from fresh ones, and that switched keeping off.)
                     p.there = Boolean(t);
                     p.name = name;
-                    p.rated = Boolean(rating);
+                    p.rating = rating;
                     p.up = up;
                     p.down = down;
                     changedTrader(id);
@@ -16235,13 +16507,23 @@
             const tk = tokensOf(src);
             const was = kept.get(id);
             if (was && sameTokens(was.tk, tk) && sameW3b(was, list)) {
-                stats.kept += 1;
-                hits += 1;
-                if (hits - 1 !== checkAt) return was.out;
+                // Stood long enough: worked out again (and counted so) - and it should say what was kept.
+                const aged = clock > 0 && clock - was.at >= keptAgeLimit(id);
+                if (!aged) {
+                    stats.kept += 1;
+                    hits += 1;
+                    if (!turn.due(hits - 1)) return was.out;
+                } else {
+                    stats.redone += 1;
+                }
                 // This redraw's check: the kept rows against fresh ones.
                 const fresh = compute(id, src);
                 stats.checked += 1;
-                if (JSON.stringify(fresh) === JSON.stringify(was.out)) return was.out;
+                if (JSON.stringify(fresh) === JSON.stringify(was.out)) {
+                    // The very rows that were kept are handed out again: what is kept against them (core/shown-buyers.js) holds.
+                    was.at = clock;
+                    return was.out;
+                }
                 stats.differed += 1;
                 off = true;
                 kept.clear();
@@ -16268,7 +16550,7 @@
                 }
                 Object.freeze(out);
             }
-            kept.set(id, { tk, w3b: list, out });
+            kept.set(id, { tk, w3b: list, out, at: clock });
             return out;
         }
 
@@ -16276,7 +16558,7 @@
             begin,
             buyers,
             stats,
-            /** Whether keeping is still on (off after a kept item differed). */
+            /** Whether keeping is on (off for the rest of a redraw in which a kept item differed). */
             on: () => !off,
             /**
              * The page was free since begin() (a redraw worked out in pieces,
@@ -16288,6 +16570,129 @@
             },
             clear: () => kept.clear(),
         };
+    }
+
+    /* ===== src/core/shown-buyers.js ===== */
+    /*
+     * The buyers an item shows, from all who buy it (3.29.0; PLAN-lag-and-prices.md, L2).
+     *
+     * Measured on the owner's page, 2026-10-12: each redraw worked through 1,361
+     * items and 61,773 trader rows, and more than half of that time was not in
+     * working out who buys an item (that is kept, core/kept-buyers.js) but in
+     * what follows it for every item, every redraw - the trust badges noted, the
+     * blacklisted taken out, favourites put first among equal prices, then the
+     * Show choices. None of it was kept: only for the one redraw.
+     *
+     * Here it is in two parts:
+     *
+     *   shownKept()   - what depends only on the item's rows, your blacklist and
+     *                   who is a favourite now. Kept between redraws by the
+     *                   caller (core/kept.js) against the very list of rows, and
+     *                   one number that moves when the blacklist or a favourite
+     *                   does (shownVersions).
+     *   shownBuyers() - what moves with every status read and with the clock:
+     *                   Buyers online only, Trusted buyers only, Fresh prices
+     *                   only. One pass each, every redraw, as before.
+     *
+     * Pure: no DOM, no storage, no clock (the caller hands `now`).
+     */
+
+
+
+
+    /**
+     * Who is a favourite now, worked out once a redraw: asked per buyer it read your Ledger's history, your
+     * edits and the clock each time.
+     *
+     * @param {object[]} partners - partnerStats(): {who, whoName, trades, last}
+     * @param {{added?: string[], removed?: string[]}} edits
+     * @param {number} now
+     * @returns {{isFav: function(object): boolean, word: string}} `word` says the same while every buyer's answer would be the same
+     */
+    function shownFavourites(partners, edits = {}, now = 0) {
+        // By id, and by name for a buyer known by name only (a later row of the same name counts, as it always did).
+        const byKey = new Map();
+        const parts = [];
+        for (const st of partners || []) {
+            if (!st) continue;
+            const fav = isFavourite(st, edits, now);
+            byKey.set('id:' + st.who, fav);
+            if (st.whoName) byKey.set('name:' + String(st.whoName).toLowerCase(), fav);
+            parts.push(st.who + ',' + (st.whoName || '') + ',' + (fav ? 1 : 0));
+        }
+        // Added by hand before any trade with them.
+        const added = new Set(((edits && edits.added) || []).map(String));
+        const isFav = (b) => {
+            let f = byKey.get(partnerKey(b));
+            if (f === undefined && b && b.name) f = byKey.get('name:' + String(b.name).toLowerCase());
+            return f !== undefined ? f : Boolean(b && b.id && added.has(String(b.id)));
+        };
+        return { isFav, word: parts.join(';') + '|' + [...added].sort().join(',') };
+    }
+
+    /**
+     * One number for "the blacklist and the favourites are what they were": it moves when either does. (A kept
+     * list is looked at for every item, every redraw: one number is compared, not two long words.)
+     * @returns {function(string, Set<string>|string[]): number}
+     */
+    function shownVersions() {
+        let fav = null;
+        let black = null;
+        let n = 0;
+        return (favWord, blacklist) => {
+            const blackWord = [...(blacklist || [])].sort().join('\n');
+            if (favWord !== fav || blackWord !== black) {
+                fav = favWord;
+                black = blackWord;
+                n += 1;
+            }
+            return n;
+        };
+    }
+
+    /**
+     * What an item shows before your Show choices: its buyers without the blacklisted ones (they are never
+     * buyers; their bazaars still are sellers), favourites first on a tie - and the rows that carry a trust
+     * badge, for the Ledger's Traders tab and Your traders.
+     *
+     * @param {object[]} all - buyersForItem(): highest first
+     * @param {Set<string>} blacklist - blacklistKeys()
+     * @param {function} isFav - (buyer) => boolean
+     * @returns {{list: object[], trust: object[]}}
+     */
+    function shownKept(all, blacklist, isFav) {
+        const trust = [];
+        for (const x of all || []) if (x && x.id && x.trust) trust.push(x);
+        return { list: favouritesFirstOnTie(withoutBlacklisted(all, blacklist), isFav), trust };
+    }
+
+    /**
+     * The buyers shown for an item: the kept list under your Show choices. Its badges are noted again in the
+     * order the items are asked for - `trustedSeen` is made anew each redraw, and the first item to name a
+     * trader gives the name.
+     *
+     * @param {{list: object[], trust: object[]}} kept - shownKept()
+     * @param {object} o
+     * @param {{onlineOnly?: boolean, trustedOnly?: boolean, freshOnly?: boolean}} o.prefs
+     * @param {function} o.levelOf - (traderId) => 'online' | 'idle' | 'offline' | 'unknown'
+     * @param {boolean} o.votesMissing - TornExchange's votes are not loaded: a trader without any is kept
+     * @param {function} o.listAtOf - (traderId) => when their list last changed (ms)
+     * @param {number} o.now
+     * @param {Map} [o.trustById] - trader id -> badge, written here
+     * @param {Map} [o.trustedSeen] - trader id -> row, of every trader with a Trusted badge, written here
+     */
+    function shownBuyers(kept, { prefs = {}, levelOf = () => 'unknown', votesMissing = false, listAtOf = () => 0, now = 0, trustById = null, trustedSeen = null } = {}) {
+        for (const x of kept.trust) {
+            const id = String(x.id);
+            if (trustById) trustById.set(id, x.trust);
+            if (trustedSeen && x.trust.level === 'Trusted' && !trustedSeen.has(id)) trustedSeen.set(id, x);
+        }
+        let b = kept.list;
+        if (prefs.onlineOnly) b = onlineOnly(b, levelOf);
+        if (prefs.trustedOnly) b = trustedOnly(b, { min: 'Known', keepUnrated: votesMissing });
+        // Fresh prices only (3.22.0): a TornW3B price from a list not changed in two days is not shown.
+        if (prefs.freshOnly) b = freshOnly(b, listAtOf, now);
+        return b;
     }
 
     /* ===== src/core/job.js ===== */
@@ -19435,6 +19840,19 @@
     @keyframes ttv2-oldlist {
         0%, 100% { filter: drop-shadow(0 0 0 rgba(246, 183, 74, 0)); }
         50% { filter: drop-shadow(0 0 4px rgba(246, 183, 74, 0.95)); }
+    }
+
+    /*
+     * That trader's price is one Torn Bids has not checked in the last minutes
+     * (3.29.0; it checks only while its own tab is open): the tag says "not
+     * checked" and is drawn grey. Not on a card that is also an NPC deal: its
+     * line is the deal's (green, and sure) with the trader's words after it.
+     */
+    .ttv2-trader.ttv2-trader.ttv2-trader[data-ttv2-trader-unsure]:not(.ttv2-hit)::after {
+        background-color: rgba(24, 27, 32, 0.94) !important;
+        border-color: rgba(150, 158, 170, 0.4) !important;
+        color: #9aa3af !important;
+        font-weight: 600 !important;
     }
 
     /*
@@ -23153,7 +23571,7 @@
         renderBids(v) {
             this.state.bidsLine = v.line || '';
             if (!this.root) return;
-            const sig = JSON.stringify([v.onBazaar, v.rows.map((r) => [r.key, r.name, r.qty, r.price, r.label, r.old]), v.friendHere, v.trade, v.toSell, v.hasKey]);
+            const sig = JSON.stringify([v.onBazaar, v.rows.map((r) => [r.key, r.name, r.qty, r.price, r.label, r.old, r.unchecked]), v.friendHere, v.trade, v.toSell, v.hasKey]);
             if (sig !== this.hereSig) {
                 this.hereSig = sig;
                 const box = this.hereEl;
@@ -23165,7 +23583,8 @@
                     for (const r of v.rows) {
                         box.appendChild(el('div', { class: 'ttv2-here-r' }, [
                             el('span', { class: 'ttv2-here-n' }, [el('b', { text: r.name }), document.createTextNode(r.qty > 1 ? ' × ' + r.qty.toLocaleString('en-US') : '')]),
-                            el('span', { class: 'ttv2-here-l' + (r.old ? ' ttv2-here-old' : ''), title: r.old ? 'Their price is from a list not changed in over a day' : '', text: r.label }),
+                            // (3.29.0: "not checked" in the words themselves - Torn Bids has not checked that price in the last 5 minutes.)
+                            el('span', { class: 'ttv2-here-l' + (r.old ? ' ttv2-here-old' : ''), title: r.unchecked ? 'Torn Bids has not checked this price in the last 5 minutes (it checks while its own tab is open): look at their list before you buy' : r.old ? 'Their price is from a list not changed in over a day' : '', text: r.label }),
                             el('button', { type: 'button', class: 'ttv2-link', 'data-here': r.key, title: 'Brings its card into view on Torn\'s page. Nothing is clicked for you.', text: 'Show', onclick: () => r.onShow && r.onShow() }),
                         ]));
                     }
@@ -28742,6 +29161,13 @@
             const wanted = info.flipsWanted || 0;
             if (info.bazaarsError && !info.bazaarsAt) pill('bad', 'Bazaars', 'not loaded', info.bazaarsError);
             else if (!info.bazaarsAt) pill('idle', 'Bazaars', 'loading', 'Loading bazaar prices from TornW3B');
+            // 3.29.0 - TornW3B's sellers lists are used up (its minute, our day's share, or it refused): said, with when
+            // the next one can be read. Until now the page only stood still, and nothing said why or for how long.
+            else if (info.w3bListing && info.w3bListing.freeAt > now) {
+                const ms = info.w3bListing.freeAt - now;
+                const wait = ms < 90000 ? Math.max(5, Math.ceil(ms / 5000) * 5) + ' s' : ms < 90 * 60000 ? Math.ceil(ms / 60000) + ' min' : Math.ceil(ms / 3600000) + ' h';
+                pill('idle', 'Bazaars', 'TornW3B frees up in ' + wait, 'TornW3B\'s sellers lists are used up for now: the next can be read in ' + wait + '. Prices already read stay, trader price lists are still read (they have no such limit)' + (wanted ? ', and ' + checked + ' of ' + wanted + ' possible flips are checked against every bazaar' : '') + '.');
+            }
             else pill(checked < wanted ? 'idle' : 'online', 'Bazaars', age(info.bazaarsAt), 'TornW3B bazaar prices, ' + formatAge(now - info.bazaarsAt) + (wanted ? '. Possible flips checked against every bazaar: ' + checked + ' of ' + wanted : ''));
 
             const perItem = info.heldCount ? ' Best buyer per item, without a key: ' + (info.teOneDone || 0) + ' of ' + info.heldCount + '.' : '';
@@ -28972,7 +29398,7 @@
             const sig = JSON.stringify([
                 'items', kind, s.counts, s.listTotal, s.desk && s.desk.itemId, info.hasKey, info.loading, info.inventoryAt ? 1 : 0, info.tradersLoading, Boolean(info.bazaarsAt), this.query, s.category,
                 list.map((r) => [r.itemId, r.name, r.held, r.lowest, r.badge && [r.badge.kind, r.badge.amount], r.pending, r.units, r.stops, r.pace, r.bid, r.mark && r.mark.text, r.still && [r.still.move, r.still.gone, r.still.was],
-                    r.to && [r.to.name, this.dotSig(r.to), r.to.old ? listAgeText(now - r.to.old.at) : ''], r.top && [r.top.name, r.top.price, this.dotSig(r.top)], paidOf.has(r.itemId) ? paidOf.get(r.itemId).each : 0]),
+                    r.to && [r.to.name, this.dotSig(r.to), r.to.old ? listAgeText(now - r.to.old.at) : ''], r.top && [r.top.name, r.top.price, this.dotSig(r.top), r.top.checked], paidOf.has(r.itemId) ? paidOf.get(r.itemId).each : 0]),
                 s.pinned || [],
             ]);
             if (sig === this.listSig) return;
@@ -29002,7 +29428,10 @@
             const max = kind === 'flips'
                 ? Math.max(1, ...list.map((r) => (r.badge && r.badge.kind === 'flip' ? r.badge.amount : 0)))
                 : Math.max(1, ...list.map((r) => (r.held || 0) * (r.bid || 0)));
-            const trader = (b, withPrice) => (b ? [this.dot(b), b.name, withPrice ? ' ' : null, withPrice ? spEl('b', { text: formatMoney(b.price) }) : null] : [spEl('span', { class: 't-muted', text: '–' })]);
+            // 3.29.0: a price TornW3B has not confirmed in the last 5 minutes is shown muted (it is a figure to read:
+            // pick the item, and their list is read at once).
+            const unsure = 'Not checked: TornW3B has not confirmed this price in the last 5 minutes. Pick the item and their list is read now.';
+            const trader = (b, withPrice) => (b ? [this.dot(b), b.name, withPrice ? ' ' : null, withPrice ? (b.checked === false ? spEl('span', { class: 't-muted', title: unsure, text: formatMoney(b.price) }) : spEl('b', { text: formatMoney(b.price) })) : null] : [spEl('span', { class: 't-muted', text: '–' })]);
             for (const r of list) {
                 const on = Boolean(s.desk && s.desk.itemId === r.itemId);
                 const flip = Boolean(r.badge && r.badge.kind === 'flip');
@@ -29047,7 +29476,8 @@
                     cells.push(spEl('td', { class: 'n' }, r.top ? trader(r.top, true) : [spEl('span', { class: 't-muted', text: r.pending ? 'Checking…' : '–' })]));
                     if (kind === 'mine') {
                         const worth = (r.held || 0) * (r.bid || 0);
-                        cells.push(spEl('td', { class: 'n' }, worth > 0 ? [this.bar(worth, max), spEl('b', { class: 'amt', text: formatMoney(worth) })] : [spEl('span', { class: 't-muted', text: '–' })]));
+                        const about = Boolean(r.top && r.top.checked === false);
+                        cells.push(spEl('td', { class: 'n' }, worth > 0 ? [this.bar(worth, max), spEl('b', { class: 'amt', title: about ? 'About: at a price that is not checked' : null, text: (about ? '≈ ' : '') + formatMoney(worth) })] : [spEl('span', { class: 't-muted', text: '–' })]));
                     }
                 }
                 rows.push(this.pickRow((on ? 'sel' : '') + (gone ? ' gone' : ''), 'item:' + r.itemId, () => this.select(r.itemId), cells));
@@ -29124,10 +29554,10 @@
         renderSellList() {
             const s = this.state;
             if (s.filter !== 'sell') return;
-            const T = s.toSell || { rows: [], groups: [], waiting: [], kept: [] };
-            const rowSig = (r) => [r.itemId, r.name, r.qty, r.each, r.why, r.best && [r.best.name, r.best.price], r.gain, r.short, r.bazaar, r.kept, r.ready];
+            const T = s.toSell || { rows: [], groups: [], unchecked: [], waiting: [], kept: [] };
+            const rowSig = (r) => [r.itemId, r.name, r.qty, r.each, r.why, r.best && [r.best.name, r.best.price, r.best.te, r.best.w3b], r.gain, r.short, r.bazaar, r.kept, r.ready, r.unchecked, r.check];
             const sig = JSON.stringify(['sell', s.desk && s.desk.itemId, s.prefs.onlineOnly, s.prefs.trustedOnly,
-                (T.groups || []).map((g) => [g.key, g.trader.name, this.dotSig(g.trader), g.gain, g.rows.map(rowSig)]), (T.waiting || []).map(rowSig), (T.kept || []).map(rowSig)]);
+                (T.groups || []).map((g) => [g.key, g.trader.name, this.dotSig(g.trader), g.gain, g.rows.map(rowSig)]), (T.unchecked || []).map(rowSig), (T.waiting || []).map(rowSig), (T.kept || []).map(rowSig)]);
             if (sig === this.listSig) return;
             this.listSig = sig;
             const heads = [{ text: 'Item' }, { text: 'Why it is here' }, { text: 'You paid', n: true }, { text: 'Best now', n: true }, { text: 'Profit', n: true }, { text: '' }];
@@ -29149,10 +29579,26 @@
             for (const g of T.groups || []) {
                 const b = g.trader;
                 rows.push(spEl('tr', { class: 'g' }, [
-                    spEl('td', { colspan: '4' }, [this.dot(b), spEl('b', {}, [this.playerName(b.name, b.id, 'board:who:' + g.key)]), ' pays more than you paid · ' + count(g.rows.length) + (g.rows.length === 1 ? ' item' : ' items') + ' · ', spEl('span', { class: 't-good', text: signed(g.gain) })]),
+                    // (3.29.0: their price lists beside the name - the price is checked, and one press shows it to you.)
+                    spEl('td', { colspan: '4' }, [this.dot(b), spEl('b', {}, [this.playerName(b.name, b.id, 'board:who:' + g.key)]), ' pays more than you paid · ' + count(g.rows.length) + (g.rows.length === 1 ? ' item' : ' items') + ' · ', spEl('span', { class: 't-good', text: signed(g.gain) }), ' ', ...this.traderLinks(b)]),
                     spEl('td', { class: 'n', colspan: '2' }, [spEl('button', { type: 'button', class: 'btn sm', 'data-focus': 'board:plan:' + g.key, title: 'One trade for everything of yours ' + b.name + ' takes: these go in as yours', text: 'Trade ' + (g.rows.length === 1 ? 'it' : 'these') + ' to ' + b.name, onclick: () => this.h.onTradePick && this.h.onTradePick(g.rows[0].itemId, g.key) })]),
                 ]));
                 for (const r of g.rows) rows.push(row(r, [spEl('b', { text: formatMoney(r.best.price) })], [this.bar(r.gain, max), spEl('b', { class: 't-good', text: signed(r.gain) })]));
+            }
+            // 3.29.0 - a trader's list says they pay more than you paid, and that price is not checked: named, muted,
+            // with their lists to look at - in no total, and no "Trade these" until TornW3B has confirmed it.
+            if ((T.unchecked || []).length) {
+                const n = T.unchecked.length;
+                const never = T.unchecked.every((r) => r.check === 'te-only' || r.check === 'no-id');
+                rows.push(spEl('tr', { class: 'g' }, [spEl('td', { colspan: '6' }, [spEl('b', { text: 'Waiting for a price check' }), ' · ' + count(n) + (n === 1 ? ' item' : ' items') + ' · '
+                    + (never ? 'a price only on TornExchange has no date and cannot be checked: open their list' : 'a trader\'s list says more than you paid; shown as a trade once TornW3B confirms the price')])]));
+                for (const r of T.unchecked) {
+                    const b = r.best;
+                    const why = this.uncheckedWhy(r.check);
+                    rows.push(row(r,
+                        [spEl('span', { class: 't-muted', title: b.name + '\'s price is not checked: ' + why }, [b.name + ' ' + formatMoney(b.price)]), ' ', ...this.traderLinks(b)],
+                        [spEl('span', { class: 't-muted', title: 'What it would make at that price. Not counted until the price is checked.', text: 'not checked' })]));
+                }
             }
             if ((T.waiting || []).length) {
                 rows.push(spEl('tr', { class: 'g' }, [spEl('td', { colspan: '6' }, [spEl('b', { text: 'Nobody pays more yet' }), ' · ' + count(T.waiting.length) + (T.waiting.length === 1 ? ' item waits' : ' items wait') + ' for a trader who pays more than you paid'])]));
@@ -29215,7 +29661,8 @@
                 ? JSON.stringify([
                     where,
                     d.itemId, d.name, d.held, d.avg, d.bazaars, d.buyersTotal, d.buyersLoading, d.buyersListNote, d.pending, d.planWhy, d.paid,
-                    d.buyers.map((b) => [b.id, b.name, b.price, b.te, b.teTop, b.teList, b.w3b, statusOf(b), b.trust ? b.trust.level + b.trust.score : '', s.networth && b.id ? s.networth.get(String(b.id)) : null, Boolean(b.favourite), b.traded || '', Boolean(b.troll), Boolean(b.lastPaidOnly), this.checkSig(b, now)]),
+                    d.yesNote || false, d.trade && d.trade.listCheck && d.trade.listCheck.readAt ? Math.min(13, Math.floor((now - d.trade.listCheck.readAt) / 5000)) : 0,
+                    d.buyers.map((b) => [b.id, b.name, b.price, b.te, b.teTop, b.teList, b.w3b, b.bulk || null, statusOf(b), b.trust ? b.trust.level + b.trust.score : '', s.networth && b.id ? s.networth.get(String(b.id)) : null, Boolean(b.favourite), b.traded || '', Boolean(b.troll), Boolean(b.lastPaidOnly), this.checkSig(b, now)]),
                     this.justBlacklisted ? this.justBlacklisted.at : 0,
                     (d.hidden || []).map((b) => [b.tradeKey, b.price, b.hiddenBy, statusOf(b), b.trust ? b.trust.level + b.trust.score : '']),
                     // How old a list is, in the words shown: drawn again when they change, not every second.
@@ -29346,8 +29793,11 @@
                 const price = line && line.bid > 0 ? line.bid : row ? row.price : 0;
                 if (price > 0) return { name: c.buyer.name, price };
             }
-            const b = (d.plan && d.plan.units > 0 && d.plan.buyer) || d.buyers.find((x) => !x.troll) || null;
-            return b ? { name: b.name, price: b.price } : null;
+            // 3.29.0: else the best trader whose price is checked; with none checked, the best believable one - and the
+            // gaps beside each bazaar are then muted ("not checked"), never green.
+            const sure = (d.plan && d.plan.units > 0 && d.plan.buyer) || d.buyers.find((x) => !x.troll && (!x.check || x.check.ok)) || null;
+            const b = sure || d.buyers.find((x) => !x.troll) || null;
+            return b ? { name: b.name, price: b.price, unchecked: !sure } : null;
         }
 
         /** The head of what you picked: its picture, its name (the Item Market), a friend's mark, its few numbers. */
@@ -29414,7 +29864,7 @@
             rows.forEach((r, i) => {
                 if (i === cut) {
                     body.appendChild(spEl('tr', { class: 'mk' }, [spEl('td', { colspan: '5' }, [
-                        spEl('b', { text: pay.name + ' pays ' + formatMoney(pay.price) + '.' }),
+                        spEl('b', { text: pay.name + (pay.unchecked ? '\'s list says ' : ' pays ') + formatMoney(pay.price) + (pay.unchecked ? ', not checked.' : '.') }),
                         anyGood ? ' Under this line a piece leaves less than your ' + pct + '%.' : ' No bazaar leaves your ' + pct + '% now.',
                     ])]));
                 }
@@ -29422,7 +29872,7 @@
                 const gap = pay ? pay.price - r.price : 0;
                 const piece = !pay ? null
                     : r.stale ? spEl('span', { title: 'TornW3B has not seen this bazaar lately: it is not counted', text: 'not seen' })
-                        : ok ? spEl('b', { class: 't-good', text: signed(gap) })
+                        : ok ? (pay.unchecked ? spEl('span', { class: 't-muted', title: 'At a price that is not checked: ' + pay.name + '\'s list says ' + formatMoney(pay.price), text: '≈ ' + signed(gap) }) : spEl('b', { class: 't-good', text: signed(gap) }))
                             : gap > 0 ? spEl('span', { title: signed(gap) + ' a piece: under your least profit of ' + pct + '%', text: 'too thin' })
                                 : spEl('span', { title: 'Over what ' + pay.name + ' pays', text: 'over' });
                 const name = r.sellerName || 'Player ' + r.sellerId;
@@ -29492,6 +29942,8 @@
                     until ? spEl('small', {}, ['said no · passed over for ' + formatAge(until - Date.now()).replace(' ago', '') + ' · ', this.wordBtn('Undo', 'plan:undo:' + b.tradeKey, 'Plan with ' + b.name + ' again', () => this.h.onTradeUndecline && this.h.onTradeUndecline(b.tradeKey))]) : null,
                     this.oldListLine(d, b),
                     this.checkLine(d, b),
+                    // 3.29.0 - their list pays another price from a count up: said in amber; the sums stand on the price for one.
+                    b.bulk ? spEl('small', { class: 't-warn', title: 'Their TornW3B list has a bulk price for this item. The sums here use ' + formatMoney(b.price) + ' each: check their list before a big trade.', text: 'Bulk price from ' + count(b.bulk.from) + ': ' + formatMoney(b.bulk.price) }) : null,
                     // Their two lists disagree: the lower is counted, and said.
                     b.differ ? spEl('small', { title: 'Their two price lists do not agree: check before trading', text: 'Lists differ: ' + this.listPrices(b, ' · ') + ' · counted at the lower' }) : null,
                     b.troll ? spEl('small', { class: 't-warn', text: 'Over 3× Item Market Average: not counted' }) : null,
@@ -29662,6 +30114,14 @@
             if (reading) return spEl('small', { text: 'Reading their price list…' });
             const said = c.ok ? 'Price checked ' + this.checkAge(now - c.at) : this.checkWhy(b, now);
             return spEl('small', {}, [said, refresh ? ' · ' : null, refresh]);
+        }
+
+        /** Why a price is not checked (core/checked.js), as the end of a sentence: "X's price is not checked: …". */
+        uncheckedWhy(why) {
+            if (why === 'te-only' || why === 'no-id') return 'it is only on TornExchange, which gives no date for a price - it cannot be checked, so look at their list';
+            if (why === 'old-list') return 'their list was not changed in over a day';
+            if (why === 'no-date') return 'when their list last changed is not known yet';
+            return 'TornW3B has not confirmed it in the last 5 minutes; it is being read';
         }
 
         /** How long ago a price was checked: "just now" under five seconds (a Refresh just answered), else the age. */
@@ -29841,6 +30301,9 @@
                     : 'Pick an item: the trade with its best trader shows here.' }));
                 return;
             }
+            // 3.29.0 - "said yes" was pressed, and their list as read at that press no longer makes the trade: said for a
+            // minute, so a press that wrote nothing down says why.
+            if (d.yesNote && !(T && T.accepted)) box.appendChild(spEl('div', { class: 'amber', role: 'status' }, [spEl('span', {}, [spEl('b', { text: 'The yes was not written down.' }), ' Their price list, read as you pressed, no longer makes the trade that was on show. What is here now is at their prices as just read.'])]));
             if (!on) {
                 box.appendChild(this.flipPlan(d));
                 return;
@@ -30053,7 +30516,11 @@
                         ' × ',
                         box && !many ? box : count(qty),
                         box && many ? spEl('small', { title: 'How many in all, over every bazaar' }, ['of ', box]) : null,
-                        spEl('small', {}, [st.sellerId ? 'at ' + formatMoney(price) : '≈ from ' + formatMoney(st.price), mark(st), first && r.noBid ? spEl('span', { class: 'warnw', text: ' · not on their list now' }) : null]),
+                        spEl('small', {}, [st.sellerId ? 'at ' + formatMoney(price) : '≈ from ' + formatMoney(st.price), mark(st), first && r.noBid ? spEl('span', { class: 'warnw', text: ' · not on their list now' }) : null,
+                            // 3.29.0 - a held line whose price check lapsed keeps the last checked price, and says how long ago that was.
+                            first && r.lapsed ? spEl('span', { class: 'warnw', title: b.name + '\'s ' + formatMoney(r.bid) + ' for it is the last price that was checked. Refresh reads their list now.', text: ' · price ' + (r.lapsed.at ? 'checked ' + formatAge(now - r.lapsed.at) : 'not checked yet') }) : null,
+                            // Their list has a bulk price for it (3.29.0): shown, in no sum.
+                            first && r.bulk ? spEl('span', { class: 'warnw', title: 'Their list pays another price from that count up. The sums here use ' + formatMoney(r.bid) + ' each: check their list before a big trade.', text: ' · bulk price from ' + count(r.bulk.from) + ': ' + formatMoney(r.bulk.price) }) : null]),
                         first ? (isMain ? spEl('span', { class: 'here', text: 'MAIN' }) : here && !c.every ? spEl('span', { class: 'here', text: 'THIS ITEM' }) : this.kindTag(r.kind)) : null,
                         j > 0 && st.sellerId ? this.link('bazaar', bazaarUrl(st.sellerId, r.itemId, st.price), { cls: 'quiet lk', title: 'Opens their bazaar at this item and the price', focus: 'trade:bazaar:' + r.itemId + ':' + st.sellerId }) : null,
                         first ? cutNote(r) : null,
@@ -30097,6 +30564,21 @@
                                 spEl('span', { class: 'p' + (on ? '' : ' none0'), text: on ? formatMoney(r.units * r.bid) : '–' }),
                             ]);
                         }),
+                    ]),
+                ]));
+            }
+            // Yours, at a price of theirs that is not checked (3.29.0): listed, in no sum - it joins once the price is confirmed.
+            if ((c.heldWaiting || []).length) {
+                route.appendChild(spEl('div', { class: 'rt' }, [
+                    spEl('span', { class: 'stop-n', text: '…' }),
+                    spEl('div', {}, [
+                        spEl('div', { class: 'rt-h' }, [spEl('b', { text: 'Yours, waiting for a price check' }), spEl('span', { class: 'seen', text: 'not counted until ' + b.name + '\'s price is confirmed' })]),
+                        ...c.heldWaiting.map((r) => spEl('div', { class: 'pl off' }, [
+                            spEl('span'),
+                            this.pic('trade-yours-wait', r.itemId),
+                            spEl('span', {}, [spEl('b', { text: r.name }), ' × ' + count(r.held), spEl('small', { title: 'Not checked: ' + this.uncheckedWhy(r.check), text: 'their list says ' + formatMoney(r.bid) + ' each · not checked' })]),
+                            spEl('span', { class: 'p none0', text: '–' }),
+                        ])),
                     ]),
                 ]));
             }
@@ -30158,14 +30640,29 @@
             const ages = [];
             if (b.te && T.teAt) ages.push('TornExchange ' + formatAge(now - T.teAt));
             if (b.w3b && T.w3bAt) ages.push('TornW3B ' + formatAge(now - T.w3bAt));
+            // 3.29.0 - their list is read at the press of a deal (picking it, Plan trade, said yes): said while it is
+            // out, and for a minute after what the read found.
+            const LC = T.listCheck || {};
+            const refresh = b.id ? this.wordBtn('Refresh', 'trade:check', 'Reads ' + b.name + '\'s price list on TornW3B now', () => this.h.onTraderCheck && this.h.onTraderCheck(d.itemId, c.key)) : null;
+            if (LC.reading) right.push(spEl('p', { class: 'note', role: 'status', text: LC.waitingYes ? 'Reading ' + b.name + '\'s price list before the yes is written down…' : 'Reading ' + b.name + '\'s price list…' }));
+            else if (LC.readAt && now - LC.readAt < 60000) {
+                right.push(spEl('p', { class: 'note', role: 'status' }, [
+                    spEl('b', { text: 'Price list read ' + this.checkAge(now - LC.readAt) + '.' }),
+                    LC.changed === null ? '' : LC.changed > 0 ? ' ' + this.plural(LC.changed, 'price') + ' of theirs had changed: this trade is priced with the list as it is now.' : ' None of their prices had changed.',
+                ]));
+            }
+            if (c.lapsed > 0 && !LC.reading) {
+                right.push(spEl('div', { class: 'amber' }, [spEl('span', {}, [spEl('b', { text: this.plural(c.lapsed, 'price') + ' in this trade ' + (c.lapsed === 1 ? 'is' : 'are') + ' not checked now.' }), ' Each keeps the last price that was checked, and says when. ']), refresh]));
+            }
             if (old) right.push(spEl('div', { class: 'amber' }, [spEl('span', {}, [spEl('b', { text: 'Check ' + b.name + '\'s list before you buy.' }), ' Their prices were last changed ' + listAgeText(now - old.at) + '.'])]));
-            else if (ages.length) right.push(spEl('p', { class: 'note', text: b.name + '\'s prices were read from ' + ages.join(', ') + '. Check their list before you buy.' }));
+            else if (ages.length && !LC.reading && !(LC.readAt && now - LC.readAt < 60000)) right.push(spEl('p', { class: 'note', text: b.name + '\'s prices were read from ' + ages.join(', ') + '. Check their list before you buy.' }));
             if (b.differ) right.push(spEl('div', { class: 'amber' }, [spEl('span', {}, [spEl('b', { text: b.name + '\'s lists differ' }), ' (' + this.listPrices(b, ', ') + '): planned at the lower.'])]));
 
             // In the order you do it: ask them, then their answer. "Said no" passes this trade over for an hour.
             const acts = spEl('div', { class: 'acts' }, [
                 this.chatLink(b, 'btn go big out'),
-                spEl('button', { type: 'button', class: 'btn big', 'data-focus': 'trade:accept:' + c.key, title: b.name + ' said yes: the trade is frozen as it is now, so nothing in it moves while you buy and send. It moves to Trades.', text: b.name + ' said yes', onclick: () => this.h.onTradeAccept && this.h.onTradeAccept(d.itemId) }),
+                // (3.29.0: their price list is read first - a few seconds - and the yes is written with the prices as just read.)
+                spEl('button', { type: 'button', class: 'btn big', 'data-focus': 'trade:accept:' + c.key, disabled: LC.waitingYes ? '' : null, title: b.name + ' said yes: their price list is read first (a few seconds), then the trade is frozen as it is, so nothing in it moves while you buy and send. It moves to Trades.', text: LC.waitingYes ? 'Reading their list…' : b.name + ' said yes', onclick: () => this.h.onTradeAccept && this.h.onTradeAccept(d.itemId) }),
                 // Nothing to buy: the trade itself can be opened now.
                 !c.stops && b.id ? this.link('Open the trade', tradeUrl(b.id), { cls: 'btn big out', title: 'Start a trade with ' + b.name + ' on Torn', focus: 'step-trade' }) : null,
                 spEl('span', { class: 'sp' }),
@@ -30233,6 +30730,11 @@
                     ? count(boughtN) + ' of ' + this.plural(steps.length, 'buy') + ' done' + (skippedN ? ' · ' + count(skippedN) + ' skipped' : '') + (left0 ? ' · about ' + Math.max(1, Math.round(left0 / 2)) + ' min left' : boughtN ? ' · now the trade' : ' · nothing bought') + ' · ' + inTrade
                     : 'Nothing to buy: send yours · ' + inTrade }),
             ];
+            // 3.29.0 - their price list was read as you pressed "said yes": what that read found, once, here.
+            const PC = A.priceCheck || null;
+            if (PC && !PC.confirmed) left.push(spEl('div', { class: 'amber' }, [spEl('span', {}, [spEl('b', { text: b.name + '\'s price list did not answer when you pressed yes.' }), ' These are the prices last checked: look at their list before you buy.'])]));
+            else if (PC && PC.changed > 0) left.push(spEl('p', { class: 'note', text: 'Their price list was read as you pressed yes: ' + this.plural(PC.changed, 'price') + ' of theirs had changed, and this trade was written down with the list as it was then.' }));
+            else if (PC && PC.confirmed) left.push(spEl('p', { class: 'note', text: 'Their price list was read as you pressed yes: these prices were confirmed then.' }));
             // Its items against the 10,000 one trade takes (3.23.0): said from nine tenths of it.
             const cv = countView(A.count, b.name);
             if (cv && cv.say) left.push(cv.state === 'full' ? spEl('div', { class: 'amber' }, [spEl('span', {}, [spEl('b', { text: cv.text + ' items.' }), ' ' + cv.say])]) : spEl('p', { class: 'note', text: cv.text + ' items. ' + cv.say }));
@@ -30449,7 +30951,11 @@
                 return spEl('div', { class: 'plan' }, kids);
             }
             let text;
-            const top = d.buyers[0];
+            // 3.29.0: the best trader whose price is checked (it was the top row, checked or not, troll bid or not);
+            // with none checked, the best believable one - and the sentence says its price is not checked.
+            const real = d.buyers.filter((x) => !x.troll);
+            const sure = real.find((x) => !x.check || x.check.ok) || null;
+            const top = sure || real[0] || d.buyers[0];
             const p = this.state.prefs;
             const who = p.trustedOnly ? 'trusted buyer' : 'buyer';
             const pct = p.minProfitPct ?? 1;
@@ -30458,6 +30964,7 @@
             else if (d.planWhy === 'loading') text = 'Loading bazaars from TornW3B…';
             else if (!top) text = 'No flip: no ' + who + ' for this item.';
             else if (d.statItem) text = 'No flip: every copy is its own (weapons, armour, cars), and traders pay one price for one - nobody buys them by the hundred.';
+            else if (!sure && top.check && !top.check.ok && !top.troll && fresh && top.price > fresh.price) text = 'No flip yet: ' + top.name + '\'s list says ' + formatMoney(top.price) + ' and the cheapest bazaar asks ' + formatMoney(fresh.price) + ', but that price is not checked: ' + this.uncheckedWhy(top.check.why) + '.';
             else if (d.sellers.rows.some((r) => !r.stale && r.price < top.price && top.price - r.price < Math.max(1, (r.price * pct) / 100))) text = 'No flip: ' + top.name + ' pays ' + formatMoney(top.price) + ' and the cheapest bazaar asks ' + formatMoney(fresh.price) + '. That leaves ' + formatMoney(top.price - fresh.price) + ' a piece, under your least profit of ' + pct + '%.';
             else if (d.sellers.rows.some((r) => !r.stale && r.price < top.price)) text = 'No flip: none of these buyers can take it at a profit (their price is over 3× the average, or their networth is too small).';
             else if (fresh) text = 'No flip: ' + top.name + ' pays ' + formatMoney(top.price) + '; the cheapest bazaar asks ' + formatMoney(fresh.price) + ', ' + formatMoney(fresh.price - top.price) + ' over it.';
@@ -30480,13 +30987,18 @@
             box.hidden = !(d && d.held && d.where);
             if (box.hidden) return;
             const w = d.where;
-            const b = d.buyers[0];
+            // 3.29.0 - the trader this counts is the best one whose price is CHECKED (it was the top row, checked or
+            // not, troll bid or not). With none checked, the best believable one is named (`u`): muted, "not
+            // checked", with their lists and Refresh - never Best, never a trade link.
+            const b = w.trader || null;
+            const u = b ? null : w.unchecked || null;
+            const who = b || u;
             const n = d.held;
             // A trade with them is going already: the row points at it, and offers no second one.
-            const going = this.goingWith(d);
+            const going = who ? this.goingWith(d) : null;
             const folded = Boolean(going && this.planOnSide() && this.tradeKeyOnShow() === going[1].key);
             const rows = [
-                { venue: 'trader', name: 'Trade to ' + (b ? b.name : 'a trader'), when: going ? (going[0] === 'waiting' ? 'you asked ' + b.name + ' · it waits for their yes' : 'a trade with ' + b.name + ' is going') + (folded ? ' · below' : '') : 'paid now, in one trade', url: b && b.id ? tradeUrl(b.id) : null, go: b ? 'Start a trade with ' + b.name : '', missing: 'No ' + (this.state.prefs.trustedOnly ? 'trusted ' : '') + 'trader buys it' },
+                { venue: 'trader', name: 'Trade to ' + (who ? who.name : 'a trader'), when: going ? (going[0] === 'waiting' ? 'you asked ' + who.name + ' · it waits for their yes' : 'a trade with ' + who.name + ' is going') + (folded ? ' · below' : '') : 'paid now, in one trade', url: b && b.id ? tradeUrl(b.id) : null, go: b ? 'Start a trade with ' + b.name : '', missing: 'No ' + (this.state.prefs.trustedOnly ? 'trusted ' : '') + 'trader buys it' },
                 { venue: 'bazaar', name: 'Your bazaar', when: '$1 under the cheapest · paid when someone buys', url: MY_BAZAAR_ADD_URL, go: 'Add to your bazaar', missing: 'No bazaar listing to price against' },
                 { venue: 'market', name: 'Item Market', when: 'after the 5% fee · paid when someone buys', url: MARKET_ADD_URL, go: 'List on the Item Market', missing: d.market.state === 'loading' ? 'Checking the Item Market…' : 'No Item Market listing to price against' },
             ].map((r) => {
@@ -30503,17 +31015,21 @@
                 const listAt = r.venue === 'bazaar' && each !== null ? ' at ' + formatMoney(each) : r.venue === 'market' && d.market.lowest > 1 ? ' at ' + formatMoney(d.market.lowest - 1) : '';
                 // A listing counted for only the first N (as many as are listed near that price now): the rest go to the trader, and it says so.
                 const rest = b ? (loss ? ' · the rest to the trader' : ', the rest to the trader') : '';
+                // A trader named at a price that is not checked: what their list says, muted - and how to check it.
+                const unsure = r.venue === 'trader' && each === null && u ? u : null;
                 body.appendChild(spEl('div', { class: 'opt' + (win ? ' best' : '') + (each === null || loss ? ' dimo' : '') }, [
                     spEl('span', { class: 'w' }, [
                         spEl('b', { text: r.name + listAt }),
                         win ? spEl('span', { class: 'badge best', text: 'Best' }) : null,
-                        spEl('small', { text: each === null ? r.missing : loss ? 'No more than the ' + formatMoney(w.paid) + ' you paid: a loss' + (part ? ' on the first ' + count(v.units) + rest : '') : r.when + (part ? ' · first ' + count(v.units) + rest : '') }),
+                        spEl('small', { text: unsure ? unsure.name + '\'s list says ' + formatMoney(unsure.price) + ' each. Not checked: ' + this.uncheckedWhy(unsure.why) + '.'
+                            : each === null ? r.missing : loss ? 'No more than the ' + formatMoney(w.paid) + ' you paid: a loss' + (part ? ' on the first ' + count(v.units) + rest : '') : r.when + (part ? ' · first ' + count(v.units) + rest : '') }),
                     ]),
-                    spEl('span', { class: 'v' }, each === null ? [spEl('b', { text: '–' })] : [
+                    spEl('span', { class: 'v' }, unsure ? [spEl('b', { class: 't-muted', text: formatMoney(unsure.price * n) }), spEl('small', { class: 't-muted', text: 'not checked' })] : each === null ? [spEl('b', { text: '–' })] : [
                         spEl('b', { text: formatMoney(r.total) }),
                         gain !== null ? spEl('small', { class: gain <= 0 ? 'loss' : '', text: signed(gain) }) : n > 1 ? spEl('small', { class: 't-muted', text: formatMoney(each) + ' each' }) : null,
                     ]),
-                    r.venue === 'trader' && going ? (folded ? spEl('span') : spEl('button', { type: 'button', class: 'btn', 'data-focus': 'where:going', title: 'The trade with ' + b.name + ' is on Trades', text: 'Open on Trades', onclick: () => this.showTrade(going[0], going[1]) }))
+                    r.venue === 'trader' && going ? (folded ? spEl('span') : spEl('button', { type: 'button', class: 'btn', 'data-focus': 'where:going', title: 'The trade with ' + who.name + ' is on Trades', text: 'Open on Trades', onclick: () => this.showTrade(going[0], going[1]) }))
+                        : unsure ? spEl('span', {}, [...this.traderLinks(unsure), unsure.id && unsure.w3b > 0 ? this.wordBtn('Refresh', 'where:check', 'Reads ' + unsure.name + '\'s price list on TornW3B now, then who buys this item', () => this.h.onTraderCheck && this.h.onTraderCheck(d.itemId, unsure.tradeKey)) : null])
                         : r.url && each !== null && !loss ? this.link(r.go, r.url, { cls: 'btn out' + (win ? ' go' : ''), title: r.venue === 'trader' ? 'Start a trade on Torn' : r.venue === 'bazaar' ? 'Opens your bazaar\'s add page' : 'Opens the Item Market\'s add page', focus: 'where:' + r.venue }) : spEl('span'),
                 ]));
             }
@@ -30522,13 +31038,18 @@
             if (w.best === 'bazaar' || w.best === 'market') {
                 const won = w.options.find((x) => x.venue === w.best);
                 const place = (w.best === 'bazaar' ? 'your bazaar' : 'the Item Market') + (won && won.units < n ? ' for the first ' + count(won.units) + ' (as many as are listed near that price now)' : '');
-                verdict = b ? 'Best: ' + place + ', ' + signed(w.gain) + ' more than the trader, but you wait for a buyer.' : 'Best: ' + place + '. ' + rows.find((r) => r.venue === 'trader').missing + '.';
+                verdict = b ? 'Best: ' + place + ', ' + signed(w.gain) + ' more than the trader, but you wait for a buyer.'
+                    : u ? 'Best: ' + place + '. ' + u.name + '\'s price is not checked, so it is not counted.' : 'Best: ' + place + '. ' + rows.find((r) => r.venue === 'trader').missing + '.';
             } else if (w.best === 'trader' && bazaar && bazaar.each !== null) {
                 const diff = bazaar.total - b.price * n;
                 verdict = diff > 0 ? 'Your bazaar would get only ' + signed(diff) + ' more than ' + b.name + '\'s trade, and you would wait.' : 'Your bazaar would get ' + formatMoney(-diff) + ' less than ' + b.name + '\'s trade.';
             }
             if (verdict) body.appendChild(spEl('p', { class: 'note', text: verdict }));
-            if (!w.best && w.paid) body.appendChild(spEl('div', { class: 'amber' }, [spEl('span', {}, [spEl('b', { text: 'Nobody pays more than the ' + formatMoney(w.paid) + ' you paid.' }), ' It waits in To sell until someone does.'])]));
+            if (!w.best && w.paid) {
+                body.appendChild(spEl('div', { class: 'amber' }, [spEl('span', {}, u && u.price > w.paid
+                    ? [spEl('b', { text: 'No checked price is over the ' + formatMoney(w.paid) + ' you paid.' }), ' ' + u.name + '\'s ' + formatMoney(u.price) + ' waits for its check; it stays in To sell until then.']
+                    : [spEl('b', { text: 'Nobody pays more than the ' + formatMoney(w.paid) + ' you paid.' }), ' It waits in To sell until someone does.'])]));
+            }
             const kept = this.keptNow(d);
             if (kept !== null) {
                 body.appendChild(spEl('div', { class: 'field' }, [
@@ -30609,17 +31130,21 @@
                 const gain = ((s.toSell || {}).groups || []).reduce((a, g) => a + g.gain, 0);
                 this.tilesInto(this.mineTiles, 'mine', [
                     { label: 'In your inventory', value: count(H.items), small: 'items', sub: [b(count(H.paidKinds)), ' of ' + this.plural(H.kinds, 'kind') + ' a trader pays for'] },
-                    { label: 'Traders pay now', value: formatMoney(H.worth), good: H.worth > 0, sub: ['for all of it, each item at its best trader'] },
-                    { label: 'Bought to resell', value: count(rows.length), small: (rows.length === 1 ? 'kind' : 'kinds') + ' · ' + this.plural(rows.reduce((a, r) => a + r.qty, 0), 'item'), sub: [b(signed(gain), gain > 0 ? 't-good' : ''), ' over what you paid if sold now · see To sell'], onPick: () => this.go('sell'), title: 'Open To sell' },
+                    // 3.29.0: about (≈) while a price in it is not checked - a figure to read, not a price to act on.
+                    { label: 'Traders pay now', value: (H.approx ? '≈ ' : '') + formatMoney(H.worth), good: H.worth > 0, sub: ['for all of it, each item at its best trader' + (H.approx ? ' · some prices not checked' : '')], title: H.approx ? 'About: some of these prices were not checked with TornW3B in the last 5 minutes' : null },
+                    { label: 'Bought to resell', value: count(rows.length), small: (rows.length === 1 ? 'kind' : 'kinds') + ' · ' + this.plural(rows.reduce((a, r) => a + r.qty, 0), 'item'), sub: [b(signed(gain), gain > 0 ? 't-good' : ''), ' over what you paid if sold now, at checked prices · see To sell'], onPick: () => this.go('sell'), title: 'Open To sell' },
                 ]);
             } else if (page === 'sell') {
-                const T = s.toSell || { rows: [], groups: [], waiting: [] };
+                const T = s.toSell || { rows: [], groups: [], unchecked: [], waiting: [] };
                 const rows = T.rows || [];
                 const good = (T.groups || []).reduce((a, g) => a + g.rows.length, 0);
+                // 3.29.0: only what a CHECKED price makes is in the sum; a trader whose price waits for its check is counted beside it.
+                const unsure = (T.unchecked || []).length;
+                const nobody = (T.waiting || []).length;
                 this.tilesInto(this.sellTiles, 'sell', [
                     { label: 'Held to resell', value: count(rows.reduce((a, r) => a + r.qty, 0)), small: 'items', sub: ['you paid ', b(formatMoney(rows.reduce((a, r) => a + r.qty * r.each, 0))), ' in all'] },
-                    { label: 'If sold to traders now', value: signed((T.groups || []).reduce((a, g) => a + g.gain, 0)), good: good > 0, sub: [b(count(good)), ' of ' + this.plural(rows.length, 'kind') + ': a trader pays more than you paid'] },
-                    { label: 'Waiting', value: count((T.waiting || []).length), small: (T.waiting || []).length === 1 ? 'kind' : 'kinds', sub: ['nobody pays more than you paid yet' + ((T.kept || []).length ? ' · ' + count(T.kept.length) + ' not for sale' : '')] },
+                    { label: 'If sold to traders now', value: signed((T.groups || []).reduce((a, g) => a + g.gain, 0)), good: good > 0, sub: [b(count(good)), ' of ' + this.plural(rows.length, 'kind') + ': a trader pays more than you paid, price checked'] },
+                    { label: 'Waiting', value: count(unsure + nobody), small: unsure + nobody === 1 ? 'kind' : 'kinds', sub: [[unsure ? count(unsure) + ' for a price check' : null, nobody || !unsure ? 'nobody pays more than you paid yet' + (unsure ? ' for ' + count(nobody) : '') : null, (T.kept || []).length ? count(T.kept.length) + ' not for sale' : null].filter(Boolean).join(' · ')] },
                 ]);
             }
         }
@@ -31101,7 +31626,8 @@
                 const rest = { kinds: H.kinds - H.top.length, worth: H.worth - H.top.reduce((a, r) => a + r.worth, 0) };
                 const share = (v) => Math.max(1, (v / Math.max(1, H.worth)) * 100).toFixed(1) + '%';
                 hbox.append(...[
-                    spEl('div', { class: 'bigrow' }, [spEl('div', { class: 'hero', text: formatMoney(H.worth) }), spEl('div', { class: 'eq', text: count(H.items) + ' items · ' + this.plural(H.kinds, 'kind') })]),
+                    // 3.29.0: about (≈) while a price in it is not checked.
+                    spEl('div', { class: 'bigrow' }, [spEl('div', { class: 'hero', title: H.approx ? 'About: some of these prices were not checked with TornW3B in the last 5 minutes' : null, text: (H.approx ? '≈ ' : '') + formatMoney(H.worth) }), spEl('div', { class: 'eq', text: count(H.items) + ' items · ' + this.plural(H.kinds, 'kind') })]),
                     spEl('div', { class: 'stack' }, [...H.top.map((r, i) => spVars(spEl('i'), { '--c': greys[i], '--w': share(r.worth) })), rest.kinds > 0 ? spVars(spEl('i'), { '--c': greys[4], '--w': share(rest.worth) }) : null]),
                     ...H.top.map((r, i) => spEl('div', { class: 'hl' }, [spVars(spEl('i'), { '--c': greys[i] }), spEl('b', { text: r.name }), ' × ' + count(r.held), spEl('span', { text: formatMoney(r.worth) })])),
                     rest.kinds > 0 ? spEl('div', { class: 'hl' }, [spVars(spEl('i'), { '--c': greys[4] }), this.plural(rest.kinds, 'more kind'), spEl('span', { text: formatMoney(rest.worth) })]) : null,
@@ -32877,10 +33403,16 @@
      * second data attribute on the same card: still nothing appended.
      */
     const TRADER_OLD_KEY = 'ttv2TraderOld';
+    /*
+     * Their price is one Torn Bids has not checked in the last minutes (3.29.0):
+     * the tag is drawn muted (grey, no blue). A third data attribute on the same
+     * card: still nothing appended.
+     */
+    const TRADER_UNSURE_KEY = 'ttv2TraderUnsure';
 
     /**
      * Tag these cards, and untag every other one.
-     * @param {Array<{el: Element, label: string, old?: 'aging'|'stale'|null}>} rows
+     * @param {Array<{el: Element, label: string, old?: 'aging'|'stale'|null, unchecked?: boolean}>} rows
      */
     function markTraderTags(rows, root = document) {
         const keep = new Set();
@@ -32892,12 +33424,15 @@
             const old = row.old === 'aging' || row.old === 'stale' ? row.old : null;
             if (!old) delete row.el.dataset[TRADER_OLD_KEY];
             else if (row.el.dataset[TRADER_OLD_KEY] !== old) row.el.dataset[TRADER_OLD_KEY] = old;
+            if (!row.unchecked) delete row.el.dataset[TRADER_UNSURE_KEY];
+            else if (row.el.dataset[TRADER_UNSURE_KEY] !== '1') row.el.dataset[TRADER_UNSURE_KEY] = '1';
         }
         for (const el of root.querySelectorAll('[' + TRADER_DATA_ATTR + ']')) {
             if (keep.has(el)) continue;
             el.classList.remove(TRADER_CLASS);
             delete el.dataset[TRADER_DATA_KEY];
             delete el.dataset[TRADER_OLD_KEY];
+            delete el.dataset[TRADER_UNSURE_KEY];
         }
     }
 
@@ -33473,6 +34008,7 @@
 
 
 
+
     const STORE_KEY = 'apiKey';
     const STORE_ITEMS = 'itemsCache';
     const STORE_NPC = 'npcCache';
@@ -33573,6 +34109,8 @@
     const STORE_BOUGHT_WINDOW = 'boughtWindow';
     /* What traders agreed to pay, per accepted trade (core/ledger.js): the Ledger splits a trade's money by it. */
     const STORE_SELL_PRICE_RECORDS = 'sellPriceRecords';
+    /* 3.29.0 - the prices Torn Bids has checked in the last minutes, for the tags on Torn's pages (core/checked.js). */
+    const STORE_SELL_CHECKED = 'sellChecked';
     /* Traders never offered anything (3.14.3): [{key, id, name, at}]; their bazaars are still used. */
     const STORE_SELL_BLACKLIST = 'sellBlacklist';
     /* Favourites you added or removed by hand: {added: [ids], removed: [ids]}. */
@@ -34693,6 +35231,17 @@
         return lookup.best.get(id);
     }
 
+    /*
+     * 3.29.0 - is a trader's price one Torn Bids checked in the last minutes (core/checked.js)? From the small
+     * table Torn Bids writes while its tab is open; read again at most every CHECKED_READ_MS. No request of its own.
+     */
+    const CHECKED_READ_MS = 10 * 1000;
+    function priceCheckedHere(itemId, buyer, now = Date.now()) {
+        if (!buyer || !buyer.id) return false;
+        if (!app.checkedTable || now - app.checkedTable.readAt > CHECKED_READ_MS) app.checkedTable = { readAt: now, table: gmGet(STORE_SELL_CHECKED, null) };
+        return checkedInTable(app.checkedTable.table, itemId, buyer.id, buyer.price, now);
+    }
+
     /** The cards on this bazaar a trusted trader pays more for, with the words for each. */
     function traderTags(listings) {
         const rows = [];
@@ -34701,12 +35250,14 @@
         for (const l of listings) {
             if (!l.el) continue;
             const buyer = trustedBuyerOf(l.itemId);
-            const label = traderTagLabel(buyer, l.listingPrice);
+            // 3.29.0: a price Torn Bids has not checked in the last 5 minutes is named, muted, with no profit beside it.
+            const unchecked = Boolean(buyer) && !priceCheckedHere(l.itemId, buyer, now);
+            const label = traderTagLabel(buyer, l.listingPrice, !unchecked);
             if (!label) continue;
             // Their price is from a list not changed in over 24 hours (3.23.0): an amber dot in the tag.
             const old = oldList(buyer, listAtOf, now);
             const known = app.index && app.index.byId ? app.index.byId.get(String(l.itemId)) : null;
-            rows.push({ el: l.el, label, old: old ? old.level : null, itemId: String(l.itemId), name: known ? known.name : 'Item ' + l.itemId, qty: Number(l.qty) || 1, price: l.listingPrice });
+            rows.push({ el: l.el, label, old: old ? old.level : null, unchecked, itemId: String(l.itemId), name: known ? known.name : 'Item ' + l.itemId, qty: Number(l.qty) || 1, price: l.listingPrice });
         }
         return rows;
     }
@@ -34832,6 +35383,7 @@
             price: r.price,
             label: 'at ' + formatMoney(r.price) + ' · ' + r.label,
             old: Boolean(r.old),
+            unchecked: Boolean(r.unchecked),
             onShow: () => markTarget(r.el, true),
         }));
         const lock = jobLock(accepted);
@@ -37593,7 +38145,7 @@
         const inside = onTradePage ? check.inside : null;
         const cart = checkoutList(trade, { here, inside });
         for (const l of cart.lines) l.url = l.sellerId ? bazaarUrl(l.sellerId, l.itemId, l.price) : null;
-        app.bought.render({ ...boughtSince(trade, { inside }), onTradePage, key: trade.key, cart, logNote: logBuysNote(), holding: sellElsewhere(trade, buyersForHolding) });
+        app.bought.render({ ...boughtSince(trade, { inside }), onTradePage, key: trade.key, cart, logNote: logBuysNote(), holding: sellElsewhere(trade, buyersForHolding, (itemId, b) => priceCheckedHere(itemId, b)) });
     }
 
     /** Whether Torn Bids checked your buys with your Torn log (3.16), in one line for Checkout. */
@@ -39608,7 +40160,7 @@
         keys.push(
             STORE_W3B_COOLDOWN, STORE_W3B_PACE, STORE_IM_WATCH, STORE_BIDS_SEEN, STORE_LIST_AT, STORE_SELL_DECLINED, STORE_SELL_ASKED, STORE_SELL_ENDED, STORE_SELL_ENDED_FULL, STORE_SELL_PAST, STORE_SELL_CANCELLED, STORE_BOUGHT_WINDOW, STORE_SELL_PRICE_RECORDS, STORE_SELL_BLACKLIST,
             STORE_SELL_FAVOURITES, STORE_SELL_TE_OWN, STORE_CHAT_WANTED, STORE_SELL_MOVES, STORE_LEDGER_REV, STORE_SELL_PRESENCE, STORE_SELL_HELD, STORE_SELL_WAS,
-            FEED_LEADER_KEY, FEED_RECHECK_KEY, FEED_REFRESH_KEY, SPEED_STORE_KEY, STORE_CLEANED,
+            FEED_LEADER_KEY, FEED_RECHECK_KEY, FEED_REFRESH_KEY, SPEED_STORE_KEY, STORE_CLEANED, STORE_SELL_CHECKED,
             STORE_API_WINDOW + '.' + app.tabId, STORE_W3B_WINDOW + '.' + app.tabId,
         );
         const rows = [];
@@ -40311,9 +40863,11 @@
      */
     function w3bIndex(now) {
         if (!sell.w3bIndex || now - sell.w3bIndexAt > 60000) {
+            const t0 = perfNow();
             sell.w3bIndex = indexW3bByItem(sell.db, now);
             sell.dbIdsByName = traderIdsByName(sell.db);
             sell.w3bIndexAt = now;
+            perfAdd(SPEED_BIDS.index, perfNow() - t0);
         }
         return sell.w3bIndex;
     }
@@ -41253,7 +41807,8 @@
         // 3.26.0: the traders of the trade on the desk - their own lists, well inside the check, so the whole
         // trade stands on prices read minutes ago (a list is not TornW3B's limited kind).
         if (!hidden) {
-            const dueList = [...(sell.deskTraders || [])].find((id) => {
+            // (3.29.0: and the traders of your pinned trades.)
+            const dueList = [...new Set([...(sell.deskTraders || []), ...(sell.pinTraders || [])])].find((id) => {
                 const w = sell.db && sell.db.traders && sell.db.traders[id] ? sell.db.traders[id].w3b : null;
                 return w && w.found && now - (w.at || 0) >= FLIP_RECHECK_MS && !(w.errorAt && now - w.errorAt < W3B_FAILED_RETRY_MS * 5);
             });
@@ -41304,7 +41859,8 @@
             candidates: candOrder,
             pinned: pinnedIds,
             // Every buyer: the desk's item, what you hold, then the possible flips.
-            buyers: [...new Set([sell.selected, ...[...heldIds()].slice(0, 20), ...candIds].filter(Boolean).map(String))],
+            // (3.29.0: and everything in To sell, before the first 20 of what else you hold.)
+            buyers: [...new Set([sell.selected, ...(sell.toSellIds || []), ...[...heldIds()].slice(0, 20), ...candIds].filter(Boolean).map(String))],
             buyersDue: (id) => itemTradersDue(id, now),
             // The items with a flip shown or possible: their buyers before more bazaars (a flip needs its check).
             check: sell.flipCheckIds || [],
@@ -41467,8 +42023,20 @@
         if (!id || !sell.w3b || !sell.db || !sell.db.traders || !sell.db.traders[id]) return false;
         if (now - (planReread.get(id) || 0) < every) return false;
         planReread.set(id, now);
-        loadW3bList(id).then(() => renderSelling());
+        // 3.29.0: said on the trade while it is out ("Reading their price list…"), and its answer is the answer to
+        // something you pressed - drawn after a moment, not in the data's turn.
+        const reading = sell.listReading || (sell.listReading = new Map());
+        const done = loadW3bList(id).then(() => {
+            if (reading.get(id) && reading.get(id).done === done) reading.delete(id);
+            renderSelling(true);
+        });
+        reading.set(id, { since: now, done });
         return true;
+    }
+
+    /** The trader id of a trade key ('id:123'), or null (a trader known by name only has no list to read). */
+    function traderIdOfKey(key) {
+        return /^id:\d+$/.test(String(key || '')) ? String(key).slice(3) : null;
     }
 
     /*
@@ -41476,8 +42044,15 @@
      * price list from there and we get fresh prices"): their own list at once, and the item's buyers after
      * it. Neither is TornW3B's limited kind. Not more often than every 15 seconds for one trader.
      */
+    /*
+     * 3.29.0 - and at the moment you take a deal (the owner, 2026-10-12: "does this also fix the issue that the price
+     * list is always fresh when getting a deal? remember tornbids exist ebcause of fast flips to traders"): a shown
+     * flip's price was confirmed up to 5 minutes ago, and nothing read the trader's list when a deal was pressed -
+     * only the Refresh word did. Now picking a flip, Plan trade, To sell's "Trade these to X" and "X said yes" each
+     * read that trader's list (`why` says which, for the log). One list read a press; the 15 seconds stay.
+     */
     const TRADER_CHECK_MS = 15 * 1000;
-    function checkTraderNow(itemId, key) {
+    function checkTraderNow(itemId, key, why = 'Check now') {
         const asked = rereadTraderList(key, Date.now(), TRADER_CHECK_MS);
         const id = String(itemId || '');
         const it = id ? sell.itemTraders.get(id) : null;
@@ -41485,8 +42060,9 @@
             sell.refreshQueue = [{ kind: 'buyers', id }, ...(sell.refreshQueue || []).filter((q) => !(q.kind === 'buyers' && String(q.id) === id))];
             sell.refreshAt = Date.now();
         }
-        logProblem('note', 'Check now: the price list of trader ' + String(key).replace(/^id:/, '') + (asked ? ' is read again' : ' was read under 15 s ago') + (id ? ', then the buyers of item ' + id : ''));
+        logProblem('note', why + ': the price list of trader ' + String(key).replace(/^id:/, '') + (asked ? ' is read again' : traderIdOfKey(key) ? ' was read under 15 s ago' : ' cannot be read (known by name only)') + (id ? ', then the buyers of item ' + id : ''));
         stepW3b();
+        return asked;
     }
 
     /* For the log, the first few of a session: a list read again that changed what a buyers read had said. */
@@ -41551,7 +42127,13 @@
             .then((body) => {
                 const at = Date.now();
                 const prices = parseW3bPriceList(body);
-                recordW3bList(sell.db, id, { prices }, at);
+                // 3.29.0: how many of their prices this read changed (a price moved, taken off or new) - said on the
+                // trade with them ("2 prices had changed"). Only against a list this page held: a first read changes none.
+                const was = sell.db && sell.db.traders[String(id)] && sell.db.traders[String(id)].w3b && sell.db.traders[String(id)].w3b.found ? sell.db.traders[String(id)].w3b.prices : null;
+                let changed = 0;
+                if (was) for (const k of new Set([...Object.keys(was), ...Object.keys(prices)])) if (Number(was[k]) !== Number(prices[k])) changed += 1;
+                (sell.listRead || (sell.listRead = new Map())).set(String(id), { at, changed, known: Boolean(was) });
+                recordW3bList(sell.db, id, { prices, bulk: parseW3bBulk(body) }, at);
                 shareOwnList(id, prices, at);
                 // 3.26.0: what the list says now stands over an older read of an item's buyers (core/checked.js).
                 const moved = applyListToItemBuyers(sell.itemTraders, id, prices, at);
@@ -41742,7 +42324,7 @@
         ]);
         for (const [id, score] of votes) if (!votesById.has(id)) votesById.set(id, score);
         // Torn Bids keeps each item's rows between redraws (3.18.0, core/kept-buyers.js): what every item shares is looked at once here.
-        if (keeper) keeper.begin({ idsByName, dbIdsByName, votesById, db });
+        if (keeper) keeper.begin({ idsByName, dbIdsByName, votesById, db }, now);
         const cache = new Map();
         return (itemId) => {
             const id = String(itemId);
@@ -41776,18 +42358,33 @@
 
     /**
      * Torn Bids' kept buyers (3.18.0): made once a page. Should its own check
-     * ever find a kept item different from a fresh one, it stops keeping (every
-     * redraw then works every item out, as before 3.18.0) and the problem log
-     * says so - the next zip shows it.
+     * ever find a kept item different from a fresh one, the problem log says so
+     * (the next zip shows it), everything kept is dropped, that redraw is worked
+     * out fresh, and keeping begins again with the next (3.29.0; until then it
+     * stayed off until the page was reloaded, and every redraw worked every item
+     * out). No kept row stands for longer than about a minute (core/kept.js).
      */
     function sellBuyersKeeper() {
         if (!sell.buyersKeeper) {
             sell.buyersKeeper = makeBuyersKeeper({
                 // 3.28.1: where they part is said (kept -> fresh), so the next zip names what the keeping did not look at.
-                onDiffer: (itemId, where) => logProblem('error', 'Kept buyers differed from fresh ones (item ' + itemId + ')', 'keeping is off until this page is reloaded; nothing shown was wrong after this line. Where, kept -> fresh: ' + (where || 'not found') + '. This page was opened ' + sellPageMinutes() + ' min ago'),
+                onDiffer: (itemId, where) => sellKeptDiffered('buyers', itemId, where),
             });
         }
         return sell.buyersKeeper;
+    }
+
+    /**
+     * A kept result differed from a fresh one (3.29.0: keeping comes back by itself): said in the problem log with
+     * where they part (kept -> fresh), so a zip names what the keeping did not look at. The first few times in
+     * full, then every 25th - should it happen every redraw, the log is not filled with it.
+     */
+    function sellKeptDiffered(what, itemId, where) {
+        const seen = sell.keptDiffered || (sell.keptDiffered = {});
+        const n = (seen[what] = (seen[what] || 0) + 1);
+        if (n > 5 && n % 25 !== 0) return;
+        logProblem('error', 'Kept ' + what + ' differed from fresh ones (item ' + itemId + ')' + (n > 1 ? ', ' + n + ' times since this page opened' : ''),
+            'everything kept was dropped and this redraw worked out fresh; keeping goes on from the next. No kept result is older than about a minute. Where, kept -> fresh: ' + (where || 'not found') + '. This page was opened ' + sellPageMinutes() + ' min ago');
     }
 
     /**
@@ -41803,10 +42400,11 @@
                 makeKeeper({
                     checkAll,
                     freeze: checkAll,
-                    onDiffer: (itemId, where) => logProblem('error', 'Kept ' + what + ' differed from fresh ones (item ' + itemId + ')', 'keeping is off until this page is reloaded; nothing shown was wrong after this line. Where, kept -> fresh: ' + (where || 'not found') + '. This page was opened ' + sellPageMinutes() + ' min ago'),
+                    onDiffer: (itemId, where) => sellKeptDiffered(what, itemId, where),
                 });
-            sell.workKeepers = { sellers: make('bazaars'), plans: make('flip plans') };
-            logProblem('note', 'Kept between redraws: each item\'s bazaars and flip plan' + (checkAll ? ' (every kept result checked)' : ''), '');
+            // 3.29.0: the list an item shows (its buyers without the blacklisted, favourites first on a tie) and its possible flip too.
+            sell.workKeepers = { sellers: make('bazaars'), plans: make('flip plans'), shown: make('shown buyers'), possible: make('possible flips'), shownVer: shownVersions() };
+            logProblem('note', 'Kept between redraws: each item\'s bazaars, flip plan, shown buyers and possible flip' + (checkAll ? ' (every kept result checked)' : ''), '');
         }
         return sell.workKeepers;
     }
@@ -41816,13 +42414,16 @@
         return sell.pageSince ? Math.round((now - sell.pageSince) / 60000) : 0;
     }
 
-    /** The three results kept between redraws, as [words for the speed log, the keeper]. */
+    /** The results kept between redraws, as [words for the speed log, the keeper]. */
     function sellKeepersNow() {
         const G = SPEED_BIDS;
+        const work = sell.workKeepers || {};
         return [
             ['buyers', G.buyersKept, G.buyersRedone, G.buyersOn, sell.buyersKeeper || null],
-            ['bazaars', G.sellersKept, G.sellersRedone, G.sellersOn, sell.workKeepers ? sell.workKeepers.sellers : null],
-            ['plans', G.plansKept, G.plansRedone, G.plansOn, sell.workKeepers ? sell.workKeepers.plans : null],
+            ['shown', G.shownKept, G.shownRedone, G.shownOn, work.shown || null],
+            ['bazaars', G.sellersKept, G.sellersRedone, G.sellersOn, work.sellers || null],
+            ['plans', G.plansKept, G.plansRedone, G.plansOn, work.plans || null],
+            ['possible', G.possibleKept, G.possibleRedone, G.possibleOn, work.possible || null],
         ];
     }
 
@@ -41854,7 +42455,7 @@
         }
         sell.shownWas = nowShown;
         // What was kept from the redraw before and what was worked out again (the pieces before this redraw too),
-        // and whether each keeping is still on: one that found a kept result differing is off until a reload.
+        // and whether each keeping is on: one that found a kept result differing is off for the rest of that redraw.
         const seen = sell.keptSeen || (sell.keptSeen = {});
         for (const [name, kept, redone, on, k] of sellKeepersNow()) {
             if (!k) continue;
@@ -41904,16 +42505,15 @@
         return typeof performance !== 'undefined' && typeof performance.now === 'function' ? performance.now() : Date.now();
     }
 
-    function renderSelling(yours = false) {
-        if (sell.warm) {
+    function renderSelling(yours = false, by = null) {
+        if (sell.warm && !yours) {
             // The buyers are being worked out in pieces: the draw follows them, and one more for this.
-            if (!yours) {
-                sell.warm.asked = true;
-                return;
-            }
-            // Something you pressed does not wait for them: its own draw, in one go.
-            stopSellWarm();
+            sell.warm.asked = true;
+            return;
         }
+        // (Something you pressed does not wait for the pieces: its own draw, in one go - which takes over what
+        // they have worked out so far, 3.29.0. Until then it threw that away and worked every item out again.)
+        if (yours) sell.redrawBy = by || 'byPress';
         const now = sellClock();
         let due = now + (yours ? SELL_RENDER_MS : redrawWait({ base: SELL_RENDER_MS, took: sell.redrawTook, ended: sell.redrawEnded, now }));
         if (sell.renderTimer) {
@@ -41962,7 +42562,7 @@
             w.at = w.ids.length;
         }
         if (w.at < w.ids.length) {
-            perfDone('Torn Bids buyers worked out in pieces (before a redraw)', t0);
+            perfDone(SPEED_BIDS.pieces, t0);
             w.worked += sellClock() - t0;
             // The page is free until the next piece: an answer may land, so the kept buyers look again before the next item.
             sellBuyersKeeper().unsettled();
@@ -41972,6 +42572,7 @@
         sell.warm = null;
         // The last piece and the draw are one stretch of work: counted as one redraw.
         try {
+            sell.redrawBy = 'byData';
             renderSellingNow(w.src, t0, w.worked);
         } finally {
             // What arrived while the pieces were worked out is in the next one (also after a draw that went wrong).
@@ -41998,6 +42599,7 @@
         if (sell.typedTimer) return;
         sell.typedTimer = setTimeout(() => {
             sell.typedTimer = null;
+            sell.redrawBy = 'byTyping';
             if (document.visibilityState !== 'visible') {
                 renderSellingNow();
                 return;
@@ -42045,8 +42647,28 @@
     function renderSellingNow(src = null, t0 = sellClock(), before = 0) {
         sell.drew = false;
         sell.hiddenWork = false;
-        // Pieces under way are overtaken by this draw (it works out what they had not reached).
+        // Who asked for this one (3.29.0, for the speed log): set by whoever led here, else the page itself, at once.
+        const by = sell.redrawBy || 'byOther';
+        sell.redrawBy = null;
+        /*
+         * Pieces under way are overtaken by this draw: it works out what they had not reached - with THEIR
+         * lookup (3.29.0), so what they did reach is not worked out a second time. Until then a draw for
+         * something pressed (and each status answer after it) threw the pieces away and began again, and the
+         * data they were for then asked for another: on the owner's page freezes came 150 ms apart, where
+         * the redraw budget should have left three times a redraw free between two.
+         * What arrived since the pieces began keeps its own redraw, on the budget. Not when the press itself
+         * changed who buys what (a favourite starred or dropped, a trader blacklisted): afresh then.
+         */
+        let again = false;
+        const w = sell.warm;
         stopSellWarm();
+        if (!src && w && document.visibilityState === 'visible' && sellSourcesStand(w.src)) {
+            src = w.src;
+            before = w.worked;
+            again = true;
+            // The page was free since the last piece: the kept buyers look again before the rest.
+            sellBuyersKeeper().unsettled();
+        }
         // 3.28.1 - the yardstick: the same small sum once a minute, just before the work it is the measure of.
         const yardAt = Date.now();
         if (sell.page && yardAt - (sell.yardAt || 0) >= 60000) {
@@ -42067,7 +42689,21 @@
                 sell.perfStartNoted = true;
                 perfStartup({ script: SCRIPT_START_MS, panel: perfNow(), items: null });
             }
+            if (sell.drew && SPEED_BIDS[by]) perfGauge(SPEED_BIDS[by], 1);
+            // What the pieces were for, and what arrived while they were worked out: its own redraw, in its turn.
+            if (again) renderSelling();
         }
+    }
+
+    /**
+     * Do the buyers a redraw's pieces were worked out from still stand for a draw you asked for? Yes, unless
+     * who your favourites are changed since (starred, dropped, blacklisted): their own lists are part of who
+     * buys what, and a star must show at once.
+     */
+    function sellSourcesStand(src) {
+        if (!src || !Array.isArray(src.favsNow)) return false;
+        const now = favouriteTraders(Date.now());
+        return now.length === src.favsNow.length && now.every((f, i) => f.id === src.favsNow[i].id);
     }
 
     /**
@@ -42127,7 +42763,7 @@
             stageT0 = perfNow();
         };
         // 3.28.1 - the many small calls inside a redraw, added up by kind: which of them the time goes to.
-        const inside = { buyers: 0, sellers: 0, plans: 0, possible: 0 };
+        const inside = { buyers: 0, shown: 0, sellers: 0, plans: 0, possible: 0 };
         if (!sell.pageSince) sell.pageSince = now;
         const prefs = sellPrefs();
         const st = teState();
@@ -42142,7 +42778,14 @@
             sell.lastSrc = sources;
             sell.lastSrcAt = now;
         }
-        const levelOf = (id) => presenceLevel(sellPresenceOf(id));
+        // Asked once per trader a redraw (3.29.0): Buyers online only asked it of every buyer row of every item.
+        const levelCache = new Map();
+        const levelOf = (id) => {
+            const key = String(id);
+            let level = levelCache.get(key);
+            if (level === undefined) levelCache.set(key, (level = presenceLevel(sellPresenceOf(key))));
+            return level;
+        };
         // Trusted means Known (20+ votes) or Trusted; while TornExchange's votes
         // are not loaded, a trader without any is kept ("no votes yet").
         const votesMissing = !(teMap.size > 0) && !(sell.votes && sell.votes.size > 0);
@@ -42154,38 +42797,38 @@
             if (st.whoName) partnerOf.set('name:' + String(st.whoName).toLowerCase(), st);
         }
         const favEdits = sellFavourites();
-        // Added by hand: looked up, not searched for, per buyer (3.17.1; the same answer).
-        const favAdded = new Set((favEdits.added || []).map(String));
         const statOf = (b) => partnerOf.get(partnerKey(b)) || (b && b.name ? partnerOf.get('name:' + String(b.name).toLowerCase()) : null) || null;
-        const favOf = (b) => {
-            const st = statOf(b);
-            return st ? isFavourite(st, favEdits, now) : Boolean(b && b.id && favAdded.has(String(b.id)));
-        };
+        // Who is a favourite now: worked out once a redraw (3.29.0, core/shown-buyers.js), looked up per buyer.
+        const favNow = shownFavourites(partnersNow(), favEdits, now);
+        const favOf = favNow.isFav;
         const blacklist = blacklistKeys(sellBlacklist());
         const listAtOf = (id) => sell.listAt.get(String(id)) || 0;
         // Every buyer lookup that is not the shown list (a pinned or picked trade, its bids) skips them too.
         const buyersAllowed = (id) => withoutBlacklisted(buyersAll(id), blacklist);
         // Every trader with a Trusted badge seen on any item (Your traders scans them).
         const trustedSeen = new Map();
+        // Each item's bazaars, flip plan, shown buyers and possible flip are kept between redraws (core/kept.js).
+        const keepers = sellWorkKeepers();
+        keepers.sellers.begin(now);
+        keepers.plans.begin(now);
+        keepers.shown.begin(now);
+        keepers.possible.begin(now);
+        // One number for "your blacklist and your favourites are what they were": a kept list holds while it stands.
+        const shownVer = keepers.shownVer(favNow.word, blacklist);
+        const shownOpts = { prefs, levelOf, votesMissing, listAtOf, now, trustById: sell.trustById, trustedSeen };
         const buyersOf = (id) => {
             const key = String(id);
             let b = shownCache.get(key);
             if (!b) {
-                // Blacklisted traders are never buyers (their bazaars still are sellers); favourites first on a tie.
                 const tb = perfNow();
                 const all = buyersAll(key);
-                inside.buyers += perfNow() - tb;
-                // Each trader's TornExchange / TornW3B badge, for the Ledger's Traders tab.
-                for (const x of all) {
-                    if (!x || !x.id || !x.trust) continue;
-                    sell.trustById.set(String(x.id), x.trust);
-                    if (x.trust.level === 'Trusted' && !trustedSeen.has(String(x.id))) trustedSeen.set(String(x.id), x);
-                }
-                b = favouritesFirstOnTie(withoutBlacklisted(all, blacklist), favOf);
-                if (prefs.onlineOnly) b = onlineOnly(b, levelOf);
-                if (prefs.trustedOnly) b = trustedOnly(b, { min: 'Known', keepUnrated: votesMissing });
-                // Fresh prices only (3.22.0): a TornW3B price from a list not changed in two days is not shown.
-                if (prefs.freshOnly) b = freshOnly(b, listAtOf, now);
+                const ts = perfNow();
+                inside.buyers += ts - tb;
+                // 3.29.0 - blacklisted traders are never buyers (their bazaars still are sellers), favourites first on a
+                // tie: kept while the item's rows are the very list they were (core/shown-buyers.js). Then each trader's
+                // badge noted for the Ledger's Traders tab, and your Show choices - those move with every status read.
+                b = shownBuyers(keepers.shown.get(key, [all, shownVer], () => shownKept(all, blacklist, favOf)), shownOpts);
+                inside.shown += perfNow() - ts;
                 shownCache.set(key, b);
             }
             return b;
@@ -42227,9 +42870,37 @@
         // it for"). Least profit decides what is worth BUYING; it kept these out of the plan, Checkout and
         // Fill all whenever the trader paid over your cost but under that margin.
         const sellEnough = (per) => per > 0;
+        /*
+         * 3.26.0 (core/checked.js; the owner, 2026-10-11: "everytime it shows a flip, its because the item list is
+         * checked"): a flip, and a line of a trade, only with a buyer whose price TornW3B confirmed minutes ago and
+         * whose list changed within a day. The believable buyers still say which bazaars are worth reading
+         * and what an item is worth; what they would make unchecked is a possible flip, checked first.
+         * 3.29.0: and so everywhere a trader's price is something to act on - To sell, the "yours" lines of a
+         * trade, Where to sell, a held trade's lines (the owner's page, 2026-10-12: To sell named a trader at a
+         * price nobody had checked for hours). The last price a check stood on is remembered for the page's life:
+         * a held trade's line whose check lapsed keeps it, and says how long ago it was checked.
+         */
+        const checkCache = new Map();
+        const lastChecked = sell.lastChecked || (sell.lastChecked = new Map());
+        const checkOf = (id, b) => {
+            const k = String(id) + '|' + (b.id || b.name);
+            let c = checkCache.get(k);
+            if (!c) {
+                const it = sell.itemTraders.get(String(id));
+                const own = b.id && sell.db.traders[b.id] ? sell.db.traders[b.id].w3b : null;
+                c = priceChecked(b, { itemId: String(id), item: it && it.at ? it : null, list: own || null, listAt: b.id ? listAtOf(b.id) : 0, now });
+                checkCache.set(k, c);
+                if (c.ok) {
+                    if (lastChecked.size > 5000) lastChecked.clear();
+                    lastChecked.set(k, { price: b.price, at: c.at });
+                }
+            }
+            return c;
+        };
         // (Your own bazaar as a way out is added once the bazaars are looked up, further down.)
-        let toSell = toSellRows(leftovers, { buyersOf, enough: sellEnough });
-        const toSellLines = toSellHeld(leftovers, { buyersOf, enough: sellEnough });
+        let toSell = toSellRows(leftovers, { buyersOf, enough: sellEnough, checkOf });
+        // The "yours" lines of a trade: the ones whose price is not checked are listed as waiting, and counted nowhere.
+        const toSellLines = toSellHeld(leftovers, { buyersOf, enough: sellEnough, checkOf });
         const toSellIds = new Set(toSell.map((r) => r.itemId));
         // The overlay's summary copy (every 30 s while a Torn tab is open), when newer (3.15).
         const sharedSummary = gmGet(STORE_W3B_SUMMARY, null);
@@ -42313,10 +42984,7 @@
         const rowsNow = (b, key) => (sharedReads ? withShared(b.rows, key, sharedReads.index, sharedReads.joined) : b.rows);
         // 3.26.2: an item this PC has no sellers list of has the server's listings as its sellers.
         if (sharedReads) serverBazaars(sharedReads.index, now);
-        // ...and kept between redraws (3.25.0) while its read, your marks on it and the server's reads are what they were.
-        const keepers = sellWorkKeepers();
-        keepers.sellers.begin();
-        keepers.plans.begin();
+        // ...and kept between redraws (3.25.0, `keepers` above) while its read, your marks on it and the server's reads are what they were.
         // Your marks on an item's bazaars (gone, the stock a page showed, what you or a friend bought), as one word per item.
         let ownSigs = null;
         const ownSigOf = (key) => {
@@ -42369,7 +43037,7 @@
             return s ? s.lowestPrice : null;
         };
         // To sell, now that the bazaars are known: your own bazaar where it is over what you paid (never a loss).
-        toSell = toSellRows(leftovers, { buyersOf, enough: sellEnough, bazaarOf: lowestOf });
+        toSell = toSellRows(leftovers, { buyersOf, enough: sellEnough, bazaarOf: lowestOf, checkOf });
         // A flip sells to a believable buyer only (see flipBuyer), and never
         // buys more than your Most per flip.
         // ...and never asks a trader to pay more than your share of their networth.
@@ -42417,24 +43085,6 @@
             }
             return flipBuyersCache.get(key);
         };
-        /*
-         * 3.26.0 (core/checked.js; the owner, 2026-10-11: "everytime it shows a flip, its because the item list is
-         * checked"): a flip, and a line of a trade, only with a buyer whose price TornW3B confirmed minutes ago and
-         * whose list changed within a day. The believable buyers above still say which bazaars are worth reading
-         * and what an item is worth; what they would make unchecked is a possible flip, checked first.
-         */
-        const checkCache = new Map();
-        const checkOf = (id, b) => {
-            const k = String(id) + '|' + (b.id || b.name);
-            let c = checkCache.get(k);
-            if (!c) {
-                const it = sell.itemTraders.get(String(id));
-                const own = b.id && sell.db.traders[b.id] ? sell.db.traders[b.id].w3b : null;
-                c = priceChecked(b, { itemId: String(id), item: it && it.at ? it : null, list: own || null, listAt: b.id ? listAtOf(b.id) : 0, now });
-                checkCache.set(k, c);
-            }
-            return c;
-        };
         // What Torn Bids sees of one trader's prices right now (3.27.0, core/past-trades.js): asked for at a yes and at a trade's end.
         sell.pricesSeen = (key, ids) => {
             const keyOf = (b) => (b.id ? 'id:' + b.id : 'name:' + String(b.name).toLowerCase());
@@ -42461,6 +43111,30 @@
                 flipCheckedCache.set(key, list);
             }
             return list;
+        };
+        // 3.29.0 - what a trader pays for an item of a trade that is HELD or pinned (its lines stay as they were):
+        // their price now while it is checked; else the last price a check stood on, and how long ago that was
+        // (`lapsed`) - the line keeps that price and says so, where it used to move to a price nobody had checked.
+        // `shown`: what their list says now, checked or not (a line you change is re-picked against it).
+        const heldBid = (id, key) => {
+            const b = buyersAllowed(id).find((x) => traderKey(x) === key);
+            if (!b) return { price: null, shown: null, lapsed: null };
+            const c = checkOf(id, b);
+            if (c.ok) return { price: b.price, shown: b.price, lapsed: null };
+            const last = lastChecked.get(String(id) + '|' + (b.id || b.name)) || null;
+            return { price: last ? last.price : null, shown: b.price, lapsed: { at: last ? last.at : c.at || 0, why: c.why } };
+        };
+        const heldPriced = (t, key) => {
+            const p = priceHeld(t, { rowsOf: sellersOf, bidOf: (id) => heldBid(id, key).price, lowestOf });
+            let lapsed = 0;
+            const lines = p.lines.map((l) => {
+                const lp = heldBid(l.itemId, key).lapsed;
+                if (!lp) return l;
+                lapsed += 1;
+                // (Not "not on their list now": they are on it - at a price that is not checked.)
+                return { ...l, noBid: false, lapsed: lp };
+            });
+            return lapsed ? { ...p, lines, lapsed } : { ...p, lapsed: 0 };
         };
         // The plan that makes the most among the checked buyers (each capped
         // by what they can pay); a tie goes to the higher bid.
@@ -42501,6 +43175,9 @@
         };
         // A possible flip: what the item would make with its highest buyer not checked yet, when a check can
         // still make it one (never a price only on TornExchange, never a list a day old). One plan an item, at most.
+        // 3.29.0 - what it would make is kept between redraws, like the plan: while the item's bazaars are the very
+        // rows they were and that buyer bids and can take what they did. (Which buyer it is - the first whose check
+        // can still come - is looked at every redraw: a check lapses by the clock alone.)
         const possibleOf = (id, rows) => {
             const all = flipBuyersOf(id);
             if (!rows || flipCheckedOf(id) === all) return null;
@@ -42509,8 +43186,11 @@
                 if (c.ok) return null;
                 if ((c.why !== 'not-checked' && c.why !== 'no-date') || declinedBy(id, b)) continue;
                 const most = Math.min(amountOf(id, buyerKeyOf(b), false), b.maxUnits ? b.maxUnits : Infinity);
-                const plan = flipPlan(rows, b.price, { cash: prefs.cash, maxUnits: most, minPct: prefs.minProfitPct });
-                return plan && plan.units > 0 ? { profit: plan.profit, buyer: b } : null;
+                const made = keepers.possible.get(String(id), [rows, b.price, most, prefs.cash, prefs.minProfitPct], () => {
+                    const plan = flipPlan(rows, b.price, { cash: prefs.cash, maxUnits: most, minPct: prefs.minProfitPct });
+                    return { profit: plan && plan.units > 0 ? plan.profit : null };
+                });
+                return made.profit !== null ? { profit: made.profit, buyer: b } : null;
             }
             return null;
         };
@@ -42693,9 +43373,18 @@
         if (!q) {
             waiting.sort((a, b) => b.profit - a.profit);
             shownFlips.sort((a, b) => b.profit - a.profit);
-            sell.flipCheckIds = [...waiting, ...shownFlips].map((f) => f.itemId);
+            // 3.29.0 - and what you bought to resell: a To sell row names a trader only at a checked price, so its buyers
+            // are read as often as a flip's (it was every 10 minutes against a check that stands 5) - and their best
+            // payers' own lists as often as a flip's traders'. Which comes first: the flips, which cannot wait - but
+            // the To sell rows waiting for their check while To sell is the tab you look at. (A price only on
+            // TornExchange never gets a check: its item is read in its turn, for a TornW3B buyer who may appear.)
+            const sellRows = toSell.filter((r) => !r.kept && r.best);
+            const sellWaiting = sellRows.filter((r) => r.unchecked && r.check !== 'te-only' && r.check !== 'no-id').map((r) => r.itemId);
+            const flipIds = [...waiting, ...shownFlips].map((f) => f.itemId);
+            sell.toSellIds = toSell.filter((r) => !r.kept).map((r) => r.itemId);
+            sell.flipCheckIds = [...new Set([...(sell.filter === 'sell' ? [...sellWaiting, ...flipIds] : [...flipIds, ...sellWaiting]), ...sellRows.map((r) => r.itemId)])];
             sell.flipCheck = new Set(sell.flipCheckIds);
-            sell.flipTraders = new Set([...waiting, ...shownFlips].map((f) => f.traderId).filter(Boolean).map(String));
+            sell.flipTraders = new Set([...[...waiting, ...shownFlips].map((f) => f.traderId), ...sellRows.map((r) => r.best.id)].filter(Boolean).map(String));
             if (waiting.length !== (sell.pricesWaiting || 0) && (!waiting.length || !sell.pricesWaiting)) {
                 logProblem('note', waiting.length
                     ? 'Possible flips waiting for a price check: ' + waiting.length + ' (' + shownFlips.length + ' flips shown) - a flip is shown only once TornW3B confirmed the price of its buyer in the last 5 minutes'
@@ -42807,6 +43496,7 @@
         redrawStage('4 the list (every item)');
         // 3.28.1 - for the speed log: where the time inside went, and what this redraw had to work through.
         perfAdd(SPEED_BIDS.inBuyers, inside.buyers);
+        perfAdd(SPEED_BIDS.inShown, inside.shown);
         perfAdd(SPEED_BIDS.inSellers, inside.sellers);
         perfAdd(SPEED_BIDS.inPlans, inside.plans);
         perfAdd(SPEED_BIDS.inPossible, inside.possible);
@@ -42893,7 +43583,10 @@
             // Your own items are not offered in a trade (the owner, 2026-09-28: "my own
             // items as cover, omit it") - except what you bought to resell (2026-10-03:
             // "turn it on for resell items only"): the To sell items this trader pays enough for.
-            const held = toSellLines.get(key) || [];
+            // 3.29.0: only at a price that is checked - the rest are listed under the trade as waiting, in no sum.
+            const yours = toSellLines.get(key) || [];
+            const held = yours.some((h) => h.unchecked) ? yours.filter((h) => !h.unchecked) : yours;
+            const heldWaiting = held === yours ? [] : yours.filter((h) => h.unchecked);
             const nw = buyer.id ? networthOf(buyer.id) : null;
             const payCap = nw !== null && nw >= 0 && prefs.networthPct > 0 ? (nw * prefs.networthPct) / 100 : Infinity;
             const t = planTrade({
@@ -42916,7 +43609,7 @@
                 everything: sell.tradeEvery.has(key),
             });
             // A To sell line makes what they pay over what you paid: part of what the trade makes.
-            return { ...t, profit: t.profit + heldGain(t.held), flipProfit: t.profit, key, buyer, estimated, payCap, every: sell.tradeEvery.has(key) };
+            return { ...t, profit: t.profit + heldGain(t.held), flipProfit: t.profit, key, buyer, estimated, payCap, every: sell.tradeEvery.has(key), heldWaiting };
         };
         /*
          * A trade's old list (3.23.0): the first of its lines - a flip, or one of
@@ -43072,8 +43765,8 @@
             // What this trader pays now (whatever the Show toggles hide), and how a
             // line you change is re-picked alone (at most 5 bazaars) - the others stay.
             const bidNow = (id) => {
-                const b = buyersAllowed(id).find((x) => traderKey(x) === chosen.key);
-                return b ? b.price : null;
+                const h = heldBid(id, chosen.key);
+                return h.price || h.shown;
             };
             sell.heldEdit = {
                 pickId: String(pickId),
@@ -43098,6 +43791,11 @@
                 // How old the prices are: check their list before buying.
                 teAt: sell.traders ? sell.traders.fetchedAt : null,
                 w3bAt: w3bT && w3bT.at ? w3bT.at : null,
+                // 3.29.0 - their list is read at the press of a deal: being read now, and what the last read changed.
+                listCheck: chosen.buyer.id ? ((id) => {
+                    const r = sell.listRead ? sell.listRead.get(id) : null;
+                    return { reading: Boolean(sell.listReading && sell.listReading.has(id)), readAt: r ? r.at : 0, changed: r && r.known ? r.changed : null, waitingYes: Boolean(sell.acceptWait && sell.acceptWait.key === chosen.key) };
+                })(String(chosen.buyer.id)) : null,
             };
 
             if (hold) {
@@ -43116,7 +43814,8 @@
                 };
                 const held = resolveEstimated(hold.held, chosen.flips.map(named), pickOwn);
                 if (held !== hold.held) saveHeldTrade(pickId, key, held, hold.pinned);
-                const priced = priceHeld(held, { rowsOf: sellersOf, bidOf, lowestOf });
+                // 3.29.0: a line whose price check lapsed keeps the last checked price, and says how long ago that was.
+                const priced = heldPriced(held, key);
                 // Yours to sell: live, as in the plan now (they need no bazaar, so nothing of them is held still) -
                 // within what this trade's lines leave of the 10,000 (3.23.0).
                 const heldUnits = priced.lines.reduce((a, l) => a + (l.units || 0), 0);
@@ -43151,6 +43850,10 @@
                         flips: priced.lines.map((l) => ({ ...l, name: l.name || nameOf(l.itemId) })),
                         off: (held.off || []).map((o) => ({ itemId: o.itemId, bid: o.bid, name: o.name || nameOf(o.itemId) })),
                         held: yoursNow,
+                        // Yours at a price that is not checked: listed as waiting, in no sum (3.29.0).
+                        heldWaiting: (chosen.heldWaiting || []).map((r) => ({ ...r, name: nameOf(r.itemId) })),
+                        // How many of its lines stand on a price whose check lapsed.
+                        lapsed: priced.lapsed,
                         items: priced.items + yoursOn.length,
                         profit: priced.profit + yoursGain,
                         cost: priced.cost,
@@ -43196,6 +43899,8 @@
                     flips: chosen.flips.map(named),
                     off: chosen.off.map(named),
                     held: chosen.held.map(named),
+                    heldWaiting: (chosen.heldWaiting || []).map((r) => ({ ...r, name: nameOf(r.itemId) })),
+                    lapsed: 0,
                     items: chosen.items,
                     profit: chosen.profit,
                     cost: chosen.cost,
@@ -43361,7 +44066,13 @@
             const paid = paidRow && Number(paidRow.each) > 0 ? Number(paidRow.each) : 0;
             const lossBuyers = paid ? buyers.filter((x) => !(x.price > paid)).map((x) => ({ ...x, hiddenBy: 'loss', paid })) : [];
             if (lossBuyers.length) buyers = buyers.filter((x) => x.price > paid);
-            const realBid = pickAvg > 0 ? listBid(buyers, pickAvg) || null : buyers[0] ? buyers[0].price : null;
+            // 3.29.0 - where to sell what you hold counts a trader only at a price that is checked (the owner's page,
+            // 2026-10-12: a price nobody had confirmed for hours stood there as "Best"). With none checked, the best
+            // believable price is still named - muted, "not checked", no Best and no trade link on it.
+            const sureBuyer = buyers.find((x) => !x.troll && x.check.ok) || null;
+            const unsureBuyer = sureBuyer ? null : buyers.find((x) => !x.troll) || null;
+            const realBid = sureBuyer ? sureBuyer.price : null;
+            const whereWho = (x) => (x ? { name: x.name, id: x.id || null, price: x.price, te: x.te || 0, w3b: x.w3b || 0, teName: x.teName || null, tradeKey: x.tradeKey, why: x.check.ok ? null : x.check.why, at: x.check.at || 0 } : null);
             // Traders Online only / Trusted only leave out here: counted and named, never just gone.
             const shownKeys = new Set([...buyers, ...lossBuyers].map((x) => x.tradeKey));
             const hidden = hiddenBuyers(withoutBlacklisted(buyersAll(pick), blacklist).filter((x) => !shownKeys.has(traderKey(x))), { prefs, levelOf, votesMissing, listAtOf, now })
@@ -43400,10 +44111,24 @@
                 planWhy: b && b.at ? null : 'loading',
                 // Weapons and armour: every copy has its own stats, so no flip (say why).
                 statItem: isStatItem(item),
-                where: held ? whereAbovePaid(whereToSell({ held, bid: realBid, bazaarLowest: lowestOf(pick), marketLowest: m ? m.lowest : null, bazaarDepth: bazaarDepthOf(pick), marketDepth: m ? m.depth : null }), paid) : null,
+                where: held ? { ...whereAbovePaid(whereToSell({ held, bid: realBid, bazaarLowest: lowestOf(pick), marketLowest: m ? m.lowest : null, bazaarDepth: bazaarDepthOf(pick), marketDepth: m ? m.depth : null }), paid), trader: whereWho(sureBuyer), unchecked: whereWho(unsureBuyer) } : null,
                 market: { state: m && m.at ? 'ok' : m && m.error ? 'error' : 'loading', lowest: m ? m.lowest : null },
             };
             desk.trade = tradeDesk(pick, buyers);
+            // "Said yes" was pressed and their list, read at the press, no longer makes that trade (3.29.0).
+            desk.yesNote = Boolean(sell.acceptNote && sell.acceptNote.itemId === String(pick) && now - sell.acceptNote.at < 60000);
+            // Each trader's bulk price for this item, when their list has one (3.29.0): shown in amber, in no sum.
+            for (const x of buyers) {
+                const bulk = x.id ? bulkPriceOf(sell.db, x.id, pick) : null;
+                if (bulk) x.bulk = bulk;
+            }
+            const shownT = desk.trade && desk.trade.chosen;
+            if (shownT && shownT.buyer && shownT.buyer.id) {
+                for (const r of shownT.flips || []) {
+                    const bulk = bulkPriceOf(sell.db, shownT.buyer.id, r.itemId);
+                    if (bulk) r.bulk = bulk;
+                }
+            }
             sell.deskTraders = deskTraderIds;
             // Flips > By trader: everything the trader of the trade on show buys, beside the cheapest bazaar.
             const shownTrade = desk.trade && (desk.trade.chosen || desk.trade.accepted);
@@ -43411,6 +44136,8 @@
                 desk.trade.buys = tradeItemsOf(shownTrade.buyer).map(({ id, fb }) => ({ itemId: String(id), name: nameOf(id), bid: fb.price, ask: lowestOf(id) || null }));
             }
             sell.lastTrade = desk.trade;
+            // The trader Where to sell names (checked or waiting for its check): read first when the item is picked.
+            sell.lastWhereKey = held && (sureBuyer || unsureBuyer) ? (sureBuyer || unsureBuyer).tradeKey : null;
             if (held) loadSellMarket(pick);
         }
         if (!desk || !desk.trade) {
@@ -43426,16 +44153,17 @@
         const deskKey = desk && desk.trade && desk.trade.chosen ? desk.trade.chosen.key : null;
         redrawStage('8 the desk');
         // A trader blacklisted after the pin: the pin is not shown (it stays stored, for Undo).
+        // 3.29.0: their traders' own lists are read again every few minutes, as the desk's are (nextW3bJob) - a pinned
+        // trade is one you mean to make, and its prices went unchecked between two looks at it.
+        const pinTraders = new Set();
         const pinned = Object.entries(sellPinned(now)).filter(([, t]) => !blacklist.has(t.key)).map(([k, t]) => {
-            const bidOf = (id) => {
-                const b = buyersAllowed(id).find((x) => traderKey(x) === t.key);
-                return b ? b.price : null;
-            };
-            const p = priceHeld(t, { rowsOf: sellersOf, bidOf, lowestOf });
+            if (t.trader && t.trader.id) pinTraders.add(String(t.trader.id));
+            const p = heldPriced(t, t.key);
             const main = t.lines.find((l) => l.itemId === t.main) || t.lines[0] || null;
             const mainId = main ? main.itemId : t.itemId;
-            return { key: k, itemId: t.itemId, mainId, name: nameOf(t.itemId), mainName: nameOf(mainId), trader: t.trader.name, traderKey: t.key, traderId: t.trader.id || null, at: t.at, items: p.items, stops: p.stops, profit: p.profit, on: Boolean(desk && desk.itemId === t.itemId && deskKey === t.key) };
+            return { key: k, itemId: t.itemId, mainId, name: nameOf(t.itemId), mainName: nameOf(mainId), trader: t.trader.name, traderKey: t.key, traderId: t.trader.id || null, at: t.at, items: p.items, stops: p.stops, profit: p.profit, lapsed: p.lapsed, on: Boolean(desk && desk.itemId === t.itemId && deskKey === t.key) };
         });
+        sell.pinTraders = pinTraders;
 
         // Trades (3.22.0, core/trades-board.js): every trade going - asked, accepted, ready - and what ended today.
         // A trade you asked about that is on the desk now: its numbers follow the desk.
@@ -43496,28 +44224,36 @@
         const heldCount = sell.inventory ? sell.inventory.length : 0;
         const teOneDone = sell.inventory ? [...heldIds()].filter((i) => sell.teOne.has(i) && !sell.teOne.get(i).failed).length : 0;
         const statuses = sellStatusMap(now);
-        const traderCount = countTraders(allIds, buyersAll);
+        const counted = countTraders(allIds, buyersAll);
+        const traderCount = counted.traders;
+        // 3.29.0, for the speed log: what every redraw walks (not when a search shows part of the items).
+        if (!q) {
+            perfGauge(SPEED_BIDS.buyerRows, counted.rows);
+            perfGauge(SPEED_BIDS.priceLists, stats.withW3b);
+        }
 
-        // Left over from a trade: who pays most for it now, against what you paid.
-        // Only what a trade left: an extra buy was never in one (it is in the To sell tab).
-        // And not what you marked "Not for sale" (3.23.0): the card is what selling to traders now would make.
-        const leftShown = leftovers.filter((l) => l.why !== 'extra' && !notForSale(l)).map((l) => {
-            // Not the trader who just said no to it.
-            const top = buyersOf(l.itemId).find((b) => !l.from || String(b.name).toLowerCase() !== String(l.from).toLowerCase()) || null;
-            return { ...l, best: top ? { name: top.name, price: top.price } : null, gain: top ? (top.price - l.each) * l.qty : null };
-        });
-        // What you hold, at what traders pay now (Today, and My items' totals): whatever the search box says.
-        const holdRows = [...heldQty].filter(([, n]) => n > 0).map(([id, n]) => {
+        // (3.29.0: the "left over from a trade" rows worked out here were drawn nowhere since the To sell tab, and were
+        // priced at whatever the top row said, checked or not: gone.)
+        // The trader an item's price in the list is: the best believable one (a troll bid - $99b for a Parcel - is
+        // never it; with no average to tell by, the top row), and whether that price is checked (3.29.0).
+        const topOf = (id) => {
             const avg = itemOf(id) ? Number(itemOf(id).marketValue) || null : null;
-            const top = buyersOf(id)[0] || null;
-            const bid = avg > 0 ? listBid(buyersOf(id), avg) : top ? top.price : 0;
-            return { itemId: String(id), name: nameOf(id), held: n, worth: n * (bid || 0) };
+            const list = buyersOf(id);
+            const b = (avg > 0 ? list.find((x) => x && believableBid(x.price, avg)) : list[0]) || null;
+            return b ? { id: b.id || null, name: b.name, price: b.price, checked: checkOf(id, b).ok } : null;
+        };
+        // What you hold, at what traders pay now (Today, and My items' totals): whatever the search box says.
+        // A worth is about (`approx`) while a price in it is not checked: it is a figure to read, not one to act on.
+        const holdRows = [...heldQty].filter(([, n]) => n > 0).map(([id, n]) => {
+            const top = topOf(id);
+            return { itemId: String(id), name: nameOf(id), held: n, worth: n * (top ? top.price : 0), approx: Boolean(top && !top.checked) };
         }).sort((a, b) => b.worth - a.worth || String(a.name).localeCompare(String(b.name)));
         const hold = {
             items: holdRows.reduce((a, r) => a + r.held, 0),
             kinds: holdRows.length,
             paidKinds: holdRows.filter((r) => r.worth > 0).length,
             worth: holdRows.reduce((a, r) => a + r.worth, 0),
+            approx: holdRows.some((r) => r.approx && r.worth > 0),
             top: holdRows.slice(0, 4),
         };
         redrawStage('9 pins shown, Trades tab, counts');
@@ -43534,7 +44270,6 @@
             still: sell.still ? { trader: sell.still.trader, waiting: stillWaits, now } : null,
             stillEnded: stillEnded(sell.stillEnded, now),
             pinned,
-            leftovers: leftShown,
             // The To sell tab: its rows, and its board (beside the list until a row is picked or a trade planned).
             toSell: { rows: toSell, ...toSellBoard(toSell), open: sell.filter === 'sell' && sell.boardOpen },
             // The Trades tab: its rows by stage, and its board (beside the list until a trade is opened).
@@ -43561,8 +44296,9 @@
                 pace: r.plan && r.plan.units > 0 && typeof r.plan.pace === 'number' ? r.plan.pace : null,
                 stops: r.plan && r.plan.units > 0 ? new Set((r.plan.steps || []).map((st) => st.sellerId || st.sellerName)).size : 0,
                 to: r.plan && r.plan.units > 0 && r.plan.buyer ? { id: r.plan.buyer.id || null, name: r.plan.buyer.name, old: oldList(r.plan.buyer, listAtOf, now) } : null,
-                top: r.best ? { id: r.best.id || null, name: r.best.name, price: r.best.price } : null,
-                bid: r.bid || (r.best ? r.best.price : 0) })),
+                // 3.29.0: the best believable trader (it was the top row, troll bid or not, beside a worth worked out from
+                // the believable one), and whether that price is checked - not checked, it is shown muted.
+                ...((top) => ({ top, bid: top ? top.price : 0 }))(topOf(r.itemId)) })),
             listTotal: listed.length,
             counts,
             filter: sell.filter,
@@ -43629,13 +44365,34 @@
             },
         });
         perfDone('Torn Bids page rebuild (inside the redraw)', pageT0);
+        sellStoreChecked(lastChecked, now);
     }
 
-    /** Distinct traders buying anything, for the status line. */
+    /**
+     * 3.29.0 - the prices checked in the last minutes, written down for the tags on Torn's pages (core/checked.js):
+     * at most every CHECKED_TABLE_WRITE_MS, and only when the table says something else than it did. Never a write a redraw.
+     */
+    function sellStoreChecked(lastChecked, now) {
+        if (now - (sell.checkedLookedAt || 0) < CHECKED_TABLE_WRITE_MS) return;
+        sell.checkedLookedAt = now;
+        const table = checkedTable(lastChecked, now);
+        const word = JSON.stringify(table.p);
+        if (word === sell.checkedWord) return;
+        sell.checkedWord = word;
+        gmSet(STORE_SELL_CHECKED, table);
+    }
+
+    /** Distinct traders buying anything, for the status line - and how many buyer rows that was (the speed log). */
     function countTraders(itemIds, buyersAll) {
         const seen = new Set();
-        for (const id of itemIds) for (const b of buyersAll(id)) seen.add(b.id || 'n:' + b.name.toLowerCase());
-        return seen.size;
+        let rows = 0;
+        for (const id of itemIds) {
+            for (const b of buyersAll(id)) {
+                rows += 1;
+                seen.add(b.id || 'n:' + b.name.toLowerCase());
+            }
+        }
+        return { traders: seen.size, rows };
     }
 
     /**
@@ -44032,6 +44789,8 @@
         sell.presenceAsked = (sell.presenceAsked || []).filter((t) => now - t < 60000);
 
         const asks = statusAsks({ ids, open, first, entries: sell.presence, now, pressed, pending, asked: sell.presenceAsked.length, maxPending: SELL_PRESENCE_MAX_PENDING, perMin: SELL_PRESENCE_PER_MIN });
+        // The statuses asked for in this one go: see the answer below.
+        const batch = { drew: false };
         for (const { id, priority } of asks) {
             const s = sell.presence.get(id);
             sell.presenceAsked.push(now);
@@ -44054,8 +44813,12 @@
                 })
                 .finally(() => {
                     s.pending = false;
-                    // The answer to something you pressed is drawn as one is: at once.
-                    renderSelling(priority === 'high');
+                    // The answer to something you pressed is drawn as one is: at once - the first of them (3.29.0).
+                    // A press asks for several statuses, and each answer drew at once: a redraw every 150 ms,
+                    // none waiting its turn. The rest of them share the next redraw on the budget.
+                    const first = priority === 'high' && !batch.drew;
+                    if (first) batch.drew = true;
+                    renderSelling(first, 'byStatus');
                 });
         }
     }
@@ -44363,12 +45126,61 @@
         }
     }
 
+    /*
+     * 3.29.0 - "X said yes" reads X's price list first (the owner, 2026-10-12: the price list fresh "when getting a
+     * deal"): the yes is written once the answer is in - a few seconds - with the trade as the new prices make it,
+     * and it says how many prices had changed. No answer in ACCEPT_WAIT_MS: it goes on, and the trade says its
+     * prices were not confirmed. A trade that is no longer one with the new prices is not written: the desk shows why.
+     */
+    const ACCEPT_WAIT_MS = 4000;
     function acceptDeskTrade(itemId) {
         logAction('Pressed accepted (item ' + itemId + ')');
         const t = sell.lastTrade && sell.lastTrade.chosen;
         if (!t) return;
+        // Already waiting for this one's list: one press is enough.
+        if (sell.acceptWait) return;
+        const traderId = traderIdOfKey(t.key);
+        checkTraderNow(itemId, t.key, 'Said yes');
+        const out = traderId && sell.listReading ? sell.listReading.get(traderId) : null;
+        if (!out) {
+            // Read in the last 15 seconds (or known by name only: no list to read): as it stands.
+            const r = traderId && sell.listRead ? sell.listRead.get(traderId) : null;
+            acceptDeskTradeNow(itemId, t.key, { confirmed: Boolean(r && Date.now() - r.at < 60000), changed: r && r.known ? r.changed : null, at: r ? r.at : 0 });
+            return;
+        }
+        const wait = (sell.acceptWait = { itemId: String(itemId), key: t.key, since: Date.now() });
+        let over = false;
+        const go = (answered) => {
+            if (over || sell.acceptWait !== wait) return;
+            over = true;
+            clearTimeout(timer);
+            sell.acceptWait = null;
+            const r = sell.listRead ? sell.listRead.get(traderId) : null;
+            const confirmed = Boolean(answered && r && r.at >= wait.since);
+            // The trade as the prices make it now (held: its lines stay, re-priced; a line they no longer buy says so).
+            renderSellingNow();
+            acceptDeskTradeNow(itemId, t.key, { confirmed, changed: confirmed && r.known ? r.changed : null, at: confirmed ? r.at : 0 });
+        };
+        const timer = setTimeout(() => go(false), ACCEPT_WAIT_MS);
+        out.done.then(() => go(true));
+        renderSellingNow();
+    }
+
+    function acceptDeskTradeNow(itemId, key, priceCheck) {
+        const t = sell.lastTrade && sell.lastTrade.chosen;
+        // With their prices as just read it is not a trade with them any more (the desk moved to another trader, or
+        // shows none): nothing is written down, and the log says why.
+        if (!t || t.key !== key || String(sell.selected) !== String(itemId)) {
+            logProblem('note', 'Said yes: not written down - with their price list as just read, the trade on the desk is no longer the one with trader ' + String(key).replace(/^id:/, ''), 'item ' + itemId);
+            // Said on the desk for a minute: a press that did nothing must say why.
+            sell.acceptNote = { itemId: String(itemId), at: Date.now() };
+            renderSellingNow();
+            return;
+        }
+        if (!priceCheck.confirmed) logProblem('note', 'Said yes: their price list did not answer in ' + Math.round(ACCEPT_WAIT_MS / 1000) + ' s - the trade is written down with the prices last checked', 'item ' + itemId);
+        else if (priceCheck.changed) logProblem('note', 'Said yes: their price list, read at the press, had ' + priceCheck.changed + (priceCheck.changed === 1 ? ' price' : ' prices') + ' changed - the trade is written down as the new prices make it', 'item ' + itemId);
         const all = sellAccepted();
-        const acc = acceptTrade(t, itemId);
+        const acc = { ...acceptTrade(t, itemId), priceCheck };
         // A trade with this trader is already under way (accepted from
         // another item's desk): show that one, never overwrite its ticks.
         const open = all[acc.key];
@@ -44414,7 +45226,12 @@
         sell.boardOpen = false;
         loadTeItemList(sell.selected);
         renderSellingNow();
-        stepW3b();
+        // 3.29.0 - the trader of the deal this put on the desk (a Best flips card, a Flips row, a To sell row): their
+        // price list is read now, so the price you are about to act on is seconds old, not up to five minutes.
+        const T = sell.lastTrade;
+        const key = T && T.chosen ? T.chosen.key : sell.lastWhereKey || null;
+        if (key && traderIdOfKey(key)) checkTraderNow(itemId, key, 'Picked a deal');
+        else stepW3b();
     }
 
     /** All, Mine or Flips: the desk moves to the first item there. */
@@ -44606,7 +45423,8 @@
                 sell.boardOpen = false;
                 // Planning a trader you declined means you are trying them again.
                 if (sellDeclined().has(declineKey(itemId, key))) setSellDeclined(declineKey(itemId, key), null);
-                rereadTraderList(key);
+                // Their list, read now (3.29.0: not more than 15 s old at the press - it was a minute), then the item's buyers.
+                checkTraderNow(itemId, key, 'Plan trade');
                 renderSellingNow();
             },
             // Planning pressed again (3.20.2, the owner): the plan with them comes off
@@ -44647,7 +45465,7 @@
                 sell.statusPressed = true;
                 sell.boardOpen = false;
                 if (sellDeclined().has(declineKey(itemId, key))) setSellDeclined(declineKey(itemId, key), null);
-                rereadTraderList(key);
+                checkTraderNow(itemId, key, 'Every flip');
                 renderSellingNow();
             },
             onTradePin: (itemId, key) => {

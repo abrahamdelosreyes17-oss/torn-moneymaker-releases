@@ -138,6 +138,56 @@ export function applyListToItemBuyers(itemTraders, traderId, prices, at) {
     return changed;
 }
 
+/*
+ * The prices a check stands on, for the pages on torn.com (3.29.0).
+ *
+ * The overlay names a trader on a bazaar card ("X pays $Y"), in "In this
+ * bazaar" and in Checkout ("sell to X at $Y") from the lists this browser
+ * has stored - with no check at all: a price hours old looked as sure as
+ * one read a minute ago. Torn Bids alone asks TornW3B; so it writes down
+ * what it has checked - item, trader, price, when - and the overlay shows a
+ * price as sure only while it is in this table and under FLIP_CHECK_MS old.
+ * Anything else it shows muted, "not checked". With Torn Bids closed the
+ * table stops being written, and within five minutes every tag is muted.
+ *
+ * Small and seldom: only checks still standing, at most CHECKED_TABLE_MAX of
+ * them, written at most every CHECKED_TABLE_WRITE_MS and only when it says
+ * something else than it did.
+ */
+export const CHECKED_TABLE_WRITE_MS = 30 * 1000;
+export const CHECKED_TABLE_MAX = 2000;
+
+/**
+ * @param {Map<string, {price: number, at: number}>} lastChecked - 'itemId|traderId' -> the price a check stood on, and when
+ * @returns {{at: number, p: Object<string, Array<[string, number, number]>>}} item id -> [[trader id, price, checked at (s)]]
+ */
+export function checkedTable(lastChecked, now = Date.now(), { checkMs = FLIP_CHECK_MS, max = CHECKED_TABLE_MAX } = {}) {
+    const rows = [];
+    for (const [k, v] of lastChecked || []) {
+        const cut = String(k).indexOf('|');
+        const itemId = cut > 0 ? String(k).slice(0, cut) : '';
+        const traderId = cut > 0 ? String(k).slice(cut + 1) : '';
+        // (A trader known by name only has no TornW3B price: nothing of theirs is ever checked.)
+        if (!/^\d+$/.test(itemId) || !/^\d+$/.test(traderId) || !v || !(v.price > 0) || !(v.at > 0) || now - v.at > checkMs) continue;
+        rows.push([itemId, traderId, v.price, Math.floor(v.at / 1000)]);
+    }
+    rows.sort((a, b) => b[3] - a[3] || Number(a[0]) - Number(b[0]) || Number(a[1]) - Number(b[1]));
+    const p = {};
+    for (const [itemId, traderId, price, at] of rows.slice(0, max)) (p[itemId] || (p[itemId] = [])).push([traderId, price, at]);
+    return { at: now, p };
+}
+
+/** Is this trader's price for this item in the table, at this price, checked within `checkMs`? */
+export function checkedInTable(table, itemId, traderId, price, now = Date.now(), checkMs = FLIP_CHECK_MS) {
+    const rows = table && table.p && traderId ? table.p[String(itemId)] : null;
+    if (!Array.isArray(rows)) return false;
+    for (const r of rows) {
+        if (!Array.isArray(r) || String(r[0]) !== String(traderId)) continue;
+        return Number(r[1]) === Number(price) && now - Number(r[2]) * 1000 <= checkMs && now - Number(r[2]) * 1000 > -60000;
+    }
+    return false;
+}
+
 /**
  * How often an item's buyers are read again, by what the item is to you.
  *

@@ -612,7 +612,7 @@ export class Panel {
     renderBids(v) {
         this.state.bidsLine = v.line || '';
         if (!this.root) return;
-        const sig = JSON.stringify([v.onBazaar, v.rows.map((r) => [r.key, r.name, r.qty, r.price, r.label, r.old]), v.friendHere, v.trade, v.toSell, v.hasKey]);
+        const sig = JSON.stringify([v.onBazaar, v.rows.map((r) => [r.key, r.name, r.qty, r.price, r.label, r.old, r.unchecked]), v.friendHere, v.trade, v.toSell, v.hasKey]);
         if (sig !== this.hereSig) {
             this.hereSig = sig;
             const box = this.hereEl;
@@ -624,7 +624,8 @@ export class Panel {
                 for (const r of v.rows) {
                     box.appendChild(el('div', { class: 'ttv2-here-r' }, [
                         el('span', { class: 'ttv2-here-n' }, [el('b', { text: r.name }), document.createTextNode(r.qty > 1 ? ' × ' + r.qty.toLocaleString('en-US') : '')]),
-                        el('span', { class: 'ttv2-here-l' + (r.old ? ' ttv2-here-old' : ''), title: r.old ? 'Their price is from a list not changed in over a day' : '', text: r.label }),
+                        // (3.29.0: "not checked" in the words themselves - Torn Bids has not checked that price in the last 5 minutes.)
+                        el('span', { class: 'ttv2-here-l' + (r.old ? ' ttv2-here-old' : ''), title: r.unchecked ? 'Torn Bids has not checked this price in the last 5 minutes (it checks while its own tab is open): look at their list before you buy' : r.old ? 'Their price is from a list not changed in over a day' : '', text: r.label }),
                         el('button', { type: 'button', class: 'ttv2-link', 'data-here': r.key, title: 'Brings its card into view on Torn\'s page. Nothing is clicked for you.', text: 'Show', onclick: () => r.onShow && r.onShow() }),
                     ]));
                 }

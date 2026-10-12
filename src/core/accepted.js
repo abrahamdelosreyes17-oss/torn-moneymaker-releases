@@ -1192,12 +1192,15 @@ export function applyLogBuys(trade, buys, { readFrom = 0, readTo = 0, bidOf = ()
  * again on every tick of every Torn page while a trade was accepted, each time
  * with a layout of the page.
  */
-export function sellElsewhere(trade, buyersOf) {
+export function sellElsewhere(trade, buyersOf, checkedOf = null) {
     const id = trade && trade.trader && trade.trader.id ? String(trade.trader.id) : null;
     const name = trade && trade.trader ? String(trade.trader.name || '').toLowerCase() : '';
     return cancelledLeftovers(trade).map(({ at, ...l }) => {
         const top = ((buyersOf && buyersOf(l.itemId)) || []).find((b) => b && !(id && b.id && String(b.id) === id) && String(b.name || '').toLowerCase() !== name) || null;
-        return { ...l, best: top ? { name: top.name, price: top.price } : null, gain: top ? (top.price - l.each) * l.qty : null };
+        // 3.29.0 (`checkedOf` handed): a price Torn Bids has not checked in the last minutes says so, and shows no gain.
+        const best = top ? { name: top.name, price: top.price } : null;
+        if (best && checkedOf && !checkedOf(l.itemId, top)) best.unchecked = true;
+        return { ...l, best, gain: top ? (top.price - l.each) * l.qty : null };
     });
 }
 

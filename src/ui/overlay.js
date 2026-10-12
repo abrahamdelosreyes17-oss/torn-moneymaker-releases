@@ -138,10 +138,16 @@ export const TRADER_DATA_ATTR = 'data-ttv2-trader';
  * second data attribute on the same card: still nothing appended.
  */
 export const TRADER_OLD_KEY = 'ttv2TraderOld';
+/*
+ * Their price is one Torn Bids has not checked in the last minutes (3.29.0):
+ * the tag is drawn muted (grey, no blue). A third data attribute on the same
+ * card: still nothing appended.
+ */
+export const TRADER_UNSURE_KEY = 'ttv2TraderUnsure';
 
 /**
  * Tag these cards, and untag every other one.
- * @param {Array<{el: Element, label: string, old?: 'aging'|'stale'|null}>} rows
+ * @param {Array<{el: Element, label: string, old?: 'aging'|'stale'|null, unchecked?: boolean}>} rows
  */
 export function markTraderTags(rows, root = document) {
     const keep = new Set();
@@ -153,12 +159,15 @@ export function markTraderTags(rows, root = document) {
         const old = row.old === 'aging' || row.old === 'stale' ? row.old : null;
         if (!old) delete row.el.dataset[TRADER_OLD_KEY];
         else if (row.el.dataset[TRADER_OLD_KEY] !== old) row.el.dataset[TRADER_OLD_KEY] = old;
+        if (!row.unchecked) delete row.el.dataset[TRADER_UNSURE_KEY];
+        else if (row.el.dataset[TRADER_UNSURE_KEY] !== '1') row.el.dataset[TRADER_UNSURE_KEY] = '1';
     }
     for (const el of root.querySelectorAll('[' + TRADER_DATA_ATTR + ']')) {
         if (keep.has(el)) continue;
         el.classList.remove(TRADER_CLASS);
         delete el.dataset[TRADER_DATA_KEY];
         delete el.dataset[TRADER_OLD_KEY];
+        delete el.dataset[TRADER_UNSURE_KEY];
     }
 }
 

@@ -157,6 +157,35 @@ export function parseW3bPriceList(body) {
     return prices;
 }
 
+/**
+ * The bulk prices of a TornW3B price list (3.29.0): {itemId: [from how many, price each]} for every item
+ * the trader pays another price for from a count up (a row is {itemId, name, buyPrice, bulkThreshold,
+ * bulkBuyPrice}). Until now they were thrown away, and every sum stood on `buyPrice` alone: a trader who
+ * pays less for 100 than for one showed the price for one. Kept and SHOWN (in amber, beside the price) -
+ * no sum is worked out from them until one real list has been seen with them in use.
+ */
+export function parseW3bBulk(body) {
+    const bulk = {};
+    if (!Array.isArray(body)) return bulk;
+    for (const row of body) {
+        const itemId = Number(row && row.itemId);
+        const price = Number(row && row.buyPrice);
+        const from = Number(row && row.bulkThreshold);
+        const each = Number(row && row.bulkBuyPrice);
+        if (!Number.isInteger(itemId) || itemId <= 0 || !Number.isFinite(price) || price <= 0) continue;
+        if (!Number.isFinite(from) || from <= 1 || !Number.isFinite(each) || each <= 0 || each === price) continue;
+        bulk[String(itemId)] = [Math.floor(from), each];
+    }
+    return bulk;
+}
+
+/** A trader's bulk price for one item, from their stored list: {from, price}, or null. */
+export function bulkPriceOf(db, traderId, itemId) {
+    const t = db && db.traders ? db.traders[String(traderId)] : null;
+    const row = t && t.w3b && t.w3b.found && t.w3b.bulk ? t.w3b.bulk[String(itemId)] : null;
+    return Array.isArray(row) && row[0] > 1 && row[1] > 0 ? { from: row[0], price: row[1] } : null;
+}
+
 /** Record the result of reading one trader's TornW3B list. */
 export function recordW3bList(db, traderId, result, now = Date.now()) {
     const id = cleanId(traderId);
@@ -172,6 +201,8 @@ export function recordW3bList(db, traderId, result, now = Date.now()) {
     t.w3b = Object.keys(prices).length
         ? { checkedAt: now, at: now, found: true, prices }
         : { checkedAt: now, found: false };
+    // (3.29.0: their bulk prices, when the list has any - see parseW3bBulk.)
+    if (t.w3b.found && result.bulk && Object.keys(result.bulk).length) t.w3b.bulk = result.bulk;
 }
 
 /** Ask for a list again soon (Refresh), without hiding the prices we have. */

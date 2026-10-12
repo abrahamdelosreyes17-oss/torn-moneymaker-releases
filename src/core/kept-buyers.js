@@ -24,15 +24,25 @@
  * Proof (test/kept-buyers.test.js): a long made-up session - lists read,
  * traders learned and dropped, ratings and votes moving, lists ageing out -
  * with the kept rows compared with a fresh buyersForItem for every item at
- * every step. And in use, one kept item each redraw is worked out again and
- * compared: should they ever differ, keeping stops for that page and it is
- * written in the problem log.
+ * every step. And in use, about one kept item in KEPT_CHECK_ONE_IN each
+ * redraw (never fewer than one) is worked out again and compared: should
+ * they ever differ, it is written in the problem log, everything kept is
+ * dropped, the rest of that redraw is worked out fresh, and keeping begins
+ * again with the next. And no item's kept rows stand for longer than about
+ * KEPT_MAX_AGE_MS (core/kept.js): whatever the keeping should fail to look
+ * at, what is shown is never further behind than that.
  *
- * Pure: no DOM, no storage, no clock.
+ * 3.29.0 (the owner's page, measured 2026-10-12): until now one difference
+ * switched keeping off until the page was reloaded, and every redraw then
+ * worked out all 1,361 items (61,773 trader rows) for the rest of the day.
+ * And one kept item a redraw was checked, so a wrong row could have stood
+ * for 1,361 redraws before its turn came.
+ *
+ * Pure: no DOM, no storage, no clock of its own (begin() is handed the redraw's).
  */
 
 import { buyersForItem } from './traders.js';
-import { keptDiffWords } from './kept.js';
+import { keptDiffWords, keptCheckTurn, keptAgeLimit } from './kept.js';
 
 const KEPT_NO_ROWS = [];
 
@@ -51,7 +61,7 @@ function keptSameMap(a, b) {
 /**
  * @param {object} [o]
  * @param {function} [o.compute] - buyersForItem (a test may count its calls)
- * @param {function} [o.onDiffer] - (itemId, where) => void: a kept item differed from a fresh one (keeping is then off); `where`: keptDiffWords
+ * @param {function} [o.onDiffer] - (itemId, where) => void: a kept item differed from a fresh one (everything kept is dropped; the rest of the redraw is worked out fresh); `where`: keptDiffWords
  * @param {boolean} [o.freeze] - freeze what is handed out (tests: a caller writing into kept rows fails loudly)
  */
 export function makeBuyersKeeper({ compute = buyersForItem, onDiffer = null, freeze = false } = {}) {
@@ -75,19 +85,23 @@ export function makeBuyersKeeper({ compute = buyersForItem, onDiffer = null, fre
         items.clear();
     };
     let off = false;
-    // One kept item a redraw is worked out again and compared: which one moves on each redraw.
+    let clock = 0;
+    // Some kept items a redraw are worked out again and compared: which ones moves on each redraw.
     let hits = 0;
-    let lastHits = 0;
-    let checkAt = 0;
+    const turn = keptCheckTurn();
     // What this redraw's begin() was handed, and whether it is still what was looked at (see `unsettled`).
     let shared = {};
     let settled = true;
 
-    /** Once a redraw, before any buyers(): what every item shares is looked at. */
-    function begin(given = {}) {
-        lastHits = hits;
+    /**
+     * Once a redraw, before any buyers(): what every item shares is looked at.
+     * @param {number} [now] - the redraw's clock: with it, keeping that went off begins again here, and kept rows age (none handed: neither)
+     */
+    function begin(given = {}, now = 0) {
+        turn.begin(hits);
         hits = 0;
-        checkAt = lastHits ? (checkAt + 7) % lastHits : 0;
+        clock = Number(now) || 0;
+        if (off && clock > 0) off = false;
         shared = given || {};
         settled = true;
         look(shared);
@@ -127,12 +141,16 @@ export function makeBuyersKeeper({ compute = buyersForItem, onDiffer = null, fre
             const down = rating ? rating.down : null;
             const p = people.get(id);
             if (!p) {
-                people.set(id, { there: Boolean(t), name, rated: Boolean(rating), up, down });
+                people.set(id, { there: Boolean(t), name, rating, up, down });
                 changedTrader(id);
-            } else if (p.there !== Boolean(t) || p.name !== name || p.rated !== Boolean(rating) || !Object.is(p.up, up) || !Object.is(p.down, down)) {
+            } else if (p.there !== Boolean(t) || p.name !== name || p.rating !== rating || !Object.is(p.up, up) || !Object.is(p.down, down)) {
+                // (`rating`: the rating itself, not only its numbers - the rows hold it, with when it was
+                // read. 3.29.0: two sources that disagreed on a trader's votes, both heard between two
+                // redraws - 523, then 524, then 523 - left the numbers as they were and the rating another
+                // one; the kept rows then differed from fresh ones, and that switched keeping off.)
                 p.there = Boolean(t);
                 p.name = name;
-                p.rated = Boolean(rating);
+                p.rating = rating;
                 p.up = up;
                 p.down = down;
                 changedTrader(id);
@@ -223,13 +241,23 @@ export function makeBuyersKeeper({ compute = buyersForItem, onDiffer = null, fre
         const tk = tokensOf(src);
         const was = kept.get(id);
         if (was && sameTokens(was.tk, tk) && sameW3b(was, list)) {
-            stats.kept += 1;
-            hits += 1;
-            if (hits - 1 !== checkAt) return was.out;
+            // Stood long enough: worked out again (and counted so) - and it should say what was kept.
+            const aged = clock > 0 && clock - was.at >= keptAgeLimit(id);
+            if (!aged) {
+                stats.kept += 1;
+                hits += 1;
+                if (!turn.due(hits - 1)) return was.out;
+            } else {
+                stats.redone += 1;
+            }
             // This redraw's check: the kept rows against fresh ones.
             const fresh = compute(id, src);
             stats.checked += 1;
-            if (JSON.stringify(fresh) === JSON.stringify(was.out)) return was.out;
+            if (JSON.stringify(fresh) === JSON.stringify(was.out)) {
+                // The very rows that were kept are handed out again: what is kept against them (core/shown-buyers.js) holds.
+                was.at = clock;
+                return was.out;
+            }
             stats.differed += 1;
             off = true;
             kept.clear();
@@ -256,7 +284,7 @@ export function makeBuyersKeeper({ compute = buyersForItem, onDiffer = null, fre
             }
             Object.freeze(out);
         }
-        kept.set(id, { tk, w3b: list, out });
+        kept.set(id, { tk, w3b: list, out, at: clock });
         return out;
     }
 
@@ -264,7 +292,7 @@ export function makeBuyersKeeper({ compute = buyersForItem, onDiffer = null, fre
         begin,
         buyers,
         stats,
-        /** Whether keeping is still on (off after a kept item differed). */
+        /** Whether keeping is on (off for the rest of a redraw in which a kept item differed). */
         on: () => !off,
         /**
          * The page was free since begin() (a redraw worked out in pieces,

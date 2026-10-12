@@ -70,7 +70,12 @@ test('the text lays Torn Bids\' redraw out hour by hour: its time beside what we
             speedAdd(p, 'w', G.stage3, ms * 0.6, 'Torn Bids', at + i);
             speedAdd(p, 'w', G.stage4, ms * 0.3, 'Torn Bids', at + i);
             speedAdd(p, 'w', G.inBuyers, ms * 0.5, 'Torn Bids', at + i);
+            speedAdd(p, 'w', G.inShown, ms * 0.2, 'Torn Bids', at + i);
+            speedAdd(p, 'w', G.pieces, 30, 'Torn Bids', at + i);
+            speedGauge(p, i < 3 ? G.byData : G.byPress, 1, at + i);
             speedGauge(p, G.items, 1000, at + i);
+            speedGauge(p, G.buyerRows, 60000, at + i);
+            speedGauge(p, G.priceLists, 2900, at + i);
             speedGauge(p, G.lists, 400, at + i);
             speedGauge(p, G.shown, 200, at + i);
             speedGauge(p, G.fresh, 3, at + i);
@@ -88,15 +93,19 @@ test('the text lays Torn Bids\' redraw out hour by hour: its time beside what we
     const lines = text.split('\n');
     const stampOf = (t) => new Date(t).toISOString().slice(0, 13).replace('T', ' ') + 'h';
     const rowsOf = (t) => lines.filter((l) => l.trim().startsWith(stampOf(t)));
-    // Three tables and the old "by hour" one: each hour is a row in all four.
-    assert.equal(rowsOf(calm).length, 4);
-    const [calmTime, calmSizes, calmKept] = rowsOf(calm);
-    const [slowTime, slowSizes, slowKept] = rowsOf(slow);
+    // Four tables and the old "by hour" one: each hour is a row in all five.
+    assert.equal(rowsOf(calm).length, 5);
+    const [calmTime, calmBeside, calmSizes, calmKept] = rowsOf(calm);
+    const [slowTime, , slowSizes, slowKept] = rowsOf(slow);
     assert.match(calmTime, /\b4\s+250\b/);
     assert.match(slowTime, /\b4\s+1,200\b/);
+    // 3.29.0: what follows "who buys an item" has a column of its own (it was outside every count)...
+    assert.match(calmTime, /\b125\s+50\.0\b/, 'in: buyers, then in: shown');
+    // ...and so has the work beside the redraw, and who asked for the redraws: 3 by data, 1 by a press.
+    assert.match(calmBeside, /h\s+120\s+4\s+-\s+0\s+3\s+1\s+0\s+0\s+0$/);
     // The same market in both hours...
-    assert.match(calmSizes, /\b1,000\s+400\b/);
-    assert.match(slowSizes, /\b1,000\s+400\b/);
+    assert.match(calmSizes, /\b1,000\s+60,000\s+2,900\s+400\b/);
+    assert.match(slowSizes, /\b1,000\s+60,000\s+2,900\s+400\b/);
     assert.match(calmSizes, /\b200\b.*\b12\b/, 'flips shown, and the new flips of the hour added up');
     // ...and what changed between them is on the page: the keeping.
     assert.match(calmKept, /99%\s+on\b/);

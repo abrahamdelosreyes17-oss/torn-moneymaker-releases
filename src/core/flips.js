@@ -711,10 +711,13 @@ export function nearMisses(summary, bidOf, { pct = 5, limit = 40, exclude = new 
  *
  * @param {{name, price, trust}|null} buyer - the best buyer
  * @param {number} listingPrice
+ * @param {boolean} [checked] - Torn Bids checked that price in the last minutes (3.29.0, core/checked.js). Not
+ *   checked: the price is said, with "not checked" where what it would make stood - a figure nobody confirmed
+ *   is not a profit to show.
  */
-export function traderTagLabel(buyer, listingPrice) {
+export function traderTagLabel(buyer, listingPrice, checked = true) {
     if (!buyer || !buyer.trust || buyer.trust.level !== 'Trusted') return null;
     if (!(buyer.price > listingPrice) || !(listingPrice > 0)) return null;
     // One line (3.20.4, the owner: two lines covered the item and its price).
-    return buyer.name + ' pays ' + formatMoney(buyer.price) + ' · +' + formatMoney(buyer.price - listingPrice) + ' each';
+    return buyer.name + ' pays ' + formatMoney(buyer.price) + ' · ' + (checked ? '+' + formatMoney(buyer.price - listingPrice) + ' each' : 'not checked');
 }

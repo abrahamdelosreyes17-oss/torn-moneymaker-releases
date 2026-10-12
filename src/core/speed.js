@@ -327,6 +327,11 @@ export const SPEED_BIDS = Object.freeze({
     stage3: 'Torn Bids redraw · 3 possible flips',
     stage4: 'Torn Bids redraw · 4 the list (every item)',
     inBuyers: 'Torn Bids redraw · inside: who buys an item, all items of one redraw',
+    // 3.29.0: what follows "who buys an item" for every item was outside every count - and was the larger half.
+    inShown: 'Torn Bids redraw · inside: the buyers an item shows (blacklist, favourites, Show choices), all items of one redraw',
+    // The buyers worked out in pieces before a redraw: not inside "Torn Bids redraw" above (only the last piece is).
+    pieces: 'Torn Bids buyers worked out in pieces (before a redraw)',
+    index: 'Torn Bids: the price lists index made again',
     inSellers: 'Torn Bids redraw · inside: an item\'s bazaars, all items of one redraw',
     inPlans: 'Torn Bids redraw · inside: an item\'s flip plan, all items of one redraw',
     inPossible: 'Torn Bids redraw · inside: an item\'s possible flip, all items of one redraw',
@@ -353,6 +358,20 @@ export const SPEED_BIDS = Object.freeze({
     plansKept: 'an item\'s flip plan: kept from the redraw before',
     plansRedone: 'an item\'s flip plan: worked out again',
     plansOn: 'an item\'s flip plan: keeping on (1) or switched off (0)',
+    shownKept: 'the buyers an item shows: kept from the redraw before',
+    shownRedone: 'the buyers an item shows: worked out again',
+    shownOn: 'the buyers an item shows: keeping on (1) or switched off (0)',
+    possibleKept: 'an item\'s possible flip: kept from the redraw before',
+    possibleRedone: 'an item\'s possible flip: worked out again',
+    possibleOn: 'an item\'s possible flip: keeping on (1) or switched off (0)',
+    // 3.29.0: what a redraw walks. The friend's redraw grew 16x in five hours with no size on record growing.
+    priceLists: 'traders with a price list in use',
+    buyerRows: 'buyer rows of all items (who buys an item, added up)',
+    byData: 'redraws asked for by arriving data (they wait their turn)',
+    byPress: 'redraws asked for by the answer to something pressed (after a moment, not waiting their turn)',
+    byStatus: 'redraws asked for by the first status answer after a press',
+    byTyping: 'redraws asked for by typing in the search box',
+    byOther: 'redraws drawn at once (a press on the page itself, a setting changed in another tab)',
     age: 'minutes since this Torn Bids page was opened',
     heap: 'memory the tab holds (MB, as the browser says)',
     nodes: 'elements in Torn Bids\' page',
@@ -464,18 +483,26 @@ export function speedText(record, { sizes = [], machine = null, version = null, 
     out.push('  time of one redraw (ms)');
     out.push(...spTable(bidsHours.map(([hour, b]) => [
         stamp(Number(hour) * SP_HOUR_MS).slice(0, 13) + 'h', b.w[B.redraw][0], cell(each(b.w[B.redraw]), spMs), cell(b.w[B.redraw][2], spMs), cell(each(b.w[B.stage3]), spMs), cell(each(b.w[B.stage4]), spMs),
-        cell(each(b.w[B.inBuyers]), spMs), cell(each(b.w[B.inSellers]), spMs), cell(each(b.w[B.inPlans]), spMs), cell(each(b.w[B.inPossible]), spMs), cell(each(b.w[B.yard]), spMs), cell(each(b.w[B.yardHidden]), spMs),
-    ]), ['hour', 'redraws', 'each', 'longest', 'possible flips', 'the list', 'in: buyers', 'in: bazaars', 'in: plans', 'in: possible', 'same sum', 'same sum hidden']));
+        cell(each(b.w[B.inBuyers]), spMs), cell(each(b.w[B.inShown]), spMs), cell(each(b.w[B.inSellers]), spMs), cell(each(b.w[B.inPlans]), spMs), cell(each(b.w[B.inPossible]), spMs), cell(each(b.w[B.yard]), spMs), cell(each(b.w[B.yardHidden]), spMs),
+    ]), ['hour', 'redraws', 'each', 'longest', 'possible flips', 'the list', 'in: buyers', 'in: shown', 'in: bazaars', 'in: plans', 'in: possible', 'same sum', 'same sum hidden']));
+    // 3.29.0: work that is NOT inside "each" above - the buyers worked out in pieces before a redraw, and the
+    // price lists index - and who asked for the redraws. (A redraw asked for by something pressed does not wait.)
+    const count = (row) => (row ? row[0] : 0);
+    out.push('  beside the redraw (ms in the hour), and who asked for the redraws');
+    out.push(...spTable(bidsHours.map(([hour, b]) => [
+        stamp(Number(hour) * SP_HOUR_MS).slice(0, 13) + 'h', cell(b.w[B.pieces] ? b.w[B.pieces][1] : null, spMs), count(b.w[B.pieces]), cell(b.w[B.index] ? b.w[B.index][1] : null, spMs), count(b.w[B.index]),
+        count(b.g[B.byData]), count(b.g[B.byPress]), count(b.g[B.byStatus]), count(b.g[B.byTyping]), count(b.g[B.byOther]),
+    ]), ['hour', 'pieces ms', 'pieces', 'index ms', 'index made', 'by data', 'by a press', 'by a status', 'by typing', 'by the page']));
     out.push('  what it worked through (the usual of the hour)');
     out.push(...spTable(bidsHours.map(([hour, b]) => [
-        stamp(Number(hour) * SP_HOUR_MS).slice(0, 13) + 'h', cell(each(b.g[B.items])), cell(each(b.g[B.lists])), cell(each(b.g[B.rows])), cell(each(b.g[B.traders])), cell(each(b.g[B.serverBazaars])),
+        stamp(Number(hour) * SP_HOUR_MS).slice(0, 13) + 'h', cell(each(b.g[B.items])), cell(each(b.g[B.buyerRows])), cell(each(b.g[B.priceLists])), cell(each(b.g[B.lists])), cell(each(b.g[B.rows])), cell(each(b.g[B.traders])), cell(each(b.g[B.serverBazaars])),
         cell(each(b.g[B.candidates])), cell(each(b.g[B.shown])), cell(each(b.g[B.waiting])), cell(b.g[B.fresh] ? b.g[B.fresh][1] : null), cell(each(b.g[B.measured])),
-    ]), ['hour', 'items', 'sellers lists', 'sellers rows', 'traders', 'server bazaars', 'picked to read', 'flips shown', 'waiting', 'new flips', 'speeds']));
+    ]), ['hour', 'items', 'buyer rows', 'price lists', 'sellers lists', 'sellers rows', 'traders', 'server bazaars', 'picked to read', 'flips shown', 'waiting', 'new flips', 'speeds']));
     out.push('  what was kept from the redraw before (share kept; keeping on or OFF), the page\'s age, memory');
     out.push(...spTable(bidsHours.map(([hour, b]) => [
-        stamp(Number(hour) * SP_HOUR_MS).slice(0, 13) + 'h', share(b.g[B.buyersKept], b.g[B.buyersRedone]), onOff(b.g[B.buyersOn]), share(b.g[B.sellersKept], b.g[B.sellersRedone]), onOff(b.g[B.sellersOn]),
-        share(b.g[B.plansKept], b.g[B.plansRedone]), onOff(b.g[B.plansOn]), cell(b.g[B.age] ? b.g[B.age][2] : null), cell(each(b.g[B.heap])), cell(b.g[B.heap] ? b.g[B.heap][2] : null), cell(each(b.g[B.nodes])), cell(each(b.g[B.gap])),
-    ]), ['hour', 'buyers kept', '', 'bazaars kept', '', 'plans kept', '', 'page age min', 'memory MB', 'most', 'elements', 's between redraws']));
+        stamp(Number(hour) * SP_HOUR_MS).slice(0, 13) + 'h', share(b.g[B.buyersKept], b.g[B.buyersRedone]), onOff(b.g[B.buyersOn]), share(b.g[B.shownKept], b.g[B.shownRedone]), onOff(b.g[B.shownOn]), share(b.g[B.sellersKept], b.g[B.sellersRedone]), onOff(b.g[B.sellersOn]),
+        share(b.g[B.plansKept], b.g[B.plansRedone]), onOff(b.g[B.plansOn]), share(b.g[B.possibleKept], b.g[B.possibleRedone]), onOff(b.g[B.possibleOn]), cell(b.g[B.age] ? b.g[B.age][2] : null), cell(each(b.g[B.heap])), cell(b.g[B.heap] ? b.g[B.heap][2] : null), cell(each(b.g[B.nodes])), cell(each(b.g[B.gap])),
+    ]), ['hour', 'buyers kept', '', 'shown kept', '', 'bazaars kept', '', 'plans kept', '', 'possible kept', '', 'page age min', 'memory MB', 'most', 'elements', 's between redraws']));
     out.push('');
 
     out.push('BY HOUR (UTC) - our own work, freezes, slow clicks and keys');
