@@ -201,7 +201,13 @@ if (/[?&]page=profile/.test(location.search)) {
         const d = document.createElement('div');
         d.innerHTML = '<div class="profile-buttons" style="display:flex;gap:6px;padding:40px">' +
             '<a id="button1-profile-' + _xid + '" class="profile-button profile-button-sendMessage active" aria-label="Private message" href="#mail">mail</a>' +
-            '<button id="button2-profile-' + _xid + '" class="profile-button profile-button-initiateChat active withoutLink" aria-label="Start chat">chat</button></div>';
+            '<button id="button2-profile-' + _xid + '" class="profile-button profile-button-initiateChat active withoutLink" aria-label="Start chat">chat</button></div>' +
+            // Torn's "User Information" box (as known, 3.30.1: not read on the real page) and the name in Basic Information.
+            '<div class="profile-wrapper" style="width:600px;margin:0 40px;font:13px Arial;color:#ddd"><div class="user-information profile-left-wrapper left">' +
+            '<div class="title-black top-round" role="heading" style="background:#2b2b2b;height:34px;line-height:34px;padding-left:10px;font-weight:700">User Information</div>' +
+            '<div class="cont bottom-round" style="background:#333;height:60px"></div></div>' +
+            '<div class="basic-information"><ul class="info-table"><li><div class="user-information-section"><span class="bold">Name</span></div>' +
+            '<div class="user-info-value"><span class="bold">KayMalta [' + _xid + ']</span></div></li></ul></div></div>';
         document.body.prepend(d);
     });
 }

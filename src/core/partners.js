@@ -179,3 +179,23 @@ export function blacklistKeys(list) {
     }
     return out;
 }
+
+/**
+ * A Torn profile's two marks (3.30.1): is that player a favourite, are they blacklisted.
+ * The profile page has no Ledger, so who is a favourite by trades alone comes from what Torn Bids
+ * last wrote down (`favourites`); your own presses (`edits`) count over it at once.
+ *
+ * @param {string|number} id - the profile's Torn id
+ * @param {{favourites?: Array<{id}>, edits?: {added?: Array, removed?: Array}, blacklist?: Array<{key}>, name?: string|null}} [o]
+ * @returns {{favourite: boolean, blacklisted: boolean}}
+ */
+export function profileMarks(id, { favourites = [], edits = {}, blacklist = [], name = null } = {}) {
+    const key = String(id);
+    const has = (l) => (l || []).map(String).includes(key);
+    const byTrades = (favourites || []).some((f) => f && String(f.id) === key);
+    const nameKey = name ? partnerKey({ name }) : null;
+    return {
+        favourite: !has(edits && edits.removed) && (has(edits && edits.added) || byTrades),
+        blacklisted: (blacklist || []).some((x) => x && (x.key === 'id:' + key || (nameKey !== null && x.key === nameKey))),
+    };
+}

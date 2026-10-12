@@ -288,6 +288,42 @@ export const PAGE_CSS = `
     50% { box-shadow: 0 0 0 11px rgba(90, 167, 255, 0.12); }
 }
 
+/* A trader's Torn profile (3.30.1): the star and the blacklist sign at the right of Torn's "User Information" header. */
+.ttv2-pmarks {
+    float: right;
+    display: flex;
+    gap: 2px;
+    margin: 0 4px 0 8px;
+}
+
+.ttv2-pmarks button {
+    all: unset;
+    cursor: pointer;
+    padding: 0 6px;
+    font-size: 17px;
+    line-height: inherit;
+    color: #8d8d8d;
+    text-shadow: none;
+}
+
+.ttv2-pmarks button:hover,
+.ttv2-pmarks button:focus-visible {
+    color: #fff;
+}
+
+.ttv2-pmarks button:focus-visible {
+    outline: 1px solid #5aa7ff;
+    outline-offset: -3px;
+}
+
+.ttv2-pmarks button.fav.on {
+    color: #ffcc4d;
+}
+
+.ttv2-pmarks button.blk.on {
+    color: #ff5a4d;
+}
+
 .ttv2-buyhere::before {
     content: attr(data-ttv2-buy);
     position: absolute;

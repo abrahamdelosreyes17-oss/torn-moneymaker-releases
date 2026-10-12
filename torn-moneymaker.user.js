@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      3.30.0
+// @version      3.30.1
 // @description  Finds Bazaar and Item Market listings below NPC / market value - on the page you are viewing, and live from the Torn API and TornW3B - ranked by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -52,7 +52,7 @@
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '3.30.0';
+    const TTV2_BUILD_VERSION = '3.30.1';
     const TTV2_SHARED_HOME = 'https://torn-bids-shared.pumping-iron-worker.workers.dev';
 
     /* ===== src/platform/gm.js ===== */
@@ -15195,6 +15195,62 @@
         return out;
     }
 
+    /**
+     * A Torn profile's two marks (3.30.1): is that player a favourite, are they blacklisted.
+     * The profile page has no Ledger, so who is a favourite by trades alone comes from what Torn Bids
+     * last wrote down (`favourites`); your own presses (`edits`) count over it at once.
+     *
+     * @param {string|number} id - the profile's Torn id
+     * @param {{favourites?: Array<{id}>, edits?: {added?: Array, removed?: Array}, blacklist?: Array<{key}>, name?: string|null}} [o]
+     * @returns {{favourite: boolean, blacklisted: boolean}}
+     */
+    function profileMarks(id, { favourites = [], edits = {}, blacklist = [], name = null } = {}) {
+        const key = String(id);
+        const has = (l) => (l || []).map(String).includes(key);
+        const byTrades = (favourites || []).some((f) => f && String(f.id) === key);
+        const nameKey = name ? partnerKey({ name }) : null;
+        return {
+            favourite: !has(edits && edits.removed) && (has(edits && edits.added) || byTrades),
+            blacklisted: (blacklist || []).some((x) => x && (x.key === 'id:' + key || (nameKey !== null && x.key === nameKey))),
+        };
+    }
+
+    /* ===== src/sources/dom/profile.js ===== */
+    /*
+     * A player's Torn profile (profiles.php?XID=), read only (3.30.1): where its
+     * "User Information" box has its header, and the player's name.
+     *
+     * The owner, 2026-10-12: "going to a traders profile, a star on the side of
+     * user information there. that makes them favorites, a blacklist sign as well".
+     *
+     * Torn's markup here is as known, not read on the real page for this build:
+     * the header is looked for by its box first, then by its words, so a renamed
+     * class still finds it. Nothing found: nothing is drawn.
+     */
+
+    /** The header of Torn's "User Information" box, or null. */
+    function profileInfoHeader(doc) {
+        if (!doc || !doc.querySelector) return null;
+        const byBox = doc.querySelector('.user-information .title-black, .user-information > [class*="title"]');
+        if (byBox) return byBox;
+        for (const el of doc.querySelectorAll('.profile-wrapper [class*="title"], [class*="title-black"], [role="heading"]')) {
+            if (/^\s*User Information\s*$/i.test(el.textContent || '')) return el;
+        }
+        return null;
+    }
+
+    /** The player's name as the profile says it ("Name [id]" in Basic Information, else the page's title), or null. */
+    function profileNameOf(doc, id) {
+        if (!doc || !/^\d+$/.test(String(id || ''))) return null;
+        const tail = new RegExp('^\\s*([^\\[\\]]{1,40}?)\\s*\\[' + id + '\\]\\s*$');
+        for (const el of doc.querySelectorAll ? doc.querySelectorAll('.user-info-value, .basic-information span, .basic-information a') : []) {
+            const m = String(el.textContent || '').match(tail);
+            if (m) return m[1];
+        }
+        const t = String(doc.title || '').match(/^\s*(.{1,40}?)(?:'s|')\s+Profile\b/i);
+        return t ? t[1] : null;
+    }
+
     /* ===== src/api/te.js ===== */
     /*
      * TornExchange (tornexchange.com) - traders' published buy prices.
@@ -20020,6 +20076,42 @@
 
     @keyframes ttv2-chatpulse {
         50% { box-shadow: 0 0 0 11px rgba(90, 167, 255, 0.12); }
+    }
+
+    /* A trader's Torn profile (3.30.1): the star and the blacklist sign at the right of Torn's "User Information" header. */
+    .ttv2-pmarks {
+        float: right;
+        display: flex;
+        gap: 2px;
+        margin: 0 4px 0 8px;
+    }
+
+    .ttv2-pmarks button {
+        all: unset;
+        cursor: pointer;
+        padding: 0 6px;
+        font-size: 17px;
+        line-height: inherit;
+        color: #8d8d8d;
+        text-shadow: none;
+    }
+
+    .ttv2-pmarks button:hover,
+    .ttv2-pmarks button:focus-visible {
+        color: #fff;
+    }
+
+    .ttv2-pmarks button:focus-visible {
+        outline: 1px solid #5aa7ff;
+        outline-offset: -3px;
+    }
+
+    .ttv2-pmarks button.fav.on {
+        color: #ffcc4d;
+    }
+
+    .ttv2-pmarks button.blk.on {
+        color: #ff5a4d;
     }
 
     .ttv2-buyhere::before {
@@ -34198,6 +34290,7 @@
 
 
 
+
     const STORE_KEY = 'apiKey';
     const STORE_ITEMS = 'itemsCache';
     const STORE_NPC = 'npcCache';
@@ -34310,6 +34403,12 @@
     const STORE_CHAT_WANTED = 'chatWanted';
     const CHAT_WANTED_MS = 10 * 60 * 1000;
     const CHAT_MARK_CLASS = 'ttv2-chatmark';
+    /* Who is a favourite now, as Torn Bids last worked it out (3.30.1): [{id, name}] - a Torn profile has no Ledger to count trades from. */
+    const STORE_SELL_FAV_NOW = 'sellFavouritesNow';
+    const PROFILE_MARKS_ID = 'ttv2-profile-marks';
+    /* A profile is looked at this often for its first ten seconds: Torn draws it a moment after the page opens. */
+    const PROFILE_FIRST_MS = 300;
+    const PROFILE_FIRST_TRIES = 34;
     /* How fast each item leaves the bazaars (core/liquidity.js): itemId -> {units, ms, at}. */
     const STORE_SELL_MOVES = 'sellMoves';
     const SELL_MOVES_MAX = 1500;
@@ -38916,6 +39015,88 @@
         }, { once: true });
     }
 
+    /**
+     * A trader's Torn profile (3.30.1; the owner, 2026-10-12: "going to a traders profile, a star on the
+     * side of user information there. that makes them favorites, a blacklist sign as well"): a star and
+     * the blacklist sign at the right of Torn's "User Information" header, the same two as on a trader in
+     * Torn Bids, kept in the same place. On every profile but your own, while Torn Bids is on. Our two
+     * buttons only: nothing of Torn's is pressed, moved or covered.
+     */
+    function markProfileTrader() {
+        const id = profileIdOf(location.href);
+        const was = document.getElementById(PROFILE_MARKS_ID);
+        const own = id ? ownIdFromPage(document) || gmGet(STORE_SELF, null) : null;
+        const show = Boolean(bidsOn() && id && String(own || '') !== id);
+        const head = !show ? null : was && was.dataset.id === id && was.parentNode ? was.parentNode : profileInfoHeader(document);
+        if (!head) {
+            if (was) was.remove();
+            return;
+        }
+        const edits = sellFavourites();
+        const blacklist = sellBlacklist();
+        const favs = gmGet(STORE_SELL_FAV_NOW, null);
+        const known = (Array.isArray(favs) ? favs : []).find((f) => f && String(f.id) === id);
+        const listed = blacklist.find((x) => x && x.key === 'id:' + id);
+        const name = (edits.names && edits.names[id]) || (known && known.name) || (listed && listed.name) || profileNameOf(document, id);
+        const marks = profileMarks(id, { favourites: Array.isArray(favs) ? favs : [], edits, blacklist, name });
+        const sig = id + '|' + marks.favourite + '|' + marks.blacklisted + '|' + (name || '');
+        if (was && was.parentNode === head && was.dataset.sig === sig) return;
+        if (was) was.remove();
+        const who = name || 'this player';
+        const box = document.createElement('span');
+        box.id = PROFILE_MARKS_ID;
+        box.className = 'ttv2-pmarks';
+        box.dataset.id = id;
+        box.dataset.sig = sig;
+        const button = (cls, on, text, title, label, press) => {
+            const b = document.createElement('button');
+            b.type = 'button';
+            b.className = cls + (on ? ' on' : '');
+            b.textContent = text;
+            b.title = title;
+            b.setAttribute('aria-label', label);
+            b.setAttribute('aria-pressed', String(on));
+            b.addEventListener('click', (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                press();
+                markProfileTrader();
+            });
+            return b;
+        };
+        box.appendChild(button('fav', marks.favourite, marks.favourite ? '\u2605' : '\u2606',
+            marks.favourite ? 'A favourite in Torn Bids: press to remove' : 'Make ' + who + ' a favourite in Torn Bids: they stay in view in By trader',
+            marks.favourite ? 'Remove ' + who + ' from your Torn Bids favourites' : 'Make ' + who + ' a Torn Bids favourite',
+            () => {
+                saveFavourite({ id, name }, !marks.favourite);
+                logAction((marks.favourite ? 'Favourite removed' : 'Favourite added') + ' on their Torn profile (player ' + id + ')');
+            }));
+        box.appendChild(button('blk', marks.blacklisted, '\u2298',
+            marks.blacklisted ? 'Blacklisted in Torn Bids: press to take them off' : 'Blacklist ' + who + ' in Torn Bids: never a buyer (their bazaars are still used)',
+            marks.blacklisted ? 'Take ' + who + ' off your Torn Bids blacklist' : 'Blacklist ' + who + ' in Torn Bids',
+            () => {
+                if (marks.blacklisted) {
+                    // Off by id, and by name too: an entry made before their id was known.
+                    saveBlacklisted({ id, name }, false);
+                    if (name) saveBlacklisted({ name }, false);
+                } else saveBlacklisted({ id, name }, true);
+                logAction((marks.blacklisted ? 'Taken off the blacklist' : 'Blacklisted') + ' on their Torn profile (player ' + id + ')');
+            }));
+        // First in the header: a float there sits on the header's own line, at its right end.
+        head.insertBefore(box, head.firstChild);
+    }
+
+    /** A profile just opened: looked at often for its first seconds (Torn draws it late), then with everything else. */
+    function watchProfileFirst() {
+        if (!profileIdOf(location.href)) return;
+        let tries = 0;
+        const t = setInterval(() => {
+            tries += 1;
+            if (document.visibilityState === 'visible') markProfileTrader();
+            if (tries >= PROFILE_FIRST_TRIES || document.getElementById(PROFILE_MARKS_ID)) clearInterval(t);
+        }, PROFILE_FIRST_MS);
+    }
+
     /*
      * Torn's trade page is read again the moment its list changes (3.21.1; the
      * owner, 2026-10-03: "i have to scroll down for fill all to show up, also
@@ -39936,6 +40117,8 @@
         gmOnChange(STORE_KEY, () => sharedSetUp());
         // The Public key's box in Torn Bids' Settings shows what the panel on Torn's pages saved or forgot.
         if (world === 'sell') for (const key of [STORE_KEY, STORE_KEY_ACCESS, STORE_KEY_DEAD]) gmOnChange(key, () => renderSelling(true));
+        // A star or the blacklist sign pressed on a trader's Torn profile (3.30.1): Torn Bids shows it at once.
+        if (world === 'sell') for (const key of [STORE_SELL_FAVOURITES, STORE_SELL_BLACKLIST]) gmOnChange(key, () => renderSelling(true));
         sharedSetUp();
         // What the server said goes to the log once per change, from the tab that does the exchanging: it knows
         // this PC, it does not (404), it wants a newer copy, or there was no exchange.
@@ -40348,7 +40531,7 @@
         // The values the first list missed (3.17.0: the speed log's "everything stored"), and this tab's own request windows.
         keys.push(
             STORE_W3B_COOLDOWN, STORE_W3B_PACE, STORE_IM_WATCH, STORE_BIDS_SEEN, STORE_LIST_AT, STORE_SELL_DECLINED, STORE_SELL_ASKED, STORE_SELL_ENDED, STORE_SELL_ENDED_FULL, STORE_SELL_PAST, STORE_SELL_CANCELLED, STORE_BOUGHT_WINDOW, STORE_SELL_PRICE_RECORDS, STORE_SELL_BLACKLIST,
-            STORE_SELL_FAVOURITES, STORE_SELL_TE_OWN, STORE_CHAT_WANTED, STORE_SELL_MOVES, STORE_LEDGER_REV, STORE_SELL_PRESENCE, STORE_SELL_HELD, STORE_SELL_WAS,
+            STORE_SELL_FAVOURITES, STORE_SELL_FAV_NOW, STORE_SELL_TE_OWN, STORE_CHAT_WANTED, STORE_SELL_MOVES, STORE_LEDGER_REV, STORE_SELL_PRESENCE, STORE_SELL_HELD, STORE_SELL_WAS,
             FEED_LEADER_KEY, FEED_RECHECK_KEY, FEED_REFRESH_KEY, SPEED_STORE_KEY, STORE_CLEANED, STORE_SELL_CHECKED,
             STORE_API_WINDOW + '.' + app.tabId, STORE_W3B_WINDOW + '.' + app.tabId,
         );
@@ -40498,6 +40681,8 @@
         renderYours: false,
         /* What the last redraw drew of what you are working on (sellNearStamp), and whether an answer has moved it since. */
         nearDrawn: null,
+        /* Who is a favourite now, as last written down for Torn's profile pages (noteFavouritesNow). */
+        favNowWord: null,
         nearAsked: false,
         /* The draw for keys typed in the search box, on its way (renderSellingTyped): one for all keys typed meanwhile. */
         typedTimer: null,
@@ -41264,6 +41449,29 @@
     function sellFavourites() {
         const f = gmGet(STORE_SELL_FAVOURITES, null);
         return f && typeof f === 'object' ? f : {};
+    }
+
+    /** A star pressed (Torn Bids, or the trader's Torn profile): the favourite added or removed by hand. */
+    function saveFavourite(b, on) {
+        // The name is kept with it: a favourite added by hand, never traded with, is named (not "Player 12").
+        const edits = sellFavourites();
+        const names = { ...(edits.names || {}) };
+        if (on && b.name && !/^Player \d+$/.test(b.name)) names[String(b.id)] = String(b.name);
+        gmSet(STORE_SELL_FAVOURITES, { ...editFavourite(edits, b.id, on), names });
+    }
+
+    /** The blacklist sign pressed (Torn Bids, or the trader's Torn profile). */
+    function saveBlacklisted(b, on) {
+        gmSet(STORE_SELL_BLACKLIST, editBlacklist(sellBlacklist(), b, on));
+    }
+
+    /** Who is a favourite now, written down when it changed: the star on a Torn profile reads it (that page has no Ledger). */
+    function noteFavouritesNow(favs) {
+        const word = favs.map((f) => f.id + ':' + (f.name || '')).join('|');
+        if (sell.favNowWord === word) return;
+        sell.favNowWord = word;
+        const was = gmGet(STORE_SELL_FAV_NOW, null);
+        if (!Array.isArray(was) || was.map((f) => f.id + ':' + (f.name || '')).join('|') !== word) gmSet(STORE_SELL_FAV_NOW, favs.map((f) => ({ id: String(f.id), name: f.name || null })));
     }
 
     /*
@@ -42962,6 +43170,8 @@
         const teMap = sell.traders ? sell.traders.map : new Map();
         // Your favourites and their own lists: read once per redraw (review M6).
         const favsNow = favouriteTraders(now);
+        // Only once the Ledger is in: before that the favourites by trades are not known, and nothing is written over them.
+        if (led.loaded) noteFavouritesNow(favsNow);
         const ownLists = sellTeOwn();
         const ownByItem = teOwnByItem(now, { favs: favsNow, lists: ownLists });
         // Every active TornExchange trader's list read in turn (3.15), beside your favourites' own.
@@ -45786,16 +45996,12 @@
             // Favourite (the star) and Blacklist (⊘) on a trader row; the Ledger's Traders tab too.
             onFavourite: (b, on) => {
                 if (!b || !b.id) return;
-                // The name is kept with it: a favourite added by hand, never traded with, is named (not "Player 12").
-                const edits = sellFavourites();
-                const names = { ...(edits.names || {}) };
-                if (on && b.name && !/^Player \d+$/.test(b.name)) names[String(b.id)] = String(b.name);
-                gmSet(STORE_SELL_FAVOURITES, { ...editFavourite(edits, b.id, on), names });
+                saveFavourite(b, on);
                 renderSellingNow();
             },
             onBlacklist: (b, on) => {
                 if (!b || (!b.id && !b.name)) return;
-                gmSet(STORE_SELL_BLACKLIST, editBlacklist(sellBlacklist(), b, on));
+                saveBlacklisted(b, on);
                 renderSellingNow();
             },
             onTradeAccept: (itemId) => acceptDeskTrade(itemId),
@@ -47045,6 +47251,7 @@
 
         window.addEventListener('hashchange', handleRouteChange);
         window.addEventListener('popstate', handleRouteChange);
+        watchProfileFirst();
 
         setInterval(() => {
             if (document.visibilityState !== 'visible') return;
@@ -47059,6 +47266,7 @@
                 // The trade page and the buying box need no item list: never wait for it.
                 if (isTradePage(location.href)) scanTradePage();
                 markChatButton();
+                markProfileTrader();
                 trackTradeBuying(null);
                 if (hasUsableKey() && !app.loading && Date.now() >= app.retryLoadAt) {
                     onScan();
@@ -47077,6 +47285,7 @@
                 // Torn's trade page, and the buying box on other pages.
                 if (isTradePage(location.href)) scanTradePage();
                 markChatButton();
+                markProfileTrader();
                 trackTradeBuying([]);
                 return;
             }

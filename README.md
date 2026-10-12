@@ -2769,6 +2769,32 @@ live and held; what two trades share; the joins in `src/main.js` and the page).
 line names it in his next zip). The desk's trades are still planned every redraw
 (up to 139 ms on his page); at the calm pace that is every 3 seconds.
 
+### A star and the blacklist sign on a trader's Torn profile (3.30.1)
+
+The owner, 2026-10-12: "going to a traders profile, a star on the side of user
+information there. that makes them favorites, a blacklist sign as well".
+
+On a player's Torn profile, while Torn Bids is on, the right end of Torn's
+"User Information" header has a star and ⊘: the same favourite and the same
+blacklist as on a trader in Torn Bids, kept in the same place
+(`markProfileTrader` in `src/main.js`, `core/partners.js` `profileMarks`,
+`sources/dom/profile.js`). Gold star = a favourite, red ⊘ = blacklisted; a
+press changes it, a second press takes it back, and an open Torn Bids tab
+redraws at once. Each press is in the action log.
+
+A profile page has no Ledger, so who is a favourite by trades alone (5 or more
+in 30 days) is what Torn Bids last wrote down (`sellFavouritesNow`); your own
+presses count over it at once.
+
+**My choices, not confirmed:** on every profile but your own, not only on
+known traders (a trader can be starred before Torn Bids has seen them); the two
+signs alone with their words on hover; grey when off.
+
+**Not seen on real Torn.** Torn's profile markup was not read for this build
+(his Chrome was not reachable): the header is looked for by its box
+(`.user-information .title-black`), else by the words "User Information". If
+neither is there, nothing is drawn and nothing breaks.
+
 ## Architecture
 
 ```
