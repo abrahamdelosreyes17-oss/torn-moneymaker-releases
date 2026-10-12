@@ -20,6 +20,39 @@
 
 const keptJsonSame = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 
+/**
+ * Where a fresh result and the kept one part (3.28.1), for the problem log: the first few places, each as
+ * "where: kept -> fresh". Until now the line only named the item, and nobody could say which of the things a
+ * result is worked out from the keeping had failed to look at.
+ * @returns {string} '' when they say the same
+ */
+export function keptDiffWords(fresh, kept, most = 4) {
+    const out = [];
+    const say = (v) => {
+        if (v === undefined) return 'nothing';
+        const s = JSON.stringify(v);
+        return s === undefined ? String(v) : s.length > 60 ? s.slice(0, 57) + '...' : s;
+    };
+    const walk = (a, b, path) => {
+        if (out.length >= most) return;
+        if (Object.is(a, b)) return;
+        const objA = a && typeof a === 'object';
+        const objB = b && typeof b === 'object';
+        if (!objA || !objB || Array.isArray(a) !== Array.isArray(b)) {
+            if (JSON.stringify(a) !== JSON.stringify(b)) out.push((path || 'the result') + ': ' + say(b) + ' -> ' + say(a));
+            return;
+        }
+        if (Array.isArray(a) && a.length !== b.length) out.push((path || 'the result') + ': ' + b.length + ' rows -> ' + a.length);
+        const keys = Array.isArray(a) ? Array.from({ length: Math.max(a.length, b.length) }, (_, i) => i) : [...new Set([...Object.keys(b), ...Object.keys(a)])];
+        for (const k of keys) {
+            if (out.length >= most) return;
+            walk(a[k], b[k], Array.isArray(a) ? path + '[' + k + ']' : path ? path + '.' + k : String(k));
+        }
+    };
+    walk(fresh, kept, '');
+    return out.join('; ');
+}
+
 function keptFreeze(v) {
     if (!v || typeof v !== 'object' || Object.isFrozen(v)) return;
     Object.freeze(v);
@@ -34,7 +67,7 @@ function keptSameSig(a, b) {
 
 /**
  * @param {object} [o]
- * @param {function} [o.onDiffer] - (key) => void: a kept result differed from a fresh one (keeping is then off)
+ * @param {function} [o.onDiffer] - (key, where) => void: a kept result differed from a fresh one (keeping is then off); `where`: keptDiffWords
  * @param {function} [o.same] - (fresh, kept) => boolean: do they say the same (JSON by default)
  * @param {boolean} [o.checkAll] - compare every kept result with a fresh one, not one a redraw (tests, the harness)
  * @param {boolean} [o.freeze] - freeze what is handed out, through and through (tests, the harness: a caller writing into a kept result fails loudly)
@@ -65,7 +98,11 @@ export function makeKeeper({ onDiffer = null, same = keptJsonSame, checkAll = fa
      * @param {function} [t.until] - (result) => the last moment it holds by the clock alone (Infinity: it does not age)
      */
     function get(key, sig, compute, { now = 0, until = null } = {}) {
-        if (off) return compute();
+        if (off) {
+            // Counted as worked out again (3.28.1): the speed log then shows what switching off costs.
+            stats.redone += 1;
+            return compute();
+        }
         const was = kept.get(key);
         if (was && now <= was.until && keptSameSig(was.sig, sig)) {
             stats.kept += 1;
@@ -77,7 +114,7 @@ export function makeKeeper({ onDiffer = null, same = keptJsonSame, checkAll = fa
             stats.differed += 1;
             off = true;
             kept.clear();
-            if (onDiffer) onDiffer(key);
+            if (onDiffer) onDiffer(key, keptDiffWords(fresh, was.out));
             return fresh;
         }
         const out = compute();

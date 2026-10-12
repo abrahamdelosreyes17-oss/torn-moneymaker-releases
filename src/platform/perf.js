@@ -14,7 +14,7 @@
  */
 
 import { gmGet, gmSet, gmSetProbe } from './gm.js';
-import { speedNew, speedAdd, speedStore, speedForeign, speedStartup, speedMachine, speedHasData, speedMerge } from '../core/speed.js';
+import { speedNew, speedAdd, speedGauge, speedStore, speedForeign, speedStartup, speedMachine, speedHasData, speedMerge } from '../core/speed.js';
 
 /** The stored record: every tab adds to it (core/speed.js speedMerge). */
 export const SPEED_STORE_KEY = 'speedLog';
@@ -62,6 +62,52 @@ export function perfTimed(kind, fn) {
     } finally {
         speedAdd(perfPending, 'w', kind, performance.now() - t0, perfWhere());
         perfArm();
+    }
+}
+
+/** Work timed by the caller itself (many small calls added up): `ms` counted under `kind`. */
+export function perfAdd(kind, ms) {
+    if (!perfHasClock || !perfStarted) return;
+    speedAdd(perfPending, 'w', kind, ms, perfWhere());
+    perfArm();
+}
+
+/** A size or a count, not a time (3.28.1): noted under `name` for this hour. */
+export function perfGauge(name, value) {
+    if (!perfStarted) return;
+    speedGauge(perfPending, name, value);
+    perfArm();
+}
+
+let perfYardSink = 0;
+function perfYardSum() {
+    let h = 7;
+    for (let i = 0; i < 400000; i += 1) h = Math.imul(h ^ i, 16777619) >>> 0;
+    return h;
+}
+
+/**
+ * The yardstick (3.28.1): the very same small sum, timed. It takes what the machine gives this tab right now -
+ * so a redraw that takes four times as long while this takes four times as long too was slowed by the machine
+ * (another program, a tab in the background, the laptop saving power), not by more work of ours.
+ * About a millisecond. Run twice: the first run is the browser warming the code up, the second is counted.
+ */
+export function perfYardstick(kind) {
+    if (!perfHasClock || !perfStarted) return;
+    perfYardSink = perfYardSum();
+    const t0 = performance.now();
+    perfYardSink ^= perfYardSum();
+    speedAdd(perfPending, 'w', kind, performance.now() - t0, perfWhere());
+    perfArm();
+}
+
+/** Megabytes of memory the tab's scripts hold, as the browser says (Chrome only); null where it does not say. */
+export function perfHeapMb() {
+    try {
+        const m = typeof performance !== 'undefined' ? performance.memory : null;
+        return m && m.usedJSHeapSize > 0 ? Math.round(m.usedJSHeapSize / 104857.6) / 10 : null;
+    } catch {
+        return null;
     }
 }
 

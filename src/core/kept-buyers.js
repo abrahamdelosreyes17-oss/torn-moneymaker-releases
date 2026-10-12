@@ -32,6 +32,7 @@
  */
 
 import { buyersForItem } from './traders.js';
+import { keptDiffWords } from './kept.js';
 
 const KEPT_NO_ROWS = [];
 
@@ -50,7 +51,7 @@ function keptSameMap(a, b) {
 /**
  * @param {object} [o]
  * @param {function} [o.compute] - buyersForItem (a test may count its calls)
- * @param {function} [o.onDiffer] - (itemId) => void: a kept item differed from a fresh one (keeping is then off)
+ * @param {function} [o.onDiffer] - (itemId, where) => void: a kept item differed from a fresh one (keeping is then off); `where`: keptDiffWords
  * @param {boolean} [o.freeze] - freeze what is handed out (tests: a caller writing into kept rows fails loudly)
  */
 export function makeBuyersKeeper({ compute = buyersForItem, onDiffer = null, freeze = false } = {}) {
@@ -207,7 +208,11 @@ export function makeBuyersKeeper({ compute = buyersForItem, onDiffer = null, fre
      */
     function buyers(itemId, src = {}) {
         const id = String(itemId);
-        if (off) return compute(id, src);
+        if (off) {
+            // Counted as worked out again (3.28.1): the speed log then shows what switching off costs.
+            stats.redone += 1;
+            return compute(id, src);
+        }
         // The page was free since the last look: what items share is looked at again first, so what is worked
         // out now is kept against what it read (and nothing kept outlives a change that went and came back).
         if (!settled) {
@@ -228,7 +233,7 @@ export function makeBuyersKeeper({ compute = buyersForItem, onDiffer = null, fre
             stats.differed += 1;
             off = true;
             kept.clear();
-            if (onDiffer) onDiffer(id);
+            if (onDiffer) onDiffer(id, keptDiffWords(fresh, was.out));
             return fresh;
         }
         const out = compute(id, src);

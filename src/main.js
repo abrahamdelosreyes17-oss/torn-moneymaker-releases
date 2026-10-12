@@ -23,8 +23,8 @@ import {
 } from './platform/gm.js';
 import { SharedLink, SHARED_CONFIG_KEY, SHARED_STATE_KEY, SHARED_GRANT_KEY, SHARED_TICK_MS, SHARED_UNKNOWN_MS, SHARED_W3B_ASK_KEY, SHARED_LISTS_OUT_KEY, SHARED_LISTS_IN_KEY, SHARED_CALLS_KEY, SHARED_MOVES_KEY } from './feed/shared-link.js';
 import { sharedMayCall, withShared, sharedHome, sharedWord, sharedSaid, sharedSaidLine, sharedGoingOwn, sharedGoingByItem, sharedOnThis, sharedGoingFor, sharedBoughtLine, sharedPanelLine, sharedDirDue, sharedDealRows, sharedKnowsLowest, sharedMayRead, sharedAskLeft, sharedList, sharedItemsSeen, SHARED_MAX_WANT, SHARED_MAX_LISTS, SHARED_MAX_LIST_ITEMS } from './core/shared.js';
-import { perfStart, perfNow, perfDone, perfTimed, perfForeign, perfStartup, perfRecord, perfMachine, SPEED_STORE_KEY } from './platform/perf.js';
-import { speedFiles } from './core/speed.js';
+import { perfStart, perfNow, perfDone, perfTimed, perfForeign, perfStartup, perfRecord, perfMachine, perfAdd, perfGauge, perfYardstick, perfHeapMb, SPEED_STORE_KEY } from './platform/perf.js';
+import { speedFiles, SPEED_BIDS } from './core/speed.js';
 import { tradesFiles, keepEndedTrades } from './core/trades-export.js';
 import { tidyAccepted, tidyPins, tidyGone, tidyStock, tidyBought, tidyDeclined, tidyAsked, tidyEnded, tidyCancelUndo, tidyLeftovers, tidyTeLists, tidyWasToSell, tidyHeld } from './core/tidy.js';
 import {
@@ -5822,6 +5822,10 @@ function usageState() {
             // 3.28.0: the item speeds in use (items measured by the server, how old its table is), how many of the flips
             // shown are planned smaller for them, and how many trader-and-item pairs are known from finished trades.
             speeds: sell.speedInfo || null,
+            // 3.28.1: the results kept between redraws, as this tab has them - how often each was kept, worked out
+            // again, checked against a fresh one, found differing; whether keeping is still on; the page's age.
+            kept: Object.fromEntries(sellKeepersNow().filter((row) => row[4]).map(([name, , , , k]) => [name, { ...k.stats, on: k.on() }])),
+            pageMinutes: sellPageMinutes(),
         },
     };
 }
@@ -8557,7 +8561,8 @@ function buyerLookup({ teMap, lists, teOne, idsByName, db, w3bByItem, dbIdsByNam
 function sellBuyersKeeper() {
     if (!sell.buyersKeeper) {
         sell.buyersKeeper = makeBuyersKeeper({
-            onDiffer: (itemId) => logProblem('error', 'Kept buyers differed from fresh ones (item ' + itemId + ')', 'keeping is off until this page is reloaded; nothing shown was wrong after this line'),
+            // 3.28.1: where they part is said (kept -> fresh), so the next zip names what the keeping did not look at.
+            onDiffer: (itemId, where) => logProblem('error', 'Kept buyers differed from fresh ones (item ' + itemId + ')', 'keeping is off until this page is reloaded; nothing shown was wrong after this line. Where, kept -> fresh: ' + (where || 'not found') + '. This page was opened ' + sellPageMinutes() + ' min ago'),
         });
     }
     return sell.buyersKeeper;
@@ -8576,12 +8581,82 @@ function sellWorkKeepers() {
             makeKeeper({
                 checkAll,
                 freeze: checkAll,
-                onDiffer: (itemId) => logProblem('error', 'Kept ' + what + ' differed from fresh ones (item ' + itemId + ')', 'keeping is off until this page is reloaded; nothing shown was wrong after this line'),
+                onDiffer: (itemId, where) => logProblem('error', 'Kept ' + what + ' differed from fresh ones (item ' + itemId + ')', 'keeping is off until this page is reloaded; nothing shown was wrong after this line. Where, kept -> fresh: ' + (where || 'not found') + '. This page was opened ' + sellPageMinutes() + ' min ago'),
             });
         sell.workKeepers = { sellers: make('bazaars'), plans: make('flip plans') };
         logProblem('note', 'Kept between redraws: each item\'s bazaars and flip plan' + (checkAll ? ' (every kept result checked)' : ''), '');
     }
     return sell.workKeepers;
+}
+
+/** Minutes since this Torn Bids page first drew (3.28.1: "it gets laggy the longer it goes on"). */
+function sellPageMinutes(now = Date.now()) {
+    return sell.pageSince ? Math.round((now - sell.pageSince) / 60000) : 0;
+}
+
+/** The three results kept between redraws, as [words for the speed log, the keeper]. */
+function sellKeepersNow() {
+    const G = SPEED_BIDS;
+    return [
+        ['buyers', G.buyersKept, G.buyersRedone, G.buyersOn, sell.buyersKeeper || null],
+        ['bazaars', G.sellersKept, G.sellersRedone, G.sellersOn, sell.workKeepers ? sell.workKeepers.sellers : null],
+        ['plans', G.plansKept, G.plansRedone, G.plansOn, sell.workKeepers ? sell.workKeepers.plans : null],
+    ];
+}
+
+/**
+ * 3.28.1 - what one redraw of Torn Bids had to work through, noted for the speed log (core/speed.js, group g).
+ * The friend's zip of 2026-10-11: a redraw went from 256 ms to 4,096 ms in five hours, and on the test page no
+ * number of items, sellers, traders or flips made it slow - so what a real session has that the test page has
+ * not must be read from a zip. Sizes and counts only: no name, id, item or price.
+ */
+function sellNoteSizes({ now, items, summary, shownIds, waiting, measured, serverBazaars }) {
+    const G = SPEED_BIDS;
+    perfGauge(G.items, items);
+    perfGauge(G.lists, sell.bazaars.size);
+    perfGauge(G.summary, summary);
+    perfGauge(G.candidates, (sell.candidates || []).length);
+    perfGauge(G.shown, shownIds.length);
+    perfGauge(G.waiting, waiting);
+    perfGauge(G.measured, measured);
+    if (serverBazaars !== null) perfGauge(G.serverBazaars, serverBazaars);
+    // Flips that came and went since the redraw before: added up over an hour, how many were found and lost.
+    const nowShown = new Set(shownIds);
+    if (sell.shownWas) {
+        let fresh = 0;
+        let left = 0;
+        for (const id of nowShown) if (!sell.shownWas.has(id)) fresh += 1;
+        for (const id of sell.shownWas) if (!nowShown.has(id)) left += 1;
+        perfGauge(G.fresh, fresh);
+        perfGauge(G.left, left);
+    }
+    sell.shownWas = nowShown;
+    // What was kept from the redraw before and what was worked out again (the pieces before this redraw too),
+    // and whether each keeping is still on: one that found a kept result differing is off until a reload.
+    const seen = sell.keptSeen || (sell.keptSeen = {});
+    for (const [name, kept, redone, on, k] of sellKeepersNow()) {
+        if (!k) continue;
+        const was = seen[name] || { kept: 0, redone: 0 };
+        perfGauge(kept, Math.max(0, k.stats.kept - was.kept));
+        perfGauge(redone, Math.max(0, k.stats.redone - was.redone));
+        perfGauge(on, k.on() ? 1 : 0);
+        seen[name] = { kept: k.stats.kept, redone: k.stats.redone };
+    }
+    perfGauge(G.age, (now - sell.pageSince) / 60000);
+    if (sell.sizesNotedAt) perfGauge(G.gap, (now - sell.sizesNotedAt) / 1000);
+    sell.sizesNotedAt = now;
+    const heap = perfHeapMb();
+    if (heap !== null) perfGauge(G.heap, heap);
+    // Counted once a minute (each walks everything held), noted with every redraw.
+    if (!sell.sizesSlow || now - sell.sizesSlow.at >= 60000) {
+        let rows = 0;
+        for (const b of sell.bazaars.values()) rows += b && Array.isArray(b.rows) ? b.rows.length : 0;
+        const shadow = sell.page && sell.page.host ? sell.page.host.shadowRoot : null;
+        sell.sizesSlow = { at: now, rows, traders: Object.keys((sell.db && sell.db.traders) || {}).length, nodes: shadow ? shadow.querySelectorAll('*').length : null };
+    }
+    perfGauge(G.rows, sell.sizesSlow.rows);
+    perfGauge(G.traders, sell.sizesSlow.traders);
+    if (sell.sizesSlow.nodes !== null) perfGauge(G.nodes, sell.sizesSlow.nodes);
 }
 
 /** Everything the page shows, from what is loaded now. */
@@ -8750,6 +8825,12 @@ function renderSellingNow(src = null, t0 = sellClock(), before = 0) {
     sell.hiddenWork = false;
     // Pieces under way are overtaken by this draw (it works out what they had not reached).
     stopSellWarm();
+    // 3.28.1 - the yardstick: the same small sum once a minute, just before the work it is the measure of.
+    const yardAt = Date.now();
+    if (sell.page && yardAt - (sell.yardAt || 0) >= 60000) {
+        sell.yardAt = yardAt;
+        perfYardstick(document.visibilityState === 'visible' ? SPEED_BIDS.yard : SPEED_BIDS.yardHidden);
+    }
     try {
         renderSellingWork(src);
     } finally {
@@ -8823,6 +8904,9 @@ function renderSellingWork(src = null) {
         perfDone('Torn Bids redraw · ' + name, stageT0);
         stageT0 = perfNow();
     };
+    // 3.28.1 - the many small calls inside a redraw, added up by kind: which of them the time goes to.
+    const inside = { buyers: 0, sellers: 0, plans: 0, possible: 0 };
+    if (!sell.pageSince) sell.pageSince = now;
     const prefs = sellPrefs();
     const st = teState();
     const access = gmGet(STORE_SELL_KEY_ACCESS, null);
@@ -8866,7 +8950,9 @@ function renderSellingWork(src = null) {
         let b = shownCache.get(key);
         if (!b) {
             // Blacklisted traders are never buyers (their bazaars still are sellers); favourites first on a tie.
+            const tb = perfNow();
             const all = buyersAll(key);
+            inside.buyers += perfNow() - tb;
             // Each trader's TornExchange / TornW3B badge, for the Ledger's Traders tab.
             for (const x of all) {
                 if (!x || !x.id || !x.trust) continue;
@@ -9021,6 +9107,7 @@ function renderSellingWork(src = null) {
         const key = String(id);
         if (sellersKept.has(key)) return sellersKept.get(key);
         const b = sell.bazaars.get(key);
+        const ts = perfNow();
         const rows =
             b && b.at
                 ? keepers.sellers.get(
@@ -9030,6 +9117,7 @@ function renderSellingWork(src = null) {
                       { now, until: freshUntil },
                   )
                 : null;
+        inside.sellers += perfNow() - ts;
         sellersKept.set(key, rows);
         return rows;
     };
@@ -9163,12 +9251,14 @@ function renderSellingWork(src = null) {
         const rows = sellersOf(id);
         if (!rows) return null;
         const fbs = flipCheckedOf(id);
+        const tp = perfNow();
         const k = keepers.plans.get(String(id), keptPlanSig(rows, prefs, fbs, (b) => declinedBy(id, b), (b) => amountOf(id, buyerKeyOf(b), false)), () => {
             const best = planFrom(id, rows);
             if (!best) return null;
             const { buyer, ...plan } = best;
             return { plan, at: fbs.indexOf(buyer) };
         });
+        inside.plans += perfNow() - tp;
         return k ? { ...k.plan, buyer: fbs[k.at] } : null;
     };
     const planFrom = (id, rows) => {
@@ -9348,7 +9438,10 @@ function renderSellingWork(src = null) {
         const best = buyersOf(id)[0] || null;
         const held = heldQty.get(id) || 0;
         const plan = planOf(id);
-        const maybe = possibleOf(id, sellersOf(id));
+        const itsRows = sellersOf(id);
+        const tm = perfNow();
+        const maybe = possibleOf(id, itsRows);
+        inside.possible += perfNow() - tm;
         if (maybe && !(plan && plan.units > 0 && plan.profit >= maybe.profit)) waiting.push({ itemId: String(id), profit: maybe.profit, traderId: maybe.buyer.id || null });
         if (plan && plan.units > 0) shownFlips.push({ itemId: String(id), profit: plan.profit, traderId: plan.buyer && plan.buyer.id ? plan.buyer.id : null });
         const lowest = lowestOf(id);
@@ -9490,6 +9583,13 @@ function renderSellingWork(src = null) {
             .sort((a, b) => b.value - a.value || (b.held > 0) - (a.held > 0) || b.bid - a.bid || String(a.name).localeCompare(String(b.name)));
     }
     redrawStage('4 the list (every item)');
+    // 3.28.1 - for the speed log: where the time inside went, and what this redraw had to work through.
+    perfAdd(SPEED_BIDS.inBuyers, inside.buyers);
+    perfAdd(SPEED_BIDS.inSellers, inside.sellers);
+    perfAdd(SPEED_BIDS.inPlans, inside.plans);
+    perfAdd(SPEED_BIDS.inPossible, inside.possible);
+    // (A search shows part of the items: its counts would read as a market that shrank.)
+    if (!q) sellNoteSizes({ now, items: allIds.size, summary: summary.size, shownIds: shownFlips.map((f) => f.itemId), waiting: waiting.length, measured: speeds ? speeds.rows.size : 0, serverBazaars: sharedReads ? sharedReads.index.bySeller.size : null });
     let strip;
     let stripWaiting = [];
     if (sell.still) {

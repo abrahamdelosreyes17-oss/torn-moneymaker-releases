@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      3.28.0
+// @version      3.28.1
 // @description  Finds Bazaar and Item Market listings below NPC / market value - on the page you are viewing, and live from the Torn API and TornW3B - ranked by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -52,7 +52,7 @@
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '3.28.0';
+    const TTV2_BUILD_VERSION = '3.28.1';
     const TTV2_SHARED_HOME = 'https://torn-bids-shared.pumping-iron-worker.workers.dev';
 
     /* ===== src/platform/gm.js ===== */
@@ -2185,6 +2185,13 @@
      * to show). Each stored value's reads and writes. How many changes inside
      * the rows we watch did not come from us. The 50 slowest single events.
      *
+     * 3.28.1 - and sizes and counts, by the hour (group `g`, speedGauge): how many
+     * items, sellers lists, flips and traders a Torn Bids redraw had to work
+     * through, how much of it was kept from the redraw before, how old the page
+     * was, how much memory the tab held. The friend's zip of 2026-10-11 showed a
+     * redraw going from 256 ms to 4,096 ms within five hours and nothing in it
+     * said why: the times were there, what they were spent on was not.
+     *
      * What is never kept: a name, a player id, an item, a price, a key, a page
      * address. Every label is one of this file's own words, or a stored value's
      * name (ours), or a kind of page ("bazaar", "trade", "Torn Bids").
@@ -2237,7 +2244,7 @@
 
     function spBucket(p, at) {
         const hour = String(Math.floor(at / SP_HOUR_MS));
-        return p.h[hour] || (p.h[hour] = { w: {}, f: {}, i: {}, s: {}, x: [0, 0, 0] });
+        return p.h[hour] || (p.h[hour] = { w: {}, f: {}, i: {}, g: {}, s: {}, x: [0, 0, 0] });
     }
 
     function spBump(group, name, ms) {
@@ -2270,6 +2277,21 @@
         const name = group === 'w' ? kind : where + ' · ' + kind;
         spBump(spBucket(p, at)[group], name, d);
         spNoteTop(p, d, group === 'w' ? kind : (group === 'f' ? 'freeze' : 'slow ' + kind), where, at);
+        return p;
+    }
+
+    /**
+     * A size or a count, not a time (3.28.1): how many times it was noted this hour, their sum, the most.
+     * @param {object} p - speedNew
+     * @param {string} name - what is counted (the caller's own words; never a name, an id, an item or a price)
+     * @param {number} value
+     */
+    function speedGauge(p, name, value, at = Date.now()) {
+        // Not known is not nothing: only a number is noted.
+        if (typeof value !== 'number') return p;
+        const v = value;
+        if (!(v >= 0) || !Number.isFinite(v)) return p;
+        spBump(spBucket(p, at).g, String(name), v);
         return p;
     }
 
@@ -2363,15 +2385,16 @@
     function spAddBucket(target, key, b, as = (k) => k) {
         const src = b && typeof b === 'object' ? b : {};
         const cur = target[key] && typeof target[key] === 'object' ? target[key] : {};
-        const out = { w: { ...(cur.w || {}) }, f: { ...(cur.f || {}) }, i: { ...(cur.i || {}) }, s: { ...(cur.s || {}) }, x: Array.isArray(cur.x) ? [...cur.x] : [0, 0, 0] };
+        const out = { w: { ...(cur.w || {}) }, f: { ...(cur.f || {}) }, i: { ...(cur.i || {}) }, g: { ...(cur.g || {}) }, s: { ...(cur.s || {}) }, x: Array.isArray(cur.x) ? [...cur.x] : [0, 0, 0] };
         spAddRows(out.w, src.w, 3, as);
         spAddRows(out.f, src.f, 3, as);
         spAddRows(out.i, src.i, 3, as);
+        spAddRows(out.g, src.g, 3, as);
         spAddRows(out.s, src.s, 7, as);
         const x = Array.isArray(src.x) ? src.x : [0, 0, 0];
         out.x = [out.x[0] + (Number(x[0]) || 0), out.x[1] + (Number(x[1]) || 0), Math.max(out.x[2], Number(x[2]) || 0)];
         // Empty parts are not stored.
-        for (const g of ['w', 'f', 'i', 's']) if (!Object.keys(out[g]).length) delete out[g];
+        for (const g of ['w', 'f', 'i', 'g', 's']) if (!Object.keys(out[g]).length) delete out[g];
         if (!out.x.some((v) => v > 0)) delete out.x;
         target[key] = out;
     }
@@ -2398,7 +2421,7 @@
         };
         for (const [hour, b] of Object.entries(p.h || {})) {
             if (!b || typeof b !== 'object') continue;
-            spAddBucket(out.h, hour, { w: b.w, f: b.f, i: b.i, x: b.x }, numberOf);
+            spAddBucket(out.h, hour, { w: b.w, f: b.f, i: b.i, g: b.g, x: b.x }, numberOf);
             // The stored values' reads and writes: by the day.
             if (b.s && Object.keys(b.s).length) spAddBucket(out.d, String(Math.floor((Number(hour) * SP_HOUR_MS) / SP_DAY_MS)), { s: b.s }, numberOf);
         }
@@ -2421,7 +2444,7 @@
     /** The record without the labels no bucket holds any more (their numbers closed up). */
     function spCompact(r) {
         const used = new Set();
-        const groups = ['w', 'f', 'i', 's'];
+        const groups = ['w', 'f', 'i', 'g', 's'];
         for (const b of [...Object.values(r.h), ...Object.values(r.d)]) for (const g of groups) for (const k of Object.keys(b[g] || {})) used.add(Number(k));
         if (used.size === r.n.length) return r;
         const order = [...used].filter((i) => r.n[i] !== undefined).sort((a, b) => a - b);
@@ -2450,7 +2473,7 @@
             const out = {};
             for (const [key, b] of Object.entries(buckets)) {
                 spAddBucket(out, key, b, nameOf);
-                out[key] = { w: {}, f: {}, i: {}, s: {}, x: [0, 0, 0], ...out[key] };
+                out[key] = { w: {}, f: {}, i: {}, g: {}, s: {}, x: [0, 0, 0], ...out[key] };
             }
             return out;
         };
@@ -2463,13 +2486,55 @@
         const all = {};
         for (const b of Object.values(r.d)) spAddBucket(all, 'all', b);
         for (const b of Object.values(r.h)) spAddBucket(all, 'all', b);
-        return { w: {}, f: {}, i: {}, s: {}, x: [0, 0, 0], ...(all.all || {}) };
+        return { w: {}, f: {}, i: {}, g: {}, s: {}, x: [0, 0, 0], ...(all.all || {}) };
     }
+
+    /*
+     * 3.28.1 - the words Torn Bids' redraw is recorded under, so the text below can lay them out hour by hour.
+     * Times (group w) and sizes (group g). main.js records under these very words.
+     */
+    const SPEED_BIDS = Object.freeze({
+        redraw: 'Torn Bids redraw (working out + page)',
+        stage3: 'Torn Bids redraw · 3 possible flips',
+        stage4: 'Torn Bids redraw · 4 the list (every item)',
+        inBuyers: 'Torn Bids redraw · inside: who buys an item, all items of one redraw',
+        inSellers: 'Torn Bids redraw · inside: an item\'s bazaars, all items of one redraw',
+        inPlans: 'Torn Bids redraw · inside: an item\'s flip plan, all items of one redraw',
+        inPossible: 'Torn Bids redraw · inside: an item\'s possible flip, all items of one redraw',
+        yard: 'the same small sum, once a minute (how fast the machine runs us)',
+        yardHidden: 'the same small sum, once a minute · hidden tab',
+        items: 'items in the list',
+        lists: 'items with a sellers list held',
+        rows: 'sellers rows held, all items',
+        summary: 'items in TornW3B\'s summary',
+        traders: 'traders known',
+        serverBazaars: 'bazaars held from the shared server',
+        candidates: 'possible flips picked to read',
+        shown: 'flips shown',
+        waiting: 'possible flips waiting for a price check',
+        fresh: 'flips newly shown since the redraw before',
+        left: 'flips gone since the redraw before',
+        measured: 'items the server measured the speed of',
+        buyersKept: 'who buys an item: kept from the redraw before',
+        buyersRedone: 'who buys an item: worked out again',
+        buyersOn: 'who buys an item: keeping on (1) or switched off (0)',
+        sellersKept: 'an item\'s bazaars: kept from the redraw before',
+        sellersRedone: 'an item\'s bazaars: worked out again',
+        sellersOn: 'an item\'s bazaars: keeping on (1) or switched off (0)',
+        plansKept: 'an item\'s flip plan: kept from the redraw before',
+        plansRedone: 'an item\'s flip plan: worked out again',
+        plansOn: 'an item\'s flip plan: keeping on (1) or switched off (0)',
+        age: 'minutes since this Torn Bids page was opened',
+        heap: 'memory the tab holds (MB, as the browser says)',
+        nodes: 'elements in Torn Bids\' page',
+        gap: 'seconds between two redraws',
+    });
 
     const spPad = (s, n) => String(s).padEnd(n);
     const spLpad = (s, n) => String(s).padStart(n);
     const spMs = (n) => (Number(n) >= 100 ? Math.round(Number(n)).toLocaleString('en-US') : (Math.round(Number(n) * 10) / 10).toFixed(1));
     const spKb = (n) => (Number(n) / 1024).toFixed(Number(n) < 10240 ? 1 : 0) + ' KB';
+    const spNum = (n) => (Number(n) >= 100 ? Math.round(Number(n)).toLocaleString('en-US') : String(Math.round(Number(n) * 10) / 10));
 
     function spTable(rows, head) {
         if (!rows.length) return ['  (nothing recorded)'];
@@ -2545,6 +2610,43 @@
         const sized = [...sizes].sort((a, b) => b[1] - a[1]);
         out.push('EVERYTHING STORED BY THE SCRIPT - ' + spKb(sized.reduce((a, s) => a + s[1], 0)) + ' in all (the browser hands all of it to the script on every page)');
         out.push(...spTable(sized.map(([k, n]) => [k, spKb(n)]), ['value', 'size']));
+        out.push('');
+
+        const sizes3 = Object.entries(all.g).sort((a, b) => a[0].localeCompare(b[0]));
+        out.push('SIZES AND COUNTS (not times) - what the work above had to go through');
+        out.push(...spTable(sizes3.map(([k, v]) => [k, v[0].toLocaleString('en-US'), spNum(v[0] ? v[1] / v[0] : 0), spNum(v[2]), spNum(v[1])]), ['what', 'noted', 'usual', 'most', 'in all']));
+        out.push('');
+
+        // Torn Bids' redraw, hour by hour: what it took beside what went into it. Read across a row: a redraw that
+        // got slower with nothing bigger to work through was slowed by something else (the "same small sum" says
+        // whether the machine itself ran us slower; "kept" whether the results kept between redraws still were).
+        const B = SPEED_BIDS;
+        const each = (row) => (row && row[0] ? row[1] / row[0] : null);
+        const cell = (v, f = spNum) => (v === null || v === undefined ? '-' : f(v));
+        const share = (kept, redone) => {
+            const k = kept ? kept[1] : 0;
+            const r = redone ? redone[1] : 0;
+            return k + r > 0 ? Math.round((k / (k + r)) * 100) + '%' : '-';
+        };
+        const onOff = (row) => (row && row[0] ? (row[1] >= row[0] ? 'on' : row[1] <= 0 ? 'OFF' : 'on ' + Math.round((row[1] / row[0]) * 100) + '%') : '-');
+        const hoursSorted = Object.entries(r.h).sort((a, b) => Number(a[0]) - Number(b[0]));
+        const bidsHours = hoursSorted.filter(([, b]) => b.w[B.redraw]);
+        out.push('TORN BIDS, HOUR BY HOUR (UTC) - one redraw, and what went into it');
+        out.push('  time of one redraw (ms)');
+        out.push(...spTable(bidsHours.map(([hour, b]) => [
+            stamp(Number(hour) * SP_HOUR_MS).slice(0, 13) + 'h', b.w[B.redraw][0], cell(each(b.w[B.redraw]), spMs), cell(b.w[B.redraw][2], spMs), cell(each(b.w[B.stage3]), spMs), cell(each(b.w[B.stage4]), spMs),
+            cell(each(b.w[B.inBuyers]), spMs), cell(each(b.w[B.inSellers]), spMs), cell(each(b.w[B.inPlans]), spMs), cell(each(b.w[B.inPossible]), spMs), cell(each(b.w[B.yard]), spMs), cell(each(b.w[B.yardHidden]), spMs),
+        ]), ['hour', 'redraws', 'each', 'longest', 'possible flips', 'the list', 'in: buyers', 'in: bazaars', 'in: plans', 'in: possible', 'same sum', 'same sum hidden']));
+        out.push('  what it worked through (the usual of the hour)');
+        out.push(...spTable(bidsHours.map(([hour, b]) => [
+            stamp(Number(hour) * SP_HOUR_MS).slice(0, 13) + 'h', cell(each(b.g[B.items])), cell(each(b.g[B.lists])), cell(each(b.g[B.rows])), cell(each(b.g[B.traders])), cell(each(b.g[B.serverBazaars])),
+            cell(each(b.g[B.candidates])), cell(each(b.g[B.shown])), cell(each(b.g[B.waiting])), cell(b.g[B.fresh] ? b.g[B.fresh][1] : null), cell(each(b.g[B.measured])),
+        ]), ['hour', 'items', 'sellers lists', 'sellers rows', 'traders', 'server bazaars', 'picked to read', 'flips shown', 'waiting', 'new flips', 'speeds']));
+        out.push('  what was kept from the redraw before (share kept; keeping on or OFF), the page\'s age, memory');
+        out.push(...spTable(bidsHours.map(([hour, b]) => [
+            stamp(Number(hour) * SP_HOUR_MS).slice(0, 13) + 'h', share(b.g[B.buyersKept], b.g[B.buyersRedone]), onOff(b.g[B.buyersOn]), share(b.g[B.sellersKept], b.g[B.sellersRedone]), onOff(b.g[B.sellersOn]),
+            share(b.g[B.plansKept], b.g[B.plansRedone]), onOff(b.g[B.plansOn]), cell(b.g[B.age] ? b.g[B.age][2] : null), cell(each(b.g[B.heap])), cell(b.g[B.heap] ? b.g[B.heap][2] : null), cell(each(b.g[B.nodes])), cell(each(b.g[B.gap])),
+        ]), ['hour', 'buyers kept', '', 'bazaars kept', '', 'plans kept', '', 'page age min', 'memory MB', 'most', 'elements', 's between redraws']));
         out.push('');
 
         out.push('BY HOUR (UTC) - our own work, freezes, slow clicks and keys');
@@ -2636,6 +2738,52 @@
         } finally {
             speedAdd(perfPending, 'w', kind, performance.now() - t0, perfWhere());
             perfArm();
+        }
+    }
+
+    /** Work timed by the caller itself (many small calls added up): `ms` counted under `kind`. */
+    function perfAdd(kind, ms) {
+        if (!perfHasClock || !perfStarted) return;
+        speedAdd(perfPending, 'w', kind, ms, perfWhere());
+        perfArm();
+    }
+
+    /** A size or a count, not a time (3.28.1): noted under `name` for this hour. */
+    function perfGauge(name, value) {
+        if (!perfStarted) return;
+        speedGauge(perfPending, name, value);
+        perfArm();
+    }
+
+    let perfYardSink = 0;
+    function perfYardSum() {
+        let h = 7;
+        for (let i = 0; i < 400000; i += 1) h = Math.imul(h ^ i, 16777619) >>> 0;
+        return h;
+    }
+
+    /**
+     * The yardstick (3.28.1): the very same small sum, timed. It takes what the machine gives this tab right now -
+     * so a redraw that takes four times as long while this takes four times as long too was slowed by the machine
+     * (another program, a tab in the background, the laptop saving power), not by more work of ours.
+     * About a millisecond. Run twice: the first run is the browser warming the code up, the second is counted.
+     */
+    function perfYardstick(kind) {
+        if (!perfHasClock || !perfStarted) return;
+        perfYardSink = perfYardSum();
+        const t0 = performance.now();
+        perfYardSink ^= perfYardSum();
+        speedAdd(perfPending, 'w', kind, performance.now() - t0, perfWhere());
+        perfArm();
+    }
+
+    /** Megabytes of memory the tab's scripts hold, as the browser says (Chrome only); null where it does not say. */
+    function perfHeapMb() {
+        try {
+            const m = typeof performance !== 'undefined' ? performance.memory : null;
+            return m && m.usedJSHeapSize > 0 ? Math.round(m.usedJSHeapSize / 104857.6) / 10 : null;
+        } catch {
+            return null;
         }
     }
 
@@ -15679,6 +15827,188 @@
         return out.join('\n');
     }
 
+    /* ===== src/core/kept.js ===== */
+    /*
+     * A worked-out result kept between Torn Bids' redraws (3.25.0; PLAN-next-session.md part 2, step 3).
+     *
+     * A redraw follows one answer (a bazaar read, a status, one trader's list) and
+     * works every item out again, though nearly every item's bazaars and plan are
+     * what they were. Kept here, like each item's buyers (core/kept-buyers.js): a
+     * result is handed back as it was while everything it was worked out from is
+     * what it was. The caller says what that is, as a flat row of values (`sig`);
+     * each is compared with Object.is, so a list stands for itself only while it
+     * is the very same list. A result that goes out of date by the clock alone
+     * (a listing turning stale) says until when it holds.
+     *
+     * Nothing is told to this file when something changes: each redraw it looks.
+     * And it does not trust itself: one kept result a redraw is worked out again
+     * and compared (`same`); should they ever differ, keeping stops and `onDiffer`
+     * is called - the page then works everything out each time, as before.
+     *
+     * Pure: no DOM, no storage, no clock (the caller hands `now`).
+     */
+
+    const keptJsonSame = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+
+    /**
+     * Where a fresh result and the kept one part (3.28.1), for the problem log: the first few places, each as
+     * "where: kept -> fresh". Until now the line only named the item, and nobody could say which of the things a
+     * result is worked out from the keeping had failed to look at.
+     * @returns {string} '' when they say the same
+     */
+    function keptDiffWords(fresh, kept, most = 4) {
+        const out = [];
+        const say = (v) => {
+            if (v === undefined) return 'nothing';
+            const s = JSON.stringify(v);
+            return s === undefined ? String(v) : s.length > 60 ? s.slice(0, 57) + '...' : s;
+        };
+        const walk = (a, b, path) => {
+            if (out.length >= most) return;
+            if (Object.is(a, b)) return;
+            const objA = a && typeof a === 'object';
+            const objB = b && typeof b === 'object';
+            if (!objA || !objB || Array.isArray(a) !== Array.isArray(b)) {
+                if (JSON.stringify(a) !== JSON.stringify(b)) out.push((path || 'the result') + ': ' + say(b) + ' -> ' + say(a));
+                return;
+            }
+            if (Array.isArray(a) && a.length !== b.length) out.push((path || 'the result') + ': ' + b.length + ' rows -> ' + a.length);
+            const keys = Array.isArray(a) ? Array.from({ length: Math.max(a.length, b.length) }, (_, i) => i) : [...new Set([...Object.keys(b), ...Object.keys(a)])];
+            for (const k of keys) {
+                if (out.length >= most) return;
+                walk(a[k], b[k], Array.isArray(a) ? path + '[' + k + ']' : path ? path + '.' + k : String(k));
+            }
+        };
+        walk(fresh, kept, '');
+        return out.join('; ');
+    }
+
+    function keptFreeze(v) {
+        if (!v || typeof v !== 'object' || Object.isFrozen(v)) return;
+        Object.freeze(v);
+        for (const k of Object.keys(v)) keptFreeze(v[k]);
+    }
+
+    function keptSameSig(a, b) {
+        if (a.length !== b.length) return false;
+        for (let i = 0; i < a.length; i += 1) if (!Object.is(a[i], b[i])) return false;
+        return true;
+    }
+
+    /**
+     * @param {object} [o]
+     * @param {function} [o.onDiffer] - (key, where) => void: a kept result differed from a fresh one (keeping is then off); `where`: keptDiffWords
+     * @param {function} [o.same] - (fresh, kept) => boolean: do they say the same (JSON by default)
+     * @param {boolean} [o.checkAll] - compare every kept result with a fresh one, not one a redraw (tests, the harness)
+     * @param {boolean} [o.freeze] - freeze what is handed out, through and through (tests, the harness: a caller writing into a kept result fails loudly)
+     */
+    function makeKeeper({ onDiffer = null, same = keptJsonSame, checkAll = false, freeze = false } = {}) {
+        const kept = new Map();
+        const stats = { kept: 0, redone: 0, checked: 0, differed: 0 };
+        let off = false;
+        // One kept result a redraw is worked out again and compared: which one moves on each redraw.
+        let hits = 0;
+        let lastHits = 0;
+        let checkAt = 0;
+
+        /** Once a redraw, before any get(). */
+        function begin() {
+            lastHits = hits;
+            hits = 0;
+            checkAt = lastHits ? (checkAt + 7) % lastHits : 0;
+        }
+
+        /**
+         * compute(), or what it gave last time for this key when it would give the same again.
+         * @param {string} key
+         * @param {Array} sig - everything compute() reads that can change, value by value
+         * @param {function} compute - () => result (never changed by the caller afterwards)
+         * @param {object} [t]
+         * @param {number} [t.now] - the redraw's clock
+         * @param {function} [t.until] - (result) => the last moment it holds by the clock alone (Infinity: it does not age)
+         */
+        function get(key, sig, compute, { now = 0, until = null } = {}) {
+            if (off) {
+                // Counted as worked out again (3.28.1): the speed log then shows what switching off costs.
+                stats.redone += 1;
+                return compute();
+            }
+            const was = kept.get(key);
+            if (was && now <= was.until && keptSameSig(was.sig, sig)) {
+                stats.kept += 1;
+                hits += 1;
+                if (!checkAll && hits - 1 !== checkAt) return was.out;
+                const fresh = compute();
+                stats.checked += 1;
+                if (same(fresh, was.out)) return was.out;
+                stats.differed += 1;
+                off = true;
+                kept.clear();
+                if (onDiffer) onDiffer(key, keptDiffWords(fresh, was.out));
+                return fresh;
+            }
+            const out = compute();
+            stats.redone += 1;
+            if (freeze) keptFreeze(out);
+            kept.set(key, { sig, until: until ? until(out) : Infinity, out });
+            return out;
+        }
+
+        return {
+            begin,
+            get,
+            stats,
+            /** Whether keeping is still on (off after a kept result differed). */
+            on: () => !off,
+            /** Forget the keys not in `keys` (items that left the page). */
+            only: (keys) => {
+                for (const k of [...kept.keys()]) if (!keys.has(k)) kept.delete(k);
+            },
+            clear: () => kept.clear(),
+        };
+    }
+
+    /* ------------------------------------------- what Torn Bids keeps with it */
+
+    /**
+     * Your marks on each item's bazaars - a listing a page showed gone, the stock a page showed, what you or
+     * a friend bought - as one word per item: an item's bazaars are worked out again when its word moves.
+     * @param {object} gone - liveGone(): 'seller|item' -> {at}
+     * @param {object} stock - liveStock(): 'seller|item' -> {qty, price, at}
+     * @param {Map<string, object[]>} boughtByItem - item -> [{sellerId, qty, each, t}]
+     * @returns {Map<string, string>}
+     */
+    function keptMarkWords(gone, stock, boughtByItem) {
+        const words = new Map();
+        const add = (item, text) => words.set(item, (words.get(item) || '') + text);
+        for (const k of Object.keys(gone || {})) add(k.slice(k.indexOf('|') + 1), 'g' + k + '@' + gone[k].at + ';');
+        for (const k of Object.keys(stock || {})) add(k.slice(k.indexOf('|') + 1), 's' + k + '=' + stock[k].qty + ',' + stock[k].price + '@' + stock[k].at + ';');
+        for (const [item, list] of boughtByItem || []) for (const x of list) add(String(item), 'b' + x.sellerId + '=' + x.qty + ',' + x.each + '@' + x.t + ';');
+        return words;
+    }
+
+    /** bazaarSellers() rows hold by the clock until the first fresh one turns stale: that moment (Infinity: none is fresh). */
+    function keptFreshUntil(rows, freshMs) {
+        let t = Infinity;
+        for (const r of rows || []) if (!r.stale && r.dataAt + freshMs < t) t = r.dataAt + freshMs;
+        return t;
+    }
+
+    /**
+     * What a flip plan is worked out from: the item's rows (the very list), your limits, and each believable
+     * buyer's bid, how many they can pay for and whether you declined them.
+     * @param {object[]} rows - sellersOf(): the kept list itself
+     * @param {{maxPerFlip, cash, minProfitPct}} prefs
+     * @param {object[]} buyers - flipBuyers()
+     * @param {function} declined - (buyer) => boolean
+     * @param {function|null} [capOf] - (buyer) => the most of the item a trade with them takes (3.28.0, amountCap)
+     */
+    function keptPlanSig(rows, prefs, buyers, declined, capOf = null) {
+        const sig = [rows, prefs.maxPerFlip, prefs.cash, prefs.minProfitPct, buyers.length];
+        for (const b of buyers) sig.push(b.id, b.name, b.price, b.maxUnits, Boolean(declined(b)), capOf ? capOf(b) : 0);
+        return sig;
+    }
+
     /* ===== src/core/kept-buyers.js ===== */
     /*
      * Each item's buyers, kept between Torn Bids' redraws (3.18.0; PLAN-speed.md
@@ -15715,6 +16045,7 @@
 
 
 
+
     const KEPT_NO_ROWS = [];
 
     /** The same keys with the same values (b may be null: no entries). */
@@ -15732,7 +16063,7 @@
     /**
      * @param {object} [o]
      * @param {function} [o.compute] - buyersForItem (a test may count its calls)
-     * @param {function} [o.onDiffer] - (itemId) => void: a kept item differed from a fresh one (keeping is then off)
+     * @param {function} [o.onDiffer] - (itemId, where) => void: a kept item differed from a fresh one (keeping is then off); `where`: keptDiffWords
      * @param {boolean} [o.freeze] - freeze what is handed out (tests: a caller writing into kept rows fails loudly)
      */
     function makeBuyersKeeper({ compute = buyersForItem, onDiffer = null, freeze = false } = {}) {
@@ -15889,7 +16220,11 @@
          */
         function buyers(itemId, src = {}) {
             const id = String(itemId);
-            if (off) return compute(id, src);
+            if (off) {
+                // Counted as worked out again (3.28.1): the speed log then shows what switching off costs.
+                stats.redone += 1;
+                return compute(id, src);
+            }
             // The page was free since the last look: what items share is looked at again first, so what is worked
             // out now is kept against what it read (and nothing kept outlives a change that went and came back).
             if (!settled) {
@@ -15910,7 +16245,7 @@
                 stats.differed += 1;
                 off = true;
                 kept.clear();
-                if (onDiffer) onDiffer(id);
+                if (onDiffer) onDiffer(id, keptDiffWords(fresh, was.out));
                 return fresh;
             }
             const out = compute(id, src);
@@ -15953,151 +16288,6 @@
             },
             clear: () => kept.clear(),
         };
-    }
-
-    /* ===== src/core/kept.js ===== */
-    /*
-     * A worked-out result kept between Torn Bids' redraws (3.25.0; PLAN-next-session.md part 2, step 3).
-     *
-     * A redraw follows one answer (a bazaar read, a status, one trader's list) and
-     * works every item out again, though nearly every item's bazaars and plan are
-     * what they were. Kept here, like each item's buyers (core/kept-buyers.js): a
-     * result is handed back as it was while everything it was worked out from is
-     * what it was. The caller says what that is, as a flat row of values (`sig`);
-     * each is compared with Object.is, so a list stands for itself only while it
-     * is the very same list. A result that goes out of date by the clock alone
-     * (a listing turning stale) says until when it holds.
-     *
-     * Nothing is told to this file when something changes: each redraw it looks.
-     * And it does not trust itself: one kept result a redraw is worked out again
-     * and compared (`same`); should they ever differ, keeping stops and `onDiffer`
-     * is called - the page then works everything out each time, as before.
-     *
-     * Pure: no DOM, no storage, no clock (the caller hands `now`).
-     */
-
-    const keptJsonSame = (a, b) => JSON.stringify(a) === JSON.stringify(b);
-
-    function keptFreeze(v) {
-        if (!v || typeof v !== 'object' || Object.isFrozen(v)) return;
-        Object.freeze(v);
-        for (const k of Object.keys(v)) keptFreeze(v[k]);
-    }
-
-    function keptSameSig(a, b) {
-        if (a.length !== b.length) return false;
-        for (let i = 0; i < a.length; i += 1) if (!Object.is(a[i], b[i])) return false;
-        return true;
-    }
-
-    /**
-     * @param {object} [o]
-     * @param {function} [o.onDiffer] - (key) => void: a kept result differed from a fresh one (keeping is then off)
-     * @param {function} [o.same] - (fresh, kept) => boolean: do they say the same (JSON by default)
-     * @param {boolean} [o.checkAll] - compare every kept result with a fresh one, not one a redraw (tests, the harness)
-     * @param {boolean} [o.freeze] - freeze what is handed out, through and through (tests, the harness: a caller writing into a kept result fails loudly)
-     */
-    function makeKeeper({ onDiffer = null, same = keptJsonSame, checkAll = false, freeze = false } = {}) {
-        const kept = new Map();
-        const stats = { kept: 0, redone: 0, checked: 0, differed: 0 };
-        let off = false;
-        // One kept result a redraw is worked out again and compared: which one moves on each redraw.
-        let hits = 0;
-        let lastHits = 0;
-        let checkAt = 0;
-
-        /** Once a redraw, before any get(). */
-        function begin() {
-            lastHits = hits;
-            hits = 0;
-            checkAt = lastHits ? (checkAt + 7) % lastHits : 0;
-        }
-
-        /**
-         * compute(), or what it gave last time for this key when it would give the same again.
-         * @param {string} key
-         * @param {Array} sig - everything compute() reads that can change, value by value
-         * @param {function} compute - () => result (never changed by the caller afterwards)
-         * @param {object} [t]
-         * @param {number} [t.now] - the redraw's clock
-         * @param {function} [t.until] - (result) => the last moment it holds by the clock alone (Infinity: it does not age)
-         */
-        function get(key, sig, compute, { now = 0, until = null } = {}) {
-            if (off) return compute();
-            const was = kept.get(key);
-            if (was && now <= was.until && keptSameSig(was.sig, sig)) {
-                stats.kept += 1;
-                hits += 1;
-                if (!checkAll && hits - 1 !== checkAt) return was.out;
-                const fresh = compute();
-                stats.checked += 1;
-                if (same(fresh, was.out)) return was.out;
-                stats.differed += 1;
-                off = true;
-                kept.clear();
-                if (onDiffer) onDiffer(key);
-                return fresh;
-            }
-            const out = compute();
-            stats.redone += 1;
-            if (freeze) keptFreeze(out);
-            kept.set(key, { sig, until: until ? until(out) : Infinity, out });
-            return out;
-        }
-
-        return {
-            begin,
-            get,
-            stats,
-            /** Whether keeping is still on (off after a kept result differed). */
-            on: () => !off,
-            /** Forget the keys not in `keys` (items that left the page). */
-            only: (keys) => {
-                for (const k of [...kept.keys()]) if (!keys.has(k)) kept.delete(k);
-            },
-            clear: () => kept.clear(),
-        };
-    }
-
-    /* ------------------------------------------- what Torn Bids keeps with it */
-
-    /**
-     * Your marks on each item's bazaars - a listing a page showed gone, the stock a page showed, what you or
-     * a friend bought - as one word per item: an item's bazaars are worked out again when its word moves.
-     * @param {object} gone - liveGone(): 'seller|item' -> {at}
-     * @param {object} stock - liveStock(): 'seller|item' -> {qty, price, at}
-     * @param {Map<string, object[]>} boughtByItem - item -> [{sellerId, qty, each, t}]
-     * @returns {Map<string, string>}
-     */
-    function keptMarkWords(gone, stock, boughtByItem) {
-        const words = new Map();
-        const add = (item, text) => words.set(item, (words.get(item) || '') + text);
-        for (const k of Object.keys(gone || {})) add(k.slice(k.indexOf('|') + 1), 'g' + k + '@' + gone[k].at + ';');
-        for (const k of Object.keys(stock || {})) add(k.slice(k.indexOf('|') + 1), 's' + k + '=' + stock[k].qty + ',' + stock[k].price + '@' + stock[k].at + ';');
-        for (const [item, list] of boughtByItem || []) for (const x of list) add(String(item), 'b' + x.sellerId + '=' + x.qty + ',' + x.each + '@' + x.t + ';');
-        return words;
-    }
-
-    /** bazaarSellers() rows hold by the clock until the first fresh one turns stale: that moment (Infinity: none is fresh). */
-    function keptFreshUntil(rows, freshMs) {
-        let t = Infinity;
-        for (const r of rows || []) if (!r.stale && r.dataAt + freshMs < t) t = r.dataAt + freshMs;
-        return t;
-    }
-
-    /**
-     * What a flip plan is worked out from: the item's rows (the very list), your limits, and each believable
-     * buyer's bid, how many they can pay for and whether you declined them.
-     * @param {object[]} rows - sellersOf(): the kept list itself
-     * @param {{maxPerFlip, cash, minProfitPct}} prefs
-     * @param {object[]} buyers - flipBuyers()
-     * @param {function} declined - (buyer) => boolean
-     * @param {function|null} [capOf] - (buyer) => the most of the item a trade with them takes (3.28.0, amountCap)
-     */
-    function keptPlanSig(rows, prefs, buyers, declined, capOf = null) {
-        const sig = [rows, prefs.maxPerFlip, prefs.cash, prefs.minProfitPct, buyers.length];
-        for (const b of buyers) sig.push(b.id, b.name, b.price, b.maxUnits, Boolean(declined(b)), capOf ? capOf(b) : 0);
-        return sig;
     }
 
     /* ===== src/core/job.js ===== */
@@ -38854,6 +39044,10 @@
                 // 3.28.0: the item speeds in use (items measured by the server, how old its table is), how many of the flips
                 // shown are planned smaller for them, and how many trader-and-item pairs are known from finished trades.
                 speeds: sell.speedInfo || null,
+                // 3.28.1: the results kept between redraws, as this tab has them - how often each was kept, worked out
+                // again, checked against a fresh one, found differing; whether keeping is still on; the page's age.
+                kept: Object.fromEntries(sellKeepersNow().filter((row) => row[4]).map(([name, , , , k]) => [name, { ...k.stats, on: k.on() }])),
+                pageMinutes: sellPageMinutes(),
             },
         };
     }
@@ -41589,7 +41783,8 @@
     function sellBuyersKeeper() {
         if (!sell.buyersKeeper) {
             sell.buyersKeeper = makeBuyersKeeper({
-                onDiffer: (itemId) => logProblem('error', 'Kept buyers differed from fresh ones (item ' + itemId + ')', 'keeping is off until this page is reloaded; nothing shown was wrong after this line'),
+                // 3.28.1: where they part is said (kept -> fresh), so the next zip names what the keeping did not look at.
+                onDiffer: (itemId, where) => logProblem('error', 'Kept buyers differed from fresh ones (item ' + itemId + ')', 'keeping is off until this page is reloaded; nothing shown was wrong after this line. Where, kept -> fresh: ' + (where || 'not found') + '. This page was opened ' + sellPageMinutes() + ' min ago'),
             });
         }
         return sell.buyersKeeper;
@@ -41608,12 +41803,82 @@
                 makeKeeper({
                     checkAll,
                     freeze: checkAll,
-                    onDiffer: (itemId) => logProblem('error', 'Kept ' + what + ' differed from fresh ones (item ' + itemId + ')', 'keeping is off until this page is reloaded; nothing shown was wrong after this line'),
+                    onDiffer: (itemId, where) => logProblem('error', 'Kept ' + what + ' differed from fresh ones (item ' + itemId + ')', 'keeping is off until this page is reloaded; nothing shown was wrong after this line. Where, kept -> fresh: ' + (where || 'not found') + '. This page was opened ' + sellPageMinutes() + ' min ago'),
                 });
             sell.workKeepers = { sellers: make('bazaars'), plans: make('flip plans') };
             logProblem('note', 'Kept between redraws: each item\'s bazaars and flip plan' + (checkAll ? ' (every kept result checked)' : ''), '');
         }
         return sell.workKeepers;
+    }
+
+    /** Minutes since this Torn Bids page first drew (3.28.1: "it gets laggy the longer it goes on"). */
+    function sellPageMinutes(now = Date.now()) {
+        return sell.pageSince ? Math.round((now - sell.pageSince) / 60000) : 0;
+    }
+
+    /** The three results kept between redraws, as [words for the speed log, the keeper]. */
+    function sellKeepersNow() {
+        const G = SPEED_BIDS;
+        return [
+            ['buyers', G.buyersKept, G.buyersRedone, G.buyersOn, sell.buyersKeeper || null],
+            ['bazaars', G.sellersKept, G.sellersRedone, G.sellersOn, sell.workKeepers ? sell.workKeepers.sellers : null],
+            ['plans', G.plansKept, G.plansRedone, G.plansOn, sell.workKeepers ? sell.workKeepers.plans : null],
+        ];
+    }
+
+    /**
+     * 3.28.1 - what one redraw of Torn Bids had to work through, noted for the speed log (core/speed.js, group g).
+     * The friend's zip of 2026-10-11: a redraw went from 256 ms to 4,096 ms in five hours, and on the test page no
+     * number of items, sellers, traders or flips made it slow - so what a real session has that the test page has
+     * not must be read from a zip. Sizes and counts only: no name, id, item or price.
+     */
+    function sellNoteSizes({ now, items, summary, shownIds, waiting, measured, serverBazaars }) {
+        const G = SPEED_BIDS;
+        perfGauge(G.items, items);
+        perfGauge(G.lists, sell.bazaars.size);
+        perfGauge(G.summary, summary);
+        perfGauge(G.candidates, (sell.candidates || []).length);
+        perfGauge(G.shown, shownIds.length);
+        perfGauge(G.waiting, waiting);
+        perfGauge(G.measured, measured);
+        if (serverBazaars !== null) perfGauge(G.serverBazaars, serverBazaars);
+        // Flips that came and went since the redraw before: added up over an hour, how many were found and lost.
+        const nowShown = new Set(shownIds);
+        if (sell.shownWas) {
+            let fresh = 0;
+            let left = 0;
+            for (const id of nowShown) if (!sell.shownWas.has(id)) fresh += 1;
+            for (const id of sell.shownWas) if (!nowShown.has(id)) left += 1;
+            perfGauge(G.fresh, fresh);
+            perfGauge(G.left, left);
+        }
+        sell.shownWas = nowShown;
+        // What was kept from the redraw before and what was worked out again (the pieces before this redraw too),
+        // and whether each keeping is still on: one that found a kept result differing is off until a reload.
+        const seen = sell.keptSeen || (sell.keptSeen = {});
+        for (const [name, kept, redone, on, k] of sellKeepersNow()) {
+            if (!k) continue;
+            const was = seen[name] || { kept: 0, redone: 0 };
+            perfGauge(kept, Math.max(0, k.stats.kept - was.kept));
+            perfGauge(redone, Math.max(0, k.stats.redone - was.redone));
+            perfGauge(on, k.on() ? 1 : 0);
+            seen[name] = { kept: k.stats.kept, redone: k.stats.redone };
+        }
+        perfGauge(G.age, (now - sell.pageSince) / 60000);
+        if (sell.sizesNotedAt) perfGauge(G.gap, (now - sell.sizesNotedAt) / 1000);
+        sell.sizesNotedAt = now;
+        const heap = perfHeapMb();
+        if (heap !== null) perfGauge(G.heap, heap);
+        // Counted once a minute (each walks everything held), noted with every redraw.
+        if (!sell.sizesSlow || now - sell.sizesSlow.at >= 60000) {
+            let rows = 0;
+            for (const b of sell.bazaars.values()) rows += b && Array.isArray(b.rows) ? b.rows.length : 0;
+            const shadow = sell.page && sell.page.host ? sell.page.host.shadowRoot : null;
+            sell.sizesSlow = { at: now, rows, traders: Object.keys((sell.db && sell.db.traders) || {}).length, nodes: shadow ? shadow.querySelectorAll('*').length : null };
+        }
+        perfGauge(G.rows, sell.sizesSlow.rows);
+        perfGauge(G.traders, sell.sizesSlow.traders);
+        if (sell.sizesSlow.nodes !== null) perfGauge(G.nodes, sell.sizesSlow.nodes);
     }
 
     /** Everything the page shows, from what is loaded now. */
@@ -41782,6 +42047,12 @@
         sell.hiddenWork = false;
         // Pieces under way are overtaken by this draw (it works out what they had not reached).
         stopSellWarm();
+        // 3.28.1 - the yardstick: the same small sum once a minute, just before the work it is the measure of.
+        const yardAt = Date.now();
+        if (sell.page && yardAt - (sell.yardAt || 0) >= 60000) {
+            sell.yardAt = yardAt;
+            perfYardstick(document.visibilityState === 'visible' ? SPEED_BIDS.yard : SPEED_BIDS.yardHidden);
+        }
         try {
             renderSellingWork(src);
         } finally {
@@ -41855,6 +42126,9 @@
             perfDone('Torn Bids redraw · ' + name, stageT0);
             stageT0 = perfNow();
         };
+        // 3.28.1 - the many small calls inside a redraw, added up by kind: which of them the time goes to.
+        const inside = { buyers: 0, sellers: 0, plans: 0, possible: 0 };
+        if (!sell.pageSince) sell.pageSince = now;
         const prefs = sellPrefs();
         const st = teState();
         const access = gmGet(STORE_SELL_KEY_ACCESS, null);
@@ -41898,7 +42172,9 @@
             let b = shownCache.get(key);
             if (!b) {
                 // Blacklisted traders are never buyers (their bazaars still are sellers); favourites first on a tie.
+                const tb = perfNow();
                 const all = buyersAll(key);
+                inside.buyers += perfNow() - tb;
                 // Each trader's TornExchange / TornW3B badge, for the Ledger's Traders tab.
                 for (const x of all) {
                     if (!x || !x.id || !x.trust) continue;
@@ -42053,6 +42329,7 @@
             const key = String(id);
             if (sellersKept.has(key)) return sellersKept.get(key);
             const b = sell.bazaars.get(key);
+            const ts = perfNow();
             const rows =
                 b && b.at
                     ? keepers.sellers.get(
@@ -42062,6 +42339,7 @@
                           { now, until: freshUntil },
                       )
                     : null;
+            inside.sellers += perfNow() - ts;
             sellersKept.set(key, rows);
             return rows;
         };
@@ -42195,12 +42473,14 @@
             const rows = sellersOf(id);
             if (!rows) return null;
             const fbs = flipCheckedOf(id);
+            const tp = perfNow();
             const k = keepers.plans.get(String(id), keptPlanSig(rows, prefs, fbs, (b) => declinedBy(id, b), (b) => amountOf(id, buyerKeyOf(b), false)), () => {
                 const best = planFrom(id, rows);
                 if (!best) return null;
                 const { buyer, ...plan } = best;
                 return { plan, at: fbs.indexOf(buyer) };
             });
+            inside.plans += perfNow() - tp;
             return k ? { ...k.plan, buyer: fbs[k.at] } : null;
         };
         const planFrom = (id, rows) => {
@@ -42380,7 +42660,10 @@
             const best = buyersOf(id)[0] || null;
             const held = heldQty.get(id) || 0;
             const plan = planOf(id);
-            const maybe = possibleOf(id, sellersOf(id));
+            const itsRows = sellersOf(id);
+            const tm = perfNow();
+            const maybe = possibleOf(id, itsRows);
+            inside.possible += perfNow() - tm;
             if (maybe && !(plan && plan.units > 0 && plan.profit >= maybe.profit)) waiting.push({ itemId: String(id), profit: maybe.profit, traderId: maybe.buyer.id || null });
             if (plan && plan.units > 0) shownFlips.push({ itemId: String(id), profit: plan.profit, traderId: plan.buyer && plan.buyer.id ? plan.buyer.id : null });
             const lowest = lowestOf(id);
@@ -42522,6 +42805,13 @@
                 .sort((a, b) => b.value - a.value || (b.held > 0) - (a.held > 0) || b.bid - a.bid || String(a.name).localeCompare(String(b.name)));
         }
         redrawStage('4 the list (every item)');
+        // 3.28.1 - for the speed log: where the time inside went, and what this redraw had to work through.
+        perfAdd(SPEED_BIDS.inBuyers, inside.buyers);
+        perfAdd(SPEED_BIDS.inSellers, inside.sellers);
+        perfAdd(SPEED_BIDS.inPlans, inside.plans);
+        perfAdd(SPEED_BIDS.inPossible, inside.possible);
+        // (A search shows part of the items: its counts would read as a market that shrank.)
+        if (!q) sellNoteSizes({ now, items: allIds.size, summary: summary.size, shownIds: shownFlips.map((f) => f.itemId), waiting: waiting.length, measured: speeds ? speeds.rows.size : 0, serverBazaars: sharedReads ? sharedReads.index.bySeller.size : null });
         let strip;
         let stripWaiting = [];
         if (sell.still) {

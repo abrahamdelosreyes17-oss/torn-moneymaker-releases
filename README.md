@@ -2520,6 +2520,61 @@ like - how many items the server can speak of, and whether an hour is the right
 measure - is known only once the server has run with it for a few hours:
 `/admin/state` then names the items that move most.
 
+### The zip says what a slow redraw was spent on (3.28.1 - logging only)
+
+The owner, 2026-10-12: "tornbids gets laggy still the longer it goes on", and
+then: "add the logging and release. make sure that when my friend runs it, by
+exporting in his zip we can see the cause and can think of a solution on how to
+improve latency and findings and deals".
+
+**What was known.** The friend's zip of 2026-10-11 (3.26.2): one redraw of Torn
+Bids took 256 ms in the 12:00 hour (UTC), 470 ms at 15:00, 1,203 ms at 16:00,
+4,096 ms at 17:00. On the test page no size makes it slow - 1,200 items, 100
+sellers each, 500 more traders, 200 flips: 33 to 48 ms on the owner's PC. So a
+real session has something the test page has not, and the zip did not say what:
+it held times, never what they were spent on.
+
+**One lead, not proven.** Torn Bids already keeps each item's buyers, bazaars and
+flip plan between redraws (3.18.0, 3.25.0) and checks one kept result a redraw
+against a fresh one; should they differ, keeping switches itself off until the
+page is reloaded. His problem log has "Kept buyers differed from fresh ones (item
+531) - keeping is off" at 16:29 UTC, seven minutes after the page was opened, and
+again at 18:36, one minute after a reload. The hours fit. The line named an item
+and nothing else, so why they differed is not known either.
+
+**What a zip holds from 3.28.1 on.** In `speed/speed.txt` (and by the hour in
+`speed.json`, group `g`):
+
+- *Torn Bids, hour by hour* - three tables with one row an hour. The time of one
+  redraw and of its parts, with the many small calls inside added up by kind (who
+  buys an item, an item's bazaars, its flip plan, its possible flip). What that
+  redraw worked through: items, sellers lists and rows held, traders, bazaars from
+  the server, possible flips picked to read, flips shown and waiting, new flips
+  found in the hour, items with a measured speed. And what was kept from the
+  redraw before - the share kept and "on" or "OFF" for each of the three - with
+  the page's age in minutes, the tab's memory and the elements in the page.
+- *The same small sum, once a minute* - a fixed piece of arithmetic, timed. If a
+  redraw takes four times as long in an hour where this does too, the machine ran
+  us slower (another program, a tab in the background, the laptop saving power);
+  if this stays put, the work is ours.
+- *Sizes and counts* for the week, by name.
+
+In the problem log, a kept result that differs now says where, kept -> fresh
+(`keptDiffWords`: "[2].price: 500 -> 520"), and how old the page was. In
+`state.json`, `coverage.kept` has each keeping's counts and whether it is on,
+and `coverage.pageMinutes`.
+
+Read a row across: slow with nothing bigger to work through and "OFF" beside it
+is the lead above confirmed; slow with the small sum slow too is the machine;
+slow with more items, rows or flips is the pile; slow with a growing memory or
+element count is something not let go.
+
+Sizes and counts only - no name, id, item or price is in the speed log, as
+before. A keeping that is off now counts its work as "worked out again"; nothing
+else in what Torn Bids shows or asks was changed. Cost: about a millisecond a
+minute for the sum, two clock reads around each of those calls. Seen on the test
+page: the tables in a zip made there, the keepings at 96-99 % kept.
+
 ## Architecture
 
 ```

@@ -812,7 +812,8 @@ if (_sweepItems) {
     for (let i = 0; i < _sweepItems; i++) {
         const id = 12000 + i;
         SWEEP_ITEMS[id] = { name: 'Bloom ' + (i + 1), type: 'Flower', sell_price: 10, market_value: 120 };
-        prices[id] = 50;
+        // &sweepbid=<n>: what Sweeper pays. Over 100 every one of them is a flip (how many flips cost a redraw).
+        prices[id] = Number(q.get('sweepbid')) || 50;
         reads[id] = { at: t - 60000, sweep: true, rows: sweepListings(id).slice(0, keepRows).map((r) => [String(r.player_id), r.player_name, r.price, r.quantity, (NOW_S - 30) * 1000, null, false]) };
     }
     Object.assign(ITEMS, SWEEP_ITEMS);

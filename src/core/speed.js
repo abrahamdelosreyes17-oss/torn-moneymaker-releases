@@ -14,6 +14,13 @@
  * to show). Each stored value's reads and writes. How many changes inside
  * the rows we watch did not come from us. The 50 slowest single events.
  *
+ * 3.28.1 - and sizes and counts, by the hour (group `g`, speedGauge): how many
+ * items, sellers lists, flips and traders a Torn Bids redraw had to work
+ * through, how much of it was kept from the redraw before, how old the page
+ * was, how much memory the tab held. The friend's zip of 2026-10-11 showed a
+ * redraw going from 256 ms to 4,096 ms within five hours and nothing in it
+ * said why: the times were there, what they were spent on was not.
+ *
  * What is never kept: a name, a player id, an item, a price, a key, a page
  * address. Every label is one of this file's own words, or a stored value's
  * name (ours), or a kind of page ("bazaar", "trade", "Torn Bids").
@@ -66,7 +73,7 @@ export function speedNew() {
 
 function spBucket(p, at) {
     const hour = String(Math.floor(at / SP_HOUR_MS));
-    return p.h[hour] || (p.h[hour] = { w: {}, f: {}, i: {}, s: {}, x: [0, 0, 0] });
+    return p.h[hour] || (p.h[hour] = { w: {}, f: {}, i: {}, g: {}, s: {}, x: [0, 0, 0] });
 }
 
 function spBump(group, name, ms) {
@@ -99,6 +106,21 @@ export function speedAdd(p, group, kind, ms, where = '', at = Date.now()) {
     const name = group === 'w' ? kind : where + ' · ' + kind;
     spBump(spBucket(p, at)[group], name, d);
     spNoteTop(p, d, group === 'w' ? kind : (group === 'f' ? 'freeze' : 'slow ' + kind), where, at);
+    return p;
+}
+
+/**
+ * A size or a count, not a time (3.28.1): how many times it was noted this hour, their sum, the most.
+ * @param {object} p - speedNew
+ * @param {string} name - what is counted (the caller's own words; never a name, an id, an item or a price)
+ * @param {number} value
+ */
+export function speedGauge(p, name, value, at = Date.now()) {
+    // Not known is not nothing: only a number is noted.
+    if (typeof value !== 'number') return p;
+    const v = value;
+    if (!(v >= 0) || !Number.isFinite(v)) return p;
+    spBump(spBucket(p, at).g, String(name), v);
     return p;
 }
 
@@ -192,15 +214,16 @@ function spAddRows(into, from, width, as) {
 function spAddBucket(target, key, b, as = (k) => k) {
     const src = b && typeof b === 'object' ? b : {};
     const cur = target[key] && typeof target[key] === 'object' ? target[key] : {};
-    const out = { w: { ...(cur.w || {}) }, f: { ...(cur.f || {}) }, i: { ...(cur.i || {}) }, s: { ...(cur.s || {}) }, x: Array.isArray(cur.x) ? [...cur.x] : [0, 0, 0] };
+    const out = { w: { ...(cur.w || {}) }, f: { ...(cur.f || {}) }, i: { ...(cur.i || {}) }, g: { ...(cur.g || {}) }, s: { ...(cur.s || {}) }, x: Array.isArray(cur.x) ? [...cur.x] : [0, 0, 0] };
     spAddRows(out.w, src.w, 3, as);
     spAddRows(out.f, src.f, 3, as);
     spAddRows(out.i, src.i, 3, as);
+    spAddRows(out.g, src.g, 3, as);
     spAddRows(out.s, src.s, 7, as);
     const x = Array.isArray(src.x) ? src.x : [0, 0, 0];
     out.x = [out.x[0] + (Number(x[0]) || 0), out.x[1] + (Number(x[1]) || 0), Math.max(out.x[2], Number(x[2]) || 0)];
     // Empty parts are not stored.
-    for (const g of ['w', 'f', 'i', 's']) if (!Object.keys(out[g]).length) delete out[g];
+    for (const g of ['w', 'f', 'i', 'g', 's']) if (!Object.keys(out[g]).length) delete out[g];
     if (!out.x.some((v) => v > 0)) delete out.x;
     target[key] = out;
 }
@@ -227,7 +250,7 @@ export function speedMerge(stored, pending, now = Date.now()) {
     };
     for (const [hour, b] of Object.entries(p.h || {})) {
         if (!b || typeof b !== 'object') continue;
-        spAddBucket(out.h, hour, { w: b.w, f: b.f, i: b.i, x: b.x }, numberOf);
+        spAddBucket(out.h, hour, { w: b.w, f: b.f, i: b.i, g: b.g, x: b.x }, numberOf);
         // The stored values' reads and writes: by the day.
         if (b.s && Object.keys(b.s).length) spAddBucket(out.d, String(Math.floor((Number(hour) * SP_HOUR_MS) / SP_DAY_MS)), { s: b.s }, numberOf);
     }
@@ -250,7 +273,7 @@ export function speedMerge(stored, pending, now = Date.now()) {
 /** The record without the labels no bucket holds any more (their numbers closed up). */
 function spCompact(r) {
     const used = new Set();
-    const groups = ['w', 'f', 'i', 's'];
+    const groups = ['w', 'f', 'i', 'g', 's'];
     for (const b of [...Object.values(r.h), ...Object.values(r.d)]) for (const g of groups) for (const k of Object.keys(b[g] || {})) used.add(Number(k));
     if (used.size === r.n.length) return r;
     const order = [...used].filter((i) => r.n[i] !== undefined).sort((a, b) => a - b);
@@ -279,7 +302,7 @@ export function speedExpand(record) {
         const out = {};
         for (const [key, b] of Object.entries(buckets)) {
             spAddBucket(out, key, b, nameOf);
-            out[key] = { w: {}, f: {}, i: {}, s: {}, x: [0, 0, 0], ...out[key] };
+            out[key] = { w: {}, f: {}, i: {}, g: {}, s: {}, x: [0, 0, 0], ...out[key] };
         }
         return out;
     };
@@ -292,13 +315,55 @@ export function speedTotals(record) {
     const all = {};
     for (const b of Object.values(r.d)) spAddBucket(all, 'all', b);
     for (const b of Object.values(r.h)) spAddBucket(all, 'all', b);
-    return { w: {}, f: {}, i: {}, s: {}, x: [0, 0, 0], ...(all.all || {}) };
+    return { w: {}, f: {}, i: {}, g: {}, s: {}, x: [0, 0, 0], ...(all.all || {}) };
 }
+
+/*
+ * 3.28.1 - the words Torn Bids' redraw is recorded under, so the text below can lay them out hour by hour.
+ * Times (group w) and sizes (group g). main.js records under these very words.
+ */
+export const SPEED_BIDS = Object.freeze({
+    redraw: 'Torn Bids redraw (working out + page)',
+    stage3: 'Torn Bids redraw · 3 possible flips',
+    stage4: 'Torn Bids redraw · 4 the list (every item)',
+    inBuyers: 'Torn Bids redraw · inside: who buys an item, all items of one redraw',
+    inSellers: 'Torn Bids redraw · inside: an item\'s bazaars, all items of one redraw',
+    inPlans: 'Torn Bids redraw · inside: an item\'s flip plan, all items of one redraw',
+    inPossible: 'Torn Bids redraw · inside: an item\'s possible flip, all items of one redraw',
+    yard: 'the same small sum, once a minute (how fast the machine runs us)',
+    yardHidden: 'the same small sum, once a minute · hidden tab',
+    items: 'items in the list',
+    lists: 'items with a sellers list held',
+    rows: 'sellers rows held, all items',
+    summary: 'items in TornW3B\'s summary',
+    traders: 'traders known',
+    serverBazaars: 'bazaars held from the shared server',
+    candidates: 'possible flips picked to read',
+    shown: 'flips shown',
+    waiting: 'possible flips waiting for a price check',
+    fresh: 'flips newly shown since the redraw before',
+    left: 'flips gone since the redraw before',
+    measured: 'items the server measured the speed of',
+    buyersKept: 'who buys an item: kept from the redraw before',
+    buyersRedone: 'who buys an item: worked out again',
+    buyersOn: 'who buys an item: keeping on (1) or switched off (0)',
+    sellersKept: 'an item\'s bazaars: kept from the redraw before',
+    sellersRedone: 'an item\'s bazaars: worked out again',
+    sellersOn: 'an item\'s bazaars: keeping on (1) or switched off (0)',
+    plansKept: 'an item\'s flip plan: kept from the redraw before',
+    plansRedone: 'an item\'s flip plan: worked out again',
+    plansOn: 'an item\'s flip plan: keeping on (1) or switched off (0)',
+    age: 'minutes since this Torn Bids page was opened',
+    heap: 'memory the tab holds (MB, as the browser says)',
+    nodes: 'elements in Torn Bids\' page',
+    gap: 'seconds between two redraws',
+});
 
 const spPad = (s, n) => String(s).padEnd(n);
 const spLpad = (s, n) => String(s).padStart(n);
 const spMs = (n) => (Number(n) >= 100 ? Math.round(Number(n)).toLocaleString('en-US') : (Math.round(Number(n) * 10) / 10).toFixed(1));
 const spKb = (n) => (Number(n) / 1024).toFixed(Number(n) < 10240 ? 1 : 0) + ' KB';
+const spNum = (n) => (Number(n) >= 100 ? Math.round(Number(n)).toLocaleString('en-US') : String(Math.round(Number(n) * 10) / 10));
 
 function spTable(rows, head) {
     if (!rows.length) return ['  (nothing recorded)'];
@@ -374,6 +439,43 @@ export function speedText(record, { sizes = [], machine = null, version = null, 
     const sized = [...sizes].sort((a, b) => b[1] - a[1]);
     out.push('EVERYTHING STORED BY THE SCRIPT - ' + spKb(sized.reduce((a, s) => a + s[1], 0)) + ' in all (the browser hands all of it to the script on every page)');
     out.push(...spTable(sized.map(([k, n]) => [k, spKb(n)]), ['value', 'size']));
+    out.push('');
+
+    const sizes3 = Object.entries(all.g).sort((a, b) => a[0].localeCompare(b[0]));
+    out.push('SIZES AND COUNTS (not times) - what the work above had to go through');
+    out.push(...spTable(sizes3.map(([k, v]) => [k, v[0].toLocaleString('en-US'), spNum(v[0] ? v[1] / v[0] : 0), spNum(v[2]), spNum(v[1])]), ['what', 'noted', 'usual', 'most', 'in all']));
+    out.push('');
+
+    // Torn Bids' redraw, hour by hour: what it took beside what went into it. Read across a row: a redraw that
+    // got slower with nothing bigger to work through was slowed by something else (the "same small sum" says
+    // whether the machine itself ran us slower; "kept" whether the results kept between redraws still were).
+    const B = SPEED_BIDS;
+    const each = (row) => (row && row[0] ? row[1] / row[0] : null);
+    const cell = (v, f = spNum) => (v === null || v === undefined ? '-' : f(v));
+    const share = (kept, redone) => {
+        const k = kept ? kept[1] : 0;
+        const r = redone ? redone[1] : 0;
+        return k + r > 0 ? Math.round((k / (k + r)) * 100) + '%' : '-';
+    };
+    const onOff = (row) => (row && row[0] ? (row[1] >= row[0] ? 'on' : row[1] <= 0 ? 'OFF' : 'on ' + Math.round((row[1] / row[0]) * 100) + '%') : '-');
+    const hoursSorted = Object.entries(r.h).sort((a, b) => Number(a[0]) - Number(b[0]));
+    const bidsHours = hoursSorted.filter(([, b]) => b.w[B.redraw]);
+    out.push('TORN BIDS, HOUR BY HOUR (UTC) - one redraw, and what went into it');
+    out.push('  time of one redraw (ms)');
+    out.push(...spTable(bidsHours.map(([hour, b]) => [
+        stamp(Number(hour) * SP_HOUR_MS).slice(0, 13) + 'h', b.w[B.redraw][0], cell(each(b.w[B.redraw]), spMs), cell(b.w[B.redraw][2], spMs), cell(each(b.w[B.stage3]), spMs), cell(each(b.w[B.stage4]), spMs),
+        cell(each(b.w[B.inBuyers]), spMs), cell(each(b.w[B.inSellers]), spMs), cell(each(b.w[B.inPlans]), spMs), cell(each(b.w[B.inPossible]), spMs), cell(each(b.w[B.yard]), spMs), cell(each(b.w[B.yardHidden]), spMs),
+    ]), ['hour', 'redraws', 'each', 'longest', 'possible flips', 'the list', 'in: buyers', 'in: bazaars', 'in: plans', 'in: possible', 'same sum', 'same sum hidden']));
+    out.push('  what it worked through (the usual of the hour)');
+    out.push(...spTable(bidsHours.map(([hour, b]) => [
+        stamp(Number(hour) * SP_HOUR_MS).slice(0, 13) + 'h', cell(each(b.g[B.items])), cell(each(b.g[B.lists])), cell(each(b.g[B.rows])), cell(each(b.g[B.traders])), cell(each(b.g[B.serverBazaars])),
+        cell(each(b.g[B.candidates])), cell(each(b.g[B.shown])), cell(each(b.g[B.waiting])), cell(b.g[B.fresh] ? b.g[B.fresh][1] : null), cell(each(b.g[B.measured])),
+    ]), ['hour', 'items', 'sellers lists', 'sellers rows', 'traders', 'server bazaars', 'picked to read', 'flips shown', 'waiting', 'new flips', 'speeds']));
+    out.push('  what was kept from the redraw before (share kept; keeping on or OFF), the page\'s age, memory');
+    out.push(...spTable(bidsHours.map(([hour, b]) => [
+        stamp(Number(hour) * SP_HOUR_MS).slice(0, 13) + 'h', share(b.g[B.buyersKept], b.g[B.buyersRedone]), onOff(b.g[B.buyersOn]), share(b.g[B.sellersKept], b.g[B.sellersRedone]), onOff(b.g[B.sellersOn]),
+        share(b.g[B.plansKept], b.g[B.plansRedone]), onOff(b.g[B.plansOn]), cell(b.g[B.age] ? b.g[B.age][2] : null), cell(each(b.g[B.heap])), cell(b.g[B.heap] ? b.g[B.heap][2] : null), cell(each(b.g[B.nodes])), cell(each(b.g[B.gap])),
+    ]), ['hour', 'buyers kept', '', 'bazaars kept', '', 'plans kept', '', 'page age min', 'memory MB', 'most', 'elements', 's between redraws']));
     out.push('');
 
     out.push('BY HOUR (UTC) - our own work, freezes, slow clicks and keys');
