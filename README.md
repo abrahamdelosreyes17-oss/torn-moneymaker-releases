@@ -2795,6 +2795,41 @@ signs alone with their words on hover; grey when off.
 (`.user-information .title-black`), else by the words "User Information". If
 neither is there, nothing is drawn and nothing breaks.
 
+### A trader's own price list, also while their shop is closed (3.31.0)
+
+The owner, 2026-10-12: his friend buys plushies for him while he sleeps. His
+shop is then closed, which takes his prices off TornW3B, and Torn Bids saw
+nobody to sell them to. "server should always keep my live pricelist. so when
+tornarchive naturally updates, it sends it to the server, then tornbids should
+look at it, this is only FOR ME".
+
+A person's Torn Archive (1.3.6) tells the shared server what they pay for each
+set piece now - closed: what they would pay if they opened - and which pieces
+they do not want now (overstocked). The server keeps the last one said under
+the Torn id Torn named for that person's key and hands it to the other PCs
+(`ownSince` in the sync, `core/shared.js` `sharedOwnIn`, kept in the stored
+value `sharedOwn` by `feed/shared-link.js`). Only somebody who runs Torn
+Archive has one; nobody else can write it.
+
+In Torn Bids it is the trader's own word (`core/traders.js` `saidLists`,
+`indexW3bByItem`): it stands over TornW3B's copy of their list, it names them
+a buyer where TornW3B has no price of theirs, and a piece they do not want
+now is not offered to them. A price that is their own word counts as checked
+(`core/checked.js`, why `said`) for as long as the server heard it within a
+day; the row says "Their own price list, told 3 h ago · their shop is closed".
+When TornW3B names them at another price than their word, that price needs its
+own check as before.
+
+**My choices, not confirmed:** a day (the same line as an old price list);
+`buyersForItem` itself is untouched, the word is laid into the lists index, so
+the buyers keeper compares what it always compared; "Online only" still hides
+an offline trader - that switch is the person's who is buying.
+
+**Not seen on real Torn.** It works only once the server is deployed with the
+`own` rows and his Torn Archive is 1.3.6. Tested against the real server code
+(`test/said-list.test.js`): his Archive says a list, he closes, four hours on
+another person's Torn Bids still has his prices and counts them checked.
+
 ## Architecture
 
 ```

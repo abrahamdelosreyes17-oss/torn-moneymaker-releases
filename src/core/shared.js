@@ -24,7 +24,7 @@ export const SHARED_BUCKETS = 16;
 const SHARED_MAX_SELLERS = 3000;
 const SHARED_MAX_NEAR = 200;
 const SHARED_MAX_WORTH = 5000;
-const SHARED_BODY_KEYS = ['app', 'ver', 'used', 'waiting', 'sellers', 'trades', 'looking', 'worth', 'since', 'seen', 'going', 'bought', 'dir', 'want', 'w3b', 'lists', 'listsSince', 'calls', 'moves'];
+const SHARED_BODY_KEYS = ['app', 'ver', 'used', 'waiting', 'sellers', 'trades', 'looking', 'worth', 'since', 'seen', 'going', 'bought', 'dir', 'want', 'w3b', 'lists', 'listsSince', 'calls', 'moves', 'ownSince'];
 /*
  * 3.26.0, the server handing out TornW3B's work (its /sync, deployed 2026-10-11):
  *   want        the items whose sellers list this PC would ask TornW3B for next, most wanted first (60 at most)
@@ -96,6 +96,56 @@ export function sharedListsIn(answer) {
         if (out.length >= SHARED_MAX_LISTS * 4) break;
     }
     return out;
+}
+
+/*
+ * A trader's own price list (3.31.0). The owner, 2026-10-12: his friend buys plushies for him while he sleeps, and
+ * his shop is then closed - which takes his prices off TornW3B, so Torn Bids saw nobody to sell them to. "server
+ * should always keep my live pricelist ... then tornbids should look at it, this is only FOR ME". His Torn Archive
+ * tells the server what he pays for each piece now (closed: what he would pay if he opened) and which pieces he
+ * does not want now; the server keeps the last one said under his Torn id and hands it on. It is the trader's own
+ * word, not a copy another PC read: it stands over TornW3B's copy of his list and counts as checked
+ * (core/checked.js) while the server heard it within a day.
+ */
+export const SHARED_MAX_OWN = 50;
+export const SHARED_MAX_OWN_ITEMS = 200;
+
+/**
+ * The answer's own lists, checked: [{trader, at, since, open, prices: {item: price}, off: [item]}] by this PC's
+ * clock - `at`: when the server last heard it from the trader's Torn Archive, `since`: since when it says the same.
+ */
+export function sharedOwnIn(answer, got) {
+    const out = [];
+    const age = (n) => Number.isFinite(n) && n >= 0 && n < 1e11;
+    for (const row of answer && Array.isArray(answer.own) ? answer.own : []) {
+        if (!Array.isArray(row) || row.length !== 6) continue;
+        const trader = sharedId(row[0]);
+        if (trader === null || !age(row[1]) || !age(row[2]) || (row[3] !== 0 && row[3] !== 1)) continue;
+        if (!row[4] || typeof row[4] !== 'object' || Array.isArray(row[4]) || !Array.isArray(row[5])) continue;
+        const prices = {};
+        let n = 0;
+        for (const [key, value] of Object.entries(row[4])) {
+            const item = sharedId(key);
+            if (item === null || !Number.isInteger(value) || value <= 0 || n >= SHARED_MAX_OWN_ITEMS) continue;
+            prices[item] = value;
+            n += 1;
+        }
+        const off = [...new Set(row[5].map(sharedId).filter((id) => id !== null && !(id in prices)))].slice(0, SHARED_MAX_OWN_ITEMS);
+        if (!n && !off.length) continue;
+        out.push({ trader, at: Math.floor(got - row[1]), since: Math.floor(got - Math.max(row[1], row[2])), open: row[3] === 1, prices, off });
+        if (out.length >= SHARED_MAX_OWN) break;
+    }
+    return out;
+}
+
+/** The own lists kept ({mark, lists: {trader: {...}}}) with one answer's put in: the newer one of a trader stands. */
+export function sharedOwnKeep(kept, got, mark) {
+    const lists = { ...(kept && kept.lists && typeof kept.lists === 'object' ? kept.lists : {}) };
+    for (const l of got) {
+        const had = lists[l.trader];
+        if (!had || !(had.at > l.at)) lists[l.trader] = { at: l.at, since: l.since, open: l.open, prices: l.prices, off: l.off };
+    }
+    return { mark: Number.isInteger(mark) && mark >= 0 ? mark : 0, lists: Object.fromEntries(Object.entries(lists).slice(-SHARED_MAX_OWN)) };
 }
 
 /**
@@ -296,7 +346,7 @@ export function sharedMarks(wants, now) {
  * come out of here, whatever is put in.
  * `now`: this PC's clock; the marks leave as ages, since every PC has its own clock.
  */
-export function sharedBody({ used = 0, waiting = 0, wants = [], since = 0, seen = 0, sendWorth = true, now = 0, ver = null, lists = null, listsSince = null, calls = null, moves = null } = {}) {
+export function sharedBody({ used = 0, waiting = 0, wants = [], since = 0, seen = 0, sendWorth = true, now = 0, ver = null, lists = null, listsSince = null, calls = null, moves = null, ownSince = null } = {}) {
     const count = (n) => (Number.isFinite(n) && n > 0 ? Math.min(1000, Math.floor(n)) : 0);
     const list = Array.isArray(wants) ? wants.filter((w) => w && typeof w === 'object') : [];
     const trades = sharedIds(list.map((w) => w.trades), SHARED_MAX_NEAR);
@@ -329,6 +379,8 @@ export function sharedBody({ used = 0, waiting = 0, wants = [], since = 0, seen 
     if (Number.isInteger(listsSince) && listsSince >= 0) body.listsSince = listsSince;
     // 3.28.0 - the table of item speeds this PC holds (its time on the server's clock): a newer one is sent back.
     if (Number.isInteger(moves) && moves >= 0 && moves < 1e13) body.moves = moves;
+    // 3.31.0 - traders' own price lists, as their Torn Archive told the server (sharedOwnIn): the running number held.
+    if (Number.isInteger(ownSince) && ownSince >= 0 && ownSince < 1e13) body.ownSince = ownSince;
     // 3.26.2 - this PC's own request counts since the last answered exchange (core/usage.js): {} = none were made.
     if (calls && typeof calls === 'object' && !Array.isArray(calls)) {
         body.calls = {};

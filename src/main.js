@@ -21,6 +21,7 @@ import {
     gmSize,
     gmPost,
 } from './platform/gm.js';
+import { SHARED_OWN_KEY } from './feed/shared-link.js';
 import { SharedLink, SHARED_CONFIG_KEY, SHARED_STATE_KEY, SHARED_GRANT_KEY, SHARED_TICK_MS, SHARED_UNKNOWN_MS, SHARED_W3B_ASK_KEY, SHARED_LISTS_OUT_KEY, SHARED_LISTS_IN_KEY, SHARED_CALLS_KEY, SHARED_MOVES_KEY } from './feed/shared-link.js';
 import { sharedMayCall, withShared, sharedHome, sharedWord, sharedSaid, sharedSaidLine, sharedGoingOwn, sharedGoingByItem, sharedOnThis, sharedGoingFor, sharedBoughtLine, sharedPanelLine, sharedDirDue, sharedDealRows, sharedKnowsLowest, sharedMayRead, sharedAskLeft, sharedList, sharedItemsSeen, SHARED_MAX_WANT, SHARED_MAX_LISTS, SHARED_MAX_LIST_ITEMS } from './core/shared.js';
 import { perfStart, perfNow, perfDone, perfTimed, perfForeign, perfStartup, perfRecord, perfMachine, perfAdd, perfGauge, perfYardstick, perfHeapMb, SPEED_STORE_KEY } from './platform/perf.js';
@@ -122,6 +123,8 @@ import {
     parseW3bBulk,
     bulkPriceOf,
     recordW3bList,
+    saidLists,
+    W3B_LIST_MAX_AGE_MS,
     nextW3bTrader,
     traderDbStats,
     buyersForItem,
@@ -1467,11 +1470,14 @@ function trustedBuyerOf(itemId) {
                 teOne: loadTeOne(now),
                 idsByName: ids && ids.map && now - ids.fetchedAt < TE_IDS_MAX_AGE_MS ? new Map(Object.entries(ids.map)) : new Map(),
                 db,
-                w3bByItem: indexW3bByItem(db, now),
+                // 3.31.0: a trader's own word (their Torn Archive, through the shared server) stands over TornW3B's copy.
+                w3bByItem: indexW3bByItem(db, now, saidLists(gmGet(SHARED_OWN_KEY, null), now)),
                 dbIdsByName: traderIdsByName(db),
                 votes: rememberedVotes(gmGet(STORE_TE_VOTES, null), now),
             }),
         };
+        // Their own word is as old as when the server last heard it: that is their list's date here.
+        for (const [id, s] of saidLists(gmGet(SHARED_OWN_KEY, null), now)) app.traderLookup.listAt.set(id, s.at);
         perfDone('trader tags: the lists read again', t0);
     }
     const id = String(itemId);
@@ -6073,6 +6079,8 @@ function startShared(world, getWant, onReads) {
     if (world === 'sell') {
         gmOnChange(SHARED_LISTS_IN_KEY, () => takeSharedLists());
         takeSharedLists();
+        // A trader's own price list, told by their Torn Archive (3.31.0).
+        gmOnChange(SHARED_OWN_KEY, () => takeSharedOwn());
         // A new table of item speeds (3.28.0): the amounts are worked out again with it.
         gmOnChange(SHARED_MOVES_KEY, () => {
             speedsReadAt = 0;
@@ -7203,10 +7211,35 @@ function learnTraders(found) {
  * ids by name; rebuilt when the database changes (or a minute on, as lists
  * age out), not on every render.
  */
+/*
+ * 3.31.0 - traders' own price lists (core/shared.js sharedOwnIn): what their Torn Archive told the shared server they
+ * pay, kept by the server also while their shop is closed and their PC is off. Read from the stored value when it
+ * changes, and once a minute so one not heard for a day lapses.
+ */
+function saidNow(now) {
+    if (!sell.said || now - (sell.saidReadAt || 0) > 60000) {
+        sell.said = saidLists(gmGet(SHARED_OWN_KEY, null), now);
+        sell.saidReadAt = now;
+    }
+    return sell.said;
+}
+
+let saidNoted = 0;
+function takeSharedOwn() {
+    sell.said = null;
+    sell.w3bIndex = null;
+    const said = saidNow(Date.now());
+    if (said.size && saidNoted < 10) {
+        saidNoted += 1;
+        logProblem('note', 'Shared: the own price list of ' + [...said.keys()].slice(0, 5).map((id) => 'trader ' + id).join(', ') + ' came through the server', [...said.values()].slice(0, 5).map((s) => Object.keys(s.prices).length + ' prices, shop ' + (s.open ? 'open' : 'closed')).join(' · ') + ' · it stands over TornW3B\'s copy and counts as checked while heard within a day');
+    }
+    renderSelling();
+}
+
 function w3bIndex(now) {
     if (!sell.w3bIndex || now - sell.w3bIndexAt > 60000) {
         const t0 = perfNow();
-        sell.w3bIndex = indexW3bByItem(sell.db, now);
+        sell.w3bIndex = indexW3bByItem(sell.db, now, saidNow(now));
         sell.dbIdsByName = traderIdsByName(sell.db);
         sell.w3bIndexAt = now;
         perfAdd(SPEED_BIDS.index, perfNow() - t0);
@@ -9222,7 +9255,9 @@ function renderSellingWork(src = null) {
     const favNow = shownFavourites(partnersNow(), favEdits, now);
     const favOf = favNow.isFav;
     const blacklist = blacklistKeys(sellBlacklist());
-    const listAtOf = (id) => sell.listAt.get(String(id)) || 0;
+    // 3.31.0: a trader's own word is as old as when the server last heard it - that is their list's date.
+    const saidOf = saidNow(now);
+    const listAtOf = (id) => { const s = saidOf.get(String(id)); return (s && s.at) || sell.listAt.get(String(id)) || 0; };
     // Every buyer lookup that is not the shown list (a pinned or picked trade, its bids) skips them too.
     const buyersAllowed = (id) => withoutBlacklisted(buyersAll(id), blacklist);
     // Every trader with a Trusted badge seen on any item (Your traders scans them).
@@ -9308,11 +9343,12 @@ function renderSellingWork(src = null) {
         if (!c) {
             const it = sell.itemTraders.get(String(id));
             const own = b.id && sell.db.traders[b.id] ? sell.db.traders[b.id].w3b : null;
-            c = priceChecked(b, { itemId: String(id), item: it && it.at ? it : null, list: own || null, listAt: b.id ? listAtOf(b.id) : 0, now });
+            c = priceChecked(b, { itemId: String(id), item: it && it.at ? it : null, list: own || null, listAt: b.id ? listAtOf(b.id) : 0, said: b.id ? saidOf.get(String(b.id)) || null : null, now });
             checkCache.set(k, c);
             if (c.ok) {
                 if (lastChecked.size > 5000) lastChecked.clear();
-                lastChecked.set(k, { price: b.price, at: c.at });
+                // Their own word stands while the server heard it within a day: for the overlay's table it is checked now.
+                lastChecked.set(k, { price: b.price, at: c.why === 'said' ? now : c.at });
             }
         }
         return c;

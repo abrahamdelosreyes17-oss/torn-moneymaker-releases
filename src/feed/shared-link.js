@@ -23,7 +23,7 @@ import {
     SHARED_SYNC_MS, SHARED_BUCKETS, sharedAddress, sharedPassOk, sharedBody, sharedOutgoingOk, sharedVersion, sharedTake, sharedPrune,
     sharedReadBucket, sharedIndex, sharedInterest, sharedPerson, sharedMarks, sharedMarksIn, sharedMarksNow,
     sharedDir, sharedDirIn,
-    sharedList, sharedListsIn, sharedAskIn, sharedMovesIn,
+    sharedList, sharedListsIn, sharedAskIn, sharedMovesIn, sharedOwnIn, sharedOwnKeep,
 } from '../core/shared.js';
 
 export const SHARED_CONFIG_KEY = 'sharedConfig';
@@ -39,6 +39,8 @@ export const SHARED_W3B_ASK_KEY = 'sharedW3bAsk';
 export const SHARED_LISTS_OUT_KEY = 'sharedListsOut';
 /* ... and the ones another person's PC read, for Torn Bids' page to take: {at, n, lists}. */
 export const SHARED_LISTS_IN_KEY = 'sharedListsIn';
+/* 3.31.0 - traders' own price lists, as their Torn Archive told the server: {mark, lists: {trader: {at, since, open, prices, off}}}. */
+export const SHARED_OWN_KEY = 'sharedOwn';
 const SHARED_LISTS_IN_KEEP = 20;
 /* 3.28.0 - how fast items leave the bazaars, as the server counted it: {at (the server's clock), got (this PC's), rows: {item: units an hour}}. */
 export const SHARED_MOVES_KEY = 'sharedMoves';
@@ -339,7 +341,10 @@ export class SharedLink {
                 // The item speeds (3.28.0): asked for only while Torn Bids' page is open - it plans by them.
                 const movesHeld = takesLists && page === 0 ? this.d.load(SHARED_MOVES_KEY) : null;
                 const movesAt = takesLists && page === 0 ? (movesHeld && Number.isInteger(movesHeld.at) && movesHeld.at > 0 ? movesHeld.at : 0) : null;
-                const body = sharedBody({ used: use.used, waiting: (Number(use.waiting) || 0) + others, wants: page === 0 ? wants : wants.map(({ want, w3b, ...w }) => w), since: seq, seen, sendWorth, now, ver, lists: listsOut, listsSince: takesLists && page === 0 ? listsAt : null, calls: callsOut, moves: movesAt });
+                // Traders' own price lists (3.31.0): asked for with the lists, by the running number held.
+                const ownHeld = takesLists && page === 0 ? this.d.load(SHARED_OWN_KEY) : null;
+                const ownSince = takesLists && page === 0 ? (ownHeld && Number.isInteger(ownHeld.mark) && ownHeld.mark > 0 ? ownHeld.mark : 0) : null;
+                const body = sharedBody({ used: use.used, waiting: (Number(use.waiting) || 0) + others, wants: page === 0 ? wants : wants.map(({ want, w3b, ...w }) => w), since: seq, seen, sendWorth, now, ver, lists: listsOut, listsSince: takesLists && page === 0 ? listsAt : null, calls: callsOut, moves: movesAt, ownSince });
                 if (!sharedOutgoingOk(body)) throw new Error('Not sent: the message was not in the agreed shape.');
 
                 const response = await this.d.post(`${cfg.address}/sync`, {
@@ -441,6 +446,12 @@ export class SharedLink {
                         listsGot.push(...sharedListsIn(answer));
                         if (Number.isInteger(answer.listsAt) && answer.listsAt >= 0) listsAt = answer.listsAt;
                         state.listsOut = (Number.isInteger(before.listsOut) ? before.listsOut : 0) + (body.lists || []).length;
+                    }
+                    // A trader's own list, said since: kept by trader, the newer one standing. (No `ownAt`: an older server.)
+                    if (ownSince !== null && Number.isInteger(answer.ownAt)) {
+                        const owns = sharedOwnIn(answer, got);
+                        if (owns.length || answer.ownAt !== ownSince) this.d.save(SHARED_OWN_KEY, sharedOwnKeep(ownHeld, owns, answer.ownAt));
+                        if (owns.length) state.ownIn = (Number.isInteger(before.ownIn) ? before.ownIn : 0) + owns.length;
                     }
                     // A newer table of item speeds: kept whole (it replaces the one before).
                     const moved = movesAt === null ? null : sharedMovesIn(answer);

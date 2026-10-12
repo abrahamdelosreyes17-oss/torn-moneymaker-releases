@@ -79,12 +79,17 @@ function checkedNamedAt(item, id, price) {
  * @param {{at: number, traders: Array, full?: Array, fullAt?: number, lately?: Array, latelyAt?: number}|null} o.item - the last read of the item's buyers, or null
  * @param {{at: number, found: boolean, prices: object, shared?: boolean}|null} o.list - the last read of this trader's own list, or null
  * @param {number} o.listAt - when they last changed their list (ms), 0: not known
- * @returns {{ok: boolean, why: 'checked'|'no-id'|'te-only'|'not-checked'|'old-list'|'no-date', at: number}}
- *   at: when TornW3B last confirmed this price (0: never)
+ * @param {{at: number, open: boolean, prices: object}|null} [o.said] - the trader's own word (3.31.0): what their Torn
+ *   Archive told our server they pay, and when the server last heard it. A price that is this one is checked for as
+ *   long as it was heard within `staleMs` - it needs no TornW3B read: TornW3B's copy is the older of the two.
+ * @returns {{ok: boolean, why: 'checked'|'said'|'no-id'|'te-only'|'not-checked'|'old-list'|'no-date', at: number, closed?: boolean}}
+ *   at: when TornW3B last confirmed this price (0: never); for 'said', when the server last heard it.
+ *   closed: 'said' while their shop is closed - the price is what they would pay once they open.
  */
-export function priceChecked(b, { itemId, item = null, list = null, listAt = 0, now = Date.now(), checkMs = FLIP_CHECK_MS, staleMs = PRICES_STALE_MS } = {}) {
+export function priceChecked(b, { itemId, item = null, list = null, listAt = 0, said = null, now = Date.now(), checkMs = FLIP_CHECK_MS, staleMs = PRICES_STALE_MS } = {}) {
     if (!b || !b.id) return { ok: false, why: 'no-id', at: 0 };
     if (!(b.w3b > 0) || b.lastPaidOnly) return { ok: false, why: 'te-only', at: 0 };
+    if (said && said.at > 0 && said.prices && Number(said.prices[String(itemId)]) === b.w3b && now - said.at <= staleMs) return { ok: true, why: 'said', at: said.at, closed: !said.open };
     let at = checkedNamedAt(item, String(b.id), b.w3b);
     // A list another PC read (it came through the shared server, by that PC's clock) is shown, and checks nothing.
     if (list && list.found && !list.shared && list.prices && Number(list.prices[String(itemId)]) === b.w3b && list.at > at) at = list.at;

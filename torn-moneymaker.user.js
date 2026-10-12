@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      3.30.1
+// @version      3.31.0
 // @description  Finds Bazaar and Item Market listings below NPC / market value - on the page you are viewing, and live from the Torn API and TornW3B - ranked by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -52,7 +52,7 @@
 (function () {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '3.30.1';
+    const TTV2_BUILD_VERSION = '3.31.0';
     const TTV2_SHARED_HOME = 'https://torn-bids-shared.pumping-iron-worker.workers.dev';
 
     /* ===== src/platform/gm.js ===== */
@@ -645,7 +645,7 @@
     const SHARED_MAX_SELLERS = 3000;
     const SHARED_MAX_NEAR = 200;
     const SHARED_MAX_WORTH = 5000;
-    const SHARED_BODY_KEYS = ['app', 'ver', 'used', 'waiting', 'sellers', 'trades', 'looking', 'worth', 'since', 'seen', 'going', 'bought', 'dir', 'want', 'w3b', 'lists', 'listsSince', 'calls', 'moves'];
+    const SHARED_BODY_KEYS = ['app', 'ver', 'used', 'waiting', 'sellers', 'trades', 'looking', 'worth', 'since', 'seen', 'going', 'bought', 'dir', 'want', 'w3b', 'lists', 'listsSince', 'calls', 'moves', 'ownSince'];
     /*
      * 3.26.0, the server handing out TornW3B's work (its /sync, deployed 2026-10-11):
      *   want        the items whose sellers list this PC would ask TornW3B for next, most wanted first (60 at most)
@@ -717,6 +717,56 @@
             if (out.length >= SHARED_MAX_LISTS * 4) break;
         }
         return out;
+    }
+
+    /*
+     * A trader's own price list (3.31.0). The owner, 2026-10-12: his friend buys plushies for him while he sleeps, and
+     * his shop is then closed - which takes his prices off TornW3B, so Torn Bids saw nobody to sell them to. "server
+     * should always keep my live pricelist ... then tornbids should look at it, this is only FOR ME". His Torn Archive
+     * tells the server what he pays for each piece now (closed: what he would pay if he opened) and which pieces he
+     * does not want now; the server keeps the last one said under his Torn id and hands it on. It is the trader's own
+     * word, not a copy another PC read: it stands over TornW3B's copy of his list and counts as checked
+     * (core/checked.js) while the server heard it within a day.
+     */
+    const SHARED_MAX_OWN = 50;
+    const SHARED_MAX_OWN_ITEMS = 200;
+
+    /**
+     * The answer's own lists, checked: [{trader, at, since, open, prices: {item: price}, off: [item]}] by this PC's
+     * clock - `at`: when the server last heard it from the trader's Torn Archive, `since`: since when it says the same.
+     */
+    function sharedOwnIn(answer, got) {
+        const out = [];
+        const age = (n) => Number.isFinite(n) && n >= 0 && n < 1e11;
+        for (const row of answer && Array.isArray(answer.own) ? answer.own : []) {
+            if (!Array.isArray(row) || row.length !== 6) continue;
+            const trader = sharedId(row[0]);
+            if (trader === null || !age(row[1]) || !age(row[2]) || (row[3] !== 0 && row[3] !== 1)) continue;
+            if (!row[4] || typeof row[4] !== 'object' || Array.isArray(row[4]) || !Array.isArray(row[5])) continue;
+            const prices = {};
+            let n = 0;
+            for (const [key, value] of Object.entries(row[4])) {
+                const item = sharedId(key);
+                if (item === null || !Number.isInteger(value) || value <= 0 || n >= SHARED_MAX_OWN_ITEMS) continue;
+                prices[item] = value;
+                n += 1;
+            }
+            const off = [...new Set(row[5].map(sharedId).filter((id) => id !== null && !(id in prices)))].slice(0, SHARED_MAX_OWN_ITEMS);
+            if (!n && !off.length) continue;
+            out.push({ trader, at: Math.floor(got - row[1]), since: Math.floor(got - Math.max(row[1], row[2])), open: row[3] === 1, prices, off });
+            if (out.length >= SHARED_MAX_OWN) break;
+        }
+        return out;
+    }
+
+    /** The own lists kept ({mark, lists: {trader: {...}}}) with one answer's put in: the newer one of a trader stands. */
+    function sharedOwnKeep(kept, got, mark) {
+        const lists = { ...(kept && kept.lists && typeof kept.lists === 'object' ? kept.lists : {}) };
+        for (const l of got) {
+            const had = lists[l.trader];
+            if (!had || !(had.at > l.at)) lists[l.trader] = { at: l.at, since: l.since, open: l.open, prices: l.prices, off: l.off };
+        }
+        return { mark: Number.isInteger(mark) && mark >= 0 ? mark : 0, lists: Object.fromEntries(Object.entries(lists).slice(-SHARED_MAX_OWN)) };
     }
 
     /**
@@ -917,7 +967,7 @@
      * come out of here, whatever is put in.
      * `now`: this PC's clock; the marks leave as ages, since every PC has its own clock.
      */
-    function sharedBody({ used = 0, waiting = 0, wants = [], since = 0, seen = 0, sendWorth = true, now = 0, ver = null, lists = null, listsSince = null, calls = null, moves = null } = {}) {
+    function sharedBody({ used = 0, waiting = 0, wants = [], since = 0, seen = 0, sendWorth = true, now = 0, ver = null, lists = null, listsSince = null, calls = null, moves = null, ownSince = null } = {}) {
         const count = (n) => (Number.isFinite(n) && n > 0 ? Math.min(1000, Math.floor(n)) : 0);
         const list = Array.isArray(wants) ? wants.filter((w) => w && typeof w === 'object') : [];
         const trades = sharedIds(list.map((w) => w.trades), SHARED_MAX_NEAR);
@@ -950,6 +1000,8 @@
         if (Number.isInteger(listsSince) && listsSince >= 0) body.listsSince = listsSince;
         // 3.28.0 - the table of item speeds this PC holds (its time on the server's clock): a newer one is sent back.
         if (Number.isInteger(moves) && moves >= 0 && moves < 1e13) body.moves = moves;
+        // 3.31.0 - traders' own price lists, as their Torn Archive told the server (sharedOwnIn): the running number held.
+        if (Number.isInteger(ownSince) && ownSince >= 0 && ownSince < 1e13) body.ownSince = ownSince;
         // 3.26.2 - this PC's own request counts since the last answered exchange (core/usage.js): {} = none were made.
         if (calls && typeof calls === 'object' && !Array.isArray(calls)) {
             body.calls = {};
@@ -1642,6 +1694,8 @@
     const SHARED_LISTS_OUT_KEY = 'sharedListsOut';
     /* ... and the ones another person's PC read, for Torn Bids' page to take: {at, n, lists}. */
     const SHARED_LISTS_IN_KEY = 'sharedListsIn';
+    /* 3.31.0 - traders' own price lists, as their Torn Archive told the server: {mark, lists: {trader: {at, since, open, prices, off}}}. */
+    const SHARED_OWN_KEY = 'sharedOwn';
     const SHARED_LISTS_IN_KEEP = 20;
     /* 3.28.0 - how fast items leave the bazaars, as the server counted it: {at (the server's clock), got (this PC's), rows: {item: units an hour}}. */
     const SHARED_MOVES_KEY = 'sharedMoves';
@@ -1942,7 +1996,10 @@
                     // The item speeds (3.28.0): asked for only while Torn Bids' page is open - it plans by them.
                     const movesHeld = takesLists && page === 0 ? this.d.load(SHARED_MOVES_KEY) : null;
                     const movesAt = takesLists && page === 0 ? (movesHeld && Number.isInteger(movesHeld.at) && movesHeld.at > 0 ? movesHeld.at : 0) : null;
-                    const body = sharedBody({ used: use.used, waiting: (Number(use.waiting) || 0) + others, wants: page === 0 ? wants : wants.map(({ want, w3b, ...w }) => w), since: seq, seen, sendWorth, now, ver, lists: listsOut, listsSince: takesLists && page === 0 ? listsAt : null, calls: callsOut, moves: movesAt });
+                    // Traders' own price lists (3.31.0): asked for with the lists, by the running number held.
+                    const ownHeld = takesLists && page === 0 ? this.d.load(SHARED_OWN_KEY) : null;
+                    const ownSince = takesLists && page === 0 ? (ownHeld && Number.isInteger(ownHeld.mark) && ownHeld.mark > 0 ? ownHeld.mark : 0) : null;
+                    const body = sharedBody({ used: use.used, waiting: (Number(use.waiting) || 0) + others, wants: page === 0 ? wants : wants.map(({ want, w3b, ...w }) => w), since: seq, seen, sendWorth, now, ver, lists: listsOut, listsSince: takesLists && page === 0 ? listsAt : null, calls: callsOut, moves: movesAt, ownSince });
                     if (!sharedOutgoingOk(body)) throw new Error('Not sent: the message was not in the agreed shape.');
 
                     const response = await this.d.post(`${cfg.address}/sync`, {
@@ -2044,6 +2101,12 @@
                             listsGot.push(...sharedListsIn(answer));
                             if (Number.isInteger(answer.listsAt) && answer.listsAt >= 0) listsAt = answer.listsAt;
                             state.listsOut = (Number.isInteger(before.listsOut) ? before.listsOut : 0) + (body.lists || []).length;
+                        }
+                        // A trader's own list, said since: kept by trader, the newer one standing. (No `ownAt`: an older server.)
+                        if (ownSince !== null && Number.isInteger(answer.ownAt)) {
+                            const owns = sharedOwnIn(answer, got);
+                            if (owns.length || answer.ownAt !== ownSince) this.d.save(SHARED_OWN_KEY, sharedOwnKeep(ownHeld, owns, answer.ownAt));
+                            if (owns.length) state.ownIn = (Number.isInteger(before.ownIn) ? before.ownIn : 0) + owns.length;
                         }
                         // A newer table of item speeds: kept whole (it replaces the one before).
                         const moved = movesAt === null ? null : sharedMovesIn(answer);
@@ -10293,11 +10356,43 @@
         return out;
     }
 
-    /** itemId -> [{id, price}] across every live TornW3B list: one pass, not one per item. */
-    function indexW3bByItem(db, now = Date.now()) {
+    /*
+     * A trader's own word (3.31.0, core/shared.js sharedOwnIn): what their Torn Archive told our server they pay.
+     * It counts while the server heard it within a day - the owner's own line for a price list (PRICES_STALE_MS).
+     */
+    const SAID_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+    /** The stored own lists, checked: Map(trader id -> {at, since, open, prices, off}) of those heard within a day. */
+    function saidLists(stored, now = Date.now()) {
         const out = new Map();
-        for (const [id, t] of Object.entries(db.traders)) {
-            const prices = liveW3bPrices(t, now);
+        const lists = stored && stored.lists && typeof stored.lists === 'object' ? stored.lists : {};
+        for (const [key, s] of Object.entries(lists)) {
+            const id = cleanId(key);
+            if (!id || !s || !(s.at > 0) || !(now - s.at <= SAID_MAX_AGE_MS) || !s.prices || typeof s.prices !== 'object') continue;
+            out.set(id, { at: s.at, since: s.since > 0 ? s.since : s.at, open: s.open === true, prices: s.prices, off: Array.isArray(s.off) ? s.off : [] });
+        }
+        return out;
+    }
+
+    /** A trader's list with their own word laid over it: their prices stand, a piece they do not want now goes. */
+    function withSaid(prices, s) {
+        const out = { ...(prices || {}) };
+        for (const [itemId, price] of Object.entries(s.prices)) if (price > 0) out[String(itemId)] = price;
+        for (const itemId of s.off) delete out[String(itemId)];
+        return out;
+    }
+
+    /**
+     * itemId -> [{id, price}] across every live TornW3B list: one pass, not one per item.
+     * @param {Map} [said] - saidLists(): a trader's own word stands over TornW3B's copy of their list, and names
+     *   them a buyer where TornW3B has no price of theirs (their shop is closed: the prices are off their list there)
+     */
+    function indexW3bByItem(db, now = Date.now(), said = null) {
+        const out = new Map();
+        const all = said && said.size ? [...Object.entries(db.traders), ...[...said.keys()].filter((id) => !db.traders[id]).map((id) => [id, null])] : Object.entries(db.traders);
+        for (const [id, t] of all) {
+            const s = said ? said.get(id) : null;
+            const prices = s ? withSaid(t ? liveW3bPrices(t, now) : null, s) : liveW3bPrices(t, now);
             if (!prices) continue;
             for (const [itemId, price] of Object.entries(prices)) {
                 let list = out.get(itemId);
@@ -10707,12 +10802,17 @@
      * @param {{at: number, traders: Array, full?: Array, fullAt?: number, lately?: Array, latelyAt?: number}|null} o.item - the last read of the item's buyers, or null
      * @param {{at: number, found: boolean, prices: object, shared?: boolean}|null} o.list - the last read of this trader's own list, or null
      * @param {number} o.listAt - when they last changed their list (ms), 0: not known
-     * @returns {{ok: boolean, why: 'checked'|'no-id'|'te-only'|'not-checked'|'old-list'|'no-date', at: number}}
-     *   at: when TornW3B last confirmed this price (0: never)
+     * @param {{at: number, open: boolean, prices: object}|null} [o.said] - the trader's own word (3.31.0): what their Torn
+     *   Archive told our server they pay, and when the server last heard it. A price that is this one is checked for as
+     *   long as it was heard within `staleMs` - it needs no TornW3B read: TornW3B's copy is the older of the two.
+     * @returns {{ok: boolean, why: 'checked'|'said'|'no-id'|'te-only'|'not-checked'|'old-list'|'no-date', at: number, closed?: boolean}}
+     *   at: when TornW3B last confirmed this price (0: never); for 'said', when the server last heard it.
+     *   closed: 'said' while their shop is closed - the price is what they would pay once they open.
      */
-    function priceChecked(b, { itemId, item = null, list = null, listAt = 0, now = Date.now(), checkMs = FLIP_CHECK_MS, staleMs = PRICES_STALE_MS } = {}) {
+    function priceChecked(b, { itemId, item = null, list = null, listAt = 0, said = null, now = Date.now(), checkMs = FLIP_CHECK_MS, staleMs = PRICES_STALE_MS } = {}) {
         if (!b || !b.id) return { ok: false, why: 'no-id', at: 0 };
         if (!(b.w3b > 0) || b.lastPaidOnly) return { ok: false, why: 'te-only', at: 0 };
+        if (said && said.at > 0 && said.prices && Number(said.prices[String(itemId)]) === b.w3b && now - said.at <= staleMs) return { ok: true, why: 'said', at: said.at, closed: !said.open };
         let at = checkedNamedAt(item, String(b.id), b.w3b);
         // A list another PC read (it came through the shared server, by that PC's clock) is shown, and checks nothing.
         if (list && list.found && !list.shared && list.prices && Number(list.prices[String(itemId)]) === b.w3b && list.at > at) at = list.at;
@@ -30382,7 +30482,9 @@
                 })
                 : null;
             if (reading) return spEl('small', { text: 'Reading their price list…' });
-            const said = c.ok ? 'Price checked ' + this.checkAge(now - c.at) : this.checkWhy(b, now);
+            // 3.31.0: their own word, told by their Torn Archive through the shared server - also with their shop closed.
+            const said = c.ok && c.why === 'said' ? 'Their own price list, told ' + this.checkAge(now - c.at) + (c.closed ? ' · their shop is closed' : '')
+                : c.ok ? 'Price checked ' + this.checkAge(now - c.at) : this.checkWhy(b, now);
             return spEl('small', {}, [said, refresh ? ' · ' : null, refresh]);
         }
 
@@ -34291,6 +34393,7 @@
 
 
 
+
     const STORE_KEY = 'apiKey';
     const STORE_ITEMS = 'itemsCache';
     const STORE_NPC = 'npcCache';
@@ -35502,11 +35605,14 @@
                     teOne: loadTeOne(now),
                     idsByName: ids && ids.map && now - ids.fetchedAt < TE_IDS_MAX_AGE_MS ? new Map(Object.entries(ids.map)) : new Map(),
                     db,
-                    w3bByItem: indexW3bByItem(db, now),
+                    // 3.31.0: a trader's own word (their Torn Archive, through the shared server) stands over TornW3B's copy.
+                    w3bByItem: indexW3bByItem(db, now, saidLists(gmGet(SHARED_OWN_KEY, null), now)),
                     dbIdsByName: traderIdsByName(db),
                     votes: rememberedVotes(gmGet(STORE_TE_VOTES, null), now),
                 }),
             };
+            // Their own word is as old as when the server last heard it: that is their list's date here.
+            for (const [id, s] of saidLists(gmGet(SHARED_OWN_KEY, null), now)) app.traderLookup.listAt.set(id, s.at);
             perfDone('trader tags: the lists read again', t0);
         }
         const id = String(itemId);
@@ -40108,6 +40214,8 @@
         if (world === 'sell') {
             gmOnChange(SHARED_LISTS_IN_KEY, () => takeSharedLists());
             takeSharedLists();
+            // A trader's own price list, told by their Torn Archive (3.31.0).
+            gmOnChange(SHARED_OWN_KEY, () => takeSharedOwn());
             // A new table of item speeds (3.28.0): the amounts are worked out again with it.
             gmOnChange(SHARED_MOVES_KEY, () => {
                 speedsReadAt = 0;
@@ -41238,10 +41346,35 @@
      * ids by name; rebuilt when the database changes (or a minute on, as lists
      * age out), not on every render.
      */
+    /*
+     * 3.31.0 - traders' own price lists (core/shared.js sharedOwnIn): what their Torn Archive told the shared server they
+     * pay, kept by the server also while their shop is closed and their PC is off. Read from the stored value when it
+     * changes, and once a minute so one not heard for a day lapses.
+     */
+    function saidNow(now) {
+        if (!sell.said || now - (sell.saidReadAt || 0) > 60000) {
+            sell.said = saidLists(gmGet(SHARED_OWN_KEY, null), now);
+            sell.saidReadAt = now;
+        }
+        return sell.said;
+    }
+
+    let saidNoted = 0;
+    function takeSharedOwn() {
+        sell.said = null;
+        sell.w3bIndex = null;
+        const said = saidNow(Date.now());
+        if (said.size && saidNoted < 10) {
+            saidNoted += 1;
+            logProblem('note', 'Shared: the own price list of ' + [...said.keys()].slice(0, 5).map((id) => 'trader ' + id).join(', ') + ' came through the server', [...said.values()].slice(0, 5).map((s) => Object.keys(s.prices).length + ' prices, shop ' + (s.open ? 'open' : 'closed')).join(' · ') + ' · it stands over TornW3B\'s copy and counts as checked while heard within a day');
+        }
+        renderSelling();
+    }
+
     function w3bIndex(now) {
         if (!sell.w3bIndex || now - sell.w3bIndexAt > 60000) {
             const t0 = perfNow();
-            sell.w3bIndex = indexW3bByItem(sell.db, now);
+            sell.w3bIndex = indexW3bByItem(sell.db, now, saidNow(now));
             sell.dbIdsByName = traderIdsByName(sell.db);
             sell.w3bIndexAt = now;
             perfAdd(SPEED_BIDS.index, perfNow() - t0);
@@ -43257,7 +43390,9 @@
         const favNow = shownFavourites(partnersNow(), favEdits, now);
         const favOf = favNow.isFav;
         const blacklist = blacklistKeys(sellBlacklist());
-        const listAtOf = (id) => sell.listAt.get(String(id)) || 0;
+        // 3.31.0: a trader's own word is as old as when the server last heard it - that is their list's date.
+        const saidOf = saidNow(now);
+        const listAtOf = (id) => { const s = saidOf.get(String(id)); return (s && s.at) || sell.listAt.get(String(id)) || 0; };
         // Every buyer lookup that is not the shown list (a pinned or picked trade, its bids) skips them too.
         const buyersAllowed = (id) => withoutBlacklisted(buyersAll(id), blacklist);
         // Every trader with a Trusted badge seen on any item (Your traders scans them).
@@ -43343,11 +43478,12 @@
             if (!c) {
                 const it = sell.itemTraders.get(String(id));
                 const own = b.id && sell.db.traders[b.id] ? sell.db.traders[b.id].w3b : null;
-                c = priceChecked(b, { itemId: String(id), item: it && it.at ? it : null, list: own || null, listAt: b.id ? listAtOf(b.id) : 0, now });
+                c = priceChecked(b, { itemId: String(id), item: it && it.at ? it : null, list: own || null, listAt: b.id ? listAtOf(b.id) : 0, said: b.id ? saidOf.get(String(b.id)) || null : null, now });
                 checkCache.set(k, c);
                 if (c.ok) {
                     if (lastChecked.size > 5000) lastChecked.clear();
-                    lastChecked.set(k, { price: b.price, at: c.at });
+                    // Their own word stands while the server heard it within a day: for the overlay's table it is checked now.
+                    lastChecked.set(k, { price: b.price, at: c.why === 'said' ? now : c.at });
                 }
             }
             return c;

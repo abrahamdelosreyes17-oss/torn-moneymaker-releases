@@ -1994,7 +1994,9 @@ export class SellingPage {
             })
             : null;
         if (reading) return spEl('small', { text: 'Reading their price list…' });
-        const said = c.ok ? 'Price checked ' + this.checkAge(now - c.at) : this.checkWhy(b, now);
+        // 3.31.0: their own word, told by their Torn Archive through the shared server - also with their shop closed.
+        const said = c.ok && c.why === 'said' ? 'Their own price list, told ' + this.checkAge(now - c.at) + (c.closed ? ' · their shop is closed' : '')
+            : c.ok ? 'Price checked ' + this.checkAge(now - c.at) : this.checkWhy(b, now);
         return spEl('small', {}, [said, refresh ? ' · ' : null, refresh]);
     }
 

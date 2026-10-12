@@ -625,11 +625,43 @@ export function traderIdsByName(db) {
     return out;
 }
 
-/** itemId -> [{id, price}] across every live TornW3B list: one pass, not one per item. */
-export function indexW3bByItem(db, now = Date.now()) {
+/*
+ * A trader's own word (3.31.0, core/shared.js sharedOwnIn): what their Torn Archive told our server they pay.
+ * It counts while the server heard it within a day - the owner's own line for a price list (PRICES_STALE_MS).
+ */
+export const SAID_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+/** The stored own lists, checked: Map(trader id -> {at, since, open, prices, off}) of those heard within a day. */
+export function saidLists(stored, now = Date.now()) {
     const out = new Map();
-    for (const [id, t] of Object.entries(db.traders)) {
-        const prices = liveW3bPrices(t, now);
+    const lists = stored && stored.lists && typeof stored.lists === 'object' ? stored.lists : {};
+    for (const [key, s] of Object.entries(lists)) {
+        const id = cleanId(key);
+        if (!id || !s || !(s.at > 0) || !(now - s.at <= SAID_MAX_AGE_MS) || !s.prices || typeof s.prices !== 'object') continue;
+        out.set(id, { at: s.at, since: s.since > 0 ? s.since : s.at, open: s.open === true, prices: s.prices, off: Array.isArray(s.off) ? s.off : [] });
+    }
+    return out;
+}
+
+/** A trader's list with their own word laid over it: their prices stand, a piece they do not want now goes. */
+function withSaid(prices, s) {
+    const out = { ...(prices || {}) };
+    for (const [itemId, price] of Object.entries(s.prices)) if (price > 0) out[String(itemId)] = price;
+    for (const itemId of s.off) delete out[String(itemId)];
+    return out;
+}
+
+/**
+ * itemId -> [{id, price}] across every live TornW3B list: one pass, not one per item.
+ * @param {Map} [said] - saidLists(): a trader's own word stands over TornW3B's copy of their list, and names
+ *   them a buyer where TornW3B has no price of theirs (their shop is closed: the prices are off their list there)
+ */
+export function indexW3bByItem(db, now = Date.now(), said = null) {
+    const out = new Map();
+    const all = said && said.size ? [...Object.entries(db.traders), ...[...said.keys()].filter((id) => !db.traders[id]).map((id) => [id, null])] : Object.entries(db.traders);
+    for (const [id, t] of all) {
+        const s = said ? said.get(id) : null;
+        const prices = s ? withSaid(t ? liveW3bPrices(t, now) : null, s) : liveW3bPrices(t, now);
         if (!prices) continue;
         for (const [itemId, price] of Object.entries(prices)) {
             let list = out.get(itemId);
