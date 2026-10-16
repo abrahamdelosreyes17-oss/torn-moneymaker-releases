@@ -35,12 +35,6 @@ function text(node) {
     return ((node && node.textContent) || '').replace(/\s+/g, ' ').trim();
 }
 
-function visible(input) {
-    if (!input) return false;
-    if (input.type === 'hidden') return false;
-    return !(input.offsetParent === null && input.getClientRects && input.getClientRects().length === 0);
-}
-
 /** The first number in a text: "x12", "12", "1,234 in stock". */
 export function countIn(value) {
     const m = String(value || '').match(/(\d[\d,]*)/);
@@ -172,34 +166,7 @@ export function readInputs(inputs) {
     return (inputs || []).map((i) => i.value);
 }
 
-/**
- * Type a value into Torn's boxes. Torn's forms listen for input events and
- * (the bazaar add page) key-ups; React keeps its own copy of a box's value,
- * so the value goes in through the native setter, which React sees.
- *
- * @param {HTMLInputElement[]} inputs
- * @param {string|string[]} value - one value for all, or one per box (Undo)
- */
-export function writeInputs(inputs, value) {
-    const list = inputs || [];
-    list.forEach((input, i) => {
-        let v = Array.isArray(value) ? value[i] : value;
-        if (v === undefined || v === null) return;
-        // A hidden twin holds the plain number (value="119999"), the visible box the formatted one.
-        if (input.type === 'hidden' && !Array.isArray(value)) v = String(v).replace(/[^\d]/g, '');
-        const proto = Object.getPrototypeOf(input);
-        const desc = Object.getOwnPropertyDescriptor(proto, 'value') || Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
-        if (desc && desc.set) desc.set.call(input, String(v));
-        else input.value = String(v);
-    });
-    // One set of events, from the box you can see (Torn mirrors it into the hidden one).
-    // The one box that is not a hidden twin is the one you see (asking the page costs a layout of all of it, 3.22.0).
-    const shown = list.filter((i) => i && i.type !== 'hidden');
-    const target = (shown.length === 1 ? shown[0] : shown.find(visible)) || list[0];
-    if (!target) return;
-    for (const type of ['input', 'change']) target.dispatchEvent(new Event(type, { bubbles: true }));
-    target.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
-}
+/* Typing into the boxes (writeInputs) is the shared folder's: #engines/dom/type-into.js (3.33.0 / engines plan 3a). */
 
 /** How a price goes into the box: the bazaar pages show 1,234,567; the Item Market takes digits. */
 export function priceText(page, price) {

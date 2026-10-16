@@ -133,8 +133,8 @@ export const TRADER_CLASS = 'ttv2-trader';
 export const TRADER_DATA_KEY = 'ttv2Trader';
 export const TRADER_DATA_ATTR = 'data-ttv2-trader';
 /*
- * Their price is from a list getting old (3.23.0): 'aging' (over 24 hours,
- * the tag's amber dot and glow) or 'stale' (over two days, the dot alone). A
+ * Their price is from a list getting old (3.23.0): 'aging' (over twelve hours,
+ * the tag's amber dot and glow) or 'stale' (over a day, the dot alone; since 3.26.0). A
  * second data attribute on the same card: still nothing appended.
  */
 export const TRADER_OLD_KEY = 'ttv2TraderOld';

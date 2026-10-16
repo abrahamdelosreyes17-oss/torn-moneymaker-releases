@@ -144,11 +144,13 @@ test('the joins: the traders are counted again only when an item\'s buyers were 
 });
 
 test('the joins: Best flips puts each trader\'s flips together, live and held, and the page draws one line over them', () => {
-    has('if (sell.filter === \'flips\') listed = togetherBy(listed, flipTraderKey, (r) => r.value);', 'the live list');
+    // The live list: core/view-model.js listOrder (test/view-model.test.js), given the tab in view.
+    has('listOrder(rows, pass, sell.filter)', 'the live list');
     has('{ together: sell.filter === \'flips\' }', 'the held list');
     has('group: sell.filter === \'flips\' ? (r.still ? r.still.to || null : flipTraderKey(r)) : null,', 'each row\'s trader, for the page');
     assert.ok(page.includes('list[j].group === list[i].group'), 'the page finds a trader\'s rows by it');
-    assert.ok(page.includes('\'group:\' + r.group'), 'and draws the line');
+    // Mockup AM: a trader's flips are one row of the list (drawFlipRows), its key the run's group.
+    assert.ok(page.includes('\'group:\' + lead.group'), 'and draws them as one row');
     assert.ok(page.includes('r.still && [r.still.move, r.still.gone, r.still.was], r.group,'), 'a row that changes trader draws the list again');
 });
 

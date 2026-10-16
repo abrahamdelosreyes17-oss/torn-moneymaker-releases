@@ -24,7 +24,7 @@ export const SHARED_BUCKETS = 16;
 const SHARED_MAX_SELLERS = 3000;
 const SHARED_MAX_NEAR = 200;
 const SHARED_MAX_WORTH = 5000;
-const SHARED_BODY_KEYS = ['app', 'ver', 'used', 'waiting', 'sellers', 'trades', 'looking', 'worth', 'since', 'seen', 'going', 'bought', 'dir', 'want', 'w3b', 'lists', 'listsSince', 'calls', 'moves', 'ownSince'];
+const SHARED_BODY_KEYS = ['app', 'ver', 'used', 'waiting', 'sellers', 'trades', 'looking', 'worth', 'since', 'seen', 'going', 'bought', 'dir', 'want', 'w3b', 'lists', 'listsSince', 'calls', 'moves', 'ownSince', 'opens', 'drops'];
 /*
  * 3.26.0, the server handing out TornW3B's work (its /sync, deployed 2026-10-11):
  *   want        the items whose sellers list this PC would ask TornW3B for next, most wanted first (60 at most)
@@ -68,6 +68,31 @@ export function sharedMovesIn(answer) {
     return { at: m.at, rows };
 }
 
+/*
+ * 3.33.0 - prices falling (engines plan 4a): each watched item's lowest bazaar price, the server's sample every
+ * ten minutes over the last day:
+ *   drops       the time of the samples this PC holds (the server's clock; 0 for none)
+ *   -> drops    {at, rows: [[item, [minutes ago, price, ...]]]} when the server has a newer sample
+ */
+export const SHARED_MAX_DROPS = 600;
+const SHARED_MAX_DROP_SAMPLES = 24 * 6 + 1;
+/** The answer's samples, checked: {at, rows: {item: [minutes ago, price, ...]}}, or null when the server sent none. */
+export function sharedDropsIn(answer) {
+    const m = answer && answer.drops;
+    if (!m || typeof m !== 'object' || !Number.isInteger(m.at) || m.at <= 0 || m.at >= 1e13 || !Array.isArray(m.rows)) return null;
+    const rows = {};
+    let n = 0;
+    for (const r of m.rows) {
+        if (n >= SHARED_MAX_DROPS) break;
+        if (!Array.isArray(r) || r.length !== 2 || !Array.isArray(r[1]) || r[1].length % 2 || r[1].length > 2 * SHARED_MAX_DROP_SAMPLES) continue;
+        const item = sharedId(r[0]);
+        if (item === null || item in rows || !r[1].every((v) => Number.isInteger(v) && v >= 0 && v < 1e13)) continue;
+        rows[item] = r[1];
+        n += 1;
+    }
+    return { at: m.at, rows };
+}
+
 /** One trader list as it may be sent or kept: [trader, readAt, {item: price}], or null. Numbers only. */
 export function sharedList(entry) {
     if (!Array.isArray(entry) || entry.length !== 3) return null;
@@ -85,6 +110,41 @@ export function sharedList(entry) {
         out[item] = Math.round(value);
     }
     return n ? [trader, at, out] : null;
+}
+
+/*
+ * 3.33.0 - is a trader's TornW3B list open (core/open-check.js)? One PC's page read serves the others for three
+ * minutes, through the server (its opens.js): sent as [trader, 1 open | 0 closed, age, changedAge, mark], ages in ms by this
+ * PC's clock (changedAge: how long before now their list last changed, 0 not known); the server stamps them with its
+ * own clock and hands them on as ages too, so no other PC's clock is taken. Unclear and failed reads are not sent.
+ * mark: sharedListMark of the prices the open read gave, so the receiver uses that check only with that very list.
+ */
+export const SHARED_MAX_OPENS = 30;
+export const SHARED_OPEN_KEEP_MS = 3 * 60 * 1000;
+
+/** One of this PC's checks, kept as [trader, state, at, changedAt, mark] (this PC's clock), as it goes out - or null. */
+export function sharedOpenOut(entry, now) {
+    if (!Array.isArray(entry) || entry.length !== 5) return null;
+    const trader = sharedId(entry[0]);
+    const [, state, at, changedAt, mark] = entry;
+    if (trader === null || (state !== 0 && state !== 1) || !Number.isFinite(at) || at <= 0) return null;
+    const age = Math.max(0, Math.floor(now - at));
+    if (age >= SHARED_OPEN_KEEP_MS) return null;
+    const changed = Number.isFinite(changedAt) && changedAt > 0 ? Math.max(1, Math.floor(now - changedAt)) : 0;
+    return [trader, state, age, Math.min(changed, 1e13 - 1), Number.isInteger(mark) && mark > 0 && mark < 2 ** 32 ? mark : 0];
+}
+
+/** The answer's open checks, made by other PCs: [trader, state, at, changedAt, mark] on this PC's clock (`got`), newest first. */
+export function sharedOpensIn(answer, got) {
+    const out = [];
+    for (const m of answer && Array.isArray(answer.opens) ? answer.opens.slice(0, SHARED_MAX_OPENS * 4) : []) {
+        if (!Array.isArray(m) || m.length !== 5) continue;
+        const trader = sharedId(m[0]);
+        const ok = (n) => Number.isInteger(n) && n >= 0 && n < 1e13;
+        if (trader === null || (m[1] !== 0 && m[1] !== 1) || !ok(m[2]) || !ok(m[3]) || !ok(m[4]) || m[2] >= SHARED_OPEN_KEEP_MS) continue;
+        out.push([trader, m[1], got - m[2], m[3] > 0 ? got - m[3] : 0, m[4]]);
+    }
+    return out;
 }
 
 /** The answer's trader lists, checked: read by another person's PC, oldest first. */
@@ -386,7 +446,7 @@ export function sharedMarks(wants, now) {
  * come out of here, whatever is put in.
  * `now`: this PC's clock; the marks leave as ages, since every PC has its own clock.
  */
-export function sharedBody({ used = 0, waiting = 0, wants = [], since = 0, seen = 0, sendWorth = true, now = 0, ver = null, lists = null, listsSince = null, calls = null, moves = null, ownSince = null } = {}) {
+export function sharedBody({ used = 0, waiting = 0, wants = [], since = 0, seen = 0, sendWorth = true, now = 0, ver = null, lists = null, listsSince = null, calls = null, moves = null, ownSince = null, opens = null, drops = null } = {}) {
     const count = (n) => (Number.isFinite(n) && n > 0 ? Math.min(1000, Math.floor(n)) : 0);
     const list = Array.isArray(wants) ? wants.filter((w) => w && typeof w === 'object') : [];
     const trades = sharedIds(list.map((w) => w.trades), SHARED_MAX_NEAR);
@@ -419,8 +479,13 @@ export function sharedBody({ used = 0, waiting = 0, wants = [], since = 0, seen 
     if (Number.isInteger(listsSince) && listsSince >= 0) body.listsSince = listsSince;
     // 3.28.0 - the table of item speeds this PC holds (its time on the server's clock): a newer one is sent back.
     if (Number.isInteger(moves) && moves >= 0 && moves < 1e13) body.moves = moves;
+    // 3.33.0 - the price samples this PC holds (their time on the server's clock): newer ones are sent back.
+    if (Number.isInteger(drops) && drops >= 0 && drops < 1e13) body.drops = drops;
     // 3.31.0 - traders' own price lists, as their Torn Archive told the server (sharedOwnIn): the running number held.
     if (Number.isInteger(ownSince) && ownSince >= 0 && ownSince < 1e13) body.ownSince = ownSince;
+    // 3.33.0 - whose TornW3B lists this PC saw open or closed in the last three minutes, as ages (sharedOpen).
+    const opensOut = (Array.isArray(opens) ? opens : []).map((o) => sharedOpenOut(o, now)).filter(Boolean).slice(0, SHARED_MAX_OPENS);
+    if (opensOut.length) body.opens = opensOut;
     // 3.26.2 - this PC's own request counts since the last answered exchange (core/usage.js): {} = none were made.
     if (calls && typeof calls === 'object' && !Array.isArray(calls)) {
         body.calls = {};
@@ -484,6 +549,9 @@ export function sharedOutgoingOk(body) {
                 if (!l[2] || typeof l[2] !== 'object' || Array.isArray(l[2]) || Object.keys(l[2]).length > SHARED_MAX_LIST_ITEMS) return false;
                 for (const [item, price] of Object.entries(l[2])) if (!/^\d{1,10}$/.test(item) || !Number.isInteger(price) || price <= 0) return false;
             }
+        } else if (key === 'opens') {
+            // [trader, 1 open | 0 closed, age, age of the list's last change (0: not known), mark of its prices (0: none)]
+            if (!Array.isArray(value) || value.length > SHARED_MAX_OPENS || !value.every((m) => Array.isArray(m) && m.length === 5 && m.every(whole) && m[0] > 0 && m[0] < 1e10 && (m[1] === 0 || m[1] === 1) && m[2] < SHARED_OPEN_KEEP_MS && m[4] < 2 ** 32)) return false;
         } else if (key === 'calls') {
             // {tag: how many}: a service's tag or how one answered, a whole number from 1 to 5,000.
             if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length > USAGE_CALLS_TAGS_MAX) return false;
@@ -508,7 +576,8 @@ export function sharedBucketOf(sellerId) {
 
 /**
  * The server's answer, taken into what is kept: `buckets` is an array of
- * SHARED_BUCKETS objects, sellerId -> [changedAt, seenAt, gen, [[item, price, qty], ...]].
+ * SHARED_BUCKETS objects, sellerId -> [changedAt, seenAt, gen, [[item, price, qty], ...], [friends, enemies]|null].
+ * The last (3.33.0, the seller rule): the seller's Torn profile counts, when the server sent them (`fe`).
  * Only items of `interest` (a Map itemId -> the gen it joined at) are kept; `gen`
  * is the interest's count now, so a later reader knows which items this entry
  * could have held (see withShared).
@@ -532,7 +601,8 @@ export function sharedTake(buckets, answer, interest, gen, now) {
         }
         const bucket = sharedBucketOf(id);
         const prev = buckets[bucket][id];
-        buckets[bucket][id] = [at, Math.max(at, prev ? prev[1] : 0), gen, items];
+        const fe = sharedCounts(read.fe) || (prev ? sharedCounts(prev[4]) : null);
+        buckets[bucket][id] = [at, Math.max(at, prev ? prev[1] : 0), gen, items, fe];
         touched.add(bucket);
     }
     // Read again by the server and found the same: still true as of then.
@@ -548,6 +618,11 @@ export function sharedTake(buckets, answer, interest, gen, now) {
         }
     }
     return touched;
+}
+
+/** A seller's [friends, enemies] as the server sends them, or null. */
+export function sharedCounts(fe) {
+    return Array.isArray(fe) && fe.length === 2 && fe.every((n) => Number.isInteger(n) && n >= 0) ? [fe[0], fe[1]] : null;
 }
 
 /** Drops what the server has not confirmed for SHARED_KEEP_MS. @returns {Set<number>} the buckets that changed */
@@ -569,8 +644,10 @@ export function sharedReadBucket(stored) {
     const out = {};
     if (!stored || typeof stored !== 'object' || Array.isArray(stored)) return out;
     for (const [id, entry] of Object.entries(stored)) {
-        if (!/^\d{1,10}$/.test(id) || !Array.isArray(entry) || entry.length !== 4) continue;
+        // Four long before 3.33.0; the fifth, the seller's counts, may be null.
+        if (!/^\d{1,10}$/.test(id) || !Array.isArray(entry) || (entry.length !== 4 && entry.length !== 5)) continue;
         const [at, seen, gen, items] = entry;
+        if (entry.length === 5 && entry[4] !== null && !sharedCounts(entry[4])) continue;
         if (!Number.isFinite(at) || !Number.isFinite(seen) || !Number.isInteger(gen) || !Array.isArray(items)) continue;
         if (!items.every((i) => Array.isArray(i) && i.length === 3 && Number.isInteger(i[0]) && Number.isFinite(i[1]) && Number.isInteger(i[2]))) continue;
         out[id] = entry;
@@ -580,7 +657,7 @@ export function sharedReadBucket(stored) {
 
 /**
  * What is kept, laid out for reading:
- *  bySeller: sellerId -> {at, seen, gen, items: Map itemId -> [{price, qty}]}
+ *  bySeller: sellerId -> {at, seen, gen, items: Map itemId -> [{price, qty}], counts: {friends, enemies}|null}
  *  byItem:   itemId -> [{sellerId, price, qty, at, seen}]
  * Ids are strings, as in the TornW3B rows.
  */
@@ -589,7 +666,7 @@ export function sharedIndex(buckets) {
     const byItem = new Map();
     for (const bucket of buckets) {
         for (const [sellerId, entry] of Object.entries(bucket)) {
-            const [at, seen, gen, list] = entry;
+            const [at, seen, gen, list, fe] = entry;
             const items = new Map();
             for (const [item, price, qty] of list) {
                 const key = String(item);
@@ -598,7 +675,8 @@ export function sharedIndex(buckets) {
                 if (!byItem.has(key)) byItem.set(key, []);
                 byItem.get(key).push({ sellerId, price, qty, at, seen });
             }
-            bySeller.set(sellerId, { at, seen, gen, items });
+            const c = sharedCounts(fe);
+            bySeller.set(sellerId, { at, seen, gen, items, counts: c ? { friends: c[0], enemies: c[1] } : null });
         }
     }
     return { bySeller, byItem };

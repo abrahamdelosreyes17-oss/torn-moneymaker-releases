@@ -115,7 +115,7 @@ export function shownBuyers(kept, { prefs = {}, levelOf = () => 'unknown', votes
     let b = kept.list;
     if (prefs.onlineOnly) b = onlineOnly(b, levelOf);
     if (prefs.trustedOnly) b = trustedOnly(b, { min: 'Known', keepUnrated: votesMissing });
-    // Fresh prices only (3.22.0): a TornW3B price from a list not changed in two days is not shown.
+    // Fresh prices only (3.22.0): a TornW3B price from a list not changed in a day is not shown.
     if (prefs.freshOnly) b = freshOnly(b, listAtOf, now);
     return b;
 }

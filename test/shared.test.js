@@ -131,14 +131,14 @@ test('the reads of the server are kept by seller, only the items of interest, an
         { id: 38, at: 1500, items: [{ id: 206, price: 'cheap', qty: 1 }, { id: 206, price: 790000, qty: 1.5 }] },
     ] }, interest, gen, 2000);
     assert.deepEqual([...touched].sort((a, b) => a - b), [sharedBucketOf(21), sharedBucketOf(38)].sort((a, b) => a - b));
-    assert.deepEqual(buckets[sharedBucketOf(21)][21], [1000, 1000, 1, [[206, 800000, 3], [367, 1100, 20]]]);
-    assert.deepEqual(buckets[sharedBucketOf(38)][38], [1500, 1500, 1, []]);
+    assert.deepEqual(buckets[sharedBucketOf(21)][21], [1000, 1000, 1, [[206, 800000, 3], [367, 1100, 20]], null]);
+    assert.deepEqual(buckets[sharedBucketOf(38)][38], [1500, 1500, 1, [], null]);
 
     assert.deepEqual([...sharedTake(buckets, { reads: [], seen: [[21, 4000], [21, 3000], [555, 4000], ['x', 1], [38]] }, interest, gen, 5000)], [sharedBucketOf(21)]);
     assert.deepEqual(buckets[sharedBucketOf(21)][21].slice(0, 2), [1000, 4000]);
     // A changed bazaar never loses a later "seen".
     sharedTake(buckets, { reads: [{ id: 21, at: 3500, items: [] }] }, interest, gen, 5000);
-    assert.deepEqual(buckets[sharedBucketOf(21)][21], [3500, 4000, 1, []]);
+    assert.deepEqual(buckets[sharedBucketOf(21)][21], [3500, 4000, 1, [], null]);
 
     assert.deepEqual([...sharedPrune(buckets, 4000 + SHARED_KEEP_MS)], [sharedBucketOf(38)]);
     assert.equal(buckets[sharedBucketOf(38)][38], undefined);

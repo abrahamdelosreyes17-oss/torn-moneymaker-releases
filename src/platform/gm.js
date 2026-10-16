@@ -137,10 +137,10 @@ export function gmHeader(text, name) {
  *   request headers (3.26.0: only TornW3B's X-API-Key, from api/w3b.js - a key is never in a URL)
  * @returns {Promise<{ok: boolean, status: number, json: function}>}
  */
-export function gmFetch(url, { timeoutMs = 30000, headers = null } = {}) {
+export function gmFetch(url, { timeoutMs = 30000, headers = null, anonymous = false } = {}) {
     // Under node and where the host has no transport of its own: fetch's answer carries `headers.get(name)`.
     if (typeof GM_xmlhttpRequest !== 'function') {
-        if (typeof fetch === 'function') return headers ? fetch(url, { headers }) : fetch(url);
+        if (typeof fetch === 'function') return headers ? fetch(url, { headers, ...(anonymous ? { credentials: 'omit' } : {}) }) : fetch(url);
         return Promise.reject(new Error('No HTTP transport available.'));
     }
 
@@ -149,12 +149,17 @@ export function gmFetch(url, { timeoutMs = 30000, headers = null } = {}) {
             method: 'GET',
             url,
             ...(headers ? { headers } : {}),
+            // 3.33.0: a TornW3B page is read with no cookie of the site (nothing of yours goes with it).
+            ...(anonymous ? { anonymous: true } : {}),
             timeout: timeoutMs,
             onload(response) {
                 resolve({
                     ok: response.status >= 200 && response.status < 300,
                     status: response.status,
+                    // Where the answer came from after redirects (3.33.0: a page must stay on its host).
+                    url: response.finalUrl || url,
                     json: async () => JSON.parse(response.responseText),
+                    text: async () => String(response.responseText || ''),
                     // One answer header by name (3.26.0: TornW3B's Retry-After), or null.
                     header: (name) => gmHeader(response.responseHeaders, name),
                 });

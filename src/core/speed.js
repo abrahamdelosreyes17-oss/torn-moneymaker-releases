@@ -370,6 +370,16 @@ export const SPEED_BIDS = Object.freeze({
     byData: 'redraws asked for by arriving data (they wait their turn)',
     // 3.30.0: of those, the ones about what is on the desk - they do not wait for the calm pace.
     byNear: 'redraws asked for by data about the item or the trade on the desk (not held to the calm pace)',
+    // 3.33.0: of all redraws, the ones with no new bazaars, market, statuses, summary, TornExchange lists, item traders
+    // or price lists since the last (votes, networth, the shared server's own data and favourites are not in the word).
+    sameData: 'redraws drawn on the same reads as the one before (by the store versions)',
+    // 3.33.0 (engines plan Stage 6): where the bazaars come from, once a minute - measured first.
+    fromServer: 'items with bazaars from the shared server only',
+    fromW3b: 'items with bazaars from TornW3B only (this PC read them)',
+    fromBoth: 'items with bazaars from both the shared server and TornW3B',
+    serverLeads: 'items the shared server leads (it agreed with TornW3B often enough)',
+    leftToServer: 'TornW3B reads left to the shared server, in the last minute',
+    ownReads: 'bazaars of sellers read from Torn to confirm a flip, in the last minute',
     byPress: 'redraws asked for by the answer to something pressed (after a moment, not waiting their turn)',
     byStatus: 'redraws asked for by the first status answer after a press',
     byTyping: 'redraws asked for by typing in the search box',

@@ -12,20 +12,19 @@
  * 0.4 a minute where 8.5 were due (the sellers lists went first, and were
  * always due); and nothing looked at the buyer again before a flip was shown.
  *
- * The rule here: a buyer makes a flip only when
- *   - the price is their TornW3B price (TornExchange gives no date for a
- *     price: one that is only there is shown under "Traders pay", and makes
- *     no flip alone);
- *   - TornW3B was asked about it in the last FLIP_CHECK_MS - the item's
- *     buyers (it names them at that price), or their own list (it holds the
- *     item at that price);
+ * The rule here (3.33.0): a buyer makes a flip only when
+ *   - their TornW3B list PAGE, read within OPEN_CHECK_MS (3 minutes), says the list is open and pays this
+ *     price (core/open-check.js) - a read of the item's buyers or of their list cannot see a closed list;
  *   - and their list was last changed within PRICES_STALE_MS (a day).
+ *   - Or the price is only on TornExchange: a flip, always marked amber (look at their list yourself).
+ *   - Or it is the owner's own word (his Torn Archive, through the server): counts also while closed.
  * Everything else is a possible flip: it waits, and its check goes first.
  *
  * Pure: no DOM, no storage, no clock.
  */
 
 import { PRICES_STALE_MS } from './traders.js';
+import { openNow, OPEN_CHECK_MS } from './open-check.js';
 
 /* How long a check stands. The buyers of a flip are read again well inside it (FLIP_RECHECK_MS). */
 export const FLIP_CHECK_MS = 5 * 60 * 1000;
@@ -36,68 +35,58 @@ export const DESK_RECHECK_MS = 2 * 60 * 1000;
 /* Every other item whose buyers are read (what you hold, the other possible flips). */
 export const OTHER_RECHECK_MS = 10 * 60 * 1000;
 
-const checkedIdsOf = new WeakMap();
-
-/** trader id -> price, from one read of an item's buyers (made once per read). */
-function checkedNamedIn(traders) {
-    if (!Array.isArray(traders)) return null;
-    let m = checkedIdsOf.get(traders);
-    if (!m) {
-        m = new Map();
-        for (const t of traders) if (t && t.id) m.set(String(t.id), Number(t.price) || 0);
-        checkedIdsOf.set(traders, m);
-    }
-    return m;
-}
-
-/**
- * When TornW3B last named this trader at this price in a read of the item's
- * buyers (0: never). A read is kept in two parts when the item has more buyers
- * than one answer holds - everyone (`full`, read at `fullAt`) and those who
- * traded lately (`lately`, at `latelyAt`) - and each part checks only what it
- * names, at its own time: `at` is the newer of the two, and is not the time
- * of a trader only the older part names.
- */
-function checkedNamedAt(item, id, price) {
-    if (!item || !(item.at > 0)) return 0;
-    const parts = [[item.full, item.fullAt], [item.lately, item.latelyAt]].filter(([rows, readAt]) => Array.isArray(rows) && readAt > 0);
-    if (!parts.length) {
-        const m = checkedNamedIn(item.traders);
-        return m && m.get(id) === price ? item.at : 0;
-    }
-    let at = 0;
-    for (const [rows, readAt] of parts) if (readAt > at && checkedNamedIn(rows).get(id) === price) at = readAt;
-    return at;
-}
-
 /**
  * Is this buyer's price for this item checked?
  *
  * @param {{id, price, w3b, te, lastPaidOnly}} b - a buyer row (buyersForItem)
  * @param {object} o
  * @param {string} o.itemId
- * @param {{at: number, traders: Array, full?: Array, fullAt?: number, lately?: Array, latelyAt?: number}|null} o.item - the last read of the item's buyers, or null
- * @param {{at: number, found: boolean, prices: object, shared?: boolean}|null} o.list - the last read of this trader's own list, or null
- * @param {number} o.listAt - when they last changed their list (ms), 0: not known
+ * @param {{at: number, state: string, prices: object|null, updatedAt: number}|null} o.open - the last page read of their
+ *   TornW3B list (3.33.0, core/open-check.js), or null. Since 3.33.0 a read of the item's buyers or of their list
+ *   (`item`, `list`, kept in the call for the callers) checks nothing: neither can see a closed list.
+ * @param {number} o.listAt - when they last changed their list (ms), 0: not known; the page's own date goes first
+ * @param {number} [o.teListAt] - when TornExchange says they last changed their list there (0: not known)
  * @param {{at: number, open: boolean, prices: object}|null} [o.said] - the trader's own word (3.31.0): what their Torn
  *   Archive told our server they pay, and when the server last heard it. A price that is this one is checked for as
  *   long as it was heard within `staleMs` - it needs no TornW3B read: TornW3B's copy is the older of the two.
- * @returns {{ok: boolean, why: 'checked'|'said'|'no-id'|'te-only'|'not-checked'|'old-list'|'no-date', at: number, closed?: boolean}}
- *   at: when TornW3B last confirmed this price (0: never); for 'said', when the server last heard it.
- *   closed: 'said' while their shop is closed - the price is what they would pay once they open.
+ * @returns {{ok: boolean, why: 'checked'|'said'|'te-only'|'no-id'|'last-paid'|'no-price'|'closed'|'not-open'|'not-checked'|'old-list'|'no-date', at: number, closed?: boolean, open?: string, te?: boolean, warn?: 'te'}}
+ *   at: when their list page last said open (0: never); for 'said', when the server last heard it.
+ *   closed: their list is closed - for 'said', the price is what they would pay once they open (it counts: the owner's
+ *   own list, so friends can buy for him while he sleeps); otherwise no flip.
+ *   open: why not open - 'unread', 'stale', 'unclear', 'failed' (core/open-check.js openNow).
+ *   warn 'te': a TornExchange-only price - shown, in amber: look at their list.
  */
-export function priceChecked(b, { itemId, item = null, list = null, listAt = 0, said = null, now = Date.now(), checkMs = FLIP_CHECK_MS, staleMs = PRICES_STALE_MS } = {}) {
-    if (!b || !b.id) return { ok: false, why: 'no-id', at: 0 };
-    if (!(b.w3b > 0) || b.lastPaidOnly) return { ok: false, why: 'te-only', at: 0 };
+export function priceChecked(b, { itemId, item = null, list = null, listAt = 0, said = null, open = null, teListAt = 0, now = Date.now(), checkMs = FLIP_CHECK_MS, openMs = OPEN_CHECK_MS, staleMs = PRICES_STALE_MS } = {}) {
+    if (!b) return { ok: false, why: 'no-id', at: 0 };
+    if (b.lastPaidOnly) return { ok: false, why: 'last-paid', at: 0 };
+    /*
+     * 3.33.0 - a price only on TornExchange is shown, and makes a flip, always in amber (the owner, 2026-10-16:
+     * "always show the torn exchange ... just have a warning or pulsating amber so were reminded to click the
+     * pricelist"): TornExchange cannot say whether a list is open, so you look at their list yourself. A list
+     * TornExchange says was last changed over a day ago makes no flip, as a TornW3B one.
+     */
+    if (!(b.w3b > 0)) {
+        if (!(b.te > 0)) return { ok: false, why: 'no-price', at: 0 };
+        const teChanged = Number(teListAt) || 0;
+        if (teChanged > 0 && now - teChanged > staleMs) return { ok: false, why: 'old-list', at: 0, te: true };
+        return { ok: true, why: 'te-only', at: 0, te: true, warn: 'te' };
+    }
+    // A TornW3B price: its list is read by Torn id.
+    if (!b.id) return { ok: false, why: 'no-id', at: 0 };
     if (said && said.at > 0 && said.prices && Number(said.prices[String(itemId)]) === b.w3b && now - said.at <= staleMs) return { ok: true, why: 'said', at: said.at, closed: !said.open };
-    let at = checkedNamedAt(item, String(b.id), b.w3b);
-    // A list another PC read (it came through the shared server, by that PC's clock) is shown, and checks nothing.
-    if (list && list.found && !list.shared && list.prices && Number(list.prices[String(itemId)]) === b.w3b && list.at > at) at = list.at;
-    if (!(at > 0) || now - at > checkMs) return { ok: false, why: 'not-checked', at };
-    const changed = Number(listAt) || 0;
-    if (!(changed > 0)) return { ok: false, why: 'no-date', at };
-    if (now - changed > staleMs) return { ok: false, why: 'old-list', at };
-    return { ok: true, why: 'checked', at };
+    /*
+     * 3.33.0 - and a TornW3B price only on a page read of their list that says it is OPEN, made within openMs, at
+     * this price (core/open-check.js; the money loss of 2026-10-14: the list read returns every price while a list
+     * is closed). Closed, not read, unclear or a failed read: no flip. The page carries the list itself, so the
+     * price is the one it gave and the list's date its own.
+     */
+    const o = openNow(open, { now, within: openMs });
+    if (!o.ok) return { ok: false, why: o.why === 'closed' ? 'closed' : 'not-open', open: o.why, at: o.at, closed: o.why === 'closed' };
+    if (!open.prices || Number(open.prices[String(itemId)]) !== b.w3b) return { ok: false, why: 'not-checked', at: o.at };
+    const changed = Number(open.updatedAt) || Number(listAt) || 0;
+    if (!(changed > 0)) return { ok: false, why: 'no-date', at: o.at };
+    if (now - changed > staleMs) return { ok: false, why: 'old-list', at: o.at };
+    return { ok: true, why: 'checked', at: o.at };
 }
 
 /**
@@ -191,6 +180,28 @@ export function checkedInTable(table, itemId, traderId, price, now = Date.now(),
         return Number(r[1]) === Number(price) && now - Number(r[2]) * 1000 <= checkMs && now - Number(r[2]) * 1000 > -60000;
     }
     return false;
+}
+
+/*
+ * After their yes (3.33.0): a trade is frozen at the prices they said yes to, and buying it can take most of an
+ * hour - their list went unread all that time. Now it is read again every few minutes while the trade is open,
+ * and a line whose price their list no longer pays is said on that line, before more of it is bought.
+ */
+
+/**
+ * What their list says now of a price they said yes to.
+ * @param {number} bid - the price of the line at their yes
+ * @param {object} o
+ * @param {number|null} o.shown - what their list says for the item now (null: they are not paying for it now)
+ * @param {number} o.readAt - when their list was last read (0: never)
+ * @param {number} o.yesAt - when they said yes
+ * @returns {{state: 'same'|'higher'|'lower'|'gone'|'unread', price: number|null}} unread: not read since the yes
+ */
+export function bidSinceYes(bid, { shown = null, readAt = 0, yesAt = 0 } = {}) {
+    if (!(readAt > yesAt)) return { state: 'unread', price: null };
+    const now = Number(shown) || 0;
+    if (!(now > 0)) return { state: 'gone', price: null };
+    return { state: now === bid ? 'same' : now > bid ? 'higher' : 'lower', price: now };
 }
 
 /**

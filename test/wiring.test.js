@@ -58,22 +58,34 @@ test('the prices: To sell and what goes into a trade are worked out with the pri
     has('const heldWaiting = held === yours ? [] : yours.filter((h) => h.unchecked);', 'the waiting ones');
     assert.ok(page.includes('c.heldWaiting'), 'and the page lists them');
     assert.ok(page.includes('T.unchecked'), 'To sell shows the rows that wait for a check');
-    // The rows that wait for a check are asked about as a flip is: before the flips while To sell is the tab in view, after them otherwise.
-    has('sell.flipCheckIds = [...new Set([...(sell.filter === \'sell\' ? [...sellWaiting, ...flipIds] : [...flipIds, ...sellWaiting]), ...sellRows.map((r) => r.itemId)])];', 'what is checked first');
-    has('sell.toSellIds = toSell.filter((r) => !r.kept).map((r) => r.itemId);', 'every To sell item has its buyers read');
-    has('...sellRows.map((r) => r.best.id)].filter(Boolean).map(String));', 'and its best payer\'s own list is read as a flip\'s trader\'s is');
+    // The rows that wait for a check are asked about as a flip is (core/schedule.js readWants, test/schedule.test.js):
+    // the join is the list in view and every To sell row.
+    has('applyWants(sell, readWants(waiting, shownFlips, toSell, { filter: sell.filter, openMax: OPEN_WANT }));', 'what is checked first');
 });
 
 test('the prices: picking a deal, Plan trade, Every flip and "said yes" each read that trader\'s price list', () => {
-    for (const why of ['Picked a deal', 'Plan trade', 'Every flip', 'Said yes']) assert.equal(callsOf('checkTraderNow').filter((line) => line.includes('\'' + why + '\'')).length, 1, why);
-    // The yes waits for the answer, and is written with what the read found.
-    has('out.done.then(() => go(true));', 'the yes follows the answer');
-    has('setTimeout(() => go(false), ACCEPT_WAIT_MS)', 'or a few seconds');
+    for (const why of ['Picked a deal', 'Plan trade', 'Every flip']) assert.equal(callsOf('checkTraderNow').filter((line) => line.includes('\'' + why + '\'')).length, 1, why);
+    // 3.33.0 - the yes reads their list page again (is it open?), waits for that answer, and is written only on it.
+    has(': loadW3bOpen(traderId);', 'the yes checks their list is open again');
+    has('Promise.resolve(done).then(go, go);', 'the yes follows the answer');
+    has('const timer = setTimeout(go, ACCEPT_WAIT_MS);', 'or a few seconds');
+    has("if (!fresh || fresh.state !== 'open') {", 'written down only on an open read made after the press');
+    has('const fresh = check && (check.sentAt || check.at) >= since ? check : null;', 'sent after the press, not only answered after it');
+    has('Promise.resolve(inFlight.done).then(() => loadW3bOpen(traderId))', 'a read in flight from before the press is not the check');
+    // The owner's own word counts while his shop is closed: Ask, Yes and Open the trade are not held on it.
+    has('if (said && said.at > 0) return pressReady(null, { needsOpen: false, now });', 'his own word');
+    has('askOf: (traderId, o) => traderAsk(traderId, Date.now(), o),', 'the page says whether a trade stands on a TornW3B price');
+    // No more traders wanted than the minute's page reads keep fresh, and none for a desk that is empty.
+    has('.slice(0, OPEN_KEPT_MAX);', 'the wanted list is capped');
+    has('    sell.deskTraders = [];\n    sell.deskShownTrader = null;\n    if (pick) {', 'emptied with the desk');
     has('const acc = { ...acceptTrade(t, itemId), priceCheck };', 'written down with the check');
     assert.ok(page.includes('A.priceCheck'), 'and the accepted trade says it');
     assert.ok(page.includes('LC.waitingYes'), 'the button says it is reading');
     // A trader's list read brings its bulk prices.
-    has('recordW3bList(sell.db, id, { prices, bulk: parseW3bBulk(body) }, at)', 'the list read');
+    has('.then((body) => takeW3bList(id, parseW3bPriceList(body), parseW3bBulk(body), Date.now()))', 'the list read');
+    has('recordW3bList(sell.db, id, { prices, bulk }, at);', 'kept');
+    // 3.33.0 - an open page is a list read too; any other page is not.
+    has('takeW3bList(key, page.prices, {}, at);', 'an open page');
 });
 
 test('the prices: Torn Bids writes down what it checked, and the overlay shows a price as sure only from that table', () => {
@@ -142,4 +154,43 @@ test('the owner\'s tab: whole sets only, and the Item Market as a stop, wherever
 test('the owner\'s tab: no person\'s name in its code - the name shown is the one the server hands', () => {
     for (const file of ['src/core/owner-tab.js', 'src/ui/owner-page.js']) assert.equal(/nochance|\babe\b|vincent/i.test(read(file)), false, file);
     has('list.name || (status && status.name) || (known && known.name) || \'Trader \' + list.id', 'the name: the server\'s, Torn\'s, TornW3B\'s');
+});
+
+test('dropping fast (3.33.0): a flagged item is no flip, and its trade note says why', () => {
+    has('if (neverFlip.has(itemCategory(item)) || droppingOf(key)) {', 'an item dropping gets no flip buyers');
+    has('if (sell.dropping && sell.dropping.has(String(id))) return \'dropping\';', 'the reason, before "no bazaar under their price"');
+    has('drop: sell.dropping.get(String(pickId)) || null', 'the note is handed the sign');
+    assert.ok(page.includes('dropping: dropWhyText(n.drop),'), 'the note says it in words');
+    // The table's ages are counted from when it arrived.
+    has('late: dropsNow ? Math.max(0, (now - dropsNow.got) / 60000) : 0', 'the ages');
+    has('prefs.dropPct, prefs.dropHours, dropsNow ? dropsNow.at : 0', 'a new sample or setting works the flips out again');
+});
+
+test('the server\'s copy first (3.33.0, Stage 6): learned from TornW3B, gaps to TornW3B, a flip confirmed with Torn', () => {
+    // Every TornW3B sellers read is compared with the server's copy.
+    has('noteServerLead(id, rows, at);', 'the comparison');
+    // A background read of a server-led item is left to the server; the desk's and a trade's are not ("own").
+    has("if (!own && leftToServer(id, how === 'sweep' || kind === 'sweep' ? W3B_SWEEP_MS : topIds.has(String(id)) ? fresh.top : fresh.other, now)) {", 'the gaps');
+    // The candidates, the desk and the trades see every row; only a shown flip waits for a confirm.
+    has('withoutGone(ownRowsNow(b, key), key, gone)', 'every row, own reads over the server\'s');
+    has('const rows = flipRowsOf(id);', 'the shown flip');
+    has('return rows && !tradeIdsNow.has(String(id)) && serverLed(id) ? confirmedRows(rows, id, sell.ownReads, now) : rows;', 'not the desk or a trade');
+    // Whose bazaars are read from Torn: the server-led possible flips' sellers, as the flips buy from them.
+    has("rows: b && b.at ? sellersOf(c.itemId) || [] : []", 'the confirm wants');
+    has('updateSellPresence(watch, now);\n    stepOwnConfirm(now);', 'the Reader');
+    has('purgeOwnReads(now);\n    const ownRowsNow', 'old reads go every redraw, hidden too');
+});
+
+test('the joins: Read now reads again within the limits, Redraw draws again and reads nothing (mockup AM)', () => {
+    // Read now: the page's button calls the handler that queues the reads through the budgeted reader.
+    assert.ok(page.includes("text: 'Read now', onclick: () => this.h.onRefresh && this.h.onRefresh()"), 'Read now');
+    has('onRefresh: onSellRefresh', 'Read now in main.js');
+    // Redraw: every signature dropped, then the page worked out again from what is kept.
+    assert.ok(page.includes("onclick: () => this.redrawAll() }, [bdIcon('redo')]"), 'the Redraw button');
+    assert.ok(page.includes('if (this.h.onRedraw) this.h.onRedraw();'), 'Redraw asks main.js');
+    // Its whole body is the draw: no signature of the scan dropped, no read queued (a new top trader is not read sooner).
+    has('onRedraw: () => {\n            renderSellingNow();\n        },', 'Redraw in main.js');
+    assert.ok(page.includes('for (const k of Object.keys(this)) if (/Sig$/.test(k)) this[k] = null;'), 'every part drawn again');
+    // Only the tab of the trade's pane in view is drawn into it, and the pane is drawn before its parts.
+    assert.ok(page.indexOf('if (this.planEl.isConnected) this.drawPlan(d);') < page.indexOf('if (this.headEl.isConnected) this.drawHead(d);'), 'the pane first');
 });

@@ -184,6 +184,7 @@ table.t { width: 100%; border-collapse: collapse; }
 .t th { text-align: left; padding: 7px 8px; color: var(--faint); font: 650 12px var(--sans); border-bottom: 1px solid var(--line); white-space: nowrap; position: sticky; top: 0; background: var(--panel); }
 .t td { padding: 7px 8px; border-bottom: 1px solid var(--line); color: var(--text2); white-space: nowrap; vertical-align: middle; }
 .t tr:last-child td { border-bottom: 0; }
+.t th button.thsort { all: unset; cursor: pointer; } .t th button.thsort:hover, .t th button.thsort.on { color: var(--text2); } .t th button.thsort:focus-visible { outline: 2px solid var(--text2); outline-offset: 2px; border-radius: 3px; }
 .t tbody tr { transition: background .14s; } .t tbody tr:hover { background: rgba(255,255,255,.028); }
 .t th:first-child, .t td:first-child { padding-left: 14px; } .t th:last-child, .t td:last-child { padding-right: 14px; }
 .t.kv th { position: static; width: 34%; white-space: normal; border-bottom: 1px solid var(--line); padding-left: 0; vertical-align: top; } .t.kv td { white-space: normal; padding-right: 0; } .t.kv tr:last-child th { border-bottom: 0; }
@@ -302,6 +303,7 @@ table.t { width: 100%; border-collapse: collapse; }
 .lbl, .k-l { font: 650 12px/1.3 var(--sans); letter-spacing: .07em; text-transform: uppercase; color: var(--muted); }
 .t td small { display: block; color: var(--muted); font-size: 12px; font-weight: 400; }
 .t tbody tr.dim td, .t tbody tr.dim td b { color: var(--faint); font-weight: 400; }
+.t tbody tr.bl td { padding-top: 2px; padding-bottom: 2px; font-size: 12px; border-top: 0; } .t tbody tr.bl td:first-child { padding-left: 34px; } .t tbody tr.bl small { display: block; }
 .t tbody tr.g td { padding-top: 13px; color: var(--muted); font-size: 12px; background: none !important; } .t tbody tr.g td b { color: var(--text); font-size: 13px; }
 .t td .it { margin-right: 9px; }
 .t td.t-good { color: var(--good); } .t td.t-bad { color: var(--bad); } .t td.t-warn { color: var(--warn); } .t td.t-muted { color: var(--muted); } .t-bad { color: var(--bad); }
@@ -335,6 +337,9 @@ table.t { width: 100%; border-collapse: collapse; }
 .acts { display: flex; gap: 8px; align-items: center; }
 .quiet { color: var(--muted); font-size: 12px; cursor: pointer; white-space: nowrap; } .quiet:hover { color: var(--text); }
 .amber { display: flex; gap: 8px; align-items: baseline; padding: 8px 11px; border-radius: 9px; background: var(--warn-bg); border: 1px solid rgba(246,183,74,.4); color: var(--text2); font-size: 12px; line-height: 1.45; } .amber b { color: var(--warn); }
+/* 3.33.0: a price only on TornExchange - shown, pulsing amber, a link to their list (reduced motion: steady amber). */
+.te-warn { color: var(--warn); font-weight: 600; text-decoration: underline; text-underline-offset: 3px; animation: te-pulse 1.6s ease-in-out infinite; }
+@keyframes te-pulse { 50% { opacity: .45; } }
 .blue { display: inline-flex; gap: 7px; align-items: center; height: 22px; padding: 0 9px; border-radius: 999px; background: var(--need-bg); color: #8fc1ff; font: 600 12px var(--sans); }
 /* the line in a price list where profit stops */
 .t tr.mk td { padding: 6px 14px; background: var(--brand-bg); box-shadow: inset 0 1px 0 var(--brand-line); color: var(--text2); font-size: 12px; } .t tr.mk td b { color: var(--good); } .t tr.mk:hover { background: none; }
@@ -778,4 +783,260 @@ export const BIDS_PAST_CSS = `
 .t td.same { color: var(--faint); }
 `;
 
-export const BIDS_CSS = BIDS_BASE_CSS + BIDS_CALM_CSS + BIDS_FORM_CSS + BIDS_PAST_CSS;
+/*
+ * Mockup AM (the owner approved it 2026-10-16: "Mockup AM is good. Build it as drawn."). The fourth look, and it
+ * comes last, so it wins. Its rules, for anything added later:
+ *  - one accent, violet, for what you press and where you are; green only for money, amber only for a warning,
+ *    red only for a loss.
+ *  - a page fills the window: a list on one side, the trade's pane on the other; what is long scrolls inside its
+ *    own panel, never the page (a narrow window lets the page scroll instead).
+ *  - a list row is a name and its money on one line, and one quiet line under it.
+ *  - the trade's pane: who and what it makes on top, tabs for the rest, the buttons along its foot.
+ *  - totals are one line in a panel's head; what they mean is their hover.
+ */
+export const BIDS_AM_CSS = `
+.bd { --bg: #090b10; --rail-bg: #0c0f15; --panel: #10131a; --raised: #171b24; --hover: #1c212c; --input: #0a0c11; --surface: #10131a; --rail: #0c0f15;
+    --line: rgba(255,255,255,.07); --line2: rgba(255,255,255,.13);
+    --text: #f3f5f9; --text2: #c9cfda; --muted: #8e96a6; --faint: #626a7a;
+    --brand: #8f7bff; --brand-bg: rgba(143,123,255,.14); --brand-line: rgba(143,123,255,.45);
+    --good: #3fcf6b; --good-bg: rgba(63,207,107,.12); --bad: #f0605d; --bad-bg: rgba(240,96,93,.12); --warn: #f5a524; --warn-bg: rgba(245,165,36,.12);
+    --grid: #1a1f29; --axis: #2a303c; --serif: var(--disp); }
+.app { background: var(--bg); font: 400 13px/1.4 var(--sans); }
+
+/* ---------- the rail: pin and hover as before, the place you are in violet ---------- */
+.mark { background: var(--brand); color: #fff; box-shadow: none; font: 700 16px/1 var(--disp); }
+.brand .lab b { font: 600 15px/1.15 var(--disp); }
+.nav-ind { background: var(--brand-bg); box-shadow: none; } .nav-ind::before { background: var(--brand); }
+.nav-b.on, .nav-b.on svg { color: var(--brand); } .nav-b.on .lab { color: var(--text); }
+.nav-b:hover { background: var(--hover); }
+.nav-b .cnt { color: var(--text2); background: rgba(255,255,255,.08); } .nav-b .cnt.hot { color: #fff; background: var(--brand); } .nav-b .pip { background: var(--brand); }
+.app.pinned .pin { color: #fff; background: var(--brand); border-color: transparent; }
+
+/* ---------- the top bar ---------- */
+.top { gap: 22px; padding: 0 16px 0 20px; background: var(--bg); }
+.top h1 { margin: 0; font: 600 19px/1 var(--disp); letter-spacing: -.01em; }
+.tabs { gap: 4px; } .tab { padding: 0 10px; font-weight: 500; }
+.tab::after { left: 10px; right: 10px; background: var(--brand); }
+.tab .c { color: var(--faint); margin-left: 4px; font-weight: 400; }
+.top .pill + .pill, .top .pill + .btn, .top .btn + .ib { margin-left: -14px; }
+.pill { position: relative; height: 30px; padding: 0 11px; gap: 6px; border: 1px solid var(--line2); border-radius: 8px; background: none; color: var(--muted); }
+.pill b { color: var(--text); font-weight: 600; font-size: 12px; }
+.pill .pop { position: absolute; right: 0; top: 36px; z-index: 60; display: none; min-width: 270px; padding: 10px 12px; border-radius: 10px; background: var(--raised); border: 1px solid var(--line2); box-shadow: 0 12px 32px rgba(0,0,0,.5); color: var(--text2); line-height: 1.7; font-size: 12px; text-align: left; cursor: default; white-space: nowrap; }
+.pill:hover .pop, .pill:focus-visible .pop, .pill:focus-within .pop { display: block; }
+.pill .pop > div { display: flex; justify-content: space-between; gap: 16px; } .pill .pop > div > span { display: inline-flex; align-items: center; gap: 7px; }
+.pill .pop b { color: var(--text); } .pill .pop hr { border: 0; border-top: 1px solid var(--line); margin: 6px 0; }
+.dot { width: 7px; height: 7px; } .dot.bad { background: var(--bad); }
+.btn { height: 32px; padding: 0 14px; border-radius: 8px; border: 1px solid var(--line2); background: var(--raised); color: var(--text); font-weight: 600; }
+.btn:hover { background: var(--hover); border-color: var(--line2); }
+.btn.sm { height: 26px; padding: 0 10px; border-radius: 8px; font-size: 12px; }
+.btn.go, .btn.pr { background: var(--brand); border-color: var(--brand); color: #fff; font-weight: 600; } .btn.go:hover, .btn.pr:hover { background: var(--brand); filter: brightness(1.08); }
+.btn.gh { background: none; border-color: transparent; color: var(--muted); font-weight: 500; padding: 0 8px; } .btn.gh:hover { color: var(--text); background: var(--hover); }
+.btn.big, .btn.lg { height: 40px; padding: 0 18px; font-size: 14px; }
+.ib { width: 30px; height: 30px; flex: none; padding: 0; border-radius: 8px; border: 1px solid var(--line2); background: none; color: var(--muted); display: grid; place-items: center; }
+.ib:hover { color: var(--text); background: var(--hover); } .ib svg.ic { width: 15px; height: 15px; stroke-width: 1.7; }
+.ib:active svg { transform: rotate(-40deg); transition: transform .12s; }
+
+/* ---------- the strip along the bottom: now on the left, just before on the right ---------- */
+.tape { gap: 14px; padding: 0 16px; background: var(--bg); }
+.tape > .dot { flex: none; }
+.tape-m { mask-image: none; flex: 0 1 auto; }
+.tape-t { animation: none; padding: 0; gap: 0; display: block; overflow: hidden; text-overflow: clip; }
+.tk.now { color: var(--text2); } .tk b { color: var(--text2); margin-right: 0; }
+.tape-r { flex: 1 1 0; min-width: 0; justify-content: flex-end; padding: 0; gap: 18px; overflow: hidden; color: var(--muted); border: 0; }
+.tape-r .tk { flex: none; } .tape-r .tk.more { color: var(--text2); cursor: default; }
+
+/* ---------- pages and panels ---------- */
+.view { padding: 14px; }
+.page, .pane, .col, .tiles, .kpis, .board { gap: 12px; }
+.panel, .panel.tint, .panel.hold { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; animation: none; }
+.panel:hover { border-color: var(--line); }
+.ph { gap: 10px; padding: 12px 16px 10px; min-height: 46px; }
+.ph h2 { font: 600 14px/1.3 var(--sans); white-space: nowrap; } .ph .sub { color: var(--muted); font-size: 12px; }
+.pb { padding: 0 16px 14px; } .pb.flush { padding: 0; }
+.pb.scroll, .fit .pb.flush, .snug .pb.flush, .tpb { scrollbar-width: thin; scrollbar-color: #262b36 transparent; }
+.empty { padding: 4px 16px 16px; text-align: left; }
+
+/* a page fills the window: the list on one side, the trade's pane on the other, each scrolling inside */
+.split { grid-template-columns: minmax(360px, 36%) minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); }
+.split.wide { grid-template-columns: minmax(0, 1fr) minmax(360px, 33%); }
+.split.trd { grid-template-columns: minmax(380px, 40%) minmax(0, 1fr); }
+.pane.one { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); }
+.page.fit { height: 100%; min-height: 0; grid-template-rows: minmax(0, 1fr); }
+.page.fit:has(> .tiles, > .slot > .tiles) { grid-template-rows: auto minmax(0, 1fr); }
+.page.fit > .pane.on { height: auto; min-height: 0; }
+.split > .slot > .panel, .pane.one > .slot > .panel { min-height: 0; max-height: 100%; height: 100%; overflow: hidden; }
+/* History's picked trade has no .pb of its own: the panel scrolls, so its buttons are reached on a short window */
+.split > .slot > .panel.hist { overflow-y: auto; scrollbar-width: thin; scrollbar-color: #262b36 transparent; }
+.split > .col, .split > .slot > .col { min-height: 0; overflow-y: auto; scrollbar-width: thin; scrollbar-color: #262b36 transparent; }
+.split > .col > .panel { flex: none; }
+.split > .slot > .panel > .pb, .split > .slot > .panel > .listbox, .pane.one > .slot > .panel > .pb { flex: 1; min-height: 0; overflow: auto; }
+@container (max-width: 1060px) {
+    .page.fit { height: auto; } .split, .split.wide, .split.trd { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto; }
+    .split > .slot > .panel { height: auto; max-height: none; } .split > .slot > .panel > .pb { overflow: visible; }
+}
+
+/* the list's search and filters */
+.find { gap: 8px; padding: 12px 16px 10px; } .find .inp { height: 32px; border-radius: 8px; }
+.only { gap: 6px; padding: 0 16px 10px; }
+.tog { height: 28px; padding: 0 10px; border: 1px solid var(--line2); border-radius: 8px; color: var(--muted); }
+.tog.on { color: var(--text); background: var(--raised); } .tog.on::before { color: var(--brand); }
+.chip.on { color: var(--text); background: var(--raised); }
+.seg { border-color: var(--line2); border-radius: 8px; } .seg button { height: 26px; border-radius: 6px; }
+.seg button.on { background: var(--raised); color: var(--text); }
+
+/* ---------- tables: 38 px rows, a hairline between, the picked row in violet ---------- */
+.t th { padding: 0 10px 6px; color: var(--faint); font: 500 12px var(--sans); border-bottom: 0; background: var(--panel); z-index: 1; }
+.t td { padding: 0 10px; height: 38px; border-bottom: 0; border-top: 1px solid var(--line); }
+.t th:first-child, .t td:first-child { padding-left: 16px; } .t th:last-child, .t td:last-child { padding-right: 16px; }
+.t tr.pick td { padding-top: 0; padding-bottom: 0; }
+.t tbody tr:hover, .t tbody tr.pick:hover td { background: var(--hover); }
+.t tbody tr.sel, .t tbody tr.sel:hover, .li.sel { background: var(--brand-bg); box-shadow: inset 2px 0 0 var(--brand); }
+.t tbody tr.sel td { background: none; }
+.t tr.pick:focus-visible { outline: 2px solid var(--brand); outline-offset: -2px; }
+.t td.n b.t-good, .t td.n b.amt { font: 600 15px var(--disp); }
+.t td.t2 { color: var(--text2); }
+.t tr.mk td { background: var(--brand-bg); box-shadow: none; }
+
+/* a list row: the name and its money on one line, one quiet line under it */
+.t tr.lr td { height: auto; padding: 0; }
+.lrow { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 12px; align-items: center; padding: 10px 16px; white-space: nowrap; }
+.lrow .a { display: flex; align-items: center; gap: 8px; min-width: 0; font-weight: 600; color: var(--text); }
+.lrow .a > b { min-width: 0; overflow-wrap: anywhere; white-space: normal; }
+.lrow .a .dot { margin: 0; } .lrow .a .star { margin: 0; }
+.lrow .p { display: flex; align-items: center; justify-content: flex-end; gap: 6px; font: 600 16px var(--disp); text-align: right; }
+.lrow .p b { font: inherit; } .lrow .p .rowpin { margin-left: 0; }
+.lrow .s { color: var(--muted); font-size: 12px; min-width: 0; white-space: normal; }
+.lrow .s2 { color: var(--muted); font-size: 12px; text-align: right; display: flex; flex-direction: column; align-items: flex-end; gap: 2px; white-space: normal; }
+.lrow .s2:empty { display: none; }
+/* a row never wider than its panel (his 2026-10-16 shots: the right end cut, a name one letter a line) */
+table.t:has(> tbody > tr.lr) { table-layout: fixed; }
+/* a row drawn again does not fade into its hover colour: no flash under the pointer at every redraw */
+.t tbody tr { transition: none; }
+.lrow { grid-template-columns: minmax(0, 1fr) minmax(0, max-content); }
+.lrow .a { flex-wrap: wrap; row-gap: 4px; } .lrow .a > b { white-space: nowrap; overflow-wrap: normal; }
+.lrow .p { flex-wrap: wrap; }
+.t tr.dim .lrow .a, .t tr.dim .lrow .p { color: var(--faint); }
+.t tr.gone .lrow .a > b { color: var(--faint); font-weight: 400; text-decoration: line-through; }
+.t tr.pinrow td { background: rgba(255,255,255,.02); }
+/* a trader's basket under their row (By trader) */
+.t tbody tr.bl td { height: auto; padding: 0; border-top: 0; font-size: 12px; }
+.t tbody tr.bl td:first-child { padding-left: 0; }
+.blr { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 0 10px; align-items: center; padding: 3px 16px 3px 32px; color: var(--text2); }
+.blr .it { margin: 0; } .blr > span:nth-child(2) { min-width: 0; white-space: normal; } .blr small { display: inline; color: var(--muted); font-size: 12px; }
+.t tbody tr.lr + tr.bl .blr { padding-top: 0; }
+
+/* tags: small and quiet; amber only for a warning, violet for yours */
+.tag, .t td .tag { display: inline-block; margin: 0; padding: 1px 6px; border-radius: 5px; background: var(--raised); color: var(--text2); font: 600 11px/16px var(--sans); white-space: nowrap; vertical-align: 1px; }
+.tag.t, .t td .tag.t { color: var(--good); background: var(--good-bg); }
+.tag.w, .tag.warn, .t td .tag.w, .t td .tag.warn { color: var(--warn); background: var(--warn-bg); }
+.tag.b, .t td .tag.b { color: var(--brand); background: var(--brand-bg); }
+.tag.r, .t td .tag.r { color: var(--bad); background: var(--bad-bg); }
+.te-pulse { animation: te-pulse 1.6s ease-in-out infinite; }
+.lk { color: var(--text2); } .lk::after { color: var(--faint); } .lk:hover, .lk:hover::after { color: var(--text); }
+.star { color: var(--text2); }
+
+/* totals on one line in a panel's head (Going, the last 30, Items) */
+.sumline { display: flex; align-items: baseline; gap: 4px 16px; flex-wrap: wrap; min-width: 0; margin-left: auto; justify-content: flex-end; color: var(--muted); font-size: 12px; }
+.sumline .si { white-space: nowrap; padding: 0; border: 0; background: none; color: inherit; font: inherit; }
+.sumline .si b { color: var(--text); font: 600 13px var(--disp); }
+.sumline button.si { cursor: pointer; border-radius: 6px; } .sumline button.si:hover { color: var(--text); } .sumline button.si:hover b { text-decoration: underline; text-underline-offset: 3px; }
+.sumline:empty, .sumrow:empty { display: none; }
+.sumrow { padding: 0 16px 10px; } .sumrow > .sumline { margin: 0; justify-content: flex-start; }
+
+/* ---------- the trade's pane ---------- */
+.planp { overflow: hidden; }
+.tp { display: flex; flex-direction: column; min-height: 0; height: 100%; }
+.tph { flex: none; padding: 16px 18px 0; display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.tph > .panel.hd { padding: 0; border: 0; background: none; border-radius: 0; }
+.tph .who h3 { font: 600 22px/1.2 var(--disp); letter-spacing: -.01em; }
+.tph .big { font: 600 34px/1 var(--disp); letter-spacing: -.02em; }
+.tph .stepbar span { border-top-width: 2px; border-color: var(--raised); font-weight: 400; }
+.tph .stepbar .done { border-color: var(--brand-line); color: var(--text2); } .tph .stepbar .done i { color: var(--brand); }
+.tph .stepbar .now { border-color: var(--brand); color: var(--text); font-weight: 600; } .tph .stepbar .now i { color: var(--brand); }
+.tpn { flex: none; padding: 10px 18px 0; }
+.subtabs { flex: none; display: flex; gap: 4px; align-items: flex-end; padding: 10px 12px 0; border-bottom: 1px solid var(--line); white-space: nowrap; flex-wrap: wrap; row-gap: 0; }
+.subtabs > button { position: relative; padding: 8px 10px; border: 0; background: none; color: var(--muted); font-weight: 500; }
+.subtabs > button:hover { color: var(--text); }
+.subtabs > button.on { color: var(--text); } .subtabs > button.on::after { content: ""; position: absolute; left: 10px; right: 10px; bottom: -1px; height: 2px; border-radius: 2px; background: var(--brand); }
+.subtabs .c { color: var(--faint); margin-left: 4px; font-weight: 400; }
+.subtabs > .sp { flex: 1; } .subtabs > .take { padding-bottom: 7px; }
+.tpb { flex: 1; min-height: 0; overflow: auto; padding: 12px 18px 14px; display: flex; flex-direction: column; gap: 12px; }
+/* nothing in the tab shrinks: the tab scrolls, its parts never run over each other */
+.tpb > * { flex: none; }
+/* who sells and who pays, moved into a tab: their own heads go, the tab says it */
+.tpb > .panel { flex: none; margin: 0 -18px; border: 0; border-radius: 0; background: none; }
+.tpb > .panel > .ph { display: none; }
+.tpb > .panel.hd { margin: 0; padding: 0; }
+.tpb > .panel > .pb.flush { padding: 0; overflow: visible; }
+.tpb > .route, .tpb .route { overflow: visible; }
+.acts.foot { flex: none; display: flex; align-items: center; gap: 10px; padding: 12px 18px; border-top: 1px solid var(--line); flex-wrap: wrap; }
+.acts.foot .quiets { margin-left: auto; }
+.rt.cur { box-shadow: inset 2px 0 0 var(--brand); background: var(--brand-bg); margin: 0 -18px; padding-left: 18px; padding-right: 18px; }
+.rt.cur .stop-n { background: var(--brand); color: #fff; } .rt.cur .st { color: var(--text); }
+.rt.done .stop-n, .stop.done .stop-n { background: var(--raised); color: var(--text2); } .rt.done .st { color: var(--text2); }
+input.tick:checked, .tick.on { background: var(--brand); color: #fff; }
+.opt.best { background: var(--brand-bg); }
+.hd h3, .who h3 { font-family: var(--disp); font-weight: 600; }
+
+/* ---------- Today: four totals; the best trades and what to do; the days and what you hold ---------- */
+.p-dash { grid-template-rows: auto auto minmax(0, 1fr); min-height: 0; }
+.kpis { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.kpi { padding: 12px 16px; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; }
+.k-l { font: 400 12px/1.3 var(--sans); letter-spacing: 0; text-transform: none; color: var(--muted); }
+.k-v { font: 600 24px/1.25 var(--disp); letter-spacing: -.01em; margin-top: 2px; }
+.k-s { font-size: 12px; }
+.kpi.pick:hover { background: var(--hover); }
+.p-dash > .panel.s8:nth-child(2) .pb.flush, .p-dash > .panel.s4:nth-child(3) .pb { max-height: 330px; overflow: auto; }
+.p-dash .t td { height: 40px; }
+.nx { padding: 10px 0; } .nx-i { width: 30px; height: 30px; border-radius: 8px; background: var(--brand-bg); color: var(--brand); }
+.nx .btn:not(.go) { color: var(--brand); text-decoration: none; } .nx .btn:not(.go):hover { color: var(--text); }
+.chartbox .day i { background: var(--good); opacity: .75; }
+.stack i { background: var(--brand); opacity: .9; } .stack i:nth-child(2) { opacity: .65; } .stack i:nth-child(3) { opacity: .45; } .stack i:nth-child(n+4) { opacity: .25; }
+.hl i { background: var(--brand); } .hl:nth-child(2) i { opacity: .65; } .hl:nth-child(3) i { opacity: .45; } .hl:nth-child(n+4) i { opacity: .25; }
+
+/* ---------- Trades: the lanes in one panel ---------- */
+.board { padding: 0 12px 12px; gap: 12px; }
+.lane { background: var(--raised); border-radius: 10px; }
+.tc { border-top: 1px solid var(--line); } .tc.sel, .tc.sel:hover { background: var(--brand-bg); box-shadow: inset 2px 0 0 var(--brand); }
+/* beside the trade, the steps stand one under another, each a heading and its trades */
+.split .board, .board { grid-template-columns: minmax(0, 1fr); gap: 8px; }
+.lane { padding: 0 0 4px; } .lane-h { padding: 10px 14px 6px; } .tc { padding: 10px 14px; }
+
+/* ---------- Ledger and Settings: the same panels ---------- */
+.lg-card, .lg-tile, .lg-tile.lg-good, .lg-tile.lg-lossbox { border: 1px solid var(--line); background: var(--panel); }
+.lg-tilebtn[aria-pressed="true"] { box-shadow: inset 0 -2px 0 var(--brand); }
+:where(.bd) .lg-bar-g { fill: var(--good); background: var(--good); }
+:where(.bd) .sp-btn.sp-primary { background: var(--brand); border-color: var(--brand); color: #fff; }
+:where(.bd) .uv-meter.uv-on { box-shadow: inset 0 -2px 0 var(--brand); } :where(.bd) .uv-fill { background: var(--brand); }
+.tab[data-flag]::before { right: 1px; }
+
+/* Settings (mockup AM): a part is a panel, two side by side; a row is its name (and its (i)) | its control */
+.sp-settings { padding: 0; }
+.sp-sbody { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); grid-auto-flow: row dense; gap: 12px; align-items: start; }
+.sp-sbody .sp-card, .sp-sbody .sp-card.wide, .sp-sbody .sp-card.sp-first { margin: 0; padding: 0 0 4px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); min-width: 0; }
+.sp-sbody .sp-card[data-sec="terms"], .sp-sbody .sp-card[data-sec="api"], .sp-sbody .sp-card[data-sec="report"], .sp-sbody .sp-card[data-sec="flips"] { grid-column: 1 / -1; }
+@container (max-width: 1060px) { .sp-sbody { grid-template-columns: minmax(0, 1fr); } }
+.sp-card h2 { display: flex; align-items: center; gap: 6px; margin: 0; padding: 12px 16px 10px; min-height: 46px; font: 600 14px/1.3 var(--sans); }
+.sp-card h2 .sstate { margin-left: auto; }
+.sp-field { grid-template-columns: 170px minmax(0, 1fr); gap: 4px 12px; align-items: center; padding: 9px 16px; min-height: 46px; border-top: 1px solid var(--line); }
+.sp-card > .sp-field:first-of-type { border-top: 1px solid var(--line); }
+.sp-sbody .sp-card[data-sec="flips"] { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: 0; }
+.sp-sbody .sp-card[data-sec="flips"] > h2 { grid-column: 1 / -1; }
+.sp-sbody .sp-card[data-sec="flips"] > .sp-field:nth-of-type(even) { border-left: 1px solid var(--line); }
+@container (max-width: 1300px) { .sp-sbody .sp-card[data-sec="flips"] { display: block; } .sp-sbody .sp-card[data-sec="flips"] > .sp-field { border-left: 0; } }
+.sp-flabel { padding-top: 0; } .sp-flabel b { font-weight: 600; white-space: nowrap; }
+.sp-fctl { max-width: none; gap: 6px; }
+.sp-fctl .sp-key, .sp-fctl select.sp-cat, .sp-fctl .sp-btn { height: 32px; border-radius: 8px; }
+.sp-inline input.sp-key { flex: 1 1 140px; max-width: none; }
+.sp-tos { margin: 0 0 6px; } .sp-tos th, .sp-tos td { padding: 6px 10px; font-size: 12px; border-top: 1px solid var(--line); vertical-align: top; } .sp-tos th:first-child { padding-left: 16px; } .sp-tos th { color: var(--muted); font-weight: 500; }
+.sp-card > .uv, .sp-card > .rv, .sp-card > div:not(.sp-field):not(.sp-tos) { padding-left: 16px; padding-right: 16px; }
+/* the (i): what a part or a setting is for, on hover or focus; its links stay links */
+.i { position: relative; display: inline-grid; place-items: center; width: 15px; height: 15px; margin-left: 5px; border-radius: 50%; border: 1px solid var(--faint); color: var(--faint); font: 600 11px/1 var(--sans); font-style: normal; cursor: help; vertical-align: 1px; flex: none; outline: none; }
+.i:hover, .i:focus-visible { color: var(--text); border-color: var(--text2); }
+.i > .ip { position: absolute; left: 20px; top: -8px; z-index: 70; display: none; width: 280px; padding: 8px 10px; border-radius: 8px; background: var(--raised); border: 1px solid var(--line2); box-shadow: 0 12px 32px rgba(0,0,0,.5); color: var(--text2); font: 400 12px/1.45 var(--sans); white-space: normal; text-align: left; cursor: auto; }
+.i:hover > .ip, .i:focus > .ip, .i:focus-within > .ip { display: grid; gap: 6px; }
+.i > .ip::before { content: ""; position: absolute; left: -8px; top: 0; width: 8px; height: 100%; }
+.ip a { color: var(--text); text-decoration: underline; text-underline-offset: 3px; } .ip .sp-note { color: var(--text2); }
+`;
+
+export const BIDS_CSS = BIDS_BASE_CSS + BIDS_CALM_CSS + BIDS_FORM_CSS + BIDS_PAST_CSS + BIDS_AM_CSS;

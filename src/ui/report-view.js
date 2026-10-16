@@ -204,7 +204,7 @@ export const REPORT_CSS = `
 .rv-text { width: 100%; padding: 10px 12px; border: 1px solid var(--line2); border-radius: 10px; background: var(--input); color: var(--text); font: inherit; resize: vertical; }
 .rv-text:focus { outline: none; border-color: var(--brand); }
 .rv-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
-.rv-row small { color: var(--muted); }
+.rv-row small { color: var(--muted); font-size: 12px; }
 .rv-btn { height: 32px; padding: 0 14px; border: 1px solid var(--line2); border-radius: 10px; background: var(--raised); color: var(--text); font-weight: 500; cursor: pointer; transition: background-color 0.15s var(--ease); }
 .rv-btn:hover { background: var(--hover); }
 .rv-btn.rv-primary { background: var(--profit); border-color: transparent; color: var(--on-profit); font-weight: 600; }

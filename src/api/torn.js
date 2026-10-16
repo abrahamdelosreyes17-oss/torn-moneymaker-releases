@@ -370,6 +370,17 @@ export async function fetchUserPresence(client, userId, { tag = null, priority =
 }
 
 /**
+ * A player's bazaar as Torn has it now (3.33.0, engines plan Stage 6): v2 user?selections=bazaar&id= answers
+ * another player's listings, with a Public key too, 20-40 s fresh (tested 2026-10-10). The answer as it came:
+ * core/server-first.js parseOwnBazaar reads it.
+ */
+export async function fetchUserBazaar(client, userId, { tag = null, priority = 'low' } = {}) {
+    const id = String(userId).replace(/\D/g, '');
+    if (!id) return null;
+    return client.get('v2/user', { selections: 'bazaar', id }, { tag, priority });
+}
+
+/**
  * A player's total networth, from their public personal stats.
  *
  * v2 `/user/{id}/personalstats?cat=networth` answers another player's total

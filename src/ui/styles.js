@@ -220,11 +220,12 @@ export const PAGE_CSS = `
 }
 
 /*
- * That trader's price is from a TornW3B list not changed in over 24 hours
- * (3.23.0): an amber dot inside the tag, at its start - drawn as the tag's
- * own background, so nothing is added to Torn's card and the tag stays one
- * line. Until two days the tag also glows amber, slowly (a filter: nothing
- * of the page is laid out again); past two days the dot alone.
+ * That trader's price is from a TornW3B list not changed in over twelve hours
+ * (3.23.0; the lines since 3.26.0, core/traders.js oldList): an amber dot inside
+ * the tag, at its start - drawn as the tag's own background, so nothing is added
+ * to Torn's card and the tag stays one line. Until a day the tag also glows
+ * amber, slowly (a filter: nothing of the page is laid out again); past a day
+ * the dot alone.
  */
 .ttv2-trader.ttv2-trader.ttv2-trader[data-ttv2-trader-old]::after {
     padding-left: 20px !important;
@@ -2014,6 +2015,7 @@ ${TOKENS_CSS}
     padding: 4px 8px;
     font-weight: normal;
     font-size: 13px;
+    white-space: normal;
     background: transparent;
     border-color: transparent;
 }
@@ -2156,6 +2158,8 @@ ${TOKENS_CSS}
     text-align: left;
     font-weight: normal;
     font-size: 13px;
+    /* A row is a button: the panel's buttons are nowrap, and at 240 px a row must wrap (engines plan 4c). */
+    white-space: normal;
     background: transparent;
     border-color: transparent;
 }
@@ -2978,6 +2982,128 @@ ${TOKENS_CSS}
 
 .ttv2-panel.ttv2-tight button.ttv2-jobb.ttv2-jobb-on {
     font-size: 12px;
+}
+
+/*
+ * Mockup AM (the owner approved it 2026-10-16): the panel in Torn Bids' new look. It is as tall as what it
+ * holds (a long list still scrolls inside, up to the old height), the switch is one segmented control, one
+ * accent - violet - for what you press, green only for money. Collapsed it is one small bar: the job, its
+ * headline, the buttons.
+ */
+.ttv2-panel {
+    --bg: #14171e;
+    --page: #090b10;
+    --rail: #10131a;
+    --surface: #14171e;
+    --raised: #1c212c;
+    --hover: #222836;
+    --input: #0a0c11;
+    --row: #171b24;
+    --line: rgba(255, 255, 255, 0.07);
+    --line2: rgba(255, 255, 255, 0.13);
+    --text: #f3f5f9;
+    --text2: #c9cfda;
+    --muted: #8e96a6;
+    --faint: #626a7a;
+    --brand: #8f7bff;
+    --serif: var(--sans);
+    height: auto;
+    max-height: min(75vh, 640px);
+    border: 1px solid var(--line2);
+    border-radius: 12px;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+}
+
+.ttv2-panel .ttv2-body {
+    flex: 0 1 auto;
+}
+
+.ttv2-head {
+    height: 40px;
+    padding: 0 8px 0 10px;
+    background: transparent;
+    border-bottom: 1px solid var(--line);
+}
+
+.ttv2-title {
+    font: 600 13px/1.2 var(--sans);
+}
+
+.ttv2-panel .ttv2-job:not(.ttv2-job-set) {
+    padding: 2px;
+    border-radius: 7px;
+    background: var(--input);
+}
+
+.ttv2-panel button.ttv2-jobb,
+.ttv2-panel button.ttv2-jobb:first-child {
+    height: 22px;
+    margin: 0;
+    padding: 0 8px;
+    border-radius: 5px;
+    font: 500 12px/22px var(--sans);
+}
+
+.ttv2-panel button.ttv2-jobb.ttv2-jobb-on {
+    background: var(--raised);
+    color: var(--text);
+    font: 600 12px/22px var(--sans);
+}
+
+.ttv2-collapsed .ttv2-job:not(.ttv2-job-set) {
+    padding: 0;
+    background: none;
+}
+
+.ttv2-collapsed button.ttv2-jobb.ttv2-jobb-on {
+    padding: 0 2px;
+    background: none;
+    font-size: 13px;
+}
+
+.ttv2-panel.ttv2-collapsed .ttv2-head {
+    border-bottom: 0;
+}
+
+.ttv2-panel button.ttv2-scan {
+    color: #fff;
+    background: var(--brand);
+}
+
+.ttv2-panel button.ttv2-scan:hover:not(:disabled) {
+    background: var(--brand);
+    filter: brightness(1.08);
+}
+
+.ttv2-panel button.ttv2-sell {
+    height: 24px;
+    padding: 0 8px;
+    border-color: var(--line2);
+    color: var(--text);
+    background: var(--raised);
+    font-weight: 600;
+}
+
+.ttv2-panel button.ttv2-sell:hover:not(:disabled) {
+    background: var(--hover);
+}
+
+.ttv2-panel button.ttv2-icon {
+    color: var(--muted);
+}
+
+.ttv2-panel button.ttv2-icon:hover:not(:disabled) {
+    color: var(--text);
+}
+
+.ttv2-panel button.ttv2-chip[aria-pressed="true"] {
+    color: var(--text);
+    border-color: var(--line2);
+    background: var(--raised);
+}
+
+.ttv2-panel button.ttv2-tab.ttv2-tab-on {
+    border-bottom-color: var(--brand);
 }
 
 @media (prefers-reduced-motion: reduce) {

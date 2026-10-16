@@ -7,8 +7,8 @@
  *              middle, the trade on the right; For <the shared server's owner> (3.32.0): his list only
  *   Trades     Going | History: a card per trade in the lane of its step, and the one you pressed under
  *              them; the last 30 trades, each with the prices it was made on
- *   My items   what you hold, and where to sell it
- *   To sell    what you bought to resell, by who pays most
+ *   Items      Everything | To resell (mockup AM: My items and To sell in one page): what you hold and
+ *              where to sell it; what you bought to resell, by who pays most
  *   Ledger     Trading | Sold | Receipts, traders, mugged
  *   Settings   Keys and sharing | Flips and reading | Help
  *
@@ -32,6 +32,7 @@ const BD_ICONS = {
     set: '<path d="M4 6h6.5M15.5 6h.5M4 14h.5M9.5 14H16"/><circle cx="13" cy="6" r="2.2"/><circle cx="7" cy="14" r="2.2"/>',
     pin: '<path d="M7 3h6l-.8 5 2.3 2.5v1.5h-9v-1.5L7.8 8 7 3ZM10 12v5"/>',
     buy: '<path d="M2.5 4h2l1.7 8.2h8.3l1.8-5.7H5.4"/><circle cx="7.8" cy="15.6" r="1.2"/><circle cx="13.8" cy="15.6" r="1.2"/>',
+    redo: '<path d="M15.5 9.5A5.5 5.5 0 1 1 13.9 5.6"/><path d="M14.5 2.8v3.4h-3.4"/>',
 };
 
 export function bdIcon(name) {
@@ -63,11 +64,10 @@ export function bdEl(tag, props = {}, children = []) {
 /** The pages, in the sidebar's order. `gap`: a thin line between groups; `push`: what follows sits at the bottom. */
 export const BD_PAGES = [
     { id: 'today', label: 'Today', icon: 'dash' },
-    { id: 'flips', label: 'Flips', icon: 'flip', tabs: ['Best flips', 'By trader', 'All items'] },
+    { id: 'flips', label: 'Flips', icon: 'flip', tabs: ['Best flips', 'By trader', 'All items', 'Dropping'] },
     { id: 'trades', label: 'Trades', icon: 'trades', tabs: ['Going', 'History'] },
     { gap: true },
-    { id: 'mine', label: 'My items', icon: 'stock' },
-    { id: 'sell', label: 'To sell', icon: 'tag' },
+    { id: 'items', label: 'Items', icon: 'stock', tabs: ['Everything', 'To resell'] },
     { id: 'ledger', label: 'Ledger', icon: 'book' },
     { push: true },
     { id: 'settings', label: 'Settings', icon: 'set', tabs: ['Keys and sharing', 'Flips and reading', 'Help'] },
@@ -77,12 +77,18 @@ export const BD_PAGES = [
 export const BD_TRADES_GOING = 0;
 export const BD_TRADES_PAST = 1;
 
+/** The tabs of Items (mockup AM). */
+export const BD_ITEMS_ALL = 0;
+export const BD_ITEMS_RESELL = 1;
+
 /** The tabs of Flips. */
 export const BD_FLIPS_BEST = 0;
 export const BD_FLIPS_TRADER = 1;
 export const BD_FLIPS_ITEMS = 2;
+/** 3.33.0 - what is no flip now, its price falling (core/dropping.js). */
+export const BD_FLIPS_DROPPING = 3;
 /** 3.32.0 - For <the shared server's owner>: there only while a price list of his is held (ui/owner-page.js). */
-export const BD_FLIPS_OWNER = 3;
+export const BD_FLIPS_OWNER = 4;
 
 /**
  * Which list a page shows: main.js works the item list out for one filter at a time
@@ -90,16 +96,15 @@ export const BD_FLIPS_OWNER = 3;
  */
 export function bdFilterOf(pageId, tab) {
     if (pageId === 'flips') return tab === BD_FLIPS_ITEMS ? 'all' : tab === BD_FLIPS_BEST ? 'flips' : null;
-    if (pageId === 'mine') return 'mine';
-    if (pageId === 'sell') return 'sell';
+    if (pageId === 'items') return tab === BD_ITEMS_RESELL ? 'sell' : 'mine';
     if (pageId === 'trades') return 'trades';
     return null;
 }
 
 /** The page and tab that show a filter (a filter set from elsewhere: "see To sell", a trade opened from Today). */
 export function bdPageOf(filter) {
-    if (filter === 'mine') return { page: 'mine', tab: 0 };
-    if (filter === 'sell') return { page: 'sell', tab: 0 };
+    if (filter === 'mine') return { page: 'items', tab: BD_ITEMS_ALL };
+    if (filter === 'sell') return { page: 'items', tab: BD_ITEMS_RESELL };
     if (filter === 'trades') return { page: 'trades', tab: 0 };
     if (filter === 'all') return { page: 'flips', tab: BD_FLIPS_ITEMS };
     return { page: 'flips', tab: BD_FLIPS_BEST };
@@ -172,25 +177,31 @@ export function bdBuildShell(page, { title, tagline, parts }) {
     };
     bd.viewEl = bdEl('div', { class: 'view' }, [
         section('today', 'p-dash', parts.today),
-        // Flips: the picker, the middle and the trade; By trader swaps what the first two hold.
+        // Flips (mockup AM): the picker on the left, the trade on the right - who sells and who pays are its tabs.
         // For the owner (3.32.0) it is another page in the same section: a few totals over a list and what it makes.
         section('flips', 'fit', [
-            bdEl('div', { class: 'pane on c3 snug' }, [slot('flips-list', 'div', 'slot'), slot('flips-mid', 'div', 'col join'), slot('flips-plan', 'div', 'slot')]),
+            bdEl('div', { class: 'pane on split' }, [slot('flips-list', 'div', 'slot'), slot('flips-plan', 'div', 'slot')]),
             slot('owner-tiles', 'div', 'slot'),
             (bd.ownerPane = bdEl('div', { class: 'pane c75 snug' }, [slot('owner-left', 'div', 'slot'), slot('owner-right', 'div', 'col')])),
+            // Dropping (3.33.0): one list of what is falling.
+            (bd.dropPane = bdEl('div', { class: 'pane one' }, [slot('drop-list', 'div', 'slot')])),
         ]),
-        // Trades: Going is the board and the trade pressed; History is its own pane (the list, and the trade picked).
-        section('trades', 'pgrows', [slot('trades-tiles', 'div', 'slot'), slot('trades-board', 'div', 'slot'), slot('trades-detail', 'div', 'slot'), (bd.pastPane = bdEl('div', { class: 'pane c57 snug' }, [slot('past-list', 'div', 'slot'), slot('past-side', 'div', 'col')]))]),
-        section('mine', 'pgrows pgfill', [slot('mine-tiles', 'div', 'slot'), bdEl('div', { class: 'pane on c75 snug' }, [slot('mine-list', 'div', 'slot'), slot('mine-side', 'div', 'col')])]),
-        section('sell', 'pgrows pgfill', [slot('sell-tiles', 'div', 'slot'), bdEl('div', { class: 'pane on c75 snug' }, [slot('sell-list', 'div', 'slot'), slot('sell-side', 'div', 'col')])]),
+        // Trades: Going is the board and the trade pressed; History is the list and the trade picked.
+        section('trades', 'fit', [
+            (bd.goingPane = bdEl('div', { class: 'pane on split' }, [slot('trades-board', 'div', 'slot'), slot('trades-detail', 'div', 'slot')])),
+            (bd.pastPane = bdEl('div', { class: 'pane split wide' }, [slot('past-list', 'div', 'slot'), slot('past-side', 'div', 'slot')])),
+        ]),
+        // Items: what you hold (Everything) or bought to resell (To resell) on the left, where to sell the one picked on the right.
+        section('items', 'fit', [bdEl('div', { class: 'pane on split wide' }, [slot('items-list', 'div', 'slot'), slot('items-side', 'div', 'col')])]),
         section('ledger', 'g1', parts.ledger),
         section('settings', 'g1', parts.settings),
     ]);
 
-    /* ---- the line along the bottom ---- */
+    /* ---- the line along the bottom (mockup AM): what is happening now, and what happened just before ---- */
+    bd.tapeDot = bdEl('i', { class: 'dot' });
     bd.tapeEl = bdEl('div', { class: 'tape-t' });
     bd.tapeRight = bdEl('div', { class: 'tape-r' });
-    const tape = bdEl('footer', { class: 'tape' }, [bdEl('div', { class: 'tape-l', text: 'Happening now' }), bdEl('div', { class: 'tape-m' }, [bd.tapeEl]), bd.tapeRight]);
+    const tape = bdEl('footer', { class: 'tape' }, [bd.tapeDot, bdEl('div', { class: 'tape-m' }, [bd.tapeEl]), bd.tapeRight]);
 
     bd.mainEl = bdEl('div', { class: 'main' }, [bd.topEl, bd.viewEl, tape]);
     page.root = bdEl('div', { class: 'sp-page bd app' }, [bd.sideEl, bd.mainEl]);

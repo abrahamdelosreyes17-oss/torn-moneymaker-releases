@@ -72,7 +72,6 @@ const opStopsWords = (stops) => {
 /** Why no whole set can go on a list now: [the few words, the line under them]. */
 function opWhySets(t, name, leastPct) {
     if (t.why === 'price') return ['No price', name + '\'s list has no price for ' + opPlural(t.missing.length, 'piece') + ' of it'];
-    if (t.why === 'takes') return ['None taken', 'their sets are full in Torn Archive for now'];
     if (t.why === 'unread') return t.on === false
         ? ['Reading…', 'after the set in view: ' + opPlural(t.unread, 'piece') + ' of ' + t.size + ' still to read']
         : ['Reading…', opPlural(t.unread, 'piece') + ' of ' + t.size + ' still to read'];
@@ -305,7 +304,7 @@ export class OwnerView {
 
         if (!p.ladder.length) return;
         const top = Math.max(1, ...p.ladder.map((l) => l.makes));
-        const said = { free: 'not on this list', out: null, over: 'more than ' + o.name + ' takes', cash: 'more than your Cash', room: 'more than one trade holds' };
+        const said = { free: 'not on this list', out: null, cash: 'more than your Cash', room: 'more than one trade holds' };
         this.moreEl.append(
             this.head('Set by set', 'each set more is dearer: the cheap listings go first'),
             this.table('tight', [['Set'], ['Costs you', 1], ['Makes', 1], ['']], p.ladder.map((l) => {

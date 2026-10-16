@@ -102,6 +102,8 @@ test('a trade is under way: one they said yes to, or one you planned and still t
     assert.deepEqual(stillTrade({ accepted: two, selected: '1', now: NOW, holdMs: HOLD }), { trader: 'KayMalta', itemId: '1' });
     // No name stored: under way all the same, and no name is made up.
     assert.deepEqual(stillTrade({ accepted: [{ itemId: '1', at: NOW, trader: {} }], now: NOW }), { trader: null, itemId: '1' });
+    // Their Torn id comes with it where the trade has one (the trade you are on first is matched by it).
+    assert.deepEqual(stillTrade({ accepted: [{ itemId: '1', at: NOW, trader: { name: 'Trader 123', id: 123 } }], now: NOW }), { trader: 'Trader 123', itemId: '1', traderId: '123' });
 });
 
 test('a search changed during the hold: the rows it brings back were there all along - placed as they are, and never counted as new', () => {

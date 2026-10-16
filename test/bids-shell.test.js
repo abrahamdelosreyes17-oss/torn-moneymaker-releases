@@ -7,14 +7,17 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { BD_PAGES, BD_FLIPS_BEST, BD_FLIPS_TRADER, BD_FLIPS_ITEMS, bdFilterOf, bdPageOf } from '../src/ui/bids-shell.js';
+import { BD_PAGES, BD_FLIPS_BEST, BD_FLIPS_TRADER, BD_FLIPS_ITEMS, BD_ITEMS_ALL, BD_ITEMS_RESELL, bdFilterOf, bdPageOf } from '../src/ui/bids-shell.js';
 
 test('the shell: each page asks for its own list, and By trader, Today, Ledger and Settings for none', () => {
     assert.equal(bdFilterOf('flips', BD_FLIPS_BEST), 'flips');
     assert.equal(bdFilterOf('flips', BD_FLIPS_ITEMS), 'all');
     assert.equal(bdFilterOf('flips', BD_FLIPS_TRADER), null);
-    assert.equal(bdFilterOf('mine', 0), 'mine');
-    assert.equal(bdFilterOf('sell', 0), 'sell');
+    // Mockup AM: My items and To resell are the two tabs of Items.
+    assert.equal(bdFilterOf('items', BD_ITEMS_ALL), 'mine');
+    assert.equal(bdFilterOf('items', BD_ITEMS_RESELL), 'sell');
+    assert.equal(bdFilterOf('mine', 0), null);
+    assert.equal(bdFilterOf('sell', 0), null);
     assert.equal(bdFilterOf('trades', 0), 'trades');
     for (const id of ['today', 'ledger', 'settings', 'nowhere']) assert.equal(bdFilterOf(id, 0), null);
 });
@@ -39,8 +42,10 @@ test('the shell: every page a filter lands on is in the sidebar, with the tab it
     assert.equal(pages.size, BD_PAGES.filter((p) => p.id).length);
 });
 
-test('the shell: Flips > For <the server owner> (3.32.0) is the tab after All items, and asks for no item list', async () => {
-    const { BD_FLIPS_OWNER } = await import('../src/ui/bids-shell.js');
-    assert.equal(BD_FLIPS_OWNER, BD_FLIPS_ITEMS + 1);
+test('the shell: Flips > Dropping (3.33.0) follows All items, For <the server owner> comes last; neither asks for an item list', async () => {
+    const { BD_FLIPS_OWNER, BD_FLIPS_DROPPING } = await import('../src/ui/bids-shell.js');
+    assert.equal(BD_FLIPS_DROPPING, BD_FLIPS_ITEMS + 1);
+    assert.equal(BD_FLIPS_OWNER, BD_FLIPS_DROPPING + 1);
     assert.equal(bdFilterOf('flips', BD_FLIPS_OWNER), null);
+    assert.equal(bdFilterOf('flips', BD_FLIPS_DROPPING), null);
 });

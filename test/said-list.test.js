@@ -101,12 +101,12 @@ test('his own word stands over TornW3B\'s copy of his list: closed there, he sti
 test('a price that is his own word is checked without a TornW3B read, says so and says his shop is closed; another price of his is not', () => {
     const said = { at: NOW - 3 * HOUR, since: NOW - 6 * HOUR, open: false, prices: { [KITTEN]: 510 }, off: [] };
     const b = { id: HIM, price: 510, w3b: 510, te: null };
-    // Nothing of TornW3B's: no read of the item's buyers, no list date.
-    assert.deepEqual(priceChecked(b, { itemId: String(KITTEN), now: NOW }), { ok: false, why: 'not-checked', at: 0 });
+    // Nothing of TornW3B's: no read of their list page (3.33.0: no open check), no list date.
+    assert.deepEqual(priceChecked(b, { itemId: String(KITTEN), now: NOW }), { ok: false, why: 'not-open', open: 'unread', at: 0, closed: false });
     assert.deepEqual(priceChecked(b, { itemId: String(KITTEN), said, now: NOW }), { ok: true, why: 'said', at: NOW - 3 * HOUR, closed: true });
     assert.equal(priceChecked(b, { itemId: String(KITTEN), said: { ...said, open: true }, now: NOW }).closed, false);
     // TornW3B names him at another price (its copy from before he changed it): that one needs its own check.
-    assert.equal(priceChecked({ ...b, price: 520, w3b: 520 }, { itemId: String(KITTEN), said, now: NOW }).why, 'not-checked');
+    assert.equal(priceChecked({ ...b, price: 520, w3b: 520 }, { itemId: String(KITTEN), said, now: NOW }).why, 'not-open');
     // An item his word does not name; a word a day old; a price only on TornExchange.
     assert.equal(priceChecked(b, { itemId: String(SHEEP), said, now: NOW }).ok, false);
     assert.equal(priceChecked(b, { itemId: String(KITTEN), said: { ...said, at: NOW - SAID_MAX_AGE_MS - 1 }, now: NOW }).ok, false);

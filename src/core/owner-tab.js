@@ -158,7 +158,7 @@ const ownLeaves = (pay, price, leastPct) => pay > price && pay - price >= (price
  * @param {number} [o.leastPct] - your least profit, a percentage of what you spend
  * @param {number} [o.maxUnits] - the most items one trade takes
  * @returns {object} `most`: the sets that can go on a list now; `n`: the sets this plan is for; `why`: when most
- *   is 0 - 'price' (he has no price for a piece), 'takes' (he takes no set now), 'unread' (a piece's listings are
+ *   is 0 - 'price' (he has no price for a piece), 'unread' (a piece's listings are
  *   not read yet), 'unlisted' (nobody sells a piece), 'nopay' (not even one set leaves your least profit), 'cash'
  */
 export function ownerSetsPlan(set, list, lotsOf, { asked = null, cash = Infinity, leastPct = 0, maxUnits = 10000 } = {}) {
@@ -167,7 +167,9 @@ export function ownerSetsPlan(set, list, lotsOf, { asked = null, cash = Infinity
     const value = ids.reduce((a, id) => a + ownNum(list.all[id]), 0);
     const takes = list.sets ? ownCount(list.sets[set.key]) ?? 0 : null;
     const room = Math.max(0, Math.floor(ownNum(maxUnits) / ids.length));
-    const want = Math.min(OWNER_MAX_SETS, room, takes === null ? OWNER_MAX_SETS : takes);
+    // 3.33.0 (the owner's rule): a whole set is suggested whenever it pays, whatever his Torn Archive says it
+    // still takes - a full set always sells. What it takes (`takes`) is only said beside it.
+    const want = Math.min(OWNER_MAX_SETS, room);
     const pieces = ids.map((id) => {
         const got = lotsOf(id) || { lots: [], unread: true };
         // One more than can go on a list: the first set that does not pay is shown beside the ones that do.
@@ -194,14 +196,14 @@ export function ownerSetsPlan(set, list, lotsOf, { asked = null, cash = Infinity
     const cost = rows.reduce((a, r) => a + r.cost, 0);
     let why = null;
     if (!most) {
-        why = missing.length ? 'price' : takes === 0 ? 'takes' : pieces.some((p) => !p.listed && p.unread) ? 'unread' : pieces.some((p) => !p.listed) ? 'unlisted' : !paying ? 'nopay' : 'cash';
+        why = missing.length ? 'price' : pieces.some((p) => !p.listed && p.unread) ? 'unread' : pieces.some((p) => !p.listed) ? 'unlisted' : !paying ? 'nopay' : 'cash';
     }
     // Set by set: the k-th set, what it costs, what it leaves - the ones on the list, then why the next is not.
     const ladder = costs.slice(0, Math.min(costs.length, Math.max(n, most) + 1)).map((c, k) => ({
         k, cost: c, makes: value - c, pct: c > 0 ? ((value - c) / c) * 100 : 0,
         // in: on the list. free: it pays and he takes it, you chose fewer. out: under your least profit.
-        // over: more than he takes. cash: more than your cash. room: more than one trade holds.
-        state: k < n ? 'in' : k < most ? 'free' : k >= paying ? 'out' : takes !== null && k >= takes ? 'over' : k >= fits ? 'cash' : 'room',
+        // cash: more than your cash. room: more than one trade holds.
+        state: k < n ? 'in' : k < most ? 'free' : k >= paying ? 'out' : k >= fits ? 'cash' : 'room',
     }));
     return {
         mode: 'sets', key: set.key, name: set.name, word: set.word, size: ids.length, value, missing, takes, paying, most, n, why,

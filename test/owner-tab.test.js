@@ -77,11 +77,13 @@ test('lots: cheapest first, a bazaar before the Item Market at one price, never 
 
 test('whole sets: the k-th set takes the k-th cheapest unit of every piece, while it leaves your least profit', () => {
     const list = ownerList(stored());
-    // Set 1 and 2 cost 13 x 800, set 3 costs 13 x 900: all under 13 x 1,000. He takes 3.
-    const plan = ownerSetsPlan(PLUSH, list, lotsOf(), { leastPct: 5 });
+    // Set 1 and 2 cost 13 x 800, set 3 costs 13 x 900: all under 13 x 1,000. He takes 3 - said, never a cap
+    // (3.33.0, the owner's rule: a whole set is suggested whenever it pays): all 16 that pay can go on the list.
+    assert.equal(ownerSetsPlan(PLUSH, list, lotsOf(), { leastPct: 5 }).most, 16);
+    const plan = ownerSetsPlan(PLUSH, list, lotsOf(), { leastPct: 5, asked: 3 });
     assert.equal(plan.value, 13000);
     assert.equal(plan.takes, 3);
-    assert.equal(plan.most, 3);
+    assert.equal(plan.most, 16);
     assert.equal(plan.n, 3);
     assert.equal(plan.units, 39);
     assert.equal(plan.cost, 2 * 13 * 800 + 13 * 900);
@@ -91,12 +93,12 @@ test('whole sets: the k-th set takes the k-th cheapest unit of every piece, whil
     assert.equal(plan.rows[0].pay, 1000, 'a piece he holds too many of is paid in a whole set');
     assert.deepEqual(plan.rows[0].parts.map((p) => [p.sellerId, p.qty, p.price]), [['71', 2, 800], ['72', 1, 900]]);
     assert.deepEqual(plan.stops.map((s) => [s.sellerId, s.units, s.market]), [['71', 26, false], ['72', 13, false]]);
-    assert.deepEqual(plan.ladder.map((l) => l.state), ['in', 'in', 'in', 'over']);
+    assert.deepEqual(plan.ladder.slice(0, 4).map((l) => l.state), ['in', 'in', 'in', 'free']);
     // Fewer asked: the rest are free to add.
     const two = ownerSetsPlan(PLUSH, list, lotsOf(), { leastPct: 5, asked: 2 });
     assert.equal(two.n, 2);
-    assert.deepEqual(two.ladder.map((l) => l.state), ['in', 'in', 'free', 'over']);
-    assert.equal(ownerSetsPlan(PLUSH, list, lotsOf(), { asked: 99 }).n, 3, 'never more than can go on a list');
+    assert.deepEqual(two.ladder.slice(0, 3).map((l) => l.state), ['in', 'in', 'free']);
+    assert.equal(ownerSetsPlan(PLUSH, list, lotsOf(), { asked: 99 }).n, 16, 'never more than can go on a list');
 });
 
 test('whole sets: a piece dearer than he pays is carried by its set, and the profit is the set\'s', () => {
@@ -121,7 +123,9 @@ test('whole sets: a piece dearer than he pays is carried by its set, and the pro
 test('whole sets: why there is none', () => {
     const why = (list, lots, o) => ownerSetsPlan(PLUSH, list, lots, o).why;
     assert.equal(why(ownerList(stored({ all: {} })), lotsOf()), 'price');
-    assert.equal(why(ownerList(stored({ sets: { plushie: 0 } })), lotsOf()), 'takes');
+    // His Torn Archive takes no set now: a whole set is suggested all the same (3.33.0).
+    assert.equal(why(ownerList(stored({ sets: { plushie: 0 } })), lotsOf()), null);
+    assert.equal(ownerSetsPlan(PLUSH, ownerList(stored({ sets: { plushie: 0 } })), lotsOf()).most, 16);
     assert.equal(why(ownerList(stored()), lotsOf(undefined, { [IDS[3]]: { lots: [], unread: true } })), 'unread');
     assert.equal(why(ownerList(stored()), lotsOf(undefined, { [IDS[3]]: { lots: [], unread: false } })), 'unlisted');
     assert.equal(why(ownerList(stored()), lotsOf(), { leastPct: 80 }), 'nopay');
@@ -184,7 +188,7 @@ test('the run: stop by stop, bazaars in the list\'s order, the Item Market last'
     const list = ownerList(stored());
     // Only bazaar A's two and the Item Market: three sets = 2 at A + 1 on the market, of every piece.
     const lots = () => ownerLots({ bazaar: [{ sellerId: '71', sellerName: 'A', price: 800, qty: 2 }], market: [{ price: 950, qty: 9 }] });
-    const plan = ownerSetsPlan(PLUSH, list, lots, { leastPct: 1 });
+    const plan = ownerSetsPlan(PLUSH, list, lots, { leastPct: 1, asked: 3 });
     assert.deepEqual(plan.stops.map((s) => [s.sellerId, s.market, s.units]), [['71', false, 26], [OWNER_MARKET, true, 13]]);
     let t = made(plan, list, { mode: 'sets', set: 'plushie', n: 3 });
     assert.deepEqual([...marketItems([t])].sort(), [...IDS].sort());
@@ -236,7 +240,7 @@ test('the Item Market after every bazaar also when a market step comes first in 
 
 test('whole sets only: a piece short holds the whole trade to the sets you have - the rest waits', () => {
     const list = ownerList(stored());
-    const plan = ownerSetsPlan(PLUSH, list, lotsOf(), { leastPct: 5 });
+    const plan = ownerSetsPlan(PLUSH, list, lotsOf(), { leastPct: 5, asked: 3 });
     let t = made(plan, list, { mode: 'sets', set: 'plushie', n: 3 });
     // Every piece bought in full (2 at A, 1 at B) - but of the first only one was left at A, and none at B.
     t.items.forEach((i, k) => {
@@ -291,7 +295,7 @@ test('whole sets only: a piece short holds the whole trade to the sets you have 
 
 test('a stop\'s chip x: a step not bought leaves the list, its money with it; one bought stays', () => {
     const list = ownerList(stored());
-    const plan = ownerSetsPlan(PLUSH, list, lotsOf(), { leastPct: 5 });
+    const plan = ownerSetsPlan(PLUSH, list, lotsOf(), { leastPct: 5, asked: 3 });
     let t = made(plan, list, { mode: 'sets', set: 'plushie', n: 3 });
     const line = t.items[0].line;
     const less = ownerDropStep(t, line, 1);

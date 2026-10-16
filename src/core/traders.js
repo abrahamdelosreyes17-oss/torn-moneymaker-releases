@@ -244,7 +244,7 @@ export function pruneTraderDb(db, now = Date.now()) {
 export const TE_SCAN_MAX_AGE_MS = 6 * 60 * 60 * 1000;
 
 /** One trader's TornExchange list read (`prices` [{itemId, price}]), or `{error: true}`. */
-export function recordTeScan(db, traderId, { prices = null, error = false } = {}, now = Date.now()) {
+export function recordTeScan(db, traderId, { prices = null, error = false, updatedAt = 0 } = {}, now = Date.now()) {
     const id = cleanId(traderId);
     if (!id) return;
     const t = db.traders[id] || (db.traders[id] = { name: 'Trader ' + id, from: 'te', seenAt: now, w3b: null });
@@ -254,7 +254,7 @@ export function recordTeScan(db, traderId, { prices = null, error = false } = {}
     }
     const map = {};
     for (const p of prices || []) if (p && p.price > 0) map[String(p.itemId)] = p.price;
-    t.te = { at: now, triedAt: now, prices: map, failed: 0 };
+    t.te = { at: now, triedAt: now, prices: map, failed: 0, changedAt: Number(updatedAt) || 0 };
 }
 
 /** itemId -> [{id, name, price}] from every TornExchange list read within TE_SCAN_MAX_AGE_MS. */
@@ -713,7 +713,7 @@ export function hiddenBuyers(buyers, { prefs = {}, levelOf = () => 'unknown', vo
  * seven came from lists weeks old - the prices nobody honours.
  *
  * A price is stale when it is that trader's TornW3B price, their list was
- * last changed over two days ago, and TornExchange has no price of theirs for
+ * last changed over a day ago (3.26.0, below), and TornExchange has no price of theirs for
  * the item (TornExchange gives no date: a price also listed there is left
  * alone). A trader whose list date was never read is not stale - not known
  * is not old.
@@ -742,7 +742,7 @@ export function stalePrice(b, listAtOf, now = Date.now()) {
  * lists, traded on or not. It can be asked for only those who traded in the
  * last N hours. With Fresh prices only on, an item with more buyers than one
  * answer holds is read both ways in turn - everyone, then those who traded
- * in the last two days (the same two days) - and the two answers are one
+ * in the last day (the same day as PRICES_STALE_MS) - and the two answers are one
  * list: nobody the full read named is lost, and nobody's list date goes
  * unread. No trader is hidden by this; it only finds the ones the cut hid.
  */
@@ -782,11 +782,11 @@ export function freshOnly(buyers, listAtOf, now = Date.now()) {
  * A list getting old (3.22.3; the owner, 2026-10-05: "we do need a pulsating
  * amber color to show that price list isnt updated over 24 hours to 2 days").
  *
- * Two days stays the line for Fresh prices only ("2 IS FINE"). A price from a
- * list last changed over 24 hours ago and not yet over two days is still
- * shown, with a pulsing amber dot and how long ago ('aging'). Over two days
- * ('stale') it is seen only with Fresh prices only off: the same amber line,
- * its dot still.
+ * Since 3.26.0 the line for Fresh prices only is a day (PRICES_STALE_MS). A
+ * price from a list last changed over twelve hours ago and not yet over a day
+ * is still shown, with a pulsing amber dot and how long ago ('aging'). Over a
+ * day ('stale') it is seen only with Fresh prices only off: the same amber
+ * line, its dot still.
  *
  * The same price as stalePrice looks at, so the two never disagree: that
  * trader's TornW3B price, with no TornExchange price of theirs for the item
@@ -892,8 +892,17 @@ export function trustedOnly(buyers, { min = 'Trusted', keepUnrated = false } = {
     return buyers.filter((b) => (b.trust ? ok.has(b.trust.level) : keepUnrated));
 }
 
-/** What each column sorts by first: prices and counts high to low, names A to Z. */
-export const SORT_FIRST_DIR = { name: 1, price: -1, buyer: 1, next: -1, traders: -1 };
+/**
+ * What each column sorts by first: what traders pay and counts high to low, names A to Z, and where you buy
+ * (the Item Market, the bazaars, the cheapest of the two: 3.33.0) low to high.
+ */
+export const SORT_FIRST_DIR = { name: 1, price: -1, buyer: 1, next: -1, traders: -1, held: -1, worth: -1, market: 1, bazaar: 1, cheap: 1 };
+
+/** The cheapest place to buy a row's item: the Item Market or the bazaars, whichever is lower (null: neither known). */
+export function cheapestSource(row) {
+    const known = [row && row.market, row && row.bazaar].map(Number).filter((x) => x > 0);
+    return known.length ? Math.min(...known) : null;
+}
 
 /**
  * Pressing a column's header: a new column sorts its natural way first, the
@@ -910,7 +919,10 @@ export function nextSort(current, key) {
  * nobody buys stay at the end whatever the order, by name; ties fall back to
  * the best price, then the name, so the order never jumps between renders.
  *
- * @param {Array<{name, buyers, best}>} rows
+ * The columns of what you hold and where it is sold (3.33.0: held, worth, market, bazaar, cheap) sort by their
+ * own number: a row without one goes last, then the best price, then the name.
+ *
+ * @param {Array<{name, buyers, best, held?, market?, bazaar?}>} rows
  * @param {{key: string, dir: 1|-1}} sort
  */
 export function sortItemRows(rows, sort) {
@@ -918,11 +930,29 @@ export function sortItemRows(rows, sort) {
     const dir = sort && sort.dir === 1 ? 1 : -1;
     const text = (a, b) => String(a).localeCompare(String(b), 'en', { sensitivity: 'base' });
     const num = (a, b) => (Number(a) || 0) - (Number(b) || 0);
+    const bestOf = (r) => (r.best ? Number(r.best.price) || 0 : 0);
+    const own = {
+        held: (r) => r.held,
+        worth: (r) => (r.held || 0) * bestOf(r),
+        market: (r) => r.market,
+        bazaar: (r) => r.bazaar,
+        cheap: cheapestSource,
+        // No second trader: last, whichever way (3.33.0).
+        next: (r) => (r.buyers && r.buyers[1] ? r.buyers[1].price : null),
+    }[key];
+    if (own) {
+        const v = (r) => (Number(own(r)) > 0 ? Number(own(r)) : null);
+        return rows.slice().sort((a, b) => {
+            const x = v(a);
+            const y = v(b);
+            if ((x === null) !== (y === null)) return x === null ? 1 : -1;
+            return (x !== null ? dir * (x - y) : 0) || bestOf(b) - bestOf(a) || text(a.name, b.name);
+        });
+    }
     const by = {
         name: (a, b) => text(a.name, b.name),
         price: (a, b) => num(a.best.price, b.best.price),
         buyer: (a, b) => text(a.best.name, b.best.name),
-        next: (a, b) => num(a.buyers[1] ? a.buyers[1].price : 0, b.buyers[1] ? b.buyers[1].price : 0),
         traders: (a, b) => a.buyers.length - b.buyers.length,
     }[key];
     return rows.slice().sort((a, b) => {

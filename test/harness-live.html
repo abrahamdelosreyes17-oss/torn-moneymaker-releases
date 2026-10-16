@@ -1048,6 +1048,15 @@ function respondFull(url) {
         return { status: 'error', message: 'Endpoint not found', __http: 404 };
     }
     if (u.hostname === 'weav3r.dev') {
+        // A trader's list PAGE (3.33.0, core/open-check.js): its RSC data, the lists below shown open (&w3bclosed=1: closed).
+        const page = u.pathname.match(/^\/pricelist\/(\d+)$/);
+        if (page) {
+            const rows = (w3bPretendLists()[page[1]] || []).filter((x) => x.itemId > 0 && x.buyPrice > 0);
+            if (!rows.length) return { __http: 404 };
+            const closed = /[?&]w3bclosed=1/.test(location.search);
+            return { __text: '{"ownerPlayerId":' + page[1] + ',"subtitle":"' + (closed ? 'This pricelist is currently closed.' : rows.length + ' items priced') + '","pricelist":{"isActive":' + !closed + ',"updatedAt":"' + new Date(NOW_S * 1000 - 3600000).toISOString() + '"},"items":[' +
+                (closed ? '' : rows.map((x) => '{"itemId":' + x.itemId + ',"itemName":"' + x.name + '","buyPrice":' + x.buyPrice + '}').join(',')) + ']}' };
+        }
         if (u.pathname === '/api/marketplace') {
             return { items: [
                 { item_id: 1, item_name: 'Hammer', lowest_price: 50, market_price: 120, total_bazaars: 3 },
@@ -1178,7 +1187,7 @@ function GM_xmlhttpRequest(opts) {
     setTimeout(() => {
         try {
             const body = respond(opts.url);
-            opts.onload({ status: (body && body.__http) || 200, responseText: JSON.stringify(body) });
+            opts.onload({ status: (body && body.__http) || 200, responseText: body && typeof body.__text === 'string' ? body.__text : JSON.stringify(body) });
         } catch (e) {
             opts.onerror(e);
         }

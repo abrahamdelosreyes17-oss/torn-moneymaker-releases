@@ -527,6 +527,26 @@ test('item rows sort by any column; items nobody buys stay last', () => {
     assert.equal(rows[0].name, 'Xanax');
 });
 
+test('item rows sort by where you buy and what you hold; a row with no number goes last (3.33.0)', async () => {
+    const { cheapestSource } = await import('../src/core/traders.js');
+    const b = (name, price) => ({ id: name, name, price });
+    const rows = [
+        { name: 'A', buyers: [b('X', 100)], best: b('X', 100), held: 2, market: 90, bazaar: 80 },
+        { name: 'B', buyers: [b('X', 300)], best: b('X', 300), held: 1, market: 70, bazaar: null },
+        { name: 'C', buyers: [], best: null, held: 0, market: null, bazaar: 60 },
+        { name: 'D', buyers: [b('X', 50)], best: b('X', 50), held: 5, market: null, bazaar: null },
+    ];
+    const names = (sort) => sortItemRows(rows, sort).map((r) => r.name);
+    assert.equal(cheapestSource(rows[0]), 80);
+    assert.equal(cheapestSource(rows[3]), null);
+    assert.deepEqual(names({ key: 'cheap', dir: 1 }), ['C', 'B', 'A', 'D']);
+    assert.deepEqual(names({ key: 'market', dir: 1 }), ['B', 'A', 'D', 'C']);
+    assert.deepEqual(names({ key: 'bazaar', dir: -1 }), ['A', 'C', 'B', 'D']);
+    assert.deepEqual(names({ key: 'held', dir: -1 }), ['D', 'A', 'B', 'C']);
+    assert.deepEqual(names({ key: 'worth', dir: -1 }), ['B', 'D', 'A', 'C']);
+    assert.deepEqual(nextSort(null, 'cheap'), { key: 'cheap', dir: 1 });
+});
+
 /* ------------------------------------------------ the database stops growing */
 
 import { pruneTraderDb as pruneDb, TRADER_FORGET_MS } from '../src/core/traders.js';
@@ -560,8 +580,10 @@ import { buyersForItem as buyersForItem3143 } from '../src/core/traders.js';
 
 test("a trader's whole TornExchange list: every item they buy, and it counts as their price", () => {
     const body = { status: 'success', data: { items: [{ item_id: 870, name: 'Stealth Virus', price: 1157499 }, { item_id: 'x', price: 5 }, { item_id: 206, price: 0 }] }, meta: { trader: 'KayMalta' } };
-    assert.deepEqual(parseTeTraderPrices(body), { name: 'KayMalta', prices: [{ itemId: '870', price: 1157499 }] });
-    assert.deepEqual(parseTeTraderPrices({}), { name: null, prices: [] });
+    assert.deepEqual(parseTeTraderPrices(body), { name: 'KayMalta', prices: [{ itemId: '870', price: 1157499 }], updatedAt: 0 });
+    assert.deepEqual(parseTeTraderPrices({}), { name: null, prices: [], updatedAt: 0 });
+    // 3.33.0: when they last changed their list, as TornExchange says (meta.last_updated).
+    assert.equal(parseTeTraderPrices({ ...body, meta: { trader: 'KayMalta', last_updated: '2026-10-16T06:26:40Z' } }).updatedAt, Date.parse('2026-10-16T06:26:40Z'));
     // KayMalta is not in Stealth Virus's top three, but their own list says they buy it.
     const rows = buyersForItem3143('870', { teBest: [{ name: 'Bob', id: '11', price: 1000000 }], teOwn: [{ id: '5001', name: 'KayMalta', price: 1157499 }] });
     assert.deepEqual(rows.map((r) => [r.name, r.price]), [['KayMalta', 1157499], ['Bob', 1000000]]);
@@ -580,8 +602,8 @@ import { fetchTeTraderPrices, TeClient as TeClient3143 } from '../src/api/te.js'
 test("a trader TornExchange does not know is an empty list, never a failure asked again forever", async () => {
     const client = (reply) => new TeClient3143({ getKey: () => 'AbCdEfGh12345678', now: () => 1_000_000, fetchImpl: async () => reply });
     const json = (status, body) => ({ ok: status < 300, status, json: async () => body });
-    assert.deepEqual(await fetchTeTraderPrices(client(json(404, { status: 'error', message: 'Trader not found' })), '5001'), { name: null, prices: [] });
-    assert.deepEqual(await fetchTeTraderPrices(client(json(200, { status: 'error', message: 'Trader not found' })), '5001'), { name: null, prices: [] }, 'said in a normal answer');
+    assert.deepEqual(await fetchTeTraderPrices(client(json(404, { status: 'error', message: 'Trader not found' })), '5001'), { name: null, prices: [], updatedAt: 0 });
+    assert.deepEqual(await fetchTeTraderPrices(client(json(200, { status: 'error', message: 'Trader not found' })), '5001'), { name: null, prices: [], updatedAt: 0 }, 'said in a normal answer');
     await assert.rejects(fetchTeTraderPrices(client(json(502, null)), '5001'), 'a real failure still fails');
     await assert.rejects(fetchTeTraderPrices(client(json(200, {})), 'bad id!'), 'never a made-up path');
 });

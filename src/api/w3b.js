@@ -40,6 +40,7 @@
  */
 
 import { gmFetch } from '../platform/gm.js';
+import { parseW3bPage } from '../core/open-check.js';
 
 export const W3B_API_BASE = 'https://weav3r.dev/api/';
 export const W3B_HOST = 'weav3r.dev';
@@ -753,6 +754,79 @@ export class W3bClient {
         return promise;
     }
 
+    /**
+     * One trader's list PAGE, as data (3.33.0, core/open-check.js): GET https://weav3r.dev/pricelist/{id} with the
+     * header `RSC: 1` - the only answer of TornW3B's that says whether a list is open. Same line, pace, minute and
+     * 429 wait as every other request; no key, no cookie, no query of ours. TornW3B sends it on to
+     * /pricelist/{id}?_rsc (a redirect), which must stay on weav3r.dev.
+     * @returns {Promise<string>} the page's data
+     */
+    getPage(traderId, { tag = 'w.open' } = {}) {
+        const id = String(traderId || '').replace(/\D/g, '');
+        const path = 'pricelist-page/' + id;
+        const run = () => (id ? this.executePage(id, path, tag) : Promise.reject(new W3bError('No trader id.'))).catch((error) => {
+            if (this.onFailed && !(error && error.paused)) {
+                try {
+                    this.onFailed({ path, tag, error });
+                } catch {
+                    // The log is best-effort.
+                }
+            }
+            throw error;
+        });
+        const promise = this.chain.catch(() => {}).then(run);
+        this.chain = promise.catch(() => {});
+        return promise;
+    }
+
+    async executePage(id, path, tag) {
+        const url = new URL('/pricelist/' + id, W3B_SITE_URL);
+        if (url.hostname !== W3B_HOST) throw new W3bError('Refusing to contact ' + url.hostname + '.');
+        let refused = this.refusal('rest');
+        if (refused) throw refused;
+        const at = await this.waitForSlot();
+        refused = this.refusal('rest');
+        if (refused) throw refused;
+        if (this.onSent) {
+            try {
+                this.onSent({ path, tag, at });
+            } catch {
+                // The usage record is best-effort.
+            }
+        }
+        let response;
+        try {
+            response = await this.fetchImpl(url.toString(), { headers: { RSC: '1' }, anonymous: true, timeoutMs: 20000 });
+        } catch (error) {
+            throw new W3bError('TornW3B network error: ' + ((error && error.message) || error));
+        }
+        if (response.status === 429) {
+            const said = w3bRetryAfterMs(w3bHeader(response, 'retry-after'), this.now());
+            this.answered(path, tag, true);
+            const until = this.coolDown(said ?? W3B_COOLDOWN_MS);
+            this.paceRefused();
+            throw new W3bError('TornW3B rate limit (429).', { http: 429, blocked: true, retryAt: until });
+        }
+        if (!response.ok) throw new W3bError('TornW3B HTTP ' + response.status, { http: response.status });
+        // A redirect off TornW3B is no answer of theirs.
+        try {
+            if (response.url && new URL(response.url).hostname !== W3B_HOST) throw new Error('moved');
+        } catch {
+            throw new W3bError('TornW3B sent the page elsewhere.', { reason: 'redirect' });
+        }
+        const text = typeof response.text === 'function' ? await response.text() : '';
+        // A challenge page is HTML; the list's data is not.
+        if (/^\s*<(!doctype|html)/i.test(text)) {
+            this.coolDown();
+            this.paceRefused();
+            this.answered(path, tag, true);
+            throw new W3bError('TornW3B returned a challenge page (blocked?).', { blocked: true });
+        }
+        this.paceAnswered();
+        this.answered(path, tag, false);
+        return text;
+    }
+
     async execute(path, tag = null, query = null) {
         const url = this.buildUrl(path, query);
         // What really leaves decides the kind: a `filler` that was dropped on the way out is a sellers list.
@@ -958,6 +1032,14 @@ export function w3bPriceListUrl(traderId) {
  *
  * @returns {Promise<Array>} the raw rows (see parseW3bPriceList)
  */
+/**
+ * Is one trader's list open, and what does it pay (3.33.0, core/open-check.js)? One page read.
+ * @returns {Promise<{state: 'open'|'closed'|'unclear', prices: object|null, updatedAt: number, items: number}>}
+ */
+export async function fetchW3bOpen(client, traderId, { tag = 'w.open' } = {}) {
+    return parseW3bPage(await client.getPage(traderId, { tag }), traderId);
+}
+
 export async function fetchW3bPriceList(client, traderId) {
     const id = String(traderId).replace(/\D/g, '');
     if (!id) throw new W3bError('No trader id.');

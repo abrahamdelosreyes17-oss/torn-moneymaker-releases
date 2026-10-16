@@ -346,7 +346,7 @@ export function parseTeBestListing(body) {
  * key is the one you log into TornExchange with, as for every keyed call.
  * No list there (404 / 400): an empty list, not an error.
  *
- * @returns {Promise<{name: string|null, prices: Array<{itemId: string, price: number}>}>}
+ * @returns {Promise<{name: string|null, prices: Array<{itemId: string, price: number}>, updatedAt: number}>}
  */
 export async function fetchTeTraderPrices(client, trader) {
     const who = String(trader || '').trim();
@@ -356,7 +356,7 @@ export async function fetchTeTraderPrices(client, trader) {
         body = await client.get('prices/' + encodeURIComponent(who));
     } catch (error) {
         // "Not found" in any form (a 404, a 400, or a normal answer saying so): no list, not a failure.
-        if (error && (error.http === 404 || error.http === 400 || /not found|no (listings|prices|price list)|does not exist|unknown trader/i.test(String(error.said || '')))) return { name: null, prices: [] };
+        if (error && (error.http === 404 || error.http === 400 || /not found|no (listings|prices|price list)|does not exist|unknown trader/i.test(String(error.said || '')))) return { name: null, prices: [], updatedAt: 0 };
         throw error;
     }
     return parseTeTraderPrices(body);
@@ -374,7 +374,9 @@ export function parseTeTraderPrices(body) {
         prices.push({ itemId, price });
     }
     const meta = (body && body.meta) || (data && data.meta) || {};
-    return { name: typeof meta.trader === 'string' && meta.trader ? meta.trader : null, prices };
+    // 3.33.0: when they last changed their list (meta.last_updated): a list older than a day makes no trade.
+    const updatedAt = Date.parse(String(meta.last_updated || ''));
+    return { name: typeof meta.trader === 'string' && meta.trader ? meta.trader : null, prices, updatedAt: Number.isFinite(updatedAt) ? updatedAt : 0 };
 }
 
 /**

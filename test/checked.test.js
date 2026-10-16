@@ -20,39 +20,29 @@ const DAY = 24 * HOUR;
 
 const buyer = (o = {}) => ({ id: '7', name: 'Seven', price: 900, w3b: 900, te: null, ...o });
 
-test('a price is checked when TornW3B named this trader at this price minutes ago, and their list changed within a day', () => {
-    const item = { at: NOW - 2 * MIN, traders: [{ id: '7', price: 900 }, { id: '8', price: 880 }] };
-    const o = { itemId: '206', item, listAt: NOW - 3 * HOUR, now: NOW };
+test('a price is checked only on a page read of their list in the last 3 minutes that says open, at this price (3.33.0)', () => {
+    const open = { at: NOW - 2 * MIN, state: 'open', prices: { 206: 900 }, updatedAt: NOW - 3 * HOUR };
+    const o = { itemId: '206', open, now: NOW };
     assert.deepEqual(priceChecked(buyer(), o), { ok: true, why: 'checked', at: NOW - 2 * MIN });
 
-    // The check stands five minutes, and no longer.
-    assert.equal(FLIP_CHECK_MS, 5 * MIN);
-    assert.equal(priceChecked(buyer(), { ...o, item: { ...item, at: NOW - FLIP_CHECK_MS } }).ok, true);
-    assert.deepEqual(priceChecked(buyer(), { ...o, item: { ...item, at: NOW - FLIP_CHECK_MS - 1 } }), { ok: false, why: 'not-checked', at: NOW - FLIP_CHECK_MS - 1 });
+    // The open check stands three minutes, and no longer.
+    assert.equal(priceChecked(buyer(), { ...o, open: { ...open, at: NOW - 3 * MIN } }).ok, true);
+    assert.deepEqual(priceChecked(buyer(), { ...o, open: { ...open, at: NOW - 3 * MIN - 1 } }), { ok: false, why: 'not-open', open: 'stale', at: NOW - 3 * MIN - 1, closed: false });
 
-    // Never read, or read and they are not in it, or in it at another price: not checked.
-    assert.deepEqual(priceChecked(buyer(), { ...o, item: null }), { ok: false, why: 'not-checked', at: 0 });
-    assert.equal(priceChecked(buyer({ id: '9' }), o).why, 'not-checked');
+    // Never read: not checked. An old read of the item's buyers, however new, checks nothing now.
+    assert.equal(priceChecked(buyer(), { ...o, open: null, item: { at: NOW - MIN, traders: [{ id: '7', price: 900 }] } }).why, 'not-open');
+    // Open, but not at this price, or not this item.
     assert.equal(priceChecked(buyer({ price: 950, w3b: 950 }), o).why, 'not-checked');
+    assert.equal(priceChecked(buyer(), { ...o, itemId: '1' }).why, 'not-checked');
 });
 
-test('a read kept in two parts checks a trader at the time of the part that names them, not of the newer part', () => {
-    // Everyone was read 40 minutes ago; those who traded lately a minute ago. Eight is only in the older part.
+test('a read kept in two parts: a list read corrects the older part and leaves the newer one', () => {
     const item = {
         at: NOW - MIN,
         full: [{ id: '7', price: 900 }, { id: '8', price: 880 }], fullAt: NOW - 40 * MIN,
         lately: [{ id: '7', price: 900 }], latelyAt: NOW - MIN,
         traders: [{ id: '7', price: 900 }, { id: '8', price: 880 }],
     };
-    const o = { itemId: '206', item, listAt: NOW - HOUR, now: NOW };
-    assert.deepEqual(priceChecked(buyer(), o), { ok: true, why: 'checked', at: NOW - MIN });
-    assert.deepEqual(priceChecked(buyer({ id: '8', price: 880, w3b: 880 }), o), { ok: false, why: 'not-checked', at: NOW - 40 * MIN });
-    // The newer part names Seven at another price: the older part's price is not the one counted.
-    const moved = { ...item, lately: [{ id: '7', price: 850 }], traders: [{ id: '8', price: 880 }, { id: '7', price: 850 }] };
-    assert.equal(priceChecked(buyer({ price: 850, w3b: 850 }), { ...o, item: moved }).ok, true);
-    assert.equal(priceChecked(buyer(), { ...o, item: moved }).at, NOW - 40 * MIN);
-
-    // A list read between the two parts corrects the older part and leaves the newer one.
     const m = new Map([['206', item]]);
     assert.deepEqual(applyListToItemBuyers(m, '8', { 206: 700 }, NOW - 10 * MIN), ['206']);
     assert.deepEqual(m.get('206').full[1], { id: '8', price: 700 });
@@ -63,35 +53,38 @@ test('a read kept in two parts checks a trader at the time of the part that name
     assert.equal(m.get('206').full.find((t) => t.id === '7').price, 1);
 });
 
-test('their own list read minutes ago checks the price as well, and the newer of the two reads is the one told', () => {
-    const list = { at: NOW - MIN, found: true, prices: { 206: 900, 180: 5 } };
-    const o = { itemId: '206', list, listAt: NOW - HOUR, now: NOW };
-    assert.deepEqual(priceChecked(buyer(), o), { ok: true, why: 'checked', at: NOW - MIN });
-    // The list no longer holds the item, or holds it at another price.
-    assert.equal(priceChecked(buyer(), { ...o, itemId: '1' }).ok, false);
-    assert.equal(priceChecked(buyer({ w3b: 910, price: 910 }), o).ok, false);
-    // A trader with no list on TornW3B.
-    assert.equal(priceChecked(buyer(), { ...o, list: { at: NOW - MIN, found: false, prices: {} } }).ok, false);
-    // Both reads: an old buyers read and a new list read is checked, at the list's time.
-    const item = { at: NOW - 30 * MIN, traders: [{ id: '7', price: 900 }] };
-    assert.deepEqual(priceChecked(buyer(), { ...o, item }), { ok: true, why: 'checked', at: NOW - MIN });
+test('a closed list, an unclear page or a failed read makes no flip, however new (the money loss of 2026-10-14)', () => {
+    const o = { itemId: '206', listAt: NOW - HOUR, now: NOW };
+    // TornW3B's list read still names every price of a closed list: none of them counts.
+    const list = { at: NOW - MIN, found: true, prices: { 206: 900 } };
+    assert.deepEqual(priceChecked(buyer(), { ...o, list, open: { at: NOW - 10_000, state: 'closed', prices: null } }), { ok: false, why: 'closed', open: 'closed', at: NOW - 10_000, closed: true });
+    assert.equal(priceChecked(buyer(), { ...o, list, open: { at: NOW - 10_000, state: 'unclear', prices: null } }).why, 'not-open');
+    assert.equal(priceChecked(buyer(), { ...o, list, open: { at: NOW - 10_000, state: 'failed', prices: null } }).ok, false);
+    // A list read alone checks nothing any more.
+    assert.equal(priceChecked(buyer(), { ...o, list }).ok, false);
 });
 
-test('a TornExchange price makes no flip alone, a list not changed in a day neither, nor one whose date is not known', () => {
-    const item = { at: NOW - MIN, traders: [{ id: '7', price: 900 }] };
-    const o = { itemId: '206', item, listAt: NOW - HOUR, now: NOW };
-    assert.deepEqual(priceChecked(buyer({ w3b: null, te: 900 }), o), { ok: false, why: 'te-only', at: 0 });
-    assert.equal(priceChecked(buyer({ w3b: 0, te: 900 }), o).why, 'te-only');
+test('a TornExchange-only price is shown, in amber; a list not changed in a day, or whose date is not known, is no flip', () => {
+    const open = { at: NOW - MIN, state: 'open', prices: { 206: 900 }, updatedAt: NOW - HOUR };
+    const o = { itemId: '206', open, now: NOW };
+    // The owner, 2026-10-16: "always show the torn exchange ... do not leave torn exhcagne out".
+    assert.deepEqual(priceChecked(buyer({ w3b: null, te: 900 }), o), { ok: true, why: 'te-only', at: 0, te: true, warn: 'te' });
+    assert.equal(priceChecked(buyer({ w3b: 0, te: 900, id: null }), o).why, 'te-only', 'known by name only: shown too');
+    // TornExchange says their list was last changed over a day ago: no flip.
+    assert.equal(priceChecked(buyer({ w3b: null, te: 900 }), { ...o, teListAt: NOW - DAY - 1 }).why, 'old-list');
+    assert.equal(priceChecked(buyer({ w3b: null, te: 900 }), { ...o, teListAt: NOW - HOUR }).ok, true);
     // What they last paid (TornW3B's receipts) is not what they pay.
-    assert.equal(priceChecked(buyer({ lastPaidOnly: true }), o).why, 'te-only');
+    assert.equal(priceChecked(buyer({ lastPaidOnly: true }), o).why, 'last-paid');
+    assert.equal(priceChecked(buyer({ w3b: null, te: null }), o).why, 'no-price');
     assert.equal(priceChecked(buyer({ id: null }), o).why, 'no-id');
     assert.equal(priceChecked(null, o).why, 'no-id');
 
     assert.equal(PRICES_STALE_MS, DAY);
-    assert.equal(priceChecked(buyer(), { ...o, listAt: NOW - DAY }).ok, true);
-    assert.deepEqual(priceChecked(buyer(), { ...o, listAt: NOW - DAY - 1 }), { ok: false, why: 'old-list', at: NOW - MIN });
-    assert.deepEqual(priceChecked(buyer(), { ...o, listAt: 0 }), { ok: false, why: 'no-date', at: NOW - MIN });
-    assert.equal(priceChecked(buyer(), { itemId: '206', item, now: NOW }).why, 'no-date');
+    assert.equal(priceChecked(buyer(), { ...o, open: { ...open, updatedAt: NOW - DAY } }).ok, true);
+    assert.deepEqual(priceChecked(buyer(), { ...o, open: { ...open, updatedAt: NOW - DAY - 1 } }), { ok: false, why: 'old-list', at: NOW - MIN });
+    // The page gives no date: the list's date known otherwise stands, else no flip.
+    assert.equal(priceChecked(buyer(), { ...o, open: { ...open, updatedAt: 0 }, listAt: NOW - HOUR }).ok, true);
+    assert.deepEqual(priceChecked(buyer(), { ...o, open: { ...open, updatedAt: 0 } }), { ok: false, why: 'no-date', at: NOW - MIN });
 });
 
 test('a list just read corrects every older read of an item\'s buyers: the new price, or no longer that trader', () => {
@@ -199,13 +192,10 @@ test('next read: the buyers of a possible flip go before the sellers lists of th
     assert.deepEqual(nextW3bRead({ ...p, check: undefined, ...dueOf(new Set(['c1']), new Set(['f2'])) }).kind, 'bazaars');
 });
 
-test('a list another PC read (through the shared server) checks nothing: only this PC\'s own read of TornW3B does', () => {
+test('a list another PC read (through the shared server) checks nothing: only an open check does', () => {
     const list = { at: NOW - MIN, checkedAt: NOW - MIN, found: true, shared: true, prices: { 206: 900 } };
     const o = { itemId: '206', list, listAt: NOW - HOUR, now: NOW };
-    assert.deepEqual(priceChecked(buyer(), o), { ok: false, why: 'not-checked', at: 0 });
-    // This PC's own read of the item's buyers still checks it, at its own time, whatever the shared list says.
-    const item = { at: NOW - 2 * MIN, traders: [{ id: '7', price: 900 }] };
-    assert.deepEqual(priceChecked(buyer(), { ...o, item }), { ok: true, why: 'checked', at: NOW - 2 * MIN });
-    // And the same list read by this PC checks it.
-    assert.equal(priceChecked(buyer(), { ...o, list: { ...list, shared: false } }).ok, true);
+    assert.equal(priceChecked(buyer(), o).ok, false);
+    assert.equal(priceChecked(buyer(), { ...o, open: { at: NOW - MIN, state: 'open', prices: { 206: 900 }, updatedAt: 0 } }).ok, true);
 });
+
