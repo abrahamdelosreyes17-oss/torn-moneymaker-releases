@@ -178,7 +178,8 @@ test('the server\'s copy first (3.33.0, Stage 6): learned from TornW3B, gaps to 
     // Whose bazaars are read from Torn: the server-led possible flips' sellers, as the flips buy from them.
     has("rows: b && b.at ? sellersOf(c.itemId) || [] : []", 'the confirm wants');
     has('updateSellPresence(watch, now);\n    stepOwnConfirm(now);', 'the Reader');
-    has('purgeOwnReads(now);\n    const ownRowsNow', 'old reads go every redraw, hidden too');
+    // (3.33.0: every working out - a press drawn on the one before reads none of them.)
+    has('purgeOwnReads(now);\n        const ownRowsNow', 'old reads go every redraw, hidden too');
 });
 
 test('the joins: Read now reads again within the limits, Redraw draws again and reads nothing (mockup AM)', () => {
@@ -193,4 +194,67 @@ test('the joins: Read now reads again within the limits, Redraw draws again and 
     assert.ok(page.includes('for (const k of Object.keys(this)) if (/Sig$/.test(k)) this[k] = null;'), 'every part drawn again');
     // Only the tab of the trade's pane in view is drawn into it, and the pane is drawn before its parts.
     assert.ok(page.indexOf('if (this.planEl.isConnected) this.drawPlan(d);') < page.indexOf('if (this.headEl.isConnected) this.drawHead(d);'), 'the pane first');
+});
+
+test('3.33.0: a press is drawn on the working out before only when its word is the same; anything else works it out in full', () => {
+    // The page's handlers are presses while they run (not Redraw: it works the page out again).
+    has('sell.page = new SellingPage(sellPresses({', 'the page\'s handlers');
+    has("/^on[A-Z]/.test(name) && name !== 'onRedraw'", 'which handlers');
+    has('sell.pressDepth += 1;', 'a press begins');
+    has('sell.pressDepth -= 1;', 'and ends');
+    // Anything that is no press asks the next press in full.
+    has('const pressed = yours && sell.pressDepth > 0;\n    if (!pressed) sell.dataAsked = true;', 'renderSelling');
+    has("renderSellingWork(src, { press, typed: by === 'byTyping' })", 'renderSellingNow hands the press on');
+    has('const press = pressed && !src && document.visibilityState === \'visible\' ? { warm: Boolean(sell.warm) } : null;', 'only a press in view, without pieces handed over');
+    // The data stages are skipped only when pressReuse says so: a press, no data asked, the same word.
+    has('const reuse = press ? pressReuse({ kept: sell.dataKept, now, asked: sell.dataAsked || press.warm, word: () => sellDataWord(prefs, now) }) : null;', 'the decision');
+    has('const kept = Boolean(reuse && reuse.ok);', 'kept only on its yes');
+    const workCalls = main.split('\n').filter((l) => /\bworkData\(\)/.test(l));
+    assert.deepEqual(workCalls.map((l) => l.trim()), ['data = workData();'], 'the working out is called in one place');
+    const at = main.indexOf('data = workData();');
+    const branch = main.slice(main.lastIndexOf('if (kept) {', at), at);
+    assert.ok(branch.includes('} else {') && branch.includes('sell.dataAsked = false;'), 'in full only when not kept - and it is what was asked');
+    // The rows of the items a press moved into or out of the trade on show are worked out again.
+    has('const idsNow = sellTradeIdsNow();\n        const moved = idsMoved(data.tradeIdsNow, idsNow);', 'the trade on show');
+    has('data.entries = rowsAgain(data.entries, moved, data.rowFor);', 'their rows again');
+    has('const tradeIdsNow = sellTradeIdsNow();', 'the working out reads the same set');
+    // Kept after every draw but a search's; the word covers what a press changes that stages 1-4 read.
+    has('if (!typed) sell.dataKept = { data, word: sellDataWord(prefs, now), at: keptAt };', 'kept');
+    const word = main.slice(main.indexOf('function sellDataWord('), main.indexOf('function sellPresses('));
+    for (const part of ['sellFavourites()', 'sellBlacklist()', 'sellDeclined(now)', 'sellLeftovers(now)', 'favouriteTraders(now)', "k !== 'keep' && k !== 'listSort'",
+        'sell.query', 'STORE_SELL_GONE', 'STORE_SELL_STOCK', 'STORE_SELL_BOUGHT', 'STORE_SELL_PAST', 'STORE_W3B_SUMMARY', 'sell.inventory', 'sell.sharedWant', 'sharedLink.marks(now)']) {
+        assert.ok(word.includes(part), 'the word: ' + part);
+    }
+    // Every store the working out reads is in the word.
+    const work = main.slice(main.indexOf('const workData = () => {'), main.indexOf('const reuse = press ? pressReuse('));
+    for (const store of new Set(work.match(/gmGet\((STORE_\w+)/g).map((s) => s.slice(6)))) assert.ok(word.includes(store), 'a store the working out reads: ' + store);
+    // And the speed log is told which it was.
+    has('perfGauge(reuse.ok ? SPEED_BIDS.pressKept : SPEED_BIDS.pressFull, 1);', 'kept or in full');
+    has('if (kept) perfDone(SPEED_BIDS.pressRedraw, workT0);', 'its time');
+});
+
+test('TE only (2026-10-16): their TornW3B list read first, both list buttons, the tag on its own line', () => {
+    const page = read('src/ui/selling-page.js');
+    has('first: sell.teOnlyWant && sell.teOnlyWant.length ? new Set(sell.teOnlyWant) : null,', 'their list first among those never read');
+    has('traderListsOf(r.plan.buyer).w3bUnread)', 'only traders whose list was never read');
+    has('!traderListsOf(r.plan.buyer).w3b), teName', 'the row says TE only only with no TornW3B list');
+    has('listsOf: (b) => traderListsOf(b),', 'the page asks which lists a trader has');
+    has('return { ...t, flips: tflips,', 'a trade line knows it is TE only');
+    assert.ok(page.includes("if (b.te || has.te) out.push(this.link('TE list'"), 'TE list whenever they have one');
+    assert.ok(page.includes("if (b.id && (b.w3b || has.w3b)) out.push(this.link('W3B list'"), 'W3B list whenever they have one');
+    assert.ok(page.includes("first && r.teOnly ? this.link('TE only'"), 'the line tag');
+});
+
+test('one trader, one row (2026-10-16): while the pointer holds the order, a row new to a trader joins their rows', () => {
+    const page = read('src/ui/selling-page.js');
+    assert.ok(page.includes('const kept = keptOrder(this.order, rows);'), 'the kept order, each trader together (test/still.test.js)');
+});
+
+test('no control characters in the source (2026-10-17: a backspace stood for \\b, so the TE only pulse restarted on every redraw)', () => {
+    const walk = (dir) => fs.readdirSync(new URL('../' + dir, import.meta.url), { withFileTypes: true }).flatMap((e) => (e.isDirectory() ? walk(dir + '/' + e.name) : e.name.endsWith('.js') ? [dir + '/' + e.name] : []));
+    for (const f of walk('src')) {
+        const m = read(f).match(/[\x00-\x08\x0b\x0c\x0e-\x1f]/);
+        assert.equal(m, null, f + ': a control character at ' + (m ? m.index : ''));
+    }
+    assert.ok(read('src/ui/selling-page.js').includes("if (/\\bte-(pulse|warn)\\b/.test(cls)) a.style.animationDelay"), 'the pulse keeps its beat');
 });

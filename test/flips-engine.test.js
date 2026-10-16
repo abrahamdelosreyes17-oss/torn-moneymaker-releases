@@ -103,5 +103,7 @@ test('wiring: the scan plans the top traders and ranks by basket; Today and By t
     assert.ok(main.includes("!((said.get(String(w.id)) || {}).at > 0)"));
     // The top traders are found when the scan is worked out again, not in its signature.
     assert.ok(main.indexOf('const sums = new Map();') > main.indexOf('sell.scanSig = scanSig;'));
-    assert.ok(page.includes("const lines = ((x.basket && x.basket.lines) || []).map((l) => spEl('tr', { class: 'bl' + (key === x.key ? ' sel' : '') }"));
+    // 2026-10-17: By trader is one row a trader, its lines only in the desk.
+    assert.ok(page.includes("return this.pickRow('lr' + (key === x.key ? ' sel' : ''), 'scan:' + x.id, pick, cells, 'Show the trade with ' + x.name);"));
+    assert.ok(!page.includes("'scan:item:'"));
 });

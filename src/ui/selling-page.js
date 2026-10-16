@@ -26,7 +26,7 @@ import { formatMoney, formatAge, parseMoneyInput, readWholeNumber } from '../cor
 import { sharedNowLine, sharedKeyLine, sharedKeyBoxLine, sharedSplit, sharedKnown } from '../core/shared.js';
 import { TRADE_MAX_UNITS, countView, stepRank } from '../core/accepted.js';
 import { enoughProfit } from '../core/profit.js';
-import { stillLine, togetherBy } from '../core/still.js';
+import { stillLine, togetherBy, keptOrder } from '../core/still.js';
 import { sameGoodsWords } from '../core/same-goods.js';
 import { TO_SELL_WHY, whereRowView } from '../core/to-sell.js';
 import { matchFifo, ledgerByPeriod, periodStart } from '../core/ledger.js';
@@ -424,9 +424,9 @@ export class SellingPage {
             this.order = rows.map((r) => r.itemId);
             return rows;
         }
-        const at = new Map(this.order.map((id, i) => [id, i]));
-        const pos = (r) => (at.has(r.itemId) ? at.get(r.itemId) : 1e9);
-        const kept = rows.slice().sort((a, b) => pos(a) - pos(b));
+        // Best flips (2026-10-16): each trader's rows together at the first of them (core/still.js keptOrder) - a
+        // Dahlia that turned up a moment later stood last, as a second KayMalta row.
+        const kept = keptOrder(this.order, rows);
         this.order = kept.map((r) => r.itemId);
         return kept;
     }
@@ -1619,18 +1619,10 @@ export class SellingPage {
             ];
             if (!ready) return spEl('tr', { class: 'lr dim', title: x.hiddenBy ? 'A favourite stays in view. Their trade is not counted while the filter is on.' : null }, cells);
             const pick = () => this.h.onTradePick && this.h.onTradePick(x.mainId, x.key);
-            const head = this.pickRow('lr' + (key === x.key ? ' sel' : ''), 'scan:' + x.id, pick, cells, 'Show the trade with ' + x.name);
-            // 3.33.0 (engines plan 2a, 2b): every line of the trade - the bazaar price, what you pay, their price - and
-            // who pays most after them. The lines add up to the trade.
-            const lines = ((x.basket && x.basket.lines) || []).map((l) => spEl('tr', { class: 'bl' + (key === x.key ? ' sel' : '') }, [
-                spEl('td', {}, [spEl('div', { class: 'blr' }, [this.pic('scan-l', l.itemId), spEl('span', {}, [
-                    this.itemLink(l.itemId, l.name, 'scan:item:' + x.id + ':' + l.itemId), ' × ' + count(l.units),
-                    spEl('small', { text: ' ' + (l.yours ? 'yours, paid ' + (l.each === null ? '?' : formatMoney(Math.round(l.each))) : 'at ' + formatMoney(Math.round(l.each)) + ' · pay ' + formatMoney(l.cost)) + ' · ' + formatMoney(l.bid) + ' each' }),
-                    l.second ? spEl('small', { class: 't-muted', title: 'The next best price for it, from another trader', text: ' · next ' + l.second.name + ' ' + formatMoney(l.second.price) }) : null,
-                ]), spEl('span', { class: l.profit < 0 ? 't-bad' : 't-good', text: signed(l.profit) })])]),
-            ]));
-            return lines.length ? [head, ...lines] : head;
-        }).flat();
+            // 2026-10-17 (the owner: "i dont need to see the items here in per trader. just the trader"): one row a
+            // trader; the trade's lines are in the desk once picked.
+            return this.pickRow('lr' + (key === x.key ? ' sel' : ''), 'scan:' + x.id, pick, cells, 'Show the trade with ' + x.name);
+        });
         const total = (sc.favourites || 0) + (sc.trusted || 0);
         const empty = q || this.favOnly
             ? (this.favOnly && !sc.favourites ? 'No favourites yet. Press ☆ beside a trader to keep them here; traders you traded with 5 or more times in 30 days join by themselves.' : 'No trader matches.')
@@ -1762,7 +1754,7 @@ export class SellingPage {
                 where,
                 d.itemId, d.name, d.held, d.avg, d.bazaars, d.buyersTotal, d.buyersLoading, d.buyersListNote, d.pending, d.planWhy, d.paid,
                 d.yesNote || false, d.trade && d.trade.listCheck && d.trade.listCheck.readAt ? Math.min(13, Math.floor((now - d.trade.listCheck.readAt) / 5000)) : 0,
-                d.buyers.map((b) => [b.id, b.name, b.price, b.te, b.teTop, b.teList, b.w3b, b.bulk || null, statusOf(b), b.trust ? b.trust.level + b.trust.score : '', s.networth && b.id ? s.networth.get(String(b.id)) : null, Boolean(b.favourite), b.traded || '', Boolean(b.troll), Boolean(b.lastPaidOnly), this.checkSig(b, now), b.listAt ? listAgeText(Math.max(0, now - b.listAt)) : '']),
+                d.buyers.map((b) => [b.id, b.name, b.price, b.te, b.teTop, b.teList, b.w3b, b.bulk || null, statusOf(b), b.trust ? b.trust.level + b.trust.score : '', s.networth && b.id ? s.networth.get(String(b.id)) : null, Boolean(b.favourite), b.traded || '', Boolean(b.troll), Boolean(b.lastPaidOnly), this.checkSig(b, now), b.listAt ? listAgeText(Math.max(0, now - b.listAt)) : '', this.h.listsOf ? JSON.stringify(this.h.listsOf(b)) : '']),
                 this.justBlacklisted ? this.justBlacklisted.at : 0,
                 (d.hidden || []).map((b) => [b.tradeKey, b.price, b.hiddenBy, statusOf(b), b.trust ? b.trust.level + b.trust.score : '']),
                 // How old a list is, in the words shown: drawn again when they change, not every second.
@@ -2332,8 +2324,11 @@ export class SellingPage {
     /** TE list and W3B list, the ones that exist; then ⊘ (blacklist: never a buyer). @returns {Node[]} */
     traderLinks(b, { blacklist = false } = {}) {
         const out = [];
-        if (b.te) out.push(this.link('TE list', tePriceListUrl(b.teName || b.name), { cls: 'btn sm lk', title: b.name + '\'s TornExchange price list: ' + formatMoney(b.te), focus: 'step-te' }));
-        if (b.w3b && b.id) out.push(this.link('W3B list', w3bPriceListUrl(b.id), { cls: 'btn sm lk', title: b.name + '\'s TornW3B price list: ' + formatMoney(b.w3b), focus: 'step-w3b' }));
+        // Every list the trader has, whatever this item's price stands on (2026-10-16, the owner: "says TE only, but
+        // it has the tornw3b link, not their torn exchange as well").
+        const has = this.h.listsOf ? this.h.listsOf(b) : { te: false, w3b: false };
+        if (b.te || has.te) out.push(this.link('TE list', tePriceListUrl(b.teName || b.name), { cls: 'btn sm lk', title: b.name + '\'s TornExchange price list' + (b.te ? ': ' + formatMoney(b.te) : ''), focus: 'step-te' }));
+        if (b.id && (b.w3b || has.w3b)) out.push(this.link('W3B list', w3bPriceListUrl(b.id), { cls: 'btn sm lk', title: b.name + '\'s TornW3B price list' + (b.w3b ? ': ' + formatMoney(b.w3b) : ''), focus: 'step-w3b' }));
         if (blacklist) {
             out.push(spEl('button', {
                 type: 'button',
@@ -2781,6 +2776,9 @@ export class SellingPage {
                         // Their list has a bulk price for it (3.29.0): shown, in no sum.
                         first && r.bulk ? spEl('span', { class: 'warnw', title: 'Their list pays another price from that count up. The sums here use ' + formatMoney(r.bid) + ' each: check their list before a big trade.', text: ' · bulk price from ' + count(r.bulk.from) + ': ' + formatMoney(r.bulk.price) }) : null]),
                     first ? (isMain ? spEl('span', { class: 'here', text: 'MAIN' }) : here && !c.every ? spEl('span', { class: 'here', text: 'THIS ITEM' }) : this.kindTag(r.kind)) : null,
+                    // 2026-10-16: an item whose price is only on their TornExchange list says so on its own line.
+                    first && r.teOnly ? ' ' : null,
+                    first && r.teOnly ? this.link('TE only', tePriceListUrl(b.teName || b.name), { cls: 'tag w te-pulse', title: b.name + '\'s price for ' + r.name + ' is only on TornExchange, which cannot say whether their list is open: press to look at their list before you trade', focus: 'trade:te-only:' + r.itemId }) : null,
                     // A space before it: "at $370" and "bazaar" never run together (engines plan 4c).
                     j > 0 && st.sellerId ? ' ' : null,
                     j > 0 && st.sellerId ? this.link('bazaar', bazaarUrl(st.sellerId, r.itemId, st.price), { cls: 'quiet lk', title: 'Opens their bazaar at this item and the price', focus: 'trade:bazaar:' + r.itemId + ':' + st.sellerId }) : null,
@@ -4903,7 +4901,7 @@ export class SellingPage {
     link(text, url, { cls = 'sp-chip', title = '', focus = '', children = null } = {}) {
         const a = spEl('a', { class: cls, href: url, title: title || null, 'data-focus': focus || null, target: '_blank', rel: 'noopener noreferrer' }, children || [text]);
         // A pulse keeps its beat with the clock: a row drawn again picks it up where it was, never starts it over.
-        if (/te-(pulse|warn)/.test(cls)) a.style.animationDelay = -(Date.now() % 1600) + 'ms';
+        if (/\bte-(pulse|warn)\b/.test(cls)) a.style.animationDelay = -(Date.now() % 1600) + 'ms';
         a.addEventListener('click', (event) => {
             event.stopPropagation();
             if (event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey) return;

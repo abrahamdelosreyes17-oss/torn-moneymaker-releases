@@ -73,6 +73,8 @@ test('the text lays Torn Bids\' redraw out hour by hour: its time beside what we
             speedAdd(p, 'w', G.inShown, ms * 0.2, 'Torn Bids', at + i);
             speedAdd(p, 'w', G.pieces, 30, 'Torn Bids', at + i);
             speedGauge(p, i < 3 ? G.byData : G.byPress, 1, at + i);
+            // 3.33.0: that press drawn on the working out before.
+            if (i === 3) speedGauge(p, G.pressKept, 1, at + i);
             speedGauge(p, G.items, 1000, at + i);
             speedGauge(p, G.buyerRows, 60000, at + i);
             speedGauge(p, G.priceLists, 2900, at + i);
@@ -102,8 +104,8 @@ test('the text lays Torn Bids\' redraw out hour by hour: its time beside what we
     // 3.29.0: what follows "who buys an item" has a column of its own (it was outside every count)...
     assert.match(calmTime, /\b125\s+50\.0\b/, 'in: buyers, then in: shown');
     // ...and so has the work beside the redraw, and who asked for the redraws: 3 by data (3.30.0: none of them
-    // about the desk), 1 by a press.
-    assert.match(calmBeside, /h\s+120\s+4\s+-\s+0\s+3\s+0\s+1\s+0\s+0\s+0$/);
+    // about the desk), 1 by a press (3.33.0: drawn on the working out before, none in full).
+    assert.match(calmBeside, /h\s+120\s+4\s+-\s+0\s+3\s+0\s+1\s+0\s+0\s+0\s+1\s+0$/);
     // The same market in both hours...
     assert.match(calmSizes, /\b1,000\s+60,000\s+2,900\s+400\b/);
     assert.match(slowSizes, /\b1,000\s+60,000\s+2,900\s+400\b/);

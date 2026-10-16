@@ -5,7 +5,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { stillStart, stillList, stillCards, stillWaiting, stillLine, stillEnded, stillTrade, stillAdopt, STILL_ENDED_MS } from '../src/core/still.js';
+import { keptOrder, stillStart, stillList, stillCards, stillWaiting, stillLine, stillEnded, stillTrade, stillAdopt, STILL_ENDED_MS } from '../src/core/still.js';
 
 const NOW = 1_800_000_000_000;
 const MIN = 60000;
@@ -151,4 +151,30 @@ test('the trade ended: said once, with how many came in - and gone after a few s
     assert.equal(stillEnded({ ...ended, let: true }, NOW + 1000), '3 new deals came in, and the rows sorted.');
     assert.equal(stillEnded(ended, NOW + STILL_ENDED_MS), null);
     assert.equal(stillEnded(null, NOW), null);
+});
+
+test('held, Best flips: a flip that sells to another trader now stands with that trader - one trader, one row (2026-10-16)', () => {
+    const flip = (itemId, value, buyer) => ({ ...row(itemId, value), plan: { buyer: { id: buyer, name: 'T' + buyer } } });
+    const still = stillStart({ rows: [flip(1, 900, 7), flip(2, 500, 8), flip(3, 100, 9)], cards: [], now: NOW });
+    // 3 sold to trader 9 at the hold; now trader 7 pays most for it.
+    const shown = stillList(still, [flip(1, 900, 7), flip(2, 500, 8), flip(3, 120, 7)], { together: true });
+    assert.deepEqual(ids(shown), ['1', '3', '2'], "trader 7's two flips stand together");
+    // A flip that is none now keeps the hold's trader.
+    const gone = stillList(still, [flip(1, 900, 7), flip(2, 500, 8), row(3, 0, { flip: false })], { together: true });
+    assert.deepEqual(ids(gone), ['1', '2', '3']);
+});
+
+test('the order kept under the pointer: rows stay where they were drawn, and a trader is never two rows (2026-10-16)', () => {
+    const r = (itemId, group = null) => ({ itemId: String(itemId), group });
+    const ids2 = (rows) => rows.map((x) => x.itemId);
+    // Nothing moved: as drawn; a new row with no trader goes last.
+    assert.deepEqual(ids2(keptOrder(['1', '2', '3'], [r(3, 'c'), r(9), r(1, 'a'), r(2, 'b')])), ['1', '2', '3', '9']);
+    // The Dahlia: a new row of KayMalta's joins KayMalta, not the end.
+    assert.deepEqual(ids2(keptOrder(['870', '335', '206'], [r(870, 'k'), r(335, 'c'), r(206, 'b'), r(1006, 'k')])), ['870', '1006', '335', '206']);
+    // (a) the middle row of Ann's leaves for W, who has no other row: Ann's stay together.
+    assert.deepEqual(ids2(keptOrder(['a', 'b', 'c'], [r('a', 'ann'), r('b', 'w'), r('c', 'ann')])), ['a', 'c', 'b']);
+    // (b) two rows far apart now both sell to K: together at the first.
+    assert.deepEqual(ids2(keptOrder(['1', '2', '3', '4', '5', '6'], ['x', 'y', 'z', 'q', 'v'].map((g, i) => r(i + 1, g)).concat(r(6, 'x')).map((x) => (x.itemId === '1' || x.itemId === '5' ? { ...x, group: 'k' } : x)))), ['1', '5', '2', '3', '4', '6']);
+    // (c) an old row now K's and a new K row: together.
+    assert.deepEqual(ids2(keptOrder(['1', '2'], [r(1, 'k'), r(2, 'b'), r(7, 'k')])), ['1', '7', '2']);
 });

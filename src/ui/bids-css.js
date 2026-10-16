@@ -850,6 +850,9 @@ export const BIDS_AM_CSS = `
 .page, .pane, .col, .tiles, .kpis, .board { gap: 12px; }
 .panel, .panel.tint, .panel.hold { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; animation: none; }
 .panel:hover { border-color: var(--line); }
+/* 2026-10-17 (the owner: "a mini animation around the border" of the big boxes): an older rule (.panel:hover
+   { border: 0 }) took the border off under the pointer, so the box and all in it jumped a pixel. It stays on. */
+.panel:hover { border: 1px solid var(--line); }
 .ph { gap: 10px; padding: 12px 16px 10px; min-height: 46px; }
 .ph h2 { font: 600 14px/1.3 var(--sans); white-space: nowrap; } .ph .sub { color: var(--muted); font-size: 12px; }
 .pb { padding: 0 16px 14px; } .pb.flush { padding: 0; }
@@ -912,6 +915,16 @@ export const BIDS_AM_CSS = `
 table.t:has(> tbody > tr.lr) { table-layout: fixed; }
 /* a row drawn again does not fade into its hover colour: no flash under the pointer at every redraw */
 .t tbody tr { transition: none; }
+/* another page is there at once (the owner, 2026-10-16: "everytime i go to a different card there is a weird
+   animation"): the sidebar's mark does not slide to it, the icons and page tabs do not fade or grow */
+.nav-ind, .nav-b, .tab, .tab::after { transition: none; }
+/* 2026-10-17 (the owner: "a mini animation around the border of the card", even on hover): a card's border changes at once */
+.panel { transition: none; }
+/* an item's head: You hold, Market average and Bazaar on one line (his 2026-10-16 shot: Bazaar fell to a second
+   line); the name wraps first when the panel is narrow */
+.hd.fx > div:not(.facts) { min-width: 0; }
+.hd.fx .facts { flex: 0 1 max-content; gap: 18px; }
+.hd.fx .facts span { white-space: nowrap; }
 .lrow { grid-template-columns: minmax(0, 1fr) minmax(0, max-content); }
 .lrow .a { flex-wrap: wrap; row-gap: 4px; } .lrow .a > b { white-space: nowrap; overflow-wrap: normal; }
 .lrow .p { flex-wrap: wrap; }

@@ -384,6 +384,14 @@ export const SPEED_BIDS = Object.freeze({
     byStatus: 'redraws asked for by the first status answer after a press',
     byTyping: 'redraws asked for by typing in the search box',
     byOther: 'redraws drawn at once (a press on the page itself, a setting changed in another tab)',
+    // 3.33.0 (the owner: "i click everything they buy, and its SO laggy"): a redraw for a press on the very data of the
+    // last full working out is drawn on it (stages 1-4 skipped); otherwise it is worked out in full, and why.
+    pressKept: 'redraws for a press drawn on the working out before (nothing stages 1-4 read had moved)',
+    pressFull: 'redraws for a press worked out in full',
+    pressData: 'redraws for a press worked out in full: data asked for a redraw since the last working out',
+    pressChanged: 'redraws for a press worked out in full: the press or a store changed what stages 1-4 read',
+    pressOld: 'redraws for a press worked out in full: no working out under 10 s old to draw on',
+    pressRedraw: 'Torn Bids redraw for a press, on the working out before (inside the redraw)',
     age: 'minutes since this Torn Bids page was opened',
     heap: 'memory the tab holds (MB, as the browser says)',
     nodes: 'elements in Torn Bids\' page',
@@ -504,7 +512,9 @@ export function speedText(record, { sizes = [], machine = null, version = null, 
     out.push(...spTable(bidsHours.map(([hour, b]) => [
         stamp(Number(hour) * SP_HOUR_MS).slice(0, 13) + 'h', cell(b.w[B.pieces] ? b.w[B.pieces][1] : null, spMs), count(b.w[B.pieces]), cell(b.w[B.index] ? b.w[B.index][1] : null, spMs), count(b.w[B.index]),
         count(b.g[B.byData]), count(b.g[B.byNear]), count(b.g[B.byPress]), count(b.g[B.byStatus]), count(b.g[B.byTyping]), count(b.g[B.byOther]),
-    ]), ['hour', 'pieces ms', 'pieces', 'index ms', 'index made', 'by data', 'the desk\'s of them', 'by a press', 'by a status', 'by typing', 'by the page']));
+        // 3.33.0: of the redraws for a press (by a press, by the page), the ones drawn on the working out before.
+        count(b.g[B.pressKept]), count(b.g[B.pressFull]),
+    ]), ['hour', 'pieces ms', 'pieces', 'index ms', 'index made', 'by data', 'the desk\'s of them', 'by a press', 'by a status', 'by typing', 'by the page', 'press: kept', 'press: in full']));
     out.push('  what it worked through (the usual of the hour)');
     out.push(...spTable(bidsHours.map(([hour, b]) => [
         stamp(Number(hour) * SP_HOUR_MS).slice(0, 13) + 'h', cell(each(b.g[B.items])), cell(each(b.g[B.buyerRows])), cell(each(b.g[B.priceLists])), cell(each(b.g[B.lists])), cell(each(b.g[B.rows])), cell(each(b.g[B.traders])), cell(each(b.g[B.serverBazaars])),

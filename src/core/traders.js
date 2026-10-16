@@ -293,8 +293,10 @@ export function liveW3bPrices(trader, now = Date.now()) {
  * @param {Set<string>} [o.hot] - traders behind a flip shown or possible: read as often as those who buy what you hold
  * @param {function} [o.listAtOf] - (trader id) => when they last changed their list (ms), 0 when not known
  * @param {function} [o.slow] - (trader id) => true: read only every W3B_SLOW_REFRESH_MS (hidden by the Trusted switch)
+ * @param {Set<string>} [o.first] - never read yet and wanted before every other never-read list (2026-10-16: a flip
+ *   shown on a TornExchange price whose trader is on TornW3B too - their list says whether it has the item)
  */
-export function nextW3bTrader(db, heldIds = new Set(), now = Date.now(), { hot = null, listAtOf = null, slow = null } = {}) {
+export function nextW3bTrader(db, heldIds = new Set(), now = Date.now(), { hot = null, listAtOf = null, slow = null, first = null } = {}) {
     let best = null;
     let bestRank = Infinity;
     for (const [id, t] of Object.entries(db.traders)) {
@@ -303,7 +305,7 @@ export function nextW3bTrader(db, heldIds = new Set(), now = Date.now(), { hot =
 
         let rank;
         if (!w || !w.checkedAt) {
-            rank = 0;
+            rank = first && first.has(id) ? -1 : 0;
         } else if (!w.found) {
             if (now - w.checkedAt < W3B_MISSING_RECHECK_MS) continue;
             rank = 3e15 + w.checkedAt;

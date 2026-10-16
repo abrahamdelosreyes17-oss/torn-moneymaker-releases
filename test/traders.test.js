@@ -207,6 +207,11 @@ test('next TornW3B list: never read first, then stale lists of traders buying wh
     const held = new Set(['180']);
 
     assert.equal(nextW3bTrader(db, held, NOW), '99');
+    // A TornExchange-only flip's trader never read: before every other never-read list (2026-10-16).
+    addTraders(db, [{ id: 98, name: 'TeOnly' }], NOW);
+    assert.equal(nextW3bTrader(db, held, NOW, { first: new Set(['98']) }), '98');
+    recordW3bList(db, 98, { prices: { 1: 5 } }, NOW);
+    assert.equal(nextW3bTrader(db, held, NOW, { first: new Set(['98']) }), '99');
     recordW3bList(db, 99, { prices: { 1: 5 } }, NOW);
 
     // Everything fresh: nothing due.

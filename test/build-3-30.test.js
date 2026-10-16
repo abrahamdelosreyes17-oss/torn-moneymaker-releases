@@ -61,16 +61,17 @@ test('Best flips while a trade holds the list still: each trader\'s flips stay t
     // Later: Cy's flip is now the biggest, Bob's second flip is none any more, Ann's small one sells to Cy now.
     const after = [flip(1, 900, 'Bob'), flip(2, 800, 'Ann'), flip(3, 0, 'Bob'), flip(4, 5000, 'Cy'), flip(5, 100, 'Cy')];
     const held = stillList(still, after, { together: true });
-    assert.deepEqual(ids(held), ['1', '3', '2', '5', '4'], 'the order of the hold');
-    // The page is told the trader of the hold for each row: the line over a trader's flips does not break.
-    assert.deepEqual(held.map((r) => r.still.to), ['name:bob', 'name:bob', 'name:ann', 'name:ann', 'name:cy']);
+    // 2026-10-16 (mockup AM, one row a trade): Ann's small one stands with Cy now, its trader - not with Ann.
+    assert.deepEqual(ids(held), ['1', '3', '2', '4', '5'], 'the order of the hold');
+    // The page's group: a live flip's trader now, one that is no flip now the hold's (Bob's second flip).
+    assert.deepEqual(held.map((r) => flipTraderKey(r) || r.still.to), ['name:bob', 'name:bob', 'name:ann', 'name:cy', 'name:cy']);
     assert.equal(held[1].still.gone, true);
-    assert.equal(held[4].still.move, 'up');
+    assert.equal(held[3].still.move, 'up');
     // Without it (All items, My items): as it always was, by the numbers of the hold alone.
     assert.deepEqual(ids(stillList(still, after)), ['1', '2', '3', '4', '5']);
     // A flip that came in later (let in) joins its trader's rows.
     const more = stillList(still, [...after, flip(6, 300, 'Ann')], { together: true });
-    assert.deepEqual(ids(more), ['1', '3', '2', '6', '5', '4']);
+    assert.deepEqual(ids(more), ['1', '3', '2', '6', '4', '5']);
 });
 
 /* ------------------------------------------------------- the same goods */
@@ -147,7 +148,7 @@ test('the joins: Best flips puts each trader\'s flips together, live and held, a
     // The live list: core/view-model.js listOrder (test/view-model.test.js), given the tab in view.
     has('listOrder(rows, pass, sell.filter)', 'the live list');
     has('{ together: sell.filter === \'flips\' }', 'the held list');
-    has('group: sell.filter === \'flips\' ? (r.still ? r.still.to || null : flipTraderKey(r)) : null,', 'each row\'s trader, for the page');
+    has('group: sell.filter === \'flips\' ? flipTraderKey(r) || (r.still ? r.still.to || null : null) : null,', 'each row\'s trader, for the page');
     assert.ok(page.includes('list[j].group === list[i].group'), 'the page finds a trader\'s rows by it');
     // Mockup AM: a trader's flips are one row of the list (drawFlipRows), its key the run's group.
     assert.ok(page.includes('\'group:\' + lead.group'), 'and draws them as one row');

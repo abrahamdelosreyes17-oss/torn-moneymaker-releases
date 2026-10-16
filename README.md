@@ -2905,6 +2905,40 @@ Torn itself: Next on the real Item Market page (it only changes the address
 after `#`), the log ticking a real Item Market buy, the trade page's Fill with
 a capped line, and the owner mark on the live server.
 
+### Engines, the open check, the Torn Bids redo and its live fixes (3.33.0 + 3.33.1)
+
+**3.33.0** (engines plan, Stages 0-6): one job per engine, and only the Reader
+calls outside services. A trader shows only after their TornW3B list page was
+read open: a closed list, or an unclear or failed read, means no trade, and Ask,
+Yes and every Send check again first. Torn Bids was redrawn as mockup AM, with a
+Today page, Flips (Best flips, By trader, All items, Dropping), Trades, Items
+and Ledger.
+
+**3.33.1**, from the owner's live look on 2026-10-16 and 2026-10-17:
+- Pages switch at once: the sidebar mark does not slide and the page tabs do not
+  fade.
+- A press (a pick, a tab, a filter) redraws from what was already worked out
+  for up to 10 s, instead of working through every item again
+  (`core/press-redraw.js`). The speed log has the columns "press: kept" and
+  "press: in full".
+- TE only: a trader with a TornExchange price who is also on TornW3B has their
+  TornW3B list read first among the lists never read. The pane shows "TE list"
+  and "W3B list" whenever the trader has that list, and "TE only" sits on the
+  trade line whose price is only on TornExchange.
+- Best flips: one trader, one row. A flip that turns up later, or now sells to
+  another trader, joins that trader's row, including while the pointer holds
+  the order (`core/still.js` `keptOrder`).
+- By trader: one row a trader. The trade's items are in the desk.
+- The amber "TE only" pulse keeps its beat when a row is drawn again: the
+  pattern that found it held two backspace characters. The source is now
+  checked for control characters.
+- The big boxes keep their border under the pointer: an older hover rule took
+  it off, and the box jumped by a pixel.
+
+**Not seen on real Torn** beyond the owner's own look in Chrome. Tested with
+`npm test` and `test/ui-check.mjs` (268 checks) before the last two CSS fixes,
+which were checked by hovering in a browser.
+
 ## Architecture
 
 ```
