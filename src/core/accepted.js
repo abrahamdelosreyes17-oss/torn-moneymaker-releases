@@ -1356,10 +1356,11 @@ export const TRADE_GONE_CHECKS = 2;
  * @param {Array} open - the accepted trades (with a trader id)
  * @param {Array<{id, partnerId}>} ongoing - your open trades on Torn, read now
  * @param {object} [o]
+ * @param {function} [o.buying] - (accepted trade) => true while a step of it is still to buy
  * @param {function} [o.finished] - (Torn trade id) => null (not among your finished trades), 'empty' (listed, nothing changed hands), else truthy
  * @returns {{going: object, gone: string[]}} what to keep, and the keys of the trades called off
  */
-export function tradesCalledOff(going, open, ongoing, { finished = () => null, checks = TRADE_GONE_CHECKS } = {}) {
+export function tradesCalledOff(going, open, ongoing, { finished = () => null, checks = TRADE_GONE_CHECKS, buying = () => false } = {}) {
     const next = {};
     const gone = [];
     for (const t of open || []) {
@@ -1371,6 +1372,10 @@ export function tradesCalledOff(going, open, ongoing, { finished = () => null, c
             next[t.key] = { yesAt: Number(t.at), ids: [...new Set([...(was ? was.ids : []), ...here])].slice(-10), misses: 0 };
             continue;
         }
+        // 2026-10-17 (the owner's zip: "trade on nochance17 overlay disappears mid flip"): while something of it is still
+        // to buy, a trade window with them that closed is no calling off - it was one from before (a new one is opened
+        // to send). It is forgotten, and only a window seen open once the buying is done is judged.
+        if (buying(t)) continue;
         // Never seen open on Torn: nothing to go by.
         if (!was || !was.ids.length) continue;
         // One that finished with something in it is not this (finishedTradeFor closes that), nor a calling off.

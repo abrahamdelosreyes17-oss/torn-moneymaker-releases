@@ -271,6 +271,22 @@ export const PAGE_CSS = `
         0 0 14px rgba(90, 167, 255, 0.35) !important;
 }
 
+/* 2026-10-17 (PLAN-buy-pages.md): the trade's other listings to buy on this page, in the same blue, lighter; they
+   pulse once Fill all is on, and the one Down brought you to for a moment. An outline: it takes no room. */
+.ttv2-buyalso:not(.ttv2-buyhere) {
+    box-shadow: inset 0 0 0 2px rgba(90, 167, 255, 0.7), inset 0 0 0 9999px rgba(90, 167, 255, 0.06) !important;
+}
+
+.ttv2-buypulse {
+    outline: 2px solid rgba(90, 167, 255, 0.9) !important;
+    outline-offset: -2px;
+    animation: ttv2-buypulse 1.6s ease-in-out infinite;
+}
+
+@keyframes ttv2-buypulse {
+    50% { outline-color: rgba(90, 167, 255, 0.15); }
+}
+
 /* Fill's line on the trade page (3.14.2) moved to the panel's trade box in 3.20: this only hides one an older version left. */
 .ttv2-fillnote {
     display: none !important;

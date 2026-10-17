@@ -112,3 +112,21 @@ test('the open trades are asked with cat=ongoing and nothing else, through the w
     const odd = new LedgerClient({ getKey: () => 'FULLKEY123456789', fetchImpl: async () => ({ ok: true, status: 200, json: async () => ({}) }), maxRetries: 0 });
     assert.equal(await fetchOngoingTrades(odd), null);
 });
+
+test('2026-10-17 (the owner zip, NoChance17): a window that closes while something is still to buy calls nothing off', () => {
+    const buying = () => true;
+    let r = tradesCalledOff(null, [trade()], [onTorn(9)], { buying });
+    r = tradesCalledOff(r.going, [trade()], [], { buying });
+    r = tradesCalledOff(r.going, [trade()], [], { buying });
+    r = tradesCalledOff(r.going, [trade()], [], { buying });
+    assert.deepEqual(r.gone, []);
+    // That old window is forgotten: once the buying is done, its absence says nothing either.
+    r = tradesCalledOff(r.going, [trade()], []);
+    r = tradesCalledOff(r.going, [trade()], []);
+    assert.deepEqual(r.gone, []);
+    // A window opened to send, then closed without going through: called off as before.
+    r = tradesCalledOff(r.going, [trade()], [onTorn(11)]);
+    r = tradesCalledOff(r.going, [trade()], []);
+    r = tradesCalledOff(r.going, [trade()], []);
+    assert.deepEqual(r.gone, ['id:500']);
+});

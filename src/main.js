@@ -221,9 +221,12 @@ import {
     profileIdOf,
     PAGE_NONE,
     PAGE_BAZAAR,
+    PAGE_ITEM_MARKET,
 } from './sources/route.js';
 import { scanDom } from './sources/dom/scan.js';
 import { writeInputs } from '#engines/dom/type-into.js';
+import { listingTile, buyBox, openBuyMenus } from '#engines/dom/buy-box.js';
+import { fillWants, fillAllType, fillAllUndo, nextListingIndex, bringIntoView, claimBuyPage } from '#engines/dom/buy-page.js';
 import { sellerRowsKept } from '#engines/rules/seller-rule.js';
 import { scanOwnBazaar, ensureRowTag, removeRowTags, OWN_BAZAAR_TAG_CLASS } from './sources/dom/ownbazaar.js';
 import {
@@ -1450,6 +1453,7 @@ function rescanNow() {
     // How soon after this page showed its list was first read (see BUY_EARLY_READ_MS).
     if (app.bzCover && app.bzReadAfter === null) app.bzReadAfter = pageShownAt === null ? Infinity : Math.max(0, performance.now() - pageShownAt);
     notePointedGone(listings);
+    trackBuyPage(listings);
     trackTradeBuying(app.pageType === PAGE_BAZAAR ? listings : []);
 
     app.lastScanAt = now;
@@ -4852,6 +4856,11 @@ function trackTradeBuying(listings) {
         last: Boolean(here && next && steps.filter((st) => !stepDone(st)).length === 1),
         // Next stays on this bazaar: another item of the trade is here too.
         same: Boolean(here && here.trade.items.some((i) => (i.steps || []).some((st) => st !== here.step && !stepDone(st) && String(st.sellerId) === String(here.step.sellerId)))),
+        // Fill all on this page (2026-10-17, engines dom/buy-page.js): every listing of the trade to buy here.
+        fillAll: buyPage.fill.length || buyPage.fillAll ? { n: buyPage.fill.length, on: Boolean(buyPage.fillAll) } : null,
+        // A trade buys something on this page: the keys are Torn Bids' here (Torn Archive was told so), whatever is drawn yet.
+        buyPage: buyPage.wants.length > 0,
+        market: Boolean(buyPage.wants.length && detectPage(location.href) === PAGE_ITEM_MARKET),
     });
     // The checkout cart, now that the step you are on and what you took here are known.
     updateBoughtWindow();
@@ -5430,6 +5439,181 @@ function clearBuyMarks() {
 
 /** What Fill on a bazaar card typed over, per quantity box, to put back on a second press. */
 const buyFill = new WeakMap();
+
+/*
+ * The buy page (2026-10-17; the owner: "we also didnt wire the checkout/hotkey/ the fill on bazaar and item market of
+ * torn archive", PLAN-buy-pages.md): Torn Archive's buying, from the shared folder (engines dom/buy-page.js). On a
+ * bazaar or the Item Market where an accepted trade still has something to buy:
+ *   - every listing of it to buy is ringed (the step you are on keeps its own mark and bar);
+ *   - Fill all (the buying box, or Up): each listing's number into its own box, also the ones Torn draws later;
+ *     pressed again it puts back what was there;
+ *   - Down: the next listing to buy brought into view; after a buy of yours, by itself;
+ *   - Right or N: Next.
+ * Nothing of Torn's is pressed: you press Buy. What you took is counted as before (trackSeenStock, Next, your log).
+ */
+const BUY_ALSO_CLASS = 'ttv2-buyalso';
+const BUY_PULSE_CLASS = 'ttv2-buypulse';
+const BUY_AIM_MS = 3000;
+const buyPage = { place: null, wants: [], list: [], fill: [], fillAll: null, aimKey: '', aimAt: 0, qty: new Map() };
+
+/** What the accepted trades still buy on this page: [{itemId, maxPrice, n}] - a bazaar's steps, or the Item Market's of its item. */
+function buyPageWants(href = location.href) {
+    if (!bidsOn()) return [];
+    const page = detectPage(href);
+    const seller = page === PAGE_BAZAAR ? bazaarOwnerId(href) : null;
+    const marketItem = page === PAGE_ITEM_MARKET ? marketPageItem(href) : null;
+    if (!seller && !marketItem) return [];
+    // Your own bazaar: nothing of yours is bought there.
+    if (seller && String(seller) === String(ownIdFromPage(document) || '')) return [];
+    const out = [];
+    for (const t of Object.values(sellAccepted())) {
+        for (const i of t.items || []) {
+            for (const st of i.steps || []) {
+                if (stepDone(st)) continue;
+                const here = seller ? String(st.sellerId) === String(seller) : marketStep(st) && String(i.itemId) === String(marketItem);
+                if (here && Number(st.qty) > 0) out.push({ itemId: String(i.itemId), maxPrice: Number(st.price) || 0, n: Number(st.qty) });
+            }
+        }
+    }
+    return out;
+}
+
+/** The listing's quantity box, when Torn shows it: in its open buy form, else in its tile. */
+function buyPageBox(i) {
+    const l = buyPage.list[i];
+    if (!l || !l.el) return null;
+    return l.menu ? buyBox(l.el) : buyBox(listingTile(l.el)) || buyQtyInput(l.el);
+}
+
+const buyPageKey = (l) => String(l.itemId) + '|' + Number(l.listingPrice);
+
+/** The scan of a bazaar or Item Market page: what to buy here, its rings, Fill all, the next listing after a buy. */
+function trackBuyPage(listings) {
+    const bp = buyPage;
+    const place = detectPage(location.href) === PAGE_BAZAAR ? 'b:' + (bazaarOwnerId(location.href) || '') : detectPage(location.href) === PAGE_ITEM_MARKET ? 'm:' + (marketPageItem(location.href) || '') : null;
+    if (place !== bp.place) {
+        fillAllUndo(bp.fillAll);
+        Object.assign(bp, { place, fillAll: null, aimKey: '', aimAt: 0, qty: new Map() });
+    }
+    bp.wants = place ? buyPageWants() : [];
+    // A listing whose buy form is open is the same listing (Torn puts the form where its card was, with no picture).
+    const list = (listings || []).slice();
+    if (bp.wants.length) {
+        for (const m of openBuyMenus(document)) {
+            const item = app.index ? findItemByName(app.index, m.name) : null;
+            if (!item || list.some((l) => l.el && m.tile.contains(l.el) && String(l.itemId) === String(item.id))) continue;
+            list.push({ el: m.el, itemId: String(item.id), name: item.name, listingPrice: m.price, qty: m.qty || 0, menu: true });
+        }
+    }
+    bp.list = list;
+    bp.fill = bp.wants.length ? fillWants(list, bp.wants) : [];
+    // Torn Archive leaves its keys and Fill all to Torn Bids here while a trade has something to buy on it.
+    claimBuyPage(document, 'tornbids', bp.wants.length > 0);
+    if (!bp.wants.length && bp.fillAll) {
+        fillAllUndo(bp.fillAll);
+        bp.fillAll = null;
+    }
+    if (bp.fillAll) fillAllType(bp.fillAll, bp.fill, buyPageBox);
+    // A listing to buy whose stock fell after your press on it: a buy of yours - the next listing comes into view.
+    const now = Date.now();
+    let bought = false;
+    // Its open buy form counts too (it says the stock), and a stock not on the page just now is kept a while: the card
+    // comes back after the form with the lower stock (review, 2026-10-17).
+    const qty = new Map();
+    for (const f of bp.fill) {
+        const l = list[f.i];
+        if (!l) continue;
+        const k = buyPageKey(l);
+        const n = Number(l.qty) || 0;
+        if (!(n > 0)) continue;
+        qty.set(k, { n, at: now });
+        const was = bp.qty.get(k);
+        const pressed = app.stockPressed ? app.stockPressed.get(k) : null;
+        if (was && was.n > n && pressed && now - pressed < STOCK_PRESS_MS) bought = true;
+    }
+    for (const [k, w] of bp.qty) if (!qty.has(k) && now - w.at < STOCK_PRESS_MS) qty.set(k, w);
+    bp.qty = qty;
+    // The Item Market has no press of its own noted (trackSeenStock is the bazaar's): a press in a listing to buy here is.
+    if (bp.wants.length && detectPage(location.href) === PAGE_ITEM_MARKET && !app.buyPagePressBound) {
+        app.buyPagePressBound = true;
+        document.addEventListener('click', (event) => {
+            if (detectPage(location.href) !== PAGE_ITEM_MARKET || !event.target || !event.target.closest) return;
+            const l = buyPage.fill.map((f) => buyPage.list[f.i]).find((x) => x && x.el && (x.el.contains(event.target) || (listingTile(x.el) || x.el).contains(event.target)));
+            if (l) (app.stockPressed = app.stockPressed || new Map()).set(buyPageKey(l), Date.now());
+        }, true);
+    }
+    markBuyPage();
+    if (bought) nextBuyListing(true);
+}
+
+/** The rings: every listing to buy here; they pulse once Fill all is on, and the one Down brought you to for a moment. */
+function markBuyPage() {
+    const bp = buyPage;
+    const want = new Set(bp.fill.map((f) => bp.list[f.i]).filter((l) => l && l.el && !l.menu).map((l) => l.el));
+    const aimed = bp.aimKey && Date.now() - bp.aimAt < BUY_AIM_MS ? bp.aimKey : '';
+    for (const n of document.querySelectorAll('.' + BUY_ALSO_CLASS + ', .' + BUY_PULSE_CLASS)) {
+        if (!want.has(n)) n.classList.remove(BUY_ALSO_CLASS, BUY_PULSE_CLASS);
+    }
+    for (const f of bp.fill) {
+        const l = bp.list[f.i];
+        if (!l || !l.el || l.menu) continue;
+        if (!l.el.classList.contains(BUY_ALSO_CLASS)) l.el.classList.add(BUY_ALSO_CLASS);
+        const pulse = Boolean(bp.fillAll) || aimed === buyPageKey(l);
+        if (l.el.classList.contains(BUY_PULSE_CLASS) !== pulse) l.el.classList.toggle(BUY_PULSE_CLASS, pulse);
+    }
+}
+
+/**
+ * The next listing to buy here, brought into view (Down; and by itself after a buy). With none of them drawn and
+ * something still to buy, Down goes a screen down the page (Torn draws only the listings near the screen), and from
+ * its foot back to the top.
+ */
+function nextBuyListing(auto = false) {
+    const bp = buyPage;
+    const rows = bp.fill.map((f) => bp.list[f.i]).filter((l) => l && l.el && l.el.isConnected && !l.menu);
+    if (!rows.length) {
+        if (auto || !bp.wants.length) return;
+        const foot = window.scrollY + window.innerHeight >= document.documentElement.scrollHeight - 2;
+        window.scrollTo({ top: foot ? 0 : window.scrollY + Math.round(window.innerHeight * 0.8), behavior: 'smooth' });
+        return;
+    }
+    const keys = rows.map(buyPageKey);
+    const k = nextListingIndex(keys, bp.aimKey, auto);
+    bp.aimKey = keys[k];
+    bp.aimAt = Date.now();
+    bringIntoView(rows[k].el);
+    markBuyPage();
+    setTimeout(markBuyPage, BUY_AIM_MS + 60);
+}
+
+/** Fill all, on or off (the buying box, or Up). */
+function toggleBuyFillAll() {
+    const bp = buyPage;
+    if (bp.fillAll) {
+        fillAllUndo(bp.fillAll);
+        bp.fillAll = null;
+        logAction('Fill all off on this page');
+    } else {
+        if (!bp.fill.length) return false;
+        bp.fillAll = { done: new Map() };
+        const typed = fillAllType(bp.fillAll, bp.fill, buyPageBox);
+        logAction('Fill all on this page: ' + bp.fill.length + ' listings to buy, ' + typed + ' boxes open now');
+    }
+    markBuyPage();
+    trackTradeBuying(null);
+    return true;
+}
+
+/** Up and Down on a buy page (the panel's key handler; Right and N are its Next): true when it was ours. */
+function onBuyKey(act) {
+    if (!buyPage.wants.length) return false;
+    if (act === 'fill-all') return toggleBuyFillAll();
+    if (act === 'next-listing') {
+        nextBuyListing(false);
+        return true;
+    }
+    return false;
+}
 
 /** The card's own quantity box (Torn shows it on the card, or once you press its buy button). */
 function buyQtyInput(card) {
@@ -10986,7 +11170,11 @@ function renderSellingWork(src = null, { press = null, typed = false } = {}) {
         // (The accepted trade above is shown whatever is missing. From here: nothing without the item's bazaars -
         // and nothing without a trader, unless a trade is held with one who has left the list.)
         const pickedNow = sell.tradePick.get(String(pickId)) || null;
-        if (!rows || (!buyers.length && !(pickedNow && heldTradeFor(pickId, pickedNow, now)))) return null;
+        // 2026-10-17 (the owner: "sometimes when we click on trader name ... it shows the item instead of the trader"):
+        // a trader you pressed is planned though the item's shown buyers are none just now (a filter, a list still
+        // loading) - chooseTrade finds them among all its buyers. Before, the desk fell back to the item.
+        const pickedThere = pickedNow && (heldTradeFor(pickId, pickedNow, now) || buyersAllowed(pickId).some((x) => traderKey(x) === pickedNow));
+        if (!rows || (!buyers.length && !pickedThere)) return null;
         const keptTrader = sell.deskTrader && sell.deskTrader.itemId === String(pickId) ? sell.deskTrader.key : null;
         const { plans, pickedKey, chosen, hasItem, better } = chooseTrade(pickId, buyers, keptTrader);
         if (better && !(sell.deskBetter === String(pickId) + '|' + better.key)) {
@@ -11621,7 +11809,7 @@ function renderSellingWork(src = null, { press = null, typed = false } = {}) {
             mark: ownGoing.has(r.itemId) ? { kind: 'you', text: 'You are on this' } : r.badge && r.badge.kind === 'flip' && friendGoing.has(r.itemId) ? { kind: 'friend', text: sharedOnThis(friendGoing.get(r.itemId), now) } : null,
             // The row as a line of a table (3.25.0): buy at, sell at, how many, from how many bazaars (core/view-model.js) - to whom.
             ...planCells(r),
-            to: r.plan && r.plan.units > 0 && r.plan.buyer ? { id: r.plan.buyer.id || null, name: r.plan.buyer.name, old: oldList(r.plan.buyer, listAtOf, now), teOnly: Boolean(r.plan.buyer.te && !r.plan.buyer.w3b && !traderListsOf(r.plan.buyer).w3b), teName: r.plan.buyer.teName || null } : null,
+            to: r.plan && r.plan.units > 0 && r.plan.buyer ? { id: r.plan.buyer.id || null, name: r.plan.buyer.name, key: traderKey(r.plan.buyer), old: oldList(r.plan.buyer, listAtOf, now), teOnly: Boolean(r.plan.buyer.te && !r.plan.buyer.w3b && !traderListsOf(r.plan.buyer).w3b), teName: r.plan.buyer.teName || null } : null,
             // 3.29.0: the best believable trader (it was the top row, troll bid or not, beside a worth worked out from
             // the believable one), and whether that price is checked - not checked, it is shown muted.
             ...(([top, second]) => ({ top, second, bid: top ? top.price : 0 }))(tradersShown(r.itemId)),
@@ -12773,6 +12961,7 @@ function bootSellingPage() {
             // Planning a trader you declined means you are trying them again.
             if (sellDeclined().has(declineKey(itemId, key))) setSellDeclined(declineKey(itemId, key), null);
             // Their list, read now (3.29.0: not more than 15 s old at the press - it was a minute), then the item's buyers.
+            loadTeItemList(sell.selected);
             checkTraderNow(itemId, key, 'Plan trade');
             renderSellingNow();
         },
@@ -13859,7 +14048,7 @@ async function watchFinishedTrades(now = Date.now(), { backup = false } = {}) {
             if (ongoing) {
                 const listed = new Set(list.map((x) => String(x && x.id)));
                 const finished = (id) => (seen[id] ? (seen[id].empty ? 'empty' : 'read') : listed.has(String(id)) ? 'listed' : null);
-                const off = tradesCalledOff(going, still, ongoing.map((x) => ({ id: x && x.id, partnerId: tradePartnerId(x, self) })), { finished });
+                const off = tradesCalledOff(going, still, ongoing.map((x) => ({ id: x && x.id, partnerId: tradePartnerId(x, self) })), { finished, buying: (t) => Boolean(nextStep(t)) });
                 going = off.going;
                 for (const key of off.gone) {
                     const t = still.find((x) => x.key === key);
@@ -14079,6 +14268,8 @@ export function boot() {
         getFront: () => frontWords(frontSide(frontSides(), Date.now())),
         getSharedLine: () => (sharedLink ? sharedPanelLine(sharedLink.status(Date.now()), Date.now()) : null),
         onBuyNext,
+        onBuyKey,
+        onBuyFillAll: () => toggleBuyFillAll(),
         onTradeCancel: onOverlayTradeCancel,
         // A tick on Torn's trade page: shared with Torn Bids.
         onTradeSent: (key, line, sent) => {

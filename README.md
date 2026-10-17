@@ -2939,6 +2939,42 @@ and Ledger.
 `npm test` and `test/ui-check.mjs` (268 checks) before the last two CSS fixes,
 which were checked by hovering in a browser.
 
+### Buying on a bazaar and the Item Market, and the trader you press (3.33.2)
+
+- **Buy pages, from the shared folder** (`D:/torn/engines` `dom/buy-box.js`,
+  `dom/buy-page.js`; PLAN-buy-pages.md). Torn Archive's buying, now in
+  Torn Bids too. On a bazaar or the Item Market where an accepted trade still
+  buys something:
+  - every listing of it is ringed;
+  - **Fill all** (the buying box, or ↑) types each listing's number into its
+    own box, also the boxes Torn draws later; pressed again, it puts back what
+    was there;
+  - ↓ brings the next listing to buy into view, and after a buy of yours it
+    comes by itself;
+  - → or N is Next.
+
+  Nothing of Torn's is pressed: you press Buy. What you took is counted as
+  before. While Torn Bids has something to buy on a page, Torn Archive leaves
+  the keys to it. Torn Archive uses the same shared code, with no change in
+  what it does.
+- **A Best flips row opens the trade with its own trader.** It used to open
+  the item's best trader, or the one the desk showed last, so another name
+  came up.
+- **A trader you press is planned even when the item's shown traders are
+  none just now** (a filter, or a list still loading). It used to fall back
+  to the item.
+- **A trade is no longer cancelled by itself in the middle of buying.** The
+  owner's zip of 2026-10-17 (NoChance17) had this: a trade window with them
+  from before closed, and that counted as "called off". While something is
+  still to buy, a closed window is forgotten. Only a window opened once the
+  buying is done counts. The other side of this: if a trader closes the
+  window while you are still buying, and you never open another, the trade
+  stays until you press Cancel trade.
+
+**Not seen on real Torn.** Tested with `npm test`, plus the Best flips press
+in the test page. The buy-page rings and keys have never been seen on a real
+bazaar or Item Market page.
+
 ## Architecture
 
 ```

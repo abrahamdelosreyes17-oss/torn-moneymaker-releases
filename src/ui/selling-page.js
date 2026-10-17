@@ -1566,7 +1566,10 @@ export class SellingPage {
             const sub2 = gone ? ['held in its place']
                 : one && live.length ? [count(lead.stops) + (lead.stops === 1 ? ' bazaar' : ' bazaars') + (lead.buy && lead.sell ? ' · buy ' + formatMoney(lead.buy) + ' · sell ' + formatMoney(lead.sell) : '') + (paced ? ' · ' + (lead.pace >= 1 ? 'about ' + count(Math.round(lead.pace)) + ' an hour sell' : 'under one an hour sells') : '')]
                     : live.length ? [this.plural(live.length, 'flip') + ' · ' + this.plural(units, 'item') + ' · ' + this.plural(stops, 'bazaar')] : [];
-            rows.push(row((on ? 'sel' : '') + (gone ? ' gone' : ''), one ? 'item:' + lead.itemId : 'group:' + lead.group, () => this.select(lead.itemId), a, p, sub, sub2,
+            // 2026-10-17: a row is its trader's trade - pressed, the trade with them opens (it opened the item's best
+            // trader, which could be another one, or the item alone).
+            const open = to && to.key && live.length ? () => (this.h.onTradePick ? this.h.onTradePick(lead.itemId, to.key) : this.select(lead.itemId)) : () => this.select(lead.itemId);
+            rows.push(row((on ? 'sel' : '') + (gone ? ' gone' : ''), one ? 'item:' + lead.itemId : 'group:' + lead.group, open, a, p, sub, sub2,
                 to ? 'Open the trade with ' + to.name : ''));
         }
         const q = this.query.trim();

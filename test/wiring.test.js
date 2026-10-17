@@ -258,3 +258,24 @@ test('no control characters in the source (2026-10-17: a backspace stood for \\b
     }
     assert.ok(read('src/ui/selling-page.js').includes("if (/\\bte-(pulse|warn)\\b/.test(cls)) a.style.animationDelay"), 'the pulse keeps its beat');
 });
+
+test('2026-10-17: a trader pressed opens their trade, never the item alone', () => {
+    const page = read('src/ui/selling-page.js');
+    assert.ok(page.includes('this.h.onTradePick(lead.itemId, to.key)'), 'a Best flips row opens the trade with its trader');
+    const main = read('src/main.js');
+    assert.ok(main.includes("key: traderKey(r.plan.buyer)"), 'the row knows the key of its trader');
+    assert.ok(main.includes('if (!rows || (!buyers.length && !pickedThere)) return null;'), 'a picked trader is planned with no shown buyers');
+    assert.ok(main.includes('{ finished, buying: (t) => Boolean(nextStep(t)) }'), 'no calling off while something is to buy');
+});
+
+test('2026-10-17 (PLAN-buy-pages.md): the buy page is the shared folder one, wired to the scan, the panel and its keys', () => {
+    const main = read('src/main.js');
+    assert.ok(main.includes("from '#engines/dom/buy-page.js'") && main.includes("from '#engines/dom/buy-box.js'"), 'from the shared folder');
+    assert.ok(main.includes('    trackBuyPage(listings);\n    trackTradeBuying(app.pageType === PAGE_BAZAAR ? listings : []);'), 'every scan, before the step (the box shows Fill all)');
+    assert.ok(main.includes("claimBuyPage(document, 'tornbids', bp.wants.length > 0)"), 'Torn Archive is told the page is ours');
+    assert.ok(main.includes('fillAll: buyPage.fill.length || buyPage.fillAll ?') && main.includes('buyPage: buyPage.wants.length > 0,'), 'the buying box gets Fill all');
+    assert.ok(main.includes('        onBuyKey,\n        onBuyFillAll: () => toggleBuyFillAll(),'), 'the panel gets the keys and Fill all');
+    const panel = read('src/ui/panel.js');
+    assert.ok(panel.includes('const act = buyKeyAction(event);') && panel.includes("this.handlers.onBuyKey(act)"), 'the panel keys go through the shared folder');
+    assert.ok(panel.includes("this.handlers.onBuyFillAll && this.handlers.onBuyFillAll()"), 'Fill all in the buying box');
+});

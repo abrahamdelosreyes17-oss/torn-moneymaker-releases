@@ -28,6 +28,7 @@ import { W3B_TERMS_URL, W3B_SITE_URL } from '../api/w3b.js';
 import { panelStyleElement } from './styles.js';
 import { renderPriceGraph } from './graph.js';
 import { buildFillForm } from './fill-form.js';
+import { buyKeyAction } from '#engines/dom/buy-page.js';
 import { keyInputAttrs, keyMask } from './mask.js';
 
 /** "last update 2m ago" turns the status amber after this. */
@@ -1211,7 +1212,8 @@ export class Panel {
         this.buySig = sig;
         box.textContent = '';
         box.style.display = v ? '' : 'none';
-        this.buyHereActive = Boolean(v && v.here && !v.ask);
+        // The keys (N, and Up / Down / Right): on a bazaar step, or a page with a trade's listings to buy (2026-10-17).
+        this.buyHereActive = Boolean(v && (v.here || v.fillAll || v.buyPage) && !v.ask);
         if (!v) return;
         // How long since they said yes: the longer, the likelier prices moved.
         box.appendChild(el('div', { class: 'ttv2-tb-head' }, [
@@ -1253,7 +1255,13 @@ export class Panel {
         // "Not here" only when it is not: a listing further down a long bazaar is still here.
         // A page that was not read says nothing about what is in it.
         const notHere = v.here && !v.here.listed && !v.here.unread && !['below', 'searching', 'away'].includes(v.here.where);
-        const label = v.here && (!v.next || v.last) ? 'Done - go to the trade' : notHere ? 'Not here - next' : v.here && v.same ? 'Next item here' : v.here ? 'Next bazaar' : 'Open the next bazaar' + (v.next && v.next.seller ? ': ' + v.next.seller : '');
+        const label = v.here && (!v.next || v.last) ? 'Done - go to the trade' : notHere ? 'Not here - next' : v.here && v.same ? 'Next item here' : v.here ? 'Next bazaar' : v.market ? 'Next' : 'Open the next bazaar' + (v.next && v.next.seller ? ': ' + v.next.seller : '');
+        // Fill all (2026-10-17, engines dom/buy-page.js): every listing of the trade to buy on this page, typed into its box; again: put back.
+        if (v.fillAll) {
+            const fa = v.fillAll;
+            box.appendChild(el('button', { type: 'button', class: 'ttv2-buyfillall' + (fa.on ? ' on' : ''), 'aria-pressed': String(Boolean(fa.on)), title: fa.on ? 'Put back what was in the boxes (key: ↑)' : 'Type how many into the box of each listing to buy here, also the ones further down as they show. You press Buy. (Key: ↑ · ↓ the next listing)', onclick: () => this.handlers.onBuyFillAll && this.handlers.onBuyFillAll() },
+                [(fa.on ? '☑ Fill all ' : '☐ Fill all ') + fa.n.toLocaleString('en-US') + (fa.n === 1 ? ' listing' : ' listings'), el('span', { class: 'ttv2-kbd', text: '↑' })]));
+        }
         this.buyNextBtn = el('button', { type: 'button', class: 'ttv2-primary ttv2-buynext', title: this.buyHereActive ? 'Key: N' : null, onclick: () => this.handlers.onBuyNext && this.handlers.onBuyNext() }, [label, this.buyHereActive ? el('span', { class: 'ttv2-kbd', text: 'N' }) : null]);
         box.appendChild(this.buyNextBtn);
         box.appendChild(this.cancelTradePart(v, () => this.setBuying(v)));
@@ -1608,12 +1616,19 @@ export class Panel {
             if (event.repeat || event.ctrlKey || event.altKey || event.metaKey) return;
             if (isTypingTarget(event)) return;
             if (!this.root) return;
-            // N: the buying run's Next (one key, one page) - only on a bazaar
-            // you are buying from for the trade, never a stray key elsewhere.
-            if ((event.key === 'n' || event.key === 'N') && this.buyHereActive && this.buyNextBtn && this.buyNextBtn.isConnected && this.buyBoxEl.style.display !== 'none') {
-                event.preventDefault();
-                this.buyNextBtn.click();
-                return;
+            // N or Right: the buying run's Next (one key, one page); Up: Fill all; Down: the next listing to buy -
+            // only on a page you are buying from for the trade, never a stray key elsewhere (engines dom/buy-page.js).
+            const act = buyKeyAction(event);
+            if (act && this.buyHereActive && this.buyBoxEl.style.display !== 'none') {
+                if (act === 'next-place' && this.buyNextBtn && this.buyNextBtn.isConnected) {
+                    event.preventDefault();
+                    this.buyNextBtn.click();
+                    return;
+                }
+                if (act !== 'next-place' && this.handlers.onBuyKey && this.handlers.onBuyKey(act)) {
+                    event.preventDefault();
+                    return;
+                }
             }
             if (event.key !== '`') return;
             event.preventDefault();
