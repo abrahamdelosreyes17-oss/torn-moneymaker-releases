@@ -41,6 +41,8 @@ export const WHO_N_ITEM = 10;
 export const WHO_N_LIST = 30;
 /** Sellers of the cheap list and of `together` that are read whole from Torn in one go. */
 export const WHO_SELLER_WANT = 6;
+/** Of the item in view, this many of its likeliest sellers are read whole. */
+export const WHO_VIEW_SELLERS = 3;
 
 /** A positive whole Torn id as a number, or null ('market', names and the like are not one). */
 export function whoId(x) {
@@ -318,18 +320,41 @@ export function rankReads(reads) {
 }
 
 /**
- * The candidate flips' items in the order they are read: cheap listings first (newest first), then rankReads.
+ * The candidate flips' items in the order they are read: cheap listings first (newest first), then rankReads - within
+ * each group (`groupOf`, e.g. flips priced on real listings before guessed ones: the groups keep their order).
  * @param {{itemId: string, profit: number}[]} candidates
  * @param {object} o
  * @param {object|null} o.who
  * @param {number} o.now
  * @param {(itemId: string) => number} [o.costOf] - reads the item still needs (1 where not given)
+ * @param {(c: object) => string|number} [o.groupOf]
  */
-export function rankItems(candidates, { who = null, now, costOf = () => 1 }) {
+export function rankItems(candidates, { who = null, now, costOf = () => 1, groupOf = () => 0 }) {
     const front = cheapItems(who, now);
     const inFront = new Set(front);
-    const rest = rankReads((candidates || []).filter((c) => !inFront.has(String(c.itemId))).map((c) => ({ id: String(c.itemId), profit: Math.max(1, Number(c.profit) || 0), chance: itemChance(who, c.itemId, now), cost: costOf(String(c.itemId)) })));
-    return [...front, ...rest];
+    const groups = new Map();
+    for (const c of candidates || []) {
+        if (inFront.has(String(c.itemId))) continue;
+        const g = groupOf(c);
+        if (!groups.has(g)) groups.set(g, []);
+        groups.get(g).push({ id: String(c.itemId), profit: Math.max(1, Number(c.profit) || 0), chance: itemChance(who, c.itemId, now), cost: costOf(String(c.itemId)) });
+    }
+    return [...front, ...[...groups.values()].flatMap((reads) => rankReads(reads))];
+}
+
+/**
+ * The pressed trader's items (core/pressed.js pressItems) in the order they are asked: by what they pay over the
+ * cheapest bazaar times how likely the index makes a find. An item with no gap known keeps its place after the known ones.
+ * @returns {{all: string[], full: string[], wide: string[], gap: object}} the same shape, reordered
+ */
+export function pressRank(items, who, now, fullMax = 8) {
+    if (!items || !whoFresh(who, now)) return items;
+    const gap = items.gap || {};
+    const known = items.all.filter((id) => id in gap);
+    const unknown = items.all.filter((id) => !(id in gap));
+    const rank = (list) => rankReads(list.map((id) => ({ id, profit: Math.max(1, gap[id] || 1), chance: itemChance(who, id, now) })));
+    const all = [...rank(known), ...rank(unknown)];
+    return { ...items, all, full: all.filter((id) => id in gap).slice(0, fullMax), wide: [...all, ...items.wide.slice(items.all.length)] };
 }
 
 /* ------------------------------------------------------------------ 4. cheap and sellers */
@@ -345,13 +370,14 @@ export function cheapItems(who, now) {
 /**
  * Whose bazaar to read whole from Torn first: the sellers of the cheap listings (to confirm them), then, while a
  * trader is pressed, the sellers that carry most of their list together.
+ * Between them the item in view's likeliest sellers.
  * @param {object} o
  * @param {object|null} o.who
  * @param {boolean} o.pressed - a press is live
  * @param {(sellerId: string) => boolean} [o.skip] - read lately or sent: left out
- * @returns {{id: string, why: 'cheap'|'together'}[]}
+ * @returns {{id: string, why: 'cheap'|'view'|'together'}[]}
  */
-export function whoSellerWants({ who, now, pressed = false, skip = () => false, max = WHO_SELLER_WANT }) {
+export function whoSellerWants({ who, now, pressed = false, view = null, skip = () => false, max = WHO_SELLER_WANT }) {
     const w = whoFresh(who, now);
     if (!w) return [];
     const out = [];
@@ -360,6 +386,8 @@ export function whoSellerWants({ who, now, pressed = false, skip = () => false, 
         out.push({ id, why });
     };
     for (const c of [...w.cheap].filter((x) => now - x.at < WHO_CHEAP_MS).sort((a, b) => b.at - a.at)) add(c.seller, 'cheap');
+    // The item in view: its likeliest sellers, a few (the page's own read of it is TornW3B's).
+    for (const v of view ? (w.items.get(String(view)) || []).slice(0, WHO_VIEW_SELLERS) : []) add(v.id, 'view');
     if (pressed) for (const t of [...w.together].sort((a, b) => b.score - a.score)) add(t.id, 'together');
     return out;
 }

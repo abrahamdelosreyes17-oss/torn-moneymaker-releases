@@ -24,7 +24,7 @@ import {
 import { SHARED_OWN_KEY } from './feed/shared-link.js';
 import { OWNER_SETS, OWNER_PIECES, OWNER_MARKET, ownerSet, ownerList, ownerLots, ownerSetsPlan, ownerPiecesPlan, ownerChosen, ownerOf, marketStep, marketItems, marketBuyRows, ownerCapped, ownerRun, ownerShort, ownerAddSteps, ownerDropStep, marketRows, marketPageItem, marketNext } from './core/owner-tab.js';
 import { BD_FLIPS_OWNER } from './ui/bids-shell.js';
-import { SharedLink, SHARED_CONFIG_KEY, SHARED_STATE_KEY, SHARED_GRANT_KEY, SHARED_TICK_MS, SHARED_UNKNOWN_MS, SHARED_W3B_ASK_KEY, SHARED_LISTS_OUT_KEY, SHARED_LISTS_IN_KEY, SHARED_OPENS_OUT_KEY, SHARED_OPENS_IN_KEY, SHARED_CALLS_KEY, SHARED_MOVES_KEY } from './feed/shared-link.js';
+import { SharedLink, SHARED_CONFIG_KEY, SHARED_STATE_KEY, SHARED_GRANT_KEY, SHARED_TICK_MS, SHARED_UNKNOWN_MS, SHARED_W3B_ASK_KEY, SHARED_LISTS_OUT_KEY, SHARED_LISTS_IN_KEY, SHARED_OPENS_OUT_KEY, SHARED_OPENS_IN_KEY, SHARED_CALLS_KEY, SHARED_MOVES_KEY, SHARED_WHO_OUT_KEY } from './feed/shared-link.js';
 import { sharedMayCall, withShared, sharedHome, sharedWord, sharedSaid, sharedSaidLine, sharedGoingOwn, sharedGoingByItem, sharedOnThis, sharedGoingFor, sharedBoughtLine, sharedPanelLine, sharedDirDue, sharedDealRows, sharedKnowsLowest, sharedMayRead, sharedAskLeft, sharedList, sharedItemsSeen, SHARED_DEAL_MAX_AGE_MS, SHARED_MAX_WANT, SHARED_MAX_LISTS, SHARED_MAX_LIST_ITEMS, SHARED_MAX_OPENS } from './core/shared.js';
 import { perfStart, perfNow, perfDone, perfTimed, perfForeign, perfStartup, perfRecord, perfMachine, perfAdd, perfGauge, perfYardstick, perfHeapMb, SPEED_STORE_KEY } from './platform/perf.js';
 import { speedFiles, SPEED_BIDS } from './core/speed.js';
@@ -64,7 +64,7 @@ import {
     SOURCE_ITEM_MARKET,
 } from './core/feed.js';
 import { bazaarSellers, flipPlan, flipBuyer, listBid, believableBid, whereToSell, depthNearCheapest, flipCandidates, nearMisses, traderTagLabel, pickBazaars, MAIN_STOPS, EXTRA_STOPS, liveGone, markGone, withoutGone, goneKey, liveStock, noteStock, liveBought, addBought, withOwnBuys, OWN_KEEP_MS, FLIP_FRESH_MS } from './core/flips.js';
-import { coverAfter, coverRowsRead, coverListings, coverListingsRead, coverVerdict, listingBoughtOut } from './core/bazaar-cover.js';
+import { coverAfter, coverWhole, coverRowsRead, coverListings, coverListingsRead, coverVerdict, listingBoughtOut } from './core/bazaar-cover.js';
 import { readBazaarList, BAZAAR_LIST_SELECTOR } from './sources/dom/bazaar-list.js';
 import { openBuyForms, buyFormBought } from './sources/dom/buy-form.js';
 import { fitLeftOut, planTrade, keepAfter } from './core/trade.js';
@@ -74,6 +74,9 @@ import { readWants, sweepOrder, applyWants, openOrder, deskPayers } from './core
 import { isMarketSeller, itemMarketRows, withItemMarket, nextItemMarket, itemMarketRoom, ITEM_MARKET_LISTINGS } from './core/item-market.js';
 import { oldListScan, oldListsWanted, OLD_SCAN_EVERY_MS } from './core/old-lists.js';
 import { inventoryPlan, inventoryLearn, inventoryDue, inventoryResume, inventoryPolicyClean, networthWanted } from './core/key-spend.js';
+import {
+    whoOutAdd, seesOf, lookedOf, missedOf, sellersOfRows, coverItemIds, whoAskPlan, whoAskBody, whoMayAsk, whoBackoffMs, rankItems, pressRank, cheapItems, whoSellerWants, cheapConfirmedBy, whoFresh,
+} from './core/who-sells.js';
 import { pressNew, pressLive, pressItems, nextPressRead, pressOpenWanted, pressWait, pressLogAdd } from './core/pressed.js';
 import { shownTraders, marketPrice } from './core/trader-prices.js';
 import { rowPass, filterRows } from './core/filters.js';
@@ -645,6 +648,8 @@ const app = {
     buyWhere: null,
     /* Listings noted as not there, once per page load: 'seller|item'. */
     goneNoted: new Set(),
+    // 3.36.0: the bazaar page last told to the who-sells index as read whole (seller|listings read).
+    whoLooked: '',
     // The listing this page was opened for, once marked not here (notePointedGone).
     pointedGone: null,
     tradeFillBound: false,
@@ -1452,6 +1457,14 @@ function rescanNow() {
         for (const r of app.bzRead.rows) for (const id of r.ids) app.bzEver.add(id);
     }
     app.bzCover = coverAfter(app.bzCover, location.href, app.bzRead);
+    // 3.36.0 - a bazaar page read whole is a bazaar looked at: told to the index when it has more to say than the last time.
+    if (sellerId && coverWhole(app.bzCover)) {
+        const looked = sellerId + '|' + coverListingsRead(app.bzCover);
+        if (app.whoLooked !== looked) {
+            app.whoLooked = looked;
+            whoFeed('looked', lookedOf(sellerId, coverItemIds(app.bzCover), Date.now()));
+        }
+    }
     // How soon after this page showed its list was first read (see BUY_EARLY_READ_MS).
     if (app.bzCover && app.bzReadAfter === null) app.bzReadAfter = pageShownAt === null ? Infinity : Math.max(0, performance.now() - pageShownAt);
     notePointedGone(listings);
@@ -4312,6 +4325,8 @@ function noteGoneListing(sellerId, itemId) {
     if (app.goneNoted.has(k)) return;
     app.goneNoted.add(k);
     gmSet(STORE_SELL_GONE, markGone(gmGet(STORE_SELL_GONE, null), sellerId, itemId));
+    // 3.36.0 - and to the index: this bazaar does not hold the item (the Item Market has no bazaar to miss in).
+    whoFeed('missed', missedOf(sellerId, itemId, Date.now()));
     // The stock it showed before it went (3.16.4) says nothing any more.
     const stock = liveStock(gmGet(STORE_SELL_STOCK, null));
     if (stock[k]) {
@@ -6169,6 +6184,16 @@ function usageState() {
             clickToFirstCheckMs: (sell.pressLog || []).map((e) => e.ms),
             itemMarket: { reads: sell.itemMarketReads || 0, items: sell.itemMarket ? sell.itemMarket.size : 0, flips: sell.itemMarketFlips ?? null },
             inventoryReads: sell.inventoryReads || 0,
+            // 3.36.0 (core/who-sells.js): the who-sells index - asked, answered, failed, reads it put first; cheap listings it
+            // named and those this PC's reads confirmed; seller lists, bazaars and gone listings told to it (sent so far).
+            whoSells: (() => {
+                const st = sharedLink ? sharedLink.status() : null;
+                return {
+                    asked: sell.whoStats.asked, answered: sell.whoStats.answered, failed: sell.whoStats.failed, readsPutFirst: sell.whoStats.used,
+                    cheapSeen: sell.whoCheapSeen.size, cheapConfirmed: sell.whoCheapDone.size,
+                    seesSent: st ? st.seesOut : null, lookedSent: st ? st.lookedOut : null, missedSent: st ? st.missedOut : null,
+                };
+            })(),
         },
     };
 }
@@ -6934,6 +6959,18 @@ const sell = {
     itemMarket: new Map(),
     itemMarketSent: [],
     itemMarketReads: 0,
+    /* 3.36.0 (core/who-sells.js): the who-sells index's last answer (null: none, or the server is off), when it was asked,
+     * the failures in a row, the counts for the zip, the (seller|item) cheap listings seen and confirmed, and the items
+     * and bazaars the answer put first. */
+    who: null,
+    whoAt: 0,
+    whoBusy: false,
+    whoFails: 0,
+    whoFailedAt: 0,
+    whoStats: { asked: 0, answered: 0, failed: 0, used: 0 },
+    whoCheapSeen: new Set(),
+    whoCheapDone: new Set(),
+    whoSellerIds: [],
     ownerMarketBusy: false,
     ownerMarketAt: 0,
     ownerHeld: undefined,
@@ -8144,8 +8181,13 @@ function stepOwnConfirm(now) {
     if (!getSellKey() || sell.keyDead || sell.ownBusy || document.visibilityState !== 'visible') return;
     sell.ownAsked = (sell.ownAsked || []).filter((t) => now - t < 60000);
     if (sell.ownAsked.length >= OWN_CONFIRM_PER_MIN) return;
-    const id = (sell.confirmWant || []).find((x) => !sell.ownSent.has(x));
+    // 3.36.0 - the index's sellers first: those with a cheap listing, and while a trader is pressed those who carry most of
+    // their list (core/who-sells.js); none read or asked for lately.
+    const recent = (x) => (sell.ownSent.has(x) && now - sell.ownSent.get(x) < OWN_CONFIRM_MS) || now - ((sell.ownReads.get(x) || {}).at || 0) < OWN_CONFIRM_MS;
+    sell.whoSellerIds = whoSellerWants({ who: sell.who, now, pressed: pressLive(sell.pressed, now), view: sell.selected, skip: recent }).map((w) => w.id);
+    const id = [...sell.whoSellerIds, ...(sell.confirmWant || [])].find((x) => !sell.ownSent.has(x) || now - sell.ownSent.get(x) >= OWN_CONFIRM_MS);
     if (!id) return;
+    if (sell.whoSellerIds.includes(id)) sell.whoStats.used += 1;
     sell.ownBusy = true;
     sell.ownAsked.push(now);
     sell.ownSent.set(id, now);
@@ -8153,7 +8195,12 @@ function stepOwnConfirm(now) {
     fetchUserBazaar(sell.client, id, { tag: 't.confirm', priority: 'low' })
         .then((data) => {
             const items = parseOwnBazaar(data);
-            if (items) sell.ownReads.set(id, { at: Date.now(), items });
+            if (items) {
+                sell.ownReads.set(id, { at: Date.now(), items });
+                // 3.36.0 - a bazaar read whole from Torn, to the index; a cheap listing of theirs is confirmed.
+                whoFeed('looked', lookedOf(id, [...items.keys()], Date.now()));
+                whoCheapSeen(id, items.keys());
+            }
         })
         .catch((error) => {
             if (isKeyDeadError(error)) markSellKeyDead(error);
@@ -8863,12 +8910,14 @@ function nextW3bJob(now, hidden = false) {
     }
     const pinnedIds = [...new Set(Object.values(sellPinned(now)).flatMap((t) => t.lines.map((l) => l.itemId)))];
     const candIds = sell.candidates.map((c) => c.itemId);
+    // 3.36.0 - items the who-sells index has a cheap new listing of: read on the top flips' schedule (core/who-sells.js).
+    const cheapIds = cheapItems(sell.who, now);
     const fresh = freshnessMs(sellPrefs());
     // 3.32.0 - the pieces of the sets on the server owner's tab, while it is in view: the set in view is read as the
     // top flips are, before them; the other set's pieces after the possible flips.
     const setIds = sell.ownerIds || [];
     const setFirst = setIds.slice(0, sell.ownerFirst || 0);
-    const topIds = new Set([...setFirst, ...candIds.slice(0, FRESH_TOP)].map(String));
+    const topIds = new Set([...setFirst, ...cheapIds, ...candIds.slice(0, FRESH_TOP)].map(String));
     // Yours alone, whoever else is on: the desk's item and everything a trade of yours holds.
     const ownIds = new Set([sell.selected, ...sell.tradeLive, ...sell.tradeWanted, ...pinnedIds, ...setIds].filter(Boolean).map(String));
     // 3.26.0: the traders of the trade on the desk - their own lists, well inside the check, so the whole
@@ -8912,13 +8961,23 @@ function nextW3bJob(now, hidden = false) {
     const lightFor = (kind) => kind !== 'desk' && (kind === 'sweep' ? lightHas.spare : lightHas.any);
     // 3.26.1 - which read an item gets (lightStandsIn): an item only near a flip is asked for its cheapest price
     // alone, as the sweep is; an item of a trade of yours that is not on the desk is 'own'.
-    const candSet = new Set(candIds.map(String));
+    // 3.36.0 (core/who-sells.js) - the order the possible flips are read in: a cheap new listing the index named first, then what
+    // each could make times how likely the index makes a find, over the reads it costs. With no fresh answer: as it was.
+    const readOrder = whoFresh(sell.who, now)
+        ? rankItems(sell.candidates.map((c) => ({ itemId: c.itemId, profit: c.score, known: c.known })), {
+            who: sell.who,
+            now,
+            costOf: (id) => (lightOn && !(sell.bazaars.get(id) || {}).lightAt ? 2 : 1),
+            groupOf: (c) => (c.known ? 0 : 1),
+        })
+        : candIds;
+    const candSet = new Set([...candIds, ...cheapIds].map(String));
     const kindOf = (id, how) => (String(id) === String(sell.selected) ? 'desk' : ownIds.has(String(id)) || how === 'desk' ? 'own'
         : how === 'slow' && !candSet.has(String(id)) ? 'sweep' : how);
     // The possible flips the light list has priced come first for a sellers list, the most made first
     // (sell.candidates is in that order); the others are asked for their light list meanwhile, which needs no
     // room in the sellers lists' minute.
-    const flipOrder = lightOn ? [...candIds.filter((id) => lightWantsFull(id, now)), ...candIds.filter((id) => !lightWantsFull(id, now))] : candIds;
+    const flipOrder = lightOn ? [...readOrder.filter((id) => lightWantsFull(id, now)), ...readOrder.filter((id) => !lightWantsFull(id, now))] : readOrder;
     const candOrder = setIds.length ? [...new Set([...setFirst, ...flipOrder.map(String), ...setIds])] : flipOrder;
     // While possible flips have no price of their own yet, two reads of three are theirs (a light list each).
     const unpriced = lightHas.any && candIds.some((id) => { const b = sell.bazaars.get(String(id)); return !b || (!b.loading && !(b.at > 0 && (!b.kept || b.server)) && !(b.lightAt > 0)); });
@@ -8984,6 +9043,8 @@ function nextW3bJob(now, hidden = false) {
         },
     });
     if (!read) return null;
+    // 3.36.0 - for the zip: a read the index put ahead (a cheap listing's item, or a flip it moved to the top).
+    if (read.id && (cheapIds.includes(String(read.id)) || (readOrder[0] === String(read.id) && candIds[0] !== readOrder[0]))) sell.whoStats.used += 1;
     if (read.kind === 'summary') return loadBazaarSummary;
     if (read.kind === 'list') return Object.assign(() => loadW3bList(read.id), { list: true });
     if (read.kind === 'buyers') return () => loadItemTraders(read.id);
@@ -8992,7 +9053,7 @@ function nextW3bJob(now, hidden = false) {
     const tag = id === String(sell.selected) ? 'w.desk'
         : setIds.includes(id) ? 'w.sets'
         : sell.tradeLive.includes(id) || sell.tradeWanted.includes(id) || pinnedIds.includes(id) ? 'w.trade'
-        : candIds.includes(id) || sell.nearIds.includes(id) ? 'w.flips'
+        : candIds.includes(id) || cheapIds.includes(id) || sell.nearIds.includes(id) ? 'w.flips'
         : 'w.sweep';
     // The light list where the sellers are not the question (core/cheap.js): the sweep and an item near a flip, a
     // possible flip read in full before or not priced yet, and an item of a trade between two sellers lists.
@@ -9039,10 +9100,11 @@ function pressedItemsNow(now) {
         sell.pressItems = null;
         return null;
     }
-    const key = press.at + '|' + (oc ? oc.at : 0) + '|' + sell.summaryAt + '|' + Object.keys(prices).length;
+    const key = press.at + '|' + (oc ? oc.at : 0) + '|' + sell.summaryAt + '|' + Object.keys(prices).length + '|' + (whoFresh(sell.who, now) ? sell.who.at : 0);
     if (sell.pressItems && sell.pressItemsKey === key) return sell.pressItems;
     sell.pressItemsKey = key;
-    sell.pressItems = pressItems(prices, { lowestOf: lowestKnown, enough: (each, price) => enoughProfit(each, price, 'TRADER', sellPrefs().minProfitPct) });
+    // 3.36.0 - their items by the gap times how likely the index makes a find (core/who-sells.js pressRank).
+    sell.pressItems = pressRank(pressItems(prices, { lowestOf: lowestKnown, enough: (each, price) => enoughProfit(each, price, 'TRADER', sellPrefs().minProfitPct) }), sell.who, now);
     return sell.pressItems;
 }
 
@@ -9349,6 +9411,54 @@ function takeSharedOpens() {
     renderSelling(true);
 }
 
+/*
+ * 3.36.0 - who sells what (core/who-sells.js). What this PC reads anyway is told to the shared server's index (a
+ * stored box the next exchange takes: no request of its own), and the index is asked, about once a minute, where to
+ * look: its answer only orders reads that were going to happen. Nothing is bought from it.
+ */
+function whoFeed(kind, entry) {
+    if (!entry || !sharedLink || !sharedLink.config()) return;
+    gmSet(SHARED_WHO_OUT_KEY, whoOutAdd(gmGet(SHARED_WHO_OUT_KEY, null), kind, entry, Date.now()));
+}
+
+/** A cheap listing the index named is confirmed when this PC's read shows the seller listing the item. */
+function whoCheapSeen(sellerId, itemIds) {
+    if (!sell.who) return;
+    for (const key of cheapConfirmedBy(sell.who, Date.now(), sellerId, itemIds)) sell.whoCheapDone.add(key);
+}
+
+/** The index asked once a minute (and at once on a press); a server that is off or answers badly is left alone for longer each time. */
+function stepWhoSells(now) {
+    if (!sharedLink || !sharedLink.config() || sell.whoBusy || document.visibilityState !== 'visible' || !bidsMayAsk(now)) return;
+    const press = sell.pressed && pressLive(sell.pressed, now) ? sell.pressed : null;
+    if (!whoMayAsk({ lastAt: sell.whoAt, pressAt: press ? press.at : 0, fails: sell.whoFails, failedAt: sell.whoFailedAt }, now)) return;
+    const body = whoAskBody(whoAskPlan({ view: sell.selected, candidates: sell.candidates, pressed: press ? pressedItemsNow(now) : null }));
+    if (!body) return;
+    sell.whoBusy = true;
+    sell.whoAt = now;
+    sell.whoStats.asked += 1;
+    sharedLink
+        .whoSells(body)
+        .then((answer) => {
+            // null: Shared is off or does not know this PC (nothing was asked).
+            if (!answer) return;
+            sell.who = answer;
+            sell.whoFails = 0;
+            sell.whoStats.answered += 1;
+            for (const c of answer.cheap) sell.whoCheapSeen.add(c.seller + '|' + c.item);
+            if (sell.whoStats.answered === 1) logProblem('note', 'The who-sells index answered: ' + (answer.known ? answer.known.sellers + ' sellers known' : 'its size is not told'), 'it only orders the reads this PC makes; nothing is bought from it');
+        })
+        .catch(() => {
+            sell.whoFails += 1;
+            sell.whoFailedAt = Date.now();
+            sell.whoStats.failed += 1;
+            if (sell.whoStats.failed === 1) logProblem('note', 'The who-sells index did not answer; asked again in ' + Math.round(whoBackoffMs(sell.whoFails) / 60000) + ' min', 'reads go in their usual order meanwhile');
+        })
+        .finally(() => {
+            sell.whoBusy = false;
+        });
+}
+
 /** This PC's open or closed read, for the other PCs (the shared link sends the last three minutes' of them). */
 function shareOpenCheck(id, state, at, updatedAt, prices) {
     if (!sharedLink || !sharedLink.config() || (state !== 'open' && state !== 'closed')) return;
@@ -9514,6 +9624,10 @@ function loadBazaars(itemId, tag = 'w.desk') {
             if (!sweep && !prev.sweep && !prev.server && prevAt && at - prevAt <= SELL_MOVES_GAP_MS && !suspect) noteMovement(id, unitsMoved(prev.rows, rows, (listings || []).length >= 100), at - prevAt, at);
             sell.bazaars.set(id, { at, fullAt: at, triedAt: at, rows, error: null, loading: false, sweep });
             sell.bazaarsDirty = true;
+            // 3.36.0 - who sells it, to the index (the Item Market is no seller; a sweep keeps the cheapest, which is still "seen selling").
+            const told = sellersOfRows(rows);
+            whoFeed('sees', seesOf(id, told, at));
+            for (const seller of new Set(told)) whoCheapSeen(seller, [id]);
             // 3.33.0 (Stage 6): does the server's copy know what TornW3B says? (A sweep keeps the cheapest only: enough.)
             noteServerLead(id, rows, at);
         })
@@ -11859,6 +11973,7 @@ function renderSellingWork(src = null, { press = null, typed = false } = {}) {
     updateSellPresence(watch, now);
     stepOwnConfirm(now);
     stepItemMarket(now);
+    stepWhoSells(now);
     // Networth: the buyers the flips sell to first, then the desk's top traders.
     // 3.35.0 (core/key-spend.js): the buyers in view first, then only the first candidate flips' - not all 150 (the key's budget).
     const nwView = [];

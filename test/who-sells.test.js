@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import {
     WHO_KEEP_MS, WHO_MAX_SEES, WHO_MAX_SEES_SELLERS, WHO_MAX_MISSED, WHO_EVERY_MS, WHO_PRESS_GAP_MS, WHO_USE_MS, WHO_CHEAP_MS,
     whoId, seesOf, lookedOf, missedOf, whoOutNew, whoOutAdd, whoOutTake, whoOutDrop, whoOutValid, sellersOfRows, coverItemIds,
-    whoAskPlan, whoAskBody, whoBackoffMs, whoMayAsk, whoAnswerIn, whoFresh, itemChance, rankReads, rankItems, cheapItems, whoSellerWants, cheapConfirmedBy,
+    whoAskPlan, whoAskBody, whoBackoffMs, whoMayAsk, whoAnswerIn, whoFresh, itemChance, rankReads, rankItems, pressRank, cheapItems, whoSellerWants, cheapConfirmedBy,
 } from '../src/core/who-sells.js';
 import { sharedBody, sharedOutgoingOk } from '../src/core/shared.js';
 
@@ -196,6 +196,8 @@ test('bazaars to read whole: cheap sellers first, together only while a trader i
     assert.deepEqual(whoSellerWants({ who: w, now: NOW, pressed: true, skip: (id) => id === '8' || id === '6' }).map((x) => x.id), ['7', '5']);
     assert.equal(whoSellerWants({ who: w, now: NOW, pressed: true, max: 3 }).length, 3);
     assert.deepEqual(whoSellerWants({ who: null, now: NOW, pressed: true }), []);
+    // the item in view: its likeliest sellers between the cheap ones and the pressed trader's
+    assert.deepEqual(whoSellerWants({ who: w, now: NOW, pressed: true, view: '1' }).map((x) => [x.id, x.why]), [['8', 'cheap'], ['7', 'cheap'], ['5', 'view'], ['6', 'view']]);
 });
 
 test('a cheap listing is confirmed when the seller\'s bazaar read lists the item', () => {
@@ -203,4 +205,21 @@ test('a cheap listing is confirmed when the seller\'s bazaar read lists the item
     assert.deepEqual(cheapConfirmedBy(w, NOW, '7', new Set(['1', '2'])), ['7|1']);
     assert.deepEqual(cheapConfirmedBy(w, NOW, '7', new Set(['2'])), []);
     assert.deepEqual(cheapConfirmedBy(null, NOW, '7', ['1']), []);
+});
+
+test('groups keep their order: flips priced on real listings stay before the guessed ones', () => {
+    const cands = [{ itemId: '1', profit: 10, known: true }, { itemId: '2', profit: 500, known: false }, { itemId: '3', profit: 20, known: true }];
+    const w = whoAnswerIn({ items: [{ item: 1, sellers: [] }] , cheap: [] }, NOW);
+    assert.deepEqual(rankItems(cands, { who: w, now: NOW, groupOf: (c) => (c.known ? 0 : 1) }), ['3', '1', '2']);
+});
+
+test('the pressed trader items: by the gap times the chance, the unknown gaps after, the wide list keeps its tail', () => {
+    const items = { all: ['1', '2', '3', '4'], full: ['1', '2', '3'], wide: ['1', '2', '3', '4', '9'], gap: { 1: 1000, 2: 900, 3: 100 } };
+    assert.equal(pressRank(items, null, NOW), items);
+    const w = whoAnswerIn({ items: [{ item: 1, sellers: [] }, { item: 3, sellers: [{ id: 5, score: 1, ago: 10 }] }], cheap: [{ item: 3, seller: 8, price: 1, worth: 2, ago: 1 }] }, NOW);
+    const r = pressRank(items, w, NOW, 2);
+    assert.deepEqual(r.all, ['2', '1', '3', '4']);
+    assert.deepEqual(r.full, ['2', '1']);
+    assert.deepEqual(r.wide, ['2', '1', '3', '4', '9']);
+    assert.deepEqual(items.all, ['1', '2', '3', '4']);
 });
