@@ -278,3 +278,19 @@ test('2026-10-17 (PLAN-buy-pages.md): the buy page is the shared folder one, wir
     assert.ok(panel.includes('const act = buyKeyAction(event);') && panel.includes("this.handlers.onBuyKey(act)"), 'the panel keys go through the shared folder');
     assert.ok(panel.includes("this.handlers.onBuyFillAll && this.handlers.onBuyFillAll()"), 'Fill all in the buying box');
 });
+
+test('3.35.0: a pressed trader is read first (core/pressed.js) and the Item Market is a buy source (core/item-market.js)', () => {
+    has('sell.pressed = pressNew({ key, itemId, why, now: Date.now() });', 'a press is kept');
+    // The pressed reads sit before the generic open-check block and the item reads in nextW3bJob.
+    const job = main.slice(main.indexOf('function nextW3bJob('));
+    assert.ok(job.indexOf('nextPressedJob(now)') > 0 && job.indexOf('nextPressedJob(now)') < job.indexOf('const wantOpen = openOrder('), 'the pressed trader is read before every other read');
+    has('pressed: pressedTraderId(now)', 'their page is first in the open-check order');
+    has('...(sell.pressItems ? sell.pressItems.all : []), ...pinned, ...sell.ownerIds]);', 'their items\' bazaars are kept');
+    // The Item Market: read from the redraw, merged into the sellers, linked in the plan.
+    has('    stepOwnConfirm(now);\n    stepItemMarket(now);', 'the Item Market is read from the redraw');
+    has('withItemMarket(b && b.at ? withoutGone(ownRowsNow(b, key), key, gone) : [], market)', 'its listings are sellers of the item');
+    has('const im = sell.itemMarket.get(String(itemId));', 'a step bought there is checked against the read');
+    const ui = read('src/ui/selling-page.js');
+    assert.ok(ui.includes('buyLink(sellerId, itemId, price, itemName, focus, who'), 'a step says where to buy');
+    assert.ok((ui.match(/this\.buyLink\(/g) || []).length >= 3, 'every plan line links the right page');
+});

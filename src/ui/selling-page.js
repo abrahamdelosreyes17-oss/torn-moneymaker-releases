@@ -1957,7 +1957,9 @@ export class SellingPage {
                             : spEl('span', { title: 'Over what ' + pay.name + ' pays', text: 'over' });
             const name = r.sellerName || 'Player ' + r.sellerId;
             body.appendChild(spEl('tr', { class: ok || !pay ? (r.stale ? 'dim' : '') : 'dim' }, [
-                spEl('td', {}, [this.link(name, bazaarUrl(r.sellerId, d.itemId, r.price), { cls: 'lk', title: 'Opens ' + name + '\'s bazaar at this item', focus: 'bazaar:' + r.sellerId, children: [spEl('b', { text: name })] })]),
+                spEl('td', {}, [String(r.sellerId) === OWNER_MARKET
+                    ? this.link(OWNER_MARKET_NAME, itemMarketUrl(d.itemId, d.name), { cls: 'lk', title: 'Opens the Item Market at this item', focus: 'bazaar:market', children: [spEl('b', { text: OWNER_MARKET_NAME })] })
+                    : this.link(name, bazaarUrl(r.sellerId, d.itemId, r.price), { cls: 'lk', title: 'Opens ' + name + '\'s bazaar at this item', focus: 'bazaar:' + r.sellerId, children: [spEl('b', { text: name })] })]),
                 spEl('td', { class: 'n' }, [this.bar(r.qty, most, ok ? '' : 'dimb'), count(r.qty)]),
                 spEl('td', { class: 'n' }, [spEl('b', { text: formatMoney(r.price) })]),
                 spEl('td', { class: 'n' }, [piece]),
@@ -2753,7 +2755,7 @@ export class SellingPage {
                     first && r.teOnly ? this.link('TE only', tePriceListUrl(b.teName || b.name), { cls: 'tag w te-pulse', title: b.name + '\'s price for ' + r.name + ' is only on TornExchange, which cannot say whether their list is open: press to look at their list before you trade', focus: 'trade:te-only:' + r.itemId }) : null,
                     // A space before it: "at $370" and "bazaar" never run together (engines plan 4c).
                     j > 0 && st.sellerId ? ' ' : null,
-                    j > 0 && st.sellerId ? this.link('bazaar', bazaarUrl(st.sellerId, r.itemId, st.price), { cls: 'quiet lk', title: 'Opens their bazaar at this item and the price', focus: 'trade:bazaar:' + r.itemId + ':' + st.sellerId }) : null,
+                    j > 0 && st.sellerId ? this.buyLink(st.sellerId, r.itemId, st.price, r.name, 'trade:bazaar:' + r.itemId + ':' + st.sellerId) : null,
                     first ? cutNote(r) : null,
                 ]),
                 spEl('span', { class: 'p' + (made < 0 ? ' badw' : '') }, [(r.estimated ? '≈ ' : '') + signed(made)]),
@@ -2771,7 +2773,7 @@ export class SellingPage {
                         this.playerName(name, stop.sellerId, 'trade:seller:' + stop.sellerId),
                         seen.length ? spEl('span', { class: 'seen', title: 'When TornW3B last saw these listings', text: 'seen ' + formatAge(now - Math.min(...seen)) }) : null,
                         spEl('span', { class: 'st' }),
-                        this.link('bazaar', bazaarUrl(stop.sellerId, l0.r.itemId, l0.st.price), { cls: 'quiet lk', title: 'Opens ' + name + '\'s bazaar at the item and the price', focus: 'trade:bazaar:' + l0.r.itemId + ':' + stop.sellerId }),
+                        this.buyLink(stop.sellerId, l0.r.itemId, l0.st.price, l0.r.name, 'trade:bazaar:' + l0.r.itemId + ':' + stop.sellerId, name + "'s"),
                     ] : [spEl('b', { text: 'Still being read' }), spEl('span', { class: 'seen', text: 'TornW3B\'s lowest price stands in until its bazaars are read' })]),
                     ...stop.lines.map(line),
                 ]),
@@ -3186,7 +3188,7 @@ export class SellingPage {
                         spEl('div', { class: 'rt-h' }, [
                             this.playerName(st.sellerName || 'Player ' + st.sellerId, st.sellerId, 'step-seller:' + st.sellerId),
                             spEl('span', { class: 'st' }),
-                            this.link('bazaar', bazaarUrl(st.sellerId, d.itemId, st.price), { cls: 'quiet lk', title: 'Opens their bazaar at this item and the price', focus: 'step-bazaar:' + st.sellerId }),
+                            this.buyLink(st.sellerId, d.itemId, st.price, d.name, 'step-bazaar:' + st.sellerId),
                         ]),
                         spEl('div', { class: 'pl noti' }, [this.pic('step:' + i, d.itemId), spEl('span', {}, [spEl('b', { text: d.name }), ' × ' + count(st.qty), spEl('small', { text: 'at ' + formatMoney(st.price) })]), spEl('span', { class: 'p', text: signed((b.price - st.price) * st.qty) })]),
                     ]),
@@ -4835,8 +4837,14 @@ export class SellingPage {
 
     /** A player's name, linking to their Torn profile when their id is known. */
     playerName(name, id, focus) {
-        if (!id) return spEl('b', { text: name });
+        if (!id || String(id) === OWNER_MARKET) return spEl('b', { text: String(id) === OWNER_MARKET ? OWNER_MARKET_NAME : name });
         return this.link(name, spProfileUrl(id), { cls: 'pname', title: 'Their profile on Torn', focus });
+    }
+
+    /** Where a step is bought (3.35.0): the seller's bazaar at the item, or the Item Market's page of the item. */
+    buyLink(sellerId, itemId, price, itemName, focus, who = 'their') {
+        if (String(sellerId) === OWNER_MARKET) return this.link('market', itemMarketUrl(itemId, itemName || ''), { cls: 'quiet lk', title: 'Opens the Item Market at this item', focus });
+        return this.link('bazaar', bazaarUrl(sellerId, itemId, price), { cls: 'quiet lk', title: 'Opens ' + who + ' bazaar at this item and the price', focus });
     }
 
     /** The focus key of what has the focus inside `box`, or null. */

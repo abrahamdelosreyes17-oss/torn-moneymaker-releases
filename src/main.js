@@ -71,6 +71,7 @@ import { fitLeftOut, planTrade, keepAfter } from './core/trade.js';
 import { holdTrade, holdKey, resolveEstimated, priceHeld, livePins, editHeld, keepHolds, keptHolds, HOLD_MS } from './core/held.js';
 import { priceChecked, applyListToItemBuyers, buyersEveryMs, FLIP_RECHECK_MS, checkedTable, checkedInTable, CHECKED_TABLE_WRITE_MS, bidSinceYes } from './core/checked.js';
 import { readWants, sweepOrder, applyWants, openOrder, deskPayers } from './core/schedule.js';
+import { itemMarketRows, withItemMarket, nextItemMarket, itemMarketRoom, ITEM_MARKET_LISTINGS } from './core/item-market.js';
 import { pressNew, pressLive, pressItems, nextPressRead, pressOpenWanted, pressWait, pressLogAdd } from './core/pressed.js';
 import { shownTraders, marketPrice } from './core/trader-prices.js';
 import { rowPass, filterRows } from './core/filters.js';
@@ -6918,6 +6919,10 @@ const sell = {
     ownerIds: [],
     ownerFirst: 0,
     ownerMarket: new Map(),
+    // 3.35.0 (core/item-market.js): the Item Market as a buy source - item id -> {at, triedAt, listings: [{price, qty}], loading, error}.
+    itemMarket: new Map(),
+    itemMarketSent: [],
+    itemMarketReads: 0,
     ownerMarketBusy: false,
     ownerMarketAt: 0,
     ownerHeld: undefined,
@@ -7611,7 +7616,10 @@ function ownerViewNow({ now, prefs, sellersOf, sellersBefore, nameOf, statuses }
 /** The Item Market listings of a piece as last read ([{price, qty}]), or null: not read yet. */
 function ownerMarketRows(itemId) {
     const m = sell.ownerMarket.get(String(itemId));
-    return m && m.at ? m.rows : null;
+    if (m && m.at) return m.rows;
+    // 3.35.0: a flip bought on the Item Market (core/item-market.js) is checked against the read that planned it.
+    const im = sell.itemMarket.get(String(itemId));
+    return im && im.at ? im.listings : null;
 }
 
 /** The next piece whose Item Market is read: the set in view first, the one read longest ago. Visible tab only. */
@@ -8140,6 +8148,40 @@ function stepOwnConfirm(now) {
             sell.ownBusy = false;
             renderSelling();
         });
+}
+
+/*
+ * 3.35.0 - the Item Market as a place to buy (core/item-market.js): one read a redraw at most, on Torn's key, counted in
+ * its budget - the pressed trader's items and the item in view first, the candidate flips' after, with what is spare.
+ */
+function stepItemMarket(now) {
+    if (!getSellKey() || sell.keyDead || document.visibilityState !== 'visible' || !bidsMayAsk(now)) return;
+    const pressed = pressLive(sell.pressed, now) && sell.pressItems ? sell.pressItems.wide : [];
+    const next = nextItemMarket({
+        pressed,
+        view: sell.selected,
+        candidates: sell.candidates.map((c) => c.itemId),
+        recOf: (id) => sell.itemMarket.get(String(id)) || null,
+        now,
+    });
+    if (!next || !itemMarketRoom(sell.itemMarketSent, { now, urgent: next.urgent })) return;
+    // Torn's key has its own window (client.stats): the background reads leave it alone when it is nearly used.
+    if (!next.urgent && sell.client.stats(now).remaining < 20) return;
+    const id = next.id;
+    const prev = sell.itemMarket.get(id) || null;
+    sell.itemMarketSent = [...sell.itemMarketSent.filter((t) => now - t < 60000), now];
+    sell.itemMarketReads += 1;
+    sell.itemMarket.set(id, { ...(prev || { at: 0, listings: [] }), loading: true, triedAt: now });
+    fetchItemMarket(sell.client, id, { limit: ITEM_MARKET_LISTINGS, tag: 't.market', priority: next.urgent ? 'normal' : 'low' })
+        .then((r) => {
+            const at = Date.now();
+            sell.itemMarket.set(id, { at, triedAt: at, listings: r.listings.map((l) => ({ price: l.price, qty: l.amount })), loading: false, error: null });
+        })
+        .catch((error) => {
+            if (isKeyDeadError(error)) markSellKeyDead(error);
+            sell.itemMarket.set(id, { ...(prev || { at: 0, listings: [] }), triedAt: Date.now(), loading: false, error: true });
+        })
+        .finally(() => renderSelling());
 }
 
 /** How fast items leave the bazaars: itemId -> {units, ms, at}, read once per page. */
@@ -10381,13 +10423,16 @@ function renderSellingWork(src = null, { press = null, typed = false } = {}) {
             if (sellersKept.has(key)) return sellersKept.get(key);
             const b = sell.bazaars.get(key);
             const ts = perfNow();
+            // 3.35.0 - and the Item Market's cheapest listings, as sellers of their own (core/item-market.js).
+            const im = sell.itemMarket.get(key);
+            const market = itemMarketRows(im, { now, freshMs: FLIP_FRESH_MS });
             const rows =
-                b && b.at
+                (b && b.at) || market.length
                     ? keepers.sellers.get(
                           key,
-                          [b.rows, b.at, sell.selfId, ownSigOf(key), sharedReads ? sharedReads.index : null, sharedReads && sharedReads.joined ? sharedReads.joined.get(key) : undefined, sellerRule.mostEnemies, sellerRule.perFriend, sell.ownReads.version || 0],
+                          [b ? b.rows : null, b ? b.at : 0, sell.selfId, ownSigOf(key), sharedReads ? sharedReads.index : null, sharedReads && sharedReads.joined ? sharedReads.joined.get(key) : undefined, sellerRule.mostEnemies, sellerRule.perFriend, sell.ownReads.version || 0, market.length ? im.at : 0],
                           // 3.33.0 - the seller rule, here once: flips, trades and the owner's tab all buy from these rows.
-                          () => sellerRowsKept(bazaarSellers(withOwnBuys(withoutGone(ownRowsNow(b, key), key, gone), key, { stock: ownStock, bought: ownBought.get(key) || null }), { selfId: sell.selfId, now }), sellerCountsOf, sellerRule).rows,
+                          () => sellerRowsKept(bazaarSellers(withOwnBuys(withItemMarket(b && b.at ? withoutGone(ownRowsNow(b, key), key, gone) : [], market), key, { stock: ownStock, bought: ownBought.get(key) || null }), { selfId: sell.selfId, now }), sellerCountsOf, sellerRule).rows,
                           { now, until: freshUntil },
                       )
                     : null;
@@ -11760,6 +11805,7 @@ function renderSellingWork(src = null, { press = null, typed = false } = {}) {
     if (ownerHere && !watch.ids.includes(String(ownerHere.id))) watch.ids = [String(ownerHere.id), ...watch.ids];
     updateSellPresence(watch, now);
     stepOwnConfirm(now);
+    stepItemMarket(now);
     // Networth: the buyers the flips sell to first, then the desk's top traders.
     const nwIds = [];
     for (const f of strip) if (f.buyer && f.buyer.id) nwIds.push(String(f.buyer.id));

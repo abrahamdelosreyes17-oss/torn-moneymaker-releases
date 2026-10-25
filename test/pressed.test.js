@@ -35,6 +35,10 @@ test('every item on their list that a bazaar can undercut is asked, the biggest 
     assert.equal(r.full.length, PRESS_FULL_MAX);
     assert.deepEqual(r.full.slice(0, 2), ['120', '119']);
     assert.equal(r.full.includes('501'), false);
+    // The Item Market may undercut what no bazaar does: it is asked for that item too, after the others.
+    assert.equal(r.wide.length, 122);
+    assert.equal(r.wide[120], '501');
+    assert.equal(r.wide[121], '500');
 });
 
 const world = (states) => ({ stateOf: (id) => states[id] || {}, fullOk: true, lightOk: true });
