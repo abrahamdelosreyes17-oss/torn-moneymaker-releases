@@ -8856,7 +8856,8 @@ function nextW3bJob(now, hidden = false) {
     // The trade on the desk comes before the possible flips only while you
     // work on it (core/desk.js): until then the flips are checked first.
     // 3.35.0 - the trader just pressed: their list, then the sellers of every item on it, before any other read.
-    if (!hidden) {
+    // (Every other turn only: the open rechecks of the trade on show and the trades going are not held back.)
+    if (!hidden && sell.w3bTurn === 1) {
         const pressedJob = nextPressedJob(now);
         if (pressedJob) return pressedJob;
     }
@@ -9049,7 +9050,9 @@ function pressedItemsNow(now) {
 function notePressWait(now) {
     const press = sell.pressed;
     if (!press || !press.traderId || press.firstAt) return;
-    const ms = pressWait(press, sell.openChecks.get(press.traderId) || null, OPEN_CHECK_MS);
+    const check = sell.openChecks.get(press.traderId) || null;
+    // A page read at or after the press that did not fail: a check seen before it is not "the first check".
+    const ms = check && check.at >= press.at && check.state !== 'failed' ? pressWait(press, check, OPEN_CHECK_MS) : null;
     if (ms === null) return;
     press.firstAt = now;
     sell.pressLog = pressLogAdd(sell.pressLog, { ms, why: press.why });
@@ -9071,7 +9074,7 @@ function nextPressedJob(now) {
     const next = nextPressRead(press, items, {
         stateOf: (id) => {
             const b = sell.bazaars.get(String(id));
-            return b ? { fullAt: b.fullAt || 0, lightAt: b.lightAt || 0, triedAt: b.triedAt || 0, loading: Boolean(b.loading), error: Boolean(b.error) } : {};
+            return b ? { fullAt: b.fullAt || 0, lightAt: b.lightAt || 0, triedAt: b.triedAt || 0, loading: Boolean(b.loading), error: Boolean(b.error || b.lightErrAt) } : {};
         },
         fullOk: w3bListingRoom(now).now,
         lightOk: lightOn && lightRoom(now).any,
@@ -12172,7 +12175,9 @@ async function loadSellInventory({ force = false } = {}) {
         // failed read already got - not the 25 categories from the first every time.
         const now0 = Date.now();
         const policy = inventoryPolicyClean(gmGet(STORE_INVENTORY_POLICY, null));
-        const plan = inventoryPlan(policy, now0);
+        // A buy or a finished trade can have filled a category that was empty: then none is skipped.
+        const plan = sell.inventoryDirty ? { ...inventoryPlan(policy, now0), skip: new Set() } : inventoryPlan(policy, now0);
+        sell.inventoryDirty = false;
         let learned = policy;
         const resume = inventoryResume(sell.invResume, now0);
         let raw;
@@ -12183,13 +12188,13 @@ async function loadSellInventory({ force = false } = {}) {
                 onLearn: (event) => { learned = inventoryLearn(learned, event, Date.now()); },
             });
         } catch (error) {
+            sell.inventoryDirty = true;
             if (error && error.partial) sell.invResume = { rows: error.partial.rows, done: error.partial.done, at: Date.now() };
             throw error;
         } finally {
             if (learned !== policy) gmSet(STORE_INVENTORY_POLICY, learned);
         }
         sell.invResume = null;
-        sell.inventoryDirty = false;
         sell.inventoryReads = (sell.inventoryReads || 0) + 1;
         const merged = mergeInventory(raw);
         gmSet(STORE_INVENTORY, makeInventoryCacheEntry(merged));
@@ -14062,6 +14067,8 @@ async function watchAcceptedBuys(now = Date.now()) {
         if (fresh.length) {
             sell.inventoryDirty = true;
             const open = Object.values(sellAccepted());
+            // Listings just bought on the Item Market are gone: read again before the next plan counts on them.
+            for (const b of fresh) if (String(b.sellerId) === OWNER_MARKET) sell.itemMarket.delete(String(b.itemId));
             for (const b of fresh.slice(-40)) {
                 const r = logBuyPlace(open, b, traderBidOf);
                 const what = '(item ' + b.itemId + '): ' + b.qty + ' at $' + Math.round(b.each);
