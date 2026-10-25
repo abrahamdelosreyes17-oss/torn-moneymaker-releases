@@ -294,3 +294,9 @@ test('3.35.0: a pressed trader is read first (core/pressed.js) and the Item Mark
     assert.ok(ui.includes('buyLink(sellerId, itemId, price, itemName, focus, who'), 'a step says where to buy');
     assert.ok((ui.match(/this\.buyLink\(/g) || []).length >= 3, 'every plan line links the right page');
 });
+
+test('3.35.0: an old list is read open, not left hidden (core/old-lists.js)', () => {
+    has('const scan = oldListScan(effective.keys(), {', 'the flips Fresh prices hides are looked for');
+    has("sell.openOld = prefs.freshOnly ? oldListsWanted(", 'only with Fresh prices on');
+    has('old: sell.openOld, pressed: pressedTraderId(now), scan: sell.scanTraders, max: OPEN_KEPT_MAX });', 'they are read after the pressed trader and the item in view');
+});

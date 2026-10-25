@@ -72,6 +72,7 @@ import { holdTrade, holdKey, resolveEstimated, priceHeld, livePins, editHeld, ke
 import { priceChecked, applyListToItemBuyers, buyersEveryMs, FLIP_RECHECK_MS, checkedTable, checkedInTable, CHECKED_TABLE_WRITE_MS, bidSinceYes } from './core/checked.js';
 import { readWants, sweepOrder, applyWants, openOrder, deskPayers } from './core/schedule.js';
 import { itemMarketRows, withItemMarket, nextItemMarket, itemMarketRoom, ITEM_MARKET_LISTINGS } from './core/item-market.js';
+import { oldListScan, oldListsWanted, OLD_SCAN_EVERY_MS } from './core/old-lists.js';
 import { pressNew, pressLive, pressItems, nextPressRead, pressOpenWanted, pressWait, pressLogAdd } from './core/pressed.js';
 import { shownTraders, marketPrice } from './core/trader-prices.js';
 import { rowPass, filterRows } from './core/filters.js';
@@ -7001,6 +7002,9 @@ const sell = {
     pressItemsKey: '',
     pressLog: [],
     openOld: [],
+    oldAll: [],
+    oldScanAt: 0,
+    hiddenCounts: { offline: 0, trust: 0, stale: 0 },
     /* The chosen trade's items, re-read like the item picked (every 2 min) while it is on the desk. */
     tradeLive: [],
     /* Items each trade has shown ('item|trader' -> Set): one that drops out stays listed, with why. */
@@ -10721,6 +10725,32 @@ function renderSellingWork(src = null, { press = null, typed = false } = {}) {
                 return { price: pick.price, maxUnits: pickMost, ...(made ? { score: made.profit } : {}) };
             }, { cash: prefs.cash, maxUnits: prefs.maxPerFlip, minPct: prefs.minProfitPct, limit: SELL_FLIP_CANDIDATES })
             : [];
+        // 3.35.0 (core/old-lists.js) - whose flips Fresh prices hides only for an old edit date: their list page is read
+        // (openOrder's `old`), and a list found open is current (freshAtOf). The same pass counts what each Show choice
+        // hides, for the zip. Worked out every OLD_SCAN_EVERY_MS: it walks every item's buyers.
+        if (sell.summary && !q && document.visibilityState === 'visible' && now - (sell.oldScanAt || 0) >= OLD_SCAN_EVERY_MS) {
+            sell.oldScanAt = now;
+            const lowestEff = (id) => (effective.get(String(id)) || {}).lowestPrice;
+            const scan = oldListScan(effective.keys(), {
+                lowestOf: lowestEff,
+                buyersOf: (id) => {
+                    const all = buyersAllowed(id);
+                    const low = lowestEff(id);
+                    if (!all.length || !(all[0].price > low)) return [];
+                    const item = itemOf(id);
+                    if (neverFlip.has(itemCategory(item))) return [];
+                    return flipBuyers(all, { avg: item ? Number(item.marketValue) || null : null, type: item ? item.type : null, subType: item ? item.subType : null, unitsOf });
+                },
+                hiddenBy: (b) => {
+                    const h = hiddenBuyers([b], { prefs, levelOf, votesMissing, listAtOf: freshAtOf, now })[0];
+                    return h ? h.hiddenBy : null;
+                },
+                enough: (each, price) => enoughProfit(each, price, 'TRADER', prefs.minProfitPct),
+            });
+            sell.oldAll = scan.old;
+            sell.hiddenCounts = scan.hidden;
+        }
+        sell.openOld = prefs.freshOnly ? oldListsWanted(sell.oldAll || [], (id) => sell.openChecks.get(String(id)) || null, { now }) : [];
         // Near-misses, then every other item someone buys, oldest read first (3.15).
         const candSet = new Set(sell.candidates.map((c) => c.itemId));
         const bestBidOf = (id) => {
