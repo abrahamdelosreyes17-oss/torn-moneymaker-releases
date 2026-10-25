@@ -99,7 +99,7 @@ test('wiring: the scan plans the top traders and ranks by basket; Today and By t
     assert.ok(page.includes('const best = traders[0] || null;'));
     assert.ok(page.includes('if (!traders.length && flips.length) {') && page.includes('for (const f of flips.slice(0, 7)) {'));
     // Their lists are kept checked open; their own word counts as open.
-    assert.ok(main.includes('...(sell.deskTraders || []), ...(sell.scanTraders || [])'));
+    assert.ok(main.includes('desk: sell.deskTraders, flips: sell.openWant, scan: sell.scanTraders'));
     assert.ok(main.includes("!((said.get(String(w.id)) || {}).at > 0)"));
     // The top traders are found when the scan is worked out again, not in its signature.
     assert.ok(main.indexOf('const sums = new Map();') > main.indexOf('sell.scanSig = scanSig;'));
