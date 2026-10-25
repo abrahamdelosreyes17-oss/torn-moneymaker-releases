@@ -24,8 +24,7 @@ import {
 import { SHARED_OWN_KEY } from './feed/shared-link.js';
 import { OWNER_SETS, OWNER_PIECES, OWNER_MARKET, ownerSet, ownerList, ownerLots, ownerSetsPlan, ownerPiecesPlan, ownerChosen, ownerOf, marketStep, marketItems, marketBuyRows, ownerCapped, ownerRun, ownerShort, ownerAddSteps, ownerDropStep, marketRows, marketPageItem, marketNext } from './core/owner-tab.js';
 import { BD_FLIPS_OWNER } from './ui/bids-shell.js';
-import { SharedLink, SHARED_CONFIG_KEY, SHARED_STATE_KEY, SHARED_GRANT_KEY, SHARED_TICK_MS, SHARED_UNKNOWN_MS, SHARED_W3B_ASK_KEY, SHARED_LISTS_OUT_KEY, SHARED_LISTS_IN_KEY, SHARED_OPENS_OUT_KEY, SHARED_OPENS_IN_KEY, SHARED_CALLS_KEY, SHARED_MOVES_KEY, SHARED_DROPS_KEY } from './feed/shared-link.js';
-import { droppingNow, notePrices, cutsOf, cutsKept } from './core/dropping.js';
+import { SharedLink, SHARED_CONFIG_KEY, SHARED_STATE_KEY, SHARED_GRANT_KEY, SHARED_TICK_MS, SHARED_UNKNOWN_MS, SHARED_W3B_ASK_KEY, SHARED_LISTS_OUT_KEY, SHARED_LISTS_IN_KEY, SHARED_OPENS_OUT_KEY, SHARED_OPENS_IN_KEY, SHARED_CALLS_KEY, SHARED_MOVES_KEY } from './feed/shared-link.js';
 import { sharedMayCall, withShared, sharedHome, sharedWord, sharedSaid, sharedSaidLine, sharedGoingOwn, sharedGoingByItem, sharedOnThis, sharedGoingFor, sharedBoughtLine, sharedPanelLine, sharedDirDue, sharedDealRows, sharedKnowsLowest, sharedMayRead, sharedAskLeft, sharedList, sharedItemsSeen, SHARED_DEAL_MAX_AGE_MS, SHARED_MAX_WANT, SHARED_MAX_LISTS, SHARED_MAX_LIST_ITEMS, SHARED_MAX_OPENS } from './core/shared.js';
 import { perfStart, perfNow, perfDone, perfTimed, perfForeign, perfStartup, perfRecord, perfMachine, perfAdd, perfGauge, perfYardstick, perfHeapMb, SPEED_STORE_KEY } from './platform/perf.js';
 import { speedFiles, SPEED_BIDS } from './core/speed.js';
@@ -71,14 +70,14 @@ import { openBuyForms, buyFormBought } from './sources/dom/buy-form.js';
 import { fitLeftOut, planTrade, keepAfter } from './core/trade.js';
 import { holdTrade, holdKey, resolveEstimated, priceHeld, livePins, editHeld, keepHolds, keptHolds, HOLD_MS } from './core/held.js';
 import { priceChecked, applyListToItemBuyers, buyersEveryMs, FLIP_RECHECK_MS, checkedTable, checkedInTable, CHECKED_TABLE_WRITE_MS, bidSinceYes } from './core/checked.js';
-import { readWants, sweepOrder, applyWants } from './core/schedule.js';
+import { readWants, sweepOrder, applyWants, openOrder, deskPayers } from './core/schedule.js';
 import { shownTraders, marketPrice } from './core/trader-prices.js';
 import { rowPass, filterRows } from './core/filters.js';
-import { listOrder, byColumn, planCells, droppingView } from './core/view-model.js';
+import { listOrder, byColumn, planCells } from './core/view-model.js';
 import { VersionedMap, versionsSig, touch } from './core/versions.js';
 import { pressReuse, idsMoved, rowsAgain, rowsOfEntries } from './core/press-redraw.js';
 import { noteAgreement, serverLeads, agreementKept, sourceSplit, withOwnReads, confirmedRows, confirmWants, parseOwnBazaar, OWN_CONFIRM_MS, OWN_CONFIRM_PER_MIN, SERVER_LEAD_SLOWER } from './core/server-first.js';
-import { nextOpenCheck, pressReady, sharedListMark, OPEN_CHECK_MS, OPEN_WANT, OPEN_KEPT_MAX } from './core/open-check.js';
+import { nextOpenCheck, pressReady, sharedListMark, openNow, OPEN_CHECK_MS, OPEN_WANT, OPEN_KEPT_MAX } from './core/open-check.js';
 import { deskItem, steadyTrader, nextW3bRead, backgroundSlot, backgroundListSlot, flipsStale, W3B_HIDDEN_PER_MIN, HIDDEN_RENDER_MS, declineKey, declinedOn, freshnessMs, FRESH_TOP, dayPaceRoom } from './core/desk.js';
 import { liquidityKind, unitsMoved, addMovement, stopsMinutes, measuredRate, amountCap, AMOUNT_HOURS } from './core/liquidity.js';
 import { usageAdd, usageMerge, usageSeries, usageCallsAdd, USAGE_SERVICES, USAGE_RANGES, USAGE_LABELS } from './core/usage.js';
@@ -396,8 +395,6 @@ const PROFILE_FIRST_MS = 300;
 const PROFILE_FIRST_TRIES = 34;
 /* How fast each item leaves the bazaars (core/liquidity.js): itemId -> {units, ms, at}. */
 const STORE_SELL_MOVES = 'sellMoves';
-/* 3.33.0 - each trader's price for an item and the one before it (core/dropping.js): "item|trader" -> [price, was, at]. */
-const STORE_SELL_PRICE_CUTS = 'sellPriceCuts';
 /* 3.33.0 (engines plan Stage 6): which items the server's copy leads, learned from this PC's TornW3B reads. */
 const STORE_SERVER_LEAD = 'serverLead';
 const SELL_MOVES_MAX = 1500;
@@ -453,7 +450,7 @@ const SELL_LEFTOVERS_KEEP_MS = 7 * 24 * 60 * 60 * 1000;
  * (`tidyAt`). {v, tidyAt}
  */
 const STORE_CLEANED = 'cleaned';
-const CLEAN_MARK = 1;
+const CLEAN_MARK = 2;
 /* The tidy-up runs about once an hour, in whichever tab finds the hour up; each tab looks every ten minutes. */
 const TIDY_EVERY_MS = 60 * 60 * 1000;
 const TIDY_STEP_MS = 10 * 60 * 1000;
@@ -6309,11 +6306,6 @@ function startShared(world, getWant, onReads) {
             speedsReadAt = 0;
             renderSelling();
         });
-        // New price samples (3.33.0): what is dropping is judged again.
-        gmOnChange(SHARED_DROPS_KEY, () => {
-            dropsReadAt = 0;
-            renderSelling();
-        });
     }
     gmOnChange(STORE_KEY, () => sharedSetUp());
     // The Public key's box in Torn Bids' Settings shows what the panel on Torn's pages saved or forgot.
@@ -6677,14 +6669,15 @@ const SCRIPT_START_MS = typeof performance !== 'undefined' ? Math.round(performa
  *   npcManual   read on every page and never written by any version (always empty);
  *   tradersPage left by 3.7.0's traders page (3.8.0 moved it);
  *   apiWindow / w3bWindow as single arrays (before 3.12.5: one per tab since) -
- *               until now looked for on every page load.
+ *               until now looked for on every page load;
+ *   sharedDrops / sellPriceCuts  the 3.33.x "Dropping fast" samples and price-cut notebook (taken out in 3.34.0).
  * The Ledger's old copy needs nothing here: loading the Ledger moves it and
  * deletes it (loadLedgerStore).
  */
 function cleanStoredOnce() {
     const c = gmGet(STORE_CLEANED, null) || {};
     if (c.v === CLEAN_MARK) return;
-    for (const k of [STORE_MANUAL_NPC, 'tradersPage', STORE_API_WINDOW, STORE_W3B_WINDOW]) if (gmSize(k)) gmDel(k);
+    for (const k of [STORE_MANUAL_NPC, 'tradersPage', STORE_API_WINDOW, STORE_W3B_WINDOW, 'sharedDrops', 'sellPriceCuts']) if (gmSize(k)) gmDel(k);
     gmSet(STORE_CLEANED, { ...c, v: CLEAN_MARK });
 }
 
@@ -6732,7 +6725,7 @@ function storageSizes() {
     // The values the first list missed (3.17.0: the speed log's "everything stored"), and this tab's own request windows.
     keys.push(
         STORE_W3B_COOLDOWN, STORE_W3B_PACE, STORE_IM_WATCH, STORE_BIDS_SEEN, STORE_LIST_AT, STORE_SELL_DECLINED, STORE_SELL_ASKED, STORE_SELL_ENDED, STORE_SELL_ENDED_FULL, STORE_SELL_PAST, STORE_SELL_CANCELLED, STORE_BOUGHT_WINDOW, STORE_SELL_PRICE_RECORDS, STORE_SELL_BLACKLIST,
-        STORE_SELL_FAVOURITES, STORE_SELL_FAV_NOW, STORE_SELL_TE_OWN, STORE_CHAT_WANTED, STORE_SELL_MOVES, STORE_LEDGER_REV, STORE_SELL_PRESENCE, STORE_SELL_HELD, STORE_SELL_WAS, STORE_SELL_PRICE_CUTS, STORE_SERVER_LEAD,
+        STORE_SELL_FAVOURITES, STORE_SELL_FAV_NOW, STORE_SELL_TE_OWN, STORE_CHAT_WANTED, STORE_SELL_MOVES, STORE_LEDGER_REV, STORE_SELL_PRESENCE, STORE_SELL_HELD, STORE_SELL_WAS, STORE_SERVER_LEAD,
         FEED_LEADER_KEY, FEED_RECHECK_KEY, FEED_REFRESH_KEY, SPEED_STORE_KEY, STORE_CLEANED, STORE_SELL_CHECKED,
         STORE_API_WINDOW + '.' + app.tabId, STORE_W3B_WINDOW + '.' + app.tabId,
     );
@@ -8068,44 +8061,6 @@ function sharedSpeeds(now = Date.now()) {
 }
 
 /*
- * 3.33.0 - prices falling (core/dropping.js): the server's samples of each watched item's lowest bazaar price, as
- * the exchanging tab stored them; read again at most every half minute, not used once hours old.
- */
-let dropsKept = null;
-let dropsReadAt = 0;
-function sharedDrops(now = Date.now()) {
-    if (!sharedLink || !sharedLink.config()) return null;
-    if (now - dropsReadAt >= SPEEDS_REREAD_MS || now < dropsReadAt) {
-        dropsReadAt = now;
-        const box = gmGet(SHARED_DROPS_KEY, null);
-        const ok = box && Number.isInteger(box.at) && Number.isFinite(box.got) && box.rows && typeof box.rows === 'object';
-        dropsKept = ok ? box : null;
-    }
-    return dropsKept && now - dropsKept.got < SPEEDS_KEEP_MS ? dropsKept : null;
-}
-
-/** Each trader's price for an item and the one before (core/dropping.js notePrices), read once per page, saved every 30 s. */
-function sellPriceCuts() {
-    if (!sell.priceCuts) {
-        const stored = gmGet(STORE_SELL_PRICE_CUTS, {});
-        sell.priceCuts = stored && typeof stored === 'object' && !Array.isArray(stored) ? stored : {};
-    }
-    return sell.priceCuts;
-}
-function notePriceCuts(itemId, buyers, now) {
-    if (!notePrices(sellPriceCuts(), String(itemId), buyers, now) || sell.priceCutsTimer) return;
-    sell.priceCutsTimer = setTimeout(() => {
-        sell.priceCutsTimer = null;
-        // Merged with what other tabs saved: per key, the newer change.
-        const stored = gmGet(STORE_SELL_PRICE_CUTS, {}) || {};
-        const merged = { ...(typeof stored === 'object' && !Array.isArray(stored) ? stored : {}) };
-        for (const [k, e] of Object.entries(sellPriceCuts())) if (!merged[k] || !(merged[k][2] >= e[2])) merged[k] = e;
-        sell.priceCuts = cutsKept(merged, Date.now());
-        gmSet(STORE_SELL_PRICE_CUTS, sell.priceCuts);
-    }, 30000);
-}
-
-/*
  * The server's copy first (3.33.0, engines plan Stage 6, core/server-first.js): which items it leads - learned by
  * comparing it with this PC's TornW3B reads of the same item - read once per page, saved every 30 s.
  */
@@ -8856,7 +8811,9 @@ function nextW3bJob(now, hidden = false) {
         // the flips' traders, the biggest first. The page carries their list too: it is the list read.
         // The trade on show and your pinned trades first, then the flips, then the desk's other traders - no more than
         // the minute's page reads keep inside OPEN_RECHECK_MS (else the last ones lapse and their flips flicker).
-        const wantOpen = [...new Set([sell.deskShownTrader, ...(sell.pinTraders || []), ...(sell.openWant || []), ...(sell.deskTraders || []), ...(sell.scanTraders || [])].filter(Boolean).map(String))].slice(0, OPEN_KEPT_MAX);
+        // 3.34.0 - and the top payers of the item in view right after those (core/schedule.js openOrder): the flips'
+        // traders come due every 150 s and used the whole budget, so the item in view stayed "Checking their list is open…".
+        const wantOpen = openOrder({ shown: sell.deskShownTrader, pinned: sell.pinTraders, desk: sell.deskTraders, flips: sell.openWant, scan: sell.scanTraders, max: OPEN_KEPT_MAX });
         const nextOpen = nextOpenCheck(wantOpen, sell.openChecks, { now, reading: new Set(sell.listReading ? sell.listReading.keys() : []), sent: sell.openSent });
         if (nextOpen) return Object.assign(() => loadW3bOpen(nextOpen), { list: true });
     }
@@ -10114,6 +10071,9 @@ function renderSellingWork(src = null, { press = null, typed = false } = {}) {
         // 3.31.0: a trader's own word is as old as when the server last heard it - that is their list's date.
         const saidOf = saidNow(now);
         const listAtOf = (id) => { const s = saidOf.get(String(id)); return (s && s.at) || sell.listAt.get(String(id)) || 0; };
+        // 3.34.0 - a list read OPEN minutes ago is current, however long since its trader last edited it: Fresh prices
+        // does not hide it (as core/checked.js lets its price flip).
+        const freshAtOf = (id) => (openNow(sell.openChecks.get(String(id)), { now }).ok ? 0 : listAtOf(id));
         // Every buyer lookup that is not the shown list (a pinned or picked trade, its bids) skips them too.
         const buyersAllowed = (id) => withoutBlacklisted(buyersAll(id), blacklist);
         // Every trader with a Trusted badge seen on any item (Your traders scans them).
@@ -10126,7 +10086,7 @@ function renderSellingWork(src = null, { press = null, typed = false } = {}) {
         keepers.possible.begin(now);
         // One number for "your blacklist and your favourites are what they were": a kept list holds while it stands.
         const shownVer = keepers.shownVer(favNow.word, blacklist);
-        const shownOpts = { prefs, levelOf, votesMissing, listAtOf, now, trustById: sell.trustById, trustedSeen };
+        const shownOpts = { prefs, levelOf, votesMissing, listAtOf: freshAtOf, now, trustById: sell.trustById, trustedSeen };
         const buyersOf = (id) => {
             const key = String(id);
             let b = shownCache.get(key);
@@ -10402,25 +10362,11 @@ function renderSellingWork(src = null, { press = null, typed = false } = {}) {
         const flipBuyersCache = new Map();
         // Settings › Flips › Never flip (Clothing by default: the friend's "don't include clothes").
         const neverFlip = new Set(prefs.neverFlip || []);
-        // 3.33.0 - prices falling (core/dropping.js): an item dropping fast is no flip; why is kept for its tab.
-        const dropsNow = sharedDrops(now);
-        // The table's "minutes ago" were counted when it arrived.
-        const dropRule = { pct: prefs.dropPct, hours: prefs.dropHours, late: dropsNow ? Math.max(0, (now - dropsNow.got) / 60000) : 0 };
-        sell.dropping = new Map();
-        const droppingOf = (key) => {
-            // One source, TornW3B, dated by when the trader's list changed: the shown price blends TornExchange in (it
-            // moves when one source ages out), and a change made while this PC was off is no cut now.
-            const buyers = buyersOf(key).filter((b) => b && b.w3b > 0).map((b) => ({ id: b.id, name: b.name, price: b.w3b, at: b.id ? listAtOf(b.id) : 0 }));
-            notePriceCuts(key, buyers, now);
-            const d = droppingNow({ flat: dropsNow ? dropsNow.rows[key] : null, cuts: cutsOf(sellPriceCuts(), key, buyers), nowMs: now }, dropRule);
-            if (d) sell.dropping.set(key, d);
-            return d;
-        };
         const flipBuyersOf = (id) => {
             const key = String(id);
             if (!flipBuyersCache.has(key)) {
                 const item = itemOf(id);
-                if (neverFlip.has(itemCategory(item)) || droppingOf(key)) {
+                if (neverFlip.has(itemCategory(item))) {
                     flipBuyersCache.set(key, []);
                     return [];
                 }
@@ -10525,7 +10471,7 @@ function renderSellingWork(src = null, { press = null, typed = false } = {}) {
             return best;
         };
         // A possible flip: what the item would make with its highest buyer not checked yet, when a check can
-        // still make it one (never a price only on TornExchange, never a list a day old). One plan an item, at most.
+        // still make it one (never a price only on TornExchange). One plan an item, at most.
         // 3.29.0 - what it would make is kept between redraws, like the plan: while the item's bazaars are the very
         // rows they were and that buyer bids and can take what they did. (Which buyer it is - the first whose check
         // can still come - is looked at every redraw: a check lapses by the clock alone.)
@@ -10535,8 +10481,8 @@ function renderSellingWork(src = null, { press = null, typed = false } = {}) {
             for (const b of all) {
                 const c = checkOf(id, b);
                 if (c.ok) return null;
-                // 3.33.0: one an open check can still make a flip - not read open yet, or its list's date not known yet.
-                if ((c.why !== 'not-open' && c.why !== 'no-date') || declinedBy(id, b)) continue;
+                // 3.33.0: one an open check can still make a flip - not read open yet (3.34.0: a list's edit date no longer matters).
+                if (c.why !== 'not-open' || declinedBy(id, b)) continue;
                 const most = Math.min(amountOf(id, buyerKeyOf(b), false), b.maxUnits ? b.maxUnits : Infinity);
                 const made = keepers.possible.get(String(id), [rows, b.price, most, prefs.cash, prefs.minProfitPct], () => {
                     const plan = flipPlan(rows, b.price, { cash: prefs.cash, maxUnits: most, minPct: prefs.minProfitPct });
@@ -10745,11 +10691,11 @@ function renderSellingWork(src = null, { press = null, typed = false } = {}) {
         }
         return {
             teMap, favsNow, ownLists, ownByItem, buyersAll, levelOf, votesMissing, favEdits,
-            statOf, favOf, blacklist, listAtOf, buyersAllowed, trustedSeen, buyersOf, heldQty,
+            statOf, favOf, blacklist, listAtOf, freshAtOf, buyersAllowed, trustedSeen, buyersOf, heldQty,
             leftovers, lastChecked, checkOf, toSell, toSellLines, toSellIds, summary, itemOf,
             nameOf, stats, teKey, teUnusable, w3bPending, pendingFor, friendGoing, ownGoing,
             sharedReads, sellersOf, sellersBefore, bazaarDepthOf, lowestOf, flipBuyerOf, speeds, kindOf,
-            tookBefore, amountOf, neverFlip, dropsNow, flipCheckedOf, heldBid, heldPriced, declinedAll,
+            tookBefore, amountOf, neverFlip, flipCheckedOf, heldBid, heldPriced, declinedAll,
             planOf, friendOf, withBid, readAt, sweepChecked, flipsChecked, flipsPriced, flipsToRead,
             oneIds, allIds, q, entries, rowFor, tradeIdsNow,
         };
@@ -10789,11 +10735,11 @@ function renderSellingWork(src = null, { press = null, typed = false } = {}) {
     }
     const {
         teMap, favsNow, ownLists, ownByItem, buyersAll, levelOf, votesMissing, favEdits,
-        statOf, favOf, blacklist, listAtOf, buyersAllowed, trustedSeen, buyersOf, heldQty,
+        statOf, favOf, blacklist, listAtOf, freshAtOf, buyersAllowed, trustedSeen, buyersOf, heldQty,
         leftovers, lastChecked, checkOf, toSell, toSellLines, toSellIds, summary, itemOf,
         nameOf, stats, teKey, teUnusable, w3bPending, pendingFor, friendGoing, ownGoing,
         sharedReads, sellersOf, sellersBefore, bazaarDepthOf, lowestOf, flipBuyerOf, speeds, kindOf,
-        tookBefore, amountOf, neverFlip, dropsNow, flipCheckedOf, heldBid, heldPriced, declinedAll,
+        tookBefore, amountOf, neverFlip, flipCheckedOf, heldBid, heldPriced, declinedAll,
         planOf, friendOf, withBid, readAt, sweepChecked, flipsChecked, flipsPriced, flipsToRead,
         oneIds, allIds, q,
     } = data;
@@ -11084,7 +11030,6 @@ function renderSellingWork(src = null, { press = null, typed = false } = {}) {
         const item = itemOf(id);
         if (isStatItem(item)) return 'type';
         if (neverFlip.has(itemCategory(item))) return 'never';
-        if (sell.dropping && sell.dropping.has(String(id))) return 'dropping';
         if (!fresh || !(fresh.price < bid)) return 'none';
         if (!enoughProfit(bid - fresh.price, fresh.price, 'TRADER', prefs.minProfitPct)) return 'profit';
         return 'cash';
@@ -11095,13 +11040,10 @@ function renderSellingWork(src = null, { press = null, typed = false } = {}) {
      * trader you picked or pinned is used even when a Show toggle hides them
      * (a pin must come back as it was pinned).
      */
-    const deskTraderIds = new Set();
     const chooseTrade = (pickId, buyers, keptKey = null) => {
         const declined = declinedOn(declinedAll, pickId);
         const plans = new Map();
         for (const b of buyers.slice(0, TRADE_TRADERS_MAX)) plans.set(traderKey(b), tradeWith(b, pickId));
-        // The traders of the item on the desk: their lists are read again every few minutes (nextW3bJob).
-        if (String(pickId) === String(sell.selected)) for (const b of buyers.slice(0, TRADE_TRADERS_MAX)) if (b.id && b.w3b > 0) deskTraderIds.add(String(b.id));
         // A pinned trade on this item comes back with its trader (after a reload too).
         const pinFor = Object.values(sellPinned(now)).find((t) => t.itemId === String(pickId) && !declined.has(t.key) && !blacklist.has(t.key));
         const pickedKey = sell.tradePick.get(String(pickId)) || (pinFor ? pinFor.key : null);
@@ -11381,7 +11323,7 @@ function renderSellingWork(src = null, { press = null, typed = false } = {}) {
                 unitsCapped: Boolean(chosen.unitsCapped),
                 gone: gone.map((id) => ({ itemId: id, name: nameOf(id) })),
                 // Planned with a trader who makes no flip on this item: say why.
-                itemNote: hasItem(chosen) ? null : { bid: chosen.buyer.price, cheapest: fresh ? fresh.price : null, why: noFlipWhy(pickId, chosen.buyer.price, fresh), drop: sell.dropping.get(String(pickId)) || null },
+                itemNote: hasItem(chosen) ? null : { bid: chosen.buyer.price, cheapest: fresh ? fresh.price : null, why: noFlipWhy(pickId, chosen.buyer.price, fresh) },
                 every,
                 hold: null,
             },
@@ -11459,7 +11401,7 @@ function renderSellingWork(src = null, { press = null, typed = false } = {}) {
         // Buyers online only (3.20.5): a status read since is a reason too - a trader found
         // offline kept "Trade +$X" here until the next working-out.
         const whoStatus = prefs.onlineOnly ? [...who.keys()].map((id) => levelOf(id) + (holdFlips && unreadStatus(id) ? '?' : '')) : null;
-        const scanSig = JSON.stringify([prefs.cash, prefs.maxPerFlip, prefs.extraItems, prefs.minProfitPct, prefs.networthPct, prefs.onlineOnly, prefs.trustedOnly, prefs.freshOnly, prefs.sellerMostEnemies, prefs.sellerEnemiesPerFriend, prefs.dropPct, prefs.dropHours, dropsNow ? dropsNow.at : 0, favEdits, [...blacklist], [...who.keys()], sell.summaryAt, whoStatus, [...sell.tradeEvery], speeds ? speeds.at : 0, tookBefore.size]);
+        const scanSig = JSON.stringify([prefs.cash, prefs.maxPerFlip, prefs.extraItems, prefs.minProfitPct, prefs.networthPct, prefs.onlineOnly, prefs.trustedOnly, prefs.freshOnly, prefs.sellerMostEnemies, prefs.sellerEnemiesPerFriend, favEdits, [...blacklist], [...who.keys()], sell.summaryAt, whoStatus, [...sell.tradeEvery], speeds ? speeds.at : 0, tookBefore.size]);
         const fresh = sell.scanSig === scanSig && now - (sell.scanAt || 0) < SCAN_EVERY_MS;
         if (!scan.open) sell.scanWatch = [];
         if (scan.open && fresh) scan.list = sell.scanList || [];
@@ -11578,7 +11520,7 @@ function renderSellingWork(src = null, { press = null, typed = false } = {}) {
         const whereWho = (x) => (x ? { name: x.name, id: x.id || null, price: x.price, te: x.te || 0, w3b: x.w3b || 0, teName: x.teName || null, tradeKey: x.tradeKey, why: x.check.ok ? null : x.check.why, at: x.check.at || 0 } : null);
         // Traders Online only / Trusted only leave out here: counted and named, never just gone.
         const shownKeys = new Set([...buyers, ...lossBuyers].map((x) => x.tradeKey));
-        const hidden = hiddenBuyers(withoutBlacklisted(buyersAll(pick), blacklist).filter((x) => !shownKeys.has(traderKey(x))), { prefs, levelOf, votesMissing, listAtOf, now })
+        const hidden = hiddenBuyers(withoutBlacklisted(buyersAll(pick), blacklist).filter((x) => !shownKeys.has(traderKey(x))), { prefs, levelOf, votesMissing, listAtOf: freshAtOf, now })
             .map((x) => ({ ...x, tradeKey: traderKey(x), traded: tradedLine(statOf(x), now), favourite: favOf(x) }));
         const b = sell.bazaars.get(pick);
         const held = heldQty.get(pick) || 0;
@@ -11632,7 +11574,10 @@ function renderSellingWork(src = null, { press = null, typed = false } = {}) {
                 if (bulk) r.bulk = bulk;
             }
         }
-        sell.deskTraders = deskTraderIds;
+        // The traders of the item on the desk: their lists are read again every few minutes (nextW3bJob). 3.34.0 - and
+        // the ones Fresh prices hides only for an old edit date (above the price you paid): a read that finds their
+        // list open shows them again (freshAtOf), even when they are the item's only payers.
+        sell.deskTraders = deskPayers(buyers.slice(0, TRADE_TRADERS_MAX), hidden.filter((x) => x.hiddenBy === 'stale' && !(paid && !(x.price > paid))), TRADE_TRADERS_MAX);
         sell.deskShownTrader = shownT && shownT.buyer && shownT.buyer.id ? String(shownT.buyer.id) : null;
         // Flips > By trader: everything the trader of the trade on show buys, beside the cheapest bazaar.
         const shownTrade = desk.trade && (desk.trade.chosen || desk.trade.accepted);
@@ -11788,8 +11733,6 @@ function renderSellingWork(src = null, { press = null, typed = false } = {}) {
         // The Trades tab: its rows by stage, and its board (beside the list until a trade is opened).
         trades: { ...tradesView, open: sell.filter === 'trades' && sell.boardOpen },
         past,
-        // Flips › Dropping (3.33.0): the items a trader buys that are no flip now, their price falling.
-        dropping: droppingView(sell.dropping, nameOf),
         ledger: ledgerView(),
         hold,
         scan,

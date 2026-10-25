@@ -15,8 +15,10 @@
  * The rule here (3.33.0): a buyer makes a flip only when
  *   - their TornW3B list PAGE, read within OPEN_CHECK_MS (3 minutes), says the list is open and pays this
  *     price (core/open-check.js) - a read of the item's buyers or of their list cannot see a closed list;
- *   - and their list was last changed within PRICES_STALE_MS (a day).
- *   - Or the price is only on TornExchange: a flip, always marked amber (look at their list yourself).
+ *   - 3.34.0: that read is the whole check. The date the list was last EDITED is not a gate (a trader who does not
+ *     edit daily still pays what the open page says, read minutes ago) - it is only shown and used to rank reads.
+ *   - Or the price is only on TornExchange: a flip, always marked amber (look at their list yourself); there the
+ *     edit date is the only sign, so a list TornExchange says was changed over a day ago makes no flip.
  *   - Or it is the owner's own word (his Torn Archive, through the server): counts also while closed.
  * Everything else is a possible flip: it waits, and its check goes first.
  *
@@ -44,15 +46,16 @@ export const OTHER_RECHECK_MS = 10 * 60 * 1000;
  * @param {{at: number, state: string, prices: object|null, updatedAt: number}|null} o.open - the last page read of their
  *   TornW3B list (3.33.0, core/open-check.js), or null. Since 3.33.0 a read of the item's buyers or of their list
  *   (`item`, `list`, kept in the call for the callers) checks nothing: neither can see a closed list.
- * @param {number} o.listAt - when they last changed their list (ms), 0: not known; the page's own date goes first
- * @param {number} [o.teListAt] - when TornExchange says they last changed their list there (0: not known)
+ * @param {number} o.listAt - when they last changed their list (ms), 0: not known. Since 3.34.0 no gate: kept in the call for the callers
+ * @param {number} [o.teListAt] - when TornExchange says they last changed their list there (0: not known); gates a TornExchange-only price
  * @param {{at: number, open: boolean, prices: object}|null} [o.said] - the trader's own word (3.31.0): what their Torn
  *   Archive told our server they pay, and when the server last heard it. A price that is this one is checked for as
  *   long as it was heard within `staleMs` - it needs no TornW3B read: TornW3B's copy is the older of the two.
- * @returns {{ok: boolean, why: 'checked'|'said'|'te-only'|'no-id'|'last-paid'|'no-price'|'closed'|'not-open'|'not-checked'|'old-list'|'no-date', at: number, closed?: boolean, open?: string, te?: boolean, warn?: 'te'}}
+ * @returns {{ok: boolean, why: 'checked'|'said'|'te-only'|'no-id'|'last-paid'|'no-price'|'closed'|'not-open'|'not-checked'|'old-list', at: number, closed?: boolean, open?: string, te?: boolean, warn?: 'te'}}
  *   at: when their list page last said open (0: never); for 'said', when the server last heard it.
  *   closed: their list is closed - for 'said', the price is what they would pay once they open (it counts: the owner's
  *   own list, so friends can buy for him while he sleeps); otherwise no flip.
+ *   'old-list': only a TornExchange-only price whose list was changed over `staleMs` ago (3.34.0).
  *   open: why not open - 'unread', 'stale', 'unclear', 'failed' (core/open-check.js openNow).
  *   warn 'te': a TornExchange-only price - shown, in amber: look at their list.
  */
@@ -78,14 +81,14 @@ export function priceChecked(b, { itemId, item = null, list = null, listAt = 0, 
      * 3.33.0 - and a TornW3B price only on a page read of their list that says it is OPEN, made within openMs, at
      * this price (core/open-check.js; the money loss of 2026-10-14: the list read returns every price while a list
      * is closed). Closed, not read, unclear or a failed read: no flip. The page carries the list itself, so the
-     * price is the one it gave and the list's date its own.
+     * price is the one it gave.
+     * 3.34.0 - and that is all: a list read open minutes ago at this price is current, whenever its trader last
+     * edited it (the owner: a Bottle of Beer at $825 that Coolz pays $943 for, online, died as "Over a day old").
+     * The old edit-date gate was a stand-in for "our copy is current"; this read checks that directly.
      */
     const o = openNow(open, { now, within: openMs });
     if (!o.ok) return { ok: false, why: o.why === 'closed' ? 'closed' : 'not-open', open: o.why, at: o.at, closed: o.why === 'closed' };
     if (!open.prices || Number(open.prices[String(itemId)]) !== b.w3b) return { ok: false, why: 'not-checked', at: o.at };
-    const changed = Number(open.updatedAt) || Number(listAt) || 0;
-    if (!(changed > 0)) return { ok: false, why: 'no-date', at: o.at };
-    if (now - changed > staleMs) return { ok: false, why: 'old-list', at: o.at };
     return { ok: true, why: 'checked', at: o.at };
 }
 

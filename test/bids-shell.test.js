@@ -42,10 +42,9 @@ test('the shell: every page a filter lands on is in the sidebar, with the tab it
     assert.equal(pages.size, BD_PAGES.filter((p) => p.id).length);
 });
 
-test('the shell: Flips > Dropping (3.33.0) follows All items, For <the server owner> comes last; neither asks for an item list', async () => {
-    const { BD_FLIPS_OWNER, BD_FLIPS_DROPPING } = await import('../src/ui/bids-shell.js');
-    assert.equal(BD_FLIPS_DROPPING, BD_FLIPS_ITEMS + 1);
-    assert.equal(BD_FLIPS_OWNER, BD_FLIPS_DROPPING + 1);
+test('the shell: Flips has three tabs, For <the server owner> comes after them and asks for no item list; a saved tab past the end falls back to Best flips (3.34.0: Dropping taken out)', async () => {
+    const { BD_FLIPS_OWNER } = await import('../src/ui/bids-shell.js');
+    assert.equal(BD_FLIPS_OWNER, BD_FLIPS_ITEMS + 1);
     assert.equal(bdFilterOf('flips', BD_FLIPS_OWNER), null);
-    assert.equal(bdFilterOf('flips', BD_FLIPS_DROPPING), null);
+    assert.deepEqual(BD_PAGES.find((p) => p.id === 'flips').tabs, ['Best flips', 'By trader', 'All items']);
 });

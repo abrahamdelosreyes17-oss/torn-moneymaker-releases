@@ -23,7 +23,7 @@ import {
     SHARED_SYNC_MS, SHARED_BUCKETS, sharedAddress, sharedPassOk, sharedBody, sharedOutgoingOk, sharedVersion, sharedTake, sharedPrune,
     sharedReadBucket, sharedIndex, sharedInterest, sharedPerson, sharedMarks, sharedMarksIn, sharedMarksNow,
     sharedDir, sharedDirIn,
-    sharedList, sharedListsIn, sharedOpensIn, sharedAskIn, sharedMovesIn, sharedDropsIn, sharedOwnIn, sharedOwnKeep,
+    sharedList, sharedListsIn, sharedOpensIn, sharedAskIn, sharedMovesIn, sharedOwnIn, sharedOwnKeep,
 } from '../core/shared.js';
 
 export const SHARED_CONFIG_KEY = 'sharedConfig';
@@ -48,8 +48,6 @@ export const SHARED_OWN_KEY = 'sharedOwn';
 const SHARED_LISTS_IN_KEEP = 20;
 /* 3.28.0 - how fast items leave the bazaars, as the server counted it: {at (the server's clock), got (this PC's), rows: {item: units an hour}}. */
 export const SHARED_MOVES_KEY = 'sharedMoves';
-/** 3.33.0 - each watched item's lowest bazaar price over the last day (prices falling). */
-export const SHARED_DROPS_KEY = 'sharedDrops';
 /* The other PCs' TornW3B reads and this PC's turn among them (core/shared.js, sharedDirIn). */
 export const SHARED_DIR_KEY = 'sharedDir';
 // 3.26.2 - this PC's request counts waiting to be sent, every tab's in one sum (core/usage.js usageCallsAdd).
@@ -347,15 +345,12 @@ export class SharedLink {
                 // The item speeds (3.28.0): asked for only while Torn Bids' page is open - it plans by them.
                 const movesHeld = takesLists && page === 0 ? this.d.load(SHARED_MOVES_KEY) : null;
                 const movesAt = takesLists && page === 0 ? (movesHeld && Number.isInteger(movesHeld.at) && movesHeld.at > 0 ? movesHeld.at : 0) : null;
-                // 3.33.0 - the price samples (prices falling), the same way.
-                const dropsHeld = takesLists && page === 0 ? this.d.load(SHARED_DROPS_KEY) : null;
-                const dropsAt = takesLists && page === 0 ? (dropsHeld && Number.isInteger(dropsHeld.at) && dropsHeld.at > 0 ? dropsHeld.at : 0) : null;
                 // Traders' own price lists (3.31.0): asked for with the lists, by the running number held.
                 const ownHeld = takesLists && page === 0 ? this.d.load(SHARED_OWN_KEY) : null;
                 const ownSince = takesLists && page === 0 ? (ownHeld && Number.isInteger(ownHeld.mark) && ownHeld.mark > 0 ? ownHeld.mark : 0) : null;
                 // 3.33.0 - this PC's open checks of the last three minutes, on the first page only.
                 const opensOut = takesLists && page === 0 ? this.d.load(SHARED_OPENS_OUT_KEY) || [] : null;
-                const body = sharedBody({ used: use.used, waiting: (Number(use.waiting) || 0) + others, wants: page === 0 ? wants : wants.map(({ want, w3b, ...w }) => w), since: seq, seen, sendWorth, now, ver, lists: listsOut, listsSince: takesLists && page === 0 ? listsAt : null, calls: callsOut, moves: movesAt, ownSince, opens: opensOut, drops: dropsAt });
+                const body = sharedBody({ used: use.used, waiting: (Number(use.waiting) || 0) + others, wants: page === 0 ? wants : wants.map(({ want, w3b, ...w }) => w), since: seq, seen, sendWorth, now, ver, lists: listsOut, listsSince: takesLists && page === 0 ? listsAt : null, calls: callsOut, moves: movesAt, ownSince, opens: opensOut });
                 if (!sharedOutgoingOk(body)) throw new Error('Not sent: the message was not in the agreed shape.');
 
                 const response = await this.d.post(`${cfg.address}/sync`, {
@@ -476,11 +471,6 @@ export class SharedLink {
                         state.moves = Object.keys(moved.rows).length;
                         movesChanged = true;
                     }
-                    const fell = dropsAt === null ? null : sharedDropsIn(answer);
-                    if (fell) {
-                        this.d.save(SHARED_DROPS_KEY, { at: fell.at, got, rows: fell.rows });
-                        movesChanged = true;
-                    }
                 }
                 if (Number.isInteger(answer.seq)) seq = answer.seq;
                 if (Number.isFinite(answer.now)) seen = answer.now;
@@ -545,7 +535,7 @@ export class SharedLink {
     /** The server's address or this PC's word changed, or there is none now: what was kept under the old one goes. */
     forget() {
         for (let i = 0; i < SHARED_BUCKETS; i += 1) this.d.del(SHARED_READS_PREFIX + i);
-        for (const key of [SHARED_STATE_KEY, SHARED_GRANT_KEY, SHARED_MARKS_KEY, SHARED_INTEREST_KEY, SHARED_ASK_KEY, SHARED_DIR_KEY, SHARED_W3B_ASK_KEY, SHARED_LISTS_OUT_KEY, SHARED_LISTS_IN_KEY, SHARED_CALLS_KEY, SHARED_MOVES_KEY, SHARED_DROPS_KEY]) this.d.del(key);
+        for (const key of [SHARED_STATE_KEY, SHARED_GRANT_KEY, SHARED_MARKS_KEY, SHARED_INTEREST_KEY, SHARED_ASK_KEY, SHARED_DIR_KEY, SHARED_W3B_ASK_KEY, SHARED_LISTS_OUT_KEY, SHARED_LISTS_IN_KEY, SHARED_CALLS_KEY, SHARED_MOVES_KEY]) this.d.del(key);
         this.w3bAskKept = null;
         this.listsSent = new Map();
         this.buckets = null;

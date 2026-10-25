@@ -45,6 +45,39 @@ export function readWants(waiting, shownFlips, toSell, { filter, openMax }) {
     return { toSellIds, flipCheckIds, flipTraders, openWant };
 }
 
+/** The item in view: this many of its best payers have their list page read before the flips' traders (3.34.0). */
+export const OPEN_DESK_FIRST = 5;
+
+/**
+ * 3.34.0 - whose TornW3B list pages are read open, first to last (the Reader takes them in this order and reads
+ * about ten a minute). The flips' traders come due every 150 s and used the whole budget, so the item in view stayed
+ * "Checking their list is open..." for good; now the item you are looking at gets its top payers read first.
+ *   1. the trader of the trade on show   2. your pinned trades' traders
+ *   3. the top OPEN_DESK_FIRST payers of the item in view
+ *   4. the flips' traders (and To sell's best payers), the biggest first
+ *   5. the item in view's other payers   6. Your traders' (By trader) ready trades
+ * @param {{shown?: string|null, pinned?: string[], desk?: Iterable<string>, flips?: string[], scan?: string[], max: number, deskFirst?: number}} o
+ *   desk: the item in view's TornW3B payers, the best price first
+ * @returns {string[]} trader ids, no repeats, at most `max`
+ */
+export function openOrder({ shown = null, pinned = [], desk = [], flips = [], scan = [], max, deskFirst = OPEN_DESK_FIRST }) {
+    const payers = [...(desk || [])];
+    const list = [shown, ...(pinned || []), ...payers.slice(0, deskFirst), ...(flips || []), ...payers.slice(deskFirst), ...(scan || [])];
+    return [...new Set(list.filter(Boolean).map(String))].slice(0, max);
+}
+
+/**
+ * 3.34.0 - the item in view's payers for openOrder's `desk`, the best price first: the shown ones and the ones Fresh
+ * prices hides only for an old edit date (a read that finds their list open shows them again).
+ * @param {{id, price, w3b}[]} shown
+ * @param {{id, price, w3b}[]} stale
+ * @returns {string[]} TornW3B traders' ids, no repeats, at most `max`
+ */
+export function deskPayers(shown, stale, max) {
+    const rows = [...(shown || []), ...(stale || [])].filter((b) => b && b.id && b.w3b > 0).sort((a, b) => b.price - a.price);
+    return [...new Set(rows.map((b) => String(b.id)))].slice(0, max);
+}
+
 /** The one place the redraw hands the Reader its lists. */
 export function applyWants(store, wants) {
     for (const k of Object.keys(wants)) store[k] = wants[k];

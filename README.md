@@ -2911,7 +2911,7 @@ a capped line, and the owner mark on the live server.
 calls outside services. A trader shows only after their TornW3B list page was
 read open: a closed list, or an unclear or failed read, means no trade, and Ask,
 Yes and every Send check again first. Torn Bids was redrawn as mockup AM, with a
-Today page, Flips (Best flips, By trader, All items, Dropping), Trades, Items
+Today page, Flips (Best flips, By trader, All items; a Dropping tab was added here and taken out in 3.34.0), Trades, Items
 and Ledger.
 
 **3.33.1**, from the owner's live look on 2026-10-16 and 2026-10-17:

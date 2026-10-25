@@ -24,7 +24,7 @@ export const SHARED_BUCKETS = 16;
 const SHARED_MAX_SELLERS = 3000;
 const SHARED_MAX_NEAR = 200;
 const SHARED_MAX_WORTH = 5000;
-const SHARED_BODY_KEYS = ['app', 'ver', 'used', 'waiting', 'sellers', 'trades', 'looking', 'worth', 'since', 'seen', 'going', 'bought', 'dir', 'want', 'w3b', 'lists', 'listsSince', 'calls', 'moves', 'ownSince', 'opens', 'drops'];
+const SHARED_BODY_KEYS = ['app', 'ver', 'used', 'waiting', 'sellers', 'trades', 'looking', 'worth', 'since', 'seen', 'going', 'bought', 'dir', 'want', 'w3b', 'lists', 'listsSince', 'calls', 'moves', 'ownSince', 'opens'];
 /*
  * 3.26.0, the server handing out TornW3B's work (its /sync, deployed 2026-10-11):
  *   want        the items whose sellers list this PC would ask TornW3B for next, most wanted first (60 at most)
@@ -64,31 +64,6 @@ export function sharedMovesIn(answer) {
             n += 1;
         }
         rows[item] = r[1];
-    }
-    return { at: m.at, rows };
-}
-
-/*
- * 3.33.0 - prices falling (engines plan 4a): each watched item's lowest bazaar price, the server's sample every
- * ten minutes over the last day:
- *   drops       the time of the samples this PC holds (the server's clock; 0 for none)
- *   -> drops    {at, rows: [[item, [minutes ago, price, ...]]]} when the server has a newer sample
- */
-export const SHARED_MAX_DROPS = 600;
-const SHARED_MAX_DROP_SAMPLES = 24 * 6 + 1;
-/** The answer's samples, checked: {at, rows: {item: [minutes ago, price, ...]}}, or null when the server sent none. */
-export function sharedDropsIn(answer) {
-    const m = answer && answer.drops;
-    if (!m || typeof m !== 'object' || !Number.isInteger(m.at) || m.at <= 0 || m.at >= 1e13 || !Array.isArray(m.rows)) return null;
-    const rows = {};
-    let n = 0;
-    for (const r of m.rows) {
-        if (n >= SHARED_MAX_DROPS) break;
-        if (!Array.isArray(r) || r.length !== 2 || !Array.isArray(r[1]) || r[1].length % 2 || r[1].length > 2 * SHARED_MAX_DROP_SAMPLES) continue;
-        const item = sharedId(r[0]);
-        if (item === null || item in rows || !r[1].every((v) => Number.isInteger(v) && v >= 0 && v < 1e13)) continue;
-        rows[item] = r[1];
-        n += 1;
     }
     return { at: m.at, rows };
 }
@@ -446,7 +421,7 @@ export function sharedMarks(wants, now) {
  * come out of here, whatever is put in.
  * `now`: this PC's clock; the marks leave as ages, since every PC has its own clock.
  */
-export function sharedBody({ used = 0, waiting = 0, wants = [], since = 0, seen = 0, sendWorth = true, now = 0, ver = null, lists = null, listsSince = null, calls = null, moves = null, ownSince = null, opens = null, drops = null } = {}) {
+export function sharedBody({ used = 0, waiting = 0, wants = [], since = 0, seen = 0, sendWorth = true, now = 0, ver = null, lists = null, listsSince = null, calls = null, moves = null, ownSince = null, opens = null } = {}) {
     const count = (n) => (Number.isFinite(n) && n > 0 ? Math.min(1000, Math.floor(n)) : 0);
     const list = Array.isArray(wants) ? wants.filter((w) => w && typeof w === 'object') : [];
     const trades = sharedIds(list.map((w) => w.trades), SHARED_MAX_NEAR);
@@ -479,8 +454,6 @@ export function sharedBody({ used = 0, waiting = 0, wants = [], since = 0, seen 
     if (Number.isInteger(listsSince) && listsSince >= 0) body.listsSince = listsSince;
     // 3.28.0 - the table of item speeds this PC holds (its time on the server's clock): a newer one is sent back.
     if (Number.isInteger(moves) && moves >= 0 && moves < 1e13) body.moves = moves;
-    // 3.33.0 - the price samples this PC holds (their time on the server's clock): newer ones are sent back.
-    if (Number.isInteger(drops) && drops >= 0 && drops < 1e13) body.drops = drops;
     // 3.31.0 - traders' own price lists, as their Torn Archive told the server (sharedOwnIn): the running number held.
     if (Number.isInteger(ownSince) && ownSince >= 0 && ownSince < 1e13) body.ownSince = ownSince;
     // 3.33.0 - whose TornW3B lists this PC saw open or closed in the last three minutes, as ages (sharedOpen).

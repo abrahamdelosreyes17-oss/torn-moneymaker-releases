@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { listOrder, byColumn, planCells, droppingView } from '../src/core/view-model.js';
+import { listOrder, byColumn, planCells } from '../src/core/view-model.js';
 
 const row = (itemId, o) => ({ itemId, name: 'I' + itemId, held: 0, value: 0, bid: 0, lowest: null, badge: null, ...o });
 
@@ -27,10 +27,4 @@ test('a flip row\'s cells', () => {
     const plan = { units: 3, firstPrice: 90, buyer: { price: 120 }, pace: 4, steps: [{ sellerId: 1 }, { sellerId: 1 }, { sellerName: 'b' }] };
     assert.deepEqual(planCells(row('1', { badge: { kind: 'flip' }, plan })), { buy: 90, sell: 120, units: 3, pace: 4, stops: 2 });
     assert.deepEqual(planCells(row('1', {})), { buy: null, sell: null, units: 0, pace: null, stops: 0 });
-});
-
-test('Dropping: the biggest fall first, then the most traders cutting', () => {
-    const d = new Map([['1', { why: 'traders', cut: 3 }], ['2', { why: 'bazaars', fell: 0.2 }], ['3', { why: 'traders', cut: 2 }]]);
-    assert.deepEqual(droppingView(d, (id) => 'I' + id).map((x) => x.itemId), ['2', '1', '3']);
-    assert.deepEqual(droppingView(null, String), []);
 });

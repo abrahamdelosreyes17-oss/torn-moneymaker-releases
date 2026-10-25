@@ -64,7 +64,7 @@ export function bdEl(tag, props = {}, children = []) {
 /** The pages, in the sidebar's order. `gap`: a thin line between groups; `push`: what follows sits at the bottom. */
 export const BD_PAGES = [
     { id: 'today', label: 'Today', icon: 'dash' },
-    { id: 'flips', label: 'Flips', icon: 'flip', tabs: ['Best flips', 'By trader', 'All items', 'Dropping'] },
+    { id: 'flips', label: 'Flips', icon: 'flip', tabs: ['Best flips', 'By trader', 'All items'] },
     { id: 'trades', label: 'Trades', icon: 'trades', tabs: ['Going', 'History'] },
     { gap: true },
     { id: 'items', label: 'Items', icon: 'stock', tabs: ['Everything', 'To resell'] },
@@ -85,10 +85,8 @@ export const BD_ITEMS_RESELL = 1;
 export const BD_FLIPS_BEST = 0;
 export const BD_FLIPS_TRADER = 1;
 export const BD_FLIPS_ITEMS = 2;
-/** 3.33.0 - what is no flip now, its price falling (core/dropping.js). */
-export const BD_FLIPS_DROPPING = 3;
 /** 3.32.0 - For <the shared server's owner>: there only while a price list of his is held (ui/owner-page.js). */
-export const BD_FLIPS_OWNER = 4;
+export const BD_FLIPS_OWNER = 3;
 
 /**
  * Which list a page shows: main.js works the item list out for one filter at a time
@@ -183,8 +181,6 @@ export function bdBuildShell(page, { title, tagline, parts }) {
             bdEl('div', { class: 'pane on split' }, [slot('flips-list', 'div', 'slot'), slot('flips-plan', 'div', 'slot')]),
             slot('owner-tiles', 'div', 'slot'),
             (bd.ownerPane = bdEl('div', { class: 'pane c75 snug' }, [slot('owner-left', 'div', 'slot'), slot('owner-right', 'div', 'col')])),
-            // Dropping (3.33.0): one list of what is falling.
-            (bd.dropPane = bdEl('div', { class: 'pane one' }, [slot('drop-list', 'div', 'slot')])),
         ]),
         // Trades: Going is the board and the trade pressed; History is the list and the trade picked.
         section('trades', 'fit', [

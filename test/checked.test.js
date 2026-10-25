@@ -64,7 +64,7 @@ test('a closed list, an unclear page or a failed read makes no flip, however new
     assert.equal(priceChecked(buyer(), { ...o, list }).ok, false);
 });
 
-test('a TornExchange-only price is shown, in amber; a list not changed in a day, or whose date is not known, is no flip', () => {
+test('a TornExchange-only price is shown, in amber; a TornExchange list not changed in a day is no flip, but an open TornW3B read is a flip whenever the list was edited (3.34.0)', () => {
     const open = { at: NOW - MIN, state: 'open', prices: { 206: 900 }, updatedAt: NOW - HOUR };
     const o = { itemId: '206', open, now: NOW };
     // The owner, 2026-10-16: "always show the torn exchange ... do not leave torn exhcagne out".
@@ -81,10 +81,15 @@ test('a TornExchange-only price is shown, in amber; a list not changed in a day,
 
     assert.equal(PRICES_STALE_MS, DAY);
     assert.equal(priceChecked(buyer(), { ...o, open: { ...open, updatedAt: NOW - DAY } }).ok, true);
-    assert.deepEqual(priceChecked(buyer(), { ...o, open: { ...open, updatedAt: NOW - DAY - 1 } }), { ok: false, why: 'old-list', at: NOW - MIN });
-    // The page gives no date: the list's date known otherwise stands, else no flip.
-    assert.equal(priceChecked(buyer(), { ...o, open: { ...open, updatedAt: 0 }, listAt: NOW - HOUR }).ok, true);
-    assert.deepEqual(priceChecked(buyer(), { ...o, open: { ...open, updatedAt: 0 } }), { ok: false, why: 'no-date', at: NOW - MIN });
+    // 3.34.0 (the owner: a $825 Bottle of Beer that Coolz, online, pays $943 for died as "Over a day old"): the page
+    // was read minutes ago and says open at this price - the date the list was last edited is no gate.
+    assert.deepEqual(priceChecked(buyer(), { ...o, open: { ...open, updatedAt: NOW - DAY - 1 } }), { ok: true, why: 'checked', at: NOW - MIN });
+    assert.deepEqual(priceChecked(buyer(), { ...o, open: { ...open, updatedAt: NOW - 30 * DAY }, listAt: NOW - 30 * DAY }), { ok: true, why: 'checked', at: NOW - MIN });
+    // No date on the page and none known otherwise: still a flip after a passing open read.
+    assert.deepEqual(priceChecked(buyer(), { ...o, open: { ...open, updatedAt: 0 } }), { ok: true, why: 'checked', at: NOW - MIN });
+    // ...but the open read still gates: old list or not, a read older than 3 minutes, or at another price, is no flip.
+    assert.equal(priceChecked(buyer(), { ...o, open: { ...open, at: NOW - 4 * MIN, updatedAt: NOW - 30 * DAY } }).why, 'not-open');
+    assert.equal(priceChecked(buyer({ price: 950, w3b: 950 }), { ...o, open: { ...open, updatedAt: NOW - 30 * DAY } }).why, 'not-checked');
 });
 
 test('a list just read corrects every older read of an item\'s buyers: the new price, or no longer that trader', () => {

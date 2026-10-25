@@ -76,7 +76,9 @@ test('the prices: picking a deal, Plan trade, Every flip and "said yes" each rea
     has('if (said && said.at > 0) return pressReady(null, { needsOpen: false, now });', 'his own word');
     has('askOf: (traderId, o) => traderAsk(traderId, Date.now(), o),', 'the page says whether a trade stands on a TornW3B price');
     // No more traders wanted than the minute's page reads keep fresh, and none for a desk that is empty.
-    has('.slice(0, OPEN_KEPT_MAX);', 'the wanted list is capped');
+    has('scan: sell.scanTraders, max: OPEN_KEPT_MAX });', 'the wanted list is capped');
+    // 3.34.0 - in the order of core/schedule.js openOrder: the item in view's top payers before the flips' traders.
+    has('const wantOpen = openOrder({ shown: sell.deskShownTrader, pinned: sell.pinTraders, desk: sell.deskTraders, flips: sell.openWant,', 'the item in view is read before the flip traders');
     has('    sell.deskTraders = [];\n    sell.deskShownTrader = null;\n    if (pick) {', 'emptied with the desk');
     has('const acc = { ...acceptTrade(t, itemId), priceCheck };', 'written down with the check');
     assert.ok(page.includes('A.priceCheck'), 'and the accepted trade says it');
@@ -156,14 +158,11 @@ test('the owner\'s tab: no person\'s name in its code - the name shown is the on
     has('list.name || (status && status.name) || (known && known.name) || \'Trader \' + list.id', 'the name: the server\'s, Torn\'s, TornW3B\'s');
 });
 
-test('dropping fast (3.33.0): a flagged item is no flip, and its trade note says why', () => {
-    has('if (neverFlip.has(itemCategory(item)) || droppingOf(key)) {', 'an item dropping gets no flip buyers');
-    has('if (sell.dropping && sell.dropping.has(String(id))) return \'dropping\';', 'the reason, before "no bazaar under their price"');
-    has('drop: sell.dropping.get(String(pickId)) || null', 'the note is handed the sign');
-    assert.ok(page.includes('dropping: dropWhyText(n.drop),'), 'the note says it in words');
-    // The table's ages are counted from when it arrived.
-    has('late: dropsNow ? Math.max(0, (now - dropsNow.got) / 60000) : 0', 'the ages');
-    has('prefs.dropPct, prefs.dropHours, dropsNow ? dropsNow.at : 0', 'a new sample or setting works the flips out again');
+test('Dropping fast is gone (3.34.0): nothing in the flips, the page, the settings or the sync mentions it', () => {
+    const src = ['src/main.js', 'src/ui/selling-page.js', 'src/ui/bids-shell.js', 'src/core/shared.js', 'src/feed/shared-link.js', 'src/core/view-model.js'].map(read).join('\n');
+    for (const gone of ['droppingOf', 'sell.dropping', 'dropWhyText', 'droppingView', 'dropPct', 'dropHours', 'sharedDrops(', 'sharedDropsIn', 'SHARED_DROPS_KEY', 'notePriceCuts', 'BD_FLIPS_DROPPING']) assert.equal(src.includes(gone), false, gone);
+    // An item's flip buyers are held back only by its category.
+    has('if (neverFlip.has(itemCategory(item))) {', 'only Never flip holds an item back');
 });
 
 test('the server\'s copy first (3.33.0, Stage 6): learned from TornW3B, gaps to TornW3B, a flip confirmed with Torn', () => {

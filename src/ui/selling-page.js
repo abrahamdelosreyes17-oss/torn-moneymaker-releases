@@ -45,9 +45,8 @@ import { keyInputAttrs, keyMask } from './mask.js';
 import { FRESH_DEFAULTS, FRESH_MIN, FRESH_MAX, FRESH_TOP, freshMinutes, keepsUp } from '../core/desk.js';
 import { BIDS_CSS } from './bids-css.js';
 import { SELLER_MOST_ENEMIES, SELLER_ENEMIES_PER_FRIEND } from '#engines/rules/seller-rule.js';
-import { bdBuildShell, bdShow, bdTabs, bdNavCount, bdPut, bdMoveInd, bdIcon, bdFilterOf, BD_FLIPS_BEST, BD_FLIPS_TRADER, BD_FLIPS_ITEMS, BD_FLIPS_OWNER, BD_FLIPS_DROPPING, BD_TRADES_PAST, BD_ITEMS_ALL, BD_ITEMS_RESELL } from './bids-shell.js';
+import { bdBuildShell, bdShow, bdTabs, bdNavCount, bdPut, bdMoveInd, bdIcon, bdFilterOf, BD_FLIPS_BEST, BD_FLIPS_TRADER, BD_FLIPS_ITEMS, BD_FLIPS_OWNER, BD_TRADES_PAST, BD_ITEMS_ALL, BD_ITEMS_RESELL } from './bids-shell.js';
 import { OwnerView, OWNER_CSS } from './owner-page.js';
-import { DROP_PCT, DROP_HOURS, DROP_TRADERS_CUT } from '../core/dropping.js';
 import { OWNER_MARKET, OWNER_MARKET_NAME } from '../core/owner-tab.js';
 import { pastState, pastMoved, pastTotals, pastSpan, pastWhen, pastSource, pastTradeText } from '../core/past-trades.js';
 
@@ -82,9 +81,6 @@ export const SELLING_PAGE_DEFAULTS = {
      */
     sellerMostEnemies: SELLER_MOST_ENEMIES,
     sellerEnemiesPerFriend: SELLER_ENEMIES_PER_FRIEND,
-    /* Dropping fast (3.33.0, core/dropping.js): the cheapest bazaar fell more than this % within this many hours. */
-    dropPct: DROP_PCT,
-    dropHours: DROP_HOURS,
     /* What you keep of your own when a trade offers it: itemId -> n | 'all'. */
     keep: {},
     /*
@@ -235,13 +231,6 @@ function spEl(tag, props = {}, children = []) {
 /** "+$3,500" / "−$60,005": money made or lost. */
 /** The waiting deals shown when the amber line is opened: the best few (a peek, not a second list). */
 const STILL_PEEK = 6;
-
-/** Why an item is dropping (core/dropping.js droppingNow), short. */
-function dropWhyText(d) {
-    if (d && d.why === 'bazaars') return 'dropping: the cheapest bazaar went ' + formatMoney(d.from) + ' → ' + formatMoney(d.to) + ' (−' + Math.round(d.fell * 100) + '%)';
-    if (d && d.why === 'traders') return 'dropping: ' + d.cut + ' traders cut what they pay';
-    return 'dropping fast';
-}
 
 function signed(n) {
     return (n >= 0 ? '+' : '−') + formatMoney(Math.abs(n));
@@ -596,7 +585,7 @@ export class SellingPage {
         this.onlineBtn = tog('Online', 'Only traders known to be online', 'onlineOnly');
         this.trustedBtn = tog('Trusted', 'Only traders other players vouch for', 'trustedOnly');
         // Fresh prices only (3.22.0, the owner): a price from a list not changed in a day (PRICES_STALE_MS) is not shown.
-        this.freshBtn = tog('Fresh prices', 'Hides a trader\'s TornW3B price when they have not changed their price list in a day (TornExchange prices have no date and stay)', 'freshOnly');
+        this.freshBtn = tog('Fresh prices', 'Hides a trader\'s TornW3B price when they have not changed their price list in a day, unless their list was just read open (TornExchange prices have no date and stay)', 'freshOnly');
         this.favBtn = spEl('button', { type: 'button', class: 'tog', 'aria-pressed': 'false', hidden: '', title: 'Your favourites only', text: '★ Favourites', onclick: () => {
             this.favOnly = !this.favOnly;
             this.favBtn.classList.toggle('on', this.favOnly);
@@ -681,12 +670,6 @@ export class SellingPage {
         this.pastTable = spEl('table', { class: 't' }, [spEl('thead', {}, [spEl('tr', {}, [spEl('th', { text: 'Trader' }), spEl('th', { text: 'They said yes' }), spEl('th', { class: 'n', text: 'In it' }), spEl('th', { class: 'n', text: 'They pay' }), spEl('th', { text: 'How it ended' })])]), this.pastBody]);
         this.pastListEl = spEl('div', { class: 'panel' }, [spEl('div', { class: 'ph' }, [spEl('h2', { text: 'The last 30 trades' }), this.pastTiles]), spEl('div', { class: 'pb flush' }, [this.pastTable, this.pastEmpty])]);
         this.pastSideEl = spEl('div', { class: 'panel planp hist' });
-        // Flips > Dropping (3.33.0): what a trader buys that is no flip now, its price falling.
-        this.dropBody = spEl('tbody');
-        this.dropEmpty = spEl('div', { class: 'empty', hidden: '', text: 'Nothing dropping.' });
-        this.dropTable = spEl('table', { class: 't' }, [spEl('thead', {}, [spEl('tr', {}, [spEl('th', { text: 'Item' }), spEl('th', { text: 'Sign' }), spEl('th', { class: 'n', text: 'Was' }), spEl('th', { class: 'n', text: 'Now' }), spEl('th', { class: 'n', text: 'Fall' })])]), this.dropBody]);
-        this.dropHeadSub = spEl('span', { class: 'sub' });
-        this.dropListEl = spEl('div', { class: 'panel' }, [ph('Dropping', null, [this.dropHeadSub]), spEl('div', { class: 'pb flush' }, [this.dropTable, this.dropEmpty])]);
         this.pastSel = null;
         // Today (mockup AM): four totals; the best trades and what to do now; your profit per day and what you hold.
         this.todayTiles = spEl('div', { class: 'kpis' });
@@ -779,8 +762,7 @@ export class SellingPage {
     tabsOf(id) {
         // 3.32.0 - a tab for the one trader whose own price list the shared server holds, by the name Torn gave.
         if (id === 'flips') {
-            const drops = (this.state.dropping || []).length;
-            return ['Best flips', 'By trader', 'All items', 'Dropping' + (drops ? ' · ' + count(drops) : ''), ...(this.state.owner ? ['For ' + this.state.owner.name] : [])];
+            return ['Best flips', 'By trader', 'All items', ...(this.state.owner ? ['For ' + this.state.owner.name] : [])];
         }
         if (id === 'ledger') {
             const mugs = ((this.state.ledger || {}).mugs || []).length;
@@ -823,11 +805,6 @@ export class SellingPage {
     /** Flips › By trader is in view. */
     onTraders() {
         return Boolean(this.bd) && this.bd.page === 'flips' && this.bd.tab === BD_FLIPS_TRADER;
-    }
-
-    /** Flips › Dropping is in view. */
-    onDropping() {
-        return Boolean(this.bd) && this.bd.page === 'flips' && this.bd.tab === BD_FLIPS_DROPPING;
     }
 
     /** Flips › For <the owner> is in view (and a list of his is held). */
@@ -945,16 +922,13 @@ export class SellingPage {
         const traders = this.onTraders();
         // For the owner: the section is laid out as a page of totals over two columns, and the picker's pane is off.
         const owner = this.onOwner();
-        const dropping = this.onDropping();
-        const flips = page === 'flips' && !owner && !dropping;
+        const flips = page === 'flips' && !owner;
         const fl = this.bd.pages.flips;
-        fl.classList.toggle('fit', !owner && !dropping);
-        fl.classList.toggle('pgrows', owner || dropping);
+        fl.classList.toggle('fit', !owner);
+        fl.classList.toggle('pgrows', owner);
         fl.classList.toggle('pgfill', owner);
-        fl.firstElementChild.classList.toggle('on', !owner && !dropping);
+        fl.firstElementChild.classList.toggle('on', !owner);
         this.bd.ownerPane.classList.toggle('on', owner);
-        this.bd.dropPane.classList.toggle('on', dropping);
-        bdPut(this, 'drop-list', dropping ? this.dropListEl : null);
         bdPut(this, 'owner-tiles', owner ? this.ownerView.tilesEl : null);
         bdPut(this, 'owner-left', owner ? this.ownerView.leftEl : null);
         bdPut(this, 'owner-right', ...(owner ? this.ownerView.right() : []));
@@ -1047,7 +1021,6 @@ export class SellingPage {
         this.renderTiles();
         this.renderBoard();
         this.renderPast();
-        this.renderDropping();
         this.renderToday();
         this.renderTape();
     }
@@ -2238,7 +2211,6 @@ export class SellingPage {
         if (why === 'closed') return 'their TornW3B list is closed';
         if (why === 'not-checked') return 'their open list does not give this price';
         if (why === 'old-list') return 'their list was not changed in over a day';
-        if (why === 'no-date') return 'when their list last changed is not known yet';
         return 'their list has not been seen open in the last 3 minutes; it is being read';
     }
 
@@ -2264,7 +2236,6 @@ export class SellingPage {
         if (c.why === 'not-open') return c.open === 'unclear' || c.open === 'failed' ? 'Couldn\'t confirm open: no flip' : 'Checking their list is open…';
         // The amber line above says when their list last changed.
         if (c.why === 'old-list') return 'Over a day old: no flip';
-        if (c.why === 'no-date') return 'No date on their list: no flip';
         return c.at ? 'Last checked ' + this.checkAge(now - c.at) + ': no flip' : 'Not checked yet: no flip';
     }
 
@@ -2276,8 +2247,7 @@ export class SellingPage {
         const words = {
             'closed': 'A closed TornW3B list makes no flip.',
             'not-open': 'A TornW3B price makes a flip only once their list is seen open, in the last 3 minutes.',
-            'old-list': 'A list not changed in over a day makes no flip until they change it.',
-            'no-date': 'A list whose last change is not known yet makes no flip.',
+            'old-list': 'A TornExchange list not changed in over a day makes no flip until they change it.',
             'unchecked': 'A price makes a flip only once checked with its trader; Refresh checks it now.',
         };
         const kinds = [];
@@ -2698,9 +2668,8 @@ export class SellingPage {
                 profit: 'under your least profit per item',
                 none: 'no bazaar sells it under their price',
                 cash: 'your Cash went to the other items',
-                dropping: dropWhyText(n.drop),
             }[n.why] || 'not a flip with your settings';
-            note('note', [spEl('b', { text: d.name + ' is not in this trade:' }), ' ' + b.name + ' pays ' + formatMoney(n.bid) + (n.cheapest && n.why !== 'dropping' ? ', the cheapest bazaar is ' + formatMoney(n.cheapest) : '') + ' - ' + why + '.']);
+            note('note', [spEl('b', { text: d.name + ' is not in this trade:' }), ' ' + b.name + ' pays ' + formatMoney(n.bid) + (n.cheapest ? ', the cheapest bazaar is ' + formatMoney(n.cheapest) : '') + ' - ' + why + '.']);
         }
         // Main flip and a few extras, or everything this trader buys. A pinned trade stays as pinned.
         const takeBtn = (label, every, title) => spEl('button', {
@@ -3535,30 +3504,6 @@ export class SellingPage {
         this.focusBack(box, keep);
     }
 
-    /** Flips › Dropping (3.33.0): each item no flip now, with its sign (core/dropping.js droppingNow). */
-    renderDropping() {
-        if (!this.onDropping()) return;
-        const rows = this.state.dropping || [];
-        const p = this.state.prefs || {};
-        const sig = JSON.stringify(['drop', rows, p.dropPct, p.dropHours]);
-        if (sig === this.dropSig) return;
-        this.dropSig = sig;
-        this.dropHeadSub.textContent = 'over ' + (p.dropPct ?? DROP_PCT) + '% within ' + (p.dropHours ?? DROP_HOURS) + ' h, or ' + DROP_TRADERS_CUT + ' traders cut · no flip';
-        this.dropTable.hidden = !rows.length;
-        this.dropEmpty.hidden = rows.length > 0;
-        this.dropBody.textContent = '';
-        for (const r of rows) {
-            const bazaars = r.why === 'bazaars';
-            this.dropBody.appendChild(spEl('tr', {}, [
-                spEl('td', {}, [spEl('div', { class: 'cell' }, [this.pic('drop', r.itemId), spEl('b', { text: r.name })])]),
-                spEl('td', { text: bazaars ? 'Bazaar' : count(r.cut) + ' traders cut' }),
-                spEl('td', { class: 'n', text: bazaars ? formatMoney(r.from) : '' }),
-                spEl('td', { class: 'n', text: bazaars ? formatMoney(r.to) : '' }),
-                spEl('td', { class: 'n t-warn', text: bazaars ? '−' + Math.round(r.fell * 100) + '%' : '' }),
-            ]));
-        }
-    }
-
     /**
      * Trades › History (3.27.0, mockup AH; the owner, 2026-10-11: "trader cancelled trade, and then he asked
      * what pricelist did you see, we couldnt find them again"): the last 30 trades from their yes, and for the
@@ -4299,26 +4244,6 @@ export class SellingPage {
                 return String(text).trim() !== '' && n >= 0 && n <= 100 ? { patch: { sellerEnemiesPerFriend: n } } : { error: 'Type a number from 0 to 100.' };
             },
         });
-        /* Dropping fast: a fall in %, within hours (core/dropping.js) */
-        this.dropPctInput = spEl('input', { type: 'text', class: 'sp-key sp-pctin', 'aria-label': 'Dropping: fall, percent', autocomplete: 'off', spellcheck: 'false', inputmode: 'decimal', 'data-focus': 'set:droppct' });
-        this.dropPctStateEl = spEl('div', { class: 'sp-keystate', role: 'status' });
-        this.dropPctBox = settingBox(this.dropPctInput, this.dropPctStateEl, {
-            show: (p) => String(p.dropPct ?? DROP_PCT),
-            read: (text) => {
-                const raw = String(text).replace(/[%,\s]/g, '');
-                const n = Number(raw);
-                return raw && n >= 1 && n <= 90 ? { patch: { dropPct: n } } : { error: 'Type a percent from 1 to 90.' };
-            },
-        });
-        this.dropHoursInput = spEl('input', { type: 'text', class: 'sp-key sp-pctin', 'aria-label': 'Dropping: within hours', autocomplete: 'off', spellcheck: 'false', inputmode: 'numeric', 'data-focus': 'set:drophours' });
-        this.dropHoursStateEl = spEl('div', { class: 'sp-keystate', role: 'status' });
-        this.dropHoursBox = settingBox(this.dropHoursInput, this.dropHoursStateEl, {
-            show: (p) => String(p.dropHours ?? DROP_HOURS),
-            read: (text) => {
-                const n = readWholeNumber(text);
-                return n >= 1 && n <= 24 ? { patch: { dropHours: n } } : { error: 'Type whole hours from 1 to 24.' };
-            },
-        });
         /* Least profit per item */
         this.minInput = spEl('input', { type: 'text', class: 'sp-key sp-pctin', 'aria-label': 'Least profit per item, percent', autocomplete: 'off', spellcheck: 'false', inputmode: 'decimal', 'data-focus': 'set:min' });
         this.minStateEl = spEl('div', { class: 'sp-keystate', role: 'status' });
@@ -4388,12 +4313,6 @@ export class SellingPage {
                 spEl('div', { class: 'sp-inline sp-pct' }, ['or over ', this.perFriendInput, ' enemies per friend']),
                 this.perFriendStateEl,
                 note(['From their Torn profile. Not read yet: bought from.']),
-            ]),
-            field('Dropping fast', null, [
-                spEl('div', { class: 'sp-inline sp-pct' }, ['No flip when the cheapest bazaar fell over ', this.dropPctInput, ' %']),
-                this.dropPctStateEl,
-                spEl('div', { class: 'sp-inline sp-pct' }, ['within ', this.dropHoursInput, ' hours, or ' + DROP_TRADERS_CUT + ' traders cut their price']),
-                this.dropHoursStateEl,
             ]),
             // Blacklisted traders, with Undo - here too, for anyone without a Ledger key (3.14.3).
             field('Blacklisted traders', null, [

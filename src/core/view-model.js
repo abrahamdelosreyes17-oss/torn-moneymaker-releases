@@ -46,9 +46,3 @@ export function planCells(r) {
         stops: p ? new Set((p.steps || []).map((st) => st.sellerId || st.sellerName)).size : 0,
     };
 }
-
-/** Flips › Dropping: the biggest fall first, then the most traders cutting, then the name. */
-export function droppingView(dropping, nameOf) {
-    return [...(dropping || new Map())].map(([id, d]) => ({ itemId: id, name: nameOf(id), ...d }))
-        .sort((a, b) => (b.fell || 0) - (a.fell || 0) || (b.cut || 0) - (a.cut || 0) || a.name.localeCompare(b.name));
-}
