@@ -57,3 +57,9 @@ test('3.34.0: the item in view\'s payers include the ones Fresh prices hides, be
     assert.deepEqual(deskPayers([], [{ id: 7, price: 943, w3b: 943 }], 12), ['7']);
     assert.deepEqual(deskPayers(stale, [], 1), ['3']);
 });
+
+test('the pressed trader is read before everything (3.35.0), the old lists after the top payers and before the flips', () => {
+    const all = openOrder({ shown: 'd3', pressed: 'x9', pinned: ['p1'], desk: ['d1', 'd2', 'd3'], old: ['o1', 'o2'], flips: ['f1'], max: 25 });
+    assert.deepEqual(all, ['x9', 'd3', 'p1', 'd1', 'd2', 'o1', 'o2', 'f1']);
+    assert.deepEqual(openOrder({ pressed: 'x9', shown: 'x9', max: 25 }), ['x9']);
+});

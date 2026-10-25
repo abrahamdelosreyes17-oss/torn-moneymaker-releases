@@ -71,6 +71,7 @@ import { fitLeftOut, planTrade, keepAfter } from './core/trade.js';
 import { holdTrade, holdKey, resolveEstimated, priceHeld, livePins, editHeld, keepHolds, keptHolds, HOLD_MS } from './core/held.js';
 import { priceChecked, applyListToItemBuyers, buyersEveryMs, FLIP_RECHECK_MS, checkedTable, checkedInTable, CHECKED_TABLE_WRITE_MS, bidSinceYes } from './core/checked.js';
 import { readWants, sweepOrder, applyWants, openOrder, deskPayers } from './core/schedule.js';
+import { pressNew, pressLive, pressItems, nextPressRead, pressOpenWanted, pressWait, pressLogAdd } from './core/pressed.js';
 import { shownTraders, marketPrice } from './core/trader-prices.js';
 import { rowPass, filterRows } from './core/filters.js';
 import { listOrder, byColumn, planCells } from './core/view-model.js';
@@ -6989,6 +6990,12 @@ const sell = {
      */
     tradeEvery: new Set(),
     tradeWanted: [],
+    // 3.35.0 (core/pressed.js): the trader just pressed, the items of their list to ask the sellers of, the zip's waits.
+    pressed: null,
+    pressItems: null,
+    pressItemsKey: '',
+    pressLog: [],
+    openOld: [],
     /* The chosen trade's items, re-read like the item picked (every 2 min) while it is on the desk. */
     tradeLive: [],
     /* Items each trade has shown ('item|trader' -> Set): one that drops out stays listed, with why. */
@@ -8792,6 +8799,11 @@ function nextW3bJob(now, hidden = false) {
     }
     // The trade on the desk comes before the possible flips only while you
     // work on it (core/desk.js): until then the flips are checked first.
+    // 3.35.0 - the trader just pressed: their list, then the sellers of every item on it, before any other read.
+    if (!hidden) {
+        const pressedJob = nextPressedJob(now);
+        if (pressedJob) return pressedJob;
+    }
     const pinnedIds = [...new Set(Object.values(sellPinned(now)).flatMap((t) => t.lines.map((l) => l.itemId)))];
     const candIds = sell.candidates.map((c) => c.itemId);
     const fresh = freshnessMs(sellPrefs());
@@ -8813,7 +8825,7 @@ function nextW3bJob(now, hidden = false) {
         // the minute's page reads keep inside OPEN_RECHECK_MS (else the last ones lapse and their flips flicker).
         // 3.34.0 - and the top payers of the item in view right after those (core/schedule.js openOrder): the flips'
         // traders come due every 150 s and used the whole budget, so the item in view stayed "Checking their list is open…".
-        const wantOpen = openOrder({ shown: sell.deskShownTrader, pinned: sell.pinTraders, desk: sell.deskTraders, flips: sell.openWant, scan: sell.scanTraders, max: OPEN_KEPT_MAX });
+        const wantOpen = openOrder({ shown: sell.deskShownTrader, pinned: sell.pinTraders, desk: sell.deskTraders, flips: sell.openWant, old: sell.openOld, pressed: pressedTraderId(now), scan: sell.scanTraders, max: OPEN_KEPT_MAX });
         const nextOpen = nextOpenCheck(wantOpen, sell.openChecks, { now, reading: new Set(sell.listReading ? sell.listReading.keys() : []), sent: sell.openSent });
         if (nextOpen) return Object.assign(() => loadW3bOpen(nextOpen), { list: true });
     }
@@ -8931,6 +8943,85 @@ function nextW3bJob(now, hidden = false) {
     if (lightOn && kind === 'sweep' && !lightHas.spare) return null;
     if (lightFor(kind) && lightStandsIn(id, kind, now)) return () => loadCheapest(read.id, kind === 'sweep' ? 'w.sweep' : tag);
     return () => loadBazaars(read.id, tag);
+}
+
+/*
+ * 3.35.0 - a pressed trader is read first (core/pressed.js; the field report of 3.34.0: after a press the rows filled in
+ * minute by minute behind the background queue, and only the first 30 items of their list were ever asked for).
+ * Torn's own API has no per-item bazaar prices (its bazaar answer names bazaars, not prices), so "the sellers of every
+ * item" is TornW3B's light list for each item (a limit of its own), a full sellers list for the trader's best few, and the
+ * Item Market on Torn's key (core/item-market.js) for all of them.
+ */
+function pressedTraderId(now) {
+    return sell.pressed && pressLive(sell.pressed, now) ? sell.pressed.traderId : null;
+}
+
+/** The cheapest bazaar price known of an item: its sellers, else the light list, else the summary's one price. */
+function lowestKnown(id) {
+    const b = sell.bazaars.get(String(id));
+    const low = (rows) => (rows || []).reduce((m, r) => (r && r.price > 0 && (m === null || r.price < m) ? r.price : m), null);
+    const fromRows = b && !b.error ? low(b.rows) : null;
+    if (fromRows) return fromRows;
+    const s = sell.summary ? sell.summary.get(String(id)) : null;
+    return s && s.lowestPrice > 0 ? s.lowestPrice : null;
+}
+
+/** The pressed trader's items to ask the sellers of, the biggest gap first (kept while neither list nor summary moves). */
+function pressedItemsNow(now) {
+    const press = sell.pressed;
+    if (!pressLive(press, now)) {
+        sell.pressItems = null;
+        return null;
+    }
+    const id = press.traderId;
+    const oc = sell.openChecks.get(id);
+    const rec = sell.db && sell.db.traders ? sell.db.traders[id] : null;
+    // A list read closed has nothing to buy for: no seller is asked.
+    const prices = oc && oc.state === 'open' && oc.prices ? oc.prices : oc && oc.state === 'closed' ? null : rec && rec.w3b && rec.w3b.found ? rec.w3b.prices : null;
+    if (!prices) {
+        sell.pressItems = null;
+        return null;
+    }
+    const key = press.at + '|' + (oc ? oc.at : 0) + '|' + sell.summaryAt + '|' + Object.keys(prices).length;
+    if (sell.pressItems && sell.pressItemsKey === key) return sell.pressItems;
+    sell.pressItemsKey = key;
+    sell.pressItems = pressItems(prices, { lowestOf: lowestKnown, enough: (each, price) => enoughProfit(each, price, 'TRADER', sellPrefs().minProfitPct) });
+    return sell.pressItems;
+}
+
+/** The zip's line: how long from the press to the first check of their list. Once a press. */
+function notePressWait(now) {
+    const press = sell.pressed;
+    if (!press || !press.traderId || press.firstAt) return;
+    const ms = pressWait(press, sell.openChecks.get(press.traderId) || null, OPEN_CHECK_MS);
+    if (ms === null) return;
+    press.firstAt = now;
+    sell.pressLog = pressLogAdd(sell.pressLog, { ms, why: press.why });
+}
+
+function nextPressedJob(now) {
+    const press = sell.pressed;
+    if (!pressLive(press, now) || !sell.w3b) return null;
+    notePressWait(now);
+    const reading = Boolean(sell.listReading && sell.listReading.has(press.traderId));
+    // A press whose page read did not leave (a read 15 s ago, a failed one): the page once more.
+    if (!press.firstAt && pressOpenWanted(press, sell.openChecks.get(press.traderId) || null, { now, reading })) {
+        const sent = (sell.openSent || []).filter((t) => now - t < 60000).length;
+        if (sent < 10) return Object.assign(() => loadW3bOpen(press.traderId), { list: true });
+    }
+    const items = pressedItemsNow(now);
+    if (!items) return null;
+    const lightOn = lightUsable(now);
+    const next = nextPressRead(press, items, {
+        stateOf: (id) => {
+            const b = sell.bazaars.get(String(id));
+            return b ? { fullAt: b.fullAt || 0, lightAt: b.lightAt || 0, triedAt: b.triedAt || 0, loading: Boolean(b.loading), error: Boolean(b.error) } : {};
+        },
+        fullOk: w3bListingRoom(now).now,
+        lightOk: lightOn && lightRoom(now).any,
+    });
+    if (!next) return null;
+    return next.how === 'full' ? () => loadBazaars(next.id, 'w.trade') : () => loadCheapest(next.id, 'w.trade');
 }
 
 /** Is an item's every-buyer list (TornW3B /traders) due? */
@@ -9087,6 +9178,10 @@ function traderIdOfKey(key) {
  */
 const TRADER_CHECK_MS = 15 * 1000;
 function checkTraderNow(itemId, key, why = 'Check now') {
+    // 3.35.0 - this trader first, every item of their list (core/pressed.js; read by nextW3bJob).
+    sell.pressed = pressNew({ key, itemId, why, now: Date.now() });
+    sell.pressItems = null;
+    sell.pressItemsKey = '';
     const asked = rereadTraderList(key, Date.now(), TRADER_CHECK_MS);
     const id = String(itemId || '');
     const it = id ? sell.itemTraders.get(id) : null;
@@ -9286,7 +9381,7 @@ function loadBazaarSummary() {
             sell.summaryError = null;
             // Listings of items no longer picked or possible flips are let go.
             const pinned = Object.values(sellPinned()).flatMap((t) => t.lines.map((l) => l.itemId));
-            const keep = new Set([sell.selected, ...sell.candidates.map((c) => c.itemId), ...sell.nearIds, ...sell.tradeWanted, ...sell.tradeLive, ...pinned, ...sell.ownerIds]);
+            const keep = new Set([sell.selected, ...sell.candidates.map((c) => c.itemId), ...sell.nearIds, ...sell.tradeWanted, ...sell.tradeLive, ...(sell.pressItems ? sell.pressItems.all : []), ...pinned, ...sell.ownerIds]);
             // The overlay reads it too (its own copy every 30 s while a Torn tab is open).
             const lowest = {};
             for (const r of rows) if (r.lowestPrice > 0) lowest[r.itemId] = r.lowestPrice;

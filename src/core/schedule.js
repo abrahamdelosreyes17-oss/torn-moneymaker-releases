@@ -60,9 +60,9 @@ export const OPEN_DESK_FIRST = 5;
  *   desk: the item in view's TornW3B payers, the best price first
  * @returns {string[]} trader ids, no repeats, at most `max`
  */
-export function openOrder({ shown = null, pinned = [], desk = [], flips = [], scan = [], max, deskFirst = OPEN_DESK_FIRST }) {
+export function openOrder({ shown = null, pressed = null, pinned = [], desk = [], old = [], flips = [], scan = [], max, deskFirst = OPEN_DESK_FIRST }) {
     const payers = [...(desk || [])];
-    const list = [shown, ...(pinned || []), ...payers.slice(0, deskFirst), ...(flips || []), ...payers.slice(deskFirst), ...(scan || [])];
+    const list = [pressed, shown, ...(pinned || []), ...payers.slice(0, deskFirst), ...(old || []), ...(flips || []), ...payers.slice(deskFirst), ...(scan || [])];
     return [...new Set(list.filter(Boolean).map(String))].slice(0, max);
 }
 
