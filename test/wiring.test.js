@@ -309,3 +309,12 @@ test('3.35.0: a possible flip shows at once as "checking", below the confirmed o
     // Nothing that buys or plans reads the checking row as a flip: the cards and the plans use badge.kind === 'flip' and r.plan.
     assert.ok(main.includes(".filter((r) => r.badge && r.badge.kind === 'flip')"), 'the cards take confirmed flips only');
 });
+
+test('3.35.0: the Torn key is spent on what is in view (core/key-spend.js)', () => {
+    has("const heldInView = sell.filter === 'mine' || sell.filter === 'sell';", 'what you hold is asked about only in its tabs');
+    has('updateSellNetworth(networthWanted({ view: nwView, candidates: nwCandidates }), now);', 'networth: view first, a few candidates');
+    has('const invDue = inventoryDue({', 'Refresh does not read the inventory within a minute of the last read');
+    has('dirty: sell.inventoryDirty,', 'the hourly timer reads sooner only when something changed');
+    for (const where of ["sell.inventoryDirty = true;\n            changed = true;", "sell.inventoryDirty = true;\n            const open = Object.values(sellAccepted());"]) has(where, 'a finished trade and a logged buy mark the inventory changed');
+    has('const resume = inventoryResume(sell.invResume, now0);', 'a failed read is resumed');
+});

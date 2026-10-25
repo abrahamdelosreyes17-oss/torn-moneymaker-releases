@@ -471,24 +471,44 @@ async function fetchInventoryPages(client, params, limit) {
  * The spec says `cat` is optional, but Torn has been seen to answer
  * "Incorrect category" without it. So: ask once without a category; if that
  * is refused as a category or field error, ask once per category instead
- * (25 calls, each paged, all through the shared limiter) and merge. A
- * category Torn no longer knows is skipped, never fatal.
+ * (each paged, all through the shared limiter) and merge. A category Torn no
+ * longer knows is skipped, never fatal.
+ *
+ * 3.35.0 (core/key-spend.js) - the 25 categories were asked in full every time, and again from the first after any
+ * failure: 27-34 calls a minute of the key's budget. Now the caller may say what it learned:
+ *   byCategory  - the no-category read is refused: go straight to the categories (one call less each time)
+ *   skip        - categories that held nothing lately: not asked
+ *   resume      - {rows, done}: what a failed read already got; those categories are not asked again
+ *   onLearn     - ({byCategory}) / ({cat, count}) as each is learned
+ * A failure that is not a category error carries what it got so far (`error.partial = {rows, done}`).
  *
  * @returns {Promise<Array>} rows from parseInventoryPage, every page
  */
-export async function fetchInventory(client, { limit = 250, categories = TORN_INVENTORY_CATEGORIES } = {}) {
-    try {
-        return await fetchInventoryPages(client, {}, limit);
-    } catch (error) {
-        if (!isCategoryError(error)) throw error;
-    }
-
-    const out = [];
-    for (const cat of categories) {
+export async function fetchInventory(client, { limit = 250, categories = TORN_INVENTORY_CATEGORIES, byCategory = false, skip = null, resume = null, onLearn = null } = {}) {
+    if (!byCategory && !resume) {
         try {
-            out.push(...(await fetchInventoryPages(client, { cat }, limit)));
+            return await fetchInventoryPages(client, {}, limit);
         } catch (error) {
             if (!isCategoryError(error)) throw error;
+            if (onLearn) onLearn({ byCategory: true });
+        }
+    }
+
+    const out = resume ? [...resume.rows] : [];
+    const done = resume ? [...resume.done] : [];
+    for (const cat of categories) {
+        if (done.includes(cat) || (skip && skip.has(cat))) continue;
+        try {
+            const rows = await fetchInventoryPages(client, { cat }, limit);
+            out.push(...rows);
+            done.push(cat);
+            if (onLearn) onLearn({ cat, count: rows.length });
+        } catch (error) {
+            if (!isCategoryError(error)) {
+                if (error && typeof error === 'object') error.partial = { rows: out, done };
+                throw error;
+            }
+            done.push(cat);
         }
     }
     return out;

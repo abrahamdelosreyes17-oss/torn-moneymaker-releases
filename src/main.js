@@ -73,6 +73,7 @@ import { priceChecked, applyListToItemBuyers, buyersEveryMs, FLIP_RECHECK_MS, ch
 import { readWants, sweepOrder, applyWants, openOrder, deskPayers } from './core/schedule.js';
 import { itemMarketRows, withItemMarket, nextItemMarket, itemMarketRoom, ITEM_MARKET_LISTINGS } from './core/item-market.js';
 import { oldListScan, oldListsWanted, OLD_SCAN_EVERY_MS } from './core/old-lists.js';
+import { inventoryPlan, inventoryLearn, inventoryDue, inventoryResume, inventoryPolicyClean, networthWanted } from './core/key-spend.js';
 import { pressNew, pressLive, pressItems, nextPressRead, pressOpenWanted, pressWait, pressLogAdd } from './core/pressed.js';
 import { shownTraders, marketPrice } from './core/trader-prices.js';
 import { rowPass, filterRows } from './core/filters.js';
@@ -182,7 +183,6 @@ import {
     mergeInventory,
     makeInventoryCacheEntry,
     readInventoryCacheEntry,
-    inventoryRefreshDue,
     INVENTORY_RETRY_MS,
 } from './core/inventory.js';
 import {
@@ -332,6 +332,8 @@ const STORE_LIST_AT = 'listAt';
 /* Each tab adds its counts to the stored record this often. */
 const USAGE_FLUSH_MS = 10000;
 const STORE_INVENTORY = 'inventory';
+// 3.35.0: what the inventory reads learned (core/key-spend.js).
+const STORE_INVENTORY_POLICY = 'inventory-policy';
 const STORE_SELL_PREFS = 'sellingPage';
 /* Our own trader database: every trader we know of, and their TornW3B list. */
 const STORE_TRADER_DB = 'traderDb';
@@ -472,7 +474,7 @@ const LEDGER_BACKFILL_S = 365 * 24 * 60 * 60;
 /* Traders' networth (public personal stats), for "could they pay": id -> {value, at}. */
 const STORE_SELL_NETWORTH = 'sellNetworth';
 /* At most this many networth lookups a minute, inside the shared 70; each kept 12 hours. */
-const SELL_NETWORTH_PER_MIN = 5;
+const SELL_NETWORTH_PER_MIN = 3;
 const SELL_NETWORTH_REFRESH_MS = 12 * 60 * 60 * 1000;
 const SELL_NETWORTH_RETRY_MS = 10 * 60 * 1000;
 
@@ -11833,7 +11835,10 @@ function renderSellingWork(src = null, { press = null, typed = false } = {}) {
             : listed.map((r) => r.itemId)
     ).filter(Boolean).map(String).slice(0, SELL_REFRESH_FIRST);
 
-    const watch = sellWatch({ desk, strip, waiting: stripWaiting, traders: sell.scanWatch || [], listed, held: [...heldQty.keys()], buyersAll });
+    // 3.35.0 (core/key-spend.js): the best buyer of each item you hold is asked about only while My items or To sell
+    // is the list in view - else it was a status read for every item held, on every page (the key's budget).
+    const heldInView = sell.filter === 'mine' || sell.filter === 'sell';
+    const watch = sellWatch({ desk, strip, waiting: stripWaiting, traders: sell.scanWatch || [], listed, held: heldInView ? [...heldQty.keys()] : [], buyersAll });
     // The server owner, while his tab is in view (3.32.0): whether he is on is said beside his name.
     const ownerHere = ownerTabOn() ? ownerListNow(now) : null;
     if (ownerHere && !watch.ids.includes(String(ownerHere.id))) watch.ids = [String(ownerHere.id), ...watch.ids];
@@ -11841,14 +11846,17 @@ function renderSellingWork(src = null, { press = null, typed = false } = {}) {
     stepOwnConfirm(now);
     stepItemMarket(now);
     // Networth: the buyers the flips sell to first, then the desk's top traders.
-    const nwIds = [];
-    for (const f of strip) if (f.buyer && f.buyer.id) nwIds.push(String(f.buyer.id));
+    // 3.35.0 (core/key-spend.js): the buyers in view first, then only the first candidate flips' - not all 150 (the key's budget).
+    const nwView = [];
+    if (sell.pressed && pressLive(sell.pressed, now)) nwView.push(sell.pressed.traderId);
+    for (const f of strip) if (f.buyer && f.buyer.id) nwView.push(String(f.buyer.id));
+    if (desk) for (const b of desk.buyers.slice(0, 5)) if (b.id) nwView.push(String(b.id));
+    const nwCandidates = [];
     for (const c of sell.candidates) {
         const b = flipBuyerOf(c.itemId);
-        if (b && b.id) nwIds.push(String(b.id));
+        if (b && b.id) nwCandidates.push(String(b.id));
     }
-    if (desk) for (const b of desk.buyers.slice(0, 5)) if (b.id) nwIds.push(String(b.id));
-    updateSellNetworth([...new Set(nwIds)], now);
+    updateSellNetworth(networthWanted({ view: nwView, candidates: nwCandidates }), now);
     const statusesKnown = watch.ids.filter((id) => !presenceUnknown(id)).length;
 
     const heldCount = sell.inventory ? sell.inventory.length : 0;
@@ -12149,7 +12157,29 @@ async function loadSellInventory({ force = false } = {}) {
             sell.keyError = null;
             return;
         }
-        const raw = await fetchInventory(sell.client);
+        // 3.35.0 (core/key-spend.js): what earlier reads taught (no-category read refused, empty categories) and what a
+        // failed read already got - not the 25 categories from the first every time.
+        const now0 = Date.now();
+        const policy = inventoryPolicyClean(gmGet(STORE_INVENTORY_POLICY, null));
+        const plan = inventoryPlan(policy, now0);
+        let learned = policy;
+        const resume = inventoryResume(sell.invResume, now0);
+        let raw;
+        try {
+            raw = await fetchInventory(sell.client, {
+                ...plan,
+                resume,
+                onLearn: (event) => { learned = inventoryLearn(learned, event, Date.now()); },
+            });
+        } catch (error) {
+            if (error && error.partial) sell.invResume = { rows: error.partial.rows, done: error.partial.done, at: Date.now() };
+            throw error;
+        } finally {
+            if (learned !== policy) gmSet(STORE_INVENTORY_POLICY, learned);
+        }
+        sell.invResume = null;
+        sell.inventoryDirty = false;
+        sell.inventoryReads = (sell.inventoryReads || 0) + 1;
         const merged = mergeInventory(raw);
         gmSet(STORE_INVENTORY, makeInventoryCacheEntry(merged));
         sell.inventory = merged;
@@ -12734,7 +12764,10 @@ function onSellRefresh() {
         sell.bazaars.delete(sell.selected);
         sell.market.delete(sell.selected);
     }
-    loadSellInventory({ force: true }).then(() => refreshSellTraders({ force: true }));
+    // 3.35.0: the inventory only when it can have changed and not within a minute of the last read (Torn keeps it an hour anyway).
+    sell.inventoryDirty = true;
+    const invDue = inventoryDue({ inventoryAt: sell.inventoryAt, retryAt: sell.inventoryRetryAt, keyDead: sell.keyDead, dirty: true, now: Date.now(), refreshMs: INVENTORY_REFRESH_MS });
+    (invDue ? loadSellInventory({ force: true }) : Promise.resolve()).then(() => refreshSellTraders({ force: true }));
     renderSelling(true);
 }
 
@@ -13492,10 +13525,12 @@ function bootSellingPage() {
             saveTraderDb();
             return;
         }
-        const due = inventoryRefreshDue({
+        const due = inventoryDue({
             inventoryAt: sell.inventoryAt,
             retryAt: sell.inventoryRetryAt,
             keyDead: sell.keyDead,
+            dirty: sell.inventoryDirty,
+            now: Date.now(),
             refreshMs: INVENTORY_REFRESH_MS,
         });
         if (due && !sell.loading && getSellKey()) loadSellInventory({ force: true });
@@ -13511,6 +13546,7 @@ function bootSellingPage() {
     document.addEventListener('visibilitychange', () => {
         if (document.visibilityState === 'visible') {
             // Back: TornExchange at once if its list is due, the next read now.
+            sell.inventoryDirty = true;
             refreshSellTraders();
             stepW3b();
             markBidsSeen();
@@ -14013,6 +14049,7 @@ async function watchAcceptedBuys(now = Date.now()) {
         const known = new Set((Array.isArray(stored.buys) ? stored.buys : []).map((b) => String(b.id)));
         const fresh = buys.filter((b) => !known.has(String(b.id)) && !goneNow.has(String(b.id)));
         if (fresh.length) {
+            sell.inventoryDirty = true;
             const open = Object.values(sellAccepted());
             for (const b of fresh.slice(-40)) {
                 const r = logBuyPlace(open, b, traderBidOf);
@@ -14137,6 +14174,7 @@ async function watchFinishedTrades(now = Date.now(), { backup = false } = {}) {
             if (!f) continue;
             closeSellAccepted(t.key, { done: true, left: tradedLeftovers(t, take(f), Date.now(), f.t), seenAt: Number(f.t) || Date.now() });
             logAction('Traded - done (your Torn trades show it; item ' + t.itemId + ')');
+            sell.inventoryDirty = true;
             changed = true;
         }
         // Cancelled, but it had gone through before you did: what they took is
