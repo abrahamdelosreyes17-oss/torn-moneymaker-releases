@@ -460,7 +460,7 @@ export function sharedBody({ used = 0, waiting = 0, wants = [], since = 0, seen 
     // 3.33.0 - whose TornW3B lists this PC saw open or closed in the last three minutes, as ages (sharedOpen).
     const opensOut = (Array.isArray(opens) ? opens : []).map((o) => sharedOpenOut(o, now)).filter(Boolean).slice(0, SHARED_MAX_OPENS);
     if (opensOut.length) body.opens = opensOut;
-    // 3.36.0 - the seller lists and bazaars this PC read, and the buys that found the item gone (core/who-sells.js): as ages.
+    // 3.35.0 - the seller lists and bazaars this PC read, and the buys that found the item gone (core/who-sells.js): as ages.
     if (who) Object.assign(body, whoOutTake(who, now).body);
     // 3.26.2 - this PC's own request counts since the last answered exchange (core/usage.js): {} = none were made.
     if (calls && typeof calls === 'object' && !Array.isArray(calls)) {

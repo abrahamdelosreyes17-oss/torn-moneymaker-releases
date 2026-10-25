@@ -325,7 +325,7 @@ test('3.35.0: the zip says what the new reads did (state.json coverage)', () => 
     has('sell.checkingCount = rows.filter((r) => r.checking).length;', 'the checking flips are counted');
 });
 
-test('3.36.0: what this PC reads is told to the who-sells index, and the index is asked where to look (core/who-sells.js)', () => {
+test('3.35.0: what this PC reads is told to the who-sells index, and the index is asked where to look (core/who-sells.js)', () => {
     has("whoFeed('sees', seesOf(id, told, at));", 'a TornW3B sellers list');
     has("whoFeed('looked', lookedOf(id, [...items.keys()], Date.now()));", 'a bazaar read whole from Torn');
     has("whoFeed('looked', lookedOf(sellerId, coverItemIds(app.bzCover), Date.now()));", 'a bazaar page read whole');
@@ -335,7 +335,7 @@ test('3.36.0: what this PC reads is told to the who-sells index, and the index i
     has('.catch(() => {\n            sell.whoFails += 1;', 'a server that is off only backs the asking off');
 });
 
-test('3.36.0: the index orders the reads that were going to happen (rankItems, pressRank, whoSellerWants)', () => {
+test('3.35.0: the index orders the reads that were going to happen (rankItems, pressRank, whoSellerWants)', () => {
     has('? rankItems(sell.candidates.map((c) => ({ itemId: c.itemId, profit: c.score, known: c.known })), {', 'the possible flips');
     has(': candIds;\n    const candSet', 'no fresh answer: the order they had');
     has('sell.pressItems = pressRank(pressItems(prices,', 'the pressed trader\'s items');
@@ -343,7 +343,7 @@ test('3.36.0: the index orders the reads that were going to happen (rankItems, p
     has('const topIds = new Set([...setFirst, ...cheapIds,', 'a cheap listing\'s item is read on the top flips\' schedule');
 });
 
-test('3.36.0: the zip says what the index did', () => {
+test('3.35.0: the zip says what the index did', () => {
     has('whoSells: (() => {', 'coverage');
     for (const k of ['readsPutFirst: sell.whoStats.used', 'cheapConfirmed: sell.whoCheapDone.size', 'seesSent: st ? st.seesOut : null']) has(k, 'the counts');
 });

@@ -46,7 +46,7 @@ export const SHARED_OPENS_OUT_KEY = 'sharedOpensOut';
 export const SHARED_OPENS_IN_KEY = 'sharedOpensIn';
 /* 3.31.0 - traders' own price lists, as their Torn Archive told the server: {mark, lists: {trader: {at, since, open, prices, off}}}. */
 export const SHARED_OWN_KEY = 'sharedOwn';
-/* 3.36.0 - the seller lists, bazaars and gone listings this PC saw, waiting to be sent: {sees, looked, missed} (core/who-sells.js; written by either part of the script). */
+/* 3.35.0 - the seller lists, bazaars and gone listings this PC saw, waiting to be sent: {sees, looked, missed} (core/who-sells.js; written by either part of the script). */
 export const SHARED_WHO_OUT_KEY = 'sharedWhoOut';
 const SHARED_LISTS_IN_KEEP = 20;
 /* 3.28.0 - how fast items leave the bazaars, as the server counted it: {at (the server's clock), got (this PC's), rows: {item: units an hour}}. */
@@ -353,7 +353,7 @@ export class SharedLink {
                 const ownSince = takesLists && page === 0 ? (ownHeld && Number.isInteger(ownHeld.mark) && ownHeld.mark > 0 ? ownHeld.mark : 0) : null;
                 // 3.33.0 - this PC's open checks of the last three minutes, on the first page only.
                 const opensOut = takesLists && page === 0 ? this.d.load(SHARED_OPENS_OUT_KEY) || [] : null;
-                // 3.36.0 - what this PC saw of who sells what, on the first page only.
+                // 3.35.0 - what this PC saw of who sells what, on the first page only.
                 const whoOut = page === 0 ? this.d.load(SHARED_WHO_OUT_KEY) : null;
                 const whoTake = whoOut ? whoOutTake(whoOut, now) : null;
                 const body = sharedBody({ who: whoOut, used: use.used, waiting: (Number(use.waiting) || 0) + others, wants: page === 0 ? wants : wants.map(({ want, w3b, ...w }) => w), since: seq, seen, sendWorth, now, ver, lists: listsOut, listsSince: takesLists && page === 0 ? listsAt : null, calls: callsOut, moves: movesAt, ownSince, opens: opensOut });
@@ -544,7 +544,7 @@ export class SharedLink {
     }
 
     /**
-     * 3.36.0 - POST /who-sells: who probably sells these items, and the cheap listings seen lately (core/who-sells.js).
+     * 3.35.0 - POST /who-sells: who probably sells these items, and the cheap listings seen lately (core/who-sells.js).
      * Costs the server no request to Torn. Any tab may ask. A server that is off, does not know this PC or answers with
      * anything but an answer gives null - the caller works as before.
      * @param {{items: number[], n: number, list?: [number, number][]}} request - from whoAskBody
@@ -610,7 +610,7 @@ export class SharedLink {
             callsSyncs: Number.isInteger(state.callsSyncs) ? state.callsSyncs : 0,
             // 3.28.0: how many items the server's last table of speeds named (null: none came yet).
             moves: Number.isInteger(state.moves) ? state.moves : null,
-            // 3.36.0: seller lists, bazaars read whole and gone listings told to the index so far.
+            // 3.35.0: seller lists, bazaars read whole and gone listings told to the index so far.
             seesOut: Number.isInteger(state.seesOut) ? state.seesOut : 0,
             lookedOut: Number.isInteger(state.lookedOut) ? state.lookedOut : 0,
             missedOut: Number.isInteger(state.missedOut) ? state.missedOut : 0,

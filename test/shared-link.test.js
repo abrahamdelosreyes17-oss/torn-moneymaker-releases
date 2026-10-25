@@ -934,7 +934,7 @@ test('item speeds (3.28.0): Torn Bids\' page asks with one number and is handed 
     assert.equal(s.gm.values.has(SHARED_MOVES_KEY), false);
 });
 
-test('who sells what (3.36.0): the seller lists this PC read leave as ages and come off the box once answered; /who-sells names them back, and a server that is off costs nothing', async () => {
+test('who sells what (3.35.0): the seller lists this PC read leave as ages and come off the box once answered; /who-sells names them back, and a server that is off costs nothing', async () => {
     const s = setUp();
     const tab = s.addTab('sell', 't-sell', { sellers: [11], worth: { 206: 850000 } });
     await s.pass(35000);

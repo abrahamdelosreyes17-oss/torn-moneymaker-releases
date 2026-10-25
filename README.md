@@ -2992,6 +2992,28 @@ edited over a day ago only once you open that item.
 
 **Not seen on real Torn.** Tested with `npm test`.
 
+### Faster checks, Item Market buys, the server's who-sells-what (3.35.0)
+
+- **The card you press goes first:** that trader's list and every item on it are
+  read before anything else.
+- **The Item Market is a place to buy** (the owner, 2026-10-25: "Cheapest bazaar
+  or item market"): a flip takes the cheapest of bazaars and the Item Market. An
+  Item Market listing names no seller, so "never sell a trader what you bought
+  from their own bazaar" cannot be checked on it.
+- **Old lists are checked, not hidden:** with Fresh prices on, a trader hidden only
+  by an old list date gets their list read open, most profit first.
+- **Possible flips show at once** as "checking" with an approximate profit, below
+  the checked ones. Nothing is bought on an unchecked price.
+- **The Torn key goes to deals:** the inventory is read hourly or after a buy,
+  trade or Refresh; networth and status only for traders in view or in a flip.
+- **The shared server's who-sells-what index** (BM25) says which bazaars probably
+  have an item; reads go to likely sellers first, then by profit per read. Cheap
+  new listings the server saw are checked first. The PCs tell it what they read.
+- The zip counts flips hidden per filter, press-to-first-check times, Item Market
+  and who-sells numbers.
+
+**Not seen on real Torn.** Tested with `npm test`.
+
 ## Architecture
 
 ```

@@ -232,7 +232,7 @@ test('the Item Market after every bazaar also when a market step comes first in 
     const plain = { items: [{ itemId: '1', kind: 'flip', steps: [{ sellerId: '9', qty: 1, price: 1, bought: true }, { sellerId: '8', qty: 1, price: 1, bought: false }] }, { itemId: '2', kind: 'flip', steps: [{ sellerId: '7', qty: 1, price: 1, bought: false }] }] };
     assert.deepEqual([nextStep(plain).itemId, nextStep(plain).index], ['1', 1]);
     // The Trades desk draws its stops by the same order (stepRank): the stops named, a bazaar they do not name,
-    // the Item Market last - and a trade without stops keeps its own order, but for the Item Market (3.36.0: a flip's
+    // the Item Market last - and a trade without stops keeps its own order, but for the Item Market (3.35.0: a flip's
     // plan may buy there; no page counts that buy, so the bazaars come first and your log has ticked it by the end).
     const t2 = { stops: ['72', '71'] };
     assert.deepEqual([OWNER_MARKET, '99', '71', '72'].sort((a, b) => stepRank(t2, a) - stepRank(t2, b)), ['72', '71', '99', OWNER_MARKET]);

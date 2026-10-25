@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      3.34.0
+// @version      3.35.0
 // @description  Finds Bazaar and Item Market listings below NPC / market value - on the page you are viewing, and live from the Torn API and TornW3B - ranked by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -53,7 +53,7 @@
 (function (undefined, NaN, Infinity, Object, Array, String, Number, Boolean, Symbol, Math, JSON, Date, RegExp, Intl, Map, Set, WeakMap, WeakSet, Promise, Error, ArrayBuffer, DataView, Uint8Array, Uint32Array, TextEncoder, URL, URLSearchParams, encodeURIComponent, document, performance) {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '3.34.0';
+    const TTV2_BUILD_VERSION = '3.35.0';
     const TTV2_SHARED_HOME = 'https://torn-bids-shared.pumping-iron-worker.workers.dev';
 
     /* ===== src/platform/gm.js ===== */
@@ -628,6 +628,409 @@
         return rows.map((r) => r.map((c) => (/[",\n]/.test(String(c)) ? '"' + String(c).replace(/"/g, '""') + '"' : String(c))).join(',')).join('\n') + '\n';
     }
 
+    /* ===== src/core/who-sells.js ===== */
+    /*
+     * The who-sells-what index (3.35.0): what this PC tells the shared server of the seller lists it reads, what it asks of
+     * the server's POST /who-sells, and how the answer orders the reads. The server side is D:\torn\server (src/index.js,
+     * host.js whoSells); it costs the server no request to Torn.
+     *
+     *   1. Feed (no request of its own): every seller list of one item this PC read (`sees`), every bazaar it read whole
+     *      (`looked`) and every buy that found the item gone (`missed`) wait in a stored box and leave with the next
+     *      exchange (feed/shared-link.js). Ages go out, not times (every PC has its own clock); nothing older than an hour.
+     *   2. Ask: items of the possible flips, the item in view and the pressed trader's list (weighted by what each would
+     *      make) are asked about at most once a minute, and at once on a press. The answer orders the reads.
+     *   3. One ranking for the reads that are left (rankReads): the profit of the flip a read could confirm, times how likely
+     *      the index makes it that the read finds something, divided by what the read costs.
+     *   4. The cheap list (listings under what a trader pays) goes to the front; nothing is ever bought from it.
+     *
+     * Pure: no page, no clock, no network.
+     */
+
+    /** Nothing older than this is told (the server takes ages up to an hour). */
+    const WHO_KEEP_MS = 60 * 60 * 1000;
+    /** The server's caps on one exchange (src/core.js). */
+    const WHO_MAX_SEES = 60;
+    const WHO_MAX_SEES_SELLERS = 300;
+    const WHO_MAX_LOOKED = 40;
+    const WHO_MAX_LOOKED_ITEMS = 500;
+    const WHO_MAX_MISSED = 100;
+    /** What /who-sells takes at most. */
+    const WHO_MAX_ASK_ITEMS = 100;
+    const WHO_MAX_LIST = 200;
+    const WHO_MAX_N = 50;
+    /** An answer is asked for again after this, at once on a press (but not twice within WHO_PRESS_GAP_MS). */
+    const WHO_EVERY_MS = 60 * 1000;
+    const WHO_PRESS_GAP_MS = 5 * 1000;
+    /** An answer orders the reads this long. */
+    const WHO_USE_MS = 5 * 60 * 1000;
+    /** A cheap listing is put first this long after the server saw it (the server keeps them half an hour). */
+    const WHO_CHEAP_MS = 10 * 60 * 1000;
+    /** How many of the pressed trader's items are asked about by name, after the item in view. */
+    const WHO_PRESS_ITEMS = 40;
+    /** Sellers asked for an item, and for the pressed list. */
+    const WHO_N_ITEM = 10;
+    const WHO_N_LIST = 30;
+    /** Sellers of the cheap list and of `together` that are read whole from Torn in one go. */
+    const WHO_SELLER_WANT = 6;
+    /** Of the item in view, this many of its likeliest sellers are read whole. */
+    const WHO_VIEW_SELLERS = 3;
+
+    /** A positive whole Torn id as a number, or null ('market', names and the like are not one). */
+    function whoId(x) {
+        const s = String(x ?? '');
+        return /^\d{1,10}$/.test(s) && Number(s) > 0 ? Number(s) : null;
+    }
+
+    const ids = (list, max) => {
+        const out = [];
+        const seen = new Set();
+        for (const x of Array.isArray(list) ? list : []) {
+            const id = whoId(x);
+            if (id === null || seen.has(id)) continue;
+            seen.add(id);
+            out.push(id);
+            if (out.length >= max) break;
+        }
+        return out;
+    };
+
+    /* ------------------------------------------------------------------ 1. feed */
+
+    /** An item's seller list this PC read, as the box keeps it: [item, at, [sellers]] - or null (no sellers, not an item). */
+    function seesOf(itemId, sellerIds, at) {
+        const item = whoId(itemId);
+        const sellers = ids(sellerIds, WHO_MAX_SEES_SELLERS);
+        return item === null || !sellers.length || !(at > 0) ? null : [item, at, sellers];
+    }
+
+    /** A bazaar this PC read whole: [seller, at, [items]] - or null. */
+    function lookedOf(sellerId, itemIds, at) {
+        const seller = whoId(sellerId);
+        const items = ids(itemIds, WHO_MAX_LOOKED_ITEMS);
+        return seller === null || !items.length || !(at > 0) ? null : [seller, at, items];
+    }
+
+    /** A buy that found the item gone: [seller, item, at] - or null. */
+    function missedOf(sellerId, itemId, at) {
+        const seller = whoId(sellerId);
+        const item = whoId(itemId);
+        return seller === null || item === null || !(at > 0) ? null : [seller, item, at];
+    }
+
+    const KINDS = {
+        sees: { key: (e) => String(e[0]), max: WHO_MAX_SEES },
+        looked: { key: (e) => String(e[0]), max: WHO_MAX_LOOKED },
+        missed: { key: (e) => e[0] + '|' + e[1], max: WHO_MAX_MISSED },
+    };
+
+    /** The box with nothing in it. */
+    const whoOutNew = () => ({ sees: [], looked: [], missed: [] });
+
+    /**
+     * One entry added to the box (the same item / bazaar / pair replaces its older one); nothing over an hour stays,
+     * and no more than one exchange can carry.
+     * @param {object|null} box
+     * @param {'sees'|'looked'|'missed'} kind
+     * @param {Array|null} entry - from seesOf, lookedOf or missedOf
+     * @returns {object} a new box
+     */
+    function whoOutAdd(box, kind, entry, now) {
+        const k = KINDS[kind];
+        const out = whoOutNew();
+        for (const name of Object.keys(KINDS)) out[name] = box && Array.isArray(box[name]) ? box[name].filter((e) => Array.isArray(e) && now - e[name === 'missed' ? 2 : 1] < WHO_KEEP_MS) : [];
+        if (!k || !entry) return out;
+        const mine = k.key(entry);
+        out[kind] = [...out[kind].filter((e) => k.key(e) !== mine), entry].slice(-k.max);
+        return out;
+    }
+
+    const age = (at, now) => Math.max(0, Math.floor(now - at));
+
+    /**
+     * What goes out with an exchange: ages in ms, the newest first, within the server's caps, and which entries they are
+     * (to take them off the box once the answer came).
+     * @returns {{body: {sees?: Array, looked?: Array, missed?: Array}, taken: object, counts: {sees: number, looked: number, missed: number}}}
+     */
+    function whoOutTake(box, now) {
+        const body = {};
+        const taken = whoOutNew();
+        const counts = { sees: 0, looked: 0, missed: 0 };
+        const fresh = (e, i) => Array.isArray(e) && now - e[i] >= 0 && now - e[i] < WHO_KEEP_MS;
+        const sees = (box && Array.isArray(box.sees) ? box.sees : []).filter((e) => fresh(e, 1)).sort((a, b) => b[1] - a[1]).slice(0, WHO_MAX_SEES);
+        const looked = (box && Array.isArray(box.looked) ? box.looked : []).filter((e) => fresh(e, 1)).sort((a, b) => b[1] - a[1]).slice(0, WHO_MAX_LOOKED);
+        const missed = (box && Array.isArray(box.missed) ? box.missed : []).filter((e) => fresh(e, 2)).sort((a, b) => b[2] - a[2]).slice(0, WHO_MAX_MISSED);
+        if (sees.length) body.sees = sees.map((e) => [e[0], age(e[1], now), e[2]]);
+        if (looked.length) body.looked = looked.map((e) => [e[0], age(e[1], now), e[2]]);
+        if (missed.length) body.missed = missed.map((e) => [e[0], e[1]]);
+        taken.sees = sees;
+        taken.looked = looked;
+        taken.missed = missed;
+        counts.sees = sees.length;
+        counts.looked = looked.length;
+        counts.missed = missed.length;
+        return { body, taken, counts };
+    }
+
+    /** The box without what was taken (an entry told again by the same time; a newer one for the same key stays). */
+    function whoOutDrop(box, taken) {
+        const out = whoOutNew();
+        for (const name of Object.keys(KINDS)) {
+            const k = KINDS[name];
+            const at = name === 'missed' ? 2 : 1;
+            const gone = new Set((taken && Array.isArray(taken[name]) ? taken[name] : []).map((e) => k.key(e) + '@' + e[at]));
+            out[name] = (box && Array.isArray(box[name]) ? box[name] : []).filter((e) => Array.isArray(e) && !gone.has(k.key(e) + '@' + e[at]));
+        }
+        return out;
+    }
+
+    /** The outgoing check for `sees`, `looked` and `missed` as they leave (ages): true when exactly what whoOutTake makes. */
+    function whoOutValid(key, value) {
+        const whole = (n) => Number.isInteger(n) && n >= 0;
+        const idOk = (n) => Number.isInteger(n) && n > 0 && n < 1e10;
+        if (!Array.isArray(value)) return false;
+        if (key === 'sees') return value.length <= WHO_MAX_SEES && value.every((e) => Array.isArray(e) && e.length === 3 && idOk(e[0]) && whole(e[1]) && e[1] <= WHO_KEEP_MS && Array.isArray(e[2]) && e[2].length <= WHO_MAX_SEES_SELLERS && e[2].every(idOk));
+        if (key === 'looked') return value.length <= WHO_MAX_LOOKED && value.every((e) => Array.isArray(e) && e.length === 3 && idOk(e[0]) && whole(e[1]) && e[1] <= WHO_KEEP_MS && Array.isArray(e[2]) && e[2].length <= WHO_MAX_LOOKED_ITEMS && e[2].every(idOk));
+        if (key === 'missed') return value.length <= WHO_MAX_MISSED && value.every((e) => Array.isArray(e) && e.length === 2 && idOk(e[0]) && idOk(e[1]));
+        return false;
+    }
+
+    /** The sellers of a list of rows (bazaar-shaped, sellerId on each) in the order given, the Item Market and the unnamed left out. */
+    function sellersOfRows(rows) {
+        return (rows || []).map((r) => r && r.sellerId).filter((s) => whoId(s) !== null);
+    }
+
+    /** The items of a bazaar page read whole (core/bazaar-cover.js: rows is {rowIndex: 'id,id,id'}), no repeats. */
+    function coverItemIds(cover) {
+        const out = new Set();
+        for (const s of Object.values((cover && cover.rows) || {})) for (const id of String(s || '').split(',')) if (whoId(id) !== null) out.add(String(whoId(id)));
+        return [...out];
+    }
+
+    /* ------------------------------------------------------------------ 2. ask */
+
+    /**
+     * What to ask the index about: the item in view first, then the pressed trader's best items, then the possible
+     * flips by what they make - at most WHO_MAX_ASK_ITEMS; and with a press, the pressed trader's whole list weighted by
+     * what each item would make (1 where the gap is not known yet).
+     * @param {object} o
+     * @param {string|null} [o.view]
+     * @param {{itemId: string, profit: number}[]} [o.candidates] - the biggest first
+     * @param {{all: string[], gap?: Object<string, number>}|null} [o.pressed] - core/pressed.js pressItems()
+     * @returns {{items: number[], list: [number, number][]|null, n: number}|null} null when there is nothing to ask
+     */
+    function whoAskPlan({ view = null, candidates = [], pressed = null } = {}) {
+        const press = pressed && Array.isArray(pressed.all) ? pressed.all : [];
+        const items = ids([view, ...press.slice(0, WHO_PRESS_ITEMS), ...(candidates || []).map((c) => c && c.itemId)], WHO_MAX_ASK_ITEMS);
+        let list = null;
+        if (press.length) {
+            list = [];
+            const seen = new Set();
+            for (const id of press) {
+                const item = whoId(id);
+                if (item === null || seen.has(item)) continue;
+                seen.add(item);
+                const gap = Number(pressed.gap && pressed.gap[id]);
+                list.push([item, gap > 0 ? Math.round(gap) || 1 : 1]);
+                if (list.length >= WHO_MAX_LIST) break;
+            }
+            if (!list.length) list = null;
+        }
+        if (!items.length && !list) return null;
+        return { items, list, n: list ? WHO_N_LIST : WHO_N_ITEM };
+    }
+
+    /** The request body for a plan: exactly the shape the server takes. */
+    function whoAskBody(plan) {
+        if (!plan) return null;
+        const body = { items: ids(plan.items, WHO_MAX_ASK_ITEMS), n: Math.min(WHO_MAX_N, Math.max(1, Math.floor(plan.n) || WHO_N_ITEM)) };
+        if (Array.isArray(plan.list) && plan.list.length) {
+            body.list = plan.list.filter((x) => Array.isArray(x) && whoId(x[0]) !== null && Number.isFinite(x[1]) && x[1] > 0).slice(0, WHO_MAX_LIST).map((x) => [whoId(x[0]), x[1]]);
+            if (!body.list.length) delete body.list;
+        }
+        return body.items.length || body.list ? body : null;
+    }
+
+    /** Wait after the n-th failed ask in a row (1 = the first): a minute, doubling, at most half an hour. */
+    function whoBackoffMs(fails) {
+        const n = Number.isInteger(fails) && fails > 0 ? fails : 1;
+        return Math.min(30 * 60 * 1000, WHO_EVERY_MS * 2 ** (n - 1));
+    }
+
+    /**
+     * May the index be asked now? Once a minute; on a press (newer than the last ask) after a few seconds; after a failure
+     * not before its back-off - the server being off must cost nothing.
+     * @param {{lastAt?: number, pressAt?: number, fails?: number, failedAt?: number}} st
+     */
+    function whoMayAsk(st, now) {
+        const s = st || {};
+        if (s.fails > 0 && now - (s.failedAt || 0) < whoBackoffMs(s.fails)) return false;
+        const last = s.lastAt || 0;
+        if ((s.pressAt || 0) > last) return now - last >= WHO_PRESS_GAP_MS;
+        return now - last >= WHO_EVERY_MS;
+    }
+
+    /**
+     * The server's answer, checked and laid out; null when it is not one.
+     * @returns {{at: number, items: Map<string, {id: string, score: number, ago: number}[]>, together: {id: string, score: number, items: number}[], cheap: {item: string, seller: string, price: number, worth: number, at: number}[], hot: Map<string, number>, known: {sellers: number, postings: number}|null}|null}
+     *   `at` and each cheap `at` are on this PC's clock (got).
+     */
+    function whoAnswerIn(answer, got) {
+        if (!answer || typeof answer !== 'object' || !Array.isArray(answer.items)) return null;
+        const num = (n) => (Number.isFinite(n) && n >= 0 ? n : null);
+        const items = new Map();
+        for (const row of answer.items.slice(0, WHO_MAX_ASK_ITEMS)) {
+            const item = whoId(row && row.item);
+            if (item === null || !Array.isArray(row.sellers)) continue;
+            const sellers = [];
+            for (const s of row.sellers.slice(0, WHO_MAX_N)) {
+                const id = whoId(s && s.id);
+                const score = num(s && s.score);
+                const ago = num(s && s.ago);
+                if (id !== null && score !== null && ago !== null) sellers.push({ id: String(id), score, ago });
+            }
+            items.set(String(item), sellers);
+        }
+        const together = [];
+        for (const s of (Array.isArray(answer.together) ? answer.together : []).slice(0, WHO_MAX_N)) {
+            const id = whoId(s && s.id);
+            const score = num(s && s.score);
+            const n = Number.isFinite(s && s.items) ? s.items : Array.isArray(s && s.items) ? s.items.length : 0;
+            if (id !== null && score !== null) together.push({ id: String(id), score, items: n });
+        }
+        const cheap = [];
+        for (const c of (Array.isArray(answer.cheap) ? answer.cheap : []).slice(0, 50)) {
+            const item = whoId(c && c.item);
+            const seller = whoId(c && c.seller);
+            const price = num(c && c.price);
+            const worth = num(c && c.worth);
+            const ago = num(c && c.ago);
+            if (item !== null && seller !== null && price > 0 && worth > 0 && ago !== null) cheap.push({ item: String(item), seller: String(seller), price, worth, at: got - ago });
+        }
+        const hot = new Map();
+        for (const h of (Array.isArray(answer.hot) ? answer.hot : []).slice(0, 30)) {
+            if (Array.isArray(h) && whoId(h[0]) !== null && num(h[1]) !== null) hot.set(String(whoId(h[0])), h[1]);
+        }
+        const k = answer.known;
+        const known = k && typeof k === 'object' && num(k.sellers) !== null && num(k.postings) !== null ? { sellers: k.sellers, postings: k.postings } : null;
+        return { at: got, items, together, cheap, hot, known };
+    }
+
+    /** The answer, if it is still good for ordering reads. */
+    function whoFresh(who, now) {
+        return who && now - who.at >= 0 && now - who.at < WHO_USE_MS ? who : null;
+    }
+
+    /* ------------------------------------------------------------------ 3. rank */
+
+    /**
+     * How likely a read of this item is to find something worth having, by the index (neutral 1 when it was not asked
+     * or is not fresh, so an item the index says nothing of keeps the place it had): sellers seen lately 0.6..1, an item
+     * asked about and nobody known to sell it 0.5, a cheap listing of it 2.
+     */
+    function itemChance(who, itemId, now) {
+        const w = whoFresh(who, now);
+        if (!w) return 1;
+        const id = String(itemId);
+        if (w.cheap.some((c) => c.item === id && now - c.at < WHO_CHEAP_MS)) return 2;
+        const sellers = w.items.get(id);
+        if (!sellers) return 1;
+        if (!sellers.length) return 0.5;
+        const newest = Math.min(...sellers.map((s) => s.ago)) + (now - w.at);
+        return 0.6 + 0.4 * Math.max(0, 1 - newest / WHO_KEEP_MS);
+    }
+
+    /**
+     * The one ranking of reads: what the flip a read could confirm would make, times how likely the index makes a find,
+     * divided by what the read costs. Equal values keep the order given (the order they had before is the tie-break).
+     * @param {{id: string, profit: number, chance?: number, cost?: number}[]} reads
+     * @returns {string[]} ids, the best first
+     */
+    function rankReads(reads) {
+        const value = (r) => (Number(r.profit) || 0) * (Number.isFinite(r.chance) ? r.chance : 1) / Math.max(0.1, Number.isFinite(r.cost) ? r.cost : 1);
+        return (reads || []).map((r, i) => ({ id: String(r.id), v: value(r), i })).sort((a, b) => b.v - a.v || a.i - b.i).map((r) => r.id);
+    }
+
+    /**
+     * The candidate flips' items in the order they are read: cheap listings first (newest first), then rankReads - within
+     * each group (`groupOf`, e.g. flips priced on real listings before guessed ones: the groups keep their order).
+     * @param {{itemId: string, profit: number}[]} candidates
+     * @param {object} o
+     * @param {object|null} o.who
+     * @param {number} o.now
+     * @param {(itemId: string) => number} [o.costOf] - reads the item still needs (1 where not given)
+     * @param {(c: object) => string|number} [o.groupOf]
+     */
+    function rankItems(candidates, { who = null, now, costOf = () => 1, groupOf = () => 0 }) {
+        const front = cheapItems(who, now);
+        const inFront = new Set(front);
+        const groups = new Map();
+        for (const c of candidates || []) {
+            if (inFront.has(String(c.itemId))) continue;
+            const g = groupOf(c);
+            if (!groups.has(g)) groups.set(g, []);
+            groups.get(g).push({ id: String(c.itemId), profit: Math.max(1, Number(c.profit) || 0), chance: itemChance(who, c.itemId, now), cost: costOf(String(c.itemId)) });
+        }
+        return [...front, ...[...groups.values()].flatMap((reads) => rankReads(reads))];
+    }
+
+    /**
+     * The pressed trader's items (core/pressed.js pressItems) in the order they are asked: by what they pay over the
+     * cheapest bazaar times how likely the index makes a find. An item with no gap known keeps its place after the known ones.
+     * @returns {{all: string[], full: string[], wide: string[], gap: object}} the same shape, reordered
+     */
+    function pressRank(items, who, now, fullMax = 8) {
+        if (!items || !whoFresh(who, now)) return items;
+        const gap = items.gap || {};
+        const known = items.all.filter((id) => id in gap);
+        const unknown = items.all.filter((id) => !(id in gap));
+        const rank = (list) => rankReads(list.map((id) => ({ id, profit: Math.max(1, gap[id] || 1), chance: itemChance(who, id, now) })));
+        const all = [...rank(known), ...rank(unknown)];
+        return { ...items, all, full: all.filter((id) => id in gap).slice(0, fullMax), wide: [...all, ...items.wide.slice(items.all.length)] };
+    }
+
+    /* ------------------------------------------------------------------ 4. cheap and sellers */
+
+    /** Items with a cheap new listing, the newest first, while it is fresh. */
+    function cheapItems(who, now) {
+        const w = whoFresh(who, now);
+        if (!w) return [];
+        const seen = new Set();
+        return w.cheap.filter((c) => now - c.at < WHO_CHEAP_MS).sort((a, b) => b.at - a.at).map((c) => c.item).filter((id) => (seen.has(id) ? false : seen.add(id)));
+    }
+
+    /**
+     * Whose bazaar to read whole from Torn first: the sellers of the cheap listings (to confirm them), then, while a
+     * trader is pressed, the sellers that carry most of their list together.
+     * Between them the item in view's likeliest sellers.
+     * @param {object} o
+     * @param {object|null} o.who
+     * @param {boolean} o.pressed - a press is live
+     * @param {(sellerId: string) => boolean} [o.skip] - read lately or sent: left out
+     * @returns {{id: string, why: 'cheap'|'view'|'together'}[]}
+     */
+    function whoSellerWants({ who, now, pressed = false, view = null, skip = () => false, max = WHO_SELLER_WANT }) {
+        const w = whoFresh(who, now);
+        if (!w) return [];
+        const out = [];
+        const add = (id, why) => {
+            if (out.length >= max || skip(id) || out.some((o) => o.id === id)) return;
+            out.push({ id, why });
+        };
+        for (const c of [...w.cheap].filter((x) => now - x.at < WHO_CHEAP_MS).sort((a, b) => b.at - a.at)) add(c.seller, 'cheap');
+        // The item in view: its likeliest sellers, a few (the page's own read of it is TornW3B's).
+        for (const v of view ? (w.items.get(String(view)) || []).slice(0, WHO_VIEW_SELLERS) : []) add(v.id, 'view');
+        if (pressed) for (const t of [...w.together].sort((a, b) => b.score - a.score)) add(t.id, 'together');
+        return out;
+    }
+
+    /** The (seller, item) cheap listings that a read of the seller's bazaar answers: [seller, item] pairs found listed there. */
+    function cheapConfirmedBy(who, now, sellerId, itemIds) {
+        const w = whoFresh(who, now) || who;
+        if (!w) return [];
+        const has = itemIds instanceof Set ? itemIds : new Set([...(itemIds || [])].map(String));
+        return w.cheap.filter((c) => c.seller === String(sellerId) && has.has(c.item)).map((c) => c.seller + '|' + c.item);
+    }
+
     /* ===== src/core/shared.js ===== */
     /**
      * Shared: this PC's side of the shared server (server/).
@@ -643,6 +1046,7 @@
 
 
 
+
     const SHARED_SYNC_MS = 30000;
     // The same split as server/src/budget.js (test/shared.test.js holds the two together):
     // of Torn's 100 calls a minute per person, 20 are never used by the server or this PC.
@@ -655,7 +1059,7 @@
     const SHARED_MAX_SELLERS = 3000;
     const SHARED_MAX_NEAR = 200;
     const SHARED_MAX_WORTH = 5000;
-    const SHARED_BODY_KEYS = ['app', 'ver', 'used', 'waiting', 'sellers', 'trades', 'looking', 'worth', 'since', 'seen', 'going', 'bought', 'dir', 'want', 'w3b', 'lists', 'listsSince', 'calls', 'moves', 'ownSince', 'opens'];
+    const SHARED_BODY_KEYS = ['app', 'ver', 'used', 'waiting', 'sellers', 'trades', 'looking', 'worth', 'since', 'seen', 'going', 'bought', 'dir', 'want', 'w3b', 'lists', 'listsSince', 'calls', 'moves', 'ownSince', 'opens', 'sees', 'looked', 'missed'];
     /*
      * 3.26.0, the server handing out TornW3B's work (its /sync, deployed 2026-10-11):
      *   want        the items whose sellers list this PC would ask TornW3B for next, most wanted first (60 at most)
@@ -1052,7 +1456,7 @@
      * come out of here, whatever is put in.
      * `now`: this PC's clock; the marks leave as ages, since every PC has its own clock.
      */
-    function sharedBody({ used = 0, waiting = 0, wants = [], since = 0, seen = 0, sendWorth = true, now = 0, ver = null, lists = null, listsSince = null, calls = null, moves = null, ownSince = null, opens = null } = {}) {
+    function sharedBody({ used = 0, waiting = 0, wants = [], since = 0, seen = 0, sendWorth = true, now = 0, ver = null, lists = null, listsSince = null, calls = null, moves = null, ownSince = null, opens = null, who = null } = {}) {
         const count = (n) => (Number.isFinite(n) && n > 0 ? Math.min(1000, Math.floor(n)) : 0);
         const list = Array.isArray(wants) ? wants.filter((w) => w && typeof w === 'object') : [];
         const trades = sharedIds(list.map((w) => w.trades), SHARED_MAX_NEAR);
@@ -1090,6 +1494,8 @@
         // 3.33.0 - whose TornW3B lists this PC saw open or closed in the last three minutes, as ages (sharedOpen).
         const opensOut = (Array.isArray(opens) ? opens : []).map((o) => sharedOpenOut(o, now)).filter(Boolean).slice(0, SHARED_MAX_OPENS);
         if (opensOut.length) body.opens = opensOut;
+        // 3.35.0 - the seller lists and bazaars this PC read, and the buys that found the item gone (core/who-sells.js): as ages.
+        if (who) Object.assign(body, whoOutTake(who, now).body);
         // 3.26.2 - this PC's own request counts since the last answered exchange (core/usage.js): {} = none were made.
         if (calls && typeof calls === 'object' && !Array.isArray(calls)) {
             body.calls = {};
@@ -1156,6 +1562,8 @@
             } else if (key === 'opens') {
                 // [trader, 1 open | 0 closed, age, age of the list's last change (0: not known), mark of its prices (0: none)]
                 if (!Array.isArray(value) || value.length > SHARED_MAX_OPENS || !value.every((m) => Array.isArray(m) && m.length === 5 && m.every(whole) && m[0] > 0 && m[0] < 1e10 && (m[1] === 0 || m[1] === 1) && m[2] < SHARED_OPEN_KEEP_MS && m[4] < 2 ** 32)) return false;
+            } else if (key === 'sees' || key === 'looked' || key === 'missed') {
+                if (!whoOutValid(key, value)) return false;
             } else if (key === 'calls') {
                 // {tag: how many}: a service's tag or how one answered, a whole number from 1 to 5,000.
                 if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length > USAGE_CALLS_TAGS_MAX) return false;
@@ -1782,6 +2190,7 @@
 
 
 
+
     const SHARED_CONFIG_KEY = 'sharedConfig';
     const SHARED_STATE_KEY = 'sharedState';
     const SHARED_GRANT_KEY = 'sharedGrant';
@@ -1801,6 +2210,8 @@
     const SHARED_OPENS_IN_KEY = 'sharedOpensIn';
     /* 3.31.0 - traders' own price lists, as their Torn Archive told the server: {mark, lists: {trader: {at, since, open, prices, off}}}. */
     const SHARED_OWN_KEY = 'sharedOwn';
+    /* 3.35.0 - the seller lists, bazaars and gone listings this PC saw, waiting to be sent: {sees, looked, missed} (core/who-sells.js; written by either part of the script). */
+    const SHARED_WHO_OUT_KEY = 'sharedWhoOut';
     const SHARED_LISTS_IN_KEEP = 20;
     /* 3.28.0 - how fast items leave the bazaars, as the server counted it: {at (the server's clock), got (this PC's), rows: {item: units an hour}}. */
     const SHARED_MOVES_KEY = 'sharedMoves';
@@ -2106,7 +2517,10 @@
                     const ownSince = takesLists && page === 0 ? (ownHeld && Number.isInteger(ownHeld.mark) && ownHeld.mark > 0 ? ownHeld.mark : 0) : null;
                     // 3.33.0 - this PC's open checks of the last three minutes, on the first page only.
                     const opensOut = takesLists && page === 0 ? this.d.load(SHARED_OPENS_OUT_KEY) || [] : null;
-                    const body = sharedBody({ used: use.used, waiting: (Number(use.waiting) || 0) + others, wants: page === 0 ? wants : wants.map(({ want, w3b, ...w }) => w), since: seq, seen, sendWorth, now, ver, lists: listsOut, listsSince: takesLists && page === 0 ? listsAt : null, calls: callsOut, moves: movesAt, ownSince, opens: opensOut });
+                    // 3.35.0 - what this PC saw of who sells what, on the first page only.
+                    const whoOut = page === 0 ? this.d.load(SHARED_WHO_OUT_KEY) : null;
+                    const whoTake = whoOut ? whoOutTake(whoOut, now) : null;
+                    const body = sharedBody({ who: whoOut, used: use.used, waiting: (Number(use.waiting) || 0) + others, wants: page === 0 ? wants : wants.map(({ want, w3b, ...w }) => w), since: seq, seen, sendWorth, now, ver, lists: listsOut, listsSince: takesLists && page === 0 ? listsAt : null, calls: callsOut, moves: movesAt, ownSince, opens: opensOut });
                     if (!sharedOutgoingOk(body)) throw new Error('Not sent: the message was not in the agreed shape.');
 
                     const response = await this.d.post(`${cfg.address}/sync`, {
@@ -2186,6 +2600,11 @@
                         this.d.save(SHARED_DIR_KEY, dirNow);
                     }
                     state.turn = dirNow.turn;
+                    if (whoTake && (whoTake.counts.sees || whoTake.counts.looked || whoTake.counts.missed)) {
+                        // Answered: what was sent comes off the box (what the tabs saw meanwhile stays for the next one).
+                        this.d.save(SHARED_WHO_OUT_KEY, whoOutDrop(this.d.load(SHARED_WHO_OUT_KEY), whoTake.taken));
+                        for (const k of ['sees', 'looked', 'missed']) state[k + 'Out'] = (Number.isInteger(before[k + 'Out']) ? before[k + 'Out'] : 0) + whoTake.counts[k];
+                    }
                     if (page === 0 && body.calls) {
                         // Answered: what was sent comes off the sum (what the tabs counted meanwhile stays for the next one).
                         const sum = Object.values(body.calls).reduce((a, n) => a + n, 0);
@@ -2288,10 +2707,30 @@
             return true;
         }
 
+        /**
+         * 3.35.0 - POST /who-sells: who probably sells these items, and the cheap listings seen lately (core/who-sells.js).
+         * Costs the server no request to Torn. Any tab may ask. A server that is off, does not know this PC or answers with
+         * anything but an answer gives null - the caller works as before.
+         * @param {{items: number[], n: number, list?: [number, number][]}} request - from whoAskBody
+         * @returns {Promise<object|null>} whoAnswerIn()
+         */
+        async whoSells(request) {
+            const cfg = this.config();
+            if (!cfg || !request) return null;
+            const state = this.d.load(SHARED_STATE_KEY) || {};
+            if (state.unknown || state.update) return null;
+            const response = await this.d.post(`${cfg.address}/who-sells`, {
+                headers: { Authorization: `Bearer ${cfg.pass}`, 'Content-Type': 'application/json' },
+                body: JSON.stringify(request),
+            });
+            if (!response || !response.ok) throw new Error(`The server answered with status ${response ? response.status : 0}.`);
+            return whoAnswerIn(await response.json(), this.now());
+        }
+
         /** The server's address or this PC's word changed, or there is none now: what was kept under the old one goes. */
         forget() {
             for (let i = 0; i < SHARED_BUCKETS; i += 1) this.d.del(SHARED_READS_PREFIX + i);
-            for (const key of [SHARED_STATE_KEY, SHARED_GRANT_KEY, SHARED_MARKS_KEY, SHARED_INTEREST_KEY, SHARED_ASK_KEY, SHARED_DIR_KEY, SHARED_W3B_ASK_KEY, SHARED_LISTS_OUT_KEY, SHARED_LISTS_IN_KEY, SHARED_CALLS_KEY, SHARED_MOVES_KEY]) this.d.del(key);
+            for (const key of [SHARED_STATE_KEY, SHARED_GRANT_KEY, SHARED_MARKS_KEY, SHARED_INTEREST_KEY, SHARED_ASK_KEY, SHARED_DIR_KEY, SHARED_W3B_ASK_KEY, SHARED_LISTS_OUT_KEY, SHARED_LISTS_IN_KEY, SHARED_CALLS_KEY, SHARED_MOVES_KEY, SHARED_WHO_OUT_KEY]) this.d.del(key);
             this.w3bAskKept = null;
             this.listsSent = new Map();
             this.buckets = null;
@@ -2335,6 +2774,10 @@
                 callsSyncs: Number.isInteger(state.callsSyncs) ? state.callsSyncs : 0,
                 // 3.28.0: how many items the server's last table of speeds named (null: none came yet).
                 moves: Number.isInteger(state.moves) ? state.moves : null,
+                // 3.35.0: seller lists, bazaars read whole and gone listings told to the index so far.
+                seesOut: Number.isInteger(state.seesOut) ? state.seesOut : 0,
+                lookedOut: Number.isInteger(state.lookedOut) ? state.lookedOut : 0,
+                missedOut: Number.isInteger(state.missedOut) ? state.missedOut : 0,
                 unknown: Boolean(cfg && state.unknown),
                 // When a PC the server does not know asks again (ms from the last asking).
                 unknownWaitMs: cfg && state.unknown ? sharedUnknownWait(state.unknownTries) : null,
@@ -2544,12 +2987,13 @@
     /**
      * Where a seller comes in the order nextStep walks a trade that names its stops (3.32.0): its place among the
      * stops, a bazaar the list did not name after them, the Item Market last. 0 for a trade without stops (its own
-     * order stands). The Trades desk draws its stops and names its next one by this.
+     * order stands, but for the Item Market, which is last in any trade). The Trades desk draws its stops and names its next one by this.
      */
     function stepRank(trade, sellerId) {
         const order = trade && Array.isArray(trade.stops) ? trade.stops.map(String) : null;
-        if (!order) return 0;
+        // The Item Market last, whether the trade names its stops or not (a flip's plan may buy there: 3.35.0).
         if (String(sellerId) === STEP_MARKET) return 2e9;
+        if (!order) return 0;
         const at = order.indexOf(String(sellerId));
         return at < 0 ? 1e9 : at;
     }
@@ -12153,9 +12597,9 @@
      *   desk: the item in view's TornW3B payers, the best price first
      * @returns {string[]} trader ids, no repeats, at most `max`
      */
-    function openOrder({ shown = null, pinned = [], desk = [], flips = [], scan = [], max, deskFirst = OPEN_DESK_FIRST }) {
+    function openOrder({ shown = null, pressed = null, pinned = [], desk = [], old = [], flips = [], scan = [], max, deskFirst = OPEN_DESK_FIRST }) {
         const payers = [...(desk || [])];
-        const list = [shown, ...(pinned || []), ...payers.slice(0, deskFirst), ...(flips || []), ...payers.slice(deskFirst), ...(scan || [])];
+        const list = [pressed, shown, ...(pinned || []), ...payers.slice(0, deskFirst), ...(old || []), ...(flips || []), ...payers.slice(deskFirst), ...(scan || [])];
         return [...new Set(list.filter(Boolean).map(String))].slice(0, max);
     }
 
@@ -12175,6 +12619,526 @@
     function applyWants(store, wants) {
         for (const k of Object.keys(wants)) store[k] = wants[k];
         if (wants.flipCheckIds) store.flipCheck = new Set(wants.flipCheckIds);
+    }
+
+    /* ===== src/core/item-market.js ===== */
+    /*
+     * The Item Market as a place to buy a flip's goods (3.35.0; the owner: "Cheapest bazaar or item market").
+     *
+     * Until now a flip's buy plan took bazaars only. The Item Market (Torn's /v2/market/{id}/itemmarket, on the Torn key,
+     * counted in its budget) often sells under every bazaar: Beer at $800 there against a trader paying $943 is a flip.
+     * Its listings have no seller, only a price and an amount, so they become bazaar-shaped rows with the seller
+     * 'market' / 'Item Market' (core/owner-tab.js marketRows - the owner's tab buys there already) and are merged into
+     * the item's sellers (main.js sellersOf): the plan takes the cheapest rows of both, and a step bought there says
+     * "Item Market" and links the item's market page instead of a bazaar.
+     *
+     * Limit: a listing has no seller, so "never sell a trader items bought from their own bazaar" cannot be told of
+     * a market row. Torn does not name the seller of an Item Market listing before you buy.
+     *
+     * Pure: no page, no clock, no network.
+     */
+
+
+
+    /** Listings asked for per item (the cheapest). */
+    const ITEM_MARKET_LISTINGS = 10;
+    /** A market row is as good as a fresh bazaar read this long (Torn renews its copy every 30 s). */
+    const ITEM_MARKET_FRESH_MS = 5 * 60 * 1000;
+    /** The item in view, and the pressed trader's items, are read again after this. */
+    const ITEM_MARKET_AGAIN_MS = 90 * 1000;
+    /** The other candidate flips' items. */
+    const ITEM_MARKET_SLOW_MS = 4 * 60 * 1000;
+    /** A failed read is tried again after this. */
+    const ITEM_MARKET_RETRY_MS = 60 * 1000;
+    /** Reads a minute: the pressed trader's items and the item in view, then the others (the rest of the Torn key's budget is not touched). */
+    const ITEM_MARKET_PRESS_PER_MIN = 24;
+    const ITEM_MARKET_SPARE_PER_MIN = 10;
+    /** Candidate flips whose Item Market is asked at all (the first by expected profit). */
+    const ITEM_MARKET_CANDIDATES = 40;
+
+    /** Is this seller id the Item Market's? */
+    const isMarketSeller = (sellerId) => String(sellerId) === OWNER_MARKET;
+
+    /**
+     * An item's Item Market listings as the item's sellers rows (bazaar-shaped), or [] when there are none or they are
+     * old. `dataAt` is moved back so the row turns stale by the clock after ITEM_MARKET_FRESH_MS, as the keeper of the
+     * rows expects (a bazaar read is fresh for freshMs, much longer).
+     * @param {{at: number, listings: {price: number, qty: number}[]}|null} rec
+     * @param {object} o
+     * @param {number} o.now
+     * @param {number} o.freshMs - how long a bazaar row stays fresh (core/flips.js FLIP_FRESH_MS)
+     */
+    function itemMarketRows(rec, { now, freshMs }) {
+        if (!rec || !(rec.at > 0) || !Array.isArray(rec.listings) || now - rec.at > freshMs) return [];
+        const rows = marketRows(rec.listings) || [];
+        const dataAt = rec.at - Math.max(0, freshMs - ITEM_MARKET_FRESH_MS);
+        return rows.map((r) => ({ ...r, dataAt }));
+    }
+
+    /** The bazaar rows and the market rows as one list: bazaarSellers sorts by price, and a bazaar comes before the market at one price. */
+    function withItemMarket(bazaarRows, marketList) {
+        if (!marketList || !marketList.length) return bazaarRows;
+        return [...(bazaarRows || []), ...marketList];
+    }
+
+    /**
+     * Whose Item Market to read next: the pressed trader's items, the item in view, then the candidate flips' in the order
+     * given. An item is asked when it was never read, or its read is older than its turn; a failed one waits a minute.
+     * @param {object} o
+     * @param {string[]} [o.pressed] - the pressed trader's items, the biggest gap first
+     * @param {string|null} [o.view] - the item in view
+     * @param {string[]} [o.candidates] - the candidate flips' items, the most expected profit first
+     * @param {(id: string) => {at?: number, triedAt?: number, error?: boolean, loading?: boolean}|null} o.recOf
+     * @param {number} o.now
+     * @returns {{id: string, urgent: boolean}|null}
+     */
+    function nextItemMarket({ pressed = [], view = null, candidates = [], recOf, now }) {
+        const due = (id, again) => {
+            const r = recOf(id);
+            if (!r) return true;
+            if (r.loading) return false;
+            if (r.error) return now - (r.triedAt || 0) >= ITEM_MARKET_RETRY_MS;
+            return now - (r.at || 0) >= again;
+        };
+        for (const id of pressed) if (due(id, ITEM_MARKET_AGAIN_MS * 4)) return { id: String(id), urgent: true };
+        if (view && due(view, ITEM_MARKET_AGAIN_MS)) return { id: String(view), urgent: true };
+        for (const id of candidates.slice(0, ITEM_MARKET_CANDIDATES)) if (due(id, ITEM_MARKET_SLOW_MS)) return { id: String(id), urgent: false };
+        return null;
+    }
+
+    /** May another read leave: the reads of the last minute against the share of its kind. */
+    function itemMarketRoom(sentTimes, { now, urgent }) {
+        const last = (sentTimes || []).filter((t) => now - t < 60000).length;
+        return last < (urgent ? ITEM_MARKET_PRESS_PER_MIN : ITEM_MARKET_SPARE_PER_MIN);
+    }
+
+    /* ===== src/core/old-lists.js ===== */
+    /*
+     * Old lists get an open check instead of being hidden (3.35.0; the owner's field report of 3.34.0: with Fresh prices
+     * on, all but two traders were hidden - a trader whose list was edited over a day ago is hidden, though their shop may
+     * be open and the price good).
+     *
+     * Fresh prices only hides a price from a list not edited for a day (core/traders.js stalePrice). Since 3.34.0 a list
+     * page read OPEN a few minutes ago is current however old the edit (core/checked.js, main.js freshAtOf): so the way back
+     * for such a trader is one page read of their list. This module finds whose: the traders of candidate flips - an item
+     * with a cheapest bazaar price a buyer pays enough over - hidden only for the old edit date, the biggest expected profit
+     * first. main.js hands them to openOrder (core/schedule.js), after the pressed trader and the item in view.
+     *
+     * The same pass counts what each Show choice hides (offline, trust, stale) for the zip.
+     *
+     * Pure: no page, no clock, no network.
+     */
+
+    /** At most this many old lists are queued for a page read at once. */
+    const OLD_OPEN_MAX = 12;
+    /** A list read closed is not asked again for this long (it would be read every few minutes for nothing). */
+    const OLD_CLOSED_WAIT_MS = 10 * 60 * 1000;
+    /** The pass is worked out at most this often (a thousand items, each with its buyers). */
+    const OLD_SCAN_EVERY_MS = 20 * 1000;
+
+    /**
+     * @param {Iterable<string>} ids - the items to look at (the ones with a cheapest bazaar price)
+     * @param {object} o
+     * @param {(id: string) => number|null} o.lowestOf - the cheapest bazaar price known
+     * @param {(id: string) => {id?: string|number, price: number, w3b?: number, maxUnits?: number}[]} o.buyersOf - the believable buyers
+     *   the blacklist leaves, the best price first - before the Show choices hide any
+     * @param {(buyer: object) => ('offline'|'trust'|'stale'|null)} o.hiddenBy - why the Show choices hide this buyer now
+     * @param {(each: number, price: number) => boolean} o.enough - is that much over `price` worth a flip (the least profit)
+     * @returns {{old: string[], hidden: {offline: number, trust: number, stale: number}}}
+     *   old: trader ids whose flips are hidden only for an old list, the most expected profit first;
+     *   hidden: items with a flip some Show choice hides, per choice (an item counted once per choice)
+     */
+    function oldListScan(ids, { lowestOf, buyersOf, hiddenBy, enough }) {
+        const worth = new Map();
+        const hidden = { offline: 0, trust: 0, stale: 0 };
+        for (const id of ids) {
+            const low = Number(lowestOf(id));
+            if (!(low > 0)) continue;
+            const seen = new Set();
+            for (const b of buyersOf(id) || []) {
+                // Best price first: from here no buyer pays enough over the cheapest.
+                if (!(b.price > low) || !enough(b.price - low, low)) break;
+                const why = hiddenBy(b);
+                if (!why) continue;
+                if (!seen.has(why)) {
+                    seen.add(why);
+                    hidden[why] += 1;
+                }
+                // Only a stale price can come back by an open check (offline and untrusted traders stay hidden).
+                if (why === 'stale' && b.id && b.w3b > 0) {
+                    const units = Number.isFinite(b.maxUnits) && b.maxUnits > 0 ? b.maxUnits : 1;
+                    worth.set(String(b.id), (worth.get(String(b.id)) || 0) + (b.price - low) * units);
+                }
+            }
+        }
+        const old = [...worth].sort((a, b) => b[1] - a[1] || Number(a[0]) - Number(b[0])).map(([id]) => id);
+        return { old, hidden };
+    }
+
+    /**
+     * The old lists to read now: the scan's, less the ones read closed lately (their shop is shut; the read said so), at most `max`.
+     * @param {string[]} old - oldListScan().old
+     * @param {(id: string) => {at?: number, state?: string}|null} checkOf - the latest page read of a trader's list
+     */
+    function oldListsWanted(old, checkOf, { now, max = OLD_OPEN_MAX, closedWait = OLD_CLOSED_WAIT_MS }) {
+        const out = [];
+        for (const id of old || []) {
+            const c = checkOf(id);
+            if (c && c.state === 'closed' && now - (c.at || 0) < closedWait) continue;
+            out.push(String(id));
+            if (out.length >= max) break;
+        }
+        return out;
+    }
+
+    /* ===== src/core/inventory.js ===== */
+    /*
+     * Your inventory, from GET /v2/user/inventory (Limited key). Pure.
+     *
+     * Torn returns one entry per stack: the same item can appear several times
+     * (different uids, an equipped copy, a faction-owned copy). The selling page
+     * wants one line per item with the quantity you could actually hand over,
+     * so stacks are merged by item id, and equipped and faction-owned copies are
+     * left out: you cannot trade what you are wearing or what is the faction's.
+     */
+
+    const INVENTORY_CACHE_VERSION = 1;
+
+    /** Torn caches the selection for an hour; re-asking sooner returns the same. */
+    const INVENTORY_TTL_MS = 60 * 60 * 1000;
+
+    /**
+     * One response page -> plain rows. Bad rows are dropped, never guessed.
+     * @returns {Array<{id: string, name: string, amount: number, equipped: boolean, factionOwned: boolean}>}
+     */
+    function parseInventoryPage(body) {
+        const inv = body && body.inventory;
+        const items = inv && Array.isArray(inv.items) ? inv.items : null;
+        if (!items) throw new Error('Torn API returned no inventory.');
+
+        const out = [];
+        for (const raw of items) {
+            if (!raw) continue;
+            const id = Number(raw.id);
+            const amount = Number(raw.amount);
+            if (!Number.isFinite(id) || id <= 0) continue;
+            if (!Number.isFinite(amount) || amount <= 0) continue;
+
+            out.push({
+                id: String(id),
+                name: typeof raw.name === 'string' ? raw.name : '',
+                amount: Math.floor(amount),
+                equipped: Boolean(raw.equipped),
+                factionOwned: Boolean(raw.faction_owned),
+            });
+        }
+        return out;
+    }
+
+    /**
+     * Merge stacks by item id; equipped and faction-owned copies are excluded.
+     * @returns {Array<{id: string, name: string, qty: number}>} sorted by id
+     */
+    function mergeInventory(rows) {
+        const byId = new Map();
+
+        for (const r of rows || []) {
+            if (!r || r.equipped || r.factionOwned) continue;
+            if (!(r.amount > 0)) continue;
+
+            const cur = byId.get(r.id);
+            if (cur) {
+                cur.qty += r.amount;
+                if (!cur.name && r.name) cur.name = r.name;
+            } else {
+                byId.set(r.id, { id: r.id, name: r.name || '', qty: r.amount });
+            }
+        }
+
+        return [...byId.values()].sort((a, b) => Number(a.id) - Number(b.id));
+    }
+
+    /** The `_metadata.links.next` offset, or null when this was the last page. */
+    function nextInventoryOffset(body) {
+        const next = body && body._metadata && body._metadata.links && body._metadata.links.next;
+        if (!next) return null;
+        try {
+            const offset = Number(new URL(String(next), 'https://api.torn.com/').searchParams.get('offset'));
+            return Number.isFinite(offset) && offset > 0 ? offset : null;
+        } catch {
+            return null;
+        }
+    }
+
+    /** A failed inventory read is not asked again sooner than this. */
+    const INVENTORY_RETRY_MS = 5 * 60 * 1000;
+
+    /**
+     * Whether the inventory should be read again now, on the timer: it is old,
+     * the last failure's wait is over, and the key is not one Torn rejected
+     * (that waits for a new key, not for time).
+     */
+    function inventoryRefreshDue({ inventoryAt, retryAt = 0, keyDead = false, now = Date.now(), refreshMs = INVENTORY_TTL_MS }) {
+        if (keyDead) return false;
+        if (now < (Number(retryAt) || 0)) return false;
+        const at = Number(inventoryAt) || 0;
+        return now - at >= refreshMs;
+    }
+
+    function makeInventoryCacheEntry(items, now = Date.now()) {
+        return { version: INVENTORY_CACHE_VERSION, fetchedAt: now, items };
+    }
+
+    /** @returns {{fetchedAt: number, items: Array}|null} */
+    function readInventoryCacheEntry(entry, now = Date.now(), ttl = INVENTORY_TTL_MS) {
+        if (!entry || entry.version !== INVENTORY_CACHE_VERSION || !Array.isArray(entry.items)) return null;
+        const at = Number(entry.fetchedAt);
+        if (!Number.isFinite(at) || now - at > ttl) return null;
+        return { fetchedAt: at, items: entry.items };
+    }
+
+    /* ===== src/core/key-spend.js ===== */
+    /*
+     * What Torn Bids spends of the Torn key (3.35.0; the field report of 3.34.0: the key's budget of ~70 a minute went to
+     * your own inventory (t.inventory, 27-34 a minute), to statuses (18-22) and to networth (11), leaving none for the
+     * Item Market and the pressed trader's items).
+     *
+     * Three places:
+     *   1. Your inventory (api/torn.js fetchInventory). Torn answers "Incorrect category" without a category for some keys,
+     *      and the page then asked 25 categories, each paged - every time, and after any failure from the start again.
+     *      Now it remembers that the no-category read is refused, skips the categories that held nothing (asked again every
+     *      INVENTORY_EMPTY_RECHECK_MS), resumes after a failed read from where it stopped, and is read again only when it
+     *      can have changed (a buy or a trade finished, Refresh, the tab back) and then not sooner than a minute after
+     *      the last read - else on the hour, as before.
+     *   2. Networth (the buyers a flip sells to): only the ones in view, not every candidate flip's buyer.
+     *   3. Statuses: only the traders on screen or in a candidate flip (core/status.js sellWatch).
+     *
+     * Pure: no page, no clock, no network.
+     */
+
+
+
+    /** A category that held nothing is asked again after this (a bought item may be the first of its kind). */
+    const INVENTORY_EMPTY_RECHECK_MS = 6 * 60 * 60 * 1000;
+    /** A read that can have changed the inventory is not repeated sooner than this. */
+    const INVENTORY_DIRTY_GAP_MS = 60 * 1000;
+    /** What a failed read already got is kept this long, to resume from. */
+    const INVENTORY_RESUME_MS = 10 * 60 * 1000;
+    /** The candidate flips' buyers asked for their networth, at most (the first by profit). */
+    const NETWORTH_CANDIDATES_MAX = 12;
+
+    /** The policy as kept between visits: {byCategory: boolean, empty: {category: seenEmptyAt}}. */
+    function inventoryPolicyClean(stored) {
+        const empty = {};
+        const raw = stored && typeof stored === 'object' && stored.empty && typeof stored.empty === 'object' ? stored.empty : {};
+        for (const [cat, at] of Object.entries(raw)) if (Number(at) > 0) empty[cat] = Number(at);
+        return { byCategory: Boolean(stored && stored.byCategory), empty };
+    }
+
+    /**
+     * How the next read goes: with or without categories, and which categories to leave out.
+     * @returns {{byCategory: boolean, skip: Set<string>}}
+     */
+    function inventoryPlan(policy, now) {
+        const p = inventoryPolicyClean(policy);
+        const skip = new Set();
+        for (const [cat, at] of Object.entries(p.empty)) if (now - at < INVENTORY_EMPTY_RECHECK_MS) skip.add(cat);
+        return { byCategory: p.byCategory, skip };
+    }
+
+    /**
+     * What a read taught: that the no-category read is refused, or that a category held something / nothing.
+     * @param {{byCategory?: boolean, cat?: string, count?: number}} event
+     */
+    function inventoryLearn(policy, event, now) {
+        const p = inventoryPolicyClean(policy);
+        if (event.byCategory) p.byCategory = true;
+        if (event.cat) {
+            if (event.count > 0) delete p.empty[event.cat];
+            else p.empty[event.cat] = now;
+        }
+        return p;
+    }
+
+    /**
+     * Should the inventory be read now? On the hour (Torn's own cache), or sooner when something that can have changed
+     * it happened - and then not sooner than INVENTORY_DIRTY_GAP_MS after the last read.
+     * @param {object} o
+     * @param {number|null} o.inventoryAt - when it was last read
+     * @param {number} [o.retryAt] - a failed read waits until
+     * @param {boolean} [o.keyDead]
+     * @param {boolean} [o.dirty] - a buy, a finished trade, Refresh or the tab back since the last read
+     * @param {number} o.now
+     */
+    function inventoryDue({ inventoryAt, retryAt = 0, keyDead = false, dirty = false, now, refreshMs = INVENTORY_TTL_MS }) {
+        if (keyDead || now < (Number(retryAt) || 0)) return false;
+        const age = now - (Number(inventoryAt) || 0);
+        if (age >= refreshMs) return true;
+        return Boolean(dirty) && age >= INVENTORY_DIRTY_GAP_MS;
+    }
+
+    /** What a failed read got so far, while it is still worth resuming from: {rows, done: string[], at}. */
+    function inventoryResume(kept, now) {
+        return kept && kept.at > 0 && now - kept.at < INVENTORY_RESUME_MS && Array.isArray(kept.rows) && Array.isArray(kept.done) ? kept : null;
+    }
+
+    /**
+     * The buyers whose networth is asked for: the ones in view first (the strip's flips, the desk's top buyers, the trader
+     * pressed), then the candidate flips' buyers, the first NETWORTH_CANDIDATES_MAX of them.
+     * @param {object} o
+     * @param {string[]} o.view - ids in view, in order
+     * @param {string[]} o.candidates - the candidate flips' buyer ids, the biggest first
+     */
+    function networthWanted({ view = [], candidates = [], max = NETWORTH_CANDIDATES_MAX }) {
+        return [...new Set([...view, ...candidates.slice(0, max)].filter(Boolean).map(String))];
+    }
+
+    /* ===== src/core/pressed.js ===== */
+    /*
+     * A pressed trader is read first (3.35.0; the owner's field report, 3.34.0: after a press the trader's rows filled in
+     * minute by minute behind the background queue, and only the first 30 items of their basket were ever asked for).
+     *
+     * A press is Best flips' row, Plan trade, Every flip or a deal picked (main.js checkTraderNow). From then, for
+     * PRESS_LIVE_MS, before any other background read:
+     *   1. the trader's list page is read (open or closed - core/open-check.js), at once, if older than a minute;
+     *   2. the sellers of EVERY item on their list are read: the ones the trader pays most over the cheapest bazaar
+     *      get a full sellers list (TornW3B: ten a minute), every other one the light list (a limit of its own, 200 a
+     *      minute) - and the Item Market, on Torn's key, for all of them (core/item-market.js pressedMarket).
+     * Rows fill in as checked as the answers arrive; when every item was asked once, the background queue goes on.
+     *
+     * Pure: no page, no clock, no network.
+     */
+
+
+
+    /** A press holds the queue at most this long (a list of hundreds of items must not hold the page for good). */
+    const PRESS_LIVE_MS = 10 * 60 * 1000;
+    /** The trader's best items read in full (sellers lists are TornW3B's ten-a-minute kind). */
+    const PRESS_FULL_MAX = 8;
+    /** How many presses the zip remembers the wait of. */
+    const PRESS_LOG_MAX = 8;
+
+    const isItemId = (id) => /^\d+$/.test(String(id));
+
+    /**
+     * A press, as the page keeps it.
+     * @param {string} key - the trader's key ('id:123', or 'name:bob' for one known by name only)
+     * @returns {{key: string, traderId: string|null, itemId: string|null, why: string, at: number, firstAt: number}}
+     */
+    function pressNew({ key, itemId = null, why = 'press', now }) {
+        const m = /^id:(\d+)$/.exec(String(key || ''));
+        return { key: String(key || ''), traderId: m ? m[1] : null, itemId: itemId ? String(itemId) : null, why, at: now, firstAt: 0 };
+    }
+
+    /** Is the press still the one being worked for? */
+    function pressLive(press, now) {
+        return Boolean(press && press.traderId && now - press.at < PRESS_LIVE_MS);
+    }
+
+    /**
+     * The trader's items to ask the sellers of, the best first.
+     *
+     * Every item on their list that a bazaar could still sell cheaper than they pay (or whose cheapest price is not
+     * known yet), by what they pay over the cheapest bazaar. Sets (negative ids) are not items to buy.
+     *
+     * @param {Object<string, number>} prices - their list: item id -> price
+     * @param {object} o
+     * @param {(id: string) => number|null} o.lowestOf - the cheapest bazaar price known (null: not known)
+     * @param {(each: number, price: number) => boolean} o.enough - is that much over `price` worth a flip (the least profit)
+     * @returns {{all: string[], full: string[], wide: string[], gap: Object<string, number>}} full: the first PRESS_FULL_MAX that have a price over a
+     *   known cheapest; wide: `all`, then the items no bazaar undercuts, the dearest bid first - the Item Market may
+     *   (core/item-market.js), so its listings are asked for every item they pay for
+     */
+    function pressItems(prices, { lowestOf, enough }) {
+        const rows = [];
+        const rest = [];
+        for (const [id, raw] of Object.entries(prices || {})) {
+            const bid = Number(raw);
+            if (!isItemId(id) || !(bid > 0)) continue;
+            const low = Number(lowestOf(id));
+            if (low > 0) {
+                if (!enough(bid - low, low)) {
+                    rest.push({ id, bid });
+                    continue;
+                }
+                rows.push({ id, over: bid - low, known: true });
+            } else {
+                rows.push({ id, over: 0, known: false });
+            }
+        }
+        rows.sort((a, b) => b.over - a.over || Number(a.id) - Number(b.id));
+        rest.sort((a, b) => b.bid - a.bid || Number(a.id) - Number(b.id));
+        const all = rows.map((r) => r.id);
+        // gap: what they pay over the cheapest bazaar known, per item (the weight the who-sells index is asked with).
+        const gap = Object.fromEntries(rows.filter((r) => r.known).map((r) => [r.id, r.over]));
+        return { all, full: rows.filter((r) => r.known).slice(0, PRESS_FULL_MAX).map((r) => r.id), wide: [...all, ...rest.map((r) => r.id)], gap };
+    }
+
+    /**
+     * The next sellers read for a press, or null when every item was asked since the press.
+     *
+     * @param {{at: number}} press
+     * @param {{all: string[], full: string[]}} items - pressItems()
+     * @param {object} o
+     * @param {(id: string) => {fullAt?: number, lightAt?: number, triedAt?: number, loading?: boolean, error?: boolean}} o.stateOf
+     * @param {boolean} o.fullOk - a sellers list may leave now
+     * @param {boolean} o.lightOk - a light list may leave now
+     * @returns {{id: string, how: 'full'|'light'}|null}
+     */
+    function nextPressRead(press, items, { stateOf, fullOk, lightOk }) {
+        if (!press || !items) return null;
+        const since = press.at;
+        const fullDone = (s) => (s.fullAt || 0) >= since || (s.error && (s.triedAt || 0) >= since);
+        const lightDone = (s) => fullDone(s) || (s.lightAt || 0) >= since;
+        if (fullOk) {
+            for (const id of items.full) {
+                const s = stateOf(id) || {};
+                if (!s.loading && !fullDone(s)) return { id, how: 'full' };
+            }
+        }
+        if (lightOk) {
+            for (const id of items.all) {
+                const s = stateOf(id) || {};
+                if (!s.loading && !lightDone(s)) return { id, how: 'light' };
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Is every item of the press asked (or its read under way, or it cannot be asked now)? Then the queue is free again.
+     * Reads that cannot leave (no room, a light list that is off) do not hold the others: only what can be asked counts.
+     */
+    function pressDone(press, items, { stateOf, fullOk, lightOk }) {
+        return !nextPressRead(press, items, { stateOf, fullOk, lightOk });
+    }
+
+    /**
+     * Whose list page to read for a press: the trader's, if it is not read within the last minute (a press wants a
+     * check made after it, not one made before).
+     * @returns {string|null} the trader's id
+     */
+    function pressOpenWanted(press, check, { now, reading = false }) {
+        if (!press || !press.traderId || reading) return null;
+        if (check && check.at > 0 && now - check.at < OPEN_PRESS_MS) return null;
+        return press.traderId;
+    }
+
+    /**
+     * The wait from the press to the first check of the trader's list: the first page read at or after the press, or 0
+     * when the list was seen open in the minutes before it (the check already stood). null: not checked yet.
+     * @param {{at: number, state: string}|null} check
+     * @param {number} openMs - how long an open check stands
+     */
+    function pressWait(press, check, openMs) {
+        if (!press || !check || !(check.at > 0)) return null;
+        if (check.at >= press.at) return check.at - press.at;
+        return check.state === 'open' && press.at - check.at <= openMs ? 0 : null;
+    }
+
+    /** The zip's line: the last few waits, newest last: [{ms, state, why}]. */
+    function pressLogAdd(log, entry, max = PRESS_LOG_MAX) {
+        return [...(log || []), entry].slice(-max);
     }
 
     /* ===== src/core/trader-prices.js ===== */
@@ -12220,13 +13184,20 @@
     const isFlip = (r) => Boolean(r.badge && r.badge.kind === 'flip');
 
     /**
+     * 3.35.0 - a possible flip whose price is not confirmed yet: shown at once, below the confirmed ones, with the profit
+     * it would make (about), and it becomes a flip when its trader's list is read open. `checking` is set on the row
+     * (main.js rowFor) whatever its badge: a held item that is also a possible flip keeps its own badge.
+     */
+    const isChecking = (r) => Boolean(r.checking);
+
+    /**
      * Does the row belong to the tab: My items (held), Flips, To sell, or All items.
      * @param {'all'|'mine'|'flips'|'sell'|string} filter
      * @param {Set<string>} toSellIds
      */
     function rowPass(filter, toSellIds) {
         if (filter === 'mine') return (r) => r.held > 0;
-        if (filter === 'flips') return isFlip;
+        if (filter === 'flips') return (r) => isFlip(r) || isChecking(r);
         if (filter === 'sell') return (r) => toSellIds.has(r.itemId);
         return () => true;
     }
@@ -12242,7 +13213,7 @@
         const shown = category ? rows.filter((r) => r.category === category) : rows;
         return {
             rows: shown,
-            counts: { all: shown.length, mine: shown.filter((r) => r.held).length, flips: shown.filter(isFlip).length, sell: sellCount },
+            counts: { all: shown.length, mine: shown.filter((r) => r.held).length, flips: shown.filter((r) => isFlip(r) || isChecking(r)).length, sell: sellCount },
         };
     }
 
@@ -12497,12 +13468,16 @@
 
 
 
+    const checkingProfit = (r) => (r.checking ? Number(r.checking.profit) || 0 : 0);
+
     /**
      * The list's own order: money to be made first, then what you hold, then the best price. Best flips: the flips that
-     * sell to one trader are one trade with them, and stand together under its total (3.30.0).
+     * sell to one trader are one trade with them, and stand together under its total (3.30.0). 3.35.0: there the possible
+     * flips still being checked (value 0) come after the confirmed ones, the most each would make first.
      */
     function listOrder(rows, pass, filter) {
-        const listed = rows.filter(pass).sort((a, b) => b.value - a.value || (b.held > 0) - (a.held > 0) || b.bid - a.bid || String(a.name).localeCompare(String(b.name)));
+        const checking = filter === 'flips' ? checkingProfit : () => 0;
+        const listed = rows.filter(pass).sort((a, b) => b.value - a.value || checking(b) - checking(a) || (b.held > 0) - (a.held > 0) || b.bid - a.bid || String(a.name).localeCompare(String(b.name)));
         return filter === 'flips' ? togetherBy(listed, flipTraderKey, (r) => r.value) : listed;
     }
 
@@ -19271,112 +20246,6 @@
         return out;
     }
 
-    /* ===== src/core/inventory.js ===== */
-    /*
-     * Your inventory, from GET /v2/user/inventory (Limited key). Pure.
-     *
-     * Torn returns one entry per stack: the same item can appear several times
-     * (different uids, an equipped copy, a faction-owned copy). The selling page
-     * wants one line per item with the quantity you could actually hand over,
-     * so stacks are merged by item id, and equipped and faction-owned copies are
-     * left out: you cannot trade what you are wearing or what is the faction's.
-     */
-
-    const INVENTORY_CACHE_VERSION = 1;
-
-    /** Torn caches the selection for an hour; re-asking sooner returns the same. */
-    const INVENTORY_TTL_MS = 60 * 60 * 1000;
-
-    /**
-     * One response page -> plain rows. Bad rows are dropped, never guessed.
-     * @returns {Array<{id: string, name: string, amount: number, equipped: boolean, factionOwned: boolean}>}
-     */
-    function parseInventoryPage(body) {
-        const inv = body && body.inventory;
-        const items = inv && Array.isArray(inv.items) ? inv.items : null;
-        if (!items) throw new Error('Torn API returned no inventory.');
-
-        const out = [];
-        for (const raw of items) {
-            if (!raw) continue;
-            const id = Number(raw.id);
-            const amount = Number(raw.amount);
-            if (!Number.isFinite(id) || id <= 0) continue;
-            if (!Number.isFinite(amount) || amount <= 0) continue;
-
-            out.push({
-                id: String(id),
-                name: typeof raw.name === 'string' ? raw.name : '',
-                amount: Math.floor(amount),
-                equipped: Boolean(raw.equipped),
-                factionOwned: Boolean(raw.faction_owned),
-            });
-        }
-        return out;
-    }
-
-    /**
-     * Merge stacks by item id; equipped and faction-owned copies are excluded.
-     * @returns {Array<{id: string, name: string, qty: number}>} sorted by id
-     */
-    function mergeInventory(rows) {
-        const byId = new Map();
-
-        for (const r of rows || []) {
-            if (!r || r.equipped || r.factionOwned) continue;
-            if (!(r.amount > 0)) continue;
-
-            const cur = byId.get(r.id);
-            if (cur) {
-                cur.qty += r.amount;
-                if (!cur.name && r.name) cur.name = r.name;
-            } else {
-                byId.set(r.id, { id: r.id, name: r.name || '', qty: r.amount });
-            }
-        }
-
-        return [...byId.values()].sort((a, b) => Number(a.id) - Number(b.id));
-    }
-
-    /** The `_metadata.links.next` offset, or null when this was the last page. */
-    function nextInventoryOffset(body) {
-        const next = body && body._metadata && body._metadata.links && body._metadata.links.next;
-        if (!next) return null;
-        try {
-            const offset = Number(new URL(String(next), 'https://api.torn.com/').searchParams.get('offset'));
-            return Number.isFinite(offset) && offset > 0 ? offset : null;
-        } catch {
-            return null;
-        }
-    }
-
-    /** A failed inventory read is not asked again sooner than this. */
-    const INVENTORY_RETRY_MS = 5 * 60 * 1000;
-
-    /**
-     * Whether the inventory should be read again now, on the timer: it is old,
-     * the last failure's wait is over, and the key is not one Torn rejected
-     * (that waits for a new key, not for time).
-     */
-    function inventoryRefreshDue({ inventoryAt, retryAt = 0, keyDead = false, now = Date.now(), refreshMs = INVENTORY_TTL_MS }) {
-        if (keyDead) return false;
-        if (now < (Number(retryAt) || 0)) return false;
-        const at = Number(inventoryAt) || 0;
-        return now - at >= refreshMs;
-    }
-
-    function makeInventoryCacheEntry(items, now = Date.now()) {
-        return { version: INVENTORY_CACHE_VERSION, fetchedAt: now, items };
-    }
-
-    /** @returns {{fetchedAt: number, items: Array}|null} */
-    function readInventoryCacheEntry(entry, now = Date.now(), ttl = INVENTORY_TTL_MS) {
-        if (!entry || entry.version !== INVENTORY_CACHE_VERSION || !Array.isArray(entry.items)) return null;
-        const at = Number(entry.fetchedAt);
-        if (!Number.isFinite(at) || now - at > ttl) return null;
-        return { fetchedAt: at, items: entry.items };
-    }
-
     /* ===== src/core/history.js ===== */
     /*
      * Price history the script records itself. Pure - the caller stores it.
@@ -20145,24 +21014,44 @@
      * The spec says `cat` is optional, but Torn has been seen to answer
      * "Incorrect category" without it. So: ask once without a category; if that
      * is refused as a category or field error, ask once per category instead
-     * (25 calls, each paged, all through the shared limiter) and merge. A
-     * category Torn no longer knows is skipped, never fatal.
+     * (each paged, all through the shared limiter) and merge. A category Torn no
+     * longer knows is skipped, never fatal.
+     *
+     * 3.35.0 (core/key-spend.js) - the 25 categories were asked in full every time, and again from the first after any
+     * failure: 27-34 calls a minute of the key's budget. Now the caller may say what it learned:
+     *   byCategory  - the no-category read is refused: go straight to the categories (one call less each time)
+     *   skip        - categories that held nothing lately: not asked
+     *   resume      - {rows, done}: what a failed read already got; those categories are not asked again
+     *   onLearn     - ({byCategory}) / ({cat, count}) as each is learned
+     * A failure that is not a category error carries what it got so far (`error.partial = {rows, done}`).
      *
      * @returns {Promise<Array>} rows from parseInventoryPage, every page
      */
-    async function fetchInventory(client, { limit = 250, categories = TORN_INVENTORY_CATEGORIES } = {}) {
-        try {
-            return await fetchInventoryPages(client, {}, limit);
-        } catch (error) {
-            if (!isCategoryError(error)) throw error;
-        }
-
-        const out = [];
-        for (const cat of categories) {
+    async function fetchInventory(client, { limit = 250, categories = TORN_INVENTORY_CATEGORIES, byCategory = false, skip = null, resume = null, onLearn = null } = {}) {
+        if (!byCategory && !resume) {
             try {
-                out.push(...(await fetchInventoryPages(client, { cat }, limit)));
+                return await fetchInventoryPages(client, {}, limit);
             } catch (error) {
                 if (!isCategoryError(error)) throw error;
+                if (onLearn) onLearn({ byCategory: true });
+            }
+        }
+
+        const out = resume ? [...resume.rows] : [];
+        const done = resume ? [...resume.done] : [];
+        for (const cat of categories) {
+            if (done.includes(cat) || (skip && skip.has(cat))) continue;
+            try {
+                const rows = await fetchInventoryPages(client, { cat }, limit);
+                out.push(...rows);
+                done.push(cat);
+                if (onLearn) onLearn({ cat, count: rows.length });
+            } catch (error) {
+                if (!isCategoryError(error)) {
+                    if (error && typeof error === 'object') error.partial = { rows: out, done };
+                    throw error;
+                }
+                done.push(cat);
             }
         }
         return out;
@@ -32741,7 +33630,7 @@
             const now = Date.now();
             const sig = JSON.stringify([
                 'items', kind, s.counts, s.listTotal, s.desk && s.desk.itemId, info.hasKey, info.loading, info.inventoryAt ? 1 : 0, info.tradersLoading, Boolean(info.bazaarsAt), this.query, s.category, Boolean(s.still),
-                list.map((r) => [r.itemId, r.name, r.held, r.lowest, r.badge && [r.badge.kind, r.badge.amount], r.pending, r.units, r.stops, r.pace, r.bid, r.mark && r.mark.text, r.still && [r.still.move, r.still.gone, r.still.was], r.group,
+                list.map((r) => [r.itemId, r.name, r.held, r.lowest, r.badge && [r.badge.kind, r.badge.amount], r.checking && r.checking.profit, r.pending, r.units, r.stops, r.pace, r.bid, r.mark && r.mark.text, r.still && [r.still.move, r.still.gone, r.still.was], r.group,
                     r.to && [r.to.name, this.dotSig(r.to), r.to.old ? listAgeText(now - r.to.old.at) : '', Boolean(r.to.teOnly)], r.top && [r.top.name, r.top.price, this.dotSig(r.top), r.top.checked], r.second && [r.second.name, r.second.price, this.dotSig(r.second), r.second.checked], r.market && [r.market.price, r.market.about], paidOf.has(r.itemId) ? paidOf.get(r.itemId).each : 0]),
                 s.pinned || [], (s.prefs.listSort || {})[kind] || null,
             ]);
@@ -32792,7 +33681,7 @@
                     gone ? spEl('span', { class: 'tag', title: 'It was a flip when the list was held. It keeps its place until your trade ends.', text: 'No flip now' }) : null,
                 ];
                 let sub;
-                if (kind === 'all') sub = flip ? null : r.badge && r.badge.kind === 'list' ? 'your bazaar pays ' + signed(r.badge.amount) + ' more than a trader' : r.pending ? 'Checking…' : 'no flip now';
+                if (kind === 'all') sub = flip ? null : r.badge && r.badge.kind === 'list' ? 'your bazaar pays ' + signed(r.badge.amount) + ' more than a trader' : r.checking ? 'checking' : r.pending ? 'Checking…' : 'no flip now';
                 else {
                     const paid = paidOf.get(r.itemId);
                     sub = paid ? 'bought to resell · you paid ' + formatMoney(paid.each) : r.badge && r.badge.kind === 'list' ? 'your bazaar pays ' + signed(r.badge.amount) + ' more than a trader' : '';
@@ -32895,8 +33784,14 @@
                         if (this.h.onPin) this.h.onPin(lead.itemId);
                     } }, [pinIcon()]);
                 })() : null;
-                const a = [this.dot(to), spEl('b', { text: to ? to.name : lead.name }), ...tags(to, run.find((r) => r.mark)), gone ? spEl('span', { class: 'tag', title: 'It was a flip when the list was held. It keeps its place until your trade ends.', text: 'No flip now' }) : null];
-                const p = gone
+                // 3.35.0: a possible flip not confirmed yet - one short word, the most it would make (about); pressed, their list is read first.
+                const wait = !live.length && !gone && run.length === 1 && lead.checking ? lead.checking : null;
+                const a = wait
+                    ? [spEl('b', { text: wait.to.name || lead.name }), spEl('span', { class: 'tag w', title: 'Their price list is being read. It is a flip once their shop is seen open.', text: 'checking' })]
+                    : [this.dot(to), spEl('b', { text: to ? to.name : lead.name }), ...tags(to, run.find((r) => r.mark)), gone ? spEl('span', { class: 'tag', title: 'It was a flip when the list was held. It keeps its place until your trade ends.', text: 'No flip now' }) : null];
+                const p = wait
+                    ? [spEl('span', { class: 't-muted', text: '≈ ' + signed(wait.profit) })]
+                    : gone
                     ? [spEl('b', { class: 't-muted', text: signed(goneWas) })]
                     : live.length ? [spEl('b', { class: 't-good', title: one ? null : 'What these flips make together. The trade with ' + (to ? to.name : 'them') + ' may take more of their items: it is in the pane once you open it.', text: signed(total) }), this.stillMark(lead.still), pin] : [];
                 const sub = [lead.name + (lead.units ? ' × ' + count(lead.units) : ''), live.length > 1 ? spEl('span', { class: 't-muted', text: ' + ' + count(live.length - 1) + ' more' }) : null,
@@ -32907,9 +33802,10 @@
                         : live.length ? [this.plural(live.length, 'flip') + ' · ' + this.plural(units, 'item') + ' · ' + this.plural(stops, 'bazaar')] : [];
                 // 2026-10-17: a row is its trader's trade - pressed, the trade with them opens (it opened the item's best
                 // trader, which could be another one, or the item alone).
-                const open = to && to.key && live.length ? () => (this.h.onTradePick ? this.h.onTradePick(lead.itemId, to.key) : this.select(lead.itemId)) : () => this.select(lead.itemId);
+                const open = wait && wait.to.key ? () => (this.h.onTradePick ? this.h.onTradePick(lead.itemId, wait.to.key) : this.select(lead.itemId))
+                    : to && to.key && live.length ? () => (this.h.onTradePick ? this.h.onTradePick(lead.itemId, to.key) : this.select(lead.itemId)) : () => this.select(lead.itemId);
                 rows.push(row((on ? 'sel' : '') + (gone ? ' gone' : ''), one ? 'item:' + lead.itemId : 'group:' + lead.group, open, a, p, sub, sub2,
-                    to ? 'Open the trade with ' + to.name : ''));
+                    wait ? 'Read their list, then open the trade with ' + wait.to.name : to ? 'Open the trade with ' + to.name : ''));
             }
             const q = this.query.trim();
             const empty = q ? 'No item matches "' + q + '"' + (s.category ? ' in ' + s.category : '') + '.'
@@ -33323,7 +34219,9 @@
                                 : spEl('span', { title: 'Over what ' + pay.name + ' pays', text: 'over' });
                 const name = r.sellerName || 'Player ' + r.sellerId;
                 body.appendChild(spEl('tr', { class: ok || !pay ? (r.stale ? 'dim' : '') : 'dim' }, [
-                    spEl('td', {}, [this.link(name, bazaarUrl(r.sellerId, d.itemId, r.price), { cls: 'lk', title: 'Opens ' + name + '\'s bazaar at this item', focus: 'bazaar:' + r.sellerId, children: [spEl('b', { text: name })] })]),
+                    spEl('td', {}, [String(r.sellerId) === OWNER_MARKET
+                        ? this.link(OWNER_MARKET_NAME, itemMarketUrl(d.itemId, d.name), { cls: 'lk', title: 'Opens the Item Market at this item', focus: 'bazaar:market', children: [spEl('b', { text: OWNER_MARKET_NAME })] })
+                        : this.link(name, bazaarUrl(r.sellerId, d.itemId, r.price), { cls: 'lk', title: 'Opens ' + name + '\'s bazaar at this item', focus: 'bazaar:' + r.sellerId, children: [spEl('b', { text: name })] })]),
                     spEl('td', { class: 'n' }, [this.bar(r.qty, most, ok ? '' : 'dimb'), count(r.qty)]),
                     spEl('td', { class: 'n' }, [spEl('b', { text: formatMoney(r.price) })]),
                     spEl('td', { class: 'n' }, [piece]),
@@ -34119,7 +35017,7 @@
                         first && r.teOnly ? this.link('TE only', tePriceListUrl(b.teName || b.name), { cls: 'tag w te-pulse', title: b.name + '\'s price for ' + r.name + ' is only on TornExchange, which cannot say whether their list is open: press to look at their list before you trade', focus: 'trade:te-only:' + r.itemId }) : null,
                         // A space before it: "at $370" and "bazaar" never run together (engines plan 4c).
                         j > 0 && st.sellerId ? ' ' : null,
-                        j > 0 && st.sellerId ? this.link('bazaar', bazaarUrl(st.sellerId, r.itemId, st.price), { cls: 'quiet lk', title: 'Opens their bazaar at this item and the price', focus: 'trade:bazaar:' + r.itemId + ':' + st.sellerId }) : null,
+                        j > 0 && st.sellerId ? this.buyLink(st.sellerId, r.itemId, st.price, r.name, 'trade:bazaar:' + r.itemId + ':' + st.sellerId) : null,
                         first ? cutNote(r) : null,
                     ]),
                     spEl('span', { class: 'p' + (made < 0 ? ' badw' : '') }, [(r.estimated ? '≈ ' : '') + signed(made)]),
@@ -34137,7 +35035,7 @@
                             this.playerName(name, stop.sellerId, 'trade:seller:' + stop.sellerId),
                             seen.length ? spEl('span', { class: 'seen', title: 'When TornW3B last saw these listings', text: 'seen ' + formatAge(now - Math.min(...seen)) }) : null,
                             spEl('span', { class: 'st' }),
-                            this.link('bazaar', bazaarUrl(stop.sellerId, l0.r.itemId, l0.st.price), { cls: 'quiet lk', title: 'Opens ' + name + '\'s bazaar at the item and the price', focus: 'trade:bazaar:' + l0.r.itemId + ':' + stop.sellerId }),
+                            this.buyLink(stop.sellerId, l0.r.itemId, l0.st.price, l0.r.name, 'trade:bazaar:' + l0.r.itemId + ':' + stop.sellerId, name + "'s"),
                         ] : [spEl('b', { text: 'Still being read' }), spEl('span', { class: 'seen', text: 'TornW3B\'s lowest price stands in until its bazaars are read' })]),
                         ...stop.lines.map(line),
                     ]),
@@ -34552,7 +35450,7 @@
                             spEl('div', { class: 'rt-h' }, [
                                 this.playerName(st.sellerName || 'Player ' + st.sellerId, st.sellerId, 'step-seller:' + st.sellerId),
                                 spEl('span', { class: 'st' }),
-                                this.link('bazaar', bazaarUrl(st.sellerId, d.itemId, st.price), { cls: 'quiet lk', title: 'Opens their bazaar at this item and the price', focus: 'step-bazaar:' + st.sellerId }),
+                                this.buyLink(st.sellerId, d.itemId, st.price, d.name, 'step-bazaar:' + st.sellerId),
                             ]),
                             spEl('div', { class: 'pl noti' }, [this.pic('step:' + i, d.itemId), spEl('span', {}, [spEl('b', { text: d.name }), ' × ' + count(st.qty), spEl('small', { text: 'at ' + formatMoney(st.price) })]), spEl('span', { class: 'p', text: signed((b.price - st.price) * st.qty) })]),
                         ]),
@@ -36201,8 +37099,14 @@
 
         /** A player's name, linking to their Torn profile when their id is known. */
         playerName(name, id, focus) {
-            if (!id) return spEl('b', { text: name });
+            if (!id || String(id) === OWNER_MARKET) return spEl('b', { text: String(id) === OWNER_MARKET ? OWNER_MARKET_NAME : name });
             return this.link(name, spProfileUrl(id), { cls: 'pname', title: 'Their profile on Torn', focus });
+        }
+
+        /** Where a step is bought (3.35.0): the seller's bazaar at the item, or the Item Market's page of the item. */
+        buyLink(sellerId, itemId, price, itemName, focus, who = 'their') {
+            if (String(sellerId) === OWNER_MARKET) return this.link('market', itemMarketUrl(itemId, itemName || ''), { cls: 'quiet lk', title: 'Opens the Item Market at this item', focus });
+            return this.link('bazaar', bazaarUrl(sellerId, itemId, price), { cls: 'quiet lk', title: 'Opens ' + who + ' bazaar at this item and the price', focus });
         }
 
         /** The focus key of what has the focus inside `box`, or null. */
@@ -37691,6 +38595,11 @@
 
 
 
+
+
+
+
+
     const STORE_KEY = 'apiKey';
     const STORE_ITEMS = 'itemsCache';
     const STORE_NPC = 'npcCache';
@@ -37745,6 +38654,8 @@
     /* Each tab adds its counts to the stored record this often. */
     const USAGE_FLUSH_MS = 10000;
     const STORE_INVENTORY = 'inventory';
+    // 3.35.0: what the inventory reads learned (core/key-spend.js).
+    const STORE_INVENTORY_POLICY = 'inventory-policy';
     const STORE_SELL_PREFS = 'sellingPage';
     /* Our own trader database: every trader we know of, and their TornW3B list. */
     const STORE_TRADER_DB = 'traderDb';
@@ -37885,7 +38796,7 @@
     /* Traders' networth (public personal stats), for "could they pay": id -> {value, at}. */
     const STORE_SELL_NETWORTH = 'sellNetworth';
     /* At most this many networth lookups a minute, inside the shared 70; each kept 12 hours. */
-    const SELL_NETWORTH_PER_MIN = 5;
+    const SELL_NETWORTH_PER_MIN = 3;
     const SELL_NETWORTH_REFRESH_MS = 12 * 60 * 60 * 1000;
     const SELL_NETWORTH_RETRY_MS = 10 * 60 * 1000;
 
@@ -38056,6 +38967,8 @@
         buyWhere: null,
         /* Listings noted as not there, once per page load: 'seller|item'. */
         goneNoted: new Set(),
+        // 3.35.0: the bazaar page last told to the who-sells index as read whole (seller|listings read).
+        whoLooked: '',
         // The listing this page was opened for, once marked not here (notePointedGone).
         pointedGone: null,
         tradeFillBound: false,
@@ -38863,6 +39776,14 @@
             for (const r of app.bzRead.rows) for (const id of r.ids) app.bzEver.add(id);
         }
         app.bzCover = coverAfter(app.bzCover, location.href, app.bzRead);
+        // 3.35.0 - a bazaar page read whole is a bazaar looked at: told to the index when it has more to say than the last time.
+        if (sellerId && coverWhole(app.bzCover)) {
+            const looked = sellerId + '|' + coverListingsRead(app.bzCover);
+            if (app.whoLooked !== looked) {
+                app.whoLooked = looked;
+                whoFeed('looked', lookedOf(sellerId, coverItemIds(app.bzCover), Date.now()));
+            }
+        }
         // How soon after this page showed its list was first read (see BUY_EARLY_READ_MS).
         if (app.bzCover && app.bzReadAfter === null) app.bzReadAfter = pageShownAt === null ? Infinity : Math.max(0, performance.now() - pageShownAt);
         notePointedGone(listings);
@@ -41723,6 +42644,8 @@
         if (app.goneNoted.has(k)) return;
         app.goneNoted.add(k);
         gmSet(STORE_SELL_GONE, markGone(gmGet(STORE_SELL_GONE, null), sellerId, itemId));
+        // 3.35.0 - and to the index: this bazaar does not hold the item (the Item Market has no bazaar to miss in).
+        whoFeed('missed', missedOf(sellerId, itemId, Date.now()));
         // The stock it showed before it went (3.16.4) says nothing any more.
         const stock = liveStock(gmGet(STORE_SELL_STOCK, null));
         if (stock[k]) {
@@ -43572,6 +44495,24 @@
                 // again, checked against a fresh one, found differing; whether keeping is still on; the page's age.
                 kept: Object.fromEntries(sellKeepersNow().filter((row) => row[4]).map(([name, , , , k]) => [name, { ...k.stats, on: k.on() }])),
                 pageMinutes: sellPageMinutes(),
+                // 3.35.0: how many items a Show choice hides a flip on (offline, trust, old list), the possible flips shown as
+                // "checking", the wait from a press to the first check of their list (the last few, ms), the Item Market
+                // (reads of Torn, items read, flips whose plan buys there) and the inventory reads this visit.
+                hiddenByFilter: sell.hiddenCounts || null,
+                flipsChecking: sell.checkingCount ?? null,
+                clickToFirstCheckMs: (sell.pressLog || []).map((e) => e.ms),
+                itemMarket: { reads: sell.itemMarketReads || 0, items: sell.itemMarket ? sell.itemMarket.size : 0, flips: sell.itemMarketFlips ?? null },
+                inventoryReads: sell.inventoryReads || 0,
+                // 3.35.0 (core/who-sells.js): the who-sells index - asked, answered, failed, reads it put first; cheap listings it
+                // named and those this PC's reads confirmed; seller lists, bazaars and gone listings told to it (sent so far).
+                whoSells: (() => {
+                    const st = sharedLink ? sharedLink.status() : null;
+                    return {
+                        asked: sell.whoStats.asked, answered: sell.whoStats.answered, failed: sell.whoStats.failed, readsPutFirst: sell.whoStats.used,
+                        cheapSeen: sell.whoCheapSeen.size, cheapConfirmed: sell.whoCheapDone.size,
+                        seesSent: st ? st.seesOut : null, lookedSent: st ? st.lookedOut : null, missedSent: st ? st.missedOut : null,
+                    };
+                })(),
             },
         };
     }
@@ -44333,6 +45274,22 @@
         ownerIds: [],
         ownerFirst: 0,
         ownerMarket: new Map(),
+        // 3.35.0 (core/item-market.js): the Item Market as a buy source - item id -> {at, triedAt, listings: [{price, qty}], loading, error}.
+        itemMarket: new Map(),
+        itemMarketSent: [],
+        itemMarketReads: 0,
+        /* 3.35.0 (core/who-sells.js): the who-sells index's last answer (null: none, or the server is off), when it was asked,
+         * the failures in a row, the counts for the zip, the (seller|item) cheap listings seen and confirmed, and the items
+         * and bazaars the answer put first. */
+        who: null,
+        whoAt: 0,
+        whoBusy: false,
+        whoFails: 0,
+        whoFailedAt: 0,
+        whoStats: { asked: 0, answered: 0, failed: 0, used: 0 },
+        whoCheapSeen: new Set(),
+        whoCheapDone: new Set(),
+        whoSellerIds: [],
         ownerMarketBusy: false,
         ownerMarketAt: 0,
         ownerHeld: undefined,
@@ -44405,6 +45362,15 @@
          */
         tradeEvery: new Set(),
         tradeWanted: [],
+        // 3.35.0 (core/pressed.js): the trader just pressed, the items of their list to ask the sellers of, the zip's waits.
+        pressed: null,
+        pressItems: null,
+        pressItemsKey: '',
+        pressLog: [],
+        openOld: [],
+        oldAll: [],
+        oldScanAt: 0,
+        hiddenCounts: { offline: 0, trust: 0, stale: 0 },
         /* The chosen trade's items, re-read like the item picked (every 2 min) while it is on the desk. */
         tradeLive: [],
         /* Items each trade has shown ('item|trader' -> Set): one that drops out stays listed, with why. */
@@ -45020,7 +45986,10 @@
     /** The Item Market listings of a piece as last read ([{price, qty}]), or null: not read yet. */
     function ownerMarketRows(itemId) {
         const m = sell.ownerMarket.get(String(itemId));
-        return m && m.at ? m.rows : null;
+        if (m && m.at) return m.rows;
+        // 3.35.0: a flip bought on the Item Market (core/item-market.js) is checked against the read that planned it.
+        const im = sell.itemMarket.get(String(itemId));
+        return im && im.at ? im.listings : null;
     }
 
     /** The next piece whose Item Market is read: the set in view first, the one read longest ago. Visible tab only. */
@@ -45531,8 +46500,13 @@
         if (!getSellKey() || sell.keyDead || sell.ownBusy || document.visibilityState !== 'visible') return;
         sell.ownAsked = (sell.ownAsked || []).filter((t) => now - t < 60000);
         if (sell.ownAsked.length >= OWN_CONFIRM_PER_MIN) return;
-        const id = (sell.confirmWant || []).find((x) => !sell.ownSent.has(x));
+        // 3.35.0 - the index's sellers first: those with a cheap listing, and while a trader is pressed those who carry most of
+        // their list (core/who-sells.js); none read or asked for lately.
+        const recent = (x) => (sell.ownSent.has(x) && now - sell.ownSent.get(x) < OWN_CONFIRM_MS) || now - ((sell.ownReads.get(x) || {}).at || 0) < OWN_CONFIRM_MS;
+        sell.whoSellerIds = whoSellerWants({ who: sell.who, now, pressed: pressLive(sell.pressed, now), view: sell.selected, skip: recent }).map((w) => w.id);
+        const id = [...sell.whoSellerIds, ...(sell.confirmWant || [])].find((x) => !sell.ownSent.has(x) || now - sell.ownSent.get(x) >= OWN_CONFIRM_MS);
         if (!id) return;
+        if (sell.whoSellerIds.includes(id)) sell.whoStats.used += 1;
         sell.ownBusy = true;
         sell.ownAsked.push(now);
         sell.ownSent.set(id, now);
@@ -45540,7 +46514,12 @@
         fetchUserBazaar(sell.client, id, { tag: 't.confirm', priority: 'low' })
             .then((data) => {
                 const items = parseOwnBazaar(data);
-                if (items) sell.ownReads.set(id, { at: Date.now(), items });
+                if (items) {
+                    sell.ownReads.set(id, { at: Date.now(), items });
+                    // 3.35.0 - a bazaar read whole from Torn, to the index; a cheap listing of theirs is confirmed.
+                    whoFeed('looked', lookedOf(id, [...items.keys()], Date.now()));
+                    whoCheapSeen(id, items.keys());
+                }
             })
             .catch((error) => {
                 if (isKeyDeadError(error)) markSellKeyDead(error);
@@ -45549,6 +46528,40 @@
                 sell.ownBusy = false;
                 renderSelling();
             });
+    }
+
+    /*
+     * 3.35.0 - the Item Market as a place to buy (core/item-market.js): one read a redraw at most, on Torn's key, counted in
+     * its budget - the pressed trader's items and the item in view first, the candidate flips' after, with what is spare.
+     */
+    function stepItemMarket(now) {
+        if (!getSellKey() || sell.keyDead || document.visibilityState !== 'visible' || !bidsMayAsk(now)) return;
+        const pressed = pressLive(sell.pressed, now) && sell.pressItems ? sell.pressItems.wide : [];
+        const next = nextItemMarket({
+            pressed,
+            view: sell.selected,
+            candidates: sell.candidates.map((c) => c.itemId),
+            recOf: (id) => sell.itemMarket.get(String(id)) || null,
+            now,
+        });
+        if (!next || !itemMarketRoom(sell.itemMarketSent, { now, urgent: next.urgent })) return;
+        // Torn's key has its own window (client.stats): the background reads leave it alone when it is nearly used.
+        if (!next.urgent && sell.client.stats(now).remaining < 20) return;
+        const id = next.id;
+        const prev = sell.itemMarket.get(id) || null;
+        sell.itemMarketSent = [...sell.itemMarketSent.filter((t) => now - t < 60000), now];
+        sell.itemMarketReads += 1;
+        sell.itemMarket.set(id, { ...(prev || { at: 0, listings: [] }), loading: true, triedAt: now });
+        fetchItemMarket(sell.client, id, { limit: ITEM_MARKET_LISTINGS, tag: 't.market', priority: next.urgent ? 'normal' : 'low' })
+            .then((r) => {
+                const at = Date.now();
+                sell.itemMarket.set(id, { at, triedAt: at, listings: r.listings.map((l) => ({ price: l.price, qty: l.amount })), loading: false, error: null });
+            })
+            .catch((error) => {
+                if (isKeyDeadError(error)) markSellKeyDead(error);
+                sell.itemMarket.set(id, { ...(prev || { at: 0, listings: [] }), triedAt: Date.now(), loading: false, error: true });
+            })
+            .finally(() => renderSelling());
     }
 
     /** How fast items leave the bazaars: itemId -> {units, ms, at}, read once per page. */
@@ -46208,14 +47221,22 @@
         }
         // The trade on the desk comes before the possible flips only while you
         // work on it (core/desk.js): until then the flips are checked first.
+        // 3.35.0 - the trader just pressed: their list, then the sellers of every item on it, before any other read.
+        // (Every other turn only: the open rechecks of the trade on show and the trades going are not held back.)
+        if (!hidden && sell.w3bTurn === 1) {
+            const pressedJob = nextPressedJob(now);
+            if (pressedJob) return pressedJob;
+        }
         const pinnedIds = [...new Set(Object.values(sellPinned(now)).flatMap((t) => t.lines.map((l) => l.itemId)))];
         const candIds = sell.candidates.map((c) => c.itemId);
+        // 3.35.0 - items the who-sells index has a cheap new listing of: read on the top flips' schedule (core/who-sells.js).
+        const cheapIds = cheapItems(sell.who, now);
         const fresh = freshnessMs(sellPrefs());
         // 3.32.0 - the pieces of the sets on the server owner's tab, while it is in view: the set in view is read as the
         // top flips are, before them; the other set's pieces after the possible flips.
         const setIds = sell.ownerIds || [];
         const setFirst = setIds.slice(0, sell.ownerFirst || 0);
-        const topIds = new Set([...setFirst, ...candIds.slice(0, FRESH_TOP)].map(String));
+        const topIds = new Set([...setFirst, ...cheapIds, ...candIds.slice(0, FRESH_TOP)].map(String));
         // Yours alone, whoever else is on: the desk's item and everything a trade of yours holds.
         const ownIds = new Set([sell.selected, ...sell.tradeLive, ...sell.tradeWanted, ...pinnedIds, ...setIds].filter(Boolean).map(String));
         // 3.26.0: the traders of the trade on the desk - their own lists, well inside the check, so the whole
@@ -46229,7 +47250,7 @@
             // the minute's page reads keep inside OPEN_RECHECK_MS (else the last ones lapse and their flips flicker).
             // 3.34.0 - and the top payers of the item in view right after those (core/schedule.js openOrder): the flips'
             // traders come due every 150 s and used the whole budget, so the item in view stayed "Checking their list is open…".
-            const wantOpen = openOrder({ shown: sell.deskShownTrader, pinned: sell.pinTraders, desk: sell.deskTraders, flips: sell.openWant, scan: sell.scanTraders, max: OPEN_KEPT_MAX });
+            const wantOpen = openOrder({ shown: sell.deskShownTrader, pinned: sell.pinTraders, desk: sell.deskTraders, flips: sell.openWant, old: sell.openOld, pressed: pressedTraderId(now), scan: sell.scanTraders, max: OPEN_KEPT_MAX });
             const nextOpen = nextOpenCheck(wantOpen, sell.openChecks, { now, reading: new Set(sell.listReading ? sell.listReading.keys() : []), sent: sell.openSent });
             if (nextOpen) return Object.assign(() => loadW3bOpen(nextOpen), { list: true });
         }
@@ -46259,13 +47280,23 @@
         const lightFor = (kind) => kind !== 'desk' && (kind === 'sweep' ? lightHas.spare : lightHas.any);
         // 3.26.1 - which read an item gets (lightStandsIn): an item only near a flip is asked for its cheapest price
         // alone, as the sweep is; an item of a trade of yours that is not on the desk is 'own'.
-        const candSet = new Set(candIds.map(String));
+        // 3.35.0 (core/who-sells.js) - the order the possible flips are read in: a cheap new listing the index named first, then what
+        // each could make times how likely the index makes a find, over the reads it costs. With no fresh answer: as it was.
+        const readOrder = whoFresh(sell.who, now)
+            ? rankItems(sell.candidates.map((c) => ({ itemId: c.itemId, profit: c.score, known: c.known })), {
+                who: sell.who,
+                now,
+                costOf: (id) => (lightOn && !(sell.bazaars.get(id) || {}).lightAt ? 2 : 1),
+                groupOf: (c) => (c.known ? 0 : 1),
+            })
+            : candIds;
+        const candSet = new Set([...candIds, ...cheapIds].map(String));
         const kindOf = (id, how) => (String(id) === String(sell.selected) ? 'desk' : ownIds.has(String(id)) || how === 'desk' ? 'own'
             : how === 'slow' && !candSet.has(String(id)) ? 'sweep' : how);
         // The possible flips the light list has priced come first for a sellers list, the most made first
         // (sell.candidates is in that order); the others are asked for their light list meanwhile, which needs no
         // room in the sellers lists' minute.
-        const flipOrder = lightOn ? [...candIds.filter((id) => lightWantsFull(id, now)), ...candIds.filter((id) => !lightWantsFull(id, now))] : candIds;
+        const flipOrder = lightOn ? [...readOrder.filter((id) => lightWantsFull(id, now)), ...readOrder.filter((id) => !lightWantsFull(id, now))] : readOrder;
         const candOrder = setIds.length ? [...new Set([...setFirst, ...flipOrder.map(String), ...setIds])] : flipOrder;
         // While possible flips have no price of their own yet, two reads of three are theirs (a light list each).
         const unpriced = lightHas.any && candIds.some((id) => { const b = sell.bazaars.get(String(id)); return !b || (!b.loading && !(b.at > 0 && (!b.kept || b.server)) && !(b.lightAt > 0)); });
@@ -46331,6 +47362,8 @@
             },
         });
         if (!read) return null;
+        // 3.35.0 - for the zip: a read the index put ahead (a cheap listing's item, or a flip it moved to the top).
+        if (read.id && (cheapIds.includes(String(read.id)) || (readOrder[0] === String(read.id) && candIds[0] !== readOrder[0]))) sell.whoStats.used += 1;
         if (read.kind === 'summary') return loadBazaarSummary;
         if (read.kind === 'list') return Object.assign(() => loadW3bList(read.id), { list: true });
         if (read.kind === 'buyers') return () => loadItemTraders(read.id);
@@ -46339,7 +47372,7 @@
         const tag = id === String(sell.selected) ? 'w.desk'
             : setIds.includes(id) ? 'w.sets'
             : sell.tradeLive.includes(id) || sell.tradeWanted.includes(id) || pinnedIds.includes(id) ? 'w.trade'
-            : candIds.includes(id) || sell.nearIds.includes(id) ? 'w.flips'
+            : candIds.includes(id) || cheapIds.includes(id) || sell.nearIds.includes(id) ? 'w.flips'
             : 'w.sweep';
         // The light list where the sellers are not the question (core/cheap.js): the sweep and an item near a flip, a
         // possible flip read in full before or not priced yet, and an item of a trade between two sellers lists.
@@ -46347,6 +47380,88 @@
         if (lightOn && kind === 'sweep' && !lightHas.spare) return null;
         if (lightFor(kind) && lightStandsIn(id, kind, now)) return () => loadCheapest(read.id, kind === 'sweep' ? 'w.sweep' : tag);
         return () => loadBazaars(read.id, tag);
+    }
+
+    /*
+     * 3.35.0 - a pressed trader is read first (core/pressed.js; the field report of 3.34.0: after a press the rows filled in
+     * minute by minute behind the background queue, and only the first 30 items of their list were ever asked for).
+     * Torn's own API has no per-item bazaar prices (its bazaar answer names bazaars, not prices), so "the sellers of every
+     * item" is TornW3B's light list for each item (a limit of its own), a full sellers list for the trader's best few, and the
+     * Item Market on Torn's key (core/item-market.js) for all of them.
+     */
+    function pressedTraderId(now) {
+        return sell.pressed && pressLive(sell.pressed, now) ? sell.pressed.traderId : null;
+    }
+
+    /** The cheapest bazaar price known of an item: its sellers, else the light list, else the summary's one price. */
+    function lowestKnown(id) {
+        const b = sell.bazaars.get(String(id));
+        const low = (rows) => (rows || []).reduce((m, r) => (r && r.price > 0 && (m === null || r.price < m) ? r.price : m), null);
+        const fromRows = b && !b.error ? low(b.rows) : null;
+        if (fromRows) return fromRows;
+        const s = sell.summary ? sell.summary.get(String(id)) : null;
+        return s && s.lowestPrice > 0 ? s.lowestPrice : null;
+    }
+
+    /** The pressed trader's items to ask the sellers of, the biggest gap first (kept while neither list nor summary moves). */
+    function pressedItemsNow(now) {
+        const press = sell.pressed;
+        if (!pressLive(press, now)) {
+            sell.pressItems = null;
+            return null;
+        }
+        const id = press.traderId;
+        const oc = sell.openChecks.get(id);
+        const rec = sell.db && sell.db.traders ? sell.db.traders[id] : null;
+        // A list read closed has nothing to buy for: no seller is asked.
+        const prices = oc && oc.state === 'open' && oc.prices ? oc.prices : oc && oc.state === 'closed' ? null : rec && rec.w3b && rec.w3b.found ? rec.w3b.prices : null;
+        if (!prices) {
+            sell.pressItems = null;
+            return null;
+        }
+        const key = press.at + '|' + (oc ? oc.at : 0) + '|' + sell.summaryAt + '|' + Object.keys(prices).length + '|' + (whoFresh(sell.who, now) ? sell.who.at : 0);
+        if (sell.pressItems && sell.pressItemsKey === key) return sell.pressItems;
+        sell.pressItemsKey = key;
+        // 3.35.0 - their items by the gap times how likely the index makes a find (core/who-sells.js pressRank).
+        sell.pressItems = pressRank(pressItems(prices, { lowestOf: lowestKnown, enough: (each, price) => enoughProfit(each, price, 'TRADER', sellPrefs().minProfitPct) }), sell.who, now);
+        return sell.pressItems;
+    }
+
+    /** The zip's line: how long from the press to the first check of their list. Once a press. */
+    function notePressWait(now) {
+        const press = sell.pressed;
+        if (!press || !press.traderId || press.firstAt) return;
+        const check = sell.openChecks.get(press.traderId) || null;
+        // A page read at or after the press that did not fail: a check seen before it is not "the first check".
+        const ms = check && check.at >= press.at && check.state !== 'failed' ? pressWait(press, check, OPEN_CHECK_MS) : null;
+        if (ms === null) return;
+        press.firstAt = now;
+        sell.pressLog = pressLogAdd(sell.pressLog, { ms, why: press.why });
+    }
+
+    function nextPressedJob(now) {
+        const press = sell.pressed;
+        if (!pressLive(press, now) || !sell.w3b) return null;
+        notePressWait(now);
+        const reading = Boolean(sell.listReading && sell.listReading.has(press.traderId));
+        // A press whose page read did not leave (a read 15 s ago, a failed one): the page once more.
+        if (!press.firstAt && pressOpenWanted(press, sell.openChecks.get(press.traderId) || null, { now, reading })) {
+            const sent = (sell.openSent || []).filter((t) => now - t < 60000).length;
+            if (sent < 10) return Object.assign(() => loadW3bOpen(press.traderId), { list: true });
+        }
+        const items = pressedItemsNow(now);
+        if (!items) return null;
+        const lightOn = lightUsable(now);
+        const next = nextPressRead(press, items, {
+            stateOf: (id) => {
+                const b = sell.bazaars.get(String(id));
+                return b ? { fullAt: b.fullAt || 0, lightAt: b.lightAt || 0, triedAt: b.triedAt || 0, loading: Boolean(b.loading), error: Boolean(b.error || b.lightErrAt) } : {};
+            },
+            fullOk: w3bListingRoom(now).now,
+            lightOk: lightOn && lightRoom(now).any,
+        });
+        if (!next) return null;
+        return next.how === 'full' ? () => loadBazaars(next.id, 'w.trade') : () => loadCheapest(next.id, 'w.trade');
     }
 
     /** Is an item's every-buyer list (TornW3B /traders) due? */
@@ -46503,6 +47618,10 @@
      */
     const TRADER_CHECK_MS = 15 * 1000;
     function checkTraderNow(itemId, key, why = 'Check now') {
+        // 3.35.0 - this trader first, every item of their list (core/pressed.js; read by nextW3bJob).
+        sell.pressed = pressNew({ key, itemId, why, now: Date.now() });
+        sell.pressItems = null;
+        sell.pressItemsKey = '';
         const asked = rereadTraderList(key, Date.now(), TRADER_CHECK_MS);
         const id = String(itemId || '');
         const it = id ? sell.itemTraders.get(id) : null;
@@ -46611,6 +47730,54 @@
         renderSelling(true);
     }
 
+    /*
+     * 3.35.0 - who sells what (core/who-sells.js). What this PC reads anyway is told to the shared server's index (a
+     * stored box the next exchange takes: no request of its own), and the index is asked, about once a minute, where to
+     * look: its answer only orders reads that were going to happen. Nothing is bought from it.
+     */
+    function whoFeed(kind, entry) {
+        if (!entry || !sharedLink || !sharedLink.config()) return;
+        gmSet(SHARED_WHO_OUT_KEY, whoOutAdd(gmGet(SHARED_WHO_OUT_KEY, null), kind, entry, Date.now()));
+    }
+
+    /** A cheap listing the index named is confirmed when this PC's read shows the seller listing the item. */
+    function whoCheapSeen(sellerId, itemIds) {
+        if (!sell.who) return;
+        for (const key of cheapConfirmedBy(sell.who, Date.now(), sellerId, itemIds)) sell.whoCheapDone.add(key);
+    }
+
+    /** The index asked once a minute (and at once on a press); a server that is off or answers badly is left alone for longer each time. */
+    function stepWhoSells(now) {
+        if (!sharedLink || !sharedLink.config() || sell.whoBusy || document.visibilityState !== 'visible' || !bidsMayAsk(now)) return;
+        const press = sell.pressed && pressLive(sell.pressed, now) ? sell.pressed : null;
+        if (!whoMayAsk({ lastAt: sell.whoAt, pressAt: press ? press.at : 0, fails: sell.whoFails, failedAt: sell.whoFailedAt }, now)) return;
+        const body = whoAskBody(whoAskPlan({ view: sell.selected, candidates: sell.candidates, pressed: press ? pressedItemsNow(now) : null }));
+        if (!body) return;
+        sell.whoBusy = true;
+        sell.whoAt = now;
+        sell.whoStats.asked += 1;
+        sharedLink
+            .whoSells(body)
+            .then((answer) => {
+                // null: Shared is off or does not know this PC (nothing was asked).
+                if (!answer) return;
+                sell.who = answer;
+                sell.whoFails = 0;
+                sell.whoStats.answered += 1;
+                for (const c of answer.cheap) sell.whoCheapSeen.add(c.seller + '|' + c.item);
+                if (sell.whoStats.answered === 1) logProblem('note', 'The who-sells index answered: ' + (answer.known ? answer.known.sellers + ' sellers known' : 'its size is not told'), 'it only orders the reads this PC makes; nothing is bought from it');
+            })
+            .catch(() => {
+                sell.whoFails += 1;
+                sell.whoFailedAt = Date.now();
+                sell.whoStats.failed += 1;
+                if (sell.whoStats.failed === 1) logProblem('note', 'The who-sells index did not answer; asked again in ' + Math.round(whoBackoffMs(sell.whoFails) / 60000) + ' min', 'reads go in their usual order meanwhile');
+            })
+            .finally(() => {
+                sell.whoBusy = false;
+            });
+    }
+
     /** This PC's open or closed read, for the other PCs (the shared link sends the last three minutes' of them). */
     function shareOpenCheck(id, state, at, updatedAt, prices) {
         if (!sharedLink || !sharedLink.config() || (state !== 'open' && state !== 'closed')) return;
@@ -46702,7 +47869,7 @@
                 sell.summaryError = null;
                 // Listings of items no longer picked or possible flips are let go.
                 const pinned = Object.values(sellPinned()).flatMap((t) => t.lines.map((l) => l.itemId));
-                const keep = new Set([sell.selected, ...sell.candidates.map((c) => c.itemId), ...sell.nearIds, ...sell.tradeWanted, ...sell.tradeLive, ...pinned, ...sell.ownerIds]);
+                const keep = new Set([sell.selected, ...sell.candidates.map((c) => c.itemId), ...sell.nearIds, ...sell.tradeWanted, ...sell.tradeLive, ...(sell.pressItems ? sell.pressItems.all : []), ...pinned, ...sell.ownerIds]);
                 // The overlay reads it too (its own copy every 30 s while a Torn tab is open).
                 const lowest = {};
                 for (const r of rows) if (r.lowestPrice > 0) lowest[r.itemId] = r.lowestPrice;
@@ -46776,6 +47943,10 @@
                 if (!sweep && !prev.sweep && !prev.server && prevAt && at - prevAt <= SELL_MOVES_GAP_MS && !suspect) noteMovement(id, unitsMoved(prev.rows, rows, (listings || []).length >= 100), at - prevAt, at);
                 sell.bazaars.set(id, { at, fullAt: at, triedAt: at, rows, error: null, loading: false, sweep });
                 sell.bazaarsDirty = true;
+                // 3.35.0 - who sells it, to the index (the Item Market is no seller; a sweep keeps the cheapest, which is still "seen selling").
+                const told = sellersOfRows(rows);
+                whoFeed('sees', seesOf(id, told, at));
+                for (const seller of new Set(told)) whoCheapSeen(seller, [id]);
                 // 3.33.0 (Stage 6): does the server's copy know what TornW3B says? (A sweep keeps the cheapest only: enough.)
                 noteServerLead(id, rows, at);
             })
@@ -47702,13 +48873,16 @@
                 if (sellersKept.has(key)) return sellersKept.get(key);
                 const b = sell.bazaars.get(key);
                 const ts = perfNow();
+                // 3.35.0 - and the Item Market's cheapest listings, as sellers of their own (core/item-market.js).
+                const im = sell.itemMarket.get(key);
+                const market = itemMarketRows(im, { now, freshMs: FLIP_FRESH_MS });
                 const rows =
-                    b && b.at
+                    (b && b.at) || market.length
                         ? keepers.sellers.get(
                               key,
-                              [b.rows, b.at, sell.selfId, ownSigOf(key), sharedReads ? sharedReads.index : null, sharedReads && sharedReads.joined ? sharedReads.joined.get(key) : undefined, sellerRule.mostEnemies, sellerRule.perFriend, sell.ownReads.version || 0],
+                              [b ? b.rows : null, b ? b.at : 0, sell.selfId, ownSigOf(key), sharedReads ? sharedReads.index : null, sharedReads && sharedReads.joined ? sharedReads.joined.get(key) : undefined, sellerRule.mostEnemies, sellerRule.perFriend, sell.ownReads.version || 0, market.length ? im.at : 0],
                               // 3.33.0 - the seller rule, here once: flips, trades and the owner's tab all buy from these rows.
-                              () => sellerRowsKept(bazaarSellers(withOwnBuys(withoutGone(ownRowsNow(b, key), key, gone), key, { stock: ownStock, bought: ownBought.get(key) || null }), { selfId: sell.selfId, now }), sellerCountsOf, sellerRule).rows,
+                              () => sellerRowsKept(bazaarSellers(withOwnBuys(withItemMarket(b && b.at ? withoutGone(ownRowsNow(b, key), key, gone) : [], market), key, { stock: ownStock, bought: ownBought.get(key) || null }), { selfId: sell.selfId, now }), sellerCountsOf, sellerRule).rows,
                               { now, until: freshUntil },
                           )
                         : null;
@@ -47997,6 +49171,32 @@
                     return { price: pick.price, maxUnits: pickMost, ...(made ? { score: made.profit } : {}) };
                 }, { cash: prefs.cash, maxUnits: prefs.maxPerFlip, minPct: prefs.minProfitPct, limit: SELL_FLIP_CANDIDATES })
                 : [];
+            // 3.35.0 (core/old-lists.js) - whose flips Fresh prices hides only for an old edit date: their list page is read
+            // (openOrder's `old`), and a list found open is current (freshAtOf). The same pass counts what each Show choice
+            // hides, for the zip. Worked out every OLD_SCAN_EVERY_MS: it walks every item's buyers.
+            if (sell.summary && !q && document.visibilityState === 'visible' && now - (sell.oldScanAt || 0) >= OLD_SCAN_EVERY_MS) {
+                sell.oldScanAt = now;
+                const lowestEff = (id) => (effective.get(String(id)) || {}).lowestPrice;
+                const scan = oldListScan(effective.keys(), {
+                    lowestOf: lowestEff,
+                    buyersOf: (id) => {
+                        const all = buyersAllowed(id);
+                        const low = lowestEff(id);
+                        if (!all.length || !(all[0].price > low)) return [];
+                        const item = itemOf(id);
+                        if (neverFlip.has(itemCategory(item))) return [];
+                        return flipBuyers(all, { avg: item ? Number(item.marketValue) || null : null, type: item ? item.type : null, subType: item ? item.subType : null, unitsOf });
+                    },
+                    hiddenBy: (b) => {
+                        const h = hiddenBuyers([b], { prefs, levelOf, votesMissing, listAtOf: freshAtOf, now })[0];
+                        return h ? h.hiddenBy : null;
+                    },
+                    enough: (each, price) => enoughProfit(each, price, 'TRADER', prefs.minProfitPct),
+                });
+                sell.oldAll = scan.old;
+                sell.hiddenCounts = scan.hidden;
+            }
+            sell.openOld = prefs.freshOnly ? oldListsWanted(sell.oldAll || [], (id) => sell.openChecks.get(String(id)) || null, { now }) : [];
             // Near-misses, then every other item someone buys, oldest read first (3.15).
             const candSet = new Set(sell.candidates.map((c) => c.itemId));
             const bestBidOf = (id) => {
@@ -48098,7 +49298,11 @@
                         badge = { kind: 'sell' };
                     }
                 }
-                return { row: { itemId: id, name, held, lowest, badge, value, bid: avg > 0 ? realBid : 0, pending: !best && pendingFor(id), plan, best, category: itemCategory(itemOf(id)) }, wait, flip };
+                // 3.35.0 - a possible flip not confirmed yet shows at once, below the confirmed ones, with what it would make
+                // (about): it becomes a flip when its trader's list is read open. A held item keeps its own badge.
+                const checking = wait && !flip && maybe ? { profit: maybe.profit, to: { id: maybe.buyer.id || null, name: maybe.buyer.name, key: buyerKeyOf(maybe.buyer) } } : null;
+                if (checking && !badge) badge = { kind: 'checking', amount: checking.profit };
+                return { row: { itemId: id, name, held, lowest, badge, value, bid: avg > 0 ? realBid : 0, pending: !best && pendingFor(id), plan, best, checking, category: itemCategory(itemOf(id)) }, wait, flip };
             };
             const entries = [];
             for (const id of allIds) {
@@ -48175,6 +49379,9 @@
             sell.pricesWaiting = waiting.length;
             // 3.28.0 - for the log and the zip: the item speeds in use, and how many of the flips shown they made smaller.
             const pacedFlips = rows.filter((r) => r.plan && r.plan.units > 0 && typeof r.plan.pace === 'number').length;
+            // 3.35.0, for the zip (coverage): the possible flips shown as checking, and the flips that buy on the Item Market.
+            sell.checkingCount = rows.filter((r) => r.checking).length;
+            sell.itemMarketFlips = rows.filter((r) => r.badge && r.badge.kind === 'flip' && r.plan && (r.plan.steps || []).some((st) => isMarketSeller(st.sellerId))).length;
             sell.speedInfo = { itemsMeasured: speeds ? speeds.rows.size : 0, tableAgeMin: speeds ? Math.round((now - speeds.got) / 60000) : null, flipsShown: shownFlips.length, flipsPlannedSmaller: pacedFlips, tookBefore: tookBefore.size };
             // Said once each way; the counts of the moment are in the zip (coverage.speeds).
             const speedWord = speeds ? 'on' : 'off';
@@ -49075,21 +50282,29 @@
                 : listed.map((r) => r.itemId)
         ).filter(Boolean).map(String).slice(0, SELL_REFRESH_FIRST);
 
-        const watch = sellWatch({ desk, strip, waiting: stripWaiting, traders: sell.scanWatch || [], listed, held: [...heldQty.keys()], buyersAll });
+        // 3.35.0 (core/key-spend.js): the best buyer of each item you hold is asked about only while My items or To sell
+        // is the list in view - else it was a status read for every item held, on every page (the key's budget).
+        const heldInView = sell.filter === 'mine' || sell.filter === 'sell';
+        const watch = sellWatch({ desk, strip, waiting: stripWaiting, traders: sell.scanWatch || [], listed, held: heldInView ? [...heldQty.keys()] : [], buyersAll });
         // The server owner, while his tab is in view (3.32.0): whether he is on is said beside his name.
         const ownerHere = ownerTabOn() ? ownerListNow(now) : null;
         if (ownerHere && !watch.ids.includes(String(ownerHere.id))) watch.ids = [String(ownerHere.id), ...watch.ids];
         updateSellPresence(watch, now);
         stepOwnConfirm(now);
+        stepItemMarket(now);
+        stepWhoSells(now);
         // Networth: the buyers the flips sell to first, then the desk's top traders.
-        const nwIds = [];
-        for (const f of strip) if (f.buyer && f.buyer.id) nwIds.push(String(f.buyer.id));
+        // 3.35.0 (core/key-spend.js): the buyers in view first, then only the first candidate flips' - not all 150 (the key's budget).
+        const nwView = [];
+        if (sell.pressed && pressLive(sell.pressed, now)) nwView.push(sell.pressed.traderId);
+        for (const f of strip) if (f.buyer && f.buyer.id) nwView.push(String(f.buyer.id));
+        if (desk) for (const b of desk.buyers.slice(0, 5)) if (b.id) nwView.push(String(b.id));
+        const nwCandidates = [];
         for (const c of sell.candidates) {
             const b = flipBuyerOf(c.itemId);
-            if (b && b.id) nwIds.push(String(b.id));
+            if (b && b.id) nwCandidates.push(String(b.id));
         }
-        if (desk) for (const b of desk.buyers.slice(0, 5)) if (b.id) nwIds.push(String(b.id));
-        updateSellNetworth([...new Set(nwIds)], now);
+        updateSellNetworth(networthWanted({ view: nwView, candidates: nwCandidates }), now);
         const statusesKnown = watch.ids.filter((id) => !presenceUnknown(id)).length;
 
         const heldCount = sell.inventory ? sell.inventory.length : 0;
@@ -49160,7 +50375,7 @@
             },
             networth: networthMap(),
             // A flip row says what you buy at and what the trader pays (the owner: "it doesn't say how much the bazaar sells it for and how much the trader buys it for").
-            list: listed.slice(0, sell.allShown).map((r) => ({ itemId: r.itemId, name: r.name, held: r.held, lowest: r.lowest, badge: r.badge, pending: r.pending, still: r.still || null,
+            list: listed.slice(0, sell.allShown).map((r) => ({ itemId: r.itemId, name: r.name, held: r.held, lowest: r.lowest, badge: r.badge, pending: r.pending, still: r.still || null, checking: r.checking || null,
                 // 3.30.0 - Best flips: the trader whose trade this flip is part of (while a trade holds the list still: as it was held).
                 // A live flip with its trader now (one trader, one row); one that is no flip now, with the hold's.
                 group: sell.filter === 'flips' ? flipTraderKey(r) || (r.still ? r.still.to || null : null) : null,
@@ -49390,7 +50605,31 @@
                 sell.keyError = null;
                 return;
             }
-            const raw = await fetchInventory(sell.client);
+            // 3.35.0 (core/key-spend.js): what earlier reads taught (no-category read refused, empty categories) and what a
+            // failed read already got - not the 25 categories from the first every time.
+            const now0 = Date.now();
+            const policy = inventoryPolicyClean(gmGet(STORE_INVENTORY_POLICY, null));
+            // A buy or a finished trade can have filled a category that was empty: then none is skipped.
+            const plan = sell.inventoryDirty ? { ...inventoryPlan(policy, now0), skip: new Set() } : inventoryPlan(policy, now0);
+            sell.inventoryDirty = false;
+            let learned = policy;
+            const resume = inventoryResume(sell.invResume, now0);
+            let raw;
+            try {
+                raw = await fetchInventory(sell.client, {
+                    ...plan,
+                    resume,
+                    onLearn: (event) => { learned = inventoryLearn(learned, event, Date.now()); },
+                });
+            } catch (error) {
+                sell.inventoryDirty = true;
+                if (error && error.partial) sell.invResume = { rows: error.partial.rows, done: error.partial.done, at: Date.now() };
+                throw error;
+            } finally {
+                if (learned !== policy) gmSet(STORE_INVENTORY_POLICY, learned);
+            }
+            sell.invResume = null;
+            sell.inventoryReads = (sell.inventoryReads || 0) + 1;
             const merged = mergeInventory(raw);
             gmSet(STORE_INVENTORY, makeInventoryCacheEntry(merged));
             sell.inventory = merged;
@@ -49975,7 +51214,10 @@
             sell.bazaars.delete(sell.selected);
             sell.market.delete(sell.selected);
         }
-        loadSellInventory({ force: true }).then(() => refreshSellTraders({ force: true }));
+        // 3.35.0: the inventory only when it can have changed and not within a minute of the last read (Torn keeps it an hour anyway).
+        sell.inventoryDirty = true;
+        const invDue = inventoryDue({ inventoryAt: sell.inventoryAt, retryAt: sell.inventoryRetryAt, keyDead: sell.keyDead, dirty: true, now: Date.now(), refreshMs: INVENTORY_REFRESH_MS });
+        (invDue ? loadSellInventory({ force: true }) : Promise.resolve()).then(() => refreshSellTraders({ force: true }));
         renderSelling(true);
     }
 
@@ -50733,10 +51975,12 @@
                 saveTraderDb();
                 return;
             }
-            const due = inventoryRefreshDue({
+            const due = inventoryDue({
                 inventoryAt: sell.inventoryAt,
                 retryAt: sell.inventoryRetryAt,
                 keyDead: sell.keyDead,
+                dirty: sell.inventoryDirty,
+                now: Date.now(),
                 refreshMs: INVENTORY_REFRESH_MS,
             });
             if (due && !sell.loading && getSellKey()) loadSellInventory({ force: true });
@@ -50752,6 +51996,7 @@
         document.addEventListener('visibilitychange', () => {
             if (document.visibilityState === 'visible') {
                 // Back: TornExchange at once if its list is due, the next read now.
+                sell.inventoryDirty = true;
                 refreshSellTraders();
                 stepW3b();
                 markBidsSeen();
@@ -51254,7 +52499,10 @@
             const known = new Set((Array.isArray(stored.buys) ? stored.buys : []).map((b) => String(b.id)));
             const fresh = buys.filter((b) => !known.has(String(b.id)) && !goneNow.has(String(b.id)));
             if (fresh.length) {
+                sell.inventoryDirty = true;
                 const open = Object.values(sellAccepted());
+                // Listings just bought on the Item Market are gone: read again before the next plan counts on them.
+                for (const b of fresh) if (String(b.sellerId) === OWNER_MARKET) sell.itemMarket.delete(String(b.itemId));
                 for (const b of fresh.slice(-40)) {
                     const r = logBuyPlace(open, b, traderBidOf);
                     const what = '(item ' + b.itemId + '): ' + b.qty + ' at $' + Math.round(b.each);
@@ -51378,6 +52626,7 @@
                 if (!f) continue;
                 closeSellAccepted(t.key, { done: true, left: tradedLeftovers(t, take(f), Date.now(), f.t), seenAt: Number(f.t) || Date.now() });
                 logAction('Traded - done (your Torn trades show it; item ' + t.itemId + ')');
+                sell.inventoryDirty = true;
                 changed = true;
             }
             // Cancelled, but it had gone through before you did: what they took is

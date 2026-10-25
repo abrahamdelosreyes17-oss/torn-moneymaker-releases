@@ -1,5 +1,5 @@
 /*
- * The who-sells-what index (3.36.0): what this PC tells the shared server of the seller lists it reads, what it asks of
+ * The who-sells-what index (3.35.0): what this PC tells the shared server of the seller lists it reads, what it asks of
  * the server's POST /who-sells, and how the answer orders the reads. The server side is D:\torn\server (src/index.js,
  * host.js whoSells); it costs the server no request to Torn.
  *
