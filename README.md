@@ -2975,6 +2975,23 @@ which were checked by hovering in a browser.
 in the test page. The buy-page rings and keys have never been seen on a real
 bazaar or Item Market page.
 
+### More flips shown: Dropping fast gone, a list read open counts (3.34.0)
+
+- **Dropping fast is taken out** (the owner, 2026-10-25: "it makes it so that i
+  cant see any deals at all"). Its tab, its settings and the rule that hid an
+  item when two traders cut their price or the cheapest bazaar fell are gone.
+- **A list read open minutes ago makes a flip, however long ago its trader
+  edited it.** "Over a day old: no flip" now comes only on a TornExchange-only
+  price, which has no open read.
+- **Fresh prices does not hide a trader whose list was just read open.**
+- **The item you look at goes first:** its top five payers' lists are read
+  before the flips' traders, also the ones Fresh prices hides.
+
+Known limit: with Fresh prices on, Best flips finds a trader with a list
+edited over a day ago only once you open that item.
+
+**Not seen on real Torn.** Tested with `npm test`.
+
 ## Architecture
 
 ```
