@@ -198,12 +198,13 @@ export function nextStep(trade) {
 /**
  * Where a seller comes in the order nextStep walks a trade that names its stops (3.32.0): its place among the
  * stops, a bazaar the list did not name after them, the Item Market last. 0 for a trade without stops (its own
- * order stands). The Trades desk draws its stops and names its next one by this.
+ * order stands, but for the Item Market, which is last in any trade). The Trades desk draws its stops and names its next one by this.
  */
 export function stepRank(trade, sellerId) {
     const order = trade && Array.isArray(trade.stops) ? trade.stops.map(String) : null;
-    if (!order) return 0;
+    // The Item Market last, whether the trade names its stops or not (a flip's plan may buy there: 3.35.0).
     if (String(sellerId) === STEP_MARKET) return 2e9;
+    if (!order) return 0;
     const at = order.indexOf(String(sellerId));
     return at < 0 ? 1e9 : at;
 }
