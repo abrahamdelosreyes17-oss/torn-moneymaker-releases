@@ -71,7 +71,7 @@ import { fitLeftOut, planTrade, keepAfter } from './core/trade.js';
 import { holdTrade, holdKey, resolveEstimated, priceHeld, livePins, editHeld, keepHolds, keptHolds, HOLD_MS } from './core/held.js';
 import { priceChecked, applyListToItemBuyers, buyersEveryMs, FLIP_RECHECK_MS, checkedTable, checkedInTable, CHECKED_TABLE_WRITE_MS, bidSinceYes } from './core/checked.js';
 import { readWants, sweepOrder, applyWants, openOrder, deskPayers } from './core/schedule.js';
-import { itemMarketRows, withItemMarket, nextItemMarket, itemMarketRoom, ITEM_MARKET_LISTINGS } from './core/item-market.js';
+import { isMarketSeller, itemMarketRows, withItemMarket, nextItemMarket, itemMarketRoom, ITEM_MARKET_LISTINGS } from './core/item-market.js';
 import { oldListScan, oldListsWanted, OLD_SCAN_EVERY_MS } from './core/old-lists.js';
 import { inventoryPlan, inventoryLearn, inventoryDue, inventoryResume, inventoryPolicyClean, networthWanted } from './core/key-spend.js';
 import { pressNew, pressLive, pressItems, nextPressRead, pressOpenWanted, pressWait, pressLogAdd } from './core/pressed.js';
@@ -6161,6 +6161,14 @@ function usageState() {
             // again, checked against a fresh one, found differing; whether keeping is still on; the page's age.
             kept: Object.fromEntries(sellKeepersNow().filter((row) => row[4]).map(([name, , , , k]) => [name, { ...k.stats, on: k.on() }])),
             pageMinutes: sellPageMinutes(),
+            // 3.35.0: how many items a Show choice hides a flip on (offline, trust, old list), the possible flips shown as
+            // "checking", the wait from a press to the first check of their list (the last few, ms), the Item Market
+            // (reads of Torn, items read, flips whose plan buys there) and the inventory reads this visit.
+            hiddenByFilter: sell.hiddenCounts || null,
+            flipsChecking: sell.checkingCount ?? null,
+            clickToFirstCheckMs: (sell.pressLog || []).map((e) => e.ms),
+            itemMarket: { reads: sell.itemMarketReads || 0, items: sell.itemMarket ? sell.itemMarket.size : 0, flips: sell.itemMarketFlips ?? null },
+            inventoryReads: sell.inventoryReads || 0,
         },
     };
 }
@@ -10935,6 +10943,9 @@ function renderSellingWork(src = null, { press = null, typed = false } = {}) {
         sell.pricesWaiting = waiting.length;
         // 3.28.0 - for the log and the zip: the item speeds in use, and how many of the flips shown they made smaller.
         const pacedFlips = rows.filter((r) => r.plan && r.plan.units > 0 && typeof r.plan.pace === 'number').length;
+        // 3.35.0, for the zip (coverage): the possible flips shown as checking, and the flips that buy on the Item Market.
+        sell.checkingCount = rows.filter((r) => r.checking).length;
+        sell.itemMarketFlips = rows.filter((r) => r.badge && r.badge.kind === 'flip' && r.plan && (r.plan.steps || []).some((st) => isMarketSeller(st.sellerId))).length;
         sell.speedInfo = { itemsMeasured: speeds ? speeds.rows.size : 0, tableAgeMin: speeds ? Math.round((now - speeds.got) / 60000) : null, flipsShown: shownFlips.length, flipsPlannedSmaller: pacedFlips, tookBefore: tookBefore.size };
         // Said once each way; the counts of the moment are in the zip (coverage.speeds).
         const speedWord = speeds ? 'on' : 'off';

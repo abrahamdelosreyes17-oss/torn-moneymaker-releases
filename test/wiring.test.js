@@ -318,3 +318,9 @@ test('3.35.0: the Torn key is spent on what is in view (core/key-spend.js)', () 
     for (const where of ["sell.inventoryDirty = true;\n            changed = true;", "sell.inventoryDirty = true;\n            const open = Object.values(sellAccepted());"]) has(where, 'a finished trade and a logged buy mark the inventory changed');
     has('const resume = inventoryResume(sell.invResume, now0);', 'a failed read is resumed');
 });
+
+test('3.35.0: the zip says what the new reads did (state.json coverage)', () => {
+    for (const k of ['hiddenByFilter: sell.hiddenCounts || null,', 'flipsChecking: sell.checkingCount ?? null,', 'clickToFirstCheckMs: (sell.pressLog || []).map((e) => e.ms),', 'itemMarket: { reads: sell.itemMarketReads || 0,', 'inventoryReads: sell.inventoryReads || 0,']) has(k, 'coverage');
+    has('sell.itemMarketFlips = rows.filter(', 'flips from the Item Market are counted');
+    has('sell.checkingCount = rows.filter((r) => r.checking).length;', 'the checking flips are counted');
+});
