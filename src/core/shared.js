@@ -10,6 +10,7 @@
  * Pure: no clock, no storage, no network. Times are milliseconds, passed in.
  */
 
+import { whoOutTake, whoOutValid } from './who-sells.js';
 import { USAGE_CALLS_TAG, USAGE_CALLS_TAGS_MAX, USAGE_CALLS_COUNT_MAX } from './usage.js';
 
 export const SHARED_SYNC_MS = 30000;
@@ -24,7 +25,7 @@ export const SHARED_BUCKETS = 16;
 const SHARED_MAX_SELLERS = 3000;
 const SHARED_MAX_NEAR = 200;
 const SHARED_MAX_WORTH = 5000;
-const SHARED_BODY_KEYS = ['app', 'ver', 'used', 'waiting', 'sellers', 'trades', 'looking', 'worth', 'since', 'seen', 'going', 'bought', 'dir', 'want', 'w3b', 'lists', 'listsSince', 'calls', 'moves', 'ownSince', 'opens'];
+const SHARED_BODY_KEYS = ['app', 'ver', 'used', 'waiting', 'sellers', 'trades', 'looking', 'worth', 'since', 'seen', 'going', 'bought', 'dir', 'want', 'w3b', 'lists', 'listsSince', 'calls', 'moves', 'ownSince', 'opens', 'sees', 'looked', 'missed'];
 /*
  * 3.26.0, the server handing out TornW3B's work (its /sync, deployed 2026-10-11):
  *   want        the items whose sellers list this PC would ask TornW3B for next, most wanted first (60 at most)
@@ -421,7 +422,7 @@ export function sharedMarks(wants, now) {
  * come out of here, whatever is put in.
  * `now`: this PC's clock; the marks leave as ages, since every PC has its own clock.
  */
-export function sharedBody({ used = 0, waiting = 0, wants = [], since = 0, seen = 0, sendWorth = true, now = 0, ver = null, lists = null, listsSince = null, calls = null, moves = null, ownSince = null, opens = null } = {}) {
+export function sharedBody({ used = 0, waiting = 0, wants = [], since = 0, seen = 0, sendWorth = true, now = 0, ver = null, lists = null, listsSince = null, calls = null, moves = null, ownSince = null, opens = null, who = null } = {}) {
     const count = (n) => (Number.isFinite(n) && n > 0 ? Math.min(1000, Math.floor(n)) : 0);
     const list = Array.isArray(wants) ? wants.filter((w) => w && typeof w === 'object') : [];
     const trades = sharedIds(list.map((w) => w.trades), SHARED_MAX_NEAR);
@@ -459,6 +460,8 @@ export function sharedBody({ used = 0, waiting = 0, wants = [], since = 0, seen 
     // 3.33.0 - whose TornW3B lists this PC saw open or closed in the last three minutes, as ages (sharedOpen).
     const opensOut = (Array.isArray(opens) ? opens : []).map((o) => sharedOpenOut(o, now)).filter(Boolean).slice(0, SHARED_MAX_OPENS);
     if (opensOut.length) body.opens = opensOut;
+    // 3.36.0 - the seller lists and bazaars this PC read, and the buys that found the item gone (core/who-sells.js): as ages.
+    if (who) Object.assign(body, whoOutTake(who, now).body);
     // 3.26.2 - this PC's own request counts since the last answered exchange (core/usage.js): {} = none were made.
     if (calls && typeof calls === 'object' && !Array.isArray(calls)) {
         body.calls = {};
@@ -525,6 +528,8 @@ export function sharedOutgoingOk(body) {
         } else if (key === 'opens') {
             // [trader, 1 open | 0 closed, age, age of the list's last change (0: not known), mark of its prices (0: none)]
             if (!Array.isArray(value) || value.length > SHARED_MAX_OPENS || !value.every((m) => Array.isArray(m) && m.length === 5 && m.every(whole) && m[0] > 0 && m[0] < 1e10 && (m[1] === 0 || m[1] === 1) && m[2] < SHARED_OPEN_KEEP_MS && m[4] < 2 ** 32)) return false;
+        } else if (key === 'sees' || key === 'looked' || key === 'missed') {
+            if (!whoOutValid(key, value)) return false;
         } else if (key === 'calls') {
             // {tag: how many}: a service's tag or how one answered, a whole number from 1 to 5,000.
             if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).length > USAGE_CALLS_TAGS_MAX) return false;

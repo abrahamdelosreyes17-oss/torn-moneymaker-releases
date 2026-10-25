@@ -3,8 +3,9 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { SharedLink, SHARED_CONFIG_KEY, SHARED_STATE_KEY, SHARED_GRANT_KEY, SHARED_MARKS_KEY, SHARED_TICK_MS, SHARED_UNKNOWN_MS, SHARED_UNKNOWN_STEPS_MS, sharedUnknownWait } from '../src/feed/shared-link.js';
+import { SharedLink, SHARED_WHO_OUT_KEY, SHARED_CONFIG_KEY, SHARED_STATE_KEY, SHARED_GRANT_KEY, SHARED_MARKS_KEY, SHARED_TICK_MS, SHARED_UNKNOWN_MS, SHARED_UNKNOWN_STEPS_MS, sharedUnknownWait } from '../src/feed/shared-link.js';
 import { sharedOutgoingOk, sharedMayCall, withShared, sharedNowLine, sharedPanelLine, sharedKnown, sharedWord, sharedSaid, sharedSaidLine } from '../src/core/shared.js';
+import { whoOutAdd, seesOf, lookedOf } from '../src/core/who-sells.js';
 import { serverFile } from './server-path.js';
 
 const { peopleFrom, whoIs } = await import(serverFile('src/host.js'));
@@ -931,4 +932,47 @@ test('item speeds (3.28.0): Torn Bids\' page asks with one number and is handed 
     // This PC's word changed (another key): the table kept under the old one goes with the rest.
     tab.link.forget();
     assert.equal(s.gm.values.has(SHARED_MOVES_KEY), false);
+});
+
+test('who sells what (3.36.0): the seller lists this PC read leave as ages and come off the box once answered; /who-sells names them back, and a server that is off costs nothing', async () => {
+    const s = setUp();
+    const tab = s.addTab('sell', 't-sell', { sellers: [11], worth: { 206: 850000 } });
+    await s.pass(35000);
+    // Read by this PC 20 s and 40 s ago (this PC's own clock).
+    const nowPc = s.world.t + SKEW;
+    s.gm.values.set(SHARED_WHO_OUT_KEY, whoOutAdd(whoOutAdd(null, 'sees', seesOf(206, [501, 502, 'market'], nowPc - 20000), nowPc), 'looked', lookedOf(503, [206, 367], nowPc - 40000), nowPc));
+    await s.pass(35000);
+    const sent = s.posts.filter((p) => p.url.endsWith('/sync') && p.body.sees);
+    assert.equal(sent.length, 1, 'told once');
+    assert.equal(sharedOutgoingOk(sent[0].body), true);
+    assert.deepEqual(sent[0].body.sees[0][2], [501, 502]);
+    assert.ok(sent[0].body.sees[0][1] >= 20000 && sent[0].body.sees[0][1] < 60000);
+    assert.equal(sent[0].body.looked[0][0], 503);
+    assert.deepEqual(s.gm.values.get(SHARED_WHO_OUT_KEY), { sees: [], looked: [], missed: [] });
+    const st = tab.link.status();
+    assert.equal(st.seesOut, 1);
+    assert.equal(st.lookedOut, 1);
+    // The index answers.
+    const answer = await tab.link.whoSells({ items: [206], n: 5 });
+    assert.ok(answer.items.get('206').map((x) => x.id).includes('501'));
+    assert.ok(!answer.items.get('206').some((x) => x.id === 'market'));
+    // Shared off: nothing is asked.
+    s.gm.values.delete(SHARED_CONFIG_KEY);
+    assert.equal(await tab.link.whoSells({ items: [1], n: 1 }), null);
+});
+
+test('who sells what: a server that is down or does not know this PC gives an error or null, never a hang', async () => {
+    let down = false;
+    const s = setUp({ down: () => down });
+    const tab = s.addTab('sell', 't-sell', { sellers: [11], worth: { 206: 850000 } });
+    await s.pass(35000);
+    down = true;
+    await assert.rejects(() => tab.link.whoSells({ items: [206], n: 5 }));
+    down = false;
+    assert.equal(await tab.link.whoSells(null), null);
+    // A word that is not in the agreed shape is no config at all: nothing is sent.
+    const stranger = setUp({ pass: 'x' });
+    const t2 = stranger.addTab('sell', 't', { sellers: [11] });
+    assert.equal(await t2.link.whoSells({ items: [206], n: 5 }), null);
+    assert.equal(stranger.posts.length, 0);
 });

@@ -19,6 +19,7 @@
 
 import { decideLeader } from '../core/leader.js';
 import { usageCallsOut, usageCallsSent } from '../core/usage.js';
+import { whoOutTake, whoOutDrop, whoAnswerIn } from '../core/who-sells.js';
 import {
     SHARED_SYNC_MS, SHARED_BUCKETS, sharedAddress, sharedPassOk, sharedBody, sharedOutgoingOk, sharedVersion, sharedTake, sharedPrune,
     sharedReadBucket, sharedIndex, sharedInterest, sharedPerson, sharedMarks, sharedMarksIn, sharedMarksNow,
@@ -45,6 +46,8 @@ export const SHARED_OPENS_OUT_KEY = 'sharedOpensOut';
 export const SHARED_OPENS_IN_KEY = 'sharedOpensIn';
 /* 3.31.0 - traders' own price lists, as their Torn Archive told the server: {mark, lists: {trader: {at, since, open, prices, off}}}. */
 export const SHARED_OWN_KEY = 'sharedOwn';
+/* 3.36.0 - the seller lists, bazaars and gone listings this PC saw, waiting to be sent: {sees, looked, missed} (core/who-sells.js; written by either part of the script). */
+export const SHARED_WHO_OUT_KEY = 'sharedWhoOut';
 const SHARED_LISTS_IN_KEEP = 20;
 /* 3.28.0 - how fast items leave the bazaars, as the server counted it: {at (the server's clock), got (this PC's), rows: {item: units an hour}}. */
 export const SHARED_MOVES_KEY = 'sharedMoves';
@@ -350,7 +353,10 @@ export class SharedLink {
                 const ownSince = takesLists && page === 0 ? (ownHeld && Number.isInteger(ownHeld.mark) && ownHeld.mark > 0 ? ownHeld.mark : 0) : null;
                 // 3.33.0 - this PC's open checks of the last three minutes, on the first page only.
                 const opensOut = takesLists && page === 0 ? this.d.load(SHARED_OPENS_OUT_KEY) || [] : null;
-                const body = sharedBody({ used: use.used, waiting: (Number(use.waiting) || 0) + others, wants: page === 0 ? wants : wants.map(({ want, w3b, ...w }) => w), since: seq, seen, sendWorth, now, ver, lists: listsOut, listsSince: takesLists && page === 0 ? listsAt : null, calls: callsOut, moves: movesAt, ownSince, opens: opensOut });
+                // 3.36.0 - what this PC saw of who sells what, on the first page only.
+                const whoOut = page === 0 ? this.d.load(SHARED_WHO_OUT_KEY) : null;
+                const whoTake = whoOut ? whoOutTake(whoOut, now) : null;
+                const body = sharedBody({ who: whoOut, used: use.used, waiting: (Number(use.waiting) || 0) + others, wants: page === 0 ? wants : wants.map(({ want, w3b, ...w }) => w), since: seq, seen, sendWorth, now, ver, lists: listsOut, listsSince: takesLists && page === 0 ? listsAt : null, calls: callsOut, moves: movesAt, ownSince, opens: opensOut });
                 if (!sharedOutgoingOk(body)) throw new Error('Not sent: the message was not in the agreed shape.');
 
                 const response = await this.d.post(`${cfg.address}/sync`, {
@@ -430,6 +436,11 @@ export class SharedLink {
                     this.d.save(SHARED_DIR_KEY, dirNow);
                 }
                 state.turn = dirNow.turn;
+                if (whoTake && (whoTake.counts.sees || whoTake.counts.looked || whoTake.counts.missed)) {
+                    // Answered: what was sent comes off the box (what the tabs saw meanwhile stays for the next one).
+                    this.d.save(SHARED_WHO_OUT_KEY, whoOutDrop(this.d.load(SHARED_WHO_OUT_KEY), whoTake.taken));
+                    for (const k of ['sees', 'looked', 'missed']) state[k + 'Out'] = (Number.isInteger(before[k + 'Out']) ? before[k + 'Out'] : 0) + whoTake.counts[k];
+                }
                 if (page === 0 && body.calls) {
                     // Answered: what was sent comes off the sum (what the tabs counted meanwhile stays for the next one).
                     const sum = Object.values(body.calls).reduce((a, n) => a + n, 0);
@@ -532,10 +543,30 @@ export class SharedLink {
         return true;
     }
 
+    /**
+     * 3.36.0 - POST /who-sells: who probably sells these items, and the cheap listings seen lately (core/who-sells.js).
+     * Costs the server no request to Torn. Any tab may ask. A server that is off, does not know this PC or answers with
+     * anything but an answer gives null - the caller works as before.
+     * @param {{items: number[], n: number, list?: [number, number][]}} request - from whoAskBody
+     * @returns {Promise<object|null>} whoAnswerIn()
+     */
+    async whoSells(request) {
+        const cfg = this.config();
+        if (!cfg || !request) return null;
+        const state = this.d.load(SHARED_STATE_KEY) || {};
+        if (state.unknown || state.update) return null;
+        const response = await this.d.post(`${cfg.address}/who-sells`, {
+            headers: { Authorization: `Bearer ${cfg.pass}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify(request),
+        });
+        if (!response || !response.ok) throw new Error(`The server answered with status ${response ? response.status : 0}.`);
+        return whoAnswerIn(await response.json(), this.now());
+    }
+
     /** The server's address or this PC's word changed, or there is none now: what was kept under the old one goes. */
     forget() {
         for (let i = 0; i < SHARED_BUCKETS; i += 1) this.d.del(SHARED_READS_PREFIX + i);
-        for (const key of [SHARED_STATE_KEY, SHARED_GRANT_KEY, SHARED_MARKS_KEY, SHARED_INTEREST_KEY, SHARED_ASK_KEY, SHARED_DIR_KEY, SHARED_W3B_ASK_KEY, SHARED_LISTS_OUT_KEY, SHARED_LISTS_IN_KEY, SHARED_CALLS_KEY, SHARED_MOVES_KEY]) this.d.del(key);
+        for (const key of [SHARED_STATE_KEY, SHARED_GRANT_KEY, SHARED_MARKS_KEY, SHARED_INTEREST_KEY, SHARED_ASK_KEY, SHARED_DIR_KEY, SHARED_W3B_ASK_KEY, SHARED_LISTS_OUT_KEY, SHARED_LISTS_IN_KEY, SHARED_CALLS_KEY, SHARED_MOVES_KEY, SHARED_WHO_OUT_KEY]) this.d.del(key);
         this.w3bAskKept = null;
         this.listsSent = new Map();
         this.buckets = null;
@@ -579,6 +610,10 @@ export class SharedLink {
             callsSyncs: Number.isInteger(state.callsSyncs) ? state.callsSyncs : 0,
             // 3.28.0: how many items the server's last table of speeds named (null: none came yet).
             moves: Number.isInteger(state.moves) ? state.moves : null,
+            // 3.36.0: seller lists, bazaars read whole and gone listings told to the index so far.
+            seesOut: Number.isInteger(state.seesOut) ? state.seesOut : 0,
+            lookedOut: Number.isInteger(state.lookedOut) ? state.lookedOut : 0,
+            missedOut: Number.isInteger(state.missedOut) ? state.missedOut : 0,
             unknown: Boolean(cfg && state.unknown),
             // When a PC the server does not know asks again (ms from the last asking).
             unknownWaitMs: cfg && state.unknown ? sharedUnknownWait(state.unknownTries) : null,

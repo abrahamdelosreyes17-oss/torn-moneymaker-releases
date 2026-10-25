@@ -49,7 +49,7 @@ export function pressLive(press, now) {
  * @param {object} o
  * @param {(id: string) => number|null} o.lowestOf - the cheapest bazaar price known (null: not known)
  * @param {(each: number, price: number) => boolean} o.enough - is that much over `price` worth a flip (the least profit)
- * @returns {{all: string[], full: string[], wide: string[]}} full: the first PRESS_FULL_MAX that have a price over a
+ * @returns {{all: string[], full: string[], wide: string[], gap: Object<string, number>}} full: the first PRESS_FULL_MAX that have a price over a
  *   known cheapest; wide: `all`, then the items no bazaar undercuts, the dearest bid first - the Item Market may
  *   (core/item-market.js), so its listings are asked for every item they pay for
  */
@@ -73,7 +73,9 @@ export function pressItems(prices, { lowestOf, enough }) {
     rows.sort((a, b) => b.over - a.over || Number(a.id) - Number(b.id));
     rest.sort((a, b) => b.bid - a.bid || Number(a.id) - Number(b.id));
     const all = rows.map((r) => r.id);
-    return { all, full: rows.filter((r) => r.known).slice(0, PRESS_FULL_MAX).map((r) => r.id), wide: [...all, ...rest.map((r) => r.id)] };
+    // gap: what they pay over the cheapest bazaar known, per item (the weight the who-sells index is asked with).
+    const gap = Object.fromEntries(rows.filter((r) => r.known).map((r) => [r.id, r.over]));
+    return { all, full: rows.filter((r) => r.known).slice(0, PRESS_FULL_MAX).map((r) => r.id), wide: [...all, ...rest.map((r) => r.id)], gap };
 }
 
 /**
