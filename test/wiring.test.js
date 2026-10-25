@@ -300,3 +300,12 @@ test('3.35.0: an old list is read open, not left hidden (core/old-lists.js)', ()
     has("sell.openOld = prefs.freshOnly ? oldListsWanted(", 'only with Fresh prices on');
     has('old: sell.openOld, pressed: pressedTraderId(now), scan: sell.scanTraders, max: OPEN_KEPT_MAX });', 'they are read after the pressed trader and the item in view');
 });
+
+test('3.35.0: a possible flip shows at once as "checking", below the confirmed ones, and pressing it checks first', () => {
+    has("if (checking && !badge) badge = { kind: 'checking', amount: checking.profit };", 'the row is marked checking');
+    has('badge: r.badge, pending: r.pending, still: r.still || null, checking: r.checking || null,', 'the page is told');
+    const ui = read('src/ui/selling-page.js');
+    assert.ok(ui.includes("text: 'checking'") && ui.includes("this.h.onTradePick(lead.itemId, wait.to.key)"), 'pressed, it plans the trade (their list is read first)');
+    // Nothing that buys or plans reads the checking row as a flip: the cards and the plans use badge.kind === 'flip' and r.plan.
+    assert.ok(main.includes(".filter((r) => r.badge && r.badge.kind === 'flip')"), 'the cards take confirmed flips only');
+});

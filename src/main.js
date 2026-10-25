@@ -10852,7 +10852,11 @@ function renderSellingWork(src = null, { press = null, typed = false } = {}) {
                     badge = { kind: 'sell' };
                 }
             }
-            return { row: { itemId: id, name, held, lowest, badge, value, bid: avg > 0 ? realBid : 0, pending: !best && pendingFor(id), plan, best, category: itemCategory(itemOf(id)) }, wait, flip };
+            // 3.35.0 - a possible flip not confirmed yet shows at once, below the confirmed ones, with what it would make
+            // (about): it becomes a flip when its trader's list is read open. A held item keeps its own badge.
+            const checking = wait && !flip && maybe ? { profit: maybe.profit, to: { id: maybe.buyer.id || null, name: maybe.buyer.name, key: buyerKeyOf(maybe.buyer) } } : null;
+            if (checking && !badge) badge = { kind: 'checking', amount: checking.profit };
+            return { row: { itemId: id, name, held, lowest, badge, value, bid: avg > 0 ? realBid : 0, pending: !best && pendingFor(id), plan, best, checking, category: itemCategory(itemOf(id)) }, wait, flip };
         };
         const entries = [];
         for (const id of allIds) {
@@ -11915,7 +11919,7 @@ function renderSellingWork(src = null, { press = null, typed = false } = {}) {
         },
         networth: networthMap(),
         // A flip row says what you buy at and what the trader pays (the owner: "it doesn't say how much the bazaar sells it for and how much the trader buys it for").
-        list: listed.slice(0, sell.allShown).map((r) => ({ itemId: r.itemId, name: r.name, held: r.held, lowest: r.lowest, badge: r.badge, pending: r.pending, still: r.still || null,
+        list: listed.slice(0, sell.allShown).map((r) => ({ itemId: r.itemId, name: r.name, held: r.held, lowest: r.lowest, badge: r.badge, pending: r.pending, still: r.still || null, checking: r.checking || null,
             // 3.30.0 - Best flips: the trader whose trade this flip is part of (while a trade holds the list still: as it was held).
             // A live flip with its trader now (one trader, one row); one that is no flip now, with the hold's.
             group: sell.filter === 'flips' ? flipTraderKey(r) || (r.still ? r.still.to || null : null) : null,

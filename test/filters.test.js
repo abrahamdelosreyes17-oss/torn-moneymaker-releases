@@ -21,3 +21,15 @@ test('a category filters the rows and their counts; To sell keeps its own count'
     assert.deepEqual(filterRows(rows, 'Drug', 7).counts, { all: 2, mine: 1, flips: 1, sell: 7 });
     assert.equal(filterRows(rows, '', 0).rows, rows);
 });
+
+test('3.35.0: a possible flip still being checked is in the Flips tab and its count, whatever its badge', () => {
+    const more = [
+        ...rows,
+        { itemId: '4', held: 0, category: 'Drug', badge: { kind: 'checking', amount: 900 }, checking: { profit: 900 } },
+        { itemId: '5', held: 3, category: 'Drug', badge: { kind: 'sell' }, checking: { profit: 500 } },
+    ];
+    const ids = (f) => more.filter(rowPass(f, new Set())).map((r) => r.itemId);
+    assert.deepEqual(ids('flips'), ['1', '4', '5']);
+    assert.deepEqual(ids('mine'), ['1', '3', '5']);
+    assert.equal(filterRows(more, '', 0).counts.flips, 3);
+});

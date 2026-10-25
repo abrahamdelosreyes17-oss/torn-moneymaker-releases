@@ -6,12 +6,16 @@ import { togetherBy, flipTraderKey } from './still.js';
 import { sortItemRows, SORT_FIRST_DIR } from './traders.js';
 import { isFlip } from './filters.js';
 
+const checkingProfit = (r) => (r.checking ? Number(r.checking.profit) || 0 : 0);
+
 /**
  * The list's own order: money to be made first, then what you hold, then the best price. Best flips: the flips that
- * sell to one trader are one trade with them, and stand together under its total (3.30.0).
+ * sell to one trader are one trade with them, and stand together under its total (3.30.0). 3.35.0: there the possible
+ * flips still being checked (value 0) come after the confirmed ones, the most each would make first.
  */
 export function listOrder(rows, pass, filter) {
-    const listed = rows.filter(pass).sort((a, b) => b.value - a.value || (b.held > 0) - (a.held > 0) || b.bid - a.bid || String(a.name).localeCompare(String(b.name)));
+    const checking = filter === 'flips' ? checkingProfit : () => 0;
+    const listed = rows.filter(pass).sort((a, b) => b.value - a.value || checking(b) - checking(a) || (b.held > 0) - (a.held > 0) || b.bid - a.bid || String(a.name).localeCompare(String(b.name)));
     return filter === 'flips' ? togetherBy(listed, flipTraderKey, (r) => r.value) : listed;
 }
 

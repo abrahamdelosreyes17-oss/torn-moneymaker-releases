@@ -1375,7 +1375,7 @@ export class SellingPage {
         const now = Date.now();
         const sig = JSON.stringify([
             'items', kind, s.counts, s.listTotal, s.desk && s.desk.itemId, info.hasKey, info.loading, info.inventoryAt ? 1 : 0, info.tradersLoading, Boolean(info.bazaarsAt), this.query, s.category, Boolean(s.still),
-            list.map((r) => [r.itemId, r.name, r.held, r.lowest, r.badge && [r.badge.kind, r.badge.amount], r.pending, r.units, r.stops, r.pace, r.bid, r.mark && r.mark.text, r.still && [r.still.move, r.still.gone, r.still.was], r.group,
+            list.map((r) => [r.itemId, r.name, r.held, r.lowest, r.badge && [r.badge.kind, r.badge.amount], r.checking && r.checking.profit, r.pending, r.units, r.stops, r.pace, r.bid, r.mark && r.mark.text, r.still && [r.still.move, r.still.gone, r.still.was], r.group,
                 r.to && [r.to.name, this.dotSig(r.to), r.to.old ? listAgeText(now - r.to.old.at) : '', Boolean(r.to.teOnly)], r.top && [r.top.name, r.top.price, this.dotSig(r.top), r.top.checked], r.second && [r.second.name, r.second.price, this.dotSig(r.second), r.second.checked], r.market && [r.market.price, r.market.about], paidOf.has(r.itemId) ? paidOf.get(r.itemId).each : 0]),
             s.pinned || [], (s.prefs.listSort || {})[kind] || null,
         ]);
@@ -1426,7 +1426,7 @@ export class SellingPage {
                 gone ? spEl('span', { class: 'tag', title: 'It was a flip when the list was held. It keeps its place until your trade ends.', text: 'No flip now' }) : null,
             ];
             let sub;
-            if (kind === 'all') sub = flip ? null : r.badge && r.badge.kind === 'list' ? 'your bazaar pays ' + signed(r.badge.amount) + ' more than a trader' : r.pending ? 'Checking…' : 'no flip now';
+            if (kind === 'all') sub = flip ? null : r.badge && r.badge.kind === 'list' ? 'your bazaar pays ' + signed(r.badge.amount) + ' more than a trader' : r.checking ? 'checking' : r.pending ? 'Checking…' : 'no flip now';
             else {
                 const paid = paidOf.get(r.itemId);
                 sub = paid ? 'bought to resell · you paid ' + formatMoney(paid.each) : r.badge && r.badge.kind === 'list' ? 'your bazaar pays ' + signed(r.badge.amount) + ' more than a trader' : '';
@@ -1529,8 +1529,14 @@ export class SellingPage {
                     if (this.h.onPin) this.h.onPin(lead.itemId);
                 } }, [pinIcon()]);
             })() : null;
-            const a = [this.dot(to), spEl('b', { text: to ? to.name : lead.name }), ...tags(to, run.find((r) => r.mark)), gone ? spEl('span', { class: 'tag', title: 'It was a flip when the list was held. It keeps its place until your trade ends.', text: 'No flip now' }) : null];
-            const p = gone
+            // 3.35.0: a possible flip not confirmed yet - one short word, the most it would make (about); pressed, their list is read first.
+            const wait = !live.length && !gone && run.length === 1 && lead.checking ? lead.checking : null;
+            const a = wait
+                ? [spEl('b', { text: wait.to.name || lead.name }), spEl('span', { class: 'tag w', title: 'Their price list is being read. It is a flip once their shop is seen open.', text: 'checking' })]
+                : [this.dot(to), spEl('b', { text: to ? to.name : lead.name }), ...tags(to, run.find((r) => r.mark)), gone ? spEl('span', { class: 'tag', title: 'It was a flip when the list was held. It keeps its place until your trade ends.', text: 'No flip now' }) : null];
+            const p = wait
+                ? [spEl('span', { class: 't-muted', text: '≈ ' + signed(wait.profit) })]
+                : gone
                 ? [spEl('b', { class: 't-muted', text: signed(goneWas) })]
                 : live.length ? [spEl('b', { class: 't-good', title: one ? null : 'What these flips make together. The trade with ' + (to ? to.name : 'them') + ' may take more of their items: it is in the pane once you open it.', text: signed(total) }), this.stillMark(lead.still), pin] : [];
             const sub = [lead.name + (lead.units ? ' × ' + count(lead.units) : ''), live.length > 1 ? spEl('span', { class: 't-muted', text: ' + ' + count(live.length - 1) + ' more' }) : null,
@@ -1541,9 +1547,10 @@ export class SellingPage {
                     : live.length ? [this.plural(live.length, 'flip') + ' · ' + this.plural(units, 'item') + ' · ' + this.plural(stops, 'bazaar')] : [];
             // 2026-10-17: a row is its trader's trade - pressed, the trade with them opens (it opened the item's best
             // trader, which could be another one, or the item alone).
-            const open = to && to.key && live.length ? () => (this.h.onTradePick ? this.h.onTradePick(lead.itemId, to.key) : this.select(lead.itemId)) : () => this.select(lead.itemId);
+            const open = wait && wait.to.key ? () => (this.h.onTradePick ? this.h.onTradePick(lead.itemId, wait.to.key) : this.select(lead.itemId))
+                : to && to.key && live.length ? () => (this.h.onTradePick ? this.h.onTradePick(lead.itemId, to.key) : this.select(lead.itemId)) : () => this.select(lead.itemId);
             rows.push(row((on ? 'sel' : '') + (gone ? ' gone' : ''), one ? 'item:' + lead.itemId : 'group:' + lead.group, open, a, p, sub, sub2,
-                to ? 'Open the trade with ' + to.name : ''));
+                wait ? 'Read their list, then open the trade with ' + wait.to.name : to ? 'Open the trade with ' + to.name : ''));
         }
         const q = this.query.trim();
         const empty = q ? 'No item matches "' + q + '"' + (s.category ? ' in ' + s.category : '') + '.'

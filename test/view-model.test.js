@@ -28,3 +28,11 @@ test('a flip row\'s cells', () => {
     assert.deepEqual(planCells(row('1', { badge: { kind: 'flip' }, plan })), { buy: 90, sell: 120, units: 3, pace: 4, stops: 2 });
     assert.deepEqual(planCells(row('1', {})), { buy: null, sell: null, units: 0, pace: null, stops: 0 });
 });
+
+test('3.35.0: Best flips - the confirmed ones first, then those still being checked, the most each would make first', () => {
+    const flip = (id, value) => ({ itemId: id, name: id, value, held: 0, bid: 0, badge: { kind: 'flip', amount: value }, plan: { buyer: { id: 'b' + id }, units: 1 } });
+    const checking = (id, profit) => ({ itemId: id, name: id, value: 0, held: 0, bid: 0, badge: { kind: 'checking', amount: profit }, checking: { profit } });
+    const pass = (r) => r.badge && (r.badge.kind === 'flip' || r.badge.kind === 'checking');
+    const order = listOrder([checking('c1', 100), flip('f1', 50), checking('c2', 900), flip('f2', 500)], pass, 'flips').map((r) => r.itemId);
+    assert.deepEqual(order, ['f2', 'f1', 'c2', 'c1']);
+});
