@@ -10855,7 +10855,7 @@ function renderSellingWork(src = null, { press = null, typed = false } = {}) {
         // 3.35.0 (core/old-lists.js) - whose flips Fresh prices hides only for an old edit date: their list page is read
         // (openOrder's `old`), and a list found open is current (freshAtOf). The same pass counts what each Show choice
         // hides, for the zip. Worked out every OLD_SCAN_EVERY_MS: it walks every item's buyers.
-        if (sell.summary && !q && document.visibilityState === 'visible' && now - (sell.oldScanAt || 0) >= OLD_SCAN_EVERY_MS) {
+        if (sell.summary && !String(sell.query || '').trim() && document.visibilityState === 'visible' && now - (sell.oldScanAt || 0) >= OLD_SCAN_EVERY_MS) {
             sell.oldScanAt = now;
             const lowestEff = (id) => (effective.get(String(id)) || {}).lowestPrice;
             const scan = oldListScan(effective.keys(), {

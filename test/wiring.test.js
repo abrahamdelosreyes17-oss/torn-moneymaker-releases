@@ -347,3 +347,26 @@ test('3.35.0: the zip says what the index did', () => {
     has('whoSells: (() => {', 'coverage');
     for (const k of ['readsPutFirst: sell.whoStats.used', 'cheapConfirmed: sell.whoCheapDone.size', 'seesSent: st ? st.seesOut : null']) has(k, 'the counts');
 });
+
+// 3.35.1 - workData used its own `const q` before the line that made it: every Torn Bids redraw threw (the owner's zip,
+// 2026-10-25 06:33: "nothing moves anymore"). A name made at workData's top level is never used above that line there.
+test('workData: no top-level name is used before its line', () => {
+    const lines = main.split('\n');
+    const start = lines.findIndex((l) => l.includes('const workData = () => {'));
+    assert.ok(start > 0);
+    let depth = 0;
+    let end = start;
+    for (let i = start; i < lines.length; i += 1) {
+        for (const c of lines[i]) depth += c === '{' ? 1 : c === '}' ? -1 : 0;
+        if (i > start && depth <= 0) { end = i; break; }
+    }
+    const plain = (l) => l.replace(/\/\/.*$/, '').replace(/'[^']*'/g, "''").replace(/`[^`]*`/g, '``');
+    const late = [];
+    for (let i = start + 1; i < end; i += 1) {
+        const m = lines[i].match(/^ {8}(?:const|let) ([A-Za-z_$][\w$]*)\s*=/);
+        if (!m) continue;
+        const use = new RegExp(`(^|[^\w$.])${m[1].replace('$', '\$')}(?![\w$:])`);
+        for (let j = start + 1; j < i; j += 1) if (/^ {8}\S/.test(lines[j]) && use.test(plain(lines[j]))) late.push(`${m[1]} used on line ${j + 1}, made on ${i + 1}`);
+    }
+    assert.deepEqual(late, []);
+});

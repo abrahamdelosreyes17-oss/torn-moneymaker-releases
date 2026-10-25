@@ -3014,6 +3014,14 @@ edited over a day ago only once you open that item.
 
 **Not seen on real Torn.** Tested with `npm test`.
 
+### Fix: Torn Bids stood still (3.35.1)
+
+- 3.35.0's old-list check used a name before the line that made it, so every
+  redraw stopped with an error: nothing moved, no trade was found and a pressed
+  card did nothing. Fixed, with a test that keeps it from coming back.
+
+**Not seen on real Torn.** Tested with `npm test`.
+
 ## Architecture
 
 ```

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Torn Trading - Buyer-side Opportunity Scanner
 // @namespace    torn-trading
-// @version      3.35.0
+// @version      3.35.1
 // @description  Finds Bazaar and Item Market listings below NPC / market value - on the page you are viewing, and live from the Torn API and TornW3B - ranked by the profit you can actually realize.
 // @author       -
 // @match        https://www.torn.com/*
@@ -53,7 +53,7 @@
 (function (undefined, NaN, Infinity, Object, Array, String, Number, Boolean, Symbol, Math, JSON, Date, RegExp, Intl, Map, Set, WeakMap, WeakSet, Promise, Error, ArrayBuffer, DataView, Uint8Array, Uint32Array, TextEncoder, URL, URLSearchParams, encodeURIComponent, document, performance) {
     'use strict';
 
-    const TTV2_BUILD_VERSION = '3.35.0';
+    const TTV2_BUILD_VERSION = '3.35.1';
     const TTV2_SHARED_HOME = 'https://torn-bids-shared.pumping-iron-worker.workers.dev';
 
     /* ===== src/platform/gm.js ===== */
@@ -49174,7 +49174,7 @@
             // 3.35.0 (core/old-lists.js) - whose flips Fresh prices hides only for an old edit date: their list page is read
             // (openOrder's `old`), and a list found open is current (freshAtOf). The same pass counts what each Show choice
             // hides, for the zip. Worked out every OLD_SCAN_EVERY_MS: it walks every item's buyers.
-            if (sell.summary && !q && document.visibilityState === 'visible' && now - (sell.oldScanAt || 0) >= OLD_SCAN_EVERY_MS) {
+            if (sell.summary && !String(sell.query || '').trim() && document.visibilityState === 'visible' && now - (sell.oldScanAt || 0) >= OLD_SCAN_EVERY_MS) {
                 sell.oldScanAt = now;
                 const lowestEff = (id) => (effective.get(String(id)) || {}).lowestPrice;
                 const scan = oldListScan(effective.keys(), {
